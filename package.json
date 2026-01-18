@@ -1,5 +1,5 @@
 {
-  "name": "code-graph",
+  "name": "@colbymchenry/codegraph",
   "version": "0.1.0",
   "description": "A local-first code intelligence system that builds a semantic knowledge graph from any codebase",
   "main": "dist/index.js",
