@@ -1,6 +1,6 @@
 {
   "name": "@colbymchenry/codegraph",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A local-first code intelligence system that builds a semantic knowledge graph from any codebase",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
