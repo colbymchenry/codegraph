@@ -1,6 +1,6 @@
 {
   "name": "@colbymchenry/codegraph",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "A local-first code intelligence system that builds a semantic knowledge graph from any codebase",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -31,9 +31,9 @@
   "license": "MIT",
   "dependencies": {
     "@xenova/transformers": "^2.17.0",
-    "figlet": "^1.8.0",
     "better-sqlite3": "^11.0.0",
     "commander": "^14.0.2",
+    "figlet": "^1.8.0",
     "sqlite-vss": "^0.1.2",
     "tree-sitter": "^0.22.4",
     "tree-sitter-c": "^0.23.4",
@@ -43,6 +43,7 @@
     "tree-sitter-java": "^0.23.5",
     "tree-sitter-javascript": "^0.23.1",
     "tree-sitter-kotlin": "^0.3.8",
+    "tree-sitter-liquid": "github:hankthetank27/tree-sitter-liquid",
     "tree-sitter-php": "^0.23.11",
     "tree-sitter-python": "^0.23.6",
     "tree-sitter-ruby": "^0.23.1",

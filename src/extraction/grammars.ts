@@ -36,6 +36,8 @@ const Ruby = require('tree-sitter-ruby');
 const Swift = require('tree-sitter-swift');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const Kotlin = require('tree-sitter-kotlin');
+// Note: tree-sitter-liquid has ABI compatibility issues with tree-sitter 0.22+
+// Liquid extraction is handled separately via regex in tree-sitter.ts
 
 /**
  * Mapping of Language to tree-sitter grammar
@@ -56,6 +58,7 @@ const GRAMMAR_MAP: Record<string, unknown> = {
   ruby: Ruby,
   swift: Swift,
   kotlin: Kotlin,
+  // liquid: uses custom regex-based extraction, not tree-sitter
 };
 
 /**
@@ -87,6 +90,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.swift': 'swift',
   '.kt': 'kotlin',
   '.kts': 'kotlin',
+  '.liquid': 'liquid',
 };
 
 /**
@@ -129,6 +133,8 @@ export function detectLanguage(filePath: string): Language {
  * Check if a language is supported
  */
 export function isLanguageSupported(language: Language): boolean {
+  // Liquid uses custom regex-based extraction, not tree-sitter
+  if (language === 'liquid') return true;
   return language !== 'unknown' && language in GRAMMAR_MAP;
 }
 
@@ -136,7 +142,10 @@ export function isLanguageSupported(language: Language): boolean {
  * Get all supported languages
  */
 export function getSupportedLanguages(): Language[] {
-  return Object.keys(GRAMMAR_MAP) as Language[];
+  const languages = Object.keys(GRAMMAR_MAP) as Language[];
+  // Add Liquid which uses custom extraction
+  languages.push('liquid');
+  return languages;
 }
 
 /**
@@ -166,6 +175,7 @@ export function getLanguageDisplayName(language: Language): string {
     ruby: 'Ruby',
     swift: 'Swift',
     kotlin: 'Kotlin',
+    liquid: 'Liquid',
     unknown: 'Unknown',
   };
   return names[language] || language;

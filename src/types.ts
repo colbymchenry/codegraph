@@ -71,6 +71,7 @@ export type Language =
   | 'ruby'
   | 'swift'
   | 'kotlin'
+  | 'liquid'
   | 'unknown';
 
 // =============================================================================
@@ -496,6 +497,8 @@ export const DEFAULT_CONFIG: CodeGraphConfig = {
     '**/*.php',
     // Ruby
     '**/*.rb',
+    // Liquid (Shopify themes)
+    '**/*.liquid',
   ],
   exclude: [
     // Version control
