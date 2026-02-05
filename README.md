@@ -68,6 +68,21 @@ We ran the same complex task 3 times with and without CodeGraph:
 
 </details>
 
+<details>
+<summary><strong>Reproducing the benchmark</strong></summary>
+
+The token and tool-call numbers above were measured manually by giving Claude Code the same task (implementing a feature in a ~10k-line TypeScript project) three times with and without CodeGraph, then reading the per-agent token counts from the Claude Code output.
+
+To run the **precision/recall evaluation suite** against the included test fixtures:
+
+```bash
+npm test -- __tests__/evaluation/evaluation.test.ts
+```
+
+This runs search, callers/callees, impact, and context queries against two fixture projects (TypeScript and Python) and reports precision, recall, and F1 scores for each.
+
+</details>
+
 ### 🔄 How It Works
 
 ```
