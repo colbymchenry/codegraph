@@ -273,10 +273,11 @@ export function writeClaudeMd(location: InstallLocation): { created: boolean; up
   const match = content.match(codegraphHeaderRegex);
 
   if (match && match.index !== undefined) {
-    // Find the end of the CodeGraph section (next ## header or end of file)
+    // Find the end of the CodeGraph section (next h2 header or end of file)
+    // Use negative lookahead (?!#) to match "## X" but not "### X"
     const sectionStart = match.index;
     const afterSection = content.substring(sectionStart + 1);
-    const nextHeaderMatch = afterSection.match(/\n## [^#]/);
+    const nextHeaderMatch = afterSection.match(/\n## (?!#)/);
 
     let sectionEnd: number;
     if (nextHeaderMatch && nextHeaderMatch.index !== undefined) {

@@ -145,5 +145,75 @@ describe('Installer Config Writer', () => {
       const tmpFiles = files.filter(f => f.includes('.tmp.'));
       expect(tmpFiles).toHaveLength(0);
     });
+
+    it('should not overwrite content after unmarked section with ### subsections', () => {
+      // Create a CLAUDE.md with an unmarked CodeGraph section that has ### subsections
+      // followed by another ## section
+      const claudeDir = path.join(tempDir, '.claude');
+      fs.mkdirSync(claudeDir, { recursive: true });
+      const claudeMdPath = path.join(claudeDir, 'CLAUDE.md');
+      fs.writeFileSync(claudeMdPath, [
+        '## Pre-existing Section',
+        '',
+        'Some content',
+        '',
+        '## CodeGraph',
+        '',
+        '### Subsection A',
+        '',
+        'Old codegraph content',
+        '',
+        '### Subsection B',
+        '',
+        'More old content',
+        '',
+        '## Important Section After',
+        '',
+        'This content must not be overwritten!',
+        '',
+      ].join('\n'));
+
+      const result = writeClaudeMd('local');
+      expect(result.updated).toBe(true);
+
+      const final = fs.readFileSync(claudeMdPath, 'utf-8');
+      // The section after CodeGraph must be preserved
+      expect(final).toContain('## Important Section After');
+      expect(final).toContain('This content must not be overwritten!');
+      // Pre-existing section should also be preserved
+      expect(final).toContain('## Pre-existing Section');
+      // New CodeGraph content should be present with markers
+      expect(final).toContain('<!-- CODEGRAPH_START -->');
+      expect(final).toContain('<!-- CODEGRAPH_END -->');
+    });
+
+    it('should replace unmarked section without subsections', () => {
+      const claudeDir = path.join(tempDir, '.claude');
+      fs.mkdirSync(claudeDir, { recursive: true });
+      const claudeMdPath = path.join(claudeDir, 'CLAUDE.md');
+      // Note: regex needs \n before ## CodeGraph, so prefix with another section
+      fs.writeFileSync(claudeMdPath, [
+        '## Intro',
+        '',
+        'Preamble',
+        '',
+        '## CodeGraph',
+        '',
+        'Old simple content',
+        '',
+        '## Next Section',
+        '',
+        'Must be preserved',
+        '',
+      ].join('\n'));
+
+      writeClaudeMd('local');
+
+      const final = fs.readFileSync(claudeMdPath, 'utf-8');
+      expect(final).toContain('<!-- CODEGRAPH_START -->');
+      expect(final).toContain('## Next Section');
+      expect(final).toContain('Must be preserved');
+      expect(final).not.toContain('Old simple content');
+    });
   });
 });
