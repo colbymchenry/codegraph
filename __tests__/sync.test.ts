@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
+import { GitHooksManager } from '../src/sync/git-hooks';
 
 describe('Sync Module', () => {
   describe('Git Hooks', () => {
@@ -263,6 +264,119 @@ describe('Sync Module', () => {
         const backupPath = path.join(hooksDir, 'post-commit.codegraph-backup');
         expect(fs.existsSync(backupPath)).toBe(false);
       });
+    });
+  });
+
+  describe('Git Worktree Support', () => {
+    let mainRepoDir: string;
+    let worktreeDir: string;
+
+    beforeEach(() => {
+      // Create a simulated main repo
+      mainRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-worktree-main-'));
+      // Create a simulated worktree directory
+      worktreeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-worktree-wt-'));
+    });
+
+    afterEach(() => {
+      if (fs.existsSync(mainRepoDir)) {
+        fs.rmSync(mainRepoDir, { recursive: true, force: true });
+      }
+      if (fs.existsSync(worktreeDir)) {
+        fs.rmSync(worktreeDir, { recursive: true, force: true });
+      }
+    });
+
+    it('should resolve hooks dir from worktree .git file (absolute path)', () => {
+      // Set up main repo .git directory with worktrees
+      const mainGitDir = path.join(mainRepoDir, '.git');
+      fs.mkdirSync(mainGitDir);
+      fs.mkdirSync(path.join(mainGitDir, 'hooks'));
+      fs.mkdirSync(path.join(mainGitDir, 'worktrees'), { recursive: true });
+      fs.mkdirSync(path.join(mainGitDir, 'worktrees', 'feature-branch'));
+
+      // Create a .git file in the worktree pointing to the worktree gitdir (absolute path)
+      const worktreeGitDir = path.join(mainGitDir, 'worktrees', 'feature-branch');
+      fs.writeFileSync(path.join(worktreeDir, '.git'), `gitdir: ${worktreeGitDir}\n`);
+
+      const manager = new GitHooksManager(worktreeDir);
+
+      // Should resolve to the main repo .git directory
+      expect(manager.isGitRepository()).toBe(true);
+
+      // Hooks dir should be in the main repo
+      const hooksDir = manager.getHooksDir();
+      expect(hooksDir).toBe(path.join(mainGitDir, 'hooks'));
+    });
+
+    it('should resolve hooks dir from worktree .git file (relative path)', () => {
+      // Set up a structure where worktree is a subdirectory of main repo
+      // This simulates: mainRepo/.git/worktrees/feature-branch and worktree at mainRepo/worktrees/feature-branch
+      const mainGitDir = path.join(mainRepoDir, '.git');
+      fs.mkdirSync(mainGitDir);
+      fs.mkdirSync(path.join(mainGitDir, 'hooks'));
+      fs.mkdirSync(path.join(mainGitDir, 'worktrees', 'feature-branch'), { recursive: true });
+
+      // Create worktree dir inside main repo for relative path test
+      const relativeWorktreeDir = path.join(mainRepoDir, 'worktrees', 'feature-branch');
+      fs.mkdirSync(relativeWorktreeDir, { recursive: true });
+
+      // Relative path from worktree to its gitdir
+      const relativeGitDir = path.relative(relativeWorktreeDir, path.join(mainGitDir, 'worktrees', 'feature-branch'));
+      fs.writeFileSync(path.join(relativeWorktreeDir, '.git'), `gitdir: ${relativeGitDir}\n`);
+
+      const manager = new GitHooksManager(relativeWorktreeDir);
+
+      expect(manager.isGitRepository()).toBe(true);
+      expect(manager.getHooksDir()).toBe(path.join(mainGitDir, 'hooks'));
+    });
+
+    it('should handle regular .git directory (not a worktree)', () => {
+      const gitDir = path.join(mainRepoDir, '.git');
+      fs.mkdirSync(gitDir);
+      fs.mkdirSync(path.join(gitDir, 'hooks'));
+
+      const manager = new GitHooksManager(mainRepoDir);
+
+      expect(manager.isGitRepository()).toBe(true);
+      expect(manager.getHooksDir()).toBe(path.join(gitDir, 'hooks'));
+    });
+
+    it('should handle missing .git (not a repo)', () => {
+      const manager = new GitHooksManager(worktreeDir);
+
+      expect(manager.isGitRepository()).toBe(false);
+    });
+
+    it('should handle .git file with invalid content', () => {
+      fs.writeFileSync(path.join(worktreeDir, '.git'), 'this is not a valid gitdir reference\n');
+
+      const manager = new GitHooksManager(worktreeDir);
+
+      // Should not crash - falls back gracefully
+      expect(manager.isGitRepository()).toBe(false);
+    });
+
+    it('should install hooks in main repo from worktree', () => {
+      // Set up main repo
+      const mainGitDir = path.join(mainRepoDir, '.git');
+      fs.mkdirSync(mainGitDir);
+      fs.mkdirSync(path.join(mainGitDir, 'worktrees', 'feature-branch'), { recursive: true });
+
+      // Create worktree .git file
+      const worktreeGitDir = path.join(mainGitDir, 'worktrees', 'feature-branch');
+      fs.writeFileSync(path.join(worktreeDir, '.git'), `gitdir: ${worktreeGitDir}\n`);
+
+      const manager = new GitHooksManager(worktreeDir);
+      const result = manager.installHook();
+
+      expect(result.success).toBe(true);
+
+      // Hook should be in the main repo's hooks dir
+      const hookPath = path.join(mainGitDir, 'hooks', 'post-commit');
+      expect(fs.existsSync(hookPath)).toBe(true);
+      const content = fs.readFileSync(hookPath, 'utf-8');
+      expect(content).toContain('CodeGraph auto-sync hook');
     });
   });
 
