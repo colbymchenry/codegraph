@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc && npm run copy-assets",
     "postinstall": "node scripts/postinstall.js",
-    "copy-assets": "cp -r src/extraction/queries dist/extraction/ && cp src/db/schema.sql dist/db/",
+    "copy-assets": "cp src/db/schema.sql dist/db/",
     "dev": "tsc --watch",
     "cli": "npm run build && node dist/bin/codegraph.js",
     "test": "vitest run",
