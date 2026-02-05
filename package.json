@@ -61,7 +61,7 @@
     "@types/node": "^20.19.30",
     "@types/picomatch": "^4.0.2",
     "typescript": "^5.0.0",
-    "vitest": "^2.0.0"
+    "vitest": "^4.0.18"
   },
   "engines": {
     "node": ">=18.0.0"
