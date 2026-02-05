@@ -163,6 +163,19 @@ describe('Sync Module', () => {
         expect(result.previousHookBackedUp).toBeUndefined();
       });
 
+      it('should log sync errors to .codegraph/sync.log', () => {
+        fs.mkdirSync(path.join(testDir, '.git'));
+        cg.installGitHooks();
+
+        const hookPath = path.join(testDir, '.git', 'hooks', 'post-commit');
+        const content = fs.readFileSync(hookPath, 'utf-8');
+
+        // Sync command should redirect stderr to sync.log
+        expect(content).toContain('.codegraph/sync.log');
+        // The actual sync commands should NOT send stderr to /dev/null
+        expect(content).toContain('codegraph sync --quiet 2>>"$LOGFILE"');
+      });
+
       it('should make hook executable', () => {
         // Initialize git
         fs.mkdirSync(path.join(testDir, '.git'));

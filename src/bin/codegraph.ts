@@ -696,6 +696,22 @@ hooksCommand
 
       if (cg.isGitHookInstalled()) {
         success('Git hook is installed');
+
+        // Check sync log for recent errors
+        const syncLogPath = path.join(projectPath, '.codegraph', 'sync.log');
+        if (fs.existsSync(syncLogPath)) {
+          try {
+            const logContent = fs.readFileSync(syncLogPath, 'utf-8').trim();
+            if (logContent.length > 0) {
+              const lines = logContent.split('\n');
+              const lastLines = lines.slice(-5);
+              warn('Recent sync errors (see .codegraph/sync.log):');
+              for (const line of lastLines) {
+                console.log(chalk.dim(`  ${line}`));
+              }
+            }
+          } catch { /* ignore read failure */ }
+        }
       } else {
         warn('Git hook is not installed');
         info('Run "codegraph hooks install" to enable auto-sync');

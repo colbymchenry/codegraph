@@ -39,11 +39,13 @@ ${CODEGRAPH_MARKER}
     exit 0
   fi
 
+  LOGFILE=".codegraph/sync.log"
+
   # Try to run codegraph sync
   if command -v codegraph >/dev/null 2>&1; then
-    codegraph sync --quiet 2>/dev/null &
+    codegraph sync --quiet 2>>"$LOGFILE" &
   elif command -v npx >/dev/null 2>&1; then
-    npx codegraph sync --quiet 2>/dev/null &
+    npx codegraph sync --quiet 2>>"$LOGFILE" &
   fi
 ) &
 
