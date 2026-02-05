@@ -104,8 +104,25 @@ export function scanDirectory(
 ): string[] {
   const files: string[] = [];
   let count = 0;
+  // Track visited real paths to detect symlink cycles
+  const visitedDirs = new Set<string>();
 
   function walk(dir: string): void {
+    // Resolve real path to detect symlink cycles
+    let realDir: string;
+    try {
+      realDir = fs.realpathSync(dir);
+    } catch {
+      logDebug('Skipping unresolvable directory', { dir });
+      return;
+    }
+
+    if (visitedDirs.has(realDir)) {
+      logDebug('Skipping already-visited directory (symlink cycle)', { dir, realDir });
+      return;
+    }
+    visitedDirs.add(realDir);
+
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -118,7 +135,28 @@ export function scanDirectory(
       const fullPath = path.join(dir, entry.name);
       const relativePath = path.relative(rootDir, fullPath);
 
-      if (entry.isDirectory()) {
+      if (entry.isDirectory() || entry.isSymbolicLink()) {
+        // For symlinks, check if they point to a directory
+        if (entry.isSymbolicLink()) {
+          try {
+            const stat = fs.statSync(fullPath);
+            if (!stat.isDirectory()) {
+              // Symlink to a file — treat as file below
+              if (stat.isFile() && shouldIncludeFile(relativePath, config)) {
+                files.push(relativePath);
+                count++;
+                if (onProgress) {
+                  onProgress(count, relativePath);
+                }
+              }
+              continue;
+            }
+          } catch {
+            logDebug('Skipping broken symlink', { path: fullPath });
+            continue;
+          }
+        }
+
         // Check if directory should be excluded
         const dirPattern = relativePath + '/';
         let excluded = false;

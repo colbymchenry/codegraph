@@ -15,7 +15,7 @@ import * as os from 'os';
 import { FileLock } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
-import { shouldIncludeFile } from '../src/extraction';
+import { shouldIncludeFile, scanDirectory } from '../src/extraction';
 import { shouldIncludeFile as configShouldInclude } from '../src/config';
 import { CodeGraphConfig, DEFAULT_CONFIG } from '../src/types';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
@@ -436,5 +436,100 @@ describe('JSON.parse Error Boundaries in DB', () => {
     expect(file!.errors).toBeUndefined();
 
     db.close();
+  });
+});
+
+describe('Symlink Cycle Detection', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  it('should handle symlink cycle without infinite loop', () => {
+    // Create directory structure with a symlink cycle
+    const srcDir = path.join(tempDir, 'src');
+    fs.mkdirSync(srcDir);
+    fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;\n');
+
+    // Create a symlink from src/loop -> tempDir (parent directory)
+    try {
+      fs.symlinkSync(tempDir, path.join(srcDir, 'loop'), 'dir');
+    } catch {
+      // Skip test if symlinks not supported (e.g., Windows without admin)
+      return;
+    }
+
+    const config: CodeGraphConfig = {
+      ...DEFAULT_CONFIG,
+      rootDir: tempDir,
+      include: ['**/*.ts'],
+      exclude: [],
+    };
+
+    // This should complete without hanging
+    const files = scanDirectory(tempDir, config);
+
+    // Should find the real file but not loop infinitely
+    expect(files).toContain('src/index.ts');
+    // Should not find duplicates via the symlink path
+    const indexFiles = files.filter(f => f.endsWith('index.ts'));
+    expect(indexFiles.length).toBe(1);
+  });
+
+  it('should follow valid symlinks to directories', () => {
+    // Create source directory with a file
+    const realDir = path.join(tempDir, 'real');
+    fs.mkdirSync(realDir);
+    fs.writeFileSync(path.join(realDir, 'hello.ts'), 'export function hello() {}\n');
+
+    // Create a symlink to realDir
+    const srcDir = path.join(tempDir, 'src');
+    fs.mkdirSync(srcDir);
+    try {
+      fs.symlinkSync(realDir, path.join(srcDir, 'linked'), 'dir');
+    } catch {
+      return;
+    }
+
+    const config: CodeGraphConfig = {
+      ...DEFAULT_CONFIG,
+      rootDir: tempDir,
+      include: ['**/*.ts'],
+      exclude: [],
+    };
+
+    const files = scanDirectory(tempDir, config);
+
+    // Should find files from both the real dir and via the symlink
+    // But deduplicate since they resolve to the same real path
+    expect(files.some(f => f.includes('hello.ts'))).toBe(true);
+  });
+
+  it('should skip broken symlinks gracefully', () => {
+    const srcDir = path.join(tempDir, 'src');
+    fs.mkdirSync(srcDir);
+    fs.writeFileSync(path.join(srcDir, 'valid.ts'), 'export const y = 2;\n');
+
+    try {
+      fs.symlinkSync('/nonexistent/path', path.join(srcDir, 'broken'), 'dir');
+    } catch {
+      return;
+    }
+
+    const config: CodeGraphConfig = {
+      ...DEFAULT_CONFIG,
+      rootDir: tempDir,
+      include: ['**/*.ts'],
+      exclude: [],
+    };
+
+    // Should not throw
+    const files = scanDirectory(tempDir, config);
+    expect(files).toContain('src/valid.ts');
   });
 });
