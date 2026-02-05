@@ -572,8 +572,7 @@ The `.codegraph/config.json` file controls indexing behavior:
     "*.min.js"
   ],
   "frameworks": ["express", "react"],
-  "maxFileSize": 1048576,
-  "gitHooksEnabled": true
+  "maxFileSize": 1048576
 }
 ```
 
@@ -585,7 +584,6 @@ The `.codegraph/config.json` file controls indexing behavior:
 | `exclude` | Glob patterns to ignore | `["node_modules/**", ...]` |
 | `frameworks` | Framework hints for better resolution | `[]` |
 | `maxFileSize` | Skip files larger than this (bytes) | `1048576` (1MB) |
-| `gitHooksEnabled` | Enable git hook installation | `true` |
 
 ## 🌐 Supported Languages
 
