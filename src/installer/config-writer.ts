@@ -46,18 +46,28 @@ function getSettingsJsonPath(location: InstallLocation): string {
 }
 
 /**
- * Read a JSON file, returning an empty object if it doesn't exist
+ * Read a JSON file, returning an empty object if it doesn't exist.
+ * Distinguishes between missing files (returns {}) and corrupted
+ * files (logs warning, returns {}).
  */
 function readJsonFile(filePath: string): Record<string, any> {
-  try {
-    if (fs.existsSync(filePath)) {
-      const content = fs.readFileSync(filePath, 'utf-8');
-      return JSON.parse(content);
-    }
-  } catch {
-    // Ignore parse errors, return empty object
+  if (!fs.existsSync(filePath)) {
+    return {};
   }
-  return {};
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    return JSON.parse(content);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`  Warning: Could not parse ${path.basename(filePath)}: ${msg}`);
+    console.warn(`  A backup will be created before overwriting.`);
+    // Create a backup of the corrupted file
+    try {
+      const backupPath = filePath + '.backup';
+      fs.copyFileSync(filePath, backupPath);
+    } catch { /* ignore backup failure */ }
+    return {};
+  }
 }
 
 /**
