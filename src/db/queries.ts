@@ -17,6 +17,7 @@ import {
   SearchOptions,
   SearchResult,
 } from '../types';
+import { logWarn } from '../errors';
 
 /**
  * Database row types (snake_case from SQLite)
@@ -76,6 +77,23 @@ interface UnresolvedRefRow {
 }
 
 /**
+ * Safely parse JSON from a database column value.
+ * Returns undefined on parse failure instead of crashing.
+ */
+function safeJsonParse(value: string | null | undefined, context: string): any {
+  if (!value) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch (err) {
+    logWarn(`Malformed JSON in database column (${context})`, {
+      value: value.substring(0, 100),
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+}
+
+/**
  * Convert database row to Node object
  */
 function rowToNode(row: NodeRow): Node {
@@ -97,8 +115,8 @@ function rowToNode(row: NodeRow): Node {
     isAsync: row.is_async === 1,
     isStatic: row.is_static === 1,
     isAbstract: row.is_abstract === 1,
-    decorators: row.decorators ? JSON.parse(row.decorators) : undefined,
-    typeParameters: row.type_parameters ? JSON.parse(row.type_parameters) : undefined,
+    decorators: safeJsonParse(row.decorators, `node ${row.id} decorators`),
+    typeParameters: safeJsonParse(row.type_parameters, `node ${row.id} type_parameters`),
     updatedAt: row.updated_at,
   };
 }
@@ -111,7 +129,7 @@ function rowToEdge(row: EdgeRow): Edge {
     source: row.source,
     target: row.target,
     kind: row.kind as EdgeKind,
-    metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
+    metadata: safeJsonParse(row.metadata, `edge ${row.source}->${row.target} metadata`),
     line: row.line ?? undefined,
     column: row.col ?? undefined,
   };
@@ -129,7 +147,7 @@ function rowToFileRecord(row: FileRow): FileRecord {
     modifiedAt: row.modified_at,
     indexedAt: row.indexed_at,
     nodeCount: row.node_count,
-    errors: row.errors ? JSON.parse(row.errors) : undefined,
+    errors: safeJsonParse(row.errors, `file ${row.path} errors`),
   };
 }
 
