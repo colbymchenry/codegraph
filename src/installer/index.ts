@@ -7,7 +7,7 @@
 
 import { execSync } from 'child_process';
 import { showBanner, showNextSteps, success, error, info, chalk } from './banner';
-import { promptInstallLocation, promptAutoAllow, InstallLocation } from './prompts';
+import { promptInstallLocation, promptAutoAllow, promptConfirm, InstallLocation } from './prompts';
 import { writeMcpConfig, writePermissions, writeClaudeMd, hasMcpConfig, hasPermissions } from './config-writer';
 import CodeGraph from '../index';
 
@@ -36,13 +36,18 @@ export async function runInstaller(): Promise<void> {
     }
 
     if (!codegraphAvailable) {
-      console.log(chalk.dim('  Installing codegraph globally...'));
-      try {
-        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe' });
-        success('Installed codegraph command globally');
-      } catch {
-        // May fail if no permissions, but that's ok - npx still works
-        info('Could not install globally (try with sudo if needed)');
+      const shouldInstall = await promptConfirm('Install codegraph globally via npm?', true);
+      if (shouldInstall) {
+        console.log(chalk.dim('  Installing codegraph globally...'));
+        try {
+          execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe' });
+          success('Installed codegraph command globally');
+        } catch {
+          // May fail if no permissions, but that's ok - npx still works
+          info('Could not install globally (try with sudo if needed)');
+        }
+      } else {
+        info('Skipping global install (npx will be used instead)');
       }
       console.log();
     }
