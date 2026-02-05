@@ -307,7 +307,14 @@ export class ContextBuilder {
    * Extract code from a node's source file
    */
   private async extractNodeCode(node: Node): Promise<string | null> {
-    const filePath = path.join(this.projectRoot, node.filePath);
+    const filePath = path.resolve(this.projectRoot, node.filePath);
+
+    // Prevent path traversal: ensure resolved path stays within project root
+    if (!filePath.startsWith(path.resolve(this.projectRoot) + path.sep) &&
+        filePath !== path.resolve(this.projectRoot)) {
+      logWarn('Path traversal blocked', { nodeId: node.id, filePath: node.filePath });
+      return null;
+    }
 
     if (!fs.existsSync(filePath)) {
       return null;
