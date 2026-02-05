@@ -4,7 +4,9 @@
 
 ### Supercharge Claude Code with Semantic Code Intelligence
 
-**30% fewer tokens • 25% fewer tool calls • 100% local**
+**30% fewer tokens • 25% fewer tool calls • 100% local***
+
+<sub>*Semantic search downloads a ~100MB model on first use; all processing is offline after that.</sub>
 
 [![npm version](https://img.shields.io/npm/v/@colbymchenry/codegraph.svg)](https://www.npmjs.com/package/@colbymchenry/codegraph)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -139,7 +141,7 @@ TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Swift, Ko
 <td width="33%" valign="top">
 
 ### 🔒 100% Local
-No data leaves your machine. No API keys. No external services. Everything runs on your local SQLite database.
+No API keys. No external services. Everything runs on your local SQLite database. Semantic search requires a one-time ~100MB model download; after that, all processing is fully offline.
 
 </td>
 <td width="33%" valign="top">
