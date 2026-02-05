@@ -228,6 +228,11 @@ program
         if (result.success) {
           success(`Indexed ${formatNumber(result.filesIndexed)} files`);
           info(`Created ${formatNumber(result.nodesCreated)} nodes and ${formatNumber(result.edgesCreated)} edges`);
+          const sizeWarnings = result.errors.filter(e => e.message.includes('exceeds max size'));
+          if (sizeWarnings.length > 0) {
+            warn(`${sizeWarnings.length} file(s) exceeded maxFileSize and were not indexed`);
+            info(`Adjust maxFileSize in .codegraph/config.json to include them`);
+          }
           info(`Completed in ${formatDuration(result.durationMs)}`);
         } else {
           warn(`Indexing completed with ${result.errors.length} errors`);
@@ -289,6 +294,14 @@ program
         if (!options.quiet) {
           success(`Indexed ${formatNumber(result.filesIndexed)} files`);
           info(`Created ${formatNumber(result.nodesCreated)} nodes and ${formatNumber(result.edgesCreated)} edges`);
+          if (result.filesSkipped > 0) {
+            info(`Skipped ${formatNumber(result.filesSkipped)} files (unsupported language or no symbols)`);
+          }
+          const sizeWarnings = result.errors.filter(e => e.message.includes('exceeds max size'));
+          if (sizeWarnings.length > 0) {
+            warn(`${sizeWarnings.length} file(s) exceeded maxFileSize and were not indexed`);
+            info(`Adjust maxFileSize in .codegraph/config.json to include them`);
+          }
           info(`Completed in ${formatDuration(result.durationMs)}`);
         }
       } else {

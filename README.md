@@ -583,7 +583,7 @@ The `.codegraph/config.json` file controls indexing behavior:
 | `languages` | Languages to index (auto-detected if empty) | `[]` |
 | `exclude` | Glob patterns to ignore | `["node_modules/**", ...]` |
 | `frameworks` | Framework hints for better resolution | `[]` |
-| `maxFileSize` | Skip files larger than this (bytes) | `1048576` (1MB) |
+| `maxFileSize` | Skip files larger than this (bytes). Skipped files won't appear in the graph. | `1048576` (1MB) |
 
 ## 🌐 Supported Languages
 
@@ -627,6 +627,7 @@ Run `codegraph init` in your project directory first.
 - Run `codegraph sync` to pick up recent changes
 - Check if the file's language is supported
 - Verify the file isn't excluded by config patterns
+- Files larger than `maxFileSize` (default 1MB) are silently skipped during indexing. Increase the limit in `.codegraph/config.json` if needed
 
 ---
 
