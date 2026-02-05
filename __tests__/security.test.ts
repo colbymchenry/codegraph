@@ -15,6 +15,9 @@ import * as os from 'os';
 import { FileLock } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
+import { shouldIncludeFile } from '../src/extraction';
+import { shouldIncludeFile as configShouldInclude } from '../src/config';
+import { CodeGraphConfig, DEFAULT_CONFIG } from '../src/types';
 
 function createTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-security-test-'));
@@ -290,5 +293,60 @@ describe('Atomic Writes', () => {
 
     const content = JSON.parse(fs.readFileSync(testFile, 'utf-8'));
     expect(content.test).toBe(true);
+  });
+});
+
+describe('Glob Matching (picomatch)', () => {
+  const makeConfig = (include: string[], exclude: string[]): CodeGraphConfig => ({
+    ...DEFAULT_CONFIG,
+    rootDir: '/test',
+    include,
+    exclude,
+  });
+
+  it('should match standard glob patterns in extraction', () => {
+    const config = makeConfig(['**/*.ts'], ['node_modules/**']);
+
+    expect(shouldIncludeFile('src/index.ts', config)).toBe(true);
+    expect(shouldIncludeFile('src/deep/nested/file.ts', config)).toBe(true);
+    expect(shouldIncludeFile('src/index.js', config)).toBe(false);
+    expect(shouldIncludeFile('node_modules/lib/index.ts', config)).toBe(false);
+  });
+
+  it('should match standard glob patterns in config', () => {
+    const config = makeConfig(['**/*.py'], ['__pycache__/**']);
+
+    expect(configShouldInclude('src/main.py', config)).toBe(true);
+    expect(configShouldInclude('src/main.ts', config)).toBe(false);
+    expect(configShouldInclude('__pycache__/module.py', config)).toBe(false);
+  });
+
+  it('should handle complex glob patterns correctly', () => {
+    const config = makeConfig(['src/**/*.{ts,tsx}', 'lib/**/*.js'], []);
+
+    expect(shouldIncludeFile('src/component.ts', config)).toBe(true);
+    expect(shouldIncludeFile('src/component.tsx', config)).toBe(true);
+    expect(shouldIncludeFile('lib/util.js', config)).toBe(true);
+    expect(shouldIncludeFile('src/component.css', config)).toBe(false);
+  });
+
+  it('should handle patterns that previously caused ReDoS', () => {
+    // This pattern would cause catastrophic backtracking with hand-rolled regex
+    const evilPattern = '**/**/**/**/**/**/**/**/**/**/**/**/**/**/a';
+    const config = makeConfig([evilPattern], []);
+
+    const start = Date.now();
+    // This should return quickly, not hang
+    shouldIncludeFile('x/x/x/x/x/x/x/x/x/x/x/x/x/x/b', config);
+    const elapsed = Date.now() - start;
+
+    // Should complete in under 100ms, not seconds
+    expect(elapsed).toBeLessThan(100);
+  });
+
+  it('should handle dot files correctly', () => {
+    const config = makeConfig(['**/*.ts'], []);
+
+    expect(shouldIncludeFile('.hidden/index.ts', config)).toBe(true);
   });
 });

@@ -6,6 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import picomatch from 'picomatch';
 import { CodeGraphConfig, DEFAULT_CONFIG, Language, NodeKind } from './types';
 
 /**
@@ -238,15 +239,8 @@ export function shouldIncludeFile(filePath: string, config: CodeGraphConfig): bo
   // Simple glob matching (for now, just check if any pattern matches)
   // A full implementation would use a proper glob library
 
-  const matchesPattern = (pattern: string, path: string): boolean => {
-    // Convert glob to regex (simplified)
-    const regexStr = pattern
-      .replace(/\./g, '\\.')
-      .replace(/\*\*/g, '.*')
-      .replace(/\*/g, '[^/]*')
-      .replace(/\?/g, '.');
-    const regex = new RegExp(`^${regexStr}$`);
-    return regex.test(path);
+  const matchesPattern = (pattern: string, filePath: string): boolean => {
+    return picomatch.isMatch(filePath, pattern, { dot: true });
   };
 
   // Check exclude patterns first

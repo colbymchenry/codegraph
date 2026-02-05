@@ -37,6 +37,7 @@
     "better-sqlite3": "^11.0.0",
     "commander": "^14.0.2",
     "figlet": "^1.8.0",
+    "picomatch": "^4.0.3",
     "sqlite-vss": "^0.1.2",
     "tree-sitter": "^0.22.4",
     "tree-sitter-c": "^0.23.4",
@@ -58,6 +59,7 @@
     "@types/better-sqlite3": "^7.6.0",
     "@types/figlet": "^1.5.8",
     "@types/node": "^20.19.30",
+    "@types/picomatch": "^4.0.2",
     "typescript": "^5.0.0",
     "vitest": "^2.0.0"
   },
