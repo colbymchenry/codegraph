@@ -214,12 +214,32 @@ export class ToolHandler {
   }
 
   /**
+   * Validate that a value is a non-empty string
+   */
+  private validateString(value: unknown, name: string): string | ToolResult {
+    if (typeof value !== 'string' || value.length === 0) {
+      return this.errorResult(`${name} must be a non-empty string`);
+    }
+    return value;
+  }
+
+  /**
+   * Validate and clamp a numeric value within bounds
+   */
+  private validateNumber(value: unknown, fallback: number, min: number, max: number): number {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return fallback;
+    return Math.min(Math.max(min, Math.round(num)), max);
+  }
+
+  /**
    * Handle codegraph_search
    */
   private async handleSearch(args: Record<string, unknown>): Promise<ToolResult> {
-    const query = args.query as string;
-    const kind = args.kind as string | undefined;
-    const limit = (args.limit as number) || 10;
+    const query = this.validateString(args.query, 'query');
+    if (typeof query !== 'string') return query;
+    const kind = typeof args.kind === 'string' ? args.kind : undefined;
+    const limit = this.validateNumber(args.limit, 10, 1, 100);
 
     const results = this.cg.searchNodes(query, {
       limit,
@@ -238,8 +258,9 @@ export class ToolHandler {
    * Handle codegraph_context
    */
   private async handleContext(args: Record<string, unknown>): Promise<ToolResult> {
-    const task = args.task as string;
-    const maxNodes = (args.maxNodes as number) || 20;
+    const task = this.validateString(args.task, 'task');
+    if (typeof task !== 'string') return task;
+    const maxNodes = this.validateNumber(args.maxNodes, 20, 1, 100);
     const includeCode = args.includeCode !== false;
 
     const context = await this.cg.buildContext(task, {
@@ -295,8 +316,9 @@ export class ToolHandler {
    * Handle codegraph_callers
    */
   private async handleCallers(args: Record<string, unknown>): Promise<ToolResult> {
-    const symbol = args.symbol as string;
-    const limit = (args.limit as number) || 20;
+    const symbol = this.validateString(args.symbol, 'symbol');
+    if (typeof symbol !== 'string') return symbol;
+    const limit = this.validateNumber(args.limit, 20, 1, 100);
 
     // First find the node by name
     const results = this.cg.searchNodes(symbol, { limit: 1 });
@@ -321,8 +343,9 @@ export class ToolHandler {
    * Handle codegraph_callees
    */
   private async handleCallees(args: Record<string, unknown>): Promise<ToolResult> {
-    const symbol = args.symbol as string;
-    const limit = (args.limit as number) || 20;
+    const symbol = this.validateString(args.symbol, 'symbol');
+    if (typeof symbol !== 'string') return symbol;
+    const limit = this.validateNumber(args.limit, 20, 1, 100);
 
     // First find the node by name
     const results = this.cg.searchNodes(symbol, { limit: 1 });
@@ -347,8 +370,9 @@ export class ToolHandler {
    * Handle codegraph_impact
    */
   private async handleImpact(args: Record<string, unknown>): Promise<ToolResult> {
-    const symbol = args.symbol as string;
-    const depth = (args.depth as number) || 2;
+    const symbol = this.validateString(args.symbol, 'symbol');
+    if (typeof symbol !== 'string') return symbol;
+    const depth = this.validateNumber(args.depth, 2, 1, 10);
 
     // First find the node by name
     const results = this.cg.searchNodes(symbol, { limit: 1 });
@@ -367,7 +391,8 @@ export class ToolHandler {
    * Handle codegraph_node
    */
   private async handleNode(args: Record<string, unknown>): Promise<ToolResult> {
-    const symbol = args.symbol as string;
+    const symbol = this.validateString(args.symbol, 'symbol');
+    if (typeof symbol !== 'string') return symbol;
     // Default to false to minimize context usage
     const includeCode = args.includeCode === true;
 
