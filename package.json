@@ -46,7 +46,7 @@
     "tree-sitter-java": "^0.23.5",
     "tree-sitter-javascript": "^0.23.1",
     "tree-sitter-kotlin": "^0.3.8",
-    "tree-sitter-liquid": "github:hankthetank27/tree-sitter-liquid",
+    "tree-sitter-liquid": "github:hankthetank27/tree-sitter-liquid#d6ebde3974742cd1b61b55d1d94aab1dacb41056",
     "tree-sitter-php": "^0.23.11",
     "tree-sitter-python": "^0.23.6",
     "tree-sitter-ruby": "^0.23.1",
