@@ -61,14 +61,30 @@ function readJsonFile(filePath: string): Record<string, any> {
 }
 
 /**
- * Write a JSON file, creating parent directories if needed
+ * Write a file atomically by writing to a temp file then renaming.
+ * Prevents corruption if the process crashes mid-write.
  */
-function writeJsonFile(filePath: string, data: Record<string, any>): void {
+function atomicWriteFileSync(filePath: string, content: string): void {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
+  const tmpPath = filePath + '.tmp.' + process.pid;
+  try {
+    fs.writeFileSync(tmpPath, content);
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    // Clean up temp file on failure
+    try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    throw err;
+  }
+}
+
+/**
+ * Write a JSON file, creating parent directories if needed
+ */
+function writeJsonFile(filePath: string, data: Record<string, any>): void {
+  atomicWriteFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
 }
 
 /**
@@ -219,7 +235,7 @@ export function writeClaudeMd(location: InstallLocation): { created: boolean; up
   // Check if file exists
   if (!fs.existsSync(claudeMdPath)) {
     // Create new file with just the CodeGraph section
-    fs.writeFileSync(claudeMdPath, CLAUDE_MD_TEMPLATE + '\n');
+    atomicWriteFileSync(claudeMdPath, CLAUDE_MD_TEMPLATE + '\n');
     return { created: true, updated: false };
   }
 
@@ -237,7 +253,7 @@ export function writeClaudeMd(location: InstallLocation): { created: boolean; up
       const before = content.substring(0, startIdx);
       const after = content.substring(endIdx + CODEGRAPH_SECTION_END.length);
       content = before + CLAUDE_MD_TEMPLATE + after;
-      fs.writeFileSync(claudeMdPath, content);
+      atomicWriteFileSync(claudeMdPath, content);
       return { created: false, updated: true };
     }
   }
@@ -263,12 +279,12 @@ export function writeClaudeMd(location: InstallLocation): { created: boolean; up
     const before = content.substring(0, sectionStart);
     const after = content.substring(sectionEnd);
     content = before + '\n' + CLAUDE_MD_TEMPLATE + after;
-    fs.writeFileSync(claudeMdPath, content);
+    atomicWriteFileSync(claudeMdPath, content);
     return { created: false, updated: true };
   }
 
   // No existing section, append to end
   content = content.trimEnd() + '\n\n' + CLAUDE_MD_TEMPLATE + '\n';
-  fs.writeFileSync(claudeMdPath, content);
+  atomicWriteFileSync(claudeMdPath, content);
   return { created: false, updated: false };
 }
