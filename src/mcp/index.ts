@@ -90,12 +90,15 @@ export class MCPServer {
    * Stop the server
    */
   stop(): void {
-    if (this.cg) {
-      this.cg.close();
-      this.cg = null;
+    try {
+      if (this.cg) {
+        this.cg.close();
+        this.cg = null;
+      }
+    } finally {
+      this.transport.stop();
+      process.exit(0);
     }
-    this.transport.stop();
-    process.exit(0);
   }
 
   /**
