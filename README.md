@@ -22,9 +22,6 @@ npx @colbymchenry/codegraph
 
 <sub>Interactive installer configures Claude Code automatically</sub>
 
-**📚 Documentation:**
-- [Complete Usage Guide](USAGE_GUIDE.md) - Comprehensive walkthrough
-- [Quick Reference](QUICK_REFERENCE.md) - One-page command reference
 
 </div>
 
@@ -648,8 +645,6 @@ Run `codegraph init` in your project directory first.
 
 ## 📚 Documentation
 
-- **[Complete Usage Guide](USAGE_GUIDE.md)** - Comprehensive documentation covering all features, workflows, and best practices
-- **[Quick Reference](QUICK_REFERENCE.md)** - One-page reference for common commands and patterns
 - **[Implementation Plan](IMPLEMENTATION_PLAN.md)** - Technical architecture and design decisions
 - **[Contributing Guide](CLAUDE.md)** - Guidelines for contributing to CodeGraph
 
