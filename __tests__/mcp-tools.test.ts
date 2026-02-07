@@ -24,6 +24,8 @@ describe('MCP ToolHandler', () => {
     });
     fs.mkdirSync(path.join(testDir, 'src', 'sdk', 'js', 'src', 'v2', 'gen'), { recursive: true });
     fs.mkdirSync(path.join(testDir, 'src', 'web'), { recursive: true });
+    fs.mkdirSync(path.join(testDir, 'src', 'backend', 'routers'), { recursive: true });
+    fs.mkdirSync(path.join(testDir, 'src', 'frontend', 'components'), { recursive: true });
 
     fs.writeFileSync(
       path.join(testDir, 'src', 'session', 'prompt.ts'),
@@ -66,6 +68,24 @@ export function Session() {
       `
 export function Session() {
   return 'sdk';
+}
+`
+    );
+
+    fs.writeFileSync(
+      path.join(testDir, 'src', 'backend', 'routers', 'auth.ts'),
+      `
+export function getAuthEndpoint() {
+  return '/api/auth';
+}
+`
+    );
+
+    fs.writeFileSync(
+      path.join(testDir, 'src', 'frontend', 'components', 'auth.ts'),
+      `
+export function renderAuthWidget() {
+  return 'auth-widget';
 }
 `
     );
@@ -295,5 +315,19 @@ export function Session() {
 
     expect(text).toContain('Auto-scope applied');
     expect(text).toContain('intent=api');
+  });
+
+  it('prefers backend route path hints for api intent', async () => {
+    const result = await tools.execute('context', {
+      task: 'map auth api endpoints and handlers',
+      intent: 'api',
+      maxNodes: 10,
+      includeCode: false,
+    });
+    const text = result.content[0]?.text ?? '';
+
+    expect(text).toContain('Auto-scope applied');
+    expect(text).toMatch(/pathHint=.*(backend\/routers|server\/routes|api|routes)/i);
+    expect(text).not.toMatch(/pathHint=.*frontend\/components/i);
   });
 });

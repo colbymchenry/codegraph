@@ -1169,11 +1169,62 @@ export class ToolHandler {
     language?: Node['language']
   ): string | undefined {
     const inferred = this.inferPathHintFromTask(task, kind, language);
-    if (!inferred) return 'server/routes';
-    if (/(^|\/)(sdk|acp|provider|generated|gen)(\/|$)/.test(inferred)) {
-      return 'server/routes';
+    if (
+      inferred &&
+      this.isApiAlignedPath(inferred) &&
+      !/(^|\/)(sdk|acp|provider|generated|gen)(\/|$)/.test(inferred)
+    ) {
+      return inferred;
     }
-    return inferred;
+
+    const terms = this.extractQueryTerms(task);
+    const apiWeightedTerms = Array.from(new Set([...terms, 'api', 'route', 'handler']));
+    const results = this.cg.searchNodes(task, {
+      limit: 40,
+      kinds: kind ? [kind as NodeKind] : ['route', 'function', 'method'] as NodeKind[],
+      languages: language ? [language] : undefined,
+      includeFiles: true,
+    });
+
+    if (results.length > 0) {
+      const scoreByHint = new Map<string, number>();
+      for (const result of results) {
+        const hint = this.suggestPathHint(result.node.filePath);
+        let score =
+          result.score *
+          this.pathQualityMultiplier(result.node.filePath) *
+          this.intentPathMultiplier(result.node.filePath, apiWeightedTerms);
+
+        if (this.isApiAlignedPath(hint)) score *= 1.8;
+        if (this.isFrontendBiasedPath(hint)) score *= 0.35;
+        if (this.isDisfavoredPath(hint)) score *= 0.4;
+
+        scoreByHint.set(hint, (scoreByHint.get(hint) ?? 0) + score);
+      }
+
+      const ranked = Array.from(scoreByHint.entries()).sort((a, b) => b[1] - a[1]);
+      const preferred = ranked.find(([hint]) => this.isApiAlignedPath(hint));
+      if (preferred) return preferred[0];
+      if (ranked.length > 0 && !this.isDisfavoredPath(ranked[0]![0])) return ranked[0]![0];
+
+      const fallbackByPresence = [
+        'backend/routers',
+        'server/routes',
+        'backend/api',
+        'api',
+        'routers',
+        'routes',
+        'controllers',
+        'handlers',
+      ];
+      for (const candidate of fallbackByPresence) {
+        if (results.some((r) => r.node.filePath.toLowerCase().includes(candidate))) {
+          return candidate;
+        }
+      }
+    }
+
+    return inferred ?? 'server/routes';
   }
 
   private pathQualityMultiplier(pathValue: string): number {
@@ -1205,6 +1256,16 @@ export class ToolHandler {
       /(^|\/)(gen|generated|dist|build|coverage|vendor|node_modules)(\/|$)/.test(value) ||
       value.includes('.gen.')
     );
+  }
+
+  private isApiAlignedPath(pathValue: string): boolean {
+    const value = pathValue.toLowerCase();
+    return /(^|\/)(api|apis|route|routes|router|routers|controller|controllers|handler|handlers|endpoint|endpoints|backend|server)(\/|$)/.test(value);
+  }
+
+  private isFrontendBiasedPath(pathValue: string): boolean {
+    const value = pathValue.toLowerCase();
+    return /(^|\/)(frontend|web|client|ui|components?|views?|pages|cli|tui)(\/|$)/.test(value);
   }
 
   private hasInfraIntent(terms: string[]): boolean {
