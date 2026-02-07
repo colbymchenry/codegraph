@@ -205,14 +205,66 @@ export class GraphTraverser {
     const kinds = edgeKinds && edgeKinds.length > 0 ? edgeKinds : undefined;
 
     if (direction === 'outgoing') {
-      return this.queries.getOutgoingEdges(nodeId, kinds);
+      return this.sortEdgesByEvidence(this.queries.getOutgoingEdges(nodeId, kinds));
     } else if (direction === 'incoming') {
-      return this.queries.getIncomingEdges(nodeId, kinds);
+      return this.sortEdgesByEvidence(this.queries.getIncomingEdges(nodeId, kinds));
     } else {
       // Both directions
       const outgoing = this.queries.getOutgoingEdges(nodeId, kinds);
       const incoming = this.queries.getIncomingEdges(nodeId, kinds);
-      return [...outgoing, ...incoming];
+      return this.sortEdgesByEvidence([...outgoing, ...incoming]);
+    }
+  }
+
+  private sortEdgesByEvidence(edges: Edge[]): Edge[] {
+    return [...edges].sort((a, b) => {
+      const diff = this.edgeEvidenceScore(b) - this.edgeEvidenceScore(a);
+      if (diff !== 0) return diff;
+
+      // Stable-ish fallback for deterministic traversal output.
+      if ((a.line ?? Number.MAX_SAFE_INTEGER) !== (b.line ?? Number.MAX_SAFE_INTEGER)) {
+        return (a.line ?? Number.MAX_SAFE_INTEGER) - (b.line ?? Number.MAX_SAFE_INTEGER);
+      }
+      if ((a.column ?? Number.MAX_SAFE_INTEGER) !== (b.column ?? Number.MAX_SAFE_INTEGER)) {
+        return (a.column ?? Number.MAX_SAFE_INTEGER) - (b.column ?? Number.MAX_SAFE_INTEGER);
+      }
+      return 0;
+    });
+  }
+
+  private edgeEvidenceScore(edge: Edge): number {
+    const metadata = edge.metadata ?? {};
+    const resolvedBy = String(metadata.resolvedBy ?? '').toLowerCase();
+    const source = String(metadata.source ?? '').toLowerCase();
+    const confidence = Number(metadata.confidence ?? 0);
+    const scipOccurrences = Number(metadata.scipOccurrences ?? 0);
+
+    let score = this.edgeKindPriority(edge.kind);
+    if (resolvedBy === 'scip') score += 2.0;
+    if (source === 'scip') score += 1.2;
+    if (!Number.isNaN(confidence) && confidence > 0) score += Math.min(confidence, 1);
+    if (!Number.isNaN(scipOccurrences) && scipOccurrences > 1) {
+      score += Math.min(Math.log10(scipOccurrences + 1), 1);
+    }
+
+    return score;
+  }
+
+  private edgeKindPriority(kind: EdgeKind): number {
+    switch (kind) {
+      case 'calls':
+        return 1.0;
+      case 'references':
+        return 0.9;
+      case 'imports':
+        return 0.8;
+      case 'extends':
+      case 'implements':
+        return 0.6;
+      case 'contains':
+        return 0.2;
+      default:
+        return 0.4;
     }
   }
 
@@ -262,7 +314,7 @@ export class GraphTraverser {
     }
     visited.add(nodeId);
 
-    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls']);
+    const incomingEdges = this.sortEdgesByEvidence(this.queries.getIncomingEdges(nodeId, ['calls']));
 
     for (const edge of incomingEdges) {
       const callerNode = this.queries.getNodeById(edge.source);
@@ -301,7 +353,7 @@ export class GraphTraverser {
     }
     visited.add(nodeId);
 
-    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls']);
+    const outgoingEdges = this.sortEdgesByEvidence(this.queries.getOutgoingEdges(nodeId, ['calls']));
 
     for (const edge of outgoingEdges) {
       const calleeNode = this.queries.getNodeById(edge.target);

@@ -293,6 +293,118 @@ export { main };
 
       expect(Array.isArray(callees)).toBe(true);
     });
+
+    it('should prioritize SCIP-backed call edges in callers/callees ordering', () => {
+      const now = Date.now();
+      const source: Node = {
+        id: 'synthetic::sourceFn',
+        kind: 'function',
+        name: 'sourceFn',
+        qualifiedName: 'synthetic::sourceFn',
+        filePath: 'src/synthetic.ts',
+        language: 'typescript',
+        startLine: 1,
+        endLine: 1,
+        startColumn: 0,
+        endColumn: 10,
+        updatedAt: now,
+      };
+      const callerScip: Node = {
+        id: 'synthetic::callerScip',
+        kind: 'function',
+        name: 'callerScip',
+        qualifiedName: 'synthetic::callerScip',
+        filePath: 'src/synthetic.ts',
+        language: 'typescript',
+        startLine: 2,
+        endLine: 2,
+        startColumn: 0,
+        endColumn: 10,
+        updatedAt: now,
+      };
+      const callerHeuristic: Node = {
+        id: 'synthetic::callerHeuristic',
+        kind: 'function',
+        name: 'callerHeuristic',
+        qualifiedName: 'synthetic::callerHeuristic',
+        filePath: 'src/synthetic.ts',
+        language: 'typescript',
+        startLine: 3,
+        endLine: 3,
+        startColumn: 0,
+        endColumn: 10,
+        updatedAt: now,
+      };
+      const calleeScip: Node = {
+        id: 'synthetic::calleeScip',
+        kind: 'function',
+        name: 'calleeScip',
+        qualifiedName: 'synthetic::calleeScip',
+        filePath: 'src/synthetic.ts',
+        language: 'typescript',
+        startLine: 4,
+        endLine: 4,
+        startColumn: 0,
+        endColumn: 10,
+        updatedAt: now,
+      };
+      const calleeHeuristic: Node = {
+        id: 'synthetic::calleeHeuristic',
+        kind: 'function',
+        name: 'calleeHeuristic',
+        qualifiedName: 'synthetic::calleeHeuristic',
+        filePath: 'src/synthetic.ts',
+        language: 'typescript',
+        startLine: 5,
+        endLine: 5,
+        startColumn: 0,
+        endColumn: 10,
+        updatedAt: now,
+      };
+
+      const queries = (cg as unknown as { queries: { insertNodes: (nodes: Node[]) => void; insertEdges: (edges: Edge[]) => void } }).queries;
+      queries.insertNodes([source, callerScip, callerHeuristic, calleeScip, calleeHeuristic]);
+      queries.insertEdges([
+        {
+          source: callerHeuristic.id,
+          target: source.id,
+          kind: 'calls',
+          metadata: { resolvedBy: 'fuzzy', confidence: 0.6 },
+          line: 30,
+          column: 2,
+        },
+        {
+          source: callerScip.id,
+          target: source.id,
+          kind: 'calls',
+          metadata: { resolvedBy: 'scip', confidence: 0.99 },
+          line: 20,
+          column: 2,
+        },
+        {
+          source: source.id,
+          target: calleeHeuristic.id,
+          kind: 'calls',
+          metadata: { resolvedBy: 'import', confidence: 0.75 },
+          line: 40,
+          column: 2,
+        },
+        {
+          source: source.id,
+          target: calleeScip.id,
+          kind: 'calls',
+          metadata: { resolvedBy: 'scip', confidence: 0.99 },
+          line: 35,
+          column: 2,
+        },
+      ]);
+
+      const callers = cg.getCallers(source.id);
+      const callees = cg.getCallees(source.id);
+
+      expect(callers[0]?.node.id).toBe(callerScip.id);
+      expect(callees[0]?.node.id).toBe(calleeScip.id);
+    });
   });
 
   describe('getImpactRadius()', () => {

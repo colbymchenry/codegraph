@@ -355,6 +355,7 @@ export class ContextBuilder {
   ): SearchResult[] {
     const terms = this.extractSearchTerms(query);
     const deduped = new Map<string, SearchResult>();
+    const graphSignalCache = new Map<string, number>();
 
     for (const result of results) {
       if (result.score < options.minScore) continue;
@@ -374,7 +375,18 @@ export class ContextBuilder {
       .map((result) => {
         const lexical = this.computeLexicalSignal(result.node, terms);
         const kindBoost = this.getKindBoost(result.node.kind);
-        const score = result.score * 0.6 + lexical * 0.3 + kindBoost * 0.1;
+        const pathIntent = this.computePathIntentSignal(result.node, terms);
+        let graphSignal = graphSignalCache.get(result.node.id);
+        if (graphSignal === undefined) {
+          graphSignal = this.computeGraphEvidenceSignal(result.node);
+          graphSignalCache.set(result.node.id, graphSignal);
+        }
+        const score =
+          result.score * 0.45 +
+          lexical * 0.25 +
+          kindBoost * 0.1 +
+          pathIntent * 0.12 +
+          graphSignal * 0.08;
         return { ...result, score };
       })
       .sort((a, b) => b.score - a.score)
@@ -405,6 +417,79 @@ export class ContextBuilder {
     }
 
     return score / terms.length;
+  }
+
+  /**
+   * Score how well query terms align with directory/path intent.
+   * This helps traces like "tui -> server -> prompt" prioritize matching subsystems.
+   */
+  private computePathIntentSignal(node: Node, terms: string[]): number {
+    if (terms.length === 0) return 0.3;
+
+    const filePath = node.filePath.toLowerCase();
+    const segments = filePath.split('/').filter(Boolean);
+    if (segments.length === 0) return 0.2;
+
+    let score = 0;
+    for (const term of terms) {
+      const exactSegment = segments.some((segment) => segment === term);
+      const partialSegment = segments.some((segment) => segment.includes(term));
+      const directoryPrefix = segments.some((segment) => segment.startsWith(term));
+
+      if (exactSegment) {
+        score += 1.0;
+      } else if (directoryPrefix) {
+        score += 0.8;
+      } else if (partialSegment) {
+        score += 0.65;
+      } else if (filePath.includes(term)) {
+        score += 0.5;
+      } else {
+        score += 0.1;
+      }
+    }
+
+    return score / terms.length;
+  }
+
+  /**
+   * Score node evidence from graph connectivity with a SCIP emphasis.
+   * Nodes with high-confidence SCIP-backed references/calls are often better anchors.
+   */
+  private computeGraphEvidenceSignal(node: Node): number {
+    const outgoing = this.queries.getOutgoingEdges(node.id);
+    const incoming = this.queries.getIncomingEdges(node.id);
+    const edges = [...outgoing, ...incoming];
+
+    if (edges.length === 0) return 0.2;
+
+    let scipBacked = 0;
+    let highConfidence = 0;
+    let structural = 0;
+
+    for (const edge of edges) {
+      const metadata = edge.metadata ?? {};
+      const resolvedBy = String(metadata.resolvedBy ?? '').toLowerCase();
+      const source = String(metadata.source ?? '').toLowerCase();
+      const confidence = Number(metadata.confidence ?? 0);
+
+      if (resolvedBy === 'scip' || source === 'scip') {
+        scipBacked++;
+      }
+      if (confidence >= 0.9) {
+        highConfidence++;
+      }
+      if (edge.kind === 'calls' || edge.kind === 'references' || edge.kind === 'imports') {
+        structural++;
+      }
+    }
+
+    const total = edges.length;
+    const scipRatio = scipBacked / total;
+    const confidenceRatio = highConfidence / total;
+    const structuralRatio = structural / total;
+
+    return Math.min(1, scipRatio * 0.45 + confidenceRatio * 0.3 + structuralRatio * 0.25);
   }
 
   private extractSearchTerms(query: string): string[] {
