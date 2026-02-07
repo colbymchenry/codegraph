@@ -15,10 +15,15 @@
 ### Get Started
 
 ```bash
-npx @colbymchenry/codegraph
+git clone https://github.com/rickross/codegraph.git
+cd codegraph
+npm install
+npm run build
+npm link
+codegraph --version
 ```
 
-<sub>Interactive installer configures MCP integration (including Claude Code)</sub>
+<sub>Recommended for this fork: use local source build for latest functionality</sub>
 
 </div>
 
@@ -151,23 +156,34 @@ Git hooks automatically sync the index on every commit. Your code intelligence i
 
 ## 🎯 Quick Start
 
-### 1. Run the Installer
+### 1. Install from Source (Recommended for This Fork)
 
 ```bash
-npx @colbymchenry/codegraph
+git clone https://github.com/rickross/codegraph.git
+cd codegraph
+npm install
+npm run build
+npm link
+codegraph --version
 ```
 
-The interactive installer will:
+### 2. Run the Installer
+
+```bash
+codegraph install
+```
+
+The interactive installer can:
 - Configure the MCP server in `~/.claude.json`
 - Set up auto-allow permissions for CodeGraph tools
 - Add global instructions to `~/.claude/CLAUDE.md` (teaches Claude how to use CodeGraph)
 - Optionally initialize your current project
 
-### 2. Restart Claude Code
+### 3. Restart Your MCP Client
 
-Restart Claude Code for the MCP server to load.
+Restart your MCP client for the MCP server to load.
 
-### 3. Initialize Projects
+### 4. Initialize Projects
 
 For each project you want to use CodeGraph with:
 
@@ -176,7 +192,15 @@ cd your-project
 codegraph init -i
 ```
 
-That's it! Claude Code will now use CodeGraph tools automatically when a `.codegraph/` directory exists.
+That's it! Your MCP client can now use CodeGraph tools automatically when a `.codegraph/` directory exists.
+
+### Optional: Published npm Build
+
+If you intentionally want the latest published npm release (which may lag this fork), you can run:
+
+```bash
+npx @colbymchenry/codegraph
+```
 
 ### Using with Other MCP Clients
 
@@ -208,7 +232,7 @@ codegraph init -i
 
 If you prefer manual configuration:
 
-**Install globally:**
+**Install globally (published npm package; may lag this fork):**
 ```bash
 npm install -g @colbymchenry/codegraph
 ```

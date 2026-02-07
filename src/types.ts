@@ -568,6 +568,9 @@ export const DEFAULT_CONFIG: CodeGraphConfig = {
 
     // Python
     '**/__pycache__/**',
+    '**/site-packages/**',
+    '**/dist-packages/**',
+    '**/*.dist-info/**',
     '**/.venv/**',
     '**/venv/**',
     '**/.pytest_cache/**',
@@ -577,6 +580,7 @@ export const DEFAULT_CONFIG: CodeGraphConfig = {
     '**/.nox/**',
     '**/*.egg-info/**',
     '**/.eggs/**',
+    '**/lambda/**/package/**',
 
     // Go
     '**/go/pkg/mod/**',
