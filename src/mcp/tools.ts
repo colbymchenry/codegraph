@@ -27,6 +27,8 @@ interface PropertySchema {
   default?: unknown;
 }
 
+type QueryIntent = 'auto' | 'discovery' | 'focused' | 'api';
+
 /**
  * Tool execution result
  */
@@ -99,6 +101,12 @@ export const tools: ToolDefinition[] = [
           description: 'Include file nodes in results (default: false)',
           default: false,
         },
+        intent: {
+          type: 'string',
+          description: 'Optional retrieval mode override. Use "api" to prioritize endpoint/route discovery.',
+          enum: ['auto', 'discovery', 'focused', 'api'],
+          default: 'auto',
+        },
       },
       required: ['query'],
     },
@@ -140,6 +148,12 @@ export const tools: ToolDefinition[] = [
           type: 'boolean',
           description: 'Include code snippets for key symbols (default: true)',
           default: true,
+        },
+        intent: {
+          type: 'string',
+          description: 'Optional retrieval mode override. Use "api" to prioritize endpoint/route mapping.',
+          enum: ['auto', 'discovery', 'focused', 'api'],
+          default: 'auto',
         },
       },
       required: ['task'],
@@ -391,18 +405,35 @@ export class ToolHandler {
    */
   private async handleSearch(args: Record<string, unknown>): Promise<ToolResult> {
     const query = args.query as string;
+    const intentInput = args.intent as string | undefined;
     const inputKind = args.kind as string | undefined;
     const inputLanguage = args.language as string | undefined;
-    const pathHint = (args.pathHint as string | undefined)?.trim();
+    const inputPathHint = (args.pathHint as string | undefined)?.trim();
     const limit = (args.limit as number) || 10;
     const inputIncludeFiles = args.includeFiles as boolean | undefined;
+    const intent = this.normalizeIntent(intentInput, query, 'search');
     const isBroadQuery = this.isBroadSearchQuery(query);
-    const exploratorySearch = this.isExploratorySearchIntent(query);
+    const exploratorySearch = intent === 'discovery'
+      ? true
+      : intent === 'focused' || intent === 'api'
+        ? false
+        : this.isExploratorySearchIntent(query);
     const focusedSearch = isBroadQuery && !exploratorySearch;
-    const kind = inputKind ?? (focusedSearch ? 'function' : undefined);
+    const kind = inputKind ?? (intent === 'api' ? 'route' : (focusedSearch ? 'function' : undefined));
     const language = inputLanguage;
-    const includeFiles = inputIncludeFiles ?? (focusedSearch ? false : (isBroadQuery ? true : undefined));
+    const includeFiles = inputIncludeFiles ?? (
+      intent === 'api'
+        ? true
+        : (focusedSearch ? false : (isBroadQuery ? true : undefined))
+    );
+    const inferredPathHint = !inputPathHint && intent === 'api'
+      ? this.inferApiPathHint(query, kind, language as Node['language'] | undefined)
+      : undefined;
+    const pathHint = inputPathHint ?? inferredPathHint;
     const autoNarrowNotes: string[] = [];
+    if (!inputPathHint && inferredPathHint) {
+      autoNarrowNotes.push(`pathHint=${inferredPathHint}`);
+    }
 
     let results = this.cg.searchNodes(query, {
       limit,
@@ -437,7 +468,7 @@ export class ToolHandler {
           this.formatSearchNoResults(query, {
             kind,
             pathHint,
-            intent: exploratorySearch ? 'discovery' : 'focused',
+            intent,
           })
         )
       );
@@ -457,24 +488,42 @@ export class ToolHandler {
    */
   private async handleContext(args: Record<string, unknown>): Promise<ToolResult> {
     const task = args.task as string;
+    const intentInput = args.intent as string | undefined;
     const maxNodes = (args.maxNodes as number) || 20;
     const inputKind = args.kind as string | undefined;
     const inputLanguage = args.language as Node['language'] | undefined;
     const inputPathHint = (args.pathHint as string | undefined)?.trim();
     const inputIncludeFiles = args.includeFiles as boolean | undefined;
     const includeCode = args.includeCode !== false;
-    const exploratoryTask = this.isExploratoryTaskIntent(task);
+    const intent = this.normalizeIntent(intentInput, task, 'context');
+    const exploratoryTask = intent === 'discovery'
+      ? true
+      : intent === 'focused' || intent === 'api'
+        ? false
+        : this.isExploratoryTaskIntent(task);
 
     // Autopilot defaults:
     // - focused tasks: narrow aggressively
     // - discovery tasks: keep breadth for foothold building
-    const kind = inputKind ?? (exploratoryTask ? undefined : 'function');
+    const kind = inputKind ?? (
+      intent === 'api'
+        ? 'route'
+        : (exploratoryTask ? undefined : 'function')
+    );
     const language = inputLanguage ?? (exploratoryTask ? undefined : this.inferPrimaryLanguage());
-    const includeFiles = inputIncludeFiles ?? (exploratoryTask ? true : false);
-    const pathHint = inputPathHint ?? (exploratoryTask ? undefined : this.inferPathHintFromTask(task, kind, language));
+    const includeFiles = inputIncludeFiles ?? (exploratoryTask ? true : intent === 'api');
+    const pathHint = inputPathHint ?? (
+      exploratoryTask
+        ? undefined
+        : intent === 'api'
+          ? this.inferApiPathHint(task, kind, language)
+          : this.inferPathHintFromTask(task, kind, language)
+    );
 
     const autoScopeNotes: string[] = [];
     if (!inputPathHint && pathHint) autoScopeNotes.push(`pathHint=${pathHint}`);
+    const explicitIntent = (intentInput || '').toLowerCase();
+    if (explicitIntent && explicitIntent !== 'auto') autoScopeNotes.push(`intent=${intent}`);
 
     const context = await this.cg.buildContext(task, {
       maxNodes,
@@ -498,13 +547,15 @@ export class ToolHandler {
     // buildContext returns string when format is 'markdown'
     if (typeof context === 'string') {
       const flowHint = this.buildFlowCoverageHint(task, context);
-      return this.textResult(this.withRootBanner(scopePrefix + context + reminder + flowHint));
+      const apiHint = intent === 'api' ? this.buildApiCoverageHint(task, context) : '';
+      return this.textResult(this.withRootBanner(scopePrefix + context + reminder + flowHint + apiHint));
     }
 
     // If it returns TaskContext, format it
     const formattedContext = this.formatTaskContext(context);
     const flowHint = this.buildFlowCoverageHint(task, formattedContext);
-    return this.textResult(this.withRootBanner(scopePrefix + formattedContext + reminder + flowHint));
+    const apiHint = intent === 'api' ? this.buildApiCoverageHint(task, formattedContext) : '';
+    return this.textResult(this.withRootBanner(scopePrefix + formattedContext + reminder + flowHint + apiHint));
   }
 
   /**
@@ -582,8 +633,12 @@ export class ToolHandler {
       return true;
     }
 
-    // Noun-like broad phrases are often discovery-oriented (e.g. "tui session", "auth flow").
     const terms = this.extractQueryTerms(query);
+    if (this.isApiIntent(query, terms)) {
+      return false;
+    }
+
+    // Noun-like broad phrases are often discovery-oriented (e.g. "tui session", "auth flow").
     if (terms.length >= 2) {
       return true;
     }
@@ -596,7 +651,7 @@ export class ToolHandler {
     options: {
       kind?: string;
       pathHint?: string;
-      intent: 'discovery' | 'focused';
+      intent: QueryIntent;
     }
   ): string {
     const escaped = query.replace(/"/g, '\\"');
@@ -615,7 +670,10 @@ export class ToolHandler {
       lines.push(`- context(task="Find where ${query} is implemented", maxNodes=20, includeCode=false)`);
     }
 
-    if (options.intent === 'focused') {
+    if (options.intent === 'api') {
+      lines.push(`- search(query="${escaped}", kind="${options.kind ?? 'route'}", pathHint="api", limit=20)`);
+      lines.push(`- context(task="Map API endpoints and handlers for ${query}", kind="route", pathHint="server/routes", maxNodes=20, includeCode=false, intent="api")`);
+    } else if (options.intent === 'focused') {
       lines.push(`- search(query="${escaped}", kind="${options.kind ?? 'method'}", pathHint="server/routes", limit=20)`);
     } else {
       lines.push(`- search(query="${escaped}", limit=25)`);
@@ -1046,10 +1104,76 @@ export class ToolHandler {
     return terms.length >= 2 || /\s/.test(trimmed);
   }
 
+  private normalizeIntent(
+    rawIntent: string | undefined,
+    text: string,
+    mode: 'search' | 'context'
+  ): QueryIntent {
+    const normalized = (rawIntent || 'auto').toLowerCase();
+    if (normalized === 'discovery' || normalized === 'focused' || normalized === 'api') {
+      return normalized;
+    }
+
+    const terms = this.extractQueryTerms(text);
+    if (this.isApiIntent(text, terms)) return 'api';
+
+    const exploratory = mode === 'search'
+      ? this.isExploratorySearchIntent(text)
+      : this.isExploratoryTaskIntent(text);
+    return exploratory ? 'discovery' : 'focused';
+  }
+
+  private isApiIntent(text: string, terms?: string[]): boolean {
+    const lower = text.toLowerCase();
+    if (/(^|\s)(get|post|put|patch|delete|options|head)\s+\/\S+/.test(lower)) {
+      return true;
+    }
+    if (lower.includes('/api/')) {
+      return true;
+    }
+
+    const effectiveTerms = terms ?? this.extractQueryTerms(text);
+    const keywords = [
+      'api', 'endpoint', 'endpoints',
+      'router', 'routers', 'controller', 'controllers',
+      'handler', 'handlers', 'rest', 'graphql', 'webhook',
+    ];
+
+    for (const term of effectiveTerms) {
+      if (keywords.some((keyword) => term === keyword || term.includes(keyword))) {
+        return true;
+      }
+    }
+
+    // "route/routes" alone is too broad (e.g. tui routes).
+    const hasRouteTerm = effectiveTerms.some((term) => term === 'route' || term === 'routes' || term.includes('route'));
+    if (hasRouteTerm) {
+      const apiCoTerms = ['api', 'endpoint', 'endpoints', 'http', 'rest', 'controller', 'handler', 'router'];
+      if (effectiveTerms.some((term) => apiCoTerms.some((co) => term === co || term.includes(co)))) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   private isFileIntentQuery(query: string): boolean {
     const trimmed = query.trim();
     if (!trimmed) return false;
     return /[\\/]/.test(trimmed) || /\.[a-z0-9]{1,8}$/i.test(trimmed);
+  }
+
+  private inferApiPathHint(
+    task: string,
+    kind?: string,
+    language?: Node['language']
+  ): string | undefined {
+    const inferred = this.inferPathHintFromTask(task, kind, language);
+    if (!inferred) return 'server/routes';
+    if (/(^|\/)(sdk|acp|provider|generated|gen)(\/|$)/.test(inferred)) {
+      return 'server/routes';
+    }
+    return inferred;
   }
 
   private pathQualityMultiplier(pathValue: string): number {
@@ -1115,6 +1239,7 @@ export class ToolHandler {
 
     const value = pathValue.toLowerCase();
     let multiplier = 1.0;
+    const apiIntent = this.isApiIntent(terms.join(' '), terms);
 
     if (this.isFlowTraceIntent(terms)) {
       if (/(^|\/)(sdk|acp)(\/|$)/.test(value) || value.includes('/provider/sdk/')) {
@@ -1122,6 +1247,15 @@ export class ToolHandler {
       }
       if (/(^|\/)(cli|tui|server|routes|session|bus|event)(\/|$)/.test(value)) {
         multiplier *= 1.18;
+      }
+    }
+
+    if (apiIntent) {
+      if (/(^|\/)(api|apis|route|routes|router|routers|controller|controllers|handler|handlers|server|endpoint|endpoints)(\/|$)/.test(value)) {
+        multiplier *= 1.22;
+      }
+      if (/(^|\/)(sdk|acp|provider|generated|gen|vendor|node_modules|dist|build)(\/|$)/.test(value) || value.includes('.gen.')) {
+        multiplier *= 0.5;
       }
     }
 
@@ -1183,6 +1317,39 @@ export class ToolHandler {
     return [
       '',
       `ℹ Coverage gap: missing ${missing.join(', ')} evidence.`,
+      'Suggested follow-ups:',
+      ...suggestions.map((item) => `- ${item}`),
+    ].join('\n');
+  }
+
+  private buildApiCoverageHint(task: string, contextText: string): string {
+    const terms = this.extractQueryTerms(task);
+    if (!this.isApiIntent(task, terms)) {
+      return '';
+    }
+
+    const lower = contextText.toLowerCase();
+    const hasEndpoints = /(route|routes|endpoint|router|controller|get\s+\/|post\s+\/|put\s+\/|delete\s+\/|patch\s+\/)/.test(lower);
+    const hasHandlers = /(handler|controller|request|response|http|server)/.test(lower);
+    const hasBusinessLogic = /(service|repo|repository|db|database|model|usecase|domain)/.test(lower);
+
+    const missing: string[] = [];
+    if (!hasEndpoints) missing.push('endpoints');
+    if (!hasHandlers) missing.push('handlers');
+    if (!hasBusinessLogic) missing.push('business-logic links');
+
+    if (missing.length === 0) {
+      return '\n\nℹ API coverage: endpoints, handlers, and business-logic links are present.';
+    }
+
+    const suggestions: string[] = [];
+    if (!hasEndpoints) suggestions.push('search(query="GET / POST / route endpoint", kind="route", pathHint="server/routes", limit=20)');
+    if (!hasHandlers) suggestions.push('search(query="controller handler", kind="function", pathHint="server", limit=20)');
+    if (!hasBusinessLogic) suggestions.push('callers(symbol="<handler>", kind="function", pathHint="server/routes", limit=20)');
+
+    return [
+      '',
+      `ℹ API coverage gap: missing ${missing.join(', ')} evidence.`,
       'Suggested follow-ups:',
       ...suggestions.map((item) => `- ${item}`),
     ].join('\n');

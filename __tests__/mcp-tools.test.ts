@@ -228,6 +228,19 @@ export function Session() {
     expect(text).toContain('context(');
   });
 
+  it('provides API-focused retry guidance when search intent is api', async () => {
+    const result = await tools.execute('search', {
+      query: 'GET /definitely/missing',
+      intent: 'api',
+      limit: 10,
+    });
+    const text = result.content[0]?.text ?? '';
+
+    expect(text).toContain('No results found');
+    expect(text).toContain('kind="route"');
+    expect(text).toContain('intent="api"');
+  });
+
   it('returns retry hints when symbol lookup fails', async () => {
     const result = await tools.execute('node', {
       symbol: 'definitely_missing_symbol_xyz',
@@ -269,5 +282,18 @@ export function Session() {
 
     expect(text).toContain('## SCIP Import Complete');
     expect(text).toContain('Imported edges: 0');
+  });
+
+  it('applies api intent defaults for context queries', async () => {
+    const result = await tools.execute('context', {
+      task: 'map api endpoints and handlers',
+      intent: 'api',
+      maxNodes: 10,
+      includeCode: false,
+    });
+    const text = result.content[0]?.text ?? '';
+
+    expect(text).toContain('Auto-scope applied');
+    expect(text).toContain('intent=api');
   });
 });
