@@ -59,7 +59,7 @@ describe('SCIP import', () => {
     fs.writeFileSync(path.join(tempDir, 'index.scip.json'), JSON.stringify(scipPayload), 'utf-8');
 
     const cg = await CodeGraph.init(tempDir);
-    await cg.indexAll();
+    await cg.indexAll({ useScip: false });
     const result = await cg.importScip('index.scip.json');
 
     expect(result.documentsParsed).toBe(1);
@@ -78,6 +78,55 @@ describe('SCIP import', () => {
     const stats = cg.getStats();
     expect(stats.scipProvenance?.lastImportedPath).toContain('index.scip.json');
     expect(stats.scipProvenance?.lastImportedEdges).toBe(result.importedEdges);
+
+    cg.destroy();
+    cleanupTempDir(tempDir);
+  });
+
+  it('skips SCIP re-import when source fingerprint is unchanged', async () => {
+    const tempDir = createTempDir();
+    const srcDir = path.join(tempDir, 'src');
+    fs.mkdirSync(srcDir, { recursive: true });
+
+    const source = [
+      'export function target() {',
+      '  return 1;',
+      '}',
+      '',
+      'export function caller() {',
+      '  return target();',
+      '}',
+      '',
+    ].join('\n');
+    fs.writeFileSync(path.join(srcDir, 'example.ts'), source, 'utf-8');
+
+    const scipPayload = {
+      documents: [
+        {
+          relative_path: 'src/example.ts',
+          occurrences: [
+            { symbol: 'scip-typescript npm test 0.0.0 src/example.ts/target().', range: [0, 16, 22], symbol_roles: 1 },
+            { symbol: 'scip-typescript npm test 0.0.0 src/example.ts/caller().', range: [4, 16, 22], symbol_roles: 1 },
+            { symbol: 'scip-typescript npm test 0.0.0 src/example.ts/target().', range: [5, 9, 15], symbol_roles: 0 },
+          ],
+        },
+      ],
+    };
+    const scipPath = path.join(tempDir, 'index.scip.json');
+    fs.writeFileSync(scipPath, JSON.stringify(scipPayload), 'utf-8');
+
+    const cg = await CodeGraph.init(tempDir);
+    await cg.indexAll({ useScip: false });
+    const first = await cg.importScip(scipPath);
+    const second = await cg.importScip(scipPath);
+
+    expect(first.importedEdges).toBeGreaterThan(0);
+    expect(second.skipped).toBe(true);
+    expect(second.importedEdges).toBe(0);
+    expect(second.indexPath).toBe(scipPath);
+
+    const stats = cg.getStats();
+    expect(stats.scipProvenance?.lastImportedFingerprint).toBeDefined();
 
     cg.destroy();
     cleanupTempDir(tempDir);

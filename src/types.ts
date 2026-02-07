@@ -738,6 +738,8 @@ export interface GraphStats {
     lastImportedPath?: string;
     /** Number of edges imported in the most recent SCIP import */
     lastImportedEdges?: number;
+    /** Fingerprint of the most recently imported SCIP source file */
+    lastImportedFingerprint?: string;
     /** Number of SCIP documents processed in the most recent import */
     lastDocuments?: number;
     /** Number of SCIP occurrences scanned in the most recent import */
@@ -765,6 +767,8 @@ export interface ScipImportResult {
   referencesMapped: number;
   /** Number of edges inserted into the graph */
   importedEdges: number;
+  /** True when import was skipped because source fingerprint is unchanged */
+  skipped?: boolean;
 }
 
 /**

@@ -36,6 +36,7 @@ export class ReferenceResolver {
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
   private nodeCache: Map<string, Node[]> = new Map();
+  private nodeByIdCache: Map<string, Node | null> = new Map();
   private fileCache: Map<string, string | null> = new Map();
   private nameCache: Map<string, Node[]> = new Map();
   private qualifiedNameCache: Map<string, Node[]> = new Map();
@@ -88,7 +89,10 @@ export class ReferenceResolver {
    */
   clearCaches(): void {
     this.nodeCache.clear();
+    this.nodeByIdCache.clear();
     this.fileCache.clear();
+    this.nameCache.clear();
+    this.qualifiedNameCache.clear();
   }
 
   /**
@@ -104,23 +108,25 @@ export class ReferenceResolver {
       },
 
       getNodesByName: (name: string) => {
-        // Bypassing cache - using DB query directly
-        // if (this.nameCache.has(name)) {
-        //   return this.nameCache.get(name)!;
-        // }
-        return this.queries.searchNodes(name, { limit: 100 }).map((r) => r.node);
+        if (this.nameCache.has(name)) {
+          return this.nameCache.get(name)!;
+        }
+        const nodes = this.queries.searchNodes(name, { limit: 100 }).map((r) => r.node);
+        this.nameCache.set(name, nodes);
+        return nodes;
       },
 
       getNodesByQualifiedName: (qualifiedName: string) => {
-        // Bypassing cache - using DB query directly
-        // if (this.qualifiedNameCache.has(qualifiedName)) {
-        //   return this.qualifiedNameCache.get(qualifiedName)!;
-        // }
+        if (this.qualifiedNameCache.has(qualifiedName)) {
+          return this.qualifiedNameCache.get(qualifiedName)!;
+        }
         // Search for exact qualified name match
-        return this.queries
+        const nodes = this.queries
           .searchNodes(qualifiedName, { limit: 50 })
           .filter((r) => r.node.qualifiedName === qualifiedName)
           .map((r) => r.node);
+        this.qualifiedNameCache.set(qualifiedName, nodes);
+        return nodes;
       },
 
       getNodesByKind: (kind: Node['kind']) => {
@@ -346,27 +352,33 @@ export class ReferenceResolver {
       return null;
     }
 
-    // Strategy 1: Try framework-specific resolution first
+    const candidates: ResolvedRef[] = [];
+
+    // Strategy 1: framework-specific resolution
     for (const framework of this.frameworks) {
       const result = framework.resolve(ref, this.context);
       if (result) {
-        return result;
+        candidates.push(result);
       }
     }
 
-    // Strategy 2: Try import-based resolution
+    // Strategy 2: import-based resolution
     const importResult = resolveViaImport(ref, this.context);
     if (importResult) {
-      return importResult;
+      candidates.push(importResult);
     }
 
-    // Strategy 3: Try name matching
+    // Strategy 3: name matching
     const nameResult = matchReference(ref, this.context);
     if (nameResult) {
-      return nameResult;
+      candidates.push(nameResult);
     }
 
-    return null;
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    return this.pickBestResolutionCandidate(ref, candidates);
   }
 
   /**
@@ -459,6 +471,57 @@ export class ReferenceResolver {
     }
 
     return false;
+  }
+
+  private getNodeById(nodeId: string): Node | null {
+    if (this.nodeByIdCache.has(nodeId)) {
+      return this.nodeByIdCache.get(nodeId)!;
+    }
+    const node = this.queries.getNodeById(nodeId) ?? null;
+    this.nodeByIdCache.set(nodeId, node);
+    return node;
+  }
+
+  private pickBestResolutionCandidate(ref: UnresolvedRef, candidates: ResolvedRef[]): ResolvedRef {
+    const strategyPriority: Record<ResolvedRef['resolvedBy'], number> = {
+      'qualified-name': 6,
+      import: 5,
+      'exact-match': 4,
+      framework: 3,
+      fuzzy: 2,
+      scip: 1,
+    };
+
+    const scoreCandidate = (candidate: ResolvedRef): number => {
+      let score = candidate.confidence * 1000;
+      const targetNode = this.getNodeById(candidate.targetNodeId);
+      if (targetNode) {
+        if (targetNode.filePath === ref.filePath) score += 50;
+        if (targetNode.language === ref.language) score += 30;
+        if (
+          ref.referenceKind === 'calls' &&
+          (targetNode.kind === 'function' || targetNode.kind === 'method')
+        ) {
+          score += 20;
+        }
+      }
+      score += strategyPriority[candidate.resolvedBy] ?? 0;
+      return score;
+    };
+
+    let best = candidates[0]!;
+    let bestScore = scoreCandidate(best);
+
+    for (let i = 1; i < candidates.length; i++) {
+      const candidate = candidates[i]!;
+      const score = scoreCandidate(candidate);
+      if (score > bestScore) {
+        best = candidate;
+        bestScore = score;
+      }
+    }
+
+    return best;
   }
 
 }

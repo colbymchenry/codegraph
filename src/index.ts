@@ -56,7 +56,7 @@ import { VectorManager, createVectorManager, EmbeddingProgress } from './vectors
 import { ContextBuilder, createContextBuilder } from './context';
 import { GitHooksManager, createGitHooksManager, HookInstallResult, HookRemoveResult } from './sync';
 import { Mutex } from './utils';
-import { ScipImporter, ScipResolvedReference } from './scip';
+import { ScipImporter, ScipResolvedReference, getScipFileFingerprint } from './scip';
 import { buildVersion } from './version';
 
 // Re-export types for consumers
@@ -728,12 +728,39 @@ export class CodeGraph {
     indexPath: string,
     onProgress?: (progress: ScipImportProgress) => void
   ): Promise<ScipImportResult> {
+    const resolvedPath = path.isAbsolute(indexPath)
+      ? indexPath
+      : path.resolve(this.projectRoot, indexPath);
+
+    const previousImportedPath = this.queries.getProjectMetadata('scip_last_imported_path');
+    const previousFingerprint = this.queries.getProjectMetadata('scip_last_imported_fingerprint');
+    const currentFingerprint = getScipFileFingerprint(resolvedPath);
+    if (previousImportedPath === resolvedPath && previousFingerprint === currentFingerprint) {
+      onProgress?.({
+        phase: 'done',
+        current: 1,
+        total: 1,
+        detail: 'SCIP unchanged, skipped import',
+      });
+
+      return {
+        indexPath: resolvedPath,
+        documentsParsed: Number(this.queries.getProjectMetadata('scip_last_documents') || '0'),
+        occurrencesScanned: Number(this.queries.getProjectMetadata('scip_last_occurrences') || '0'),
+        definitionsMapped: 0,
+        referencesMapped: 0,
+        importedEdges: 0,
+        skipped: true,
+      };
+    }
+
     const importer = new ScipImporter(this.projectRoot, this.queries);
-    const result = importer.importFromFile(indexPath, onProgress);
+    const result = importer.importFromFile(resolvedPath, onProgress);
 
     const importedAt = Date.now();
     this.queries.setProjectMetadata('scip_last_imported_at', String(importedAt));
     this.queries.setProjectMetadata('scip_last_imported_path', result.indexPath);
+    this.queries.setProjectMetadata('scip_last_imported_fingerprint', currentFingerprint);
     this.queries.setProjectMetadata('scip_last_imported_edges', String(result.importedEdges));
     this.queries.setProjectMetadata('scip_last_documents', String(result.documentsParsed));
     this.queries.setProjectMetadata('scip_last_occurrences', String(result.occurrencesScanned));
@@ -801,10 +828,33 @@ export class CodeGraph {
 
     // SCIP-first pass: resolve what we can with high-confidence semantic data,
     // then send only the remainder through heuristic resolvers.
+    const scipProgressBudget = onProgress && scipIndexPath ? Math.max(1, Math.floor(unresolvedRefs.length * 0.2)) : 0;
+
     if (scipIndexPath) {
       try {
         const importer = new ScipImporter(this.projectRoot, this.queries);
-        const scipResult = importer.resolveUnresolvedReferences(scipIndexPath, unresolvedRefs);
+        const scipResult = importer.resolveUnresolvedReferences(
+          scipIndexPath,
+          unresolvedRefs,
+          onProgress
+            ? (progress) => {
+                if (scipProgressBudget <= 0) return;
+                const safeTotal = Math.max(progress.total, 1);
+                const stageProgress = Math.max(0, Math.min(1, progress.current / safeTotal));
+                const phaseWeight = progress.phase === 'mapping-definitions'
+                  ? { start: 0, span: 0.45 }
+                  : progress.phase === 'mapping-references'
+                    ? { start: 0.45, span: 0.5 }
+                    : { start: 0.95, span: 0.05 };
+                const normalized = phaseWeight.start + (phaseWeight.span * stageProgress);
+                const mapped = Math.max(
+                  0,
+                  Math.min(scipProgressBudget, Math.floor(normalized * scipProgressBudget))
+                );
+                onProgress(mapped, unresolvedRefs.length);
+              }
+            : undefined
+        );
         scipResolvedRefs = scipResult.resolved.map((r) => this.toResolvedRef(r));
         refsForHeuristic = scipResult.unresolved;
       } catch {
@@ -820,6 +870,15 @@ export class CodeGraph {
           refsForHeuristic,
           Math.max(1, Math.floor(numWorkers)),
           onProgress
+            ? (current, total) => {
+                const safeTotal = Math.max(total, 1);
+                const fraction = Math.max(0, Math.min(1, current / safeTotal));
+                const mapped = scipProgressBudget + Math.floor(
+                  fraction * (unresolvedRefs.length - scipProgressBudget)
+                );
+                onProgress(mapped, unresolvedRefs.length);
+              }
+            : undefined
         )
       : {
           resolved: [],

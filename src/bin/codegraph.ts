@@ -626,7 +626,11 @@ scipProgram
       const result = await cg.importScip(resolvedIndexPath, printScipProgress);
       process.stdout.write('\r' + ' '.repeat(100) + '\r');
 
-      success(`Imported ${formatNumber(result.importedEdges)} semantic edges from SCIP`);
+      if (result.skipped) {
+        success('SCIP import skipped (index unchanged)');
+      } else {
+        success(`Imported ${formatNumber(result.importedEdges)} semantic edges from SCIP`);
+      }
       info(`SCIP file: ${result.indexPath}`);
       info(`Documents: ${formatNumber(result.documentsParsed)}, occurrences: ${formatNumber(result.occurrencesScanned)}`);
       info(`Definitions mapped: ${formatNumber(result.definitionsMapped)}, references mapped: ${formatNumber(result.referencesMapped)}`);

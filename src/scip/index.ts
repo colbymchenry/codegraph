@@ -45,9 +45,22 @@ interface ScipRange {
 }
 
 type ProgressCallback = (progress: ScipImportProgress) => void;
+type ResolveProgressPhase = 'mapping-definitions' | 'mapping-references' | 'done';
+type ResolveProgressCallback = (progress: {
+  phase: ResolveProgressPhase;
+  current: number;
+  total: number;
+  detail?: string;
+}) => void;
 
 const LOCAL_SYMBOL_PREFIX = /^local\s+\d+$/;
 const SCIP_RESOLUTION_COLUMN_WINDOW = 12;
+
+interface ParsedScipDocuments {
+  resolvedPath: string;
+  fingerprint: string;
+  documents: ScipDocument[];
+}
 
 export interface ScipResolvedReference {
   reference: UnresolvedReference;
@@ -212,7 +225,15 @@ function referenceKindCompatible(referenceKind: Edge['kind'], isImport: boolean)
   return referenceKind !== 'imports';
 }
 
+export function getScipFileFingerprint(indexPath: string): string {
+  const stats = fs.statSync(indexPath);
+  return `${stats.size}:${Math.trunc(stats.mtimeMs)}`;
+}
+
 export class ScipImporter {
+  private static readonly MAX_DOCUMENT_CACHE_ENTRIES = 2;
+  private static readonly documentCache = new Map<string, { fingerprint: string; documents: ScipDocument[] }>();
+
   private projectRoot: string;
   private queries: QueryBuilder;
   private nodesByFile = new Map<string, Node[]>();
@@ -224,24 +245,7 @@ export class ScipImporter {
   }
 
   importFromFile(indexPath: string, onProgress?: ProgressCallback): ScipImportResult {
-    onProgress?.({
-      phase: 'loading',
-      current: 0,
-      total: 1,
-      detail: 'Reading SCIP JSON',
-    });
-    const resolvedPath = path.isAbsolute(indexPath)
-      ? indexPath
-      : path.resolve(this.projectRoot, indexPath);
-    const raw = fs.readFileSync(resolvedPath, 'utf-8');
-    const payload = JSON.parse(raw) as ScipIndexPayload | unknown;
-    const documents = parseDocuments(payload);
-    onProgress?.({
-      phase: 'loading',
-      current: 1,
-      total: 1,
-      detail: `Loaded ${documents.length} documents`,
-    });
+    const { resolvedPath, documents } = this.loadDocuments(indexPath, onProgress);
 
     const symbolDefinitions = new Map<string, Set<string>>();
     let occurrencesScanned = 0;
@@ -397,23 +401,20 @@ export class ScipImporter {
 
   resolveUnresolvedReferences(
     indexPath: string,
-    unresolvedRefs: UnresolvedReference[]
+    unresolvedRefs: UnresolvedReference[],
+    onProgress?: ResolveProgressCallback
   ): ScipResolutionResult {
     if (unresolvedRefs.length === 0) {
       return { resolved: [], unresolved: [] };
     }
 
-    const resolvedPath = path.isAbsolute(indexPath)
-      ? indexPath
-      : path.resolve(this.projectRoot, indexPath);
-    const raw = fs.readFileSync(resolvedPath, 'utf-8');
-    const payload = JSON.parse(raw) as ScipIndexPayload | unknown;
-    const documents = parseDocuments(payload);
+    const { documents } = this.loadDocuments(indexPath);
 
     const symbolDefinitions = new Map<string, Set<string>>();
 
     // Pass 1: map definitions to concrete graph node IDs.
-    for (const document of documents) {
+    for (let i = 0; i < documents.length; i++) {
+      const document = documents[i]!;
       const rawPath = document.relative_path ?? document.relativePath;
       if (!rawPath || !Array.isArray(document.occurrences)) continue;
       const filePath = normalizeDocumentPath(this.projectRoot, rawPath);
@@ -434,6 +435,15 @@ export class ScipImporter {
         existing.add(definitionNode.id);
         symbolDefinitions.set(symbolKey, existing);
       }
+
+      if ((i + 1) % 20 === 0 || i + 1 === documents.length) {
+        onProgress?.({
+          phase: 'mapping-definitions',
+          current: i + 1,
+          total: documents.length,
+          detail: filePath,
+        });
+      }
     }
 
     const refsByFileLine = new Map<string, UnresolvedReference[]>();
@@ -448,7 +458,8 @@ export class ScipImporter {
     const resolved: ScipResolvedReference[] = [];
 
     // Pass 2: map occurrences to unresolved refs in the same file/line/source node.
-    for (const document of documents) {
+    for (let i = 0; i < documents.length; i++) {
+      const document = documents[i]!;
       const rawPath = document.relative_path ?? document.relativePath;
       if (!rawPath || !Array.isArray(document.occurrences)) continue;
       const filePath = normalizeDocumentPath(this.projectRoot, rawPath);
@@ -496,10 +507,90 @@ export class ScipImporter {
           confidence: 0.99,
         });
       }
+
+      if ((i + 1) % 20 === 0 || i + 1 === documents.length) {
+        onProgress?.({
+          phase: 'mapping-references',
+          current: i + 1,
+          total: documents.length,
+          detail: filePath,
+        });
+      }
     }
 
     const unresolved = unresolvedRefs.filter((ref) => !matched.has(unresolvedReferenceKey(ref)));
+    onProgress?.({
+      phase: 'done',
+      current: 1,
+      total: 1,
+      detail: `Resolved ${resolved.length} references`,
+    });
     return { resolved, unresolved };
+  }
+
+  private loadDocuments(indexPath: string, onProgress?: ProgressCallback): ParsedScipDocuments {
+    const resolvedPath = path.isAbsolute(indexPath)
+      ? indexPath
+      : path.resolve(this.projectRoot, indexPath);
+    const fingerprint = getScipFileFingerprint(resolvedPath);
+    const cached = ScipImporter.documentCache.get(resolvedPath);
+
+    if (cached && cached.fingerprint === fingerprint) {
+      onProgress?.({
+        phase: 'loading',
+        current: 1,
+        total: 1,
+        detail: `Loaded ${cached.documents.length} documents (cache hit)`,
+      });
+      ScipImporter.touchDocumentCache(resolvedPath, cached);
+      return {
+        resolvedPath,
+        fingerprint,
+        documents: cached.documents,
+      };
+    }
+
+    onProgress?.({
+      phase: 'loading',
+      current: 0,
+      total: 1,
+      detail: 'Reading SCIP JSON',
+    });
+
+    const raw = fs.readFileSync(resolvedPath, 'utf-8');
+    const payload = JSON.parse(raw) as ScipIndexPayload | unknown;
+    const documents = parseDocuments(payload);
+
+    const entry = { fingerprint, documents };
+    ScipImporter.touchDocumentCache(resolvedPath, entry);
+
+    onProgress?.({
+      phase: 'loading',
+      current: 1,
+      total: 1,
+      detail: `Loaded ${documents.length} documents`,
+    });
+
+    return {
+      resolvedPath,
+      fingerprint,
+      documents,
+    };
+  }
+
+  private static touchDocumentCache(
+    resolvedPath: string,
+    entry: { fingerprint: string; documents: ScipDocument[] }
+  ): void {
+    if (ScipImporter.documentCache.has(resolvedPath)) {
+      ScipImporter.documentCache.delete(resolvedPath);
+    }
+    ScipImporter.documentCache.set(resolvedPath, entry);
+    while (ScipImporter.documentCache.size > ScipImporter.MAX_DOCUMENT_CACHE_ENTRIES) {
+      const oldestKey = ScipImporter.documentCache.keys().next().value;
+      if (!oldestKey) break;
+      ScipImporter.documentCache.delete(oldestKey);
+    }
   }
 
   private getNodesForFile(filePath: string): Node[] {

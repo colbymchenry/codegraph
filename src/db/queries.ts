@@ -1258,6 +1258,7 @@ export class QueryBuilder {
     const scipLastImportedAtRaw = this.getProjectMetadata('scip_last_imported_at');
     const scipLastImportedPath = this.getProjectMetadata('scip_last_imported_path');
     const scipLastImportedEdgesRaw = this.getProjectMetadata('scip_last_imported_edges');
+    const scipLastImportedFingerprint = this.getProjectMetadata('scip_last_imported_fingerprint');
     const scipLastDocumentsRaw = this.getProjectMetadata('scip_last_documents');
     const scipLastOccurrencesRaw = this.getProjectMetadata('scip_last_occurrences');
     const scipLastGeneratedAtRaw = this.getProjectMetadata('scip_last_generated_at');
@@ -1283,6 +1284,7 @@ export class QueryBuilder {
         lastImportedAt: scipLastImportedAtRaw ? Number(scipLastImportedAtRaw) : undefined,
         lastImportedPath: scipLastImportedPath || undefined,
         lastImportedEdges: scipLastImportedEdgesRaw ? Number(scipLastImportedEdgesRaw) : undefined,
+        lastImportedFingerprint: scipLastImportedFingerprint || undefined,
         lastDocuments: scipLastDocumentsRaw ? Number(scipLastDocumentsRaw) : undefined,
         lastOccurrences: scipLastOccurrencesRaw ? Number(scipLastOccurrencesRaw) : undefined,
         lastGeneratedAt: scipLastGeneratedAtRaw ? Number(scipLastGeneratedAtRaw) : undefined,
