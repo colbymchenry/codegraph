@@ -107,6 +107,11 @@ function resolveRelativeImport(
   const basePath = path.resolve(fromDir, importPath);
   const relativePath = path.relative(projectRoot, basePath);
 
+  // Reject paths that escape the project root
+  if (relativePath.startsWith('..')) {
+    return null;
+  }
+
   // Try each extension
   for (const ext of extensions) {
     const candidatePath = relativePath + ext;

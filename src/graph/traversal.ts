@@ -11,13 +11,16 @@ import { QueryBuilder } from '../db/queries';
  * Default traversal options
  */
 const DEFAULT_OPTIONS: Required<TraversalOptions> = {
-  maxDepth: Infinity,
+  maxDepth: 20,
   edgeKinds: [],
   nodeKinds: [],
   direction: 'outgoing',
   limit: 1000,
   includeStart: true,
 };
+
+/** Maximum number of nodes visited during findPath BFS */
+const FIND_PATH_MAX_VISITED = 10000;
 
 /**
  * Result of a single traversal step
@@ -512,23 +515,28 @@ export class GraphTraverser {
       return null;
     }
 
-    // BFS to find shortest path
+    // BFS to find shortest path (bounded to prevent resource exhaustion)
     const visited = new Set<string>();
     const queue: Array<{ nodeId: string; path: Array<{ node: Node; edge: Edge | null }> }> = [
       { nodeId: fromId, path: [{ node: fromNode, edge: null }] },
     ];
 
     while (queue.length > 0) {
-      const { nodeId, path } = queue.shift()!;
+      const { nodeId, path: currentPath } = queue.shift()!;
 
       if (nodeId === toId) {
-        return path;
+        return currentPath;
       }
 
       if (visited.has(nodeId)) {
         continue;
       }
       visited.add(nodeId);
+
+      // Bound: stop if we've visited too many nodes
+      if (visited.size >= FIND_PATH_MAX_VISITED) {
+        return null;
+      }
 
       // Get outgoing edges
       const outgoingEdges = this.queries.getOutgoingEdges(
@@ -542,7 +550,7 @@ export class GraphTraverser {
           if (nextNode) {
             queue.push({
               nodeId: edge.target,
-              path: [...path, { node: nextNode, edge }],
+              path: [...currentPath, { node: nextNode, edge }],
             });
           }
         }

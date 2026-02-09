@@ -8,6 +8,7 @@
 import Database from 'better-sqlite3';
 import { Node } from '../types';
 import { TextEmbedder, EMBEDDING_DIMENSION } from './embedder';
+import { logDebug, logWarn } from '../errors';
 
 /**
  * Options for vector search
@@ -49,16 +50,15 @@ export class VectorSearchManager {
       // Try to load sqlite-vss extension
       await this.loadVssExtension();
       this.vssEnabled = true;
-      console.log('sqlite-vss extension loaded successfully');
+      logDebug('sqlite-vss extension loaded successfully');
 
       // Create the VSS virtual table
       this.createVssTable();
     } catch (error) {
       // Fall back to brute-force search
-      console.warn(
-        'sqlite-vss extension not available, falling back to brute-force search:',
-        error instanceof Error ? error.message : String(error)
-      );
+      logWarn('sqlite-vss extension not available, falling back to brute-force search', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       this.vssEnabled = false;
     }
 
@@ -204,10 +204,9 @@ export class VectorSearchManager {
     } catch (error) {
       // VSS operations can fail for various reasons (dimension mismatch, etc.)
       // Fall back to brute-force search silently
-      console.warn(
-        'VSS storage failed, using brute-force search:',
-        error instanceof Error ? error.message : String(error)
-      );
+      logWarn('VSS storage failed, using brute-force search', {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -344,10 +343,9 @@ export class VectorSearchManager {
         .filter((r) => r.score >= minScore);
     } catch (error) {
       // VSS search failed, fall back to brute force
-      console.warn(
-        'VSS search failed, using brute-force:',
-        error instanceof Error ? error.message : String(error)
-      );
+      logWarn('VSS search failed, using brute-force', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       return this.searchBruteForce(queryEmbedding, limit, minScore);
     }
   }

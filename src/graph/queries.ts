@@ -4,6 +4,7 @@
  * Higher-level query functions built on top of traversal algorithms.
  */
 
+import picomatch from 'picomatch';
 import { Node, Edge, Context, Subgraph, EdgeKind } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from './traversal';
@@ -182,13 +183,8 @@ export class GraphQueryManager {
    * @returns Array of matching nodes
    */
   findByQualifiedName(pattern: string): Node[] {
-    // Convert glob pattern to regex
-    const regexPattern = pattern
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replace(/\*/g, '.*')
-      .replace(/\?/g, '.');
-
-    const regex = new RegExp(`^${regexPattern}$`);
+    // Use picomatch for safe glob matching (avoids ReDoS from regex construction)
+    const isMatch = picomatch(pattern, { dot: true });
 
     // This is inefficient for large graphs - would need FTS index on qualified_name
     // For now, use kind-based filtering if possible
@@ -206,7 +202,7 @@ export class GraphQueryManager {
     for (const kind of kinds) {
       const nodes = this.queries.getNodesByKind(kind);
       for (const node of nodes) {
-        if (regex.test(node.qualifiedName)) {
+        if (isMatch(node.qualifiedName)) {
           allNodes.push(node);
         }
       }

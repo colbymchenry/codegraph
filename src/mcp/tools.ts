@@ -7,6 +7,13 @@
 import CodeGraph from '../index';
 import type { Node, SearchResult, Subgraph, TaskContext, NodeKind } from '../types';
 
+const VALID_NODE_KINDS: ReadonlySet<string> = new Set<NodeKind>([
+  'file', 'module', 'class', 'struct', 'interface', 'trait', 'protocol',
+  'function', 'method', 'property', 'field', 'variable', 'constant',
+  'enum', 'enum_member', 'type_alias', 'namespace', 'parameter',
+  'import', 'export', 'route', 'component',
+]);
+
 /**
  * MCP Tool definition
  */
@@ -238,12 +245,14 @@ export class ToolHandler {
   private async handleSearch(args: Record<string, unknown>): Promise<ToolResult> {
     const query = this.validateString(args.query, 'query');
     if (typeof query !== 'string') return query;
-    const kind = typeof args.kind === 'string' ? args.kind : undefined;
+    const kind = typeof args.kind === 'string' && VALID_NODE_KINDS.has(args.kind)
+      ? (args.kind as NodeKind)
+      : undefined;
     const limit = this.validateNumber(args.limit, 10, 1, 100);
 
     const results = this.cg.searchNodes(query, {
       limit,
-      kinds: kind ? [kind as NodeKind] : undefined,
+      kinds: kind ? [kind] : undefined,
     });
 
     if (results.length === 0) {

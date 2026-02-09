@@ -15,6 +15,8 @@
  * ```
  */
 
+import { fileURLToPath } from 'url';
+import * as path from 'path';
 import CodeGraph from '../index';
 import { StdioTransport, JsonRpcRequest, JsonRpcNotification, ErrorCodes } from './transport';
 import { tools, ToolHandler } from './tools';
@@ -161,11 +163,16 @@ export class MCPServer {
     // Extract project path from rootUri or workspaceFolders
     let projectPath = this.projectPath;
 
-    if (params?.rootUri) {
-      // Convert file:// URI to path
-      projectPath = params.rootUri.replace(/^file:\/\//, '');
-    } else if (params?.workspaceFolders?.[0]?.uri) {
-      projectPath = params.workspaceFolders[0].uri.replace(/^file:\/\//, '');
+    const rawUri = params?.rootUri || params?.workspaceFolders?.[0]?.uri;
+    if (rawUri) {
+      try {
+        // Use Node.js url.fileURLToPath for proper file:// URI conversion
+        projectPath = rawUri.startsWith('file://')
+          ? path.resolve(fileURLToPath(rawUri))
+          : path.resolve(rawUri);
+      } catch {
+        // If URI parsing fails, fall through to default
+      }
     }
 
     // Fall back to current working directory if no path provided

@@ -23,6 +23,7 @@ import { GraphTraverser } from '../graph';
 import { VectorManager } from '../vectors';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug, logWarn } from '../errors';
+import { isPathWithinRoot } from '../utils';
 
 /**
  * Default options for context building
@@ -310,8 +311,7 @@ export class ContextBuilder {
     const filePath = path.resolve(this.projectRoot, node.filePath);
 
     // Prevent path traversal: ensure resolved path stays within project root
-    if (!filePath.startsWith(path.resolve(this.projectRoot) + path.sep) &&
-        filePath !== path.resolve(this.projectRoot)) {
+    if (!isPathWithinRoot(node.filePath, this.projectRoot)) {
       logWarn('Path traversal blocked', { nodeId: node.id, filePath: node.filePath });
       return null;
     }

@@ -25,7 +25,7 @@ import {
 } from './types';
 import { DatabaseConnection, getDatabasePath } from './db';
 import { QueryBuilder } from './db/queries';
-import { loadConfig, saveConfig, createDefaultConfig } from './config';
+import { loadConfig, saveConfig, createDefaultConfig, validateConfig } from './config';
 import {
   isInitialized,
   createDirectory,
@@ -202,6 +202,9 @@ export class CodeGraph {
     if (options.config) {
       Object.assign(config, options.config);
     }
+    if (!validateConfig(config)) {
+      throw new Error('Invalid configuration after merge');
+    }
     saveConfig(resolvedRoot, config);
 
     // Initialize database
@@ -237,6 +240,9 @@ export class CodeGraph {
     const config = createDefaultConfig(resolvedRoot);
     if (options.config) {
       Object.assign(config, options.config);
+    }
+    if (!validateConfig(config)) {
+      throw new Error('Invalid configuration after merge');
     }
     saveConfig(resolvedRoot, config);
 
@@ -345,7 +351,11 @@ export class CodeGraph {
    * Update configuration
    */
   updateConfig(updates: Partial<CodeGraphConfig>): void {
-    Object.assign(this.config, updates);
+    const merged = { ...this.config, ...updates };
+    if (!validateConfig(merged)) {
+      throw new Error('Invalid configuration after merge');
+    }
+    this.config = merged;
     saveConfig(this.projectRoot, this.config);
     // Recreate orchestrator and resolver with new config
     this.orchestrator = new ExtractionOrchestrator(

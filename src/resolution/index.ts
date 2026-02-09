@@ -18,7 +18,8 @@ import {
 import { matchReference } from './name-matcher';
 import { resolveViaImport } from './import-resolver';
 import { detectFrameworks } from './frameworks';
-import { logDebug } from '../errors';
+import { logDebug, logWarn } from '../errors';
+import { isPathWithinRoot } from '../utils';
 
 // Re-export types
 export * from './types';
@@ -87,6 +88,11 @@ export class ReferenceResolver {
       },
 
       fileExists: (filePath: string) => {
+        // Prevent path traversal
+        if (!isPathWithinRoot(filePath, this.projectRoot)) {
+          logWarn('Path traversal blocked in fileExists', { filePath });
+          return false;
+        }
         const fullPath = path.join(this.projectRoot, filePath);
         try {
           return fs.existsSync(fullPath);
@@ -99,6 +105,13 @@ export class ReferenceResolver {
       readFile: (filePath: string) => {
         if (this.fileCache.has(filePath)) {
           return this.fileCache.get(filePath)!;
+        }
+
+        // Prevent path traversal
+        if (!isPathWithinRoot(filePath, this.projectRoot)) {
+          logWarn('Path traversal blocked in readFile', { filePath });
+          this.fileCache.set(filePath, null);
+          return null;
         }
 
         const fullPath = path.join(this.projectRoot, filePath);

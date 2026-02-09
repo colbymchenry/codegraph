@@ -438,9 +438,11 @@ export class QueryBuilder {
     // Add prefix wildcard for better matching (e.g., "auth" matches "AuthService", "authenticate")
     // Escape special FTS5 characters and add prefix wildcard
     const ftsQuery = query
-      .replace(/['"*()]/g, '') // Remove special chars
+      .replace(/['"*():^]/g, '') // Remove FTS5 special chars
       .split(/\s+/)
       .filter(term => term.length > 0)
+      // Strip FTS5 boolean operators to prevent query manipulation
+      .filter(term => !/^(AND|OR|NOT|NEAR)$/i.test(term))
       .map(term => `"${term}"*`) // Prefix match each term
       .join(' OR ');
 
@@ -756,7 +758,7 @@ export class QueryBuilder {
       referenceKind: row.reference_kind as EdgeKind,
       line: row.line,
       column: row.col,
-      candidates: row.candidates ? JSON.parse(row.candidates) : undefined,
+      candidates: safeJsonParse(row.candidates, 'unresolved_refs.candidates'),
     }));
   }
 
@@ -771,7 +773,7 @@ export class QueryBuilder {
       referenceKind: row.reference_kind as EdgeKind,
       line: row.line,
       column: row.col,
-      candidates: row.candidates ? JSON.parse(row.candidates) : undefined,
+      candidates: safeJsonParse(row.candidates, 'unresolved_refs.candidates'),
     }));
   }
 

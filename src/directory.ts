@@ -139,6 +139,10 @@ export function getDirectorySize(projectRoot: string): number {
  * Ensure a subdirectory exists within .codegraph
  */
 export function ensureSubdirectory(projectRoot: string, subdirName: string): string {
+  if (subdirName.includes('..') || subdirName.includes(path.sep) || subdirName.includes('/')) {
+    throw new Error(`Invalid subdirectory name: ${subdirName}`);
+  }
+
   const subdirPath = path.join(getCodeGraphDir(projectRoot), subdirName);
 
   if (!fs.existsSync(subdirPath)) {

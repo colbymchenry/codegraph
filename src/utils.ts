@@ -28,6 +28,8 @@
  * ```
  */
 
+import * as path from 'path';
+
 /**
  * Process items in batches to manage memory
  *
@@ -63,6 +65,23 @@ export async function processInBatches<T, R>(
   }
 
   return results;
+}
+
+/**
+ * Check if a file path resolves to a location within the given root directory.
+ *
+ * Prevents path traversal attacks by ensuring the resolved absolute path
+ * starts with the resolved root path. Handles '..' sequences, symlink-like
+ * relative paths, and platform-specific separators.
+ *
+ * @param filePath - The path to check (can be relative or absolute)
+ * @param rootDir - The root directory that filePath must stay within
+ * @returns true if filePath resolves to a location within rootDir
+ */
+export function isPathWithinRoot(filePath: string, rootDir: string): boolean {
+  const resolvedPath = path.resolve(rootDir, filePath);
+  const resolvedRoot = path.resolve(rootDir);
+  return resolvedPath.startsWith(resolvedRoot + path.sep) || resolvedPath === resolvedRoot;
 }
 
 /**

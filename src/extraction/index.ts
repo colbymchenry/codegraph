@@ -17,7 +17,8 @@ import {
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { detectLanguage, isLanguageSupported } from './grammars';
-import { logDebug } from '../errors';
+import { logDebug, logWarn } from '../errors';
+import { isPathWithinRoot } from '../utils';
 import picomatch from 'picomatch';
 
 /**
@@ -139,6 +140,14 @@ export function scanDirectory(
         // For symlinks, check if they point to a directory
         if (entry.isSymbolicLink()) {
           try {
+            // Verify symlink target stays within project root
+            const realTarget = fs.realpathSync(fullPath);
+            const realRoot = fs.realpathSync(rootDir);
+            if (!realTarget.startsWith(realRoot + path.sep) && realTarget !== realRoot) {
+              logWarn('Skipping symlink that escapes project root', { path: fullPath, target: realTarget });
+              continue;
+            }
+
             const stat = fs.statSync(fullPath);
             if (!stat.isDirectory()) {
               // Symlink to a file — treat as file below
@@ -342,7 +351,19 @@ export class ExtractionOrchestrator {
    * Index a single file
    */
   async indexFile(relativePath: string): Promise<ExtractionResult> {
-    const fullPath = path.join(this.rootDir, relativePath);
+    const fullPath = path.resolve(this.rootDir, relativePath);
+
+    // Prevent path traversal: ensure resolved path stays within project root
+    if (!isPathWithinRoot(relativePath, this.rootDir)) {
+      logWarn('Path traversal blocked in indexFile', { relativePath });
+      return {
+        nodes: [],
+        edges: [],
+        unresolvedReferences: [],
+        errors: [{ message: 'Path traversal blocked', severity: 'error' }],
+        durationMs: 0,
+      };
+    }
 
     // Check file exists and is readable
     let content: string;
