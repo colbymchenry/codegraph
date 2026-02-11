@@ -11,13 +11,47 @@ import { QueryBuilder } from '../db/queries';
  * Default traversal options
  */
 const DEFAULT_OPTIONS: Required<TraversalOptions> = {
-  maxDepth: Infinity,
+  maxDepth: 20,
   edgeKinds: [],
   nodeKinds: [],
   direction: 'outgoing',
   limit: 1000,
   includeStart: true,
 };
+
+/** Maximum nodes to visit in findPath before giving up */
+const FIND_PATH_MAX_VISITED = 10000;
+
+/** Edge kind priority for evidence-based sorting (higher = more informative) */
+const EDGE_KIND_PRIORITY: Record<string, number> = {
+  calls: 10,
+  extends: 9,
+  implements: 8,
+  imports: 7,
+  exports: 6,
+  type_of: 5,
+  returns: 4,
+  instantiates: 3,
+  references: 2,
+  overrides: 7,
+  decorates: 3,
+  contains: 1,
+};
+
+function edgeEvidenceScore(edge: Edge): number {
+  const kindPriority = EDGE_KIND_PRIORITY[edge.kind] ?? 0;
+  const hasLine = edge.line != null ? 1 : 0;
+  const confidence = (edge.metadata as { confidence?: number })?.confidence ?? 0.5;
+  return kindPriority + hasLine + confidence;
+}
+
+/**
+ * Sort edges by evidence quality (most informative first)
+ */
+export function sortEdgesByEvidence(edges: Edge[]): Edge[] {
+  if (edges.length <= 1) return edges;
+  return [...edges].sort((a, b) => edgeEvidenceScore(b) - edgeEvidenceScore(a));
+}
 
 /**
  * Result of a single traversal step
@@ -207,17 +241,20 @@ export class GraphTraverser {
     edgeKinds?: EdgeKind[]
   ): Edge[] {
     const kinds = edgeKinds && edgeKinds.length > 0 ? edgeKinds : undefined;
+    let edges: Edge[];
 
     if (direction === 'outgoing') {
-      return this.queries.getOutgoingEdges(nodeId, kinds);
+      edges = this.queries.getOutgoingEdges(nodeId, kinds);
     } else if (direction === 'incoming') {
-      return this.queries.getIncomingEdges(nodeId, kinds);
+      edges = this.queries.getIncomingEdges(nodeId, kinds);
     } else {
       // Both directions
       const outgoing = this.queries.getOutgoingEdges(nodeId, kinds);
       const incoming = this.queries.getIncomingEdges(nodeId, kinds);
-      return [...outgoing, ...incoming];
+      edges = [...outgoing, ...incoming];
     }
+
+    return sortEdgesByEvidence(edges);
   }
 
   /**
@@ -333,7 +370,7 @@ export class GraphTraverser {
 
     return {
       nodes,
-      edges,
+      edges: sortEdgesByEvidence(edges),
       roots: [nodeId],
     };
   }
@@ -352,16 +389,17 @@ export class GraphTraverser {
 
     const nodes = new Map<string, Node>();
     const edges: Edge[] = [];
-    const visited = new Set<string>();
+    const visitedAncestors = new Set<string>();
+    const visitedDescendants = new Set<string>();
 
     // Add focal node
     nodes.set(focalNode.id, focalNode);
 
     // Get ancestors (what this extends/implements)
-    this.getTypeAncestors(nodeId, nodes, edges, visited);
+    this.getTypeAncestors(nodeId, nodes, edges, visitedAncestors);
 
     // Get descendants (what extends/implements this)
-    this.getTypeDescendants(nodeId, nodes, edges, visited);
+    this.getTypeDescendants(nodeId, nodes, edges, visitedDescendants);
 
     return {
       nodes,
@@ -516,44 +554,43 @@ export class GraphTraverser {
       return null;
     }
 
-    // BFS to find shortest path
-    const visited = new Set<string>();
-    const queue: Array<{ nodeId: string; path: Array<{ node: Node; edge: Edge | null }> }> = [
-      { nodeId: fromId, path: [{ node: fromNode, edge: null }] },
-    ];
+    // Parent-pointer BFS with visit limit for memory safety
+    const parentMap = new Map<string, { node: Node; edge: Edge | null; parentId: string | null }>();
+    parentMap.set(fromId, { node: fromNode, edge: null, parentId: null });
 
-    while (queue.length > 0) {
-      const { nodeId, path } = queue.shift()!;
+    const queue: string[] = [fromId];
+    const kinds = edgeKinds.length > 0 ? edgeKinds : undefined;
+
+    while (queue.length > 0 && parentMap.size < FIND_PATH_MAX_VISITED) {
+      const nodeId = queue.shift()!;
 
       if (nodeId === toId) {
+        // Reconstruct path from parent pointers
+        const path: Array<{ node: Node; edge: Edge | null }> = [];
+        let currentId: string | null = toId;
+        while (currentId !== null) {
+          const entry = parentMap.get(currentId);
+          if (!entry) break;
+          path.unshift({ node: entry.node, edge: entry.edge });
+          currentId = entry.parentId;
+        }
         return path;
       }
 
-      if (visited.has(nodeId)) {
-        continue;
-      }
-      visited.add(nodeId);
-
-      // Get outgoing edges
-      const outgoingEdges = this.queries.getOutgoingEdges(
-        nodeId,
-        edgeKinds.length > 0 ? edgeKinds : undefined
-      );
+      const outgoingEdges = this.queries.getOutgoingEdges(nodeId, kinds);
 
       for (const edge of outgoingEdges) {
-        if (!visited.has(edge.target)) {
+        if (!parentMap.has(edge.target)) {
           const nextNode = this.queries.getNodeById(edge.target);
           if (nextNode) {
-            queue.push({
-              nodeId: edge.target,
-              path: [...path, { node: nextNode, edge }],
-            });
+            parentMap.set(edge.target, { node: nextNode, edge, parentId: nodeId });
+            queue.push(edge.target);
           }
         }
       }
     }
 
-    return null; // No path found
+    return null; // No path found within visit limit
   }
 
   /**

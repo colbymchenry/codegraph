@@ -8,6 +8,7 @@
 import Database from 'better-sqlite3';
 import { Node } from '../types';
 import { TextEmbedder, EMBEDDING_DIMENSION } from './embedder';
+import { logDebug, logWarn } from '../errors';
 
 /**
  * Options for vector search
@@ -24,6 +25,51 @@ export interface VectorSearchOptions {
 }
 
 /**
+ * Min-heap for efficiently finding top-K highest scores.
+ * Maintains a heap of size K where the root is the smallest score.
+ */
+class TopKHeap {
+  private heap: Array<{ nodeId: string; score: number }> = [];
+  private k: number;
+  constructor(k: number) { this.k = k; }
+  push(item: { nodeId: string; score: number }): void {
+    if (this.heap.length < this.k) {
+      this.heap.push(item);
+      this.bubbleUp(this.heap.length - 1);
+    } else if (this.heap.length > 0 && item.score > this.heap[0]!.score) {
+      this.heap[0] = item;
+      this.sinkDown(0);
+    }
+  }
+  toSortedArray(): Array<{ nodeId: string; score: number }> {
+    return [...this.heap].sort((a, b) => b.score - a.score);
+  }
+  get size(): number { return this.heap.length; }
+  private bubbleUp(i: number): void {
+    while (i > 0) {
+      const parent = Math.floor((i - 1) / 2);
+      if (this.heap[parent]!.score > this.heap[i]!.score) {
+        [this.heap[parent]!, this.heap[i]!] = [this.heap[i]!, this.heap[parent]!];
+        i = parent;
+      } else break;
+    }
+  }
+  private sinkDown(i: number): void {
+    const n = this.heap.length;
+    while (true) {
+      let smallest = i;
+      const left = 2 * i + 1, right = 2 * i + 2;
+      if (left < n && this.heap[left]!.score < this.heap[smallest]!.score) smallest = left;
+      if (right < n && this.heap[right]!.score < this.heap[smallest]!.score) smallest = right;
+      if (smallest !== i) {
+        [this.heap[smallest]!, this.heap[i]!] = [this.heap[i]!, this.heap[smallest]!];
+        i = smallest;
+      } else break;
+    }
+  }
+}
+
+/**
  * Vector Search Manager
  *
  * Handles vector storage and similarity search for semantic code search.
@@ -32,6 +78,7 @@ export class VectorSearchManager {
   private db: Database.Database;
   private vssEnabled = false;
   private embeddingDimension: number;
+  private vectorCache = new Map<string, Float32Array>();
 
   constructor(db: Database.Database, dimension: number = EMBEDDING_DIMENSION) {
     this.db = db;
@@ -49,16 +96,15 @@ export class VectorSearchManager {
       // Try to load sqlite-vss extension
       await this.loadVssExtension();
       this.vssEnabled = true;
-      console.log('sqlite-vss extension loaded successfully');
+      logDebug('sqlite-vss extension loaded successfully');
 
       // Create the VSS virtual table
       this.createVssTable();
     } catch (error) {
       // Fall back to brute-force search
-      console.warn(
-        'sqlite-vss extension not available, falling back to brute-force search:',
-        error instanceof Error ? error.message : String(error)
-      );
+      logWarn('sqlite-vss extension not available, falling back to brute-force search', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       this.vssEnabled = false;
     }
 
@@ -150,6 +196,7 @@ export class VectorSearchManager {
    */
   storeVector(nodeId: string, embedding: Float32Array, model: string): void {
     const now = Date.now();
+    this.vectorCache.set(nodeId, embedding);
 
     // Store in the vectors table (always, for persistence)
     const blob = Buffer.from(embedding.buffer);
@@ -204,10 +251,9 @@ export class VectorSearchManager {
     } catch (error) {
       // VSS operations can fail for various reasons (dimension mismatch, etc.)
       // Fall back to brute-force search silently
-      console.warn(
-        'VSS storage failed, using brute-force search:',
-        error instanceof Error ? error.message : String(error)
-      );
+      logWarn('VSS storage failed, using brute-force search', {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -250,6 +296,9 @@ export class VectorSearchManager {
    * @returns Embedding or null if not found
    */
   getVector(nodeId: string): Float32Array | null {
+    const cached = this.vectorCache.get(nodeId);
+    if (cached) return cached;
+
     const row = this.db
       .prepare('SELECT embedding FROM vectors WHERE node_id = ?')
       .get(nodeId) as { embedding: Buffer } | undefined;
@@ -258,10 +307,12 @@ export class VectorSearchManager {
       return null;
     }
 
-    return new Float32Array(row.embedding.buffer.slice(
+    const embedding = new Float32Array(row.embedding.buffer.slice(
       row.embedding.byteOffset,
       row.embedding.byteOffset + row.embedding.byteLength
     ));
+    this.vectorCache.set(nodeId, embedding);
+    return embedding;
   }
 
   /**
@@ -270,6 +321,7 @@ export class VectorSearchManager {
    * @param nodeId - ID of the node
    */
   deleteVector(nodeId: string): void {
+    this.vectorCache.delete(nodeId);
     this.db.prepare('DELETE FROM vectors WHERE node_id = ?').run(nodeId);
 
     if (this.vssEnabled) {
@@ -296,12 +348,12 @@ export class VectorSearchManager {
     queryEmbedding: Float32Array,
     options: VectorSearchOptions = {}
   ): Array<{ nodeId: string; score: number }> {
-    const { limit = 10, minScore = 0 } = options;
+    const { limit = 10, minScore = 0, nodeKinds } = options;
 
     if (this.vssEnabled) {
       return this.searchWithVss(queryEmbedding, limit, minScore);
     } else {
-      return this.searchBruteForce(queryEmbedding, limit, minScore);
+      return this.searchBruteForce(queryEmbedding, limit, minScore, nodeKinds);
     }
   }
 
@@ -345,10 +397,9 @@ export class VectorSearchManager {
         .filter((r) => r.score >= minScore);
     } catch (error) {
       // VSS search failed, fall back to brute force
-      console.warn(
-        'VSS search failed, using brute-force:',
-        error instanceof Error ? error.message : String(error)
-      );
+      logWarn('VSS search failed, using brute-force', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       return this.searchBruteForce(queryEmbedding, limit, minScore);
     }
   }
@@ -359,32 +410,47 @@ export class VectorSearchManager {
   private searchBruteForce(
     queryEmbedding: Float32Array,
     limit: number,
-    minScore: number
+    minScore: number,
+    nodeKinds?: Node['kind'][]
   ): Array<{ nodeId: string; score: number }> {
-    // Get all vectors
-    const rows = this.db
-      .prepare('SELECT node_id, embedding FROM vectors')
-      .all() as Array<{ node_id: string; embedding: Buffer }>;
+    // Build SQL with optional nodeKinds filter
+    let sql: string;
+    let params: unknown[];
+    if (nodeKinds && nodeKinds.length > 0) {
+      const placeholders = nodeKinds.map(() => '?').join(',');
+      sql = `SELECT v.node_id, v.embedding FROM vectors v JOIN nodes n ON n.id = v.node_id WHERE n.kind IN (${placeholders})`;
+      params = nodeKinds;
+    } else {
+      sql = 'SELECT node_id, embedding FROM vectors';
+      params = [];
+    }
 
-    // Calculate cosine similarity for each
-    const results: Array<{ nodeId: string; score: number }> = [];
+    const rows = this.db
+      .prepare(sql)
+      .all(...params) as Array<{ node_id: string; embedding: Buffer }>;
+
+    // Use TopKHeap for O(N log K) instead of O(N log N) full sort
+    const heap = new TopKHeap(limit);
 
     for (const row of rows) {
-      const embedding = new Float32Array(row.embedding.buffer.slice(
-        row.embedding.byteOffset,
-        row.embedding.byteOffset + row.embedding.byteLength
-      ));
+      // Use vectorCache for Float32Array conversion
+      let embedding = this.vectorCache.get(row.node_id);
+      if (!embedding) {
+        embedding = new Float32Array(row.embedding.buffer.slice(
+          row.embedding.byteOffset,
+          row.embedding.byteOffset + row.embedding.byteLength
+        ));
+        this.vectorCache.set(row.node_id, embedding);
+      }
 
       const score = TextEmbedder.cosineSimilarity(queryEmbedding, embedding);
 
       if (score >= minScore) {
-        results.push({ nodeId: row.node_id, score });
+        heap.push({ nodeId: row.node_id, score });
       }
     }
 
-    // Sort by score descending and limit
-    results.sort((a, b) => b.score - a.score);
-    return results.slice(0, limit);
+    return heap.toSortedArray();
   }
 
   /**
@@ -421,6 +487,7 @@ export class VectorSearchManager {
    * Clear all vectors
    */
   clear(): void {
+    this.vectorCache.clear();
     this.db.prepare('DELETE FROM vectors').run();
 
     if (this.vssEnabled) {

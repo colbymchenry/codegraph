@@ -4,6 +4,7 @@
  * Higher-level query functions built on top of traversal algorithms.
  */
 
+import picomatch from 'picomatch';
 import { Node, Edge, Context, Subgraph, EdgeKind } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from './traversal';
@@ -44,13 +45,11 @@ export class GraphQueryManager {
 
     // Get incoming references (things that reference this node)
     const incomingEdges = this.queries.getIncomingEdges(nodeId);
+    const nonContainsIncoming = incomingEdges.filter(e => e.kind !== 'contains');
+    const incomingNodeMap = this.queries.getNodesByIds(nonContainsIncoming.map(e => e.source));
     const incomingRefs: Array<{ node: Node; edge: Edge }> = [];
-    for (const edge of incomingEdges) {
-      // Skip containment edges (already in ancestors)
-      if (edge.kind === 'contains') {
-        continue;
-      }
-      const node = this.queries.getNodeById(edge.source);
+    for (const edge of nonContainsIncoming) {
+      const node = incomingNodeMap.get(edge.source);
       if (node) {
         incomingRefs.push({ node, edge });
       }
@@ -58,13 +57,11 @@ export class GraphQueryManager {
 
     // Get outgoing references (things this node references)
     const outgoingEdges = this.queries.getOutgoingEdges(nodeId);
+    const nonContainsOutgoing = outgoingEdges.filter(e => e.kind !== 'contains');
+    const outgoingNodeMap = this.queries.getNodesByIds(nonContainsOutgoing.map(e => e.target));
     const outgoingRefs: Array<{ node: Node; edge: Edge }> = [];
-    for (const edge of outgoingEdges) {
-      // Skip containment edges (already in children)
-      if (edge.kind === 'contains') {
-        continue;
-      }
-      const node = this.queries.getNodeById(edge.target);
+    for (const edge of nonContainsOutgoing) {
+      const node = outgoingNodeMap.get(edge.target);
       if (node) {
         outgoingRefs.push({ node, edge });
       }
@@ -125,9 +122,10 @@ export class GraphQueryManager {
 
     const dependencies = new Set<string>();
     const importEdges = this.queries.getOutgoingEdges(fileNode.id, ['imports']);
+    const targetNodeMap = this.queries.getNodesByIds(importEdges.map(e => e.target));
 
     for (const edge of importEdges) {
-      const targetNode = this.queries.getNodeById(edge.target);
+      const targetNode = targetNodeMap.get(edge.target);
       if (targetNode && targetNode.filePath !== filePath) {
         dependencies.add(targetNode.filePath);
       }
@@ -148,16 +146,24 @@ export class GraphQueryManager {
     const nodes = this.queries.getNodesByFile(filePath);
     const dependents = new Set<string>();
 
-    // For each exported symbol in this file, find imports
+    // Collect all incoming import edges for exported symbols
+    const allSourceIds: string[] = [];
+    const edgesBySource = new Map<string, Edge[]>();
     for (const node of nodes) {
       if (node.isExported) {
         const incomingEdges = this.queries.getIncomingEdges(node.id, ['imports']);
         for (const edge of incomingEdges) {
-          const sourceNode = this.queries.getNodeById(edge.source);
-          if (sourceNode && sourceNode.filePath !== filePath) {
-            dependents.add(sourceNode.filePath);
-          }
+          allSourceIds.push(edge.source);
+          if (!edgesBySource.has(edge.source)) edgesBySource.set(edge.source, []);
+          edgesBySource.get(edge.source)!.push(edge);
         }
+      }
+    }
+    const sourceNodeMap = this.queries.getNodesByIds(allSourceIds);
+    for (const [sourceId] of edgesBySource) {
+      const sourceNode = sourceNodeMap.get(sourceId);
+      if (sourceNode && sourceNode.filePath !== filePath) {
+        dependents.add(sourceNode.filePath);
       }
     }
 
@@ -182,17 +188,9 @@ export class GraphQueryManager {
    * @returns Array of matching nodes
    */
   findByQualifiedName(pattern: string): Node[] {
-    // Convert glob pattern to regex
-    const regexPattern = pattern
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replace(/\*/g, '.*')
-      .replace(/\?/g, '.');
+    // Use picomatch for safe glob matching (no ReDoS risk)
+    const isMatch = picomatch(pattern, { dot: true });
 
-    const regex = new RegExp(`^${regexPattern}$`);
-
-    // This is inefficient for large graphs - would need FTS index on qualified_name
-    // For now, use kind-based filtering if possible
-    const allNodes: Node[] = [];
     const kinds: Node['kind'][] = [
       'class',
       'function',
@@ -203,16 +201,9 @@ export class GraphQueryManager {
       'constant',
     ];
 
-    for (const kind of kinds) {
-      const nodes = this.queries.getNodesByKind(kind);
-      for (const node of nodes) {
-        if (regex.test(node.qualifiedName)) {
-          allNodes.push(node);
-        }
-      }
-    }
-
-    return allNodes;
+    // Batch-fetch all nodes of relevant kinds
+    const allKindNodes = this.queries.getNodesByKinds(kinds);
+    return allKindNodes.filter(node => isMatch(node.qualifiedName));
   }
 
   /**
@@ -249,9 +240,19 @@ export class GraphQueryManager {
     const cycles: string[][] = [];
     const visited = new Set<string>();
     const recursionStack = new Set<string>();
+    const depsCache = new Map<string, string[]>();
 
-    const dfs = (filePath: string, path: string[]): void => {
-      if (recursionStack.has(filePath)) {
+    const getDeps = (filePath: string): string[] => {
+      let deps = depsCache.get(filePath);
+      if (deps === undefined) {
+        deps = this.getFileDependencies(filePath);
+        depsCache.set(filePath, deps);
+      }
+      return deps;
+    };
+
+    const dfs = (filePath: string, path: string[], pathSet: Set<string>): void => {
+      if (pathSet.has(filePath)) {
         // Found a cycle
         const cycleStart = path.indexOf(filePath);
         if (cycleStart !== -1) {
@@ -266,18 +267,22 @@ export class GraphQueryManager {
 
       visited.add(filePath);
       recursionStack.add(filePath);
+      path.push(filePath);
+      pathSet.add(filePath);
 
-      const dependencies = this.getFileDependencies(filePath);
+      const dependencies = getDeps(filePath);
       for (const dep of dependencies) {
-        dfs(dep, [...path, filePath]);
+        dfs(dep, path, pathSet);
       }
 
+      path.pop();
+      pathSet.delete(filePath);
       recursionStack.delete(filePath);
     };
 
     for (const file of files) {
       if (!visited.has(file.path)) {
-        dfs(file.path, []);
+        dfs(file.path, [], new Set());
       }
     }
 

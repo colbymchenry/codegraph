@@ -428,6 +428,50 @@ export class QueryBuilder {
   }
 
   /**
+   * Get multiple nodes by their IDs in a single batch query
+   */
+  getNodesByIds(ids: string[]): Map<string, Node> {
+    const result = new Map<string, Node>();
+    if (ids.length === 0) return result;
+    const missing: string[] = [];
+    for (const id of ids) {
+      if (this.nodeCache.has(id)) {
+        const cached = this.nodeCache.get(id)!;
+        // Move to end for LRU
+        this.nodeCache.delete(id);
+        this.nodeCache.set(id, cached);
+        result.set(id, cached);
+      } else {
+        missing.push(id);
+      }
+    }
+    const CHUNK_SIZE = 999;
+    for (let i = 0; i < missing.length; i += CHUNK_SIZE) {
+      const chunk = missing.slice(i, i + CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const sql = `SELECT * FROM nodes WHERE id IN (${placeholders})`;
+      const rows = this.db.prepare(sql).all(...chunk) as NodeRow[];
+      for (const row of rows) {
+        const node = rowToNode(row);
+        this.cacheNode(node);
+        result.set(node.id, node);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Get nodes matching any of the specified kinds in a single query
+   */
+  getNodesByKinds(kinds: NodeKind[]): Node[] {
+    if (kinds.length === 0) return [];
+    const placeholders = kinds.map(() => '?').join(',');
+    const sql = `SELECT * FROM nodes WHERE kind IN (${placeholders})`;
+    const rows = this.db.prepare(sql).all(...kinds) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
    * Get all nodes in the database
    */
   getAllNodes(): Node[] {

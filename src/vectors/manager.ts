@@ -66,6 +66,8 @@ export class VectorManager {
   private nodeKinds: Node['kind'][];
   private batchSize: number;
   private initialized = false;
+  private queryEmbeddingCache = new Map<string, Float32Array>();
+  private static readonly QUERY_CACHE_MAX_SIZE = 50;
 
   constructor(
     db: Database.Database,
@@ -192,6 +194,32 @@ export class VectorManager {
    * @param options - Search options
    * @returns Array of search results with similarity scores
    */
+  /**
+   * Get cached query embedding (LRU via Map insertion order)
+   */
+  private async getCachedQueryEmbedding(query: string): Promise<Float32Array> {
+    const cached = this.queryEmbeddingCache.get(query);
+    if (cached) {
+      // Move to end for LRU
+      this.queryEmbeddingCache.delete(query);
+      this.queryEmbeddingCache.set(query, cached);
+      return cached;
+    }
+
+    const result = await this.embedder.embedQuery(query);
+
+    // Evict oldest entry if at capacity
+    if (this.queryEmbeddingCache.size >= VectorManager.QUERY_CACHE_MAX_SIZE) {
+      const firstKey = this.queryEmbeddingCache.keys().next().value;
+      if (firstKey !== undefined) {
+        this.queryEmbeddingCache.delete(firstKey);
+      }
+    }
+
+    this.queryEmbeddingCache.set(query, result.embedding);
+    return result.embedding;
+  }
+
   async search(query: string, options: SearchOptions = {}): Promise<SearchResult[]> {
     if (!this.initialized) {
       throw new Error('VectorManager not initialized. Call initialize() first.');
@@ -199,11 +227,11 @@ export class VectorManager {
 
     const { limit = 10, kinds } = options;
 
-    // Generate query embedding
-    const queryResult = await this.embedder.embedQuery(query);
+    // Generate query embedding (cached)
+    const queryEmbedding = await this.getCachedQueryEmbedding(query);
 
     // Search for similar vectors
-    const vectorResults = this.searchManager.search(queryResult.embedding, {
+    const vectorResults = this.searchManager.search(queryEmbedding, {
       limit: limit * 2, // Get more results to filter
       minScore: 0.3, // Minimum similarity threshold
     });
