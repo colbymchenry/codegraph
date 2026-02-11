@@ -169,10 +169,18 @@ export function getParser(language: Language): Parser | null {
     return null;
   }
 
-  const parser = new Parser();
-  parser.setLanguage(grammar as Parameters<typeof parser.setLanguage>[0]);
-  parserCache.set(language, parser);
-  return parser;
+  try {
+    const parser = new Parser();
+    parser.setLanguage(grammar as Parameters<typeof parser.setLanguage>[0]);
+    parserCache.set(language, parser);
+    return parser;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[CodeGraph] Failed to initialize ${language} parser — ABI incompatible: ${message}`);
+    unavailableGrammarErrors.set(language, message);
+    grammarCache.set(language, null);
+    return null;
+  }
 }
 
 /**
@@ -190,7 +198,7 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'liquid') return true; // custom regex extractor
   if (language === 'unknown') return false;
-  return loadGrammar(language) !== null;
+  return getParser(language) !== null;
 }
 
 /**
@@ -198,7 +206,7 @@ export function isLanguageSupported(language: Language): boolean {
  */
 export function getSupportedLanguages(): Language[] {
   const available = (Object.keys(grammarLoaders) as GrammarLanguage[])
-    .filter((language) => loadGrammar(language) !== null);
+    .filter((language) => getParser(language) !== null);
   return [...available, 'svelte', 'liquid'];
 }
 

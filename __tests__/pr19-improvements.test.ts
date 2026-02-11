@@ -320,8 +320,8 @@ describe('Database Layer Improvements', () => {
     const { DatabaseConnection } = await import('../src/db');
     const { QueryBuilder } = await import('../src/db/queries');
 
-    const db = DatabaseConnection.initialize(testDir);
-    const queries = new QueryBuilder(db.getDatabase());
+    const db = DatabaseConnection.initialize(path.join(testDir, 'test.db'));
+    const queries = new QueryBuilder(db.getDb());
 
     // Insert a node first (needed as foreign key)
     queries.insertNode({
@@ -375,8 +375,8 @@ describe('Database Layer Improvements', () => {
     const { DatabaseConnection } = await import('../src/db');
     const { QueryBuilder } = await import('../src/db/queries');
 
-    const db = DatabaseConnection.initialize(testDir);
-    const queries = new QueryBuilder(db.getDatabase());
+    const db = DatabaseConnection.initialize(path.join(testDir, 'test.db'));
+    const queries = new QueryBuilder(db.getDb());
 
     // Insert some nodes
     for (let i = 0; i < 3; i++) {
@@ -405,8 +405,8 @@ describe('Database Layer Improvements', () => {
   it.skipIf(!HAS_SQLITE)('should set performance pragmas on initialization', async () => {
     const { DatabaseConnection } = await import('../src/db');
 
-    const db = DatabaseConnection.initialize(testDir);
-    const rawDb = db.getDatabase();
+    const db = DatabaseConnection.initialize(path.join(testDir, 'test.db'));
+    const rawDb = db.getDb();
 
     // Check pragmas were set
     const synchronous = rawDb.pragma('synchronous', { simple: true });
@@ -428,8 +428,8 @@ describe('Database Layer Improvements', () => {
     const { DatabaseConnection } = await import('../src/db');
     const { QueryBuilder } = await import('../src/db/queries');
 
-    const db = DatabaseConnection.initialize(testDir);
-    const queries = new QueryBuilder(db.getDatabase());
+    const db = DatabaseConnection.initialize(path.join(testDir, 'test.db'));
+    const queries = new QueryBuilder(db.getDb());
 
     // Should not throw on empty array
     expect(() => queries.insertUnresolvedRefsBatch([])).not.toThrow();
@@ -502,6 +502,7 @@ describe('MCP Tool Improvements', () => {
 
     // Access private method for testing
     const handler = Object.create(ToolHandler.prototype);
+    (handler as any).MAX_OUTPUT_LENGTH = 15000;
     const truncate = (handler as any).truncateOutput.bind(handler);
 
     // Short text should not be truncated
@@ -519,6 +520,7 @@ describe('MCP Tool Improvements', () => {
     const { ToolHandler } = await import('../src/mcp/tools');
 
     const handler = Object.create(ToolHandler.prototype);
+    (handler as any).MAX_OUTPUT_LENGTH = 15000;
     const truncate = (handler as any).truncateOutput.bind(handler);
 
     // Build text with newlines exceeding the limit
