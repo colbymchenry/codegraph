@@ -20,10 +20,31 @@ import {
 import { matchReference } from './name-matcher';
 import { resolveViaImport, extractImportMappings } from './import-resolver';
 import { detectFrameworks } from './frameworks';
-import { logDebug } from '../errors';
+import { logDebug, logWarn } from '../errors';
+import { isPathWithinRoot } from '../utils';
 
 // Re-export types
 export * from './types';
+
+// Module-level Sets for O(1) built-in lookups (instead of arrays with .includes())
+const jsBuiltIns = new Set([
+  'console', 'window', 'document', 'global', 'process',
+  'Promise', 'Array', 'Object', 'String', 'Number', 'Boolean',
+  'Date', 'Math', 'JSON', 'RegExp', 'Error', 'Map', 'Set',
+  'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
+  'fetch', 'require', 'module', 'exports', '__dirname', '__filename',
+]);
+
+const reactHooks = new Set([
+  'useState', 'useEffect', 'useContext', 'useReducer', 'useCallback',
+  'useMemo', 'useRef', 'useLayoutEffect', 'useImperativeHandle', 'useDebugValue',
+]);
+
+const pythonBuiltIns = new Set([
+  'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple',
+  'open', 'input', 'type', 'isinstance', 'hasattr', 'getattr', 'setattr',
+  'super', 'self', 'cls', 'None', 'True', 'False',
+]);
 
 /**
  * Reference Resolver
@@ -167,6 +188,11 @@ export class ReferenceResolver {
       },
 
       fileExists: (filePath: string) => {
+        // Prevent path traversal
+        if (!isPathWithinRoot(filePath, this.projectRoot)) {
+          logWarn('Path traversal blocked in fileExists', { filePath });
+          return false;
+        }
         // Check pre-built known files set first (O(1))
         if (this.knownFiles) {
           const normalized = filePath.replace(/\\/g, '/');
@@ -188,6 +214,13 @@ export class ReferenceResolver {
       readFile: (filePath: string) => {
         if (this.fileCache.has(filePath)) {
           return this.fileCache.get(filePath)!;
+        }
+
+        // Prevent path traversal
+        if (!isPathWithinRoot(filePath, this.projectRoot)) {
+          logWarn('Path traversal blocked in readFile', { filePath });
+          this.fileCache.set(filePath, null);
+          return null;
         }
 
         const fullPath = path.join(this.projectRoot, filePath);
@@ -394,16 +427,8 @@ export class ReferenceResolver {
   private isBuiltInOrExternal(ref: UnresolvedRef): boolean {
     const name = ref.referenceName;
 
-    // JavaScript/TypeScript built-ins
-    const jsBuiltIns = [
-      'console', 'window', 'document', 'global', 'process',
-      'Promise', 'Array', 'Object', 'String', 'Number', 'Boolean',
-      'Date', 'Math', 'JSON', 'RegExp', 'Error', 'Map', 'Set',
-      'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-      'fetch', 'require', 'module', 'exports', '__dirname', '__filename',
-    ];
-
-    if (jsBuiltIns.includes(name)) {
+    // JavaScript/TypeScript built-ins (O(1) Set lookup)
+    if (jsBuiltIns.has(name)) {
       return true;
     }
 
@@ -412,20 +437,13 @@ export class ReferenceResolver {
       return true;
     }
 
-    // React hooks from React itself
-    const reactHooks = ['useState', 'useEffect', 'useContext', 'useReducer', 'useCallback', 'useMemo', 'useRef', 'useLayoutEffect', 'useImperativeHandle', 'useDebugValue'];
-    if (reactHooks.includes(name)) {
+    // React hooks from React itself (O(1) Set lookup)
+    if (reactHooks.has(name)) {
       return true;
     }
 
-    // Python built-ins
-    const pythonBuiltIns = [
-      'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple',
-      'open', 'input', 'type', 'isinstance', 'hasattr', 'getattr', 'setattr',
-      'super', 'self', 'cls', 'None', 'True', 'False',
-    ];
-
-    if (ref.language === 'python' && pythonBuiltIns.includes(name)) {
+    // Python built-ins (O(1) Set lookup)
+    if (ref.language === 'python' && pythonBuiltIns.has(name)) {
       return true;
     }
 
