@@ -6,11 +6,10 @@
  */
 
 import * as fs from 'fs';
+import * as path from 'path';
 import {
   Node,
   Edge,
-  NodeKind,
-  EdgeKind,
   Subgraph,
   CodeBlock,
   TaskContext,
@@ -24,75 +23,8 @@ import { GraphTraverser } from '../graph';
 import { VectorManager } from '../vectors';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug, logWarn } from '../errors';
-import { validatePathWithinRoot } from '../utils';
-
-/**
- * Extract likely symbol names from a natural language query
- *
- * Identifies potential code symbols using patterns:
- * - CamelCase: UserService, signInWithGoogle
- * - snake_case: user_service, sign_in
- * - SCREAMING_SNAKE: MAX_RETRIES
- * - dot.notation: app.isPackaged (extracts both sides)
- * - Single words that look like identifiers (no spaces, not common English words)
- *
- * @param query - Natural language query
- * @returns Array of potential symbol names
- */
-function extractSymbolsFromQuery(query: string): string[] {
-  const symbols = new Set<string>();
-
-  // Extract CamelCase identifiers (2+ chars, starts with letter)
-  const camelCasePattern = /\b([A-Z][a-z]+(?:[A-Z][a-z]*)*|[a-z]+(?:[A-Z][a-z]*)+)\b/g;
-  let match;
-  while ((match = camelCasePattern.exec(query)) !== null) {
-    if (match[1] && match[1].length >= 2) {
-      symbols.add(match[1]);
-    }
-  }
-
-  // Extract snake_case identifiers
-  const snakeCasePattern = /\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b/gi;
-  while ((match = snakeCasePattern.exec(query)) !== null) {
-    if (match[1] && match[1].length >= 3) {
-      symbols.add(match[1]);
-    }
-  }
-
-  // Extract SCREAMING_SNAKE_CASE
-  const screamingPattern = /\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b/g;
-  while ((match = screamingPattern.exec(query)) !== null) {
-    if (match[1]) {
-      symbols.add(match[1]);
-    }
-  }
-
-  // Extract dot.notation and split into parts (e.g., "app.isPackaged" -> ["app", "isPackaged"])
-  const dotPattern = /\b([a-zA-Z][a-zA-Z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*)+)\b/g;
-  while ((match = dotPattern.exec(query)) !== null) {
-    if (match[1]) {
-      // Add both the full path and individual parts
-      symbols.add(match[1]);
-      const parts = match[1].split('.');
-      for (const part of parts) {
-        if (part.length >= 2) {
-          symbols.add(part);
-        }
-      }
-    }
-  }
-
-  // Filter out common English words that might match patterns
-  const commonWords = new Set([
-    'the', 'and', 'for', 'with', 'from', 'this', 'that', 'have', 'been',
-    'will', 'would', 'could', 'should', 'does', 'done', 'make', 'made',
-    'use', 'used', 'using', 'work', 'works', 'find', 'found', 'show',
-    'call', 'called', 'calling', 'get', 'set', 'add', 'all', 'any',
-    'how', 'what', 'when', 'where', 'which', 'who', 'why'
-  ]);
-
-  return Array.from(symbols).filter(s => !commonWords.has(s.toLowerCase()));
-}
+import { isPathWithinRoot } from '../utils';
+import { scorePathRelevance, kindBonus } from '../search/query-utils';
 
 /**
  * Default options for context building
@@ -114,16 +46,6 @@ const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
 };
 
 /**
- * Node kinds that provide high information value in context results.
- * Imports/exports are excluded because they have near-zero information density -
- * they tell you something exists, not how it works.
- */
-const HIGH_VALUE_NODE_KINDS: NodeKind[] = [
-  'function', 'method', 'class', 'interface', 'type_alias', 'struct', 'trait',
-  'component', 'route', 'variable', 'constant', 'enum', 'module', 'namespace',
-];
-
-/**
  * Default options for finding relevant context
  */
 const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
@@ -132,7 +54,7 @@ const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
   maxNodes: 20,          // Reduced from 50
   minScore: 0.3,
   edgeKinds: [],
-  nodeKinds: HIGH_VALUE_NODE_KINDS, // Filter out imports/exports by default
+  nodeKinds: [],         // No kind filtering — scoring handles relevance
 };
 
 /**
@@ -146,6 +68,7 @@ export class ContextBuilder {
   private queries: QueryBuilder;
   private traverser: GraphTraverser;
   private vectorManager: VectorManager | null;
+  private fileContentCache: Map<string, string> = new Map();
 
   constructor(
     projectRoot: string,
@@ -179,69 +102,71 @@ export class ContextBuilder {
   ): Promise<TaskContext | string> {
     const opts = { ...DEFAULT_BUILD_OPTIONS, ...options };
 
-    // Parse input
-    const query = typeof input === 'string' ? input : `${input.title}${input.description ? `: ${input.description}` : ''}`;
+    try {
+      // Parse input
+      const query = typeof input === 'string' ? input : `${input.title}${input.description ? `: ${input.description}` : ''}`;
 
-    // Find relevant context (semantic search + graph expansion)
-    const subgraph = await this.findRelevantContext(query, {
-      searchLimit: opts.searchLimit,
-      traversalDepth: opts.traversalDepth,
-      maxNodes: opts.maxNodes,
-      minScore: opts.minScore,
-    });
+      // Find relevant context (semantic search + graph expansion)
+      const subgraph = await this.findRelevantContext(query, {
+        searchLimit: opts.searchLimit,
+        traversalDepth: opts.traversalDepth,
+        maxNodes: opts.maxNodes,
+        minScore: opts.minScore,
+      });
 
-    // Get entry points (nodes from semantic search)
-    const entryPoints = this.getEntryPoints(subgraph);
+      // Get entry points (nodes from semantic search)
+      const entryPoints = this.getEntryPoints(subgraph);
 
-    // Extract code blocks for key nodes
-    const codeBlocks = opts.includeCode
-      ? await this.extractCodeBlocks(subgraph, opts.maxCodeBlocks, opts.maxCodeBlockSize)
-      : [];
+      // Extract code blocks for key nodes
+      const codeBlocks = opts.includeCode
+        ? await this.extractCodeBlocks(subgraph, opts.maxCodeBlocks, opts.maxCodeBlockSize)
+        : [];
 
-    // Get related files
-    const relatedFiles = this.getRelatedFiles(subgraph);
+      // Get related files
+      const relatedFiles = this.getRelatedFiles(subgraph);
 
-    // Generate summary
-    const summary = this.generateSummary(query, subgraph, entryPoints);
+      // Generate summary
+      const summary = this.generateSummary(query, subgraph, entryPoints);
 
-    // Calculate stats
-    const stats = {
-      nodeCount: subgraph.nodes.size,
-      edgeCount: subgraph.edges.length,
-      fileCount: relatedFiles.length,
-      codeBlockCount: codeBlocks.length,
-      totalCodeSize: codeBlocks.reduce((sum, block) => sum + block.content.length, 0),
-    };
+      // Calculate stats
+      const stats = {
+        nodeCount: subgraph.nodes.size,
+        edgeCount: subgraph.edges.length,
+        fileCount: relatedFiles.length,
+        codeBlockCount: codeBlocks.length,
+        totalCodeSize: codeBlocks.reduce((sum, block) => sum + block.content.length, 0),
+      };
 
-    const context: TaskContext = {
-      query,
-      subgraph,
-      entryPoints,
-      codeBlocks,
-      relatedFiles,
-      summary,
-      stats,
-    };
+      const context: TaskContext = {
+        query,
+        subgraph,
+        entryPoints,
+        codeBlocks,
+        relatedFiles,
+        summary,
+        stats,
+      };
 
-    // Return formatted output or raw context
-    if (opts.format === 'markdown') {
-      return formatContextAsMarkdown(context);
-    } else if (opts.format === 'json') {
-      return formatContextAsJson(context);
+      // Return formatted output or raw context
+      if (opts.format === 'markdown') {
+        return formatContextAsMarkdown(context);
+      } else if (opts.format === 'json') {
+        return formatContextAsJson(context);
+      }
+
+      return context;
+    } finally {
+      this.fileContentCache.clear();
     }
-
-    return context;
   }
 
   /**
    * Find relevant subgraph for a query
    *
-   * Uses hybrid search combining exact symbol lookup with semantic search:
-   * 1. Extract potential symbol names from query
-   * 2. Look up exact matches for those symbols (high confidence)
-   * 3. Use semantic search for concept matching
-   * 4. Merge results, prioritizing exact matches
-   * 5. Traverse graph from entry points
+   * Uses semantic-first search with multi-signal scoring:
+   * 1. Semantic search (with text search fallback)
+   * 2. Multi-signal scoring: lexical relevance, kind bonus, path relevance
+   * 3. Traverse graph from top-scored entry points
    *
    * @param query - Natural language query
    * @param options - Search and traversal options
@@ -256,6 +181,7 @@ export class ContextBuilder {
     // Start with empty subgraph
     const nodes = new Map<string, Node>();
     const edges: Edge[] = [];
+    const edgeKeys = new Set<string>();
     const roots: string[] = [];
 
     // Handle empty query - return empty subgraph
@@ -263,84 +189,48 @@ export class ContextBuilder {
       return { nodes, edges, roots };
     }
 
-    // === HYBRID SEARCH ===
+    // === SEMANTIC-FIRST SEARCH ===
 
-    // Step 1: Extract potential symbol names from query
-    const symbolsFromQuery = extractSymbolsFromQuery(query);
-    logDebug('Extracted symbols from query', { query, symbols: symbolsFromQuery });
+    let searchResults: SearchResult[] = [];
 
-    // Step 2: Look up exact matches for extracted symbols
-    let exactMatches: SearchResult[] = [];
-    if (symbolsFromQuery.length > 0) {
-      try {
-        exactMatches = this.queries.findNodesByExactName(symbolsFromQuery, {
-          limit: Math.ceil(opts.searchLimit * 2), // Get more since we'll merge
-          kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
-        });
-        logDebug('Exact symbol matches', { count: exactMatches.length });
-      } catch (error) {
-        logDebug('Exact symbol lookup failed', { error: String(error) });
-      }
-    }
-
-    // Step 3: Try semantic search if vector manager is available
-    let semanticResults: SearchResult[] = [];
+    // Try semantic search first if vector manager is available
     if (this.vectorManager && this.vectorManager.isInitialized()) {
       try {
-        semanticResults = await this.vectorManager.search(query, {
-          limit: opts.searchLimit,
+        searchResults = await this.vectorManager.search(query, {
+          limit: opts.searchLimit * 2,
           kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
         });
-        logDebug('Semantic search results', { count: semanticResults.length });
+        logDebug('Semantic search results', { count: searchResults.length });
       } catch (error) {
         logDebug('Semantic search failed, falling back to text search', { query, error: String(error) });
       }
     }
 
-    // Step 4: Fall back to text search if no semantic results
-    if (semanticResults.length === 0 && exactMatches.length === 0) {
+    // Fall back to text search if no semantic results
+    if (searchResults.length === 0) {
       try {
-        const textResults = this.queries.searchNodes(query, {
-          limit: opts.searchLimit,
+        searchResults = this.queries.searchNodes(query, {
+          limit: opts.searchLimit * 2,
           kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
         });
-        semanticResults = textResults;
       } catch (error) {
         logWarn('Text search failed', { query, error: String(error) });
-        // Return empty results
       }
     }
 
-    // Step 5: Merge results, prioritizing exact matches
-    const seenIds = new Set<string>();
-    let searchResults: SearchResult[] = [];
+    // Multi-signal scoring
+    const scoredResults = searchResults.map(r => {
+      const lexicalScore = r.score * 0.4;
+      const kBonus = kindBonus(r.node.kind) * 0.02;
+      const pathScore = scorePathRelevance(r.node.filePath, query) * 0.02;
+      return { ...r, score: lexicalScore + kBonus + pathScore };
+    });
+    scoredResults.sort((a, b) => b.score - a.score);
 
-    // Add exact matches first (highest priority)
-    for (const result of exactMatches) {
-      if (!seenIds.has(result.node.id)) {
-        seenIds.add(result.node.id);
-        searchResults.push(result);
-      }
-    }
-
-    // Add semantic/text results
-    for (const result of semanticResults) {
-      if (!seenIds.has(result.node.id)) {
-        seenIds.add(result.node.id);
-        searchResults.push(result);
-      }
-    }
-
-    // Limit total results
-    searchResults = searchResults.slice(0, opts.searchLimit * 2);
-
-    // Filter by minimum score
-    let filteredResults = searchResults.filter((r) => r.score >= opts.minScore);
-
-    // Resolve imports/exports to their actual definitions
-    // If someone searches "terminal" and finds `import { TerminalPanel }`,
-    // they want the TerminalPanel class, not the import statement
-    filteredResults = this.resolveImportsToDefinitions(filteredResults);
+    // Filter by minimum score and limit
+    const filteredResults = scoredResults
+      .filter((r) => r.score >= opts.minScore)
+      .slice(0, opts.searchLimit);
 
     // Add entry points to subgraph
     for (const result of filteredResults) {
@@ -365,12 +255,11 @@ export class ContextBuilder {
         }
       }
 
-      // Merge edges (avoid duplicates)
+      // Merge edges with O(1) deduplication
       for (const edge of traversalResult.edges) {
-        const exists = edges.some(
-          (e) => e.source === edge.source && e.target === edge.target && e.kind === edge.kind
-        );
-        if (!exists) {
+        const key = `${edge.source}|${edge.target}|${edge.kind}`;
+        if (!edgeKeys.has(key)) {
+          edgeKeys.add(key);
           edges.push(edge);
         }
       }
@@ -438,14 +327,22 @@ export class ContextBuilder {
    * Extract code from a node's source file
    */
   private async extractNodeCode(node: Node): Promise<string | null> {
-    const filePath = validatePathWithinRoot(this.projectRoot, node.filePath);
+    if (!isPathWithinRoot(node.filePath, this.projectRoot)) {
+      logWarn('Path traversal blocked', { nodeId: node.id, filePath: node.filePath });
+      return null;
+    }
 
-    if (!filePath || !fs.existsSync(filePath)) {
+    const filePath = path.resolve(this.projectRoot, node.filePath);
+    if (!fs.existsSync(filePath)) {
       return null;
     }
 
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
+      let content = this.fileContentCache.get(filePath);
+      if (content === undefined) {
+        content = fs.readFileSync(filePath, 'utf-8');
+        this.fileContentCache.set(filePath, content);
+      }
       const lines = content.split('\n');
 
       // Extract lines (1-indexed to 0-indexed)
@@ -478,34 +375,21 @@ export class ContextBuilder {
   ): Promise<CodeBlock[]> {
     const blocks: CodeBlock[] = [];
 
-    // Prioritize entry points, then functions/methods
-    const priorityNodes: Node[] = [];
-
-    // First: entry points
+    // Single-pass categorization
+    const rootSet = new Set(subgraph.roots);
+    const entryNodes: Node[] = [];
+    const funcNodes: Node[] = [];
+    const classNodes: Node[] = [];
     for (const id of subgraph.roots) {
       const node = subgraph.nodes.get(id);
-      if (node) {
-        priorityNodes.push(node);
-      }
+      if (node) entryNodes.push(node);
     }
-
-    // Then: functions and methods
     for (const node of subgraph.nodes.values()) {
-      if (!subgraph.roots.includes(node.id)) {
-        if (node.kind === 'function' || node.kind === 'method') {
-          priorityNodes.push(node);
-        }
-      }
+      if (rootSet.has(node.id)) continue;
+      if (node.kind === 'function' || node.kind === 'method') funcNodes.push(node);
+      else if (node.kind === 'class') classNodes.push(node);
     }
-
-    // Then: classes
-    for (const node of subgraph.nodes.values()) {
-      if (!subgraph.roots.includes(node.id)) {
-        if (node.kind === 'class') {
-          priorityNodes.push(node);
-        }
-      }
-    }
+    const priorityNodes = [...entryNodes, ...funcNodes, ...classNodes];
 
     // Extract code for priority nodes
     for (const node of priorityNodes) {
@@ -563,65 +447,6 @@ export class ContextBuilder {
       `${edgeCount} relationships identified.`;
   }
 
-  /**
-   * Resolve import/export nodes to their actual definitions
-   *
-   * When search returns `import { TerminalPanel }`, users want the TerminalPanel
-   * class definition, not the import statement. This follows the `imports` edge
-   * to find and return the actual definition instead.
-   *
-   * @param results - Search results that may include import/export nodes
-   * @returns Results with imports resolved to definitions where possible
-   */
-  private resolveImportsToDefinitions(results: SearchResult[]): SearchResult[] {
-    const resolved: SearchResult[] = [];
-    const seenIds = new Set<string>();
-
-    for (const result of results) {
-      const { node, score } = result;
-
-      // If it's not an import/export, keep it as-is
-      if (node.kind !== 'import' && node.kind !== 'export') {
-        if (!seenIds.has(node.id)) {
-          seenIds.add(node.id);
-          resolved.push(result);
-        }
-        continue;
-      }
-
-      // For imports/exports, try to find what they reference
-      // Imports have outgoing 'imports' edges to the definition
-      // Exports have outgoing 'exports' edges to the definition
-      const edgeKind = node.kind === 'import' ? 'imports' : 'exports';
-      const outgoingEdges = this.queries.getOutgoingEdges(node.id, [edgeKind as EdgeKind]);
-
-      let foundDefinition = false;
-      for (const edge of outgoingEdges) {
-        const targetNode = this.queries.getNodeById(edge.target);
-        if (targetNode && !seenIds.has(targetNode.id)) {
-          // Found the definition - use it instead of the import
-          seenIds.add(targetNode.id);
-          resolved.push({
-            node: targetNode,
-            score: score, // Preserve the original score
-          });
-          foundDefinition = true;
-          logDebug('Resolved import to definition', {
-            import: node.name,
-            definition: targetNode.name,
-            kind: targetNode.kind,
-          });
-        }
-      }
-
-      // If we couldn't resolve the import, skip it (it's low-value on its own)
-      if (!foundDefinition) {
-        logDebug('Skipping unresolved import', { name: node.name, file: node.filePath });
-      }
-    }
-
-    return resolved;
-  }
 }
 
 /**
