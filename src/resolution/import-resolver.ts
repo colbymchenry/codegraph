@@ -7,6 +7,7 @@
 import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping } from './types';
+import { normalizePath } from '../utils';
 
 /**
  * Extension resolution order by language
@@ -107,17 +108,20 @@ function resolveRelativeImport(
   const basePath = path.resolve(fromDir, importPath);
   const relativePath = path.relative(projectRoot, basePath);
 
+  // Normalize to forward slashes for cross-platform consistency
+  const normalizedRelativePath = normalizePath(relativePath);
+
   // Try each extension
   for (const ext of extensions) {
-    const candidatePath = relativePath + ext;
+    const candidatePath = normalizedRelativePath + ext;
     if (context.fileExists(candidatePath)) {
       return candidatePath;
     }
   }
 
   // Try without extension (might already have one)
-  if (context.fileExists(relativePath)) {
-    return relativePath;
+  if (context.fileExists(normalizedRelativePath)) {
+    return normalizedRelativePath;
   }
 
   return null;

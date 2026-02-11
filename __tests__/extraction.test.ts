@@ -115,8 +115,7 @@ describe('Language Support', () => {
     expect(languages).toContain('csharp');
     expect(languages).toContain('php');
     expect(languages).toContain('ruby');
-    expect(languages).toContain('kotlin');
-    // swift and dart grammars may not be available on all platforms
+    // kotlin, swift and dart grammars may not be available on all platforms
     // (ABI incompatibilities or missing native bindings)
   });
 });
@@ -816,7 +815,7 @@ public protocol Repository {
   });
 });
 
-describe('Kotlin Extraction', () => {
+describe.skipIf(!isLanguageSupported('kotlin'))('Kotlin Extraction', () => {
   it('should extract class declarations', () => {
     const code = `
 class UserRepository(private val database: Database) {
@@ -1358,7 +1357,7 @@ import Alamofire
     });
   });
 
-  describe('Kotlin imports', () => {
+  describe.skipIf(!isLanguageSupported('kotlin'))('Kotlin imports', () => {
     it('should extract simple import', () => {
       const code = `import java.io.IOException`;
       const result = extractFromSource('Main.kt', code);
