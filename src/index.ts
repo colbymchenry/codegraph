@@ -48,6 +48,9 @@ import { GraphTraverser, GraphQueryManager } from './graph';
 import { VectorManager, createVectorManager, EmbeddingProgress } from './vectors';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
+import { GitHooksManager, createGitHooksManager, HookInstallResult, HookRemoveResult } from './sync';
+import { getRuntimeVersion } from './version';
+import { ScipImporter } from './scip';
 
 // Re-export types for consumers
 export * from './types';
@@ -79,6 +82,8 @@ export {
 } from './errors';
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
 export { MCPServer } from './mcp';
+export { HookInstallResult, HookRemoveResult } from './sync';
+export { getRuntimeVersion } from './version';
 
 /**
  * Options for initializing a new CodeGraph project
@@ -132,6 +137,7 @@ export class CodeGraph {
   private traverser: GraphTraverser;
   private vectorManager: VectorManager | null = null;
   private contextBuilder: ContextBuilder;
+  private gitHooksManager: GitHooksManager;
 
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
@@ -152,6 +158,7 @@ export class CodeGraph {
     this.fileLock = new FileLock(
       path.join(projectRoot, '.codegraph', 'codegraph.lock')
     );
+    this.gitHooksManager = createGitHooksManager(projectRoot);
     this.orchestrator = new ExtractionOrchestrator(projectRoot, config, queries);
     this.resolver = createResolver(projectRoot, queries);
     this.graphManager = new GraphQueryManager(queries);
@@ -968,6 +975,85 @@ export class CodeGraph {
       this.vectorManager
     );
     return this.contextBuilder.buildContext(input, options);
+  }
+
+  // ===========================================================================
+  // Git Integration
+  // ===========================================================================
+
+  /**
+   * Check if the project root is a git repository
+   */
+  isGitRepository(): boolean {
+    return this.gitHooksManager.isGitRepository();
+  }
+
+  /**
+   * Check if the codegraph git hook is installed
+   */
+  isGitHookInstalled(): boolean {
+    return this.gitHooksManager.isHookInstalled();
+  }
+
+  /**
+   * Install the codegraph post-commit git hook
+   */
+  installGitHooks(): HookInstallResult {
+    return this.gitHooksManager.installHook();
+  }
+
+  /**
+   * Remove the codegraph post-commit git hook
+   */
+  removeGitHooks(): HookRemoveResult {
+    return this.gitHooksManager.removeHook();
+  }
+
+  /**
+   * Get all metadata key-value pairs
+   */
+  getMetadata(): Record<string, string> | null {
+    try {
+      return this.queries.getAllMetadata();
+    } catch {
+      return null;
+    }
+  }
+
+  // ===========================================================================
+  // SCIP Import
+  // ===========================================================================
+
+  /**
+   * Import SCIP semantic data to create precise cross-reference edges
+   *
+   * @param scipPath - Path to SCIP JSON file (auto-detects if not provided)
+   * @returns Number of edges created and documents processed
+   */
+  importSCIP(scipPath?: string): { edgesCreated: number; documentsProcessed: number } {
+    const importer = new ScipImporter(this.projectRoot, this.queries);
+    if (scipPath) {
+      return importer.importSCIP(scipPath);
+    }
+    const scipFiles = ScipImporter.findSCIPFiles(this.projectRoot);
+    if (scipFiles.length === 0) {
+      return { edgesCreated: 0, documentsProcessed: 0 };
+    }
+    let totalEdges = 0;
+    let totalDocs = 0;
+    for (const file of scipFiles) {
+      const result = importer.importSCIP(file);
+      totalEdges += result.edgesCreated;
+      totalDocs += result.documentsProcessed;
+    }
+    return { edgesCreated: totalEdges, documentsProcessed: totalDocs };
+  }
+
+  /**
+   * Get runtime version information
+   */
+  static getVersion(): { package: string; git: string | null } {
+    return getRuntimeVersion();
   }
 
   // ===========================================================================

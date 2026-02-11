@@ -29,6 +29,7 @@ import CodeGraph, { getCodeGraphDir, findNearestCodeGraphRoot } from '../index';
 import type { IndexProgress } from '../index';
 import { runInstaller } from '../installer';
 import { initSentry, captureException } from '../sentry';
+import { getRuntimeVersion } from '../version';
 
 // Check if running with no arguments - run installer
 // Read version for Sentry release tag
@@ -219,6 +220,17 @@ function info(message: string): void {
  */
 function warn(message: string): void {
   console.log(chalk.yellow('⚠') + ' ' + message);
+}
+
+/**
+ * Display detailed index statistics
+ */
+function displayIndexStats(stats: { fileCount: number; nodeCount: number; edgeCount: number; dbSizeBytes: number }): void {
+  console.log(chalk.bold('Index Statistics:'));
+  console.log(`  Files:     ${formatNumber(stats.fileCount)}`);
+  console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);
+  console.log(`  Edges:     ${formatNumber(stats.edgeCount)}`);
+  console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
 }
 
 // =============================================================================
@@ -505,16 +517,16 @@ program
 
       console.log(chalk.bold('\nCodeGraph Status\n'));
 
+      // Version info
+      const version = getRuntimeVersion();
+      console.log(chalk.cyan('Version:'), version.package + (version.git ? ` (${version.git})` : ''));
+
       // Project info
       console.log(chalk.cyan('Project:'), projectPath);
       console.log();
 
       // Index stats
-      console.log(chalk.bold('Index Statistics:'));
-      console.log(`  Files:     ${formatNumber(stats.fileCount)}`);
-      console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);
-      console.log(`  Edges:     ${formatNumber(stats.edgeCount)}`);
-      console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
+      displayIndexStats(stats);
       console.log();
 
       // Node breakdown
@@ -995,6 +1007,109 @@ program
       // Never fail — this runs at the end of Claude responses
     }
     process.exit(0);
+  });
+
+/**
+ * codegraph hooks install/remove/status
+ */
+const hooks = program
+  .command('hooks')
+  .description('Manage git hooks for automatic sync');
+
+hooks
+  .command('install [path]')
+  .description('Install post-commit git hook for automatic sync')
+  .action(async (pathArg: string | undefined) => {
+    const projectPath = resolveProjectPath(pathArg);
+
+    try {
+      if (!CodeGraph.isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const cg = await CodeGraph.open(projectPath);
+      const result = cg.installGitHooks();
+
+      if (result.success) {
+        success(result.message);
+        if (result.hookPath) {
+          info(`Hook path: ${result.hookPath}`);
+        }
+      } else {
+        error(result.message);
+        process.exit(1);
+      }
+
+      cg.destroy();
+    } catch (err) {
+      captureException(err);
+      error(`Failed to install hooks: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+hooks
+  .command('remove [path]')
+  .description('Remove post-commit git hook')
+  .action(async (pathArg: string | undefined) => {
+    const projectPath = resolveProjectPath(pathArg);
+
+    try {
+      if (!CodeGraph.isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const cg = await CodeGraph.open(projectPath);
+      const result = cg.removeGitHooks();
+
+      if (result.success) {
+        success(result.message);
+      } else {
+        error(result.message);
+        process.exit(1);
+      }
+
+      cg.destroy();
+    } catch (err) {
+      captureException(err);
+      error(`Failed to remove hooks: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+hooks
+  .command('status [path]')
+  .description('Check if git hooks are installed')
+  .action(async (pathArg: string | undefined) => {
+    const projectPath = resolveProjectPath(pathArg);
+
+    try {
+      if (!CodeGraph.isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const cg = await CodeGraph.open(projectPath);
+
+      if (cg.isGitRepository()) {
+        if (cg.isGitHookInstalled()) {
+          success('Git hook is installed');
+        } else {
+          info('Git hook is not installed');
+          info('Run "codegraph hooks install" to install');
+        }
+      } else {
+        warn('Not a git repository');
+      }
+
+      cg.destroy();
+    } catch (err) {
+      captureException(err);
+      error(`Failed to check hooks: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
   });
 
 /**
