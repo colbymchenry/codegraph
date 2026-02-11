@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/github-actions-pipeline]
   pull_request:
     branches: [main]
 
@@ -67,7 +67,14 @@ jobs:
         run: npm ci --ignore-scripts && npm rebuild better-sqlite3
 
       - run: npm run build
-      - run: npm test
+
+      - name: Run tests
+        if: matrix.node-version != 22 || matrix.os != 'ubuntu-latest'
+        run: npm test
+
+      - name: Run tests with coverage
+        if: matrix.node-version == 22 && matrix.os == 'ubuntu-latest'
+        run: npx vitest run --coverage
 
       - name: Upload coverage
         if: matrix.node-version == 22 && matrix.os == 'ubuntu-latest'

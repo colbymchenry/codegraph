@@ -45,6 +45,7 @@
     "@types/figlet": "^1.5.8",
     "@types/node": "^20.19.30",
     "@types/picomatch": "^4.0.2",
+    "@vitest/coverage-v8": "^2.1.9",
     "typescript": "^5.0.0",
     "vitest": "^2.1.9"
   },
