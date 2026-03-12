@@ -813,6 +813,65 @@ const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
       return node.type === 'declConst';
     },
   },
+  mql5: {
+    functionTypes: ['function_definition'],
+    classTypes: ['class_definition'],
+    methodTypes: ['function_definition'],
+    interfaceTypes: [],
+    structTypes: ['struct_definition'],
+    enumTypes: ['enum_definition'],
+    typeAliasTypes: ['type'],
+    importTypes: ['preproc_include'],
+    callTypes: ['function_call'],
+    variableTypes: ['variable_declaration'],
+    nameField: 'name',
+    bodyField: 'block',
+    paramsField: 'parameter',
+    returnField: 'type',
+
+    getSignature: (node, source) => {
+      const params = getChildByField(node, 'parameter');
+      const returnType = getChildByField(node, 'type');
+
+      let sig = '';
+
+      if (params) {
+        sig += getNodeText(params, source);
+      }
+
+      if (returnType) {
+        sig = `${getNodeText(returnType, source)} ${sig}`;
+      }
+
+      return sig || undefined;
+    },
+
+    getVisibility: (_node) => {
+      // MQL5 n'a pas de visibilité explicite
+      return 'public';
+    },
+
+    isExported: (_node, _source) => {
+      // Tout est visible dans MQL5
+      return true;
+    },
+
+    isStatic: (node) => {
+      for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (child?.type === 'static') return true;
+      }
+      return false;
+    },
+
+    isConst: (node) => {
+      for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (child?.type === 'const') return true;
+      }
+      return false;
+    }
+  }
 };
 
 // TSX and JSX use the same extractors as their base languages
@@ -1392,7 +1451,7 @@ export class TreeSitterExtractor {
 
     // Extract variable declarators based on language
     if (this.language === 'typescript' || this.language === 'javascript' ||
-        this.language === 'tsx' || this.language === 'jsx') {
+      this.language === 'tsx' || this.language === 'jsx') {
       // Handle lexical_declaration and variable_declaration
       // These contain one or more variable_declarator children
       for (let i = 0; i < node.namedChildCount; i++) {
@@ -1588,7 +1647,7 @@ export class TreeSitterExtractor {
     let moduleName = '';
 
     if (this.language === 'typescript' || this.language === 'javascript' ||
-        this.language === 'tsx' || this.language === 'jsx') {
+      this.language === 'tsx' || this.language === 'jsx') {
       const source = getChildByField(node, 'source');
       if (source) {
         moduleName = getNodeText(source, this.source).replace(/['"]/g, '');
@@ -1689,9 +1748,9 @@ export class TreeSitterExtractor {
         if (!firstChild) return getNodeText(scopedNode, this.source);
 
         if (firstChild.type === 'identifier' ||
-            firstChild.type === 'crate' ||
-            firstChild.type === 'super' ||
-            firstChild.type === 'self') {
+          firstChild.type === 'crate' ||
+          firstChild.type === 'super' ||
+          firstChild.type === 'self') {
           return getNodeText(firstChild, this.source);
         } else if (firstChild.type === 'scoped_identifier') {
           return getRootModule(firstChild);
