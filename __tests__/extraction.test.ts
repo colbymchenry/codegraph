@@ -3079,3 +3079,131 @@ describe('Directory Exclusion', () => {
     expect(files.every((f) => !f.includes('vendor'))).toBe(true);
   });
 });
+
+describe('ReScript Extraction', () => {
+  it('should detect ReScript files', () => {
+    expect(detectLanguage('src/EventLog.res')).toBe('rescript');
+    expect(detectLanguage('src/EventLog.resi')).toBe('rescript');
+  });
+
+  it('should extract function declarations (let bindings with function body)', () => {
+    const code = `let make = (~name, ~opts=?) => {
+  let storage = Storage.make(~name, ~opts)
+  storage
+}`;
+    const result = extractFromSource('EventLog_Builder.res', code);
+    const funcNode = result.nodes.find((n) => n.kind === 'function');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.name).toBe('make');
+  });
+
+  it('should extract variable declarations (non-function let bindings)', () => {
+    const code = `let componentType = ComponentType.EventLog`;
+    const result = extractFromSource('EventLog.res', code);
+    const varNode = result.nodes.find((n) => n.kind === 'variable');
+    expect(varNode).toBeDefined();
+    expect(varNode?.name).toBe('componentType');
+  });
+
+  it('should extract type declarations', () => {
+    const code = `type t
+type component<'operations> = Component.t<t, outputs, 'operations>`;
+    const result = extractFromSource('EventLog.res', code);
+    const typeNodes = result.nodes.filter((n) => n.kind === 'type_alias');
+    expect(typeNodes.length).toBeGreaterThanOrEqual(2);
+    expect(typeNodes.map(n => n.name)).toContain('t');
+    expect(typeNodes.map(n => n.name)).toContain('component');
+  });
+
+  it('should extract variant types as enums', () => {
+    const code = `type event =
+  | ItemCreated({itemId: string, name: string})
+  | ItemUpdated({itemId: string, name: string})
+  | ItemDeleted({itemId: string})`;
+    const result = extractFromSource('CatalogSpec.res', code);
+    const enumNode = result.nodes.find((n) => n.kind === 'enum');
+    expect(enumNode).toBeDefined();
+    expect(enumNode?.name).toBe('event');
+    const members = result.nodes.filter((n) => n.kind === 'enum_member');
+    expect(members.map(m => m.name)).toContain('ItemCreated');
+    expect(members.map(m => m.name)).toContain('ItemUpdated');
+    expect(members.map(m => m.name)).toContain('ItemDeleted');
+  });
+
+  it('should extract record types as structs', () => {
+    const code = `type operations = {
+  append: append<Id.t, event>,
+  replay: replay<Id.t, event>,
+}`;
+    const result = extractFromSource('EventLog.res', code);
+    const structNode = result.nodes.find((n) => n.kind === 'struct');
+    expect(structNode).toBeDefined();
+    expect(structNode?.name).toBe('operations');
+    const fields = result.nodes.filter((n) => n.kind === 'field');
+    expect(fields.map(f => f.name)).toContain('append');
+    expect(fields.map(f => f.name)).toContain('replay');
+  });
+
+  it('should extract module declarations as namespaces', () => {
+    const code = `module Make = (Spec: EventLog.T, Storage: EventLog_Adapter.Storage) => {
+  module Spec = Spec
+  let construct = (self, name) => {
+    Storage.make(~name)
+  }
+}`;
+    const result = extractFromSource('EventLog_Builder.res', code);
+    const moduleNode = result.nodes.find((n) => n.kind === 'namespace');
+    expect(moduleNode).toBeDefined();
+    expect(moduleNode?.name).toBe('Make');
+  });
+
+  it('should extract module type declarations as interfaces', () => {
+    const code = `module type T = {
+  module Spec: ReventlessInfra.EventLog.T
+  type operations
+  let make: (~name: string) => component
+}`;
+    const result = extractFromSource('EventLog.res', code);
+    const ifaceNode = result.nodes.find((n) => n.kind === 'interface');
+    expect(ifaceNode).toBeDefined();
+    expect(ifaceNode?.name).toBe('T');
+  });
+
+  it('should extract open statements as imports', () => {
+    const code = `open ReventlessCore
+open Belt`;
+    const result = extractFromSource('test.res', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import');
+    expect(imports.map(i => i.name)).toContain('ReventlessCore');
+    expect(imports.map(i => i.name)).toContain('Belt');
+  });
+
+  it('should extract external declarations as functions', () => {
+    const code = `@module("uuid") external v4: unit => string = "v4"`;
+    const result = extractFromSource('UUID.res', code);
+    const funcNode = result.nodes.find((n) => n.kind === 'function');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.name).toBe('v4');
+  });
+
+  it('should extract call expressions', () => {
+    const code = `let make = (~name) => {
+  let storage = Storage.make(~name)
+  storage
+}`;
+    const result = extractFromSource('Builder.res', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.some(c => c.referenceName.includes('Storage.make'))).toBe(true);
+  });
+
+  it('should extract pipe expression calls', () => {
+    const code = `let process = (items) => {
+  items->Array.map(item => item.name)->Array.filter(name => name !== "")
+}`;
+    const result = extractFromSource('Utils.res', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    expect(calls.some(c => c.referenceName.includes('Array.map'))).toBe(true);
+    expect(calls.some(c => c.referenceName.includes('Array.filter'))).toBe(true);
+  });
+});

@@ -2306,6 +2306,7 @@ export class TreeSitterExtractor {
       }
     }
   }
+
 }
 
 
