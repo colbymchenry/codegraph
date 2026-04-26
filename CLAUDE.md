@@ -81,6 +81,8 @@ Defined in `src/types.ts`. Both extractors and resolvers must use these exact st
 - `instructions-template.ts` no longer holds an instructions body — it exports only the `<!-- CODEGRAPH_START -->`/`<!-- CODEGRAPH_END -->` markers. The installer **stopped writing** a `## CodeGraph` block into each agent's instructions file (`CLAUDE.md` / `~/.codex/AGENTS.md` / `~/.config/opencode/AGENTS.md` / `~/.gemini/GEMINI.md` / `.cursor/rules/codegraph.mdc` / Kiro steering doc) because it duplicated the MCP `initialize` instructions verbatim (issue #529). Each target's `install` (self-heal on upgrade) and `uninstall` use the markers to **strip** a block a previous install left behind. `server-instructions.ts` is the single source of truth for agent-facing guidance.
 - All installer changes need matching coverage in `__tests__/installer-targets.test.ts` — there are ~47 parameterized contract tests covering install idempotency, sibling preservation, uninstall reverses install, byte-equal re-runs returning `unchanged`, and partial-state recovery for Codex.
 
+To add a new language, follow the cookbook at [`docs/ADDING-A-LANGUAGE.md`](docs/ADDING-A-LANGUAGE.md).
+
 ### Cursor MCP working-directory quirk
 
 Cursor launches MCP subprocesses with the wrong cwd and doesn't pass `rootUri` in `initialize`. The installer injects `--path` into Cursor's MCP args — absolute path for local installs, `${workspaceFolder}` for global installs. If you touch Cursor wiring, preserve this.
