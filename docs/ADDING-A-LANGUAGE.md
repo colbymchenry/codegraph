@@ -122,9 +122,54 @@ Save the probe output before you start coding — you'll refer to it constantly.
 
 ## 3. Register the language
 
-Three files, all small.
+Adding a language is **one new file plus two registry lines**. The per-language
+registry (`src/extraction/languages/`) is the single source of truth — extension
+maps, include globs, grammar config, and the EXTRACTORS lookup are all derived
+from it.
 
-**`src/types.ts`** — add to the `Language` union and to `DEFAULT_CONFIG.include`:
+**Step 3a — Create `src/extraction/languages/foo.ts`** with a `LanguageDef`:
+
+```ts
+import type { LanguageDef } from './types';
+import type { LanguageExtractor } from '../tree-sitter-types';
+
+// Path A languages (procedural / OO — Python, Ruby, R) define a
+// LanguageExtractor here and reference it from the def below.
+export const fooExtractor: LanguageExtractor = {
+  functionTypes: ['function_definition'],
+  classTypes: ['class_definition'],
+  // ... see Section 5a for the full shape
+};
+
+export const FOO_DEF: LanguageDef = {
+  name: 'foo',
+  displayName: 'Foo',
+  extensions: ['.foo'],
+  includeGlobs: ['**/*.foo'],
+  grammar: {
+    wasmFile: 'tree-sitter-foo.wasm',
+    vendored: true,            // omit if the wasm lives in `tree-sitter-wasms`
+    extractor: fooExtractor,
+  },
+  // For Path B languages (HCL / SQL / Liquid — non-OO), set
+  // customExtractor instead of (or in addition to) `extractor`:
+  // customExtractor: (filePath, source) => new FooExtractor(filePath, source).extract(),
+};
+```
+
+**Step 3b — Register in `src/extraction/languages/registry.ts`** (2 lines):
+
+```ts
+import { FOO_DEF } from './foo';   // alphabetical
+// ...
+const ALL_DEFS: readonly LanguageDef[] = [
+  // ... existing definitions, alphabetical
+  FOO_DEF,
+  // ...
+];
+```
+
+**Step 3c — Add `'foo'` to the `Language` union in `src/types.ts`** (1 line):
 
 ```ts
 export type Language =
@@ -132,38 +177,23 @@ export type Language =
   | ...
   | 'foo'                  // ← add here
   | 'unknown';
-
-export const DEFAULT_CONFIG: CodeGraphConfig = {
-  ...
-  include: [
-    ...
-    '**/*.foo',            // ← and here
-  ],
-};
 ```
 
-**`src/extraction/grammars.ts`** — wire up the wasm path, extension map, and display name:
+That's it. `DEFAULT_CONFIG.include`, `EXTENSION_MAP`, the `EXTRACTORS` lookup,
+and `getLanguageDisplayName()` are all derived from the registry — no parallel
+lists to keep in sync.
 
-```ts
-const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
-  ...
-  foo: 'tree-sitter-foo.wasm',
-};
+The `Language` union update is the only spot that touches a shared file. New
+languages registered only via the registry (without a `Language` union entry)
+also work at runtime — the union is mostly for TypeScript narrowing in
+language-specific resolution code.
 
-// If vendored under src/extraction/wasm/ instead of tree-sitter-wasms:
-const VENDORED_WASM_LANGUAGES: ReadonlySet<GrammarLanguage> = new Set([
-  'pascal',
-  'foo',                   // ← add here
-]);
-
-export const EXTENSION_MAP: Record<string, Language> = {
-  ...
-  '.foo': 'foo',
-};
-
-// And in getLanguageDisplayName():
-foo: 'Foo',
-```
+> **Why per-file?** Two PRs adding two different languages used to collide on
+> the same `EXTRACTORS` map, the same `EXTENSION_MAP`, the same `Language`
+> union, and the same `WASM_GRAMMAR_FILES` table. With per-file `LanguageDef`s,
+> two language PRs only conflict if their alphabetical positions in `registry.ts`
+> happen to land on the same line — almost never. See `src/extraction/languages/`
+> for ~20 worked examples.
 
 **`CLAUDE.md`** — append the language to the "Supported Languages" line so the
 LLM-readable architecture doc stays in sync.
@@ -221,14 +251,14 @@ export const fooExtractor: LanguageExtractor = {
 };
 ```
 
-Then register it in `src/extraction/languages/index.ts`:
+Reference it from your `LanguageDef` (Section 3a):
 
 ```ts
-import { fooExtractor } from './foo';
-
-export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
-  ...
-  foo: fooExtractor,
+// in src/extraction/languages/foo.ts
+export const FOO_DEF: LanguageDef = {
+  name: 'foo',
+  // ...
+  grammar: { wasmFile: 'tree-sitter-foo.wasm', vendored: true, extractor: fooExtractor },
 };
 ```
 
@@ -299,19 +329,29 @@ export class FooExtractor {
 }
 ```
 
-Wire the dispatch in `src/extraction/tree-sitter.ts`:
+Wire the dispatch via `customExtractor` in your `LanguageDef` (Section 3a):
 
 ```ts
-import { FooExtractor } from './foo-extractor';
+// in src/extraction/languages/foo.ts
+import { FooExtractor } from '../foo-extractor';
+import type { LanguageDef } from './types';
 
-export function extractFromSource(filePath, source, language?) {
-  ...
-  if (detectedLanguage === 'foo') {
-    return new FooExtractor(filePath, source).extract();
-  }
-  ...
-}
+export const FOO_DEF: LanguageDef = {
+  name: 'foo',
+  displayName: 'Foo',
+  extensions: ['.foo'],
+  includeGlobs: ['**/*.foo'],
+  // For languages that need a tree-sitter parser AND a custom extractor
+  // (HCL, SQL): set both `grammar` and `customExtractor`. The grammar
+  // entry only registers the wasm so the parser is available; the
+  // customExtractor takes the dispatch.
+  grammar: { wasmFile: 'tree-sitter-foo.wasm', vendored: true, extractor: { /* skeleton */ } },
+  customExtractor: (filePath, source) => new FooExtractor(filePath, source).extract(),
+};
 ```
+
+The dispatch in `src/extraction/tree-sitter.ts` reads `customExtractor` off
+the language def — no per-language `if` branches to maintain.
 
 **Worked examples:**
 
