@@ -15,8 +15,8 @@
  *
  *   kind:    one of function|method|class|interface|struct|...
  *   lang:    one of typescript|python|go|...   (alias: language:)
- *   path:    glob/prefix matched against file_path
- *   name:    exact substring of the symbol's name (case-insensitive)
+ *   path:    case-insensitive substring of file_path
+ *   name:    case-insensitive substring of the symbol's name
  *
  * Unknown field prefixes (e.g. `foo:bar`) are passed through to FTS
  * as plain text — that's how someone searching for `TODO:` gets a
@@ -28,6 +28,7 @@
  *   no nested escapes).
  */
 
+import { NODE_KINDS, LANGUAGES } from '../types';
 import type { NodeKind, Language } from '../types';
 
 export interface ParsedQuery {
@@ -37,58 +38,17 @@ export interface ParsedQuery {
   kinds: NodeKind[];
   /** lang:/language: filters (OR'd). Empty when none specified. */
   languages: Language[];
-  /** path: filters (OR'd, prefix match against file_path). Empty when none. */
+  /** path: filters (OR'd, case-insensitive substring of file_path). Empty when none. */
   pathFilters: string[];
   /** name: filters (OR'd, case-insensitive substring of node.name). */
   nameFilters: string[];
 }
 
-const KIND_VALUES: ReadonlySet<string> = new Set<NodeKind>([
-  'file',
-  'module',
-  'class',
-  'struct',
-  'interface',
-  'trait',
-  'protocol',
-  'function',
-  'method',
-  'property',
-  'field',
-  'variable',
-  'constant',
-  'enum',
-  'enum_member',
-  'type_alias',
-  'namespace',
-  'parameter',
-  'import',
-  'export',
-  'route',
-  'component',
-]);
-
-const LANGUAGE_VALUES: ReadonlySet<string> = new Set<Language>([
-  'typescript',
-  'javascript',
-  'tsx',
-  'jsx',
-  'python',
-  'go',
-  'rust',
-  'java',
-  'c',
-  'cpp',
-  'csharp',
-  'php',
-  'ruby',
-  'swift',
-  'kotlin',
-  'dart',
-  'liquid',
-  'pascal',
-  'svelte',
-]);
+// Derived from the canonical `NODE_KINDS` / `LANGUAGES` arrays in
+// types.ts so adding a new kind or language doesn't silently fall
+// through to plain text here.
+const KIND_VALUES: ReadonlySet<string> = new Set<NodeKind>(NODE_KINDS);
+const LANGUAGE_VALUES: ReadonlySet<string> = new Set<Language>(LANGUAGES);
 
 /**
  * Strip a surrounding pair of double quotes from `s`. Allows users to
