@@ -22,6 +22,8 @@ import { detectLanguage, isLanguageSupported, initGrammars, loadGrammarsForLangu
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import picomatch from 'picomatch';
+import { detectFrameworks } from '../resolution/frameworks';
+import type { ResolutionContext } from '../resolution/types';
 
 /**
  * Number of files to read in parallel during indexing.
@@ -399,11 +401,69 @@ export class ExtractionOrchestrator {
   private rootDir: string;
   private config: CodeGraphConfig;
   private queries: QueryBuilder;
+  /**
+   * Names of frameworks detected for this project, populated by indexAll().
+   * Passed to extractFromSource so framework-specific extractors (route nodes,
+   * middleware, etc.) run after the tree-sitter pass. Cleared if detection
+   * hasn't run yet so single-file re-index paths can detect on the spot.
+   */
+  private detectedFrameworkNames: string[] | null = null;
 
   constructor(rootDir: string, config: CodeGraphConfig, queries: QueryBuilder) {
     this.rootDir = rootDir;
     this.config = config;
     this.queries = queries;
+  }
+
+  /**
+   * Build a filesystem-backed ResolutionContext sufficient for framework
+   * detection. Graph-query methods (getNodesByName etc.) return empty because
+   * the DB hasn't been populated yet, but detect() only uses readFile,
+   * fileExists, and getAllFiles, so that's fine.
+   */
+  private buildDetectionContext(files: string[]): ResolutionContext {
+    const rootDir = this.rootDir;
+    return {
+      getNodesInFile: () => [],
+      getNodesByName: () => [],
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      getNodesByLowerName: () => [],
+      getImportMappings: () => [],
+      getAllFiles: () => files,
+      getProjectRoot: () => rootDir,
+      fileExists: (relativePath: string) => {
+        const full = validatePathWithinRoot(rootDir, relativePath);
+        if (!full) return false;
+        try {
+          return fs.existsSync(full);
+        } catch {
+          return false;
+        }
+      },
+      readFile: (relativePath: string) => {
+        const full = validatePathWithinRoot(rootDir, relativePath);
+        if (!full) return null;
+        try {
+          return fs.readFileSync(full, 'utf-8');
+        } catch {
+          return null;
+        }
+      },
+    };
+  }
+
+  /**
+   * Detect frameworks on demand using the current scanned files (or a fresh
+   * scan if none are provided). Cached on the orchestrator so repeat calls
+   * inside a single run don't re-scan.
+   */
+  private ensureDetectedFrameworks(files?: string[]): string[] {
+    if (this.detectedFrameworkNames !== null) return this.detectedFrameworkNames;
+    const fileList = files ?? scanDirectory(this.rootDir, this.config);
+    const context = this.buildDetectionContext(fileList);
+    this.detectedFrameworkNames = detectFrameworks(context).map((r) => r.name);
+    return this.detectedFrameworkNames;
   }
 
   /**
@@ -442,6 +502,14 @@ export class ExtractionOrchestrator {
         currentFile: file,
       });
     });
+
+    // Detect frameworks once per indexAll run using the scanned file list.
+    // Names are passed to each parse call so framework-specific extractors
+    // (route nodes, middleware, etc.) run after the tree-sitter pass.
+    // Framework detection is reset each run so adding e.g. requirements.txt
+    // between runs is picked up without restarting the process.
+    this.detectedFrameworkNames = null;
+    const frameworkNames = this.ensureDetectedFrameworks(files);
 
     if (signal?.aborted) {
       return {
@@ -584,7 +652,12 @@ export class ExtractionOrchestrator {
     async function requestParse(filePath: string, content: string): Promise<ExtractionResult> {
       if (!WorkerClass) {
         // In-process fallback
-        return extractFromSource(filePath, content, detectLanguage(filePath, content));
+        return extractFromSource(
+          filePath,
+          content,
+          detectLanguage(filePath, content),
+          frameworkNames
+        );
       }
 
       // Recycle the worker before the next parse if we've hit the threshold.
@@ -614,7 +687,7 @@ export class ExtractionOrchestrator {
         }, timeoutMs);
 
         pendingParses.set(id, { resolve, reject, timer });
-        worker.postMessage({ type: 'parse', id, filePath, content });
+        worker.postMessage({ type: 'parse', id, filePath, content, frameworkNames });
       });
     }
 
@@ -686,6 +759,26 @@ export class ExtractionOrchestrator {
             severity: 'error',
             code: 'read_error',
           });
+          continue;
+        }
+
+        // Honour config.maxFileSize. Without this check, vendored
+        // generated headers, minified bundles, and other multi-MB
+        // files get indexed despite the user setting a size cap —
+        // wasting WASM heap and the worker recycle budget on inputs
+        // the user explicitly opted out of. The single-file extractFile
+        // path already enforces this; the bulk path used to silently
+        // skip the check.
+        if (stats.size > this.config.maxFileSize) {
+          processed++;
+          filesSkipped++;
+          errors.push({
+            message: `File exceeds max size (${stats.size} > ${this.config.maxFileSize})`,
+            filePath,
+            severity: 'warning',
+            code: 'size_exceeded',
+          });
+          onProgress?.({ phase: 'parsing', current: processed, total });
           continue;
         }
 
@@ -1004,8 +1097,11 @@ export class ExtractionOrchestrator {
       };
     }
 
-    // Extract from source
-    const result = extractFromSource(relativePath, content, language);
+    // Extract from source. Use cached framework names if indexAll has run,
+    // otherwise detect on the spot so single-file re-index paths still emit
+    // route nodes / middleware / etc.
+    const frameworkNames = this.ensureDetectedFrameworks();
+    const result = extractFromSource(relativePath, content, language, frameworkNames);
 
     // Store in database
     if (result.nodes.length > 0 || result.errors.length === 0) {

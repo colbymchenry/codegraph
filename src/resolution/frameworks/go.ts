@@ -6,9 +6,11 @@
 
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
+import { stripCommentsForRegex } from '../strip-comments';
 
 export const goResolver: FrameworkResolver = {
   name: 'go',
+  languages: ['go'],
 
   detect(context: ResolutionContext): boolean {
     // Check for go.mod file (Go modules)
@@ -78,24 +80,30 @@ export const goResolver: FrameworkResolver = {
     return null;
   },
 
-  extractNodes(filePath: string, content: string): Node[] {
+  extract(filePath, content) {
+    if (!filePath.endsWith('.go')) return { nodes: [], references: [] };
     const nodes: Node[] = [];
+    const references: UnresolvedRef[] = [];
     const now = Date.now();
+    const safe = stripCommentsForRegex(content, 'go');
 
-    // Extract Gin routes
-    // r.GET("/path", handler), router.POST("/path", handler), etc.
-    const ginRoutePattern = /\.\s*(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s*\(\s*["']([^"']+)["']/g;
+    // (router|r|mux|app).METHOD("/path", handler)
+    // Handles Gin (GET/POST/...), Chi (Get/Post/...), net/http (HandleFunc/Handle).
+    const routeRegex = /\b(?:router|r|mux|app|e)\.(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Get|Post|Put|Patch|Delete|Handle|HandleFunc)\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g;
+    let match: RegExpExecArray | null;
+    while ((match = routeRegex.exec(safe)) !== null) {
+      const [, rawMethod, routePath, handlerExpr] = match;
+      const line = safe.slice(0, match.index).split('\n').length;
+      const method =
+        rawMethod === 'Handle' || rawMethod === 'HandleFunc'
+          ? 'ANY'
+          : rawMethod!.toUpperCase();
 
-    let match;
-    while ((match = ginRoutePattern.exec(content)) !== null) {
-      const [, method, path] = match;
-      const line = content.slice(0, match.index).split('\n').length;
-
-      nodes.push({
-        id: `route:${filePath}:${method}:${path}:${line}`,
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${method}:${routePath}`,
         kind: 'route',
-        name: `${method} ${path}`,
-        qualifiedName: `${filePath}::${method}:${path}`,
+        name: `${method} ${routePath}`,
+        qualifiedName: `${filePath}::route:${routePath}`,
         filePath,
         startLine: line,
         endLine: line,
@@ -103,80 +111,33 @@ export const goResolver: FrameworkResolver = {
         endColumn: match[0].length,
         language: 'go',
         updatedAt: now,
-      });
+      };
+      nodes.push(routeNode);
+
+      const handlerName = extractGoTailIdent(handlerExpr!);
+      if (handlerName) {
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: handlerName,
+          referenceKind: 'references',
+          line,
+          column: 0,
+          filePath,
+          language: 'go',
+        });
+      }
     }
 
-    // Extract Echo routes
-    // e.GET("/path", handler)
-    const echoRoutePattern = /e\.\s*(GET|POST|PUT|PATCH|DELETE)\s*\(\s*["']([^"']+)["']/g;
-
-    while ((match = echoRoutePattern.exec(content)) !== null) {
-      const [, method, path] = match;
-      const line = content.slice(0, match.index).split('\n').length;
-
-      nodes.push({
-        id: `route:${filePath}:${method}:${path}:${line}`,
-        kind: 'route',
-        name: `${method} ${path}`,
-        qualifiedName: `${filePath}::${method}:${path}`,
-        filePath,
-        startLine: line,
-        endLine: line,
-        startColumn: 0,
-        endColumn: match[0].length,
-        language: 'go',
-        updatedAt: now,
-      });
-    }
-
-    // Extract Chi routes
-    // r.Get("/path", handler), r.Post("/path", handler)
-    const chiRoutePattern = /r\.\s*(Get|Post|Put|Patch|Delete)\s*\(\s*["']([^"']+)["']/g;
-
-    while ((match = chiRoutePattern.exec(content)) !== null) {
-      const [, method, path] = match;
-      const line = content.slice(0, match.index).split('\n').length;
-
-      nodes.push({
-        id: `route:${filePath}:${method!.toUpperCase()}:${path}:${line}`,
-        kind: 'route',
-        name: `${method!.toUpperCase()} ${path}`,
-        qualifiedName: `${filePath}::${method!.toUpperCase()}:${path}`,
-        filePath,
-        startLine: line,
-        endLine: line,
-        startColumn: 0,
-        endColumn: match[0].length,
-        language: 'go',
-        updatedAt: now,
-      });
-    }
-
-    // Extract standard library http.HandleFunc
-    const httpHandlePattern = /http\.HandleFunc\s*\(\s*["']([^"']+)["']/g;
-
-    while ((match = httpHandlePattern.exec(content)) !== null) {
-      const [, path] = match;
-      const line = content.slice(0, match.index).split('\n').length;
-
-      nodes.push({
-        id: `route:${filePath}:ANY:${path}:${line}`,
-        kind: 'route',
-        name: `ANY ${path}`,
-        qualifiedName: `${filePath}::ANY:${path}`,
-        filePath,
-        startLine: line,
-        endLine: line,
-        startColumn: 0,
-        endColumn: match[0].length,
-        language: 'go',
-        updatedAt: now,
-      });
-    }
-
-    return nodes;
+    return { nodes, references };
   },
 };
+
+/** Extract the last identifier from an expression like `pkg.Sub.handler` or `handler`. */
+function extractGoTailIdent(expr: string): string | null {
+  const cleaned = expr.trim().replace(/\s+/g, '').replace(/\(\)$/, '');
+  const m = cleaned.match(/(?:\.|^)([A-Za-z_][A-Za-z0-9_]*)$/);
+  return m ? m[1]! : null;
+}
 
 // Directory patterns for framework resolution
 const HANDLER_DIRS = ['handler', 'handlers', 'api', 'routes', 'controller', 'controllers'];

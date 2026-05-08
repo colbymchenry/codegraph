@@ -83,6 +83,31 @@ export interface ResolutionContext {
   getNodesByLowerName(lowerName: string): Node[];
   /** Get cached import mappings for a file */
   getImportMappings(filePath: string, language: Language): ImportMapping[];
+  /**
+   * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
+   * `null` when the project doesn't define any. Cached per resolver
+   * instance — safe to call from any resolver code path. Optional so
+   * existing test fixtures and external context implementations
+   * compile without modification; production resolver implements it.
+   */
+  getProjectAliases?(): import('./path-aliases').AliasMap | null;
+  /**
+   * Re-exports declared by a file (`export { x } from './other'`,
+   * `export * from './other'`). Empty array when the file has none.
+   * Optional so older callers compile; the import resolver follows
+   * re-export chains when this is provided.
+   */
+  getReExports?(filePath: string, language: Language): ReExport[];
+}
+
+/**
+ * Result of framework-specific file extraction.
+ */
+export interface FrameworkExtractionResult {
+  /** Framework-specific nodes (e.g. routes) */
+  nodes: Node[];
+  /** Framework-specific unresolved references (e.g. route -> handler) */
+  references: UnresolvedRef[];
 }
 
 /**
@@ -91,12 +116,21 @@ export interface ResolutionContext {
 export interface FrameworkResolver {
   /** Framework name */
   name: string;
-  /** Detect if project uses this framework */
+  /** Languages this framework applies to. If omitted, applies to all languages. */
+  languages?: Language[];
+  /** Detect if project uses this framework (project-level, called once at startup) */
   detect(context: ResolutionContext): boolean;
   /** Resolve a reference using framework-specific patterns */
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null;
-  /** Extract additional nodes specific to this framework */
-  extractNodes?(filePath: string, content: string): Node[];
+  /**
+   * Extract framework-specific nodes and references from a file.
+   *
+   * Returns route nodes, middleware nodes, etc., plus unresolved references
+   * that link those nodes to handlers (view classes, controller methods,
+   * included modules). Unresolved references flow into the normal resolution
+   * pipeline; the framework's own `resolve()` is one of the strategies tried.
+   */
+  extract?(filePath: string, content: string): FrameworkExtractionResult;
 }
 
 /**
@@ -116,3 +150,24 @@ export interface ImportMapping {
   /** Resolved file path (if local) */
   resolvedPath?: string;
 }
+
+/**
+ * Re-export from a file: `export { x } from './other'` or
+ * `export * from './other'`. Used by the resolver to chase
+ * symbols through barrel files.
+ */
+export type ReExport =
+  | {
+      kind: 'named';
+      /** Name as exported by THIS file. */
+      exportedName: string;
+      /** Name in the upstream module (differs when renamed: `as`). */
+      originalName: string;
+      /** Module specifier of the upstream module. */
+      source: string;
+    }
+  | {
+      kind: 'wildcard';
+      /** Module specifier of the upstream module. */
+      source: string;
+    };

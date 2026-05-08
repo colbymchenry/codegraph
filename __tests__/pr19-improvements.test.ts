@@ -299,7 +299,7 @@ describe('Best-Candidate Resolution', () => {
 describe('Schema v2 Migration', () => {
   it.skipIf(!HAS_SQLITE)('should have correct current schema version', async () => {
     const { CURRENT_SCHEMA_VERSION } = await import('../src/db/migrations');
-    expect(CURRENT_SCHEMA_VERSION).toBe(3);
+    expect(CURRENT_SCHEMA_VERSION).toBe(4);
   });
 
   it.skipIf(!HAS_SQLITE)('should have migration for version 2', async () => {

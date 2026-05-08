@@ -6,9 +6,11 @@
 
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
+import { stripCommentsForRegex } from '../strip-comments';
 
 export const aspnetResolver: FrameworkResolver = {
   name: 'aspnet',
+  languages: ['csharp'],
 
   detect(context: ResolutionContext): boolean {
     // Check for .csproj files with ASP.NET references
@@ -114,91 +116,26 @@ export const aspnetResolver: FrameworkResolver = {
     return null;
   },
 
-  extractNodes(filePath: string, content: string): Node[] {
+  extract(filePath, content) {
+    if (!filePath.endsWith('.cs')) return { nodes: [], references: [] };
     const nodes: Node[] = [];
+    const references: UnresolvedRef[] = [];
     const now = Date.now();
+    const safe = stripCommentsForRegex(content, 'csharp');
 
-    // Extract route attributes
-    // [HttpGet("path")], [HttpPost("path")], [Route("path")]
-    const routePatterns = [
-      /\[(Http(Get|Post|Put|Patch|Delete))\s*\(\s*["']([^"']+)["']\s*\)\]/g,
-      /\[(Http(Get|Post|Put|Patch|Delete))\s*\]/g,
-      /\[Route\s*\(\s*["']([^"']+)["']\s*\)\]/g,
-    ];
+    // [HttpGet("path")], [HttpPost("path")], etc.
+    const attrRegex = /\[(HttpGet|HttpPost|HttpPut|HttpPatch|HttpDelete)\s*\(\s*"([^"]+)"\s*\)\]/g;
+    let match: RegExpExecArray | null;
+    while ((match = attrRegex.exec(safe)) !== null) {
+      const [, verb, routePath] = match;
+      const method = verb!.replace(/^Http/, '').toUpperCase();
+      const line = safe.slice(0, match.index).split('\n').length;
 
-    for (const pattern of routePatterns) {
-      let match;
-      while ((match = pattern.exec(content)) !== null) {
-        const line = content.slice(0, match.index).split('\n').length;
-
-        if (pattern.source.includes('Http')) {
-          if (match[3]) {
-            // HttpGet("path") style
-            const [, , method, path] = match;
-            nodes.push({
-              id: `route:${filePath}:${method!.toUpperCase()}:${path}:${line}`,
-              kind: 'route',
-              name: `${method!.toUpperCase()} ${path}`,
-              qualifiedName: `${filePath}::${method!.toUpperCase()}:${path}`,
-              filePath,
-              startLine: line,
-              endLine: line,
-              startColumn: 0,
-              endColumn: match[0].length,
-              language: 'csharp',
-              updatedAt: now,
-            });
-          } else if (match[2]) {
-            // HttpGet style without path
-            const [, , method] = match;
-            nodes.push({
-              id: `route:${filePath}:${method!.toUpperCase()}:${line}`,
-              kind: 'route',
-              name: `${method!.toUpperCase()}`,
-              qualifiedName: `${filePath}::${method!.toUpperCase()}`,
-              filePath,
-              startLine: line,
-              endLine: line,
-              startColumn: 0,
-              endColumn: match[0].length,
-              language: 'csharp',
-              updatedAt: now,
-            });
-          }
-        } else {
-          // [Route("path")] style
-          const [, path] = match;
-          nodes.push({
-            id: `route:${filePath}:ROUTE:${path}:${line}`,
-            kind: 'route',
-            name: `ROUTE ${path}`,
-            qualifiedName: `${filePath}::ROUTE:${path}`,
-            filePath,
-            startLine: line,
-            endLine: line,
-            startColumn: 0,
-            endColumn: match[0].length,
-            language: 'csharp',
-            updatedAt: now,
-          });
-        }
-      }
-    }
-
-    // Extract minimal API routes (ASP.NET Core 6+)
-    // app.MapGet("/path", ...), app.MapPost("/path", ...)
-    const minimalApiPattern = /\.Map(Get|Post|Put|Patch|Delete)\s*\(\s*["']([^"']+)["']/g;
-
-    let match;
-    while ((match = minimalApiPattern.exec(content)) !== null) {
-      const [, method, path] = match;
-      const line = content.slice(0, match.index).split('\n').length;
-
-      nodes.push({
-        id: `route:${filePath}:${method!.toUpperCase()}:${path}:${line}`,
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${method}:${routePath}`,
         kind: 'route',
-        name: `${method!.toUpperCase()} ${path}`,
-        qualifiedName: `${filePath}::${method!.toUpperCase()}:${path}`,
+        name: `${method} ${routePath}`,
+        qualifiedName: `${filePath}::route:${routePath}`,
         filePath,
         startLine: line,
         endLine: line,
@@ -206,12 +143,71 @@ export const aspnetResolver: FrameworkResolver = {
         endColumn: match[0].length,
         language: 'csharp',
         updatedAt: now,
-      });
+      };
+      nodes.push(routeNode);
+
+      // Capture the next method declaration
+      const tail = safe.slice(match.index + match[0].length);
+      const methodMatch = tail.match(/(?:public|private|protected|internal)\s+[\w<>,\s\[\]]+?\s+(\w+)\s*\(/);
+      if (methodMatch) {
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: methodMatch[1]!,
+          referenceKind: 'references',
+          line,
+          column: 0,
+          filePath,
+          language: 'csharp',
+        });
+      }
     }
 
-    return nodes;
+    // Minimal APIs: app.MapGet("/path", handler)
+    const minimalRegex = /\.Map(Get|Post|Put|Patch|Delete)\s*\(\s*"([^"]+)"\s*,\s*([^,)]+)/g;
+    while ((match = minimalRegex.exec(safe)) !== null) {
+      const [, verb, routePath, handlerExpr] = match;
+      const method = verb!.toUpperCase();
+      const line = safe.slice(0, match.index).split('\n').length;
+
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${method}:${routePath}`,
+        kind: 'route',
+        name: `${method} ${routePath}`,
+        qualifiedName: `${filePath}::route:${routePath}`,
+        filePath,
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: match[0].length,
+        language: 'csharp',
+        updatedAt: now,
+      };
+      nodes.push(routeNode);
+
+      const handlerName = extractCSharpTailIdent(handlerExpr!);
+      if (handlerName) {
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: handlerName,
+          referenceKind: 'references',
+          line,
+          column: 0,
+          filePath,
+          language: 'csharp',
+        });
+      }
+    }
+
+    return { nodes, references };
   },
 };
+
+/** Extract last identifier from an expression like `MyService.Handler` or `Handler`. */
+function extractCSharpTailIdent(expr: string): string | null {
+  const cleaned = expr.trim().replace(/\s+/g, '');
+  const m = cleaned.match(/(?:\.|^)([A-Za-z_][A-Za-z0-9_]*)$/);
+  return m ? m[1]! : null;
+}
 
 // Directory patterns
 const CONTROLLER_DIRS = ['/Controllers/'];

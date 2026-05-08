@@ -6,9 +6,11 @@
 
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
+import { stripCommentsForRegex } from '../strip-comments';
 
 export const springResolver: FrameworkResolver = {
   name: 'spring',
+  languages: ['java'],
 
   detect(context: ResolutionContext): boolean {
     // Check for pom.xml with Spring
@@ -116,63 +118,54 @@ export const springResolver: FrameworkResolver = {
     return null;
   },
 
-  extractNodes(filePath: string, content: string): Node[] {
+  extract(filePath, content) {
+    if (!filePath.endsWith('.java')) return { nodes: [], references: [] };
     const nodes: Node[] = [];
+    const references: UnresolvedRef[] = [];
     const now = Date.now();
+    const safe = stripCommentsForRegex(content, 'java');
 
-    // Extract REST endpoints
-    // @GetMapping("/path"), @PostMapping("/path"), etc.
-    const mappingPatterns = [
-      /@(Get|Post|Put|Patch|Delete|Request)Mapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/g,
-      /@(Get|Post|Put|Patch|Delete|Request)Mapping\s*\(\s*(?:path\s*=\s*)?["']([^"']+)["']/g,
-    ];
+    // @GetMapping("/path"), @PostMapping(value = "/path"), @RequestMapping("/path")
+    const mappingRegex = /@(GetMapping|PostMapping|PutMapping|PatchMapping|DeleteMapping|RequestMapping)\s*\(\s*(?:value\s*=\s*|path\s*=\s*)?["']([^"']+)["'][^)]*\)/g;
+    let match: RegExpExecArray | null;
+    while ((match = mappingRegex.exec(safe)) !== null) {
+      const [, mappingName, routePath] = match;
+      const line = safe.slice(0, match.index).split('\n').length;
+      const method =
+        mappingName === 'RequestMapping' ? 'ANY' : mappingName!.replace(/Mapping$/, '').toUpperCase();
 
-    for (const pattern of mappingPatterns) {
-      let match;
-      while ((match = pattern.exec(content)) !== null) {
-        const [, mappingType, path] = match;
-        const line = content.slice(0, match.index).split('\n').length;
-
-        const method = mappingType === 'Request' ? 'ANY' : mappingType!.toUpperCase();
-
-        nodes.push({
-          id: `route:${filePath}:${method}:${path}:${line}`,
-          kind: 'route',
-          name: `${method} ${path}`,
-          qualifiedName: `${filePath}::${method}:${path}`,
-          filePath,
-          startLine: line,
-          endLine: line,
-          startColumn: 0,
-          endColumn: match[0].length,
-          language: 'java',
-          updatedAt: now,
-        });
-      }
-    }
-
-    // Extract class-level @RequestMapping for base path
-    const baseMappingMatch = content.match(/@RequestMapping\s*\(\s*["']([^"']+)["']\s*\)/);
-    if (baseMappingMatch) {
-      const [, basePath] = baseMappingMatch;
-      const line = content.slice(0, baseMappingMatch.index).split('\n').length;
-
-      nodes.push({
-        id: `route:${filePath}:BASE:${basePath}:${line}`,
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${method}:${routePath}`,
         kind: 'route',
-        name: `BASE ${basePath}`,
-        qualifiedName: `${filePath}::BASE:${basePath}`,
+        name: `${method} ${routePath}`,
+        qualifiedName: `${filePath}::route:${routePath}`,
         filePath,
         startLine: line,
         endLine: line,
         startColumn: 0,
-        endColumn: baseMappingMatch[0].length,
+        endColumn: match[0].length,
         language: 'java',
         updatedAt: now,
-      });
+      };
+      nodes.push(routeNode);
+
+      // Look for the next public/private/protected method after the annotation
+      const tail = safe.slice(match.index + match[0].length);
+      const methodMatch = tail.match(/\b(?:public|private|protected)\s+[^;{]*?\s+(\w+)\s*\(/);
+      if (methodMatch) {
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: methodMatch[1]!,
+          referenceKind: 'references',
+          line,
+          column: 0,
+          filePath,
+          language: 'java',
+        });
+      }
     }
 
-    return nodes;
+    return { nodes, references };
   },
 };
 

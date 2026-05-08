@@ -26,6 +26,13 @@ npx @colbymchenry/codegraph
 
 ![1_C_VYnhpys0UHrOuOgpgoyw](https://github.com/user-attachments/assets/f168182f-4d9a-44e0-94d7-08d018cc8a3a)
 
+#### Initialize Projects
+
+```bash
+cd your-project
+codegraph init -i
+```
+
 </div>
 
 ---
@@ -107,7 +114,29 @@ All tests used Claude Opus 4.6 (1M context) with Claude Code v2.1.91. Each test 
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
 | **19+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Swift, Kotlin, Dart, Svelte, Liquid, Pascal/Delphi |
+| **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 13 frameworks |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
+
+---
+
+## Framework-aware Routes
+
+CodeGraph detects web-framework routing files and emits `route` nodes linked by `references` edges to their handler classes or functions. Querying callers of a view/controller now surfaces the URL pattern that binds it.
+
+| Framework | Shapes recognized |
+|---|---|
+| **Django** | `path()`, `re_path()`, `url()`, `include()` in `urls.py` (CBV `.as_view()`, dotted paths) |
+| **Flask** | `@app.route('/path', methods=[...])`, blueprint routes |
+| **FastAPI** | `@app.get(...)`, `@router.post(...)`, all standard methods |
+| **Express** | `app.get(...)`, `router.post(...)` with middleware chains |
+| **Laravel** | `Route::get()`, `Route::resource()`, `Controller@action`, tuple syntax |
+| **Rails** | `get '/x', to: 'users#index'`, hash-rocket `=>` syntax |
+| **Spring** | `@GetMapping`, `@PostMapping`, `@RequestMapping` on methods |
+| **Gin / chi / gorilla / mux** | `r.GET(...)`, `router.HandleFunc(...)` |
+| **Axum / actix / Rocket** | `.route("/x", get(handler))` |
+| **ASP.NET** | `[HttpGet("/x")]` attributes on action methods |
+| **Vapor** | `app.get("x", use: handler)` |
+| **React Router** / **SvelteKit** | Route component nodes |
 
 ---
 
@@ -399,6 +428,7 @@ The `.codegraph/config.json` file controls indexing:
 | Kotlin | `.kt`, `.kts` | Full support |
 | Dart | `.dart` | Full support |
 | Svelte | `.svelte` | Full support (script extraction, Svelte 5 runes, SvelteKit routes) |
+| Vue | `.vue` | Full support (script + script-setup extraction, Nuxt page/API/middleware routes) |
 | Liquid | `.liquid` | Full support |
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX form files) |
 

@@ -376,7 +376,7 @@ export const useUIStore = create<UIState>((set) => ({
 `;
     const result = extractFromSource('store.ts', code);
 
-    const varNode = result.nodes.find((n) => n.kind === 'variable' && n.name === 'useUIStore');
+    const varNode = result.nodes.find((n) => n.kind === 'constant' && n.name === 'useUIStore');
     expect(varNode).toBeDefined();
     expect(varNode?.isExported).toBe(true);
   });
@@ -390,7 +390,7 @@ export const config = {
 `;
     const result = extractFromSource('config.ts', code);
 
-    const varNode = result.nodes.find((n) => n.kind === 'variable' && n.name === 'config');
+    const varNode = result.nodes.find((n) => n.kind === 'constant' && n.name === 'config');
     expect(varNode).toBeDefined();
     expect(varNode?.isExported).toBe(true);
   });
@@ -401,7 +401,7 @@ export const SCREEN_NAMES = ['home', 'settings', 'profile'] as const;
 `;
     const result = extractFromSource('constants.ts', code);
 
-    const varNode = result.nodes.find((n) => n.kind === 'variable' && n.name === 'SCREEN_NAMES');
+    const varNode = result.nodes.find((n) => n.kind === 'constant' && n.name === 'SCREEN_NAMES');
     expect(varNode).toBeDefined();
     expect(varNode?.isExported).toBe(true);
   });
@@ -413,7 +413,7 @@ export const API_VERSION = "v2";
 `;
     const result = extractFromSource('constants.ts', code);
 
-    const variables = result.nodes.filter((n) => n.kind === 'variable');
+    const variables = result.nodes.filter((n) => n.kind === 'constant');
     expect(variables).toHaveLength(2);
     expect(variables.map((n) => n.name).sort()).toEqual(['API_VERSION', 'MAX_RETRIES']);
   });
@@ -457,7 +457,7 @@ export const userSchema = z.object({
 `;
     const result = extractFromSource('schemas.ts', code);
 
-    const varNode = result.nodes.find((n) => n.kind === 'variable' && n.name === 'userSchema');
+    const varNode = result.nodes.find((n) => n.kind === 'constant' && n.name === 'userSchema');
     expect(varNode).toBeDefined();
     expect(varNode?.isExported).toBe(true);
   });
@@ -475,7 +475,7 @@ export const authMachine = createMachine({
 `;
     const result = extractFromSource('machine.ts', code);
 
-    const varNode = result.nodes.find((n) => n.kind === 'variable' && n.name === 'authMachine');
+    const varNode = result.nodes.find((n) => n.kind === 'constant' && n.name === 'authMachine');
     expect(varNode).toBeDefined();
     expect(varNode?.isExported).toBe(true);
   });
@@ -3347,5 +3347,253 @@ def processData(): Unit = {
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
       expect(calls.length).toBeGreaterThan(0);
     });
+  });
+});
+
+describe('Vue Extraction', () => {
+  it('should detect Vue files', () => {
+    expect(detectLanguage('App.vue')).toBe('vue');
+    expect(detectLanguage('components/Button.vue')).toBe('vue');
+    expect(isLanguageSupported('vue')).toBe(true);
+  });
+
+  it('should extract component node from a Vue SFC', () => {
+    const code = `<template>
+  <div>{{ message }}</div>
+</template>
+
+<script>
+export default {
+  data() {
+    return { message: 'Hello' };
+  }
+}
+</script>
+`;
+    const result = extractFromSource('HelloWorld.vue', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('HelloWorld');
+    expect(componentNode?.language).toBe('vue');
+    expect(componentNode?.isExported).toBe(true);
+  });
+
+  it('should extract functions from <script> block', () => {
+    const code = `<template>
+  <button @click="handleClick">Click</button>
+</template>
+
+<script>
+function handleClick() {
+  console.log('clicked');
+}
+
+const count = 0;
+</script>
+`;
+    const result = extractFromSource('Button.vue', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Button');
+
+    const funcNode = result.nodes.find((n) => n.kind === 'function' && n.name === 'handleClick');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.language).toBe('vue');
+  });
+
+  it('should extract from <script setup lang="ts"> block', () => {
+    const code = `<template>
+  <div>{{ count }}</div>
+</template>
+
+<script setup lang="ts">
+import { ref } from 'vue';
+
+const count = ref(0);
+
+function increment(): void {
+  count.value++;
+}
+</script>
+`;
+    const result = extractFromSource('Counter.vue', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Counter');
+
+    const funcNode = result.nodes.find((n) => n.kind === 'function' && n.name === 'increment');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.language).toBe('vue');
+
+    // All nodes should be marked as vue language
+    for (const node of result.nodes) {
+      expect(node.language).toBe('vue');
+    }
+  });
+
+  it('should extract from both <script> and <script setup> blocks', () => {
+    const code = `<template>
+  <div>{{ msg }}</div>
+</template>
+
+<script>
+export default {
+  name: 'DualScript'
+}
+</script>
+
+<script setup>
+const msg = 'hello';
+
+function greet() {
+  return msg;
+}
+</script>
+`;
+    const result = extractFromSource('DualScript.vue', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+
+    const greetFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'greet');
+    expect(greetFunc).toBeDefined();
+  });
+
+  it('should create component node for template-only Vue file', () => {
+    const code = `<template>
+  <div>Static content</div>
+</template>
+`;
+    const result = extractFromSource('Static.vue', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Static');
+    expect(componentNode?.language).toBe('vue');
+
+    // Only the component node should exist (no script nodes)
+    expect(result.nodes.length).toBe(1);
+  });
+
+  it('should create containment edges from component to script nodes', () => {
+    const code = `<template>
+  <div>{{ value }}</div>
+</template>
+
+<script setup lang="ts">
+const value = 42;
+</script>
+`;
+    const result = extractFromSource('Contained.vue', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+
+    // Should have containment edges from component to child nodes
+    const containEdges = result.edges.filter(
+      (e) => e.source === componentNode!.id && e.kind === 'contains'
+    );
+    expect(containEdges.length).toBeGreaterThan(0);
+  });
+});
+
+describe('Instantiates + Decorates edge extraction', () => {
+  it('emits an instantiates ref for `new Foo()`', () => {
+    const code = `
+class Foo {}
+function bootstrap() { return new Foo(); }
+`;
+    const result = extractFromSource('app.ts', code);
+    const ref = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'Foo'
+    );
+    expect(ref).toBeDefined();
+  });
+
+  it('strips type-argument suffix from generic constructors', () => {
+    const code = `
+class Container<T> { constructor(_: T) {} }
+function go() { return new Container<string>('x'); }
+`;
+    const result = extractFromSource('app.ts', code);
+    const ref = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates'
+    );
+    expect(ref).toBeDefined();
+    // Container<string> must be normalised to "Container" — otherwise
+    // resolution can never match the class node.
+    expect(ref!.referenceName).toBe('Container');
+  });
+
+  it('keeps trailing identifier from qualified `new ns.Foo()`', () => {
+    const code = `
+const ns = { Foo: class {} };
+function go() { return new ns.Foo(); }
+`;
+    const result = extractFromSource('app.ts', code);
+    const ref = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates'
+    );
+    // We can't always resolve which Foo, but the name should be the
+    // simple identifier so name-matching has a chance.
+    expect(ref?.referenceName).toBe('Foo');
+  });
+
+  it('emits a decorates ref for `@Foo class X {}`', () => {
+    const code = `
+function Foo(_arg: string) { return (cls: any) => cls; }
+@Foo('x')
+class X {}
+`;
+    const result = extractFromSource('app.ts', code);
+    const decorClass = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'decorates' && r.referenceName === 'Foo'
+    );
+    expect(decorClass).toBeDefined();
+  });
+
+  it('does NOT attribute a prior class\'s decorator to the next class', () => {
+    // Regression: the sibling-walk must stop at the first non-
+    // decorator separator. `@A class Foo {} @B class Bar {}` must
+    // produce `decorates(Foo, A)` and `decorates(Bar, B)` — never
+    // `decorates(Bar, A)`.
+    const code = `
+function A(cls: any) { return cls; }
+function B(cls: any) { return cls; }
+@A
+class Foo {}
+@B
+class Bar {}
+`;
+    const result = extractFromSource('app.ts', code);
+    const decoratesEdges = result.unresolvedReferences.filter(
+      (r) => r.referenceKind === 'decorates'
+    );
+    // Exactly one decorates ref per decorated class, no cross-attribution.
+    const fromBar = decoratesEdges.filter((r) =>
+      result.nodes.find((n) => n.id === r.fromNodeId && n.name === 'Bar')
+    );
+    expect(fromBar.length).toBe(1);
+    expect(fromBar[0]!.referenceName).toBe('B');
+  });
+
+  it('emits a decorates ref for `@Foo method() {}`', () => {
+    const code = `
+function Get(p: string) { return (t: any, k: string) => t; }
+class Svc {
+  @Get('/x') method() { return 1; }
+}
+`;
+    const result = extractFromSource('app.ts', code);
+    const decorMethod = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'decorates' && r.referenceName === 'Get'
+    );
+    expect(decorMethod).toBeDefined();
+    // The decorated symbol must be `method`, not the constructor or class.
+    const decoratedNode = result.nodes.find((n) => n.id === decorMethod!.fromNodeId);
+    expect(decoratedNode?.name).toBe('method');
   });
 });

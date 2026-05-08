@@ -44,6 +44,7 @@ const SVELTEKIT_MODULE_PREFIXES = [
 
 export const svelteResolver: FrameworkResolver = {
   name: 'svelte',
+  languages: ['svelte'],
 
   detect(context: ResolutionContext): boolean {
     // Check for svelte or @sveltejs/kit in package.json
@@ -144,7 +145,7 @@ export const svelteResolver: FrameworkResolver = {
     return null;
   },
 
-  extractNodes(filePath: string, _content: string): Node[] {
+  extract(filePath, _content) {
     const nodes: Node[] = [];
     const now = Date.now();
 
@@ -174,7 +175,7 @@ export const svelteResolver: FrameworkResolver = {
       }
     }
 
-    return nodes;
+    return { nodes, references: [] };
   },
 };
 

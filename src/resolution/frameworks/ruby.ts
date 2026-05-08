@@ -6,9 +6,11 @@
 
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
+import { stripCommentsForRegex } from '../strip-comments';
 
 export const railsResolver: FrameworkResolver = {
   name: 'rails',
+  languages: ['ruby'],
 
   detect(context: ResolutionContext): boolean {
     // Check for Gemfile with rails
@@ -85,104 +87,48 @@ export const railsResolver: FrameworkResolver = {
     return null;
   },
 
-  extractNodes(filePath: string, content: string): Node[] {
+  extract(filePath, content) {
+    if (!filePath.endsWith('.rb')) return { nodes: [], references: [] };
     const nodes: Node[] = [];
+    const references: UnresolvedRef[] = [];
     const now = Date.now();
+    const safe = stripCommentsForRegex(content, 'ruby');
 
-    // Extract route definitions from config/routes.rb
-    if (filePath.includes('routes.rb')) {
-      // get/post/put/patch/delete 'path'
-      const routePatterns = [
-        /(get|post|put|patch|delete)\s+['"]([^'"]+)['"]/g,
-        /resources?\s+:(\w+)/g,
-        /root\s+['"]([^'"]+)['"]/g,
-        /root\s+to:\s*['"]([^'"]+)['"]/g,
-      ];
+    // get/post/put/patch/delete/match '/path', to: 'controller#action'
+    // Also: get '/path' => 'controller#action'
+    const routeRegex = /\b(get|post|put|patch|delete|match)\s+['"]([^'"]+)['"]\s*(?:,\s*to:\s*|=>\s*)['"]([^#'"]+)#([^'"]+)['"]/g;
+    let match: RegExpExecArray | null;
+    while ((match = routeRegex.exec(safe)) !== null) {
+      const [, method, routePath, _controller, action] = match;
+      const line = safe.slice(0, match.index).split('\n').length;
+      const upper = method!.toUpperCase();
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${upper}:${routePath}`,
+        kind: 'route',
+        name: `${upper} ${routePath}`,
+        qualifiedName: `${filePath}::route:${routePath}`,
+        filePath,
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: match[0].length,
+        language: 'ruby',
+        updatedAt: now,
+      };
+      nodes.push(routeNode);
 
-      for (const pattern of routePatterns) {
-        let match;
-        while ((match = pattern.exec(content)) !== null) {
-          const line = content.slice(0, match.index).split('\n').length;
-
-          if (pattern.source.includes('resources')) {
-            const [, resourceName] = match;
-            nodes.push({
-              id: `route:${filePath}:resource:${resourceName}:${line}`,
-              kind: 'route',
-              name: `resource:${resourceName}`,
-              qualifiedName: `${filePath}::resource:${resourceName}`,
-              filePath,
-              startLine: line,
-              endLine: line,
-              startColumn: 0,
-              endColumn: match[0].length,
-              language: 'ruby',
-              updatedAt: now,
-            });
-          } else if (pattern.source.includes('root')) {
-            const [, target] = match;
-            nodes.push({
-              id: `route:${filePath}:root:${line}`,
-              kind: 'route',
-              name: `/ -> ${target}`,
-              qualifiedName: `${filePath}::root`,
-              filePath,
-              startLine: line,
-              endLine: line,
-              startColumn: 0,
-              endColumn: match[0].length,
-              language: 'ruby',
-              updatedAt: now,
-            });
-          } else {
-            const [, method, path] = match;
-            nodes.push({
-              id: `route:${filePath}:${method!.toUpperCase()}:${path}:${line}`,
-              kind: 'route',
-              name: `${method!.toUpperCase()} ${path}`,
-              qualifiedName: `${filePath}::${method!.toUpperCase()}:${path}`,
-              filePath,
-              startLine: line,
-              endLine: line,
-              startColumn: 0,
-              endColumn: match[0].length,
-              language: 'ruby',
-              updatedAt: now,
-            });
-          }
-        }
-      }
+      references.push({
+        fromNodeId: routeNode.id,
+        referenceName: action!,
+        referenceKind: 'references',
+        line,
+        column: 0,
+        filePath,
+        language: 'ruby',
+      });
     }
 
-    // Extract controller actions
-    if (filePath.includes('controllers/') && filePath.endsWith('.rb')) {
-      const actionPattern = /def\s+(\w+)/g;
-      let match;
-      while ((match = actionPattern.exec(content)) !== null) {
-        const [, actionName] = match;
-        const line = content.slice(0, match.index).split('\n').length;
-
-        // Skip private methods and common Rails callbacks
-        const privateMethods = ['initialize', 'set_', 'before_', 'after_'];
-        if (!privateMethods.some((p) => actionName!.startsWith(p))) {
-          nodes.push({
-            id: `action:${filePath}:${actionName}:${line}`,
-            kind: 'method',
-            name: actionName!,
-            qualifiedName: `${filePath}::${actionName}`,
-            filePath,
-            startLine: line,
-            endLine: line,
-            startColumn: 0,
-            endColumn: match[0].length,
-            language: 'ruby',
-            updatedAt: now,
-          });
-        }
-      }
-    }
-
-    return nodes;
+    return { nodes, references };
   },
 };
 

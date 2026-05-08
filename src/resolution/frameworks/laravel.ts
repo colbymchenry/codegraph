@@ -6,6 +6,7 @@
 
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
+import { stripCommentsForRegex } from '../strip-comments';
 
 /**
  * Laravel facade mappings to underlying classes
@@ -36,6 +37,7 @@ export const FACADE_MAPPINGS: Record<string, string> = {
 
 export const laravelResolver: FrameworkResolver = {
   name: 'laravel',
+  languages: ['php'],
 
   detect(context: ResolutionContext): boolean {
     // Check for artisan file (Laravel signature)
@@ -90,62 +92,114 @@ export const laravelResolver: FrameworkResolver = {
     return null;
   },
 
-  extractNodes(filePath: string, content: string): Node[] {
+  extract(filePath, content) {
+    if (!filePath.endsWith('.php')) return { nodes: [], references: [] };
     const nodes: Node[] = [];
+    const references: UnresolvedRef[] = [];
     const now = Date.now();
+    const safe = stripCommentsForRegex(content, 'php');
 
-    // Extract route definitions
-    const routePatterns = [
-      // Route::get('/path', ...)
-      /Route::(get|post|put|patch|delete|options|any)\(\s*['"]([^'"]+)['"]/g,
-      // Route::resource('name', ...)
-      /Route::resource\(\s*['"]([^'"]+)['"]/g,
-      // Route::apiResource('name', ...)
-      /Route::apiResource\(\s*['"]([^'"]+)['"]/g,
-    ];
+    // Route::METHOD('/path', handler-expr)
+    // handler-expr can be: [Class::class, 'method'] | 'Controller@method' | Closure | Class::class
+    const routeRegex = /Route::(get|post|put|patch|delete|options|any)\s*\(\s*['"]([^'"]+)['"]\s*,\s*([^)]+)\)/g;
+    let match: RegExpExecArray | null;
+    while ((match = routeRegex.exec(safe)) !== null) {
+      const [, method, routePath, handlerExpr] = match;
+      const line = safe.slice(0, match.index).split('\n').length;
+      const upper = method!.toUpperCase();
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${upper}:${routePath}`,
+        kind: 'route',
+        name: `${upper} ${routePath}`,
+        qualifiedName: `${filePath}::route:${routePath}`,
+        filePath,
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: match[0].length,
+        language: 'php',
+        updatedAt: now,
+      };
+      nodes.push(routeNode);
 
-    for (const pattern of routePatterns) {
-      let match;
-      while ((match = pattern.exec(content)) !== null) {
-        if (pattern.source.includes('resource')) {
-          const [, resourceName] = match;
-          const line = content.slice(0, match.index).split('\n').length;
-          nodes.push({
-            id: `route:${filePath}:resource:${resourceName}:${line}`,
-            kind: 'route',
-            name: `resource:${resourceName}`,
-            qualifiedName: `${filePath}::resource:${resourceName}`,
+      const handlerName = extractLaravelHandler(handlerExpr!);
+      if (handlerName) {
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: handlerName,
+          referenceKind: 'references',
+          line,
+          column: 0,
+          filePath,
+          language: 'php',
+        });
+      }
+    }
+
+    // Route::resource('name', Controller::class) / Route::apiResource('name', Controller::class)
+    const resourceRegex = /Route::(resource|apiResource)\s*\(\s*['"]([^'"]+)['"]\s*(?:,\s*([^)]+))?\)/g;
+    while ((match = resourceRegex.exec(safe)) !== null) {
+      const [, _fn, resourceName, handlerExpr] = match;
+      const line = safe.slice(0, match.index).split('\n').length;
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:RESOURCE:${resourceName}`,
+        kind: 'route',
+        name: `resource:${resourceName}`,
+        qualifiedName: `${filePath}::route:${resourceName}`,
+        filePath,
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: match[0].length,
+        language: 'php',
+        updatedAt: now,
+      };
+      nodes.push(routeNode);
+
+      if (handlerExpr) {
+        const controllerName = extractLaravelHandler(handlerExpr);
+        if (controllerName) {
+          references.push({
+            fromNodeId: routeNode.id,
+            referenceName: controllerName,
+            referenceKind: 'imports',
+            line,
+            column: 0,
             filePath,
-            startLine: line,
-            endLine: line,
-            startColumn: 0,
-            endColumn: match[0].length,
             language: 'php',
-            updatedAt: now,
-          });
-        } else {
-          const [, method, path] = match;
-          const line = content.slice(0, match.index).split('\n').length;
-          nodes.push({
-            id: `route:${filePath}:${method!.toUpperCase()}:${path}:${line}`,
-            kind: 'route',
-            name: `${method!.toUpperCase()} ${path}`,
-            qualifiedName: `${filePath}::${method!.toUpperCase()}:${path}`,
-            filePath,
-            startLine: line,
-            endLine: line,
-            startColumn: 0,
-            endColumn: match[0].length,
-            language: 'php',
-            updatedAt: now,
           });
         }
       }
     }
 
-    return nodes;
+    return { nodes, references };
   },
 };
+
+/**
+ * Parse a Laravel route handler expression and return the symbol to link.
+ *  - `[Class::class, 'method']`  -> `method`
+ *  - `'Controller@method'`       -> `method`
+ *  - `Class::class`              -> `Class`
+ *  - anything else (closure etc) -> null
+ */
+function extractLaravelHandler(expr: string): string | null {
+  const trimmed = expr.trim();
+
+  // [Class::class, 'method'] — grab the string literal
+  const tupleMatch = trimmed.match(/^\[\s*[^,]+,\s*['"]([^'"]+)['"]\s*\]/);
+  if (tupleMatch) return tupleMatch[1]!;
+
+  // 'Controller@method'
+  const atMatch = trimmed.match(/^['"]([^'"@]+)@([^'"]+)['"]$/);
+  if (atMatch) return atMatch[2]!;
+
+  // Controller::class
+  const classMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)::class/);
+  if (classMatch) return classMatch[1]!;
+
+  return null;
+}
 
 /**
  * Resolve a Model::method() call

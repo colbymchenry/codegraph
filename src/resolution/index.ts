@@ -17,9 +17,11 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference } from './name-matcher';
-import { resolveViaImport, extractImportMappings } from './import-resolver';
+import { resolveViaImport, extractImportMappings, extractReExports } from './import-resolver';
 import { detectFrameworks } from './frameworks';
+import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { logDebug } from '../errors';
+import type { ReExport } from './types';
 
 // Re-export types
 export * from './types';
@@ -122,12 +124,17 @@ export class ReferenceResolver {
   private nodeCache: Map<string, Node[]> = new Map(); // per-file node cache (bounded)
   private fileCache: Map<string, string | null> = new Map(); // per-file content cache (bounded)
   private importMappingCache: Map<string, ImportMapping[]> = new Map();
+  private reExportCache: Map<string, ReExport[]> = new Map();
   private nameCache: Map<string, Node[]> = new Map(); // name → nodes cache
   private lowerNameCache: Map<string, Node[]> = new Map(); // lower(name) → nodes cache
   private qualifiedNameCache: Map<string, Node[]> = new Map(); // qualified_name → nodes cache
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
+  // tsconfig/jsconfig path-alias map. `undefined` = not yet computed,
+  // `null` = computed and absent. Treated as immutable for the
+  // resolver's lifetime; callers re-create the resolver if config changes.
+  private projectAliases: AliasMap | null | undefined = undefined;
 
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
@@ -168,6 +175,7 @@ export class ReferenceResolver {
     this.nodeCache.clear();
     this.fileCache.clear();
     this.importMappingCache.clear();
+    this.reExportCache.clear();
     this.nameCache.clear();
     this.lowerNameCache.clear();
     this.qualifiedNameCache.clear();
@@ -271,6 +279,26 @@ export class ReferenceResolver {
         const mappings = extractImportMappings(filePath, content, language);
         this.importMappingCache.set(cacheKey, mappings);
         return mappings;
+      },
+
+      getProjectAliases: () => {
+        if (this.projectAliases === undefined) {
+          this.projectAliases = loadProjectAliases(this.projectRoot);
+        }
+        return this.projectAliases;
+      },
+
+      getReExports: (filePath: string, language) => {
+        const cached = this.reExportCache.get(filePath);
+        if (cached) return cached;
+        const content = this.context.readFile(filePath);
+        if (!content) {
+          this.reExportCache.set(filePath, []);
+          return [];
+        }
+        const reExports = extractReExports(content, language);
+        this.reExportCache.set(filePath, reExports);
+        return reExports;
       },
     };
   }
@@ -380,6 +408,25 @@ export class ReferenceResolver {
   }
 
   /**
+   * Does `ref.referenceName` match an import declared in its containing
+   * file? Used as a pre-filter escape so re-export chain resolution
+   * still gets a chance when the name has no project-wide declaration.
+   */
+  private matchesAnyImport(ref: UnresolvedRef): boolean {
+    const imports = this.context.getImportMappings(ref.filePath, ref.language);
+    if (imports.length === 0) return false;
+    for (const imp of imports) {
+      if (
+        imp.localName === ref.referenceName ||
+        ref.referenceName.startsWith(imp.localName + '.')
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Resolve a single reference
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
@@ -389,7 +436,12 @@ export class ReferenceResolver {
     }
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
-    if (!this.hasAnyPossibleMatch(ref.referenceName)) {
+    // AND the name doesn't match a local import. The import escape is
+    // necessary because re-export rename chains (`import { login }
+    // from './barrel'` where the barrel has `export { signIn as login }
+    // from './auth'`) intentionally call a name that has no
+    // declaration anywhere — only the renamed upstream symbol does.
+    if (!this.hasAnyPossibleMatch(ref.referenceName) && !this.matchesAnyImport(ref)) {
       return null;
     }
 
@@ -440,6 +492,18 @@ export class ReferenceResolver {
           if (sourceNode && sourceNode.kind !== 'interface' && sourceNode.kind !== 'protocol') {
             kind = 'implements';
           }
+        }
+      }
+
+      // Promote "calls" to "instantiates" when the resolved target is a
+      // class/struct. Languages without a `new` keyword (Python, Ruby)
+      // express instantiation as `Foo()` — extraction can't tell that
+      // apart from a function call without symbol info, but resolution
+      // can: if `Foo` resolves to a class, the call IS an instantiation.
+      if (kind === 'calls') {
+        const targetNode = this.queries.getNodeById(ref.targetNodeId);
+        if (targetNode && (targetNode.kind === 'class' || targetNode.kind === 'struct')) {
+          kind = 'instantiates';
         }
       }
 

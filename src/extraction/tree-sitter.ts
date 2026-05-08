@@ -22,6 +22,11 @@ import { EXTRACTORS } from './languages';
 import { LiquidExtractor } from './liquid-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
+import { VueExtractor } from './vue-extractor';
+import {
+  getAllFrameworkResolvers,
+  getApplicableFrameworks,
+} from '../resolution/frameworks';
 
 // Re-export for backward compatibility
 export { generateNodeId } from './tree-sitter-helpers';
@@ -94,6 +99,17 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
 
   return '<anonymous>';
 }
+
+/**
+ * Tree-sitter node kinds that represent constructor invocations
+ * (`new Foo()` and friends). Used by extractInstantiation to emit
+ * an `instantiates` reference targeting the class name.
+ */
+const INSTANTIATION_KINDS: ReadonlySet<string> = new Set([
+  'new_expression',                  // typescript / javascript / tsx / jsx
+  'object_creation_expression',      // java / c#
+  'instance_creation_expression',    // some grammars
+]);
 
 /**
  * TreeSitterExtractor - Main extraction class
@@ -320,12 +336,19 @@ export class TreeSitterExtractor {
       this.extractVariable(node);
       skipChildren = true; // extractVariable handles children
     }
-    // Check for export statements containing non-function variable declarations
-    // e.g. `export const X = create(...)`, `export const X = { ... }`
-    else if (nodeType === 'export_statement') {
-      this.extractExportedVariables(node);
-      // Don't skip children — still need to visit inner nodes (functions, calls, etc.)
-    }
+    // `export_statement` itself is not extracted — the walker descends
+    // into children, where the inner declaration (lexical_declaration,
+    // function_declaration, class_declaration, etc.) is dispatched to
+    // its own extractor. `isExported` walks the parent chain, so the
+    // exported flag is preserved automatically.
+    //
+    // Calling extractExportedVariables here AND descending caused every
+    // `export const X = ...` to produce two nodes for the same symbol —
+    // one kind:'variable' from extractExportedVariables and one
+    // kind:'constant' from extractVariable. The dedicated dispatch is
+    // the correct one (it picks kind from isConst, captures the
+    // initializer signature, and walks type annotations); the
+    // export-statement helper was redundant.
     // Check for imports
     else if (this.extractor.importTypes.includes(nodeType)) {
       this.extractImport(node);
@@ -334,6 +357,17 @@ export class TreeSitterExtractor {
     else if (this.extractor.callTypes.includes(nodeType)) {
       this.extractCall(node);
     }
+    // `new Foo(...)` / `Foo::new(...)` / object_creation_expression —
+    // produce an `instantiates` reference. Children still walked so
+    // nested calls inside the constructor args (`new Foo(bar())`) get
+    // their own `calls` refs.
+    else if (INSTANTIATION_KINDS.has(nodeType)) {
+      this.extractInstantiation(node);
+    }
+    // (Decorator handling lives inside the symbol-creating extractors
+    // — extractClass / extractFunction / extractProperty — because the
+    // decorator node sits BEFORE the symbol in the AST and the walker
+    // would otherwise see the wrong nodeStack head.)
     // Rust: `impl Trait for Type { ... }` — creates implements edge from Type to Trait
     else if (nodeType === 'impl_item') {
       this.extractRustImplItem(node);
@@ -531,6 +565,11 @@ export class TreeSitterExtractor {
     // Extract type annotations (parameter types and return type)
     this.extractTypeAnnotations(node, funcNode.id);
 
+    // Extract decorators applied to the function (rare in JS/TS but
+    // present in Python `@decorator def f():` and Java/Kotlin
+    // annotations on free functions).
+    this.extractDecoratorsFor(node, funcNode.id);
+
     // Push to stack and visit body
     this.nodeStack.push(funcNode.id);
     const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
@@ -561,6 +600,9 @@ export class TreeSitterExtractor {
 
     // Extract extends/implements
     this.extractInheritance(node, classNode.id);
+
+    // Extract decorators applied to the class (`@Foo class X {}`).
+    this.extractDecoratorsFor(node, classNode.id);
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
@@ -654,6 +696,9 @@ export class TreeSitterExtractor {
 
     // Extract type annotations (parameter types and return type)
     this.extractTypeAnnotations(node, methodNode.id);
+
+    // Extract decorators (`@Get('/list') list() {}`).
+    this.extractDecoratorsFor(node, methodNode.id);
 
     // Push to stack and visit body
     this.nodeStack.push(methodNode.id);
@@ -834,12 +879,18 @@ export class TreeSitterExtractor {
     const typeText = typeNode ? getNodeText(typeNode, this.source) : undefined;
     const signature = typeText ? `${typeText} ${name}` : name;
 
-    this.createNode('property', name, node, {
+    const propNode = this.createNode('property', name, node, {
       docstring,
       signature,
       visibility,
       isStatic,
     });
+
+    // `@Inject() private svc: Foo` and similar — capture the
+    // decorator->target relationship for class properties too.
+    if (propNode) {
+      this.extractDecoratorsFor(node, propNode.id);
+    }
   }
 
   /**
@@ -913,12 +964,15 @@ export class TreeSitterExtractor {
         if (!nameNode) continue;
         const name = getNodeText(nameNode, this.source);
         const signature = typeText ? `${typeText} ${name}` : name;
-        this.createNode('field', name, decl, {
+        const fieldNode = this.createNode('field', name, decl, {
           docstring,
           signature,
           visibility,
           isStatic,
         });
+        // Java/Kotlin annotations / TS field decorators sit on the
+        // outer field_declaration, not on the individual declarator.
+        if (fieldNode) this.extractDecoratorsFor(node, fieldNode.id);
       }
     } else {
       // Fallback: try to find an identifier child directly
@@ -1171,59 +1225,11 @@ export class TreeSitterExtractor {
     return false;
   }
 
-  /**
-   * Extract an exported variable declaration that isn't a function.
-   * Handles patterns like:
-   *   export const X = create(...)
-   *   export const X = { ... }
-   *   export const X = [...]
-   *   export const X = "value"
-   *
-   * This is called for `export_statement` nodes that contain a
-   * `lexical_declaration` with `variable_declarator` children whose
-   * values are NOT already handled by functionTypes (arrow_function,
-   * function_expression).
-   */
-  private extractExportedVariables(exportNode: SyntaxNode): void {
-    if (!this.extractor) return;
-
-    // Find the lexical_declaration or variable_declaration child
-    for (let i = 0; i < exportNode.namedChildCount; i++) {
-      const decl = exportNode.namedChild(i);
-      if (!decl || (decl.type !== 'lexical_declaration' && decl.type !== 'variable_declaration')) {
-        continue;
-      }
-
-      // Iterate over each variable_declarator in the declaration
-      for (let j = 0; j < decl.namedChildCount; j++) {
-        const declarator = decl.namedChild(j);
-        if (!declarator || declarator.type !== 'variable_declarator') continue;
-
-        const nameNode = getChildByField(declarator, 'name');
-        if (!nameNode) continue;
-        const name = getNodeText(nameNode, this.source);
-
-        // Skip if the value is a function type — those are already handled
-        // by extractFunction via the functionTypes dispatch
-        const value = getChildByField(declarator, 'value');
-        if (value) {
-          const valueType = value.type;
-          if (
-            this.extractor.functionTypes.includes(valueType)
-          ) {
-            continue; // Already handled by extractFunction
-          }
-        }
-
-        const docstring = getPrecedingDocstring(exportNode, this.source);
-
-        this.createNode('variable', name, declarator, {
-          docstring,
-          isExported: true,
-        });
-      }
-    }
-  }
+  // extractExportedVariables removed — the walker now descends into
+  // export_statement children and the inner declaration's dedicated
+  // extractor (extractVariable, extractFunction, extractClass, etc.)
+  // handles the symbol with isExported=true via parent-walk in the
+  // language extractor's isExported predicate.
 
   /**
    * Extract an import
@@ -1449,6 +1455,162 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * `new Foo(...)` / `Foo::new(...)` / object_creation_expression —
+   * emit an `instantiates` reference to the class name. The resolver
+   * then links it to the class node, producing the `instantiates`
+   * edge that powers "what creates instances of X" queries.
+   *
+   * Children are still walked so nested calls inside the constructor
+   * arguments (`new Foo(bar())`) get their own `calls` references.
+   */
+  private extractInstantiation(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0) return;
+    const fromId = this.nodeStack[this.nodeStack.length - 1];
+    if (!fromId) return;
+
+    // The class name is in the `constructor`/`type`/first-named-child
+    // depending on grammar.
+    const ctor =
+      getChildByField(node, 'constructor') ||
+      getChildByField(node, 'type') ||
+      getChildByField(node, 'name') ||
+      node.namedChild(0);
+    if (!ctor) return;
+
+    let className = getNodeText(ctor, this.source);
+    // Strip type-argument suffix first: `new Map<K, V>()` would
+    // otherwise produce className 'Map<K, V>' (the constructor
+    // field is a `generic_type` node) and resolution would fail
+    // because no class is named with the angle-bracket suffix.
+    const ltIdx = className.indexOf('<');
+    if (ltIdx > 0) className = className.slice(0, ltIdx);
+    // For namespaced/qualified constructors (`new ns.Foo()`,
+    // `new ns::Foo()`) keep the trailing identifier — that's what
+    // matches a class node in the index.
+    const lastDot = Math.max(
+      className.lastIndexOf('.'),
+      className.lastIndexOf('::')
+    );
+    if (lastDot >= 0) className = className.slice(lastDot + 1).replace(/^[:.]/, '');
+    className = className.trim();
+
+    if (className) {
+      this.unresolvedReferences.push({
+        fromNodeId: fromId,
+        referenceName: className,
+        referenceKind: 'instantiates',
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column,
+      });
+    }
+  }
+
+  /**
+   * Scan `declNode` and its preceding siblings (within the parent's
+   * named children) for decorator nodes, emitting a `decorates`
+   * reference from `decoratedId` to each decorator's function name.
+   *
+   * Why preceding siblings: in TypeScript, `@Foo class Bar {}` parses
+   * as an `export_statement` (or top-level wrapper) with the
+   * `decorator` as a child *before* the `class_declaration` — so the
+   * decorator isn't a child of the class itself. For methods/
+   * properties, the decorator IS a direct child of the declaration,
+   * so we also scan declNode.namedChildren.
+   *
+   * Idempotent across grammars: if neither location yields decorators
+   * (most non-decorator-using languages), the function is a no-op.
+   */
+  private extractDecoratorsFor(declNode: SyntaxNode, decoratedId: string): void {
+    const consider = (n: SyntaxNode | null): void => {
+      if (!n) return;
+      // `marker_annotation` is Java's grammar for arg-less annotations
+      // (`@Override`, `@Deprecated`); without including it, every
+      // such Java annotation would be silently skipped.
+      if (
+        n.type !== 'decorator' &&
+        n.type !== 'annotation' &&
+        n.type !== 'marker_annotation'
+      ) {
+        return;
+      }
+      // Find the leading identifier: skip the `@` punct, unwrap
+      // a call_expression if the decorator is invoked with args.
+      let target: SyntaxNode | null = null;
+      for (let i = 0; i < n.namedChildCount; i++) {
+        const child = n.namedChild(i);
+        if (!child) continue;
+        if (child.type === 'call_expression') {
+          const fn = getChildByField(child, 'function') ?? child.namedChild(0);
+          if (fn) target = fn;
+          if (target) break;
+        }
+        if (
+          child.type === 'identifier' ||
+          child.type === 'member_expression' ||
+          child.type === 'scoped_identifier' ||
+          child.type === 'navigation_expression'
+        ) {
+          target = child;
+          break;
+        }
+      }
+      if (!target) return;
+      let name = getNodeText(target, this.source);
+      const lastDot = Math.max(name.lastIndexOf('.'), name.lastIndexOf('::'));
+      if (lastDot >= 0) name = name.slice(lastDot + 1).replace(/^[:.]/, '');
+      if (!name) return;
+      this.unresolvedReferences.push({
+        fromNodeId: decoratedId,
+        referenceName: name,
+        referenceKind: 'decorates',
+        line: n.startPosition.row + 1,
+        column: n.startPosition.column,
+      });
+    };
+
+    // 1. Decorators that are direct children of the declaration
+    //    (method/property style, also some grammars for class).
+    for (let i = 0; i < declNode.namedChildCount; i++) {
+      consider(declNode.namedChild(i));
+    }
+
+    // 2. Decorators that are PRECEDING siblings of the declaration
+    //    inside the parent's children (TypeScript class style).
+    //    Walk BACKWARDS from the declaration and stop at the first
+    //    non-decorator sibling — without that stop, decorators
+    //    belonging to an EARLIER unrelated declaration leak in
+    //    (e.g. `@A class Foo {} @B class Bar {}` would otherwise
+    //    attribute @A to Bar).
+    //
+    //    Note on identity: tree-sitter web bindings return fresh JS
+    //    wrapper objects from `parent`/`namedChild` navigation, so
+    //    `sibling === declNode` is unreliable — `startIndex` does
+    //    the matching instead.
+    const parent = declNode.parent;
+    if (parent) {
+      const declStart = declNode.startIndex;
+      let declIdx = -1;
+      for (let i = 0; i < parent.namedChildCount; i++) {
+        const sibling = parent.namedChild(i);
+        if (sibling && sibling.startIndex === declStart) {
+          declIdx = i;
+          break;
+        }
+      }
+      if (declIdx > 0) {
+        for (let j = declIdx - 1; j >= 0; j--) {
+          const sibling = parent.namedChild(j);
+          if (!sibling) continue;
+          if (sibling.type !== 'decorator' && sibling.type !== 'annotation' && sibling.type !== 'marker_annotation') {
+            break; // non-decorator separator → stop consuming
+          }
+          consider(sibling);
+        }
+      }
+    }
+  }
+
+  /**
    * Visit function body and extract calls (and structural nodes).
    *
    * In addition to call expressions, this also detects class/struct/enum
@@ -1466,6 +1628,12 @@ export class TreeSitterExtractor {
 
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);
+      } else if (INSTANTIATION_KINDS.has(nodeType)) {
+        // `new Foo()` inside a function body — emit an `instantiates`
+        // reference. Without this branch the body walker only knew
+        // about `call_expression`, so constructor invocations
+        // produced no graph edges at all.
+        this.extractInstantiation(node);
       } else if (this.extractor!.extractBareCall) {
         const calleeName = this.extractor!.extractBareCall(node, this.source);
         if (calleeName && this.nodeStack.length > 0) {
@@ -2310,37 +2478,71 @@ export class TreeSitterExtractor {
 
 
 /**
- * Extract nodes and edges from source code
+ * Extract nodes and edges from source code.
+ *
+ * If `frameworkNames` is provided, framework-specific extractors matching
+ * those names and the file's language are run after the tree-sitter pass.
+ * Their nodes/references/errors are merged into the returned result.
  */
 export function extractFromSource(
   filePath: string,
   source: string,
-  language?: Language
+  language?: Language,
+  frameworkNames?: string[]
 ): ExtractionResult {
   const detectedLanguage = language || detectLanguage(filePath, source);
   const fileExtension = path.extname(filePath).toLowerCase();
 
+  let result: ExtractionResult;
+
   // Use custom extractor for Svelte
   if (detectedLanguage === 'svelte') {
     const extractor = new SvelteExtractor(filePath, source);
-    return extractor.extract();
-  }
-
-  // Use custom extractor for Liquid
-  if (detectedLanguage === 'liquid') {
+    result = extractor.extract();
+  } else if (detectedLanguage === 'vue') {
+    // Use custom extractor for Vue
+    const extractor = new VueExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'liquid') {
+    // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
-    return extractor.extract();
-  }
-
-  // Use custom extractor for DFM/FMX form files
-  if (
+    result = extractor.extract();
+  } else if (
     detectedLanguage === 'pascal' &&
     (fileExtension === '.dfm' || fileExtension === '.fmx')
   ) {
+    // Use custom extractor for DFM/FMX form files
     const extractor = new DfmExtractor(filePath, source);
-    return extractor.extract();
+    result = extractor.extract();
+  } else {
+    const extractor = new TreeSitterExtractor(filePath, source, detectedLanguage);
+    result = extractor.extract();
   }
 
-  const extractor = new TreeSitterExtractor(filePath, source, detectedLanguage);
-  return extractor.extract();
+  // Framework-specific extraction (routes, middleware, etc.)
+  if (frameworkNames && frameworkNames.length > 0) {
+    const allResolvers = getAllFrameworkResolvers();
+    const applicable = getApplicableFrameworks(
+      allResolvers.filter((r) => frameworkNames.includes(r.name)),
+      detectedLanguage
+    );
+    for (const fw of applicable) {
+      if (!fw.extract) continue;
+      try {
+        const fwResult = fw.extract(filePath, source);
+        result.nodes.push(...fwResult.nodes);
+        result.unresolvedReferences.push(...fwResult.references);
+      } catch (err) {
+        result.errors.push({
+          message: `Framework extractor '${fw.name}' failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          filePath,
+          severity: 'warning',
+        });
+      }
+    }
+  }
+
+  return result;
 }

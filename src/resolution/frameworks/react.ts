@@ -9,6 +9,7 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 
 export const reactResolver: FrameworkResolver = {
   name: 'react',
+  languages: ['javascript', 'typescript'],
 
   detect(context: ResolutionContext): boolean {
     // Check for React in package.json
@@ -73,7 +74,7 @@ export const reactResolver: FrameworkResolver = {
     return null;
   },
 
-  extractNodes(filePath: string, content: string): Node[] {
+  extract(filePath, content) {
     const nodes: Node[] = [];
     const now = Date.now();
 
@@ -168,7 +169,7 @@ export const reactResolver: FrameworkResolver = {
       }
     }
 
-    return nodes;
+    return { nodes, references: [] };
   },
 };
 

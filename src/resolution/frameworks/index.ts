@@ -5,10 +5,12 @@
  */
 
 import { FrameworkResolver, ResolutionContext } from '../types';
+import type { Language } from '../../types';
 import { laravelResolver } from './laravel';
 import { expressResolver } from './express';
 import { reactResolver } from './react';
 import { svelteResolver } from './svelte';
+import { vueResolver } from './vue';
 import { djangoResolver, flaskResolver, fastapiResolver } from './python';
 import { railsResolver } from './ruby';
 import { springResolver } from './java';
@@ -27,6 +29,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   expressResolver,
   reactResolver,
   svelteResolver,
+  vueResolver,
   // Python
   djangoResolver,
   flaskResolver,
@@ -75,6 +78,19 @@ export function detectFrameworks(context: ResolutionContext): FrameworkResolver[
 }
 
 /**
+ * Filter a list of detected frameworks down to ones that apply to a given language.
+ * Frameworks without an explicit `languages` list are treated as universal.
+ */
+export function getApplicableFrameworks(
+  detected: FrameworkResolver[],
+  language: Language
+): FrameworkResolver[] {
+  return detected.filter(
+    (fw) => !fw.languages || fw.languages.includes(language)
+  );
+}
+
+/**
  * Register a custom framework resolver
  */
 export function registerFrameworkResolver(resolver: FrameworkResolver): void {
@@ -91,6 +107,7 @@ export { laravelResolver, FACADE_MAPPINGS } from './laravel';
 export { expressResolver } from './express';
 export { reactResolver } from './react';
 export { svelteResolver } from './svelte';
+export { vueResolver } from './vue';
 export { djangoResolver, flaskResolver, fastapiResolver } from './python';
 export { railsResolver } from './ruby';
 export { springResolver } from './java';
