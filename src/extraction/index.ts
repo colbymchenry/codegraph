@@ -762,6 +762,26 @@ export class ExtractionOrchestrator {
           continue;
         }
 
+        // Honour config.maxFileSize. Without this check, vendored
+        // generated headers, minified bundles, and other multi-MB
+        // files get indexed despite the user setting a size cap —
+        // wasting WASM heap and the worker recycle budget on inputs
+        // the user explicitly opted out of. The single-file extractFile
+        // path already enforces this; the bulk path used to silently
+        // skip the check.
+        if (stats.size > this.config.maxFileSize) {
+          processed++;
+          filesSkipped++;
+          errors.push({
+            message: `File exceeds max size (${stats.size} > ${this.config.maxFileSize})`,
+            filePath,
+            severity: 'warning',
+            code: 'size_exceeded',
+          });
+          onProgress?.({ phase: 'parsing', current: processed, total });
+          continue;
+        }
+
         // Parse in worker thread (main thread stays unblocked).
         // Wrapped in try/catch to handle worker timeouts and crashes gracefully.
         let result: ExtractionResult;

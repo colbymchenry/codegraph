@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 /**
  * Migration definition
@@ -51,6 +51,17 @@ const migrations: Migration[] = [
     up: (db) => {
       db.exec(`
         CREATE INDEX IF NOT EXISTS idx_nodes_lower_name ON nodes(lower(name));
+      `);
+    },
+  },
+  {
+    version: 4,
+    description:
+      'Drop redundant idx_edges_source / idx_edges_target (covered by source_kind / target_kind composites)',
+    up: (db) => {
+      db.exec(`
+        DROP INDEX IF EXISTS idx_edges_source;
+        DROP INDEX IF EXISTS idx_edges_target;
       `);
     },
   },

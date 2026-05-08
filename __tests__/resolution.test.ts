@@ -606,5 +606,244 @@ function main(): void {
       // Should have attempted resolution
       expect(result.stats.total).toBeGreaterThanOrEqual(0);
     });
+
+    it('promotes calls→instantiates when target resolves to a class (Python)', async () => {
+      // Python has no `new` keyword — `Foo()` is the standard
+      // instantiation syntax. Extraction can't tell that apart from
+      // a function call without symbol info, so it emits a `calls`
+      // ref. Resolution promotes it to `instantiates` once the
+      // target is known to be a class.
+      const srcDir = path.join(tempDir, 'src');
+      fs.mkdirSync(srcDir, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(srcDir, 'app.py'),
+        `class UserService:
+    def __init__(self):
+        self.db = None
+
+def bootstrap():
+    return UserService()
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const bootstrap = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'bootstrap');
+      expect(bootstrap).toBeDefined();
+
+      const outgoing = cg.getOutgoingEdges(bootstrap!.id);
+      const instantiates = outgoing.find((e) => e.kind === 'instantiates');
+      expect(instantiates).toBeDefined();
+      // Same edge must NOT also appear as a `calls` edge — promotion
+      // replaces the kind, doesn't duplicate.
+      const callsToUserService = outgoing.filter(
+        (e) => e.kind === 'calls' && e.target === instantiates!.target
+      );
+      expect(callsToUserService).toHaveLength(0);
+    });
+  });
+
+  describe('Name Matcher: kind bias for new ref kinds', () => {
+    const baseContext = (candidates: Node[]): ResolutionContext => ({
+      getNodesInFile: () => [],
+      getNodesByName: (name) => candidates.filter((c) => c.name === name),
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      fileExists: () => true,
+      readFile: () => null,
+      getProjectRoot: () => '/test',
+      getAllFiles: () => [],
+      getNodesByLowerName: () => [],
+      getImportMappings: () => [],
+    });
+
+    it('prefers a class candidate over a function for `instantiates` refs', () => {
+      // A class and a function share a name across the codebase.
+      // Without the kind bias, the function (which gets the +25 `calls`
+      // bonus historically applied to all candidates of that kind) would
+      // win. Now the instantiates branch reverses it.
+      const fn: Node = {
+        id: 'func:utils.ts:Logger:5', kind: 'function', name: 'Logger',
+        qualifiedName: 'utils.ts::Logger', filePath: 'utils.ts', language: 'typescript',
+        startLine: 5, endLine: 7, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const cls: Node = {
+        id: 'class:logger.ts:Logger:10', kind: 'class', name: 'Logger',
+        qualifiedName: 'logger.ts::Logger', filePath: 'logger.ts', language: 'typescript',
+        startLine: 10, endLine: 30, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+
+      const ref = {
+        fromNodeId: 'func:main.ts:bootstrap:1',
+        referenceName: 'Logger',
+        referenceKind: 'instantiates' as const,
+        line: 5, column: 0, filePath: 'main.ts', language: 'typescript' as const,
+      };
+
+      const result = matchReference(ref, baseContext([fn, cls]));
+      expect(result?.targetNodeId).toBe('class:logger.ts:Logger:10');
+    });
+
+    it('prefers a function candidate over a non-function for `decorates` refs', () => {
+      const variable: Node = {
+        id: 'var:config.ts:Inject:5', kind: 'variable', name: 'Inject',
+        qualifiedName: 'config.ts::Inject', filePath: 'config.ts', language: 'typescript',
+        startLine: 5, endLine: 5, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const decorator: Node = {
+        id: 'func:di.ts:Inject:10', kind: 'function', name: 'Inject',
+        qualifiedName: 'di.ts::Inject', filePath: 'di.ts', language: 'typescript',
+        startLine: 10, endLine: 20, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+
+      const ref = {
+        fromNodeId: 'class:svc.ts:UserService:1',
+        referenceName: 'Inject',
+        referenceKind: 'decorates' as const,
+        line: 5, column: 0, filePath: 'svc.ts', language: 'typescript' as const,
+      };
+
+      const result = matchReference(ref, baseContext([variable, decorator]));
+      expect(result?.targetNodeId).toBe('func:di.ts:Inject:10');
+    });
+  });
+
+  describe('tsconfig path aliases', () => {
+    it('resolves an aliased import to the alias-mapped file (not a same-named file elsewhere)', async () => {
+      // Two same-named exports in different directories. Without alias
+      // resolution, name-matcher would pick whichever it finds first;
+      // with alias resolution, the import path uniquely picks one.
+      fs.mkdirSync(path.join(tempDir, 'src/utils'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'src/legacy'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src/utils/format.ts'),
+        `export function pickMe(): number { return 1; }\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/legacy/format.ts'),
+        `export function pickMe(): number { return 99; }\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/main.ts'),
+        `import { pickMe } from '@utils/format';\nexport function go(): number { return pickMe(); }\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'tsconfig.json'),
+        JSON.stringify({
+          compilerOptions: {
+            baseUrl: './src',
+            paths: { '@utils/*': ['utils/*'] },
+          },
+        })
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      // The two pickMe nodes live in different files. The aliased
+      // import should attach the call edge to the @utils-mapped one,
+      // not the legacy duplicate.
+      const all = cg.getNodesByKind('function').filter((n) => n.name === 'pickMe');
+      const utilsNode = all.find((n) => n.filePath === 'src/utils/format.ts');
+      const legacyNode = all.find((n) => n.filePath === 'src/legacy/format.ts');
+      expect(utilsNode).toBeDefined();
+      expect(legacyNode).toBeDefined();
+
+      const utilsCallers = cg.getCallers(utilsNode!.id);
+      const legacyCallers = cg.getCallers(legacyNode!.id);
+      expect(utilsCallers.length).toBeGreaterThan(0);
+      expect(utilsCallers.some((c) => c.node.filePath === 'src/main.ts')).toBe(true);
+      // The legacy node should NOT have a caller from src/main.ts —
+      // the alias correctly picked the utils version.
+      expect(legacyCallers.some((c) => c.node.filePath === 'src/main.ts')).toBe(false);
+    });
+
+    it('falls back gracefully when tsconfig is absent', async () => {
+      fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src/a.ts'),
+        `export function aFn(): void {}\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/b.ts'),
+        `import { aFn } from './a';\nexport function bFn(): void { aFn(); }\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // No tsconfig present — index should still complete and the
+      // relative-import-based call edge should be created.
+      const aFn = cg.getNodesByKind('function').find((n) => n.name === 'aFn');
+      expect(aFn).toBeDefined();
+      const callers = cg.getCallers(aFn!.id);
+      expect(callers.some((c) => c.node.filePath === 'src/b.ts')).toBe(true);
+    });
+  });
+
+  describe('re-export chain following', () => {
+    it('chases a 3-hop barrel chain (wildcard → named → declaration)', async () => {
+      // main.ts → all.ts (wildcard) → index.ts (named) → auth.ts (declaration).
+      // Without chain following, `signIn` resolves to nothing because
+      // none of the barrel files declare it directly.
+      fs.mkdirSync(path.join(tempDir, 'src/services'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src/services/auth.ts'),
+        `export function signIn(): void {}\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/services/index.ts'),
+        `export { signIn } from './auth';\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/all.ts'),
+        `export * from './services/index';\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/main.ts'),
+        `import { signIn } from './all';\nexport function go(): void { signIn(); }\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const signInNode = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'signIn' && n.filePath === 'src/services/auth.ts');
+      expect(signInNode).toBeDefined();
+      const callers = cg.getCallers(signInNode!.id);
+      expect(callers.some((c) => c.node.filePath === 'src/main.ts')).toBe(true);
+    });
+
+    it('follows a renamed named re-export (export { foo as bar } from ...)', async () => {
+      // The chase has to look up `foo` in the upstream module even
+      // though the importer asked for `bar` — exercises the rename
+      // branch of findExportedSymbol.
+      fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src/auth.ts'),
+        `export function signIn(): void {}\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/index.ts'),
+        `export { signIn as login } from './auth';\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/main.ts'),
+        `import { login } from './index';\nexport function go(): void { login(); }\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const signInNode = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'signIn' && n.filePath === 'src/auth.ts');
+      expect(signInNode).toBeDefined();
+      const callers = cg.getCallers(signInNode!.id);
+      expect(callers.some((c) => c.node.filePath === 'src/main.ts')).toBe(true);
+    });
   });
 });

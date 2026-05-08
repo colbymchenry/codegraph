@@ -19,6 +19,7 @@ import * as path from 'path';
 import CodeGraph, { findNearestCodeGraphRoot } from '../index';
 import { StdioTransport, JsonRpcRequest, JsonRpcNotification, ErrorCodes } from './transport';
 import { tools, ToolHandler } from './tools';
+import { SERVER_INSTRUCTIONS } from './server-instructions';
 
 /**
  * Convert a file:// URI to a filesystem path.
@@ -268,13 +269,17 @@ export class MCPServer {
     // Try to initialize the default project (non-fatal if it fails)
     await this.tryInitializeDefault(projectPath);
 
-    // We accept the client's protocol version but respond with our supported version
+    // We accept the client's protocol version but respond with our supported version.
+    // The `instructions` field is surfaced by MCP clients in the agent's system
+    // prompt automatically — it's the right place for the universal tool-selection
+    // playbook, ahead of individual tool descriptions.
     this.transport.sendResult(request.id, {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: {
         tools: {},
       },
       serverInfo: SERVER_INFO,
+      instructions: SERVER_INSTRUCTIONS,
     });
   }
 
