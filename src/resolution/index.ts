@@ -443,6 +443,18 @@ export class ReferenceResolver {
         }
       }
 
+      // Promote "calls" to "instantiates" when the resolved target is a
+      // class/struct. Languages without a `new` keyword (Python, Ruby)
+      // express instantiation as `Foo()` — extraction can't tell that
+      // apart from a function call without symbol info, but resolution
+      // can: if `Foo` resolves to a class, the call IS an instantiation.
+      if (kind === 'calls') {
+        const targetNode = this.queries.getNodeById(ref.targetNodeId);
+        if (targetNode && (targetNode.kind === 'class' || targetNode.kind === 'struct')) {
+          kind = 'instantiates';
+        }
+      }
+
       return {
         source: ref.original.fromNodeId,
         target: ref.targetNodeId,

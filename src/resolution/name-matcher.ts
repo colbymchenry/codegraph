@@ -352,6 +352,30 @@ function findBestMatch(
       }
     }
 
+    // For instantiation references (`new Foo()`), prefer class-like
+    // targets — without this, a function named `Foo` in another module
+    // could outscore the actual class.
+    if (ref.referenceKind === 'instantiates') {
+      if (
+        candidate.kind === 'class' ||
+        candidate.kind === 'struct' ||
+        candidate.kind === 'interface'
+      ) {
+        score += 25;
+      }
+    }
+
+    // For decorator references (`@Foo`), prefer functions. Class
+    // decorators (Python `@SomeClass`, Java annotation interfaces)
+    // also resolve here, hence the smaller class bonus.
+    if (ref.referenceKind === 'decorates') {
+      if (candidate.kind === 'function' || candidate.kind === 'method') {
+        score += 25;
+      } else if (candidate.kind === 'class' || candidate.kind === 'interface') {
+        score += 15;
+      }
+    }
+
     // Exported bonus
     if (candidate.isExported) {
       score += 10;

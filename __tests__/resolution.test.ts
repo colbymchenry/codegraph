@@ -606,5 +606,109 @@ function main(): void {
       // Should have attempted resolution
       expect(result.stats.total).toBeGreaterThanOrEqual(0);
     });
+
+    it('promotes calls→instantiates when target resolves to a class (Python)', async () => {
+      // Python has no `new` keyword — `Foo()` is the standard
+      // instantiation syntax. Extraction can't tell that apart from
+      // a function call without symbol info, so it emits a `calls`
+      // ref. Resolution promotes it to `instantiates` once the
+      // target is known to be a class.
+      const srcDir = path.join(tempDir, 'src');
+      fs.mkdirSync(srcDir, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(srcDir, 'app.py'),
+        `class UserService:
+    def __init__(self):
+        self.db = None
+
+def bootstrap():
+    return UserService()
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const bootstrap = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'bootstrap');
+      expect(bootstrap).toBeDefined();
+
+      const outgoing = cg.getOutgoingEdges(bootstrap!.id);
+      const instantiates = outgoing.find((e) => e.kind === 'instantiates');
+      expect(instantiates).toBeDefined();
+      // Same edge must NOT also appear as a `calls` edge — promotion
+      // replaces the kind, doesn't duplicate.
+      const callsToUserService = outgoing.filter(
+        (e) => e.kind === 'calls' && e.target === instantiates!.target
+      );
+      expect(callsToUserService).toHaveLength(0);
+    });
+  });
+
+  describe('Name Matcher: kind bias for new ref kinds', () => {
+    const baseContext = (candidates: Node[]): ResolutionContext => ({
+      getNodesInFile: () => [],
+      getNodesByName: (name) => candidates.filter((c) => c.name === name),
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      fileExists: () => true,
+      readFile: () => null,
+      getProjectRoot: () => '/test',
+      getAllFiles: () => [],
+      getNodesByLowerName: () => [],
+      getImportMappings: () => [],
+    });
+
+    it('prefers a class candidate over a function for `instantiates` refs', () => {
+      // A class and a function share a name across the codebase.
+      // Without the kind bias, the function (which gets the +25 `calls`
+      // bonus historically applied to all candidates of that kind) would
+      // win. Now the instantiates branch reverses it.
+      const fn: Node = {
+        id: 'func:utils.ts:Logger:5', kind: 'function', name: 'Logger',
+        qualifiedName: 'utils.ts::Logger', filePath: 'utils.ts', language: 'typescript',
+        startLine: 5, endLine: 7, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const cls: Node = {
+        id: 'class:logger.ts:Logger:10', kind: 'class', name: 'Logger',
+        qualifiedName: 'logger.ts::Logger', filePath: 'logger.ts', language: 'typescript',
+        startLine: 10, endLine: 30, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+
+      const ref = {
+        fromNodeId: 'func:main.ts:bootstrap:1',
+        referenceName: 'Logger',
+        referenceKind: 'instantiates' as const,
+        line: 5, column: 0, filePath: 'main.ts', language: 'typescript' as const,
+      };
+
+      const result = matchReference(ref, baseContext([fn, cls]));
+      expect(result?.targetNodeId).toBe('class:logger.ts:Logger:10');
+    });
+
+    it('prefers a function candidate over a non-function for `decorates` refs', () => {
+      const variable: Node = {
+        id: 'var:config.ts:Inject:5', kind: 'variable', name: 'Inject',
+        qualifiedName: 'config.ts::Inject', filePath: 'config.ts', language: 'typescript',
+        startLine: 5, endLine: 5, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const decorator: Node = {
+        id: 'func:di.ts:Inject:10', kind: 'function', name: 'Inject',
+        qualifiedName: 'di.ts::Inject', filePath: 'di.ts', language: 'typescript',
+        startLine: 10, endLine: 20, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+
+      const ref = {
+        fromNodeId: 'class:svc.ts:UserService:1',
+        referenceName: 'Inject',
+        referenceKind: 'decorates' as const,
+        line: 5, column: 0, filePath: 'svc.ts', language: 'typescript' as const,
+      };
+
+      const result = matchReference(ref, baseContext([variable, decorator]));
+      expect(result?.targetNodeId).toBe('func:di.ts:Inject:10');
+    });
   });
 });
