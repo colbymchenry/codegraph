@@ -4,13 +4,13 @@
  * Handles SQLite database initialization and connection management.
  */
 
-import { SqliteDatabase, createDatabase } from './sqlite-adapter';
+import { SqliteDatabase, SqliteBackend, createDatabase } from './sqlite-adapter';
 import * as fs from 'fs';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
 
-export { SqliteDatabase, getActiveBackend } from './sqlite-adapter';
+export { SqliteDatabase, SqliteBackend, WASM_FALLBACK_FIX_RECIPE } from './sqlite-adapter';
 
 /**
  * Database connection wrapper with lifecycle management
@@ -18,10 +18,12 @@ export { SqliteDatabase, getActiveBackend } from './sqlite-adapter';
 export class DatabaseConnection {
   private db: SqliteDatabase;
   private dbPath: string;
+  private backend: SqliteBackend;
 
-  private constructor(db: SqliteDatabase, dbPath: string) {
+  private constructor(db: SqliteDatabase, dbPath: string, backend: SqliteBackend) {
     this.db = db;
     this.dbPath = dbPath;
+    this.backend = backend;
   }
 
   /**
@@ -35,7 +37,7 @@ export class DatabaseConnection {
     }
 
     // Create and configure database
-    const db = createDatabase(dbPath);
+    const { db, backend } = createDatabase(dbPath);
 
     // Enable foreign keys and WAL mode for better performance
     db.pragma('foreign_keys = ON');
@@ -62,7 +64,7 @@ export class DatabaseConnection {
       ).run(CURRENT_SCHEMA_VERSION, Date.now(), 'Initial schema includes all migrations');
     }
 
-    return new DatabaseConnection(db, dbPath);
+    return new DatabaseConnection(db, dbPath, backend);
   }
 
   /**
@@ -73,7 +75,7 @@ export class DatabaseConnection {
       throw new Error(`Database not found: ${dbPath}`);
     }
 
-    const db = createDatabase(dbPath);
+    const { db, backend } = createDatabase(dbPath);
 
     // Enable foreign keys and WAL mode
     db.pragma('foreign_keys = ON');
@@ -88,7 +90,7 @@ export class DatabaseConnection {
     db.pragma('mmap_size = 268435456');
 
     // Check and run migrations if needed
-    const conn = new DatabaseConnection(db, dbPath);
+    const conn = new DatabaseConnection(db, dbPath, backend);
     const currentVersion = getCurrentVersion(db);
 
     if (currentVersion < CURRENT_SCHEMA_VERSION) {
@@ -103,6 +105,15 @@ export class DatabaseConnection {
    */
   getDb(): SqliteDatabase {
     return this.db;
+  }
+
+  /**
+   * Get the SQLite backend serving this connection. Per-instance so
+   * MCP cross-project queries report the right backend even when
+   * multiple project DBs are open in the same process.
+   */
+  getBackend(): SqliteBackend {
+    return this.backend;
   }
 
   /**

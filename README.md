@@ -439,6 +439,30 @@ The `.codegraph/config.json` file controls indexing:
 
 **Indexing is slow** — Check that `node_modules` and other large directories are excluded. Use `--quiet` to reduce output overhead.
 
+**Indexing is slow / MCP `database is locked` / WASM fallback active** — `codegraph` ships with a WASM SQLite fallback for environments where `better-sqlite3` (a native module, declared as `optionalDependencies`) can't install. The fallback is 5-10x slower than the native backend and uses a journal mode that lets writers block readers, so MCP queries can also hit `database is locked` while indexing runs. Run `codegraph status` and look at the `Backend:` line:
+
+- `Backend: native` — you're on the fast path, nothing to do.
+- `Backend: wasm` — you're on the slow fallback. Common causes: missing C build tools, prebuilt binary unavailable for your Node version, or your Node version changed after install. Fix:
+
+  ```bash
+  # macOS
+  xcode-select --install                                  # installs the C compiler
+
+  # Linux (Debian / Ubuntu)
+  sudo apt install build-essential python3 make
+
+  # Linux (RHEL / Fedora)
+  sudo yum groupinstall "Development Tools"
+
+  # Then rebuild on any platform:
+  npm rebuild better-sqlite3
+
+  # Or force-include as a hard dep:
+  npm install better-sqlite3 --save
+  ```
+
+  After the fix, `codegraph status` should show `Backend: native`.
+
 **MCP server not connecting** — Ensure the project is initialized/indexed, verify the path in your MCP config, and check that `codegraph serve --mcp` works from the command line.
 
 **Missing symbols** — The MCP server auto-syncs on save (wait a couple seconds). Run `codegraph sync` manually if needed. Check that the file's language is supported and isn't excluded by config patterns.

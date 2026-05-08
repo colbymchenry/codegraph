@@ -22,13 +22,51 @@ export interface SqliteDatabase {
 
 export type SqliteBackend = 'native' | 'wasm';
 
-let activeBackend: SqliteBackend | null = null;
+/**
+ * One-line summary of the recovery steps shown when WASM fallback is
+ * active. Single source of truth so the recipe can't drift between the
+ * stderr banner and the MCP status formatter.
+ */
+export const WASM_FALLBACK_FIX_RECIPE =
+  '`xcode-select --install` (macOS) or `apt install build-essential` (Debian/Ubuntu), ' +
+  'then `npm rebuild better-sqlite3`, or `npm install better-sqlite3 --save` to force-include it.';
 
 /**
- * Get the currently active SQLite backend.
+ * Multi-line banner shown to stderr when `createDatabase` falls back to
+ * WASM. Replaces a one-line `console.warn` that MCP transports (which
+ * take stdout for the protocol) typically swallow, leaving users on a
+ * 5-10x slower backend with no signal.
+ *
+ * Exported for unit testing — pinning the recipe content prevents
+ * future edits from silently stripping the recovery commands.
  */
-export function getActiveBackend(): SqliteBackend | null {
-  return activeBackend;
+export function buildWasmFallbackBanner(nativeError?: string): string {
+  const sep = '─'.repeat(72);
+  const lines = [
+    sep,
+    '[CodeGraph] WASM SQLite fallback active (better-sqlite3 unavailable)',
+    sep,
+    'Indexing and sync will be 5-10x slower than the native backend.',
+    '',
+    'Fix on macOS:',
+    '  xcode-select --install        # install C build tools',
+    '  npm rebuild better-sqlite3    # rebuild native binding for current Node',
+    '',
+    'Fix on Linux:',
+    '  sudo apt install build-essential python3 make    # Debian/Ubuntu',
+    '  # or: sudo yum groupinstall "Development Tools"  # RHEL/Fedora',
+    '  npm rebuild better-sqlite3',
+    '',
+    'Or force-include as a hard dependency on any platform:',
+    '  npm install better-sqlite3 --save',
+    '',
+    'Verify after fix: `codegraph status` should show `Backend: native`.',
+  ];
+  if (nativeError) {
+    lines.push('', `Native load error: ${nativeError}`);
+  }
+  lines.push(sep);
+  return lines.join('\n');
 }
 
 /**
@@ -192,9 +230,13 @@ class WasmDatabaseAdapter implements SqliteDatabase {
 
 /**
  * Create a database connection. Tries native better-sqlite3 first,
- * falls back to node-sqlite3-wasm.
+ * falls back to node-sqlite3-wasm. Returns the active backend
+ * alongside the db so each `DatabaseConnection` can report its own
+ * backend per-instance — MCP can open multiple project DBs in one
+ * process (`tools.ts` getCodeGraph cache), so a process-global would
+ * race / overwrite.
  */
-export function createDatabase(dbPath: string): SqliteDatabase {
+export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: SqliteBackend } {
   let nativeError: string | undefined;
   let wasmError: string | undefined;
 
@@ -203,8 +245,7 @@ export function createDatabase(dbPath: string): SqliteDatabase {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const Database = require('better-sqlite3');
     const db = new Database(dbPath);
-    activeBackend = 'native';
-    return db as SqliteDatabase;
+    return { db: db as SqliteDatabase, backend: 'native' };
   } catch (error) {
     nativeError = error instanceof Error ? error.message : String(error);
   }
@@ -212,9 +253,8 @@ export function createDatabase(dbPath: string): SqliteDatabase {
   // Fall back to WASM
   try {
     const db = new WasmDatabaseAdapter(dbPath);
-    activeBackend = 'wasm';
-    console.warn('[CodeGraph] Using WASM SQLite backend (native better-sqlite3 unavailable)');
-    return db;
+    console.warn(buildWasmFallbackBanner(nativeError));
+    return { db, backend: 'wasm' };
   } catch (error) {
     wasmError = error instanceof Error ? error.message : String(error);
   }

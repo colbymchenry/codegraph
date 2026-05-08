@@ -11,6 +11,7 @@ import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { clamp, validatePathWithinRoot } from '../utils';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { WASM_FALLBACK_FIX_RECIPE } from '../db';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -973,9 +974,22 @@ export class ToolHandler {
       `**Total nodes:** ${stats.nodeCount}`,
       `**Total edges:** ${stats.edgeCount}`,
       `**Database size:** ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`,
-      '',
-      '### Nodes by Kind:',
     ];
+
+    // Surface the active SQLite backend. Without this, users on the
+    // silent WASM fallback (better-sqlite3 install failed) see "slow"
+    // indexing and DB-lock errors with no signal of why.
+    const backend = cg.getBackend();
+    if (backend === 'native') {
+      lines.push(`**Backend:** native (better-sqlite3)`);
+    } else {
+      lines.push(
+        `**Backend:** ⚠ wasm (better-sqlite3 unavailable) — ` +
+        `5-10x slower than native. Fix: ${WASM_FALLBACK_FIX_RECIPE}`
+      );
+    }
+
+    lines.push('', '### Nodes by Kind:');
 
     for (const [kind, count] of Object.entries(stats.nodesByKind)) {
       if ((count as number) > 0) {

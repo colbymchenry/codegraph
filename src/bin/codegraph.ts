@@ -643,6 +643,7 @@ program
       const cg = await CodeGraph.open(projectPath);
       const stats = cg.getStats();
       const changes = cg.getChangedFiles();
+      const backend = cg.getBackend();
 
       // JSON output mode
       if (options.json) {
@@ -653,6 +654,7 @@ program
           nodeCount: stats.nodeCount,
           edgeCount: stats.edgeCount,
           dbSizeBytes: stats.dbSizeBytes,
+          backend,
           nodesByKind: stats.nodesByKind,
           languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
           pendingChanges: {
@@ -677,6 +679,14 @@ program
       console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);
       console.log(`  Edges:     ${formatNumber(stats.edgeCount)}`);
       console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
+      // Surface the active SQLite backend so users can spot the silent
+      // WASM fallback (5-10x slower). better-sqlite3 is in
+      // `optionalDependencies`, so `npm install` succeeds without it
+      // when the native build fails.
+      const backendLabel = backend === 'native'
+        ? chalk.green('native')
+        : chalk.yellow('wasm — slower fallback; run `npm rebuild better-sqlite3`');
+      console.log(`  Backend:   ${backendLabel}`);
       console.log();
 
       // Node breakdown
