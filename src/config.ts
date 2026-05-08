@@ -67,7 +67,6 @@ export function validateConfig(config: unknown): config is CodeGraphConfig {
   if (typeof c.maxFileSize !== 'number') return false;
   if (typeof c.extractDocstrings !== 'boolean') return false;
   if (typeof c.trackCallSites !== 'boolean') return false;
-  if (typeof c.enableEmbeddings !== 'boolean') return false;
 
   // Validate include/exclude are string arrays
   if (!c.include.every((p) => typeof p === 'string')) return false;
@@ -128,7 +127,6 @@ function mergeConfig(
     maxFileSize: overrides.maxFileSize ?? defaults.maxFileSize,
     extractDocstrings: overrides.extractDocstrings ?? defaults.extractDocstrings,
     trackCallSites: overrides.trackCallSites ?? defaults.trackCallSites,
-    enableEmbeddings: overrides.enableEmbeddings ?? defaults.enableEmbeddings,
     customPatterns: overrides.customPatterns ?? defaults.customPatterns,
   };
 }

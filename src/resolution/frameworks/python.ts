@@ -34,7 +34,7 @@ export const djangoResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Model references
     if (ref.referenceName.endsWith('Model') || /^[A-Z][a-z]+$/.test(ref.referenceName)) {
-      const result = resolveModel(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, MODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -47,7 +47,7 @@ export const djangoResolver: FrameworkResolver = {
 
     // Pattern 2: View references
     if (ref.referenceName.endsWith('View') || ref.referenceName.endsWith('ViewSet')) {
-      const result = resolveView(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, VIEW_KINDS, VIEW_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -60,7 +60,7 @@ export const djangoResolver: FrameworkResolver = {
 
     // Pattern 3: Form references
     if (ref.referenceName.endsWith('Form')) {
-      const result = resolveForm(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, FORM_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -140,7 +140,7 @@ export const flaskResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Blueprint references
     if (ref.referenceName.endsWith('_bp') || ref.referenceName.endsWith('_blueprint')) {
-      const result = resolveBlueprint(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, VARIABLE_KINDS, [], context);
       if (result) {
         return {
           original: ref,
@@ -215,7 +215,7 @@ export const fastapiResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Router references
     if (ref.referenceName.endsWith('_router') || ref.referenceName === 'router') {
-      const result = resolveRouter(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, VARIABLE_KINDS, ROUTER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -228,7 +228,7 @@ export const fastapiResolver: FrameworkResolver = {
 
     // Pattern 2: Dependency references
     if (ref.referenceName.startsWith('get_') || ref.referenceName.startsWith('Depends')) {
-      const result = resolveDependency(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, FUNCTION_KINDS, DEP_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -274,126 +274,41 @@ export const fastapiResolver: FrameworkResolver = {
   },
 };
 
-// Helper functions
+// Directory patterns
+const MODEL_DIRS = ['models', 'app/models', 'src/models'];
+const VIEW_DIRS = ['views', 'app/views', 'src/views', 'api/views'];
+const FORM_DIRS = ['forms', 'app/forms', 'src/forms'];
+const ROUTER_DIRS = ['/routers/', '/api/', '/routes/', '/endpoints/'];
+const DEP_DIRS = ['/dependencies/', '/deps/', '/core/'];
 
-function resolveModel(name: string, context: ResolutionContext): string | null {
-  const modelDirs = ['models', 'app/models', 'src/models'];
+const CLASS_KINDS = new Set(['class']);
+const VIEW_KINDS = new Set(['class', 'function']);
+const VARIABLE_KINDS = new Set(['variable']);
+const FUNCTION_KINDS = new Set(['function']);
 
-  for (const dir of modelDirs) {
-    const allFiles = context.getAllFiles();
-    for (const file of allFiles) {
-      if (file.startsWith(dir) && file.endsWith('.py')) {
-        const nodes = context.getNodesInFile(file);
-        const modelNode = nodes.find(
-          (n) => n.kind === 'class' && n.name === name
-        );
-        if (modelNode) {
-          return modelNode.id;
-        }
-      }
-    }
+/**
+ * Resolve a symbol by name using indexed queries instead of scanning all files.
+ */
+function resolveByNameAndKind(
+  name: string,
+  kinds: Set<string>,
+  preferredDirPatterns: string[],
+  context: ResolutionContext,
+): string | null {
+  const candidates = context.getNodesByName(name);
+  if (candidates.length === 0) return null;
+
+  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
+  if (kindFiltered.length === 0) return null;
+
+  // Prefer candidates in framework-conventional directories
+  if (preferredDirPatterns.length > 0) {
+    const preferred = kindFiltered.filter((n) =>
+      preferredDirPatterns.some((d) => n.filePath.includes(d))
+    );
+    if (preferred.length > 0) return preferred[0]!.id;
   }
 
-  return null;
-}
-
-function resolveView(name: string, context: ResolutionContext): string | null {
-  const viewDirs = ['views', 'app/views', 'src/views', 'api/views'];
-
-  for (const dir of viewDirs) {
-    const allFiles = context.getAllFiles();
-    for (const file of allFiles) {
-      if (file.startsWith(dir) && file.endsWith('.py')) {
-        const nodes = context.getNodesInFile(file);
-        const viewNode = nodes.find(
-          (n) => (n.kind === 'class' || n.kind === 'function') && n.name === name
-        );
-        if (viewNode) {
-          return viewNode.id;
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveForm(name: string, context: ResolutionContext): string | null {
-  const formDirs = ['forms', 'app/forms', 'src/forms'];
-
-  for (const dir of formDirs) {
-    const allFiles = context.getAllFiles();
-    for (const file of allFiles) {
-      if (file.startsWith(dir) && file.endsWith('.py')) {
-        const nodes = context.getNodesInFile(file);
-        const formNode = nodes.find(
-          (n) => n.kind === 'class' && n.name === name
-        );
-        if (formNode) {
-          return formNode.id;
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveBlueprint(name: string, context: ResolutionContext): string | null {
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.py')) {
-      const nodes = context.getNodesInFile(file);
-      const bpNode = nodes.find(
-        (n) => n.kind === 'variable' && n.name === name
-      );
-      if (bpNode) {
-        return bpNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveRouter(name: string, context: ResolutionContext): string | null {
-  const routerDirs = ['routers', 'api', 'routes', 'endpoints'];
-
-  for (const dir of routerDirs) {
-    const allFiles = context.getAllFiles();
-    for (const file of allFiles) {
-      if ((file.startsWith(dir) || file.includes('/routers/')) && file.endsWith('.py')) {
-        const nodes = context.getNodesInFile(file);
-        const routerNode = nodes.find(
-          (n) => n.kind === 'variable' && n.name === name
-        );
-        if (routerNode) {
-          return routerNode.id;
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveDependency(name: string, context: ResolutionContext): string | null {
-  const depDirs = ['dependencies', 'deps', 'core'];
-
-  for (const dir of depDirs) {
-    const allFiles = context.getAllFiles();
-    for (const file of allFiles) {
-      if ((file.startsWith(dir) || file.includes('/dependencies/')) && file.endsWith('.py')) {
-        const nodes = context.getNodesInFile(file);
-        const depNode = nodes.find(
-          (n) => n.kind === 'function' && n.name === name
-        );
-        if (depNode) {
-          return depNode.id;
-        }
-      }
-    }
-  }
-
-  return null;
+  // Fall back to any match
+  return kindFiltered[0]!.id;
 }

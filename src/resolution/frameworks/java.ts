@@ -50,7 +50,7 @@ export const springResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Service references (dependency injection)
     if (ref.referenceName.endsWith('Service')) {
-      const result = resolveService(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -63,7 +63,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 2: Repository references
     if (ref.referenceName.endsWith('Repository')) {
-      const result = resolveRepository(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, REPO_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -76,7 +76,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 3: Controller references
     if (ref.referenceName.endsWith('Controller')) {
-      const result = resolveController(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, CONTROLLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -89,7 +89,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 4: Entity/Model references
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveEntity(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, ENTITY_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -102,7 +102,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 5: Component references
     if (ref.referenceName.endsWith('Component') || ref.referenceName.endsWith('Config')) {
-      const result = resolveComponent(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, COMPONENT_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -176,118 +176,38 @@ export const springResolver: FrameworkResolver = {
   },
 };
 
-// Helper functions
+// Directory patterns
+const SERVICE_DIRS = ['/service/', '/services/'];
+const REPO_DIRS = ['/repository/', '/repositories/'];
+const CONTROLLER_DIRS = ['/controller/', '/controllers/'];
+const ENTITY_DIRS = ['/entity/', '/entities/', '/model/', '/models/', '/domain/'];
+const COMPONENT_DIRS = ['/component/', '/components/', '/config/'];
 
-function resolveService(name: string, context: ResolutionContext): string | null {
-  const allFiles = context.getAllFiles();
+const CLASS_KINDS = new Set(['class']);
+const SERVICE_KINDS = new Set(['class', 'interface']);
 
-  for (const file of allFiles) {
-    if (file.endsWith('.java') && (file.includes('/service/') || file.includes('/services/'))) {
-      const nodes = context.getNodesInFile(file);
-      const serviceNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (serviceNode) {
-        return serviceNode.id;
-      }
-    }
-  }
+/**
+ * Resolve a symbol by name using indexed queries instead of scanning all files.
+ */
+function resolveByNameAndKind(
+  name: string,
+  kinds: Set<string>,
+  preferredDirPatterns: string[],
+  context: ResolutionContext,
+): string | null {
+  const candidates = context.getNodesByName(name);
+  if (candidates.length === 0) return null;
 
-  // Also check interface definitions
-  for (const file of allFiles) {
-    if (file.endsWith('.java')) {
-      const nodes = context.getNodesInFile(file);
-      const serviceNode = nodes.find(
-        (n) => (n.kind === 'class' || n.kind === 'interface') && n.name === name
-      );
-      if (serviceNode) {
-        return serviceNode.id;
-      }
-    }
-  }
+  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
+  if (kindFiltered.length === 0) return null;
 
-  return null;
-}
+  // Prefer candidates in framework-conventional directories
+  const preferred = kindFiltered.filter((n) =>
+    preferredDirPatterns.some((d) => n.filePath.includes(d))
+  );
 
-function resolveRepository(name: string, context: ResolutionContext): string | null {
-  const allFiles = context.getAllFiles();
+  if (preferred.length > 0) return preferred[0]!.id;
 
-  for (const file of allFiles) {
-    if (file.endsWith('.java') && (file.includes('/repository/') || file.includes('/repositories/'))) {
-      const nodes = context.getNodesInFile(file);
-      const repoNode = nodes.find(
-        (n) => (n.kind === 'class' || n.kind === 'interface') && n.name === name
-      );
-      if (repoNode) {
-        return repoNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveController(name: string, context: ResolutionContext): string | null {
-  const allFiles = context.getAllFiles();
-
-  for (const file of allFiles) {
-    if (file.endsWith('.java') && (file.includes('/controller/') || file.includes('/controllers/'))) {
-      const nodes = context.getNodesInFile(file);
-      const controllerNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (controllerNode) {
-        return controllerNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveEntity(name: string, context: ResolutionContext): string | null {
-  const allFiles = context.getAllFiles();
-
-  // Check entity/model directories first
-  for (const file of allFiles) {
-    if (file.endsWith('.java') && (
-      file.includes('/entity/') ||
-      file.includes('/entities/') ||
-      file.includes('/model/') ||
-      file.includes('/models/') ||
-      file.includes('/domain/')
-    )) {
-      const nodes = context.getNodesInFile(file);
-      const entityNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (entityNode) {
-        return entityNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveComponent(name: string, context: ResolutionContext): string | null {
-  const allFiles = context.getAllFiles();
-
-  for (const file of allFiles) {
-    if (file.endsWith('.java') && (
-      file.includes('/component/') ||
-      file.includes('/components/') ||
-      file.includes('/config/')
-    )) {
-      const nodes = context.getNodesInFile(file);
-      const componentNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (componentNode) {
-        return componentNode.id;
-      }
-    }
-  }
-
-  return null;
+  // Fall back to any match
+  return kindFiltered[0]!.id;
 }

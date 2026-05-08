@@ -1,14 +1,24 @@
 /**
  * CodeGraph Interactive Installer
  *
- * Provides a beautiful interactive CLI experience for setting up CodeGraph
- * with Claude Code.
+ * Uses @clack/prompts for a polished interactive CLI experience.
  */
 
 import { execSync } from 'child_process';
-import { showBanner, showNextSteps, success, error, info, chalk } from './banner';
-import { promptInstallLocation, promptAutoAllow, InstallLocation } from './prompts';
-import { writeMcpConfig, writePermissions, writeClaudeMd, writeHooks, hasMcpConfig, hasPermissions, hasHooks } from './config-writer';
+import * as path from 'path';
+import * as fs from 'fs';
+import {
+  writeMcpConfig, writePermissions, writeClaudeMd,
+  hasMcpConfig, hasPermissions,
+} from './config-writer';
+
+import type { InstallLocation } from './config-writer';
+
+// Dynamic import helper — tsc compiles import() to require() in CJS mode,
+// which fails for ESM-only packages. This bypasses the transformation.
+// eslint-disable-next-line @typescript-eslint/no-implied-eval
+const importESM = new Function('specifier', 'return import(specifier)') as
+  (specifier: string) => Promise<typeof import('@clack/prompts')>;
 
 /**
  * Format a number with commas
@@ -18,100 +28,134 @@ function formatNumber(n: number): string {
 }
 
 /**
+ * Get the package version
+ */
+function getVersion(): string {
+  try {
+    const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+    return packageJson.version;
+  } catch {
+    return '0.0.0';
+  }
+}
+
+/**
  * Run the interactive installer
  */
 export async function runInstaller(): Promise<void> {
-  // Show the banner
-  showBanner();
+  const clack = await importESM('@clack/prompts');
 
-  try {
-    // Step 1: Install codegraph globally.
-    // Always run npm install -g — we can't use `command -v codegraph` to check
-    // because npx puts a temporary binary in PATH that vanishes when npx exits.
-    console.log(chalk.dim('  Installing codegraph globally...'));
+  clack.intro(`CodeGraph v${getVersion()}`);
+
+  // Step 1: Install globally
+  const shouldInstallGlobally = await clack.confirm({
+    message: 'Install codegraph globally? (Required for MCP server)',
+    initialValue: true,
+  });
+
+  if (clack.isCancel(shouldInstallGlobally)) {
+    clack.cancel('Installation cancelled.');
+    process.exit(0);
+  }
+
+  if (shouldInstallGlobally) {
+    const s = clack.spinner();
+    s.start('Installing codegraph globally...');
     try {
       execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe' });
-      success('Installed codegraph command globally');
+      s.stop('Installed codegraph globally');
     } catch {
-      info('Could not install globally (permission denied)');
-      info('Try: sudo npm install -g @colbymchenry/codegraph');
+      s.stop('Could not install globally (permission denied)');
+      clack.log.warn('Try: sudo npm install -g @colbymchenry/codegraph');
     }
-    console.log();
+  } else {
+    clack.log.info('Skipped global install — MCP server may not work without it');
+  }
 
-    // Step 2: Ask for installation location
-    const location = await promptInstallLocation();
-    console.log();
+  // Step 2: Installation location
+  const location = await clack.select({
+    message: 'Where would you like to install?',
+    options: [
+      { value: 'global' as const, label: 'Global', hint: '~/.claude — available in all projects' },
+      { value: 'local' as const, label: 'Local', hint: './.claude — this project only' },
+    ],
+    initialValue: 'global' as const,
+  });
 
-    // Step 3: Write MCP configuration (always uses npx for reliability)
-    const alreadyHasMcp = hasMcpConfig(location);
-    writeMcpConfig(location);
+  if (clack.isCancel(location)) {
+    clack.cancel('Installation cancelled.');
+    process.exit(0);
+  }
 
-    if (alreadyHasMcp) {
-      success(`Updated MCP server in ${location === 'global' ? '~/.claude.json' : './.claude.json'}`);
-    } else {
-      success(`Added MCP server to ${location === 'global' ? '~/.claude.json' : './.claude.json'}`);
-    }
+  // Step 3: Auto-allow permissions
+  const autoAllow = await clack.confirm({
+    message: 'Auto-allow CodeGraph commands? (Skips permission prompts)',
+    initialValue: true,
+  });
 
-    // Step 4: Ask about auto-allow permissions
-    const autoAllow = await promptAutoAllow();
-    console.log();
+  if (clack.isCancel(autoAllow)) {
+    clack.cancel('Installation cancelled.');
+    process.exit(0);
+  }
 
-    if (autoAllow) {
-      const alreadyHasPerms = hasPermissions(location);
-      writePermissions(location);
+  // Step 4: Write configuration files
+  writeConfigs(clack, location, autoAllow);
 
-      if (alreadyHasPerms) {
-        success(`Updated permissions in ${location === 'global' ? '~/.claude/settings.json' : './.claude/settings.json'}`);
-      } else {
-        success(`Added permissions to ${location === 'global' ? '~/.claude/settings.json' : './.claude/settings.json'}`);
-      }
-    }
+  // Step 5: For local install, initialize the project
+  if (location === 'local') {
+    await initializeLocalProject(clack);
+  }
 
-    // Step 5: Write auto-sync hooks
-    const alreadyHasHooks = hasHooks(location);
-    writeHooks(location);
+  // Done
+  if (location === 'global') {
+    clack.note(
+      'cd your-project\ncodegraph init -i',
+      'Quick start',
+    );
+  }
 
-    if (alreadyHasHooks) {
-      success(`Updated auto-sync hooks in ${location === 'global' ? '~/.claude/settings.json' : './.claude/settings.json'}`);
-    } else {
-      success(`Added auto-sync hooks to ${location === 'global' ? '~/.claude/settings.json' : './.claude/settings.json'}`);
-    }
+  clack.outro('Done! Restart Claude Code to use CodeGraph.');
+}
 
-    // Step 6: Write CLAUDE.md instructions
-    const claudeMdResult = writeClaudeMd(location);
-    const claudeMdPath = location === 'global' ? '~/.claude/CLAUDE.md' : './.claude/CLAUDE.md';
+/**
+ * Write all configuration files and log results
+ */
+function writeConfigs(
+  clack: typeof import('@clack/prompts'),
+  location: InstallLocation,
+  autoAllow: boolean,
+): void {
+  const locationLabel = location === 'global' ? '~/.claude' : './.claude';
 
-    if (claudeMdResult.created) {
-      success(`Created ${claudeMdPath} with CodeGraph instructions`);
-    } else if (claudeMdResult.updated) {
-      success(`Updated CodeGraph section in ${claudeMdPath}`);
-    } else {
-      success(`Added CodeGraph instructions to ${claudeMdPath}`);
-    }
+  // MCP config
+  const mcpAction = hasMcpConfig(location) ? 'Updated' : 'Added';
+  writeMcpConfig(location);
+  clack.log.success(`${mcpAction} MCP server in ${locationLabel}.json`);
 
-    // Step 7: For local install, initialize the project
-    if (location === 'local') {
-      await initializeLocalProject();
-    }
+  // Permissions
+  if (autoAllow) {
+    const permAction = hasPermissions(location) ? 'Updated' : 'Added';
+    writePermissions(location);
+    clack.log.success(`${permAction} permissions in ${locationLabel}/settings.json`);
+  }
 
-    // Show next steps
-    showNextSteps(location);
-  } catch (err) {
-    console.log();
-    if (err instanceof Error && err.message.includes('readline was closed')) {
-      // User cancelled with Ctrl+C
-      console.log(chalk.dim('  Installation cancelled.'));
-    } else {
-      error(`Installation failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    process.exit(1);
+  // CLAUDE.md
+  const claudeMdResult = writeClaudeMd(location);
+  const claudeMdPath = `${locationLabel}/CLAUDE.md`;
+  if (claudeMdResult.created) {
+    clack.log.success(`Created ${claudeMdPath}`);
+  } else if (claudeMdResult.updated) {
+    clack.log.success(`Updated ${claudeMdPath}`);
+  } else {
+    clack.log.success(`Added CodeGraph instructions to ${claudeMdPath}`);
   }
 }
 
 /**
  * Initialize CodeGraph in the current project (for local installs)
  */
-async function initializeLocalProject(): Promise<void> {
+async function initializeLocalProject(clack: typeof import('@clack/prompts')): Promise<void> {
   const projectPath = process.cwd();
 
   // Lazy-load CodeGraph (requires native modules)
@@ -120,52 +164,40 @@ async function initializeLocalProject(): Promise<void> {
     CodeGraph = (await import('../index')).default;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    error(`Could not load native modules: ${msg}`);
-    info('Skipping project initialization. You can run "codegraph init -i" later.');
-    info('If this persists, try a Node.js LTS version (20 or 22).');
+    clack.log.error(`Could not load native modules: ${msg}`);
+    clack.log.info('Skipping project initialization. Run "codegraph init -i" later.');
     return;
   }
 
   // Check if already initialized
   if (CodeGraph.isInitialized(projectPath)) {
-    info('CodeGraph already initialized in this project');
+    clack.log.info('CodeGraph already initialized in this project');
     return;
   }
 
-  console.log();
-  console.log(chalk.dim('  Initializing CodeGraph in current project...'));
-
-  // Initialize CodeGraph
+  // Initialize
   const cg = await CodeGraph.init(projectPath);
-  success('Created .codegraph/ directory');
+  clack.log.success('Created .codegraph/ directory');
 
-  // Index the project
+  // Index the project with shimmer progress (worker thread for smooth animation)
+  const { createShimmerProgress } = await import('../ui/shimmer-progress');
+  process.stdout.write(`\x1b[2m│\x1b[0m\n`);
+  const progress = createShimmerProgress();
+
   const result = await cg.indexAll({
-    onProgress: (progress) => {
-      // Simple progress indicator
-      const phaseNames: Record<string, string> = {
-        scanning: 'Scanning files',
-        parsing: 'Parsing code',
-        storing: 'Storing data',
-        resolving: 'Resolving refs',
-      };
-      const phaseName = phaseNames[progress.phase] || progress.phase;
-      const percent = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
-      process.stdout.write(`\r  ${chalk.dim(phaseName)}... ${percent}%   `);
-    },
+    onProgress: progress.onProgress,
   });
 
-  // Clear progress line
-  process.stdout.write('\r' + ' '.repeat(50) + '\r');
+  await progress.stop();
 
-  if (result.success) {
-    success(`Indexed ${formatNumber(result.filesIndexed)} files (${formatNumber(result.nodesCreated)} symbols)`);
+  if (result.filesErrored > 0) {
+    clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files (${formatNumber(result.filesErrored)} failed, ${formatNumber(result.nodesCreated)} symbols)`);
   } else {
-    success(`Indexed ${formatNumber(result.filesIndexed)} files with ${result.errors.length} warnings`);
+    clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files (${formatNumber(result.nodesCreated)} symbols)`);
   }
 
   cg.close();
 }
 
-// Export for use in CLI
-export { InstallLocation };
+// Re-export for CLI
+export type { InstallLocation };

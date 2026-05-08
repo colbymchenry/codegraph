@@ -9,31 +9,38 @@
 // =============================================================================
 
 /**
- * Types of nodes in the knowledge graph
+ * Types of nodes in the knowledge graph.
+ *
+ * Defined as a runtime-iterable `as const` array so the same source
+ * of truth backs both the TS type and any runtime validation
+ * (e.g. the search query parser).
  */
-export type NodeKind =
-  | 'file'
-  | 'module'
-  | 'class'
-  | 'struct'
-  | 'interface'
-  | 'trait'
-  | 'protocol'
-  | 'function'
-  | 'method'
-  | 'property'
-  | 'field'
-  | 'variable'
-  | 'constant'
-  | 'enum'
-  | 'enum_member'
-  | 'type_alias'
-  | 'namespace'
-  | 'parameter'
-  | 'import'
-  | 'export'
-  | 'route'
-  | 'component';
+export const NODE_KINDS = [
+  'file',
+  'module',
+  'class',
+  'struct',
+  'interface',
+  'trait',
+  'protocol',
+  'function',
+  'method',
+  'property',
+  'field',
+  'variable',
+  'constant',
+  'enum',
+  'enum_member',
+  'type_alias',
+  'namespace',
+  'parameter',
+  'import',
+  'export',
+  'route',
+  'component',
+] as const;
+
+export type NodeKind = (typeof NODE_KINDS)[number];
 
 /**
  * Types of edges (relationships) between nodes
@@ -53,30 +60,34 @@ export type EdgeKind =
   | 'decorates';      // Decorator applied to symbol
 
 /**
- * Supported programming languages
+ * Supported programming languages. See NODE_KINDS for why this is a
+ * runtime-iterable const array.
  */
-export type Language =
-  | 'typescript'
-  | 'javascript'
-  | 'tsx'
-  | 'jsx'
-  | 'python'
-  | 'go'
-  | 'rust'
-  | 'java'
-  | 'c'
-  | 'cpp'
-  | 'csharp'
-  | 'php'
-  | 'ruby'
-  | 'swift'
-  | 'kotlin'
-  | 'dart'
-  | 'svelte'
-  | 'vue'
-  | 'liquid'
-  | 'pascal'
-  | 'unknown';
+export const LANGUAGES = [
+  'typescript',
+  'javascript',
+  'tsx',
+  'jsx',
+  'python',
+  'go',
+  'rust',
+  'java',
+  'c',
+  'cpp',
+  'csharp',
+  'php',
+  'ruby',
+  'swift',
+  'kotlin',
+  'dart',
+  'svelte',
+  'vue',
+  'liquid',
+  'pascal',
+  'unknown',
+] as const;
+
+export type Language = (typeof LANGUAGES)[number];
 
 // =============================================================================
 // Core Graph Types
@@ -232,6 +243,9 @@ export interface ExtractionResult {
 export interface ExtractionError {
   /** Error message */
   message: string;
+
+  /** File path where the error occurred */
+  filePath?: string;
 
   /** Line number if available */
   line?: number;
@@ -463,9 +477,6 @@ export interface CodeGraphConfig {
   /** Whether to track call sites */
   trackCallSites: boolean;
 
-  /** Whether to compute embeddings for semantic search */
-  enableEmbeddings: boolean;
-
   /** Custom symbol patterns to extract */
   customPatterns?: {
     /** Name for this pattern group */
@@ -678,7 +689,6 @@ export const DEFAULT_CONFIG: CodeGraphConfig = {
   maxFileSize: 1024 * 1024, // 1MB
   extractDocstrings: true,
   trackCallSites: true,
-  enableEmbeddings: false,
 };
 
 // =============================================================================

@@ -81,8 +81,14 @@ export class GraphTraverser {
         continue;
       }
 
-      // Get adjacent edges
+      // Get adjacent edges, prioritizing structural edges (contains, calls)
+      // over reference edges so BFS discovers internal structure before
+      // fanning out to external references (e.g., component usages in templates).
       const adjacentEdges = this.getAdjacentEdges(node.id, opts.direction, opts.edgeKinds);
+      adjacentEdges.sort((a, b) => {
+        const priority = (e: Edge) => e.kind === 'contains' ? 0 : e.kind === 'calls' ? 1 : 2;
+        return priority(a) - priority(b);
+      });
 
       for (const adjEdge of adjacentEdges) {
         // Determine next node: for 'both' direction, edges can be either
@@ -248,7 +254,7 @@ export class GraphTraverser {
     }
     visited.add(nodeId);
 
-    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls']);
+    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports']);
 
     for (const edge of incomingEdges) {
       const callerNode = this.queries.getNodeById(edge.source);
@@ -287,7 +293,7 @@ export class GraphTraverser {
     }
     visited.add(nodeId);
 
-    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls']);
+    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports']);
 
     for (const edge of outgoingEdges) {
       const calleeNode = this.queries.getNodeById(edge.target);
@@ -482,6 +488,25 @@ export class GraphTraverser {
       return;
     }
     visited.add(nodeId);
+
+    // For container nodes (classes, interfaces, structs, etc.), also traverse
+    // into their children so that callers of contained methods appear in impact
+    const focalNode = this.queries.getNodeById(nodeId);
+    if (focalNode) {
+      const containerKinds = new Set(['class', 'interface', 'struct', 'trait', 'protocol', 'module', 'enum']);
+      if (containerKinds.has(focalNode.kind)) {
+        const containsEdges = this.queries.getOutgoingEdges(nodeId, ['contains']);
+        for (const edge of containsEdges) {
+          const childNode = this.queries.getNodeById(edge.target);
+          if (childNode && !visited.has(childNode.id)) {
+            nodes.set(childNode.id, childNode);
+            edges.push(edge);
+            // Recurse into children at the same depth (they're part of the same symbol)
+            this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited);
+          }
+        }
+      }
+    }
 
     // Get all incoming edges (things that depend on this node)
     const incomingEdges = this.queries.getIncomingEdges(nodeId);

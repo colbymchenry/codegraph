@@ -46,9 +46,9 @@ import {
   ResolutionResult,
 } from './resolution';
 import { GraphTraverser, GraphQueryManager } from './graph';
-import { VectorManager, createVectorManager, EmbeddingProgress } from './vectors';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
+import { FileWatcher, WatchOptions } from './sync';
 
 // Re-export types for consumers
 export * from './types';
@@ -63,7 +63,6 @@ export {
 export { IndexProgress, IndexResult, SyncResult } from './extraction';
 export { detectLanguage, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './extraction';
 export { ResolutionResult } from './resolution';
-export { EmbeddingProgress } from './vectors';
 export {
   CodeGraphError,
   FileError,
@@ -79,6 +78,7 @@ export {
   defaultLogger,
 } from './errors';
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
+export { FileWatcher, WatchOptions } from './sync';
 export { MCPServer } from './mcp';
 
 /**
@@ -115,6 +115,9 @@ export interface IndexOptions {
 
   /** Abort signal for cancellation */
   signal?: AbortSignal;
+
+  /** Enable verbose logging (worker lifecycle, memory, timeouts) */
+  verbose?: boolean;
 }
 
 /**
@@ -131,7 +134,6 @@ export class CodeGraph {
   private resolver: ReferenceResolver;
   private graphManager: GraphQueryManager;
   private traverser: GraphTraverser;
-  private vectorManager: VectorManager | null = null;
   private contextBuilder: ContextBuilder;
 
   // Mutex for preventing concurrent indexing operations (in-process)
@@ -139,6 +141,9 @@ export class CodeGraph {
 
   // File lock for preventing concurrent writes across processes (CLI, MCP, git hooks)
   private fileLock: FileLock;
+
+  // File watcher for auto-sync on file changes
+  private watcher: FileWatcher | null = null;
 
   private constructor(
     db: DatabaseConnection,
@@ -157,17 +162,10 @@ export class CodeGraph {
     this.resolver = createResolver(projectRoot, queries);
     this.graphManager = new GraphQueryManager(queries);
     this.traverser = new GraphTraverser(queries);
-    // Vector manager is created lazily when embeddings are enabled
-    // Uses global ~/.codegraph/models directory for shared embedding models
-    if (config.enableEmbeddings) {
-      this.vectorManager = createVectorManager(db.getDb(), queries, {});
-    }
-    // Context builder (uses vector manager if available)
     this.contextBuilder = createContextBuilder(
       projectRoot,
       queries,
-      this.traverser,
-      this.vectorManager
+      this.traverser
     );
   }
 
@@ -326,13 +324,9 @@ export class CodeGraph {
    * Close the CodeGraph instance and release resources
    */
   close(): void {
+    this.unwatch();
     // Release file lock if held
     this.fileLock.release();
-    // Dispose vector manager first to release ONNX workers
-    if (this.vectorManager) {
-      this.vectorManager.dispose();
-      this.vectorManager = null;
-    }
     this.db.close();
   }
 
@@ -383,15 +377,15 @@ export class CodeGraph {
       try {
         this.fileLock.acquire();
       } catch {
-        return { success: false, filesIndexed: 0, filesSkipped: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
+        return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
-        const result = await this.orchestrator.indexAll(options.onProgress, options.signal);
+        const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
 
         // Resolve references to create call/import/extends edges
         if (result.success && result.filesIndexed > 0) {
-          // Get count of unresolved references for accurate progress
-          const unresolvedCount = this.queries.getUnresolvedReferences().length;
+          // Get count without loading all refs into memory
+          const unresolvedCount = this.queries.getUnresolvedReferencesCount();
 
           options.onProgress?.({
             phase: 'resolving',
@@ -399,7 +393,7 @@ export class CodeGraph {
             total: unresolvedCount,
           });
 
-          this.resolveReferences((current, total) => {
+          await this.resolveReferencesBatched((current, total) => {
             options.onProgress?.({
               phase: 'resolving',
               current,
@@ -425,7 +419,7 @@ export class CodeGraph {
       try {
         this.fileLock.acquire();
       } catch {
-        return { success: false, filesIndexed: 0, filesSkipped: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
+        return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
         return this.orchestrator.indexFiles(filePaths);
@@ -452,24 +446,41 @@ export class CodeGraph {
 
         // Resolve references if files were updated
         if (result.filesAdded > 0 || result.filesModified > 0) {
-          // Scope resolution to changed files when available (git fast path)
-          const unresolvedRefs = result.changedFilePaths
-            ? this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths)
-            : this.queries.getUnresolvedReferences();
+          if (result.changedFilePaths) {
+            // Scope resolution to changed files (git fast path — bounded set)
+            const unresolvedRefs = this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths);
 
-          options.onProgress?.({
-            phase: 'resolving',
-            current: 0,
-            total: unresolvedRefs.length,
-          });
-
-          this.resolver.resolveAndPersist(unresolvedRefs, (current, total) => {
             options.onProgress?.({
               phase: 'resolving',
-              current,
-              total,
+              current: 0,
+              total: unresolvedRefs.length,
             });
-          });
+
+            this.resolver.resolveAndPersist(unresolvedRefs, (current, total) => {
+              options.onProgress?.({
+                phase: 'resolving',
+                current,
+                total,
+              });
+            });
+          } else {
+            // No git info — use batched resolution to avoid OOM
+            const unresolvedCount = this.queries.getUnresolvedReferencesCount();
+
+            options.onProgress?.({
+              phase: 'resolving',
+              current: 0,
+              total: unresolvedCount,
+            });
+
+            await this.resolveReferencesBatched((current, total) => {
+              options.onProgress?.({
+                phase: 'resolving',
+                current,
+                total,
+              });
+            });
+          }
         }
 
         return result;
@@ -484,6 +495,53 @@ export class CodeGraph {
    */
   isIndexing(): boolean {
     return this.indexMutex.isLocked();
+  }
+
+  // ===========================================================================
+  // File Watching
+  // ===========================================================================
+
+  /**
+   * Start watching for file changes and auto-syncing.
+   *
+   * Uses native OS file events (FSEvents on macOS, inotify on Linux 19+,
+   * ReadDirectoryChangesW on Windows) with debouncing to avoid thrashing.
+   *
+   * @param options - Watch options (debounce delay, callbacks)
+   * @returns true if watching started successfully
+   */
+  watch(options: WatchOptions = {}): boolean {
+    if (this.watcher?.isActive()) return true;
+
+    this.watcher = new FileWatcher(
+      this.projectRoot,
+      this.config,
+      async () => {
+        const result = await this.sync();
+        const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
+        return { filesChanged, durationMs: result.durationMs };
+      },
+      options
+    );
+
+    return this.watcher.start();
+  }
+
+  /**
+   * Stop watching for file changes.
+   */
+  unwatch(): void {
+    if (this.watcher) {
+      this.watcher.stop();
+      this.watcher = null;
+    }
+  }
+
+  /**
+   * Check if the file watcher is active.
+   */
+  isWatching(): boolean {
+    return this.watcher?.isActive() ?? false;
   }
 
   /**
@@ -517,6 +575,14 @@ export class CodeGraph {
     // Get all unresolved references from the database
     const unresolvedRefs = this.queries.getUnresolvedReferences();
     return this.resolver.resolveAndPersist(unresolvedRefs, onProgress);
+  }
+
+  /**
+   * Resolve references in batches to keep memory bounded on large codebases.
+   * Processes chunks of unresolved refs, persisting results after each batch.
+   */
+  async resolveReferencesBatched(onProgress?: (current: number, total: number) => void): Promise<ResolutionResult> {
+    return this.resolver.resolveAndPersistBatched(onProgress);
   }
 
   /**
@@ -814,102 +880,6 @@ export class CodeGraph {
   }
 
   // ===========================================================================
-  // Semantic Search (Vector Embeddings)
-  // ===========================================================================
-
-  /**
-   * Initialize the embedding system
-   *
-   * This downloads the embedding model on first use and initializes
-   * the vector search system. Must be called before using semantic search.
-   */
-  async initializeEmbeddings(): Promise<void> {
-    if (!this.vectorManager) {
-      this.vectorManager = createVectorManager(this.db.getDb(), this.queries, {
-        embedder: {
-          showProgress: true,
-        },
-      });
-    }
-    await this.vectorManager.initialize();
-  }
-
-  /**
-   * Check if embeddings are initialized
-   */
-  isEmbeddingsInitialized(): boolean {
-    return this.vectorManager?.isInitialized() ?? false;
-  }
-
-  /**
-   * Generate embeddings for all eligible nodes
-   *
-   * @param onProgress - Optional progress callback
-   * @returns Number of nodes embedded
-   */
-  async generateEmbeddings(
-    onProgress?: (progress: EmbeddingProgress) => void
-  ): Promise<number> {
-    if (!this.vectorManager) {
-      await this.initializeEmbeddings();
-    }
-    return this.vectorManager!.embedAllNodes(onProgress);
-  }
-
-  /**
-   * Semantic search using embeddings
-   *
-   * Searches for code nodes semantically similar to the query.
-   * Requires embeddings to be initialized first.
-   *
-   * @param query - Natural language search query
-   * @param limit - Maximum number of results (default: 10)
-   * @returns Array of search results with similarity scores
-   */
-  async semanticSearch(query: string, limit: number = 10): Promise<SearchResult[]> {
-    if (!this.vectorManager || !this.vectorManager.isInitialized()) {
-      throw new Error(
-        'Embeddings not initialized. Call initializeEmbeddings() first.'
-      );
-    }
-    return this.vectorManager.search(query, { limit });
-  }
-
-  /**
-   * Find similar code blocks
-   *
-   * Finds nodes semantically similar to a given node.
-   * Requires embeddings to be initialized first.
-   *
-   * @param nodeId - ID of the node to find similar nodes for
-   * @param limit - Maximum number of results (default: 10)
-   * @returns Array of similar nodes with similarity scores
-   */
-  async findSimilar(nodeId: string, limit: number = 10): Promise<SearchResult[]> {
-    if (!this.vectorManager || !this.vectorManager.isInitialized()) {
-      throw new Error(
-        'Embeddings not initialized. Call initializeEmbeddings() first.'
-      );
-    }
-    return this.vectorManager.findSimilar(nodeId, { limit });
-  }
-
-  /**
-   * Get vector embedding statistics
-   */
-  getEmbeddingStats(): {
-    totalVectors: number;
-    vssEnabled: boolean;
-    modelId: string;
-    dimension: number;
-  } | null {
-    if (!this.vectorManager) {
-      return null;
-    }
-    return this.vectorManager.getStats();
-  }
-
-  // ===========================================================================
   // Context Building
   // ===========================================================================
 
@@ -939,13 +909,6 @@ export class CodeGraph {
     query: string,
     options?: FindRelevantContextOptions
   ): Promise<Subgraph> {
-    // Update context builder with current vector manager
-    this.contextBuilder = createContextBuilder(
-      this.projectRoot,
-      this.queries,
-      this.traverser,
-      this.vectorManager
-    );
     return this.contextBuilder.findRelevantContext(query, options);
   }
 
@@ -953,7 +916,7 @@ export class CodeGraph {
    * Build context for a task
    *
    * Creates comprehensive context by:
-   * 1. Running semantic search to find entry points
+   * 1. Running FTS search to find entry points
    * 2. Expanding the graph around entry points
    * 3. Extracting code blocks for key nodes
    * 4. Formatting output for Claude
@@ -966,13 +929,6 @@ export class CodeGraph {
     input: TaskInput,
     options?: BuildContextOptions
   ): Promise<TaskContext | string> {
-    // Update context builder with current vector manager
-    this.contextBuilder = createContextBuilder(
-      this.projectRoot,
-      this.queries,
-      this.traverser,
-      this.vectorManager
-    );
     return this.contextBuilder.buildContext(input, options);
   }
 

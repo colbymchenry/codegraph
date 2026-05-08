@@ -189,7 +189,7 @@ export const railsResolver: FrameworkResolver = {
 // Helper functions
 
 function resolveModel(name: string, context: ResolutionContext): string | null {
-  // Convert CamelCase to snake_case for file lookup
+  // Try direct file path lookup first (Rails convention: CamelCase -> snake_case.rb)
   const snakeName = name.replace(/([A-Z])/g, '_$1').toLowerCase().slice(1);
   const possiblePaths = [
     `app/models/${snakeName}.rb`,
@@ -208,25 +208,18 @@ function resolveModel(name: string, context: ResolutionContext): string | null {
     }
   }
 
-  // Search all model files
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.includes('app/models/') && file.endsWith('.rb')) {
-      const nodes = context.getNodesInFile(file);
-      const modelNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (modelNode) {
-        return modelNode.id;
-      }
-    }
-  }
+  // Fall back to name-based lookup
+  const candidates = context.getNodesByName(name);
+  const modelNode = candidates.find(
+    (n) => n.kind === 'class' && n.filePath.includes('app/models/')
+  );
+  if (modelNode) return modelNode.id;
 
   return null;
 }
 
 function resolveController(name: string, context: ResolutionContext): string | null {
-  // Convert CamelCase to snake_case
+  // Try direct file path lookup first
   const snakeName = name.replace(/([A-Z])/g, '_$1').toLowerCase().slice(1);
   const possiblePaths = [
     `app/controllers/${snakeName}.rb`,
@@ -246,19 +239,12 @@ function resolveController(name: string, context: ResolutionContext): string | n
     }
   }
 
-  // Search all controller files
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.includes('controllers/') && file.endsWith('.rb')) {
-      const nodes = context.getNodesInFile(file);
-      const controllerNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (controllerNode) {
-        return controllerNode.id;
-      }
-    }
-  }
+  // Fall back to name-based lookup
+  const candidates = context.getNodesByName(name);
+  const controllerNode = candidates.find(
+    (n) => n.kind === 'class' && n.filePath.includes('controllers/')
+  );
+  if (controllerNode) return controllerNode.id;
 
   return null;
 }

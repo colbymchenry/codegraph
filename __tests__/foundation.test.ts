@@ -275,18 +275,6 @@ describe('CodeGraph Foundation', () => {
       cg.close();
     });
 
-    it('should require embedding initialization for semantic search', async () => {
-      const cg = CodeGraph.initSync(tempDir);
-
-      // Semantic search requires embeddings to be initialized first
-      await expect(cg.semanticSearch('test')).rejects.toThrow(/not initialized/i);
-      await expect(cg.findSimilar('test')).rejects.toThrow(/not initialized/i);
-
-      // Check embedding status
-      expect(cg.isEmbeddingsInitialized()).toBe(false);
-
-      cg.close();
-    });
   });
 });
 
@@ -317,7 +305,7 @@ describe('Database Connection', () => {
 
     const version = db.getSchemaVersion();
     expect(version).not.toBeNull();
-    expect(version?.version).toBe(2);
+    expect(version?.version).toBe(4);
 
     db.close();
   });

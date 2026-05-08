@@ -6,7 +6,6 @@
  * Removes all CodeGraph configuration from Claude Code:
  *   - MCP server entry from ~/.claude.json
  *   - Permissions from ~/.claude/settings.json
- *   - Hooks from ~/.claude/settings.json
  *   - CodeGraph section from ~/.claude/CLAUDE.md
  *
  * This script must never throw — a failed cleanup must not block uninstall.
@@ -51,14 +50,12 @@ function removeMcpConfig(): void {
 }
 
 /**
- * Remove CodeGraph permissions and hooks from ~/.claude/settings.json
+ * Remove CodeGraph permissions from ~/.claude/settings.json
  */
 function removeSettings(): void {
   const filePath = path.join(os.homedir(), '.claude', 'settings.json');
   const settings = readJson(filePath);
   if (!settings) return;
-
-  let changed = false;
 
   // Remove codegraph permissions
   if (Array.isArray(settings.permissions?.allow)) {
@@ -66,7 +63,7 @@ function removeSettings(): void {
     settings.permissions.allow = settings.permissions.allow.filter(
       (p: string) => !p.startsWith('mcp__codegraph__')
     );
-    if (settings.permissions.allow.length !== before) changed = true;
+    if (settings.permissions.allow.length === before) return;
 
     // Clean up empty allow array
     if (settings.permissions.allow.length === 0) {
@@ -76,33 +73,7 @@ function removeSettings(): void {
     if (Object.keys(settings.permissions).length === 0) {
       delete settings.permissions;
     }
-  }
 
-  // Remove codegraph hooks
-  if (settings.hooks) {
-    for (const event of Object.keys(settings.hooks)) {
-      if (!Array.isArray(settings.hooks[event])) continue;
-
-      const before = settings.hooks[event].length;
-      settings.hooks[event] = settings.hooks[event].filter((entry: any) => {
-        const json = JSON.stringify(entry);
-        return !json.includes('codegraph mark-dirty') && !json.includes('codegraph sync-if-dirty');
-      });
-      if (settings.hooks[event].length !== before) changed = true;
-
-      // Clean up empty event arrays
-      if (settings.hooks[event].length === 0) {
-        delete settings.hooks[event];
-      }
-    }
-
-    // Clean up empty hooks object
-    if (Object.keys(settings.hooks).length === 0) {
-      delete settings.hooks;
-    }
-  }
-
-  if (changed) {
     writeJson(filePath, settings);
   }
 }

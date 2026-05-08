@@ -18,7 +18,7 @@ dist/
 Thumbs.db
 
 # Test coverage
-coverage/
+/coverage/
 .nyc_output/
 
 # Environment
@@ -42,6 +42,8 @@ npm-debug.log*
 
 # CodeGraph data directories (in test projects)
 .codegraph/
+
+test_frameworks
 
 # Test language repos for manual testing
 test-languages/

@@ -16,25 +16,25 @@ CodeGraph builds a semantic knowledge graph of codebases for faster, smarter cod
 
 ### If \`.codegraph/\` exists in the project
 
-**Use codegraph tools for faster exploration.** These tools provide instant lookups via the code graph instead of scanning files:
+**NEVER call \`codegraph_explore\` or \`codegraph_context\` directly in the main session.** These tools return large amounts of source code that fills up main session context. Instead, ALWAYS spawn an Explore agent for any exploration question (e.g., "how does X work?", "explain the Y system", "where is Z implemented?").
+
+**When spawning Explore agents**, include this instruction in the prompt:
+
+> This project has CodeGraph initialized (.codegraph/ exists). Use \`codegraph_explore\` as your PRIMARY tool — it returns full source code sections from all relevant files in one call.
+>
+> **Rules:**
+> 1. Follow the explore call budget in the \`codegraph_explore\` tool description — it scales automatically based on project size.
+> 2. Do NOT re-read files that codegraph_explore already returned source code for. The source sections are complete and authoritative.
+> 3. Only fall back to grep/glob/read for files listed under "Additional relevant files" if you need more detail, or if codegraph returned no results.
+
+**The main session may only use these lightweight tools directly** (for targeted lookups before making edits, not for exploration):
 
 | Tool | Use For |
 |------|---------|
-| \`codegraph_search\` | Find symbols by name (functions, classes, types) |
-| \`codegraph_context\` | Get relevant code context for a task |
-| \`codegraph_callers\` | Find what calls a function |
-| \`codegraph_callees\` | Find what a function calls |
-| \`codegraph_impact\` | See what's affected by changing a symbol |
-| \`codegraph_node\` | Get details + source code for a symbol |
-
-**When spawning Explore agents in a codegraph-enabled project:**
-
-Tell the Explore agent to use codegraph tools for faster exploration.
-
-**For quick lookups in the main session:**
-- Use \`codegraph_search\` instead of grep for finding symbols
-- Use \`codegraph_callers\`/\`codegraph_callees\` to trace code flow
-- Use \`codegraph_impact\` before making changes to see what's affected
+| \`codegraph_search\` | Find symbols by name |
+| \`codegraph_callers\` / \`codegraph_callees\` | Trace call flow |
+| \`codegraph_impact\` | Check what's affected before editing |
+| \`codegraph_node\` | Get a single symbol's details |
 
 ### If \`.codegraph/\` does NOT exist
 

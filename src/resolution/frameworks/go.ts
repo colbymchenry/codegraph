@@ -25,7 +25,7 @@ export const goResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Handler references
     if (ref.referenceName.endsWith('Handler') || ref.referenceName.startsWith('Handle')) {
-      const result = resolveHandler(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, 'function', HANDLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -38,7 +38,7 @@ export const goResolver: FrameworkResolver = {
 
     // Pattern 2: Service/Repository references
     if (ref.referenceName.endsWith('Service') || ref.referenceName.endsWith('Repository') || ref.referenceName.endsWith('Store')) {
-      const result = resolveService(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, null, SERVICE_DIRS, context, SERVICE_KINDS);
       if (result) {
         return {
           original: ref,
@@ -51,7 +51,7 @@ export const goResolver: FrameworkResolver = {
 
     // Pattern 3: Middleware references
     if (ref.referenceName.endsWith('Middleware') || ref.referenceName.startsWith('Auth') || ref.referenceName.startsWith('Log')) {
-      const result = resolveMiddleware(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, 'function', MIDDLEWARE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -64,7 +64,7 @@ export const goResolver: FrameworkResolver = {
 
     // Pattern 4: Model/Entity references (typically PascalCase structs)
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveModel(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, 'struct', MODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -178,93 +178,43 @@ export const goResolver: FrameworkResolver = {
   },
 };
 
-// Helper functions
+// Directory patterns for framework resolution
+const HANDLER_DIRS = ['handler', 'handlers', 'api', 'routes', 'controller', 'controllers'];
+const SERVICE_DIRS = ['service', 'services', 'repository', 'store', 'pkg'];
+const MIDDLEWARE_DIRS = ['middleware', 'middlewares'];
+const MODEL_DIRS = ['model', 'models', 'entity', 'entities', 'domain', 'pkg'];
+const SERVICE_KINDS = new Set(['struct', 'interface']);
 
-function resolveHandler(name: string, context: ResolutionContext): string | null {
-  const handlerDirs = ['handler', 'handlers', 'api', 'routes', 'controller', 'controllers'];
+/**
+ * Resolve a symbol by name using indexed queries instead of scanning all files.
+ * Uses getNodesByName (O(log n) indexed lookup) instead of iterating every file.
+ */
+function resolveByNameAndKind(
+  name: string,
+  kind: string | null,
+  preferredDirs: string[],
+  context: ResolutionContext,
+  kinds?: Set<string>
+): string | null {
+  const candidates = context.getNodesByName(name);
+  if (candidates.length === 0) return null;
 
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.go') && handlerDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const handlerNode = nodes.find(
-        (n) => n.kind === 'function' && n.name === name
-      );
-      if (handlerNode) {
-        return handlerNode.id;
-      }
-    }
-  }
+  // Filter by kind
+  const kindFiltered = candidates.filter((n) => {
+    if (kinds) return kinds.has(n.kind);
+    if (kind) return n.kind === kind;
+    return true;
+  });
 
-  // Search all go files
-  for (const file of allFiles) {
-    if (file.endsWith('.go')) {
-      const nodes = context.getNodesInFile(file);
-      const handlerNode = nodes.find(
-        (n) => n.kind === 'function' && n.name === name
-      );
-      if (handlerNode) {
-        return handlerNode.id;
-      }
-    }
-  }
+  if (kindFiltered.length === 0) return null;
 
-  return null;
-}
+  // Prefer candidates in framework-conventional directories
+  const preferred = kindFiltered.filter((n) =>
+    preferredDirs.some((d) => n.filePath.includes(`/${d}/`))
+  );
 
-function resolveService(name: string, context: ResolutionContext): string | null {
-  const serviceDirs = ['service', 'services', 'repository', 'store', 'pkg'];
+  if (preferred.length > 0) return preferred[0]!.id;
 
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.go') && serviceDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const serviceNode = nodes.find(
-        (n) => (n.kind === 'struct' || n.kind === 'interface') && n.name === name
-      );
-      if (serviceNode) {
-        return serviceNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveMiddleware(name: string, context: ResolutionContext): string | null {
-  const middlewareDirs = ['middleware', 'middlewares'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.go') && middlewareDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const mwNode = nodes.find(
-        (n) => n.kind === 'function' && n.name === name
-      );
-      if (mwNode) {
-        return mwNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveModel(name: string, context: ResolutionContext): string | null {
-  const modelDirs = ['model', 'models', 'entity', 'entities', 'domain', 'pkg'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.go') && modelDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const modelNode = nodes.find(
-        (n) => n.kind === 'struct' && n.name === name
-      );
-      if (modelNode) {
-        return modelNode.id;
-      }
-    }
-  }
-
-  return null;
+  // Fall back to any match
+  return kindFiltered[0]!.id;
 }

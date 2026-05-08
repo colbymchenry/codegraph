@@ -5,7 +5,6 @@
  */
 
 import * as readline from 'readline';
-import { captureException } from '../sentry';
 
 /**
  * JSON-RPC 2.0 Request
@@ -163,7 +162,6 @@ export class StdioTransport {
       try {
         await this.messageHandler(parsed as JsonRpcRequest | JsonRpcNotification);
       } catch (err) {
-        captureException(err, { operation: 'mcp-message-handler' });
         const message = parsed as JsonRpcRequest;
         if ('id' in message) {
           this.sendError(

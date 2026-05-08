@@ -18,7 +18,8 @@ import {
   SearchResult,
 } from '../types';
 import { safeJsonParse } from '../utils';
-import { kindBonus, scorePathRelevance } from '../search/query-utils';
+import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
+import { parseQuery, boundedEditDistance } from '../search/query-parser';
 
 /**
  * Database row types (snake_case from SQLite)
@@ -172,6 +173,13 @@ export class QueryBuilder {
     insertUnresolved?: SqliteStatement;
     deleteUnresolvedByNode?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
+    getNodesByName?: SqliteStatement;
+    getNodesByQualifiedNameExact?: SqliteStatement;
+    getNodesByLowerName?: SqliteStatement;
+    getUnresolvedCount?: SqliteStatement;
+    getUnresolvedBatch?: SqliteStatement;
+    getAllFilePaths?: SqliteStatement;
+    getAllNodeNames?: SqliteStatement;
   } = {};
 
   constructor(db: SqliteDatabase) {
@@ -240,16 +248,6 @@ export class QueryBuilder {
         updatedAt: node.updatedAt ?? Date.now(),
       });
     } catch (error) {
-      const { captureException } = require('../sentry');
-      captureException(error, {
-        operation: 'insertNode',
-        nodeId: node.id,
-        nodeKind: node.kind,
-        nodeName: node.name,
-        filePath: node.filePath,
-        language: node.language,
-        startLine: node.startLine,
-      });
       throw error;
     }
   }
@@ -436,6 +434,43 @@ export class QueryBuilder {
   }
 
   /**
+   * Get nodes by exact name match (uses idx_nodes_name index)
+   */
+  getNodesByName(name: string): Node[] {
+    if (!this.stmts.getNodesByName) {
+      this.stmts.getNodesByName = this.db.prepare('SELECT * FROM nodes WHERE name = ?');
+    }
+    const rows = this.stmts.getNodesByName.all(name) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
+   * Get nodes by exact qualified name match (uses idx_nodes_qualified_name index)
+   */
+  getNodesByQualifiedNameExact(qualifiedName: string): Node[] {
+    if (!this.stmts.getNodesByQualifiedNameExact) {
+      this.stmts.getNodesByQualifiedNameExact = this.db.prepare(
+        'SELECT * FROM nodes WHERE qualified_name = ?'
+      );
+    }
+    const rows = this.stmts.getNodesByQualifiedNameExact.all(qualifiedName) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
+   * Get nodes by lowercase name match (uses idx_nodes_lower_name expression index)
+   */
+  getNodesByLowerName(lowerName: string): Node[] {
+    if (!this.stmts.getNodesByLowerName) {
+      this.stmts.getNodesByLowerName = this.db.prepare(
+        'SELECT * FROM nodes WHERE lower(name) = ?'
+      );
+    }
+    const rows = this.stmts.getNodesByLowerName.all(lowerName) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
    * Search nodes by name using FTS with fallback to LIKE for better matching
    *
    * Search strategy:
@@ -444,25 +479,213 @@ export class QueryBuilder {
    * 3. Score results based on match quality
    */
   searchNodes(query: string, options: SearchOptions = {}): SearchResult[] {
-    const { kinds, languages, limit = 100, offset = 0 } = options;
+    const { limit = 100, offset = 0 } = options;
+
+    // Parse field-qualified bits out of the raw query (kind:, lang:,
+    // path:, name:). Anything not recognised stays in `text` and goes
+    // to FTS unchanged. Filters compose with the SearchOptions arg —
+    // both are applied (intersection-style).
+    const parsed = parseQuery(query);
+    const mergedKinds =
+      parsed.kinds.length > 0
+        ? Array.from(new Set([...(options.kinds ?? []), ...parsed.kinds]))
+        : options.kinds;
+    const mergedLanguages =
+      parsed.languages.length > 0
+        ? Array.from(new Set([...(options.languages ?? []), ...parsed.languages]))
+        : options.languages;
+    const pathFilters = parsed.pathFilters;
+    const nameFilters = parsed.nameFilters;
+    // The text portion drives FTS/LIKE; if all the user typed was
+    // filters (`kind:function`), we still need *some* candidate set,
+    // so synthesise an empty-text path that returns everything matching
+    // the filters.
+    const text = parsed.text;
+    const kinds = mergedKinds;
+    const languages = mergedLanguages;
 
     // First try FTS5 with prefix matching
-    let results = this.searchNodesFTS(query, { kinds, languages, limit, offset });
+    let results = text
+      ? this.searchNodesFTS(text, { kinds, languages, limit, offset })
+      // Over-fetch by 5× when running filter-only (no text). The
+      // post-scoring path: + name: filters can be very selective, so
+      // a smaller multiplier risks returning fewer than `limit`
+      // results despite the DB having plenty of matches.
+      : this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
 
     // If no FTS results, try LIKE-based substring search
-    if (results.length === 0 && query.length >= 2) {
-      results = this.searchNodesLike(query, { kinds, languages, limit, offset });
+    if (results.length === 0 && text.length >= 2) {
+      results = this.searchNodesLike(text, { kinds, languages, limit, offset });
+    }
+
+    // Final fuzzy fallback: scan all known names and keep those within
+    // a tight Levenshtein distance. Only fires when both FTS and LIKE
+    // returned nothing AND there's a text portion long enough to be
+    // worth fuzzing (1-char queries would match too much).
+    if (results.length === 0 && text.length >= 3) {
+      results = this.searchNodesFuzzy(text, { kinds, languages, limit });
+    }
+
+    // Supplement: ensure exact name matches are always candidates.
+    // BM25 can bury short exact-match names (e.g. "getBean") under hundreds of
+    // compound names (e.g. "getBeanDescriptor") in large codebases,
+    // pushing them past the FTS fetch limit before post-hoc scoring can help.
+    // Use the max BM25 score as the base so the nameMatchBonus (exact=30 vs
+    // prefix=20) actually differentiates them after rescoring.
+    if (results.length > 0 && query) {
+      const existingIds = new Set(results.map(r => r.node.id));
+      const maxFtsScore = Math.max(...results.map(r => r.score));
+      const terms = query.split(/\s+/).filter(t => t.length >= 2);
+      for (const term of terms) {
+        let sql = 'SELECT * FROM nodes WHERE name = ? COLLATE NOCASE';
+        const params: (string | number)[] = [term];
+        if (kinds && kinds.length > 0) {
+          sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+          params.push(...kinds);
+        }
+        if (languages && languages.length > 0) {
+          sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
+          params.push(...languages);
+        }
+        sql += ' LIMIT 20';
+        const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+        for (const row of rows) {
+          if (!existingIds.has(row.id)) {
+            results.push({ node: rowToNode(row), score: maxFtsScore });
+            existingIds.add(row.id);
+          }
+        }
+      }
     }
 
     // Apply multi-signal scoring
-    if (results.length > 0 && query) {
+    if (results.length > 0 && (text || query)) {
+      const scoringQuery = text || query;
       results = results.map(r => ({
         ...r,
-        score: r.score + kindBonus(r.node.kind) + scorePathRelevance(r.node.filePath, query),
+        score: r.score
+          + kindBonus(r.node.kind)
+          + scorePathRelevance(r.node.filePath, scoringQuery)
+          + nameMatchBonus(r.node.name, scoringQuery),
       }));
       results.sort((a, b) => b.score - a.score);
+      // Trim to requested limit after rescoring
+      if (results.length > limit) {
+        results = results.slice(0, limit);
+      }
     }
 
+    // Apply path: + name: filters AFTER scoring. Scoring already uses
+    // path/name as a soft signal; the explicit filters here are a hard
+    // gate. Done last so the FTS limit fetched plenty of candidates to
+    // narrow from.
+    if (pathFilters.length > 0) {
+      const lowered = pathFilters.map((p) => p.toLowerCase());
+      results = results.filter((r) => {
+        const fp = r.node.filePath.toLowerCase();
+        return lowered.some((p) => fp.includes(p));
+      });
+    }
+    if (nameFilters.length > 0) {
+      const lowered = nameFilters.map((n) => n.toLowerCase());
+      results = results.filter((r) => {
+        const nm = r.node.name.toLowerCase();
+        return lowered.some((n) => nm.includes(n));
+      });
+    }
+
+    return results;
+  }
+
+  /**
+   * Match-everything path used when the user supplied only field
+   * filters (`kind:function lang:typescript`) with no text. Returns
+   * candidates ordered by name; the caller's filter pass narrows to
+   * what was asked for.
+   */
+  private searchAllByFilters(options: {
+    kinds?: NodeKind[];
+    languages?: Language[];
+    limit: number;
+  }): SearchResult[] {
+    const { kinds, languages, limit } = options;
+    let sql = 'SELECT * FROM nodes WHERE 1=1';
+    const params: (string | number)[] = [];
+    if (kinds && kinds.length > 0) {
+      sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+      params.push(...kinds);
+    }
+    if (languages && languages.length > 0) {
+      sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
+      params.push(...languages);
+    }
+    sql += ' ORDER BY name LIMIT ?';
+    params.push(limit);
+    const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+    return rows.map((row) => ({ node: rowToNode(row), score: 1 }));
+  }
+
+  /**
+   * Fuzzy fallback: when zero FTS/LIKE hits, try an edit-distance
+   * sweep over the distinct symbol-name set. Caps `maxDist` at 2 so
+   * `getUssr` finds `getUser` but `process` doesn't match `prosody`.
+   * Bounded edit distance keeps each comparison cheap; the per-query
+   * scan is O(distinct-name-count) which is far smaller than total
+   * node count on any real codebase.
+   */
+  private searchNodesFuzzy(
+    text: string,
+    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number }
+  ): SearchResult[] {
+    const { kinds, languages, limit } = options;
+    const lowered = text.toLowerCase();
+    const maxDist = lowered.length <= 4 ? 1 : 2;
+
+    // Pull the distinct name list once. The set is cached on QueryBuilder
+    // by getAllNodeNames(); even on a 200k-node project the distinct
+    // name set is typically O(10k) because most names repeat. The
+    // candidate-cap below bounds memory regardless.
+    const allNames = this.getAllNodeNames();
+    const candidates: Array<{ name: string; dist: number }> = [];
+    for (const name of allNames) {
+      const dist = boundedEditDistance(name.toLowerCase(), lowered, maxDist);
+      if (dist <= maxDist) candidates.push({ name, dist });
+    }
+    candidates.sort((a, b) => a.dist - b.dist);
+
+    // Cap the per-name follow-up queries. Each survivor triggers a
+    // separate `SELECT * FROM nodes WHERE name = ?`; without this cap
+    // a project with many similar names (`getUser1`, `getUser2`...)
+    // could fan out far beyond `limit` queries before the inner-loop
+    // limit kicks in.
+    const FUZZY_FOLLOWUP_CAP = Math.max(limit * 2, 50);
+    const cappedCandidates = candidates.slice(0, FUZZY_FOLLOWUP_CAP);
+
+    const results: SearchResult[] = [];
+    const seen = new Set<string>();
+    for (const c of cappedCandidates) {
+      if (results.length >= limit) break;
+      let sql = 'SELECT * FROM nodes WHERE name = ?';
+      const params: (string | number)[] = [c.name];
+      if (kinds && kinds.length > 0) {
+        sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+        params.push(...kinds);
+      }
+      if (languages && languages.length > 0) {
+        sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
+        params.push(...languages);
+      }
+      sql += ' LIMIT 5';
+      const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+      for (const row of rows) {
+        if (seen.has(row.id)) continue;
+        seen.add(row.id);
+        // Lower the score for each edit step away from the query so
+        // exact-match fallbacks (dist 0) outrank dist-2 typos.
+        results.push({ node: rowToNode(row), score: 1 / (1 + c.dist) });
+        if (results.length >= limit) break;
+      }
+    }
     return results;
   }
 
@@ -487,8 +710,15 @@ export class QueryBuilder {
       return [];
     }
 
+    // BM25 column weights: id=0, name=20, qualified_name=5, docstring=1, signature=2
+    // Heavy name weight ensures exact/prefix name matches rank above incidental
+    // mentions in long docstrings or qualified names of nested symbols.
+    // Fetch 5x requested limit so post-hoc rescoring (kindBonus, pathRelevance,
+    // nameMatchBonus) can promote results that BM25 alone undervalues.
+    const ftsLimit = Math.max(limit * 5, 100);
+
     let sql = `
-      SELECT nodes.*, bm25(nodes_fts) as score
+      SELECT nodes.*, bm25(nodes_fts, 0, 20, 5, 1, 2) as score
       FROM nodes_fts
       JOIN nodes ON nodes_fts.id = nodes.id
       WHERE nodes_fts MATCH ?
@@ -507,7 +737,7 @@ export class QueryBuilder {
     }
 
     sql += ' ORDER BY score LIMIT ? OFFSET ?';
-    params.push(limit, offset);
+    params.push(ftsLimit, offset);
 
     try {
       const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
@@ -596,19 +826,107 @@ export class QueryBuilder {
 
     const { kinds, languages, limit = 50 } = options;
 
-    // Build query with exact matches (case-insensitive)
-    let sql = `
-      SELECT nodes.*,
-        CASE
-          WHEN name COLLATE NOCASE IN (${names.map(() => '?').join(',')}) THEN 1.0
-          ELSE 0.9
-        END as score
-      FROM nodes
-      WHERE name COLLATE NOCASE IN (${names.map(() => '?').join(',')})
-    `;
+    // Two-pass approach to handle common names (e.g., "run" has 40+ matches):
+    // Pass 1: Find which files contain distinctive (rare) symbols from the query.
+    // Pass 2: Query each name, boosting results that co-locate with distinctive symbols.
 
-    // Duplicate names for both SELECT and WHERE clauses
-    const params: (string | number)[] = [...names, ...names];
+    // Pass 1: Find files containing each queried name, identify distinctive names
+    const nameToFiles = new Map<string, Set<string>>();
+    for (const name of names) {
+      let sql = 'SELECT DISTINCT file_path FROM nodes WHERE name COLLATE NOCASE = ?';
+      const params: (string | number)[] = [name];
+      if (kinds && kinds.length > 0) {
+        sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+        params.push(...kinds);
+      }
+      sql += ' LIMIT 100';
+      const rows = this.db.prepare(sql).all(...params) as { file_path: string }[];
+      nameToFiles.set(name.toLowerCase(), new Set(rows.map(r => r.file_path)));
+    }
+
+    // Distinctive names are those with fewer than 10 file matches (e.g., "scrapeLoop" = 1 file)
+    const distinctiveFiles = new Set<string>();
+    for (const [, files] of nameToFiles) {
+      if (files.size > 0 && files.size < 10) {
+        for (const f of files) distinctiveFiles.add(f);
+      }
+    }
+
+    // Pass 2: Query each name with per-name limit, scoring by co-location
+    const perNameLimit = Math.max(8, Math.ceil(limit / names.length));
+    const allResults: SearchResult[] = [];
+    const seenIds = new Set<string>();
+
+    for (const name of names) {
+      let sql = `
+        SELECT nodes.*, 1.0 as score
+        FROM nodes
+        WHERE name COLLATE NOCASE = ?
+      `;
+      const params: (string | number)[] = [name];
+
+      if (kinds && kinds.length > 0) {
+        sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+        params.push(...kinds);
+      }
+
+      if (languages && languages.length > 0) {
+        sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
+        params.push(...languages);
+      }
+
+      // Fetch enough to find co-located results among common names
+      sql += ' LIMIT ?';
+      params.push(Math.max(perNameLimit * 3, 50));
+
+      const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+      const nameResults: SearchResult[] = [];
+      for (const row of rows) {
+        const node = rowToNode(row);
+        if (seenIds.has(node.id)) continue;
+        // Boost results in files that also contain distinctive symbols
+        const coLocationBoost = distinctiveFiles.has(node.filePath) ? 20 : 0;
+        nameResults.push({ node, score: row.score + coLocationBoost });
+      }
+
+      // Sort by score (co-located first), take per-name limit
+      nameResults.sort((a, b) => b.score - a.score);
+      for (const r of nameResults.slice(0, perNameLimit)) {
+        seenIds.add(r.node.id);
+        allResults.push(r);
+      }
+    }
+
+    // Sort all results by score so co-located results bubble up
+    allResults.sort((a, b) => b.score - a.score);
+    return allResults.slice(0, limit);
+  }
+
+  /**
+   * Find nodes whose name contains a substring (LIKE-based).
+   * Useful for CamelCase-part matching where FTS fails because
+   * e.g. "TransportSearchAction" is one FTS token, not matchable by "Search"*.
+   *
+   * Results are ordered by name length (shorter = more likely to be the core type).
+   */
+  findNodesByNameSubstring(
+    substring: string,
+    options: SearchOptions & { excludePrefix?: boolean } = {}
+  ): SearchResult[] {
+    const { kinds, languages, limit = 30, excludePrefix } = options;
+
+    let sql = `
+      SELECT nodes.*, 1.0 as score
+      FROM nodes
+      WHERE name LIKE ?
+    `;
+    const params: (string | number)[] = [`%${substring}%`];
+
+    // Exclude prefix matches (handled by FTS-based prefix search in Step 2b)
+    if (excludePrefix) {
+      sql += ` AND name NOT LIKE ?`;
+      params.push(`${substring}%`);
+    }
 
     if (kinds && kinds.length > 0) {
       sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
@@ -620,11 +938,10 @@ export class QueryBuilder {
       params.push(...languages);
     }
 
-    sql += ' ORDER BY score DESC, length(name) ASC LIMIT ?';
+    sql += ' ORDER BY length(name) ASC LIMIT ?';
     params.push(limit);
 
     const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
-
     return rows.map((row) => ({
       node: rowToNode(row),
       score: row.score,
@@ -721,6 +1038,26 @@ export class QueryBuilder {
       this.stmts.getEdgesByTarget = this.db.prepare('SELECT * FROM edges WHERE target = ?');
     }
     const rows = this.stmts.getEdgesByTarget.all(targetId) as EdgeRow[];
+    return rows.map(rowToEdge);
+  }
+
+  /**
+   * Find all edges where both source and target are in the given node set.
+   * Useful for recovering inter-node connectivity after BFS.
+   */
+  findEdgesBetweenNodes(nodeIds: string[], kinds?: EdgeKind[]): Edge[] {
+    if (nodeIds.length === 0) return [];
+
+    const idsJson = JSON.stringify(nodeIds);
+    let sql = `SELECT * FROM edges WHERE source IN (SELECT value FROM json_each(?)) AND target IN (SELECT value FROM json_each(?))`;
+    const params: string[] = [idsJson, idsJson];
+
+    if (kinds && kinds.length > 0) {
+      sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+      params.push(...kinds);
+    }
+
+    const rows = this.db.prepare(sql).all(...params) as EdgeRow[];
     return rows.map(rowToEdge);
   }
 
@@ -897,6 +1234,64 @@ export class QueryBuilder {
   }
 
   /**
+   * Get the count of unresolved references without loading them into memory
+   */
+  getUnresolvedReferencesCount(): number {
+    if (!this.stmts.getUnresolvedCount) {
+      this.stmts.getUnresolvedCount = this.db.prepare(
+        'SELECT COUNT(*) as count FROM unresolved_refs'
+      );
+    }
+    const row = this.stmts.getUnresolvedCount.get() as { count: number };
+    return row.count;
+  }
+
+  /**
+   * Get a batch of unresolved references using LIMIT/OFFSET pagination.
+   * Used to process references in bounded memory chunks.
+   */
+  getUnresolvedReferencesBatch(offset: number, limit: number): UnresolvedReference[] {
+    if (!this.stmts.getUnresolvedBatch) {
+      this.stmts.getUnresolvedBatch = this.db.prepare(
+        'SELECT * FROM unresolved_refs LIMIT ? OFFSET ?'
+      );
+    }
+    const rows = this.stmts.getUnresolvedBatch.all(limit, offset) as UnresolvedRefRow[];
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+    }));
+  }
+
+  /**
+   * Get all tracked file paths (lightweight — no full FileRecord objects)
+   */
+  getAllFilePaths(): string[] {
+    if (!this.stmts.getAllFilePaths) {
+      this.stmts.getAllFilePaths = this.db.prepare('SELECT path FROM files ORDER BY path');
+    }
+    const rows = this.stmts.getAllFilePaths.all() as Array<{ path: string }>;
+    return rows.map((r) => r.path);
+  }
+
+  /**
+   * Get all distinct node names (lightweight — just name strings for pre-filtering)
+   */
+  getAllNodeNames(): string[] {
+    if (!this.stmts.getAllNodeNames) {
+      this.stmts.getAllNodeNames = this.db.prepare('SELECT DISTINCT name FROM nodes');
+    }
+    const rows = this.stmts.getAllNodeNames.all() as Array<{ name: string }>;
+    return rows.map((r) => r.name);
+  }
+
+  /**
    * Get unresolved references scoped to specific file paths.
    * Uses the idx_unresolved_file_path index for efficient lookup.
    */
@@ -934,6 +1329,23 @@ export class QueryBuilder {
     if (fromNodeIds.length === 0) return;
     const placeholders = fromNodeIds.map(() => '?').join(',');
     this.db.prepare(`DELETE FROM unresolved_refs WHERE from_node_id IN (${placeholders})`).run(...fromNodeIds);
+  }
+
+  /**
+   * Delete specific resolved references by (fromNodeId, referenceName, referenceKind) tuples.
+   * More precise than deleteResolvedReferences — only removes refs that were actually resolved.
+   */
+  deleteSpecificResolvedReferences(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>): void {
+    if (refs.length === 0) return;
+    const stmt = this.db.prepare(
+      'DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?'
+    );
+    const deleteMany = this.db.transaction((items: typeof refs) => {
+      for (const ref of items) {
+        stmt.run(ref.fromNodeId, ref.referenceName, ref.referenceKind);
+      }
+    });
+    deleteMany(refs);
   }
 
   // ===========================================================================
@@ -1028,7 +1440,6 @@ export class QueryBuilder {
     this.nodeCache.clear();
     this.db.transaction(() => {
       this.db.exec('DELETE FROM unresolved_refs');
-      this.db.exec('DELETE FROM vectors');
       this.db.exec('DELETE FROM edges');
       this.db.exec('DELETE FROM nodes');
       this.db.exec('DELETE FROM files');

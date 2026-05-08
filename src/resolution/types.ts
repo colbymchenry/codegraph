@@ -39,7 +39,7 @@ export interface ResolvedRef {
   /** Confidence score (0-1) */
   confidence: number;
   /** How it was resolved */
-  resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy';
+  resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path';
 }
 
 /**
@@ -83,6 +83,21 @@ export interface ResolutionContext {
   getNodesByLowerName(lowerName: string): Node[];
   /** Get cached import mappings for a file */
   getImportMappings(filePath: string, language: Language): ImportMapping[];
+  /**
+   * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
+   * `null` when the project doesn't define any. Cached per resolver
+   * instance — safe to call from any resolver code path. Optional so
+   * existing test fixtures and external context implementations
+   * compile without modification; production resolver implements it.
+   */
+  getProjectAliases?(): import('./path-aliases').AliasMap | null;
+  /**
+   * Re-exports declared by a file (`export { x } from './other'`,
+   * `export * from './other'`). Empty array when the file has none.
+   * Optional so older callers compile; the import resolver follows
+   * re-export chains when this is provided.
+   */
+  getReExports?(filePath: string, language: Language): ReExport[];
 }
 
 /**
@@ -116,3 +131,24 @@ export interface ImportMapping {
   /** Resolved file path (if local) */
   resolvedPath?: string;
 }
+
+/**
+ * Re-export from a file: `export { x } from './other'` or
+ * `export * from './other'`. Used by the resolver to chase
+ * symbols through barrel files.
+ */
+export type ReExport =
+  | {
+      kind: 'named';
+      /** Name as exported by THIS file. */
+      exportedName: string;
+      /** Name in the upstream module (differs when renamed: `as`). */
+      originalName: string;
+      /** Module specifier of the upstream module. */
+      source: string;
+    }
+  | {
+      kind: 'wildcard';
+      /** Module specifier of the upstream module. */
+      source: string;
+    };

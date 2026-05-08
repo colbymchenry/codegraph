@@ -201,47 +201,25 @@ function isPascalCase(str: string): boolean {
 }
 
 /**
- * Resolve a Svelte component reference to its .svelte file
+ * Resolve a Svelte component reference using name-based lookup
  */
 function resolveComponent(
   name: string,
   fromFile: string,
   context: ResolutionContext
 ): string | null {
-  // Look for matching .svelte files
-  const allFiles = context.getAllFiles();
-  const svelteFiles = allFiles.filter((f) => f.endsWith('.svelte'));
+  // Look for component nodes by name
+  const candidates = context.getNodesByName(name);
+  const components = candidates.filter((n) => n.kind === 'component');
 
-  // Check for exact name match (Button -> Button.svelte)
-  for (const file of svelteFiles) {
-    const fileName = file.split(/[/\\]/).pop() || '';
-    const componentName = fileName.replace(/\.svelte$/, '');
-    if (componentName === name) {
-      const nodes = context.getNodesInFile(file);
-      const component = nodes.find((n) => n.kind === 'component' && n.name === name);
-      if (component) {
-        return component.id;
-      }
-    }
-  }
+  if (components.length === 0) return null;
 
-  // Check same directory first for better specificity
+  // Prefer same directory
   const fromDir = fromFile.substring(0, fromFile.lastIndexOf('/'));
-  for (const file of svelteFiles) {
-    if (file.startsWith(fromDir)) {
-      const fileName = file.split(/[/\\]/).pop() || '';
-      const componentName = fileName.replace(/\.svelte$/, '');
-      if (componentName === name) {
-        const nodes = context.getNodesInFile(file);
-        const component = nodes.find((n) => n.kind === 'component');
-        if (component) {
-          return component.id;
-        }
-      }
-    }
-  }
+  const sameDir = components.filter((n) => n.filePath.startsWith(fromDir));
+  if (sameDir.length > 0) return sameDir[0]!.id;
 
-  return null;
+  return components[0]!.id;
 }
 
 /**

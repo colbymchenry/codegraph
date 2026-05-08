@@ -216,12 +216,12 @@ function resolveControllerMethod(
     }
   }
 
-  // Try subdirectories (namespaced controllers)
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith(`${controller}.php`) && file.includes('Controllers')) {
-      const nodes = context.getNodesInFile(file);
-      const methodNode = nodes.find(
+  // Try name-based lookup for namespaced controllers
+  const controllerCandidates = context.getNodesByName(controller);
+  for (const ctrl of controllerCandidates) {
+    if (ctrl.kind === 'class' && ctrl.filePath.includes('Controllers')) {
+      const nodesInFile = context.getNodesInFile(ctrl.filePath);
+      const methodNode = nodesInFile.find(
         (n) => n.kind === 'method' && n.name === method
       );
       if (methodNode) {

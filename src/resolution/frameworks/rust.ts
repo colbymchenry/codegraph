@@ -18,7 +18,7 @@ export const rustResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Handler references
     if (ref.referenceName.endsWith('_handler') || ref.referenceName.startsWith('handle_')) {
-      const result = resolveHandler(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, FUNCTION_KINDS, HANDLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -31,7 +31,7 @@ export const rustResolver: FrameworkResolver = {
 
     // Pattern 2: Service/Repository trait implementations
     if (ref.referenceName.endsWith('Service') || ref.referenceName.endsWith('Repository')) {
-      const result = resolveService(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -44,7 +44,7 @@ export const rustResolver: FrameworkResolver = {
 
     // Pattern 3: Struct references (PascalCase)
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveStruct(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, STRUCT_KINDS, MODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -153,91 +153,39 @@ export const rustResolver: FrameworkResolver = {
   },
 };
 
-// Helper functions
+// Directory patterns
+const HANDLER_DIRS = ['/handlers/', '/handler/', '/api/', '/routes/', '/controllers/'];
+const SERVICE_DIRS = ['/services/', '/service/', '/repository/', '/domain/'];
+const MODEL_DIRS = ['/models/', '/model/', '/entities/', '/entity/', '/domain/', '/types/'];
 
-function resolveHandler(name: string, context: ResolutionContext): string | null {
-  const handlerDirs = ['handlers', 'handler', 'api', 'routes', 'controllers'];
+const FUNCTION_KINDS = new Set(['function']);
+const SERVICE_KINDS = new Set(['struct', 'trait']);
+const STRUCT_KINDS = new Set(['struct']);
 
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.rs') && handlerDirs.some((d) => file.includes(`/${d}/`) || file.includes(`/${d}.rs`))) {
-      const nodes = context.getNodesInFile(file);
-      const handlerNode = nodes.find(
-        (n) => n.kind === 'function' && n.name === name
-      );
-      if (handlerNode) {
-        return handlerNode.id;
-      }
-    }
-  }
+/**
+ * Resolve a symbol by name using indexed queries instead of scanning all files.
+ */
+function resolveByNameAndKind(
+  name: string,
+  kinds: Set<string>,
+  preferredDirPatterns: string[],
+  context: ResolutionContext,
+): string | null {
+  const candidates = context.getNodesByName(name);
+  if (candidates.length === 0) return null;
 
-  // Search all Rust files
-  for (const file of allFiles) {
-    if (file.endsWith('.rs')) {
-      const nodes = context.getNodesInFile(file);
-      const handlerNode = nodes.find(
-        (n) => n.kind === 'function' && n.name === name
-      );
-      if (handlerNode) {
-        return handlerNode.id;
-      }
-    }
-  }
+  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
+  if (kindFiltered.length === 0) return null;
 
-  return null;
-}
+  // Prefer candidates in framework-conventional directories
+  const preferred = kindFiltered.filter((n) =>
+    preferredDirPatterns.some((d) => n.filePath.includes(d))
+  );
 
-function resolveService(name: string, context: ResolutionContext): string | null {
-  const serviceDirs = ['services', 'service', 'repository', 'domain'];
+  if (preferred.length > 0) return preferred[0]!.id;
 
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.rs') && serviceDirs.some((d) => file.includes(`/${d}/`) || file.includes(`/${d}.rs`))) {
-      const nodes = context.getNodesInFile(file);
-      const serviceNode = nodes.find(
-        (n) => (n.kind === 'struct' || n.kind === 'trait') && n.name === name
-      );
-      if (serviceNode) {
-        return serviceNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveStruct(name: string, context: ResolutionContext): string | null {
-  const modelDirs = ['models', 'model', 'entities', 'entity', 'domain', 'types'];
-
-  const allFiles = context.getAllFiles();
-
-  // Check model directories first
-  for (const file of allFiles) {
-    if (file.endsWith('.rs') && modelDirs.some((d) => file.includes(`/${d}/`) || file.includes(`/${d}.rs`))) {
-      const nodes = context.getNodesInFile(file);
-      const structNode = nodes.find(
-        (n) => n.kind === 'struct' && n.name === name
-      );
-      if (structNode) {
-        return structNode.id;
-      }
-    }
-  }
-
-  // Search all Rust files
-  for (const file of allFiles) {
-    if (file.endsWith('.rs')) {
-      const nodes = context.getNodesInFile(file);
-      const structNode = nodes.find(
-        (n) => n.kind === 'struct' && n.name === name
-      );
-      if (structNode) {
-        return structNode.id;
-      }
-    }
-  }
-
-  return null;
+  // Fall back to any match
+  return kindFiltered[0]!.id;
 }
 
 function resolveModule(name: string, context: ResolutionContext): string | null {

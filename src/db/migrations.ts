@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 /**
  * Migration definition
@@ -42,6 +42,26 @@ const migrations: Migration[] = [
         ALTER TABLE edges ADD COLUMN provenance TEXT DEFAULT NULL;
         CREATE INDEX IF NOT EXISTS idx_unresolved_file_path ON unresolved_refs(file_path);
         CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
+      `);
+    },
+  },
+  {
+    version: 3,
+    description: 'Add lower(name) expression index for memory-efficient case-insensitive lookups',
+    up: (db) => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_nodes_lower_name ON nodes(lower(name));
+      `);
+    },
+  },
+  {
+    version: 4,
+    description:
+      'Drop redundant idx_edges_source / idx_edges_target (covered by source_kind / target_kind composites)',
+    up: (db) => {
+      db.exec(`
+        DROP INDEX IF EXISTS idx_edges_source;
+        DROP INDEX IF EXISTS idx_edges_target;
       `);
     },
   },

@@ -233,13 +233,8 @@ export function logWarn(message: string, context?: Record<string, unknown>): voi
 }
 
 /**
- * Log an error message (also sends to Sentry if initialized)
+ * Log an error message
  */
 export function logError(message: string, context?: Record<string, unknown>): void {
   currentLogger.error(message, context);
-  // Lazy import to avoid circular deps
-  try {
-    const { captureMessage } = require('./sentry');
-    captureMessage(message, context);
-  } catch {}
 }

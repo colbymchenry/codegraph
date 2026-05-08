@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🔮 CodeGraph
+# CodeGraph
 
 ### Supercharge Claude Code with Semantic Code Intelligence
 
-**30% fewer tokens • 25% fewer tool calls • 100% local**
+**94% fewer tool calls · 77% faster exploration · 100% local**
 
 [![npm version](https://img.shields.io/npm/v/@colbymchenry/codegraph.svg)](https://www.npmjs.com/package/@colbymchenry/codegraph)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -24,136 +24,94 @@ npx @colbymchenry/codegraph
 
 <sub>Interactive installer configures Claude Code automatically</sub>
 
+![1_C_VYnhpys0UHrOuOgpgoyw](https://github.com/user-attachments/assets/f168182f-4d9a-44e0-94d7-08d018cc8a3a)
+
 </div>
 
 ---
 
-## 🚀 Why CodeGraph?
+## Why CodeGraph?
 
-When you ask Claude Code to work on a complex task, it spawns **Explore agents** that scan your codebase using grep, glob, and file reads. These agents consume tokens with every tool call.
+When Claude Code explores a codebase, it spawns **Explore agents** that scan files with grep, glob, and Read — consuming tokens on every tool call.
 
-**CodeGraph gives those agents a semantic knowledge graph** — pre-indexed symbol relationships, call graphs, and code structure. Instead of scanning files, agents query the graph instantly.
+**CodeGraph gives those agents a pre-indexed knowledge graph** — symbol relationships, call graphs, and code structure. Agents query the graph instantly instead of scanning files.
 
-### 📊 Benchmark Results
+### Benchmark Results
 
-We ran the same complex task 3 times with and without CodeGraph:
+Tested across 6 real-world codebases comparing Claude Code's Explore agent **with** and **without** CodeGraph:
 
-| Metric | Without CodeGraph | With CodeGraph | Improvement |
-|--------|-------------------|----------------|-------------|
-| **Explore tokens** | 157.8k | 111.7k | **29% fewer** |
-| **Per-agent tokens** | 74.0k | 46.4k | **37% fewer** |
-| **Tool calls** | 60 | 45 | **25% fewer** |
-| **Main context usage** | 28.7% | 24.0% | **4.7% less** |
+> **Average: 92% fewer tool calls · 71% faster**
+
+| Codebase | With CG | Without CG | Improvement |
+|----------|---------|------------|-------------|
+| **VS Code** · TypeScript | 3 calls, 17s | 52 calls, 1m 37s | **94% fewer · 82% faster** |
+| **Excalidraw** · TypeScript | 3 calls, 29s | 47 calls, 1m 45s | **94% fewer · 72% faster** |
+| **Claude Code** · Python + Rust | 3 calls, 39s | 40 calls, 1m 8s | **93% fewer · 43% faster** |
+| **Claude Code** · Java | 1 call, 19s | 26 calls, 1m 22s | **96% fewer · 77% faster** |
+| **Alamofire** · Swift | 3 calls, 22s | 32 calls, 1m 39s | **91% fewer · 78% faster** |
+| **Swift Compiler** · Swift/C++ | 6 calls, 35s | 37 calls, 2m 8s | **84% fewer · 73% faster** |
 
 <details>
-<summary><strong>Full benchmark data</strong></summary>
+<summary><strong>Full benchmark details</strong></summary>
 
-**With CodeGraph:**
-| Test | Agents | Tool Uses | Explore Tokens | Plan Tokens | Time |
-|------|--------|-----------|----------------|-------------|------|
-| 1 | 3 | 54 | 149.7k | 76.4k | 1m 43s |
-| 2 | 2 | 41 | 102.1k | 74.8k | 1m 29s |
-| 3 | 2 | 40 | 83.3k | 63.3k | 1m 25s |
-| **Avg** | **2.3** | **45** | **111.7k** | **71.5k** | **1m 32s** |
+All tests used Claude Opus 4.6 (1M context) with Claude Code v2.1.91. Each test spawned a single Explore agent with the same question.
 
-**Without CodeGraph:**
-| Test | Agents | Tool Uses | Explore Tokens | Plan Tokens | Time |
-|------|--------|-----------|----------------|-------------|------|
-| 1 | 3 | 74 | 177.3k | 80.5k | 1m 54s |
-| 2 | 2 | 55 | 149.3k | 64.0k | 1m 27s |
-| 3 | 2 | 51 | 146.7k | 62.3k | 1m 17s |
-| **Avg** | **2.3** | **60** | **157.8k** | **68.9k** | **1m 33s** |
+**Queries used:**
+| Codebase | Query |
+|----------|-------|
+| VS Code | "How does the extension host communicate with the main process?" |
+| Excalidraw | "How does collaborative editing and real-time sync work?" |
+| Claude Code (Python+Rust) | "How does tool execution work end to end?" |
+| Claude Code (Java) | "How does tool execution work end to end?" |
+| Alamofire | "Trace how a request flows from Session.request() through to the URLSession layer" |
+| Swift Compiler | "How does the Swift compiler handle error diagnostics?" |
+
+**With CodeGraph — the agent uses `codegraph_explore` and stops:**
+| Codebase | Files Indexed | Nodes | Tool Uses | Tokens | Time | File Reads |
+|----------|--------------|-------|-----------|--------|------|------------|
+| VS Code (TypeScript) | 4,002 | 59,377 | 3 | 56.6k | 17s | 0 |
+| Excalidraw (TypeScript) | 626 | 9,859 | 3 | 57.1k | 29s | 0 |
+| Claude Code (Python+Rust) | 115 | 3,080 | 3 | 67.1k | 39s | 0 |
+| Claude Code (Java) | — | — | 1 | 40.8k | 19s | 0 |
+| Alamofire (Swift) | 102 | 2,624 | 3 | 57.3k | 22s | 0 |
+| Swift Compiler (Swift/C++) | 25,874 | 272,898 | 6 | 77.4k | 35s | 0 |
+
+**Without CodeGraph — the agent uses grep, find, ls, and Read extensively:**
+| Codebase | Tool Uses | Tokens | Time | File Reads |
+|----------|-----------|--------|------|------------|
+| VS Code (TypeScript) | 52 | 89.4k | 1m 37s | ~15 |
+| Excalidraw (TypeScript) | 47 | 77.9k | 1m 45s | ~20 |
+| Claude Code (Python+Rust) | 40 | 69.3k | 1m 8s | ~15 |
+| Claude Code (Java) | 26 | 73.3k | 1m 22s | ~15 |
+| Alamofire (Swift) | 32 | 52.4k | 1m 39s | ~10 |
+| Swift Compiler (Swift/C++) | 37 | 99.1k | 2m 8s | ~20 |
+
+**Key observations:**
+- With CodeGraph, the agent **never fell back to reading files** — it trusted the codegraph_explore results completely
+- Without CodeGraph, agents spent most of their time on discovery (find, ls, grep) before they could even start reading relevant code
+- The Java codebase needed only **1 codegraph_explore call** to answer the entire question
+- Cross-language queries (Python+Rust) worked seamlessly — CodeGraph's graph traversal found connections across language boundaries
+- The Swift benchmark (Alamofire) traced a **9-step call chain** from `Session.request()` to `URLSession.dataTask()` — CodeGraph's graph traversal at depth 3 captured the full chain in one explore call
+- The **Swift Compiler** benchmark is the largest codebase tested (**25,874 files, 272,898 nodes**) — CodeGraph indexed it in under 4 minutes and the agent answered a complex cross-cutting question with **6 explore calls and zero file reads** in 35 seconds
 
 </details>
 
-### 🔄 How It Works
+---
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Claude Code                               │
-│                                                                  │
-│  "Implement user authentication"                                 │
-│           │                                                      │
-│           ▼                                                      │
-│  ┌─────────────────┐      ┌─────────────────┐                   │
-│  │  Explore Agent  │ ──── │  Explore Agent  │                   │
-│  └────────┬────────┘      └────────┬────────┘                   │
-│           │                        │                             │
-└───────────┼────────────────────────┼─────────────────────────────┘
-            │                        │
-            ▼                        ▼
-┌───────────────────────────────────────────────────────────────────┐
-│                     CodeGraph MCP Server                          │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │
-│  │   Search    │  │   Callers   │  │   Context   │               │
-│  │  "auth"     │  │  "login()"  │  │  for task   │               │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘               │
-│         │                │                │                       │
-│         └────────────────┼────────────────┘                       │
-│                          ▼                                        │
-│              ┌───────────────────────┐                            │
-│              │   SQLite Graph DB     │                            │
-│              │   • 387 symbols       │                            │
-│              │   • 1,204 edges       │                            │
-│              │   • Instant lookups   │                            │
-│              └───────────────────────┘                            │
-└───────────────────────────────────────────────────────────────────┘
-```
+## Key Features
 
-**Without CodeGraph:** Explore agents use `grep`, `glob`, and `Read` to scan files → many API calls, high token usage
-
-**With CodeGraph:** Explore agents query the graph via MCP tools → instant results, local processing, fewer tokens
+| | |
+|---|---|
+| **Smart Context Building** | One tool call returns entry points, related symbols, and code snippets — no expensive exploration agents |
+| **Full-Text Search** | Find code by name instantly across your entire codebase, powered by FTS5 |
+| **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
+| **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
+| **19+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Swift, Kotlin, Dart, Svelte, Liquid, Pascal/Delphi |
+| **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
 
 ---
 
-## ✨ Key Features
-
-<table>
-<tr>
-<td width="33%" valign="top">
-
-### 🧠 Smart Context Building
-One tool call returns everything Claude needs—entry points, related symbols, and code snippets. No more expensive exploration agents.
-
-</td>
-<td width="33%" valign="top">
-
-### 🔍 Semantic Search
-Find code by meaning, not just text. Search for "authentication" and find `login`, `validateToken`, `AuthService`—even with different naming conventions.
-
-</td>
-<td width="33%" valign="top">
-
-### 📈 Impact Analysis
-Know exactly what breaks before you change it. Trace callers, callees, and the full impact radius of any symbol.
-
-</td>
-</tr>
-<tr>
-<td width="33%" valign="top">
-
-### 🌍 19+ Languages
-TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Swift, Kotlin, Dart, Svelte, Liquid, Pascal/Delphi—all with the same API.
-
-</td>
-<td width="33%" valign="top">
-
-### 🔒 100% Local
-No data leaves your machine. No API keys. No external services. Everything runs on your local SQLite database.
-
-</td>
-<td width="33%" valign="top">
-
-### ⚡ Always Fresh
-Claude Code hooks automatically sync the index as you work. Your code intelligence is always up to date.
-
-</td>
-</tr>
-</table>
-
----
-
-## 🎯 Quick Start
+## Quick Start
 
 ### 1. Run the Installer
 
@@ -161,11 +119,11 @@ Claude Code hooks automatically sync the index as you work. Your code intelligen
 npx @colbymchenry/codegraph
 ```
 
-The interactive installer will:
+The installer will:
+- Prompt to install `codegraph` globally (needed for the MCP server)
 - Configure the MCP server in `~/.claude.json`
 - Set up auto-allow permissions for CodeGraph tools
-- Add global instructions to `~/.claude/CLAUDE.md` (teaches Claude how to use CodeGraph)
-- Install Claude Code hooks for automatic index syncing
+- Add global instructions to `~/.claude/CLAUDE.md`
 - Optionally initialize your current project
 
 ### 2. Restart Claude Code
@@ -174,19 +132,15 @@ Restart Claude Code for the MCP server to load.
 
 ### 3. Initialize Projects
 
-For each project you want to use CodeGraph with:
-
 ```bash
 cd your-project
 codegraph init -i
 ```
 
-That's it! Claude Code will now use CodeGraph tools automatically when a `.codegraph/` directory exists.
+That's it! Claude Code will use CodeGraph tools automatically when a `.codegraph/` directory exists.
 
 <details>
 <summary><strong>Manual Setup (Alternative)</strong></summary>
-
-If you prefer manual configuration:
 
 **Install globally:**
 ```bash
@@ -229,7 +183,7 @@ npm install -g @colbymchenry/codegraph
 <details>
 <summary><strong>Global Instructions Reference</strong></summary>
 
-The installer automatically adds these instructions to `~/.claude/CLAUDE.md`. This is provided here for reference:
+The installer automatically adds these instructions to `~/.claude/CLAUDE.md`:
 
 ```markdown
 ## CodeGraph
@@ -238,26 +192,25 @@ CodeGraph builds a semantic knowledge graph of codebases for faster, smarter cod
 
 ### If `.codegraph/` exists in the project
 
-**Use codegraph tools for faster exploration.** These tools provide instant lookups via the code graph instead of scanning files:
+**NEVER call `codegraph_explore` or `codegraph_context` directly in the main session.** These tools return large amounts of source code that fills up main session context. Instead, ALWAYS spawn an Explore agent for any exploration question (e.g., "how does X work?", "explain the Y system", "where is Z implemented?").
+
+**When spawning Explore agents**, include this instruction in the prompt:
+
+> This project has CodeGraph initialized (.codegraph/ exists). Use `codegraph_explore` as your PRIMARY tool — it returns full source code sections from all relevant files in one call.
+>
+> **Rules:**
+> 1. Follow the explore call budget in the `codegraph_explore` tool description — it scales automatically based on project size.
+> 2. Do NOT re-read files that codegraph_explore already returned source code for. The source sections are complete and authoritative.
+> 3. Only fall back to grep/glob/read for files listed under "Additional relevant files" if you need more detail, or if codegraph returned no results.
+
+**The main session may only use these lightweight tools directly** (for targeted lookups before making edits, not for exploration):
 
 | Tool | Use For |
 |------|---------|
-| `codegraph_search` | Find symbols by name (functions, classes, types) |
-| `codegraph_context` | Get relevant code context for a task |
-| `codegraph_callers` | Find what calls a function |
-| `codegraph_callees` | Find what a function calls |
-| `codegraph_impact` | See what's affected by changing a symbol |
-| `codegraph_node` | Get details + source code for a symbol |
-| `codegraph_files` | Get project file structure from the index |
-
-**When spawning Explore agents in a codegraph-enabled project:**
-
-Tell the Explore agent to use codegraph tools for faster exploration.
-
-**For quick lookups in the main session:**
-- Use `codegraph_search` instead of grep for finding symbols
-- Use `codegraph_callers`/`codegraph_callees` to trace code flow
-- Use `codegraph_impact` before making changes to see what's affected
+| `codegraph_search` | Find symbols by name |
+| `codegraph_callers` / `codegraph_callees` | Trace call flow |
+| `codegraph_impact` | Check what's affected before editing |
+| `codegraph_node` | Get a single symbol's details |
 
 ### If `.codegraph/` does NOT exist
 
@@ -270,385 +223,153 @@ At the start of a session, ask the user if they'd like to initialize CodeGraph:
 
 ---
 
-## 📋 Requirements
+## How It Works
 
-- Node.js >= 18.0.0
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Claude Code                               │
+│                                                                  │
+│  "Implement user authentication"                                 │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌─────────────────┐      ┌─────────────────┐                   │
+│  │  Explore Agent  │ ──── │  Explore Agent  │                   │
+│  └────────┬────────┘      └────────┬────────┘                   │
+│           │                        │                             │
+└───────────┼────────────────────────┼─────────────────────────────┘
+            │                        │
+            ▼                        ▼
+┌───────────────────────────────────────────────────────────────────┐
+│                     CodeGraph MCP Server                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │
+│  │   Search    │  │   Callers   │  │   Context   │               │
+│  │  "auth"     │  │  "login()"  │  │  for task   │               │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘               │
+│         │                │                │                       │
+│         └────────────────┼────────────────┘                       │
+│                          ▼                                        │
+│              ┌───────────────────────┐                            │
+│              │   SQLite Graph DB     │                            │
+│              │   • 387 symbols       │                            │
+│              │   • 1,204 edges       │                            │
+│              │   • Instant lookups   │                            │
+│              └───────────────────────┘                            │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+1. **Extraction** — [tree-sitter](https://tree-sitter.github.io/) parses source code into ASTs. Language-specific queries extract nodes (functions, classes, methods) and edges (calls, imports, extends, implements).
+
+2. **Storage** — Everything goes into a local SQLite database (`.codegraph/codegraph.db`) with FTS5 full-text search.
+
+3. **Resolution** — After extraction, references are resolved: function calls → definitions, imports → source files, class inheritance, and framework-specific patterns.
+
+4. **Auto-Sync** — The MCP server watches your project using native OS file events. Changes are debounced (2-second quiet window), filtered to source files only, and incrementally synced. The graph stays fresh as you code — no configuration needed.
 
 ---
 
-## 💻 CLI Usage
+## CLI Reference
 
 ```bash
-codegraph                   # Run interactive installer
-codegraph install           # Run interactive installer (explicit)
-codegraph init [path]       # Initialize in a project
-codegraph uninit [path]     # Remove CodeGraph from a project
-codegraph index [path]      # Full index
-codegraph sync [path]       # Incremental update
-codegraph status [path]     # Show statistics
-codegraph query <search>    # Search symbols
-codegraph files [path]      # Show project file structure
-codegraph context <task>    # Build context for AI
-codegraph affected [files]  # Find test files affected by changes
-codegraph serve --mcp       # Start MCP server
-```
-
-## 📖 CLI Commands
-
-### `codegraph` / `codegraph install`
-
-Run the interactive installer for Claude Code integration. Configures MCP server and permissions automatically.
-
-```bash
-codegraph                         # Run installer (when no args)
+codegraph                         # Run interactive installer
 codegraph install                 # Run installer (explicit)
-npx @colbymchenry/codegraph       # Run via npx (no global install needed)
+codegraph init [path]             # Initialize in a project (--index to also index)
+codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
+codegraph index [path]            # Full index (--force to re-index, --quiet for less output)
+codegraph sync [path]             # Incremental update
+codegraph status [path]           # Show statistics
+codegraph query <search>          # Search symbols (--kind, --limit, --json)
+codegraph files [path]            # Show file structure (--format, --filter, --max-depth, --json)
+codegraph context <task>          # Build context for AI (--format, --max-nodes)
+codegraph affected [files...]     # Find test files affected by changes (see below)
+codegraph serve --mcp             # Start MCP server
 ```
 
-The installer will:
-1. Ask for installation location (global `~/.claude` or local `./.claude`)
-2. Configure the MCP server in `claude.json`
-3. Optionally set up auto-allow permissions
-4. Add global instructions to `~/.claude/CLAUDE.md` (teaches Claude how to use CodeGraph)
-5. Install Claude Code hooks for automatic index syncing
-6. For local installs: initialize and index the current project
+### `codegraph affected`
 
-### `codegraph init [path]`
-
-Initialize CodeGraph in a project directory. Creates a `.codegraph/` directory with the database and configuration.
-
-```bash
-codegraph init                    # Initialize in current directory
-codegraph init /path/to/project   # Initialize in specific directory
-codegraph init --index            # Initialize and immediately index
-```
-
-### `codegraph uninit [path]`
-
-Remove CodeGraph from a project. Deletes the `.codegraph/` directory and all indexed data.
-
-```bash
-codegraph uninit                  # Remove from current directory
-codegraph uninit --force          # Skip confirmation prompt
-```
-
-### `codegraph index [path]`
-
-Index all files in the project. Extracts functions, classes, methods, and their relationships.
-
-```bash
-codegraph index                   # Index current directory
-codegraph index --force           # Force full re-index
-codegraph index --quiet           # Suppress progress output
-```
-
-### `codegraph sync [path]`
-
-Incrementally sync changes since the last index. Only processes added, modified, or removed files.
-
-```bash
-codegraph sync                    # Sync current directory
-codegraph sync --quiet            # Suppress output
-```
-
-### `codegraph status [path]`
-
-Show index status and statistics.
-
-```bash
-codegraph status
-```
-
-Output includes:
-- Files indexed, nodes, edges
-- Nodes by kind (functions, classes, methods, etc.)
-- Files by language
-- Pending changes (if any)
-
-### `codegraph query <search>`
-
-Search for symbols in the codebase by name.
-
-```bash
-codegraph query "authenticate"           # Search for symbols
-codegraph query "User" --kind class      # Filter by kind
-codegraph query "process" --limit 20     # Limit results
-codegraph query "validate" --json        # Output as JSON
-```
-
-### `codegraph files [path]`
-
-Show the project file structure from the index. Faster than filesystem scanning since it reads from the indexed data.
-
-```bash
-codegraph files                           # Show file tree
-codegraph files --format flat             # Simple list
-codegraph files --format grouped          # Group by language
-codegraph files --filter src/components   # Filter by directory
-codegraph files --pattern "*.test.ts"     # Filter by glob pattern
-codegraph files --max-depth 2             # Limit tree depth
-codegraph files --no-metadata             # Hide language/symbol counts
-codegraph files --json                    # Output as JSON
-```
-
-### `codegraph context <task>`
-
-Build relevant code context for a task. Uses semantic search to find entry points, then expands through the graph to find related code.
-
-```bash
-codegraph context "fix checkout bug"
-codegraph context "add user authentication" --format json
-codegraph context "refactor payment service" --max-nodes 30
-```
-
-### `codegraph affected [files...]`
-
-Find test files affected by changed source files. Traces import dependencies transitively through the graph to discover which test files depend on the code you changed. Works with any test framework and any language CodeGraph supports.
+Traces import dependencies transitively to find which test files are affected by changed source files.
 
 ```bash
 codegraph affected src/utils.ts src/api.ts         # Pass files as arguments
 git diff --name-only | codegraph affected --stdin   # Pipe from git diff
-codegraph affected --stdin --json < changed.txt     # JSON output
 codegraph affected src/auth.ts --filter "e2e/*"     # Custom test file pattern
-codegraph affected src/lib.ts --depth 3 --quiet     # Shallow search, paths only
 ```
-
-**Options:**
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--stdin` | Read file list from stdin (one per line) | `false` |
+| `--stdin` | Read file list from stdin | `false` |
 | `-d, --depth <n>` | Max dependency traversal depth | `5` |
 | `-f, --filter <glob>` | Custom glob to identify test files | auto-detect |
 | `-j, --json` | Output as JSON | `false` |
-| `-q, --quiet` | Output file paths only, no decoration | `false` |
-| `-p, --path <path>` | Project path | auto-detect |
+| `-q, --quiet` | Output file paths only | `false` |
 
-**How it works:**
-
-1. For each changed file, BFS-traverses its transitive dependents (files that import from it, directly or indirectly)
-2. Filters results to test files using common conventions (`*.spec.*`, `*.test.*`, `e2e/`, `tests/`, `__tests__/`) or a custom `--filter` glob
-3. Changed files that are themselves test files are always included
-
-**Example: CI/hook integration**
+**CI/hook example:**
 
 ```bash
 #!/usr/bin/env bash
-# In a pre-commit hook or CI step:
 AFFECTED=$(git diff --name-only HEAD | codegraph affected --stdin --quiet)
 if [ -n "$AFFECTED" ]; then
-  echo "Running affected tests..."
   npx vitest run $AFFECTED
 fi
 ```
 
-### `codegraph serve`
+---
 
-Start CodeGraph as an MCP server for AI assistants.
+## MCP Tools
 
-```bash
-codegraph serve                          # Show MCP configuration help
-codegraph serve --mcp                    # Start MCP server (stdio)
-codegraph serve --mcp --path /project    # Specify project path
-```
+When running as an MCP server, CodeGraph exposes these tools to Claude Code:
 
-## 🔌 MCP Tools Reference
+| Tool | Purpose |
+|------|---------|
+| `codegraph_search` | Find symbols by name across the codebase |
+| `codegraph_context` | Build relevant code context for a task |
+| `codegraph_callers` | Find what calls a function |
+| `codegraph_callees` | Find what a function calls |
+| `codegraph_impact` | Analyze what code is affected by changing a symbol |
+| `codegraph_node` | Get details about a specific symbol (optionally with source code) |
+| `codegraph_files` | Get indexed file structure (faster than filesystem scanning) |
+| `codegraph_status` | Check index health and statistics |
 
-When running as an MCP server, CodeGraph exposes these tools to AI assistants. **These tools are designed to be used by Claude's Explore agents** for faster, more efficient codebase exploration.
+---
 
-### `codegraph_context`
-
-Build context for a specific task. Good for focused queries.
-
-```
-codegraph_context(task: "fix checkout validation bug", maxNodes: 20)
-```
-
-### `codegraph_search`
-
-Quick symbol search by name. Returns locations only.
-
-```
-codegraph_search(query: "UserService", kind: "class", limit: 10)
-```
-
-### `codegraph_callers` / `codegraph_callees`
-
-Find what calls a function, or what a function calls.
-
-```
-codegraph_callers(symbol: "validatePayment", limit: 20)
-codegraph_callees(symbol: "processOrder", limit: 20)
-```
-
-### `codegraph_impact`
-
-Analyze what code would be affected by changing a symbol.
-
-```
-codegraph_impact(symbol: "UserService", depth: 2)
-```
-
-### `codegraph_node`
-
-Get details about a specific symbol. Use `includeCode: true` only when needed.
-
-```
-codegraph_node(symbol: "authenticate", includeCode: true)
-```
-
-### `codegraph_files`
-
-Get the project file structure from the index. Faster than filesystem scanning.
-
-```
-codegraph_files(path: "src/components", format: "tree", includeMetadata: true)
-```
-
-### `codegraph_status`
-
-Check index health and statistics.
-
-### How It Works With Claude Code
-
-Claude's **Explore agents** use these tools instead of grep/glob/Read for faster exploration:
-
-| Without CodeGraph | With CodeGraph | Benefit |
-|-------------------|----------------|---------|
-| `grep -r "auth"` | `codegraph_search("auth")` | Instant symbol lookup |
-| Multiple `Read` calls | `codegraph_context(task)` | Related code in one call |
-| Manual file tracing | `codegraph_callers/callees` | Call graph traversal |
-| Guessing impact | `codegraph_impact(symbol)` | Know what breaks |
-| `Glob`/`find` scanning | `codegraph_files(path)` | Indexed file structure |
-
-This hybrid approach gives you **~30% fewer tokens** and **~25% fewer tool calls** while letting Claude's native agents handle synthesis.
-
-## 📚 Library Usage
-
-CodeGraph can also be used as a library in your Node.js applications:
+## Library Usage
 
 ```typescript
 import CodeGraph from '@colbymchenry/codegraph';
 
-// Initialize a new project
 const cg = await CodeGraph.init('/path/to/project');
+// Or: const cg = await CodeGraph.open('/path/to/project');
 
-// Or open an existing one
-const cg = await CodeGraph.open('/path/to/project');
-
-// Index with progress callback
 await cg.indexAll({
-  onProgress: (progress) => {
-    console.log(`${progress.phase}: ${progress.current}/${progress.total}`);
-  }
+  onProgress: (p) => console.log(`${p.phase}: ${p.current}/${p.total}`)
 });
 
-// Search for symbols
 const results = cg.searchNodes('UserService');
+const callers = cg.getCallers(results[0].node.id);
+const context = await cg.buildContext('fix login bug', { maxNodes: 20, includeCode: true, format: 'markdown' });
+const impact = cg.getImpactRadius(results[0].node.id, 2);
 
-// Get callers of a function
-const node = results[0].node;
-const callers = cg.getCallers(node.id);
-
-// Build context for a task
-const context = await cg.buildContext('fix login bug', {
-  maxNodes: 20,
-  includeCode: true,
-  format: 'markdown'
-});
-
-// Get impact radius
-const impact = cg.getImpactRadius(node.id, 2);
-
-// Sync changes
-const syncResult = await cg.sync();
-
-// Clean up
+cg.watch();   // auto-sync on file changes
+cg.unwatch(); // stop watching
 cg.close();
 ```
 
-## ⚙️ How It Works
+---
 
-### 1. Extraction
+## Configuration
 
-CodeGraph uses [tree-sitter](https://tree-sitter.github.io/) to parse source code into ASTs. Language-specific queries (`.scm` files) extract:
-
-- **Nodes**: Functions, methods, classes, interfaces, types, variables
-- **Edges**: Calls, imports, extends, implements, returns_type
-
-Each node gets a unique ID based on its kind, file path, name, and line number.
-
-### 2. Storage
-
-All data is stored in a local SQLite database (`.codegraph/codegraph.db`):
-
-- **nodes** table: All code entities with metadata
-- **edges** table: Relationships between nodes
-- **files** table: File tracking for incremental updates
-- **unresolved_refs** table: References pending resolution
-- **vectors** table: Embeddings stored as BLOBs for semantic search
-- **nodes_fts**: FTS5 virtual table for full-text search
-- **schema_versions** table: Schema version tracking
-- **project_metadata** table: Project-level key-value metadata
-
-### 3. Reference Resolution
-
-After extraction, CodeGraph resolves references:
-
-1. Match function calls to function definitions
-2. Resolve imports to their source files
-3. Link class inheritance and interface implementations
-4. Apply framework-specific patterns (Express routes, etc.)
-
-### 4. Semantic Search
-
-CodeGraph uses local embeddings (via [@xenova/transformers](https://github.com/xenova/transformers.js)) to enable semantic search:
-
-1. Code symbols are embedded using a transformer model
-2. Queries are embedded and compared using cosine similarity
-3. Results are ranked by relevance
-
-### 5. Graph Queries
-
-The graph structure enables powerful queries:
-
-- **Callers/Callees**: Direct call relationships
-- **Impact Radius**: BFS traversal to find all potentially affected code
-- **Dependencies**: What a symbol depends on
-- **Dependents**: What depends on a symbol
-
-### 6. Context Building
-
-When you request context for a task:
-
-1. Semantic search finds relevant entry points
-2. Graph traversal expands to related code
-3. Code snippets are extracted
-4. Results are formatted for AI consumption
-
-## ⚙️ Configuration
-
-The `.codegraph/config.json` file controls indexing behavior:
+The `.codegraph/config.json` file controls indexing:
 
 ```json
 {
   "version": 1,
   "languages": ["typescript", "javascript"],
-  "exclude": [
-    "node_modules/**",
-    "dist/**",
-    "build/**",
-    "*.min.js"
-  ],
+  "exclude": ["node_modules/**", "dist/**", "build/**", "*.min.js"],
   "frameworks": [],
   "maxFileSize": 1048576,
   "extractDocstrings": true,
-  "trackCallSites": true,
-  "enableEmbeddings": false
+  "trackCallSites": true
 }
 ```
-
-### Options
 
 | Option | Description | Default |
 |--------|-------------|---------|
@@ -656,11 +377,10 @@ The `.codegraph/config.json` file controls indexing behavior:
 | `exclude` | Glob patterns to ignore | `["node_modules/**", ...]` |
 | `frameworks` | Framework hints for better resolution | `[]` |
 | `maxFileSize` | Skip files larger than this (bytes) | `1048576` (1MB) |
-| `extractDocstrings` | Whether to extract docstrings from code | `true` |
-| `trackCallSites` | Whether to track call site locations | `true` |
-| `enableEmbeddings` | Enable semantic search embeddings | `false` |
+| `extractDocstrings` | Extract docstrings from code | `true` |
+| `trackCallSites` | Track call site locations | `true` |
 
-## 🌐 Supported Languages
+## Supported Languages
 
 | Language | Extension | Status |
 |----------|-----------|--------|
@@ -675,41 +395,24 @@ The `.codegraph/config.json` file controls indexing behavior:
 | Ruby | `.rb` | Full support |
 | C | `.c`, `.h` | Full support |
 | C++ | `.cpp`, `.hpp`, `.cc` | Full support |
-| Swift | `.swift` | Basic support |
-| Kotlin | `.kt`, `.kts` | Basic support |
+| Swift | `.swift` | Full support |
+| Kotlin | `.kt`, `.kts` | Full support |
 | Dart | `.dart` | Full support |
 | Svelte | `.svelte` | Full support (script extraction, Svelte 5 runes, SvelteKit routes) |
 | Liquid | `.liquid` | Full support |
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX form files) |
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
-### "CodeGraph not initialized"
+**"CodeGraph not initialized"** — Run `codegraph init` in your project directory first.
 
-Run `codegraph init` in your project directory first.
+**Indexing is slow** — Check that `node_modules` and other large directories are excluded. Use `--quiet` to reduce output overhead.
 
-### Indexing is slow
+**MCP server not connecting** — Ensure the project is initialized/indexed, verify the path in your MCP config, and check that `codegraph serve --mcp` works from the command line.
 
-- Check if `node_modules` or other large directories are excluded
-- Use `--quiet` flag to reduce console output overhead
-- Consider increasing `maxFileSize` if you have large files to skip
+**Missing symbols** — The MCP server auto-syncs on save (wait a couple seconds). Run `codegraph sync` manually if needed. Check that the file's language is supported and isn't excluded by config patterns.
 
-### MCP server not connecting
-
-1. Ensure the project is initialized and indexed
-2. Check the path in your MCP configuration is correct
-3. Verify `codegraph serve --mcp` works from the command line
-4. Check Claude Code logs for connection errors
-
-### Missing symbols in search
-
-- Run `codegraph sync` to pick up recent changes
-- Check if the file's language is supported
-- Verify the file isn't excluded by config patterns
-
----
-
-## 📄 License
+## License
 
 MIT
 
@@ -717,7 +420,7 @@ MIT
 
 <div align="center">
 
-**Made for the Claude Code community** 🤖
+**Made for the Claude Code community**
 
 [Report Bug](https://github.com/colbymchenry/codegraph/issues) · [Request Feature](https://github.com/colbymchenry/codegraph/issues)
 

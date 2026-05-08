@@ -20,7 +20,6 @@ import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { detectLanguage, isLanguageSupported, initGrammars, loadGrammarsForLanguages } from './grammars';
 import { logDebug, logWarn } from '../errors';
-import { captureException } from '../sentry';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import picomatch from 'picomatch';
 
@@ -29,6 +28,24 @@ import picomatch from 'picomatch';
  * File reads are I/O-bound; batching overlaps I/O wait with CPU parse work.
  */
 const FILE_IO_BATCH_SIZE = 10;
+
+// PARSER_RESET_INTERVAL moved to parse-worker.ts (runs in worker thread)
+
+/**
+ * Maximum time (ms) to wait for a single file to parse in the worker thread.
+ * If tree-sitter hangs or WASM runs out of memory, this prevents the entire
+ * indexing run from freezing. The worker is restarted after a timeout.
+ */
+const PARSE_TIMEOUT_MS = 10_000;
+
+/**
+ * Number of files to parse before recycling the worker thread.
+ * WASM linear memory can grow but NEVER shrink (WebAssembly spec limitation).
+ * The only way to reclaim tree-sitter's WASM heap is to destroy the entire
+ * V8 isolate by terminating the worker thread and spawning a fresh one.
+ * This interval balances memory usage against the cost of reloading grammars.
+ */
+const WORKER_RECYCLE_INTERVAL = 250;
 
 /**
  * Progress callback for indexing operations
@@ -47,6 +64,7 @@ export interface IndexResult {
   success: boolean;
   filesIndexed: number;
   filesSkipped: number;
+  filesErrored: number;
   nodesCreated: number;
   edgesCreated: number;
   errors: ExtractionError[];
@@ -112,6 +130,30 @@ export function shouldIncludeFile(
  */
 function getGitVisibleFiles(rootDir: string): Set<string> | null {
   try {
+    // Check if the project directory is gitignored by a parent repo.
+    // When rootDir lives inside a parent git repo that ignores it,
+    // `git ls-files` returns nothing — fall back to filesystem walk.
+    const gitRoot = execFileSync(
+      'git',
+      ['rev-parse', '--show-toplevel'],
+      { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
+    ).trim();
+
+    if (path.resolve(gitRoot) !== path.resolve(rootDir)) {
+      try {
+        // git check-ignore exits 0 if the path IS ignored, 1 if not
+        execFileSync(
+          'git',
+          ['check-ignore', '-q', path.resolve(rootDir)],
+          { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
+        );
+        // Directory is gitignored by parent repo — fall back to filesystem walk
+        return null;
+      } catch {
+        // Not ignored — safe to use git ls-files
+      }
+    }
+
     // -c = cached (tracked), -o = others (untracked), --exclude-standard = respect .gitignore
     const output = execFileSync(
       'git',
@@ -220,6 +262,36 @@ export function scanDirectory(
 }
 
 /**
+ * Async variant of scanDirectory that yields to the event loop periodically,
+ * allowing worker threads to receive and render progress messages.
+ */
+export async function scanDirectoryAsync(
+  rootDir: string,
+  config: CodeGraphConfig,
+  onProgress?: (current: number, file: string) => void
+): Promise<string[]> {
+  const gitFiles = getGitVisibleFiles(rootDir);
+  if (gitFiles) {
+    const files: string[] = [];
+    let count = 0;
+    for (const filePath of gitFiles) {
+      if (shouldIncludeFile(filePath, config)) {
+        files.push(filePath);
+        count++;
+        onProgress?.(count, filePath);
+        // Yield every 100 files so worker threads can render progress
+        if (count % 100 === 0) {
+          await new Promise<void>(r => setImmediate(r));
+        }
+      }
+    }
+    return files;
+  }
+
+  return scanDirectoryWalk(rootDir, config, onProgress);
+}
+
+/**
  * Filesystem walk fallback for non-git projects.
  */
 function scanDirectoryWalk(
@@ -257,7 +329,6 @@ function scanDirectoryWalk(
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch (error) {
-      captureException(error, { operation: 'walk-directory', dir });
       logDebug('Skipping unreadable directory', { dir, error: String(error) });
       return;
     }
@@ -340,15 +411,21 @@ export class ExtractionOrchestrator {
    */
   async indexAll(
     onProgress?: (progress: IndexProgress) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    verbose?: boolean
   ): Promise<IndexResult> {
     await initGrammars();
     const startTime = Date.now();
     const errors: ExtractionError[] = [];
     let filesIndexed = 0;
     let filesSkipped = 0;
+    let filesErrored = 0;
     let totalNodes = 0;
     let totalEdges = 0;
+
+    const log = verbose
+      ? (msg: string) => { console.log(`[worker] ${msg}`); }
+      : (_msg: string) => {};
 
     // Phase 1: Scan for files
     onProgress?.({
@@ -357,7 +434,7 @@ export class ExtractionOrchestrator {
       total: 0,
     });
 
-    const files = scanDirectory(this.rootDir, this.config, (current, file) => {
+    const files = await scanDirectoryAsync(this.rootDir, this.config, (current, file) => {
       onProgress?.({
         phase: 'scanning',
         current,
@@ -371,6 +448,7 @@ export class ExtractionOrchestrator {
         success: false,
         filesIndexed: 0,
         filesSkipped: 0,
+        filesErrored: 0,
         nodesCreated: 0,
         edgesCreated: 0,
         errors: [{ message: 'Aborted', severity: 'error' }],
@@ -378,22 +456,176 @@ export class ExtractionOrchestrator {
       };
     }
 
-    // Load only the grammars needed for languages actually present in the project.
-    // This avoids compiling all 16+ WASM grammar modules upfront, which can cause
-    // V8 WASM Zone OOM on large codebases (see issue #54).
-    const neededLanguages = [...new Set(files.map((f) => detectLanguage(f)))];
-    await loadGrammarsForLanguages(neededLanguages);
-
-    // Phase 2: Parse files (read in parallel batches, parse/store sequentially)
+    // Phase 2: Parse files in a worker thread (keeps main thread unblocked for UI)
     const total = files.length;
     let processed = 0;
 
+    // Emit parsing phase immediately so the progress bar appears during worker setup.
+    // The yield lets the shimmer worker flush the phase transition to stdout before
+    // the main thread starts synchronous grammar detection work.
+    onProgress?.({
+      phase: 'parsing',
+      current: 0,
+      total,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+
+    // Detect needed languages and load grammars in the parse worker
+    const neededLanguages = [...new Set(files.map((f) => detectLanguage(f)))];
+    // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded when c is needed
+    if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
+      neededLanguages.push('cpp');
+    }
+
+    // Try to use a worker thread for parsing (keeps main thread unblocked for UI).
+    // Falls back to in-process parsing if the compiled worker is unavailable (e.g. tests).
+    const parseWorkerPath = path.join(__dirname, 'parse-worker.js');
+    const useWorker = fs.existsSync(parseWorkerPath);
+    let WorkerClass: typeof import('worker_threads').Worker | null = null;
+
+    if (useWorker) {
+      const { Worker } = await import('worker_threads');
+      WorkerClass = Worker;
+    } else {
+      // In-process fallback: load grammars locally
+      await loadGrammarsForLanguages(neededLanguages);
+    }
+
+    // --- Worker lifecycle management ---
+    // The worker can crash (OOM in WASM) or hang on pathological files.
+    // We track pending parse promises and handle both cases:
+    //   - Timeout: terminate + restart the worker, reject the timed-out request
+    //   - Crash: reject all pending promises, restart for remaining files
+    let parseWorker: import('worker_threads').Worker | null = null;
+    let nextId = 0;
+    let workerParseCount = 0;
+    const pendingParses = new Map<number, {
+      resolve: (result: ExtractionResult) => void;
+      reject: (err: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }>();
+
+    function rejectAllPending(reason: string): void {
+      for (const [id, pending] of pendingParses) {
+        clearTimeout(pending.timer);
+        pendingParses.delete(id);
+        pending.reject(new Error(reason));
+      }
+    }
+
+    function attachWorkerHandlers(w: import('worker_threads').Worker): void {
+      w.on('message', (msg: { type: string; id?: number; result?: ExtractionResult }) => {
+        if (msg.type === 'parse-result' && msg.id !== undefined) {
+          const pending = pendingParses.get(msg.id);
+          if (pending) {
+            clearTimeout(pending.timer);
+            pendingParses.delete(msg.id);
+            pending.resolve(msg.result!);
+          }
+        }
+      });
+
+      w.on('error', (err) => {
+        logWarn('Parse worker error', { error: err.message });
+        rejectAllPending(`Worker error: ${err.message}`);
+      });
+
+      w.on('exit', (code) => {
+        if (code !== 0 && pendingParses.size > 0) {
+          logWarn('Parse worker exited unexpectedly', { code });
+          rejectAllPending(`Worker exited with code ${code}`);
+        }
+        // Clear reference so we know to respawn, reset count so
+        // the fresh worker gets a full cycle before recycling.
+        if (parseWorker === w) {
+          parseWorker = null;
+          workerParseCount = 0;
+        }
+      });
+    }
+
+    async function ensureWorker(): Promise<import('worker_threads').Worker> {
+      if (parseWorker) return parseWorker;
+      log('Spawning new parse worker...');
+      parseWorker = new WorkerClass!(parseWorkerPath);
+      attachWorkerHandlers(parseWorker);
+
+      // Load grammars in the new worker
+      await new Promise<void>((resolve, reject) => {
+        parseWorker!.once('message', (msg: { type: string }) => {
+          if (msg.type === 'grammars-loaded') resolve();
+          else reject(new Error(`Unexpected message: ${msg.type}`));
+        });
+        parseWorker!.postMessage({ type: 'load-grammars', languages: neededLanguages });
+      });
+
+      return parseWorker;
+    }
+
+    if (WorkerClass) {
+      await ensureWorker();
+    }
+
+    /**
+     * Recycle the worker thread to reclaim WASM memory.
+     * Terminates the current worker and clears the reference so
+     * ensureWorker() will spawn a fresh one on the next call.
+     */
+    function recycleWorker(): void {
+      if (!parseWorker) return;
+      log(`Recycling worker after ${workerParseCount} parses (heap: ${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB RSS)`);
+      const w = parseWorker;
+      parseWorker = null;
+      workerParseCount = 0;
+      // Fire-and-forget: worker.terminate() can hang if WASM is stuck
+      w.terminate().catch(() => {});
+    }
+
+    async function requestParse(filePath: string, content: string): Promise<ExtractionResult> {
+      if (!WorkerClass) {
+        // In-process fallback
+        return extractFromSource(filePath, content, detectLanguage(filePath, content));
+      }
+
+      // Recycle the worker before the next parse if we've hit the threshold.
+      // This destroys the WASM linear memory (which can grow but never shrink)
+      // and starts a fresh worker with a clean heap.
+      if (workerParseCount >= WORKER_RECYCLE_INTERVAL) {
+        await recycleWorker();
+      }
+
+      const worker = await ensureWorker();
+      const id = nextId++;
+      workerParseCount++;
+
+      // Scale timeout for large files: base 10s + 10s per 100KB
+      const timeoutMs = PARSE_TIMEOUT_MS + Math.floor(content.length / 100_000) * 10_000;
+
+      return new Promise<ExtractionResult>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingParses.delete(id);
+          log(`TIMEOUT: ${filePath} exceeded ${timeoutMs}ms — killing worker`);
+          // Reject FIRST — worker.terminate() can hang if WASM is stuck
+          parseWorker = null;
+          workerParseCount = 0;
+          reject(new Error(`Parse timed out after ${timeoutMs}ms`));
+          // Fire-and-forget: kill the stuck worker in the background
+          worker.terminate().catch(() => {});
+        }, timeoutMs);
+
+        pendingParses.set(id, { resolve, reject, timer });
+        worker.postMessage({ type: 'parse', id, filePath, content });
+      });
+    }
+
     for (let i = 0; i < files.length; i += FILE_IO_BATCH_SIZE) {
       if (signal?.aborted) {
+        if (parseWorker) (parseWorker as import('worker_threads').Worker).terminate().catch(() => {});
         return {
           success: false,
           filesIndexed,
           filesSkipped,
+          filesErrored,
           nodesCreated: totalNodes,
           edgesCreated: totalEdges,
           errors: [{ message: 'Aborted', severity: 'error' }, ...errors],
@@ -421,13 +653,15 @@ export class ExtractionOrchestrator {
         })
       );
 
-      // Parse and store sequentially
+      // Send to worker for parsing, store results on main thread
       for (const { filePath, content, stats, error } of fileContents) {
         if (signal?.aborted) {
+          if (parseWorker) (parseWorker as import('worker_threads').Worker).terminate().catch(() => {});
           return {
             success: false,
             filesIndexed,
             filesSkipped,
+            filesErrored,
             nodesCreated: totalNodes,
             edgesCreated: totalEdges,
             errors: [{ message: 'Aborted', severity: 'error' }, ...errors],
@@ -435,7 +669,7 @@ export class ExtractionOrchestrator {
           };
         }
 
-        processed++;
+        // Report progress before parsing (show current file being worked on)
         onProgress?.({
           phase: 'parsing',
           current: processed,
@@ -444,16 +678,66 @@ export class ExtractionOrchestrator {
         });
 
         if (error || content === null || stats === null) {
+          processed++;
+          filesErrored++;
           errors.push({
             message: `Failed to read file: ${error instanceof Error ? error.message : String(error)}`,
+            filePath,
             severity: 'error',
+            code: 'read_error',
           });
           continue;
         }
 
-        const result = await this.indexFileWithContent(filePath, content, stats);
+        // Honour config.maxFileSize. Without this check, vendored
+        // generated headers, minified bundles, and other multi-MB
+        // files get indexed despite the user setting a size cap —
+        // wasting WASM heap and the worker recycle budget on inputs
+        // the user explicitly opted out of. The single-file extractFile
+        // path already enforces this; the bulk path used to silently
+        // skip the check.
+        if (stats.size > this.config.maxFileSize) {
+          processed++;
+          filesSkipped++;
+          errors.push({
+            message: `File exceeds max size (${stats.size} > ${this.config.maxFileSize})`,
+            filePath,
+            severity: 'warning',
+            code: 'size_exceeded',
+          });
+          onProgress?.({ phase: 'parsing', current: processed, total });
+          continue;
+        }
+
+        // Parse in worker thread (main thread stays unblocked).
+        // Wrapped in try/catch to handle worker timeouts and crashes gracefully.
+        let result: ExtractionResult;
+        try {
+          result = await requestParse(filePath, content);
+        } catch (parseErr) {
+          processed++;
+          filesErrored++;
+          errors.push({
+            message: parseErr instanceof Error ? parseErr.message : String(parseErr),
+            filePath,
+            severity: 'error',
+            code: 'parse_error',
+          });
+          continue;
+        }
+
+        processed++;
+
+        // Store in database on main thread (SQLite is not thread-safe)
+        if (result.nodes.length > 0 || result.errors.length === 0) {
+          const language = detectLanguage(filePath, content);
+          this.storeExtractionResult(filePath, content, language, stats, result);
+        }
 
         if (result.errors.length > 0) {
+          for (const err of result.errors) {
+            if (!err.filePath) err.filePath = filePath;
+          }
           errors.push(...result.errors);
         }
 
@@ -461,25 +745,142 @@ export class ExtractionOrchestrator {
           filesIndexed++;
           totalNodes += result.nodes.length;
           totalEdges += result.edges.length;
-        } else if (result.errors.length === 0) {
+        } else if (result.errors.some((e) => e.severity === 'error')) {
+          filesErrored++;
+        } else {
           filesSkipped++;
         }
       }
     }
 
-    // Phase 3: Resolve references
+    // Report 100% so the progress bar doesn't hang at 99%
     onProgress?.({
-      phase: 'resolving',
-      current: 0,
-      total: 1,
+      phase: 'parsing',
+      current: total,
+      total,
     });
 
-    // TODO: Implement reference resolution in Phase 3
+    // Yield so the shimmer worker's buffered stdout writes can flush.
+    // Worker thread stdout is proxied through the main thread's event loop,
+    // so synchronous work here blocks the animation from rendering.
+    await new Promise(resolve => setImmediate(resolve));
+
+    // Retry pass: files that failed due to WASM memory corruption may succeed
+    // on a fresh worker with a clean heap. Recycle before each attempt so
+    // every file gets the absolute cleanest WASM state possible.
+    const retryableErrors = errors.filter(
+      (e) => e.code === 'parse_error' && e.filePath &&
+        (e.message.includes('Worker exited') || e.message.includes('memory access out of bounds'))
+    );
+
+    if (retryableErrors.length > 0 && WorkerClass) {
+      log(`Retrying ${retryableErrors.length} files that failed due to WASM memory errors...`);
+
+      const stillFailing: typeof retryableErrors = [];
+
+      for (const errEntry of retryableErrors) {
+        const filePath = errEntry.filePath!;
+        if (signal?.aborted) break;
+
+        // Fresh worker for every retry — maximum WASM headroom
+        recycleWorker();
+
+        let content: string;
+        try {
+          const fullPath = validatePathWithinRoot(this.rootDir, filePath);
+          if (!fullPath) continue;
+          content = await fsp.readFile(fullPath, 'utf-8');
+        } catch {
+          continue;
+        }
+
+        let result: ExtractionResult;
+        try {
+          result = await requestParse(filePath, content);
+        } catch {
+          stillFailing.push(errEntry);
+          continue;
+        }
+
+        if (result.nodes.length > 0 || result.errors.length === 0) {
+          const language = detectLanguage(filePath, content);
+          const stats = await fsp.stat(path.join(this.rootDir, filePath));
+          this.storeExtractionResult(filePath, content, language, stats, result);
+
+          const idx = errors.indexOf(errEntry);
+          if (idx >= 0) errors.splice(idx, 1);
+          filesErrored--;
+          filesIndexed++;
+          totalNodes += result.nodes.length;
+          totalEdges += result.edges.length;
+          log(`Retry OK: ${filePath} (${result.nodes.length} nodes)`);
+        }
+      }
+
+      // Last resort: for files that still crash on a clean worker, strip
+      // comment-only lines to reduce WASM memory pressure. Many compiler
+      // test files are 90%+ comments (CHECK directives) that don't contribute
+      // code nodes but consume parser memory.
+      if (stillFailing.length > 0) {
+        log(`${stillFailing.length} files still failing — retrying with comments stripped...`);
+
+        for (const errEntry of stillFailing) {
+          const filePath = errEntry.filePath!;
+          if (signal?.aborted) break;
+
+          recycleWorker();
+
+          let fullContent: string;
+          try {
+            const fullPath = validatePathWithinRoot(this.rootDir, filePath);
+            if (!fullPath) continue;
+            fullContent = await fsp.readFile(fullPath, 'utf-8');
+          } catch {
+            continue;
+          }
+
+          // Strip lines that are entirely comments (preserving line numbers
+          // by replacing with empty lines so node positions stay correct)
+          const stripped = fullContent
+            .split('\n')
+            .map(line => /^\s*\/\//.test(line) ? '' : line)
+            .join('\n');
+
+          let result: ExtractionResult;
+          try {
+            result = await requestParse(filePath, stripped);
+          } catch {
+            continue;
+          }
+
+          if (result.nodes.length > 0 || result.errors.length === 0) {
+            const language = detectLanguage(filePath, fullContent);
+            const stats = await fsp.stat(path.join(this.rootDir, filePath));
+            this.storeExtractionResult(filePath, fullContent, language, stats, result);
+
+            const idx = errors.indexOf(errEntry);
+            if (idx >= 0) errors.splice(idx, 1);
+            filesErrored--;
+            filesIndexed++;
+            totalNodes += result.nodes.length;
+            totalEdges += result.edges.length;
+            log(`Retry (stripped) OK: ${filePath} (${result.nodes.length} nodes)`);
+          }
+        }
+      }
+    }
+
+    // Shut down parse worker and clear any pending timers
+    rejectAllPending('Indexing complete');
+    if (parseWorker) {
+      (parseWorker as import('worker_threads').Worker).terminate().catch(() => {});
+    }
 
     return {
-      success: errors.filter((e) => e.severity === 'error').length === 0,
+      success: filesIndexed > 0 || errors.filter((e) => e.severity === 'error').length === 0,
       filesIndexed,
       filesSkipped,
+      filesErrored,
       nodesCreated: totalNodes,
       edgesCreated: totalEdges,
       errors,
@@ -495,6 +896,7 @@ export class ExtractionOrchestrator {
     const errors: ExtractionError[] = [];
     let filesIndexed = 0;
     let filesSkipped = 0;
+    let filesErrored = 0;
     let totalNodes = 0;
     let totalEdges = 0;
 
@@ -509,15 +911,18 @@ export class ExtractionOrchestrator {
         filesIndexed++;
         totalNodes += result.nodes.length;
         totalEdges += result.edges.length;
+      } else if (result.errors.some((e) => e.severity === 'error')) {
+        filesErrored++;
       } else {
         filesSkipped++;
       }
     }
 
     return {
-      success: errors.filter((e) => e.severity === 'error').length === 0,
+      success: filesIndexed > 0 || errors.filter((e) => e.severity === 'error').length === 0,
       filesIndexed,
       filesSkipped,
+      filesErrored,
       nodesCreated: totalNodes,
       edgesCreated: totalEdges,
       errors,
@@ -536,7 +941,7 @@ export class ExtractionOrchestrator {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
-        errors: [{ message: `Path traversal blocked: ${relativePath}`, severity: 'error' }],
+        errors: [{ message: `Path traversal blocked: ${relativePath}`, filePath: relativePath, severity: 'error', code: 'path_traversal' }],
         durationMs: 0,
       };
     }
@@ -548,7 +953,6 @@ export class ExtractionOrchestrator {
       stats = await fsp.stat(fullPath);
       content = await fsp.readFile(fullPath, 'utf-8');
     } catch (error) {
-      captureException(error, { operation: 'extract-file', filePath: fullPath });
       return {
         nodes: [],
         edges: [],
@@ -556,7 +960,9 @@ export class ExtractionOrchestrator {
         errors: [
           {
             message: `Failed to read file: ${error instanceof Error ? error.message : String(error)}`,
+            filePath: relativePath,
             severity: 'error',
+            code: 'read_error',
           },
         ],
         durationMs: 0,
@@ -583,7 +989,7 @@ export class ExtractionOrchestrator {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
-        errors: [{ message: 'Path traversal blocked', severity: 'error' }],
+        errors: [{ message: 'Path traversal blocked', filePath: relativePath, severity: 'error', code: 'path_traversal' }],
         durationMs: 0,
       };
     }
@@ -597,7 +1003,9 @@ export class ExtractionOrchestrator {
         errors: [
           {
             message: `File exceeds max size (${stats.size} > ${this.config.maxFileSize})`,
+            filePath: relativePath,
             severity: 'warning',
+            code: 'size_exceeded',
           },
         ],
         durationMs: 0,
@@ -605,7 +1013,7 @@ export class ExtractionOrchestrator {
     }
 
     // Detect language
-    const language = detectLanguage(relativePath);
+    const language = detectLanguage(relativePath, content);
     if (!isLanguageSupported(language)) {
       return {
         nodes: [],
@@ -744,7 +1152,6 @@ export class ExtractionOrchestrator {
         try {
           content = fs.readFileSync(fullPath, 'utf-8');
         } catch (error) {
-          captureException(error, { operation: 'sync-read-file', filePath });
           logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
           continue;
         }
@@ -796,7 +1203,6 @@ export class ExtractionOrchestrator {
         try {
           content = fs.readFileSync(fullPath, 'utf-8');
         } catch (error) {
-          captureException(error, { operation: 'sync-read-file', filePath });
           logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
           continue;
         }
@@ -819,6 +1225,10 @@ export class ExtractionOrchestrator {
     // Load only grammars needed for changed files
     if (filesToIndex.length > 0) {
       const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f)))];
+      // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded
+      if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
+        neededLanguages.push('cpp');
+      }
       await loadGrammarsForLanguages(neededLanguages);
     }
 
@@ -876,7 +1286,6 @@ export class ExtractionOrchestrator {
         try {
           content = fs.readFileSync(fullPath, 'utf-8');
         } catch (error) {
-          captureException(error, { operation: 'detect-changes-read-file', filePath });
           logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
           continue;
         }
@@ -927,7 +1336,6 @@ export class ExtractionOrchestrator {
       try {
         content = fs.readFileSync(fullPath, 'utf-8');
       } catch (error) {
-        captureException(error, { operation: 'detect-changes-read-file', filePath });
         logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
         continue;
       }

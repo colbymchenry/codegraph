@@ -48,7 +48,7 @@ export const aspnetResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Controller references
     if (ref.referenceName.endsWith('Controller')) {
-      const result = resolveController(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, CONTROLLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -61,7 +61,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 2: Service references (dependency injection)
     if (ref.referenceName.endsWith('Service') || ref.referenceName.startsWith('I') && ref.referenceName.length > 1) {
-      const result = resolveService(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -74,7 +74,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 3: Repository references
     if (ref.referenceName.endsWith('Repository')) {
-      const result = resolveRepository(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, REPO_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -87,7 +87,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 4: Model/Entity references
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveModel(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, MODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -100,7 +100,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 5: ViewModel references
     if (ref.referenceName.endsWith('ViewModel') || ref.referenceName.endsWith('Dto')) {
-      const result = resolveViewModel(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, VIEWMODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -213,111 +213,38 @@ export const aspnetResolver: FrameworkResolver = {
   },
 };
 
-// Helper functions
+// Directory patterns
+const CONTROLLER_DIRS = ['/Controllers/'];
+const SERVICE_DIRS = ['/Services/', '/Service/', '/Application/'];
+const REPO_DIRS = ['/Repositories/', '/Repository/', '/Data/', '/Infrastructure/'];
+const MODEL_DIRS = ['/Models/', '/Model/', '/Entities/', '/Entity/', '/Domain/'];
+const VIEWMODEL_DIRS = ['/ViewModels/', '/ViewModel/', '/DTOs/', '/Dto/'];
 
-function resolveController(name: string, context: ResolutionContext): string | null {
-  const allFiles = context.getAllFiles();
+const CLASS_KINDS = new Set(['class']);
+const SERVICE_KINDS = new Set(['class', 'interface']);
 
-  for (const file of allFiles) {
-    if (file.endsWith('.cs') && file.includes('/Controllers/')) {
-      const nodes = context.getNodesInFile(file);
-      const controllerNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (controllerNode) {
-        return controllerNode.id;
-      }
-    }
-  }
+/**
+ * Resolve a symbol by name using indexed queries instead of scanning all files.
+ */
+function resolveByNameAndKind(
+  name: string,
+  kinds: Set<string>,
+  preferredDirPatterns: string[],
+  context: ResolutionContext,
+): string | null {
+  const candidates = context.getNodesByName(name);
+  if (candidates.length === 0) return null;
 
-  return null;
-}
+  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
+  if (kindFiltered.length === 0) return null;
 
-function resolveService(name: string, context: ResolutionContext): string | null {
-  const serviceDirs = ['Services', 'Service', 'Application'];
+  // Prefer candidates in framework-conventional directories
+  const preferred = kindFiltered.filter((n) =>
+    preferredDirPatterns.some((d) => n.filePath.includes(d))
+  );
 
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.cs') && serviceDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const serviceNode = nodes.find(
-        (n) => (n.kind === 'class' || n.kind === 'interface') && n.name === name
-      );
-      if (serviceNode) {
-        return serviceNode.id;
-      }
-    }
-  }
+  if (preferred.length > 0) return preferred[0]!.id;
 
-  // Search all C# files for interfaces (often services are injected via interface)
-  for (const file of allFiles) {
-    if (file.endsWith('.cs')) {
-      const nodes = context.getNodesInFile(file);
-      const serviceNode = nodes.find(
-        (n) => (n.kind === 'class' || n.kind === 'interface') && n.name === name
-      );
-      if (serviceNode) {
-        return serviceNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveRepository(name: string, context: ResolutionContext): string | null {
-  const repoDirs = ['Repositories', 'Repository', 'Data', 'Infrastructure'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.cs') && repoDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const repoNode = nodes.find(
-        (n) => (n.kind === 'class' || n.kind === 'interface') && n.name === name
-      );
-      if (repoNode) {
-        return repoNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveModel(name: string, context: ResolutionContext): string | null {
-  const modelDirs = ['Models', 'Model', 'Entities', 'Entity', 'Domain'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.cs') && modelDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const modelNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (modelNode) {
-        return modelNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveViewModel(name: string, context: ResolutionContext): string | null {
-  const viewModelDirs = ['ViewModels', 'ViewModel', 'DTOs', 'Dto'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.cs') && viewModelDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const vmNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (vmNode) {
-        return vmNode.id;
-      }
-    }
-  }
-
-  return null;
+  // Fall back to any match
+  return kindFiltered[0]!.id;
 }

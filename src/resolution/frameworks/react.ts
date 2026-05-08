@@ -183,116 +183,89 @@ function isPascalCase(str: string): boolean {
  * Check if name is a built-in type
  */
 function isBuiltInType(name: string): boolean {
-  const builtIns = [
-    'Array', 'Boolean', 'Date', 'Error', 'Function', 'JSON', 'Math', 'Number',
-    'Object', 'Promise', 'RegExp', 'String', 'Symbol', 'Map', 'Set', 'WeakMap', 'WeakSet',
-    'React', 'Component', 'Fragment', 'Suspense', 'StrictMode',
-  ];
-  return builtIns.includes(name);
+  return BUILT_IN_TYPES.has(name);
 }
 
+const BUILT_IN_TYPES = new Set([
+  'Array', 'Boolean', 'Date', 'Error', 'Function', 'JSON', 'Math', 'Number',
+  'Object', 'Promise', 'RegExp', 'String', 'Symbol', 'Map', 'Set', 'WeakMap', 'WeakSet',
+  'React', 'Component', 'Fragment', 'Suspense', 'StrictMode',
+]);
+
+const COMPONENT_KINDS = new Set(['component', 'function', 'class']);
+
 /**
- * Resolve a component reference
+ * Resolve a component reference using name-based lookup
  */
 function resolveComponent(
   name: string,
   fromFile: string,
   context: ResolutionContext
 ): string | null {
-  // Look for component in common locations
-  const componentDirs = [
-    'components',
-    'src/components',
-    'app/components',
-    'pages',
-    'src/pages',
-    'views',
-    'src/views',
-  ];
+  const candidates = context.getNodesByName(name);
+  if (candidates.length === 0) return null;
 
-  // First, check same directory
+  const components = candidates.filter((n) => COMPONENT_KINDS.has(n.kind));
+  if (components.length === 0) return null;
+
+  // Prefer same directory
   const fromDir = fromFile.substring(0, fromFile.lastIndexOf('/'));
-  const sameDir = context.getAllFiles().filter((f) => f.startsWith(fromDir));
-  for (const file of sameDir) {
-    if (file.toLowerCase().includes(name.toLowerCase())) {
-      const nodes = context.getNodesInFile(file);
-      const component = nodes.find(
-        (n) => (n.kind === 'component' || n.kind === 'function' || n.kind === 'class') && n.name === name
-      );
-      if (component) {
-        return component.id;
-      }
-    }
-  }
+  const sameDir = components.filter((n) => n.filePath.startsWith(fromDir));
+  if (sameDir.length > 0) return sameDir[0]!.id;
 
-  // Then check component directories
-  for (const dir of componentDirs) {
-    const allFiles = context.getAllFiles();
-    for (const file of allFiles) {
-      if (file.startsWith(dir) && file.toLowerCase().includes(name.toLowerCase())) {
-        const nodes = context.getNodesInFile(file);
-        const component = nodes.find(
-          (n) => (n.kind === 'component' || n.kind === 'function' || n.kind === 'class') && n.name === name
-        );
-        if (component) {
-          return component.id;
-        }
-      }
-    }
-  }
+  // Prefer component directories
+  const COMPONENT_DIRS = ['/components/', '/src/components/', '/app/components/', '/pages/', '/src/pages/', '/views/', '/src/views/'];
+  const preferred = components.filter((n) =>
+    COMPONENT_DIRS.some((d) => n.filePath.includes(d))
+  );
+  if (preferred.length > 0) return preferred[0]!.id;
 
-  return null;
+  return components[0]!.id;
 }
 
 /**
- * Resolve a custom hook reference
+ * Resolve a custom hook reference using name-based lookup
  */
 function resolveHook(name: string, context: ResolutionContext): string | null {
-  const hookDirs = ['hooks', 'src/hooks', 'lib/hooks', 'utils/hooks'];
+  const candidates = context.getNodesByName(name);
+  if (candidates.length === 0) return null;
 
-  for (const dir of hookDirs) {
-    const allFiles = context.getAllFiles();
-    for (const file of allFiles) {
-      if (file.startsWith(dir) || file.includes('/hooks/')) {
-        const nodes = context.getNodesInFile(file);
-        const hook = nodes.find((n) => n.kind === 'function' && n.name === name);
-        if (hook) {
-          return hook.id;
-        }
-      }
-    }
-  }
+  const hooks = candidates.filter((n) => n.kind === 'function' && n.name.startsWith('use'));
+  if (hooks.length === 0) return null;
 
-  // Also check all files for the hook
-  const allNodes = context.getNodesByName(name);
-  const hookNode = allNodes.find((n) => n.kind === 'function' && n.name.startsWith('use'));
-  if (hookNode) {
-    return hookNode.id;
-  }
+  // Prefer hooks directories
+  const HOOK_DIRS = ['/hooks/', '/src/hooks/', '/lib/hooks/', '/utils/hooks/'];
+  const preferred = hooks.filter((n) =>
+    HOOK_DIRS.some((d) => n.filePath.includes(d))
+  );
+  if (preferred.length > 0) return preferred[0]!.id;
 
-  return null;
+  return hooks[0]!.id;
 }
 
 /**
- * Resolve a context reference
+ * Resolve a context reference using name-based lookup
  */
 function resolveContext(name: string, context: ResolutionContext): string | null {
-  const contextDirs = ['context', 'contexts', 'src/context', 'src/contexts', 'providers', 'src/providers'];
-
-  for (const dir of contextDirs) {
-    const allFiles = context.getAllFiles();
-    for (const file of allFiles) {
-      if (file.startsWith(dir) || file.includes('/context/') || file.includes('/contexts/')) {
-        const nodes = context.getNodesInFile(file);
-        const contextNode = nodes.find((n) => n.name === name || n.name === name.replace(/Context$|Provider$/, ''));
-        if (contextNode) {
-          return contextNode.id;
-        }
-      }
+  const candidates = context.getNodesByName(name);
+  if (candidates.length === 0) {
+    // Try without Context/Provider suffix
+    const baseName = name.replace(/Context$|Provider$/, '');
+    if (baseName !== name) {
+      const baseCandidates = context.getNodesByName(baseName);
+      if (baseCandidates.length > 0) return baseCandidates[0]!.id;
     }
+    return null;
   }
 
-  return null;
+  // Prefer context directories
+  const CONTEXT_DIRS = ['/context/', '/contexts/', '/src/context/', '/src/contexts/', '/providers/', '/src/providers/'];
+  const preferred = candidates.filter((n) =>
+    CONTEXT_DIRS.some((d) => n.filePath.includes(d))
+  );
+  if (preferred.length > 0) return preferred[0]!.id;
+
+  return candidates[0]!.id;
 }
 
 /**

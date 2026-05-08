@@ -5,7 +5,6 @@
  */
 
 import { Node as SyntaxNode, Tree } from 'web-tree-sitter';
-import * as crypto from 'crypto';
 import * as path from 'path';
 import {
   Language,
@@ -17,807 +16,16 @@ import {
   UnresolvedReference,
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported } from './grammars';
-import { captureException } from '../sentry';
+import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
+import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
+import { EXTRACTORS } from './languages';
+import { LiquidExtractor } from './liquid-extractor';
+import { SvelteExtractor } from './svelte-extractor';
+import { DfmExtractor } from './dfm-extractor';
+import { VueExtractor } from './vue-extractor';
 
-/**
- * Generate a unique node ID
- *
- * Uses a 32-character (128-bit) hash to avoid collisions when indexing
- * large codebases with many files containing similar symbols.
- */
-export function generateNodeId(
-  filePath: string,
-  kind: NodeKind,
-  name: string,
-  line: number
-): string {
-  const hash = crypto
-    .createHash('sha256')
-    .update(`${filePath}:${kind}:${name}:${line}`)
-    .digest('hex')
-    .substring(0, 32);
-  return `${kind}:${hash}`;
-}
-
-/**
- * Extract text from a syntax node
- */
-function getNodeText(node: SyntaxNode, source: string): string {
-  return source.substring(node.startIndex, node.endIndex);
-}
-
-/**
- * Find a child node by field name
- */
-function getChildByField(node: SyntaxNode, fieldName: string): SyntaxNode | null {
-  return node.childForFieldName(fieldName);
-}
-
-/**
- * Get the docstring/comment preceding a node
- */
-function getPrecedingDocstring(node: SyntaxNode, source: string): string | undefined {
-  let sibling = node.previousNamedSibling;
-  const comments: string[] = [];
-
-  while (sibling) {
-    if (
-      sibling.type === 'comment' ||
-      sibling.type === 'line_comment' ||
-      sibling.type === 'block_comment' ||
-      sibling.type === 'documentation_comment'
-    ) {
-      comments.unshift(getNodeText(sibling, source));
-      sibling = sibling.previousNamedSibling;
-    } else {
-      break;
-    }
-  }
-
-  if (comments.length === 0) return undefined;
-
-  // Clean up comment markers
-  return comments
-    .map((c) =>
-      c
-        .replace(/^\/\*\*?|\*\/$/g, '')
-        .replace(/^\/\/\s?/gm, '')
-        .replace(/^\s*\*\s?/gm, '')
-        .trim()
-    )
-    .join('\n')
-    .trim();
-}
-
-/**
- * Language-specific extraction configuration
- */
-interface LanguageExtractor {
-  /** Node types that represent functions */
-  functionTypes: string[];
-  /** Node types that represent classes */
-  classTypes: string[];
-  /** Node types that represent methods */
-  methodTypes: string[];
-  /** Node types that represent interfaces/protocols/traits */
-  interfaceTypes: string[];
-  /** Node types that represent structs */
-  structTypes: string[];
-  /** Node types that represent enums */
-  enumTypes: string[];
-  /** Node types that represent type aliases (e.g. `type X = ...`) */
-  typeAliasTypes: string[];
-  /** Node types that represent imports */
-  importTypes: string[];
-  /** Node types that represent function calls */
-  callTypes: string[];
-  /** Node types that represent variable declarations (const, let, var, etc.) */
-  variableTypes: string[];
-  /** Field name for identifier/name */
-  nameField: string;
-  /** Field name for body */
-  bodyField: string;
-  /** Field name for parameters */
-  paramsField: string;
-  /** Field name for return type */
-  returnField?: string;
-  /** Extract signature from node */
-  getSignature?: (node: SyntaxNode, source: string) => string | undefined;
-  /** Extract visibility from node */
-  getVisibility?: (node: SyntaxNode) => 'public' | 'private' | 'protected' | 'internal' | undefined;
-  /** Check if node is exported */
-  isExported?: (node: SyntaxNode, source: string) => boolean;
-  /** Check if node is async */
-  isAsync?: (node: SyntaxNode) => boolean;
-  /** Check if node is static */
-  isStatic?: (node: SyntaxNode) => boolean;
-  /** Check if variable declaration is a constant (const vs let/var) */
-  isConst?: (node: SyntaxNode) => boolean;
-}
-
-/**
- * Language-specific extractors
- */
-const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
-  typescript: {
-    functionTypes: ['function_declaration', 'arrow_function', 'function_expression'],
-    classTypes: ['class_declaration'],
-    methodTypes: ['method_definition', 'public_field_definition'],
-    interfaceTypes: ['interface_declaration'],
-    structTypes: [],
-    enumTypes: ['enum_declaration'],
-    typeAliasTypes: ['type_alias_declaration'],
-    importTypes: ['import_statement'],
-    callTypes: ['call_expression'],
-    variableTypes: ['lexical_declaration', 'variable_declaration'],
-    nameField: 'name',
-    bodyField: 'body',
-    paramsField: 'parameters',
-    returnField: 'return_type',
-    getSignature: (node, source) => {
-      const params = getChildByField(node, 'parameters');
-      const returnType = getChildByField(node, 'return_type');
-      if (!params) return undefined;
-      let sig = getNodeText(params, source);
-      if (returnType) {
-        sig += ': ' + getNodeText(returnType, source).replace(/^:\s*/, '');
-      }
-      return sig;
-    },
-    getVisibility: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'accessibility_modifier') {
-          const text = child.text;
-          if (text === 'public') return 'public';
-          if (text === 'private') return 'private';
-          if (text === 'protected') return 'protected';
-        }
-      }
-      return undefined;
-    },
-    isExported: (node, _source) => {
-      // Walk the parent chain to find an export_statement ancestor.
-      // This correctly handles deeply nested nodes like arrow functions
-      // inside variable declarations: `export const X = () => { ... }`
-      // where the arrow_function is 3 levels deep under export_statement.
-      let current = node.parent;
-      while (current) {
-        if (current.type === 'export_statement') return true;
-        current = current.parent;
-      }
-      return false;
-    },
-    isAsync: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'async') return true;
-      }
-      return false;
-    },
-    isStatic: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'static') return true;
-      }
-      return false;
-    },
-    isConst: (node) => {
-      // For lexical_declaration, check if it's 'const' or 'let'
-      // For variable_declaration, it's always 'var'
-      if (node.type === 'lexical_declaration') {
-        for (let i = 0; i < node.childCount; i++) {
-          const child = node.child(i);
-          if (child?.type === 'const') return true;
-        }
-      }
-      return false;
-    },
-  },
-  javascript: {
-    functionTypes: ['function_declaration', 'arrow_function', 'function_expression'],
-    classTypes: ['class_declaration'],
-    methodTypes: ['method_definition', 'field_definition'],
-    interfaceTypes: [],
-    structTypes: [],
-    enumTypes: [],
-    typeAliasTypes: [],
-    importTypes: ['import_statement'],
-    callTypes: ['call_expression'],
-    variableTypes: ['lexical_declaration', 'variable_declaration'],
-    nameField: 'name',
-    bodyField: 'body',
-    paramsField: 'parameters',
-    getSignature: (node, source) => {
-      const params = getChildByField(node, 'parameters');
-      return params ? getNodeText(params, source) : undefined;
-    },
-    isExported: (node, _source) => {
-      let current = node.parent;
-      while (current) {
-        if (current.type === 'export_statement') return true;
-        current = current.parent;
-      }
-      return false;
-    },
-    isAsync: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'async') return true;
-      }
-      return false;
-    },
-    isConst: (node) => {
-      if (node.type === 'lexical_declaration') {
-        for (let i = 0; i < node.childCount; i++) {
-          const child = node.child(i);
-          if (child?.type === 'const') return true;
-        }
-      }
-      return false;
-    },
-  },
-  python: {
-    functionTypes: ['function_definition'],
-    classTypes: ['class_definition'],
-    methodTypes: ['function_definition'], // Methods are functions inside classes
-    interfaceTypes: [],
-    structTypes: [],
-    enumTypes: [],
-    typeAliasTypes: [],
-    importTypes: ['import_statement', 'import_from_statement'],
-    callTypes: ['call'],
-    variableTypes: ['assignment'], // Python uses assignment for variable declarations
-    nameField: 'name',
-    bodyField: 'body',
-    paramsField: 'parameters',
-    returnField: 'return_type',
-    getSignature: (node, source) => {
-      const params = getChildByField(node, 'parameters');
-      const returnType = getChildByField(node, 'return_type');
-      if (!params) return undefined;
-      let sig = getNodeText(params, source);
-      if (returnType) {
-        sig += ' -> ' + getNodeText(returnType, source);
-      }
-      return sig;
-    },
-    isAsync: (node) => {
-      const prev = node.previousSibling;
-      return prev?.type === 'async';
-    },
-    isStatic: (node) => {
-      // Check for @staticmethod decorator
-      const prev = node.previousNamedSibling;
-      if (prev?.type === 'decorator') {
-        const text = prev.text;
-        return text.includes('staticmethod');
-      }
-      return false;
-    },
-  },
-  go: {
-    functionTypes: ['function_declaration'],
-    classTypes: [], // Go doesn't have classes
-    methodTypes: ['method_declaration'],
-    interfaceTypes: ['interface_type'],
-    structTypes: ['struct_type'],
-    enumTypes: [],
-    typeAliasTypes: ['type_spec'], // Go type declarations
-    importTypes: ['import_declaration'],
-    callTypes: ['call_expression'],
-    variableTypes: ['var_declaration', 'short_var_declaration', 'const_declaration'],
-    nameField: 'name',
-    bodyField: 'body',
-    paramsField: 'parameters',
-    returnField: 'result',
-    getSignature: (node, source) => {
-      const params = getChildByField(node, 'parameters');
-      const result = getChildByField(node, 'result');
-      if (!params) return undefined;
-      let sig = getNodeText(params, source);
-      if (result) {
-        sig += ' ' + getNodeText(result, source);
-      }
-      return sig;
-    },
-  },
-  rust: {
-    functionTypes: ['function_item'],
-    classTypes: [], // Rust has impl blocks
-    methodTypes: ['function_item'], // Methods are functions in impl blocks
-    interfaceTypes: ['trait_item'],
-    structTypes: ['struct_item'],
-    enumTypes: ['enum_item'],
-    typeAliasTypes: ['type_item'], // Rust type aliases
-    importTypes: ['use_declaration'],
-    callTypes: ['call_expression'],
-    variableTypes: ['let_declaration', 'const_item', 'static_item'],
-    nameField: 'name',
-    bodyField: 'body',
-    paramsField: 'parameters',
-    returnField: 'return_type',
-    getSignature: (node, source) => {
-      const params = getChildByField(node, 'parameters');
-      const returnType = getChildByField(node, 'return_type');
-      if (!params) return undefined;
-      let sig = getNodeText(params, source);
-      if (returnType) {
-        sig += ' -> ' + getNodeText(returnType, source);
-      }
-      return sig;
-    },
-    isAsync: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'async') return true;
-      }
-      return false;
-    },
-    getVisibility: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'visibility_modifier') {
-          return child.text.includes('pub') ? 'public' : 'private';
-        }
-      }
-      return 'private'; // Rust defaults to private
-    },
-  },
-  java: {
-    functionTypes: [],
-    classTypes: ['class_declaration'],
-    methodTypes: ['method_declaration', 'constructor_declaration'],
-    interfaceTypes: ['interface_declaration'],
-    structTypes: [],
-    enumTypes: ['enum_declaration'],
-    typeAliasTypes: [],
-    importTypes: ['import_declaration'],
-    callTypes: ['method_invocation'],
-    variableTypes: ['local_variable_declaration', 'field_declaration'],
-    nameField: 'name',
-    bodyField: 'body',
-    paramsField: 'parameters',
-    returnField: 'type',
-    getSignature: (node, source) => {
-      const params = getChildByField(node, 'parameters');
-      const returnType = getChildByField(node, 'type');
-      if (!params) return undefined;
-      const paramsText = getNodeText(params, source);
-      return returnType ? getNodeText(returnType, source) + ' ' + paramsText : paramsText;
-    },
-    getVisibility: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'modifiers') {
-          const text = child.text;
-          if (text.includes('public')) return 'public';
-          if (text.includes('private')) return 'private';
-          if (text.includes('protected')) return 'protected';
-        }
-      }
-      return undefined;
-    },
-    isStatic: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'modifiers' && child.text.includes('static')) {
-          return true;
-        }
-      }
-      return false;
-    },
-  },
-  c: {
-    functionTypes: ['function_definition'],
-    classTypes: [],
-    methodTypes: [],
-    interfaceTypes: [],
-    structTypes: ['struct_specifier'],
-    enumTypes: ['enum_specifier'],
-    typeAliasTypes: ['type_definition'], // typedef
-    importTypes: ['preproc_include'],
-    callTypes: ['call_expression'],
-    variableTypes: ['declaration'],
-    nameField: 'declarator',
-    bodyField: 'body',
-    paramsField: 'parameters',
-  },
-  cpp: {
-    functionTypes: ['function_definition'],
-    classTypes: ['class_specifier'],
-    methodTypes: ['function_definition'],
-    interfaceTypes: [],
-    structTypes: ['struct_specifier'],
-    enumTypes: ['enum_specifier'],
-    typeAliasTypes: ['type_definition', 'alias_declaration'], // typedef and using
-    importTypes: ['preproc_include'],
-    callTypes: ['call_expression'],
-    variableTypes: ['declaration'],
-    nameField: 'declarator',
-    bodyField: 'body',
-    paramsField: 'parameters',
-    getVisibility: (node) => {
-      // Check for access specifier in parent
-      const parent = node.parent;
-      if (parent) {
-        for (let i = 0; i < parent.childCount; i++) {
-          const child = parent.child(i);
-          if (child?.type === 'access_specifier') {
-            const text = child.text;
-            if (text.includes('public')) return 'public';
-            if (text.includes('private')) return 'private';
-            if (text.includes('protected')) return 'protected';
-          }
-        }
-      }
-      return undefined;
-    },
-  },
-  csharp: {
-    functionTypes: [],
-    classTypes: ['class_declaration'],
-    methodTypes: ['method_declaration', 'constructor_declaration'],
-    interfaceTypes: ['interface_declaration'],
-    structTypes: ['struct_declaration'],
-    enumTypes: ['enum_declaration'],
-    typeAliasTypes: [],
-    importTypes: ['using_directive'],
-    callTypes: ['invocation_expression'],
-    variableTypes: ['local_declaration_statement', 'field_declaration'],
-    nameField: 'name',
-    bodyField: 'body',
-    paramsField: 'parameter_list',
-    getVisibility: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'modifier') {
-          const text = child.text;
-          if (text === 'public') return 'public';
-          if (text === 'private') return 'private';
-          if (text === 'protected') return 'protected';
-          if (text === 'internal') return 'internal';
-        }
-      }
-      return 'private'; // C# defaults to private
-    },
-    isStatic: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'modifier' && child.text === 'static') {
-          return true;
-        }
-      }
-      return false;
-    },
-    isAsync: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'modifier' && child.text === 'async') {
-          return true;
-        }
-      }
-      return false;
-    },
-  },
-  php: {
-    functionTypes: ['function_definition'],
-    classTypes: ['class_declaration'],
-    methodTypes: ['method_declaration'],
-    interfaceTypes: ['interface_declaration'],
-    structTypes: [],
-    enumTypes: ['enum_declaration'],
-    typeAliasTypes: [],
-    importTypes: ['namespace_use_declaration'],
-    callTypes: ['function_call_expression', 'member_call_expression', 'scoped_call_expression'],
-    variableTypes: ['property_declaration', 'const_declaration'],
-    nameField: 'name',
-    bodyField: 'body',
-    paramsField: 'parameters',
-    returnField: 'return_type',
-    getVisibility: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'visibility_modifier') {
-          const text = child.text;
-          if (text === 'public') return 'public';
-          if (text === 'private') return 'private';
-          if (text === 'protected') return 'protected';
-        }
-      }
-      return 'public'; // PHP defaults to public
-    },
-    isStatic: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'static_modifier') return true;
-      }
-      return false;
-    },
-  },
-  ruby: {
-    functionTypes: ['method'],
-    classTypes: ['class'],
-    methodTypes: ['method', 'singleton_method'],
-    interfaceTypes: [], // Ruby uses modules
-    structTypes: [],
-    enumTypes: [],
-    typeAliasTypes: [],
-    importTypes: ['call'], // require/require_relative
-    callTypes: ['call', 'method_call'],
-    variableTypes: ['assignment'], // Ruby uses assignment like Python
-    nameField: 'name',
-    bodyField: 'body',
-    paramsField: 'parameters',
-    getVisibility: (node) => {
-      // Ruby visibility is based on preceding visibility modifiers
-      let sibling = node.previousNamedSibling;
-      while (sibling) {
-        if (sibling.type === 'call') {
-          const methodName = getChildByField(sibling, 'method');
-          if (methodName) {
-            const text = methodName.text;
-            if (text === 'private') return 'private';
-            if (text === 'protected') return 'protected';
-            if (text === 'public') return 'public';
-          }
-        }
-        sibling = sibling.previousNamedSibling;
-      }
-      return 'public';
-    },
-  },
-  swift: {
-    functionTypes: ['function_declaration'],
-    classTypes: ['class_declaration'],
-    methodTypes: ['function_declaration'], // Methods are functions inside classes
-    interfaceTypes: ['protocol_declaration'],
-    structTypes: ['struct_declaration'],
-    enumTypes: ['enum_declaration'],
-    typeAliasTypes: ['typealias_declaration'],
-    importTypes: ['import_declaration'],
-    callTypes: ['call_expression'],
-    variableTypes: ['property_declaration', 'constant_declaration'],
-    nameField: 'name',
-    bodyField: 'body',
-    paramsField: 'parameter',
-    returnField: 'return_type',
-    getSignature: (node, source) => {
-      // Swift function signature: func name(params) -> ReturnType
-      const params = getChildByField(node, 'parameter');
-      const returnType = getChildByField(node, 'return_type');
-      if (!params) return undefined;
-      let sig = getNodeText(params, source);
-      if (returnType) {
-        sig += ' -> ' + getNodeText(returnType, source);
-      }
-      return sig;
-    },
-    getVisibility: (node) => {
-      // Check for visibility modifiers in Swift
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'modifiers') {
-          const text = child.text;
-          if (text.includes('public')) return 'public';
-          if (text.includes('private')) return 'private';
-          if (text.includes('internal')) return 'internal';
-          if (text.includes('fileprivate')) return 'private';
-        }
-      }
-      return 'internal'; // Swift defaults to internal
-    },
-    isStatic: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'modifiers') {
-          if (child.text.includes('static') || child.text.includes('class')) {
-            return true;
-          }
-        }
-      }
-      return false;
-    },
-    isAsync: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'modifiers' && child.text.includes('async')) {
-          return true;
-        }
-      }
-      return false;
-    },
-  },
-  kotlin: {
-    functionTypes: ['function_declaration'],
-    classTypes: ['class_declaration'],
-    methodTypes: ['function_declaration'], // Methods are functions inside classes
-    interfaceTypes: ['class_declaration'], // Interfaces use class_declaration with 'interface' modifier
-    structTypes: [], // Kotlin uses data classes
-    enumTypes: ['class_declaration'], // Enums use class_declaration with 'enum' modifier
-    typeAliasTypes: ['type_alias'],
-    importTypes: ['import_header'],
-    callTypes: ['call_expression'],
-    variableTypes: ['property_declaration'],
-    nameField: 'simple_identifier',
-    bodyField: 'function_body',
-    paramsField: 'function_value_parameters',
-    returnField: 'type',
-    getSignature: (node, source) => {
-      // Kotlin function signature: fun name(params): ReturnType
-      const params = getChildByField(node, 'function_value_parameters');
-      const returnType = getChildByField(node, 'type');
-      if (!params) return undefined;
-      let sig = getNodeText(params, source);
-      if (returnType) {
-        sig += ': ' + getNodeText(returnType, source);
-      }
-      return sig;
-    },
-    getVisibility: (node) => {
-      // Check for visibility modifiers in Kotlin
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'modifiers') {
-          const text = child.text;
-          if (text.includes('public')) return 'public';
-          if (text.includes('private')) return 'private';
-          if (text.includes('protected')) return 'protected';
-          if (text.includes('internal')) return 'internal';
-        }
-      }
-      return 'public'; // Kotlin defaults to public
-    },
-    isStatic: (_node) => {
-      // Kotlin doesn't have static, uses companion objects
-      // Check if inside companion object would require more context
-      return false;
-    },
-    isAsync: (node) => {
-      // Kotlin uses suspend keyword for coroutines
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
-        if (child?.type === 'modifiers' && child.text.includes('suspend')) {
-          return true;
-        }
-      }
-      return false;
-    },
-  },
-  dart: {
-    functionTypes: ['function_signature'],
-    classTypes: ['class_definition'],
-    methodTypes: ['method_signature'],
-    interfaceTypes: [],
-    structTypes: [],
-    enumTypes: ['enum_declaration'],
-    typeAliasTypes: ['type_alias'],
-    importTypes: ['import_or_export'],
-    callTypes: [],  // Dart calls use identifier+selector, handled via function body traversal
-    variableTypes: [],
-    nameField: 'name',
-    bodyField: 'body', // class_definition uses 'body' field
-    paramsField: 'formal_parameter_list',
-    returnField: 'type',
-    getSignature: (node, source) => {
-      // For function_signature: extract params + return type
-      // For method_signature: delegate to inner function_signature
-      let sig = node;
-      if (node.type === 'method_signature') {
-        const inner = node.namedChildren.find((c: SyntaxNode) =>
-          c.type === 'function_signature' || c.type === 'getter_signature' || c.type === 'setter_signature'
-        );
-        if (inner) sig = inner;
-      }
-      const params = sig.namedChildren.find((c: SyntaxNode) => c.type === 'formal_parameter_list');
-      const retType = sig.namedChildren.find((c: SyntaxNode) =>
-        c.type === 'type_identifier' || c.type === 'void_type'
-      );
-      if (!params && !retType) return undefined;
-      let result = '';
-      if (retType) result += getNodeText(retType, source) + ' ';
-      if (params) result += getNodeText(params, source);
-      return result.trim() || undefined;
-    },
-    getVisibility: (node) => {
-      // Dart convention: _ prefix means private, otherwise public
-      let nameNode: SyntaxNode | null = null;
-      if (node.type === 'method_signature') {
-        const inner = node.namedChildren.find((c: SyntaxNode) =>
-          c.type === 'function_signature' || c.type === 'getter_signature' || c.type === 'setter_signature'
-        );
-        if (inner) nameNode = inner.namedChildren.find((c: SyntaxNode) => c.type === 'identifier') || null;
-      } else {
-        nameNode = node.childForFieldName('name');
-      }
-      if (nameNode && nameNode.text.startsWith('_')) return 'private';
-      return 'public';
-    },
-    isAsync: (node) => {
-      // In Dart, 'async' is on the function_body (next sibling), not the signature
-      const nextSibling = node.nextNamedSibling;
-      if (nextSibling?.type === 'function_body') {
-        for (let i = 0; i < nextSibling.childCount; i++) {
-          const child = nextSibling.child(i);
-          if (child?.type === 'async') return true;
-        }
-      }
-      return false;
-    },
-    isStatic: (node) => {
-      // For method_signature, check for 'static' child
-      if (node.type === 'method_signature') {
-        for (let i = 0; i < node.childCount; i++) {
-          const child = node.child(i);
-          if (child?.type === 'static') return true;
-        }
-      }
-      return false;
-    },
-  },
-  pascal: {
-    functionTypes: ['declProc'],
-    classTypes: ['declClass'],
-    methodTypes: ['declProc'],
-    interfaceTypes: ['declIntf'],
-    structTypes: [],
-    enumTypes: ['declEnum'],
-    typeAliasTypes: ['declType'],
-    importTypes: ['declUses'],
-    callTypes: ['exprCall'],
-    variableTypes: ['declField', 'declConst'],
-    nameField: 'name',
-    bodyField: 'body',
-    paramsField: 'args',
-    returnField: 'type',
-    getSignature: (node, source) => {
-      const args = getChildByField(node, 'args');
-      const returnType = node.namedChildren.find(
-        (c: SyntaxNode) => c.type === 'typeref'
-      );
-      if (!args && !returnType) return undefined;
-      let sig = '';
-      if (args) sig = getNodeText(args, source);
-      if (returnType) {
-        sig += ': ' + getNodeText(returnType, source);
-      }
-      return sig || undefined;
-    },
-    getVisibility: (node) => {
-      let current = node.parent;
-      while (current) {
-        if (current.type === 'declSection') {
-          for (let i = 0; i < current.childCount; i++) {
-            const child = current.child(i);
-            if (child?.type === 'kPublic' || child?.type === 'kPublished')
-              return 'public';
-            if (child?.type === 'kPrivate') return 'private';
-            if (child?.type === 'kProtected') return 'protected';
-          }
-        }
-        current = current.parent;
-      }
-      return undefined;
-    },
-    isExported: (_node, _source) => {
-      // In Pascal, symbols declared in the interface section are exported
-      return false;
-    },
-    isStatic: (node) => {
-      for (let i = 0; i < node.childCount; i++) {
-        if (node.child(i)?.type === 'kClass') return true;
-      }
-      return false;
-    },
-    isConst: (node) => {
-      return node.type === 'declConst';
-    },
-  },
-};
-
-// TSX and JSX use the same extractors as their base languages
-EXTRACTORS.tsx = EXTRACTORS.typescript;
-EXTRACTORS.jsx = EXTRACTORS.javascript;
+// Re-export for backward compatibility
+export { generateNodeId } from './tree-sitter-helpers';
 
 /**
  * Extract the name from a node based on language
@@ -826,12 +34,19 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
   if (nameNode) {
-    // Handle complex declarators (C/C++)
-    if (nameNode.type === 'function_declarator' || nameNode.type === 'declarator') {
-      const innerName = getChildByField(nameNode, 'declarator') || nameNode.namedChild(0);
-      return innerName ? getNodeText(innerName, source) : getNodeText(nameNode, source);
+    // Unwrap pointer_declarator(s) for C/C++ pointer return types
+    let resolved = nameNode;
+    while (resolved.type === 'pointer_declarator') {
+      const inner = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
+      if (!inner) break;
+      resolved = inner;
     }
-    return getNodeText(nameNode, source);
+    // Handle complex declarators (C/C++)
+    if (resolved.type === 'function_declarator' || resolved.type === 'declarator') {
+      const innerName = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
+      return innerName ? getNodeText(innerName, source) : getNodeText(resolved, source);
+    }
+    return getNodeText(resolved, source);
   }
 
   // For Dart method_signature, look inside inner signature types
@@ -856,6 +71,14 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
     }
   }
 
+  // Arrow/function expressions get their name from the parent variable_declarator,
+  // not from identifiers in their body. Without this, single-expression arrow
+  // functions like `const fn = () => someIdentifier` get named "someIdentifier"
+  // instead of "fn", because the fallback below finds the body identifier.
+  if (node.type === 'arrow_function' || node.type === 'function_expression') {
+    return '<anonymous>';
+  }
+
   // Fall back to first identifier child
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
@@ -872,6 +95,17 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
 
   return '<anonymous>';
 }
+
+/**
+ * Tree-sitter node kinds that represent constructor invocations
+ * (`new Foo()` and friends). Used by extractInstantiation to emit
+ * an `instantiates` reference targeting the class name.
+ */
+const INSTANTIATION_KINDS: ReadonlySet<string> = new Set([
+  'new_expression',                  // typescript / javascript / tsx / jsx
+  'object_creation_expression',      // java / c#
+  'instance_creation_expression',    // some grammars
+]);
 
 /**
  * TreeSitterExtractor - Main extraction class
@@ -892,7 +126,7 @@ export class TreeSitterExtractor {
   constructor(filePath: string, source: string, language?: Language) {
     this.filePath = filePath;
     this.source = source;
-    this.language = language || detectLanguage(filePath);
+    this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
   }
 
@@ -910,7 +144,9 @@ export class TreeSitterExtractor {
         errors: [
           {
             message: `Unsupported language: ${this.language}`,
+            filePath: this.filePath,
             severity: 'error',
+            code: 'unsupported_language',
           },
         ],
         durationMs: Date.now() - startTime,
@@ -926,7 +162,9 @@ export class TreeSitterExtractor {
         errors: [
           {
             message: `Failed to get parser for language: ${this.language}`,
+            filePath: this.filePath,
             severity: 'error',
+            code: 'parser_error',
           },
         ],
         durationMs: Date.now() - startTime,
@@ -961,11 +199,30 @@ export class TreeSitterExtractor {
       this.visitNode(this.tree.rootNode);
       this.nodeStack.pop();
     } catch (error) {
-      captureException(error, { operation: 'tree-sitter-parse', filePath: this.filePath, language: this.language });
+      const msg = error instanceof Error ? error.message : String(error);
+
+      // WASM memory errors leave the module in a corrupted state — all subsequent
+      // parses would also fail. Re-throw so the worker can detect and crash,
+      // forcing a clean restart with a fresh heap.
+      if (msg.includes('memory access out of bounds') || msg.includes('out of memory')) {
+        throw error;
+      }
+
       this.errors.push({
-        message: `Parse error: ${error instanceof Error ? error.message : String(error)}`,
+        message: `Parse error: ${msg}`,
+        filePath: this.filePath,
         severity: 'error',
+        code: 'parse_error',
       });
+    } finally {
+      // Free tree-sitter WASM memory immediately — trees hold native heap memory
+      // invisible to V8's GC that accumulates across thousands of files.
+      if (this.tree) {
+        this.tree.delete();
+        this.tree = null;
+      }
+      // Release source string to reduce GC pressure
+      this.source = '';
     }
 
     return {
@@ -985,6 +242,13 @@ export class TreeSitterExtractor {
 
     const nodeType = node.type;
     let skipChildren = false;
+
+    // Language-specific custom visitor hook
+    if (this.extractor.visitNode) {
+      const ctx = this.makeExtractorContext();
+      const handled = this.extractor.visitNode(node, ctx);
+      if (handled) return;
+    }
 
     // Pascal-specific AST handling
     if (this.language === 'pascal') {
@@ -1006,19 +270,23 @@ export class TreeSitterExtractor {
     }
     // Check for class declarations
     else if (this.extractor.classTypes.includes(nodeType)) {
-      // Swift uses class_declaration for both classes and structs
-      // Check for 'struct' child to differentiate
-      if (this.language === 'swift' && this.hasChildOfType(node, 'struct')) {
+      // Some languages reuse class_declaration for structs/enums (e.g. Swift)
+      const classification = this.extractor.classifyClassNode?.(node) ?? 'class';
+      if (classification === 'struct') {
         this.extractStruct(node);
-      } else if (this.language === 'swift' && this.hasChildOfType(node, 'enum')) {
+      } else if (classification === 'enum') {
         this.extractEnum(node);
+      } else if (classification === 'interface') {
+        this.extractInterface(node);
+      } else if (classification === 'trait') {
+        this.extractClass(node, 'trait');
       } else {
         this.extractClass(node);
       }
       skipChildren = true; // extractClass visits body children
     }
-    // Dart-specific: mixin and extension declarations treated as classes
-    else if (this.language === 'dart' && (nodeType === 'mixin_declaration' || nodeType === 'extension_declaration')) {
+    // Extra class node types (e.g. Dart mixin_declaration, extension_declaration)
+    else if (this.extractor.extraClassNodeTypes?.includes(nodeType)) {
       this.extractClass(node);
       skipChildren = true;
     }
@@ -1043,8 +311,20 @@ export class TreeSitterExtractor {
       skipChildren = true; // extractEnum visits body children
     }
     // Check for type alias declarations (e.g. `type X = ...` in TypeScript)
+    // For Go, type_spec wraps struct/interface definitions — resolveTypeAliasKind
+    // detects these and extractTypeAlias creates the correct node kind.
     else if (this.extractor.typeAliasTypes.includes(nodeType)) {
-      this.extractTypeAlias(node);
+      skipChildren = this.extractTypeAlias(node);
+    }
+    // Check for class properties (e.g. C# property_declaration)
+    else if (this.extractor.propertyTypes?.includes(nodeType) && this.isInsideClassLikeNode()) {
+      this.extractProperty(node);
+      skipChildren = true;
+    }
+    // Check for class fields (e.g. Java field_declaration, C# field_declaration)
+    else if (this.extractor.fieldTypes?.includes(nodeType) && this.isInsideClassLikeNode()) {
+      this.extractField(node);
+      skipChildren = true;
     }
     // Check for variable declarations (const, let, var, etc.)
     // Only extract top-level variables (not inside functions/methods)
@@ -1052,12 +332,19 @@ export class TreeSitterExtractor {
       this.extractVariable(node);
       skipChildren = true; // extractVariable handles children
     }
-    // Check for export statements containing non-function variable declarations
-    // e.g. `export const X = create(...)`, `export const X = { ... }`
-    else if (nodeType === 'export_statement') {
-      this.extractExportedVariables(node);
-      // Don't skip children — still need to visit inner nodes (functions, calls, etc.)
-    }
+    // `export_statement` itself is not extracted — the walker descends
+    // into children, where the inner declaration (lexical_declaration,
+    // function_declaration, class_declaration, etc.) is dispatched to
+    // its own extractor. `isExported` walks the parent chain, so the
+    // exported flag is preserved automatically.
+    //
+    // Calling extractExportedVariables here AND descending caused every
+    // `export const X = ...` to produce two nodes for the same symbol —
+    // one kind:'variable' from extractExportedVariables and one
+    // kind:'constant' from extractVariable. The dedicated dispatch is
+    // the correct one (it picks kind from isConst, captures the
+    // initializer signature, and walks type annotations); the
+    // export-statement helper was redundant.
     // Check for imports
     else if (this.extractor.importTypes.includes(nodeType)) {
       this.extractImport(node);
@@ -1065,6 +352,21 @@ export class TreeSitterExtractor {
     // Check for function calls
     else if (this.extractor.callTypes.includes(nodeType)) {
       this.extractCall(node);
+    }
+    // `new Foo(...)` / `Foo::new(...)` / object_creation_expression —
+    // produce an `instantiates` reference. Children still walked so
+    // nested calls inside the constructor args (`new Foo(bar())`) get
+    // their own `calls` refs.
+    else if (INSTANTIATION_KINDS.has(nodeType)) {
+      this.extractInstantiation(node);
+    }
+    // (Decorator handling lives inside the symbol-creating extractors
+    // — extractClass / extractFunction / extractProperty — because the
+    // decorator node sits BEFORE the symbol in the AST and the walker
+    // would otherwise see the wrong nodeStack head.)
+    // Rust: `impl Trait for Type { ... }` — creates implements edge from Type to Trait
+    else if (nodeType === 'impl_item') {
+      this.extractRustImplItem(node);
     }
 
     // Visit children (unless the extract method already visited them)
@@ -1128,14 +430,27 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Find first named child whose type is in the given list.
+   * Used to locate inner type nodes (e.g. enum_specifier inside a typedef).
+   */
+  private findChildByTypes(node: SyntaxNode, types: string[]): SyntaxNode | null {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child && types.includes(child.type)) return child;
+    }
+    return null;
+  }
+
+  /**
    * Build qualified name from node stack
    */
   private buildQualifiedName(name: string): string {
-    // Get names from the node stack
-    const parts: string[] = [this.filePath];
+    // Build a qualified name from the semantic hierarchy only (no file path).
+    // The file path is stored separately in filePath and pollutes FTS if included here.
+    const parts: string[] = [];
     for (const nodeId of this.nodeStack) {
       const node = this.nodes.find((n) => n.id === nodeId);
-      if (node) {
+      if (node && node.kind !== 'file') {
         parts.push(node.name);
       }
     }
@@ -1144,16 +459,23 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Check if a node has a child of a specific type
+   * Build an ExtractorContext for passing to language-specific visitNode hooks.
    */
-  private hasChildOfType(node: SyntaxNode, type: string): boolean {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
-      if (child?.type === type) {
-        return true;
-      }
-    }
-    return false;
+  private makeExtractorContext(): ExtractorContext {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this;
+    return {
+      createNode: (kind, name, node, extra) => self.createNode(kind, name, node, extra),
+      visitNode: (node) => self.visitNode(node),
+      visitFunctionBody: (body, functionId) => self.visitFunctionBody(body, functionId),
+      addUnresolvedReference: (ref) => self.unresolvedReferences.push(ref),
+      pushScope: (nodeId) => self.nodeStack.push(nodeId),
+      popScope: () => self.nodeStack.pop(),
+      get filePath() { return self.filePath; },
+      get source() { return self.source; },
+      get nodeStack() { return self.nodeStack; },
+      get nodes() { return self.nodes; },
+    };
   }
 
   /**
@@ -1171,7 +493,8 @@ export class TreeSitterExtractor {
       parentNode.kind === 'struct' ||
       parentNode.kind === 'interface' ||
       parentNode.kind === 'trait' ||
-      parentNode.kind === 'enum'
+      parentNode.kind === 'enum' ||
+      parentNode.kind === 'module'
     );
   }
 
@@ -1180,6 +503,13 @@ export class TreeSitterExtractor {
    */
   private extractFunction(node: SyntaxNode): void {
     if (!this.extractor) return;
+
+    // If the language provides getReceiverType and this function has a receiver
+    // (e.g., Rust function_item inside an impl block), extract as method instead
+    if (this.extractor.getReceiverType?.(node, this.source)) {
+      this.extractMethod(node);
+      return;
+    }
 
     let name = extractName(node, this.source, this.extractor);
     // For arrow functions and function expressions assigned to variables,
@@ -1200,6 +530,17 @@ export class TreeSitterExtractor {
     }
     if (name === '<anonymous>') return; // Skip anonymous functions
 
+    // Check for misparse artifacts (e.g. C++ macros causing "namespace detail" functions)
+    // Skip the node but still visit the body for calls and structural nodes
+    if (this.extractor.isMisparsedFunction?.(name, node)) {
+      const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+        ?? getChildByField(node, this.extractor.bodyField);
+      if (body) {
+        this.visitFunctionBody(body, '');
+      }
+      return;
+    }
+
     const docstring = getPrecedingDocstring(node, this.source);
     const signature = this.extractor.getSignature?.(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
@@ -1217,12 +558,18 @@ export class TreeSitterExtractor {
     });
     if (!funcNode) return;
 
+    // Extract type annotations (parameter types and return type)
+    this.extractTypeAnnotations(node, funcNode.id);
+
+    // Extract decorators applied to the function (rare in JS/TS but
+    // present in Python `@decorator def f():` and Java/Kotlin
+    // annotations on free functions).
+    this.extractDecoratorsFor(node, funcNode.id);
+
     // Push to stack and visit body
     this.nodeStack.push(funcNode.id);
-    // Dart: function_body is a next sibling of function_signature, not a child
-    const body = this.language === 'dart'
-      ? node.nextNamedSibling?.type === 'function_body' ? node.nextNamedSibling : null
-      : getChildByField(node, this.extractor.bodyField);
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
     if (body) {
       this.visitFunctionBody(body, funcNode.id);
     }
@@ -1232,7 +579,7 @@ export class TreeSitterExtractor {
   /**
    * Extract a class
    */
-  private extractClass(node: SyntaxNode): void {
+  private extractClass(node: SyntaxNode, kind: NodeKind = 'class'): void {
     if (!this.extractor) return;
 
     const name = extractName(node, this.source, this.extractor);
@@ -1240,7 +587,7 @@ export class TreeSitterExtractor {
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
-    const classNode = this.createNode('class', name, node, {
+    const classNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
@@ -1250,15 +597,13 @@ export class TreeSitterExtractor {
     // Extract extends/implements
     this.extractInheritance(node, classNode.id);
 
+    // Extract decorators applied to the class (`@Foo class X {}`).
+    this.extractDecoratorsFor(node, classNode.id);
+
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
-    let body = getChildByField(node, this.extractor.bodyField);
-    // Dart: mixin_declaration uses class_body, extension uses extension_body
-    if (!body && this.language === 'dart') {
-      body = node.namedChildren.find((c: SyntaxNode) =>
-        c.type === 'class_body' || c.type === 'extension_body'
-      ) || null;
-    }
+    let body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
     if (!body) body = node;
 
     // Visit all children for methods and properties
@@ -1277,36 +622,84 @@ export class TreeSitterExtractor {
   private extractMethod(node: SyntaxNode): void {
     if (!this.extractor) return;
 
+    // For languages with receiver types (Go, Rust), include receiver in qualified name
+    // so FTS can match "scrapeLoop.run" → qualified_name "...::scrapeLoop::run"
+    const receiverType = this.extractor.getReceiverType?.(node, this.source);
+
     // For most languages, only extract as method if inside a class-like node
-    // But Go methods are top-level with a receiver, so always treat them as methods
-    if (!this.isInsideClassLikeNode() && this.language !== 'go') {
-      // Not inside a class-like node and not Go, treat as function
+    // Languages with methodsAreTopLevel (e.g. Go) always treat them as methods
+    // Languages with getReceiverType (e.g. Rust) extract as method when receiver is found
+    if (!this.isInsideClassLikeNode() && !this.extractor.methodsAreTopLevel && !receiverType) {
+      // Skip method_definition nodes inside object literals (getters/setters/methods
+      // in inline objects). These are ephemeral and create noise (e.g., Svelte context
+      // objects: `ctx.set({ get view() { ... } })`).
+      if (node.parent?.type === 'object' || node.parent?.type === 'object_expression') {
+        return;
+      }
+      // Not inside a class-like node and no receiver type, treat as function
       this.extractFunction(node);
       return;
     }
 
     const name = extractName(node, this.source, this.extractor);
+
+    // Check for misparse artifacts (e.g. C++ "switch" inside macro-confused class body)
+    if (this.extractor.isMisparsedFunction?.(name, node)) {
+      const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+        ?? getChildByField(node, this.extractor.bodyField);
+      if (body) {
+        this.visitFunctionBody(body, '');
+      }
+      return;
+    }
+
     const docstring = getPrecedingDocstring(node, this.source);
     const signature = this.extractor.getSignature?.(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
-
-    const methodNode = this.createNode('method', name, node, {
+    const extraProps: Partial<Node> = {
       docstring,
       signature,
       visibility,
       isAsync,
       isStatic,
-    });
+    };
+    if (receiverType) {
+      extraProps.qualifiedName = `${receiverType}::${name}`;
+    }
+
+    const methodNode = this.createNode('method', name, node, extraProps);
     if (!methodNode) return;
+
+    // For methods with a receiver type but no class-like parent on the stack
+    // (e.g., Rust impl blocks), add a contains edge from the owning struct/trait
+    if (receiverType && !this.isInsideClassLikeNode()) {
+      const ownerNode = this.nodes.find(
+        (n) =>
+          n.name === receiverType &&
+          n.filePath === this.filePath &&
+          (n.kind === 'struct' || n.kind === 'class' || n.kind === 'enum' || n.kind === 'trait')
+      );
+      if (ownerNode) {
+        this.edges.push({
+          source: ownerNode.id,
+          target: methodNode.id,
+          kind: 'contains',
+        });
+      }
+    }
+
+    // Extract type annotations (parameter types and return type)
+    this.extractTypeAnnotations(node, methodNode.id);
+
+    // Extract decorators (`@Get('/list') list() {}`).
+    this.extractDecoratorsFor(node, methodNode.id);
 
     // Push to stack and visit body
     this.nodeStack.push(methodNode.id);
-    // Dart: function_body is a next sibling of method_signature, not a child
-    const body = this.language === 'dart'
-      ? node.nextNamedSibling?.type === 'function_body' ? node.nextNamedSibling : null
-      : getChildByField(node, this.extractor.bodyField);
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
     if (body) {
       this.visitFunctionBody(body, methodNode.id);
     }
@@ -1323,14 +716,29 @@ export class TreeSitterExtractor {
     const docstring = getPrecedingDocstring(node, this.source);
     const isExported = this.extractor.isExported?.(node, this.source);
 
-    // Determine kind based on language
-    let kind: NodeKind = 'interface';
-    if (this.language === 'rust') kind = 'trait';
+    const kind: NodeKind = this.extractor.interfaceKind ?? 'interface';
 
-    this.createNode(kind, name, node, {
+    const interfaceNode = this.createNode(kind, name, node, {
       docstring,
       isExported,
     });
+    if (!interfaceNode) return;
+
+    // Extract extends (interface inheritance)
+    this.extractInheritance(node, interfaceNode.id);
+
+    // Visit body children for interface methods and nested types
+    this.nodeStack.push(interfaceNode.id);
+    let body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    if (!body) body = node;
+    for (let i = 0; i < body.namedChildCount; i++) {
+      const child = body.namedChild(i);
+      if (child) {
+        this.visitNode(child);
+      }
+    }
+    this.nodeStack.pop();
   }
 
   /**
@@ -1338,6 +746,10 @@ export class TreeSitterExtractor {
    */
   private extractStruct(node: SyntaxNode): void {
     if (!this.extractor) return;
+
+    // Skip forward declarations and type references (no body = not a definition)
+    const body = getChildByField(node, this.extractor.bodyField);
+    if (!body) return;
 
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
@@ -1351,9 +763,11 @@ export class TreeSitterExtractor {
     });
     if (!structNode) return;
 
+    // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
+    this.extractInheritance(node, structNode.id);
+
     // Push to stack for field extraction
     this.nodeStack.push(structNode.id);
-    const body = getChildByField(node, this.extractor.bodyField) || node;
     for (let i = 0; i < body.namedChildCount; i++) {
       const child = body.namedChild(i);
       if (child) {
@@ -1369,16 +783,206 @@ export class TreeSitterExtractor {
   private extractEnum(node: SyntaxNode): void {
     if (!this.extractor) return;
 
+    // Skip forward declarations and type references (no body = not a definition)
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    if (!body) return;
+
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
-    this.createNode('enum', name, node, {
+    const enumNode = this.createNode('enum', name, node, {
       docstring,
       visibility,
       isExported,
     });
+    if (!enumNode) return;
+
+    // Extract inheritance (e.g. Swift: enum AFError: Error)
+    this.extractInheritance(node, enumNode.id);
+
+    // Push to stack and visit body children (enum members, nested types, methods)
+    this.nodeStack.push(enumNode.id);
+
+    const memberTypes = this.extractor.enumMemberTypes;
+    for (let i = 0; i < body.namedChildCount; i++) {
+      const child = body.namedChild(i);
+      if (!child) continue;
+
+      if (memberTypes?.includes(child.type)) {
+        this.extractEnumMembers(child);
+      } else {
+        this.visitNode(child);
+      }
+    }
+    this.nodeStack.pop();
+  }
+
+  /**
+   * Extract enum member names from an enum member node.
+   * Handles multi-case declarations (Swift: `case put, delete`) and single-case patterns.
+   */
+  private extractEnumMembers(node: SyntaxNode): void {
+    // Try field-based name first (e.g. Rust enum_variant has a 'name' field)
+    const nameNode = getChildByField(node, 'name');
+    if (nameNode) {
+      this.createNode('enum_member', getNodeText(nameNode, this.source), node);
+      return;
+    }
+
+    // Check for identifier-like children (Swift: simple_identifier, TS: property_identifier)
+    let found = false;
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child && (child.type === 'simple_identifier' || child.type === 'identifier' || child.type === 'property_identifier')) {
+        this.createNode('enum_member', getNodeText(child, this.source), child);
+        found = true;
+      }
+    }
+
+    // If the node itself IS the identifier (e.g. TS property_identifier directly in enum body)
+    if (!found && node.namedChildCount === 0) {
+      this.createNode('enum_member', getNodeText(node, this.source), node);
+    }
+  }
+
+  /**
+   * Extract a class property declaration (e.g. C# `public string Name { get; set; }`).
+   * Extracts as 'property' kind node inside the owning class.
+   */
+  private extractProperty(node: SyntaxNode): void {
+    if (!this.extractor) return;
+
+    const docstring = getPrecedingDocstring(node, this.source);
+    const visibility = this.extractor.getVisibility?.(node);
+    const isStatic = this.extractor.isStatic?.(node) ?? false;
+
+    // Property name is a direct identifier child
+    const nameNode = getChildByField(node, 'name')
+      || node.namedChildren.find(c => c.type === 'identifier');
+    if (!nameNode) return;
+
+    const name = getNodeText(nameNode, this.source);
+
+    // Get property type from the type child (first named child that isn't modifier or identifier)
+    const typeNode = node.namedChildren.find(
+      c => c.type !== 'modifier' && c.type !== 'modifiers'
+        && c.type !== 'identifier' && c.type !== 'accessor_list'
+        && c.type !== 'accessors' && c.type !== 'equals_value_clause'
+    );
+    const typeText = typeNode ? getNodeText(typeNode, this.source) : undefined;
+    const signature = typeText ? `${typeText} ${name}` : name;
+
+    const propNode = this.createNode('property', name, node, {
+      docstring,
+      signature,
+      visibility,
+      isStatic,
+    });
+
+    // `@Inject() private svc: Foo` and similar — capture the
+    // decorator->target relationship for class properties too.
+    if (propNode) {
+      this.extractDecoratorsFor(node, propNode.id);
+    }
+  }
+
+  /**
+   * Extract a class field declaration (e.g. Java field_declaration, C# field_declaration).
+   * Extracts each declarator as a 'field' kind node inside the owning class.
+   */
+  private extractField(node: SyntaxNode): void {
+    if (!this.extractor) return;
+
+    const docstring = getPrecedingDocstring(node, this.source);
+    const visibility = this.extractor.getVisibility?.(node);
+    const isStatic = this.extractor.isStatic?.(node) ?? false;
+
+    // Java field_declaration: "private final String name = value;" → variable_declarator(s) are direct children
+    // C# field_declaration: wraps in variable_declaration → variable_declarator(s)
+    let declarators = node.namedChildren.filter(
+      c => c.type === 'variable_declarator'
+    );
+    // C#: look inside variable_declaration wrapper
+    if (declarators.length === 0) {
+      const varDecl = node.namedChildren.find(c => c.type === 'variable_declaration');
+      if (varDecl) {
+        declarators = varDecl.namedChildren.filter(c => c.type === 'variable_declarator');
+      }
+    }
+
+    // PHP property_declaration: property_element → variable_name → name
+    if (declarators.length === 0) {
+      const propElements = node.namedChildren.filter(c => c.type === 'property_element');
+      if (propElements.length > 0) {
+        // Get type annotation if present (e.g. "string", "int", "?Foo")
+        const typeNode = node.namedChildren.find(
+          c => c.type !== 'visibility_modifier' && c.type !== 'static_modifier'
+            && c.type !== 'readonly_modifier' && c.type !== 'property_element'
+            && c.type !== 'var_modifier'
+        );
+        const typeText = typeNode ? getNodeText(typeNode, this.source) : undefined;
+
+        for (const elem of propElements) {
+          const varName = elem.namedChildren.find(c => c.type === 'variable_name');
+          const nameNode = varName?.namedChildren.find(c => c.type === 'name');
+          if (!nameNode) continue;
+          const name = getNodeText(nameNode, this.source);
+          const signature = typeText ? `${typeText} $${name}` : `$${name}`;
+          this.createNode('field', name, elem, {
+            docstring,
+            signature,
+            visibility,
+            isStatic,
+          });
+        }
+        return;
+      }
+    }
+
+    if (declarators.length > 0) {
+      // Get field type from the type child
+      // Java: type is a direct child of field_declaration
+      // C#: type is inside variable_declaration wrapper
+      const varDecl = node.namedChildren.find(c => c.type === 'variable_declaration');
+      const typeSearchNode = varDecl ?? node;
+      const typeNode = typeSearchNode.namedChildren.find(
+        c => c.type !== 'modifiers' && c.type !== 'modifier' && c.type !== 'variable_declarator'
+          && c.type !== 'variable_declaration' && c.type !== 'marker_annotation' && c.type !== 'annotation'
+      );
+      const typeText = typeNode ? getNodeText(typeNode, this.source) : undefined;
+
+      for (const decl of declarators) {
+        const nameNode = getChildByField(decl, 'name')
+          || decl.namedChildren.find(c => c.type === 'identifier');
+        if (!nameNode) continue;
+        const name = getNodeText(nameNode, this.source);
+        const signature = typeText ? `${typeText} ${name}` : name;
+        const fieldNode = this.createNode('field', name, decl, {
+          docstring,
+          signature,
+          visibility,
+          isStatic,
+        });
+        // Java/Kotlin annotations / TS field decorators sit on the
+        // outer field_declaration, not on the individual declarator.
+        if (fieldNode) this.extractDecoratorsFor(node, fieldNode.id);
+      }
+    } else {
+      // Fallback: try to find an identifier child directly
+      const nameNode = getChildByField(node, 'name')
+        || node.namedChildren.find(c => c.type === 'identifier');
+      if (nameNode) {
+        const name = getNodeText(nameNode, this.source);
+        this.createNode('field', name, node, {
+          docstring,
+          visibility,
+          isStatic,
+        });
+      }
+    }
   }
 
   /**
@@ -1412,6 +1016,11 @@ export class TreeSitterExtractor {
           const valueNode = getChildByField(child, 'value');
 
           if (nameNode) {
+            // Skip destructured patterns (e.g., `let { x, y } = $props()` in Svelte)
+            // These produce ugly multi-line names like "{ class: className }"
+            if (nameNode.type === 'object_pattern' || nameNode.type === 'array_pattern') {
+              continue;
+            }
             const name = getNodeText(nameNode, this.source);
             // Arrow functions / function expressions: extract as function instead of variable
             if (valueNode && (valueNode.type === 'arrow_function' || valueNode.type === 'function_expression')) {
@@ -1423,11 +1032,16 @@ export class TreeSitterExtractor {
             const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
             const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
-            this.createNode(kind, name, child, {
+            const varNode = this.createNode(kind, name, child, {
               docstring,
               signature: initSignature,
               isExported,
             });
+
+            // Extract type annotation references (e.g., const x: ITextModel = ...)
+            if (varNode) {
+              this.extractVariableTypeAnnotation(child, varNode.id);
+            }
           }
         }
       }
@@ -1515,75 +1129,103 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Extract a type alias (e.g. `export type X = ...` in TypeScript)
+   * Extract a type alias (e.g. `export type X = ...` in TypeScript).
+   * For languages like Go, resolveTypeAliasKind detects when the type_spec
+   * wraps a struct or interface definition and creates the correct node kind.
+   * Returns true if children should be skipped (struct/interface handled body visiting).
    */
-  private extractTypeAlias(node: SyntaxNode): void {
-    if (!this.extractor) return;
+  private extractTypeAlias(node: SyntaxNode): boolean {
+    if (!this.extractor) return false;
 
     const name = extractName(node, this.source, this.extractor);
-    if (name === '<anonymous>') return;
+    if (name === '<anonymous>') return false;
     const docstring = getPrecedingDocstring(node, this.source);
     const isExported = this.extractor.isExported?.(node, this.source);
 
-    this.createNode('type_alias', name, node, {
+    // Check if this type alias is actually a struct or interface definition
+    // (e.g. Go: `type Foo struct { ... }` is a type_spec wrapping struct_type)
+    const resolvedKind = this.extractor.resolveTypeAliasKind?.(node, this.source);
+
+    if (resolvedKind === 'struct') {
+      const structNode = this.createNode('struct', name, node, { docstring, isExported });
+      if (!structNode) return true;
+      // Visit body children for field extraction
+      this.nodeStack.push(structNode.id);
+      // Try Go-style 'type' field first, then find inner struct child (C typedef struct)
+      const typeChild = getChildByField(node, 'type')
+        || this.findChildByTypes(node, this.extractor.structTypes);
+      if (typeChild) {
+        // Extract struct embedding (e.g. Go: `type DB struct { *Head; Queryable }`)
+        this.extractInheritance(typeChild, structNode.id);
+        const body = getChildByField(typeChild, this.extractor.bodyField) || typeChild;
+        for (let i = 0; i < body.namedChildCount; i++) {
+          const child = body.namedChild(i);
+          if (child) this.visitNode(child);
+        }
+      }
+      this.nodeStack.pop();
+      return true;
+    }
+
+    if (resolvedKind === 'enum') {
+      const enumNode = this.createNode('enum', name, node, { docstring, isExported });
+      if (!enumNode) return true;
+      this.nodeStack.push(enumNode.id);
+      // Find the inner enum type child (e.g. C: typedef enum { ... } name)
+      const innerEnum = this.findChildByTypes(node, this.extractor.enumTypes);
+      if (innerEnum) {
+        this.extractInheritance(innerEnum, enumNode.id);
+        const body = this.extractor.resolveBody?.(innerEnum, this.extractor.bodyField)
+          ?? getChildByField(innerEnum, this.extractor.bodyField);
+        if (body) {
+          const memberTypes = this.extractor.enumMemberTypes;
+          for (let i = 0; i < body.namedChildCount; i++) {
+            const child = body.namedChild(i);
+            if (!child) continue;
+            if (memberTypes?.includes(child.type)) {
+              this.extractEnumMembers(child);
+            } else {
+              this.visitNode(child);
+            }
+          }
+        }
+      }
+      this.nodeStack.pop();
+      return true;
+    }
+
+    if (resolvedKind === 'interface') {
+      const kind: NodeKind = this.extractor.interfaceKind ?? 'interface';
+      const interfaceNode = this.createNode(kind, name, node, { docstring, isExported });
+      if (!interfaceNode) return true;
+      // Extract interface inheritance from the inner type node
+      const typeChild = getChildByField(node, 'type');
+      if (typeChild) this.extractInheritance(typeChild, interfaceNode.id);
+      return true;
+    }
+
+    const typeAliasNode = this.createNode('type_alias', name, node, {
       docstring,
       isExported,
     });
-  }
 
-  /**
-   * Extract an exported variable declaration that isn't a function.
-   * Handles patterns like:
-   *   export const X = create(...)
-   *   export const X = { ... }
-   *   export const X = [...]
-   *   export const X = "value"
-   *
-   * This is called for `export_statement` nodes that contain a
-   * `lexical_declaration` with `variable_declarator` children whose
-   * values are NOT already handled by functionTypes (arrow_function,
-   * function_expression).
-   */
-  private extractExportedVariables(exportNode: SyntaxNode): void {
-    if (!this.extractor) return;
-
-    // Find the lexical_declaration or variable_declaration child
-    for (let i = 0; i < exportNode.namedChildCount; i++) {
-      const decl = exportNode.namedChild(i);
-      if (!decl || (decl.type !== 'lexical_declaration' && decl.type !== 'variable_declaration')) {
-        continue;
-      }
-
-      // Iterate over each variable_declarator in the declaration
-      for (let j = 0; j < decl.namedChildCount; j++) {
-        const declarator = decl.namedChild(j);
-        if (!declarator || declarator.type !== 'variable_declarator') continue;
-
-        const nameNode = getChildByField(declarator, 'name');
-        if (!nameNode) continue;
-        const name = getNodeText(nameNode, this.source);
-
-        // Skip if the value is a function type — those are already handled
-        // by extractFunction via the functionTypes dispatch
-        const value = getChildByField(declarator, 'value');
-        if (value) {
-          const valueType = value.type;
-          if (
-            this.extractor.functionTypes.includes(valueType)
-          ) {
-            continue; // Already handled by extractFunction
-          }
-        }
-
-        const docstring = getPrecedingDocstring(exportNode, this.source);
-
-        this.createNode('variable', name, declarator, {
-          docstring,
-          isExported: true,
-        });
+    // Extract type references from the alias value (e.g., `type X = ITextModel | null`)
+    if (typeAliasNode && this.TYPE_ANNOTATION_LANGUAGES.has(this.language)) {
+      // The value is everything after the `=`, which is typically the last named child
+      // In tree-sitter TS: type_alias_declaration has name + value children
+      const value = getChildByField(node, 'value');
+      if (value) {
+        this.extractTypeRefsFromSubtree(value, typeAliasNode.id);
       }
     }
+    return false;
   }
+
+  // extractExportedVariables removed — the walker now descends into
+  // export_statement children and the inner declaration's dedicated
+  // extractor (extractVariable, extractFunction, extractClass, etc.)
+  // handles the symbol with isExported=true via parent-walk in the
+  // language extractor's isExported predicate.
 
   /**
    * Extract an import
@@ -1592,207 +1234,108 @@ export class TreeSitterExtractor {
    * Also creates unresolved references for resolution purposes.
    */
   private extractImport(node: SyntaxNode): void {
+    if (!this.extractor) return;
+
     const importText = getNodeText(node, this.source).trim();
 
-    // Extract module/package name based on language
-    let moduleName = '';
-
-    if (this.language === 'typescript' || this.language === 'javascript' ||
-        this.language === 'tsx' || this.language === 'jsx') {
-      const source = getChildByField(node, 'source');
-      if (source) {
-        moduleName = getNodeText(source, this.source).replace(/['"]/g, '');
-      }
-
-      // Create import node with full statement as signature for searchability
-      if (moduleName) {
-        this.createNode('import', moduleName, node, {
-          signature: importText,
+    // Try language-specific hook first
+    if (this.extractor.extractImport) {
+      const info = this.extractor.extractImport(node, this.source);
+      if (info) {
+        this.createNode('import', info.moduleName, node, {
+          signature: info.signature,
         });
-      }
-    } else if (this.language === 'python') {
-      // Python has two import forms:
-      // 1. import_statement: import os, sys
-      // 2. import_from_statement: from os import path
-      if (node.type === 'import_from_statement') {
-        const moduleNode = getChildByField(node, 'module_name');
-        if (moduleNode) {
-          moduleName = getNodeText(moduleNode, this.source);
+        // Create unresolved reference unless the hook handled it
+        if (!info.handledRefs && info.moduleName && this.nodeStack.length > 0) {
+          const parentId = this.nodeStack[this.nodeStack.length - 1];
+          if (parentId) {
+            this.unresolvedReferences.push({
+              fromNodeId: parentId,
+              referenceName: info.moduleName,
+              referenceKind: 'imports',
+              line: node.startPosition.row + 1,
+              column: node.startPosition.column,
+            });
+          }
         }
-      } else {
-        // import_statement - may have multiple modules
-        // Can be dotted_name (import os) or aliased_import (import numpy as np)
-        for (let i = 0; i < node.namedChildCount; i++) {
-          const child = node.namedChild(i);
-          if (child?.type === 'dotted_name') {
-            const name = getNodeText(child, this.source);
-            this.createNode('import', name, node, {
+        return;
+      }
+      // Hook returned null — fall through to multi-import inline handlers only
+      // (hook returning null means "I didn't handle this" for multi-import cases,
+      // NOT "use generic fallback" — the hook already declined)
+    }
+
+    // Multi-import cases that create multiple nodes (can't be expressed with single-return hook)
+
+    // Python import_statement: import os, sys (creates one import per module)
+    if (this.language === 'python' && node.type === 'import_statement') {
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child?.type === 'dotted_name') {
+          this.createNode('import', getNodeText(child, this.source), node, {
+            signature: importText,
+          });
+        } else if (child?.type === 'aliased_import') {
+          const dottedName = child.namedChildren.find(c => c.type === 'dotted_name');
+          if (dottedName) {
+            this.createNode('import', getNodeText(dottedName, this.source), node, {
               signature: importText,
             });
-          } else if (child?.type === 'aliased_import') {
-            // Extract the module name from inside aliased_import
-            const dottedName = child.namedChildren.find(c => c.type === 'dotted_name');
-            if (dottedName) {
-              const name = getNodeText(dottedName, this.source);
-              this.createNode('import', name, node, {
-                signature: importText,
+          }
+        }
+      }
+      return;
+    }
+
+    // Go imports: single or grouped (creates one import per spec)
+    if (this.language === 'go') {
+      const parentId = this.nodeStack.length > 0 ? this.nodeStack[this.nodeStack.length - 1] : null;
+      const extractFromSpec = (spec: SyntaxNode): void => {
+        const stringLiteral = spec.namedChildren.find(c => c.type === 'interpreted_string_literal');
+        if (stringLiteral) {
+          const importPath = getNodeText(stringLiteral, this.source).replace(/['"]/g, '');
+          if (importPath) {
+            this.createNode('import', importPath, spec, {
+              signature: getNodeText(spec, this.source).trim(),
+            });
+            // Create unresolved reference so the resolver can create imports edges
+            if (parentId) {
+              this.unresolvedReferences.push({
+                fromNodeId: parentId,
+                referenceName: importPath,
+                referenceKind: 'imports',
+                line: spec.startPosition.row + 1,
+                column: spec.startPosition.column,
               });
             }
           }
         }
-        // Skip creating another node below if we handled import_statement
-        if (node.type === 'import_statement') {
-          return;
-        }
-      }
-
-      if (moduleName) {
-        this.createNode('import', moduleName, node, {
-          signature: importText,
-        });
-      }
-    } else if (this.language === 'go') {
-      // Go imports can be single or grouped
-      // Single: import "fmt" - uses import_spec directly as child
-      // Grouped: import ( "fmt" \n "os" ) - uses import_spec_list containing import_spec children
-
-      // Helper function to extract path from import_spec
-      const extractFromSpec = (spec: SyntaxNode): void => {
-        const stringLiteral = spec.namedChildren.find(c => c.type === 'interpreted_string_literal');
-        if (stringLiteral) {
-          const path = getNodeText(stringLiteral, this.source).replace(/['"]/g, '');
-          if (path) {
-            this.createNode('import', path, spec, {
-              signature: getNodeText(spec, this.source).trim(),
-            });
-          }
-        }
       };
 
-      // Find import_spec_list for grouped imports
       const importSpecList = node.namedChildren.find(c => c.type === 'import_spec_list');
-
       if (importSpecList) {
-        // Grouped imports - iterate through import_spec children
-        const importSpecs = importSpecList.namedChildren.filter(c => c.type === 'import_spec');
-        for (const spec of importSpecs) {
+        for (const spec of importSpecList.namedChildren.filter(c => c.type === 'import_spec')) {
           extractFromSpec(spec);
         }
       } else {
-        // Single import: import "fmt" - import_spec is direct child
         const importSpec = node.namedChildren.find(c => c.type === 'import_spec');
         if (importSpec) {
           extractFromSpec(importSpec);
         }
       }
-      return; // Go handled completely above
-    } else if (this.language === 'rust') {
-      // Rust use declarations
-      // use std::{ffi::OsStr, io}; -> scoped_use_list with identifier "std"
-      // use crate::error::Error;  -> scoped_identifier starting with "crate"
-      // use super::utils;         -> scoped_identifier starting with "super"
+      return;
+    }
 
-      // Helper to get the root crate/module from a scoped path
-      const getRootModule = (scopedNode: SyntaxNode): string => {
-        // Recursively find the leftmost identifier/crate/super/self
-        const firstChild = scopedNode.namedChild(0);
-        if (!firstChild) return getNodeText(scopedNode, this.source);
-
-        if (firstChild.type === 'identifier' ||
-            firstChild.type === 'crate' ||
-            firstChild.type === 'super' ||
-            firstChild.type === 'self') {
-          return getNodeText(firstChild, this.source);
-        } else if (firstChild.type === 'scoped_identifier') {
-          return getRootModule(firstChild);
-        }
-        return getNodeText(firstChild, this.source);
-      };
-
-      // Find the use argument (scoped_use_list or scoped_identifier)
-      const useArg = node.namedChildren.find(c =>
-        c.type === 'scoped_use_list' ||
-        c.type === 'scoped_identifier' ||
-        c.type === 'use_list' ||
-        c.type === 'identifier'
-      );
-
-      if (useArg) {
-        moduleName = getRootModule(useArg);
-        this.createNode('import', moduleName, node, {
-          signature: importText,
-        });
-      }
-      return; // Rust handled completely above
-    } else if (this.language === 'swift') {
-      // Swift imports: import Foundation, @testable import Alamofire
-      // AST structure: import_declaration -> identifier -> simple_identifier
-      const identifier = node.namedChildren.find(c => c.type === 'identifier');
-      if (identifier) {
-        moduleName = getNodeText(identifier, this.source);
-        this.createNode('import', moduleName, node, {
-          signature: importText,
-        });
-      }
-      return; // Swift handled completely above
-    } else if (this.language === 'kotlin') {
-      // Kotlin imports: import java.io.IOException, import x.y.Z as Alias, import x.y.*
-      // AST structure: import_header -> identifier (dotted path)
-      const identifier = node.namedChildren.find(c => c.type === 'identifier');
-      if (identifier) {
-        moduleName = getNodeText(identifier, this.source);
-        this.createNode('import', moduleName, node, {
-          signature: importText,
-        });
-      }
-      return; // Kotlin handled completely above
-    } else if (this.language === 'java') {
-      // Java imports: import java.util.List, import static x.Y.method, import x.y.*
-      // AST structure: import_declaration -> scoped_identifier (dotted path)
-      const scopedId = node.namedChildren.find(c => c.type === 'scoped_identifier');
-      if (scopedId) {
-        moduleName = getNodeText(scopedId, this.source);
-        this.createNode('import', moduleName, node, {
-          signature: importText,
-        });
-      }
-      return; // Java handled completely above
-    } else if (this.language === 'csharp') {
-      // C# using directives: using System, using System.Collections.Generic, using static X, using Alias = X
-      // AST structure: using_directive -> qualified_name (dotted) or identifier (simple)
-      // For alias imports: identifier = qualified_name - we want the qualified_name
-      const qualifiedName = node.namedChildren.find(c => c.type === 'qualified_name');
-      if (qualifiedName) {
-        moduleName = getNodeText(qualifiedName, this.source);
-      } else {
-        // Simple namespace like "using System;" - get the first identifier
-        const identifier = node.namedChildren.find(c => c.type === 'identifier');
-        if (identifier) {
-          moduleName = getNodeText(identifier, this.source);
-        }
-      }
-      if (moduleName) {
-        this.createNode('import', moduleName, node, {
-          signature: importText,
-        });
-      }
-      return; // C# handled completely above
-    } else if (this.language === 'php') {
-      // PHP use declarations: use X\Y\Z, use X as Y, use function X\func, use X\{A, B}
-      // AST structure: namespace_use_declaration -> namespace_use_clause -> qualified_name or name
-
-      // Check for grouped imports first: use X\{A, B}
+    // PHP grouped imports: use X\{A, B} (creates one import per item)
+    if (this.language === 'php') {
       const namespacePrefix = node.namedChildren.find(c => c.type === 'namespace_name');
       const useGroup = node.namedChildren.find(c => c.type === 'namespace_use_group');
-
       if (namespacePrefix && useGroup) {
-        // Grouped import - create one import per item
         const prefix = getNodeText(namespacePrefix, this.source);
         const useClauses = useGroup.namedChildren.filter((c: SyntaxNode) =>
           c.type === 'namespace_use_group_clause' || c.type === 'namespace_use_clause'
         );
         for (const clause of useClauses) {
-          // WASM grammar wraps names in namespace_name; native uses name directly
           const nsName = clause.namedChildren.find((c: SyntaxNode) => c.type === 'namespace_name');
           const name = nsName
             ? nsName.namedChildren.find((c: SyntaxNode) => c.type === 'name')
@@ -1806,149 +1349,15 @@ export class TreeSitterExtractor {
         }
         return;
       }
-
-      // Single import - find namespace_use_clause
-      const useClause = node.namedChildren.find(c => c.type === 'namespace_use_clause');
-      if (useClause) {
-        // Look for qualified_name (full path) or name (simple)
-        const qualifiedName = useClause.namedChildren.find((c: SyntaxNode) => c.type === 'qualified_name');
-        if (qualifiedName) {
-          moduleName = getNodeText(qualifiedName, this.source);
-        } else {
-          const name = useClause.namedChildren.find((c: SyntaxNode) => c.type === 'name');
-          if (name) {
-            moduleName = getNodeText(name, this.source);
-          }
-        }
-      }
-
-      if (moduleName) {
-        this.createNode('import', moduleName, node, {
-          signature: importText,
-        });
-      }
-      return; // PHP handled completely above
-    } else if (this.language === 'ruby') {
-      // Ruby imports: require 'json', require_relative '../helper'
-      // AST structure: call -> identifier (require/require_relative) + argument_list -> string -> string_content
-
-      // Check if this is a require/require_relative call
-      const identifier = node.namedChildren.find(c => c.type === 'identifier');
-      if (!identifier) return;
-      const methodName = getNodeText(identifier, this.source);
-      if (methodName !== 'require' && methodName !== 'require_relative') {
-        return; // Not an import, skip
-      }
-
-      // Find the argument (string)
-      const argList = node.namedChildren.find(c => c.type === 'argument_list');
-      if (argList) {
-        const stringNode = argList.namedChildren.find((c: SyntaxNode) => c.type === 'string');
-        if (stringNode) {
-          // Get string_content (without quotes)
-          const stringContent = stringNode.namedChildren.find((c: SyntaxNode) => c.type === 'string_content');
-          if (stringContent) {
-            moduleName = getNodeText(stringContent, this.source);
-          }
-        }
-      }
-
-      if (moduleName) {
-        this.createNode('import', moduleName, node, {
-          signature: importText,
-        });
-      }
-      return; // Ruby handled completely above
-    } else if (this.language === 'dart') {
-      // Dart imports: import 'dart:async'; import 'package:foo/bar.dart' as bar;
-      // AST: import_or_export -> library_import -> import_specification -> configurable_uri -> uri -> string_literal
-      const libraryImport = node.namedChildren.find(c => c.type === 'library_import');
-      if (libraryImport) {
-        const importSpec = libraryImport.namedChildren.find((c: SyntaxNode) => c.type === 'import_specification');
-        if (importSpec) {
-          const configurableUri = importSpec.namedChildren.find((c: SyntaxNode) => c.type === 'configurable_uri');
-          if (configurableUri) {
-            const uri = configurableUri.namedChildren.find((c: SyntaxNode) => c.type === 'uri');
-            if (uri) {
-              const stringLiteral = uri.namedChildren.find((c: SyntaxNode) => c.type === 'string_literal');
-              if (stringLiteral) {
-                moduleName = getNodeText(stringLiteral, this.source).replace(/['"]/g, '');
-              }
-            }
-          }
-        }
-      }
-      // Also handle exports: export 'src/foo.dart';
-      const libraryExport = node.namedChildren.find(c => c.type === 'library_export');
-      if (libraryExport) {
-        const configurableUri = libraryExport.namedChildren.find((c: SyntaxNode) => c.type === 'configurable_uri');
-        if (configurableUri) {
-          const uri = configurableUri.namedChildren.find((c: SyntaxNode) => c.type === 'uri');
-          if (uri) {
-            const stringLiteral = uri.namedChildren.find((c: SyntaxNode) => c.type === 'string_literal');
-            if (stringLiteral) {
-              moduleName = getNodeText(stringLiteral, this.source).replace(/['"]/g, '');
-            }
-          }
-        }
-      }
-
-      if (moduleName) {
-        this.createNode('import', moduleName, node, {
-          signature: importText,
-        });
-      }
-      return; // Dart handled completely above
-    } else if (this.language === 'c' || this.language === 'cpp') {
-      // C/C++ includes: #include <iostream>, #include "myheader.h"
-      // AST: preproc_include -> system_lib_string (<...>) or string_literal ("...")
-
-      // Check for system include: <path>
-      const systemLib = node.namedChildren.find(c => c.type === 'system_lib_string');
-      if (systemLib) {
-        // Remove angle brackets: <iostream> -> iostream
-        moduleName = getNodeText(systemLib, this.source).replace(/^<|>$/g, '');
-      } else {
-        // Check for local include: "path"
-        const stringLiteral = node.namedChildren.find(c => c.type === 'string_literal');
-        if (stringLiteral) {
-          const stringContent = stringLiteral.namedChildren.find((c: SyntaxNode) => c.type === 'string_content');
-          if (stringContent) {
-            moduleName = getNodeText(stringContent, this.source);
-          }
-        }
-      }
-
-      if (moduleName) {
-        this.createNode('import', moduleName, node, {
-          signature: importText,
-        });
-      }
-      return; // C/C++ handled completely above
-    } else {
-      // Generic extraction for other languages
-      moduleName = importText;
-      if (moduleName) {
-        this.createNode('import', moduleName, node, {
-          signature: importText,
-        });
-      }
     }
 
-    // Keep unresolved reference creation for resolution purposes
-    // This is used to resolve imports to their target files/modules
-    if (moduleName && this.nodeStack.length > 0) {
-      const parentId = this.nodeStack[this.nodeStack.length - 1];
-      if (parentId) {
-        this.unresolvedReferences.push({
-          fromNodeId: parentId,
-          referenceName: moduleName,
-          referenceKind: 'imports',
-          line: node.startPosition.row + 1,
-          column: node.startPosition.column,
-        });
-      }
-    }
+    // If a hook exists but returned null, it intentionally declined this node — don't create fallback
+    if (this.extractor.extractImport) return;
+
+    // Generic fallback for languages without hooks
+    this.createNode('import', importText, node, {
+      signature: importText,
+    });
   }
 
   /**
@@ -1962,20 +1371,71 @@ export class TreeSitterExtractor {
 
     // Get the function/method being called
     let calleeName = '';
-    const func = getChildByField(node, 'function') || node.namedChild(0);
 
-    if (func) {
-      if (func.type === 'member_expression' || func.type === 'attribute') {
-        // Method call: obj.method()
-        const property = getChildByField(func, 'property') || func.namedChild(1);
-        if (property) {
-          calleeName = getNodeText(property, this.source);
+    // Java/Kotlin method_invocation has 'object' + 'name' fields instead of 'function'
+    // PHP member_call_expression has 'object' + 'name', scoped_call_expression has 'scope' + 'name'
+    const nameField = getChildByField(node, 'name');
+    const objectField = getChildByField(node, 'object') || getChildByField(node, 'scope');
+
+    if (nameField && objectField && (node.type === 'method_invocation' || node.type === 'member_call_expression' || node.type === 'scoped_call_expression')) {
+      // Method call with explicit receiver: receiver.method() / $receiver->method() / ClassName::method()
+      const methodName = getNodeText(nameField, this.source);
+      let receiverName = getNodeText(objectField, this.source);
+      // Strip PHP $ prefix from variable names
+      receiverName = receiverName.replace(/^\$/, '');
+
+      if (methodName) {
+        // Skip self/this/parent/static receivers — they don't aid resolution
+        const SKIP_RECEIVERS = new Set(['self', 'this', 'cls', 'super', 'parent', 'static']);
+        if (SKIP_RECEIVERS.has(receiverName)) {
+          calleeName = methodName;
+        } else {
+          calleeName = `${receiverName}.${methodName}`;
         }
-      } else if (func.type === 'scoped_identifier' || func.type === 'scoped_call_expression') {
-        // Scoped call: Module::function()
-        calleeName = getNodeText(func, this.source);
-      } else {
-        calleeName = getNodeText(func, this.source);
+      }
+    } else {
+      const func = getChildByField(node, 'function') || node.namedChild(0);
+
+      if (func) {
+        if (func.type === 'member_expression' || func.type === 'attribute' || func.type === 'selector_expression' || func.type === 'navigation_expression') {
+          // Method call: obj.method() or obj.field.method()
+          // Go uses selector_expression with 'field', JS/TS uses member_expression with 'property'
+          // Kotlin uses navigation_expression with navigation_suffix > simple_identifier
+          let property = getChildByField(func, 'property') || getChildByField(func, 'field');
+          if (!property) {
+            const child1 = func.namedChild(1);
+            // Kotlin: navigation_suffix wraps the method name — extract simple_identifier from it
+            if (child1?.type === 'navigation_suffix') {
+              property = child1.namedChildren.find((c: SyntaxNode) => c.type === 'simple_identifier') ?? child1;
+            } else {
+              property = child1;
+            }
+          }
+          if (property) {
+            const methodName = getNodeText(property, this.source);
+            // Include receiver name for qualified resolution (e.g., console.print → "console.print")
+            // This helps the resolver distinguish method calls from bare function calls
+            // (e.g., Python's console.print() vs builtin print())
+            // Skip self/this/cls as they don't aid resolution
+            const receiver = getChildByField(func, 'object') || getChildByField(func, 'operand') || func.namedChild(0);
+            const SKIP_RECEIVERS = new Set(['self', 'this', 'cls', 'super']);
+            if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier')) {
+              const receiverName = getNodeText(receiver, this.source);
+              if (!SKIP_RECEIVERS.has(receiverName)) {
+                calleeName = `${receiverName}.${methodName}`;
+              } else {
+                calleeName = methodName;
+              }
+            } else {
+              calleeName = methodName;
+            }
+          }
+        } else if (func.type === 'scoped_identifier' || func.type === 'scoped_call_expression') {
+          // Scoped call: Module::function()
+          calleeName = getNodeText(func, this.source);
+        } else {
+          calleeName = getNodeText(func, this.source);
+        }
       }
     }
 
@@ -1991,26 +1451,234 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Visit function body and extract calls
+   * `new Foo(...)` / `Foo::new(...)` / object_creation_expression —
+   * emit an `instantiates` reference to the class name. The resolver
+   * then links it to the class node, producing the `instantiates`
+   * edge that powers "what creates instances of X" queries.
+   *
+   * Children are still walked so nested calls inside the constructor
+   * arguments (`new Foo(bar())`) get their own `calls` references.
+   */
+  private extractInstantiation(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0) return;
+    const fromId = this.nodeStack[this.nodeStack.length - 1];
+    if (!fromId) return;
+
+    // The class name is in the `constructor`/`type`/first-named-child
+    // depending on grammar.
+    const ctor =
+      getChildByField(node, 'constructor') ||
+      getChildByField(node, 'type') ||
+      getChildByField(node, 'name') ||
+      node.namedChild(0);
+    if (!ctor) return;
+
+    let className = getNodeText(ctor, this.source);
+    // Strip type-argument suffix first: `new Map<K, V>()` would
+    // otherwise produce className 'Map<K, V>' (the constructor
+    // field is a `generic_type` node) and resolution would fail
+    // because no class is named with the angle-bracket suffix.
+    const ltIdx = className.indexOf('<');
+    if (ltIdx > 0) className = className.slice(0, ltIdx);
+    // For namespaced/qualified constructors (`new ns.Foo()`,
+    // `new ns::Foo()`) keep the trailing identifier — that's what
+    // matches a class node in the index.
+    const lastDot = Math.max(
+      className.lastIndexOf('.'),
+      className.lastIndexOf('::')
+    );
+    if (lastDot >= 0) className = className.slice(lastDot + 1).replace(/^[:.]/, '');
+    className = className.trim();
+
+    if (className) {
+      this.unresolvedReferences.push({
+        fromNodeId: fromId,
+        referenceName: className,
+        referenceKind: 'instantiates',
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column,
+      });
+    }
+  }
+
+  /**
+   * Scan `declNode` and its preceding siblings (within the parent's
+   * named children) for decorator nodes, emitting a `decorates`
+   * reference from `decoratedId` to each decorator's function name.
+   *
+   * Why preceding siblings: in TypeScript, `@Foo class Bar {}` parses
+   * as an `export_statement` (or top-level wrapper) with the
+   * `decorator` as a child *before* the `class_declaration` — so the
+   * decorator isn't a child of the class itself. For methods/
+   * properties, the decorator IS a direct child of the declaration,
+   * so we also scan declNode.namedChildren.
+   *
+   * Idempotent across grammars: if neither location yields decorators
+   * (most non-decorator-using languages), the function is a no-op.
+   */
+  private extractDecoratorsFor(declNode: SyntaxNode, decoratedId: string): void {
+    const consider = (n: SyntaxNode | null): void => {
+      if (!n) return;
+      // `marker_annotation` is Java's grammar for arg-less annotations
+      // (`@Override`, `@Deprecated`); without including it, every
+      // such Java annotation would be silently skipped.
+      if (
+        n.type !== 'decorator' &&
+        n.type !== 'annotation' &&
+        n.type !== 'marker_annotation'
+      ) {
+        return;
+      }
+      // Find the leading identifier: skip the `@` punct, unwrap
+      // a call_expression if the decorator is invoked with args.
+      let target: SyntaxNode | null = null;
+      for (let i = 0; i < n.namedChildCount; i++) {
+        const child = n.namedChild(i);
+        if (!child) continue;
+        if (child.type === 'call_expression') {
+          const fn = getChildByField(child, 'function') ?? child.namedChild(0);
+          if (fn) target = fn;
+          if (target) break;
+        }
+        if (
+          child.type === 'identifier' ||
+          child.type === 'member_expression' ||
+          child.type === 'scoped_identifier' ||
+          child.type === 'navigation_expression'
+        ) {
+          target = child;
+          break;
+        }
+      }
+      if (!target) return;
+      let name = getNodeText(target, this.source);
+      const lastDot = Math.max(name.lastIndexOf('.'), name.lastIndexOf('::'));
+      if (lastDot >= 0) name = name.slice(lastDot + 1).replace(/^[:.]/, '');
+      if (!name) return;
+      this.unresolvedReferences.push({
+        fromNodeId: decoratedId,
+        referenceName: name,
+        referenceKind: 'decorates',
+        line: n.startPosition.row + 1,
+        column: n.startPosition.column,
+      });
+    };
+
+    // 1. Decorators that are direct children of the declaration
+    //    (method/property style, also some grammars for class).
+    for (let i = 0; i < declNode.namedChildCount; i++) {
+      consider(declNode.namedChild(i));
+    }
+
+    // 2. Decorators that are PRECEDING siblings of the declaration
+    //    inside the parent's children (TypeScript class style).
+    //    Walk BACKWARDS from the declaration and stop at the first
+    //    non-decorator sibling — without that stop, decorators
+    //    belonging to an EARLIER unrelated declaration leak in
+    //    (e.g. `@A class Foo {} @B class Bar {}` would otherwise
+    //    attribute @A to Bar).
+    //
+    //    Note on identity: tree-sitter web bindings return fresh JS
+    //    wrapper objects from `parent`/`namedChild` navigation, so
+    //    `sibling === declNode` is unreliable — `startIndex` does
+    //    the matching instead.
+    const parent = declNode.parent;
+    if (parent) {
+      const declStart = declNode.startIndex;
+      let declIdx = -1;
+      for (let i = 0; i < parent.namedChildCount; i++) {
+        const sibling = parent.namedChild(i);
+        if (sibling && sibling.startIndex === declStart) {
+          declIdx = i;
+          break;
+        }
+      }
+      if (declIdx > 0) {
+        for (let j = declIdx - 1; j >= 0; j--) {
+          const sibling = parent.namedChild(j);
+          if (!sibling) continue;
+          if (sibling.type !== 'decorator' && sibling.type !== 'annotation' && sibling.type !== 'marker_annotation') {
+            break; // non-decorator separator → stop consuming
+          }
+          consider(sibling);
+        }
+      }
+    }
+  }
+
+  /**
+   * Visit function body and extract calls (and structural nodes).
+   *
+   * In addition to call expressions, this also detects class/struct/enum
+   * definitions inside function bodies. This handles two cases:
+   *   1. Local class/struct/enum definitions (valid in C++, Java, etc.)
+   *   2. C++ macro misparsing — macros like NLOHMANN_JSON_NAMESPACE_BEGIN cause
+   *      tree-sitter to interpret the namespace block as a function_definition,
+   *      hiding real class/struct/enum nodes inside the "function body".
    */
   private visitFunctionBody(body: SyntaxNode, _functionId: string): void {
     if (!this.extractor) return;
 
-    // Recursively find all call expressions
-    const visitForCalls = (node: SyntaxNode): void => {
-      if (this.extractor!.callTypes.includes(node.type)) {
+    const visitForCallsAndStructure = (node: SyntaxNode): void => {
+      const nodeType = node.type;
+
+      if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);
+      } else if (INSTANTIATION_KINDS.has(nodeType)) {
+        // `new Foo()` inside a function body — emit an `instantiates`
+        // reference. Without this branch the body walker only knew
+        // about `call_expression`, so constructor invocations
+        // produced no graph edges at all.
+        this.extractInstantiation(node);
+      } else if (this.extractor!.extractBareCall) {
+        const calleeName = this.extractor!.extractBareCall(node, this.source);
+        if (calleeName && this.nodeStack.length > 0) {
+          const callerId = this.nodeStack[this.nodeStack.length - 1];
+          if (callerId) {
+            this.unresolvedReferences.push({
+              fromNodeId: callerId,
+              referenceName: calleeName,
+              referenceKind: 'calls',
+              line: node.startPosition.row + 1,
+              column: node.startPosition.column,
+            });
+          }
+        }
+      }
+
+      // Extract structural nodes found inside function bodies.
+      // Each extract method visits its own children, so we return after extracting.
+      if (this.extractor!.classTypes.includes(nodeType)) {
+        const classification = this.extractor!.classifyClassNode?.(node) ?? 'class';
+        if (classification === 'struct') this.extractStruct(node);
+        else if (classification === 'enum') this.extractEnum(node);
+        else if (classification === 'interface') this.extractInterface(node);
+        else if (classification === 'trait') this.extractClass(node, 'trait');
+        else this.extractClass(node);
+        return;
+      }
+      if (this.extractor!.structTypes.includes(nodeType)) {
+        this.extractStruct(node);
+        return;
+      }
+      if (this.extractor!.enumTypes.includes(nodeType)) {
+        this.extractEnum(node);
+        return;
+      }
+      if (this.extractor!.interfaceTypes.includes(nodeType)) {
+        this.extractInterface(node);
+        return;
       }
 
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child) {
-          visitForCalls(child);
+          visitForCallsAndStructure(child);
         }
       }
     };
 
-    visitForCalls(body);
+    visitForCallsAndStructure(body);
   }
 
   /**
@@ -2024,31 +1692,39 @@ export class TreeSitterExtractor {
 
       if (
         child.type === 'extends_clause' ||
-        child.type === 'class_heritage' ||
-        child.type === 'superclass'
+        child.type === 'superclass' ||
+        child.type === 'base_clause' || // PHP class extends
+        child.type === 'extends_interfaces' // Java interface extends
       ) {
-        // Extract parent class name
-        const superclass = child.namedChild(0);
-        if (superclass) {
-          const name = getNodeText(superclass, this.source);
-          this.unresolvedReferences.push({
-            fromNodeId: classId,
-            referenceName: name,
-            referenceKind: 'extends',
-            line: child.startPosition.row + 1,
-            column: child.startPosition.column,
-          });
+        // Extract parent class/interface names
+        // Java uses type_list wrapper: superclass -> type_identifier, extends_interfaces -> type_list -> type_identifier
+        const typeList = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_list');
+        const targets = typeList ? typeList.namedChildren : [child.namedChild(0)];
+        for (const target of targets) {
+          if (target) {
+            const name = getNodeText(target, this.source);
+            this.unresolvedReferences.push({
+              fromNodeId: classId,
+              referenceName: name,
+              referenceKind: 'extends',
+              line: target.startPosition.row + 1,
+              column: target.startPosition.column,
+            });
+          }
         }
       }
 
       if (
         child.type === 'implements_clause' ||
         child.type === 'class_interface_clause' ||
+        child.type === 'super_interfaces' || // Java class implements
         child.type === 'interfaces' // Dart
       ) {
         // Extract implemented interfaces
-        for (let j = 0; j < child.namedChildCount; j++) {
-          const iface = child.namedChild(j);
+        // Java uses type_list wrapper: super_interfaces -> type_list -> type_identifier
+        const typeList = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_list');
+        const targets = typeList ? typeList.namedChildren : child.namedChildren;
+        for (const iface of targets) {
           if (iface) {
             const name = getNodeText(iface, this.source);
             this.unresolvedReferences.push({
@@ -2060,6 +1736,332 @@ export class TreeSitterExtractor {
             });
           }
         }
+      }
+
+      // Python superclass list: `class Flask(Scaffold, Mixin):`
+      // argument_list contains identifier children for each parent class
+      if (child.type === 'argument_list' && node.type === 'class_definition') {
+        for (const arg of child.namedChildren) {
+          if (arg.type === 'identifier' || arg.type === 'attribute') {
+            const name = getNodeText(arg, this.source);
+            this.unresolvedReferences.push({
+              fromNodeId: classId,
+              referenceName: name,
+              referenceKind: 'extends',
+              line: arg.startPosition.row + 1,
+              column: arg.startPosition.column,
+            });
+          }
+        }
+      }
+
+      // Go interface embedding: `type Querier interface { LabelQuerier; ... }`
+      // constraint_elem wraps the embedded interface type identifier
+      if (child.type === 'constraint_elem') {
+        const typeId = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+        if (typeId) {
+          const name = getNodeText(typeId, this.source);
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: name,
+            referenceKind: 'extends',
+            line: typeId.startPosition.row + 1,
+            column: typeId.startPosition.column,
+          });
+        }
+      }
+
+      // Go struct embedding: field_declaration without field_identifier
+      // e.g. `type DB struct { *Head; Queryable }` — no field name means embedded type
+      if (child.type === 'field_declaration') {
+        const hasFieldIdentifier = child.namedChildren.some((c: SyntaxNode) => c.type === 'field_identifier');
+        if (!hasFieldIdentifier) {
+          const typeId = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+          if (typeId) {
+            const name = getNodeText(typeId, this.source);
+            this.unresolvedReferences.push({
+              fromNodeId: classId,
+              referenceName: name,
+              referenceKind: 'extends',
+              line: typeId.startPosition.row + 1,
+              column: typeId.startPosition.column,
+            });
+          }
+        }
+      }
+
+      // Rust trait supertraits: `trait SubTrait: SuperTrait + Display { ... }`
+      // trait_bounds contains type_identifier, generic_type, or higher_ranked_trait_bound children
+      if (child.type === 'trait_bounds') {
+        for (const bound of child.namedChildren) {
+          let typeName: string | undefined;
+          let posNode: SyntaxNode | undefined;
+
+          if (bound.type === 'type_identifier') {
+            typeName = getNodeText(bound, this.source);
+            posNode = bound;
+          } else if (bound.type === 'generic_type') {
+            // e.g. `Deserialize<'de>`
+            const inner = bound.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+            if (inner) { typeName = getNodeText(inner, this.source); posNode = inner; }
+          } else if (bound.type === 'higher_ranked_trait_bound') {
+            // e.g. `for<'de> Deserialize<'de>`
+            const generic = bound.namedChildren.find((c: SyntaxNode) => c.type === 'generic_type');
+            const typeId = generic?.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier')
+              ?? bound.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+            if (typeId) { typeName = getNodeText(typeId, this.source); posNode = typeId; }
+          }
+
+          if (typeName && posNode) {
+            this.unresolvedReferences.push({
+              fromNodeId: classId,
+              referenceName: typeName,
+              referenceKind: 'extends',
+              line: posNode.startPosition.row + 1,
+              column: posNode.startPosition.column,
+            });
+          }
+        }
+      }
+
+      // C#: `class Movie : BaseItem, IPlugin` → base_list with identifier children
+      // base_list combines both base class and interfaces in a single colon-separated list.
+      // We emit all as 'extends' since the syntax doesn't distinguish them.
+      if (child.type === 'base_list') {
+        for (const baseType of child.namedChildren) {
+          if (baseType) {
+            // For generic base types like `ClientBase<T>`, extract just the type name
+            const name = baseType.type === 'generic_name'
+              ? getNodeText(baseType.namedChildren.find((c: SyntaxNode) => c.type === 'identifier') ?? baseType, this.source)
+              : getNodeText(baseType, this.source);
+            this.unresolvedReferences.push({
+              fromNodeId: classId,
+              referenceName: name,
+              referenceKind: 'extends',
+              line: baseType.startPosition.row + 1,
+              column: baseType.startPosition.column,
+            });
+          }
+        }
+      }
+
+      // Kotlin: `class Foo : Bar, Baz` → delegation_specifier > user_type > type_identifier
+      // Also handles `class Foo : Bar()` → delegation_specifier > constructor_invocation > user_type
+      if (child.type === 'delegation_specifier') {
+        const userType = child.namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
+        const constructorInvocation = child.namedChildren.find((c: SyntaxNode) => c.type === 'constructor_invocation');
+        const target = userType ?? constructorInvocation;
+        if (target) {
+          const typeId = target.type === 'user_type'
+            ? target.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier') ?? target
+            : target.namedChildren.find((c: SyntaxNode) => c.type === 'user_type')?.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier')
+              ?? target.namedChildren.find((c: SyntaxNode) => c.type === 'user_type') ?? target;
+          const name = getNodeText(typeId, this.source);
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: name,
+            referenceKind: 'extends',
+            line: typeId.startPosition.row + 1,
+            column: typeId.startPosition.column,
+          });
+        }
+      }
+
+      // Swift: inheritance_specifier > user_type > type_identifier
+      // Used for class inheritance, protocol conformance, and protocol inheritance
+      if (child.type === 'inheritance_specifier') {
+        const userType = child.namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
+        const typeId = userType?.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+        if (typeId) {
+          const name = getNodeText(typeId, this.source);
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: name,
+            referenceKind: 'extends',
+            line: typeId.startPosition.row + 1,
+            column: typeId.startPosition.column,
+          });
+        }
+      }
+
+      // JavaScript class_heritage has bare identifier without extends_clause wrapper
+      // e.g. `class Foo extends Bar {}` → class_heritage → identifier("Bar")
+      if (
+        (child.type === 'identifier' || child.type === 'type_identifier') &&
+        node.type === 'class_heritage'
+      ) {
+        const name = getNodeText(child, this.source);
+        this.unresolvedReferences.push({
+          fromNodeId: classId,
+          referenceName: name,
+          referenceKind: 'extends',
+          line: child.startPosition.row + 1,
+          column: child.startPosition.column,
+        });
+      }
+
+      // Recurse into container nodes (e.g. field_declaration_list in Go structs,
+      // class_heritage in TypeScript which wraps extends_clause/implements_clause)
+      if (child.type === 'field_declaration_list' || child.type === 'class_heritage') {
+        this.extractInheritance(child, classId);
+      }
+    }
+  }
+
+  /**
+   * Rust `impl Trait for Type` — creates an implements edge from Type to Trait.
+   * For plain `impl Type { ... }` (no trait), no inheritance edge is needed.
+   */
+  private extractRustImplItem(node: SyntaxNode): void {
+    // Check if this is `impl Trait for Type` by looking for a `for` keyword
+    const hasFor = node.children.some(
+      (c: SyntaxNode) => c.type === 'for' && !c.isNamed
+    );
+    if (!hasFor) return;
+
+    // In `impl Trait for Type`, the type_identifiers are:
+    // first = Trait name, last = implementing Type name
+    // Also handle generic types like `impl<T> Trait for MyStruct<T>`
+    const typeIdents = node.namedChildren.filter(
+      (c: SyntaxNode) => c.type === 'type_identifier' || c.type === 'generic_type' || c.type === 'scoped_type_identifier'
+    );
+    if (typeIdents.length < 2) return;
+
+    const traitNode = typeIdents[0]!;
+    const typeNode = typeIdents[typeIdents.length - 1]!;
+
+    // Get the trait name (handle scoped paths like std::fmt::Display)
+    const traitName = traitNode.type === 'scoped_type_identifier'
+      ? this.source.substring(traitNode.startIndex, traitNode.endIndex)
+      : getNodeText(traitNode, this.source);
+
+    // Get the implementing type name (extract inner type_identifier for generics)
+    let typeName: string;
+    if (typeNode.type === 'generic_type') {
+      const inner = typeNode.namedChildren.find(
+        (c: SyntaxNode) => c.type === 'type_identifier'
+      );
+      typeName = inner ? getNodeText(inner, this.source) : getNodeText(typeNode, this.source);
+    } else {
+      typeName = getNodeText(typeNode, this.source);
+    }
+
+    // Find the struct/type node for the implementing type
+    const typeNodeId = this.findNodeByName(typeName);
+    if (typeNodeId) {
+      this.unresolvedReferences.push({
+        fromNodeId: typeNodeId,
+        referenceName: traitName,
+        referenceKind: 'implements',
+        line: traitNode.startPosition.row + 1,
+        column: traitNode.startPosition.column,
+      });
+    }
+  }
+
+  /**
+   * Find a previously-extracted node by name (used for back-references like impl blocks)
+   */
+  private findNodeByName(name: string): string | undefined {
+    for (const node of this.nodes) {
+      if (node.name === name && (node.kind === 'struct' || node.kind === 'enum' || node.kind === 'class')) {
+        return node.id;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Languages that support type annotations (TypeScript, etc.)
+   */
+  private readonly TYPE_ANNOTATION_LANGUAGES = new Set([
+    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp',
+  ]);
+
+  /**
+   * Built-in/primitive type names that shouldn't create references
+   */
+  private readonly BUILTIN_TYPES = new Set([
+    'string', 'number', 'boolean', 'void', 'null', 'undefined', 'never', 'any', 'unknown',
+    'object', 'symbol', 'bigint', 'true', 'false',
+    // Rust
+    'str', 'bool', 'i8', 'i16', 'i32', 'i64', 'i128', 'isize',
+    'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'f32', 'f64', 'char',
+    // Java/C#
+    'int', 'long', 'short', 'byte', 'float', 'double', 'char',
+    // Go
+    'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64',
+    'float32', 'float64', 'complex64', 'complex128', 'rune', 'error',
+  ]);
+
+  /**
+   * Extract type references from type annotations on a function/method/field node.
+   * Creates 'references' edges for parameter types, return types, and field types.
+   */
+  private extractTypeAnnotations(node: SyntaxNode, nodeId: string): void {
+    if (!this.extractor) return;
+    if (!this.TYPE_ANNOTATION_LANGUAGES.has(this.language)) return;
+
+    // Extract parameter type annotations
+    const params = getChildByField(node, this.extractor.paramsField || 'parameters');
+    if (params) {
+      this.extractTypeRefsFromSubtree(params, nodeId);
+    }
+
+    // Extract return type annotation
+    const returnType = getChildByField(node, this.extractor.returnField || 'return_type');
+    if (returnType) {
+      this.extractTypeRefsFromSubtree(returnType, nodeId);
+    }
+
+    // Extract direct type annotation (for class fields like `model: ITextModel`)
+    const typeAnnotation = node.namedChildren.find(
+      (c: SyntaxNode) => c.type === 'type_annotation'
+    );
+    if (typeAnnotation) {
+      this.extractTypeRefsFromSubtree(typeAnnotation, nodeId);
+    }
+  }
+
+  /**
+   * Extract type references from a variable's type annotation.
+   */
+  private extractVariableTypeAnnotation(node: SyntaxNode, nodeId: string): void {
+    if (!this.TYPE_ANNOTATION_LANGUAGES.has(this.language)) return;
+
+    // Find type_annotation child (covers TS `: Type`, Rust `: Type`, etc.)
+    const typeAnnotation = node.namedChildren.find(
+      (c: SyntaxNode) => c.type === 'type_annotation'
+    );
+    if (typeAnnotation) {
+      this.extractTypeRefsFromSubtree(typeAnnotation, nodeId);
+    }
+  }
+
+  /**
+   * Recursively walk a subtree and extract all type_identifier references.
+   * Handles unions, intersections, generics, arrays, etc.
+   */
+  private extractTypeRefsFromSubtree(node: SyntaxNode, fromNodeId: string): void {
+    if (node.type === 'type_identifier') {
+      const typeName = getNodeText(node, this.source);
+      if (typeName && !this.BUILTIN_TYPES.has(typeName)) {
+        this.unresolvedReferences.push({
+          fromNodeId,
+          referenceName: typeName,
+          referenceKind: 'references',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return; // type_identifier is a leaf
+    }
+
+    // Recurse into children (handles union_type, intersection_type, generic_type, etc.)
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child) {
+        this.extractTypeRefsFromSubtree(child, fromNodeId);
       }
     }
   }
@@ -2372,7 +2374,7 @@ export class TreeSitterExtractor {
 
           // For Pascal methods, also index qualified forms (e.g. TAuthService.Create).
           if (n.kind === 'method') {
-            const qualifiedParts = n.qualifiedName.split('::').slice(1); // drop file path
+            const qualifiedParts = n.qualifiedName.split('::');
             if (qualifiedParts.length >= 2) {
               // Create suffix keys so both "Module.Class.Method" and "Class.Method" can resolve.
               for (let i = 0; i < qualifiedParts.length - 1; i++) {
@@ -2470,899 +2472,6 @@ export class TreeSitterExtractor {
   }
 }
 
-/**
- * LiquidExtractor - Extracts relationships from Liquid template files
- *
- * Liquid is a templating language (used by Shopify, Jekyll, etc.) that doesn't
- * have traditional functions or classes. Instead, we extract:
- * - Section references ({% section 'name' %})
- * - Snippet references ({% render 'name' %} and {% include 'name' %})
- * - Schema blocks ({% schema %}...{% endschema %})
- */
-export class LiquidExtractor {
-  private filePath: string;
-  private source: string;
-  private nodes: Node[] = [];
-  private edges: Edge[] = [];
-  private unresolvedReferences: UnresolvedReference[] = [];
-  private errors: ExtractionError[] = [];
-
-  constructor(filePath: string, source: string) {
-    this.filePath = filePath;
-    this.source = source;
-  }
-
-  /**
-   * Extract from Liquid source
-   */
-  extract(): ExtractionResult {
-    const startTime = Date.now();
-
-    try {
-      // Create file node
-      const fileNode = this.createFileNode();
-
-      // Extract render/include statements (snippet references)
-      this.extractSnippetReferences(fileNode.id);
-
-      // Extract section references
-      this.extractSectionReferences(fileNode.id);
-
-      // Extract schema block
-      this.extractSchema(fileNode.id);
-
-      // Extract assign statements as variables
-      this.extractAssignments(fileNode.id);
-    } catch (error) {
-      captureException(error, { operation: 'liquid-extraction', filePath: this.filePath });
-      this.errors.push({
-        message: `Liquid extraction error: ${error instanceof Error ? error.message : String(error)}`,
-        severity: 'error',
-      });
-    }
-
-    return {
-      nodes: this.nodes,
-      edges: this.edges,
-      unresolvedReferences: this.unresolvedReferences,
-      errors: this.errors,
-      durationMs: Date.now() - startTime,
-    };
-  }
-
-  /**
-   * Create a file node for the Liquid template
-   */
-  private createFileNode(): Node {
-    const lines = this.source.split('\n');
-    const id = generateNodeId(this.filePath, 'file', this.filePath, 1);
-
-    const fileNode: Node = {
-      id,
-      kind: 'file',
-      name: this.filePath.split('/').pop() || this.filePath,
-      qualifiedName: this.filePath,
-      filePath: this.filePath,
-      language: 'liquid',
-      startLine: 1,
-      endLine: lines.length,
-      startColumn: 0,
-      endColumn: lines[lines.length - 1]?.length || 0,
-      updatedAt: Date.now(),
-    };
-
-    this.nodes.push(fileNode);
-    return fileNode;
-  }
-
-  /**
-   * Extract {% render 'snippet' %} and {% include 'snippet' %} references
-   */
-  private extractSnippetReferences(fileNodeId: string): void {
-    // Match {% render 'name' %} or {% include 'name' %} with optional parameters
-    const renderRegex = /\{%[-]?\s*(render|include)\s+['"]([^'"]+)['"]/g;
-    let match;
-
-    while ((match = renderRegex.exec(this.source)) !== null) {
-      const [fullMatch, tagType, snippetName] = match;
-      const line = this.getLineNumber(match.index);
-
-      // Create an import node for searchability
-      const importNodeId = generateNodeId(this.filePath, 'import', snippetName!, line);
-      const importNode: Node = {
-        id: importNodeId,
-        kind: 'import',
-        name: snippetName!,
-        qualifiedName: `${this.filePath}::import:${snippetName}`,
-        filePath: this.filePath,
-        language: 'liquid',
-        signature: fullMatch,
-        startLine: line,
-        endLine: line,
-        startColumn: match.index - this.getLineStart(line),
-        endColumn: match.index - this.getLineStart(line) + fullMatch.length,
-        updatedAt: Date.now(),
-      };
-      this.nodes.push(importNode);
-
-      // Add containment edge from file to import
-      this.edges.push({
-        source: fileNodeId,
-        target: importNodeId,
-        kind: 'contains',
-      });
-
-      // Create a component node for the snippet reference
-      const nodeId = generateNodeId(this.filePath, 'component', `${tagType}:${snippetName}`, line);
-
-      const node: Node = {
-        id: nodeId,
-        kind: 'component',
-        name: snippetName!,
-        qualifiedName: `${this.filePath}::${tagType}:${snippetName}`,
-        filePath: this.filePath,
-        language: 'liquid',
-        startLine: line,
-        endLine: line,
-        startColumn: match.index - this.getLineStart(line),
-        endColumn: match.index - this.getLineStart(line) + fullMatch.length,
-        updatedAt: Date.now(),
-      };
-
-      this.nodes.push(node);
-
-      // Add containment edge from file
-      this.edges.push({
-        source: fileNodeId,
-        target: nodeId,
-        kind: 'contains',
-      });
-
-      // Add unresolved reference to the snippet file
-      this.unresolvedReferences.push({
-        fromNodeId: fileNodeId,
-        referenceName: `snippets/${snippetName}.liquid`,
-        referenceKind: 'references',
-        line,
-        column: match.index - this.getLineStart(line),
-      });
-    }
-  }
-
-  /**
-   * Extract {% section 'name' %} references
-   */
-  private extractSectionReferences(fileNodeId: string): void {
-    // Match {% section 'name' %}
-    const sectionRegex = /\{%[-]?\s*section\s+['"]([^'"]+)['"]/g;
-    let match;
-
-    while ((match = sectionRegex.exec(this.source)) !== null) {
-      const [fullMatch, sectionName] = match;
-      const line = this.getLineNumber(match.index);
-
-      // Create an import node for searchability
-      const importNodeId = generateNodeId(this.filePath, 'import', sectionName!, line);
-      const importNode: Node = {
-        id: importNodeId,
-        kind: 'import',
-        name: sectionName!,
-        qualifiedName: `${this.filePath}::import:${sectionName}`,
-        filePath: this.filePath,
-        language: 'liquid',
-        signature: fullMatch,
-        startLine: line,
-        endLine: line,
-        startColumn: match.index - this.getLineStart(line),
-        endColumn: match.index - this.getLineStart(line) + fullMatch.length,
-        updatedAt: Date.now(),
-      };
-      this.nodes.push(importNode);
-
-      // Add containment edge from file to import
-      this.edges.push({
-        source: fileNodeId,
-        target: importNodeId,
-        kind: 'contains',
-      });
-
-      // Create a component node for the section reference
-      const nodeId = generateNodeId(this.filePath, 'component', `section:${sectionName}`, line);
-
-      const node: Node = {
-        id: nodeId,
-        kind: 'component',
-        name: sectionName!,
-        qualifiedName: `${this.filePath}::section:${sectionName}`,
-        filePath: this.filePath,
-        language: 'liquid',
-        startLine: line,
-        endLine: line,
-        startColumn: match.index - this.getLineStart(line),
-        endColumn: match.index - this.getLineStart(line) + fullMatch.length,
-        updatedAt: Date.now(),
-      };
-
-      this.nodes.push(node);
-
-      // Add containment edge from file
-      this.edges.push({
-        source: fileNodeId,
-        target: nodeId,
-        kind: 'contains',
-      });
-
-      // Add unresolved reference to the section file
-      this.unresolvedReferences.push({
-        fromNodeId: fileNodeId,
-        referenceName: `sections/${sectionName}.liquid`,
-        referenceKind: 'references',
-        line,
-        column: match.index - this.getLineStart(line),
-      });
-    }
-  }
-
-  /**
-   * Extract {% schema %}...{% endschema %} blocks
-   */
-  private extractSchema(fileNodeId: string): void {
-    // Match {% schema %}...{% endschema %}
-    const schemaRegex = /\{%[-]?\s*schema\s*[-]?%\}([\s\S]*?)\{%[-]?\s*endschema\s*[-]?%\}/g;
-    let match;
-
-    while ((match = schemaRegex.exec(this.source)) !== null) {
-      const [fullMatch, schemaContent] = match;
-      const startLine = this.getLineNumber(match.index);
-      const endLine = this.getLineNumber(match.index + fullMatch.length);
-
-      // Try to parse the schema JSON to get the name
-      let schemaName = 'schema';
-      try {
-        const schemaJson = JSON.parse(schemaContent!);
-        if (schemaJson.name) {
-          schemaName = schemaJson.name;
-        }
-      } catch {
-        // Schema isn't valid JSON, use default name
-      }
-
-      // Create a node for the schema
-      const nodeId = generateNodeId(this.filePath, 'constant', `schema:${schemaName}`, startLine);
-
-      const node: Node = {
-        id: nodeId,
-        kind: 'constant',
-        name: schemaName,
-        qualifiedName: `${this.filePath}::schema:${schemaName}`,
-        filePath: this.filePath,
-        language: 'liquid',
-        startLine,
-        endLine,
-        startColumn: match.index - this.getLineStart(startLine),
-        endColumn: 0,
-        docstring: schemaContent?.trim().substring(0, 200), // Store first 200 chars as docstring
-        updatedAt: Date.now(),
-      };
-
-      this.nodes.push(node);
-
-      // Add containment edge from file
-      this.edges.push({
-        source: fileNodeId,
-        target: nodeId,
-        kind: 'contains',
-      });
-    }
-  }
-
-  /**
-   * Extract {% assign var = value %} statements
-   */
-  private extractAssignments(fileNodeId: string): void {
-    // Match {% assign variable_name = ... %}
-    const assignRegex = /\{%[-]?\s*assign\s+(\w+)\s*=/g;
-    let match;
-
-    while ((match = assignRegex.exec(this.source)) !== null) {
-      const [, variableName] = match;
-      const line = this.getLineNumber(match.index);
-
-      // Create a variable node
-      const nodeId = generateNodeId(this.filePath, 'variable', variableName!, line);
-
-      const node: Node = {
-        id: nodeId,
-        kind: 'variable',
-        name: variableName!,
-        qualifiedName: `${this.filePath}::${variableName}`,
-        filePath: this.filePath,
-        language: 'liquid',
-        startLine: line,
-        endLine: line,
-        startColumn: match.index - this.getLineStart(line),
-        endColumn: match.index - this.getLineStart(line) + match[0].length,
-        updatedAt: Date.now(),
-      };
-
-      this.nodes.push(node);
-
-      // Add containment edge from file
-      this.edges.push({
-        source: fileNodeId,
-        target: nodeId,
-        kind: 'contains',
-      });
-    }
-  }
-
-  /**
-   * Get the line number for a character index
-   */
-  private getLineNumber(index: number): number {
-    const substring = this.source.substring(0, index);
-    return (substring.match(/\n/g) || []).length + 1;
-  }
-
-  /**
-   * Get the character index of the start of a line
-   */
-  private getLineStart(lineNumber: number): number {
-    const lines = this.source.split('\n');
-    let index = 0;
-    for (let i = 0; i < lineNumber - 1 && i < lines.length; i++) {
-      index += lines[i]!.length + 1; // +1 for newline
-    }
-    return index;
-  }
-}
-
-/**
- * SvelteExtractor - Extracts code relationships from Svelte component files
- *
- * Svelte files are multi-language (script + template + style). Rather than
- * parsing the full Svelte grammar, we extract the <script> block content
- * and delegate it to the TypeScript/JavaScript TreeSitterExtractor.
- *
- * Every .svelte file produces a component node (Svelte components are always importable).
- */
-export class SvelteExtractor {
-  private filePath: string;
-  private source: string;
-  private nodes: Node[] = [];
-  private edges: Edge[] = [];
-  private unresolvedReferences: UnresolvedReference[] = [];
-  private errors: ExtractionError[] = [];
-
-  constructor(filePath: string, source: string) {
-    this.filePath = filePath;
-    this.source = source;
-  }
-
-  /**
-   * Extract from Svelte source
-   */
-  extract(): ExtractionResult {
-    const startTime = Date.now();
-
-    try {
-      // Create component node for the .svelte file itself
-      const componentNode = this.createComponentNode();
-
-      // Extract and process script blocks
-      const scriptBlocks = this.extractScriptBlocks();
-
-      for (const block of scriptBlocks) {
-        this.processScriptBlock(block, componentNode.id);
-      }
-    } catch (error) {
-      captureException(error, { operation: 'svelte-extraction', filePath: this.filePath });
-      this.errors.push({
-        message: `Svelte extraction error: ${error instanceof Error ? error.message : String(error)}`,
-        severity: 'error',
-      });
-    }
-
-    return {
-      nodes: this.nodes,
-      edges: this.edges,
-      unresolvedReferences: this.unresolvedReferences,
-      errors: this.errors,
-      durationMs: Date.now() - startTime,
-    };
-  }
-
-  /**
-   * Create a component node for the .svelte file
-   */
-  private createComponentNode(): Node {
-    const lines = this.source.split('\n');
-    const fileName = this.filePath.split(/[/\\]/).pop() || this.filePath;
-    const componentName = fileName.replace(/\.svelte$/, '');
-    const id = generateNodeId(this.filePath, 'component', componentName, 1);
-
-    const node: Node = {
-      id,
-      kind: 'component',
-      name: componentName,
-      qualifiedName: `${this.filePath}::${componentName}`,
-      filePath: this.filePath,
-      language: 'svelte',
-      startLine: 1,
-      endLine: lines.length,
-      startColumn: 0,
-      endColumn: lines[lines.length - 1]?.length || 0,
-      isExported: true, // Svelte components are always importable
-      updatedAt: Date.now(),
-    };
-
-    this.nodes.push(node);
-    return node;
-  }
-
-  /**
-   * Extract <script> blocks from the Svelte source
-   */
-  private extractScriptBlocks(): Array<{
-    content: string;
-    startLine: number;
-    isModule: boolean;
-    isTypeScript: boolean;
-  }> {
-    const blocks: Array<{
-      content: string;
-      startLine: number;
-      isModule: boolean;
-      isTypeScript: boolean;
-    }> = [];
-
-    const scriptRegex = /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g;
-    let match;
-
-    while ((match = scriptRegex.exec(this.source)) !== null) {
-      const attrs = match[1] || '';
-      const content = match.groups?.content || match[2] || '';
-
-      // Detect TypeScript from lang attribute
-      const isTypeScript = /lang\s*=\s*["'](ts|typescript)["']/.test(attrs);
-
-      // Detect module script
-      const isModule = /context\s*=\s*["']module["']/.test(attrs);
-
-      // Calculate start line of the script content (line after <script>)
-      const beforeScript = this.source.substring(0, match.index);
-      const scriptTagLine = (beforeScript.match(/\n/g) || []).length;
-      // The content starts on the line after the opening <script> tag
-      const openingTag = match[0].substring(0, match[0].indexOf('>') + 1);
-      const openingTagLines = (openingTag.match(/\n/g) || []).length;
-      const contentStartLine = scriptTagLine + openingTagLines + 1; // 0-indexed line
-
-      blocks.push({
-        content,
-        startLine: contentStartLine,
-        isModule,
-        isTypeScript,
-      });
-    }
-
-    return blocks;
-  }
-
-  /**
-   * Process a script block by delegating to TreeSitterExtractor
-   */
-  private processScriptBlock(
-    block: { content: string; startLine: number; isModule: boolean; isTypeScript: boolean },
-    componentNodeId: string
-  ): void {
-    const scriptLanguage: Language = block.isTypeScript ? 'typescript' : 'javascript';
-
-    // Check if the script language parser is available
-    if (!isLanguageSupported(scriptLanguage)) {
-      this.errors.push({
-        message: `Parser for ${scriptLanguage} not available, cannot parse Svelte script block`,
-        severity: 'warning',
-      });
-      return;
-    }
-
-    // Delegate to TreeSitterExtractor
-    const extractor = new TreeSitterExtractor(this.filePath, block.content, scriptLanguage);
-    const result = extractor.extract();
-
-    // Offset line numbers from script block back to .svelte file positions
-    for (const node of result.nodes) {
-      node.startLine += block.startLine;
-      node.endLine += block.startLine;
-      node.language = 'svelte'; // Mark as svelte, not TS/JS
-
-      this.nodes.push(node);
-
-      // Add containment edge from component to this node
-      this.edges.push({
-        source: componentNodeId,
-        target: node.id,
-        kind: 'contains',
-      });
-    }
-
-    // Offset edges (they reference line numbers)
-    for (const edge of result.edges) {
-      if (edge.line) {
-        edge.line += block.startLine;
-      }
-      this.edges.push(edge);
-    }
-
-    // Offset unresolved references
-    for (const ref of result.unresolvedReferences) {
-      ref.line += block.startLine;
-      ref.filePath = this.filePath;
-      ref.language = 'svelte';
-      this.unresolvedReferences.push(ref);
-    }
-
-    // Carry over errors
-    for (const error of result.errors) {
-      if (error.line) {
-        error.line += block.startLine;
-      }
-      this.errors.push(error);
-    }
-  }
-}
-
-/**
- * VueExtractor - Extracts code relationships from Vue Single-File Component files
- *
- * Vue SFCs are multi-language (script + template + style). Rather than
- * parsing the full Vue grammar, we extract the <script> block content
- * and delegate it to the TypeScript/JavaScript TreeSitterExtractor.
- *
- * Every .vue file produces a component node (Vue components are always importable).
- */
-export class VueExtractor {
-  private filePath: string;
-  private source: string;
-  private nodes: Node[] = [];
-  private edges: Edge[] = [];
-  private unresolvedReferences: UnresolvedReference[] = [];
-  private errors: ExtractionError[] = [];
-
-  constructor(filePath: string, source: string) {
-    this.filePath = filePath;
-    this.source = source;
-  }
-
-  /**
-   * Extract from Vue source
-   */
-  extract(): ExtractionResult {
-    const startTime = Date.now();
-
-    try {
-      // Create component node for the .vue file itself
-      const componentNode = this.createComponentNode();
-
-      // Extract and process script blocks
-      const scriptBlocks = this.extractScriptBlocks();
-
-      for (const block of scriptBlocks) {
-        this.processScriptBlock(block, componentNode.id);
-      }
-    } catch (error) {
-      captureException(error, { operation: 'vue-extraction', filePath: this.filePath });
-      this.errors.push({
-        message: `Vue extraction error: ${error instanceof Error ? error.message : String(error)}`,
-        severity: 'error',
-      });
-    }
-
-    return {
-      nodes: this.nodes,
-      edges: this.edges,
-      unresolvedReferences: this.unresolvedReferences,
-      errors: this.errors,
-      durationMs: Date.now() - startTime,
-    };
-  }
-
-  /**
-   * Create a component node for the .vue file
-   */
-  private createComponentNode(): Node {
-    const lines = this.source.split('\n');
-    const fileName = this.filePath.split(/[/\\]/).pop() || this.filePath;
-    const componentName = fileName.replace(/\.vue$/, '');
-    const id = generateNodeId(this.filePath, 'component', componentName, 1);
-
-    const node: Node = {
-      id,
-      kind: 'component',
-      name: componentName,
-      qualifiedName: `${this.filePath}::${componentName}`,
-      filePath: this.filePath,
-      language: 'vue',
-      startLine: 1,
-      endLine: lines.length,
-      startColumn: 0,
-      endColumn: lines[lines.length - 1]?.length || 0,
-      isExported: true, // Vue components are always importable
-      updatedAt: Date.now(),
-    };
-
-    this.nodes.push(node);
-    return node;
-  }
-
-  /**
-   * Extract <script> and <script setup> blocks from the Vue source
-   */
-  private extractScriptBlocks(): Array<{
-    content: string;
-    startLine: number;
-    isSetup: boolean;
-    isTypeScript: boolean;
-  }> {
-    const blocks: Array<{
-      content: string;
-      startLine: number;
-      isSetup: boolean;
-      isTypeScript: boolean;
-    }> = [];
-
-    const scriptRegex = /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g;
-    let match;
-
-    while ((match = scriptRegex.exec(this.source)) !== null) {
-      const attrs = match[1] || '';
-      const content = match.groups?.content || match[2] || '';
-
-      // Detect TypeScript from lang attribute
-      const isTypeScript = /lang\s*=\s*["'](ts|typescript)["']/.test(attrs);
-
-      // Detect <script setup>
-      const isSetup = /\bsetup\b/.test(attrs);
-
-      // Calculate start line of the script content (line after <script>)
-      const beforeScript = this.source.substring(0, match.index);
-      const scriptTagLine = (beforeScript.match(/\n/g) || []).length;
-      // The content starts on the line after the opening <script> tag
-      const openingTag = match[0].substring(0, match[0].indexOf('>') + 1);
-      const openingTagLines = (openingTag.match(/\n/g) || []).length;
-      const contentStartLine = scriptTagLine + openingTagLines + 1; // 0-indexed line
-
-      blocks.push({
-        content,
-        startLine: contentStartLine,
-        isSetup,
-        isTypeScript,
-      });
-    }
-
-    return blocks;
-  }
-
-  /**
-   * Process a script block by delegating to TreeSitterExtractor
-   */
-  private processScriptBlock(
-    block: { content: string; startLine: number; isSetup: boolean; isTypeScript: boolean },
-    componentNodeId: string
-  ): void {
-    const scriptLanguage: Language = block.isTypeScript ? 'typescript' : 'javascript';
-
-    // Check if the script language parser is available
-    if (!isLanguageSupported(scriptLanguage)) {
-      this.errors.push({
-        message: `Parser for ${scriptLanguage} not available, cannot parse Vue script block`,
-        severity: 'warning',
-      });
-      return;
-    }
-
-    // Delegate to TreeSitterExtractor
-    const extractor = new TreeSitterExtractor(this.filePath, block.content, scriptLanguage);
-    const result = extractor.extract();
-
-    // Offset line numbers from script block back to .vue file positions
-    for (const node of result.nodes) {
-      node.startLine += block.startLine;
-      node.endLine += block.startLine;
-      node.language = 'vue'; // Mark as vue, not TS/JS
-
-      this.nodes.push(node);
-
-      // Add containment edge from component to this node
-      this.edges.push({
-        source: componentNodeId,
-        target: node.id,
-        kind: 'contains',
-      });
-    }
-
-    // Offset edges (they reference line numbers)
-    for (const edge of result.edges) {
-      if (edge.line) {
-        edge.line += block.startLine;
-      }
-      this.edges.push(edge);
-    }
-
-    // Offset unresolved references
-    for (const ref of result.unresolvedReferences) {
-      ref.line += block.startLine;
-      ref.filePath = this.filePath;
-      ref.language = 'vue';
-      this.unresolvedReferences.push(ref);
-    }
-
-    // Carry over errors
-    for (const error of result.errors) {
-      if (error.line) {
-        error.line += block.startLine;
-      }
-      this.errors.push(error);
-    }
-  }
-}
-
-/**
- * Custom extractor for Delphi DFM/FMX form files.
- *
- * DFM/FMX files describe the visual component hierarchy and event handler
- * bindings. They use a simple text format (object/end blocks) that we parse
- * with regex — no tree-sitter grammar exists for this format.
- *
- * Extracted information:
- * - Components as NodeKind `component`
- * - Nesting as EdgeKind `contains`
- * - Event handlers (OnClick = MethodName) as UnresolvedReference → EdgeKind `references`
- */
-export class DfmExtractor {
-  private filePath: string;
-  private source: string;
-  private nodes: Node[] = [];
-  private edges: Edge[] = [];
-  private unresolvedReferences: UnresolvedReference[] = [];
-  private errors: ExtractionError[] = [];
-
-  constructor(filePath: string, source: string) {
-    this.filePath = filePath;
-    this.source = source;
-  }
-
-  /**
-   * Extract components and event handler references from DFM/FMX source
-   */
-  extract(): ExtractionResult {
-    const startTime = Date.now();
-
-    try {
-      const fileNode = this.createFileNode();
-      this.parseComponents(fileNode.id);
-    } catch (error) {
-      captureException(error, { operation: 'dfm-extraction', filePath: this.filePath });
-      this.errors.push({
-        message: `DFM extraction error: ${error instanceof Error ? error.message : String(error)}`,
-        severity: 'error',
-      });
-    }
-
-    return {
-      nodes: this.nodes,
-      edges: this.edges,
-      unresolvedReferences: this.unresolvedReferences,
-      errors: this.errors,
-      durationMs: Date.now() - startTime,
-    };
-  }
-
-  /** Create a file node for the DFM form file */
-  private createFileNode(): Node {
-    const lines = this.source.split('\n');
-    const id = generateNodeId(this.filePath, 'file', this.filePath, 1);
-
-    const fileNode: Node = {
-      id,
-      kind: 'file',
-      name: this.filePath.split('/').pop() || this.filePath,
-      qualifiedName: this.filePath,
-      filePath: this.filePath,
-      language: 'pascal',
-      startLine: 1,
-      endLine: lines.length,
-      startColumn: 0,
-      endColumn: lines[lines.length - 1]?.length || 0,
-      updatedAt: Date.now(),
-    };
-
-    this.nodes.push(fileNode);
-    return fileNode;
-  }
-
-  /** Parse object/end blocks and extract components + event handlers */
-  private parseComponents(fileNodeId: string): void {
-    const lines = this.source.split('\n');
-    const stack: string[] = [fileNodeId];
-
-    const objectPattern = /^\s*(object|inherited|inline)\s+(\w+)\s*:\s*(\w+)/;
-    const eventPattern = /^\s*(On\w+)\s*=\s*(\w+)\s*$/;
-    const endPattern = /^\s*end\s*$/;
-    const multiLineStart = /=\s*\(\s*$/;
-    const multiLineItemStart = /=\s*<\s*$/;
-    let inMultiLine = false;
-    let multiLineEndChar = ')';
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]!;
-      const lineNum = i + 1;
-
-      // Skip multi-line properties
-      if (inMultiLine) {
-        if (line.trimEnd().endsWith(multiLineEndChar)) inMultiLine = false;
-        continue;
-      }
-      if (multiLineStart.test(line)) {
-        inMultiLine = true;
-        multiLineEndChar = ')';
-        continue;
-      }
-      if (multiLineItemStart.test(line)) {
-        inMultiLine = true;
-        multiLineEndChar = '>';
-        continue;
-      }
-
-      // Component declaration
-      const objMatch = line.match(objectPattern);
-      if (objMatch) {
-        const [, , name, typeName] = objMatch;
-        const nodeId = generateNodeId(this.filePath, 'component', name!, lineNum);
-        this.nodes.push({
-          id: nodeId,
-          kind: 'component',
-          name: name!,
-          qualifiedName: `${this.filePath}#${name}`,
-          filePath: this.filePath,
-          language: 'pascal',
-          startLine: lineNum,
-          endLine: lineNum,
-          startColumn: 0,
-          endColumn: line.length,
-          signature: typeName,
-          updatedAt: Date.now(),
-        });
-        this.edges.push({
-          source: stack[stack.length - 1]!,
-          target: nodeId,
-          kind: 'contains',
-        });
-        stack.push(nodeId);
-        continue;
-      }
-
-      // Event handler
-      const eventMatch = line.match(eventPattern);
-      if (eventMatch) {
-        const [, , methodName] = eventMatch;
-        this.unresolvedReferences.push({
-          fromNodeId: stack[stack.length - 1]!,
-          referenceName: methodName!,
-          referenceKind: 'references',
-          line: lineNum,
-          column: 0,
-        });
-        continue;
-      }
-
-      // Block end
-      if (endPattern.test(line)) {
-        if (stack.length > 1) stack.pop();
-      }
-    }
-  }
-}
 
 /**
  * Extract nodes and edges from source code
@@ -3372,7 +2481,7 @@ export function extractFromSource(
   source: string,
   language?: Language
 ): ExtractionResult {
-  const detectedLanguage = language || detectLanguage(filePath);
+  const detectedLanguage = language || detectLanguage(filePath, source);
   const fileExtension = path.extname(filePath).toLowerCase();
 
   // Use custom extractor for Svelte

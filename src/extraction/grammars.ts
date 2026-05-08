@@ -175,9 +175,25 @@ export function getParser(language: Language): Parser | null {
 /**
  * Detect language from file extension
  */
-export function detectLanguage(filePath: string): Language {
+export function detectLanguage(filePath: string, source?: string): Language {
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
-  return EXTENSION_MAP[ext] || 'unknown';
+  const lang = EXTENSION_MAP[ext] || 'unknown';
+
+  // .h files could be C or C++ — check source content for C++ features
+  if (lang === 'c' && ext === '.h' && source) {
+    if (looksLikeCpp(source)) return 'cpp';
+  }
+
+  return lang;
+}
+
+/**
+ * Heuristic: does a .h file contain C++ constructs?
+ * Checks the first ~8KB for patterns that are unique to C++ and never valid C.
+ */
+function looksLikeCpp(source: string): boolean {
+  const sample = source.substring(0, 8192);
+  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
 }
 
 /**
@@ -208,9 +224,27 @@ export function getSupportedLanguages(): Language[] {
 }
 
 /**
+ * Reset the cached parser for a language to reclaim WASM heap memory.
+ * The tree-sitter WASM runtime accumulates fragmented memory over thousands
+ * of parses. Deleting and recreating the Parser instance forces the WASM
+ * heap to reset, preventing "memory access out of bounds" crashes in
+ * large repos.
+ */
+export function resetParser(language: Language): void {
+  const old = parserCache.get(language);
+  if (old) {
+    old.delete();
+    parserCache.delete(language);
+  }
+}
+
+/**
  * Clear parser/grammar caches (useful for testing)
  */
 export function clearParserCache(): void {
+  for (const parser of parserCache.values()) {
+    parser.delete();
+  }
   parserCache.clear();
   // Note: languageCache is NOT cleared — WASM languages persist.
   // To fully re-init, set parserInitialized = false and call initGrammars() again.

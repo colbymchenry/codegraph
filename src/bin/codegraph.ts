@@ -16,19 +16,13 @@
  *   codegraph files [options]    Show project file structure
  *   codegraph context <task>     Build context for a task
  *   codegraph affected [files]   Find test files affected by changes
- *   codegraph mark-dirty [path]  Mark project as needing sync (hooks)
- *   codegraph sync-if-dirty [path] Sync if marked dirty (hooks)
- *
- * Note: Git hooks have been removed. CodeGraph sync is triggered automatically
- * through codegraph's Claude Code hooks integration.
  */
 
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { spawn } from 'child_process';
-import { getCodeGraphDir, findNearestCodeGraphRoot, isInitialized } from '../directory';
-import { initSentry, captureException } from '../sentry';
+import { getCodeGraphDir, isInitialized } from '../directory';
+import { createShimmerProgress } from '../ui/shimmer-progress';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -44,22 +38,33 @@ async function loadCodeGraph(): Promise<typeof import('../index')> {
   }
 }
 
-type IndexProgress = import('../index').IndexProgress;
+// Dynamic import helper — tsc compiles import() to require() in CJS mode,
+// which fails for ESM-only packages. This bypasses the transformation.
+// eslint-disable-next-line @typescript-eslint/no-implied-eval
+const importESM = new Function('specifier', 'return import(specifier)') as
+  (specifier: string) => Promise<typeof import('@clack/prompts')>;
+
+// Warn about unsupported Node.js versions (Node 25+ has V8 turboshaft WASM bugs)
+const nodeVersion = process.versions.node;
+const nodeMajor = parseInt(nodeVersion.split('.')[0] ?? '0', 10);
+if (nodeMajor >= 25) {
+  console.warn(
+    '\x1b[33m⚠\x1b[0m  CodeGraph may crash on Node.js %s due to a V8 WASM compiler bug in Node 25+.',
+    nodeVersion
+  );
+  console.warn(
+    '   Please use Node.js 22 LTS instead: https://nodejs.org/en/download'
+  );
+  console.warn(
+    '   See: https://github.com/colbymchenry/codegraph/issues/81\n'
+  );
+}
 
 // Check if running with no arguments - run installer
-// Read version for Sentry release tag
-const pkgVersion = (() => {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf-8')).version;
-  } catch { return undefined; }
-})();
-initSentry({ processName: 'codegraph-cli', version: pkgVersion });
-
 if (process.argv.length === 2) {
   import('../installer').then(({ runInstaller }) =>
     runInstaller()
   ).catch((err) => {
-    captureException(err);
     console.error('Installation failed:', err instanceof Error ? err.message : String(err));
     process.exit(1);
   });
@@ -69,12 +74,10 @@ if (process.argv.length === 2) {
 }
 
 process.on('uncaughtException', (error) => {
-  captureException(error);
   console.error('[CodeGraph] Uncaught exception:', error);
 });
 
 process.on('unhandledRejection', (reason) => {
-  captureException(reason);
   console.error('[CodeGraph] Unhandled rejection:', reason);
 });
 
@@ -180,35 +183,41 @@ function formatDuration(ms: number): string {
   return `${minutes}m ${remainingSeconds.toFixed(0)}s`;
 }
 
-/**
- * Create a progress bar string
- */
-function progressBar(current: number, total: number, width: number = 30): string {
-  const percent = total > 0 ? current / total : 0;
-  const filled = Math.round(width * percent);
-  const empty = width - filled;
-  const bar = chalk.green('█'.repeat(filled)) + chalk.gray('░'.repeat(empty));
-  const percentStr = `${Math.round(percent * 100)}%`.padStart(4);
-  return `${bar} ${percentStr}`;
-}
+// Shimmer progress renderer (runs in a worker thread for smooth animation)
+// Imported at top of file from '../ui/shimmer-progress'
 
 /**
- * Print a progress update (overwrites current line)
+ * Create a plain-text progress callback for --verbose mode.
+ * No animations, no ANSI tricks — just timestamped lines to stdout.
  */
-function printProgress(progress: IndexProgress): void {
-  const phaseNames: Record<string, string> = {
-    scanning: 'Scanning files',
-    parsing: 'Parsing code',
-    storing: 'Storing data',
-    resolving: 'Resolving refs',
+function createVerboseProgress(): (progress: { phase: string; current: number; total: number; currentFile?: string }) => void {
+  let lastPhase = '';
+  let lastPct = -1;
+  const startTime = Date.now();
+
+  return (progress) => {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+    if (progress.phase !== lastPhase) {
+      lastPhase = progress.phase;
+      lastPct = -1;
+      console.log(`[${elapsed}s] Phase: ${progress.phase}`);
+    }
+
+    if (progress.total > 0) {
+      const pct = Math.floor((progress.current / progress.total) * 100);
+      // Log every 5% to keep output manageable
+      if (pct >= lastPct + 5 || progress.current === progress.total) {
+        lastPct = pct;
+        console.log(`[${elapsed}s]   ${progress.current}/${progress.total} (${pct}%)${progress.currentFile ? ` — ${progress.currentFile}` : ''}`);
+      }
+    } else if (progress.current > 0) {
+      // Scanning phase (no total yet) — log periodically
+      if (progress.current % 1000 === 0 || progress.current === 1) {
+        console.log(`[${elapsed}s]   ${formatNumber(progress.current)} files found`);
+      }
+    }
   };
-
-  const phaseName = phaseNames[progress.phase] || progress.phase;
-  const bar = progressBar(progress.current, progress.total);
-  const file = progress.currentFile ? chalk.dim(` ${progress.currentFile}`) : '';
-
-  // Clear line and print progress
-  process.stdout.write(`\r${chalk.cyan(phaseName)}: ${bar}${file}`.padEnd(100));
 }
 
 /**
@@ -239,6 +248,138 @@ function warn(message: string): void {
   console.log(chalk.yellow('⚠') + ' ' + message);
 }
 
+type IndexResult = {
+  success: boolean;
+  filesIndexed: number;
+  filesSkipped: number;
+  filesErrored: number;
+  nodesCreated: number;
+  edgesCreated: number;
+  errors: Array<{ message: string; filePath?: string; severity: string; code?: string }>;
+  durationMs: number;
+};
+
+/**
+ * Print indexing results using clack log methods
+ */
+function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexResult, projectPath?: string): void {
+  const hasErrors = result.filesErrored > 0;
+
+  // Surface non-file-level failures (e.g. lock-acquisition failure
+  // when another indexer is running) before the file-count branches.
+  // Without this the CLI falls through to "No files found to index",
+  // which is actively misleading — the index DID run, it just couldn't
+  // get the lock.
+  //
+  // If success is false but no severity:'error' entry exists in
+  // `result.errors` (degenerate case — shouldn't happen in practice
+  // but worth guarding because the result shape is plumbed through
+  // multiple call sites), fall back to a generic message rather than
+  // continuing to the misleading "No files found" branch or throwing.
+  if (!result.success && !hasErrors && result.filesIndexed === 0) {
+    const generic = result.errors.find((e) => e.severity === 'error');
+    clack.log.error(generic?.message ?? 'Indexing failed — no further details available');
+    return;
+  }
+
+  if (result.filesIndexed > 0) {
+    if (hasErrors) {
+      clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files (${formatNumber(result.filesErrored)} could not be parsed)`);
+    } else {
+      clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
+    }
+    clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+  } else if (hasErrors) {
+    clack.log.error(`Indexing failed — all ${formatNumber(result.filesErrored)} files had errors`);
+  } else {
+    clack.log.warn('No files found to index');
+  }
+
+  if (hasErrors) {
+    const errorsByCode = new Map<string, number>();
+    for (const err of result.errors) {
+      if (err.severity === 'error') {
+        const code = err.code || 'unknown';
+        errorsByCode.set(code, (errorsByCode.get(code) || 0) + 1);
+      }
+    }
+
+    const codeLabels: Record<string, string> = {
+      parse_error: 'files failed to parse',
+      read_error: 'files could not be read',
+      size_exceeded: 'files exceeded size limit',
+      path_traversal: 'blocked paths',
+      unsupported_language: 'unsupported language',
+      parser_error: 'parser initialization failures',
+    };
+
+    const breakdown = Array.from(errorsByCode)
+      .map(([code, count]) => `${formatNumber(count)} ${codeLabels[code] || code}`)
+      .join('\n');
+    clack.note(breakdown, 'Error breakdown');
+
+    if (projectPath) {
+      writeErrorLog(projectPath, result.errors);
+      clack.log.info('See .codegraph/errors.log for details');
+    }
+
+    if (result.filesIndexed > 0) {
+      clack.log.info('The index is fully usable — only the failed files are missing.');
+    }
+  } else if (projectPath) {
+    const logPath = path.join(projectPath, '.codegraph', 'errors.log');
+    if (fs.existsSync(logPath)) {
+      fs.unlinkSync(logPath);
+    }
+  }
+}
+
+/**
+ * Write detailed error log to .codegraph/errors.log
+ */
+function writeErrorLog(projectPath: string, errors: Array<{ message: string; filePath?: string; severity: string; code?: string }>): void {
+  const cgDir = path.join(projectPath, '.codegraph');
+  if (!fs.existsSync(cgDir)) return;
+
+  const logPath = path.join(cgDir, 'errors.log');
+
+  // Group errors by file path
+  const errorsByFile = new Map<string, Array<{ message: string; code?: string }>>();
+  const noFileErrors: Array<{ message: string; code?: string }> = [];
+
+  for (const err of errors) {
+    if (err.severity !== 'error') continue;
+    if (err.filePath) {
+      let list = errorsByFile.get(err.filePath);
+      if (!list) {
+        list = [];
+        errorsByFile.set(err.filePath, list);
+      }
+      list.push({ message: err.message, code: err.code });
+    } else {
+      noFileErrors.push({ message: err.message, code: err.code });
+    }
+  }
+
+  const lines: string[] = [
+    `CodeGraph Error Log — ${new Date().toISOString()}`,
+    `${errorsByFile.size} files with errors`,
+    '',
+  ];
+
+  for (const [filePath, fileErrors] of errorsByFile) {
+    for (const err of fileErrors) {
+      lines.push(`${filePath}: ${err.message}`);
+    }
+  }
+
+  for (const err of noFileErrors) {
+    lines.push(err.message);
+  }
+
+  fs.writeFileSync(logPath, lines.join('\n') + '\n');
+}
+
 // =============================================================================
 // Commands
 // =============================================================================
@@ -250,54 +391,51 @@ program
   .command('init [path]')
   .description('Initialize CodeGraph in a project directory')
   .option('-i, --index', 'Run initial indexing after initialization')
-  .action(async (pathArg: string | undefined, options: { index?: boolean }) => {
-    const projectPath = resolveProjectPath(pathArg);
+  .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean }) => {
+    const projectPath = path.resolve(pathArg || process.cwd());
+    const clack = await importESM('@clack/prompts');
 
-    console.log(chalk.bold('\nInitializing CodeGraph...\n'));
+    clack.intro('Initializing CodeGraph');
 
     try {
-      // Check if already initialized
       if (isInitialized(projectPath)) {
-        warn(`CodeGraph already initialized in ${projectPath}`);
-        info('Use "codegraph index" to re-index or "codegraph sync" to update');
+        clack.log.warn(`Already initialized in ${projectPath}`);
+        clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+        clack.outro('');
         return;
       }
 
-      // Initialize
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.init(projectPath, {
-        index: false, // We'll handle indexing ourselves for progress
-      });
+      const cg = await CodeGraph.init(projectPath, { index: false });
+      clack.log.success(`Initialized in ${projectPath}`);
 
-      success(`Initialized CodeGraph in ${projectPath}`);
-      info(`Created .codegraph/ directory`);
-
-      // Run initial index if requested
       if (options.index) {
-        console.log('\nIndexing project...\n');
+        let result: IndexResult;
 
-        const result = await cg.indexAll({
-          onProgress: printProgress,
-        });
-
-        // Clear progress line
-        process.stdout.write('\r' + ' '.repeat(100) + '\r');
-
-        if (result.success) {
-          success(`Indexed ${formatNumber(result.filesIndexed)} files`);
-          info(`Created ${formatNumber(result.nodesCreated)} nodes and ${formatNumber(result.edgesCreated)} edges`);
-          info(`Completed in ${formatDuration(result.durationMs)}`);
+        if (options.verbose) {
+          result = await cg.indexAll({
+            onProgress: createVerboseProgress(),
+            verbose: true,
+          });
         } else {
-          warn(`Indexing completed with ${result.errors.length} errors`);
+          process.stdout.write(`${colors.dim}│${colors.reset}\n`);
+          const progress = createShimmerProgress();
+          result = await cg.indexAll({
+            onProgress: progress.onProgress,
+          });
+          await progress.stop();
         }
+
+        printIndexResult(clack, result, projectPath);
       } else {
-        info('Run "codegraph index" to index the project');
+        clack.log.info('Run "codegraph index" to index the project');
       }
 
+      clack.outro('Done');
       cg.destroy();
     } catch (err) {
-      captureException(err);
-      error(`Failed to initialize: ${err instanceof Error ? err.message : String(err)}`);
+      clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });
@@ -342,7 +480,6 @@ program
 
       success(`Removed CodeGraph from ${projectPath}`);
     } catch (err) {
-      captureException(err);
       error(`Failed to uninitialize: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
@@ -356,7 +493,8 @@ program
   .description('Index all files in the project')
   .option('-f, --force', 'Force full re-index even if already indexed')
   .option('-q, --quiet', 'Suppress progress output')
-  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean }) => {
+  .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
+  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -369,49 +507,48 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
-      if (!options.quiet) {
-        console.log(chalk.bold('\nIndexing project...\n'));
+      if (options.quiet) {
+        // Quiet mode: no UI, just run
+        if (options.force) cg.clear();
+        const result = await cg.indexAll();
+        if (!result.success) process.exit(1);
+        cg.destroy();
+        return;
       }
 
-      // Clear existing data if force
+      const clack = await importESM('@clack/prompts');
+      clack.intro('Indexing project');
+
       if (options.force) {
         cg.clear();
-        if (!options.quiet) {
-          info('Cleared existing index');
-        }
+        clack.log.info('Cleared existing index');
       }
 
-      const result = await cg.indexAll({
-        onProgress: options.quiet ? undefined : printProgress,
-      });
+      let result: IndexResult;
 
-      // Clear progress line
-      if (!options.quiet) {
-        process.stdout.write('\r' + ' '.repeat(100) + '\r');
-      }
-
-      if (result.success) {
-        if (!options.quiet) {
-          success(`Indexed ${formatNumber(result.filesIndexed)} files`);
-          info(`Created ${formatNumber(result.nodesCreated)} nodes and ${formatNumber(result.edgesCreated)} edges`);
-          info(`Completed in ${formatDuration(result.durationMs)}`);
-        }
+      if (options.verbose) {
+        result = await cg.indexAll({
+          onProgress: createVerboseProgress(),
+          verbose: true,
+        });
       } else {
-        if (!options.quiet) {
-          warn(`Indexing completed with ${result.errors.length} errors`);
-          for (const err of result.errors.slice(0, 5)) {
-            console.log(chalk.dim(`  - ${err.message}`));
-          }
-          if (result.errors.length > 5) {
-            console.log(chalk.dim(`  ... and ${result.errors.length - 5} more`));
-          }
-        }
+        process.stdout.write(`${colors.dim}│${colors.reset}\n`);
+        const progress = createShimmerProgress();
+        result = await cg.indexAll({
+          onProgress: progress.onProgress,
+        });
+        await progress.stop();
+      }
+
+      printIndexResult(clack, result, projectPath);
+
+      if (!result.success) {
         process.exit(1);
       }
 
+      clack.outro('Done');
       cg.destroy();
     } catch (err) {
-      captureException(err);
       error(`Failed to index: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
@@ -438,38 +575,40 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
+      if (options.quiet) {
+        await cg.sync();
+        cg.destroy();
+        return;
+      }
+
+      const clack = await importESM('@clack/prompts');
+      clack.intro('Syncing CodeGraph');
+
+      process.stdout.write(`${colors.dim}│${colors.reset}\n`);
+      const progress = createShimmerProgress();
+
       const result = await cg.sync({
-        onProgress: options.quiet ? undefined : printProgress,
+        onProgress: progress.onProgress,
       });
 
-      // Clear progress line
-      if (!options.quiet) {
-        process.stdout.write('\r' + ' '.repeat(100) + '\r');
-      }
+      await progress.stop();
 
       const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
 
-      if (!options.quiet) {
-        if (totalChanges === 0) {
-          success('Already up to date');
-        } else {
-          success(`Synced ${formatNumber(totalChanges)} changed files`);
-          if (result.filesAdded > 0) {
-            info(`  Added: ${result.filesAdded}`);
-          }
-          if (result.filesModified > 0) {
-            info(`  Modified: ${result.filesModified}`);
-          }
-          if (result.filesRemoved > 0) {
-            info(`  Removed: ${result.filesRemoved}`);
-          }
-          info(`Updated ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
-        }
+      if (totalChanges === 0) {
+        clack.log.info('Already up to date');
+      } else {
+        clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
+        const details: string[] = [];
+        if (result.filesAdded > 0) details.push(`Added: ${result.filesAdded}`);
+        if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
+        if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
+        clack.log.info(`${details.join(', ')} — ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
       }
 
+      clack.outro('Done');
       cg.destroy();
     } catch (err) {
-      captureException(err);
       if (!options.quiet) {
         error(`Failed to sync: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -581,7 +720,6 @@ program
 
       cg.destroy();
     } catch (err) {
-      captureException(err);
       error(`Failed to get status: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
@@ -644,7 +782,6 @@ program
 
       cg.destroy();
     } catch (err) {
-      captureException(err);
       error(`Search failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
@@ -770,7 +907,6 @@ program
       console.log();
       cg.destroy();
     } catch (err) {
-      captureException(err);
       error(`Failed to list files: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
@@ -898,7 +1034,6 @@ program
 
       cg.destroy();
     } catch (err) {
-      captureException(err);
       error(`Failed to build context: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
@@ -949,92 +1084,9 @@ program
         console.error(chalk.cyan('  codegraph_status') + '    - Get index status');
       }
     } catch (err) {
-      captureException(err);
       error(`Failed to start server: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
-  });
-
-/**
- * codegraph mark-dirty [path]
- *
- * Touches .codegraph/.dirty to signal that files have changed.
- * Used by Claude Code PostToolUse hooks to batch syncs.
- * Runs silently and always exits 0.
- */
-program
-  .command('mark-dirty [path]')
-  .description('Mark project as needing sync (used by Claude Code hooks)')
-  .action(async (pathArg: string | undefined) => {
-    try {
-      const startPath = path.resolve(pathArg || process.cwd());
-      const projectRoot = findNearestCodeGraphRoot(startPath);
-      if (!projectRoot) {
-        // No .codegraph/ found — exit silently
-        process.exit(0);
-      }
-      const dirtyPath = path.join(getCodeGraphDir(projectRoot), '.dirty');
-      fs.writeFileSync(dirtyPath, Date.now().toString(), 'utf-8');
-    } catch {
-      // Never fail — this runs in the background during edits
-    }
-    process.exit(0);
-  });
-
-/**
- * codegraph sync-if-dirty [path]
- *
- * Checks if .codegraph/.dirty exists and, if so, spawns a detached
- * background process to run `codegraph sync`. The hook process exits
- * immediately so Claude Code's Stop hook never blocks.
- *
- * Removes the marker BEFORE spawning so edits during sync
- * create a new marker for the next Stop event.
- * Runs silently and always exits 0.
- */
-program
-  .command('sync-if-dirty [path]')
-  .description('Sync if project was marked dirty (used by Claude Code hooks)')
-  .action(async (pathArg: string | undefined) => {
-    try {
-      const startPath = path.resolve(pathArg || process.cwd());
-      const projectRoot = findNearestCodeGraphRoot(startPath);
-      if (!projectRoot) {
-        process.exit(0);
-      }
-      const dirtyPath = path.join(getCodeGraphDir(projectRoot!), '.dirty');
-
-      // No marker → nothing to do (sub-ms exit)
-      if (!fs.existsSync(dirtyPath)) {
-        process.exit(0);
-      }
-
-      // Remove marker FIRST so edits during sync create a new one
-      try { fs.unlinkSync(dirtyPath); } catch { /* ignore */ }
-
-      // If not fully initialized (no DB), exit
-      if (!isInitialized(projectRoot!)) {
-        process.exit(0);
-      }
-
-      // Spawn sync as a detached background process
-      // so this hook exits immediately and doesn't block Claude Code.
-      // Uses process.argv[0]/[1] (e.g. node /path/to/codegraph.js) so it
-      // works whether invoked via global install, npx, or directly.
-      const child = spawn(
-        process.argv[0]!,
-        [process.argv[1]!, 'sync', '--quiet', projectRoot!],
-        {
-          detached: true,
-          stdio: 'ignore',
-          windowsHide: true,
-        }
-      );
-      child.unref();
-    } catch {
-      // Never fail — this runs at the end of Claude responses
-    }
-    process.exit(0);
   });
 
 /**
@@ -1062,7 +1114,6 @@ program
       fs.unlinkSync(lockPath);
       success('Removed lock file. You can now run indexing again.');
     } catch (err) {
-      captureException(err);
       error(`Failed to remove lock: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
@@ -1201,7 +1252,6 @@ program
 
       cg.destroy();
     } catch (err) {
-      captureException(err);
       error(`Affected analysis failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }

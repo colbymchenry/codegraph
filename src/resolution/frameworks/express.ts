@@ -61,7 +61,7 @@ export const expressResolver: FrameworkResolver = {
     const controllerMatch = ref.referenceName.match(/^(\w+)Controller\.(\w+)$/);
     if (controllerMatch) {
       const [, controller, method] = controllerMatch;
-      const result = resolveController(controller!, method!, context);
+      const result = resolveControllerMethod(controller!, method!, context);
       if (result) {
         return {
           original: ref,
@@ -76,7 +76,7 @@ export const expressResolver: FrameworkResolver = {
     const serviceMatch = ref.referenceName.match(/^(\w+)(Service|Helper|Utils?)\.(\w+)$/);
     if (serviceMatch) {
       const [, name, suffix, method] = serviceMatch;
-      const result = resolveService(name! + suffix!, method!, context);
+      const result = resolveServiceMethod(name! + suffix!, method!, context);
       if (result) {
         return {
           original: ref,
@@ -154,93 +154,83 @@ function isMiddlewareName(name: string): boolean {
 }
 
 /**
- * Resolve middleware reference
+ * Resolve middleware reference using name-based lookup
  */
 function resolveMiddleware(
   name: string,
   context: ResolutionContext
 ): string | null {
-  // Look in middleware directories
-  const middlewareDirs = ['middleware', 'middlewares', 'src/middleware', 'src/middlewares'];
+  // Try exact name first
+  const candidates = context.getNodesByName(name);
+  const match = candidates.find((n) =>
+    n.name.toLowerCase() === name.toLowerCase() ||
+    n.name.toLowerCase() === name.replace(/Middleware$/i, '').toLowerCase()
+  );
+  if (match) return match.id;
 
-  for (const dir of middlewareDirs) {
-    const allFiles = context.getAllFiles();
-    for (const file of allFiles) {
-      if (file.startsWith(dir) || file.includes('/middleware/')) {
-        const nodes = context.getNodesInFile(file);
-        const match = nodes.find(
-          (n) =>
-            n.name.toLowerCase() === name.toLowerCase() ||
-            n.name.toLowerCase() === name.replace(/Middleware$/i, '').toLowerCase()
-        );
-        if (match) {
-          return match.id;
-        }
-      }
-    }
+  // Try without Middleware suffix
+  const baseName = name.replace(/Middleware$/i, '');
+  if (baseName !== name) {
+    const baseCandidates = context.getNodesByName(baseName);
+    const MIDDLEWARE_DIRS = ['/middleware/', '/middlewares/'];
+    const preferred = baseCandidates.filter((n) =>
+      MIDDLEWARE_DIRS.some((d) => n.filePath.includes(d))
+    );
+    if (preferred.length > 0) return preferred[0]!.id;
+    if (baseCandidates.length > 0) return baseCandidates[0]!.id;
   }
 
   return null;
 }
 
 /**
- * Resolve controller method
+ * Resolve controller method using name-based lookup
  */
-function resolveController(
+function resolveControllerMethod(
   controller: string,
   method: string,
   context: ResolutionContext
 ): string | null {
-  const controllerDirs = ['controllers', 'src/controllers', 'app/controllers'];
+  // Look for the method name directly
+  const methodCandidates = context.getNodesByName(method);
+  const methodNodes = methodCandidates.filter(
+    (n) => (n.kind === 'method' || n.kind === 'function') &&
+      n.filePath.toLowerCase().includes(controller.toLowerCase())
+  );
 
-  for (const dir of controllerDirs) {
-    const allFiles = context.getAllFiles();
-    for (const file of allFiles) {
-      if (
-        (file.startsWith(dir) || file.includes('/controllers/')) &&
-        file.toLowerCase().includes(controller.toLowerCase())
-      ) {
-        const nodes = context.getNodesInFile(file);
-        const methodNode = nodes.find(
-          (n) => (n.kind === 'method' || n.kind === 'function') && n.name === method
-        );
-        if (methodNode) {
-          return methodNode.id;
-        }
-      }
-    }
+  if (methodNodes.length > 0) return methodNodes[0]!.id;
+
+  // Fall back: look for controller class, then find the method in its file
+  const controllerName = controller + 'Controller';
+  const controllerCandidates = context.getNodesByName(controllerName);
+  for (const ctrl of controllerCandidates) {
+    const nodesInFile = context.getNodesInFile(ctrl.filePath);
+    const methodNode = nodesInFile.find(
+      (n) => (n.kind === 'method' || n.kind === 'function') && n.name === method
+    );
+    if (methodNode) return methodNode.id;
   }
 
   return null;
 }
 
 /**
- * Resolve service/helper
+ * Resolve service/helper method using name-based lookup
  */
-function resolveService(
+function resolveServiceMethod(
   serviceName: string,
   method: string,
   context: ResolutionContext
 ): string | null {
-  const serviceDirs = ['services', 'src/services', 'helpers', 'src/helpers', 'utils', 'src/utils'];
+  // Look for the method in files matching the service name
+  const methodCandidates = context.getNodesByName(method);
+  const stripped = serviceName.replace(/(Service|Helper|Utils?)$/i, '').toLowerCase();
+  const methodNodes = methodCandidates.filter(
+    (n) => (n.kind === 'method' || n.kind === 'function') &&
+      n.filePath.toLowerCase().includes(stripped)
+  );
 
-  for (const dir of serviceDirs) {
-    const allFiles = context.getAllFiles();
-    for (const file of allFiles) {
-      if (
-        (file.startsWith(dir) || file.includes('/services/') || file.includes('/helpers/') || file.includes('/utils/')) &&
-        file.toLowerCase().includes(serviceName.toLowerCase().replace(/(service|helper|utils?)$/i, ''))
-      ) {
-        const nodes = context.getNodesInFile(file);
-        const methodNode = nodes.find(
-          (n) => (n.kind === 'method' || n.kind === 'function') && n.name === method
-        );
-        if (methodNode) {
-          return methodNode.id;
-        }
-      }
-    }
-  }
+  if (methodNodes.length > 0) return methodNodes[0]!.id;
 
   return null;
 }

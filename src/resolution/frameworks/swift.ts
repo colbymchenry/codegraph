@@ -35,7 +35,7 @@ export const swiftUIResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: View references (SwiftUI views are PascalCase ending in View)
     if (ref.referenceName.endsWith('View') && /^[A-Z]/.test(ref.referenceName)) {
-      const result = resolveView(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, VIEW_KINDS, VIEW_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -48,7 +48,7 @@ export const swiftUIResolver: FrameworkResolver = {
 
     // Pattern 2: ViewModel/ObservableObject references
     if (ref.referenceName.endsWith('ViewModel') || ref.referenceName.endsWith('Store') || ref.referenceName.endsWith('Manager')) {
-      const result = resolveViewModel(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, VIEWMODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -61,7 +61,7 @@ export const swiftUIResolver: FrameworkResolver = {
 
     // Pattern 3: Model references
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveModel(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, MODEL_KINDS, MODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -153,7 +153,7 @@ export const uikitResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: ViewController references
     if (ref.referenceName.endsWith('ViewController')) {
-      const result = resolveViewController(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, VC_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -166,7 +166,7 @@ export const uikitResolver: FrameworkResolver = {
 
     // Pattern 2: UIView subclass references
     if (ref.referenceName.endsWith('View') && !ref.referenceName.endsWith('ViewController')) {
-      const result = resolveUIView(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, UIVIEW_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -179,7 +179,7 @@ export const uikitResolver: FrameworkResolver = {
 
     // Pattern 3: Cell references
     if (ref.referenceName.endsWith('Cell')) {
-      const result = resolveCell(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, CELL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -192,7 +192,7 @@ export const uikitResolver: FrameworkResolver = {
 
     // Pattern 4: Delegate/DataSource references
     if (ref.referenceName.endsWith('Delegate') || ref.referenceName.endsWith('DataSource')) {
-      const result = resolveProtocol(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, PROTOCOL_KINDS, [], context);
       if (result) {
         return {
           original: ref,
@@ -286,7 +286,7 @@ export const vaporResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Controller references
     if (ref.referenceName.endsWith('Controller')) {
-      const result = resolveVaporController(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, VAPOR_CONTROLLER_KINDS, VAPOR_CONTROLLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -299,7 +299,7 @@ export const vaporResolver: FrameworkResolver = {
 
     // Pattern 2: Model references (Fluent)
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveFluentModel(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, FLUENT_MODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -312,7 +312,7 @@ export const vaporResolver: FrameworkResolver = {
 
     // Pattern 3: Middleware references
     if (ref.referenceName.endsWith('Middleware')) {
-      const result = resolveVaporMiddleware(ref.referenceName, context);
+      const result = resolveByNameAndKind(ref.referenceName, VAPOR_CONTROLLER_KINDS, VAPOR_MIDDLEWARE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -382,210 +382,46 @@ export const vaporResolver: FrameworkResolver = {
   },
 };
 
-// Helper functions for SwiftUI
+// Directory patterns
+const VIEW_DIRS = ['/Views/', '/View/', '/Screens/', '/Components/', '/UI/'];
+const VIEWMODEL_DIRS = ['/ViewModels/', '/ViewModel/', '/Stores/', '/Managers/', '/Services/'];
+const MODEL_DIRS = ['/Models/', '/Model/', '/Entities/', '/Domain/'];
+const VC_DIRS = ['/ViewControllers/', '/ViewController/', '/Controllers/', '/Screens/'];
+const UIVIEW_DIRS = ['/Views/', '/View/', '/UI/', '/Components/'];
+const CELL_DIRS = ['/Cells/', '/Cell/', '/Views/', '/TableViewCells/', '/CollectionViewCells/'];
+const VAPOR_CONTROLLER_DIRS = ['/Controllers/', '/Controller/', '/Routes/'];
+const FLUENT_MODEL_DIRS = ['/Models/', '/Model/', '/Entities/', '/Database/'];
+const VAPOR_MIDDLEWARE_DIRS = ['/Middleware/', '/Middlewares/'];
 
-function resolveView(name: string, context: ResolutionContext): string | null {
-  const viewDirs = ['Views', 'View', 'Screens', 'Components', 'UI'];
+const VIEW_KINDS = new Set(['struct', 'component']);
+const CLASS_KINDS = new Set(['class']);
+const MODEL_KINDS = new Set(['struct', 'class']);
+const PROTOCOL_KINDS = new Set(['protocol']);
+const VAPOR_CONTROLLER_KINDS = new Set(['class', 'struct']);
 
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.swift') && viewDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const viewNode = nodes.find(
-        (n) => (n.kind === 'struct' || n.kind === 'component') && n.name === name
-      );
-      if (viewNode) {
-        return viewNode.id;
-      }
-    }
+/**
+ * Resolve a symbol by name using indexed queries instead of scanning all files.
+ */
+function resolveByNameAndKind(
+  name: string,
+  kinds: Set<string>,
+  preferredDirPatterns: string[],
+  context: ResolutionContext,
+): string | null {
+  const candidates = context.getNodesByName(name);
+  if (candidates.length === 0) return null;
+
+  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
+  if (kindFiltered.length === 0) return null;
+
+  // Prefer candidates in framework-conventional directories
+  if (preferredDirPatterns.length > 0) {
+    const preferred = kindFiltered.filter((n) =>
+      preferredDirPatterns.some((d) => n.filePath.includes(d))
+    );
+    if (preferred.length > 0) return preferred[0]!.id;
   }
 
-  // Search all Swift files
-  for (const file of allFiles) {
-    if (file.endsWith('.swift')) {
-      const nodes = context.getNodesInFile(file);
-      const viewNode = nodes.find(
-        (n) => (n.kind === 'struct' || n.kind === 'component') && n.name === name
-      );
-      if (viewNode) {
-        return viewNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveViewModel(name: string, context: ResolutionContext): string | null {
-  const vmDirs = ['ViewModels', 'ViewModel', 'Stores', 'Managers', 'Services'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.swift') && vmDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const vmNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (vmNode) {
-        return vmNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveModel(name: string, context: ResolutionContext): string | null {
-  const modelDirs = ['Models', 'Model', 'Entities', 'Domain'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.swift') && modelDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const modelNode = nodes.find(
-        (n) => (n.kind === 'struct' || n.kind === 'class') && n.name === name
-      );
-      if (modelNode) {
-        return modelNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-// Helper functions for UIKit
-
-function resolveViewController(name: string, context: ResolutionContext): string | null {
-  const vcDirs = ['ViewControllers', 'ViewController', 'Controllers', 'Screens'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.swift') && (vcDirs.some((d) => file.includes(`/${d}/`)) || file.includes(name))) {
-      const nodes = context.getNodesInFile(file);
-      const vcNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (vcNode) {
-        return vcNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveUIView(name: string, context: ResolutionContext): string | null {
-  const viewDirs = ['Views', 'View', 'UI', 'Components'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.swift') && viewDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const viewNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (viewNode) {
-        return viewNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveCell(name: string, context: ResolutionContext): string | null {
-  const cellDirs = ['Cells', 'Cell', 'Views', 'TableViewCells', 'CollectionViewCells'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.swift') && cellDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const cellNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (cellNode) {
-        return cellNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveProtocol(name: string, context: ResolutionContext): string | null {
-  const allFiles = context.getAllFiles();
-
-  for (const file of allFiles) {
-    if (file.endsWith('.swift')) {
-      const nodes = context.getNodesInFile(file);
-      const protocolNode = nodes.find(
-        (n) => n.kind === 'protocol' && n.name === name
-      );
-      if (protocolNode) {
-        return protocolNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-// Helper functions for Vapor
-
-function resolveVaporController(name: string, context: ResolutionContext): string | null {
-  const controllerDirs = ['Controllers', 'Controller', 'Routes'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.swift') && controllerDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const controllerNode = nodes.find(
-        (n) => (n.kind === 'class' || n.kind === 'struct') && n.name === name
-      );
-      if (controllerNode) {
-        return controllerNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveFluentModel(name: string, context: ResolutionContext): string | null {
-  const modelDirs = ['Models', 'Model', 'Entities', 'Database'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.swift') && modelDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const modelNode = nodes.find(
-        (n) => n.kind === 'class' && n.name === name
-      );
-      if (modelNode) {
-        return modelNode.id;
-      }
-    }
-  }
-
-  return null;
-}
-
-function resolveVaporMiddleware(name: string, context: ResolutionContext): string | null {
-  const middlewareDirs = ['Middleware', 'Middlewares'];
-
-  const allFiles = context.getAllFiles();
-  for (const file of allFiles) {
-    if (file.endsWith('.swift') && middlewareDirs.some((d) => file.includes(`/${d}/`))) {
-      const nodes = context.getNodesInFile(file);
-      const mwNode = nodes.find(
-        (n) => (n.kind === 'class' || n.kind === 'struct') && n.name === name
-      );
-      if (mwNode) {
-        return mwNode.id;
-      }
-    }
-  }
-
-  return null;
+  // Fall back to any match
+  return kindFiltered[0]!.id;
 }
