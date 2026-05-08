@@ -24,6 +24,8 @@ import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized } from '../directory';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 
+import { buildNode25BlockBanner } from './node-version-check';
+
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
   try {
@@ -44,20 +46,21 @@ async function loadCodeGraph(): Promise<typeof import('../index')> {
 const importESM = new Function('specifier', 'return import(specifier)') as
   (specifier: string) => Promise<typeof import('@clack/prompts')>;
 
-// Warn about unsupported Node.js versions (Node 25+ has V8 turboshaft WASM bugs)
+// Block CodeGraph on Node.js 25.x — V8's turboshaft WASM JIT has a Zone
+// allocator bug that reliably crashes when compiling tree-sitter
+// grammars (see #54, #81, #140). The previous behaviour was a soft
+// console.warn that scrolls off-screen before the OOM crash 30 seconds
+// later, leading to a steady stream of "what is this OOM" reports.
+// Hard-exit before any WASM work; allow override via env var for users
+// who patched V8 themselves or want to test a future fix.
 const nodeVersion = process.versions.node;
 const nodeMajor = parseInt(nodeVersion.split('.')[0] ?? '0', 10);
 if (nodeMajor >= 25) {
-  console.warn(
-    '\x1b[33m⚠\x1b[0m  CodeGraph may crash on Node.js %s due to a V8 WASM compiler bug in Node 25+.',
-    nodeVersion
-  );
-  console.warn(
-    '   Please use Node.js 22 LTS instead: https://nodejs.org/en/download'
-  );
-  console.warn(
-    '   See: https://github.com/colbymchenry/codegraph/issues/81\n'
-  );
+  process.stderr.write(buildNode25BlockBanner(nodeVersion) + '\n');
+  if (!process.env.CODEGRAPH_ALLOW_UNSAFE_NODE) {
+    process.exit(1);
+  }
+  // Override active — banner shown for visibility, continuing.
 }
 
 // Check if running with no arguments - run installer
