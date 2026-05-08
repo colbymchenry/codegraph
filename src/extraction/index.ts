@@ -156,19 +156,31 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
       }
     }
 
-    // -c = cached (tracked), -o = others (untracked), --exclude-standard = respect .gitignore
-    const output = execFileSync(
-      'git',
-      ['ls-files', '-co', '--exclude-standard'],
-      { cwd: rootDir, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] }
-    );
     const files = new Set<string>();
-    for (const line of output.split('\n')) {
+    const gitOpts = { cwd: rootDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'] };
+
+    // Tracked files. --recurse-submodules pulls in files from active submodules,
+    // which the main repo's index would otherwise represent only as a commit pointer.
+    // Without this, monorepos using submodules index 0 files. (See issue #147.)
+    // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
+    // can't be combined with -o, so untracked files are gathered separately below.
+    const tracked = execFileSync('git', ['ls-files', '-c', '--recurse-submodules'], gitOpts);
+    for (const line of tracked.split('\n')) {
       const trimmed = line.trim();
       if (trimmed) {
         files.add(normalizePath(trimmed));
       }
     }
+
+    // Untracked files in the main repo (submodules manage their own untracked state).
+    const untracked = execFileSync('git', ['ls-files', '-o', '--exclude-standard'], gitOpts);
+    for (const line of untracked.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed) {
+        files.add(normalizePath(trimmed));
+      }
+    }
+
     return files;
   } catch {
     return null;
