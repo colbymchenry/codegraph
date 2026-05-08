@@ -408,6 +408,25 @@ export class ReferenceResolver {
   }
 
   /**
+   * Does `ref.referenceName` match an import declared in its containing
+   * file? Used as a pre-filter escape so re-export chain resolution
+   * still gets a chance when the name has no project-wide declaration.
+   */
+  private matchesAnyImport(ref: UnresolvedRef): boolean {
+    const imports = this.context.getImportMappings(ref.filePath, ref.language);
+    if (imports.length === 0) return false;
+    for (const imp of imports) {
+      if (
+        imp.localName === ref.referenceName ||
+        ref.referenceName.startsWith(imp.localName + '.')
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Resolve a single reference
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
@@ -417,7 +436,12 @@ export class ReferenceResolver {
     }
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
-    if (!this.hasAnyPossibleMatch(ref.referenceName)) {
+    // AND the name doesn't match a local import. The import escape is
+    // necessary because re-export rename chains (`import { login }
+    // from './barrel'` where the barrel has `export { signIn as login }
+    // from './auth'`) intentionally call a name that has no
+    // declaration anywhere — only the renamed upstream symbol does.
+    if (!this.hasAnyPossibleMatch(ref.referenceName) && !this.matchesAnyImport(ref)) {
       return null;
     }
 
