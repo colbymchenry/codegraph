@@ -9,6 +9,16 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 import { stripCommentsForRegex } from '../strip-comments';
 import { getCargoWorkspaceCrateMap } from './cargo-workspace';
 
+const cargoWorkspaceMapCache = new WeakMap<ResolutionContext, Map<string, string>>();
+
+function getCachedCargoWorkspaceCrateMap(context: ResolutionContext): Map<string, string> {
+  const cached = cargoWorkspaceMapCache.get(context);
+  if (cached) return cached;
+  const map = getCargoWorkspaceCrateMap(context);
+  cargoWorkspaceMapCache.set(context, map);
+  return map;
+}
+
 export const rustResolver: FrameworkResolver = {
   name: 'rust',
   languages: ['rust'],
@@ -198,7 +208,7 @@ function resolveModule(name: string, context: ResolutionContext): string | null 
     `src/${name}.rs`,
     `src/${name}/mod.rs`,
   ];
-  const workspaceCrates = getCargoWorkspaceCrateMap(context);
+  const workspaceCrates = getCachedCargoWorkspaceCrateMap(context);
   const cratePath = workspaceCrates.get(name);
   if (cratePath) {
     possiblePaths.push(`${cratePath}/src/lib.rs`, `${cratePath}/src/main.rs`);

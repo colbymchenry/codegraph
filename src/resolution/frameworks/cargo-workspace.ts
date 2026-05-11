@@ -27,33 +27,129 @@ function getSection(content: string, sectionName: string): string | null {
 
 function extractQuotedValues(valueList: string): string[] {
   const values: string[] = [];
-  const valueRegex = /"([^"]+)"|'([^']+)'/g;
-  let match: RegExpExecArray | null;
-  while ((match = valueRegex.exec(valueList)) !== null) {
-    values.push((match[1] ?? match[2] ?? '').trim());
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  let current = '';
+
+  for (const ch of valueList) {
+    if (!quote) {
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        current = '';
+      }
+      continue;
+    }
+
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+
+    if (ch === quote) {
+      values.push(current.trim());
+      quote = null;
+      current = '';
+      continue;
+    }
+
+    current += ch;
   }
+
   return values.filter(Boolean);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getArrayValue(section: string, key: string): string | null {
+  const keyRegex = new RegExp(`\\b${escapeRegExp(key)}\\b\\s*=`, 'm');
+  const keyMatch = keyRegex.exec(section);
+  if (!keyMatch) return null;
+
+  let i = keyMatch.index + keyMatch[0].length;
+  while (i < section.length && /\s/.test(section.charAt(i))) i++;
+  if (section.charAt(i) !== '[') return null;
+  i++;
+
+  let inQuote: '"' | "'" | null = null;
+  let escaped = false;
+  let depth = 1;
+  const start = i;
+
+  while (i < section.length) {
+    const ch = section.charAt(i);
+
+    if (inQuote) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === inQuote) {
+        inQuote = null;
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      inQuote = ch;
+      i++;
+      continue;
+    }
+
+    if (ch === '[') {
+      depth++;
+      i++;
+      continue;
+    }
+
+    if (ch === ']') {
+      depth--;
+      if (depth === 0) {
+        return section.slice(start, i);
+      }
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  return null;
 }
 
 function parseWorkspaceMembers(cargoToml: string): string[] {
   const workspaceSection = getSection(cargoToml, 'workspace');
   if (!workspaceSection) return [];
-  const membersMatch = workspaceSection.match(/members\s*=\s*\[([\s\S]*?)\]/m);
-  if (!membersMatch) return [];
-  return extractQuotedValues(membersMatch[1]!);
+  const membersValue = getArrayValue(workspaceSection, 'members');
+  if (!membersValue) return [];
+  return extractQuotedValues(membersValue);
 }
 
 function parsePackageName(cargoToml: string): string | null {
   const packageSection = getSection(cargoToml, 'package');
   if (!packageSection) return null;
-  const packageNameMatch = packageSection.match(/name\s*=\s*["']([^"']+)["']/);
-  return packageNameMatch?.[1]?.trim() || null;
+  const packageNameMatch = packageSection.match(/name\s*=\s*["']([^"'\n]+)["']/);
+  return packageNameMatch?.[1]?.trim() ?? null;
 }
 
 function addCrateAlias(map: Map<string, string>, crateName: string, memberPath: string): void {
   const normalized = crateName.replace(/-/g, '_');
   map.set(crateName, memberPath);
-  map.set(normalized, memberPath);
+  if (normalized !== crateName) {
+    map.set(normalized, memberPath);
+  }
+}
+
+function cleanPath(memberPath: string): string {
+  return memberPath.replace(/\\/g, '/').replace(/\/$/, '');
 }
 
 /**
@@ -67,7 +163,7 @@ export function getCargoWorkspaceCrateMap(context: ResolutionContext): Map<strin
 
   const members = parseWorkspaceMembers(rootCargoToml);
   for (const memberPath of members) {
-    const cleanMemberPath = memberPath.replace(/\\/g, '/').replace(/\/$/, '');
+    const cleanMemberPath = cleanPath(memberPath);
     const memberCargoPath = `${cleanMemberPath}/Cargo.toml`;
     const memberCargoToml = context.readFile(memberCargoPath);
     if (!memberCargoToml) continue;
