@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { getCargoWorkspaceCrateMap } from './cargo-workspace';
 
 export const rustResolver: FrameworkResolver = {
   name: 'rust',
@@ -193,10 +194,15 @@ function resolveByNameAndKind(
 
 function resolveModule(name: string, context: ResolutionContext): string | null {
   // Rust modules can be either mod.rs in a directory or name.rs
-  const possiblePaths = [
+  const possiblePaths: string[] = [
     `src/${name}.rs`,
     `src/${name}/mod.rs`,
   ];
+  const workspaceCrates = getCargoWorkspaceCrateMap(context);
+  const cratePath = workspaceCrates.get(name);
+  if (cratePath) {
+    possiblePaths.push(`${cratePath}/src/lib.rs`, `${cratePath}/src/main.rs`);
+  }
 
   for (const modPath of possiblePaths) {
     if (context.fileExists(modPath)) {
