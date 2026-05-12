@@ -98,6 +98,15 @@ export interface ResolutionContext {
    * re-export chains when this is provided.
    */
   getReExports?(filePath: string, language: Language): ReExport[];
+  /**
+   * List immediate subdirectories of `relativePath` (relative to the
+   * project root). Returns an empty array when the path doesn't exist
+   * or isn't a directory. Used by framework resolvers that need to
+   * walk build-system metadata (e.g. Cargo workspace globs). Optional
+   * so external context implementations and test fixtures compile
+   * without modification.
+   */
+  listDirectories?(relativePath: string): string[];
 }
 
 /**

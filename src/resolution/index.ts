@@ -257,6 +257,24 @@ export class ReferenceResolver {
         return this.queries.getAllFilePaths();
       },
 
+      listDirectories: (relativePath: string) => {
+        const target = relativePath === '.' || relativePath === ''
+          ? this.projectRoot
+          : path.join(this.projectRoot, relativePath);
+        try {
+          return fs
+            .readdirSync(target, { withFileTypes: true })
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => entry.name);
+        } catch (error) {
+          logDebug('Failed to list directory for resolution', {
+            relativePath,
+            error: String(error),
+          });
+          return [];
+        }
+      },
+
       getNodesByLowerName: (lowerName: string) => {
         const cached = this.lowerNameCache.get(lowerName);
         if (cached !== undefined) return cached;

@@ -72,10 +72,15 @@ export const rustResolver: FrameworkResolver = {
     if (/^[a-z_]+$/.test(ref.referenceName)) {
       const result = resolveModule(ref.referenceName, context);
       if (result) {
+        // Workspace-manifest hits are an exact crate-name -> crate-root
+        // mapping straight from Cargo.toml, so we trust them above
+        // name-matcher self-file matches (which otherwise win at 0.7
+        // because every file containing `use foo::...` has its own
+        // import node named `foo`).
         return {
           original: ref,
-          targetNodeId: result,
-          confidence: 0.6,
+          targetNodeId: result.targetId,
+          confidence: result.fromWorkspace ? 0.95 : 0.6,
           resolvedBy: 'framework',
         };
       }
@@ -202,30 +207,32 @@ function resolveByNameAndKind(
   return kindFiltered[0]!.id;
 }
 
-function resolveModule(name: string, context: ResolutionContext): string | null {
+interface ModuleResolution {
+  targetId: string;
+  fromWorkspace: boolean;
+}
+
+function resolveModule(name: string, context: ResolutionContext): ModuleResolution | null {
   // Rust modules can be either mod.rs in a directory or name.rs
-  const possiblePaths: string[] = [
-    `src/${name}.rs`,
-    `src/${name}/mod.rs`,
-  ];
+  const localPaths = [`src/${name}.rs`, `src/${name}/mod.rs`];
+
   const workspaceCrates = getCachedCargoWorkspaceCrateMap(context);
   const cratePath = workspaceCrates.get(name);
-  if (cratePath) {
-    possiblePaths.push(`${cratePath}/src/lib.rs`, `${cratePath}/src/main.rs`);
-  }
+  const workspacePaths = cratePath
+    ? [`${cratePath}/src/lib.rs`, `${cratePath}/src/main.rs`]
+    : [];
 
-  for (const modPath of possiblePaths) {
-    if (context.fileExists(modPath)) {
-      const nodes = context.getNodesInFile(modPath);
-      const modNode = nodes.find((n) => n.kind === 'module');
-      if (modNode) {
-        return modNode.id;
-      }
-      // If no explicit module node, return the first node in the file
-      if (nodes.length > 0) {
-        return nodes[0]!.id;
-      }
-    }
+  const candidates: Array<{ path: string; fromWorkspace: boolean }> = [
+    ...localPaths.map((path) => ({ path, fromWorkspace: false })),
+    ...workspacePaths.map((path) => ({ path, fromWorkspace: true })),
+  ];
+
+  for (const { path: modPath, fromWorkspace } of candidates) {
+    if (!context.fileExists(modPath)) continue;
+    const nodes = context.getNodesInFile(modPath);
+    const modNode = nodes.find((n) => n.kind === 'module');
+    if (modNode) return { targetId: modNode.id, fromWorkspace };
+    if (nodes.length > 0) return { targetId: nodes[0]!.id, fromWorkspace };
   }
 
   return null;
