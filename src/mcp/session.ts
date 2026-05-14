@@ -15,7 +15,6 @@
 import * as path from 'path';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
-import { tools } from './tools';
 import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_UNINDEXED } from './server-instructions';
 import { CodeGraphPackageVersion } from './version';
 import { findNearestCodeGraphRoot } from '../directory';
@@ -245,8 +244,8 @@ export class MCPSession {
     const toolName = params.name;
     const toolArgs = params.arguments || {};
 
-    const tool = tools.find((t) => t.name === toolName);
-    if (!tool) {
+    const projectPath = typeof toolArgs.projectPath === 'string' ? toolArgs.projectPath : undefined;
+    if (!this.engine.getToolHandler().isToolEnabled(toolName, projectPath)) {
       this.transport.sendError(
         request.id,
         ErrorCodes.InvalidParams,

@@ -249,6 +249,13 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       try {
         await ensureEngine();
         const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
+        const projectPath = typeof params.arguments?.projectPath === 'string'
+          ? params.arguments.projectPath
+          : undefined;
+        if (!engine!.getToolHandler().isToolEnabled(params.name, projectPath)) {
+          writeClient({ jsonrpc: '2.0', id, error: { code: -32602, message: `Unknown tool: ${params.name}` } });
+          return;
+        }
         const result = await engine!.getToolHandler().execute(params.name, params.arguments || {});
         writeClient({ jsonrpc: '2.0', id, result });
         getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
@@ -298,7 +305,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         writeClient({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: SERVER_INSTRUCTIONS } });
         routeToDaemon(line); // prime the daemon so it resolves the project (its reply is suppressed below)
       } else if (msg.method === 'tools/list') {
-        writeClient({ jsonrpc: '2.0', id: msg.id, result: { tools: getStaticTools() } });
+        writeClient({ jsonrpc: '2.0', id: msg.id, result: { tools: getStaticTools(deps.root) } });
       } else if (msg.method === 'resources/list') {
         // No resources exposed — answer the probe locally so it never reaches
         // the daemon as an unhandled method and logs `-32601`. (#621)
