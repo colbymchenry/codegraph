@@ -14,6 +14,8 @@
 [![macOS](https://img.shields.io/badge/macOS-supported-blue.svg)](#)
 [![Linux](https://img.shields.io/badge/Linux-supported-blue.svg)](#)
 
+**English** · [简体中文](./README.zh-CN.md)
+
 <br />
 
 ### Get Started
