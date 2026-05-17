@@ -150,14 +150,31 @@ npx @colbymchenry/codegraph
 
 The installer will:
 - Prompt to install `codegraph` globally (needed for the MCP server)
-- Configure the MCP server in `~/.claude.json`
-- Set up auto-allow permissions for CodeGraph tools
-- Add global instructions to `~/.claude/CLAUDE.md`
+- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**
+- Write each chosen agent's MCP server config + an instructions file (e.g. `CLAUDE.md`, `.cursor/rules/codegraph.mdc`, `~/.codex/AGENTS.md`)
+- Set up auto-allow permissions for the chosen agent (Claude Code only)
 - Optionally initialize your current project
 
-### 2. Restart Claude Code
+**Non-interactive (scripting / CI):**
 
-Restart Claude Code for the MCP server to load.
+```bash
+codegraph install --yes                              # auto-detect agents, install global
+codegraph install --target=cursor,claude --yes       # explicit target list
+codegraph install --target=auto --location=local     # detected agents, project-local
+codegraph install --print-config codex               # print snippet, no file writes
+```
+
+| Flag | Values | Default |
+|---|---|---|
+| `--target` | `auto`, `all`, `none`, or csv (`claude,cursor,...`) | prompt |
+| `--location` | `global`, `local` | prompt |
+| `--yes` | (boolean) | prompt every step |
+| `--no-permissions` | (boolean) skip Claude auto-allow list | permissions on |
+| `--print-config <id>` | dump snippet for one agent and exit | — |
+
+### 2. Restart Your Agent
+
+Restart your agent (Claude Code / Cursor / Codex CLI / opencode) for the MCP server to load.
 
 ### 3. Initialize Projects
 

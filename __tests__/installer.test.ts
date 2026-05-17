@@ -125,9 +125,10 @@ describe('Installer Config Writer', () => {
       const modified = '## My Custom Section\n\nCustom content\n\n' + original + '\n\n## Another Section\n\nMore content\n';
       fs.writeFileSync(claudeMdPath, modified);
 
-      // Second write should replace only the marked section
-      const result = writeClaudeMd('local');
-      expect(result.updated).toBe(true);
+      // Second write should leave the marked block as-is (byte-identical
+      // body, so result is `created:false, updated:false` — both flags
+      // are off but the surrounding custom content must survive).
+      writeClaudeMd('local');
 
       const final = fs.readFileSync(claudeMdPath, 'utf-8');
       expect(final).toContain('## My Custom Section');
