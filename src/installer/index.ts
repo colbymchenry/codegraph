@@ -86,7 +86,18 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   // --yes implies all defaults; explicit flags still win.
   const useDefaults = opts.yes === true;
 
-  // Step 1: install codegraph globally on PATH (always offered;
+  // Step 1: which agent targets? Asked FIRST so the user knows what
+  // they're committing to before we touch npm or disk. Detection
+  // probes the user-provided location if known, else 'global' as the
+  // most common default — labels are a hint, not load-bearing.
+  const detectionLocation: Location = opts.location ?? 'global';
+  const targets = await resolveTargets(clack, opts, detectionLocation, useDefaults);
+  if (targets.length === 0) {
+    clack.outro('No agent targets selected — nothing to do.');
+    return;
+  }
+
+  // Step 2: install codegraph globally on PATH (always offered;
   // matches existing behavior). Skipped when --yes (assume present).
   if (!useDefaults) {
     const shouldInstallGlobally = await clack.confirm({
@@ -112,32 +123,34 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
-  // Step 2: install location.
+  // Step 3: install location.
   let location: Location;
   if (opts.location) {
     location = opts.location;
   } else if (useDefaults) {
     location = 'global';
   } else {
-    const sel = await clack.select({
-      message: 'Where would you like to install?',
-      options: [
-        { value: 'global' as const, label: 'Global', hint: 'available in all projects' },
-        { value: 'local' as const, label: 'Local',  hint: 'this project only' },
-      ],
-      initialValue: 'global' as const,
-    });
-    if (clack.isCancel(sel)) {
-      clack.cancel('Installation cancelled.');
-      process.exit(0);
+    // If every selected target is global-only (e.g. Codex), skip the
+    // prompt and force global — local would just produce skip warnings.
+    const allGlobalOnly = targets.every((t) => !t.supportsLocation('local'));
+    if (allGlobalOnly) {
+      location = 'global';
+      clack.log.info('Using global install (selected agents do not support project-local).');
+    } else {
+      const sel = await clack.select({
+        message: 'Where would you like to install?',
+        options: [
+          { value: 'global' as const, label: 'Global', hint: 'available in all projects' },
+          { value: 'local' as const, label: 'Local',  hint: 'this project only' },
+        ],
+        initialValue: 'global' as const,
+      });
+      if (clack.isCancel(sel)) {
+        clack.cancel('Installation cancelled.');
+        process.exit(0);
+      }
+      location = sel;
     }
-    location = sel;
-  }
-
-  // Step 3: which agent targets?
-  const targets = await resolveTargets(clack, opts, location, useDefaults);
-  if (targets.length === 0) {
-    clack.log.info('No agent targets selected — skipping agent config writes.');
   }
 
   // Step 4: auto-allow permissions (only meaningful for Claude;
@@ -236,11 +249,10 @@ async function resolveTargets(
     options: ALL_TARGETS.map((t) => {
       const det = detected.find(({ target }) => target.id === t.id)!.detection;
       const flag = det.installed ? '(detected)' : '(not found)';
-      const supportsHere = t.supportsLocation(location);
-      const support = supportsHere ? '' : ` — no ${location} support, will skip`;
+      const globalOnly = !t.supportsLocation('local') ? ' — global only' : '';
       return {
         value: t.id,
-        label: `${t.displayName} ${flag}${support}`,
+        label: `${t.displayName} ${flag}${globalOnly}`,
       };
     }),
     initialValues: initial,
