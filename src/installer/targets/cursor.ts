@@ -9,6 +9,24 @@
  *     global cursor rules aren't a stable convention as of 2026-05.
  *     For `--location=global`, only mcp.json is written.
  *
+ * ## Why we hardcode `--path` for Cursor
+ *
+ * Cursor launches MCP-server subprocesses with a working directory
+ * that ISN'T the workspace root AND doesn't pass `rootUri` /
+ * `workspaceFolders` in the MCP initialize call. The codegraph MCP
+ * server's `process.cwd()` fallback therefore misses the workspace's
+ * `.codegraph/` and reports "not initialized" on every tool call.
+ *
+ * So we inject `--path` into the args ourselves:
+ *
+ *   - `local`  install: absolute path (we know it at install time).
+ *   - `global` install: `${workspaceFolder}` — Cursor expands this to
+ *     the open workspace's root, giving us per-workspace behavior
+ *     from a single global config.
+ *
+ * Codex and Claude do not need this — they launch MCP servers with
+ * `cwd = workspace` and pass `rootUri`, respectively.
+ *
  * No permissions concept — Cursor doesn't have an auto-allow list
  * the installer can populate. `autoAllow` is silently ignored.
  */
@@ -132,7 +150,7 @@ class CursorTarget implements AgentTarget {
 
   printConfig(loc: Location): string {
     const target = mcpJsonPath(loc);
-    const snippet = JSON.stringify({ mcpServers: { codegraph: getMcpServerConfig() } }, null, 2);
+    const snippet = JSON.stringify({ mcpServers: { codegraph: buildCursorMcpConfig(loc) } }, null, 2);
     return `# Add to ${target}\n\n${snippet}\n`;
   }
 
@@ -143,11 +161,24 @@ class CursorTarget implements AgentTarget {
   }
 }
 
+/**
+ * Build the codegraph MCP-server config for Cursor at the given
+ * location. Inherits the shared shape ({type, command, args}) and
+ * appends `--path` so the spawned MCP server resolves the workspace
+ * correctly regardless of Cursor's launch cwd. See file header for
+ * the full rationale.
+ */
+function buildCursorMcpConfig(loc: Location): { type: string; command: string; args: string[] } {
+  const base = getMcpServerConfig();
+  const pathArg = loc === 'local' ? process.cwd() : '${workspaceFolder}';
+  return { ...base, args: [...base.args, '--path', pathArg] };
+}
+
 function writeMcpEntry(loc: Location): WriteResult['files'][number] {
   const file = mcpJsonPath(loc);
   const existing = readJsonFile(file);
   const before = existing.mcpServers?.codegraph;
-  const after = getMcpServerConfig();
+  const after = buildCursorMcpConfig(loc);
 
   if (jsonDeepEqual(before, after)) {
     return { path: file, action: 'unchanged' };
