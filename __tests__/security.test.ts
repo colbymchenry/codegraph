@@ -532,4 +532,45 @@ describe('Symlink Cycle Detection', () => {
     const files = scanDirectory(tempDir, config);
     expect(files).toContain('src/valid.ts');
   });
+
+  it('should not index symlinked files that resolve outside the project root', async () => {
+    const outsideDir = createTempDir();
+    let cg: CodeGraph | null = null;
+
+    try {
+      const srcDir = path.join(tempDir, 'src');
+      fs.mkdirSync(srcDir);
+
+      fs.writeFileSync(
+        path.join(outsideDir, 'secret.ts'),
+        'export function leakedSecret() { return "nope"; }\n'
+      );
+
+      try {
+        fs.symlinkSync(
+          path.join(outsideDir, 'secret.ts'),
+          path.join(srcDir, 'secret.ts'),
+          'file'
+        );
+      } catch {
+        return;
+      }
+
+      cg = CodeGraph.initSync(tempDir, {
+        config: { include: ['**/*.ts'], exclude: [] },
+      });
+      await cg.indexAll();
+
+      expect(cg.searchNodes('leakedSecret')).toHaveLength(0);
+      expect(scanDirectory(tempDir, {
+        ...DEFAULT_CONFIG,
+        rootDir: tempDir,
+        include: ['**/*.ts'],
+        exclude: [],
+      })).not.toContain('src/secret.ts');
+    } finally {
+      if (cg) cg.destroy();
+      cleanupTempDir(outsideDir);
+    }
+  });
 });

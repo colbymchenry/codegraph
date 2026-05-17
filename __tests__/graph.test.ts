@@ -379,12 +379,15 @@ export { main };
       const deps = cg.getFileDependencies('src/main.ts');
 
       expect(Array.isArray(deps)).toBe(true);
+      expect(deps).toContain('src/derived.ts');
+      expect(deps).toContain('src/utils.ts');
     });
 
     it('should get file dependents', () => {
       const dependents = cg.getFileDependents('src/utils.ts');
 
       expect(Array.isArray(dependents)).toBe(true);
+      expect(dependents).toContain('src/main.ts');
     });
   });
 

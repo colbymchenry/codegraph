@@ -20,7 +20,7 @@ import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { detectLanguage, isLanguageSupported, initGrammars, loadGrammarsForLanguages } from './grammars';
 import { logDebug, logWarn } from '../errors';
-import { validatePathWithinRoot, normalizePath } from '../utils';
+import { validatePathWithinRoot, normalizePath, isPathWithinRootReal } from '../utils';
 import picomatch from 'picomatch';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
@@ -353,6 +353,11 @@ function scanDirectoryWalk(
 
       if (entry.isSymbolicLink()) {
         try {
+          if (!isPathWithinRootReal(relativePath, rootDir)) {
+            logDebug('Skipping symlink that resolves outside project root', { path: fullPath });
+            continue;
+          }
+
           const realTarget = fs.realpathSync(fullPath);
           const stat = fs.statSync(realTarget);
           if (stat.isDirectory()) {

@@ -61,6 +61,19 @@ export function validatePathWithinRoot(projectRoot: string, filePath: string): s
   if (!resolved.startsWith(normalizedRoot + path.sep) && resolved !== normalizedRoot) {
     return null;
   }
+
+  if (fs.existsSync(resolved)) {
+    try {
+      const realResolved = fs.realpathSync(resolved);
+      const realRoot = fs.realpathSync(normalizedRoot);
+      if (!realResolved.startsWith(realRoot + path.sep) && realResolved !== realRoot) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
   return resolved;
 }
 
