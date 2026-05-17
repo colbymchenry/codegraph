@@ -49,6 +49,7 @@ import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions } from './sync';
+import { assertSupportedNodeVersion } from './bin/node-version-check';
 
 // Re-export types for consumers
 export * from './types';
@@ -151,6 +152,7 @@ export class CodeGraph {
     config: CodeGraphConfig,
     projectRoot: string
   ) {
+    assertSupportedNodeVersion();
     this.db = db;
     this.queries = queries;
     this.config = config;
@@ -183,6 +185,7 @@ export class CodeGraph {
    * @returns A new CodeGraph instance
    */
   static async init(projectRoot: string, options: InitOptions = {}): Promise<CodeGraph> {
+    assertSupportedNodeVersion();
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
 
@@ -220,6 +223,7 @@ export class CodeGraph {
    * Initialize synchronously (without indexing)
    */
   static initSync(projectRoot: string, options: Omit<InitOptions, 'index' | 'onProgress'> = {}): CodeGraph {
+    assertSupportedNodeVersion();
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if already initialized
@@ -253,6 +257,7 @@ export class CodeGraph {
    * @returns A CodeGraph instance
    */
   static async open(projectRoot: string, options: OpenOptions = {}): Promise<CodeGraph> {
+    assertSupportedNodeVersion();
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
 
@@ -289,6 +294,7 @@ export class CodeGraph {
    * Open synchronously (without sync)
    */
   static openSync(projectRoot: string): CodeGraph {
+    assertSupportedNodeVersion();
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if initialized

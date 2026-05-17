@@ -8,7 +8,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@colbymchenry/codegraph.svg)](https://www.npmjs.com/package/@colbymchenry/codegraph)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-18%20%7C%2020%20%7C%2022-green.svg)](https://nodejs.org/)
 
 [![Windows](https://img.shields.io/badge/Windows-supported-blue.svg)](#)
 [![macOS](https://img.shields.io/badge/macOS-supported-blue.svg)](#)
@@ -143,6 +143,9 @@ CodeGraph detects web-framework routing files and emits `route` nodes linked by 
 ## Quick Start
 
 ### 1. Run the Installer
+
+Requires Node.js 18, 20, or 22. Current Node.js 24+ releases are blocked because
+their V8 WASM compiler can crash while CodeGraph loads tree-sitter grammars.
 
 ```bash
 npx @colbymchenry/codegraph

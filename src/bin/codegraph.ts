@@ -24,7 +24,10 @@ import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized } from '../directory';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 
-import { buildNode25BlockBanner } from './node-version-check';
+import {
+  buildUnsupportedNodeBlockBanner,
+  isUnsupportedNodeVersion,
+} from './node-version-check';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -46,17 +49,16 @@ async function loadCodeGraph(): Promise<typeof import('../index')> {
 const importESM = new Function('specifier', 'return import(specifier)') as
   (specifier: string) => Promise<typeof import('@clack/prompts')>;
 
-// Block CodeGraph on Node.js 25.x — V8's turboshaft WASM JIT has a Zone
-// allocator bug that reliably crashes when compiling tree-sitter
-// grammars (see #54, #81, #140). The previous behaviour was a soft
-// console.warn that scrolls off-screen before the OOM crash 30 seconds
-// later, leading to a steady stream of "what is this OOM" reports.
+// Block CodeGraph on Node.js 24+ — current V8 turboshaft WASM JIT builds
+// have a Zone allocator bug that reliably crashes when compiling
+// tree-sitter grammars (see #54, #81, #140). The previous behaviour was
+// a soft console.warn that scrolls off-screen before the OOM crash
+// seconds later, leading to a steady stream of "what is this OOM" reports.
 // Hard-exit before any WASM work; allow override via env var for users
 // who patched V8 themselves or want to test a future fix.
 const nodeVersion = process.versions.node;
-const nodeMajor = parseInt(nodeVersion.split('.')[0] ?? '0', 10);
-if (nodeMajor >= 25) {
-  process.stderr.write(buildNode25BlockBanner(nodeVersion) + '\n');
+if (isUnsupportedNodeVersion(nodeVersion)) {
+  process.stderr.write(buildUnsupportedNodeBlockBanner(nodeVersion) + '\n');
   if (!process.env.CODEGRAPH_ALLOW_UNSAFE_NODE) {
     process.exit(1);
   }
