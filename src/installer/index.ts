@@ -97,11 +97,11 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     return;
   }
 
-  // Step 2: install codegraph globally on PATH (always offered;
+  // Step 2: install the codegraph npm package on PATH (always offered;
   // matches existing behavior). Skipped when --yes (assume present).
   if (!useDefaults) {
     const shouldInstallGlobally = await clack.confirm({
-      message: 'Install codegraph globally? (Required for MCP server)',
+      message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
       initialValue: true,
     });
     if (clack.isCancel(shouldInstallGlobally)) {
@@ -110,20 +110,20 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
     if (shouldInstallGlobally) {
       const s = clack.spinner();
-      s.start('Installing codegraph globally...');
+      s.start('Installing codegraph CLI...');
       try {
         execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe' });
-        s.stop('Installed codegraph globally');
+        s.stop('Installed codegraph CLI on PATH');
       } catch {
-        s.stop('Could not install globally (permission denied)');
+        s.stop('Could not install (permission denied)');
         clack.log.warn('Try: sudo npm install -g @colbymchenry/codegraph');
       }
     } else {
-      clack.log.info('Skipped global install — MCP server may not work without it');
+      clack.log.info('Skipped CLI install — agents will not be able to launch the MCP server without it');
     }
   }
 
-  // Step 3: install location.
+  // Step 3: where the per-agent config files should land.
   let location: Location;
   if (opts.location) {
     location = opts.location;
@@ -131,17 +131,18 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     location = 'global';
   } else {
     // If every selected target is global-only (e.g. Codex), skip the
-    // prompt and force global — local would just produce skip warnings.
+    // prompt and force user-wide — project-local would just produce
+    // skip warnings.
     const allGlobalOnly = targets.every((t) => !t.supportsLocation('local'));
     if (allGlobalOnly) {
       location = 'global';
-      clack.log.info('Using global install (selected agents do not support project-local).');
+      clack.log.info('Writing user-wide configs (selected agents have no project-local config).');
     } else {
       const sel = await clack.select({
-        message: 'Where would you like to install?',
+        message: 'Apply agent configs to all your projects, or just this one?',
         options: [
-          { value: 'global' as const, label: 'Global', hint: 'available in all projects' },
-          { value: 'local' as const, label: 'Local',  hint: 'this project only' },
+          { value: 'global' as const, label: 'All projects', hint: '~/.claude, ~/.cursor, etc.' },
+          { value: 'local'  as const, label: 'Just this project', hint: './.claude, ./.cursor, etc.' },
         ],
         initialValue: 'global' as const,
       });
