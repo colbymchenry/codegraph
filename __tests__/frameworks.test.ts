@@ -199,6 +199,194 @@ describe('laravelResolver.extract', () => {
   });
 });
 
+import { codeigniterResolver } from '../src/resolution/frameworks/codeigniter';
+
+describe('codeigniterResolver.extract', () => {
+  it('extracts explicit route from routes.php', () => {
+    const src = `$route['products/(:any)'] = 'catalog/product_lookup';\n`;
+    const { nodes, references } = codeigniterResolver.extract!(
+      'application/config/routes.php',
+      src
+    );
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].name).toBe('ANY /products/(:any)');
+    expect(nodes[0].kind).toBe('route');
+    expect(references[0].referenceName).toBe('catalog/product_lookup');
+  });
+
+  it('extracts HTTP-verb-scoped route from routes.php', () => {
+    const src = `$route['api/users']['POST'] = 'api/users/create';\n`;
+    const { nodes } = codeigniterResolver.extract!('application/config/routes.php', src);
+    expect(nodes[0].name).toBe('POST /api/users');
+  });
+
+  it('skips reserved keys like default_controller and 404_override', () => {
+    const src =
+      `$route['default_controller'] = 'welcome';\n` +
+      `$route['404_override'] = '';\n` +
+      `$route['translate_uri_dashes'] = FALSE;\n`;
+    const { nodes } = codeigniterResolver.extract!('application/config/routes.php', src);
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('synthesizes convention routes for each public controller method', () => {
+    const src =
+      `<?php\n` +
+      `class Welcome extends CI_Controller {\n` +
+      `  public function index() {}\n` +
+      `  public function about() {}\n` +
+      `  public function _helper() {}\n` +
+      `  private function secret() {}\n` +
+      `  public function __construct() { parent::__construct(); }\n` +
+      `}\n`;
+    const { nodes, references } = codeigniterResolver.extract!(
+      'application/controllers/Welcome.php',
+      src
+    );
+    const paths = nodes.map((n) => n.name).sort();
+    expect(paths).toEqual(['ANY /welcome', 'ANY /welcome/about']);
+    const refNames = references.map((r) => r.referenceName).sort();
+    expect(refNames).toEqual(['about', 'index']);
+  });
+
+  it('builds URL from controller subdirectory', () => {
+    const src =
+      `class Users extends CI_Controller {\n` +
+      `  public function list() {}\n` +
+      `}\n`;
+    const { nodes } = codeigniterResolver.extract!(
+      'application/controllers/admin/Users.php',
+      src
+    );
+    expect(nodes.map((n) => n.name).sort()).toEqual(['ANY /admin/users/list']);
+  });
+
+  it('does not emit convention routes for files that are not CI controllers', () => {
+    const src = `class Foo {\n  public function bar() {}\n}\n`;
+    const { nodes } = codeigniterResolver.extract!(
+      'application/controllers/Foo.php',
+      src
+    );
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('ignores non-controller PHP files', () => {
+    const src = `class Foo extends CI_Controller {\n  public function bar() {}\n}\n`;
+    const { nodes } = codeigniterResolver.extract!('app/Http/Foo.php', src);
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('emits file -> Model imports reference for $this->load->model() calls', () => {
+    const src =
+      `<?php\n` +
+      `class Welcome extends CI_Controller {\n` +
+      `  public function index() {\n` +
+      `    $this->load->model('Restomodel');\n` +
+      `    $this->load->model('drivers/Drivers_model');\n` +
+      `    $this->load->library('Form_validation');\n` +
+      `  }\n` +
+      `}\n`;
+    const { references } = codeigniterResolver.extract!(
+      'application/controllers/Welcome.php',
+      src
+    );
+
+    const imports = references.filter((r) => r.referenceKind === 'imports');
+    const names = imports.map((r) => r.referenceName).sort();
+    expect(names).toEqual(['Drivers_model', 'Form_validation', 'Restomodel']);
+
+    const ref = imports.find((r) => r.referenceName === 'Restomodel')!;
+    expect(ref.fromNodeId).toBe('file:application/controllers/Welcome.php');
+  });
+
+  it('deduplicates repeated $this->load->model() calls in the same file', () => {
+    const src =
+      `<?php\n` +
+      `class Foo extends CI_Controller {\n` +
+      `  public function a() { $this->load->model('Restomodel'); }\n` +
+      `  public function b() { $this->load->model('Restomodel'); }\n` +
+      `  public function c() { $this->load->model('Restomodel'); }\n` +
+      `}\n`;
+    const { references } = codeigniterResolver.extract!(
+      'application/controllers/Foo.php',
+      src
+    );
+    const imports = references.filter(
+      (r) => r.referenceKind === 'imports' && r.referenceName === 'Restomodel'
+    );
+    expect(imports).toHaveLength(1);
+  });
+
+  it('capitalizes lowercase model names per CI3 file naming convention', () => {
+    const src = `<?php\n$this->load->model('restomodel');\n`;
+    const { references } = codeigniterResolver.extract!(
+      'application/libraries/MyLib.php',
+      src
+    );
+    const ref = references.find((r) => r.referenceName === 'Restomodel');
+    expect(ref).toBeDefined();
+  });
+
+  it('emits file -> ModelName imports for magic property access $this->Foo->bar()', () => {
+    const src =
+      `<?php\n` +
+      `class Welcome extends CI_Controller {\n` +
+      `  public function index() {\n` +
+      `    $hour = $this->Restomodel->get_real_hour(now());\n` +
+      `    $this->Drivers_model->insert($data);\n` +
+      `    $this->load->view('welcome');\n` +
+      `    $row = $this->db->where('id', 1)->get('users')->row();\n` +
+      `    $this->session->set_userdata('x', 'y');\n` +
+      `  }\n` +
+      `}\n`;
+    const { references } = codeigniterResolver.extract!(
+      'application/controllers/Welcome.php',
+      src
+    );
+    const names = references
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName)
+      .sort();
+    // CI3 built-ins (load, db, session) are lowercase and must be excluded.
+    expect(names).toEqual(['Drivers_model', 'Restomodel']);
+  });
+
+  it('does not duplicate when both load->model and $this->X-> appear', () => {
+    const src =
+      `<?php\n` +
+      `class Foo extends CI_Controller {\n` +
+      `  public function a() {\n` +
+      `    $this->load->model('Restomodel');\n` +
+      `    return $this->Restomodel->something();\n` +
+      `  }\n` +
+      `}\n`;
+    const { references } = codeigniterResolver.extract!(
+      'application/controllers/Foo.php',
+      src
+    );
+    const restoRefs = references.filter(
+      (r) => r.referenceKind === 'imports' && r.referenceName === 'Restomodel'
+    );
+    expect(restoRefs).toHaveLength(1);
+  });
+
+  it('recognizes MX_Controller (HMVC) and MY_Controller base classes', () => {
+    const mx = `class Foo extends MX_Controller {\n  public function index() {}\n}\n`;
+    const { nodes: mxNodes } = codeigniterResolver.extract!(
+      'application/controllers/Foo.php',
+      mx
+    );
+    expect(mxNodes).toHaveLength(1);
+
+    const my = `class Bar extends MY_Controller {\n  public function index() {}\n}\n`;
+    const { nodes: myNodes } = codeigniterResolver.extract!(
+      'application/controllers/Bar.php',
+      my
+    );
+    expect(myNodes).toHaveLength(1);
+  });
+});
+
 import { railsResolver } from '../src/resolution/frameworks/ruby';
 
 describe('railsResolver.extract', () => {

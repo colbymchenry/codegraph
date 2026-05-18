@@ -7,6 +7,7 @@
 import { FrameworkResolver, ResolutionContext } from '../types';
 import type { Language } from '../../types';
 import { laravelResolver } from './laravel';
+import { codeigniterResolver } from './codeigniter';
 import { expressResolver } from './express';
 import { reactResolver } from './react';
 import { svelteResolver } from './svelte';
@@ -25,6 +26,7 @@ import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   // PHP
   laravelResolver,
+  codeigniterResolver,
   // JavaScript/TypeScript
   expressResolver,
   reactResolver,
@@ -104,6 +106,7 @@ export function registerFrameworkResolver(resolver: FrameworkResolver): void {
 
 // Re-export framework resolvers
 export { laravelResolver, FACADE_MAPPINGS } from './laravel';
+export { codeigniterResolver } from './codeigniter';
 export { expressResolver } from './express';
 export { reactResolver } from './react';
 export { svelteResolver } from './svelte';
