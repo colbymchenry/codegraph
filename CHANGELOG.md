@@ -7,6 +7,37 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **CodeIgniter 3 framework support**. CodeGraph now indexes CI3 projects
+  with the same depth it already had for Laravel:
+  - **Explicit routes** from `application/config/routes.php` —
+    `$route['pattern'] = 'controller/method'`, including HTTP-verb-scoped
+    variants (`$route['x']['POST'] = '...'`) and CI3 wildcards (`(:any)`,
+    `(:num)`). Reserved keys (`default_controller`, `404_override`,
+    `translate_uri_dashes`) are skipped.
+  - **Convention routes** synthesized from every public method on each
+    controller in `application/controllers/**`. Without this the graph
+    would be near-empty since most CI3 projects barely touch routes.php.
+    URLs are lowercased per CI3 routing rules, methods prefixed with `_`
+    and `__construct`/`__destruct` are excluded. Recognized controller
+    bases: `CI_Controller`, `MX_Controller` (HMVC), `MY_Controller`,
+    `REST_Controller`, plus common project-specific patterns
+    (`Admin_Controller`, `Public_Controller`, `Frontend_Controller`,
+    `Backend_Controller`).
+  - **Magic-loaded models and libraries** — both `$this->load->model('X')`
+    / `$this->load->library('X')` calls and the runtime property accesses
+    that follow (`$this->ModelName->method()`). Critical for CI3
+    codebases: in a real-world project, only ~0.2% of model usages are
+    explicit `load->model()` calls; the rest are property accesses on
+    pre-loaded models that pure static analysis can't see. The resolver
+    filters by PascalCase to avoid false positives on built-in CI3
+    properties (`$this->load`, `$this->db`, `$this->input`, …).
+- Reference resolution: `controller/method` strings in routes.php resolve
+  to method nodes in `application/controllers/`, trying both PascalCase
+  (CI3 file-naming convention) and the literal segment as fallback.
+
 ## [0.7.8] - 2026-05-17
 
 ### Fixed
