@@ -20,7 +20,7 @@ import {
   getTarget,
   resolveTargetFlag,
 } from './targets/registry';
-import type { AgentTarget, Location } from './targets/types';
+import type { AgentTarget, Location, WriteResult } from './targets/types';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -208,6 +208,38 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     ? `Done! Restart your agent${targets.length > 1 ? 's' : ''} to use CodeGraph.`
     : 'Done!';
   clack.outro(finalNote);
+}
+
+/**
+ * For every target that has a global config and exposes
+ * `wireProjectSurfaces`, write its project-local surfaces (e.g.
+ * Cursor's `.cursor/rules/codegraph.mdc`). Idempotent — runs
+ * silently when there's nothing to write.
+ *
+ * Called by `codegraph init` so that a user who ran
+ * `codegraph install` once globally doesn't have to re-run it per
+ * project to get full agent support.
+ *
+ * Returns the list of `(target, file)` pairs that were created or
+ * updated — caller decides how to surface them.
+ */
+export function wireProjectSurfacesForGlobalAgents(): Array<{
+  target: AgentTarget;
+  file: WriteResult['files'][number];
+}> {
+  const written: Array<{ target: AgentTarget; file: WriteResult['files'][number] }> = [];
+  for (const target of ALL_TARGETS) {
+    if (typeof target.wireProjectSurfaces !== 'function') continue;
+    const detection = target.detect('global');
+    if (!detection.alreadyConfigured) continue;
+    const result = target.wireProjectSurfaces();
+    for (const file of result.files) {
+      if (file.action === 'created' || file.action === 'updated') {
+        written.push({ target, file });
+      }
+    }
+  }
+  return written;
 }
 
 /**

@@ -159,6 +159,16 @@ class CursorTarget implements AgentTarget {
       ? [mcpJsonPath(loc), rulesPath()]
       : [mcpJsonPath(loc)];
   }
+
+  /**
+   * Write the project-local `.cursor/rules/codegraph.mdc` file. Used
+   * by `codegraph init` to bootstrap projects that have only the
+   * global `~/.cursor/mcp.json` — without the rules file, the Cursor
+   * agent has no signal to prefer codegraph over native grep.
+   */
+  wireProjectSurfaces(): WriteResult {
+    return { files: [writeRulesEntry()] };
+  }
 }
 
 /**
