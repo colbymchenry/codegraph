@@ -2,7 +2,7 @@
 
 # CodeGraph
 
-### Supercharge Claude Code with Semantic Code Intelligence
+### Supercharge Claude Code, Cursor & Codex with Semantic Code Intelligence
 
 **94% fewer tool calls · 77% faster exploration · 100% local**
 
@@ -14,6 +14,11 @@
 [![macOS](https://img.shields.io/badge/macOS-supported-blue.svg)](#)
 [![Linux](https://img.shields.io/badge/Linux-supported-blue.svg)](#)
 
+[![Claude Code](https://img.shields.io/badge/Claude_Code-supported-blueviolet.svg)](#)
+[![Cursor](https://img.shields.io/badge/Cursor-supported-blueviolet.svg)](#)
+[![Codex CLI](https://img.shields.io/badge/Codex_CLI-supported-blueviolet.svg)](#)
+[![opencode](https://img.shields.io/badge/opencode-supported-blueviolet.svg)](#)
+
 <br />
 
 ### Get Started
@@ -22,7 +27,7 @@
 npx @colbymchenry/codegraph
 ```
 
-<sub>Interactive installer configures Claude Code automatically</sub>
+<sub>Interactive installer auto-configures your agent(s) — Claude Code, Cursor, Codex CLI, opencode</sub>
 
 #### Initialize Projects
 
@@ -149,11 +154,12 @@ npx @colbymchenry/codegraph
 ```
 
 The installer will:
-- Prompt to install `codegraph` globally (needed for the MCP server)
 - Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**
+- Prompt to install `codegraph` on your PATH (so agents can launch the MCP server)
+- Ask whether configs apply to all your projects or just this one
 - Write each chosen agent's MCP server config + an instructions file (e.g. `CLAUDE.md`, `.cursor/rules/codegraph.mdc`, `~/.codex/AGENTS.md`)
-- Set up auto-allow permissions for the chosen agent (Claude Code only)
-- Optionally initialize your current project
+- Set up auto-allow permissions when Claude Code is one of the targets
+- Initialize your current project (local installs only)
 
 **Non-interactive (scripting / CI):**
 
@@ -183,7 +189,9 @@ cd your-project
 codegraph init -i
 ```
 
-That's it! Claude Code will use CodeGraph tools automatically when a `.codegraph/` directory exists.
+Builds the per-project knowledge graph index. Also wires up any project-local agent surfaces (e.g. Cursor's `.cursor/rules/codegraph.mdc`) so a single global `codegraph install` works in every project you open — no need to re-run the installer per project.
+
+That's it — your agent will use CodeGraph tools automatically when a `.codegraph/` directory exists.
 
 <details>
 <summary><strong>Manual Setup (Alternative)</strong></summary>
