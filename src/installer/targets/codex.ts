@@ -16,7 +16,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
+import { homedir } from './home';
 import {
   AgentTarget,
   DetectionResult,
@@ -40,7 +40,7 @@ import { buildTomlTable, removeTomlTable, upsertTomlTable } from './toml';
 const TOML_HEADER = 'mcp_servers.codegraph';
 
 function configDir(): string {
-  return path.join(os.homedir(), '.codex');
+  return path.join(homedir(), '.codex');
 }
 function tomlConfigPath(): string {
   return path.join(configDir(), 'config.toml');

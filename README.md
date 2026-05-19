@@ -8,7 +8,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@colbymchenry/codegraph.svg)](https://www.npmjs.com/package/@colbymchenry/codegraph)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
+[![Bun](https://img.shields.io/badge/Bun-1.1+-f9f1e1.svg)](https://bun.sh/)
 
 [![Windows](https://img.shields.io/badge/Windows-supported-blue.svg)](#)
 [![macOS](https://img.shields.io/badge/macOS-supported-blue.svg)](#)
@@ -24,7 +24,7 @@
 ### Get Started
 
 ```bash
-npx @colbymchenry/codegraph
+bunx @colbymchenry/codegraph
 ```
 
 <sub>Interactive installer auto-configures your agent(s) — Claude Code, Cursor, Codex CLI, opencode</sub>
@@ -150,7 +150,7 @@ CodeGraph detects web-framework routing files and emits `route` nodes linked by 
 ### 1. Run the Installer
 
 ```bash
-npx @colbymchenry/codegraph
+bunx @colbymchenry/codegraph
 ```
 
 The installer will:
@@ -198,7 +198,7 @@ That's it — your agent will use CodeGraph tools automatically when a `.codegra
 
 **Install globally:**
 ```bash
-npm install -g @colbymchenry/codegraph
+bun install -g @colbymchenry/codegraph
 ```
 
 **Add to `~/.claude.json`:**
@@ -362,7 +362,7 @@ codegraph affected src/auth.ts --filter "e2e/*"     # Custom test file pattern
 #!/usr/bin/env bash
 AFFECTED=$(git diff --name-only HEAD | codegraph affected --stdin --quiet)
 if [ -n "$AFFECTED" ]; then
-  npx vitest run $AFFECTED
+  bun test $AFFECTED
 fi
 ```
 
@@ -464,29 +464,7 @@ The `.codegraph/config.json` file controls indexing:
 
 **Indexing is slow** — Check that `node_modules` and other large directories are excluded. Use `--quiet` to reduce output overhead.
 
-**Indexing is slow / MCP `database is locked` / WASM fallback active** — `codegraph` ships with a WASM SQLite fallback for environments where `better-sqlite3` (a native module, declared as `optionalDependencies`) can't install. The fallback is 5-10x slower than the native backend and uses a journal mode that lets writers block readers, so MCP queries can also hit `database is locked` while indexing runs. Run `codegraph status` and look at the `Backend:` line:
-
-- `Backend: native` — you're on the fast path, nothing to do.
-- `Backend: wasm` — you're on the slow fallback. Common causes: missing C build tools, prebuilt binary unavailable for your Node version, or your Node version changed after install. Fix:
-
-  ```bash
-  # macOS
-  xcode-select --install                                  # installs the C compiler
-
-  # Linux (Debian / Ubuntu)
-  sudo apt install build-essential python3 make
-
-  # Linux (RHEL / Fedora)
-  sudo yum groupinstall "Development Tools"
-
-  # Then rebuild on any platform:
-  npm rebuild better-sqlite3
-
-  # Or force-include as a hard dep:
-  npm install better-sqlite3 --save
-  ```
-
-  After the fix, `codegraph status` should show `Backend: native`.
+**`bun: command not found`** — CodeGraph runs on the [Bun](https://bun.sh) runtime. Install it with `curl -fsSL https://bun.sh/install | bash` (macOS/Linux) or `powershell -c "irm bun.sh/install.ps1 | iex"` (Windows). Bun 1.1+ is required.
 
 **MCP server not connecting** — Ensure the project is initialized/indexed, verify the path in your MCP config, and check that `codegraph serve --mcp` works from the command line.
 

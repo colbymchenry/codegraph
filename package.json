@@ -13,16 +13,16 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc && npm run copy-assets && node -e \"require('fs').chmodSync('dist/bin/codegraph.js', 0o755)\"",
-    "preuninstall": "node dist/bin/uninstall.js",
-    "copy-assets": "node -e \"const fs=require('fs');fs.mkdirSync('dist/db',{recursive:true});fs.copyFileSync('src/db/schema.sql','dist/db/schema.sql');fs.mkdirSync('dist/extraction/wasm',{recursive:true});fs.readdirSync('src/extraction/wasm').filter(f=>f.endsWith('.wasm')).forEach(f=>fs.copyFileSync('src/extraction/wasm/'+f,'dist/extraction/wasm/'+f))\"",
-    "dev": "tsc --watch",
-    "cli": "npm run build && node dist/bin/codegraph.js",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:eval": "vitest run __tests__/evaluation/",
-    "eval": "npm run build && npx tsx __tests__/evaluation/runner.ts",
-    "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true})\""
+    "build": "tsc -p tsconfig.build.json && bun run copy-assets && bun -e \"require('fs').chmodSync('dist/bin/codegraph.js', 0o755)\"",
+    "preuninstall": "bun dist/bin/uninstall.js",
+    "copy-assets": "bun -e \"const fs=require('fs');fs.mkdirSync('dist/db',{recursive:true});fs.copyFileSync('src/db/schema.sql','dist/db/schema.sql');fs.mkdirSync('dist/extraction/wasm',{recursive:true});fs.readdirSync('src/extraction/wasm').filter(f=>f.endsWith('.wasm')).forEach(f=>fs.copyFileSync('src/extraction/wasm/'+f,'dist/extraction/wasm/'+f))\"",
+    "dev": "tsc -p tsconfig.build.json --watch",
+    "cli": "bun run build && bun dist/bin/codegraph.js",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "test:eval": "bun test __tests__/evaluation/",
+    "eval": "bun run build && bun __tests__/evaluation/runner.ts",
+    "clean": "bun -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true})\""
   },
   "keywords": [
     "code-intelligence",
@@ -37,23 +37,19 @@
     "fast-string-width": "^3.0.2",
     "fast-wrap-ansi": "^0.2.0",
     "jsonc-parser": "^3.3.1",
-    "node-sqlite3-wasm": "^0.8.30",
     "picomatch": "^4.0.3",
     "sisteransi": "^1.0.5",
     "tree-sitter-wasms": "^0.1.11",
     "web-tree-sitter": "^0.25.3"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.0",
+    "@types/bun": "^1.1.0",
     "@types/node": "^20.19.30",
     "@types/picomatch": "^4.0.2",
     "typescript": "^5.0.0",
     "vitest": "^2.1.9"
   },
-  "optionalDependencies": {
-    "better-sqlite3": "^11.0.0"
-  },
   "engines": {
-    "node": ">=18.0.0 <25.0.0"
+    "bun": ">=1.1.0"
   }
 }

@@ -5,7 +5,7 @@
 # Run AFTER you have:
 #   - bumped package.json
 #   - added a `## [X.Y.Z] - YYYY-MM-DD` block at the top of CHANGELOG.md
-#   - committed, pushed to origin, and run `npm publish`
+#   - committed, pushed to origin, and run `bun publish`
 #
 # Idempotent: safe to re-run after a partial failure. Skips steps that are
 # already done (tag created, tag pushed, release published).

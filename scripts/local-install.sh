@@ -11,24 +11,24 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-PKG=$(node -p "require('./package.json').name")
-VERSION=$(node -p "require('./package.json').version")
+PKG=$(bun -e "console.log(require('./package.json').name)")
+VERSION=$(bun -e "console.log(require('./package.json').version)")
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
 if [ "${1:-}" = "--undo" ]; then
   echo "→ unlinking ${PKG}"
-  npm unlink -g "${PKG}" >/dev/null 2>&1 || true
+  bun unlink -g "${PKG}" >/dev/null 2>&1 || true
   echo "→ reinstalling published ${PKG}"
-  npm install -g "${PKG}"
+  bun install -g "${PKG}"
   echo "done: global codegraph -> $(command -v codegraph)"
   exit 0
 fi
 
 echo "→ building ${PKG} ${VERSION} (${BRANCH})"
-npm run build
+bun run build
 
 echo "→ linking globally"
-npm link
+bun link
 
 LINKED=$(command -v codegraph || echo "(not on PATH)")
 echo

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * CodeGraph CLI
  *
@@ -25,8 +25,6 @@ import { getCodeGraphDir, isInitialized } from '../directory';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 
-import { buildNode25BlockBanner } from './node-version-check';
-
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
   try {
@@ -34,9 +32,9 @@ async function loadCodeGraph(): Promise<typeof import('../index')> {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`\x1b[31m${getGlyphs().err}\x1b[0m Failed to load CodeGraph modules.`);
-    console.error(`\n  Node: ${process.version}  Platform: ${process.platform} ${process.arch}`);
+    console.error(`\n  Runtime: ${process.versions.bun ? 'bun ' + process.versions.bun : 'node ' + process.version}  Platform: ${process.platform} ${process.arch}`);
     console.error(`\n  Error: ${msg}`);
-    console.error('\n  Try reinstalling with: npm install -g @colbymchenry/codegraph\n');
+    console.error('\n  Try reinstalling with: bun install -g @colbymchenry/codegraph\n');
     process.exit(1);
   }
 }
@@ -46,23 +44,6 @@ async function loadCodeGraph(): Promise<typeof import('../index')> {
 // eslint-disable-next-line @typescript-eslint/no-implied-eval
 const importESM = new Function('specifier', 'return import(specifier)') as
   (specifier: string) => Promise<typeof import('@clack/prompts')>;
-
-// Block CodeGraph on Node.js 25.x — V8's turboshaft WASM JIT has a Zone
-// allocator bug that reliably crashes when compiling tree-sitter
-// grammars (see #54, #81, #140). The previous behaviour was a soft
-// console.warn that scrolls off-screen before the OOM crash 30 seconds
-// later, leading to a steady stream of "what is this OOM" reports.
-// Hard-exit before any WASM work; allow override via env var for users
-// who patched V8 themselves or want to test a future fix.
-const nodeVersion = process.versions.node;
-const nodeMajor = parseInt(nodeVersion.split('.')[0] ?? '0', 10);
-if (nodeMajor >= 25) {
-  process.stderr.write(buildNode25BlockBanner(nodeVersion) + '\n');
-  if (!process.env.CODEGRAPH_ALLOW_UNSAFE_NODE) {
-    process.exit(1);
-  }
-  // Override active — banner shown for visibility, continuing.
-}
 
 // Check if running with no arguments - run installer
 if (process.argv.length === 2) {
@@ -670,7 +651,6 @@ program
       const cg = await CodeGraph.open(projectPath);
       const stats = cg.getStats();
       const changes = cg.getChangedFiles();
-      const backend = cg.getBackend();
 
       // JSON output mode
       if (options.json) {
@@ -681,7 +661,6 @@ program
           nodeCount: stats.nodeCount,
           edgeCount: stats.edgeCount,
           dbSizeBytes: stats.dbSizeBytes,
-          backend,
           nodesByKind: stats.nodesByKind,
           languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
           pendingChanges: {
@@ -706,14 +685,6 @@ program
       console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);
       console.log(`  Edges:     ${formatNumber(stats.edgeCount)}`);
       console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
-      // Surface the active SQLite backend so users can spot the silent
-      // WASM fallback (5-10x slower). better-sqlite3 is in
-      // `optionalDependencies`, so `npm install` succeeds without it
-      // when the native build fails.
-      const backendLabel = backend === 'native'
-        ? chalk.green('native')
-        : chalk.yellow(`wasm ${getGlyphs().dash} slower fallback; run \`npm rebuild better-sqlite3\``);
-      console.log(`  Backend:   ${backendLabel}`);
       console.log();
 
       // Node breakdown

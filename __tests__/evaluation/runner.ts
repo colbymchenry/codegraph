@@ -8,8 +8,8 @@ import type { EvalReport, EvalResult } from './types.js';
 
 const codebasePath = process.env.EVAL_CODEBASE || process.argv[2];
 if (!codebasePath) {
-  console.error('Usage: EVAL_CODEBASE=/path/to/codebase npx tsx __tests__/evaluation/runner.ts');
-  console.error('   or: npx tsx __tests__/evaluation/runner.ts /path/to/codebase');
+  console.error('Usage: EVAL_CODEBASE=/path/to/codebase bun __tests__/evaluation/runner.ts');
+  console.error('   or: bun __tests__/evaluation/runner.ts /path/to/codebase');
   process.exit(1);
 }
 

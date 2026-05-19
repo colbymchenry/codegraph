@@ -33,7 +33,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
+import { homedir } from './home';
 import {
   AgentTarget,
   DetectionResult,
@@ -58,7 +58,7 @@ import {
 
 function mcpJsonPath(loc: Location): string {
   return loc === 'global'
-    ? path.join(os.homedir(), '.cursor', 'mcp.json')
+    ? path.join(homedir(), '.cursor', 'mcp.json')
     : path.join(process.cwd(), '.cursor', 'mcp.json');
 }
 /**
@@ -103,7 +103,7 @@ class CursorTarget implements AgentTarget {
     // "Installed" heuristic: does ~/.cursor exist (global) or has the
     // user opted into a project-local cursor config dir?
     const installed = loc === 'global'
-      ? fs.existsSync(path.join(os.homedir(), '.cursor'))
+      ? fs.existsSync(path.join(homedir(), '.cursor'))
       : fs.existsSync(path.join(process.cwd(), '.cursor'));
     return { installed, alreadyConfigured, configPath: mcpPath };
   }

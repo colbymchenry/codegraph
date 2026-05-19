@@ -28,7 +28,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
+import { homedir } from './home';
 import { parse as parseJsonc, modify, applyEdits } from 'jsonc-parser';
 import {
   AgentTarget,
@@ -51,13 +51,13 @@ import {
 
 function globalConfigDir(): string {
   if (process.platform === 'win32') {
-    const appData = process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming');
+    const appData = process.env.APPDATA ?? path.join(homedir(), 'AppData', 'Roaming');
     return path.join(appData, 'opencode');
   }
   // XDG_CONFIG_HOME if set, else ~/.config — matches opencode's docs.
   const xdg = process.env.XDG_CONFIG_HOME && process.env.XDG_CONFIG_HOME.trim().length > 0
     ? process.env.XDG_CONFIG_HOME
-    : path.join(os.homedir(), '.config');
+    : path.join(homedir(), '.config');
   return path.join(xdg, 'opencode');
 }
 

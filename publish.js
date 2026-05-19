@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -12,6 +12,15 @@ const rl = readline.createInterface({ input: process.stdin, output: process.stdo
 
 function ask(question) {
   return new Promise((resolve) => rl.question(question, resolve));
+}
+
+function bumpVersion(bump) {
+  const updated = { ...pkg };
+  if (bump === 'patch') updated.version = `${major}.${minor}.${patch + 1}`;
+  else if (bump === 'minor') updated.version = `${major}.${minor + 1}.0`;
+  else if (bump === 'major') updated.version = `${major + 1}.0.0`;
+  fs.writeFileSync(PKG_PATH, JSON.stringify(updated, null, 2) + '\n');
+  return updated.version;
 }
 
 async function main() {
@@ -34,13 +43,10 @@ async function main() {
       process.exit(1);
   }
 
-  // Bump version in package.json
-  execSync(`npm version ${bump} --no-git-tag-version`, { stdio: 'inherit' });
+  const newVersion = bumpVersion(bump);
+  console.log(`\nVersion bumped to ${newVersion}`);
 
-  const updated = JSON.parse(fs.readFileSync(PKG_PATH, 'utf-8'));
-  console.log(`\nVersion bumped to ${updated.version}`);
-
-  const confirm = await ask(`Publish ${updated.name}@${updated.version} to npm? (y/n): `);
+  const confirm = await ask(`Publish ${pkg.name}@${newVersion} to npm? (y/n): `);
   if (confirm.trim().toLowerCase() !== 'y') {
     console.log('Aborted.');
     rl.close();
@@ -49,12 +55,12 @@ async function main() {
 
   // Build and publish
   console.log('\nBuilding...');
-  execSync('npm run build', { stdio: 'inherit' });
+  execSync('bun run build', { stdio: 'inherit' });
 
   console.log('\nPublishing...');
-  execSync('npm publish --access public', { stdio: 'inherit' });
+  execSync('bun publish --access public', { stdio: 'inherit' });
 
-  console.log(`\nPublished ${updated.name}@${updated.version}`);
+  console.log(`\nPublished ${pkg.name}@${newVersion}`);
   rl.close();
 }
 

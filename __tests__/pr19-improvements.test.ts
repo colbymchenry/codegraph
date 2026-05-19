@@ -45,10 +45,10 @@ function cleanupTempDir(dir: string): void {
   }
 }
 
-// Check if better-sqlite3 native bindings are available
+// Check if SQLite bindings are available (bun:sqlite is built-in under Bun)
 function hasSqliteBindings(): boolean {
   try {
-    const Database = require('better-sqlite3');
+    const { Database } = require('bun:sqlite');
     const db = new Database(':memory:');
     db.close();
     return true;

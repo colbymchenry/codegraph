@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "web-tree-sitter": ["./src/web-tree-sitter.d.ts"]
+    }
+  }
+}
