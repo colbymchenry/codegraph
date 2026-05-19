@@ -32,7 +32,7 @@ async function loadCodeGraph(): Promise<typeof import('../index')> {
     return await import('../index');
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error('\x1b[31m✗\x1b[0m Failed to load CodeGraph modules.');
+    console.error('\x1b[31m[ERR]\x1b[0m Failed to load CodeGraph modules.');
     console.error(`\n  Node: ${process.version}  Platform: ${process.platform} ${process.arch}`);
     console.error(`\n  Error: ${msg}`);
     console.error('\n  Try reinstalling with: npm install -g @colbymchenry/codegraph\n');
@@ -191,7 +191,7 @@ function formatDuration(ms: number): string {
 
 /**
  * Create a plain-text progress callback for --verbose mode.
- * No animations, no ANSI tricks — just timestamped lines to stdout.
+ * No animations, no ANSI tricks - just timestamped lines to stdout.
  */
 function createVerboseProgress(): (progress: { phase: string; current: number; total: number; currentFile?: string }) => void {
   let lastPhase = '';
@@ -212,10 +212,10 @@ function createVerboseProgress(): (progress: { phase: string; current: number; t
       // Log every 5% to keep output manageable
       if (pct >= lastPct + 5 || progress.current === progress.total) {
         lastPct = pct;
-        console.log(`[${elapsed}s]   ${progress.current}/${progress.total} (${pct}%)${progress.currentFile ? ` — ${progress.currentFile}` : ''}`);
+        console.log(`[${elapsed}s]   ${progress.current}/${progress.total} (${pct}%)${progress.currentFile ? ` - ${progress.currentFile}` : ''}`);
       }
     } else if (progress.current > 0) {
-      // Scanning phase (no total yet) — log periodically
+      // Scanning phase (no total yet) - log periodically
       if (progress.current % 1000 === 0 || progress.current === 1) {
         console.log(`[${elapsed}s]   ${formatNumber(progress.current)} files found`);
       }
@@ -227,28 +227,28 @@ function createVerboseProgress(): (progress: { phase: string; current: number; t
  * Print success message
  */
 function success(message: string): void {
-  console.log(chalk.green('✓') + ' ' + message);
+  console.log(chalk.green('[OK]') + ' ' + message);
 }
 
 /**
  * Print error message
  */
 function error(message: string): void {
-  console.error(chalk.red('✗') + ' ' + message);
+  console.error(chalk.red('[ERR]') + ' ' + message);
 }
 
 /**
  * Print info message
  */
 function info(message: string): void {
-  console.log(chalk.blue('ℹ') + ' ' + message);
+  console.log(chalk.blue('[INFO]') + ' ' + message);
 }
 
 /**
  * Print warning message
  */
 function warn(message: string): void {
-  console.log(chalk.yellow('⚠') + ' ' + message);
+  console.log(chalk.yellow('[WARN]') + ' ' + message);
 }
 
 type IndexResult = {
