@@ -7,6 +7,28 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **MCP / explore**: `codegraph_explore` output is now adaptive to project
+  size. The tool used to apply a fixed 35KB cap regardless of how large the
+  codebase was, which on small projects (~100 files) produced bigger
+  responses than the agent's native grep+Read flow would have — exactly the
+  scenario reported in
+  [#185](https://github.com/colbymchenry/codegraph/issues/185). The budget
+  now scales with indexed file count: small projects (<500 files) cap at
+  ~18KB and skip the "Additional relevant files" / completeness / explore-
+  budget reminders that earn their keep on bigger codebases; medium
+  (<5,000) caps at ~28KB; large (<15,000) keeps the historical ~35KB; very
+  large goes up to ~38KB. A new per-file char cap also prevents a single
+  file with many adjacent symbols from collapsing into one whole-file dump
+  (the Alamofire `Session.swift` case from #185). Measured against the
+  same repos used in the README benchmark: Alamofire ~62% smaller per call,
+  Excalidraw ~35%, VS Code ~14%. Agent-trust floor still holds — the
+  Relationships section, scored cluster selection, and structured-source
+  output are all retained. Thanks to
+  [@essopsp](https://github.com/essopsp) for the repro.
+
 ## [0.7.10] - 2026-05-19
 
 ### Fixed
