@@ -23,6 +23,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized } from '../directory';
 import { createShimmerProgress } from '../ui/shimmer-progress';
+import { getGlyphs } from '../ui/glyphs';
 
 import {
   buildUnsupportedNodeBlockBanner,
@@ -35,7 +36,7 @@ async function loadCodeGraph(): Promise<typeof import('../index')> {
     return await import('../index');
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error('\x1b[31m✗\x1b[0m Failed to load CodeGraph modules.');
+    console.error(`\x1b[31m${getGlyphs().err}\x1b[0m Failed to load CodeGraph modules.`);
     console.error(`\n  Node: ${process.version}  Platform: ${process.platform} ${process.arch}`);
     console.error(`\n  Error: ${msg}`);
     console.error('\n  Try reinstalling with: npm install -g @colbymchenry/codegraph\n');
@@ -49,11 +50,11 @@ async function loadCodeGraph(): Promise<typeof import('../index')> {
 const importESM = new Function('specifier', 'return import(specifier)') as
   (specifier: string) => Promise<typeof import('@clack/prompts')>;
 
-// Block CodeGraph on Node.js 24+ — current V8 turboshaft WASM JIT builds
-// have a Zone allocator bug that reliably crashes when compiling
-// tree-sitter grammars (see #54, #81, #140). The previous behaviour was
-// a soft console.warn that scrolls off-screen before the OOM crash
-// seconds later, leading to a steady stream of "what is this OOM" reports.
+// Block CodeGraph on Node.js 25.x — V8's turboshaft WASM JIT has a Zone
+// allocator bug that reliably crashes when compiling tree-sitter
+// grammars (see #54, #81, #140). The previous behaviour was a soft
+// console.warn that scrolls off-screen before the OOM crash 30 seconds
+// later, leading to a steady stream of "what is this OOM" reports.
 // Hard-exit before any WASM work; allow override via env var for users
 // who patched V8 themselves or want to test a future fix.
 const nodeVersion = process.versions.node;
@@ -214,7 +215,7 @@ function createVerboseProgress(): (progress: { phase: string; current: number; t
       // Log every 5% to keep output manageable
       if (pct >= lastPct + 5 || progress.current === progress.total) {
         lastPct = pct;
-        console.log(`[${elapsed}s]   ${progress.current}/${progress.total} (${pct}%)${progress.currentFile ? ` — ${progress.currentFile}` : ''}`);
+        console.log(`[${elapsed}s]   ${progress.current}/${progress.total} (${pct}%)${progress.currentFile ? ` ${getGlyphs().dash} ${progress.currentFile}` : ''}`);
       }
     } else if (progress.current > 0) {
       // Scanning phase (no total yet) — log periodically
@@ -229,28 +230,28 @@ function createVerboseProgress(): (progress: { phase: string; current: number; t
  * Print success message
  */
 function success(message: string): void {
-  console.log(chalk.green('✓') + ' ' + message);
+  console.log(chalk.green(getGlyphs().ok) + ' ' + message);
 }
 
 /**
  * Print error message
  */
 function error(message: string): void {
-  console.error(chalk.red('✗') + ' ' + message);
+  console.error(chalk.red(getGlyphs().err) + ' ' + message);
 }
 
 /**
  * Print info message
  */
 function info(message: string): void {
-  console.log(chalk.blue('ℹ') + ' ' + message);
+  console.log(chalk.blue(getGlyphs().info) + ' ' + message);
 }
 
 /**
  * Print warning message
  */
 function warn(message: string): void {
-  console.log(chalk.yellow('⚠') + ' ' + message);
+  console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
 }
 
 type IndexResult = {
@@ -283,7 +284,7 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
   // continuing to the misleading "No files found" branch or throwing.
   if (!result.success && !hasErrors && result.filesIndexed === 0) {
     const generic = result.errors.find((e) => e.severity === 'error');
-    clack.log.error(generic?.message ?? 'Indexing failed — no further details available');
+    clack.log.error(generic?.message ?? `Indexing failed ${getGlyphs().dash} no further details available`);
     return;
   }
 
@@ -295,7 +296,7 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
     }
     clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
   } else if (hasErrors) {
-    clack.log.error(`Indexing failed — all ${formatNumber(result.filesErrored)} files had errors`);
+    clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
   } else {
     clack.log.warn('No files found to index');
   }
@@ -329,7 +330,7 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
     }
 
     if (result.filesIndexed > 0) {
-      clack.log.info('The index is fully usable — only the failed files are missing.');
+      clack.log.info(`The index is fully usable ${getGlyphs().dash} only the failed files are missing.`);
     }
   } else if (projectPath) {
     const logPath = path.join(projectPath, '.codegraph', 'errors.log');
@@ -367,7 +368,7 @@ function writeErrorLog(projectPath: string, errors: Array<{ message: string; fil
   }
 
   const lines: string[] = [
-    `CodeGraph Error Log — ${new Date().toISOString()}`,
+    `CodeGraph Error Log - ${new Date().toISOString()}`,
     `${errorsByFile.size} files with errors`,
     '',
   ];
@@ -407,6 +408,19 @@ program
       if (isInitialized(projectPath)) {
         clack.log.warn(`Already initialized in ${projectPath}`);
         clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+        // Re-run agent surface wiring so re-running `init` is the
+        // documented way to recover a project that's missing its
+        // Cursor rules file (or future per-agent project surfaces).
+        try {
+          const { wireProjectSurfacesForGlobalAgents } = await import('../installer');
+          for (const { target, file } of wireProjectSurfacesForGlobalAgents()) {
+            clack.log.success(`${target.displayName}: ${file.action} ${file.path}`);
+          }
+        } catch { /* non-fatal */ }
+        try {
+          const { offerWatchFallback } = await import('../installer');
+          await offerWatchFallback(clack, projectPath);
+        } catch { /* non-fatal */ }
         clack.outro('');
         return;
       }
@@ -414,6 +428,20 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.init(projectPath, { index: false });
       clack.log.success(`Initialized in ${projectPath}`);
+
+      // Bootstrap project-local surfaces for any agent that's
+      // configured globally (Cursor needs ./.cursor/rules/codegraph.mdc
+      // to actually prefer codegraph over native grep). Silent when
+      // there's nothing to write.
+      try {
+        const { wireProjectSurfacesForGlobalAgents } = await import('../installer');
+        for (const { target, file } of wireProjectSurfacesForGlobalAgents()) {
+          clack.log.success(`${target.displayName}: ${file.action} ${file.path}`);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        clack.log.warn(`Skipped wiring project-local agent surfaces: ${msg}`);
+      }
 
       if (options.index) {
         let result: IndexResult;
@@ -424,7 +452,7 @@ program
             verbose: true,
           });
         } else {
-          process.stdout.write(`${colors.dim}│${colors.reset}\n`);
+          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
           const progress = createShimmerProgress();
           result = await cg.indexAll({
             onProgress: progress.onProgress,
@@ -436,6 +464,11 @@ program
       } else {
         clack.log.info('Run "codegraph index" to index the project');
       }
+
+      try {
+        const { offerWatchFallback } = await import('../installer');
+        await offerWatchFallback(clack, projectPath);
+      } catch { /* non-fatal */ }
 
       clack.outro('Done');
       cg.destroy();
@@ -467,7 +500,7 @@ program
         const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
         const answer = await new Promise<string>((resolve) => {
           rl.question(
-            chalk.yellow('⚠ This will permanently delete all CodeGraph data. Continue? (y/N) '),
+            chalk.yellow(`${getGlyphs().warn} This will permanently delete all CodeGraph data. Continue? (y/N) `),
             resolve
           );
         });
@@ -482,6 +515,15 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = CodeGraph.openSync(projectPath);
       cg.uninitialize();
+
+      // Clean up any git sync hooks we installed (no-op if none / not a repo).
+      try {
+        const { removeGitSyncHook } = await import('../sync/git-hooks');
+        const removed = removeGitSyncHook(projectPath);
+        if (removed.installed.length > 0) {
+          info(`Removed git ${removed.installed.join(', ')} sync hook${removed.installed.length > 1 ? 's' : ''}`);
+        }
+      } catch { /* non-fatal */ }
 
       success(`Removed CodeGraph from ${projectPath}`);
     } catch (err) {
@@ -537,7 +579,7 @@ program
           verbose: true,
         });
       } else {
-        process.stdout.write(`${colors.dim}│${colors.reset}\n`);
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
         const progress = createShimmerProgress();
         result = await cg.indexAll({
           onProgress: progress.onProgress,
@@ -589,7 +631,7 @@ program
       const clack = await importESM('@clack/prompts');
       clack.intro('Syncing CodeGraph');
 
-      process.stdout.write(`${colors.dim}│${colors.reset}\n`);
+      process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
       const progress = createShimmerProgress();
 
       const result = await cg.sync({
@@ -608,7 +650,7 @@ program
         if (result.filesAdded > 0) details.push(`Added: ${result.filesAdded}`);
         if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
         if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
-        clack.log.info(`${details.join(', ')} — ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
+        clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
       }
 
       clack.outro('Done');
@@ -690,7 +732,7 @@ program
       // when the native build fails.
       const backendLabel = backend === 'native'
         ? chalk.green('native')
-        : chalk.yellow('wasm — slower fallback; run `npm rebuild better-sqlite3`');
+        : chalk.yellow(`wasm ${getGlyphs().dash} slower fallback; run \`npm rebuild better-sqlite3\``);
       console.log(`  Backend:   ${backendLabel}`);
       console.log();
 
@@ -979,8 +1021,9 @@ function printFileTree(
   const renderNode = (node: TreeNode, prefix: string, isLast: boolean, depth: number): void => {
     if (maxDepth !== undefined && depth > maxDepth) return;
 
-    const connector = isLast ? '└── ' : '├── ';
-    const childPrefix = isLast ? '    ' : '│   ';
+    const glyphs = getGlyphs();
+    const connector = isLast ? glyphs.treeLast : glyphs.treeBranch;
+    const childPrefix = isLast ? '    ' : glyphs.treePipe;
 
     if (node.name) {
       let line = prefix + connector + node.name;
@@ -1062,8 +1105,15 @@ program
   .description('Start CodeGraph as an MCP server for AI assistants')
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
-  .action(async (options: { path?: string; mcp?: boolean }) => {
+  .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
+  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
+
+    // Commander sets watch=false when --no-watch is passed. Route it through
+    // the same env-var chokepoint the watcher and MCP server already honor.
+    if (options.watch === false) {
+      process.env.CODEGRAPH_NO_WATCH = '1';
+    }
 
     try {
       if (options.mcp) {
@@ -1076,7 +1126,7 @@ program
         // Default: show info about MCP mode.
         // Use stderr so stdout stays clean for any piped/stdio usage.
         console.error(chalk.bold('\nCodeGraph MCP Server\n'));
-        console.error(chalk.blue('ℹ') + ' Use --mcp flag to start the MCP server');
+        console.error(chalk.blue(getGlyphs().info) + ' Use --mcp flag to start the MCP server');
         console.error('\nTo use with Claude Code, add to your MCP configuration:');
         console.error(chalk.dim(`
 {
@@ -1122,7 +1172,7 @@ program
       const lockPath = path.join(getCodeGraphDir(projectPath), 'codegraph.lock');
 
       if (!fs.existsSync(lockPath)) {
-        info('No lock file found — nothing to do');
+        info(`No lock file found ${getGlyphs().dash} nothing to do`);
         return;
       }
 
@@ -1277,10 +1327,61 @@ program
  */
 program
   .command('install')
-  .description('Run interactive installer for Claude Code integration')
-  .action(async () => {
-    const { runInstaller } = await import('../installer');
-    await runInstaller();
+  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode)')
+  .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "auto"|"all"|"none". Default: prompt')
+  .option('-l, --location <where>', 'Install location: "global" or "local". Default: prompt')
+  .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
+  .option('--no-permissions', 'Skip writing the auto-allow permissions list (Claude Code only)')
+  .option('--print-config <id>', 'Print MCP config snippet for the named agent and exit (no file writes)')
+  .action(async (opts: {
+    target?: string;
+    location?: string;
+    yes?: boolean;
+    permissions?: boolean;
+    printConfig?: string;
+  }) => {
+    if (opts.printConfig) {
+      const { getTarget, listTargetIds } = await import('../installer/targets/registry');
+      const target = getTarget(opts.printConfig);
+      if (!target) {
+        const known = listTargetIds().join(', ');
+        error(`Unknown target "${opts.printConfig}". Known: ${known}.`);
+        process.exit(1);
+      }
+      const loc = (opts.location === 'local' ? 'local' : 'global') as 'global' | 'local';
+      process.stdout.write(target.printConfig(loc));
+      return;
+    }
+
+    const { runInstallerWithOptions } = await import('../installer');
+    if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
+      error(`--location must be "global" or "local" (got "${opts.location}").`);
+      process.exit(1);
+    }
+    try {
+      // Commander's `--no-permissions` makes `opts.permissions === false`;
+      // omitting the flag leaves it `true` (the positive-form default).
+      // We MUST treat the default-true as "user did not override — let
+      // the orchestrator prompt" and only forward an explicit `false`
+      // (or `true` when --yes implies it). Otherwise the auto-allow
+      // prompt is silently skipped on every interactive run.
+      const explicitNoPermissions = opts.permissions === false;
+      const autoAllow: boolean | undefined = explicitNoPermissions
+        ? false
+        : opts.yes
+          ? true
+          : undefined;
+
+      await runInstallerWithOptions({
+        target: opts.target,
+        location: opts.location as 'global' | 'local' | undefined,
+        autoAllow,
+        yes: opts.yes,
+      });
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
   });
 
 // Parse and run

@@ -126,9 +126,60 @@ export function shouldIncludeFile(
 }
 
 /**
+ * Collect git-visible files (tracked + untracked, .gitignore-respected) from the
+ * git repository rooted at `repoDir`, adding each to `files` with `prefix`
+ * prepended so paths stay relative to the original scan root.
+ *
+ * Recurses into embedded git repositories — nested repos that are NOT submodules
+ * (independent clones living inside the workspace, common in CMake "super-repo"
+ * layouts). The parent repo's `git ls-files` cannot see into them: tracked output
+ * skips them entirely, and untracked output reports them only as an opaque
+ * "subdir/" entry (trailing slash) rather than expanding their files. Each
+ * embedded repo is its own git boundary, so we re-run `git ls-files` inside it.
+ * (See issue #193.)
+ */
+function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): void {
+  const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'] };
+
+  // Tracked files. --recurse-submodules pulls in files from active submodules,
+  // which the index would otherwise represent only as a commit pointer.
+  // Without this, monorepos using submodules index 0 files. (See issue #147.)
+  // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
+  // can't be combined with -o, so untracked files are gathered separately below.
+  const tracked = execFileSync('git', ['ls-files', '-c', '--recurse-submodules'], gitOpts);
+  for (const line of tracked.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed) {
+      files.add(normalizePath(prefix + trimmed));
+    }
+  }
+
+  // Untracked files (submodules manage their own untracked state). Embedded git
+  // repos surface here as a single "subdir/" entry that git refuses to descend
+  // into — recurse into those as their own repos so their source gets indexed.
+  const untracked = execFileSync('git', ['ls-files', '-o', '--exclude-standard'], gitOpts);
+  for (const line of untracked.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.endsWith('/')) {
+      // git only emits a trailing-slash directory entry for an embedded repo.
+      // Guard with a .git check anyway, and skip anything else exactly as git
+      // itself skips it (we never descend into a non-repo opaque dir).
+      const childDir = path.join(repoDir, trimmed);
+      if (fs.existsSync(path.join(childDir, '.git'))) {
+        collectGitFiles(childDir, prefix + trimmed, files);
+      }
+      continue;
+    }
+    files.add(normalizePath(prefix + trimmed));
+  }
+}
+
+/**
  * Get all files visible to git (tracked + untracked but not ignored).
- * Respects .gitignore at all levels (root, subdirectories).
- * Returns null on failure (non-git project) so callers can fall back.
+ * Respects .gitignore at all levels (root, subdirectories) and descends into
+ * embedded (nested, non-submodule) git repos. Returns null on failure
+ * (non-git project) so callers can fall back to a filesystem walk.
  */
 function getGitVisibleFiles(rootDir: string): Set<string> | null {
   try {
@@ -157,30 +208,7 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     }
 
     const files = new Set<string>();
-    const gitOpts = { cwd: rootDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'] };
-
-    // Tracked files. --recurse-submodules pulls in files from active submodules,
-    // which the main repo's index would otherwise represent only as a commit pointer.
-    // Without this, monorepos using submodules index 0 files. (See issue #147.)
-    // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
-    // can't be combined with -o, so untracked files are gathered separately below.
-    const tracked = execFileSync('git', ['ls-files', '-c', '--recurse-submodules'], gitOpts);
-    for (const line of tracked.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed) {
-        files.add(normalizePath(trimmed));
-      }
-    }
-
-    // Untracked files in the main repo (submodules manage their own untracked state).
-    const untracked = execFileSync('git', ['ls-files', '-o', '--exclude-standard'], gitOpts);
-    for (const line of untracked.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed) {
-        files.add(normalizePath(trimmed));
-      }
-    }
-
+    collectGitFiles(rootDir, '', files);
     return files;
   } catch {
     return null;
@@ -1233,8 +1261,12 @@ export class ExtractionOrchestrator {
         }
       }
 
-      // Handle modified files — read + hash only these files
-      for (const filePath of gitChanges.modified) {
+      // Handle modified + added files — read + hash only these. Untracked
+      // (`??`) files stay untracked in git even after we index them, so they
+      // can't be trusted as "new": re-hash and compare against the DB exactly
+      // like modified files. Otherwise every sync re-indexes them and status
+      // reports them as pending forever. (See issue #206.)
+      for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
         const fullPath = path.join(this.rootDir, filePath);
         let content: string;
         try {
@@ -1256,13 +1288,6 @@ export class ExtractionOrchestrator {
           changedFilePaths.push(filePath);
           filesModified++;
         }
-      }
-
-      // Handle added (untracked) files
-      for (const filePath of gitChanges.added) {
-        filesToIndex.push(filePath);
-        changedFilePaths.push(filePath);
-        filesAdded++;
       }
     } else {
       // === Fallback: full scan (non-git project or git failure) ===
@@ -1367,8 +1392,11 @@ export class ExtractionOrchestrator {
         }
       }
 
-      // Modified files — read + hash only these, compare with DB
-      for (const filePath of gitChanges.modified) {
+      // Modified + added files — read + hash, compare with DB. Untracked (`??`)
+      // files stay untracked in git even after indexing, so they must be
+      // hash-compared like modified files instead of always counting as added —
+      // otherwise status reports them as pending forever. (See issue #206.)
+      for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
         const fullPath = path.join(this.rootDir, filePath);
         let content: string;
         try {
@@ -1386,11 +1414,6 @@ export class ExtractionOrchestrator {
         } else if (tracked.contentHash !== contentHash) {
           modified.push(filePath);
         }
-      }
-
-      // Added (untracked) files
-      for (const filePath of gitChanges.added) {
-        added.push(filePath);
       }
 
       return { added, modified, removed };

@@ -1,0 +1,63 @@
+{
+  "_comment": "Test corpus for /agent-eval. Add entries freely. size: Small (<~150 files), Medium (~150-1500), Large (>~1500). 'question' is a representative architectural question that exercises cross-file understanding.",
+  "TypeScript": [
+    { "name": "ky", "repo": "https://github.com/sindresorhus/ky", "size": "Small", "files": "~25", "question": "How does ky implement request retries and timeouts?" },
+    { "name": "excalidraw", "repo": "https://github.com/excalidraw/excalidraw", "size": "Medium", "files": "~600", "question": "How does Excalidraw render and update canvas elements?" },
+    { "name": "vscode", "repo": "https://github.com/microsoft/vscode", "size": "Large", "files": "~10000", "question": "How does the extension host communicate with the main process?" }
+  ],
+  "JavaScript": [
+    { "name": "express", "repo": "https://github.com/expressjs/express", "size": "Small", "files": "~50", "question": "How does Express route a request through its middleware stack?" }
+  ],
+  "Go": [
+    { "name": "cobra", "repo": "https://github.com/spf13/cobra", "size": "Small", "files": "~50", "question": "How does cobra parse commands and flags?" },
+    { "name": "gin", "repo": "https://github.com/gin-gonic/gin", "size": "Medium", "files": "~150", "question": "How does gin route requests through its middleware chain?" },
+    { "name": "terraform", "repo": "https://github.com/hashicorp/terraform", "size": "Large", "files": "~4000", "question": "How does Terraform build and walk the resource dependency graph?" }
+  ],
+  "Python": [
+    { "name": "click", "repo": "https://github.com/pallets/click", "size": "Small", "files": "~60", "question": "How does click parse command-line arguments into commands?" },
+    { "name": "flask", "repo": "https://github.com/pallets/flask", "size": "Medium", "files": "~90", "question": "How does Flask dispatch a request to a view function?" },
+    { "name": "django", "repo": "https://github.com/django/django", "size": "Large", "files": "~2700", "question": "How does Django's ORM build and execute a query from a QuerySet?" }
+  ],
+  "Rust": [
+    { "name": "clap", "repo": "https://github.com/clap-rs/clap", "size": "Medium", "files": "~200", "question": "How does clap parse arguments against a derived command definition?" },
+    { "name": "tokio", "repo": "https://github.com/tokio-rs/tokio", "size": "Large", "files": "~700", "question": "How does tokio schedule and run async tasks on its runtime?" },
+    { "name": "deno", "repo": "https://github.com/denoland/deno", "size": "Large", "files": "~1500", "question": "How does Deno load and execute a TypeScript module?" }
+  ],
+  "Java": [
+    { "name": "gson", "repo": "https://github.com/google/gson", "size": "Medium", "files": "~200", "question": "How does Gson serialize an object to JSON?" },
+    { "name": "okhttp", "repo": "https://github.com/square/okhttp", "size": "Medium", "files": "~640", "question": "How does OkHttp process a request through its interceptor chain?" },
+    { "name": "guava", "repo": "https://github.com/google/guava", "size": "Large", "files": "~3000", "question": "How does Guava's CacheBuilder build and configure a cache?" }
+  ],
+  "Kotlin": [
+    { "name": "koin", "repo": "https://github.com/InsertKoinIO/koin", "size": "Medium", "files": "~300", "question": "How does Koin resolve and inject dependencies?" },
+    { "name": "leakcanary", "repo": "https://github.com/square/leakcanary", "size": "Medium", "files": "~250", "question": "How does LeakCanary detect and analyze a memory leak?" }
+  ],
+  "Swift": [
+    { "name": "alamofire", "repo": "https://github.com/Alamofire/Alamofire", "size": "Small", "files": "~100", "question": "How does Alamofire build, send, and validate a request?" }
+  ],
+  "C#": [
+    { "name": "serilog", "repo": "https://github.com/serilog/serilog", "size": "Medium", "files": "~250", "question": "How does Serilog route a log event to its sinks?" },
+    { "name": "jellyfin", "repo": "https://github.com/jellyfin/jellyfin", "size": "Large", "files": "~2500", "question": "How does Jellyfin scan and identify items in a media library?" }
+  ],
+  "Ruby": [
+    { "name": "sinatra", "repo": "https://github.com/sinatra/sinatra", "size": "Small", "files": "~60", "question": "How does Sinatra match a request to a route handler?" },
+    { "name": "discourse", "repo": "https://github.com/discourse/discourse", "size": "Large", "files": "~3000", "question": "How does Discourse create and render a new post?" }
+  ],
+  "PHP": [
+    { "name": "slim", "repo": "https://github.com/slimphp/Slim", "size": "Small", "files": "~80", "question": "How does Slim handle a request through its middleware?" },
+    { "name": "laravel", "repo": "https://github.com/laravel/framework", "size": "Large", "files": "~3000", "question": "How does Laravel resolve and dispatch a route to a controller?" }
+  ],
+  "C": [
+    { "name": "redis", "repo": "https://github.com/redis/redis", "size": "Large", "files": "~600", "question": "How does Redis parse and dispatch a client command?" }
+  ],
+  "C++": [
+    { "name": "json", "repo": "https://github.com/nlohmann/json", "size": "Small", "files": "~100", "question": "How does nlohmann::json parse a JSON string into a value?" },
+    { "name": "grpc", "repo": "https://github.com/grpc/grpc", "size": "Large", "files": "~3000", "question": "How does gRPC dispatch an incoming RPC to its handler?" }
+  ],
+  "Dart": [
+    { "name": "flutter", "repo": "https://github.com/flutter/flutter", "size": "Large", "files": "~6000", "question": "How does Flutter build and lay out a widget tree?" }
+  ],
+  "Svelte": [
+    { "name": "shadcn-svelte", "repo": "https://github.com/huntabyte/shadcn-svelte", "size": "Medium", "files": "~600", "question": "How do shadcn-svelte components compose and apply their styling?" }
+  ]
+}

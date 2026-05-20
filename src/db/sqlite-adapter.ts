@@ -5,6 +5,11 @@
  * node-sqlite3-wasm (WASM fallback) for universal cross-platform support.
  */
 
+import {
+  buildUnsafeWasmFallbackBlockBanner,
+  shouldBlockWasmFallbackForNode,
+} from '../bin/node-version-check';
+
 export interface SqliteStatement {
   run(...params: any[]): { changes: number; lastInsertRowid: number | bigint };
   get(...params: any[]): any;
@@ -248,6 +253,12 @@ export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: S
     return { db: db as SqliteDatabase, backend: 'native' };
   } catch (error) {
     nativeError = error instanceof Error ? error.message : String(error);
+  }
+
+  if (shouldBlockWasmFallbackForNode()) {
+    throw new Error(
+      buildUnsafeWasmFallbackBlockBanner(process.versions.node, nativeError)
+    );
   }
 
   // Fall back to WASM

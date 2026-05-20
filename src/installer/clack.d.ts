@@ -24,6 +24,13 @@ declare module '@clack/prompts' {
     initialValue?: Value;
   }): Promise<Value | symbol>;
 
+  export function multiselect<Value>(opts: {
+    message: string;
+    options: { value: Value; label: string; hint?: string }[];
+    initialValues?: Value[];
+    required?: boolean;
+  }): Promise<Value[] | symbol>;
+
   export function spinner(): {
     start(message?: string): void;
     stop(message?: string): void;

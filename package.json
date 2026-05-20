@@ -1,6 +1,6 @@
 {
   "name": "@colbymchenry/codegraph",
-  "version": "0.7.6",
+  "version": "0.7.11",
   "description": "Supercharge Claude Code with semantic code intelligence. 94% fewer tool calls • 77% faster exploration • 100% local.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -36,6 +36,7 @@
     "commander": "^14.0.2",
     "fast-string-width": "^3.0.2",
     "fast-wrap-ansi": "^0.2.0",
+    "jsonc-parser": "^3.3.1",
     "node-sqlite3-wasm": "^0.8.30",
     "picomatch": "^4.0.3",
     "sisteransi": "^1.0.5",
@@ -50,9 +51,9 @@
     "vitest": "^2.1.9"
   },
   "optionalDependencies": {
-    "better-sqlite3": "^11.0.0"
+    "better-sqlite3": "^12.4.1"
   },
   "engines": {
-    "node": ">=18.0.0 <24.0.0"
+    "node": ">=20.0.0 <25.0.0"
   }
 }

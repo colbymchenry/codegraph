@@ -1,5 +1,6 @@
 import { parentPort, workerData } from 'worker_threads';
 import { writeSync } from 'fs';
+import { getGlyphs } from './glyphs';
 import type { ShimmerWorkerMessage } from './types';
 
 // Write directly to fd 1 (stdout) instead of writeStdout().
@@ -7,11 +8,16 @@ import type { ShimmerWorkerMessage } from './types';
 // thread's event loop — so if the main thread is blocked (e.g. SQLite),
 // stdout writes from the worker queue up and the animation freezes.
 // fs.writeSync(1, ...) is a direct kernel syscall that bypasses this.
+//
+// Side effect: bypasses Node's TTY-aware encoding conversion on Windows,
+// so UTF-8 bytes hit the console raw and mojibake on OEM codepages.
+// `getGlyphs()` returns ASCII fallbacks on Windows to avoid this (#168).
 function writeStdout(s: string): void {
   writeSync(1, s);
 }
 
-const SPINNER_GLYPHS = ['·', '✢', '✳', '✶', '✻', '✽'];
+const G = getGlyphs();
+const SPINNER_GLYPHS = G.spinner;
 const ANIM_INTERVAL = 150;
 const FRAMES_PER_GLYPH = 3;
 
@@ -43,7 +49,7 @@ function formatNumber(n: number): string {
 }
 
 function renderBar(frame: number, filled: number, empty: number): string {
-  if (filled === 0) return `${DM}${'░'.repeat(empty)}${RST}`;
+  if (filled === 0) return `${DM}${G.barEmpty.repeat(empty)}${RST}`;
   const cycleFrames = 24;
   const shimmerPos = ((frame % cycleFrames) / cycleFrames) * (filled + 6) - 3;
   const shimmerWidth = 3;
@@ -54,9 +60,9 @@ function renderBar(frame: number, filled: number, empty: number): string {
     const r = lerp(160, 251, t);
     const g = lerp(100, 191, t);
     const b = lerp(9, 36, t);
-    bar += `\x1b[38;2;${r};${g};${b}m${BOLD}█`;
+    bar += `\x1b[38;2;${r};${g};${b}m${BOLD}${G.barFilled}`;
   }
-  bar += `${RST}${DM}${'░'.repeat(empty)}${RST}`;
+  bar += `${RST}${DM}${G.barEmpty.repeat(empty)}${RST}`;
   return bar;
 }
 
@@ -69,7 +75,7 @@ function render(): void {
   if (!currentMessage) return;
   const frame = animFrame();
   const glyphIdx = Math.floor(frame / FRAMES_PER_GLYPH) % SPINNER_GLYPHS.length;
-  const glyph = SPINNER_GLYPHS[glyphIdx] ?? '·';
+  const glyph = SPINNER_GLYPHS[glyphIdx] ?? SPINNER_GLYPHS[0] ?? '.';
   const color = shimmerColor(frame);
 
   let line: string;
@@ -77,11 +83,11 @@ function render(): void {
     const barWidth = 25;
     const filled = Math.round(barWidth * currentPercent / 100);
     const empty = barWidth - filled;
-    line = `${DM}│${RST}  ${color}${glyph}${RST} ${currentMessage}  ${renderBar(frame, filled, empty)}  ${currentPercent}%`;
+    line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${currentMessage}  ${renderBar(frame, filled, empty)}  ${currentPercent}%`;
   } else if (currentCount > 0) {
-    line = `${DM}│${RST}  ${color}${glyph}${RST} ${currentMessage}... ${formatNumber(currentCount)} found`;
+    line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${currentMessage}... ${formatNumber(currentCount)} found`;
   } else {
-    line = `${DM}│${RST}  ${color}${glyph}${RST} ${currentMessage}...`;
+    line = `${DM}${G.rail}${RST}  ${color}${glyph}${RST} ${currentMessage}...`;
   }
 
   writeStdout(`\r\x1b[K${line}`);
@@ -91,9 +97,9 @@ function finishPhase(): void {
   if (!currentMessage) return;
   writeStdout(`\r\x1b[K`);
   let detail = '';
-  if (currentPercent >= 0) detail = ' — done';
-  else if (currentCount > 0) detail = ` — ${formatNumber(currentCount)} found`;
-  writeStdout(`${DM}│${RST}  ${GRN}◆${RST} ${currentMessage}${detail}\n`);
+  if (currentPercent >= 0) detail = ` ${G.dash} done`;
+  else if (currentCount > 0) detail = ` ${G.dash} ${formatNumber(currentCount)} found`;
+  writeStdout(`${DM}${G.rail}${RST}  ${GRN}${G.phaseDone}${RST} ${currentMessage}${detail}\n`);
   currentMessage = '';
   currentPercent = -1;
   currentCount = 0;

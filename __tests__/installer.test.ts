@@ -48,21 +48,21 @@ describe('Installer Config Writer', () => {
 
   describe('readJsonFile error handling', () => {
     it('should return empty object for non-existent file', () => {
-      // writeMcpConfig reads claude.json - if it doesn't exist, it should create it
+      // writeMcpConfig reads .mcp.json - if it doesn't exist, it should create it
       writeMcpConfig('local');
 
-      const claudeJson = path.join(tempDir, '.claude.json');
-      expect(fs.existsSync(claudeJson)).toBe(true);
+      const mcpJson = path.join(tempDir, '.mcp.json');
+      expect(fs.existsSync(mcpJson)).toBe(true);
 
-      const content = JSON.parse(fs.readFileSync(claudeJson, 'utf-8'));
+      const content = JSON.parse(fs.readFileSync(mcpJson, 'utf-8'));
       expect(content.mcpServers).toBeDefined();
       expect(content.mcpServers.codegraph).toBeDefined();
     });
 
     it('should handle corrupted JSON by creating backup', () => {
-      // Create a corrupted claude.json
-      const claudeJson = path.join(tempDir, '.claude.json');
-      fs.writeFileSync(claudeJson, '{ this is not valid json !!!');
+      // Create a corrupted .mcp.json
+      const mcpJson = path.join(tempDir, '.mcp.json');
+      fs.writeFileSync(mcpJson, '{ this is not valid json !!!');
 
       // Suppress console.warn during test
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -76,28 +76,28 @@ describe('Installer Config Writer', () => {
       expect(warnMsg).toContain('Warning');
 
       // Backup should exist
-      expect(fs.existsSync(claudeJson + '.backup')).toBe(true);
+      expect(fs.existsSync(mcpJson + '.backup')).toBe(true);
       // Original backup content should be the corrupted content
-      const backup = fs.readFileSync(claudeJson + '.backup', 'utf-8');
+      const backup = fs.readFileSync(mcpJson + '.backup', 'utf-8');
       expect(backup).toContain('this is not valid json');
 
       // New file should be valid JSON with codegraph config
-      const content = JSON.parse(fs.readFileSync(claudeJson, 'utf-8'));
+      const content = JSON.parse(fs.readFileSync(mcpJson, 'utf-8'));
       expect(content.mcpServers.codegraph).toBeDefined();
 
       warnSpy.mockRestore();
     });
 
     it('should preserve existing valid config when adding codegraph', () => {
-      const claudeJson = path.join(tempDir, '.claude.json');
-      fs.writeFileSync(claudeJson, JSON.stringify({
+      const mcpJson = path.join(tempDir, '.mcp.json');
+      fs.writeFileSync(mcpJson, JSON.stringify({
         mcpServers: { other: { command: 'other-tool' } },
         customField: 'preserved',
       }, null, 2));
 
       writeMcpConfig('local');
 
-      const content = JSON.parse(fs.readFileSync(claudeJson, 'utf-8'));
+      const content = JSON.parse(fs.readFileSync(mcpJson, 'utf-8'));
       expect(content.mcpServers.codegraph).toBeDefined();
       expect(content.mcpServers.other).toBeDefined();
       expect(content.customField).toBe('preserved');
@@ -125,9 +125,10 @@ describe('Installer Config Writer', () => {
       const modified = '## My Custom Section\n\nCustom content\n\n' + original + '\n\n## Another Section\n\nMore content\n';
       fs.writeFileSync(claudeMdPath, modified);
 
-      // Second write should replace only the marked section
-      const result = writeClaudeMd('local');
-      expect(result.updated).toBe(true);
+      // Second write should leave the marked block as-is (byte-identical
+      // body, so result is `created:false, updated:false` — both flags
+      // are off but the surrounding custom content must survive).
+      writeClaudeMd('local');
 
       const final = fs.readFileSync(claudeMdPath, 'utf-8');
       expect(final).toContain('## My Custom Section');

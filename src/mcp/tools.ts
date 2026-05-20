@@ -17,6 +17,21 @@ import { WASM_FALLBACK_FIX_RECIPE } from '../db';
 const MAX_OUTPUT_LENGTH = 15000;
 
 /**
+ * Rust path roots that have no file-system equivalent — `crate` is the
+ * current crate, `super` is the parent module, `self` is the current
+ * module. Used by `matchesSymbol` to strip these before file-path
+ * matching so `crate::configurator::stage_apply::run` resolves the
+ * same as `configurator::stage_apply::run`.
+ */
+const RUST_PATH_PREFIXES = new Set(['crate', 'super', 'self']);
+
+/** Last `::` / `.` / `/`-separated segment of a qualified symbol. */
+function lastQualifierPart(symbol: string): string {
+  const parts = symbol.split(/::|[./]/).filter((p) => p.length > 0);
+  return parts[parts.length - 1] ?? symbol;
+}
+
+/**
  * Calculate the recommended number of codegraph_explore calls based on project size.
  * Larger codebases need more exploration calls to cover their surface area,
  * but smaller ones should use fewer to avoid unnecessary overhead.
@@ -27,6 +42,136 @@ export function getExploreBudget(fileCount: number): number {
   if (fileCount < 15000) return 3;
   if (fileCount < 25000) return 4;
   return 5;
+}
+
+/**
+ * Adaptive output budget for `codegraph_explore`, scaled to project size.
+ *
+ * Smaller codebases get a tighter total cap, fewer default files, smaller
+ * per-file cap, and tighter clustering — so a focused query on a 100-file
+ * project doesn't dump a whole file's worth of source into the agent's
+ * context. Larger codebases keep the generous defaults because the
+ * agent's native discovery cost (grep + find + many Reads) genuinely
+ * dwarfs a fat explore call at that scale.
+ *
+ * Meta-text (relationships map, "additional relevant files" list,
+ * completeness signal, budget note) is gated off for tiny projects
+ * where one rich call is the whole story and the extra prose is just
+ * overhead.
+ *
+ * Tier breakpoints mirror `getExploreBudget` so a project sits in the
+ * same tier across both knobs.
+ */
+export interface ExploreOutputBudget {
+  /** Hard cap on total output characters. */
+  maxOutputChars: number;
+  /** Default `maxFiles` when the caller didn't specify one. */
+  defaultMaxFiles: number;
+  /** Cap on contiguous source returned per file (across all its clusters). */
+  maxCharsPerFile: number;
+  /** Cluster gap threshold in lines — tighter clustering on small projects. */
+  gapThreshold: number;
+  /** Max symbols listed in the per-file header (`#### path — sym(kind), ...`). */
+  maxSymbolsInFileHeader: number;
+  /** Max edges shown per relationship kind in the Relationships section. */
+  maxEdgesPerRelationshipKind: number;
+  /** Include the "Relationships" section. */
+  includeRelationships: boolean;
+  /** Include the "Additional relevant files (not shown)" trailing list. */
+  includeAdditionalFiles: boolean;
+  /** Include the "Complete source code is included above…" reminder. */
+  includeCompletenessSignal: boolean;
+  /** Include the explore-budget reminder at the end. */
+  includeBudgetNote: boolean;
+}
+
+export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
+  if (fileCount < 500) {
+    return {
+      maxOutputChars: 18000,
+      defaultMaxFiles: 5,
+      maxCharsPerFile: 3800,
+      gapThreshold: 8,
+      maxSymbolsInFileHeader: 6,
+      maxEdgesPerRelationshipKind: 6,
+      includeRelationships: true,
+      includeAdditionalFiles: false,
+      includeCompletenessSignal: false,
+      includeBudgetNote: false,
+    };
+  }
+  if (fileCount < 5000) {
+    return {
+      maxOutputChars: 28000,
+      defaultMaxFiles: 9,
+      maxCharsPerFile: 5000,
+      gapThreshold: 12,
+      maxSymbolsInFileHeader: 10,
+      maxEdgesPerRelationshipKind: 10,
+      includeRelationships: true,
+      includeAdditionalFiles: true,
+      includeCompletenessSignal: true,
+      includeBudgetNote: true,
+    };
+  }
+  if (fileCount < 15000) {
+    return {
+      maxOutputChars: 35000,
+      defaultMaxFiles: 12,
+      maxCharsPerFile: 7000,
+      gapThreshold: 15,
+      maxSymbolsInFileHeader: 15,
+      maxEdgesPerRelationshipKind: 15,
+      includeRelationships: true,
+      includeAdditionalFiles: true,
+      includeCompletenessSignal: true,
+      includeBudgetNote: true,
+    };
+  }
+  return {
+    maxOutputChars: 38000,
+    defaultMaxFiles: 14,
+    maxCharsPerFile: 7000,
+    gapThreshold: 15,
+    maxSymbolsInFileHeader: 15,
+    maxEdgesPerRelationshipKind: 15,
+    includeRelationships: true,
+    includeAdditionalFiles: true,
+    includeCompletenessSignal: true,
+    includeBudgetNote: true,
+  };
+}
+
+/**
+ * Whether `codegraph_explore` should prefix source lines with their line
+ * numbers (cat -n style: `<num>\t<code>`).
+ *
+ * Line numbers let the agent cite `file:line` straight from the explore
+ * payload instead of re-Reading the file just to find a line number — the
+ * dominant residual cost on precise-tracing questions (#185 follow-up).
+ *
+ * Defaults ON. Set `CODEGRAPH_EXPLORE_LINENUMS=0` to disable (used by the
+ * A/B harness to measure the payload-cost vs. read-savings tradeoff).
+ */
+function exploreLineNumbersEnabled(): boolean {
+  return process.env.CODEGRAPH_EXPLORE_LINENUMS !== '0';
+}
+
+/**
+ * Prefix each line of a source slice with its 1-based line number, matching
+ * the Read tool's `cat -n` convention (number + tab) so the agent treats it
+ * the same way it treats Read output.
+ *
+ * @param slice  contiguous source text (already extracted from the file)
+ * @param firstLineNumber  the 1-based line number of the slice's first line
+ */
+function numberSourceLines(slice: string, firstLineNumber: number): string {
+  const out: string[] = [];
+  const split = slice.split('\n');
+  for (let i = 0; i < split.length; i++) {
+    out.push(`${firstLineNumber + i}\t${split[i]}`);
+  }
+  return out.join('\n');
 }
 
 /**
@@ -295,6 +440,9 @@ export const tools: ToolDefinition[] = [
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
+  // The directory the server last searched for a default project. Surfaced in
+  // the "not initialized" error so users can see why detection missed.
+  private defaultProjectHint: string | null = null;
 
   constructor(private cg: CodeGraph | null) {}
 
@@ -303,6 +451,14 @@ export class ToolHandler {
    */
   setDefaultCodeGraph(cg: CodeGraph): void {
     this.cg = cg;
+  }
+
+  /**
+   * Record the directory the server tried to resolve the default project from.
+   * Used only to make the "no default project" error actionable.
+   */
+  setDefaultProjectHint(searchedPath: string): void {
+    this.defaultProjectHint = searchedPath;
   }
 
   /**
@@ -350,7 +506,16 @@ export class ToolHandler {
   private getCodeGraph(projectPath?: string): CodeGraph {
     if (!projectPath) {
       if (!this.cg) {
-        throw new Error('CodeGraph not initialized for this project. Run \'codegraph init\' first.');
+        const searched = this.defaultProjectHint ?? process.cwd();
+        throw new Error(
+          'No CodeGraph project is loaded for this session.\n' +
+          `Searched for a .codegraph/ directory starting from: ${searched}\n` +
+          'The index is likely fine — this is a working-directory detection issue: ' +
+          "the MCP client launched the server outside your project and didn't report the " +
+          'workspace root. Fix it either way:\n' +
+          '  • Pass projectPath to the tool call, e.g. projectPath: "/absolute/path/to/your/project"\n' +
+          '  • Or add --path to the server\'s MCP config args: ["serve", "--mcp", "--path", "/absolute/path/to/your/project"]'
+        );
       }
       return this.cg;
     }
@@ -641,23 +806,34 @@ export class ToolHandler {
     return this.textResult(this.truncateOutput(formatted));
   }
 
-  /** Maximum output for explore tool — sized to stay under MCP client token limits (~10k tokens) */
-  private static readonly EXPLORE_MAX_OUTPUT = 35000;
-
   /**
    * Handle codegraph_explore — deep exploration in a single call
    *
    * Strategy: find relevant symbols via graph traversal, group by file,
    * then read contiguous file sections covering all symbols per file.
    * This replaces multiple codegraph_node + Read calls.
+   *
+   * Output size is adaptive to project file count via
+   * `getExploreOutputBudget` — see #185 for why a fixed 35k cap was a
+   * tax on small projects while earning its keep on large ones.
    */
   private async handleExplore(args: Record<string, unknown>): Promise<ToolResult> {
     const query = this.validateString(args.query, 'query');
     if (typeof query !== 'string') return query;
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
-    const maxFiles = clamp((args.maxFiles as number) || 12, 1, 20);
     const projectRoot = cg.getProjectRoot();
+
+    // Resolve adaptive output budget from project size. Falls back to the
+    // largest-tier defaults if stats aren't available, which preserves
+    // pre-#185 behavior for callers that hit the rare stats failure.
+    let budget: ExploreOutputBudget;
+    try {
+      budget = getExploreOutputBudget(cg.getStats().fileCount);
+    } catch {
+      budget = getExploreOutputBudget(Infinity);
+    }
+    const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
 
     // Step 1: Find relevant context with generous parameters.
     // Use a large maxNodes budget — explore has its own 35k char output limit
@@ -750,7 +926,7 @@ export class ToolHandler {
       e.kind !== 'contains' // skip contains — it's implied by file grouping
     );
 
-    if (significantEdges.length > 0) {
+    if (budget.includeRelationships && significantEdges.length > 0) {
       lines.push('### Relationships');
       lines.push('');
 
@@ -767,14 +943,14 @@ export class ToolHandler {
       }
 
       for (const [kind, edges] of byKind) {
-        // Show up to 15 relationships per kind
-        const shown = edges.slice(0, 15);
+        const cap = budget.maxEdgesPerRelationshipKind;
+        const shown = edges.slice(0, cap);
         lines.push(`**${kind}:**`);
         for (const e of shown) {
           lines.push(`- ${e.source} → ${e.target}`);
         }
-        if (edges.length > 15) {
-          lines.push(`- ... and ${edges.length - 15} more`);
+        if (edges.length > cap) {
+          lines.push(`- ... and ${edges.length - cap} more`);
         }
         lines.push('');
       }
@@ -786,10 +962,11 @@ export class ToolHandler {
 
     let totalChars = lines.join('\n').length;
     let filesIncluded = 0;
+    let anyFileTrimmed = false;
 
     for (const [filePath, group] of sortedFiles) {
       if (filesIncluded >= maxFiles) break;
-      if (totalChars > ToolHandler.EXPLORE_MAX_OUTPUT * 0.9) break;
+      if (totalChars > budget.maxOutputChars * 0.9) break;
 
       const absPath = validatePathWithinRoot(projectRoot, filePath);
       if (!absPath || !existsSync(absPath)) continue;
@@ -805,14 +982,35 @@ export class ToolHandler {
       const lang = group.nodes[0]?.language || '';
 
       // Cluster nearby symbols to avoid reading huge gaps between distant symbols.
-      // Sort by start line, then merge overlapping/adjacent ranges (within 15 lines).
-      // Include both node ranges AND edge source locations so template sections
-      // with component usages/calls are covered (not just script block symbols).
-      const ranges: Array<{ start: number; end: number; name: string; kind: string }> = group.nodes
+      // Sort by start line, then merge overlapping/adjacent ranges (within the
+      // adaptive gap threshold). Include both node ranges AND edge source
+      // locations so template sections with component usages/calls are
+      // covered (not just script block symbols).
+      //
+      // Each range carries an `importance` score so we can rank clusters
+      // when the per-file budget forces us to drop some: entry-point nodes
+      // are worth 10, directly-connected nodes 3, peripheral nodes 1, and
+      // bare edge-source lines 2 (less than a connected node but more than
+      // a peripheral one — they hint at a reference but aren't a definition).
+      // Container kinds whose body can span most/all of a file. When such a
+      // node covers most of the file we drop it from the ranges: keeping it
+      // would merge every method inside it into one giant cluster spanning
+      // the whole file, which then tail-trims down to just the container's
+      // opening lines (its header/declarations) and buries the methods the
+      // query actually asked about (#185 follow-up — Session.swift in
+      // Alamofire is the canonical case: the `Session` class spans ~1,400
+      // lines). We want the granular symbols inside, not the envelope.
+      const ENVELOPE_KINDS = new Set(['file', 'module', 'class', 'struct', 'interface', 'enum', 'namespace', 'protocol', 'trait', 'component']);
+      const ranges: Array<{ start: number; end: number; name: string; kind: string; importance: number }> = group.nodes
         .filter(n => n.startLine > 0 && n.endLine > 0)
-        // Skip file/component nodes that span the entire file — they'd create one giant cluster
-        .filter(n => !(n.kind === 'component' && n.startLine === 1 && n.endLine >= fileLines.length - 1))
-        .map(n => ({ start: n.startLine, end: n.endLine, name: n.name, kind: n.kind }));
+        // Drop whole-file envelope nodes (containers covering >50% of the file).
+        .filter(n => !(ENVELOPE_KINDS.has(n.kind) && (n.endLine - n.startLine + 1) > fileLines.length * 0.5))
+        .map(n => {
+          let importance = 1;
+          if (entryNodeIds.has(n.id)) importance = 10;
+          else if (connectedToEntry.has(n.id)) importance = 3;
+          return { start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance };
+        });
 
       // Add edge source locations in this file — captures template references
       // (component usages, event handlers) that aren't nodes themselves.
@@ -829,7 +1027,7 @@ export class ToolHandler {
           // Look up target name from subgraph first, fall back to edge kind
           const targetNode = subgraph.nodes.get(edge.target);
           const targetName = targetNode?.name ?? edge.kind;
-          ranges.push({ start: edge.line, end: edge.line, name: targetName, kind: edge.kind });
+          ranges.push({ start: edge.line, end: edge.line, name: targetName, kind: edge.kind, importance: 2 });
         }
       }
 
@@ -837,46 +1035,143 @@ export class ToolHandler {
 
       if (ranges.length === 0) continue;
 
-      const GAP_THRESHOLD = 15; // merge sections within 15 lines of each other
-      const clusters: Array<{ start: number; end: number; symbols: string[] }> = [];
-      let current = { start: ranges[0]!.start, end: ranges[0]!.end, symbols: [`${ranges[0]!.name}(${ranges[0]!.kind})`] };
+      const gapThreshold = budget.gapThreshold;
+      const clusters: Array<{ start: number; end: number; symbols: string[]; score: number; maxImportance: number }> = [];
+      let current = {
+        start: ranges[0]!.start,
+        end: ranges[0]!.end,
+        symbols: [`${ranges[0]!.name}(${ranges[0]!.kind})`],
+        score: ranges[0]!.importance,
+        maxImportance: ranges[0]!.importance,
+      };
 
       for (let i = 1; i < ranges.length; i++) {
         const r = ranges[i]!;
-        if (r.start <= current.end + GAP_THRESHOLD) {
+        if (r.start <= current.end + gapThreshold) {
           current.end = Math.max(current.end, r.end);
           current.symbols.push(`${r.name}(${r.kind})`);
+          current.score += r.importance;
+          current.maxImportance = Math.max(current.maxImportance, r.importance);
         } else {
           clusters.push(current);
-          current = { start: r.start, end: r.end, symbols: [`${r.name}(${r.kind})`] };
+          current = {
+            start: r.start,
+            end: r.end,
+            symbols: [`${r.name}(${r.kind})`],
+            score: r.importance,
+            maxImportance: r.importance,
+          };
         }
       }
       clusters.push(current);
 
-      // Build file section output from clusters
+      // Build file section output from clusters, capped by per-file budget.
+      // The pathological case (#185): a file like Session.swift where every
+      // method is adjacent collapses into one cluster spanning the whole
+      // file, and dumping that into the agent's context is most of the
+      // token cost on small projects. We pick clusters in priority order
+      // until the per-file char cap is hit. Truly enormous single clusters
+      // get tail-trimmed with a marker.
       const contextPadding = 3;
+      const withLineNumbers = exploreLineNumbersEnabled();
+      const buildSection = (c: { start: number; end: number }): string => {
+        const startIdx = Math.max(0, c.start - 1 - contextPadding);
+        const endIdx = Math.min(fileLines.length, c.end + contextPadding);
+        const slice = fileLines.slice(startIdx, endIdx).join('\n');
+        // startIdx is 0-based, so the slice's first line is line startIdx + 1.
+        return withLineNumbers ? numberSourceLines(slice, startIdx + 1) : slice;
+      };
+      // Language-neutral separator (no `//` — not a comment in Python, Ruby,
+      // etc.). With line numbers on, the line-number jump also signals the gap.
+      const GAP_MARKER = '\n\n... (gap) ...\n\n';
+
+      // Rank clusters for inclusion under the per-file cap. Entry-point
+      // clusters come first: a cluster containing a query entry point
+      // (importance 10) must outrank a dense block of mere declarations,
+      // otherwise on a large file like Session.swift the top-of-file class
+      // header + property list (many adjacent low-importance nodes, high
+      // density) wins the budget and buries the actual methods the query
+      // asked about (perform/didCreateURLRequest/task live deep in the
+      // file). Within the same importance tier, prefer density (score per
+      // line) so we still favor focused clusters over sprawling ones, then
+      // smaller span as a cheap-to-include tiebreak.
+      const rankedClusters = clusters
+        .map((c, i) => ({ idx: i, span: c.end - c.start + 1, c }))
+        .sort((a, b) => {
+          if (b.c.maxImportance !== a.c.maxImportance) return b.c.maxImportance - a.c.maxImportance;
+          const densityA = a.c.score / a.span;
+          const densityB = b.c.score / b.span;
+          if (densityB !== densityA) return densityB - densityA;
+          if (b.c.score !== a.c.score) return b.c.score - a.c.score;
+          return a.span - b.span;
+        });
+
+      const chosenIndices = new Set<number>();
+      let projectedChars = 0;
+      for (const rc of rankedClusters) {
+        const sectionLen = buildSection(rc.c).length + (chosenIndices.size > 0 ? GAP_MARKER.length : 0);
+        // Always take the top-ranked cluster, even if oversize, so we don't
+        // return an empty file section (agent would then re-Read the file,
+        // negating the savings).
+        if (chosenIndices.size === 0) {
+          chosenIndices.add(rc.idx);
+          projectedChars += sectionLen;
+          continue;
+        }
+        if (projectedChars + sectionLen > budget.maxCharsPerFile) continue;
+        chosenIndices.add(rc.idx);
+        projectedChars += sectionLen;
+      }
+
+      // Emit chosen clusters in source order so the file reads top-to-bottom.
       let fileSection = '';
       const allSymbols: string[] = [];
-
-      for (const cluster of clusters) {
-        const startIdx = Math.max(0, cluster.start - 1 - contextPadding);
-        const endIdx = Math.min(fileLines.length, cluster.end + contextPadding);
-        const section = fileLines.slice(startIdx, endIdx).join('\n');
-
-        if (fileSection.length > 0) {
-          fileSection += '\n\n// ... (gap) ...\n\n';
-        }
+      let fileTrimmed = false;
+      for (let i = 0; i < clusters.length; i++) {
+        if (!chosenIndices.has(i)) continue;
+        const cluster = clusters[i]!;
+        const section = buildSection(cluster);
+        if (fileSection.length > 0) fileSection += GAP_MARKER;
         fileSection += section;
         allSymbols.push(...cluster.symbols);
       }
 
-      // Skip if this section would blow the output limit
-      if (totalChars + fileSection.length + 200 > ToolHandler.EXPLORE_MAX_OUTPUT) {
-        const budget = ToolHandler.EXPLORE_MAX_OUTPUT - totalChars - 200;
-        if (budget < 500) break;
-        const trimmed = fileSection.slice(0, budget) + '\n// ... trimmed ...';
+      // If a single chosen cluster is still oversize (long monolithic
+      // function), tail-trim it. Better one trimmed view than nothing.
+      if (fileSection.length > budget.maxCharsPerFile) {
+        fileSection = fileSection.slice(0, budget.maxCharsPerFile) + '\n... (trimmed) ...';
+        fileTrimmed = true;
+      }
+      if (chosenIndices.size < clusters.length || fileTrimmed) {
+        anyFileTrimmed = true;
+      }
 
-        lines.push(`#### ${filePath} — ${allSymbols.join(', ')}`);
+      // Dedupe + cap the symbols list shown in the per-file header. Some
+      // files (Session.swift in Alamofire) produced 3.4KB symbol lists
+      // from cluster scoring + edge-source lines, dwarfing the per-file
+      // body cap. Show top names by frequency, with a "+N more" tail.
+      const symbolCounts = new Map<string, number>();
+      for (const s of allSymbols) {
+        symbolCounts.set(s, (symbolCounts.get(s) ?? 0) + 1);
+      }
+      const sortedSymbols = [...symbolCounts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([name]) => name);
+      const headerCap = budget.maxSymbolsInFileHeader;
+      const headerSymbols = sortedSymbols.slice(0, headerCap);
+      const omittedCount = sortedSymbols.length - headerSymbols.length;
+      const headerSuffix = omittedCount > 0
+        ? `${headerSymbols.join(', ')}, +${omittedCount} more`
+        : headerSymbols.join(', ');
+      const fileHeader = `#### ${filePath} — ${headerSuffix}`;
+
+      // Respect the total output cap on a file-by-file basis.
+      if (totalChars + fileSection.length + 200 > budget.maxOutputChars) {
+        const remaining = budget.maxOutputChars - totalChars - 200;
+        if (remaining < 500) break;
+        const trimmed = fileSection.slice(0, remaining) + '\n... (trimmed) ...';
+
+        lines.push(fileHeader);
         lines.push('');
         lines.push('```' + lang);
         lines.push(trimmed);
@@ -884,10 +1179,11 @@ export class ToolHandler {
         lines.push('');
         totalChars += trimmed.length + 200;
         filesIncluded++;
+        anyFileTrimmed = true;
         break;
       }
 
-      lines.push(`#### ${filePath} — ${allSymbols.join(', ')}`);
+      lines.push(fileHeader);
       lines.push('');
       lines.push('```' + lang);
       lines.push(fileSection);
@@ -898,37 +1194,51 @@ export class ToolHandler {
       filesIncluded++;
     }
 
-    // Add remaining files as references (from both relevant and peripheral files)
-    const remainingRelevant = sortedFiles.slice(filesIncluded);
-    const peripheralFiles = [...fileGroups.entries()]
-      .filter(([, group]) => group.score < 3)
-      .sort((a, b) => b[1].score - a[1].score);
-    const remainingFiles = [...remainingRelevant, ...peripheralFiles];
-    if (remainingFiles.length > 0) {
-      lines.push('### Additional relevant files (not shown)');
-      lines.push('');
-      for (const [filePath, group] of remainingFiles.slice(0, 10)) {
-        const symbols = group.nodes.map(n => `${n.name}:${n.startLine}`).join(', ');
-        lines.push(`- ${filePath}: ${symbols}`);
-      }
-      if (remainingFiles.length > 10) {
-        lines.push(`- ... and ${remainingFiles.length - 10} more files`);
+    // Add remaining files as references (from both relevant and peripheral files).
+    // Small projects (per budget) skip this — the relevant story already fits
+    // in the source section, and a trailing pointer list is pure overhead.
+    if (budget.includeAdditionalFiles) {
+      const remainingRelevant = sortedFiles.slice(filesIncluded);
+      const peripheralFiles = [...fileGroups.entries()]
+        .filter(([, group]) => group.score < 3)
+        .sort((a, b) => b[1].score - a[1].score);
+      const remainingFiles = [...remainingRelevant, ...peripheralFiles];
+      if (remainingFiles.length > 0) {
+        lines.push('### Additional relevant files (not shown)');
+        lines.push('');
+        for (const [filePath, group] of remainingFiles.slice(0, 10)) {
+          const symbols = group.nodes.map(n => `${n.name}:${n.startLine}`).join(', ');
+          lines.push(`- ${filePath}: ${symbols}`);
+        }
+        if (remainingFiles.length > 10) {
+          lines.push(`- ... and ${remainingFiles.length - 10} more files`);
+        }
       }
     }
 
-    // Add completeness signal so agents know they don't need to re-read these files
-    lines.push('');
-    lines.push('---');
-    lines.push(`> **Complete source code is included above for ${filesIncluded} files.** You do NOT need to re-read these files — the relevant sections are already shown in full. Only use Read/Grep for files listed under "Additional relevant files" if you need more detail.`);
+    // Add completeness signal so agents know they don't need to re-read these files.
+    // On small projects the budget gates this off — but if we actually had to
+    // trim or drop clusters, surface a brief note so the agent knows it can
+    // still Read for more detail.
+    if (budget.includeCompletenessSignal) {
+      lines.push('');
+      lines.push('---');
+      lines.push(`> **Complete source code is included above for ${filesIncluded} files.** You do NOT need to re-read these files — the relevant sections are already shown in full. Only use Read/Grep for files listed under "Additional relevant files" if you need more detail.`);
+    } else if (anyFileTrimmed) {
+      lines.push('');
+      lines.push(`> Some file sections were trimmed for size. Use \`codegraph_node\` or Read for the full source if needed.`);
+    }
 
     // Add explore budget note based on project size
-    try {
-      const stats = cg.getStats();
-      const budget = getExploreBudget(stats.fileCount);
-      lines.push('');
-      lines.push(`> **Explore budget: ${budget} calls max for this project (${stats.fileCount.toLocaleString()} files indexed).** Stop exploring and synthesize your answer once you've used ${budget} calls — do NOT make additional explore calls beyond this budget.`);
-    } catch {
-      // Stats unavailable — skip budget note
+    if (budget.includeBudgetNote) {
+      try {
+        const stats = cg.getStats();
+        const callBudget = getExploreBudget(stats.fileCount);
+        lines.push('');
+        lines.push(`> **Explore budget: ${callBudget} calls max for this project (${stats.fileCount.toLocaleString()} files indexed).** Stop exploring and synthesize your answer once you've used ${callBudget} calls — do NOT make additional explore calls beyond this budget.`);
+      } catch {
+        // Stats unavailable — skip budget note
+      }
     }
 
     return this.textResult(lines.join('\n'));
@@ -1204,9 +1514,22 @@ export class ToolHandler {
    * Returns the best match and a note about alternatives if any.
    */
   /**
-   * Check if a node matches a symbol query, supporting both simple names and
-   * qualified "Parent.child" notation (e.g., "Session.request" matches a method
-   * named "request" inside a class named "Session").
+   * Check if a node matches a symbol query.
+   *
+   * Accepts simple names (`run`) and three flavors of qualifier:
+   *   - dotted     `Session.request`         (TS/JS/Python)
+   *   - colon-pair `stage_apply::run`        (Rust, C++, Ruby)
+   *   - slash      `configurator/stage_apply` (path-ish)
+   *
+   * Multi-level qualifiers compose: `crate::configurator::stage_apply::run`
+   * works. Rust path prefixes (`crate`, `super`, `self`) are stripped so
+   * the canonical `crate::module::symbol` form resolves.
+   *
+   * Resolution order, last part must always equal `node.name`:
+   *   1. Suffix-match against `qualifiedName` (handles class-scoped methods
+   *      where the extractor builds the qualified name from the AST stack)
+   *   2. File-path containment (handles file-derived modules in Rust/
+   *      Python — `stage_apply::run` matches a `run` in `stage_apply.rs`)
    */
   private matchesSymbol(node: Node, symbol: string): boolean {
     // Simple name match
@@ -1214,21 +1537,52 @@ export class ToolHandler {
     // File basename match (e.g., "product-card" matches "product-card.liquid")
     if (node.kind === 'file' && node.name.replace(/\.[^.]+$/, '') === symbol) return true;
 
-    // Qualified name match: "Parent.child" → look for "::Parent::child" in qualified_name
-    if (symbol.includes('.')) {
-      const parts = symbol.split('.');
-      const qualifiedSuffix = parts.join('::');
-      if (node.qualifiedName.includes(qualifiedSuffix)) return true;
-    }
+    // Qualified-name lookups: split on any supported separator. `\w` keeps
+    // identifier chars (incl. `_`) intact; everything else is treated as
+    // a separator we tolerate.
+    if (!/[.\/]|::/.test(symbol)) return false;
+    const parts = symbol.split(/::|[./]/).filter((p) => p.length > 0);
+    if (parts.length < 2) return false;
 
-    return false;
+    const lastPart = parts[parts.length - 1]!;
+    if (node.name !== lastPart) return false;
+
+    // Stage 1: qualified-name suffix match. The extractor joins the
+    // semantic hierarchy with `::`, so `Session.request` and
+    // `Session::request` both become `Session::request` here.
+    const colonSuffix = parts.join('::');
+    if (node.qualifiedName.includes(colonSuffix)) return true;
+
+    // Stage 2: file-path containment. Rust modules and Python packages
+    // are not in `qualifiedName` — they're encoded in the file path. So
+    // `stage_apply::run` matches a `run` in any file whose path
+    // contains a `stage_apply` segment (with or without an extension).
+    //
+    // Filter out Rust path prefixes that have no file-system equivalent.
+    const containerHints = parts.slice(0, -1).filter((p) => !RUST_PATH_PREFIXES.has(p));
+    if (containerHints.length === 0) return false;
+
+    const segments = node.filePath.split('/').filter((s) => s.length > 0);
+    return containerHints.every((hint) =>
+      segments.some((seg) => seg === hint || seg.replace(/\.[^.]+$/, '') === hint)
+    );
   }
 
   private findSymbol(cg: CodeGraph, symbol: string): { node: Node; note: string } | null {
-    // Use higher limit for qualified lookups (e.g., "Session.request") since the
-    // target may rank lower in FTS when there are many partial matches
-    const limit = symbol.includes('.') ? 50 : 10;
-    const results = cg.searchNodes(symbol, { limit });
+    // Use higher limit for qualified lookups (e.g., "Session.request",
+    // "stage_apply::run") since the target may rank lower in FTS when
+    // there are many partial matches across the qualifier parts.
+    const isQualified = /[.\/]|::/.test(symbol);
+    const limit = isQualified ? 50 : 10;
+    let results = cg.searchNodes(symbol, { limit });
+
+    // FTS strips colons as a special char, so `stage_apply::run` searches
+    // for the literal `stage_applyrun` and finds nothing. Re-search by
+    // the bare last part and let `matchesSymbol` filter by qualifier.
+    if (isQualified && results.length === 0) {
+      const tail = lastQualifierPart(symbol);
+      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit });
+    }
 
     if (results.length === 0 || !results[0]) {
       return null;
@@ -1250,7 +1604,11 @@ export class ToolHandler {
       return { node: picked, note };
     }
 
-    // No exact match, use best fuzzy match
+    // No exact match. For qualified lookups, don't silently fall back
+    // to a fuzzy result — the user typed a specific qualifier, and
+    // resolving `stage_apply::nonexistent_fn` to the unrelated
+    // `stage_apply.rs` file would be actively misleading (#173).
+    if (isQualified) return null;
     return { node: results[0]!.node, note: '' };
   }
 
@@ -1259,7 +1617,15 @@ export class ToolHandler {
    * results across all matching symbols (e.g., multiple classes with an `execute` method).
    */
   private findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
-    const results = cg.searchNodes(symbol, { limit: 50 });
+    let results = cg.searchNodes(symbol, { limit: 50 });
+
+    // Mirror the fallback in `findSymbol` for qualified queries — FTS
+    // strips colons, so a module-qualified lookup needs a second pass
+    // by the bare last part.
+    if (results.length === 0 && /[.\/]|::/.test(symbol)) {
+      const tail = lastQualifierPart(symbol);
+      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit: 50 });
+    }
 
     if (results.length === 0) {
       return { nodes: [], note: '' };

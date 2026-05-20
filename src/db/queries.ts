@@ -696,8 +696,14 @@ export class QueryBuilder {
     const { kinds, languages, limit = 100, offset = 0 } = options;
 
     // Add prefix wildcard for better matching (e.g., "auth" matches "AuthService", "authenticate")
-    // Escape special FTS5 characters and add prefix wildcard
+    // Escape special FTS5 characters and add prefix wildcard.
+    //
+    // `::` is a qualifier separator in Rust/C++/Ruby, not a token char,
+    // so treat it as whitespace before the strip step. Otherwise queries
+    // like `stage_apply::run` collapse to `stage_applyrun` (the colons
+    // are stripped without splitting) and find nothing. See #173.
     const ftsQuery = query
+      .replace(/::/g, ' ') // Rust/C++/Ruby qualifier separator
       .replace(/['"*():^]/g, '') // Remove FTS5 special chars
       .split(/\s+/)
       .filter(term => term.length > 0)

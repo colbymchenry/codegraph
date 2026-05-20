@@ -1006,9 +1006,11 @@ export class ContextBuilder {
 
       const code = await this.extractNodeCode(node);
       if (code) {
-        // Truncate if too long
+        // Truncate if too long. Language-neutral marker (no `//` — not a
+        // comment in Python, Ruby, etc.); this renders inside a fenced
+        // source block whose language varies.
         const truncated = code.length > maxBlockSize
-          ? code.slice(0, maxBlockSize) + '\n// ... truncated ...'
+          ? code.slice(0, maxBlockSize) + '\n... (truncated) ...'
           : code;
 
         blocks.push({
