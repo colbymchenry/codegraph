@@ -94,6 +94,10 @@ describe('Language Detection', () => {
     expect(detectLanguage('main.dart')).toBe('dart');
   });
 
+  it('should detect Nix files', () => {
+    expect(detectLanguage('default.nix')).toBe('nix');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -105,6 +109,7 @@ describe('Language Support', () => {
     expect(isLanguageSupported('typescript')).toBe(true);
     expect(isLanguageSupported('python')).toBe(true);
     expect(isLanguageSupported('go')).toBe(true);
+    expect(isLanguageSupported('nix')).toBe(true);
     expect(isLanguageSupported('unknown')).toBe(false);
   });
 
@@ -122,6 +127,28 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('nix');
+  });
+});
+
+describe('Nix Extraction', () => {
+  it('should extract Nix bindings and imports', () => {
+    const code = `{
+      hello = "world";
+      package = import ./default.nix;
+    }`;
+
+    const result = extractFromSource('default.nix', code);
+    const hello = result.nodes.find((n) => n.kind === 'variable' && n.name === 'hello');
+    const packageNode = result.nodes.find((n) => n.kind === 'variable' && n.name === 'package');
+    const importNode = result.nodes.find((n) => n.kind === 'import');
+
+    expect(hello).toBeDefined();
+    expect(packageNode).toBeDefined();
+    expect(importNode).toMatchObject({
+      kind: 'import',
+      name: './default.nix',
+    });
   });
 });
 

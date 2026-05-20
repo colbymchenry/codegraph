@@ -33,6 +33,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   swift: 'tree-sitter-swift.wasm',
   kotlin: 'tree-sitter-kotlin.wasm',
   dart: 'tree-sitter-dart.wasm',
+  nix: 'tree-sitter-nix.wasm',
   pascal: 'tree-sitter-pascal.wasm',
   scala: 'tree-sitter-scala.wasm',
 };
@@ -67,6 +68,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.kt': 'kotlin',
   '.kts': 'kotlin',
   '.dart': 'dart',
+  '.nix': 'nix',
   '.liquid': 'liquid',
   '.svelte': 'svelte',
   '.vue': 'vue',
@@ -125,8 +127,8 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
   for (const lang of toLoad) {
     const wasmFile = WASM_GRAMMAR_FILES[lang];
     try {
-      // Pascal and Scala ship their own WASMs (not in tree-sitter-wasms)
-      const wasmPath = (lang === 'pascal' || lang === 'scala')
+      // Pascal, Scala, and Nix ship their own WASMs (not in tree-sitter-wasms)
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'nix')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -286,6 +288,7 @@ export function getLanguageDisplayName(language: Language): string {
     swift: 'Swift',
     kotlin: 'Kotlin',
     dart: 'Dart',
+    nix: 'Nix',
     svelte: 'Svelte',
     vue: 'Vue',
     liquid: 'Liquid',

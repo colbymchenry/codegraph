@@ -23,6 +23,7 @@ import { kotlinExtractor } from './kotlin';
 import { dartExtractor } from './dart';
 import { pascalExtractor } from './pascal';
 import { scalaExtractor } from './scala';
+import { nixExtractor } from './nix';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -41,6 +42,7 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   swift: swiftExtractor,
   kotlin: kotlinExtractor,
   dart: dartExtractor,
+  nix: nixExtractor,
   pascal: pascalExtractor,
   scala: scalaExtractor,
 };

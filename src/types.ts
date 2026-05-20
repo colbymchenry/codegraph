@@ -80,11 +80,13 @@ export const LANGUAGES = [
   'swift',
   'kotlin',
   'dart',
+  'nix',
   'svelte',
   'vue',
   'liquid',
   'pascal',
   'scala',
+  'nix',
   'unknown',
 ] as const;
 
@@ -529,6 +531,8 @@ export const DEFAULT_CONFIG: CodeGraphConfig = {
     '**/*.kts',
     // Dart
     '**/*.dart',
+    // Nix
+    '**/*.nix',
     // Svelte
     '**/*.svelte',
     // Vue

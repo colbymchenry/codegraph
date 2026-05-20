@@ -457,6 +457,7 @@ The `.codegraph/config.json` file controls indexing:
 | Vue | `.vue` | Full support (script + script-setup extraction, Nuxt page/API/middleware routes) |
 | Liquid | `.liquid` | Full support |
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX form files) |
+| Nix | `.nix` | Full support |
 
 ## Troubleshooting
 
