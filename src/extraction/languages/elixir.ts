@@ -303,7 +303,7 @@ function handleAttribute(node: SyntaxNode, ctx: ExtractorContext): boolean {
  */
 function handleImportLike(
   callNode: SyntaxNode,
-  mechanism: 'alias' | 'import' | 'require' | 'use',
+  _mechanism: 'alias' | 'import' | 'require' | 'use',
   ctx: ExtractorContext
 ): boolean {
   const args = getChildByField(callNode, 'arguments') ?? findChild(callNode, 'arguments');
@@ -569,11 +569,27 @@ function enclosingFunctionId(ctx: ExtractorContext): string | null {
   return null;
 }
 
+/**
+ * Elixir control-flow and metaprogramming forms parse as plain `call`
+ * nodes (since `case foo do … end` IS syntactically a call to `case`).
+ * They aren't function references and should not be emitted as
+ * `calls`-kind edges. Macros like `quote`/`unquote`/`raise`/`throw` are
+ * arguable, but excluding them keeps the graph signal-heavy.
+ */
+const NON_CALL_FORMS = new Set([
+  'case', 'cond', 'if', 'unless', 'with', 'for', 'try', 'receive',
+  'quote', 'unquote', 'unquote_splicing', 'fn',
+  'raise', 'throw', 'reraise',
+]);
+
 function handleUserCall(callNode: SyntaxNode, ctx: ExtractorContext): void {
   const fnId = enclosingFunctionId(ctx);
   if (!fnId) return;
   const callee = resolveCallee(callNode, ctx.source);
   if (!callee) return;
+  // Strip the control-flow forms — they live syntactically as calls but
+  // aren't function references.
+  if (NON_CALL_FORMS.has(callee.name)) return;
   const effectiveArity = callee.argCount + (pipeAddsArg(callNode, ctx.source) ? 1 : 0);
   ctx.addUnresolvedReference({
     fromNodeId: fnId,
