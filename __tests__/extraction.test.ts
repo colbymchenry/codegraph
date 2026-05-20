@@ -3658,6 +3658,77 @@ end
       expect(ref).toBeDefined();
     });
   });
+
+  describe('Call extraction', () => {
+    it('should emit a calls reference for a plain local call', () => {
+      const code = `
+defmodule Foo do
+  def caller, do: helper(1, 2)
+  def helper(a, b), do: a + b
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const caller = result.nodes.find((n) => n.kind === 'function' && n.name === 'caller/0');
+      const ref = result.unresolvedReferences.find(
+        (r) => r.fromNodeId === caller?.id && r.referenceName === 'helper/2' && r.referenceKind === 'calls'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    it('should emit a calls reference for a remote call with arity', () => {
+      const code = `
+defmodule Foo do
+  def go(x) do
+    String.upcase(x)
+  end
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const go = result.nodes.find((n) => n.kind === 'function' && n.name === 'go/1');
+      const ref = result.unresolvedReferences.find(
+        (r) =>
+          r.fromNodeId === go?.id &&
+          r.referenceName === 'String.upcase/1' &&
+          r.referenceKind === 'calls'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    it('should count the pipeline LHS as an extra argument', () => {
+      const code = `
+defmodule Foo do
+  def go(x), do: x |> String.upcase()
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const go = result.nodes.find((n) => n.kind === 'function' && n.name === 'go/1');
+      const ref = result.unresolvedReferences.find(
+        (r) =>
+          r.fromNodeId === go?.id &&
+          r.referenceName === 'String.upcase/1' &&
+          r.referenceKind === 'calls'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    it('should not emit calls refs for declaration forms (def, alias, ...)', () => {
+      const code = `
+defmodule Foo do
+  alias Bar.Baz
+
+  def hello, do: :ok
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'Foo');
+      const stray = result.unresolvedReferences.find(
+        (r) =>
+          r.fromNodeId === mod?.id &&
+          (r.referenceName.startsWith('def') || r.referenceName.startsWith('alias'))
+      );
+      expect(stray).toBeUndefined();
+    });
+  });
 });
 
 describe('Vue Extraction', () => {

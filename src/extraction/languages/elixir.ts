@@ -158,12 +158,10 @@ function handleDefmodule(node: SyntaxNode, ctx: ExtractorContext): boolean {
   ctx.pushScope(moduleNode.id);
   try {
     const body = findChild(node, 'do_block');
-    if (body) {
-      for (let i = 0; i < body.namedChildCount; i++) {
-        const child = body.namedChild(i);
-        if (child) ctx.visitNode(child);
-      }
-    }
+    // Visit the do_block itself — our hook returns false for non-call
+    // nodes, letting the default walker iterate its named children
+    // (each module-level form: alias, def, defstruct, …).
+    if (body) ctx.visitNode(body);
   } finally {
     ctx.popScope();
   }
@@ -181,13 +179,20 @@ function handleDef(
   const isPrivate = defKind === 'defp' || defKind === 'defmacrop';
 
   if (findExistingFunction(name, ctx)) {
-    // Multi-clause: merge into the first node. Still walk the body for
-    // call-site extraction so calls inside later clauses are captured.
+    // Multi-clause: merge into the first node. Still walk the body so
+    // calls inside later clauses are captured. We need to push the
+    // existing function node onto scope first so `enclosingFunctionId`
+    // sees a function ancestor for any nested call sites.
+    const existing = ctx.nodes.find(
+      (n) => n.kind === 'function' && n.qualifiedName === expectedQualifiedName(name, ctx)
+    );
     const body = resolveDefBody(node);
-    if (body) {
-      for (let i = 0; i < body.namedChildCount; i++) {
-        const child = body.namedChild(i);
-        if (child) ctx.visitNode(child);
+    if (body && existing) {
+      ctx.pushScope(existing.id);
+      try {
+        ctx.visitNode(body);
+      } finally {
+        ctx.popScope();
       }
     }
     return true;
@@ -201,12 +206,7 @@ function handleDef(
   ctx.pushScope(fnNode.id);
   try {
     const body = resolveDefBody(node);
-    if (body) {
-      for (let i = 0; i < body.namedChildCount; i++) {
-        const child = body.namedChild(i);
-        if (child) ctx.visitNode(child);
-      }
-    }
+    if (body) ctx.visitNode(body);
   } finally {
     ctx.popScope();
   }
@@ -322,6 +322,91 @@ function handleImportLike(
   return true;
 }
 
+/**
+ * Resolve the callee name + arity for a user call site.
+ *
+ *   helper(a, b)      → "helper/2"
+ *   String.upcase(x)  → "String.upcase/1"
+ *   length(list)      → "length/1"
+ *
+ * Returns null for shapes we don't recognise (operator-style calls,
+ * anonymous-fn invocations `fun.()`, etc.) — phase 2c emits nothing
+ * rather than guessing wrong.
+ */
+function resolveCallee(callNode: SyntaxNode, source: string): { name: string; argCount: number } | null {
+  const target = callNode.namedChild(0);
+  if (!target) return null;
+  const args = getChildByField(callNode, 'arguments') ?? findChild(callNode, 'arguments');
+  const argCount = args ? args.namedChildCount : 0;
+
+  if (target.type === 'identifier') {
+    return { name: getNodeText(target, source), argCount };
+  }
+  if (target.type === 'dot') {
+    // `String.upcase` — left is the receiver (an alias or expression),
+    // right is the method identifier. Anonymous-fn `.()` invocation has
+    // no right field; ignore for now.
+    const left = getChildByField(target, 'left') ?? target.namedChild(0);
+    const right = getChildByField(target, 'right') ?? target.namedChild(1);
+    if (!left || !right || right.type !== 'identifier') return null;
+    const receiver = getNodeText(left, source).trim();
+    return { name: `${receiver}.${getNodeText(right, source)}`, argCount };
+  }
+  return null;
+}
+
+/**
+ * Is this call the right-hand operand of a `|>` pipe? If so, the pipe
+ * threads its LHS in as an implicit first argument, so the effective
+ * arity is `argCount + 1`.
+ *
+ * tree-sitter-elixir doesn't expose the operator text as a field — we
+ * detect `|>` by reading the source slice between the parent's left and
+ * right children.
+ */
+function pipeAddsArg(callNode: SyntaxNode, source: string): boolean {
+  const parent = callNode.parent;
+  if (!parent || parent.type !== 'binary_operator') return false;
+  const right = getChildByField(parent, 'right');
+  if (right?.id !== callNode.id) return false;
+  const left = getChildByField(parent, 'left');
+  if (!left) return false;
+  const operatorText = source.substring(left.endIndex, callNode.startIndex);
+  return operatorText.includes('|>');
+}
+
+/**
+ * Find the enclosing function on the scope stack, if any. Calls outside
+ * a function (e.g. module-level `use Foo`) are skipped — without a
+ * caller, an unresolved reference has nothing useful to anchor to.
+ */
+function enclosingFunctionId(ctx: ExtractorContext): string | null {
+  for (let i = ctx.nodeStack.length - 1; i >= 0; i--) {
+    const id = ctx.nodeStack[i]!;
+    const n = ctx.nodes.find((x) => x.id === id);
+    if (n?.kind === 'function') return id;
+    if (n?.kind === 'module') return null;
+  }
+  return null;
+}
+
+function handleUserCall(callNode: SyntaxNode, ctx: ExtractorContext): void {
+  const fnId = enclosingFunctionId(ctx);
+  if (!fnId) return;
+  const callee = resolveCallee(callNode, ctx.source);
+  if (!callee) return;
+  const effectiveArity = callee.argCount + (pipeAddsArg(callNode, ctx.source) ? 1 : 0);
+  ctx.addUnresolvedReference({
+    fromNodeId: fnId,
+    referenceName: `${callee.name}/${effectiveArity}`,
+    referenceKind: 'calls',
+    line: callNode.startPosition.row + 1,
+    column: callNode.startPosition.column,
+    filePath: ctx.filePath,
+    language: 'elixir',
+  });
+}
+
 // --- LanguageExtractor config ----------------------------------------------
 
 export const elixirExtractor: LanguageExtractor = {
@@ -359,8 +444,11 @@ export const elixirExtractor: LanguageExtractor = {
         case 'use':
           return handleImportLike(node, target, ctx);
       }
-      // For any other call, let the default walker descend so nested
-      // structures (e.g. defmodule inside an `if`) are still visited.
+      // Generic user call site — emit a `calls` reference if we're
+      // inside a function. Returning false lets the default walker
+      // descend into the arguments so nested calls (e.g. `f(g(x))`)
+      // are also captured.
+      handleUserCall(node, ctx);
       return false;
     }
     if (node.type === 'unary_operator') {
