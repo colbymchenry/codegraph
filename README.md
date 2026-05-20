@@ -4,7 +4,7 @@
 
 ### Supercharge Claude Code, Cursor, Codex, and OpenCode with Semantic Code Intelligence
 
-**94% fewer tool calls · 77% faster exploration · 100% local**
+**~35% cheaper · ~70% fewer tool calls · 100% local**
 
 [![npm version](https://img.shields.io/npm/v/@colbymchenry/codegraph.svg)](https://www.npmjs.com/package/@colbymchenry/codegraph)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -50,61 +50,50 @@ When Claude Code explores a codebase, it spawns **Explore agents** that scan fil
 
 ### Benchmark Results
 
-Tested across 6 real-world codebases comparing Claude Code's Explore agent **with** and **without** CodeGraph:
+Tested across **7 real-world open-source codebases** spanning 7 languages, comparing an agent (Claude Code, headless) answering one architecture question **with** and **without** CodeGraph. Each cell is the savings at the **median of 4 runs per arm**.
 
-> **Average: 92% fewer tool calls · 71% faster**
+> **Average: 35% cheaper · 59% fewer tokens · 49% faster · 70% fewer tool calls**
 
-| Codebase | With CG | Without CG | Improvement |
-|----------|---------|------------|-------------|
-| **VS Code** · TypeScript | 3 calls, 17s | 52 calls, 1m 37s | **94% fewer · 82% faster** |
-| **Excalidraw** · TypeScript | 3 calls, 29s | 47 calls, 1m 45s | **94% fewer · 72% faster** |
-| **Claude Code** · Python + Rust | 3 calls, 39s | 40 calls, 1m 8s | **93% fewer · 43% faster** |
-| **Claude Code** · Java | 1 call, 19s | 26 calls, 1m 22s | **96% fewer · 77% faster** |
-| **Alamofire** · Swift | 3 calls, 22s | 32 calls, 1m 39s | **91% fewer · 78% faster** |
-| **Swift Compiler** · Swift/C++ | 6 calls, 35s | 37 calls, 2m 8s | **84% fewer · 73% faster** |
+| Codebase | Language | Cost | Tokens | Time | Tool calls |
+|----------|----------|------|--------|------|------------|
+| **VS Code** | TypeScript · ~10k files | 35% cheaper | 73% fewer | 41% faster | 72% fewer |
+| **Excalidraw** | TypeScript · ~600 | 47% cheaper | 73% fewer | 60% faster | 86% fewer |
+| **Django** | Python · ~2.7k | 34% cheaper | 64% fewer | 59% faster | 81% fewer |
+| **Tokio** | Rust · ~700 | 52% cheaper | 81% fewer | 63% faster | 89% fewer |
+| **OkHttp** | Java · ~640 | 17% cheaper | 41% fewer | 36% faster | 64% fewer |
+| **Gin** | Go · ~150 | 22% cheaper | 23% fewer | 34% faster | 19% fewer |
+| **Alamofire** | Swift · ~100 | 38% cheaper | 59% fewer | 51% faster | 77% fewer |
+
+The gains scale with codebase size: on large repos the agent answers from the index in a handful of calls with **zero file reads**, while the no-CodeGraph agent fans out across grep/find/Read (and the sub-agents it spawns). On a small repo like Gin (~150 files) native search is already cheap, so the margin narrows.
 
 <details>
 <summary><strong>Full benchmark details</strong></summary>
 
-All tests used Claude Opus 4.6 (1M context) with Claude Code v2.1.91. Each test spawned a single Explore agent with the same question.
+**Methodology.** Each arm is `claude -p` (Claude Opus 4.7, Claude Code v2.1.145) run headlessly against the repo with `--strict-mcp-config`: **WITH** = CodeGraph's MCP server enabled, **WITHOUT** = an empty MCP config. Built-in Read/Grep/Bash stay available to both. Same question per repo, **4 runs per arm, median reported**. Cost = the run's `total_cost_usd`; Tokens = total tokens processed (input incl. cached + output); Time = wall-clock; Tool calls = every tool invocation, including those inside any sub-agents the model spawns. Repos cloned at `--depth 1` and indexed by the same CodeGraph build that served them.
 
-**Queries used:**
+**Queries:**
 | Codebase | Query |
 |----------|-------|
 | VS Code | "How does the extension host communicate with the main process?" |
-| Excalidraw | "How does collaborative editing and real-time sync work?" |
-| Claude Code (Python+Rust) | "How does tool execution work end to end?" |
-| Claude Code (Java) | "How does tool execution work end to end?" |
-| Alamofire | "Trace how a request flows from Session.request() through to the URLSession layer" |
-| Swift Compiler | "How does the Swift compiler handle error diagnostics?" |
+| Excalidraw | "How does Excalidraw render and update canvas elements?" |
+| Django | "How does Django's ORM build and execute a query from a QuerySet?" |
+| Tokio | "How does tokio schedule and run async tasks on its runtime?" |
+| OkHttp | "How does OkHttp process a request through its interceptor chain?" |
+| Gin | "How does gin route requests through its middleware chain?" |
+| Alamofire | "How does Alamofire build, send, and validate a request?" |
 
-**With CodeGraph — the agent uses `codegraph_explore` and stops:**
-| Codebase | Files Indexed | Nodes | Tool Uses | Tokens | Time | File Reads |
-|----------|--------------|-------|-----------|--------|------|------------|
-| VS Code (TypeScript) | 4,002 | 59,377 | 3 | 56.6k | 17s | 0 |
-| Excalidraw (TypeScript) | 626 | 9,859 | 3 | 57.1k | 29s | 0 |
-| Claude Code (Python+Rust) | 115 | 3,080 | 3 | 67.1k | 39s | 0 |
-| Claude Code (Java) | — | — | 1 | 40.8k | 19s | 0 |
-| Alamofire (Swift) | 102 | 2,624 | 3 | 57.3k | 22s | 0 |
-| Swift Compiler (Swift/C++) | 25,874 | 272,898 | 6 | 77.4k | 35s | 0 |
+**Raw medians — WITH → WITHOUT:**
+| Codebase | Cost | Tokens | Time | Tool calls |
+|----------|------|--------|------|------------|
+| VS Code | $0.42 → $0.64 | 393k → 1.4M | 1m 0s → 1m 43s | 7 → 23 |
+| Excalidraw | $0.54 → $1.02 | 851k → 3.2M | 1m 17s → 3m 14s | 12 → 83 |
+| Django | $0.41 → $0.62 | 499k → 1.4M | 1m 0s → 2m 25s | 9 → 48 |
+| Tokio | $0.50 → $1.04 | 657k → 3.4M | 1m 5s → 2m 56s | 9 → 75 |
+| OkHttp | $0.36 → $0.44 | 352k → 596k | 45s → 1m 11s | 5 → 14 |
+| Gin | $0.36 → $0.46 | 431k → 562k | 47s → 1m 11s | 7 → 8 |
+| Alamofire | $0.61 → $0.99 | 1.1M → 2.6M | 1m 19s → 2m 41s | 15 → 64 |
 
-**Without CodeGraph — the agent uses grep, find, ls, and Read extensively:**
-| Codebase | Tool Uses | Tokens | Time | File Reads |
-|----------|-----------|--------|------|------------|
-| VS Code (TypeScript) | 52 | 89.4k | 1m 37s | ~15 |
-| Excalidraw (TypeScript) | 47 | 77.9k | 1m 45s | ~20 |
-| Claude Code (Python+Rust) | 40 | 69.3k | 1m 8s | ~15 |
-| Claude Code (Java) | 26 | 73.3k | 1m 22s | ~15 |
-| Alamofire (Swift) | 32 | 52.4k | 1m 39s | ~10 |
-| Swift Compiler (Swift/C++) | 37 | 99.1k | 2m 8s | ~20 |
-
-**Key observations:**
-- With CodeGraph, the agent **never fell back to reading files** — it trusted the codegraph_explore results completely
-- Without CodeGraph, agents spent most of their time on discovery (find, ls, grep) before they could even start reading relevant code
-- The Java codebase needed only **1 codegraph_explore call** to answer the entire question
-- Cross-language queries (Python+Rust) worked seamlessly — CodeGraph's graph traversal found connections across language boundaries
-- The Swift benchmark (Alamofire) traced a **9-step call chain** from `Session.request()` to `URLSession.dataTask()` — CodeGraph's graph traversal at depth 3 captured the full chain in one explore call
-- The **Swift Compiler** benchmark is the largest codebase tested (**25,874 files, 272,898 nodes**) — CodeGraph indexed it in under 4 minutes and the agent answered a complex cross-cutting question with **6 explore calls and zero file reads** in 35 seconds
+**Why CodeGraph wins:** with the index available, the agent answers directly — `codegraph_context` to map the area, then one `codegraph_explore` for the relevant source — and stops, usually with zero file reads. Without it, the agent (and the Explore sub-agents it spawns) spends most of its budget on discovery (find/ls/grep) before reading the right code. CodeGraph only helps when queried *directly*, so its instructions steer agents to answer directly rather than delegate exploration to file-reading sub-agents — otherwise a sub-agent reads files regardless and CodeGraph becomes overhead.
 
 </details>
 
