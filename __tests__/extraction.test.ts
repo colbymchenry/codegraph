@@ -3492,6 +3492,115 @@ describe('Elixir Extraction', () => {
       expect(getSupportedLanguages()).toContain('elixir');
     });
   });
+
+  describe('Module extraction', () => {
+    it('should extract a top-level defmodule as a module node', () => {
+      const code = `
+defmodule Foo do
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'Foo');
+      expect(mod).toBeDefined();
+      expect(mod?.language).toBe('elixir');
+    });
+
+    it('should preserve the full dotted module name', () => {
+      const code = `
+defmodule Talkie.Accounts.User do
+end
+`;
+      const result = extractFromSource('lib/talkie/accounts/user.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module');
+      expect(mod?.name).toBe('Talkie.Accounts.User');
+    });
+
+    it('should attach @moduledoc as docstring', () => {
+      const code = `
+defmodule Foo do
+  @moduledoc "A demo module."
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'Foo');
+      expect(mod?.docstring).toContain('A demo module.');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract def with arity in the name', () => {
+      const code = `
+defmodule Foo do
+  def hello(name), do: name
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function');
+      expect(fns.find((f) => f.name === 'hello/1')).toBeDefined();
+    });
+
+    it('should mark defp as private', () => {
+      const code = `
+defmodule Foo do
+  defp secret(x), do: x
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'secret/1');
+      expect(fn).toBeDefined();
+      expect(fn?.visibility).toBe('private');
+    });
+
+    it('should extract zero-arity functions as name/0', () => {
+      const code = `
+defmodule Foo do
+  def greeting, do: "hi"
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'greeting/0');
+      expect(fn).toBeDefined();
+    });
+
+    it('should merge multi-clause defs into one node per name/arity', () => {
+      const code = `
+defmodule Foo do
+  def add(0, y), do: y
+  def add(x, 0), do: x
+  def add(x, y), do: x + y
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const adds = result.nodes.filter((n) => n.kind === 'function' && n.name === 'add/2');
+      expect(adds.length).toBe(1);
+    });
+
+    it('should emit a contains edge from the enclosing module', () => {
+      const code = `
+defmodule Foo do
+  def hello, do: :ok
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'Foo');
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'hello/0');
+      const edge = result.edges.find(
+        (e) => e.source === mod?.id && e.target === fn?.id && e.kind === 'contains'
+      );
+      expect(edge).toBeDefined();
+    });
+
+    it('should mark defmacro/defmacrop with metadata.macro', () => {
+      const code = `
+defmodule Foo do
+  defmacro do_thing(x), do: quote do: unquote(x)
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'do_thing/1');
+      expect(fn).toBeDefined();
+    });
+  });
 });
 
 describe('Vue Extraction', () => {
