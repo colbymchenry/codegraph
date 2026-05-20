@@ -17,6 +17,22 @@ import { WASM_FALLBACK_FIX_RECIPE } from '../db';
 const MAX_OUTPUT_LENGTH = 15000;
 
 /**
+ * Maximum length for free-form string inputs (query, task, symbol).
+ * Bounds memory and CPU when a buggy or hostile MCP client sends a
+ * huge payload — without this an attacker could ship a 100MB string
+ * and force a full FTS5 scan / OOM the server. 10 000 characters is
+ * far beyond any realistic legitimate query.
+ */
+const MAX_INPUT_LENGTH = 10_000;
+
+/**
+ * Maximum length for path-like string inputs (projectPath, path
+ * filter, glob pattern). Paths beyond a few thousand chars are
+ * never legitimate and signal abuse or a bug upstream.
+ */
+const MAX_PATH_LENGTH = 4_096;
+
+/**
  * Rust path roots that have no file-system equivalent — `crate` is the
  * current crate, `super` is the parent module, `self` is the current
  * module. Used by `matchesSymbol` to strip these before file-path
@@ -540,11 +556,45 @@ export class ToolHandler {
   }
 
   /**
-   * Validate that a value is a non-empty string
+   * Validate that a value is a non-empty string within length bounds.
+   *
+   * The `maxLength` cap protects against MCP clients that ship huge
+   * payloads (10MB+ query strings either by accident or maliciously).
+   * Without this, a single oversized input can pin the FTS5 index or
+   * exhaust memory before any real work runs.
    */
-  private validateString(value: unknown, name: string): string | ToolResult {
+  private validateString(
+    value: unknown,
+    name: string,
+    maxLength: number = MAX_INPUT_LENGTH
+  ): string | ToolResult {
     if (typeof value !== 'string' || value.length === 0) {
       return this.errorResult(`${name} must be a non-empty string`);
+    }
+    if (value.length > maxLength) {
+      return this.errorResult(
+        `${name} exceeds maximum length of ${maxLength} characters (got ${value.length})`
+      );
+    }
+    return value;
+  }
+
+  /**
+   * Validate an optional path-like string input. Returns the value if
+   * valid (or undefined), or a ToolResult with the error.
+   */
+  private validateOptionalPath(
+    value: unknown,
+    name: string
+  ): string | undefined | ToolResult {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'string') {
+      return this.errorResult(`${name} must be a string`);
+    }
+    if (value.length > MAX_PATH_LENGTH) {
+      return this.errorResult(
+        `${name} exceeds maximum length of ${MAX_PATH_LENGTH} characters (got ${value.length})`
+      );
     }
     return value;
   }
@@ -554,6 +604,25 @@ export class ToolHandler {
    */
   async execute(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
     try {
+      // Cross-cutting input validation. All tools accept an optional
+      // `projectPath` and most accept either `query`, `task`, or
+      // `symbol` — bound their lengths centrally so individual handlers
+      // can stay focused on tool-specific logic.
+      const pathCheck = this.validateOptionalPath(args.projectPath, 'projectPath');
+      if (typeof pathCheck === 'object' && pathCheck !== undefined) {
+        return pathCheck;
+      }
+      // The `path` and `pattern` properties used by codegraph_files are
+      // also path-shaped — apply the same cap.
+      if (args.path !== undefined) {
+        const check = this.validateOptionalPath(args.path, 'path');
+        if (typeof check === 'object' && check !== undefined) return check;
+      }
+      if (args.pattern !== undefined) {
+        const check = this.validateOptionalPath(args.pattern, 'pattern');
+        if (typeof check === 'object' && check !== undefined) return check;
+      }
+
       switch (toolName) {
         case 'codegraph_search':
           return await this.handleSearch(args);
