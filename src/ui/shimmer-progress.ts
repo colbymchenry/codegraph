@@ -12,6 +12,9 @@ export interface IndexProgress {
   phase: string;
   current: number;
   total: number;
+  // Added optional fields for the new metrics
+  estimatedTimeRemainingMs?: number;
+  itemsPerSecond?: number;
 }
 
 export interface ShimmerProgress {
@@ -21,6 +24,7 @@ export interface ShimmerProgress {
 
 export function createShimmerProgress(): ShimmerProgress {
   let lastPhase = '';
+  let phaseStartTime = Date.now();
 
   const workerPath = path.join(__dirname, 'shimmer-worker.js');
   const worker = new Worker(workerPath, {
@@ -33,7 +37,42 @@ export function createShimmerProgress(): ShimmerProgress {
 
       if (progress.phase !== lastPhase && lastPhase) {
         worker.postMessage({ type: 'finish-phase' });
+        phaseStartTime = Date.now(); // Reset timer for the new phase
       }
+
+      lastPhase = progress.phase;
+
+      // New Feature: Calculate performance metrics
+      const elapsedMs = Date.now() - phaseStartTime;
+      const itemsPerSecond = progress.current > 0 && elapsedMs > 0 
+        ? Math.round((progress.current / elapsedMs) * 1000) 
+        : 0;
+
+      const remainingItems = progress.total - progress.current;
+      const estimatedTimeRemainingMs = itemsPerSecond > 0 
+        ? Math.round((remainingItems / itemsPerSecond) * 1000) 
+        : undefined;
+
+      // Pass the enhanced metrics back or forward as needed
+      const enrichedProgress: IndexProgress = {
+        ...progress,
+        itemsPerSecond,
+        estimatedTimeRemainingMs,
+      };
+
+      // Example of utilizing the data (can be routed to your worker or UI logger)
+      worker.postMessage({ 
+        type: 'progress-update', 
+        phaseName, 
+        ...enrichedProgress 
+      });
+    },
+
+    async stop() {
+      await worker.terminate();
+    }
+  };
+}
       lastPhase = progress.phase;
 
       let percent = -1;
