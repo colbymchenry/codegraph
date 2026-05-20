@@ -33,6 +33,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   setup is actually fast. `codegraph uninit` removes any hooks it installed.
 
 ### Changed
+- **Minimum Node.js is now 20** (was 18). Node 18 is end-of-life and the
+  native SQLite binding (`better-sqlite3` 12.x) no longer ships a Node 18
+  prebuilt binary. Node 22 LTS and Node 24 get the native backend out of the
+  box; on other Node versions CodeGraph still runs via the WASM fallback
+  (slower, but functional). Node 25+ remains blocked (V8 WASM JIT crash, see
+  [#81](https://github.com/colbymchenry/codegraph/issues/81)).
 - **MCP / explore**: `codegraph_explore` output is now adaptive to project
   size. The tool used to apply a fixed 35KB cap regardless of how large the
   codebase was, which on small projects (~100 files) produced bigger
@@ -57,6 +63,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Thanks to [@essopsp](https://github.com/essopsp) for the repro.
 
 ### Fixed
+- **Native SQLite backend on Node 24**: indexing on Node 24 always dropped to
+  the 5-10x-slower WASM backend, printing a `better-sqlite3 unavailable`
+  warning that `npm rebuild better-sqlite3` / `xcode-select --install` could
+  not clear ([#203](https://github.com/colbymchenry/codegraph/issues/203)).
+  The bundled `better-sqlite3` was pinned to a v11 release that ships no
+  prebuilt binary for Node 24's ABI (`node-v137`), so every Node 24 install
+  silently degraded — and because CodeGraph is usually installed globally, the
+  `npm install` / `npm rebuild` people ran in their own project never touched
+  CodeGraph's copy. CodeGraph now requires `better-sqlite3` `^12.4.1`, whose
+  prebuilds include Node 24, so a fresh install on Node 22 or Node 24 gets the
+  native backend with no compiler. On an already-broken install, reinstall
+  CodeGraph (e.g. `npm install -g @colbymchenry/codegraph`) to pull the new
+  binding; `codegraph status` should then report `Backend: native`. Thanks to
+  [@Finndersen](https://github.com/Finndersen) for the report.
 - **MCP**: tools no longer fail with "CodeGraph not initialized" when the index
   actually exists. This hit clients that launch the MCP server from a directory
   other than your project and don't report a workspace root in `initialize`

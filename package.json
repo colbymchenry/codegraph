@@ -51,9 +51,9 @@
     "vitest": "^2.1.9"
   },
   "optionalDependencies": {
-    "better-sqlite3": "^11.0.0"
+    "better-sqlite3": "^12.4.1"
   },
   "engines": {
-    "node": ">=18.0.0 <25.0.0"
+    "node": ">=20.0.0 <25.0.0"
   }
 }
