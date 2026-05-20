@@ -33,6 +33,25 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   setup is actually fast. `codegraph uninit` removes any hooks it installed.
 
 ### Changed
+- **MCP / agent guidance**: CodeGraph now tells agents to answer "how does X
+  work" / architecture questions *directly* — `codegraph_context`, then one
+  `codegraph_explore` for the surfaced symbols — instead of delegating to a
+  file-reading sub-agent or a grep+read loop. The server instructions and the
+  installed instruction files (`CLAUDE.md`, `.cursor/rules/codegraph.mdc`,
+  `AGENTS.md`) previously suggested *spawning a sub-agent* for explore-class
+  questions, which produced the opposite, more expensive behavior: the
+  sub-agent reads files regardless of the index, so CodeGraph became overhead
+  stacked on top of the reads. In rigorous N≥4-per-arm benchmarks this cut the
+  cost of an architecture question by ~42–47% versus a no-CodeGraph agent on
+  medium and large repos (Excalidraw ~600 files, VS Code ~10k), with
+  equal-or-better, `file:line`-cited answers and ~6× fewer tool calls; on a
+  tiny repo (~25 files) it's a wash, since native grep is already trivially
+  cheap there.
+- **MCP / codegraph_node**: `includeCode=true` on a class/interface/struct/enum
+  now returns a compact member outline (fields + method signatures + line
+  numbers) instead of the entire class body — which could be thousands of
+  characters and was rarely needed in full. Functions and methods still return
+  their full body; request a specific member for its source.
 - **Minimum Node.js is now 20** (was 18). Node 18 is end-of-life and the
   native SQLite binding (`better-sqlite3` 12.x) no longer ships a Node 18
   prebuilt binary. Node 22 LTS and Node 24 get the native backend out of the
@@ -48,7 +67,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now scales with indexed file count: small projects (<500 files) cap at
   ~18KB and skip the "Additional relevant files" / completeness / explore-
   budget reminders that earn their keep on bigger codebases; medium
-  (<5,000) caps at ~28KB; large (<15,000) keeps the historical ~35KB; very
+  (<5,000) caps at ~13KB; large (<15,000) keeps the historical ~35KB; very
   large goes up to ~38KB. A new per-file char cap also prevents a single
   file with many adjacent symbols from collapsing into one whole-file dump
   (the Alamofire `Session.swift` case from #185). Per-file cluster
@@ -63,6 +82,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Thanks to [@essopsp](https://github.com/essopsp) for the repro.
 
 ### Fixed
+- **MCP / explore**: `codegraph_explore` output is now hard-capped to its
+  adaptive size budget. It could previously overrun (e.g. ~30K against a 28K
+  cap) once the relationship map and trailer sections were appended; the
+  oversized payload then sat in the agent's context and was re-read on every
+  later turn.
 - **Sync / status**: git-untracked files are no longer reported as pending
   "Added" forever. After `codegraph sync` indexed a newly-created untracked
   source file, `codegraph status` kept listing it under Pending Changes and

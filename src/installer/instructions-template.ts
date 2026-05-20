@@ -37,16 +37,17 @@ Use codegraph for **structural** questions — what calls what, what would break
 | "What would break if I changed Z?" | \`codegraph_impact\` |
 | "Show me Y's signature / source / docstring" | \`codegraph_node\` |
 | "Give me focused context for a task/area" | \`codegraph_context\` |
-| "Survey an unfamiliar module/topic" | \`codegraph_explore\` |
+| "See several related symbols' source at once" | \`codegraph_explore\` |
 | "What files exist under path/" | \`codegraph_files\` |
 | "Is the index healthy?" | \`codegraph_status\` |
 
 ### Rules of thumb
 
+- **Answer directly — don't delegate exploration.** For "how does X work" / architecture / trace questions, answer with 2-3 codegraph calls: \`codegraph_context\` first, then ONE \`codegraph_explore\` for the source of the symbols it surfaces. Codegraph IS the pre-built index, so spawning a separate file-reading sub-task/agent — or running a grep + read loop — repeats work codegraph already did and costs more for the same answer.
 - **Trust codegraph results.** They come from a full AST parse. Do NOT re-verify them with grep — that's slower, less accurate, and wastes context.
 - **Don't grep first** when looking up a symbol by name. \`codegraph_search\` is faster and returns kind + location + signature in one call.
 - **Don't chain \`codegraph_search\` + \`codegraph_node\`** when you just want context — \`codegraph_context\` is one call.
-- **\`codegraph_explore\` is the heavy hitter** for unfamiliar areas — it returns full source from all relevant files in one call, but is token-heavy. If your harness supports parallel subagents (e.g., Claude Code's Task tool), spawn one for explore-class questions to keep main session context clean.
+- **Don't loop \`codegraph_node\` over many symbols** — one \`codegraph_explore\` call returns several symbols' source grouped in a single capped call, while each separate node/Read call re-reads the whole context and costs far more.
 - **Index lag**: the file watcher debounces ~500ms behind writes; don't re-query immediately after editing a file in the same turn.
 
 ### If \`.codegraph/\` doesn't exist
