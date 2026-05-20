@@ -18,6 +18,28 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 
+// --- per-file buffers -------------------------------------------------------
+//
+// `@doc "…"` and `@spec name(args) :: t` attach to the *next* `def` sibling.
+// During the AST walk we see them strictly before the def, so when we
+// process the attribute we stash the value keyed by the upcoming def call's
+// tree-sitter startIndex (unique within a tree). `handleDef` then reads and
+// clears the buffers.
+//
+// Cleared on every visit to a `source` (root) node, so concurrent files
+// don't bleed into each other — extractFromSource is synchronous per call
+// and the singleton extractor sees one `source` per file.
+let docBuffer = new Map<number, string>();
+let specBuffer = new Map<number, string>();
+
+// Stack of per-module alias maps. Each entry maps a *short* receiver
+// name (the local binding inside that module — e.g. `Mod` from
+// `alias My.Deep.Module, as: Mod`, or `Module` from `alias My.Deep.Module`)
+// to its fully-qualified dotted path. Pushed in `handleDefmodule` /
+// `handleDefimpl`, popped on exit, consulted by `handleUserCall` to
+// expand short receivers into candidate fully-qualified names.
+let aliasStack: Array<Map<string, string>> = [];
+
 // --- helpers ----------------------------------------------------------------
 
 function callTarget(node: SyntaxNode, source: string): string | null {
@@ -44,6 +66,32 @@ function findChildren(node: SyntaxNode, wanted: string): SyntaxNode[] {
     if (c && c.type === wanted) out.push(c);
   }
   return out;
+}
+
+/**
+ * Skip forward through siblings looking for the next `def`/`defp`/
+ * `defmacro`/`defmacrop` call. `@doc` and `@spec` may have other module
+ * attributes between them and the target def (a common pattern is
+ * `@doc … @spec … def …`), so we hop past intermediate
+ * `unary_operator` attributes.
+ */
+function findNextDefSibling(attrNode: SyntaxNode): SyntaxNode | null {
+  let cur: SyntaxNode | null = attrNode.nextNamedSibling;
+  while (cur) {
+    if (cur.type === 'call') {
+      const head = cur.namedChild(0);
+      if (head?.type === 'identifier') {
+        const txt = head.text;
+        if (txt === 'def' || txt === 'defp' || txt === 'defmacro' || txt === 'defmacrop') {
+          return cur;
+        }
+      }
+      return null; // some other call broke the chain
+    }
+    if (cur.type !== 'unary_operator') return null;
+    cur = cur.nextNamedSibling;
+  }
+  return null;
 }
 
 /** Read a dotted alias node, e.g. `Foo.Bar.Baz`. */
@@ -156,6 +204,7 @@ function handleDefmodule(node: SyntaxNode, ctx: ExtractorContext): boolean {
   if (!moduleNode) return true;
 
   ctx.pushScope(moduleNode.id);
+  aliasStack.push(new Map());
   try {
     const body = findChild(node, 'do_block');
     // Visit the do_block itself — our hook returns false for non-call
@@ -163,6 +212,7 @@ function handleDefmodule(node: SyntaxNode, ctx: ExtractorContext): boolean {
     // (each module-level form: alias, def, defstruct, …).
     if (body) ctx.visitNode(body);
   } finally {
+    aliasStack.pop();
     ctx.popScope();
   }
   return true;
@@ -198,8 +248,16 @@ function handleDef(
     return true;
   }
 
+  // Consume any pending @doc / @spec that targets this def.
+  const docstring = docBuffer.get(node.startIndex);
+  const signature = specBuffer.get(node.startIndex);
+  if (docstring !== undefined) docBuffer.delete(node.startIndex);
+  if (signature !== undefined) specBuffer.delete(node.startIndex);
+
   const fnNode = ctx.createNode('function', name, node, {
     visibility: isPrivate ? 'private' : 'public',
+    docstring,
+    signature,
   });
   if (!fnNode) return true;
 
@@ -254,6 +312,59 @@ function handleAttribute(node: SyntaxNode, ctx: ExtractorContext): boolean {
     return true;
   }
 
+  if (target === 'doc') {
+    // `@doc "…"` — stash for the next def sibling.
+    const args = getChildByField(operand, 'arguments') ?? findChild(operand, 'arguments');
+    const str = args ? findChild(args, 'string') : null;
+    if (str) {
+      const doc = stripHeredoc(getNodeText(str, ctx.source));
+      const nextDef = findNextDefSibling(node);
+      if (nextDef) docBuffer.set(nextDef.startIndex, doc);
+    }
+    return true;
+  }
+
+  if (target === 'spec') {
+    // `@spec hello(String.t()) :: String.t()` — stash for the next def.
+    const args = getChildByField(operand, 'arguments') ?? findChild(operand, 'arguments');
+    if (args) {
+      const sig = getNodeText(args, ctx.source).trim();
+      const nextDef = findNextDefSibling(node);
+      if (nextDef) specBuffer.set(nextDef.startIndex, sig);
+    }
+    return true;
+  }
+
+  if (target === 'callback' || target === 'macrocallback') {
+    // `@callback name(args) :: t` — emit an abstract function in the
+    // enclosing module. The operand's arguments contain a binary_operator
+    // whose left side is the head call (`name(args)`).
+    const args = getChildByField(operand, 'arguments') ?? findChild(operand, 'arguments');
+    if (args) {
+      const binOp = findChild(args, 'binary_operator');
+      const headCall = binOp
+        ? (getChildByField(binOp, 'left') ?? binOp.namedChild(0))
+        : args.namedChild(0);
+      if (headCall && headCall.type === 'call') {
+        const nameNode = headCall.namedChild(0);
+        const innerArgs = getChildByField(headCall, 'arguments') ?? findChild(headCall, 'arguments');
+        if (nameNode && nameNode.type === 'identifier') {
+          const name = getNodeText(nameNode, ctx.source);
+          const arity = innerArgs ? innerArgs.namedChildCount : 0;
+          const fnName = `${name}/${arity}`;
+          if (!findExistingFunction(fnName, ctx)) {
+            ctx.createNode('function', fnName, node, {
+              visibility: 'public',
+              isAbstract: true,
+              signature: getNodeText(args, ctx.source).trim(),
+            });
+          }
+        }
+      }
+    }
+    return true;
+  }
+
   if (target === 'behaviour' || target === 'behavior') {
     // `@behaviour Foo` → implements reference from enclosing module to Foo.
     const args = getChildByField(operand, 'arguments') ?? findChild(operand, 'arguments');
@@ -303,7 +414,7 @@ function handleAttribute(node: SyntaxNode, ctx: ExtractorContext): boolean {
  */
 function handleImportLike(
   callNode: SyntaxNode,
-  _mechanism: 'alias' | 'import' | 'require' | 'use',
+  mechanism: 'alias' | 'import' | 'require' | 'use',
   ctx: ExtractorContext
 ): boolean {
   const args = getChildByField(callNode, 'arguments') ?? findChild(callNode, 'arguments');
@@ -311,8 +422,28 @@ function handleImportLike(
   const first = args.namedChild(0)!;
   const signature = getNodeText(callNode, ctx.source).trim();
 
+  // For `alias`, optional `as: Short` overrides the default short name.
+  let asOverride: string | null = null;
+  if (mechanism === 'alias' && args.namedChildCount > 1) {
+    const kw = findChild(args, 'keywords');
+    if (kw) {
+      for (const pair of findChildren(kw, 'pair')) {
+        const key = getChildByField(pair, 'key') ?? pair.namedChild(0);
+        const value = getChildByField(pair, 'value') ?? pair.namedChild(1);
+        if (key && value && getNodeText(key, ctx.source).trim().startsWith('as')) {
+          asOverride = readAliasText(value, ctx.source);
+          break;
+        }
+      }
+    }
+  }
+
   const parentId = ctx.nodeStack.length > 0 ? ctx.nodeStack[ctx.nodeStack.length - 1]! : null;
-  const emit = (moduleName: string, posNode: SyntaxNode): void => {
+  const aliasFrame = mechanism === 'alias' && aliasStack.length > 0
+    ? aliasStack[aliasStack.length - 1]!
+    : null;
+
+  const emit = (moduleName: string, posNode: SyntaxNode, shortName: string): void => {
     const imp = ctx.createNode('import', moduleName, posNode, { signature });
     if (!imp) return;
     if (parentId) {
@@ -326,10 +457,16 @@ function handleImportLike(
         language: 'elixir',
       });
     }
+    // Populate the alias map for receiver-name rewriting later.
+    if (aliasFrame) aliasFrame.set(shortName, moduleName);
   };
 
   if (first.type === 'alias') {
-    emit(readAliasText(first, ctx.source), first);
+    const full = readAliasText(first, ctx.source);
+    // Default short name is the last dotted segment ("My.Deep.Mod" → "Mod"),
+    // unless `as: Short` overrode it.
+    const lastSeg = full.split('.').pop() ?? full;
+    emit(full, first, asOverride ?? lastSeg);
   } else if (first.type === 'dot') {
     // alias Foo.{Bar, Baz} — left=Foo, right=tuple of suffix aliases
     const left = getChildByField(first, 'left') ?? first.namedChild(0);
@@ -337,11 +474,15 @@ function handleImportLike(
     if (left && right && right.type === 'tuple') {
       const prefix = readAliasText(left, ctx.source);
       for (const suffix of findChildren(right, 'alias')) {
-        emit(`${prefix}.${readAliasText(suffix, ctx.source)}`, suffix);
+        const suf = readAliasText(suffix, ctx.source);
+        const lastSeg = suf.split('.').pop() ?? suf;
+        emit(`${prefix}.${suf}`, suffix, lastSeg);
       }
     } else if (left) {
       // Unusual shape — fall back to the whole dot expression text.
-      emit(readAliasText(first, ctx.source), first);
+      const full = readAliasText(first, ctx.source);
+      const lastSeg = full.split('.').pop() ?? full;
+      emit(full, first, asOverride ?? lastSeg);
     }
   }
   return true;
@@ -492,10 +633,12 @@ function handleDefimpl(callNode: SyntaxNode, ctx: ExtractorContext): boolean {
   });
 
   ctx.pushScope(implModule.id);
+  aliasStack.push(new Map());
   try {
     const body = findChild(callNode, 'do_block');
     if (body) ctx.visitNode(body);
   } finally {
+    aliasStack.pop();
     ctx.popScope();
   }
   return true;
@@ -582,6 +725,19 @@ const NON_CALL_FORMS = new Set([
   'raise', 'throw', 'reraise',
 ]);
 
+/**
+ * Walk the alias stack from innermost to outermost; first frame that
+ * binds `shortName` wins. Returns the fully-qualified dotted path or null.
+ */
+function lookupAlias(shortName: string): string | null {
+  for (let i = aliasStack.length - 1; i >= 0; i--) {
+    const m = aliasStack[i]!;
+    const full = m.get(shortName);
+    if (full) return full;
+  }
+  return null;
+}
+
 function handleUserCall(callNode: SyntaxNode, ctx: ExtractorContext): void {
   const fnId = enclosingFunctionId(ctx);
   if (!fnId) return;
@@ -591,14 +747,30 @@ function handleUserCall(callNode: SyntaxNode, ctx: ExtractorContext): void {
   // aren't function references.
   if (NON_CALL_FORMS.has(callee.name)) return;
   const effectiveArity = callee.argCount + (pipeAddsArg(callNode, ctx.source) ? 1 : 0);
+  const refName = `${callee.name}/${effectiveArity}`;
+
+  // Alias-aware expansion: if the callee is `Receiver.method/...` and
+  // `Receiver` resolves through the current alias stack, emit the
+  // expanded path as an additional resolution candidate. Multi-segment
+  // receivers (`A.B.method`) also work — we look up the *first* segment.
+  const candidates: string[] = [];
+  const dotIdx = callee.name.indexOf('.');
+  if (dotIdx > 0) {
+    const firstSeg = callee.name.substring(0, dotIdx);
+    const tail = callee.name.substring(dotIdx); // includes leading '.'
+    const expanded = lookupAlias(firstSeg);
+    if (expanded) candidates.push(`${expanded}${tail}/${effectiveArity}`);
+  }
+
   ctx.addUnresolvedReference({
     fromNodeId: fnId,
-    referenceName: `${callee.name}/${effectiveArity}`,
+    referenceName: refName,
     referenceKind: 'calls',
     line: callNode.startPosition.row + 1,
     column: callNode.startPosition.column,
     filePath: ctx.filePath,
     language: 'elixir',
+    candidates: candidates.length > 0 ? candidates : undefined,
   });
 }
 
@@ -623,6 +795,15 @@ export const elixirExtractor: LanguageExtractor = {
   paramsField: 'arguments',
 
   visitNode(node, ctx) {
+    if (node.type === 'source') {
+      // New file — discard any @doc/@spec buffers and alias frames left
+      // over from the previous file (extractFromSource is synchronous,
+      // but the extractor singleton outlives a single call).
+      docBuffer = new Map();
+      specBuffer = new Map();
+      aliasStack = [];
+      return false;
+    }
     if (node.type === 'call') {
       const target = callTarget(node, ctx.source);
       switch (target) {

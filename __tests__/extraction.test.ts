@@ -122,6 +122,9 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('pascal');
+    expect(languages).toContain('scala');
+    expect(languages).toContain('elixir');
   });
 });
 
@@ -3806,6 +3809,89 @@ end
           r.referenceKind === 'implements'
       );
       expect(ref).toBeDefined();
+    });
+  });
+
+  describe('Module attributes: @doc, @spec, @callback', () => {
+    it('should attach @doc to the next def as docstring', () => {
+      const code = `
+defmodule Foo do
+  @doc "greets the user by name."
+  def hello(name), do: name
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'hello/1');
+      expect(fn?.docstring).toContain('greets the user by name.');
+    });
+
+    it('should attach @spec to the next def as signature', () => {
+      const code = `
+defmodule Foo do
+  @spec hello(String.t()) :: String.t()
+  def hello(name), do: name
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'hello/1');
+      expect(fn?.signature).toContain('String.t()');
+    });
+
+    it('should emit @callback as an abstract function in the enclosing module', () => {
+      const code = `
+defmodule MyBehaviour do
+  @callback do_thing(term) :: term
+end
+`;
+      const result = extractFromSource('lib/my_behaviour.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'do_thing/1');
+      expect(fn).toBeDefined();
+      expect(fn?.isAbstract).toBe(true);
+    });
+  });
+
+  describe('Alias-aware reference rewriting (phase 3)', () => {
+    it('should rewrite a short-name call to its aliased full path', () => {
+      const code = `
+defmodule Foo do
+  alias My.Deep.Module, as: Mod
+  def call_it(x), do: Mod.frobnicate(x, 2)
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'Mod.frobnicate/2'
+      );
+      expect(ref).toBeDefined();
+      expect(ref?.candidates).toContain('My.Deep.Module.frobnicate/2');
+    });
+
+    it('should expand single-segment aliases (alias My.Deep.Module → Module)', () => {
+      const code = `
+defmodule Foo do
+  alias My.Deep.Module
+  def call_it(x), do: Module.frobnicate(x)
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'Module.frobnicate/1'
+      );
+      expect(ref?.candidates).toContain('My.Deep.Module.frobnicate/1');
+    });
+
+    it('should NOT expand a receiver that is not aliased in scope', () => {
+      const code = `
+defmodule Foo do
+  def call_it(x), do: NotAliased.frobnicate(x)
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'NotAliased.frobnicate/1'
+      );
+      expect(ref).toBeDefined();
+      expect(ref?.candidates ?? []).not.toContain('Foo.NotAliased.frobnicate/1');
     });
   });
 });

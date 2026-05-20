@@ -143,6 +143,60 @@ export function matchByQualifiedName(
     }
   }
 
+  // Elixir bridge: codegraph's qualifiedName joins scope with `::`
+  // (e.g. `Foo.Bar::changeset/2`), but Elixir source refers to remote
+  // calls with `.` throughout (`Foo.Bar.changeset/2`). Try replacing
+  // the last `.` separator with `::` and re-matching.
+  if (ref.language === 'elixir' && lastName) {
+    const lastDot = ref.referenceName.lastIndexOf('.');
+    if (lastDot > 0) {
+      const elixirCanonical =
+        ref.referenceName.substring(0, lastDot) + '::' + ref.referenceName.substring(lastDot + 1);
+
+      const directHits = context.getNodesByQualifiedName(elixirCanonical);
+      if (directHits.length === 1) {
+        return {
+          original: ref,
+          targetNodeId: directHits[0]!.id,
+          confidence: 0.95,
+          resolvedBy: 'qualified-name',
+        };
+      }
+      // Suffix match against converted form.
+      for (const candidate of context.getNodesByName(lastName)) {
+        if (candidate.qualifiedName.endsWith(elixirCanonical)) {
+          return {
+            original: ref,
+            targetNodeId: candidate.id,
+            confidence: 0.9,
+            resolvedBy: 'qualified-name',
+          };
+        }
+      }
+    }
+  }
+
+  // Elixir alias-expansion candidates: when the extractor knew this
+  // call site sat under `alias Foo.Bar.Baz`, the unresolved ref carries
+  // candidate fully-qualified names (`Foo.Bar.Baz.func/2`). Try each
+  // before giving up.
+  if (ref.language === 'elixir' && ref.candidates && ref.candidates.length > 0) {
+    for (const altName of ref.candidates) {
+      const lastDot = altName.lastIndexOf('.');
+      if (lastDot <= 0) continue;
+      const canonical = altName.substring(0, lastDot) + '::' + altName.substring(lastDot + 1);
+      const hits = context.getNodesByQualifiedName(canonical);
+      if (hits.length === 1) {
+        return {
+          original: ref,
+          targetNodeId: hits[0]!.id,
+          confidence: 0.95,
+          resolvedBy: 'qualified-name',
+        };
+      }
+    }
+  }
+
   return null;
 }
 

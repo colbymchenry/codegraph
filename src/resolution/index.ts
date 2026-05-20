@@ -91,6 +91,50 @@ const PASCAL_UNIT_PREFIXES = [
   'IdHTTP', 'IdTCP', 'IdSSL',
 ];
 
+// Elixir / Erlang standard library modules and Phoenix/Ecto ecosystem
+// modules. References whose dotted prefix matches any of these are
+// resolved as external — they belong to OTP, Hex deps, or first-party
+// frameworks, not to user code in the indexed project.
+const ELIXIR_STDLIB_PREFIXES = [
+  // Core Elixir
+  'Kernel.', 'Enum.', 'Stream.', 'Map.', 'List.', 'Tuple.', 'Keyword.',
+  'String.', 'Integer.', 'Float.', 'Atom.', 'Range.', 'Regex.', 'Date.',
+  'DateTime.', 'NaiveDateTime.', 'Time.', 'Calendar.',
+  'IO.', 'File.', 'Path.', 'URI.', 'System.', 'Process.', 'Node.',
+  'Module.', 'Code.', 'Macro.', 'Function.', 'Protocol.', 'Application.',
+  'Agent.', 'Task.', 'GenServer.', 'Supervisor.', 'DynamicSupervisor.',
+  'Registry.', 'GenStage.', 'Logger.', 'Mix.',
+  // Erlang stdlib (the ones Elixir devs reach for most)
+  ':lists.', ':maps.', ':ets.', ':erlang.', ':timer.', ':crypto.',
+  ':binary.', ':gen_server.', ':gen_statem.', ':inet.', ':ssl.',
+  // Phoenix
+  'Phoenix.', 'Plug.',
+  // Ecto
+  'Ecto.', 'Postgrex.',
+  // Common Hex deps
+  'Jason.', 'Floki.', 'Tesla.', 'HTTPoison.', 'Finch.', 'Req.',
+  'Oban.', 'Broadway.', 'Nx.', 'Bandit.', 'Cowboy.',
+];
+
+const ELIXIR_KERNEL_FUNCS = new Set([
+  // Guards / type predicates
+  'is_atom/1', 'is_binary/1', 'is_bitstring/1', 'is_boolean/1',
+  'is_float/1', 'is_function/1', 'is_function/2', 'is_integer/1',
+  'is_list/1', 'is_map/1', 'is_map_key/2', 'is_nil/1', 'is_number/1',
+  'is_pid/1', 'is_port/1', 'is_reference/1', 'is_struct/1', 'is_struct/2',
+  'is_tuple/1', 'is_exception/1', 'is_exception/2',
+  // Common Kernel functions imported automatically
+  'to_string/1', 'to_charlist/1', 'inspect/1', 'inspect/2',
+  'tap/2', 'then/2', 'send/2', 'spawn/1', 'spawn/3', 'spawn_link/1',
+  'self/0', 'apply/2', 'apply/3', 'binding/0', 'binding/1',
+  'raise/1', 'raise/2', 'throw/1', 'exit/1',
+  'length/1', 'hd/1', 'tl/1', 'elem/2', 'put_elem/3', 'tuple_size/1',
+  'map_size/1', 'byte_size/1', 'bit_size/1',
+  'abs/1', 'div/2', 'rem/2', 'max/2', 'min/2', 'round/1', 'trunc/1',
+  // Macros (we accept some of these since they parse as calls)
+  'use/1', 'require/1', 'import/1', 'alias/1',
+]);
+
 const PASCAL_BUILT_INS = new Set([
   'System', 'SysUtils', 'Classes', 'Types', 'Variants', 'StrUtils',
   'Math', 'DateUtils', 'IOUtils', 'Generics.Collections', 'Generics.Defaults',
@@ -422,6 +466,19 @@ export class ReferenceResolver {
       if (this.knownNames.has(fileName)) return true;
     }
 
+    // Elixir dotted-qualified call refs (`Foo.Bar.Baz.func/2`) — check
+    // the last segment (`func/2`) directly as a known function name.
+    // Without this, the pre-filter rejects every cross-module Elixir
+    // call before the qualified-name bridge in matchByQualifiedName
+    // has a chance to run.
+    if (dotIdx > 0) {
+      const lastDot = name.lastIndexOf('.');
+      if (lastDot > 0) {
+        const tail = name.substring(lastDot + 1);
+        if (this.knownNames.has(tail)) return true;
+      }
+    }
+
     return false;
   }
 
@@ -734,6 +791,16 @@ export class ReferenceResolver {
         return true;
       }
       if (PASCAL_BUILT_INS.has(name)) {
+        return true;
+      }
+    }
+
+    // Elixir/Erlang stdlib + ecosystem libs (Phoenix, Ecto, Hex deps)
+    if (ref.language === 'elixir') {
+      if (ELIXIR_STDLIB_PREFIXES.some((p) => name.startsWith(p))) {
+        return true;
+      }
+      if (ELIXIR_KERNEL_FUNCS.has(name)) {
         return true;
       }
     }
