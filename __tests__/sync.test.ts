@@ -225,6 +225,50 @@ describe('Sync Module', () => {
       expect(nodes.length).toBeGreaterThan(0);
     });
 
+    it('should stop reporting untracked files once they are indexed (issue #206)', async () => {
+      // Untracked files stay `??` in git status even after codegraph indexes
+      // them. Change detection must compare them against the DB by hash, not
+      // report every untracked file as "added" on every sync/status.
+      fs.writeFileSync(
+        path.join(testDir, 'src', 'new.ts'),
+        `export function newFunc() { return 42; }`
+      );
+
+      // First sync indexes the untracked file.
+      const first = await cg.sync();
+      expect(first.filesAdded).toBe(1);
+
+      // The file is still untracked in git, but now lives in the DB.
+      expect(cg.searchNodes('newFunc').length).toBeGreaterThan(0);
+
+      // status must not keep flagging it as a pending addition...
+      const changes = cg.getChangedFiles();
+      expect(changes.added).not.toContain('src/new.ts');
+      expect(changes.modified).not.toContain('src/new.ts');
+
+      // ...and a second sync must be a no-op for it.
+      const second = await cg.sync();
+      expect(second.filesAdded).toBe(0);
+      expect(second.filesModified).toBe(0);
+    });
+
+    it('should re-index an untracked file when its contents change', async () => {
+      const filePath = path.join(testDir, 'src', 'new.ts');
+      fs.writeFileSync(filePath, `export function newFunc() { return 42; }`);
+      await cg.sync();
+
+      // Modify the still-untracked file.
+      fs.writeFileSync(filePath, `export function renamedFunc() { return 7; }`);
+
+      const changes = cg.getChangedFiles();
+      expect(changes.modified).toContain('src/new.ts');
+
+      const result = await cg.sync();
+      expect(result.filesModified).toBe(1);
+      expect(cg.searchNodes('renamedFunc').length).toBeGreaterThan(0);
+      expect(cg.searchNodes('newFunc').length).toBe(0);
+    });
+
     it('should detect deleted files via git', async () => {
       fs.unlinkSync(path.join(testDir, 'src', 'index.ts'));
 

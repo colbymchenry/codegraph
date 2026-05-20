@@ -1261,8 +1261,12 @@ export class ExtractionOrchestrator {
         }
       }
 
-      // Handle modified files — read + hash only these files
-      for (const filePath of gitChanges.modified) {
+      // Handle modified + added files — read + hash only these. Untracked
+      // (`??`) files stay untracked in git even after we index them, so they
+      // can't be trusted as "new": re-hash and compare against the DB exactly
+      // like modified files. Otherwise every sync re-indexes them and status
+      // reports them as pending forever. (See issue #206.)
+      for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
         const fullPath = path.join(this.rootDir, filePath);
         let content: string;
         try {
@@ -1284,13 +1288,6 @@ export class ExtractionOrchestrator {
           changedFilePaths.push(filePath);
           filesModified++;
         }
-      }
-
-      // Handle added (untracked) files
-      for (const filePath of gitChanges.added) {
-        filesToIndex.push(filePath);
-        changedFilePaths.push(filePath);
-        filesAdded++;
       }
     } else {
       // === Fallback: full scan (non-git project or git failure) ===
@@ -1395,8 +1392,11 @@ export class ExtractionOrchestrator {
         }
       }
 
-      // Modified files — read + hash only these, compare with DB
-      for (const filePath of gitChanges.modified) {
+      // Modified + added files — read + hash, compare with DB. Untracked (`??`)
+      // files stay untracked in git even after indexing, so they must be
+      // hash-compared like modified files instead of always counting as added —
+      // otherwise status reports them as pending forever. (See issue #206.)
+      for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
         const fullPath = path.join(this.rootDir, filePath);
         let content: string;
         try {
@@ -1414,11 +1414,6 @@ export class ExtractionOrchestrator {
         } else if (tracked.contentHash !== contentHash) {
           modified.push(filePath);
         }
-      }
-
-      // Added (untracked) files
-      for (const filePath of gitChanges.added) {
-        added.push(filePath);
       }
 
       return { added, modified, removed };

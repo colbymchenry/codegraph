@@ -63,6 +63,18 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Thanks to [@essopsp](https://github.com/essopsp) for the repro.
 
 ### Fixed
+- **Sync / status**: git-untracked files are no longer reported as pending
+  "Added" forever. After `codegraph sync` indexed a newly-created untracked
+  source file, `codegraph status` kept listing it under Pending Changes and
+  every subsequent `sync` re-indexed it from scratch — even though its symbols
+  were already queryable. Change detection trusted `git status` and counted
+  every untracked (`??`) entry as new without checking the index, but indexing
+  a file doesn't make git track it, so the file stayed `??` and got re-added on
+  each run. CodeGraph now hash-compares untracked files against the index the
+  same way it does tracked files: a file counts as "added" only if it's missing
+  from the index, "modified" if its contents changed, and is skipped otherwise.
+  Closes [#206](https://github.com/colbymchenry/codegraph/issues/206). Thanks to
+  [@15290391025](https://github.com/15290391025) for the report.
 - **Indexing**: `codegraph init -i` now finds source inside nested, independent
   git repositories — separate clones living inside the workspace that are **not**
   git submodules (common in CMake "super-repo" layouts). When the top-level
