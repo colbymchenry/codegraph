@@ -20,6 +20,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the line number while the line-numbered arm answered with zero follow-up
   tool calls. Payload cost is small (~3-5%). Set
   `CODEGRAPH_EXPLORE_LINENUMS=0` to disable.
+- **MCP / watcher**: CodeGraph now skips the live file watcher on WSL2
+  `/mnt/*` drives, where recursive `fs.watch` is slow enough to break MCP
+  startup (see Fixed). When the watcher is off, `codegraph init` /
+  `codegraph install` offer to keep the index fresh via git hooks
+  (`post-commit`, `post-merge`, `post-checkout`) that run `codegraph sync`
+  in the background — accept for automatic refresh on commit / pull /
+  checkout, or decline and sync by hand. Either way you're told the index
+  stays frozen until it's re-synced. New controls: `CODEGRAPH_NO_WATCH=1`
+  (or `codegraph serve --mcp --no-watch`) forces the watcher off anywhere;
+  `CODEGRAPH_FORCE_WATCH=1` overrides the WSL auto-detect when your `/mnt`
+  setup is actually fast. `codegraph uninit` removes any hooks it installed.
 
 ### Changed
 - **MCP / explore**: `codegraph_explore` output is now adaptive to project
@@ -46,6 +57,19 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Thanks to [@essopsp](https://github.com/essopsp) for the repro.
 
 ### Fixed
+- **MCP**: the server no longer hangs on startup under WSL2 when the project
+  lives on an NTFS `/mnt/*` mount. Setting up the recursive file watcher
+  there took tens of seconds — every directory read crosses the Windows/9p
+  boundary — which blew past the host's initialization timeout (opencode's
+  30s), so the codegraph tools silently never appeared, even on small
+  projects. This is the file-watcher half of the
+  [#172](https://github.com/colbymchenry/codegraph/issues/172) startup fix:
+  that one moved the database/WASM open off the handshake, but the watcher
+  setup was still on the critical path. CodeGraph now auto-skips the watcher
+  on those mounts, with manual and git-hook sync fallbacks (see Added).
+  Closes [#199](https://github.com/colbymchenry/codegraph/issues/199).
+  Thanks to [@mengfanbo123](https://github.com/mengfanbo123) for the precise
+  root-cause analysis and workaround.
 - **Installer (Claude Code)**: project-local installs (`Just this project`)
   now write the MCP server to `.mcp.json` in the project root — the file
   Claude Code actually reads for project-scoped servers. Previously they

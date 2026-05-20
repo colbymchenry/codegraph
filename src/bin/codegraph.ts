@@ -415,6 +415,10 @@ program
             clack.log.success(`${target.displayName}: ${file.action} ${file.path}`);
           }
         } catch { /* non-fatal */ }
+        try {
+          const { offerWatchFallback } = await import('../installer');
+          await offerWatchFallback(clack, projectPath);
+        } catch { /* non-fatal */ }
         clack.outro('');
         return;
       }
@@ -458,6 +462,11 @@ program
       } else {
         clack.log.info('Run "codegraph index" to index the project');
       }
+
+      try {
+        const { offerWatchFallback } = await import('../installer');
+        await offerWatchFallback(clack, projectPath);
+      } catch { /* non-fatal */ }
 
       clack.outro('Done');
       cg.destroy();
@@ -504,6 +513,15 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = CodeGraph.openSync(projectPath);
       cg.uninitialize();
+
+      // Clean up any git sync hooks we installed (no-op if none / not a repo).
+      try {
+        const { removeGitSyncHook } = await import('../sync/git-hooks');
+        const removed = removeGitSyncHook(projectPath);
+        if (removed.installed.length > 0) {
+          info(`Removed git ${removed.installed.join(', ')} sync hook${removed.installed.length > 1 ? 's' : ''}`);
+        }
+      } catch { /* non-fatal */ }
 
       success(`Removed CodeGraph from ${projectPath}`);
     } catch (err) {
@@ -1085,8 +1103,15 @@ program
   .description('Start CodeGraph as an MCP server for AI assistants')
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
-  .action(async (options: { path?: string; mcp?: boolean }) => {
+  .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
+  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
+
+    // Commander sets watch=false when --no-watch is passed. Route it through
+    // the same env-var chokepoint the watcher and MCP server already honor.
+    if (options.watch === false) {
+      process.env.CODEGRAPH_NO_WATCH = '1';
+    }
 
     try {
       if (options.mcp) {

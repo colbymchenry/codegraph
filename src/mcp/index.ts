@@ -17,6 +17,7 @@
 
 import * as path from 'path';
 import CodeGraph, { findNearestCodeGraphRoot } from '../index';
+import { watchDisabledReason } from '../sync';
 import { StdioTransport, JsonRpcRequest, JsonRpcNotification, ErrorCodes } from './transport';
 import { tools, ToolHandler } from './tools';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
@@ -173,6 +174,18 @@ export class MCPServer {
   private startWatching(): void {
     if (!this.cg) return;
 
+    // When the watcher is intentionally disabled (e.g. WSL2 /mnt drives, or
+    // CODEGRAPH_NO_WATCH=1), say so explicitly and tell the user how to keep
+    // the graph fresh — otherwise the silent staleness is hard to diagnose.
+    const disabledReason = watchDisabledReason(this.projectPath ?? process.cwd());
+    if (disabledReason) {
+      process.stderr.write(
+        `[CodeGraph MCP] File watcher disabled — ${disabledReason}. ` +
+        `The graph will not auto-update; run \`codegraph sync\` (or install the git sync hooks via \`codegraph init\`) to refresh.\n`
+      );
+      return;
+    }
+
     const started = this.cg.watch({
       onSyncComplete: (result) => {
         if (result.filesChanged > 0) {
@@ -188,6 +201,11 @@ export class MCPServer {
 
     if (started) {
       process.stderr.write('[CodeGraph MCP] File watcher active — graph will auto-sync on changes\n');
+    } else {
+      // start() can also return false when recursive fs.watch isn't supported.
+      process.stderr.write(
+        '[CodeGraph MCP] File watcher unavailable on this platform — run `codegraph sync` to refresh the graph after changes.\n'
+      );
     }
   }
 

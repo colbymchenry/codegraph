@@ -13,6 +13,7 @@ import { CodeGraphConfig } from '../types';
 import { shouldIncludeFile } from '../extraction';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
+import { watchDisabledReason } from './watch-policy';
 
 /**
  * Options for the file watcher
@@ -81,6 +82,16 @@ export class FileWatcher {
   start(): boolean {
     if (this.watcher) return true; // Already watching
     this.stopped = false;
+
+    // Some environments make recursive fs.watch unusable — most notably WSL2
+    // /mnt/ drives, where setup blocks long enough to break MCP startup
+    // handshakes (issue #199). Skip watching there; callers fall back to
+    // manual `codegraph sync` or the git sync hooks.
+    const disabledReason = watchDisabledReason(this.projectRoot);
+    if (disabledReason) {
+      logDebug('File watcher disabled', { reason: disabledReason, projectRoot: this.projectRoot });
+      return false;
+    }
 
     try {
       this.watcher = fs.watch(
