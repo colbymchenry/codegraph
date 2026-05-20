@@ -55,6 +55,16 @@ function setHome(dir: string): { restore: () => void } {
   };
 }
 
+function setPlatform(platform: NodeJS.Platform): { restore: () => void } {
+  const previous = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: platform });
+  return {
+    restore() {
+      if (previous) Object.defineProperty(process, 'platform', previous);
+    },
+  };
+}
+
 describe('Installer targets — contract', () => {
   let tmpHome: string;
   let tmpCwd: string;
@@ -233,6 +243,33 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(result.files[0].action).toBe('created');
   });
 
+  it('opencode: Windows global install uses ~/.config/opencode instead of APPDATA', () => {
+    const platform = setPlatform('win32');
+    const appData = path.join(tmpHome, 'AppData', 'Roaming');
+    const prevAppData = process.env.APPDATA;
+    const prevXdgConfigHome = process.env.XDG_CONFIG_HOME;
+    process.env.APPDATA = appData;
+    delete process.env.XDG_CONFIG_HOME;
+
+    try {
+      const opencode = getTarget('opencode')!;
+      const result = opencode.install('global', { autoAllow: true });
+      const configFile = path.join(tmpHome, '.config', 'opencode', 'opencode.jsonc');
+      const instructionsFile = path.join(tmpHome, '.config', 'opencode', 'AGENTS.md');
+      const appDataConfigFile = path.join(appData, 'opencode', 'opencode.jsonc');
+
+      expect(result.files.map((f) => f.path)).toContain(configFile);
+      expect(result.files.map((f) => f.path)).toContain(instructionsFile);
+      expect(fs.existsSync(configFile)).toBe(true);
+      expect(fs.existsSync(instructionsFile)).toBe(true);
+      expect(fs.existsSync(appDataConfigFile)).toBe(false);
+    } finally {
+      platform.restore();
+      if (prevAppData === undefined) delete process.env.APPDATA; else process.env.APPDATA = prevAppData;
+      if (prevXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prevXdgConfigHome;
+    }
+  });
+
   it('opencode: preserves line and block comments through install + idempotent re-run', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
@@ -311,10 +348,10 @@ describe('Installer targets — partial-state idempotency', () => {
   it('opencode: local install writes ./opencode.jsonc and ./AGENTS.md in cwd', () => {
     const opencode = getTarget('opencode')!;
     const result = opencode.install('local', { autoAllow: true });
-    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
-    // macOS realpath shenanigans (/var vs /private/var) — suffix match.
-    expect(paths.some((p) => p.endsWith('/opencode.jsonc'))).toBe(true);
-    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+    const paths = result.files.map((f) => f.path);
+    // Avoid absolute-path quirks (/var vs /private/var, or \ vs /).
+    expect(paths.some((p) => path.basename(p) === 'opencode.jsonc')).toBe(true);
+    expect(paths.some((p) => path.basename(p) === 'AGENTS.md')).toBe(true);
   });
 
   it('hermes: install adds codegraph MCP server and cli toolset, preserving existing yaml', () => {

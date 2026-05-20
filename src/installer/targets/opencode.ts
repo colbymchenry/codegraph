@@ -2,7 +2,7 @@
  * opencode target.
  *
  *   - MCP server entry to `~/.config/opencode/opencode.jsonc` (global,
- *     XDG-style; `%APPDATA%/opencode/opencode.jsonc` on Windows) or
+ *     XDG-style, including on Windows) or
  *     `./opencode.jsonc` (local). Falls back to `opencode.json` when a
  *     `.json` file already exists; defaults new installs to `.jsonc`
  *     because that's what opencode itself creates on first run.
@@ -50,11 +50,8 @@ import {
 } from '../instructions-template';
 
 function globalConfigDir(): string {
-  if (process.platform === 'win32') {
-    const appData = process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming');
-    return path.join(appData, 'opencode');
-  }
-  // XDG_CONFIG_HOME if set, else ~/.config — matches opencode's docs.
+  // OpenCode documents the same ~/.config/opencode global config path
+  // on Windows too; do not route Windows installs through APPDATA.
   const xdg = process.env.XDG_CONFIG_HOME && process.env.XDG_CONFIG_HOME.trim().length > 0
     ? process.env.XDG_CONFIG_HOME
     : path.join(os.homedir(), '.config');
