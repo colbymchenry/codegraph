@@ -3130,6 +3130,37 @@ describe('Git Submodules', () => {
     expect(files).toContain('app.ts');
     expect(files).toContain('libs/lib/lib.ts');
   });
+
+  it('should index files inside independent nested git repositories (issue #193)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const mainDir = path.join(tempDir, 'main');
+    fs.mkdirSync(mainDir, { recursive: true });
+    git(mainDir, 'init', '-q');
+    git(mainDir, 'config', 'user.email', 'test@test.com');
+    git(mainDir, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(mainDir, 'CMakeLists.txt'), 'add_subdirectory(sub_repo1)\n');
+    git(mainDir, 'add', 'CMakeLists.txt');
+    git(mainDir, 'commit', '-q', '-m', 'root init');
+
+    const nestedRepo = path.join(mainDir, 'sub_repo1');
+    fs.mkdirSync(path.join(nestedRepo, 'src'), { recursive: true });
+    git(nestedRepo, 'init', '-q');
+    git(nestedRepo, 'config', 'user.email', 'test@test.com');
+    git(nestedRepo, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(nestedRepo, 'CMakeLists.txt'), 'project(sub_repo1)\n');
+    fs.writeFileSync(path.join(nestedRepo, 'src', 'main.cpp'), 'int main() { return 0; }\n');
+    git(nestedRepo, 'add', '-A');
+    git(nestedRepo, 'commit', '-q', '-m', 'nested init');
+
+    const config = { ...DEFAULT_CONFIG, rootDir: mainDir };
+    const files = scanDirectory(mainDir, config);
+
+    expect(files).toContain('sub_repo1/src/main.cpp');
+    expect(files.every((file) => !file.includes('.git/'))).toBe(true);
+  });
 });
 
 // =============================================================================

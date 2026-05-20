@@ -101,6 +101,14 @@ function matchesGlob(filePath: string, pattern: string): boolean {
   return picomatch.isMatch(filePath, pattern, { dot: true });
 }
 
+function isSameDirectory(left: string, right: string): boolean {
+  try {
+    return fs.realpathSync(left) === fs.realpathSync(right);
+  } catch {
+    return path.resolve(left) === path.resolve(right);
+  }
+}
+
 /**
  * Check if a file should be included based on config
  */
@@ -141,7 +149,7 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
       { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
     ).trim();
 
-    if (path.resolve(gitRoot) !== path.resolve(rootDir)) {
+    if (!isSameDirectory(gitRoot, rootDir)) {
       try {
         // git check-ignore exits 0 if the path IS ignored, 1 if not
         execFileSync(
@@ -177,7 +185,20 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     for (const line of untracked.split('\n')) {
       const trimmed = line.trim();
       if (trimmed) {
-        files.add(normalizePath(trimmed));
+        const normalized = normalizePath(trimmed);
+        // Git reports unregistered nested repos as "dir/" entries; expand
+        // them so top-level workspace indexes can see the repo's files.
+        if (normalized.endsWith('/')) {
+          const nestedFiles = getNestedGitRepoFiles(rootDir, normalized);
+          if (nestedFiles.length > 0) {
+            for (const nestedFile of nestedFiles) {
+              files.add(nestedFile);
+            }
+            continue;
+          }
+        }
+
+        files.add(normalized);
       }
     }
 
@@ -243,6 +264,38 @@ function getGitChangedFiles(rootDir: string, config: CodeGraphConfig): GitChange
  * Marker file name that indicates a directory (and all children) should be skipped
  */
 const CODEGRAPH_IGNORE_MARKER = '.codegraphignore';
+
+function isGitRepositoryRoot(dir: string): boolean {
+  try {
+    const gitRoot = execFileSync(
+      'git',
+      ['rev-parse', '--show-toplevel'],
+      { cwd: dir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
+    ).trim();
+    return isSameDirectory(gitRoot, dir);
+  } catch {
+    return false;
+  }
+}
+
+function getNestedGitRepoFiles(rootDir: string, nestedRelativePath: string): string[] {
+  const nestedPrefix = normalizePath(nestedRelativePath).replace(/\/+$/, '');
+  if (!nestedPrefix) return [];
+
+  const nestedRoot = path.join(rootDir, nestedPrefix);
+  try {
+    if (!fs.statSync(nestedRoot).isDirectory()) return [];
+  } catch {
+    return [];
+  }
+
+  if (!isGitRepositoryRoot(nestedRoot)) return [];
+
+  const nestedFiles = getGitVisibleFiles(nestedRoot);
+  if (!nestedFiles) return [];
+
+  return [...nestedFiles].map((filePath) => normalizePath(path.join(nestedPrefix, filePath)));
+}
 
 /**
  * Recursively scan directory for source files.
