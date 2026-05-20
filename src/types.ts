@@ -85,6 +85,7 @@ export const LANGUAGES = [
   'liquid',
   'pascal',
   'scala',
+  'elixir',
   'unknown',
 ] as const;
 
@@ -545,6 +546,9 @@ export const DEFAULT_CONFIG: CodeGraphConfig = {
     // Scala
     '**/*.scala',
     '**/*.sc',
+    // Elixir
+    '**/*.ex',
+    '**/*.exs',
   ],
   exclude: [
     // Version control

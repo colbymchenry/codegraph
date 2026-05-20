@@ -3475,6 +3475,25 @@ def processData(): Unit = {
   });
 });
 
+// =============================================================================
+// Elixir
+// =============================================================================
+
+describe('Elixir Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Elixir files', () => {
+      expect(detectLanguage('lib/foo.ex')).toBe('elixir');
+      expect(detectLanguage('script.exs')).toBe('elixir');
+      expect(detectLanguage('test/foo_test.exs')).toBe('elixir');
+    });
+
+    it('should report Elixir as supported', () => {
+      expect(isLanguageSupported('elixir')).toBe(true);
+      expect(getSupportedLanguages()).toContain('elixir');
+    });
+  });
+});
+
 describe('Vue Extraction', () => {
   it('should detect Vue files', () => {
     expect(detectLanguage('App.vue')).toBe('vue');
