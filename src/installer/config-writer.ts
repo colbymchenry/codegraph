@@ -46,9 +46,11 @@ export function writeClaudeMd(location: InstallLocation): { created: boolean; up
 }
 
 export function hasMcpConfig(location: InstallLocation): boolean {
+  // local scope lives in ./.mcp.json (project scope); global is the
+  // user-scope ~/.claude.json. Mirrors the Claude target's paths.
   const file = location === 'global'
     ? path.join(os.homedir(), '.claude.json')
-    : path.join(process.cwd(), '.claude.json');
+    : path.join(process.cwd(), '.mcp.json');
   const config = readJsonFile(file);
   return !!config.mcpServers?.codegraph;
 }

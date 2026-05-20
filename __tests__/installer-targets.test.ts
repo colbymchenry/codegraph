@@ -352,6 +352,87 @@ describe('Installer targets — partial-state idempotency', () => {
     const after = fs.readFileSync(tomlPath, 'utf-8');
     expect(after).not.toContain('enabled = true');
   });
+
+  it('claude: local install writes ./.mcp.json (project scope), not ./.claude.json', () => {
+    const claude = getTarget('claude')!;
+    const result = claude.install('local', { autoAllow: false });
+    // The MCP entry lands in ./.mcp.json — the file Claude Code reads.
+    expect(result.files.some((f) => f.path.endsWith('/.mcp.json'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpCwd, '.mcp.json'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpCwd, '.claude.json'))).toBe(false);
+    const cfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('claude: global install targets ~/.claude.json (user scope)', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: false });
+    const cfg = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude.json'), 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('claude: local install migrates a legacy ./.claude.json codegraph entry into ./.mcp.json', () => {
+    const claude = getTarget('claude')!;
+    const legacy = path.join(tmpCwd, '.claude.json');
+    fs.writeFileSync(
+      legacy,
+      JSON.stringify({ mcpServers: { codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] } } }, null, 2),
+    );
+
+    claude.install('local', { autoAllow: false });
+
+    // codegraph now lives in .mcp.json; the legacy file (which held only
+    // codegraph) is gone.
+    const mcp = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
+    expect(mcp.mcpServers.codegraph).toBeDefined();
+    expect(fs.existsSync(legacy)).toBe(false);
+  });
+
+  it('claude: legacy ./.claude.json migration preserves sibling servers and unrelated keys', () => {
+    const claude = getTarget('claude')!;
+    const legacy = path.join(tmpCwd, '.claude.json');
+    fs.writeFileSync(
+      legacy,
+      JSON.stringify({
+        mcpServers: {
+          codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] },
+          other: { command: 'x' },
+        },
+        somethingElse: true,
+      }, null, 2),
+    );
+
+    claude.install('local', { autoAllow: false });
+
+    // Only codegraph is stripped from the legacy file; siblings survive.
+    const after = JSON.parse(fs.readFileSync(legacy, 'utf-8'));
+    expect(after.mcpServers.codegraph).toBeUndefined();
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.somethingElse).toBe(true);
+    const mcp = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
+    expect(mcp.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('claude: uninstall strips codegraph from ./.mcp.json and a legacy ./.claude.json', () => {
+    const claude = getTarget('claude')!;
+    // A user left with both the working .mcp.json and a stale .claude.json.
+    fs.writeFileSync(
+      path.join(tmpCwd, '.mcp.json'),
+      JSON.stringify({ mcpServers: { codegraph: { command: 'codegraph' } } }, null, 2),
+    );
+    fs.writeFileSync(
+      path.join(tmpCwd, '.claude.json'),
+      JSON.stringify({ mcpServers: { codegraph: { command: 'codegraph' }, other: { command: 'x' } } }, null, 2),
+    );
+
+    claude.uninstall('local');
+
+    const mcp = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
+    expect(mcp.mcpServers).toBeUndefined();
+    const legacy = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.claude.json'), 'utf-8'));
+    expect(legacy.mcpServers.codegraph).toBeUndefined();
+    expect(legacy.mcpServers.other).toBeDefined();
+  });
 });
 
 describe('Installer targets — registry', () => {

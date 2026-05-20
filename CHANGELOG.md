@@ -46,6 +46,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Thanks to [@essopsp](https://github.com/essopsp) for the repro.
 
 ### Fixed
+- **Installer (Claude Code)**: project-local installs (`Just this project`)
+  now write the MCP server to `.mcp.json` in the project root — the file
+  Claude Code actually reads for project-scoped servers. Previously they
+  wrote `.claude.json`, which Claude Code ignores, so the codegraph tools
+  silently never appeared and you had to rename the file by hand to make it
+  work. Re-running `codegraph install` (or `codegraph init`) on an affected
+  project migrates the stale `.claude.json` entry into `.mcp.json`
+  automatically; uninstall cleans up both. Global (`All projects`) installs
+  were unaffected — they correctly target `~/.claude.json`. Closes
+  [#207](https://github.com/colbymchenry/codegraph/issues/207). Thanks to
+  [@Jhsmit](https://github.com/Jhsmit) for the report and the workaround.
 - **MCP**: source-omission markers in `codegraph_explore` and
   `codegraph_context` output are now language-neutral (`... (gap) ...`,
   `... (trimmed) ...`, `... (truncated) ...`) instead of C-style `//`
