@@ -446,7 +446,25 @@ export class CodeGraph {
 
         // Resolve references if files were updated
         if (result.filesAdded > 0 || result.filesModified > 0) {
-          if (result.changedFilePaths) {
+          if (result.filesAdded > 0) {
+            // A newly added file can satisfy unresolved references from any
+            // already-indexed file, so re-check the unresolved table globally.
+            const unresolvedCount = this.queries.getUnresolvedReferencesCount();
+
+            options.onProgress?.({
+              phase: 'resolving',
+              current: 0,
+              total: unresolvedCount,
+            });
+
+            await this.resolveReferencesBatched((current, total) => {
+              options.onProgress?.({
+                phase: 'resolving',
+                current,
+                total,
+              });
+            });
+          } else if (result.changedFilePaths) {
             // Scope resolution to changed files (git fast path — bounded set)
             const unresolvedRefs = this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths);
 

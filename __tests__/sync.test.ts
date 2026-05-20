@@ -149,6 +149,46 @@ describe('Sync Module', () => {
         expect(result.filesRemoved).toBe(0);
         expect(result.filesChecked).toBeGreaterThan(0);
       });
+
+      it('should resolve references from unchanged files when a missing import target is added', async () => {
+        cg.destroy();
+        fs.rmSync(path.join(testDir, '.codegraph'), { recursive: true, force: true });
+
+        fs.writeFileSync(
+          path.join(testDir, 'src', 'caller.ts'),
+          `import { addedLater } from './added-later';
+
+export function caller() {
+  return addedLater();
+}
+`
+        );
+
+        cg = CodeGraph.initSync(testDir, {
+          config: {
+            include: ['**/*.ts'],
+            exclude: [],
+          },
+        });
+        await cg.indexAll();
+
+        const callerBefore = cg.searchNodes('caller', { kinds: ['function'], limit: 1 })[0]!.node;
+        expect(cg.getCallees(callerBefore.id)).toHaveLength(0);
+
+        fs.writeFileSync(
+          path.join(testDir, 'src', 'added-later.ts'),
+          `export function addedLater() {
+  return 42;
+}
+`
+        );
+
+        const result = await cg.sync();
+        expect(result.filesAdded).toBe(1);
+
+        const callerAfter = cg.searchNodes('caller', { kinds: ['function'], limit: 1 })[0]!.node;
+        expect(cg.getCallees(callerAfter.id).map(({ node }) => node.name)).toContain('addedLater');
+      });
     });
   });
 

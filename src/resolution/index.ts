@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference } from './name-matcher';
-import { resolveViaImport, extractImportMappings, extractReExports } from './import-resolver';
+import { resolveViaImport, extractImportMappings, extractReExports, resolveImportPath } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { logDebug } from '../errors';
@@ -453,6 +453,11 @@ export class ReferenceResolver {
       return null;
     }
 
+    const importFileResult = this.resolveImportToFile(ref);
+    if (importFileResult !== undefined) {
+      return importFileResult;
+    }
+
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
@@ -492,6 +497,60 @@ export class ReferenceResolver {
     // Return highest confidence candidate
     return candidates.reduce((best, curr) =>
       curr.confidence > best.confidence ? curr : best
+    );
+  }
+
+  /**
+   * Resolve module import references to file nodes. Without this, module
+   * specifiers like "./utils" fall through to the name matcher and resolve to
+   * their own import node, which makes file dependency analysis useless.
+   *
+   * Returns undefined when the reference should continue through the normal
+   * strategies, or null when a local module import should remain unresolved
+   * until the target file appears.
+   */
+  private resolveImportToFile(ref: UnresolvedRef): ResolvedRef | null | undefined {
+    if (ref.referenceKind !== 'imports') {
+      return undefined;
+    }
+
+    const resolvedPath = resolveImportPath(
+      ref.referenceName,
+      ref.filePath,
+      ref.language,
+      this.context
+    );
+
+    if (resolvedPath) {
+      const fileNode = this.context
+        .getNodesInFile(resolvedPath)
+        .find((n) => n.kind === 'file');
+
+      if (fileNode) {
+        return {
+          original: ref,
+          targetNodeId: fileNode.id,
+          confidence: 0.95,
+          resolvedBy: 'file-path',
+        };
+      }
+    }
+
+    return this.isLocalImportSpecifier(ref.referenceName) ? null : undefined;
+  }
+
+  private isLocalImportSpecifier(specifier: string): boolean {
+    if (specifier.startsWith('.')) return true;
+
+    const aliases = this.context.getProjectAliases?.();
+    if (aliases) {
+      for (const pattern of aliases.patterns) {
+        if (specifier.startsWith(pattern.prefix)) return true;
+      }
+    }
+
+    return ['@/', '~/', '@src/', 'src/', '@app/', 'app/'].some((prefix) =>
+      specifier.startsWith(prefix)
     );
   }
 
@@ -590,10 +649,12 @@ export class ReferenceResolver {
       byMethod: {} as Record<string, number>,
     };
 
-    // Process in batches. We always read from offset 0 because resolved refs
-    // are deleted after each batch, shifting the remaining rows forward.
+    // Process in batches while preserving unresolved refs for future syncs.
+    // Added files can make a previously unresolved local import/call resolvable,
+    // so unresolved rows are intentionally left in the table.
+    let offset = 0;
     while (true) {
-      const batch = this.queries.getUnresolvedReferencesBatch(0, batchSize);
+      const batch = this.queries.getUnresolvedReferencesBatch(offset, batchSize);
       if (batch.length === 0) break;
 
       const result = this.resolveAll(batch);
@@ -615,17 +676,6 @@ export class ReferenceResolver {
         );
       }
 
-      // Delete unresolvable refs from this batch to avoid re-processing them
-      if (result.unresolved.length > 0) {
-        this.queries.deleteSpecificResolvedReferences(
-          result.unresolved.map((r) => ({
-            fromNodeId: r.fromNodeId,
-            referenceName: r.referenceName,
-            referenceKind: r.referenceKind,
-          }))
-        );
-      }
-
       // Aggregate stats
       aggregateStats.total += result.stats.total;
       aggregateStats.resolved += result.stats.resolved;
@@ -640,11 +690,9 @@ export class ReferenceResolver {
       // Yield so progress UI can render between batches
       await new Promise(resolve => setImmediate(resolve));
 
-      // If nothing was resolved or removed in this batch, we'd loop forever
-      // on the same rows. Break to avoid infinite loop.
-      if (result.resolved.length === 0 && result.unresolved.length === batch.length) {
-        break;
-      }
+      // Resolved rows were deleted, so only the unresolved rows from this batch
+      // still occupy positions before the next unprocessed row.
+      offset += result.unresolved.length;
     }
 
     return {
