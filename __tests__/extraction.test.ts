@@ -3729,6 +3729,85 @@ end
       expect(stray).toBeUndefined();
     });
   });
+
+  describe('Struct, protocol, behaviour', () => {
+    it('should extract defstruct as a struct node with field children', () => {
+      const code = `
+defmodule Point do
+  defstruct [:x, :y]
+end
+`;
+      const result = extractFromSource('lib/point.ex', code);
+      const struct_ = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Point');
+      expect(struct_).toBeDefined();
+      const fieldNames = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fieldNames).toContain('x');
+      expect(fieldNames).toContain('y');
+    });
+
+    it('should treat defexception the same as defstruct', () => {
+      const code = `
+defmodule MyError do
+  defexception [:message, :reason]
+end
+`;
+      const result = extractFromSource('lib/my_error.ex', code);
+      const struct_ = result.nodes.find((n) => n.kind === 'struct' && n.name === 'MyError');
+      expect(struct_).toBeDefined();
+      const fieldNames = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fieldNames).toContain('message');
+      expect(fieldNames).toContain('reason');
+    });
+
+    it('should extract defprotocol as a protocol node with abstract functions', () => {
+      const code = `
+defprotocol Sizable do
+  def size(thing)
+end
+`;
+      const result = extractFromSource('lib/sizable.ex', code);
+      const proto = result.nodes.find((n) => n.kind === 'protocol' && n.name === 'Sizable');
+      expect(proto).toBeDefined();
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'size/1');
+      expect(fn).toBeDefined();
+      expect(fn?.isAbstract).toBe(true);
+    });
+
+    it('should emit an implements reference for defimpl', () => {
+      const code = `
+defimpl Sizable, for: List do
+  def size(list), do: length(list)
+end
+`;
+      const result = extractFromSource('lib/sizable_list.ex', code);
+      const impl = result.nodes.find((n) => n.kind === 'module' && n.name === 'Sizable.List');
+      expect(impl).toBeDefined();
+      const ref = result.unresolvedReferences.find(
+        (r) =>
+          r.fromNodeId === impl?.id &&
+          r.referenceName === 'Sizable' &&
+          r.referenceKind === 'implements'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    it('should emit an implements reference for @behaviour', () => {
+      const code = `
+defmodule MyServer do
+  @behaviour GenServer
+end
+`;
+      const result = extractFromSource('lib/my_server.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'MyServer');
+      const ref = result.unresolvedReferences.find(
+        (r) =>
+          r.fromNodeId === mod?.id &&
+          r.referenceName === 'GenServer' &&
+          r.referenceKind === 'implements'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
 });
 
 describe('Vue Extraction', () => {

@@ -254,9 +254,34 @@ function handleAttribute(node: SyntaxNode, ctx: ExtractorContext): boolean {
     return true;
   }
 
-  // For other attributes, swallow them so the default walker doesn't
-  // mis-interpret their operand `call` (e.g. `behaviour GenServer`) as
-  // a user call site. Later phases will handle these properly.
+  if (target === 'behaviour' || target === 'behavior') {
+    // `@behaviour Foo` → implements reference from enclosing module to Foo.
+    const args = getChildByField(operand, 'arguments') ?? findChild(operand, 'arguments');
+    const protoNode = args ? findChild(args, 'alias') : null;
+    if (protoNode) {
+      const moduleId = [...ctx.nodeStack].reverse().find((id) => {
+        const n = ctx.nodes.find((x) => x.id === id);
+        return n?.kind === 'module';
+      });
+      if (moduleId) {
+        ctx.addUnresolvedReference({
+          fromNodeId: moduleId,
+          referenceName: readAliasText(protoNode, ctx.source),
+          referenceKind: 'implements',
+          line: protoNode.startPosition.row + 1,
+          column: protoNode.startPosition.column,
+          filePath: ctx.filePath,
+          language: 'elixir',
+        });
+      }
+    }
+    return true;
+  }
+
+  // For other attributes (@doc, @callback, @spec, custom), swallow them
+  // so the default walker doesn't mis-interpret their operand `call`
+  // (e.g. `spec hello(...)`) as a user call site. Later phases can do
+  // proper docstring / abstract-function extraction here.
   return true;
 }
 
@@ -318,6 +343,160 @@ function handleImportLike(
       // Unusual shape — fall back to the whole dot expression text.
       emit(readAliasText(first, ctx.source), first);
     }
+  }
+  return true;
+}
+
+/**
+ * `defstruct [:a, :b]` and `defexception [:msg, :reason]`.
+ * Both produce a `struct` node named after the *enclosing module* and a
+ * `field` child per atom in the list. They have no separate name of
+ * their own — the module IS the struct.
+ */
+function handleDefstruct(callNode: SyntaxNode, ctx: ExtractorContext): boolean {
+  // Find the enclosing module's name from the scope stack.
+  let moduleName: string | null = null;
+  let moduleId: string | null = null;
+  for (let i = ctx.nodeStack.length - 1; i >= 0; i--) {
+    const id = ctx.nodeStack[i]!;
+    const n = ctx.nodes.find((x) => x.id === id);
+    if (n?.kind === 'module') {
+      moduleName = n.name;
+      moduleId = id;
+      break;
+    }
+  }
+  if (!moduleName || !moduleId) return true;
+
+  const structNode = ctx.createNode('struct', moduleName, callNode);
+  if (!structNode) return true;
+
+  // The args are typically a single `list` of atoms. We accept either
+  // `list` or `keywords` (for `defstruct a: nil, b: 0`).
+  const args = getChildByField(callNode, 'arguments') ?? findChild(callNode, 'arguments');
+  if (!args) return true;
+  const listNode = findChild(args, 'list') ?? findChild(args, 'keywords');
+  if (!listNode) return true;
+
+  ctx.pushScope(structNode.id);
+  try {
+    for (let i = 0; i < listNode.namedChildCount; i++) {
+      const child = listNode.namedChild(i);
+      if (!child) continue;
+      let fieldName: string | null = null;
+      let posNode: SyntaxNode = child;
+      if (child.type === 'atom') {
+        // `:name` — leading `:` is part of the text.
+        fieldName = getNodeText(child, ctx.source).replace(/^:/, '');
+      } else if (child.type === 'pair') {
+        const key = getChildByField(child, 'key') ?? child.namedChild(0);
+        if (key) {
+          fieldName = getNodeText(key, ctx.source).replace(/[:\s]/g, '');
+          posNode = key;
+        }
+      }
+      if (fieldName) {
+        ctx.createNode('field', fieldName, posNode);
+      }
+    }
+  } finally {
+    ctx.popScope();
+  }
+  return true;
+}
+
+/**
+ * `defprotocol Sizable do def size(thing) end`. The module-shaped
+ * container becomes a `protocol` node; bodyless `def` clauses inside
+ * become `function` nodes marked `isAbstract: true`.
+ */
+function handleDefprotocol(callNode: SyntaxNode, ctx: ExtractorContext): boolean {
+  const args = getChildByField(callNode, 'arguments') ?? findChild(callNode, 'arguments');
+  const aliasNode = args ? findChild(args, 'alias') : null;
+  if (!aliasNode) return true;
+  const name = readAliasText(aliasNode, ctx.source);
+
+  const protoNode = ctx.createNode('protocol', name, callNode);
+  if (!protoNode) return true;
+
+  ctx.pushScope(protoNode.id);
+  try {
+    const body = findChild(callNode, 'do_block');
+    if (!body) return true;
+    for (let i = 0; i < body.namedChildCount; i++) {
+      const stmt = body.namedChild(i);
+      if (!stmt || stmt.type !== 'call') continue;
+      const target = callTarget(stmt, ctx.source);
+      if (target !== 'def') {
+        // Pass through anything else (rare in protocols).
+        ctx.visitNode(stmt);
+        continue;
+      }
+      const head = parseDefHead(stmt, ctx.source);
+      if (!head) continue;
+      const fnName = `${head.name}/${head.arity}`;
+      if (!findExistingFunction(fnName, ctx)) {
+        ctx.createNode('function', fnName, stmt, {
+          visibility: 'public',
+          isAbstract: true,
+        });
+      }
+    }
+  } finally {
+    ctx.popScope();
+  }
+  return true;
+}
+
+/**
+ * `defimpl Proto, for: Type do … end`. Produces:
+ *   - a `module` node named `${Proto}.${Type}` (Elixir's own naming convention),
+ *   - an `implements`-kind unresolved reference from that module to `Proto`,
+ *   - regular function extraction inside the body.
+ */
+function handleDefimpl(callNode: SyntaxNode, ctx: ExtractorContext): boolean {
+  const args = getChildByField(callNode, 'arguments') ?? findChild(callNode, 'arguments');
+  if (!args) return true;
+
+  // First positional argument is the protocol alias.
+  const protoNode = findChild(args, 'alias');
+  if (!protoNode) return true;
+  const protoName = readAliasText(protoNode, ctx.source);
+
+  // `for: TypeName` lives in the keywords list.
+  const keywords = findChild(args, 'keywords');
+  let forType = 'Any';
+  if (keywords) {
+    for (const pair of findChildren(keywords, 'pair')) {
+      const key = getChildByField(pair, 'key') ?? pair.namedChild(0);
+      const value = getChildByField(pair, 'value') ?? pair.namedChild(1);
+      if (key && value && getNodeText(key, ctx.source).trim().startsWith('for')) {
+        forType = readAliasText(value, ctx.source);
+        break;
+      }
+    }
+  }
+
+  const implName = `${protoName}.${forType}`;
+  const implModule = ctx.createNode('module', implName, callNode);
+  if (!implModule) return true;
+
+  ctx.addUnresolvedReference({
+    fromNodeId: implModule.id,
+    referenceName: protoName,
+    referenceKind: 'implements',
+    line: protoNode.startPosition.row + 1,
+    column: protoNode.startPosition.column,
+    filePath: ctx.filePath,
+    language: 'elixir',
+  });
+
+  ctx.pushScope(implModule.id);
+  try {
+    const body = findChild(callNode, 'do_block');
+    if (body) ctx.visitNode(body);
+  } finally {
+    ctx.popScope();
   }
   return true;
 }
@@ -443,6 +622,13 @@ export const elixirExtractor: LanguageExtractor = {
         case 'require':
         case 'use':
           return handleImportLike(node, target, ctx);
+        case 'defstruct':
+        case 'defexception':
+          return handleDefstruct(node, ctx);
+        case 'defprotocol':
+          return handleDefprotocol(node, ctx);
+        case 'defimpl':
+          return handleDefimpl(node, ctx);
       }
       // Generic user call site — emit a `calls` reference if we're
       // inside a function. Returning false lets the default walker
