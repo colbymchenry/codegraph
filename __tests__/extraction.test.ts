@@ -3601,6 +3601,63 @@ end
       expect(fn).toBeDefined();
     });
   });
+
+  describe('Alias / import / require / use', () => {
+    it('should extract a single-target alias as an import node', () => {
+      const code = `
+defmodule Foo do
+  alias Bar.Baz
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const imp = result.nodes.find((n) => n.kind === 'import' && n.name === 'Bar.Baz');
+      expect(imp).toBeDefined();
+      expect(imp?.language).toBe('elixir');
+    });
+
+    it('should expand alias Foo.{A, B} into two import nodes', () => {
+      const code = `
+defmodule Foo do
+  alias Bar.{Baz, Qux}
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import');
+      expect(imports.find((i) => i.name === 'Bar.Baz')).toBeDefined();
+      expect(imports.find((i) => i.name === 'Bar.Qux')).toBeDefined();
+    });
+
+    it('should record import/require/use with distinct mechanisms in signature', () => {
+      const code = `
+defmodule Foo do
+  import Ecto.Query
+  require Logger
+  use Phoenix.LiveView
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const importNode = result.nodes.find((n) => n.kind === 'import' && n.name === 'Ecto.Query');
+      const requireNode = result.nodes.find((n) => n.kind === 'import' && n.name === 'Logger');
+      const useNode = result.nodes.find((n) => n.kind === 'import' && n.name === 'Phoenix.LiveView');
+      expect(importNode?.signature).toContain('import');
+      expect(requireNode?.signature).toContain('require');
+      expect(useNode?.signature).toContain('use');
+    });
+
+    it('should emit an imports unresolved-reference from the enclosing module', () => {
+      const code = `
+defmodule Foo do
+  alias Bar.Baz
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'Foo');
+      const ref = result.unresolvedReferences.find(
+        (r) => r.fromNodeId === mod?.id && r.referenceName === 'Bar.Baz' && r.referenceKind === 'imports'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
 });
 
 describe('Vue Extraction', () => {

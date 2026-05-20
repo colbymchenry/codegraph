@@ -260,6 +260,68 @@ function handleAttribute(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true;
 }
 
+/**
+ * Handle `alias`, `import`, `require`, and `use` directives. All four
+ * share the same surface shape — a call whose first identifier names
+ * the mechanism and whose `arguments` carry one or more module references.
+ *
+ * Variants we recognise:
+ *   alias Bar.Baz                      → one import node "Bar.Baz"
+ *   alias Bar.{Baz, Qux}               → two import nodes "Bar.Baz", "Bar.Qux"
+ *   import Ecto.Query, only: [...]     → one import node "Ecto.Query"
+ *   require Logger                     → one import node "Logger"
+ *   use Phoenix.LiveView, layout: {…}  → one import node "Phoenix.LiveView"
+ *
+ * Each emitted import node carries `signature` = the full directive text
+ * (mechanism + target + options), so `metadata.mechanism` lives there
+ * without needing a separate Node field.
+ */
+function handleImportLike(
+  callNode: SyntaxNode,
+  mechanism: 'alias' | 'import' | 'require' | 'use',
+  ctx: ExtractorContext
+): boolean {
+  const args = getChildByField(callNode, 'arguments') ?? findChild(callNode, 'arguments');
+  if (!args || args.namedChildCount === 0) return true;
+  const first = args.namedChild(0)!;
+  const signature = getNodeText(callNode, ctx.source).trim();
+
+  const parentId = ctx.nodeStack.length > 0 ? ctx.nodeStack[ctx.nodeStack.length - 1]! : null;
+  const emit = (moduleName: string, posNode: SyntaxNode): void => {
+    const imp = ctx.createNode('import', moduleName, posNode, { signature });
+    if (!imp) return;
+    if (parentId) {
+      ctx.addUnresolvedReference({
+        fromNodeId: parentId,
+        referenceName: moduleName,
+        referenceKind: 'imports',
+        line: posNode.startPosition.row + 1,
+        column: posNode.startPosition.column,
+        filePath: ctx.filePath,
+        language: 'elixir',
+      });
+    }
+  };
+
+  if (first.type === 'alias') {
+    emit(readAliasText(first, ctx.source), first);
+  } else if (first.type === 'dot') {
+    // alias Foo.{Bar, Baz} — left=Foo, right=tuple of suffix aliases
+    const left = getChildByField(first, 'left') ?? first.namedChild(0);
+    const right = getChildByField(first, 'right') ?? first.namedChild(1);
+    if (left && right && right.type === 'tuple') {
+      const prefix = readAliasText(left, ctx.source);
+      for (const suffix of findChildren(right, 'alias')) {
+        emit(`${prefix}.${readAliasText(suffix, ctx.source)}`, suffix);
+      }
+    } else if (left) {
+      // Unusual shape — fall back to the whole dot expression text.
+      emit(readAliasText(first, ctx.source), first);
+    }
+  }
+  return true;
+}
+
 // --- LanguageExtractor config ----------------------------------------------
 
 export const elixirExtractor: LanguageExtractor = {
@@ -291,6 +353,11 @@ export const elixirExtractor: LanguageExtractor = {
         case 'defmacro':
         case 'defmacrop':
           return handleDef(node, target, ctx);
+        case 'alias':
+        case 'import':
+        case 'require':
+        case 'use':
+          return handleImportLike(node, target, ctx);
       }
       // For any other call, let the default walker descend so nested
       // structures (e.g. defmodule inside an `if`) are still visited.
