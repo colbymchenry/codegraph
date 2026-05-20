@@ -440,6 +440,9 @@ export const tools: ToolDefinition[] = [
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
+  // The directory the server last searched for a default project. Surfaced in
+  // the "not initialized" error so users can see why detection missed.
+  private defaultProjectHint: string | null = null;
 
   constructor(private cg: CodeGraph | null) {}
 
@@ -448,6 +451,14 @@ export class ToolHandler {
    */
   setDefaultCodeGraph(cg: CodeGraph): void {
     this.cg = cg;
+  }
+
+  /**
+   * Record the directory the server tried to resolve the default project from.
+   * Used only to make the "no default project" error actionable.
+   */
+  setDefaultProjectHint(searchedPath: string): void {
+    this.defaultProjectHint = searchedPath;
   }
 
   /**
@@ -495,7 +506,16 @@ export class ToolHandler {
   private getCodeGraph(projectPath?: string): CodeGraph {
     if (!projectPath) {
       if (!this.cg) {
-        throw new Error('CodeGraph not initialized for this project. Run \'codegraph init\' first.');
+        const searched = this.defaultProjectHint ?? process.cwd();
+        throw new Error(
+          'No CodeGraph project is loaded for this session.\n' +
+          `Searched for a .codegraph/ directory starting from: ${searched}\n` +
+          'The index is likely fine — this is a working-directory detection issue: ' +
+          "the MCP client launched the server outside your project and didn't report the " +
+          'workspace root. Fix it either way:\n' +
+          '  • Pass projectPath to the tool call, e.g. projectPath: "/absolute/path/to/your/project"\n' +
+          '  • Or add --path to the server\'s MCP config args: ["serve", "--mcp", "--path", "/absolute/path/to/your/project"]'
+        );
       }
       return this.cg;
     }

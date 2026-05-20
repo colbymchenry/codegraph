@@ -55,6 +55,26 @@ const SERVER_INFO = {
 const PROTOCOL_VERSION = '2024-11-05';
 
 /**
+ * How long to wait for the client's `roots/list` response before giving up
+ * and falling back to the process cwd.
+ */
+const ROOTS_LIST_TIMEOUT_MS = 5000;
+
+/**
+ * Extract the first usable filesystem path from a `roots/list` result.
+ * Shape per MCP spec: `{ roots: [{ uri: "file:///path", name?: string }] }`.
+ * Returns null if the result is empty or malformed.
+ */
+function firstRootPath(result: unknown): string | null {
+  if (!result || typeof result !== 'object') return null;
+  const roots = (result as { roots?: unknown }).roots;
+  if (!Array.isArray(roots) || roots.length === 0) return null;
+  const first = roots[0] as { uri?: unknown };
+  if (typeof first?.uri !== 'string') return null;
+  return fileUriToPath(first.uri);
+}
+
+/**
  * MCP Server for CodeGraph
  *
  * Implements the Model Context Protocol to expose CodeGraph
@@ -68,6 +88,13 @@ export class MCPServer {
   // In-flight background init kicked off from handleInitialize. Tracked so the
   // sync retry path doesn't race against it (double-opening the SQLite file).
   private initPromise: Promise<void> | null = null;
+  // Whether the client advertised the MCP `roots` capability during initialize.
+  // If so, and no explicit project path was given, we ask it for the workspace
+  // root via roots/list rather than guessing from the (often wrong) cwd.
+  private clientSupportsRoots = false;
+  // Guards the one-shot deferred resolution (roots/list or cwd) so we don't
+  // re-issue roots/list on every tool call.
+  private rootsAttempted = false;
 
   constructor(projectPath?: string) {
     this.projectPath = projectPath || null;
@@ -108,6 +135,9 @@ export class MCPServer {
    * are still possible.
    */
   private async tryInitializeDefault(projectPath: string): Promise<void> {
+    // Record where we searched so a later "not initialized" error can name it.
+    this.toolHandler.setDefaultProjectHint(projectPath);
+
     // Walk up parent directories to find nearest .codegraph/
     const resolvedRoot = findNearestCodeGraphRoot(projectPath);
 
@@ -146,10 +176,28 @@ export class MCPServer {
 
     // Already initialized successfully
     if (this.toolHandler.hasDefaultCodeGraph()) return;
-    // No project path to retry with
-    if (!this.projectPath) return;
 
-    const resolvedRoot = findNearestCodeGraphRoot(this.projectPath);
+    // No explicit path was given at initialize. Resolve it now, exactly once:
+    // ask the client via roots/list (if it advertised roots), else use cwd.
+    // Deferring to here lets a roots answer override the wrong cwd, and the
+    // one-shot guard means we never re-issue roots/list per tool call.
+    if (!this.projectPath && !this.rootsAttempted) {
+      this.rootsAttempted = true;
+      this.initPromise = (
+        this.clientSupportsRoots
+          ? this.initFromRoots()
+          : this.tryInitializeDefault(process.cwd())
+      ).finally(() => { this.initPromise = null; });
+      try { await this.initPromise; } catch { /* fall through to last-resort below */ }
+      if (this.toolHandler.hasDefaultCodeGraph()) return;
+    }
+
+    // Last resort: re-walk from the best candidate we have. Picks up projects
+    // initialized after the server started, and covers clients that sent no
+    // usable initialize signal at all.
+    const candidate = this.projectPath ?? process.cwd();
+    this.toolHandler.setDefaultProjectHint(candidate);
+    const resolvedRoot = findNearestCodeGraphRoot(candidate);
     if (!resolvedRoot) return;
 
     try {
@@ -165,6 +213,28 @@ export class MCPServer {
     } catch {
       // Still failing — will retry on next tool call
     }
+  }
+
+  /**
+   * Resolve the project root via the MCP `roots/list` request and initialize
+   * from the first root the client reports. Falls back to the process cwd if
+   * the client returns no usable root or doesn't answer in time. See issue #196.
+   */
+  private async initFromRoots(): Promise<void> {
+    let target = process.cwd();
+    try {
+      const result = await this.transport.request('roots/list', undefined, ROOTS_LIST_TIMEOUT_MS);
+      const rootPath = firstRootPath(result);
+      if (rootPath) {
+        target = rootPath;
+      } else {
+        process.stderr.write('[CodeGraph MCP] Client returned no workspace roots; falling back to process cwd.\n');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[CodeGraph MCP] roots/list request failed (${msg}); falling back to process cwd.\n`);
+    }
+    await this.tryInitializeDefault(target);
   }
 
   /**
@@ -279,20 +349,25 @@ export class MCPServer {
     const params = request.params as {
       rootUri?: string;
       workspaceFolders?: Array<{ uri: string; name: string }>;
+      capabilities?: { roots?: unknown };
     } | undefined;
 
-    // Extract project path from rootUri or workspaceFolders
-    let projectPath = this.projectPath;
+    // Does the client support the MCP `roots` protocol? If so, and we have no
+    // explicit path, we ask it for the workspace root after the handshake
+    // instead of falling back to the (frequently wrong) cwd. See issue #196.
+    this.clientSupportsRoots = !!params?.capabilities?.roots;
 
+    // Explicit project signal, strongest first: a client-provided rootUri /
+    // workspaceFolders (LSP-style, non-standard but some clients send it), else
+    // the --path the server was launched with. cwd is NOT used here — we defer
+    // it so a roots/list answer can win over it.
+    let explicitPath: string | null = null;
     if (params?.rootUri) {
-      projectPath = fileUriToPath(params.rootUri);
+      explicitPath = fileUriToPath(params.rootUri);
     } else if (params?.workspaceFolders?.[0]?.uri) {
-      projectPath = fileUriToPath(params.workspaceFolders[0].uri);
-    }
-
-    // Fall back to current working directory if no path provided
-    if (!projectPath) {
-      projectPath = process.cwd();
+      explicitPath = fileUriToPath(params.workspaceFolders[0].uri);
+    } else if (this.projectPath) {
+      explicitPath = this.projectPath;
     }
 
     // Respond to the handshake BEFORE doing any heavy initialization. Loading
@@ -315,13 +390,20 @@ export class MCPServer {
       instructions: SERVER_INSTRUCTIONS,
     });
 
-    // Kick off the default-project init in the background. Tool calls that
-    // arrive before it finishes will see the "not initialized yet" path and
-    // fall through to `retryInitIfNeeded`, which now waits for this promise
-    // rather than racing against it with a second open.
-    this.initPromise = this.tryInitializeDefault(projectPath).finally(() => {
-      this.initPromise = null;
-    });
+    // If we know the project dir, kick off init in the background now. Tool
+    // calls that arrive before it finishes fall through to `retryInitIfNeeded`,
+    // which waits for this promise rather than racing it with a second open.
+    //
+    // If we DON'T know it (no rootUri, no --path), defer: the first tool call
+    // resolves it via roots/list (when the client supports roots) or cwd. This
+    // is the fix for issue #196 — clients that launch the server outside the
+    // project and don't pass a rootUri previously got a misleading "not
+    // initialized" error on every call.
+    if (explicitPath) {
+      this.initPromise = this.tryInitializeDefault(explicitPath).finally(() => {
+        this.initPromise = null;
+      });
+    }
   }
 
   /**

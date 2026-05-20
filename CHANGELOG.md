@@ -57,6 +57,23 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Thanks to [@essopsp](https://github.com/essopsp) for the repro.
 
 ### Fixed
+- **MCP**: tools no longer fail with "CodeGraph not initialized" when the index
+  actually exists. This hit clients that launch the MCP server from a directory
+  other than your project and don't report a workspace root in `initialize`
+  (some IDE/JetBrains-family integrations) — the server fell back to its own
+  working directory, missed the project's `.codegraph/`, and returned the
+  misleading "Run 'codegraph init' first" on every call. The only workaround
+  was passing `projectPath` to each tool by hand. Now, when no project path is
+  supplied, the server asks the client for its workspace root via the standard
+  MCP `roots/list` request (when the client advertises the `roots` capability)
+  before falling back to the working directory — so detection just works for
+  spec-compliant clients. When it still can't resolve a project, the error is
+  now actionable: it names the directory it searched and tells you to pass
+  `projectPath` or add `--path /abs/project` to the server's MCP config args,
+  instead of pointing you at a re-init you don't need. Closes
+  [#196](https://github.com/colbymchenry/codegraph/issues/196). Thanks to
+  [@zhangyu1197](https://github.com/zhangyu1197) for the report and the
+  `projectPath` workaround.
 - **MCP**: the server no longer hangs on startup under WSL2 when the project
   lives on an NTFS `/mnt/*` mount. Setting up the recursive file watcher
   there took tens of seconds — every directory read crosses the Windows/9p
