@@ -10,6 +10,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Framework routes (NestJS)**: CodeGraph now recognises NestJS projects and
+  emits `route` nodes — each linked by a `references` edge to its handler
+  method — across all four transport layers: HTTP controllers (the
+  `@Controller` prefix joined with `@Get`/`@Post`/`@Put`/`@Patch`/`@Delete`/
+  `@Head`/`@Options`/`@All`, including empty `@Controller()`/`@Get()`),
+  GraphQL resolvers (`@Query`/`@Mutation`/`@Subscription`), microservice
+  handlers (`@MessagePattern`/`@EventPattern`), and WebSocket gateways
+  (`@SubscribeMessage`, prefixed with the gateway namespace). Detected
+  automatically from any `@nestjs/*` dependency in `package.json`. Querying a
+  controller method or resolver now surfaces the route that binds it.
+  Resolves [#220](https://github.com/colbymchenry/codegraph/issues/220).
 - **MCP / explore**: `codegraph_explore` source sections now carry line
   numbers (cat -n style `<num>\t<code>`, matching the Read tool). This lets
   the agent cite `file:line` straight from the explore payload instead of
