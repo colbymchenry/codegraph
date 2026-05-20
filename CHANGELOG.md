@@ -63,6 +63,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Thanks to [@essopsp](https://github.com/essopsp) for the repro.
 
 ### Fixed
+- **Indexing**: `codegraph init -i` now finds source inside nested, independent
+  git repositories — separate clones living inside the workspace that are **not**
+  git submodules (common in CMake "super-repo" layouts). When the top-level
+  workspace is itself a git repo, `git ls-files` reports an embedded repo only as
+  an opaque `subdir/` entry and never lists its files, so indexing from the
+  workspace root reported "No files found to index" even though indexing each
+  sub-repo individually worked. CodeGraph now detects these embedded repos and
+  indexes their tracked and untracked source, honoring each repo's own
+  `.gitignore`. Closes
+  [#193](https://github.com/colbymchenry/codegraph/issues/193). Thanks to
+  [@timxx](https://github.com/timxx) for the report.
 - **Native SQLite backend on Node 24**: indexing on Node 24 always dropped to
   the 5-10x-slower WASM backend, printing a `better-sqlite3 unavailable`
   warning that `npm rebuild better-sqlite3` / `xcode-select --install` could

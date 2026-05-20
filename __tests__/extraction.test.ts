@@ -3132,6 +3132,79 @@ describe('Git Submodules', () => {
   });
 });
 
+describe('Nested non-submodule git repos', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  it('should index files in embedded git repos run from a git super-repo (issue #193)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    // Top-level workspace is itself a git repo, holding no source directly —
+    // the CMake "super-repo" layout from the issue.
+    const root = path.join(tempDir, 'root');
+    fs.mkdirSync(path.join(root, 'coding'), { recursive: true });
+    git(root, 'init', '-q');
+    git(root, 'config', 'user.email', 'test@test.com');
+    git(root, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(root, 'CMakeLists.txt'), 'cmake_minimum_required(VERSION 3.10)\n');
+
+    // Two independent clones living inside the workspace (NOT submodules):
+    // one with committed source, one with only untracked source.
+    const sub1 = path.join(root, 'sub_repo1', 'src');
+    fs.mkdirSync(sub1, { recursive: true });
+    git(path.join(root, 'sub_repo1'), 'init', '-q');
+    git(path.join(root, 'sub_repo1'), 'config', 'user.email', 'test@test.com');
+    git(path.join(root, 'sub_repo1'), 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(sub1, 'one.ts'), 'export const one = 1;');
+    git(path.join(root, 'sub_repo1'), 'add', '-A');
+    git(path.join(root, 'sub_repo1'), 'commit', '-q', '-m', 'sub1 init');
+
+    const sub2 = path.join(root, 'sub_repo2', 'src');
+    fs.mkdirSync(sub2, { recursive: true });
+    git(path.join(root, 'sub_repo2'), 'init', '-q');
+    fs.writeFileSync(path.join(sub2, 'two.ts'), 'export const two = 2;');
+
+    const config = { ...DEFAULT_CONFIG, rootDir: root };
+    const files = scanDirectory(root, config);
+
+    // Both committed and untracked source from the nested repos must be found.
+    expect(files).toContain('sub_repo1/src/one.ts');
+    expect(files).toContain('sub_repo2/src/two.ts');
+  });
+
+  it('should respect each embedded repo\'s own .gitignore', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+
+    const sub = path.join(root, 'sub_repo', 'src');
+    fs.mkdirSync(sub, { recursive: true });
+    git(path.join(root, 'sub_repo'), 'init', '-q');
+    fs.writeFileSync(path.join(root, 'sub_repo', '.gitignore'), 'src/generated.ts\n');
+    fs.writeFileSync(path.join(sub, 'real.ts'), 'export const real = 1;');
+    fs.writeFileSync(path.join(sub, 'generated.ts'), 'export const generated = 1;');
+
+    const config = { ...DEFAULT_CONFIG, rootDir: root };
+    const files = scanDirectory(root, config);
+
+    expect(files).toContain('sub_repo/src/real.ts');
+    expect(files).not.toContain('sub_repo/src/generated.ts');
+  });
+});
+
 // =============================================================================
 // Scala
 // =============================================================================
