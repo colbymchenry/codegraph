@@ -467,6 +467,164 @@ describe('Installer targets — TOML serializer (Codex backbone)', () => {
   });
 });
 
+describe('Copilot CLI target — specific edge cases', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it('copilot: preserves existing sibling MCP servers in mcp-config.json', () => {
+    const copilot = getTarget('copilot')!;
+    const dir = path.join(tmpHome, '.copilot');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'mcp-config.json');
+    const seed = {
+      mcpServers: {
+        aspire: {
+          type: 'local',
+          command: 'aspire',
+          args: ['agent', 'mcp'],
+          tools: ['*'],
+        },
+      },
+    };
+    fs.writeFileSync(file, JSON.stringify(seed, null, 2) + '\n');
+
+    copilot.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(after.mcpServers.aspire).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+    expect(after.mcpServers.codegraph.type).toBe('local');
+    expect(after.mcpServers.codegraph.tools).toEqual(['*']);
+  });
+
+  it('copilot: handles empty or missing mcp-config.json gracefully', () => {
+    const copilot = getTarget('copilot')!;
+    // No pre-existing config
+    const result = copilot.install('global', { autoAllow: true });
+    const mcpPath = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    
+    expect(fs.existsSync(mcpPath)).toBe(true);
+    const config = JSON.parse(fs.readFileSync(mcpPath, 'utf-8'));
+    expect(config.mcpServers.codegraph).toBeDefined();
+    expect(result.files.find((f) => f.path === mcpPath)?.action).toBe('created');
+  });
+
+  it('copilot: install() called with location=local returns empty files array with note', () => {
+    const copilot = getTarget('copilot')!;
+    const result = copilot.install('local', { autoAllow: true });
+    
+    expect(result.files).toEqual([]);
+    expect(result.notes).toBeDefined();
+    expect(result.notes?.[0]).toContain('no project-local config');
+    expect(result.notes?.[0]).toContain('--location=global');
+  });
+
+  it('copilot: uninstall when nothing installed returns not-found actions', () => {
+    const copilot = getTarget('copilot')!;
+    // No install, just uninstall
+    const result = copilot.uninstall('global');
+    
+    expect(result.files.length).toBeGreaterThan(0);
+    // MCP config should be not-found (no config file), AGENTS.md should be kept (file doesn't exist)
+    const mcpFile = result.files.find((f) => f.path.includes('mcp-config.json'));
+    const agentsFile = result.files.find((f) => f.path.includes('AGENTS.md'));
+    expect(mcpFile?.action).toBe('not-found');
+    expect(agentsFile?.action).toBe('kept');
+  });
+
+  it('copilot: printConfig(local) returns message about global-only support', () => {
+    const copilot = getTarget('copilot')!;
+    const output = copilot.printConfig('local');
+    
+    expect(output).toContain('no project-local config');
+    expect(output).toContain('--location=global');
+  });
+
+  it('copilot: printConfig(global) returns valid JSON with Copilot-specific fields', () => {
+    const copilot = getTarget('copilot')!;
+    const output = copilot.printConfig('global');
+    
+    expect(output).toContain('mcp-config.json');
+    expect(output).toContain('"type": "local"');
+    expect(output).toContain('"tools"');
+    
+    // Extract JSON block and validate it parses
+    const jsonMatch = output.match(/\{[\s\S]*\}/);
+    expect(jsonMatch).toBeTruthy();
+    const parsed = JSON.parse(jsonMatch![0]);
+    expect(parsed.mcpServers.codegraph.type).toBe('local');
+    expect(parsed.mcpServers.codegraph.tools).toEqual(['*']);
+  });
+
+  it('copilot: AGENTS.md install preserves pre-existing user content outside markers', () => {
+    const copilot = getTarget('copilot')!;
+    const dir = path.join(tmpHome, '.copilot');
+    fs.mkdirSync(dir, { recursive: true });
+    const agentsMd = path.join(dir, 'AGENTS.md');
+    fs.writeFileSync(agentsMd, '# My Copilot instructions\n\nAlways use TypeScript.\n');
+
+    copilot.install('global', { autoAllow: true });
+    const body = fs.readFileSync(agentsMd, 'utf-8');
+    
+    expect(body).toContain('# My Copilot instructions');
+    expect(body).toContain('Always use TypeScript.');
+    expect(body).toContain('<!-- CODEGRAPH_START -->');
+    expect(body).toContain('codegraph_callers');
+  });
+
+  it('copilot: uninstall strips only the codegraph block from AGENTS.md', () => {
+    const copilot = getTarget('copilot')!;
+    const dir = path.join(tmpHome, '.copilot');
+    fs.mkdirSync(dir, { recursive: true });
+    const agentsMd = path.join(dir, 'AGENTS.md');
+    fs.writeFileSync(agentsMd, '# My Copilot instructions\n\nAlways use TypeScript.\n');
+
+    copilot.install('global', { autoAllow: true });
+    copilot.uninstall('global');
+
+    const body = fs.readFileSync(agentsMd, 'utf-8');
+    expect(body).toContain('# My Copilot instructions');
+    expect(body).toContain('Always use TypeScript.');
+    expect(body).not.toContain('CODEGRAPH_START');
+    expect(body).not.toContain('codegraph_callers');
+  });
+
+  it('copilot: detect.installed is true when .copilot dir exists', () => {
+    const copilot = getTarget('copilot')!;
+    const dir = path.join(tmpHome, '.copilot');
+    fs.mkdirSync(dir, { recursive: true });
+
+    const detection = copilot.detect('global');
+    expect(detection.installed).toBe(true);
+    expect(detection.alreadyConfigured).toBe(false);
+  });
+
+  it('copilot: detect.alreadyConfigured is true after install', () => {
+    const copilot = getTarget('copilot')!;
+    expect(copilot.detect('global').alreadyConfigured).toBe(false);
+
+    copilot.install('global', { autoAllow: true });
+    expect(copilot.detect('global').alreadyConfigured).toBe(true);
+  });
+});
+
 function listAllFiles(dir: string): string[] {
   if (!fs.existsSync(dir)) return [];
   const out: string[] = [];

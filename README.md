@@ -2,7 +2,7 @@
 
 # CodeGraph
 
-### Supercharge Claude Code, Cursor, Codex, and OpenCode with Semantic Code Intelligence
+### Supercharge Claude Code, Cursor, Codex, OpenCode, and GitHub Copilot CLI with Semantic Code Intelligence
 
 **94% fewer tool calls · 77% faster exploration · 100% local**
 
@@ -18,6 +18,7 @@
 [![Cursor](https://img.shields.io/badge/Cursor-supported-blueviolet.svg)](#)
 [![Codex CLI](https://img.shields.io/badge/Codex_CLI-supported-blueviolet.svg)](#)
 [![opencode](https://img.shields.io/badge/opencode-supported-blueviolet.svg)](#)
+[![Copilot CLI](https://img.shields.io/badge/Copilot_CLI-supported-blueviolet.svg)](#)
 
 <br />
 
@@ -27,7 +28,7 @@
 npx @colbymchenry/codegraph
 ```
 
-<sub>Interactive installer auto-configures your agent(s) — Claude Code, Cursor, Codex CLI, opencode</sub>
+<sub>Interactive installer auto-configures your agent(s) — Claude Code, Cursor, Codex CLI, opencode, GitHub Copilot CLI</sub>
 
 #### Initialize Projects
 

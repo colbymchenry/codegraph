@@ -10,6 +10,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Installer**: GitHub Copilot CLI installer target — `codegraph install` now auto-configures Copilot CLI alongside Claude Code, Cursor, Codex CLI, and opencode. Supports global installation at `~/.copilot/mcp-config.json` and `~/.copilot/AGENTS.md`.
 - **MCP / explore**: `codegraph_explore` source sections now carry line
   numbers (cat -n style `<num>\t<code>`, matching the Read tool). This lets
   the agent cite `file:line` straight from the explore payload instead of
