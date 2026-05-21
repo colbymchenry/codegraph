@@ -3,7 +3,7 @@
 End-to-end verification that `codegraph completions <shell>` produces a
 script that actually works when installed into a real shell. Runs in a
 pinned Docker image so the result doesn't depend on the developer's
-local zsh/bash/fish versions.
+local zsh/bash/fish/pwsh versions.
 
 ## Run
 
@@ -11,16 +11,24 @@ local zsh/bash/fish versions.
 npm run smoke:completions
 ```
 
-Expected final line on success: `smoke: zsh bash fish OK`.
+Expected final line on success: `smoke: zsh bash fish powershell OK`.
 
 ## What this proves
 
 - `npm pack` artifact installs cleanly via `npm install -g`.
-- `codegraph completions <shell> --install` writes to the correct path
-  for zsh, bash, and fish, and the resulting file is non-empty.
+- `codegraph completions <shell> --install` writes to the correct
+  detected path for each of zsh / bash / fish / powershell, and the
+  resulting file is non-empty.
+- **Auto-detection (zsh tier 1)**: with `$ZSH` set to an oh-my-zsh
+  directory, the installer picks `$ZSH/completions/_codegraph` instead
+  of the `~/.zsh/completions` fallback. The installer messages report
+  `(detected: oh-my-zsh)`.
+- **PowerShell idempotency**: re-running `--install` for powershell
+  does NOT duplicate the dot-source line in `$PROFILE`.
 - **bash**: the installed completion, sourced via `bash-completion`,
-  produces the expected COMPREPLY for top-level commands, subcommand
-  flags, options with `<path>` values, and the global `--help` / `--version`.
+  registers via `complete -F` and produces the expected COMPREPLY for
+  top-level commands, subcommand flags, options with `<path>` values,
+  and the global `--help` / `--version`.
 - **fish**: `complete -C "codegraph …"` returns the expected suggestions
   for top-level commands, subcommand flags, and file-hint options.
 - **zsh**: the script parses (`zsh -n`), is registered as an
@@ -28,6 +36,9 @@ Expected final line on success: `smoke: zsh bash fish OK`.
   cross-section of per-subcommand helper functions is defined after
   autoload (proves the file body ran to completion — if any helper is
   missing, the script crashed mid-way).
+- **powershell**: dot-sourced in a `pwsh -NoProfile` session, `TabExpansion2`
+  returns the expected `CompletionMatches` for top-level subcommands,
+  global flags, and subcommand flag completion.
 
 ## What this does NOT prove
 
@@ -52,11 +63,12 @@ engineering effort from this smoke harness.
 
 ## What's tested
 
-| Shell | Mechanism                                          | Strength |
-|-------|----------------------------------------------------|----------|
-| bash  | Source script, set `COMP_*`, call `_codegraph`, assert `COMPREPLY` | Full content |
-| fish  | `complete -C "codegraph …"` stdout assertions       | Full content |
-| zsh   | Syntax + `compinit` load + cross-section of helpers defined | Structural |
+| Shell | Mechanism | Strength |
+|---|---|---|
+| bash       | Source script, set `COMP_*`, call `_codegraph`, assert `COMPREPLY` | Full content |
+| fish       | `complete -C "codegraph …"` stdout assertions | Full content |
+| zsh        | Syntax + `compinit` load + cross-section of helpers defined | Structural |
+| powershell | Dot-source in `pwsh -NoProfile`, drive `TabExpansion2`, assert `CompletionMatches` | Full content |
 
 ## Architecture
 

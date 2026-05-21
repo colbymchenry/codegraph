@@ -8,9 +8,17 @@
  * pin the structural pieces (function names, value hints, alias dispatch).
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { Command } from 'commander';
-import { emit, parseShell, SUPPORTED_SHELLS, installPathFor } from '../src/completions';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import {
+  emit,
+  parseShell,
+  SUPPORTED_SHELLS,
+  detectInstallTarget,
+} from '../src/completions';
 
 const buildProgram = (): Command => {
   const program = new Command();
@@ -49,19 +57,127 @@ describe('completions/parseShell', () => {
     }
   });
 
+  it('resolves common powershell aliases', () => {
+    expect(parseShell('pwsh')).toBe('powershell');
+    expect(parseShell('PS')).toBe('powershell');
+    expect(parseShell('ps1')).toBe('powershell');
+  });
+
   it('rejects unknown shells', () => {
-    expect(parseShell('powershell')).toBeNull();
+    expect(parseShell('nushell')).toBeNull();
     expect(parseShell('')).toBeNull();
   });
 });
 
-describe('completions/installPathFor', () => {
-  it('returns per-shell standard paths', () => {
-    expect(installPathFor('zsh')).toMatch(/\.zsh\/completions\/_codegraph$/);
-    expect(installPathFor('bash')).toMatch(
-      /\.local\/share\/bash-completion\/completions\/codegraph$/,
-    );
-    expect(installPathFor('fish')).toMatch(/\.config\/fish\/completions\/codegraph\.fish$/);
+// ─────────────────────────────────────────────────────────────────────
+// detectInstallTarget — exercises each tier by manipulating env + tmp
+// dirs so we don't depend on whether the test machine has oh-my-zsh,
+// Homebrew, etc. Each test owns its own tmp tree to avoid cross-talk.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('completions/detectInstallTarget', () => {
+  let tmpHome: string;
+
+  beforeEach(() => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-install-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  describe('zsh', () => {
+    it('tier 1: picks oh-my-zsh when $ZSH points to a writable dir', () => {
+      const zshDir = path.join(tmpHome, '.oh-my-zsh');
+      fs.mkdirSync(zshDir, { recursive: true });
+      const target = detectInstallTarget('zsh', { ZSH: zshDir }, tmpHome);
+      expect(target).not.toBeNull();
+      expect(target!.source).toBe('oh-my-zsh');
+      expect(target!.path).toBe(path.join(zshDir, 'completions', '_codegraph'));
+      expect(target!.postInstallHint).toBeUndefined();
+    });
+
+    it('tier 3: falls back to ~/.zsh/completions with fpath hint when no signals', () => {
+      // Empty env (no ZSH), and we pass a tmpHome that doesn't have
+      // /opt/homebrew or /usr/local — but `detectZsh` checks real
+      // filesystem paths for Homebrew, not under tmpHome. To make the
+      // test deterministic regardless of host, we accept that
+      // Homebrew tier may pick up if the test machine has it. The
+      // assertion below holds either way: when no oh-my-zsh signal is
+      // present, source is one of homebrew-zsh / zsh-fallback.
+      const target = detectInstallTarget('zsh', {}, tmpHome);
+      expect(target).not.toBeNull();
+      expect(['zsh-site-functions', 'zsh-fallback']).toContain(target!.source);
+      if (target!.source === 'zsh-fallback') {
+        expect(target!.path).toBe(
+          path.join(tmpHome, '.zsh', 'completions', '_codegraph'),
+        );
+        expect(target!.postInstallHint).toMatch(/fpath/);
+      }
+    });
+  });
+
+  describe('bash', () => {
+    it('falls back to XDG bash-completion path under HOME when no Homebrew', () => {
+      // Same caveat as zsh: if test machine has /opt/homebrew/etc/
+      // bash_completion.d writable, that tier wins. Otherwise XDG.
+      const target = detectInstallTarget('bash', {}, tmpHome);
+      expect(target).not.toBeNull();
+      expect(['homebrew-bash-completion', 'xdg-bash-completion']).toContain(
+        target!.source,
+      );
+      if (target!.source === 'xdg-bash-completion') {
+        expect(target!.path).toBe(
+          path.join(
+            tmpHome,
+            '.local',
+            'share',
+            'bash-completion',
+            'completions',
+            'codegraph',
+          ),
+        );
+      }
+    });
+
+    it('honors $XDG_DATA_HOME override', () => {
+      const xdg = path.join(tmpHome, 'custom-xdg');
+      fs.mkdirSync(xdg, { recursive: true });
+      const target = detectInstallTarget('bash', { XDG_DATA_HOME: xdg }, tmpHome);
+      // Only assert XDG-tier behavior; Homebrew tier (if it wins on
+      // the host) doesn't read XDG_DATA_HOME so this check still
+      // exercises the XDG branch on most dev machines.
+      if (target?.source === 'xdg-bash-completion') {
+        expect(target.path).toBe(
+          path.join(xdg, 'bash-completion', 'completions', 'codegraph'),
+        );
+      }
+    });
+  });
+
+  describe('fish', () => {
+    it('always returns ~/.config/fish/completions/codegraph.fish', () => {
+      const target = detectInstallTarget('fish', {}, tmpHome);
+      expect(target).not.toBeNull();
+      expect(target!.source).toBe('fish-config');
+      expect(target!.path).toBe(
+        path.join(tmpHome, '.config', 'fish', 'completions', 'codegraph.fish'),
+      );
+    });
+  });
+
+  describe('powershell', () => {
+    it('returns a standalone .ps1 path + a profile path + a dot-source line', () => {
+      const target = detectInstallTarget('powershell', {}, tmpHome);
+      expect(target).not.toBeNull();
+      expect(target!.source).toBe('pwsh-profile-dir');
+      // Linux/macOS test runner — Windows branch tested in CI on win.
+      expect(target!.path).toContain(path.join('.config', 'powershell'));
+      expect(target!.path).toMatch(/codegraph\.ps1$/);
+      expect(target!.profilePath).toMatch(/Microsoft\.PowerShell_profile\.ps1$/);
+      expect(target!.profileLine).toMatch(/^\. '.*codegraph\.ps1'/);
+      expect(target!.profileLine).toContain('# codegraph completions');
+    });
   });
 });
 
@@ -141,5 +257,58 @@ describe('completions/fish', () => {
     expect(out).toContain('-l path -r -F');
     // --limit takes a value but valueName is "number" -> -x (no file hint).
     expect(out).toContain('-l limit -r -x');
+  });
+});
+
+describe('completions/powershell', () => {
+  const out = emit(buildProgram(), 'powershell');
+
+  it('opens with using-namespace declarations', () => {
+    expect(out).toContain('using namespace System.Management.Automation');
+    expect(out).toContain('using namespace System.Management.Automation.Language');
+  });
+
+  it('registers a Native completer for codegraph', () => {
+    expect(out).toContain(
+      "Register-ArgumentCompleter -Native -CommandName 'codegraph'",
+    );
+  });
+
+  it('builds command path by joining elements with semicolons', () => {
+    expect(out).toContain("-join ';'");
+  });
+
+  it('emits a switch arm for each canonical subcommand', () => {
+    expect(out).toContain("'codegraph;init' {");
+    expect(out).toContain("'codegraph;query' {");
+    expect(out).toContain("'codegraph;affected' {");
+  });
+
+  it('emits a switch arm for each alias surface (so `a` works like `affected`)', () => {
+    expect(out).toContain("'codegraph;a' {");
+  });
+
+  it('emits CompletionResult entries with ParameterName for flags', () => {
+    expect(out).toMatch(
+      /\[CompletionResult\]::new\('--index', '--index', \[CompletionResultType\]::ParameterName/,
+    );
+  });
+
+  it('emits CompletionResult entries with ParameterValue for subcommands', () => {
+    expect(out).toMatch(
+      /\[CompletionResult\]::new\('init', 'init', \[CompletionResultType\]::ParameterValue/,
+    );
+  });
+
+  it('filters by $wordToComplete prefix at the end', () => {
+    expect(out).toContain('$_.CompletionText -like "$wordToComplete*"');
+  });
+
+  it("escapes single quotes in descriptions (PS '' escape rule)", () => {
+    const prog = new Command();
+    prog.name('foo').version('0');
+    prog.command('weird').description("it's tricky").action(() => {});
+    const psOut = emit(prog, 'powershell');
+    expect(psOut).toContain("it''s tricky");
   });
 });

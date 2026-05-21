@@ -16,10 +16,13 @@ set -e
 declare -i fail=0
 
 # 1. Syntax check.
-zsh -n "$HOME/.zsh/completions/_codegraph" || { echo "FAIL [zsh:syntax]" >&2; exit 1; }
+zsh -n "${ZSH_PATH:-$HOME/.zsh/completions/_codegraph}" || { echo "FAIL [zsh:syntax]" >&2; exit 1; }
 
-# 2. compinit must load the file as an autoloadable function.
-fpath=("$HOME/.zsh/completions" $fpath)
+# 2. compinit must load the file as an autoloadable function. Add the
+#    install dir to $fpath — for tier-2 installs into
+#    /usr/local/share/zsh/site-functions this is a no-op (already there);
+#    for tier-3 (~/.zsh/completions fallback) it's required.
+fpath=("${ZSH_PATH:A:h}" $fpath)
 autoload -Uz compinit
 # -u: don't bail on insecure dirs (container HOME is owned by root, fine)
 # -d: per-run dump in /tmp so we don't pollute HOME

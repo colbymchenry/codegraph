@@ -14,14 +14,23 @@ import type { Command } from 'commander';
 import { emitZsh } from './zsh';
 import { emitBash } from './bash';
 import { emitFish } from './fish';
+import { emitPowershell } from './powershell';
 
-export type Shell = 'zsh' | 'bash' | 'fish';
+export type Shell = 'zsh' | 'bash' | 'fish' | 'powershell';
 
-export const SUPPORTED_SHELLS: readonly Shell[] = ['zsh', 'bash', 'fish'] as const;
+export const SUPPORTED_SHELLS: readonly Shell[] = ['zsh', 'bash', 'fish', 'powershell'] as const;
+
+// Accept common spellings (`pwsh`, `ps`) — easier than asking users to remember.
+const SHELL_ALIASES: Record<string, Shell> = {
+  pwsh: 'powershell',
+  ps: 'powershell',
+  ps1: 'powershell',
+};
 
 export const parseShell = (s: string): Shell | null => {
   const lower = s.toLowerCase();
-  return (SUPPORTED_SHELLS as readonly string[]).includes(lower) ? (lower as Shell) : null;
+  if ((SUPPORTED_SHELLS as readonly string[]).includes(lower)) return lower as Shell;
+  return SHELL_ALIASES[lower] ?? null;
 };
 
 export const emit = (program: Command, shell: Shell): string => {
@@ -32,7 +41,10 @@ export const emit = (program: Command, shell: Shell): string => {
       return emitBash(program);
     case 'fish':
       return emitFish(program);
+    case 'powershell':
+      return emitPowershell(program);
   }
 };
 
-export { installCompletions, installPathFor } from './install';
+export { installCompletions, detectInstallTarget } from './install';
+export type { InstallTarget, InstallResult } from './install';

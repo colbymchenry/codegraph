@@ -6,7 +6,8 @@
 set -euo pipefail
 
 source /usr/share/bash-completion/bash_completion
-source "$HOME/.local/share/bash-completion/completions/codegraph"
+# $BASH_PATH is exported by run.sh — wherever the installer wrote the script.
+source "${BASH_PATH:-$HOME/.local/share/bash-completion/completions/codegraph}"
 
 declare -i fail=0
 

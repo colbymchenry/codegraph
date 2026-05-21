@@ -326,7 +326,7 @@ codegraph files [path]            # Show file structure (--format, --filter, --m
 codegraph context <task>          # Build context for AI (--format, --max-nodes)
 codegraph affected [files...]     # Find test files affected by changes (see below)
 codegraph serve --mcp             # Start MCP server
-codegraph completions <shell>     # Generate shell completions (see below)
+codegraph completions <shell>     # Generate shell completions for zsh/bash/fish/powershell (see below)
 ```
 
 ### `codegraph affected`
@@ -359,27 +359,31 @@ fi
 
 ### `codegraph completions`
 
-Generate a static completion script for your shell. Supported shells: `zsh`, `bash`, `fish`.
+Generate a static completion script for your shell. Supported shells: `zsh`, `bash`, `fish`, `powershell` (aliases: `pwsh`, `ps`).
 
 ```bash
-codegraph completions zsh --install      # write to ~/.zsh/completions/_codegraph
-codegraph completions bash --install     # write to ~/.local/share/bash-completion/completions/codegraph
-codegraph completions fish --install     # write to ~/.config/fish/completions/codegraph.fish
+codegraph completions zsh        --install   # auto-detects best path
+codegraph completions bash       --install
+codegraph completions fish       --install
+codegraph completions powershell --install
+```
 
-# Or pipe yourself:
+With `--install`, the tool auto-detects the right location for your environment and writes there. The exact path is reported with a `(detected: …)` line so you know which tier was picked.
+
+| Shell | Detection priority |
+|---|---|
+| **zsh** | oh-my-zsh (`$ZSH/completions/`) → `<prefix>/share/zsh/site-functions/` if writable → `~/.zsh/completions/` (fallback; prints fpath hint) |
+| **bash** | `<homebrew>/etc/bash_completion.d/` if writable → XDG `~/.local/share/bash-completion/completions/` |
+| **fish** | `~/.config/fish/completions/` (auto-discovered) |
+| **powershell** | Writes a standalone `.ps1` to `~/.config/powershell/` (or `~/Documents/PowerShell/` on Windows), then idempotently appends a dot-source line to `$PROFILE` |
+
+To pipe yourself instead:
+
+```bash
 codegraph completions zsh > ~/.zsh/completions/_codegraph
 ```
 
-**Zsh setup:** the install path must be on `$fpath` before `compinit`. Add to `~/.zshrc`:
-
-```bash
-fpath=(~/.zsh/completions $fpath)
-autoload -Uz compinit && compinit
-```
-
-**Bash setup:** requires the `bash-completion` package (`brew install bash-completion@2` on macOS).
-
-**Fish setup:** no extra config — fish auto-discovers `~/.config/fish/completions/`.
+If you're on a shell we don't recognize (nushell, xonsh, etc.), `--install` exits non-zero with a hint; nothing is written.
 
 ---
 
