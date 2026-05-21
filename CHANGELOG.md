@@ -7,6 +7,28 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Framework support: Drupal 8/9/10/11** — CodeGraph now detects Drupal
+  projects (via a `drupal/*` dependency in `composer.json`) and adds three
+  levels of intelligence:
+  - **Route extraction**: `*.routing.yml` files emit a `route` node per route,
+    linked by a `references` edge to the `_controller`, `_form`, or
+    entity-handler class/method, so querying a controller method surfaces the
+    URL route that binds it.
+  - **Hook detection**: hook implementations in `.module`, `.install`, `.theme`,
+    and `.inc` files are detected via docblock (`Implements hook_X()`) with a
+    module-name-prefix fallback. Each emits a `references` edge to the canonical
+    `hook_X` name so `codegraph_callers("hook_form_alter")` returns every
+    implementation across modules.
+  - **Resolution**: `_controller`/`_form` FQCNs resolve to their PHP
+    class/method nodes.
+  New `yaml`/`twig` languages are tracked at the file level, the Drupal PHP
+  extensions (`.module`/`.install`/`.theme`/`.inc`) are indexed with the PHP
+  grammar, and `web/core`, `web/modules/contrib`, `web/themes/contrib` are
+  excluded by default. Resolves [#268](https://github.com/colbymchenry/codegraph/issues/268).
+
 ## [0.9.1] - 2026-05-21
 
 ### Fixed
@@ -63,32 +85,6 @@ npm i -g @colbymchenry/codegraph
   everything Lua extracts, plus `type` / `export type` aliases, typed function
   signatures, generics, and Roblox instance-path `require(script.Parent.X)`
   imports.
-- **Framework support: Drupal** — CodeGraph now detects Drupal 8/9/10/11
-  projects (via `drupal/*` dependencies in `composer.json`) and provides three
-  levels of intelligence:
-  - **Route extraction**: `*.routing.yml` files are parsed and a `route` node
-    is emitted for each route, linked by a `references` edge to the
-    `_controller`, `_form`, or entity-handler class/method. Querying a
-    controller method now surfaces the URL route that binds it.
-  - **Hook detection**: Drupal hook implementations in `.module`, `.install`,
-    `.theme`, and `.inc` files are detected via docblock (`Implements hook_X()`)
-    with a module-name-prefix fallback. Each implementation emits a `references`
-    edge to the canonical `hook_X` name so `codegraph_callers("hook_form_alter")`
-    returns all implementations across modules.
-  - **Resolution**: `_controller` FQCNs (`\Drupal\mod\Controller\Foo::bar`) and
-    `_form` FQCNs are resolved to their PHP class/method nodes.
-- **New file extensions indexed**: `.module`, `.install`, `.theme`, `.inc`
-  (Drupal PHP files, extracted with the existing PHP tree-sitter grammar);
-  `*.routing.yml` (YAML, route extraction only); `*.twig` (Twig templates,
-  file-level tracking — no symbol extraction in v1).
-- **Drupal excludes**: `web/core/**`, `web/modules/contrib/**`, and
-  `web/themes/contrib/**` are excluded by default so indexing focuses on
-  custom code.
-- **New languages**: `yaml` and `twig` added to the language registry. Both
-  are tracked at the file-record level (appear in `codegraph_files`); `yaml`
-  also allows framework extractors (e.g. Drupal's route resolver) to run on
-  YAML files.
-  Resolves [#268](https://github.com/colbymchenry/codegraph/issues/268).
 
 ### Changed
 - **SQLite backend is now Node's built-in `node:sqlite`** (real SQLite, WAL +
