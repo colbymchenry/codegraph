@@ -2535,6 +2535,11 @@ export function extractFromSource(
     // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
     result = extractor.extract();
+  } else if (detectedLanguage === 'yaml' || detectedLanguage === 'twig') {
+    // No symbol extraction — file is tracked at the file-record level only.
+    // Framework extractors (e.g. Drupal routing resolver) run below and may
+    // add route nodes / references for yaml files such as *.routing.yml.
+    result = { nodes: [], edges: [], unresolvedReferences: [], errors: [], durationMs: 0 };
   } else if (
     detectedLanguage === 'pascal' &&
     (fileExtension === '.dfm' || fileExtension === '.fmx')

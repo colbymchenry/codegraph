@@ -10,7 +10,7 @@ import * as path from 'path';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'yaml' | 'twig' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -63,6 +63,16 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.hxx': 'cpp',
   '.cs': 'csharp',
   '.php': 'php',
+  // Drupal-specific PHP file extensions
+  '.module': 'php',
+  '.install': 'php',
+  '.theme': 'php',
+  '.inc': 'php',
+  // YAML (used for Drupal routing files; no symbol extraction, file-level tracking only)
+  '.yml': 'yaml',
+  '.yaml': 'yaml',
+  // Twig templates (file-level tracking only, no symbol extraction)
+  '.twig': 'twig',
   '.rb': 'ruby',
   '.rake': 'ruby',
   '.swift': 'swift',
@@ -215,6 +225,8 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'vue') return true; // custom extractor (script block delegation)
   if (language === 'liquid') return true; // custom regex extractor
+  if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver
+  if (language === 'twig') return true; // file-level tracking only
   if (language === 'unknown') return false;
   return language in WASM_GRAMMAR_FILES;
 }
@@ -224,6 +236,7 @@ export function isLanguageSupported(language: Language): boolean {
  */
 export function isGrammarLoaded(language: Language): boolean {
   if (language === 'svelte' || language === 'vue' || language === 'liquid') return true;
+  if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
   return languageCache.has(language);
 }
 
@@ -301,6 +314,8 @@ export function getLanguageDisplayName(language: Language): string {
     scala: 'Scala',
     lua: 'Lua',
     luau: 'Luau',
+    yaml: 'YAML',
+    twig: 'Twig',
     unknown: 'Unknown',
   };
   return names[language] || language;

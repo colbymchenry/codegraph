@@ -87,6 +87,8 @@ export const LANGUAGES = [
   'scala',
   'lua',
   'luau',
+  'yaml',
+  'twig',
   'unknown',
 ] as const;
 
@@ -522,6 +524,15 @@ export const DEFAULT_CONFIG: CodeGraphConfig = {
     '**/*.cs',
     // PHP
     '**/*.php',
+    // Drupal-specific PHP extensions
+    '**/*.module',
+    '**/*.install',
+    '**/*.theme',
+    '**/*.inc',
+    // Drupal routing YAML
+    '**/*.routing.yml',
+    // Twig templates
+    '**/*.twig',
     // Ruby
     '**/*.rb',
     // Swift
@@ -666,6 +677,11 @@ export const DEFAULT_CONFIG: CodeGraphConfig = {
     '**/.composer/**',
     '**/storage/framework/**',
     '**/bootstrap/cache/**',
+
+    // Drupal - core and contrib are rarely customised; index only custom code
+    '**/web/core/**',
+    '**/web/modules/contrib/**',
+    '**/web/themes/contrib/**',
 
     // Ruby
     '**/.bundle/**',
