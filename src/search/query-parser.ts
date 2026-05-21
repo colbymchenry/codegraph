@@ -3,7 +3,7 @@
  *
  * Splits a raw query like
  *
- *     kind:function name:auth path:src/api authenticate
+ * kind:function name:auth path:src/api authenticate -lang:python
  *
  * into structured filters (kind=function, name="auth", path prefix
  * "src/api") plus the free-text portion ("authenticate") that goes
@@ -13,27 +13,96 @@
  * Recognised fields (case-insensitive, value is the rest until
  * whitespace):
  *
- *   kind:    one of function|method|class|interface|struct|...
- *   lang:    one of typescript|python|go|...   (alias: language:)
- *   path:    case-insensitive substring of file_path
- *   name:    case-insensitive substring of the symbol's name
+ * kind:    one of function|method|class|interface|struct|...
+ * lang:    one of typescript|python|go|...   (alias: language:)
+ * path:    case-insensitive substring of file_path
+ * name:    case-insensitive substring of the symbol's name
+ *
+ * Prefixes can be negated with a minus sign (e.g., `-kind:class`).
  *
  * Unknown field prefixes (e.g. `foo:bar`) are passed through to FTS
  * as plain text — that's how someone searching for `TODO:` gets a
  * result instead of a parse error.
  *
  * Quoting:
- *   kind:function path:"src/some path/with spaces" → handled by stripping
- *   the surrounding double quotes from the value (single token only,
- *   no nested escapes).
+ * kind:function path:"src/some path/with spaces" → handled by stripping
+ * the surrounding double quotes from the value (single token only,
+ * no nested escapes).
  */
 
 import { NODE_KINDS, LANGUAGES } from '../types';
 import type { NodeKind, Language } from '../types';
 
+export interface QueryFilters {
+  kind?: NodeKind;
+  lang?: Language;
+  path?: string;
+  name?: string;
+}
+
 export interface ParsedQuery {
   /** Free-text portion to feed to FTS / LIKE. May be empty. */
   text: string;
+  /** Positive filters that must match */
+  filters: QueryFilters;
+  /** Negative filters that must NOT match */
+  excludeFilters: QueryFilters;
+}
+
+/**
+ * Parses a raw query string into structured positive/negative filters and free-text.
+ */
+export function parseQuery(query: string): ParsedQuery {
+  const result: ParsedQuery = {
+    text: '',
+    filters: {},
+    excludeFilters: {}
+  };
+
+  if (!query || !query.trim()) {
+    return result;
+  };
+
+  // Match optional negative sign, field prefix, and either a quoted string or unquoted word.
+  // Group 1: optional '-'
+  // Group 2: field key (e.g., 'kind', 'lang')
+  // Group 3: quoted value (without quotes)
+  // Group 4: unquoted value
+  // Group 5: fallback for standalone words / unknown patterns
+  const tokenRegex = /(?:(-)?([\w]+):(?:(?:\"([^\"]*)\")|([^\s\"]+)))|([^\s]+)/gi;
+  const textParts: string[] = [];
+  let match;
+
+  while ((match = tokenRegex.exec(query)) !== null) {
+    const [fullMatch, isNegated, key, quotedVal, unquotedVal, plainText] = match;
+
+    if (plainText) {
+      textParts.push(plainText);
+      continue;
+    }
+
+    const lowerKey = key.toLowerCase();
+    const rawValue = quotedVal !== undefined ? quotedVal : unquotedVal;
+    const lowerValue = rawValue.toLowerCase();
+    const targetFilters = isNegated ? result.excludeFilters : result.filters;
+
+    if (lowerKey === 'kind' && NODE_KINDS.includes(lowerValue as NodeKind)) {
+      targetFilters.kind = lowerValue as NodeKind;
+    } else if ((lowerKey === 'lang' || lowerKey === 'language') && LANGUAGES.includes(lowerValue as Language)) {
+      targetFilters.lang = lowerValue as Language;
+    } else if (lowerKey === 'path') {
+      targetFilters.path = rawValue; // Paths preserve case stability in many FS
+    } else if (lowerKey === 'name') {
+      targetFilters.name = rawValue;
+    } else {
+      // Unknown fields (e.g. foo:bar or unrecognized kind values) pass through to FTS
+      textParts.push(fullMatch);
+    }
+  }
+
+  result.text = textParts.join(' ');
+  return result;
+}
   /** kind: filters (OR'd). Empty when none specified. */
   kinds: NodeKind[];
   /** lang:/language: filters (OR'd). Empty when none specified. */
