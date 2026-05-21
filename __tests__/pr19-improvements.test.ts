@@ -45,11 +45,11 @@ function cleanupTempDir(dir: string): void {
   }
 }
 
-// Check if better-sqlite3 native bindings are available
+// Check if the node:sqlite backend is available (Node >= 22.5)
 function hasSqliteBindings(): boolean {
   try {
-    const Database = require('better-sqlite3');
-    const db = new Database(':memory:');
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(':memory:');
     db.close();
     return true;
   } catch {

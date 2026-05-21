@@ -1,0 +1,98 @@
+name: Release
+
+# Manually triggered ("Run workflow"). On trigger it:
+#   1. reads the version from package.json,
+#   2. builds a self-contained bundle for every platform (one runner — there's no
+#      native compilation, so cross-packaging is fine),
+#   3. creates the GitHub Release (tag v<version>) with all archives, using the
+#      release notes from CHANGELOG.md,
+#   4. publishes the npm thin-installer (shim + per-platform packages).
+#
+# Before triggering: bump package.json and make sure CHANGELOG.md has the matching
+# section (## [<version>], or ## [Unreleased]). Set the NPM_TOKEN repo secret.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # create the GitHub Release + tag
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - name: Ensure zip/unzip
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zip unzip
+
+      - name: Build all platform bundles
+        run: |
+          for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64 win32-arm64; do
+            bash scripts/build-bundle.sh "$t"
+          done
+          ls -lh release
+
+      - name: Resolve version
+        id: ver
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          node scripts/extract-release-notes.mjs "$V" > notes.md 2>/dev/null \
+            || node scripts/extract-release-notes.mjs Unreleased > notes.md 2>/dev/null || true
+          if [ ! -s notes.md ]; then
+            echo "::error::No release notes in CHANGELOG.md for [$V] or [Unreleased]."
+            exit 1
+          fi
+          echo "----- release notes -----"; cat notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          # Idempotent: create the release once, otherwise (re-run) refresh assets.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/codegraph-* --clobber
+          else
+            gh release create "$TAG" release/codegraph-* --title "$TAG" --notes-file notes.md
+          fi
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          bash scripts/pack-npm.sh "$V"
+          # Platform packages first, then the main shim (which depends on them).
+          # Skip any already on the registry so a re-run only fills in gaps.
+          for dir in release/npm/codegraph-* release/npm/main; do
+            name=$(node -p "require('./$dir/package.json').name")
+            if npm view "$name@$V" version >/dev/null 2>&1; then
+              echo "skip $name@$V (already published)"
+            else
+              echo "publishing $name@$V"
+              ( cd "$dir" && npm publish --access public )
+            fi
+          done
+
+      - name: Verify every package is actually on the registry
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          # npm publish can print success without persisting; confirm against the
+          # registry (with retries for propagation) so green means really shipped.
+          for dir in release/npm/codegraph-* release/npm/main; do
+            name=$(node -p "require('./$dir/package.json').name")
+            ok=
+            for i in 1 2 3 4 5 6; do
+              if npm view "$name@$V" version >/dev/null 2>&1; then ok=1; break; fi
+              echo "waiting for $name@$V to appear ($i)…"; sleep 10
+            done
+            [ -n "$ok" ] || { echo "::error::$name@$V never appeared on the registry"; exit 1; }
+            echo "verified $name@$V"
+          done
