@@ -15,9 +15,7 @@ import * as os from 'os';
 import { FileLock } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
-import { shouldIncludeFile, scanDirectory } from '../src/extraction';
-import { shouldIncludeFile as configShouldInclude } from '../src/config';
-import { CodeGraphConfig, DEFAULT_CONFIG } from '../src/types';
+import { scanDirectory, isSourceFile } from '../src/extraction';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
 
@@ -298,58 +296,24 @@ describe('Atomic Writes', () => {
   });
 });
 
-describe('Glob Matching (picomatch)', () => {
-  const makeConfig = (include: string[], exclude: string[]): CodeGraphConfig => ({
-    ...DEFAULT_CONFIG,
-    rootDir: '/test',
-    include,
-    exclude,
+describe('Source file detection (isSourceFile)', () => {
+  it('selects files by supported extension', () => {
+    expect(isSourceFile('src/index.ts')).toBe(true);
+    expect(isSourceFile('src/deep/nested/file.ts')).toBe(true);
+    expect(isSourceFile('src/component.tsx')).toBe(true);
+    expect(isSourceFile('lib/util.js')).toBe(true);
+    expect(isSourceFile('src/main.py')).toBe(true);
   });
 
-  it('should match standard glob patterns in extraction', () => {
-    const config = makeConfig(['**/*.ts'], ['node_modules/**']);
-
-    expect(shouldIncludeFile('src/index.ts', config)).toBe(true);
-    expect(shouldIncludeFile('src/deep/nested/file.ts', config)).toBe(true);
-    expect(shouldIncludeFile('src/index.js', config)).toBe(false);
-    expect(shouldIncludeFile('node_modules/lib/index.ts', config)).toBe(false);
+  it('rejects unsupported extensions and extensionless files', () => {
+    expect(isSourceFile('src/component.css')).toBe(false);
+    expect(isSourceFile('README.md')).toBe(false);
+    expect(isSourceFile('Makefile')).toBe(false);
+    expect(isSourceFile('.gitignore')).toBe(false);
   });
 
-  it('should match standard glob patterns in config', () => {
-    const config = makeConfig(['**/*.py'], ['__pycache__/**']);
-
-    expect(configShouldInclude('src/main.py', config)).toBe(true);
-    expect(configShouldInclude('src/main.ts', config)).toBe(false);
-    expect(configShouldInclude('__pycache__/module.py', config)).toBe(false);
-  });
-
-  it('should handle complex glob patterns correctly', () => {
-    const config = makeConfig(['src/**/*.{ts,tsx}', 'lib/**/*.js'], []);
-
-    expect(shouldIncludeFile('src/component.ts', config)).toBe(true);
-    expect(shouldIncludeFile('src/component.tsx', config)).toBe(true);
-    expect(shouldIncludeFile('lib/util.js', config)).toBe(true);
-    expect(shouldIncludeFile('src/component.css', config)).toBe(false);
-  });
-
-  it('should handle patterns that previously caused ReDoS', () => {
-    // This pattern would cause catastrophic backtracking with hand-rolled regex
-    const evilPattern = '**/**/**/**/**/**/**/**/**/**/**/**/**/**/a';
-    const config = makeConfig([evilPattern], []);
-
-    const start = Date.now();
-    // This should return quickly, not hang
-    shouldIncludeFile('x/x/x/x/x/x/x/x/x/x/x/x/x/x/b', config);
-    const elapsed = Date.now() - start;
-
-    // Should complete in under 100ms, not seconds
-    expect(elapsed).toBeLessThan(100);
-  });
-
-  it('should handle dot files correctly', () => {
-    const config = makeConfig(['**/*.ts'], []);
-
-    expect(shouldIncludeFile('.hidden/index.ts', config)).toBe(true);
+  it('matches regardless of leading dot directories', () => {
+    expect(isSourceFile('.hidden/index.ts')).toBe(true);
   });
 });
 
@@ -464,15 +428,9 @@ describe('Symlink Cycle Detection', () => {
       return;
     }
 
-    const config: CodeGraphConfig = {
-      ...DEFAULT_CONFIG,
-      rootDir: tempDir,
-      include: ['**/*.ts'],
-      exclude: [],
-    };
 
     // This should complete without hanging
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     // Should find the real file but not loop infinitely
     expect(files).toContain('src/index.ts');
@@ -496,14 +454,8 @@ describe('Symlink Cycle Detection', () => {
       return;
     }
 
-    const config: CodeGraphConfig = {
-      ...DEFAULT_CONFIG,
-      rootDir: tempDir,
-      include: ['**/*.ts'],
-      exclude: [],
-    };
 
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     // Should find files from both the real dir and via the symlink
     // But deduplicate since they resolve to the same real path
@@ -521,15 +473,9 @@ describe('Symlink Cycle Detection', () => {
       return;
     }
 
-    const config: CodeGraphConfig = {
-      ...DEFAULT_CONFIG,
-      rootDir: tempDir,
-      include: ['**/*.ts'],
-      exclude: [],
-    };
 
     // Should not throw
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
     expect(files).toContain('src/valid.ts');
   });
 });

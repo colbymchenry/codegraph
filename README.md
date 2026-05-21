@@ -418,28 +418,23 @@ cg.close();
 
 ## Configuration
 
-The `.codegraph/config.json` file controls indexing:
+There isn't any — CodeGraph is zero-config. It indexes every file whose
+extension maps to a [supported language](#supported-languages) and **respects
+your `.gitignore`**: in git repos via git itself, and in non-git projects by
+reading `.gitignore` files directly (root and nested, the same way git would).
 
-```json
-{
-  "version": 1,
-  "languages": ["typescript", "javascript"],
-  "exclude": ["node_modules/**", "dist/**", "build/**", "*.min.js"],
-  "frameworks": [],
-  "maxFileSize": 1048576,
-  "extractDocstrings": true,
-  "trackCallSites": true
-}
-```
+What that means in practice:
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `languages` | Languages to index (auto-detected if empty) | `[]` |
-| `exclude` | Glob patterns to ignore | `["node_modules/**", ...]` |
-| `frameworks` | Framework hints for better resolution | `[]` |
-| `maxFileSize` | Skip files larger than this (bytes) | `1048576` (1MB) |
-| `extractDocstrings` | Extract docstrings from code | `true` |
-| `trackCallSites` | Track call site locations | `true` |
+- Anything git ignores — `node_modules`, build output, secrets in `.env` — is
+  never indexed. **To keep something out of the graph, add it to `.gitignore`.**
+- There's no config file to write or keep in sync, and nothing to wire up per
+  language: support is automatic from the file extension.
+- Files larger than 1 MB are skipped (generated bundles, minified JS, vendored
+  blobs) — they cost parse budget for no useful symbols.
+
+> Committed files that aren't gitignored *are* indexed, even under `vendor/` or a
+> committed `dist/`. If you commit a dependency or build directory you don't want
+> in the graph, add it to `.gitignore`.
 
 ## Supported Languages
 

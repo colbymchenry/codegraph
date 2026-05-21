@@ -9,8 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { DEFAULT_CONFIG, Node, Edge } from '../src/types';
-import { loadConfig, saveConfig } from '../src/config';
+import { Node, Edge } from '../src/types';
 import { isInitialized, getCodeGraphDir, validateDirectory } from '../src/directory';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
 
@@ -60,40 +59,11 @@ describe('CodeGraph Foundation', () => {
       cg.close();
     });
 
-    it('should create config.json with defaults', () => {
-      const cg = CodeGraph.initSync(tempDir);
-
-      const configPath = path.join(getCodeGraphDir(tempDir), 'config.json');
-      expect(fs.existsSync(configPath)).toBe(true);
-
-      const config = cg.getConfig();
-      expect(config.version).toBe(DEFAULT_CONFIG.version);
-      expect(config.include).toEqual(DEFAULT_CONFIG.include);
-      expect(config.exclude).toEqual(DEFAULT_CONFIG.exclude);
-
-      cg.close();
-    });
-
     it('should throw if already initialized', () => {
       const cg = CodeGraph.initSync(tempDir);
       cg.close();
 
       expect(() => CodeGraph.initSync(tempDir)).toThrow(/already initialized/i);
-    });
-
-    it('should accept custom config options', () => {
-      const cg = CodeGraph.initSync(tempDir, {
-        config: {
-          maxFileSize: 500000,
-          extractDocstrings: false,
-        },
-      });
-
-      const config = cg.getConfig();
-      expect(config.maxFileSize).toBe(500000);
-      expect(config.extractDocstrings).toBe(false);
-
-      cg.close();
     });
   });
 
@@ -111,17 +81,6 @@ describe('CodeGraph Foundation', () => {
 
     it('should throw if not initialized', () => {
       expect(() => CodeGraph.openSync(tempDir)).toThrow(/not initialized/i);
-    });
-
-    it('should preserve configuration across open/close', () => {
-      const cg1 = CodeGraph.initSync(tempDir, {
-        config: { maxFileSize: 123456 },
-      });
-      cg1.close();
-
-      const cg2 = CodeGraph.openSync(tempDir);
-      expect(cg2.getConfig().maxFileSize).toBe(123456);
-      cg2.close();
     });
   });
 
@@ -179,31 +138,6 @@ describe('CodeGraph Foundation', () => {
       expect(stats.nodeCount).toBe(0);
 
       cg.close();
-    });
-  });
-
-  describe('Configuration', () => {
-    it('should load and merge config with defaults', () => {
-      const cg = CodeGraph.initSync(tempDir);
-      cg.close();
-
-      const config = loadConfig(tempDir);
-      expect(config.version).toBe(DEFAULT_CONFIG.version);
-      expect(config.rootDir).toBe(path.resolve(tempDir));
-    });
-
-    it('should update configuration', () => {
-      const cg = CodeGraph.initSync(tempDir);
-
-      cg.updateConfig({ maxFileSize: 999999 });
-
-      expect(cg.getConfig().maxFileSize).toBe(999999);
-
-      cg.close();
-
-      // Verify persistence
-      const config = loadConfig(tempDir);
-      expect(config.maxFileSize).toBe(999999);
     });
   });
 

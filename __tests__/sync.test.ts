@@ -281,11 +281,11 @@ describe('Sync Module', () => {
       expect(nodes.length).toBe(0);
     });
 
-    it('should skip files not matching config', async () => {
-      // Create a .js file which doesn't match **/*.ts
+    it('should skip files with unsupported extensions', async () => {
+      // A .txt file has no supported grammar, so sync must not index it.
       fs.writeFileSync(
-        path.join(testDir, 'src', 'ignored.js'),
-        `function ignored() {}`
+        path.join(testDir, 'src', 'notes.txt'),
+        `just some notes`
       );
 
       const result = await cg.sync();

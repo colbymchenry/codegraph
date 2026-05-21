@@ -95,6 +95,17 @@ export const EXTENSION_MAP: Record<string, Language> = {
 };
 
 /**
+ * Whether a file is one CodeGraph can parse, based purely on its extension.
+ * This is the single source of truth for "should we index this file" — derived
+ * from EXTENSION_MAP so parser support and indexing selection never drift.
+ */
+export function isSourceFile(filePath: string): boolean {
+  const dot = filePath.lastIndexOf('.');
+  if (dot < 0) return false;
+  return filePath.slice(dot).toLowerCase() in EXTENSION_MAP;
+}
+
+/**
  * Caches for loaded grammars and parsers
  */
 const parserCache = new Map<Language, Parser>();

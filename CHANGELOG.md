@@ -29,6 +29,37 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   grammar, and `web/core`, `web/modules/contrib`, `web/themes/contrib` are
   excluded by default. Resolves [#268](https://github.com/colbymchenry/codegraph/issues/268).
 
+### Changed
+- **Zero-config indexing that respects `.gitignore`.** CodeGraph no longer has a
+  config file. It indexes every file whose extension maps to a supported language
+  and honors your `.gitignore` everywhere: in git repos via git itself, and in
+  non-git projects (e.g. a freshly-scaffolded app before `git init`) by reading
+  `.gitignore` files directly — root and nested, the same way git does (via the
+  `ignore` library, so negation/anchoring/nested rules all behave correctly). To
+  keep something out of the graph, add it to `.gitignore`. **Behavior change:**
+  committed files that are *not* gitignored are now indexed even under `vendor/`,
+  `Pods/`, or a committed `dist/` — previously a hardcoded exclude list skipped
+  those names; now `.gitignore` is the single source of truth. Resolves
+  [#283](https://github.com/colbymchenry/codegraph/issues/283).
+
+### Removed
+- **`.codegraph/config.json` and the entire config surface.** Every field was
+  either inert or now redundant with `.gitignore`:
+  - `languages`/`frameworks` never affected indexing (languages are detected per
+    file from extensions; frameworks are auto-detected). `languages` was also
+    broken — its validator only knew the original 8 languages, so setting it to
+    anything newer (C#, PHP, Ruby, C/C++, Swift, Kotlin, Dart, Vue, Scala, Lua, …)
+    threw `Invalid configuration format`.
+  - `extractDocstrings`/`trackCallSites`/`customPatterns` were never read by any
+    extractor.
+  - `include` is now derived from the supported language extensions, `exclude` is
+    replaced by `.gitignore`, and `maxFileSize` (1 MB) is a constant.
+
+  **Breaking (library API):** the `CodeGraphConfig` type, the `config` option on
+  `CodeGraph.init()`, and the `getConfig()`/`updateConfig()`/`getConfigPath`
+  exports are gone. Existing `.codegraph/config.json` files are simply ignored.
+  The `.codegraphignore` marker is no longer supported — use `.gitignore`.
+
 ## [0.9.1] - 2026-05-21
 
 ### Fixed

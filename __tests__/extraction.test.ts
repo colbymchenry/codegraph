@@ -9,10 +9,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory, shouldIncludeFile } from '../src/extraction';
+import { extractFromSource, scanDirectory } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars } from '../src/extraction/grammars';
 import { normalizePath } from '../src/utils';
-import { DEFAULT_CONFIG } from '../src/types';
 
 beforeAll(async () => {
   await initGrammars();
@@ -3003,39 +3002,57 @@ describe('Directory Exclusion', () => {
     cleanupTempDir(tempDir);
   });
 
-  it('should exclude node_modules directories', () => {
-    // Create structure: src/index.ts + node_modules/pkg/index.js
+  it('should exclude directories listed in .gitignore', () => {
+    // Create structure: src/index.ts + node_modules/pkg/index.js, gitignore node_modules
     const srcDir = path.join(tempDir, 'src');
     const nmDir = path.join(tempDir, 'node_modules', 'pkg');
     fs.mkdirSync(srcDir, { recursive: true });
     fs.mkdirSync(nmDir, { recursive: true });
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
     fs.writeFileSync(path.join(nmDir, 'index.js'), 'module.exports = {};');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'node_modules/\n');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files).toContain('src/index.ts');
     expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
   });
 
-  it('should exclude nested node_modules directories', () => {
-    // Create structure: packages/app/node_modules/pkg/index.js
+  it('should exclude nested node_modules via a root .gitignore', () => {
+    // A trailing-slash pattern with no leading slash matches at any depth.
     const srcDir = path.join(tempDir, 'packages', 'app', 'src');
     const nmDir = path.join(tempDir, 'packages', 'app', 'node_modules', 'pkg');
     fs.mkdirSync(srcDir, { recursive: true });
     fs.mkdirSync(nmDir, { recursive: true });
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
     fs.writeFileSync(path.join(nmDir, 'index.js'), 'module.exports = {};');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'node_modules/\n');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files).toContain('packages/app/src/index.ts');
     expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
   });
 
-  it('should exclude .git directories', () => {
+  it('should apply a nested .gitignore only to its own subtree', () => {
+    const appSrc = path.join(tempDir, 'app', 'src');
+    fs.mkdirSync(appSrc, { recursive: true });
+    fs.writeFileSync(path.join(appSrc, 'keep.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(appSrc, 'skip.ts'), 'export const b = 2;');
+    fs.writeFileSync(path.join(tempDir, 'app', '.gitignore'), 'src/skip.ts\n');
+    // A sibling with the same name outside app/ must NOT be ignored.
+    const otherDir = path.join(tempDir, 'other', 'src');
+    fs.mkdirSync(otherDir, { recursive: true });
+    fs.writeFileSync(path.join(otherDir, 'skip.ts'), 'export const c = 3;');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('app/src/keep.ts');
+    expect(files).not.toContain('app/src/skip.ts');
+    expect(files).toContain('other/src/skip.ts');
+  });
+
+  it('should always skip .git directories', () => {
     const srcDir = path.join(tempDir, 'src');
     const gitDir = path.join(tempDir, '.git', 'objects');
     fs.mkdirSync(srcDir, { recursive: true });
@@ -3043,8 +3060,7 @@ describe('Directory Exclusion', () => {
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
     fs.writeFileSync(path.join(gitDir, 'pack.ts'), 'export const y = 2;');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files).toContain('src/index.ts');
     expect(files.every((f) => !f.includes('.git'))).toBe(true);
@@ -3055,28 +3071,11 @@ describe('Directory Exclusion', () => {
     fs.mkdirSync(srcDir, { recursive: true });
     fs.writeFileSync(path.join(srcDir, 'Button.tsx'), 'export function Button() {}');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files.length).toBe(1);
     expect(files[0]).toBe('src/components/Button.tsx');
     expect(files[0]).not.toContain('\\');
-  });
-
-  it('should respect .codegraphignore marker', () => {
-    const srcDir = path.join(tempDir, 'src');
-    const vendorDir = path.join(tempDir, 'vendor');
-    fs.mkdirSync(srcDir, { recursive: true });
-    fs.mkdirSync(vendorDir, { recursive: true });
-    fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
-    fs.writeFileSync(path.join(vendorDir, 'lib.ts'), 'export const y = 2;');
-    fs.writeFileSync(path.join(vendorDir, '.codegraphignore'), '');
-
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
-
-    expect(files).toContain('src/index.ts');
-    expect(files.every((f) => !f.includes('vendor'))).toBe(true);
   });
 });
 
@@ -3124,8 +3123,7 @@ describe('Git Submodules', () => {
     );
     git(mainDir, 'commit', '-q', '-m', 'add submodule');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: mainDir };
-    const files = scanDirectory(mainDir, config);
+    const files = scanDirectory(mainDir);
 
     expect(files).toContain('app.ts');
     expect(files).toContain('libs/lib/lib.ts');
@@ -3173,8 +3171,7 @@ describe('Nested non-submodule git repos', () => {
     git(path.join(root, 'sub_repo2'), 'init', '-q');
     fs.writeFileSync(path.join(sub2, 'two.ts'), 'export const two = 2;');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: root };
-    const files = scanDirectory(root, config);
+    const files = scanDirectory(root);
 
     // Both committed and untracked source from the nested repos must be found.
     expect(files).toContain('sub_repo1/src/one.ts');
@@ -3197,8 +3194,7 @@ describe('Nested non-submodule git repos', () => {
     fs.writeFileSync(path.join(sub, 'real.ts'), 'export const real = 1;');
     fs.writeFileSync(path.join(sub, 'generated.ts'), 'export const generated = 1;');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: root };
-    const files = scanDirectory(root, config);
+    const files = scanDirectory(root);
 
     expect(files).toContain('sub_repo/src/real.ts');
     expect(files).not.toContain('sub_repo/src/generated.ts');
