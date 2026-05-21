@@ -533,3 +533,94 @@ describe('Symlink Cycle Detection', () => {
     expect(files).toContain('src/valid.ts');
   });
 });
+
+describe('Session marker symlink resistance', () => {
+  // The marker write lives in src/mcp/tools.ts behind handleContext. We exercise
+  // it end-to-end via ToolHandler.execute so the test exercises the same code
+  // path Claude Code drives. The session id is per-test so other parallel test
+  // runs can't collide with the marker file we plant a symlink at.
+  const SESSION_ID = `cg-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const crypto = require('crypto') as typeof import('crypto');
+  const hash = crypto.createHash('md5').update(SESSION_ID).digest('hex').slice(0, 16);
+  const markerPath = path.join(os.tmpdir(), `codegraph-consulted-${hash}`);
+
+  let projectDir: string;
+  let victimDir: string;
+  let victimFile: string;
+
+  beforeEach(async () => {
+    projectDir = createTempDir();
+    victimDir = createTempDir();
+    victimFile = path.join(victimDir, 'private.txt');
+    fs.writeFileSync(victimFile, 'SECRET-DO-NOT-OVERWRITE\n');
+    if (fs.existsSync(markerPath)) fs.unlinkSync(markerPath);
+
+    // A real .codegraph/ has to exist for handleContext to get past the
+    // "not initialized" guard — index a tiny fixture so the call reaches the
+    // marker write step rather than short-circuiting on missing project state.
+    fs.writeFileSync(path.join(projectDir, 'a.ts'), 'export const x = 1;\n');
+    const cg = await CodeGraph.init(projectDir);
+    await cg.indexAll();
+    cg.close();
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(markerPath)) fs.unlinkSync(markerPath);
+    cleanupTempDir(projectDir);
+    cleanupTempDir(victimDir);
+  });
+
+  it('does not follow a pre-planted symlink at the marker path', async () => {
+    // Skip on platforms where the user can't create symlinks (Windows without
+    // dev mode + admin). The CWE-59 risk we're guarding against doesn't apply
+    // when symlinks aren't creatable, so the skip is correct, not a gap.
+    try {
+      fs.symlinkSync(victimFile, markerPath);
+    } catch {
+      return;
+    }
+
+    const cg = await CodeGraph.open(projectDir);
+    const handler = new ToolHandler(cg);
+    process.env.CLAUDE_SESSION_ID = SESSION_ID;
+    try {
+      await handler.execute('codegraph_context', { task: 'find x' });
+    } finally {
+      delete process.env.CLAUDE_SESSION_ID;
+      cg.close();
+    }
+
+    // The victim file's contents must be untouched — the old writeFileSync
+    // path would have followed the symlink and written an ISO timestamp here.
+    expect(fs.readFileSync(victimFile, 'utf8')).toBe('SECRET-DO-NOT-OVERWRITE\n');
+
+    // And the marker path itself must still be the symlink we planted —
+    // no fallback path that quietly unlinked + recreated it (which would
+    // also work, but is a behavior we don't want to silently rely on).
+    expect(fs.lstatSync(markerPath).isSymbolicLink()).toBe(true);
+  });
+
+  it('writes the marker file with 0o600 perms on a clean path', async () => {
+    // No symlink planted — happy path. Verifies the new openSync(mode: 0o600)
+    // call is what actually lands on disk (regression guard for the perm
+    // tightening that came with the O_NOFOLLOW fix).
+    const cg = await CodeGraph.open(projectDir);
+    const handler = new ToolHandler(cg);
+    process.env.CLAUDE_SESSION_ID = SESSION_ID;
+    try {
+      await handler.execute('codegraph_context', { task: 'find x' });
+    } finally {
+      delete process.env.CLAUDE_SESSION_ID;
+      cg.close();
+    }
+
+    expect(fs.existsSync(markerPath)).toBe(true);
+    // chmod's low 9 bits — strip the file-type bits for a clean compare.
+    // Windows can't enforce 0o600 in the POSIX sense; skip the assertion
+    // there since the underlying OS will normalize the mode anyway.
+    if (process.platform !== 'win32') {
+      const mode = fs.statSync(markerPath).mode & 0o777;
+      expect(mode).toBe(0o600);
+    }
+  });
+});

@@ -7,7 +7,14 @@
 import CodeGraph, { findNearestCodeGraphRoot } from '../index';
 import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind } from '../types';
 import { createHash } from 'crypto';
-import { writeFileSync, readFileSync, existsSync } from 'fs';
+import {
+  constants as fsConstants,
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  writeSync,
+} from 'fs';
 import { clamp, validatePathWithinRoot } from '../utils';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -187,14 +194,36 @@ function numberSourceLines(slice: string, firstLineNumber: number): string {
 /**
  * Mark a Claude session as having consulted MCP tools.
  * This enables Grep/Glob/Bash commands that would otherwise be blocked.
+ *
+ * Why the explicit openSync + O_NOFOLLOW dance instead of plain writeFileSync:
+ * tmpdir() is world-writable on Linux (mode 1777), so on a shared multi-user
+ * machine any other local user can pre-create `codegraph-consulted-<hash>` as
+ * a symlink pointing at a file the victim owns. The old `writeFileSync` would
+ * happily follow that link and overwrite the target's contents with the ISO
+ * timestamp string (CWE-59). The session-id hash provides the predictability
+ * gate, but it's defense-in-depth: if a session id ever surfaces in logs,
+ * argv, or telemetry the attack becomes trivial, and the right fix is to not
+ * follow links from /tmp paths in the first place.
  */
 function markSessionConsulted(sessionId: string): void {
   try {
     const hash = createHash('md5').update(sessionId).digest('hex').slice(0, 16);
     const markerPath = join(tmpdir(), `codegraph-consulted-${hash}`);
-    writeFileSync(markerPath, new Date().toISOString(), 'utf8');
+    // O_NOFOLLOW makes openSync throw ELOOP if markerPath is already a symlink.
+    // O_CREAT + O_TRUNC keep the original "create-or-overwrite" semantics, and
+    // mode 0o600 prevents readback by other local users (the marker payload is
+    // benign, but narrowing the exposure costs nothing).
+    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
+    const fd = openSync(markerPath, flags, 0o600);
+    try {
+      writeSync(fd, new Date().toISOString());
+    } finally {
+      closeSync(fd);
+    }
   } catch {
-    // Silently fail - don't break MCP on marker write failure
+    // Silently fail - don't break MCP on marker write failure. ELOOP from a
+    // planted symlink lands here too, which is the intended behavior: refuse
+    // to write rather than overwrite an attacker-chosen target.
   }
 }
 
