@@ -215,6 +215,7 @@ npm install -g @colbymchenry/codegraph
       "mcp__codegraph__codegraph_callees",
       "mcp__codegraph__codegraph_impact",
       "mcp__codegraph__codegraph_node",
+      "mcp__codegraph__codegraph_explore",
       "mcp__codegraph__codegraph_status",
       "mcp__codegraph__codegraph_files"
     ]
@@ -227,40 +228,40 @@ npm install -g @colbymchenry/codegraph
 <details>
 <summary><strong>Global Instructions Reference</strong></summary>
 
-The installer automatically adds these instructions to `~/.claude/CLAUDE.md`:
+The installer automatically adds instructions like this to your agent instructions file (for example `~/.claude/CLAUDE.md`, `.cursor/rules/codegraph.mdc`, `~/.codex/AGENTS.md`, or opencode `AGENTS.md`):
 
 ```markdown
 ## CodeGraph
 
-CodeGraph builds a semantic knowledge graph of codebases for faster, smarter code exploration.
+This project has a CodeGraph MCP server (`codegraph_*` tools) configured. CodeGraph is a tree-sitter-parsed knowledge graph of every symbol, edge, and file. Reads are sub-millisecond and return structural information grep cannot.
 
-### If `.codegraph/` exists in the project
+### When to prefer codegraph over native search
 
-**NEVER call `codegraph_explore` or `codegraph_context` directly in the main session.** These tools return large amounts of source code that fills up main session context. Instead, ALWAYS spawn an Explore agent for any exploration question (e.g., "how does X work?", "explain the Y system", "where is Z implemented?").
+Use codegraph for **structural** questions — what calls what, what would break, where is X defined, what is X's signature. Use native grep/read only for **literal text** queries (string contents, comments, log messages) or after you already have a specific file open.
 
-**When spawning Explore agents**, include this instruction in the prompt:
+| Question | Tool |
+|---|---|
+| "Where is X defined?" / "Find symbol named X" | `codegraph_search` |
+| "What calls function Y?" | `codegraph_callers` |
+| "What does Y call?" | `codegraph_callees` |
+| "What would break if I changed Z?" | `codegraph_impact` |
+| "Show me Y's signature / source / docstring" | `codegraph_node` |
+| "Give me focused context for a task/area" | `codegraph_context` |
+| "See several related symbols' source at once" | `codegraph_explore` |
+| "What files exist under path/" | `codegraph_files` |
+| "Is the index healthy?" | `codegraph_status` |
 
-> This project has CodeGraph initialized (.codegraph/ exists). Use `codegraph_explore` as your PRIMARY tool — it returns full source code sections from all relevant files in one call.
->
-> **Rules:**
-> 1. Follow the explore call budget in the `codegraph_explore` tool description — it scales automatically based on project size.
-> 2. Do NOT re-read files that codegraph_explore already returned source code for. The source sections are complete and authoritative.
-> 3. Only fall back to grep/glob/read for files listed under "Additional relevant files" if you need more detail, or if codegraph returned no results.
+### Rules of thumb
 
-**The main session may only use these lightweight tools directly** (for targeted lookups before making edits, not for exploration):
+- **Answer directly — don't delegate exploration.** For "how does X work" / architecture / trace questions, answer with 2-3 codegraph calls: `codegraph_context` first, then ONE `codegraph_explore` for the source of the symbols it surfaces.
+- **Trust codegraph results.** They come from a full AST parse. Do NOT re-verify them with grep — that's slower, less accurate, and wastes context.
+- **Don't grep first** when looking up a symbol by name. `codegraph_search` is faster and returns kind + location + signature in one call.
+- **Don't loop `codegraph_node` over many symbols** — one `codegraph_explore` call returns several symbols' source grouped in a single capped call.
+- **Index lag**: the file watcher debounces ~500ms behind writes; don't re-query immediately after editing a file in the same turn.
 
-| Tool | Use For |
-|------|---------|
-| `codegraph_search` | Find symbols by name |
-| `codegraph_callers` / `codegraph_callees` | Trace call flow |
-| `codegraph_impact` | Check what's affected before editing |
-| `codegraph_node` | Get a single symbol's details |
+### If `.codegraph/` doesn't exist
 
-### If `.codegraph/` does NOT exist
-
-At the start of a session, ask the user if they'd like to initialize CodeGraph:
-
-"I notice this project doesn't have CodeGraph initialized. Would you like me to run `codegraph init -i` to build a code knowledge graph?"
+The MCP server returns "not initialized." Ask the user: *"I notice this project doesn't have CodeGraph initialized. Want me to run `codegraph init -i` to build the index?"*
 ```
 
 </details>
