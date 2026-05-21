@@ -20,6 +20,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
+import { cleanupLegacyHooks } from '../src/installer/targets/claude';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -432,6 +433,120 @@ describe('Installer targets — partial-state idempotency', () => {
     const legacy = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.claude.json'), 'utf-8'));
     expect(legacy.mcpServers.codegraph).toBeUndefined();
     expect(legacy.mcpServers.other).toBeDefined();
+  });
+
+  // ---- Legacy auto-sync hook cleanup ----
+  // Pre-0.8 installs wrote `codegraph mark-dirty` / `sync-if-dirty`
+  // hooks to settings.json. Both subcommands were removed from the CLI,
+  // so the Stop hook fails every turn ("unknown command
+  // 'sync-if-dirty'"). The installer must strip them on upgrade and
+  // uninstall — without touching the user's unrelated hooks.
+
+  function seedSettings(loc: 'global' | 'local', settings: Record<string, any>): string {
+    const dir = path.join(loc === 'global' ? tmpHome : tmpCwd, '.claude');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'settings.json');
+    fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n');
+    return file;
+  }
+
+  // Realistic pre-0.8 settings.json: our two auto-sync hooks plus an
+  // unrelated GitKraken Stop hook the user added (matches the report).
+  function legacyHookSettings(): Record<string, any> {
+    return {
+      hooks: {
+        PostToolUse: [
+          { matcher: 'Edit|Write', hooks: [{ type: 'command', command: 'codegraph mark-dirty', async: true }] },
+        ],
+        Stop: [
+          { hooks: [{ type: 'command', command: 'codegraph sync-if-dirty' }] },
+          { hooks: [{ type: 'command', command: '"/Users/me/gk" ai hook run --host claude-code' }] },
+        ],
+      },
+    };
+  }
+
+  it('claude: install strips stale codegraph auto-sync hooks but keeps the user\'s GitKraken hook', () => {
+    const claude = getTarget('claude')!;
+    const file = seedSettings('global', legacyHookSettings());
+
+    claude.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    // The only PostToolUse group held mark-dirty → the event is gone.
+    expect(after.hooks?.PostToolUse).toBeUndefined();
+    const stopCommands = (after.hooks?.Stop ?? []).flatMap((g: any) =>
+      (g.hooks ?? []).map((h: any) => h.command),
+    );
+    expect(stopCommands).not.toContain('codegraph sync-if-dirty');
+    // The unrelated GitKraken hook survives untouched.
+    expect(stopCommands.some((c: string) => c.includes('gk') && c.includes('ai hook run'))).toBe(true);
+    // Permissions still written as normal alongside the cleanup.
+    expect(after.permissions?.allow).toContain('mcp__codegraph__codegraph_search');
+  });
+
+  it('claude: cleanupLegacyHooks preserves a sibling hook sharing our matcher group', () => {
+    const file = seedSettings('global', {
+      hooks: {
+        Stop: [
+          {
+            hooks: [
+              { type: 'command', command: 'codegraph sync-if-dirty' },
+              { type: 'command', command: 'gk ai hook run --host claude-code' },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(cleanupLegacyHooks('global').action).toBe('removed');
+
+    const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(after.hooks.Stop[0].hooks.map((h: any) => h.command)).toEqual([
+      'gk ai hook run --host claude-code',
+    ]);
+  });
+
+  it('claude: cleanupLegacyHooks is a byte-for-byte no-op without codegraph hooks', () => {
+    const original =
+      JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'gk ai hook run' }] }] } }, null, 2) + '\n';
+    const file = seedSettings('global', JSON.parse(original));
+
+    expect(cleanupLegacyHooks('global').action).toBe('unchanged');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(original);
+  });
+
+  it('claude: cleanupLegacyHooks reports not-found when settings.json is absent', () => {
+    expect(cleanupLegacyHooks('global').action).toBe('not-found');
+  });
+
+  it('claude: re-running install after a legacy cleanup leaves settings.json unchanged', () => {
+    const claude = getTarget('claude')!;
+    const file = seedSettings('global', legacyHookSettings());
+    claude.install('global', { autoAllow: true });
+    const firstPass = fs.readFileSync(file, 'utf-8');
+    claude.install('global', { autoAllow: true });
+    expect(fs.readFileSync(file, 'utf-8')).toBe(firstPass);
+  });
+
+  it('claude: uninstall strips stale hooks written in the npx form (local)', () => {
+    const claude = getTarget('claude')!;
+    const file = seedSettings('local', {
+      hooks: {
+        PostToolUse: [
+          { matcher: 'Edit|Write', hooks: [{ type: 'command', command: 'npx @colbymchenry/codegraph mark-dirty', async: true }] },
+        ],
+        Stop: [
+          { hooks: [{ type: 'command', command: 'npx @colbymchenry/codegraph sync-if-dirty' }] },
+        ],
+      },
+    });
+
+    claude.uninstall('local');
+
+    const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    // Both events emptied → the whole `hooks` object is removed.
+    expect(after.hooks).toBeUndefined();
   });
 });
 

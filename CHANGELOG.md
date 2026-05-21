@@ -21,6 +21,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   signatures, generics, and Roblox instance-path `require(script.Parent.X)`
   imports.
 
+### Fixed
+- **Installer**: re-running `codegraph install` now removes the broken
+  auto-sync hooks that pre-0.8 versions wrote to Claude Code's
+  `settings.json`. Those builds added a `Stop → codegraph sync-if-dirty`
+  hook (and a `PostToolUse → codegraph mark-dirty` partner); both
+  subcommands were later removed from the CLI, so Claude Code reported
+  `Stop hook error: ... unknown command 'sync-if-dirty'` on every turn.
+  The cleanup is surgical — only codegraph's own hook entries are
+  stripped, so unrelated hooks sharing the same file or event (e.g. a
+  GitKraken `gk ai hook run` hook) are left untouched — and it also runs
+  on uninstall, so the npm `preuninstall` step fully reverses a legacy
+  install. Re-run `codegraph install` once on an affected machine to
+  clear the error.
+
 ## [0.8.0] - 2026-05-20
 
 ### Added
