@@ -42,9 +42,9 @@ export class DatabaseConnection {
     // Enable foreign keys and WAL mode for better performance
     db.pragma('foreign_keys = ON');
     db.pragma('journal_mode = WAL');
-    // Wait up to 2 minutes if database is locked by another process
+    // Wait up to 5 minutes if database is locked by another process
     // (indexing operations can hold locks for extended periods)
-    db.pragma('busy_timeout = 120000');
+    db.pragma('busy_timeout = 300000'); // Increased from 120000
     // Performance tuning
     db.pragma('synchronous = NORMAL');     // Safe with WAL mode
     db.pragma('cache_size = -64000');      // 64 MB page cache
@@ -80,17 +80,16 @@ export class DatabaseConnection {
     // Enable foreign keys and WAL mode
     db.pragma('foreign_keys = ON');
     db.pragma('journal_mode = WAL');
-    // Wait up to 2 minutes if database is locked by another process
+    // Wait up to 5 minutes if database is locked by another process
     // (indexing operations can hold locks for extended periods)
-    db.pragma('busy_timeout = 120000');
+    db.pragma('busy_timeout = 300000'); // Increased from 120000
     // Performance tuning
     db.pragma('synchronous = NORMAL');
     db.pragma('cache_size = -64000');
     db.pragma('temp_store = MEMORY');
     db.pragma('mmap_size = 268435456');
 
-    // Check and run migrations if needed
-    const conn = new DatabaseConnection(db, dbPath, backend);
+    // Check and run migrations if needed\n    const conn = new DatabaseConnection(db, dbPath, backend);
     const currentVersion = getCurrentVersion(db);
 
     if (currentVersion < CURRENT_SCHEMA_VERSION) {
@@ -109,8 +108,7 @@ export class DatabaseConnection {
 
   /**
    * Get the SQLite backend serving this connection. Per-instance so
-   * MCP cross-project queries report the right backend even when
-   * multiple project DBs are open in the same process.
+   * MCP cross-project queries report the right backend even when\n   * multiple project DBs are open in the same process.
    */
   getBackend(): SqliteBackend {
     return this.backend;
