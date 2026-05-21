@@ -1398,6 +1398,69 @@ program
     }
   });
 
+/**
+ * codegraph completions <shell> [--install]
+ *
+ * Without --install: prints the script to stdout. Safe to redirect.
+ * With --install: detects the best target for the environment
+ * (oh-my-zsh, Homebrew zsh/bash-completion, fish config, pwsh $PROFILE)
+ * and writes there. If no target can be detected (e.g., pwsh on a
+ * system with no detectable profile dir), exits non-zero with a hint.
+ */
+program
+  .command('completions <shell>')
+  .description('Generate shell completions (zsh, bash, fish, powershell)')
+  .option('--install', 'Auto-install to the best location for your environment')
+  .action(async (shellArg: string, options: { install?: boolean }) => {
+    const { parseShell, emit, installCompletions, SUPPORTED_SHELLS } = await import(
+      '../completions'
+    );
+    const shell = parseShell(shellArg);
+    if (!shell) {
+      error(
+        `Unsupported shell '${shellArg}'. Supported: ${SUPPORTED_SHELLS.join(', ')} (aliases: pwsh, ps).`,
+      );
+      process.exit(1);
+    }
+    const script = emit(program, shell);
+    if (!options.install) {
+      process.stdout.write(script);
+      return;
+    }
+    try {
+      const result = installCompletions(shell, script);
+      if (!result) {
+        error(
+          `Could not detect an install location for ${shell} on this system.`,
+        );
+        console.log('');
+        console.log('Write the script yourself:');
+        console.log(`  codegraph completions ${shell} > /path/of/your/choice`);
+        if (shell === 'powershell') {
+          console.log('Then dot-source it from your $PROFILE.');
+        }
+        process.exit(1);
+      }
+      const { target, profileUpdated } = result;
+      success(`Installed ${shell} completions to ${target.path}`);
+      console.log(`  (detected: ${target.source})`);
+      if (shell === 'powershell' && target.profilePath) {
+        if (profileUpdated === true) {
+          console.log(`  Appended dot-source line to ${target.profilePath}`);
+        } else if (profileUpdated === false) {
+          console.log(`  ${target.profilePath} already references this script — left untouched`);
+        }
+      }
+      if (target.postInstallHint) {
+        console.log('');
+        console.log(target.postInstallHint);
+      }
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
 // Parse and run
 program.parse();
 
