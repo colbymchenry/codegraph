@@ -2,7 +2,8 @@
  * CodeGraph Interactive Installer
  *
  * Multi-target: writes MCP server config + instructions for the
- * agents the user picks (Claude Code, Cursor, Codex CLI, opencode).
+ * agents the user picks (Claude Code, Cursor, Codex CLI, opencode,
+ * Hermes Agent).
  * Defaults to the Claude-only behavior for backwards compatibility
  * when no targets are explicitly chosen and nothing else is detected.
  *

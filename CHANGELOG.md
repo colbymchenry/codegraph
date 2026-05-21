@@ -7,9 +7,52 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.1] - 2026-05-21
+
+### Fixed
+- **Standalone installers** (`curl … | sh`, `irm … | iex`): the bundled launcher
+  failed with `exec: …/node: not found` because it didn't resolve the symlink the
+  installer puts on your PATH. Installing on a machine with **no Node** now works.
+- **npm**: `@colbymchenry/codegraph-linux-x64` is now published — the 0.9.0
+  release silently shipped 6 of 7 packages, so `npm i -g` on linux-x64 couldn't
+  find its bundle. The release pipeline now verifies every package reached the
+  registry (and is idempotent), so a release can't pass green-but-broken again.
+
+[0.9.1]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.1
+
+## [0.9.0] - 2026-05-21
+
+### 🎉 Self-contained: CodeGraph bundles its own runtime — install anywhere, on any Node (or none)
+
+**No more `database is locked`. No more native build failures. No more "WASM fallback active."**
+
+CodeGraph used to need `better-sqlite3`, a native module compiled against your exact
+Node version. When that build failed (common on Windows and locked-down machines) it
+silently dropped to a slow WASM SQLite build with **no WAL** — the root cause of the
+intermittent `database is locked` errors on concurrent MCP tool calls
+([#238](https://github.com/colbymchenry/codegraph/issues/238)). That entire class of
+problem is **gone**: CodeGraph now ships a self-contained Node runtime and uses Node's
+built-in `node:sqlite` (real SQLite, full WAL + FTS5).
+
+- ✅ **Zero native compilation** — nothing to build, ever; nothing to rebuild when Node changes.
+- ✅ **Runs on any Node version — or with no Node at all.** Install via the standalone installers with no Node present, or keep using `npm`/`npx` on any version (your Node only launches the bundled runtime).
+- ✅ **`database is locked` fixed at the root** — real WAL means readers never block on a writer.
+- ⚡ **5–10× faster** than the old WASM fallback for anyone who was stuck on it.
+
+```bash
+# macOS / Linux — no Node required
+curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
+# Windows (PowerShell) — no Node required
+irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
+# or, if you have Node (any version):
+npm i -g @colbymchenry/codegraph
+```
 
 ### Added
+- **Standalone installers** — one-line install with no Node.js required:
+  `curl -fsSL .../install.sh | sh` (macOS/Linux) and `irm .../install.ps1 | iex`
+  (Windows). They fetch the matching self-contained bundle from GitHub Releases
+  and put `codegraph` on your PATH.
 - **Lua**: CodeGraph now indexes Lua (`.lua`) — functions, methods (table `t.f`
   and `t:m` definitions become methods with a `t::f` receiver-qualified name),
   local variables, `require(...)` imports, and the call edges between them.
@@ -46,6 +89,39 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also allows framework extractors (e.g. Drupal's route resolver) to run on
   YAML files.
   Resolves [#268](https://github.com/colbymchenry/codegraph/issues/268).
+
+### Changed
+- **SQLite backend is now Node's built-in `node:sqlite`** (real SQLite, WAL +
+  FTS5), shipped inside a bundled Node runtime. This fixes the concurrent-read
+  `database is locked` errors ([#238](https://github.com/colbymchenry/codegraph/issues/238))
+  at the root and removes the native build step entirely.
+- **`npm i -g` / `npx` now install a self-contained bundle.** The main package is
+  a tiny shim; the runtime ships as per-platform `optionalDependencies`, so the
+  install works on any Node version (your Node only launches the bundle).
+- **`codegraph status`** now reports the effective journal mode (`wal` vs not),
+  so a `database is locked` report is triageable at a glance.
+
+### Removed
+- **`better-sqlite3`** (optional native dependency) and **`node-sqlite3-wasm`**
+  (WASM fallback) — along with the native-build banner, the WASM fallback path,
+  and the no-WAL lock retries they required. The dependency tree now has zero
+  native addons.
+
+### Fixed
+- **Installer**: re-running `codegraph install` now removes the broken
+  auto-sync hooks that pre-0.8 versions wrote to Claude Code's
+  `settings.json`. Those builds added a `Stop → codegraph sync-if-dirty`
+  hook (and a `PostToolUse → codegraph mark-dirty` partner); both
+  subcommands were later removed from the CLI, so Claude Code reported
+  `Stop hook error: ... unknown command 'sync-if-dirty'` on every turn.
+  The cleanup is surgical — only codegraph's own hook entries are
+  stripped, so unrelated hooks sharing the same file or event (e.g. a
+  GitKraken `gk ai hook run` hook) are left untouched — and it also runs
+  on uninstall, so the npm `preuninstall` step fully reverses a legacy
+  install. Re-run `codegraph install` once on an affected machine to
+  clear the error.
+
+[0.9.0]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.0
 
 ## [0.8.0] - 2026-05-20
 
