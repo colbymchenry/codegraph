@@ -3722,3 +3722,157 @@ class Svc {
     expect(decoratedNode?.name).toBe('method');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Jupyter Notebook Extraction
+// ---------------------------------------------------------------------------
+
+describe('Jupyter Notebook Extraction', () => {
+  it('detects .ipynb files as jupyter language', () => {
+    expect(detectLanguage('analysis.ipynb')).toBe('jupyter');
+  });
+
+  it('reports jupyter as a supported language', () => {
+    expect(isLanguageSupported('jupyter')).toBe(true);
+  });
+
+  it('includes jupyter in getSupportedLanguages()', () => {
+    expect(getSupportedLanguages()).toContain('jupyter');
+  });
+
+  const minimalNotebook = (cells: object[]) =>
+    JSON.stringify({
+      nbformat: 4,
+      metadata: { kernelspec: { language: 'python' } },
+      cells,
+    });
+
+  it('extracts a function from a code cell', () => {
+    const notebook = minimalNotebook([
+      {
+        cell_type: 'code',
+        source: ['def greet(name):\n', '    return f"Hello {name}"\n'],
+        metadata: {},
+      },
+    ]);
+    const result = extractFromSource('notebook.ipynb', notebook);
+
+    const funcNode = result.nodes.find((n) => n.kind === 'function');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.name).toBe('greet');
+    expect(funcNode?.language).toBe('jupyter');
+    expect(funcNode?.filePath).toBe('notebook.ipynb');
+  });
+
+  it('extracts a class from a code cell', () => {
+    const notebook = minimalNotebook([
+      {
+        cell_type: 'code',
+        source: 'class DataProcessor:\n    def run(self):\n        pass\n',
+        metadata: {},
+      },
+    ]);
+    const result = extractFromSource('notebook.ipynb', notebook);
+
+    const classNode = result.nodes.find((n) => n.kind === 'class');
+    expect(classNode).toBeDefined();
+    expect(classNode?.name).toBe('DataProcessor');
+  });
+
+  it('creates a module node for the notebook', () => {
+    const notebook = minimalNotebook([
+      { cell_type: 'code', source: 'x = 1\n', metadata: {} },
+    ]);
+    const result = extractFromSource('my_analysis.ipynb', notebook);
+
+    const moduleNode = result.nodes.find((n) => n.kind === 'module');
+    expect(moduleNode).toBeDefined();
+    expect(moduleNode?.name).toBe('my_analysis');
+    expect(moduleNode?.language).toBe('jupyter');
+  });
+
+  it('ignores markdown cells', () => {
+    const notebook = minimalNotebook([
+      { cell_type: 'markdown', source: '# Title\n\nSome text.', metadata: {} },
+      {
+        cell_type: 'code',
+        source: 'def only_function():\n    pass\n',
+        metadata: {},
+      },
+    ]);
+    const result = extractFromSource('notebook.ipynb', notebook);
+    const functions = result.nodes.filter((n) => n.kind === 'function');
+    expect(functions).toHaveLength(1);
+    expect(functions[0]?.name).toBe('only_function');
+  });
+
+  it('strips IPython line magics without breaking parse', () => {
+    const notebook = minimalNotebook([
+      {
+        cell_type: 'code',
+        source: '%matplotlib inline\ndef plot_data(df):\n    pass\n',
+        metadata: {},
+      },
+    ]);
+    const result = extractFromSource('notebook.ipynb', notebook);
+    // No parse errors from the magic
+    const errors = result.errors.filter((e) => e.severity === 'error');
+    expect(errors).toHaveLength(0);
+    // Function still extracted
+    const funcNode = result.nodes.find((n) => n.kind === 'function');
+    expect(funcNode?.name).toBe('plot_data');
+  });
+
+  it('strips shell commands without breaking parse', () => {
+    const notebook = minimalNotebook([
+      {
+        cell_type: 'code',
+        source: '!pip install pandas\nimport pandas as pd\n',
+        metadata: {},
+      },
+    ]);
+    const result = extractFromSource('notebook.ipynb', notebook);
+    const errors = result.errors.filter((e) => e.severity === 'error');
+    expect(errors).toHaveLength(0);
+  });
+
+  it('offsets line numbers across multiple cells', () => {
+    const cell0 = 'def first():\n    pass\n'; // 2 lines
+    const cell1 = 'def second():\n    pass\n'; // starts after cell0
+
+    const notebook = minimalNotebook([
+      { cell_type: 'code', source: cell0, metadata: {} },
+      { cell_type: 'code', source: cell1, metadata: {} },
+    ]);
+    const result = extractFromSource('notebook.ipynb', notebook);
+
+    const first = result.nodes.find((n) => n.name === 'first');
+    const second = result.nodes.find((n) => n.name === 'second');
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    // second must start after first ends
+    expect(second!.startLine).toBeGreaterThan(first!.endLine);
+  });
+
+  it('returns an error node for malformed JSON', () => {
+    const result = extractFromSource('bad.ipynb', '{ not valid json }');
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0]?.code).toBe('parse_error');
+  });
+
+  it('skips code cell extraction for non-Python kernels', () => {
+    const notebook = JSON.stringify({
+      nbformat: 4,
+      metadata: { kernelspec: { language: 'r' } },
+      cells: [
+        { cell_type: 'code', source: 'x <- 1\n', metadata: {} },
+      ],
+    });
+    const result = extractFromSource('r_notebook.ipynb', notebook);
+    // No function/class nodes — R code is not parsed as Python
+    const codeNodes = result.nodes.filter((n) =>
+      n.kind === 'function' || n.kind === 'class'
+    );
+    expect(codeNodes).toHaveLength(0);
+  });
+});

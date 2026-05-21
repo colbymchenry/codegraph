@@ -23,6 +23,7 @@ import { LiquidExtractor } from './liquid-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
+import { JupyterExtractor } from './jupyter-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -2506,6 +2507,10 @@ export function extractFromSource(
   } else if (detectedLanguage === 'liquid') {
     // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'jupyter') {
+    // Use custom extractor for Jupyter notebooks (delegates cells to Python parser)
+    const extractor = new JupyterExtractor(filePath, source);
     result = extractor.extract();
   } else if (
     detectedLanguage === 'pascal' &&
