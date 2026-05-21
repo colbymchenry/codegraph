@@ -368,22 +368,36 @@ codegraph completions fish       --install
 codegraph completions powershell --install
 ```
 
-With `--install`, the tool auto-detects the right location for your environment and writes there. The exact path is reported with a `(detected: …)` line so you know which tier was picked.
+With `--install`, codegraph picks the right location for your environment and writes there. The exact path is reported as `(detected: <tier>)` so you can see which rule fired. **Restart your shell** (or `exec $SHELL`) to pick up the new completions.
 
 | Shell | Detection priority |
 |---|---|
-| **zsh** | oh-my-zsh (`$ZSH/completions/`) → `<prefix>/share/zsh/site-functions/` if writable → `~/.zsh/completions/` (fallback; prints fpath hint) |
+| **zsh** | oh-my-zsh (`$ZSH/completions/`) → `<prefix>/share/zsh/site-functions/` if writable → `~/.zsh/completions/` (fallback; prints `fpath` hint) |
 | **bash** | `<homebrew>/etc/bash_completion.d/` if writable → XDG `~/.local/share/bash-completion/completions/` |
 | **fish** | `~/.config/fish/completions/` (auto-discovered) |
-| **powershell** | Writes a standalone `.ps1` to `~/.config/powershell/` (or `~/Documents/PowerShell/` on Windows), then idempotently appends a dot-source line to `$PROFILE` |
+| **powershell** | Standalone `.ps1` in `~/.config/powershell/` (`~/Documents/PowerShell/` on Windows) + idempotent dot-source line in `$PROFILE`. Re-running `--install` won't duplicate the line. |
 
-To pipe yourself instead:
+**Without `--install`** the script goes to stdout — pipe it wherever you want:
 
 ```bash
-codegraph completions zsh > ~/.zsh/completions/_codegraph
+codegraph completions zsh        > ~/.zsh/completions/_codegraph
+codegraph completions bash       > ~/.local/share/bash-completion/completions/codegraph
+codegraph completions fish       > ~/.config/fish/completions/codegraph.fish
+codegraph completions powershell > ~/codegraph-completion.ps1   # then dot-source from $PROFILE
 ```
 
-If you're on a shell we don't recognize (nushell, xonsh, etc.), `--install` exits non-zero with a hint; nothing is written.
+**Per-shell requirements:**
+- **bash**: needs the `bash-completion` package. macOS: `brew install bash-completion@2` (and follow its post-install instructions).
+- **zsh** (fallback tier only): if codegraph wrote to `~/.zsh/completions/_codegraph`, add this to `~/.zshrc` *before* `compinit`:
+  ```zsh
+  fpath=(~/.zsh/completions $fpath)
+  autoload -Uz compinit && compinit
+  ```
+  If the install reported `(detected: oh-my-zsh)` or `(detected: zsh-site-functions)`, this step is unnecessary.
+- **fish**: no extra config — auto-discovered.
+- **powershell**: works in PowerShell 7.x (`pwsh`). Windows PowerShell 5.1 also works but uses a different `$PROFILE` path; if our chosen path doesn't match yours, dot-source the `.ps1` manually.
+
+If you're on a shell we don't recognize (`nushell`, `xonsh`, etc.), the command exits non-zero with a hint and writes nothing.
 
 ---
 
