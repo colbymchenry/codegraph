@@ -8,6 +8,7 @@ import { FrameworkResolver, ResolutionContext } from '../types';
 import type { Language } from '../../types';
 import { laravelResolver } from './laravel';
 import { expressResolver } from './express';
+import { nestjsResolver } from './nestjs';
 import { reactResolver } from './react';
 import { svelteResolver } from './svelte';
 import { vueResolver } from './vue';
@@ -27,6 +28,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   laravelResolver,
   // JavaScript/TypeScript
   expressResolver,
+  nestjsResolver,
   reactResolver,
   svelteResolver,
   vueResolver,
@@ -105,6 +107,7 @@ export function registerFrameworkResolver(resolver: FrameworkResolver): void {
 // Re-export framework resolvers
 export { laravelResolver, FACADE_MAPPINGS } from './laravel';
 export { expressResolver } from './express';
+export { nestjsResolver } from './nestjs';
 export { reactResolver } from './react';
 export { svelteResolver } from './svelte';
 export { vueResolver } from './vue';

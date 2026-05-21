@@ -36,6 +36,8 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   pascal: 'tree-sitter-pascal.wasm',
   scala: 'tree-sitter-scala.wasm',
   elixir: 'tree-sitter-elixir.wasm',
+  lua: 'tree-sitter-lua.wasm',
+  luau: 'tree-sitter-luau.wasm',
 };
 
 /**
@@ -81,6 +83,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.sc': 'scala',
   '.ex': 'elixir',
   '.exs': 'elixir',
+  '.lua': 'lua',
+  '.luau': 'luau',
 };
 
 /**
@@ -128,8 +132,12 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
   for (const lang of toLoad) {
     const wasmFile = WASM_GRAMMAR_FILES[lang];
     try {
-      // Pascal and Scala ship their own WASMs (not in tree-sitter-wasms)
-      const wasmPath = (lang === 'pascal' || lang === 'scala')
+      // Some grammars ship their own WASMs (not in tree-sitter-wasms, or the
+      // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
+      // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
+      // 0.25 (drops nested calls/imports on every file after the first); we
+      // vendor the upstream ABI-15 wasm instead.
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -295,6 +303,8 @@ export function getLanguageDisplayName(language: Language): string {
     pascal: 'Pascal / Delphi',
     scala: 'Scala',
     elixir: 'Elixir',
+    lua: 'Lua',
+    luau: 'Luau',
     unknown: 'Unknown',
   };
   return names[language] || language;

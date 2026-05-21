@@ -86,6 +86,8 @@ export const LANGUAGES = [
   'pascal',
   'scala',
   'elixir',
+  'lua',
+  'luau',
   'unknown',
 ] as const;
 
@@ -549,6 +551,10 @@ export const DEFAULT_CONFIG: CodeGraphConfig = {
     // Elixir
     '**/*.ex',
     '**/*.exs',
+    // Lua
+    '**/*.lua',
+    // Luau
+    '**/*.luau',
   ],
   exclude: [
     // Version control

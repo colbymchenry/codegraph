@@ -50,6 +50,17 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
       const innerName = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
       return innerName ? getNodeText(innerName, source) : getNodeText(resolved, source);
     }
+    // Lua: `function t.f()` / `function t:m()` — the name node is a dot/method
+    // index expression; the simple name is the trailing field/method (the table
+    // receiver is captured separately via getReceiverType).
+    if (resolved.type === 'dot_index_expression') {
+      const field = getChildByField(resolved, 'field');
+      if (field) return getNodeText(field, source);
+    }
+    if (resolved.type === 'method_index_expression') {
+      const method = getChildByField(resolved, 'method');
+      if (method) return getNodeText(method, source);
+    }
     return getNodeText(resolved, source);
   }
 
@@ -1111,6 +1122,23 @@ export class TreeSitterExtractor {
           }
         }
       }
+    } else if (this.language === 'lua' || this.language === 'luau') {
+      // Lua/Luau: variable_declaration → assignment_statement → variable_list
+      //      (name: identifier...) = expression_list. `local x, y = 1, 2`
+      //      declares multiple names; only plain identifiers are locals.
+      const assign = node.namedChildren.find((c) => c.type === 'assignment_statement') ?? node;
+      const varList = assign.namedChildren.find((c) => c.type === 'variable_list');
+      const exprList = assign.namedChildren.find((c) => c.type === 'expression_list');
+      const values = exprList ? exprList.namedChildren : [];
+      const names = varList ? varList.namedChildren.filter((c) => c.type === 'identifier') : [];
+      names.forEach((nameNode, i) => {
+        const name = getNodeText(nameNode, this.source);
+        if (!name) return;
+        const valueNode = values[i];
+        const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
+        const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
+        this.createNode(kind, name, nameNode, { docstring, signature: initSignature, isExported });
+      });
     } else {
       // Generic fallback for other languages
       // Try to find identifier children

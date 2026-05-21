@@ -175,6 +175,287 @@ describe('expressResolver.extract', () => {
   });
 });
 
+import { nestjsResolver } from '../src/resolution/frameworks/nestjs';
+
+describe('nestjsResolver.extract — HTTP', () => {
+  it('joins @Controller prefix with @Get and links the handler', () => {
+    const src = `
+@Controller('users')
+export class UsersController {
+  @Get()
+  findAll() { return []; }
+}
+`;
+    const { nodes, references } = nestjsResolver.extract!('users.controller.ts', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].kind).toBe('route');
+    expect(nodes[0].name).toBe('GET /users');
+    expect(references[0].referenceName).toBe('findAll');
+    expect(references[0].referenceKind).toBe('references');
+    expect(references[0].fromNodeId).toBe(nodes[0].id);
+  });
+
+  it('joins controller prefix with a method-level path param', () => {
+    const src = `
+@Controller('cats')
+export class CatsController {
+  @Get(':id')
+  findOne(@Param('id') id: string) { return id; }
+}
+`;
+    const { nodes, references } = nestjsResolver.extract!('cats.controller.ts', src);
+    expect(nodes[0].name).toBe('GET /cats/:id');
+    expect(references[0].referenceName).toBe('findOne');
+  });
+
+  it('handles an empty @Controller() and empty @Post()', () => {
+    const src = `
+@Controller()
+export class AppController {
+  @Post()
+  create() {}
+}
+`;
+    const { nodes, references } = nestjsResolver.extract!('app.controller.ts', src);
+    expect(nodes[0].name).toBe('POST /');
+    expect(references[0].referenceName).toBe('create');
+  });
+
+  it('covers HTTP verbs and skips intervening method decorators', () => {
+    const src = `
+@Controller('todos')
+export class TodosController {
+  @Put(':id')
+  @UseGuards(AuthGuard)
+  update(@Param('id') id: string) {}
+
+  @Delete(':id')
+  async remove(@Param('id') id: string) {}
+}
+`;
+    const { nodes, references } = nestjsResolver.extract!('todos.controller.ts', src);
+    expect(nodes.map((n) => n.name)).toEqual(['PUT /todos/:id', 'DELETE /todos/:id']);
+    expect(references.map((r) => r.referenceName)).toEqual(['update', 'remove']);
+  });
+
+  it('attributes methods to the right controller when a file has two', () => {
+    const src = `
+@Controller('a')
+export class AController {
+  @Get('x')
+  ax() {}
+}
+
+@Controller('b')
+export class BController {
+  @Get('y')
+  by() {}
+}
+`;
+    const { nodes } = nestjsResolver.extract!('multi.controller.ts', src);
+    expect(nodes.map((n) => n.name)).toEqual(['GET /a/x', 'GET /b/y']);
+  });
+});
+
+describe('nestjsResolver.extract — GraphQL', () => {
+  it('emits QUERY/MUTATION nodes from a resolver, defaulting to the method name', () => {
+    const src = `
+@Resolver(() => User)
+export class UsersResolver {
+  @Query(() => [User])
+  users() { return []; }
+
+  @Mutation(() => User)
+  createUser(@Args('input') input: CreateUserInput) {}
+}
+`;
+    const { nodes, references } = nestjsResolver.extract!('users.resolver.ts', src);
+    expect(nodes.map((n) => n.name)).toEqual(['QUERY users', 'MUTATION createUser']);
+    expect(references.map((r) => r.referenceName)).toEqual(['users', 'createUser']);
+  });
+
+  it('uses an explicit operation name when given', () => {
+    const src = `
+@Resolver()
+export class CatsResolver {
+  @Query(() => Cat, { name: 'cat' })
+  getCat() {}
+}
+`;
+    const { nodes } = nestjsResolver.extract!('cats.resolver.ts', src);
+    expect(nodes[0].name).toBe('QUERY cat');
+  });
+
+  it('does NOT treat the REST @Query() parameter decorator as a GraphQL op', () => {
+    const src = `
+@Controller('search')
+export class SearchController {
+  @Get()
+  search(@Query() query: SearchDto) { return query; }
+}
+`;
+    const { nodes } = nestjsResolver.extract!('search.controller.ts', src);
+    // Only the HTTP route — the @Query() param decorator must be ignored.
+    expect(nodes.map((n) => n.name)).toEqual(['GET /search']);
+  });
+});
+
+describe('nestjsResolver.extract — microservices & websockets', () => {
+  it('extracts @MessagePattern and @EventPattern handlers', () => {
+    const src = `
+@Controller()
+export class MathController {
+  @MessagePattern({ cmd: 'sum' })
+  accumulate(data: number[]) {}
+
+  @EventPattern('user.created')
+  handleUserCreated(data: any) {}
+}
+`;
+    const { nodes, references } = nestjsResolver.extract!('math.controller.ts', src);
+    expect(nodes.map((n) => n.name)).toEqual(['MESSAGE sum', 'EVENT user.created']);
+    expect(references.map((r) => r.referenceName)).toEqual(['accumulate', 'handleUserCreated']);
+  });
+
+  it('extracts @SubscribeMessage handlers with the gateway namespace', () => {
+    const src = `
+@WebSocketGateway({ namespace: 'chat' })
+export class ChatGateway {
+  @SubscribeMessage('message')
+  handleMessage(@MessageBody() data: string) {}
+}
+`;
+    const { nodes, references } = nestjsResolver.extract!('chat.gateway.ts', src);
+    expect(nodes[0].name).toBe('WS chat:message');
+    expect(references[0].referenceName).toBe('handleMessage');
+  });
+
+  it('extracts @SubscribeMessage without a namespace', () => {
+    const src = `
+@WebSocketGateway()
+export class EventsGateway {
+  @SubscribeMessage('events')
+  onEvent() {}
+}
+`;
+    const { nodes } = nestjsResolver.extract!('events.gateway.ts', src);
+    expect(nodes[0].name).toBe('WS events');
+  });
+
+  it('returns empty for a non-JS/TS file', () => {
+    const { nodes, references } = nestjsResolver.extract!('thing.py', '@Controller("x")');
+    expect(nodes).toEqual([]);
+    expect(references).toEqual([]);
+  });
+});
+
+describe('nestjsResolver.detect', () => {
+  const baseContext = {
+    getNodesInFile: () => [],
+    getNodesByName: () => [],
+    getNodesByQualifiedName: () => [],
+    getNodesByKind: () => [],
+    fileExists: () => false,
+    getProjectRoot: () => '/test',
+    getAllFiles: () => [],
+    getNodesByLowerName: () => [],
+    getImportMappings: () => [],
+  };
+
+  it('detects @nestjs/* in package.json', () => {
+    const context = {
+      ...baseContext,
+      readFile: (p: string) =>
+        p === 'package.json'
+          ? JSON.stringify({ dependencies: { '@nestjs/common': '^10.0.0' } })
+          : null,
+    };
+    expect(nestjsResolver.detect(context as any)).toBe(true);
+  });
+
+  it('detects @Controller in a *.controller.ts file when package.json is absent', () => {
+    const context = {
+      ...baseContext,
+      getAllFiles: () => ['src/users.controller.ts'],
+      readFile: (p: string) =>
+        p === 'src/users.controller.ts'
+          ? `@Controller('users')\nexport class UsersController {}`
+          : null,
+    };
+    expect(nestjsResolver.detect(context as any)).toBe(true);
+  });
+
+  it('returns false for a non-Nest project', () => {
+    const context = {
+      ...baseContext,
+      readFile: (p: string) =>
+        p === 'package.json' ? JSON.stringify({ dependencies: { express: '^4' } }) : null,
+    };
+    expect(nestjsResolver.detect(context as any)).toBe(false);
+  });
+});
+
+describe('nestjsResolver.resolve', () => {
+  const baseContext = {
+    getNodesInFile: () => [],
+    getNodesByName: () => [],
+    getNodesByQualifiedName: () => [],
+    getNodesByKind: () => [],
+    fileExists: () => false,
+    readFile: () => null,
+    getProjectRoot: () => '/test',
+    getAllFiles: () => [],
+    getNodesByLowerName: () => [],
+    getImportMappings: () => [],
+  };
+
+  it('resolves an injected *Service reference to the class in a *.service.ts file', () => {
+    const svcNode: Node = {
+      id: 'class:src/users/users.service.ts:UsersService:3',
+      kind: 'class',
+      name: 'UsersService',
+      qualifiedName: 'src/users/users.service.ts::UsersService',
+      filePath: 'src/users/users.service.ts',
+      language: 'typescript',
+      startLine: 3,
+      endLine: 3,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: Date.now(),
+    };
+    const context = {
+      ...baseContext,
+      getNodesByName: (n: string) => (n === 'UsersService' ? [svcNode] : []),
+    };
+    const ref = {
+      fromNodeId: 'class:src/users/users.controller.ts:UsersController:5',
+      referenceName: 'UsersService',
+      referenceKind: 'references' as const,
+      line: 6,
+      column: 4,
+      filePath: 'src/users/users.controller.ts',
+      language: 'typescript' as const,
+    };
+    const result = nestjsResolver.resolve(ref, context as any);
+    expect(result?.targetNodeId).toBe(svcNode.id);
+    expect(result?.resolvedBy).toBe('framework');
+    expect(result?.confidence).toBeGreaterThanOrEqual(0.85);
+  });
+
+  it('returns null for a name without a provider suffix', () => {
+    const ref = {
+      fromNodeId: 'x',
+      referenceName: 'doThing',
+      referenceKind: 'references' as const,
+      line: 1,
+      column: 1,
+      filePath: 'a.ts',
+      language: 'typescript' as const,
+    };
+    expect(nestjsResolver.resolve(ref, baseContext as any)).toBeNull();
+  });
+});
+
 import { laravelResolver } from '../src/resolution/frameworks/laravel';
 
 describe('laravelResolver.extract', () => {
@@ -767,5 +1048,22 @@ app.get("real", use: listUsers)
     const { nodes, references } = vaporResolver.extract!('routes.swift', src);
     expect(nodes.map((n) => n.name)).toEqual(['GET real']);
     expect(references.map((r) => r.referenceName)).toEqual(['listUsers']);
+  });
+
+  it('nestjs: skips // and /* */ commented decorators', () => {
+    const src = `
+@Controller('users')
+export class UsersController {
+  // @Get('fake')
+  // fake() {}
+  /* @Post('also-fake')
+     alsoFake() {} */
+  @Get('real')
+  real() {}
+}
+`;
+    const { nodes, references } = nestjsResolver.extract!('users.controller.ts', src);
+    expect(nodes.map((n) => n.name)).toEqual(['GET /users/real']);
+    expect(references.map((r) => r.referenceName)).toEqual(['real']);
   });
 });

@@ -59,5 +59,15 @@
   ],
   "Svelte": [
     { "name": "shadcn-svelte", "repo": "https://github.com/huntabyte/shadcn-svelte", "size": "Medium", "files": "~600", "question": "How do shadcn-svelte components compose and apply their styling?" }
+  ],
+  "Lua": [
+    { "name": "lualine.nvim", "repo": "https://github.com/nvim-lualine/lualine.nvim", "size": "Small", "files": "~120", "question": "How does lualine assemble and render its statusline sections and components?" },
+    { "name": "telescope.nvim", "repo": "https://github.com/nvim-telescope/telescope.nvim", "size": "Medium", "files": "~80", "question": "How does Telescope wire a picker to its finder, sorter, and previewer?" },
+    { "name": "kong", "repo": "https://github.com/Kong/kong", "size": "Large", "files": "~1330", "question": "How does Kong execute plugins across a request's lifecycle phases?" }
+  ],
+  "Luau": [
+    { "name": "Knit", "repo": "https://github.com/Sleitnick/Knit", "size": "Small", "files": "~10", "question": "How does Knit register services and expose them to clients?" },
+    { "name": "vide", "repo": "https://github.com/centau/vide", "size": "Small", "files": "~40", "question": "How does vide track reactive sources and re-run effects when state changes?" },
+    { "name": "Fusion", "repo": "https://github.com/dphfox/Fusion", "size": "Medium", "files": "~115", "question": "How does Fusion build and update its reactive UI graph from state objects?" }
   ]
 }

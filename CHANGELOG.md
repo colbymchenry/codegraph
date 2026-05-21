@@ -10,6 +10,31 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Lua**: CodeGraph now indexes Lua (`.lua`) — functions, methods (table `t.f`
+  and `t:m` definitions become methods with a `t::f` receiver-qualified name),
+  local variables, `require(...)` imports, and the call edges between them.
+  Querying a Lua project (Neovim plugins, Kong, OpenResty, game code) now
+  surfaces its modules, methods, and call graph.
+- **Luau** ([#232](https://github.com/colbymchenry/codegraph/issues/232)):
+  CodeGraph now indexes Luau (`.luau`), Roblox's typed superset of Lua —
+  everything Lua extracts, plus `type` / `export type` aliases, typed function
+  signatures, generics, and Roblox instance-path `require(script.Parent.X)`
+  imports.
+
+## [0.8.0] - 2026-05-20
+
+### Added
+- **Framework routes (NestJS)**: CodeGraph now recognises NestJS projects and
+  emits `route` nodes — each linked by a `references` edge to its handler
+  method — across all four transport layers: HTTP controllers (the
+  `@Controller` prefix joined with `@Get`/`@Post`/`@Put`/`@Patch`/`@Delete`/
+  `@Head`/`@Options`/`@All`, including empty `@Controller()`/`@Get()`),
+  GraphQL resolvers (`@Query`/`@Mutation`/`@Subscription`), microservice
+  handlers (`@MessagePattern`/`@EventPattern`), and WebSocket gateways
+  (`@SubscribeMessage`, prefixed with the gateway namespace). Detected
+  automatically from any `@nestjs/*` dependency in `package.json`. Querying a
+  controller method or resolver now surfaces the route that binds it.
+  Resolves [#220](https://github.com/colbymchenry/codegraph/issues/220).
 - **MCP / explore**: `codegraph_explore` source sections now carry line
   numbers (cat -n style `<num>\t<code>`, matching the Read tool). This lets
   the agent cite `file:line` straight from the explore payload instead of
@@ -80,6 +105,18 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   VS Code ~12%. Agent-trust floor still holds — the Relationships section,
   scored cluster selection, and structured-source output are all retained.
   Thanks to [@essopsp](https://github.com/essopsp) for the repro.
+- **Search ranking (Kotlin / Swift / Scala / C#)**: test files in these
+  languages are now correctly de-prioritized in `codegraph_search`,
+  `codegraph_context`, and `codegraph affected`. Detection previously only
+  recognized `snake_case`/`.test.`-style names plus a handful of Java
+  suffixes, so CamelCase test files (`FooTest.kt`, `BarTests.swift`,
+  `BazSpec.scala`, `QuxTestCase.cs`) and Gradle / Kotlin-Multiplatform /
+  Xcode test source-set directories (`jvmTest/`, `commonTest/`,
+  `androidTest/`, `iosTest/`, `integrationTest/`) were treated as production
+  code and could outrank the real implementation. Detection now matches
+  capital-led `*Test` / `*Tests` / `*Spec` / `*TestCase` filenames and
+  source-set directories — deliberately capital-led so lowercase look-alikes
+  like `latest.kt` and `manifest.kt` are not misclassified.
 
 ### Fixed
 - **MCP / explore**: `codegraph_explore` output is now hard-capped to its
@@ -224,6 +261,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
       returns `null` instead of resolving to an unrelated `rollback`
       in the same file.
 
+[0.8.0]: https://github.com/colbymchenry/codegraph/releases/tag/v0.8.0
 [0.7.10]: https://github.com/colbymchenry/codegraph/releases/tag/v0.7.10
 
 ## [0.7.8] - 2026-05-17

@@ -24,6 +24,8 @@ import { dartExtractor } from './dart';
 import { pascalExtractor } from './pascal';
 import { scalaExtractor } from './scala';
 import { elixirExtractor } from './elixir';
+import { luaExtractor } from './lua';
+import { luauExtractor } from './luau';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -45,4 +47,6 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   pascal: pascalExtractor,
   scala: scalaExtractor,
   elixir: elixirExtractor,
+  lua: luaExtractor,
+  luau: luauExtractor,
 };
