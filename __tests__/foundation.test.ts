@@ -10,7 +10,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { DEFAULT_CONFIG, Node, Edge } from '../src/types';
-import { loadConfig, saveConfig } from '../src/config';
+import { loadConfig, saveConfig, validateConfig } from '../src/config';
 import { isInitialized, getCodeGraphDir, validateDirectory } from '../src/directory';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
 
@@ -204,6 +204,26 @@ describe('CodeGraph Foundation', () => {
       // Verify persistence
       const config = loadConfig(tempDir);
       expect(config.maxFileSize).toBe(999999);
+    });
+
+    it('should accept every supported language in configuration', () => {
+      const config = {
+        ...DEFAULT_CONFIG,
+        rootDir: tempDir,
+        languages: ['php', 'tsx', 'vue', 'liquid', 'pascal', 'scala'],
+      };
+
+      expect(validateConfig(config)).toBe(true);
+    });
+
+    it('should reject unknown languages in configuration', () => {
+      const config = {
+        ...DEFAULT_CONFIG,
+        rootDir: tempDir,
+        languages: ['typescript', 'not-a-language'],
+      };
+
+      expect(validateConfig(config)).toBe(false);
     });
   });
 
