@@ -15,7 +15,7 @@ import {
   readFileSync,
   writeSync,
 } from 'fs';
-import { clamp, validatePathWithinRoot } from '../utils';
+import { clamp, validatePathWithinRoot, validateProjectPath } from '../utils';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -577,6 +577,12 @@ export class ToolHandler {
     // Check cache first (using original path as key)
     if (this.projectCache.has(projectPath)) {
       return this.projectCache.get(projectPath)!;
+    }
+
+    // Validate the path is safe before opening
+    const pathError = validateProjectPath(projectPath);
+    if (pathError) {
+      throw new Error(pathError);
     }
 
     // Walk up parent directories to find nearest .codegraph/
