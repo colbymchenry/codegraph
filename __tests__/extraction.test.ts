@@ -761,6 +761,55 @@ public class Calculator {
     expect(methodNode).toBeDefined();
     expect(methodNode?.isStatic).toBe(true);
   });
+
+  it('should emit MyBatis mapper XML references from interface methods', () => {
+    const code = `
+package com.example.mapper;
+
+public interface UserMapper {
+    User findById(String id);
+}
+`;
+    const result = extractFromSource('src/main/java/com/example/mapper/UserMapper.java', code);
+
+    const methodNode = result.nodes.find((n) => n.kind === 'method' && n.name === 'findById');
+    expect(methodNode).toBeDefined();
+
+    const mapperRef = result.unresolvedReferences.find(
+      (r) => r.fromNodeId === methodNode?.id && r.referenceName === 'com.example.mapper.UserMapper.findById'
+    );
+    expect(mapperRef).toMatchObject({
+      referenceKind: 'references',
+      language: 'java',
+    });
+  });
+});
+
+describe('MyBatis Mapper XML Extraction', () => {
+  it('should extract mapper SQL statements as Java method-like nodes', () => {
+    const xml = `
+<?xml version="1.0" encoding="UTF-8" ?>
+<mapper namespace="com.example.mapper.UserMapper">
+  <select id="findById" parameterType="string" resultType="User">
+    select * from users where id = #{id}
+  </select>
+  <update id="touch">
+    update users set updated_at = now()
+  </update>
+</mapper>
+`;
+    const result = extractFromSource('src/main/resources/mapper/UserMapper.xml', xml);
+
+    const statements = result.nodes.filter((n) => n.kind === 'method');
+    expect(statements.map((n) => n.name).sort()).toEqual(['findById', 'touch']);
+
+    const findById = statements.find((n) => n.name === 'findById');
+    expect(findById).toMatchObject({
+      language: 'java',
+      qualifiedName: 'com.example.mapper.UserMapper.findById',
+      signature: '<select id="findById" parameterType="string" resultType="User">',
+    });
+  });
 });
 
 describe('C# Extraction', () => {

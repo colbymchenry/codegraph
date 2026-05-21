@@ -23,6 +23,7 @@ import { LiquidExtractor } from './liquid-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
+import { MyBatisExtractor, looksLikeMyBatisMapper } from './mybatis-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -2514,6 +2515,19 @@ export function extractFromSource(
     // Use custom extractor for DFM/FMX form files
     const extractor = new DfmExtractor(filePath, source);
     result = extractor.extract();
+  } else if (fileExtension === '.xml') {
+    if (looksLikeMyBatisMapper(filePath, source)) {
+      const extractor = new MyBatisExtractor(filePath, source);
+      result = extractor.extract();
+    } else {
+      result = {
+        nodes: [],
+        edges: [],
+        unresolvedReferences: [],
+        errors: [],
+        durationMs: 0,
+      };
+    }
   } else {
     const extractor = new TreeSitterExtractor(filePath, source, detectedLanguage);
     result = extractor.extract();

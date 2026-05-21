@@ -180,6 +180,10 @@ export function getParser(language: Language): Parser | null {
  */
 export function detectLanguage(filePath: string, source?: string): Language {
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
+  if (ext === '.xml' && (filePath.endsWith('Mapper.xml') || !!source?.includes('<mapper'))) {
+    return 'java';
+  }
+
   const lang = EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C or C++ — check source content for C++ features

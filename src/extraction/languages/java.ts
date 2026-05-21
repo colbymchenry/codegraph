@@ -1,6 +1,6 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
-import type { LanguageExtractor } from '../tree-sitter-types';
+import { generateNodeId, getNodeText, getChildByField } from '../tree-sitter-helpers';
+import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 
 export const javaExtractor: LanguageExtractor = {
   functionTypes: [],
@@ -19,6 +19,12 @@ export const javaExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'type',
+  visitNode: (node, ctx) => {
+    if (node.type === 'method_declaration') {
+      addMyBatisMapperStatementRef(node, ctx);
+    }
+    return false;
+  },
   getSignature: (node, source) => {
     const params = getChildByField(node, 'parameters');
     const returnType = getChildByField(node, 'type');
@@ -57,3 +63,41 @@ export const javaExtractor: LanguageExtractor = {
     return null;
   },
 };
+
+function addMyBatisMapperStatementRef(node: SyntaxNode, ctx: ExtractorContext): void {
+  if (node.parent?.type !== 'interface_body') return;
+
+  const nameNode = getChildByField(node, 'name');
+  if (!nameNode) return;
+
+  const methodName = getNodeText(nameNode, ctx.source);
+  if (!methodName) return;
+
+  const owner = getCurrentInterfaceNode(ctx);
+  if (!owner) return;
+
+  const line = node.startPosition.row + 1;
+  const fromNodeId = generateNodeId(ctx.filePath, 'method', methodName, line);
+  const pkg = extractPackageName(ctx.source);
+  const mapperRef = pkg ? `${pkg}.${owner.name}.${methodName}` : `${owner.name}.${methodName}`;
+
+  ctx.addUnresolvedReference({
+    fromNodeId,
+    referenceName: mapperRef,
+    referenceKind: 'references',
+    line,
+    column: node.startPosition.column,
+    filePath: ctx.filePath,
+    language: 'java',
+  });
+}
+
+function getCurrentInterfaceNode(ctx: ExtractorContext) {
+  const currentId = ctx.nodeStack[ctx.nodeStack.length - 1];
+  return ctx.nodes.find((n) => n.id === currentId && n.kind === 'interface');
+}
+
+function extractPackageName(source: string): string | null {
+  const match = source.match(/^\s*package\s+([\w.]+)\s*;/m);
+  return match?.[1] ?? null;
+}

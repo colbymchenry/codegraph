@@ -404,6 +404,8 @@ export class ReferenceResolver {
       const receiver = name.substring(0, dotIdx);
       const member = name.substring(dotIdx + 1);
       if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      const lastMember = name.substring(name.lastIndexOf('.') + 1);
+      if (this.knownNames.has(lastMember)) return true;
       // Also check capitalized receiver (instance-method resolution)
       const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
       if (this.knownNames.has(capitalized)) return true;

@@ -509,6 +509,7 @@ export const DEFAULT_CONFIG: CodeGraphConfig = {
     '**/*.rs',
     // Java
     '**/*.java',
+    '**/*Mapper.xml',
     // C/C++
     '**/*.c',
     '**/*.h',

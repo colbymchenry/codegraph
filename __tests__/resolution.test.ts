@@ -645,6 +645,46 @@ def bootstrap():
       );
       expect(callsToUserService).toHaveLength(0);
     });
+
+    it('links Java mapper interface methods to MyBatis XML statements', async () => {
+      const javaDir = path.join(tempDir, 'src/main/java/com/example/mapper');
+      const xmlDir = path.join(tempDir, 'src/main/resources/mapper');
+      fs.mkdirSync(javaDir, { recursive: true });
+      fs.mkdirSync(xmlDir, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(javaDir, 'UserMapper.java'),
+        `package com.example.mapper;
+
+public interface UserMapper {
+    User findById(String id);
+}
+`
+      );
+
+      fs.writeFileSync(
+        path.join(xmlDir, 'UserMapper.xml'),
+        `<mapper namespace="com.example.mapper.UserMapper">
+  <select id="findById" parameterType="string" resultType="User">
+    select * from users where id = #{id}
+  </select>
+</mapper>
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const methods = cg.getNodesByKind('method').filter((n) => n.name === 'findById');
+      const javaMethod = methods.find((n) => n.filePath.endsWith('UserMapper.java'));
+      const xmlStatement = methods.find((n) => n.filePath.endsWith('UserMapper.xml'));
+
+      expect(javaMethod).toBeDefined();
+      expect(xmlStatement).toBeDefined();
+
+      const usages = cg.findUsages(xmlStatement!.id);
+      expect(usages.some((u) => u.node.id === javaMethod!.id && u.edge.kind === 'references')).toBe(true);
+    });
   });
 
   describe('Name Matcher: kind bias for new ref kinds', () => {
