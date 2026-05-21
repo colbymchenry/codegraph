@@ -30,13 +30,25 @@ function mkTmpDir(label: string): string {
 // `os.homedir()` reads first. Same trick the rest of the suite uses
 // when it needs a mock home.
 function setHome(dir: string): { restore: () => void } {
-  const prev = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  const prev = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    APPDATA: process.env.APPDATA,
+    XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+    HERMES_HOME: process.env.HERMES_HOME,
+  };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
+  process.env.APPDATA = path.join(dir, '.config');
+  process.env.XDG_CONFIG_HOME = path.join(dir, '.config');
+  delete process.env.HERMES_HOME;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
       if (prev.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prev.USERPROFILE;
+      if (prev.APPDATA === undefined) delete process.env.APPDATA; else process.env.APPDATA = prev.APPDATA;
+      if (prev.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prev.XDG_CONFIG_HOME;
+      if (prev.HERMES_HOME === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = prev.HERMES_HOME;
     },
   };
 }
@@ -297,10 +309,57 @@ describe('Installer targets — partial-state idempotency', () => {
   it('opencode: local install writes ./opencode.jsonc and ./AGENTS.md in cwd', () => {
     const opencode = getTarget('opencode')!;
     const result = opencode.install('local', { autoAllow: true });
-    const paths = result.files.map((f) => f.path);
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
     // macOS realpath shenanigans (/var vs /private/var) — suffix match.
     expect(paths.some((p) => p.endsWith('/opencode.jsonc'))).toBe(true);
     expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+  });
+
+  it('hermes: install adds codegraph MCP server and cli toolset, preserving existing yaml', () => {
+    const hermes = getTarget('hermes')!;
+    const config = path.join(tmpHome, '.hermes', 'config.yaml');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    fs.writeFileSync(config, [
+      'model:',
+      '  default: qwen-3.7',
+      'mcp_servers:',
+      '  other:',
+      '    command: other',
+      'platform_toolsets:',
+      '  cli:',
+      '    - hermes-cli',
+      '  discord:',
+      '    - hermes-discord',
+      '',
+    ].join('\n'));
+
+    const result = hermes.install('global', { autoAllow: true });
+    expect(result.files[0].action).toBe('updated');
+    const body = fs.readFileSync(config, 'utf-8');
+    expect(body).toContain('model:\n  default: qwen-3.7');
+    expect(body).toContain('mcp_servers:\n  other:\n    command: other');
+    expect(body).toContain('  codegraph:\n    command: codegraph');
+    expect(body).toContain('    - hermes-cli');
+    expect(body).toContain('    - mcp-codegraph');
+    expect(body).toContain('  discord:\n    - hermes-discord');
+
+    const second = hermes.install('global', { autoAllow: true });
+    expect(second.files[0].action).toBe('unchanged');
+  });
+
+  it('hermes: uninstall removes only codegraph MCP server and toolset entry', () => {
+    const hermes = getTarget('hermes')!;
+    const config = path.join(tmpHome, '.hermes', 'config.yaml');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+
+    hermes.install('global', { autoAllow: true });
+    fs.appendFileSync(config, 'custom:\n  keep: true\n');
+
+    hermes.uninstall('global');
+    const body = fs.readFileSync(config, 'utf-8');
+    expect(body).not.toContain('codegraph:');
+    expect(body).not.toContain('mcp-codegraph');
+    expect(body).toContain('custom:\n  keep: true');
   });
 
   it('opencode: uninstall removes only mcp.codegraph, preserves comments and siblings', () => {
@@ -357,7 +416,7 @@ describe('Installer targets — partial-state idempotency', () => {
     const claude = getTarget('claude')!;
     const result = claude.install('local', { autoAllow: false });
     // The MCP entry lands in ./.mcp.json — the file Claude Code reads.
-    expect(result.files.some((f) => f.path.endsWith('/.mcp.json'))).toBe(true);
+    expect(result.files.some((f) => f.path.replace(/\\/g, '/').endsWith('/.mcp.json'))).toBe(true);
     expect(fs.existsSync(path.join(tmpCwd, '.mcp.json'))).toBe(true);
     expect(fs.existsSync(path.join(tmpCwd, '.claude.json'))).toBe(false);
     const cfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
@@ -441,6 +500,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('cursor')?.id).toBe('cursor');
     expect(getTarget('codex')?.id).toBe('codex');
     expect(getTarget('opencode')?.id).toBe('opencode');
+    expect(getTarget('hermes')?.id).toBe('hermes');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
