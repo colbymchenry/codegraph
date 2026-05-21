@@ -7,7 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import picomatch from 'picomatch';
-import { CodeGraphConfig, DEFAULT_CONFIG, Language, NodeKind } from './types';
+import { CodeGraphConfig, DEFAULT_CONFIG, LANGUAGES, Language, NodeKind } from './types';
 import { normalizePath } from './utils';
 
 /**
@@ -72,18 +72,7 @@ export function validateConfig(config: unknown): config is CodeGraphConfig {
   if (!c.include.every((p) => typeof p === 'string')) return false;
   if (!c.exclude.every((p) => typeof p === 'string')) return false;
 
-  // Validate languages
-  const validLanguages: Language[] = [
-    'typescript',
-    'javascript',
-    'python',
-    'go',
-    'rust',
-    'java',
-    'svelte',
-    'unknown',
-  ];
-  if (!c.languages.every((l) => validLanguages.includes(l as Language))) return false;
+  if (!c.languages.every((l) => LANGUAGES.includes(l as Language))) return false;
 
   // Validate frameworks
   for (const fw of c.frameworks) {

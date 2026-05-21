@@ -9,8 +9,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { DEFAULT_CONFIG, Node, Edge } from '../src/types';
-import { loadConfig, saveConfig } from '../src/config';
+import { DEFAULT_CONFIG, LANGUAGES } from '../src/types';
+import { loadConfig, saveConfig, validateConfig } from '../src/config';
 import { isInitialized, getCodeGraphDir, validateDirectory } from '../src/directory';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
 
@@ -190,6 +190,28 @@ describe('CodeGraph Foundation', () => {
       const config = loadConfig(tempDir);
       expect(config.version).toBe(DEFAULT_CONFIG.version);
       expect(config.rootDir).toBe(path.resolve(tempDir));
+    });
+
+    it('should validate every supported language from the shared registry', () => {
+      for (const language of LANGUAGES) {
+        expect(
+          validateConfig({
+            ...DEFAULT_CONFIG,
+            rootDir: tempDir,
+            languages: [language],
+          })
+        ).toBe(true);
+      }
+    });
+
+    it('should reject unknown languages', () => {
+      expect(
+        validateConfig({
+          ...DEFAULT_CONFIG,
+          rootDir: tempDir,
+          languages: ['not-a-language'],
+        })
+      ).toBe(false);
     });
 
     it('should update configuration', () => {
