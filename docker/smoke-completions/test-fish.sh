@@ -30,9 +30,12 @@ assert_contains "top-level/init" "init" "$out"
 assert_contains "top-level/query" "query" "$out"
 assert_contains "top-level/completions" "completions" "$out"
 
-# 2. Subcommand flag completion.
+# 2. Subcommand flag completion — both per-sub options AND the
+#    --help/-h injected by the introspect layer.
 out=$(fish -c 'complete -C "codegraph init -"')
 assert_contains "init/--index" "--index" "$out"
+assert_contains "init/--help"  "--help"  "$out"
+assert_contains "init/-h"      "-h"      "$out"
 
 # 3. Value-hint: --path should trigger file completion. With files in
 #    cwd, fish lists them.

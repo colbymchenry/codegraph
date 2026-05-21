@@ -260,6 +260,103 @@ describe('completions/fish', () => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────
+// Help/version coverage — guards the introspect layer's behavior of
+// injecting --help/-h on every command (commander doesn't expose them
+// via .options) and only emitting --version once (commander's
+// .version() puts -V/--version on .options exactly once).
+// ─────────────────────────────────────────────────────────────────────
+
+describe('completions/help-version', () => {
+  // Count occurrences of an exact-match flag token in the emitter output.
+  // Looks for `--flag` either standalone, in option specs ('--flag'),
+  // or in CompletionResult literals — each emitter has its own format
+  // so we count distinct flag mentions rather than line counts.
+  const countFlag = (out: string, flag: string): number => {
+    // Match the flag bounded by non-flag characters or end-of-line.
+    // Excludes prefix-overlaps (e.g. --version vs --version-foo).
+    const re = new RegExp(`(?<![\\w-])${flag.replace('-', '\\-')}(?![\\w-])`, 'g');
+    return (out.match(re) || []).length;
+  };
+
+  it('zsh: --version appears (commander auto-registered, not duplicated)', () => {
+    const out = emit(buildProgram(), 'zsh');
+    // Zsh paired-spec emits --version twice in the `'(-V --version)'{-V,--version}'[…]'`
+    // syntax; that's intentional (it's one option spec). Hardcoded
+    // duplicate would have produced two separate _arguments lines.
+    expect(out).toMatch(/'\(-V --version\)'\{-V,--version\}/);
+    // Should be exactly one matching pair, not two.
+    expect((out.match(/'\(-V --version\)'/g) ?? []).length).toBe(1);
+  });
+
+  it('bash: --version appears once in the rootFlags list', () => {
+    const out = emit(buildProgram(), 'bash');
+    // The root-flag list is a single compgen -W "..." string; --version
+    // should appear once. Duplicates would show as two tokens.
+    const rootFlagsLine = out.match(/compgen -W "([^"]*)" -- "\$cur"/)?.[1] ?? '';
+    expect(rootFlagsLine.split(/\s+/).filter((f) => f === '--version').length).toBe(1);
+  });
+
+  it('fish: --version appears once (as -l version spec, not literal)', () => {
+    // Fish encodes flags via `-s X -l XX` rather than emitting the
+    // literal `--X`. One occurrence of `-l version` per command path.
+    const out = emit(buildProgram(), 'fish');
+    expect((out.match(/-l version\b/g) ?? []).length).toBe(1);
+  });
+
+  it('powershell: --version appears once in root switch arm', () => {
+    const out = emit(buildProgram(), 'powershell');
+    // PS emits each CompletionResult as `[CompletionResult]::new('--version', '--version', …)`
+    // — two text occurrences per emission. One emission = 2 matches.
+    expect(countFlag(out, '--version')).toBe(2);
+  });
+
+  it('zsh: --help spec appears on root + every subcommand', () => {
+    // Zsh emits `'(-h --help)'{-h,--help}'[…]'` per command via _arguments.
+    // Test program: root + 3 subs = 4 total.
+    const out = emit(buildProgram(), 'zsh');
+    expect((out.match(/'\(-h --help\)'\{-h,--help\}/g) ?? []).length).toBe(4);
+  });
+
+  it('bash: --help appears in every flag-completion compgen list', () => {
+    // Bash emits `compgen -W "<words>"` lists for both flag-completion
+    // (where words look like `-x --xx -h --help`) and subcommand-name
+    // completion (`init query affected a`). Only the flag lists need
+    // --help; capture and filter on the word-list content (a flag list
+    // is one where the first word starts with `-`).
+    const out = emit(buildProgram(), 'bash');
+    const wordLists: string[] = [];
+    const re = /compgen -W "([^"]*)" -- "\$cur"/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(out)) !== null) wordLists.push(m[1]);
+    const flagLists = wordLists.filter((w) => w.trim().startsWith('-'));
+    expect(flagLists.length).toBeGreaterThanOrEqual(4); // root flags + 3 subs
+    for (const list of flagLists) {
+      expect(list.split(/\s+/)).toContain('--help');
+    }
+  });
+
+  it('fish: -l help appears on root + every subcommand condition block', () => {
+    // Fish emits one `complete -c codegraph -n '<cond>' -s h -l help …`
+    // line per command path. Conditions can be `__fish_use_subcommand`
+    // (root) or `__fish_seen_subcommand_from <name1> [<name2> …]`
+    // (per-sub, possibly with aliases joined by spaces).
+    const out = emit(buildProgram(), 'fish');
+    expect((out.match(/-s h -l help\b/g) ?? []).length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('powershell: --help/-h appear in every switch arm', () => {
+    const out = emit(buildProgram(), 'powershell');
+    // Root arm + per-sub arms + per-alias arms. Each gets help injected.
+    const arms = out.match(/'codegraph(;[^']+)?' \{[\s\S]*?break\n        \}/g) ?? [];
+    expect(arms.length).toBeGreaterThanOrEqual(4);
+    for (const arm of arms) {
+      expect(arm).toContain("'--help'");
+      expect(arm).toContain("'-h'");
+    }
+  });
+});
+
 describe('completions/powershell', () => {
   const out = emit(buildProgram(), 'powershell');
 

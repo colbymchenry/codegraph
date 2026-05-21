@@ -47,15 +47,27 @@ Assert-Contains "top-level/completions" "completions" $names
 
 # 2. Top-level flags surface from the root switch arm.
 Assert-Contains "top-level/--help"    "--help"    $names
+Assert-Contains "top-level/-h"        "-h"        $names
 Assert-Contains "top-level/--version" "--version" $names
+Assert-Contains "top-level/-V"        "-V"        $names
 
-# 3. Subcommand flag completion.
+# 2a. --version exactly once — regression guard for the pre-cb2389e
+#     duplicate (commander's auto --version + a hardcoded one).
+$verCount = ($names | Where-Object { $_ -eq "--version" }).Count
+if ($verCount -ne 1) {
+    Write-Host "FAIL [powershell:--version-dedupe]: expected --version exactly once, got $verCount"
+    $script:fail = $true
+}
+
+# 3. Subcommand flag completion — per-sub flags AND injected help.
 $line = "codegraph init -"
 $r = TabExpansion2 -inputScript $line -cursorColumn $line.Length
 Assert-NonEmpty "init/-" $r
 $flags = $r.CompletionMatches.CompletionText
 Assert-Contains "init/--index" "--index" $flags
 Assert-Contains "init/-i"      "-i"      $flags
+Assert-Contains "init/--help"  "--help"  $flags
+Assert-Contains "init/-h"      "-h"      $flags
 
 if ($script:fail) { exit 1 } else { Write-Output "powershell smoke OK"; exit 0 }
 PSSCRIPT

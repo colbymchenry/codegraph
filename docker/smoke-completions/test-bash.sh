@@ -81,4 +81,20 @@ out=$(complete_line "codegraph -")
 assert_contains "top-level/--help" "--help" "$out"
 assert_contains "top-level/--version" "--version" "$out"
 
+# 5. --version must appear exactly once — regression guard for the
+#    pre-cb2389e bug where commander's auto-registered --version
+#    collided with a hardcoded --version in the emitter.
+ver_count=$(grep -cx -- "--version" <<<"$out" || true)
+if [[ "$ver_count" != "1" ]]; then
+  echo "FAIL [bash:--version-dedupe]: expected --version exactly once, got $ver_count" >&2
+  fail=1
+fi
+
+# 6. Subcommand --help / -h. Commander doesn't surface help in
+#    cmd.options; the introspect layer injects it. Regression guard
+#    so a future refactor doesn't drop it.
+out=$(complete_line "codegraph init -")
+assert_contains "init/--help" "--help" "$out"
+assert_contains "init/-h"     "-h"     "$out"
+
 exit $fail
