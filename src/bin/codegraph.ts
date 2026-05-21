@@ -1382,6 +1382,42 @@ program
     }
   });
 
+/**
+ * codegraph completions <shell> [--install]
+ */
+program
+  .command('completions <shell>')
+  .description('Generate shell completions (zsh, bash, fish)')
+  .option('--install', 'Install to the standard location for the shell')
+  .action(async (shellArg: string, options: { install?: boolean }) => {
+    const { parseShell, emit, installCompletions, SUPPORTED_SHELLS } = await import(
+      '../completions'
+    );
+    const shell = parseShell(shellArg);
+    if (!shell) {
+      error(
+        `Unsupported shell '${shellArg}'. Supported: ${SUPPORTED_SHELLS.join(', ')}.`,
+      );
+      process.exit(1);
+    }
+    const script = emit(program, shell);
+    if (options.install) {
+      try {
+        const { path: installedAt, postInstallHint } = installCompletions(shell, script);
+        success(`Installed ${shell} completions to ${installedAt}`);
+        if (postInstallHint) {
+          console.log('');
+          console.log(postInstallHint);
+        }
+      } catch (err) {
+        error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+    } else {
+      process.stdout.write(script);
+    }
+  });
+
 // Parse and run
 program.parse();
 

@@ -326,6 +326,7 @@ codegraph files [path]            # Show file structure (--format, --filter, --m
 codegraph context <task>          # Build context for AI (--format, --max-nodes)
 codegraph affected [files...]     # Find test files affected by changes (see below)
 codegraph serve --mcp             # Start MCP server
+codegraph completions <shell>     # Generate shell completions (see below)
 ```
 
 ### `codegraph affected`
@@ -355,6 +356,30 @@ if [ -n "$AFFECTED" ]; then
   npx vitest run $AFFECTED
 fi
 ```
+
+### `codegraph completions`
+
+Generate a static completion script for your shell. Supported shells: `zsh`, `bash`, `fish`.
+
+```bash
+codegraph completions zsh --install      # write to ~/.zsh/completions/_codegraph
+codegraph completions bash --install     # write to ~/.local/share/bash-completion/completions/codegraph
+codegraph completions fish --install     # write to ~/.config/fish/completions/codegraph.fish
+
+# Or pipe yourself:
+codegraph completions zsh > ~/.zsh/completions/_codegraph
+```
+
+**Zsh setup:** the install path must be on `$fpath` before `compinit`. Add to `~/.zshrc`:
+
+```bash
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
+```
+
+**Bash setup:** requires the `bash-completion` package (`brew install bash-completion@2` on macOS).
+
+**Fish setup:** no extra config — fish auto-discovers `~/.config/fish/completions/`.
 
 ---
 
