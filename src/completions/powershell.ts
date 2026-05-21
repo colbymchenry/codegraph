@@ -68,13 +68,10 @@ const switchCaseFor = (commandPath: string, cmd: CommandDesc, isRoot: boolean): 
   for (const opt of cmd.options) {
     lines.push(...optionResult(opt));
   }
-  // At the root, expose --help / --version always.
-  if (isRoot) {
-    lines.push(
-      `            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Show help')`,
-      `            [CompletionResult]::new('--version', '--version', [CompletionResultType]::ParameterName, 'Show version')`,
-    );
-  }
+  // --help / --version are now surfaced via the introspect layer
+  // (helpOption is injected; --version comes from .version() being
+  // registered as a regular option). No special-casing needed here.
+  void isRoot;
   return `        '${psEscape(commandPath)}' {
 ${lines.join('\n')}
             break

@@ -80,12 +80,26 @@ const describeArg = (arg: CommanderArgument): ArgDesc => ({
   hint: hintForName(arg.name()),
 });
 
+// Commander auto-registers `-h, --help` on every command but doesn't
+// expose it via `cmd.options` (it lives behind internal helpOption
+// machinery). Inject it explicitly so completion menus actually
+// include it — every other CLI's user expects --help on Tab.
+const helpOption: OptionDesc = {
+  short: '-h',
+  long: '--help',
+  flags: '-h, --help',
+  description: 'Display help for command',
+  takesValue: false,
+  valueHint: 'none',
+  negate: false,
+};
+
 export const describeCommand = (cmd: Command): CommandDesc => ({
   name: cmd.name(),
   aliases: cmd.aliases(),
   description: cmd.description(),
   // `registeredArguments` is commander 10+ — the project pins ^14, so safe.
   args: (cmd as Command & { registeredArguments: CommanderArgument[] }).registeredArguments.map(describeArg),
-  options: cmd.options.map(describeOption),
+  options: [...cmd.options.map(describeOption), helpOption],
   subcommands: cmd.commands.map(describeCommand),
 });

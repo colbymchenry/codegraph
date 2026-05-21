@@ -99,7 +99,7 @@ _codegraph() {
 
   if [[ -z "$sub" ]]; then
     if [[ "$cur" == -* ]]; then
-      COMPREPLY=( $(compgen -W "${rootFlags} --help --version" -- "$cur") )
+      COMPREPLY=( $(compgen -W "${rootFlags}" -- "$cur") )
     else
       COMPREPLY=( $(compgen -W "${subNames}" -- "$cur") )
     fi
