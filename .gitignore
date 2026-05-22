@@ -50,3 +50,6 @@ test-languages/
 
 nul
 release/
+
+# Ignore cursor rules
+.cursor/
