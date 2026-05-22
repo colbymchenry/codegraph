@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference } from './name-matcher';
-import { resolveViaImport, extractImportMappings, extractReExports } from './import-resolver';
+import { resolveViaImport, extractImportMappings, extractReExports, resolveImportPath } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { logDebug } from '../errors';
@@ -453,13 +453,38 @@ export class ReferenceResolver {
       return null;
     }
 
+    // Special resolution for file-level imports (e.g. Nix, Liquid)
+    if (ref.referenceKind === 'imports') {
+      const resolvedPath = resolveImportPath(
+        ref.referenceName,
+        ref.filePath,
+        ref.language,
+        this.context
+      );
+      if (resolvedPath) {
+        const targetNodeId = `file:${resolvedPath}`;
+        if (this.context.fileExists(resolvedPath)) {
+          return {
+            original: ref,
+            targetNodeId,
+            confidence: 0.95,
+            resolvedBy: 'file-path',
+          };
+        }
+      }
+    }
+
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
     // from './barrel'` where the barrel has `export { signIn as login }
     // from './auth'`) intentionally call a name that has no
     // declaration anywhere — only the renamed upstream symbol does.
-    if (!this.hasAnyPossibleMatch(ref.referenceName) && !this.matchesAnyImport(ref)) {
+    if (
+      ref.referenceKind !== 'imports' &&
+      !this.hasAnyPossibleMatch(ref.referenceName) &&
+      !this.matchesAnyImport(ref)
+    ) {
       return null;
     }
 

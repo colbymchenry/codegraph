@@ -3895,3 +3895,170 @@ local count = 0
     });
   });
 });
+
+// =============================================================================
+// Nix Extraction
+// =============================================================================
+
+describe('Nix Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Nix files', () => {
+      expect(detectLanguage('default.nix')).toBe('nix');
+      expect(detectLanguage('pkgs/development/tools/misc/codegraph/default.nix')).toBe('nix');
+    });
+
+    it('should report Nix as supported', () => {
+      expect(isLanguageSupported('nix')).toBe(true);
+      expect(getSupportedLanguages()).toContain('nix');
+    });
+  });
+
+  describe('Variables and Functions', () => {
+    it('should extract variables and functions from bindings', () => {
+      const code = `
+        let
+          x = 10;
+          y = arg: arg + 1;
+          z = { name }: "Hello " + name;
+        in
+        {
+          a = x;
+          b = y;
+        }
+      `;
+      const result = extractFromSource('test.nix', code);
+
+      const variables = result.nodes.filter(n => n.kind === 'variable').map(n => n.name);
+      const functions = result.nodes.filter(n => n.kind === 'function').map(n => n.name);
+
+      expect(variables).toContain('x');
+      expect(variables).toContain('a');
+      expect(variables).toContain('b');
+
+      expect(functions).toContain('y');
+      expect(functions).toContain('z');
+
+      const yFunc = result.nodes.find(n => n.name === 'y');
+      expect(yFunc?.signature).toBe('(arg)');
+
+      const zFunc = result.nodes.find(n => n.name === 'z');
+      expect(zFunc?.signature).toBe('{ name }');
+    });
+
+    it('should handle curried functions and destructuring patterns', () => {
+      const code = `
+        let
+          curried = a: b: c: a + b + c;
+          destruct = { x, y } @ args: someCall x y;
+          destructPrefix = args @ { x, y }: otherCall x y;
+        in
+        {
+          f1 = curried;
+          f2 = destruct;
+          f3 = destructPrefix;
+        }
+      `;
+      const result = extractFromSource('test.nix', code);
+
+      const functions = result.nodes.filter(n => n.kind === 'function').map(n => n.name);
+      expect(functions).toContain('curried');
+      expect(functions).toContain('destruct');
+      expect(functions).toContain('destructPrefix');
+
+      const curriedFunc = result.nodes.find(n => n.name === 'curried');
+      expect(curriedFunc?.signature).toBe('a : b : c');
+
+      const destructFunc = result.nodes.find(n => n.name === 'destruct');
+      expect(destructFunc?.signature).toBe('{ x, y } @ args');
+
+      const destructPrefixFunc = result.nodes.find(n => n.name === 'destructPrefix');
+      expect(destructPrefixFunc?.signature).toBe('args @ { x, y }');
+
+      // Verify that call references inside destructured functions are correctly extracted
+      // because we traversed their bodies (last named child) rather than mistaking 'args' or '{ x, y }' as the body.
+      const calls = result.unresolvedReferences.filter(r => r.referenceKind === 'calls').map(r => r.referenceName);
+      expect(calls).toContain('someCall');
+      expect(calls).toContain('otherCall');
+    });
+  });
+
+  describe('Inherits', () => {
+    it('should extract inherited attributes as variables', () => {
+      const code = `
+        let
+          inherit (pkgs) lib stdenv;
+          inherit writeShellScriptBin;
+        in
+        stdenv.mkDerivation {}
+      `;
+      const result = extractFromSource('test.nix', code);
+
+      const variables = result.nodes.filter(n => n.kind === 'variable').map(n => n.name);
+
+      expect(variables).toContain('lib');
+      expect(variables).toContain('stdenv');
+      expect(variables).toContain('writeShellScriptBin');
+    });
+  });
+
+  describe('Imports and Calls', () => {
+    it('should extract import statements and function calls', () => {
+      const code = `
+        let
+          pkgs = import <nixpkgs> {};
+          myLib = import ./lib.nix;
+          someVal = pkgs.lib.mkIf true "val";
+          curried = map (x: x + 1) [ 1 2 3 ];
+        in
+        someVal
+      `;
+      const result = extractFromSource('test.nix', code);
+
+      const imports = result.nodes.filter(n => n.kind === 'import').map(n => n.name);
+      expect(imports).toContain('<nixpkgs>');
+      expect(imports).toContain('./lib.nix');
+
+      const callRefs = result.unresolvedReferences.filter(r => r.referenceKind === 'calls').map(r => r.referenceName);
+      expect(callRefs).toContain('pkgs.lib.mkIf');
+      expect(callRefs).toContain('map');
+
+      const importRefs = result.unresolvedReferences.filter(r => r.referenceKind === 'imports').map(r => r.referenceName);
+      expect(importRefs).toContain('<nixpkgs>');
+      expect(importRefs).toContain('./lib.nix');
+    });
+  });
+
+  describe('Exports and Scopes', () => {
+    it('should identify top-level attributes as exported and let-bindings/nested attributes as private', () => {
+      const code = `
+        let
+          localVal = 10;
+        in
+        {
+          exportedVal = localVal;
+          exportedFunc = x: x + 1;
+          nestedAttr = {
+            privateVal = 20;
+          };
+          inherit (pkgs) exportedInherit;
+        }
+      `;
+      const result = extractFromSource('test.nix', code);
+
+      const localVal = result.nodes.find(n => n.name === 'localVal');
+      expect(localVal?.isExported).toBe(false);
+
+      const exportedVal = result.nodes.find(n => n.name === 'exportedVal');
+      expect(exportedVal?.isExported).toBe(true);
+
+      const exportedFunc = result.nodes.find(n => n.name === 'exportedFunc');
+      expect(exportedFunc?.isExported).toBe(true);
+
+      const privateVal = result.nodes.find(n => n.name === 'privateVal');
+      expect(privateVal?.isExported).toBe(false);
+
+      const exportedInherit = result.nodes.find(n => n.name === 'exportedInherit');
+      expect(exportedInherit?.isExported).toBe(true);
+    });
+  });
+});

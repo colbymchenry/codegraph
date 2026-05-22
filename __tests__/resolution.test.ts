@@ -846,4 +846,52 @@ def bootstrap():
       expect(callers.some((c) => c.node.filePath === 'src/main.ts')).toBe(true);
     });
   });
+
+  describe('Nix Import Path Resolution', () => {
+    it('resolves relative Nix imports to file nodes', async () => {
+      // Create a Nix project layout
+      const coreDir = path.join(tempDir, 'core');
+      const dataDir = path.join(tempDir, 'data');
+      fs.mkdirSync(coreDir, { recursive: true });
+      fs.mkdirSync(dataDir, { recursive: true });
+
+      // Create core/ports.nix
+      fs.writeFileSync(
+        path.join(coreDir, 'ports.nix'),
+        `{
+          http = 80;
+          https = 443;
+        }`
+      );
+
+      // Create data/postgresql.nix that imports core/ports.nix
+      fs.writeFileSync(
+        path.join(dataDir, 'postgresql.nix'),
+        `let
+          ports = import ../core/ports.nix;
+        in
+        {
+          port = ports.https;
+        }`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      // Find the file node for postgresql.nix
+      const postgresqlFileNode = cg.getNodesByKind('file').find((n) => n.filePath === 'data/postgresql.nix');
+      expect(postgresqlFileNode).toBeDefined();
+
+      // Find outgoing edges from postgresql.nix
+      // (The import expression inside data/postgresql.nix is contained by the file, so it should resolve to core/ports.nix file node)
+      const outgoing = cg.getOutgoingEdges(postgresqlFileNode!.id);
+      const importEdge = outgoing.find((e) => e.kind === 'imports');
+      expect(importEdge).toBeDefined();
+
+      const targetNode = cg.getNodesByKind('file').find((n) => n.id === importEdge!.target);
+      expect(targetNode).toBeDefined();
+      expect(targetNode?.kind).toBe('file');
+      expect(targetNode?.filePath).toBe('core/ports.nix');
+    });
+  });
 });

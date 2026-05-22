@@ -89,6 +89,7 @@ export const LANGUAGES = [
   'luau',
   'yaml',
   'twig',
+  'nix',
   'unknown',
 ] as const;
 
