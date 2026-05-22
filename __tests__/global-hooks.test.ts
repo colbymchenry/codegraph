@@ -202,6 +202,15 @@ describe('removeGlobalAutoInitHook', () => {
     expect(result.reason).toBeDefined();
   });
 
+  it('G15b: returns skipped when hook file exists but contains no codegraph block', () => {
+    fs.writeFileSync(hookFile(), '#!/bin/sh\necho "user hook"\n', { mode: 0o755 });
+    const result = removeGlobalAutoInitHook();
+    expect(result.status).toBe('skipped');
+    expect(result.reason).toBeDefined();
+    // File must be preserved untouched
+    expect(fs.readFileSync(hookFile(), 'utf8')).toContain('echo "user hook"');
+  });
+
   it('G16: does not modify git config init.templateDir during remove', () => {
     installGlobalAutoInitHook();
     const before = execFileSync('git', ['config', '--global', 'init.templateDir'], {
