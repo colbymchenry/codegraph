@@ -21,6 +21,8 @@ function autoInitBlock(): string {
     MARKER_BEGIN,
     '# Auto-initializes CodeGraph in newly cloned repos.',
     '# Managed by codegraph; remove with: codegraph auto-init-repos --remove',
+    '# $3 is 1 for branch checkout, 0 for file checkout — skip file-level checkouts',
+    '[ "$3" = "1" ] || exit 0',
     'if command -v codegraph >/dev/null 2>&1; then',
     '  if [ ! -d .codegraph ]; then',
     '    codegraph init . >/dev/null 2>&1',
@@ -67,7 +69,9 @@ export function resolveTemplateDir(opts: { writeConfig?: boolean } = {}): {
     }
   }
 
-  fs.mkdirSync(path.join(dir, 'hooks'), { recursive: true });
+  if (writeConfig) {
+    fs.mkdirSync(path.join(dir, 'hooks'), { recursive: true });
+  }
   return { dir, configWasSet };
 }
 
@@ -90,7 +94,7 @@ export function installGlobalAutoInitHook(): GlobalHookResult {
       ? `${stripped}\n\n${block}\n`
       : `#!/bin/sh\n${block}\n`;
 
-    if (existing === newContent) {
+    if (existing.replace(/\s*$/, '') === newContent.replace(/\s*$/, '')) {
       return { templateDir, status: 'unchanged', configWasSet };
     }
 

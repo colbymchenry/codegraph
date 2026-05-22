@@ -126,6 +126,11 @@ describe('installGlobalAutoInitHook', () => {
     );
   });
 
+  it('G8b: hook script skips file-level checkouts via $3 guard', () => {
+    installGlobalAutoInitHook();
+    expect(fs.readFileSync(hookFile(), 'utf8')).toContain('[ "$3" = "1" ] || exit 0');
+  });
+
   it('G9: re-running install does not duplicate the marker block', () => {
     installGlobalAutoInitHook();
     installGlobalAutoInitHook();
