@@ -31,7 +31,10 @@ try {
   if (isWindows) {
     command = require.resolve(pkg + '/node.exe');
     var entry = require.resolve(pkg + '/lib/dist/bin/codegraph.js');
-    args = [entry].concat(process.argv.slice(2));
+    // --liftoff-only: keep tree-sitter's WASM grammars off V8's turboshaft tier
+    // to avoid the Zone OOM on Node >= 22 (issues #293/#298). The unix launcher
+    // passes this too; on Windows we invoke node.exe directly so add it here.
+    args = ['--liftoff-only', entry].concat(process.argv.slice(2));
   } else {
     command = require.resolve(pkg + '/bin/codegraph');
     args = process.argv.slice(2);

@@ -27,6 +27,7 @@ import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
+import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -74,6 +75,13 @@ if (nodeMajor < MIN_NODE_MAJOR) {
   }
   // Override active — banner shown for visibility, continuing.
 }
+
+// Re-exec with V8's `--liftoff-only` if it isn't already set, so tree-sitter's
+// large WASM grammars never hit the turboshaft Zone OOM (`Fatal process out of
+// memory: Zone`) on Node >= 22. No-op under the bundled launcher, which already
+// passes the flag. Must run before any grammar (in the parse worker, which
+// inherits this process's flags) is compiled. See ../extraction/wasm-runtime-flags.
+relaunchWithWasmRuntimeFlagsIfNeeded(__filename);
 
 // Check if running with no arguments - run installer
 if (process.argv.length === 2) {
