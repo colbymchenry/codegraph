@@ -239,6 +239,20 @@ describe('MCP Input Validation', () => {
     expect(result.content[0].text).toContain('non-empty string');
   });
 
+  it('should truncate oversized codegraph_context output', async () => {
+    const oversizedContext = Array.from({ length: 400 }, (_, i) => `line-${i} ${'x'.repeat(80)}`).join('\n');
+    const fakeCg = {
+      buildContext: async () => oversizedContext,
+    };
+    const fakeHandler = new ToolHandler(fakeCg as unknown as CodeGraph);
+
+    const result = await fakeHandler.execute('codegraph_context', { task: 'find example' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text.length).toBeLessThan(oversizedContext.length);
+    expect(result.content[0].text).toContain('... (output truncated)');
+  });
+
   it('should reject non-string symbol in codegraph_impact', async () => {
     const result = await handler.execute('codegraph_impact', { symbol: [] });
     expect(result.isError).toBe(true);

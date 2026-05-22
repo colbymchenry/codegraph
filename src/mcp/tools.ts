@@ -706,11 +706,11 @@ export class ToolHandler {
 
     // buildContext returns string when format is 'markdown'
     if (typeof context === 'string') {
-      return this.textResult(context + reminder);
+      return this.textResult(this.truncateOutput(context + reminder));
     }
 
     // If it returns TaskContext, format it
-    return this.textResult(this.formatTaskContext(context) + reminder);
+    return this.textResult(this.truncateOutput(this.formatTaskContext(context) + reminder));
   }
 
   /**
