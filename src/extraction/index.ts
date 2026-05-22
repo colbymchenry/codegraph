@@ -14,14 +14,13 @@ import {
   FileRecord,
   ExtractionResult,
   ExtractionError,
-  CodeGraphConfig,
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
-import { detectLanguage, isLanguageSupported, initGrammars, loadGrammarsForLanguages } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, initGrammars, loadGrammarsForLanguages } from './grammars';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
-import picomatch from 'picomatch';
+import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
 
@@ -94,41 +93,67 @@ export function hashContent(content: string): string {
 }
 
 /**
- * Check if a path matches any glob pattern (simplified)
+ * Skip files larger than this (bytes). Generated bundles, minified JS, and
+ * vendored blobs blow the WASM heap and the worker-recycle budget for no useful
+ * symbols. 1 MB covers essentially all hand-written source.
  */
-function matchesGlob(filePath: string, pattern: string): boolean {
-  filePath = normalizePath(filePath);
-  return picomatch.isMatch(filePath, pattern, { dot: true });
-}
+const MAX_FILE_SIZE = 1024 * 1024;
 
 /**
- * Check if a file should be included based on config
+ * Collect git-visible files (tracked + untracked, .gitignore-respected) from the
+ * git repository rooted at `repoDir`, adding each to `files` with `prefix`
+ * prepended so paths stay relative to the original scan root.
+ *
+ * Recurses into embedded git repositories — nested repos that are NOT submodules
+ * (independent clones living inside the workspace, common in CMake "super-repo"
+ * layouts). The parent repo's `git ls-files` cannot see into them: tracked output
+ * skips them entirely, and untracked output reports them only as an opaque
+ * "subdir/" entry (trailing slash) rather than expanding their files. Each
+ * embedded repo is its own git boundary, so we re-run `git ls-files` inside it.
+ * (See issue #193.)
  */
-export function shouldIncludeFile(
-  filePath: string,
-  config: CodeGraphConfig
-): boolean {
-  // Check exclude patterns first
-  for (const pattern of config.exclude) {
-    if (matchesGlob(filePath, pattern)) {
-      return false;
+function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): void {
+  const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'] };
+
+  // Tracked files. --recurse-submodules pulls in files from active submodules,
+  // which the index would otherwise represent only as a commit pointer.
+  // Without this, monorepos using submodules index 0 files. (See issue #147.)
+  // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
+  // can't be combined with -o, so untracked files are gathered separately below.
+  const tracked = execFileSync('git', ['ls-files', '-c', '--recurse-submodules'], gitOpts);
+  for (const line of tracked.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed) {
+      files.add(normalizePath(prefix + trimmed));
     }
   }
 
-  // Check include patterns
-  for (const pattern of config.include) {
-    if (matchesGlob(filePath, pattern)) {
-      return true;
+  // Untracked files (submodules manage their own untracked state). Embedded git
+  // repos surface here as a single "subdir/" entry that git refuses to descend
+  // into — recurse into those as their own repos so their source gets indexed.
+  const untracked = execFileSync('git', ['ls-files', '-o', '--exclude-standard'], gitOpts);
+  for (const line of untracked.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.endsWith('/')) {
+      // git only emits a trailing-slash directory entry for an embedded repo.
+      // Guard with a .git check anyway, and skip anything else exactly as git
+      // itself skips it (we never descend into a non-repo opaque dir).
+      const childDir = path.join(repoDir, trimmed);
+      if (fs.existsSync(path.join(childDir, '.git'))) {
+        collectGitFiles(childDir, prefix + trimmed, files);
+      }
+      continue;
     }
+    files.add(normalizePath(prefix + trimmed));
   }
-
-  return false;
 }
 
 /**
  * Get all files visible to git (tracked + untracked but not ignored).
- * Respects .gitignore at all levels (root, subdirectories).
- * Returns null on failure (non-git project) so callers can fall back.
+ * Respects .gitignore at all levels (root, subdirectories) and descends into
+ * embedded (nested, non-submodule) git repos. Returns null on failure
+ * (non-git project) so callers can fall back to a filesystem walk.
  */
 function getGitVisibleFiles(rootDir: string): Set<string> | null {
   try {
@@ -157,30 +182,7 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     }
 
     const files = new Set<string>();
-    const gitOpts = { cwd: rootDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'] };
-
-    // Tracked files. --recurse-submodules pulls in files from active submodules,
-    // which the main repo's index would otherwise represent only as a commit pointer.
-    // Without this, monorepos using submodules index 0 files. (See issue #147.)
-    // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
-    // can't be combined with -o, so untracked files are gathered separately below.
-    const tracked = execFileSync('git', ['ls-files', '-c', '--recurse-submodules'], gitOpts);
-    for (const line of tracked.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed) {
-        files.add(normalizePath(trimmed));
-      }
-    }
-
-    // Untracked files in the main repo (submodules manage their own untracked state).
-    const untracked = execFileSync('git', ['ls-files', '-o', '--exclude-standard'], gitOpts);
-    for (const line of untracked.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed) {
-        files.add(normalizePath(trimmed));
-      }
-    }
-
+    collectGitFiles(rootDir, '', files);
     return files;
   } catch {
     return null;
@@ -202,7 +204,7 @@ interface GitChanges {
  * Use `git status` to detect changed files instead of scanning every file.
  * Returns null on failure so callers fall back to full scan.
  */
-function getGitChangedFiles(rootDir: string, config: CodeGraphConfig): GitChanges | null {
+function getGitChangedFiles(rootDir: string): GitChanges | null {
   try {
     const output = execFileSync(
       'git',
@@ -220,8 +222,8 @@ function getGitChangedFiles(rootDir: string, config: CodeGraphConfig): GitChange
       const statusCode = line.substring(0, 2);
       const filePath = normalizePath(line.substring(3));
 
-      // Skip files that don't match include/exclude config
-      if (!shouldIncludeFile(filePath, config)) continue;
+      // Skip non-source files (git status already omits .gitignored paths).
+      if (!isSourceFile(filePath)) continue;
 
       if (statusCode === '??') {
         added.push(filePath);
@@ -240,20 +242,14 @@ function getGitChangedFiles(rootDir: string, config: CodeGraphConfig): GitChange
 }
 
 /**
- * Marker file name that indicates a directory (and all children) should be skipped
- */
-const CODEGRAPH_IGNORE_MARKER = '.codegraphignore';
-
-/**
- * Recursively scan directory for source files.
+ * Recursively scan a directory for source files.
  *
- * In git repos, uses `git ls-files` to get the file list (inherently
- * respects .gitignore at all levels), then filters by config include patterns.
- * Falls back to filesystem walk for non-git projects.
+ * In git repos, uses `git ls-files` (inherently respects .gitignore at all
+ * levels), then keeps files with a supported source extension. For non-git
+ * projects, falls back to a filesystem walk that parses .gitignore itself.
  */
 export function scanDirectory(
   rootDir: string,
-  config: CodeGraphConfig,
   onProgress?: (current: number, file: string) => void
 ): string[] {
   // Fast path: use git to get all visible files (respects .gitignore everywhere)
@@ -262,7 +258,7 @@ export function scanDirectory(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (shouldIncludeFile(filePath, config)) {
+      if (isSourceFile(filePath)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -272,7 +268,7 @@ export function scanDirectory(
   }
 
   // Fallback: walk filesystem for non-git projects
-  return scanDirectoryWalk(rootDir, config, onProgress);
+  return scanDirectoryWalk(rootDir, onProgress);
 }
 
 /**
@@ -281,7 +277,6 @@ export function scanDirectory(
  */
 export async function scanDirectoryAsync(
   rootDir: string,
-  config: CodeGraphConfig,
   onProgress?: (current: number, file: string) => void
 ): Promise<string[]> {
   const gitFiles = getGitVisibleFiles(rootDir);
@@ -289,7 +284,7 @@ export async function scanDirectoryAsync(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (shouldIncludeFile(filePath, config)) {
+      if (isSourceFile(filePath)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -302,7 +297,7 @@ export async function scanDirectoryAsync(
     return files;
   }
 
-  return scanDirectoryWalk(rootDir, config, onProgress);
+  return scanDirectoryWalk(rootDir, onProgress);
 }
 
 /**
@@ -310,14 +305,44 @@ export async function scanDirectoryAsync(
  */
 function scanDirectoryWalk(
   rootDir: string,
-  config: CodeGraphConfig,
   onProgress?: (current: number, file: string) => void
 ): string[] {
   const files: string[] = [];
   let count = 0;
   const visitedDirs = new Set<string>();
 
-  function walk(dir: string): void {
+  // A .gitignore matcher scoped to the directory that declared it. Patterns in
+  // a nested .gitignore are relative to that directory, so we keep the dir
+  // alongside the matcher and test paths relative to it — mirroring how git
+  // applies .gitignore files at every level.
+  interface ScopedIgnore {
+    dir: string;
+    ig: Ignore;
+  }
+
+  const loadIgnore = (dir: string): ScopedIgnore | null => {
+    try {
+      const giPath = path.join(dir, '.gitignore');
+      if (fs.existsSync(giPath)) {
+        return { dir, ig: ignore().add(fs.readFileSync(giPath, 'utf-8')) };
+      }
+    } catch {
+      // Unreadable .gitignore — treat as absent.
+    }
+    return null;
+  };
+
+  const isIgnored = (fullPath: string, isDir: boolean, matchers: ScopedIgnore[]): boolean => {
+    for (const { dir, ig } of matchers) {
+      let rel = normalizePath(path.relative(dir, fullPath));
+      if (!rel || rel.startsWith('..')) continue; // not under this matcher's dir
+      if (isDir) rel += '/'; // dir-only rules (e.g. `build/`) only match with the slash
+      if (ig.ignores(rel)) return true;
+    }
+    return false;
+  };
+
+  function walk(dir: string, matchers: ScopedIgnore[]): void {
     let realDir: string;
     try {
       realDir = fs.realpathSync(dir);
@@ -332,12 +357,9 @@ function scanDirectoryWalk(
     }
     visitedDirs.add(realDir);
 
-    // Check for .codegraphignore marker file
-    const ignoreMarker = path.join(dir, CODEGRAPH_IGNORE_MARKER);
-    if (fs.existsSync(ignoreMarker)) {
-      logDebug('Skipping directory due to .codegraphignore marker', { dir });
-      return;
-    }
+    // This directory's own .gitignore (if present) applies to everything below it.
+    const own = loadIgnore(dir);
+    const active = own ? [...matchers, own] : matchers;
 
     let entries: fs.Dirent[];
     try {
@@ -348,6 +370,9 @@ function scanDirectoryWalk(
     }
 
     for (const entry of entries) {
+      // Never descend into git internals or our own data directory.
+      if (entry.name === '.git' || entry.name === '.codegraph') continue;
+
       const fullPath = path.join(dir, entry.name);
       const relativePath = normalizePath(path.relative(rootDir, fullPath));
 
@@ -356,19 +381,11 @@ function scanDirectoryWalk(
           const realTarget = fs.realpathSync(fullPath);
           const stat = fs.statSync(realTarget);
           if (stat.isDirectory()) {
-            const dirPattern = relativePath + '/';
-            let excluded = false;
-            for (const pattern of config.exclude) {
-              if (matchesGlob(dirPattern, pattern) || matchesGlob(relativePath, pattern)) {
-                excluded = true;
-                break;
-              }
-            }
-            if (!excluded) {
-              walk(fullPath);
+            if (!isIgnored(fullPath, true, active)) {
+              walk(fullPath, active);
             }
           } else if (stat.isFile()) {
-            if (shouldIncludeFile(relativePath, config)) {
+            if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath)) {
               files.push(relativePath);
               count++;
               onProgress?.(count, relativePath);
@@ -381,19 +398,11 @@ function scanDirectoryWalk(
       }
 
       if (entry.isDirectory()) {
-        const dirPattern = relativePath + '/';
-        let excluded = false;
-        for (const pattern of config.exclude) {
-          if (matchesGlob(dirPattern, pattern) || matchesGlob(relativePath, pattern)) {
-            excluded = true;
-            break;
-          }
-        }
-        if (!excluded) {
-          walk(fullPath);
+        if (!isIgnored(fullPath, true, active)) {
+          walk(fullPath, active);
         }
       } else if (entry.isFile()) {
-        if (shouldIncludeFile(relativePath, config)) {
+        if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath)) {
           files.push(relativePath);
           count++;
           onProgress?.(count, relativePath);
@@ -402,7 +411,7 @@ function scanDirectoryWalk(
     }
   }
 
-  walk(rootDir);
+  walk(rootDir, []);
   return files;
 }
 
@@ -411,7 +420,6 @@ function scanDirectoryWalk(
  */
 export class ExtractionOrchestrator {
   private rootDir: string;
-  private config: CodeGraphConfig;
   private queries: QueryBuilder;
   /**
    * Names of frameworks detected for this project, populated by indexAll().
@@ -421,9 +429,8 @@ export class ExtractionOrchestrator {
    */
   private detectedFrameworkNames: string[] | null = null;
 
-  constructor(rootDir: string, config: CodeGraphConfig, queries: QueryBuilder) {
+  constructor(rootDir: string, queries: QueryBuilder) {
     this.rootDir = rootDir;
-    this.config = config;
     this.queries = queries;
   }
 
@@ -472,7 +479,7 @@ export class ExtractionOrchestrator {
    */
   private ensureDetectedFrameworks(files?: string[]): string[] {
     if (this.detectedFrameworkNames !== null) return this.detectedFrameworkNames;
-    const fileList = files ?? scanDirectory(this.rootDir, this.config);
+    const fileList = files ?? scanDirectory(this.rootDir);
     const context = this.buildDetectionContext(fileList);
     this.detectedFrameworkNames = detectFrameworks(context).map((r) => r.name);
     return this.detectedFrameworkNames;
@@ -506,7 +513,7 @@ export class ExtractionOrchestrator {
       total: 0,
     });
 
-    const files = await scanDirectoryAsync(this.rootDir, this.config, (current, file) => {
+    const files = await scanDirectoryAsync(this.rootDir, (current, file) => {
       onProgress?.({
         phase: 'scanning',
         current,
@@ -774,18 +781,16 @@ export class ExtractionOrchestrator {
           continue;
         }
 
-        // Honour config.maxFileSize. Without this check, vendored
-        // generated headers, minified bundles, and other multi-MB
-        // files get indexed despite the user setting a size cap —
-        // wasting WASM heap and the worker recycle budget on inputs
-        // the user explicitly opted out of. The single-file extractFile
-        // path already enforces this; the bulk path used to silently
-        // skip the check.
-        if (stats.size > this.config.maxFileSize) {
+        // Honour MAX_FILE_SIZE. Without this check, vendored generated
+        // headers, minified bundles, and other multi-MB files get indexed,
+        // wasting WASM heap and the worker recycle budget on inputs with no
+        // useful symbols. The single-file extractFile path already enforces
+        // this; the bulk path used to silently skip the check.
+        if (stats.size > MAX_FILE_SIZE) {
           processed++;
           filesSkipped++;
           errors.push({
-            message: `File exceeds max size (${stats.size} > ${this.config.maxFileSize})`,
+            message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
             filePath,
             severity: 'warning',
             code: 'size_exceeded',
@@ -1080,14 +1085,14 @@ export class ExtractionOrchestrator {
     }
 
     // Check file size
-    if (stats.size > this.config.maxFileSize) {
+    if (stats.size > MAX_FILE_SIZE) {
       return {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
         errors: [
           {
-            message: `File exceeds max size (${stats.size} > ${this.config.maxFileSize})`,
+            message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
             filePath: relativePath,
             severity: 'warning',
             code: 'size_exceeded',
@@ -1217,7 +1222,7 @@ export class ExtractionOrchestrator {
     });
 
     const filesToIndex: string[] = [];
-    const gitChanges = getGitChangedFiles(this.rootDir, this.config);
+    const gitChanges = getGitChangedFiles(this.rootDir);
 
     if (gitChanges) {
       // === Git fast path ===
@@ -1233,8 +1238,12 @@ export class ExtractionOrchestrator {
         }
       }
 
-      // Handle modified files — read + hash only these files
-      for (const filePath of gitChanges.modified) {
+      // Handle modified + added files — read + hash only these. Untracked
+      // (`??`) files stay untracked in git even after we index them, so they
+      // can't be trusted as "new": re-hash and compare against the DB exactly
+      // like modified files. Otherwise every sync re-indexes them and status
+      // reports them as pending forever. (See issue #206.)
+      for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
         const fullPath = path.join(this.rootDir, filePath);
         let content: string;
         try {
@@ -1257,16 +1266,9 @@ export class ExtractionOrchestrator {
           filesModified++;
         }
       }
-
-      // Handle added (untracked) files
-      for (const filePath of gitChanges.added) {
-        filesToIndex.push(filePath);
-        changedFilePaths.push(filePath);
-        filesAdded++;
-      }
     } else {
       // === Fallback: full scan (non-git project or git failure) ===
-      const currentFiles = new Set(scanDirectory(this.rootDir, this.config));
+      const currentFiles = new Set(scanDirectory(this.rootDir));
       filesChecked = currentFiles.size;
 
       // Build Map for O(1) lookups instead of .find() per file
@@ -1351,7 +1353,7 @@ export class ExtractionOrchestrator {
    * Uses git status as a fast path when available, falling back to full scan.
    */
   getChangedFiles(): { added: string[]; modified: string[]; removed: string[] } {
-    const gitChanges = getGitChangedFiles(this.rootDir, this.config);
+    const gitChanges = getGitChangedFiles(this.rootDir);
 
     if (gitChanges) {
       // === Git fast path ===
@@ -1367,8 +1369,11 @@ export class ExtractionOrchestrator {
         }
       }
 
-      // Modified files — read + hash only these, compare with DB
-      for (const filePath of gitChanges.modified) {
+      // Modified + added files — read + hash, compare with DB. Untracked (`??`)
+      // files stay untracked in git even after indexing, so they must be
+      // hash-compared like modified files instead of always counting as added —
+      // otherwise status reports them as pending forever. (See issue #206.)
+      for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
         const fullPath = path.join(this.rootDir, filePath);
         let content: string;
         try {
@@ -1388,16 +1393,11 @@ export class ExtractionOrchestrator {
         }
       }
 
-      // Added (untracked) files
-      for (const filePath of gitChanges.added) {
-        added.push(filePath);
-      }
-
       return { added, modified, removed };
     }
 
     // === Fallback: full scan (non-git project or git failure) ===
-    const currentFiles = new Set(scanDirectory(this.rootDir, this.config));
+    const currentFiles = new Set(scanDirectory(this.rootDir));
     const trackedFiles = this.queries.getAllFiles();
 
     // Build Map for O(1) lookups
@@ -1444,4 +1444,4 @@ export class ExtractionOrchestrator {
 
 // Re-export useful types and functions
 export { extractFromSource } from './tree-sitter';
-export { detectLanguage, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './grammars';
+export { detectLanguage, isSourceFile, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './grammars';

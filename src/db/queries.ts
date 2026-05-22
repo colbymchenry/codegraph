@@ -224,32 +224,34 @@ export class QueryBuilder {
       return;
     }
 
-    try {
-      this.stmts.insertNode.run({
-        id: node.id,
-        kind: node.kind,
-        name: node.name,
-        qualifiedName: node.qualifiedName ?? node.name,
-        filePath: node.filePath,
-        language: node.language,
-        startLine: node.startLine ?? 0,
-        endLine: node.endLine ?? 0,
-        startColumn: node.startColumn ?? 0,
-        endColumn: node.endColumn ?? 0,
-        docstring: node.docstring ?? null,
-        signature: node.signature ?? null,
-        visibility: node.visibility ?? null,
-        isExported: node.isExported ? 1 : 0,
-        isAsync: node.isAsync ? 1 : 0,
-        isStatic: node.isStatic ? 1 : 0,
-        isAbstract: node.isAbstract ? 1 : 0,
-        decorators: node.decorators ? JSON.stringify(node.decorators) : null,
-        typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
-        updatedAt: node.updatedAt ?? Date.now(),
-      });
-    } catch (error) {
-      throw error;
-    }
+    // INSERT OR REPLACE may overwrite a node we have cached. Drop the
+    // stale entry so the next getNodeById sees the new row, not the old
+    // one (matches the cache-invalidation pattern used by updateNode and
+    // deleteNode below).
+    this.nodeCache.delete(node.id);
+
+    this.stmts.insertNode.run({
+      id: node.id,
+      kind: node.kind,
+      name: node.name,
+      qualifiedName: node.qualifiedName ?? node.name,
+      filePath: node.filePath,
+      language: node.language,
+      startLine: node.startLine ?? 0,
+      endLine: node.endLine ?? 0,
+      startColumn: node.startColumn ?? 0,
+      endColumn: node.endColumn ?? 0,
+      docstring: node.docstring ?? null,
+      signature: node.signature ?? null,
+      visibility: node.visibility ?? null,
+      isExported: node.isExported ? 1 : 0,
+      isAsync: node.isAsync ? 1 : 0,
+      isStatic: node.isStatic ? 1 : 0,
+      isAbstract: node.isAbstract ? 1 : 0,
+      decorators: node.decorators ? JSON.stringify(node.decorators) : null,
+      typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
+      updatedAt: node.updatedAt ?? Date.now(),
+    });
   }
 
   /**
@@ -378,6 +380,59 @@ export class QueryBuilder {
     const node = rowToNode(row);
     this.cacheNode(node);
     return node;
+  }
+
+  /**
+   * Batch lookup: fetch many nodes by ID in a single SQL round-trip.
+   *
+   * Replaces the N+1 pattern in graph traversal where every edge would
+   * trigger its own `getNodeById` call. For a function with 50 callers
+   * this collapses 50 point reads into one IN-list query (~10-50x
+   * faster end-to-end).
+   *
+   * Returns a Map keyed by id so callers can preserve their own ordering
+   * (typically the order edges were returned from the graph). Missing IDs
+   * are simply absent from the map.
+   *
+   * Cache-aware: ids already in the LRU cache are served from memory and
+   * the SQL query only touches the misses.
+   */
+  getNodesByIds(ids: readonly string[]): Map<string, Node> {
+    const out = new Map<string, Node>();
+    if (ids.length === 0) return out;
+
+    // Serve cache hits first; build the miss list for SQL.
+    const misses: string[] = [];
+    for (const id of ids) {
+      const cached = this.nodeCache.get(id);
+      if (cached !== undefined) {
+        // LRU touch
+        this.nodeCache.delete(id);
+        this.nodeCache.set(id, cached);
+        out.set(id, cached);
+      } else {
+        misses.push(id);
+      }
+    }
+    if (misses.length === 0) return out;
+
+    // Chunk under SQLite's parameter limit (default 999, raised to 32766
+    // in better-sqlite3 builds — chunk at 500 for safety across both
+    // backends and to keep the query plan simple).
+    const CHUNK = 500;
+    for (let i = 0; i < misses.length; i += CHUNK) {
+      const chunk = misses.slice(i, i + CHUNK);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT * FROM nodes WHERE id IN (${placeholders})`)
+        .all(...chunk) as NodeRow[];
+      for (const row of rows) {
+        const node = rowToNode(row);
+        out.set(node.id, node);
+        this.cacheNode(node);
+      }
+    }
+    return out;
   }
 
   /**

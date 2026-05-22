@@ -22,6 +22,18 @@ in the workspace. Reads are sub-millisecond; the index lags writes by
 about a second through the file watcher. Consult it BEFORE writing or
 editing code, not during.
 
+## Answer directly — don't delegate exploration
+
+For "how does X work", architecture, trace, or where-is-X questions,
+answer DIRECTLY using 2-3 codegraph calls: \`codegraph_context\` first,
+then ONE \`codegraph_explore\` for the source of the symbols it surfaces.
+Codegraph IS the pre-built search index — so delegating the lookup to a
+separate file-reading sub-task/agent, or running your own grep + read
+loop, repeats work codegraph already did and costs more for the same
+answer. Reach for raw Read/Grep only to confirm a specific detail
+codegraph didn't cover. A direct codegraph answer is typically a handful
+of calls; a grep/read exploration is dozens.
+
 ## Tool selection by intent
 
 - **"What is the symbol named X?"** → \`codegraph_search\`
@@ -30,7 +42,7 @@ editing code, not during.
 - **"What does this call?"** → \`codegraph_callees\`
 - **"What would changing this break?"** → \`codegraph_impact\`
 - **"Show me this symbol's source / signature / docstring."** → \`codegraph_node\`
-- **"Survey an unfamiliar topic / pattern / module."** → \`codegraph_explore\` (heavier; deep dive)
+- **"Show me several related symbols' source / survey an area."** → \`codegraph_explore\` (ONE capped call; prefer over many codegraph_node/Read)
 - **"What's in directory X?"** → \`codegraph_files\`
 - **"Is the index ready / what's its size?"** → \`codegraph_status\`
 
@@ -44,7 +56,7 @@ editing code, not during.
 
 - **Don't grep first** when looking up a symbol by name — \`codegraph_search\` is faster and returns kind + location + signature.
 - **Don't chain \`codegraph_search\` + \`codegraph_node\`** when you just want context — \`codegraph_context\` is one round-trip.
-- **Don't use \`codegraph_explore\` for narrow questions** — it's a multi-call deep dive, expensive in tokens. Save it for genuine "I'm new here" surveys.
+- **Don't loop \`codegraph_node\` over many symbols** — one \`codegraph_explore\` call returns them all grouped by file, while each separate call re-reads the whole context and costs far more. Use \`codegraph_node\` for a single symbol.
 - **Don't query the index immediately after editing a file** — the watcher needs ~500ms to debounce + sync. Wait for the next turn.
 
 ## Limitations

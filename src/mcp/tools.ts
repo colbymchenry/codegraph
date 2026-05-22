@@ -7,14 +7,37 @@
 import CodeGraph, { findNearestCodeGraphRoot } from '../index';
 import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind } from '../types';
 import { createHash } from 'crypto';
-import { writeFileSync, readFileSync, existsSync } from 'fs';
-import { clamp, validatePathWithinRoot } from '../utils';
+import {
+  constants as fsConstants,
+  closeSync,
+  existsSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  writeSync,
+} from 'fs';
+import { clamp, validatePathWithinRoot, validateProjectPath } from '../utils';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { WASM_FALLBACK_FIX_RECIPE } from '../db';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
+
+/**
+ * Maximum length for free-form string inputs (query, task, symbol).
+ * Bounds memory and CPU when a buggy or hostile MCP client sends a
+ * huge payload — without this an attacker could ship a 100MB string
+ * and force a full FTS5 scan / OOM the server. 10 000 characters is
+ * far beyond any realistic legitimate query.
+ */
+const MAX_INPUT_LENGTH = 10_000;
+
+/**
+ * Maximum length for path-like string inputs (projectPath, path
+ * filter, glob pattern). Paths beyond a few thousand chars are
+ * never legitimate and signal abuse or a bug upstream.
+ */
+const MAX_PATH_LENGTH = 4_096;
 
 /**
  * Rust path roots that have no file-system equivalent — `crate` is the
@@ -24,6 +47,16 @@ const MAX_OUTPUT_LENGTH = 15000;
  * same as `configurator::stage_apply::run`.
  */
 const RUST_PATH_PREFIXES = new Set(['crate', 'super', 'self']);
+
+/**
+ * Node kinds that contain other symbols. For these, `codegraph_node` with
+ * `includeCode=true` returns a structural outline (member names + signatures
+ * + line numbers) instead of the full body, which for a large class is a
+ * multi-thousand-character wall of source that bloats the agent's context.
+ */
+const CONTAINER_NODE_KINDS = new Set<NodeKind>([
+  'class', 'struct', 'interface', 'trait', 'protocol', 'enum', 'namespace', 'module',
+]);
 
 /** Last `::` / `.` / `/`-separated segment of a qualified symbol. */
 function lastQualifierPart(symbol: string): string {
@@ -102,12 +135,12 @@ export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
   }
   if (fileCount < 5000) {
     return {
-      maxOutputChars: 28000,
-      defaultMaxFiles: 9,
-      maxCharsPerFile: 5000,
-      gapThreshold: 12,
-      maxSymbolsInFileHeader: 10,
-      maxEdgesPerRelationshipKind: 10,
+      maxOutputChars: 13000,
+      defaultMaxFiles: 6,
+      maxCharsPerFile: 2500,
+      gapThreshold: 10,
+      maxSymbolsInFileHeader: 8,
+      maxEdgesPerRelationshipKind: 8,
       includeRelationships: true,
       includeAdditionalFiles: true,
       includeCompletenessSignal: true,
@@ -177,14 +210,46 @@ function numberSourceLines(slice: string, firstLineNumber: number): string {
 /**
  * Mark a Claude session as having consulted MCP tools.
  * This enables Grep/Glob/Bash commands that would otherwise be blocked.
+ *
+ * Why the explicit openSync + O_NOFOLLOW dance instead of plain writeFileSync:
+ * tmpdir() is world-writable on Linux (mode 1777), so on a shared multi-user
+ * machine any other local user can pre-create `codegraph-consulted-<hash>` as
+ * a symlink pointing at a file the victim owns. The old `writeFileSync` would
+ * happily follow that link and overwrite the target's contents with the ISO
+ * timestamp string (CWE-59). The session-id hash provides the predictability
+ * gate, but it's defense-in-depth: if a session id ever surfaces in logs,
+ * argv, or telemetry the attack becomes trivial, and the right fix is to not
+ * follow links from /tmp paths in the first place.
  */
 function markSessionConsulted(sessionId: string): void {
   try {
     const hash = createHash('md5').update(sessionId).digest('hex').slice(0, 16);
     const markerPath = join(tmpdir(), `codegraph-consulted-${hash}`);
-    writeFileSync(markerPath, new Date().toISOString(), 'utf8');
+    // Refuse to follow a pre-planted symlink at the marker path (CWE-59).
+    // O_NOFOLLOW (below) is the atomic, TOCTOU-free guard on POSIX, but it is
+    // `undefined` on Windows (libuv ignores it), so the bitwise-OR silently
+    // drops it and openSync would follow the link. This lstat check closes that
+    // gap cross-platform; ENOENT (path is free) falls through to create it.
+    try {
+      if (lstatSync(markerPath).isSymbolicLink()) return;
+    } catch {
+      // No existing entry (or stat failed) — nothing to refuse; proceed.
+    }
+    // O_NOFOLLOW makes openSync throw ELOOP if markerPath is already a symlink.
+    // O_CREAT + O_TRUNC keep the original "create-or-overwrite" semantics, and
+    // mode 0o600 prevents readback by other local users (the marker payload is
+    // benign, but narrowing the exposure costs nothing).
+    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
+    const fd = openSync(markerPath, flags, 0o600);
+    try {
+      writeSync(fd, new Date().toISOString());
+    } finally {
+      closeSync(fd);
+    }
   } catch {
-    // Silently fail - don't break MCP on marker write failure
+    // Silently fail - don't break MCP on marker write failure. ELOOP from a
+    // planted symlink lands here too, which is the intended behavior: refuse
+    // to write rather than overwrite an attacker-chosen target.
   }
 }
 
@@ -263,7 +328,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_context',
-    description: 'PRIMARY TOOL: Build comprehensive context for a task. Returns entry points, related symbols, and key code - often enough to understand the codebase without additional tool calls. NOTE: This provides CODE context, not product requirements. For new features, still clarify UX/behavior questions with the user before implementing.',
+    description: 'PRIMARY TOOL — call this FIRST for any "how does X work", architecture, feature, or bug-context question. Composes search + node + callers + callees and returns entry points, related symbols, and key code in ONE call — usually enough to answer with no further search/Read/Grep. Prefer this over chaining codegraph_search + codegraph_node, and over codegraph_explore. NOTE: provides CODE context, not product requirements; for new features still clarify UX/edge cases with the user.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -348,7 +413,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_node',
-    description: 'Get detailed information about a specific code symbol. Use includeCode=true only when you need the full source code - otherwise just get location and signature to minimize context usage.',
+    description: 'Get detailed info about ONE symbol (location, signature, docstring). Pass includeCode=true for source: a function/method returns its body; a class/interface/struct/enum returns a compact member OUTLINE (fields + method signatures + line numbers), not every method body — Read or codegraph_node a specific member for its body. Keep includeCode=false to minimize context. For SEVERAL related symbols, make ONE codegraph_explore (or codegraph_context) call instead of many node calls — repeated node calls each re-read the whole context and cost far more.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -368,7 +433,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_explore',
-    description: 'Deep exploration tool — returns comprehensive context for a topic in a SINGLE call. Groups all relevant source code by file (contiguous sections, not snippets), includes a relationship map, and uses deeper graph traversal. Designed to replace multiple codegraph_node + file Read calls. Use this instead of codegraph_context when you need thorough understanding. IMPORTANT: Use specific symbol names, file names, or short code terms in your query — NOT natural language sentences. Before calling this, use codegraph_search to discover relevant symbol names, then include those names in your query. Bad: "how are agent prompts loaded and passed to the CLI". Good: "readAgentsFromDirectory createClaudeSession chat-manager agents.ts".',
+    description: 'Returns source for SEVERAL related symbols grouped by file, plus a relationship map, in ONE capped call. This is the efficient way to inspect many related symbols at once — strongly prefer it over a series of codegraph_node or Read calls (each separate call re-reads the whole context, so 8 node calls cost far more than 1 explore). Use it after codegraph_context when you need to see the actual source of several symbols. Query with specific symbol/file/code terms, NOT natural-language sentences — run codegraph_search first to find names. Bad: "how are agent prompts loaded and passed to the CLI". Good: "renderStaticScene drawElementOnCanvas ShapeCache renderElement.ts".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -440,6 +505,9 @@ export const tools: ToolDefinition[] = [
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
+  // The directory the server last searched for a default project. Surfaced in
+  // the "not initialized" error so users can see why detection missed.
+  private defaultProjectHint: string | null = null;
 
   constructor(private cg: CodeGraph | null) {}
 
@@ -448,6 +516,14 @@ export class ToolHandler {
    */
   setDefaultCodeGraph(cg: CodeGraph): void {
     this.cg = cg;
+  }
+
+  /**
+   * Record the directory the server tried to resolve the default project from.
+   * Used only to make the "no default project" error actionable.
+   */
+  setDefaultProjectHint(searchedPath: string): void {
+    this.defaultProjectHint = searchedPath;
   }
 
   /**
@@ -495,7 +571,16 @@ export class ToolHandler {
   private getCodeGraph(projectPath?: string): CodeGraph {
     if (!projectPath) {
       if (!this.cg) {
-        throw new Error('CodeGraph not initialized for this project. Run \'codegraph init\' first.');
+        const searched = this.defaultProjectHint ?? process.cwd();
+        throw new Error(
+          'No CodeGraph project is loaded for this session.\n' +
+          `Searched for a .codegraph/ directory starting from: ${searched}\n` +
+          'The index is likely fine — this is a working-directory detection issue: ' +
+          "the MCP client launched the server outside your project and didn't report the " +
+          'workspace root. Fix it either way:\n' +
+          '  • Pass projectPath to the tool call, e.g. projectPath: "/absolute/path/to/your/project"\n' +
+          '  • Or add --path to the server\'s MCP config args: ["serve", "--mcp", "--path", "/absolute/path/to/your/project"]'
+        );
       }
       return this.cg;
     }
@@ -505,11 +590,34 @@ export class ToolHandler {
       return this.projectCache.get(projectPath)!;
     }
 
+    // Reject sensitive system directories before opening. Only validate a
+    // path that actually exists — a nested or not-yet-created sub-path of a
+    // real project must still be allowed to resolve UP to its .codegraph/
+    // root below (issue #238), so we don't run the existence-checking
+    // validator on paths that are meant to walk up.
+    if (existsSync(projectPath)) {
+      const pathError = validateProjectPath(projectPath);
+      if (pathError) {
+        throw new Error(pathError);
+      }
+    }
+
     // Walk up parent directories to find nearest .codegraph/
     const resolvedRoot = findNearestCodeGraphRoot(projectPath);
 
     if (!resolvedRoot) {
       throw new Error(`CodeGraph not initialized in ${projectPath}. Run 'codegraph init' in that project first.`);
+    }
+
+    // If the path resolves to the default project, reuse the already-open
+    // default instance rather than opening a SECOND connection to the same DB.
+    // A duplicate connection serializes reads against the watcher's auto-sync
+    // writes; on the wasm backend (no WAL) that surfaces as intermittent
+    // "database is locked" on concurrent tool calls. See issue #238. Deliberately
+    // not cached under projectPath — the server owns and closes the default
+    // instance, so routing it through projectCache.closeAll() would double-close it.
+    if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
+      return this.cg;
     }
 
     // Check if we already have this resolved root cached (different path, same project)
@@ -540,11 +648,45 @@ export class ToolHandler {
   }
 
   /**
-   * Validate that a value is a non-empty string
+   * Validate that a value is a non-empty string within length bounds.
+   *
+   * The `maxLength` cap protects against MCP clients that ship huge
+   * payloads (10MB+ query strings either by accident or maliciously).
+   * Without this, a single oversized input can pin the FTS5 index or
+   * exhaust memory before any real work runs.
    */
-  private validateString(value: unknown, name: string): string | ToolResult {
+  private validateString(
+    value: unknown,
+    name: string,
+    maxLength: number = MAX_INPUT_LENGTH
+  ): string | ToolResult {
     if (typeof value !== 'string' || value.length === 0) {
       return this.errorResult(`${name} must be a non-empty string`);
+    }
+    if (value.length > maxLength) {
+      return this.errorResult(
+        `${name} exceeds maximum length of ${maxLength} characters (got ${value.length})`
+      );
+    }
+    return value;
+  }
+
+  /**
+   * Validate an optional path-like string input. Returns the value if
+   * valid (or undefined), or a ToolResult with the error.
+   */
+  private validateOptionalPath(
+    value: unknown,
+    name: string
+  ): string | undefined | ToolResult {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'string') {
+      return this.errorResult(`${name} must be a string`);
+    }
+    if (value.length > MAX_PATH_LENGTH) {
+      return this.errorResult(
+        `${name} exceeds maximum length of ${MAX_PATH_LENGTH} characters (got ${value.length})`
+      );
     }
     return value;
   }
@@ -554,6 +696,25 @@ export class ToolHandler {
    */
   async execute(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
     try {
+      // Cross-cutting input validation. All tools accept an optional
+      // `projectPath` and most accept either `query`, `task`, or
+      // `symbol` — bound their lengths centrally so individual handlers
+      // can stay focused on tool-specific logic.
+      const pathCheck = this.validateOptionalPath(args.projectPath, 'projectPath');
+      if (typeof pathCheck === 'object' && pathCheck !== undefined) {
+        return pathCheck;
+      }
+      // The `path` and `pattern` properties used by codegraph_files are
+      // also path-shaped — apply the same cap.
+      if (args.path !== undefined) {
+        const check = this.validateOptionalPath(args.path, 'path');
+        if (typeof check === 'object' && check !== undefined) return check;
+      }
+      if (args.pattern !== undefined) {
+        const check = this.validateOptionalPath(args.pattern, 'pattern');
+        if (typeof check === 'object' && check !== undefined) return check;
+      }
+
       switch (toolName) {
         case 'codegraph_search':
           return await this.handleSearch(args);
@@ -637,11 +798,11 @@ export class ToolHandler {
 
     // buildContext returns string when format is 'markdown'
     if (typeof context === 'string') {
-      return this.textResult(context + reminder);
+      return this.textResult(this.truncateOutput(context + reminder));
     }
 
     // If it returns TaskContext, format it
-    return this.textResult(this.formatTaskContext(context) + reminder);
+    return this.textResult(this.truncateOutput(this.formatTaskContext(context) + reminder));
   }
 
   /**
@@ -1221,7 +1382,20 @@ export class ToolHandler {
       }
     }
 
-    return this.textResult(lines.join('\n'));
+    // Hard-cap to the adaptive budget. The per-file loop bounds the source
+    // sections, but the relationship map, additional-files list, and
+    // completeness/budget notes can still push the assembled output past
+    // maxOutputChars (observed 30k against a 28k tier cap). A fat explore
+    // payload persists in the agent's context and is re-read as cache-input
+    // on every subsequent turn, so the overrun is paid many times over.
+    const output = lines.join('\n');
+    if (output.length > budget.maxOutputChars) {
+      const cut = output.slice(0, budget.maxOutputChars);
+      const lastNewline = cut.lastIndexOf('\n');
+      const safe = lastNewline > budget.maxOutputChars * 0.8 ? cut.slice(0, lastNewline) : cut;
+      return this.textResult(safe + '\n\n... (explore output truncated to budget — use codegraph_node or Read for more)');
+    }
+    return this.textResult(output);
   }
 
   /**
@@ -1241,12 +1415,24 @@ export class ToolHandler {
     }
 
     let code: string | null = null;
+    let outline: string | null = null;
 
     if (includeCode) {
-      code = await cg.getCode(match.node.id);
+      // For container symbols (class/interface/struct/…), the full body is the
+      // sum of every method body — a wall of source (e.g. a 10k-char class)
+      // that bloats context and is rarely needed in full. Return a structural
+      // outline (members + signatures + line numbers) instead; the agent can
+      // Read or codegraph_node a specific method for its body. Leaf symbols
+      // (function/method/etc.) return their full body as before.
+      if (CONTAINER_NODE_KINDS.has(match.node.kind)) {
+        outline = this.buildContainerOutline(cg, match.node);
+      }
+      if (!outline) {
+        code = await cg.getCode(match.node.id);
+      }
     }
 
-    const formatted = this.formatNodeDetails(match.node, code) + match.note;
+    const formatted = this.formatNodeDetails(match.node, code, outline) + match.note;
     return this.textResult(this.truncateOutput(formatted));
   }
 
@@ -1266,16 +1452,21 @@ export class ToolHandler {
       `**Database size:** ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`,
     ];
 
-    // Surface the active SQLite backend. Without this, users on the
-    // silent WASM fallback (better-sqlite3 install failed) see "slow"
-    // indexing and DB-lock errors with no signal of why.
-    const backend = cg.getBackend();
-    if (backend === 'native') {
-      lines.push(`**Backend:** native (better-sqlite3)`);
+    // Surface the active SQLite backend (node:sqlite, Node's built-in real
+    // SQLite — full WAL + FTS5, no native build).
+    lines.push(`**Backend:** node:sqlite (Node built-in) — full WAL + FTS5`);
+
+    // Effective journal mode. 'wal' ⇒ concurrent reads never block on a writer;
+    // anything else ⇒ they can ("database is locked"). node:sqlite supports WAL
+    // everywhere, so a non-wal mode means the filesystem can't (network/
+    // virtualized mounts, WSL2 /mnt). See issue #238.
+    const journalMode = cg.getJournalMode();
+    if (journalMode === 'wal') {
+      lines.push(`**Journal mode:** wal (concurrent reads safe)`);
     } else {
       lines.push(
-        `**Backend:** ⚠ wasm (better-sqlite3 unavailable) — ` +
-        `5-10x slower than native. Fix: ${WASM_FALLBACK_FIX_RECIPE}`
+        `**Journal mode:** ⚠ ${journalMode || 'unknown'} — WAL not active, so reads ` +
+        `can block on a concurrent write (WAL appears unsupported on this filesystem)`
       );
     }
 
@@ -1696,7 +1887,29 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  private formatNodeDetails(node: Node, code: string | null): string {
+  /**
+   * Build a compact structural outline of a container symbol from its
+   * indexed children (methods, fields, properties, …) — name, kind,
+   * line number, and signature — so the agent gets the shape of a class
+   * without the full source of every method. Returns '' when the container
+   * has no indexed children, so the caller can fall back to full source.
+   */
+  private buildContainerOutline(cg: CodeGraph, node: Node): string {
+    const children = cg.getChildren(node.id)
+      .filter(c => c.kind !== 'import' && c.kind !== 'export')
+      .sort((a, b) => (a.startLine ?? 0) - (b.startLine ?? 0));
+    if (children.length === 0) return '';
+
+    const lines = [`**Members (${children.length}):**`, ''];
+    for (const c of children) {
+      const loc = c.startLine ? `:${c.startLine}` : '';
+      const sig = c.signature ? ` — \`${c.signature}\`` : '';
+      lines.push(`- ${c.name} (${c.kind})${loc}${sig}`);
+    }
+    return lines.join('\n');
+  }
+
+  private formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
     const location = node.startLine ? `:${node.startLine}` : '';
     const lines: string[] = [
       `## ${node.name} (${node.kind})`,
@@ -1713,7 +1926,10 @@ export class ToolHandler {
       lines.push('', node.docstring);
     }
 
-    if (code) {
+    if (outline) {
+      lines.push('', outline, '',
+        `> Structural outline only. Read \`${node.filePath}\` or call codegraph_node on a specific member for its body.`);
+    } else if (code) {
       lines.push('', '```' + node.language, code, '```');
     }
 

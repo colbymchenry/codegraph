@@ -2,7 +2,8 @@
  * CodeGraph Interactive Installer
  *
  * Multi-target: writes MCP server config + instructions for the
- * agents the user picks (Claude Code, Cursor, Codex CLI, opencode).
+ * agents the user picks (Claude Code, Cursor, Codex CLI, opencode,
+ * Hermes Agent).
  * Defaults to the Claude-only behavior for backwards compatibility
  * when no targets are explicitly chosen and nothing else is detected.
  *
@@ -20,8 +21,13 @@ import {
   getTarget,
   resolveTargetFlag,
 } from './targets/registry';
-import type { AgentTarget, Location, WriteResult } from './targets/types';
+import type { AgentTarget, Location, TargetId, WriteResult } from './targets/types';
 import { getGlyphs } from '../ui/glyphs';
+// Import the lightweight submodules directly (not the ../sync barrel, which
+// re-exports FileWatcher and would transitively pull in ../extraction — the
+// installer must stay importable even when native modules can't load).
+import { watchDisabledReason } from '../sync/watch-policy';
+import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -198,7 +204,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
 
   // Step 6: for local install, initialize the project.
   if (location === 'local') {
-    await initializeLocalProject(clack);
+    await initializeLocalProject(clack, useDefaults);
   }
 
   if (location === 'global') {
@@ -209,6 +215,167 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     ? `Done! Restart your agent${targets.length > 1 ? 's' : ''} to use CodeGraph.`
     : 'Done!';
   clack.outro(finalNote);
+}
+
+export interface RunUninstallerOptions {
+  /**
+   * Comma-separated target list, or `auto` / `all` / `none`. Defaults
+   * to `all` — uninstall sweeps every known agent and reports which
+   * ones it actually touched, so the user doesn't have to know where
+   * they configured it.
+   */
+  target?: string;
+  /** Skip the location prompt; use this value directly. */
+  location?: Location;
+  /** Non-interactive: location=global, target=all, no prompts. */
+  yes?: boolean;
+}
+
+export type UninstallStatus = 'removed' | 'not-configured' | 'unsupported';
+
+/**
+ * Per-target outcome of an uninstall sweep. `removed` means we deleted
+ * at least one thing; `not-configured` means the agent had no codegraph
+ * config at this location (nothing to do); `unsupported` means the
+ * agent has no config concept for this location (e.g. Codex is
+ * global-only, so a `local` uninstall skips it).
+ */
+export interface UninstallReport {
+  id: TargetId;
+  displayName: string;
+  status: UninstallStatus;
+  /** Absolute paths we actually edited/removed (action === 'removed'). */
+  removedPaths: string[];
+  /** Verbatim notes from the target (rare for uninstall). */
+  notes: string[];
+}
+
+/**
+ * Pure uninstall sweep — no prompts, no I/O beyond the targets' own
+ * file edits. Exposed (and unit-tested) separately from the clack UI in
+ * `runUninstaller` so the aggregation logic can be asserted directly.
+ *
+ * Each target's `uninstall()` is already safe to call when nothing was
+ * installed (it returns `not-found` actions), so this is safe to run
+ * across every target unconditionally.
+ */
+export function uninstallTargets(
+  targets: readonly AgentTarget[],
+  location: Location,
+): UninstallReport[] {
+  return targets.map((target) => {
+    if (!target.supportsLocation(location)) {
+      const only: Location = location === 'local' ? 'global' : 'local';
+      return {
+        id: target.id,
+        displayName: target.displayName,
+        status: 'unsupported' as const,
+        removedPaths: [],
+        notes: [`no ${location} config — this agent is ${only}-only`],
+      };
+    }
+    const result = target.uninstall(location);
+    const removedPaths = result.files
+      .filter((f) => f.action === 'removed')
+      .map((f) => f.path);
+    return {
+      id: target.id,
+      displayName: target.displayName,
+      status: removedPaths.length > 0 ? ('removed' as const) : ('not-configured' as const),
+      removedPaths,
+      notes: result.notes ?? [],
+    };
+  });
+}
+
+/**
+ * Interactive uninstaller — the inverse of `runInstallerWithOptions`.
+ * Asks global-vs-local first (unless `--location`/`--yes` is given),
+ * then sweeps every agent target (or the `--target` subset) and prints
+ * one block per agent so the user sees exactly which providers it hit.
+ *
+ * Removes only what install wrote (MCP server entry, instructions
+ * block, permissions) — never the `.codegraph/` index, which `codegraph
+ * uninit` owns.
+ */
+export async function runUninstaller(opts: RunUninstallerOptions): Promise<void> {
+  const clack = await importESM('@clack/prompts');
+
+  clack.intro(`CodeGraph v${getVersion()} — uninstall`);
+
+  const useDefaults = opts.yes === true;
+
+  // Step 1: which location — asked FIRST, the one decision the user
+  // must make. Global sweeps ~/.claude, ~/.codex, etc.; local sweeps
+  // the configs in this project directory.
+  let location: Location;
+  if (opts.location) {
+    location = opts.location;
+  } else if (useDefaults) {
+    location = 'global';
+  } else {
+    const sel = await clack.select({
+      message: 'Remove CodeGraph from all your projects, or just this one?',
+      options: [
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes' },
+        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc' },
+      ],
+      initialValue: 'global' as const,
+    });
+    if (clack.isCancel(sel)) {
+      clack.cancel('Uninstall cancelled.');
+      process.exit(0);
+    }
+    location = sel;
+  }
+
+  // Step 2: which agents. Default is every agent, so the user doesn't
+  // have to remember where they installed it — unconfigured agents are
+  // reported as "nothing to remove" and left untouched. An explicit
+  // --target subsets this.
+  let targets: AgentTarget[];
+  if (opts.target !== undefined) {
+    targets = resolveTargetFlag(opts.target, location);
+  } else {
+    targets = [...ALL_TARGETS];
+  }
+  if (targets.length === 0) {
+    clack.outro('No agent targets selected — nothing to do.');
+    return;
+  }
+
+  // Step 3: sweep + per-agent feedback.
+  const reports = uninstallTargets(targets, location);
+  const removed = reports.filter((r) => r.status === 'removed');
+
+  for (const r of reports) {
+    if (r.status === 'removed') {
+      for (const p of r.removedPaths) {
+        clack.log.success(`${r.displayName}: removed ${tildify(p)}`);
+      }
+    } else if (r.status === 'not-configured') {
+      clack.log.info(`${r.displayName}: not configured — nothing to remove`);
+    } else {
+      clack.log.info(`${r.displayName}: skipped — ${r.notes[0] ?? 'unsupported location'}`);
+    }
+  }
+
+  // Step 4: for local uninstall, the index dir is separate — point at
+  // `uninit` so the user knows it's still there (and how to remove it).
+  if (location === 'local' && fs.existsSync(path.join(process.cwd(), '.codegraph'))) {
+    clack.log.info('The .codegraph/ index for this project is still here. Run `codegraph uninit` to delete it.');
+  }
+
+  // Step 5: summary.
+  if (removed.length > 0) {
+    const names = removed.map((r) => r.displayName).join(', ');
+    clack.outro(
+      `Removed CodeGraph from ${removed.length} agent${removed.length > 1 ? 's' : ''}: ${names}. ` +
+      `Restart ${removed.length > 1 ? 'them' : 'it'} to apply.`,
+    );
+  } else {
+    clack.outro(`CodeGraph was not configured in any ${location} agent — nothing to remove.`);
+  }
 }
 
 /**
@@ -304,10 +471,14 @@ async function resolveTargets(
 }
 
 /**
- * Initialize CodeGraph in the current project (for local installs).
- * Unchanged from the pre-refactor version — agent-agnostic by nature.
+ * Initialize CodeGraph in the current project (for local installs), then
+ * offer the watch fallback when the live watcher won't run here (see
+ * offerWatchFallback). Agent-agnostic by nature.
  */
-async function initializeLocalProject(clack: typeof import('@clack/prompts')): Promise<void> {
+async function initializeLocalProject(
+  clack: typeof import('@clack/prompts'),
+  useDefaults = false,
+): Promise<void> {
   const projectPath = process.cwd();
 
   let CodeGraph: typeof import('../index').default;
@@ -323,6 +494,7 @@ async function initializeLocalProject(clack: typeof import('@clack/prompts')): P
   // Check if already initialized
   if (CodeGraph.isInitialized(projectPath)) {
     clack.log.info('CodeGraph already initialized in this project');
+    await offerWatchFallback(clack, projectPath, { yes: useDefaults });
     return;
   }
 
@@ -348,4 +520,77 @@ async function initializeLocalProject(clack: typeof import('@clack/prompts')): P
   }
 
   cg.close();
+
+  await offerWatchFallback(clack, projectPath, { yes: useDefaults });
+}
+
+/**
+ * When the live file watcher will be disabled for this project (e.g. WSL2
+ * /mnt drives, or CODEGRAPH_NO_WATCH), the index would silently go stale.
+ * Explain that, and offer to keep it fresh automatically via git hooks
+ * (commit / pull / checkout) instead of manual `codegraph sync`.
+ *
+ * No-op on environments where the watcher runs normally, so it's safe to
+ * call unconditionally after init.
+ */
+export async function offerWatchFallback(
+  clack: typeof import('@clack/prompts'),
+  projectPath: string,
+  opts: { yes?: boolean } = {},
+): Promise<void> {
+  const reason = watchDisabledReason(projectPath);
+  if (!reason) return; // Watcher runs normally — nothing to set up.
+
+  clack.log.warn(`Live file watching is disabled here — ${reason}.`);
+  clack.log.info('Until you re-sync, the CodeGraph index stays frozen — it will not pick up edits on its own.');
+
+  // No git repo → the commit-hook path doesn't apply; point at manual sync.
+  if (!isGitRepo(projectPath)) {
+    clack.log.info('Run `codegraph sync` after changing files to refresh the index.');
+    return;
+  }
+
+  // Already wired up on a previous run — confirm and move on without nagging.
+  if (isSyncHookInstalled(projectPath)) {
+    clack.log.info('Git sync hooks are already installed — the index refreshes after commit / pull / checkout.');
+    return;
+  }
+
+  let choice: 'hook' | 'manual';
+  if (opts.yes) {
+    choice = 'hook';
+  } else {
+    const sel = await clack.select({
+      message: 'How should CodeGraph keep its index fresh?',
+      options: [
+        { value: 'hook' as const, label: 'Sync on git commit / pull / checkout', hint: 'installs git hooks (recommended)' },
+        { value: 'manual' as const, label: 'I\'ll run `codegraph sync` myself', hint: 'fully manual' },
+      ],
+      initialValue: 'hook' as const,
+    });
+    if (clack.isCancel(sel)) {
+      clack.log.info('Skipped — run `codegraph sync` after changes to refresh the index.');
+      return;
+    }
+    choice = sel;
+  }
+
+  if (choice === 'manual') {
+    clack.log.info('Run `codegraph sync` after changing files to refresh the index.');
+    return;
+  }
+
+  const result = installGitSyncHook(projectPath);
+  if (result.installed.length > 0) {
+    clack.log.success(
+      `Installed git ${result.installed.join(', ')} hook${result.installed.length > 1 ? 's' : ''} — ` +
+      'the index refreshes in the background after each.',
+    );
+    clack.log.info('Run `codegraph sync` anytime to refresh immediately.');
+  } else {
+    clack.log.warn(
+      `Could not install git hooks${result.skipped ? ` (${result.skipped})` : ''}. ` +
+      'Run `codegraph sync` after changes instead.',
+    );
+  }
 }

@@ -63,6 +63,13 @@ export type MessageHandler = (message: JsonRpcRequest | JsonRpcNotification) => 
 export class StdioTransport {
   private rl: readline.Interface | null = null;
   private messageHandler: MessageHandler | null = null;
+  // Outstanding server-initiated requests (e.g. roots/list), keyed by the id
+  // we sent. Responses from the client are matched back here.
+  private pending = new Map<string | number, {
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+  }>();
+  private nextRequestId = 1;
 
   /**
    * Start listening for messages on stdin
@@ -89,10 +96,40 @@ export class StdioTransport {
    * Stop listening
    */
   stop(): void {
+    // Fail any in-flight server-initiated requests so their awaiters don't hang.
+    for (const { reject } of this.pending.values()) {
+      reject(new Error('Transport stopped'));
+    }
+    this.pending.clear();
     if (this.rl) {
       this.rl.close();
       this.rl = null;
     }
+  }
+
+  /**
+   * Send a server-initiated request to the client and await its response.
+   *
+   * MCP is bidirectional: the server can ask the client questions too. We use
+   * this for `roots/list` — the spec-blessed way to learn the workspace root
+   * when the client didn't pass one in `initialize` (see issue #196). Rejects
+   * on timeout so callers can fall back rather than hang forever.
+   */
+  request(method: string, params?: unknown, timeoutMs = 5000): Promise<unknown> {
+    const id = `cg-srv-${this.nextRequestId++}`;
+    return new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Timed out after ${timeoutMs}ms waiting for "${method}" response`));
+      }, timeoutMs);
+      // Don't let a pending request keep the process alive on shutdown.
+      timer.unref?.();
+      this.pending.set(id, {
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+    });
   }
 
   /**
@@ -152,6 +189,20 @@ export class StdioTransport {
       return;
     }
 
+    // Response to a server-initiated request (has id + result/error, no method).
+    // Route it to the awaiting requester instead of the message handler — these
+    // used to be dropped as "Invalid Request" because they carry no method.
+    const obj = parsed as Record<string, unknown>;
+    if (
+      obj?.jsonrpc === '2.0' &&
+      typeof obj.method !== 'string' &&
+      'id' in obj &&
+      ('result' in obj || 'error' in obj)
+    ) {
+      this.handleResponse(obj);
+      return;
+    }
+
     // Validate basic JSON-RPC structure
     if (!this.isValidMessage(parsed)) {
       this.sendError(null, ErrorCodes.InvalidRequest, 'Invalid Request: not a valid JSON-RPC 2.0 message');
@@ -171,6 +222,24 @@ export class StdioTransport {
           );
         }
       }
+    }
+  }
+
+  /**
+   * Resolve (or reject) the pending server-initiated request matching this
+   * response's id. Unknown ids are ignored — the client may echo something we
+   * never sent, or a request may have already timed out.
+   */
+  private handleResponse(msg: Record<string, unknown>): void {
+    const id = msg.id as string | number;
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    this.pending.delete(id);
+    if ('error' in msg && msg.error) {
+      const err = msg.error as { message?: string };
+      pending.reject(new Error(err.message || 'Request failed'));
+    } else {
+      pending.resolve(msg.result);
     }
   }
 

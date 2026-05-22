@@ -9,7 +9,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { FileWatcher } from '../src/sync/watcher';
-import type { CodeGraphConfig } from '../src/types';
 import CodeGraph from '../src/index';
 
 /**
@@ -34,18 +33,6 @@ function waitFor(
 describe('FileWatcher', () => {
   let testDir: string;
 
-  const baseConfig: CodeGraphConfig = {
-    version: 1,
-    rootDir: '.',
-    include: ['**/*.ts', '**/*.js'],
-    exclude: ['**/node_modules/**', '**/dist/**'],
-    languages: [],
-    frameworks: [],
-    maxFileSize: 1024 * 1024,
-    extractDocstrings: true,
-    trackCallSites: true,
-  };
-
   beforeEach(() => {
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-watcher-'));
     // Create a source file so the directory isn't empty
@@ -63,7 +50,7 @@ describe('FileWatcher', () => {
   describe('start/stop lifecycle', () => {
     it('should start and stop without errors', () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, baseConfig, syncFn);
+      const watcher = new FileWatcher(testDir, syncFn);
 
       const started = watcher.start();
       expect(started).toBe(true);
@@ -75,7 +62,7 @@ describe('FileWatcher', () => {
 
     it('should be idempotent on double start', () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, baseConfig, syncFn);
+      const watcher = new FileWatcher(testDir, syncFn);
 
       expect(watcher.start()).toBe(true);
       expect(watcher.start()).toBe(true); // Should not throw
@@ -86,7 +73,7 @@ describe('FileWatcher', () => {
 
     it('should be idempotent on double stop', () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, baseConfig, syncFn);
+      const watcher = new FileWatcher(testDir, syncFn);
 
       watcher.start();
       watcher.stop();
@@ -98,7 +85,7 @@ describe('FileWatcher', () => {
   describe('debounced sync', () => {
     it('should trigger sync after file change', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
-      const watcher = new FileWatcher(testDir, baseConfig, syncFn, { debounceMs: 200 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 200 });
 
       watcher.start();
 
@@ -114,7 +101,7 @@ describe('FileWatcher', () => {
 
     it('should debounce rapid changes into a single sync', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
-      const watcher = new FileWatcher(testDir, baseConfig, syncFn, { debounceMs: 500 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 500 });
 
       watcher.start();
 
@@ -140,7 +127,7 @@ describe('FileWatcher', () => {
   describe('filtering', () => {
     it('should ignore files not matching include patterns', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, baseConfig, syncFn, { debounceMs: 200 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 200 });
 
       watcher.start();
 
@@ -160,7 +147,7 @@ describe('FileWatcher', () => {
 
     it('should ignore .codegraph directory changes', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, baseConfig, syncFn, { debounceMs: 200 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 200 });
 
       watcher.start();
 
@@ -185,7 +172,7 @@ describe('FileWatcher', () => {
     it('should call onSyncComplete after successful sync', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 2, durationMs: 50 });
       const onSyncComplete = vi.fn();
-      const watcher = new FileWatcher(testDir, baseConfig, syncFn, {
+      const watcher = new FileWatcher(testDir, syncFn, {
         debounceMs: 200,
         onSyncComplete,
       });
@@ -203,7 +190,7 @@ describe('FileWatcher', () => {
     it('should call onSyncError when sync throws', async () => {
       const syncFn = vi.fn().mockRejectedValue(new Error('sync failed'));
       const onSyncError = vi.fn();
-      const watcher = new FileWatcher(testDir, baseConfig, syncFn, {
+      const watcher = new FileWatcher(testDir, syncFn, {
         debounceMs: 200,
         onSyncError,
       });
