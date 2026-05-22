@@ -10,15 +10,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Self-contained](https://img.shields.io/badge/Node.js-bundled%20%C2%B7%20none%20required-brightgreen.svg)](https://nodejs.org/)
 
-[![Windows](https://img.shields.io/badge/Windows-supported-blue.svg)](#)
-[![macOS](https://img.shields.io/badge/macOS-supported-blue.svg)](#)
-[![Linux](https://img.shields.io/badge/Linux-supported-blue.svg)](#)
+[![Windows](https://img.shields.io/badge/Windows-supported-blue.svg)](#supported-platforms)
+[![macOS](https://img.shields.io/badge/macOS-supported-blue.svg)](#supported-platforms)
+[![Linux](https://img.shields.io/badge/Linux-supported-blue.svg)](#supported-platforms)
 
-[![Claude Code](https://img.shields.io/badge/Claude_Code-supported-blueviolet.svg)](#)
-[![Cursor](https://img.shields.io/badge/Cursor-supported-blueviolet.svg)](#)
-[![Codex CLI](https://img.shields.io/badge/Codex_CLI-supported-blueviolet.svg)](#)
-[![opencode](https://img.shields.io/badge/opencode-supported-blueviolet.svg)](#)
-[![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-supported-blueviolet.svg)](#)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-supported-blueviolet.svg)](#supported-agents)
+[![Cursor](https://img.shields.io/badge/Cursor-supported-blueviolet.svg)](#supported-agents)
+[![Codex CLI](https://img.shields.io/badge/Codex_CLI-supported-blueviolet.svg)](#supported-agents)
+[![opencode](https://img.shields.io/badge/opencode-supported-blueviolet.svg)](#supported-agents)
+[![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-supported-blueviolet.svg)](#supported-agents)
 
 </div>
 
@@ -42,6 +42,20 @@ npm i -g @colbymchenry/codegraph
 ```
 
 <sub>CodeGraph bundles its own runtime — nothing to compile, no native build, works the same everywhere. The interactive installer auto-configures your agent(s) — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent.</sub>
+
+## Supported Platforms
+
+- Windows (PowerShell installer or npm)
+- macOS (shell installer or npm)
+- Linux (shell installer or npm)
+
+## Supported Agents
+
+- Claude Code
+- Cursor
+- Codex CLI
+- opencode
+- Hermes Agent
 
 ### Initialize Projects
 
