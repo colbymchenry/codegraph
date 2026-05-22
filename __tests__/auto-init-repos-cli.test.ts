@@ -138,9 +138,12 @@ describe('autoInitReposAction — error handling', () => {
   it('C12: logs error message via clack.log.error when installGlobalAutoInitHook throws', async () => {
     mockInstall.mockImplementation(() => { throw new Error('write failed'); });
     const clack = makeClack();
-    vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('exit'); });
-    await expect(autoInitReposAction({}, clack as unknown as MockClack)).rejects.toThrow('exit');
-    expect(clack.log.error).toHaveBeenCalledWith(expect.stringContaining('write failed'));
-    vi.restoreAllMocks();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('exit'); });
+    try {
+      await expect(autoInitReposAction({}, clack as unknown as MockClack)).rejects.toThrow('exit');
+      expect(clack.log.error).toHaveBeenCalledWith(expect.stringContaining('write failed'));
+    } finally {
+      exitSpy.mockRestore();
+    }
   });
 });
