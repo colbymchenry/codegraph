@@ -31,6 +31,15 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CODEGRAPH_DOWNLOAD_BASE=<url>` to point it at your own mirror of the release
   archives; the standalone `install.sh` remains the no-Node alternative. Resolves
   [#303](https://github.com/colbymchenry/codegraph/issues/303).
+- **`install.sh` failing with `403` / "could not resolve latest version" on
+  shared or cloud hosts.** The standalone installer resolved the latest release
+  through the GitHub API, whose unauthenticated limit is 60 requests/hour per IP
+  — routinely exhausted on cloud devboxes and CI where many users share an
+  address, returning `403` (issue #325). It now resolves the version from the
+  `releases/latest` web redirect, which isn't rate-limited (and still falls back
+  to the API). `CODEGRAPH_VERSION` also accepts a bare `0.9.4` in addition to
+  `v0.9.4`. Resolves
+  [#325](https://github.com/colbymchenry/codegraph/issues/325).
 
 ## [0.9.3] - 2026-05-22
 
