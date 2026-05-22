@@ -43,7 +43,7 @@ import * as path from 'path';
 const SENSITIVE_PATHS = new Set([
   '/', '/etc', '/usr', '/bin', '/sbin', '/var', '/tmp', '/dev', '/proc', '/sys',
   '/root', '/boot', '/lib', '/lib64', '/opt',
-  'C:\\', 'C:\\Windows', 'C:\\Windows\\System32',
+  'c:\\', 'c:\\windows', 'c:\\windows\\system32',
 ]);
 
 /**

@@ -230,32 +230,28 @@ export class QueryBuilder {
     // deleteNode below).
     this.nodeCache.delete(node.id);
 
-    try {
-      this.stmts.insertNode.run({
-        id: node.id,
-        kind: node.kind,
-        name: node.name,
-        qualifiedName: node.qualifiedName ?? node.name,
-        filePath: node.filePath,
-        language: node.language,
-        startLine: node.startLine ?? 0,
-        endLine: node.endLine ?? 0,
-        startColumn: node.startColumn ?? 0,
-        endColumn: node.endColumn ?? 0,
-        docstring: node.docstring ?? null,
-        signature: node.signature ?? null,
-        visibility: node.visibility ?? null,
-        isExported: node.isExported ? 1 : 0,
-        isAsync: node.isAsync ? 1 : 0,
-        isStatic: node.isStatic ? 1 : 0,
-        isAbstract: node.isAbstract ? 1 : 0,
-        decorators: node.decorators ? JSON.stringify(node.decorators) : null,
-        typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
-        updatedAt: node.updatedAt ?? Date.now(),
-      });
-    } catch (error) {
-      throw error;
-    }
+    this.stmts.insertNode.run({
+      id: node.id,
+      kind: node.kind,
+      name: node.name,
+      qualifiedName: node.qualifiedName ?? node.name,
+      filePath: node.filePath,
+      language: node.language,
+      startLine: node.startLine ?? 0,
+      endLine: node.endLine ?? 0,
+      startColumn: node.startColumn ?? 0,
+      endColumn: node.endColumn ?? 0,
+      docstring: node.docstring ?? null,
+      signature: node.signature ?? null,
+      visibility: node.visibility ?? null,
+      isExported: node.isExported ? 1 : 0,
+      isAsync: node.isAsync ? 1 : 0,
+      isStatic: node.isStatic ? 1 : 0,
+      isAbstract: node.isAbstract ? 1 : 0,
+      decorators: node.decorators ? JSON.stringify(node.decorators) : null,
+      typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
+      updatedAt: node.updatedAt ?? Date.now(),
+    });
   }
 
   /**
