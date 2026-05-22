@@ -3827,6 +3827,154 @@ local function run(y) return helper(y) end
 });
 
 // =============================================================================
+// Julia (tree-sitter-julia WASM vendored; extends colbymchenry/codegraph#244)
+// =============================================================================
+
+describe('Julia Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Julia files', () => {
+      expect(detectLanguage('main.jl')).toBe('julia');
+      expect(detectLanguage('graph_utils.jl')).toBe('julia');
+    });
+
+    it('should report Julia as supported', () => {
+      expect(isLanguageSupported('julia')).toBe(true);
+      expect(getSupportedLanguages()).toContain('julia');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract top-level function definitions', () => {
+      const code = `
+function greet(name::String)
+  println("Hello")
+end
+
+function add(a::Int, b::Int)::Int
+  return a + b
+end
+`;
+      const result = extractFromSource('utils.jl', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function');
+      expect(fns.find((f) => f.name === 'greet')).toBeDefined();
+      expect(fns.find((f) => f.name === 'add')).toBeDefined();
+    });
+
+    it('should extract function signature', () => {
+      const code = `
+function process(x::Int, y::Float64)::String
+  return string(x + y)
+end
+`;
+      const result = extractFromSource('process.jl', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'process');
+      expect(fn).toBeDefined();
+      expect(fn?.signature).toContain('x::Int');
+    });
+
+    it('should extract macro definitions', () => {
+      const code = `
+macro mytime(expr)
+  return :(0)
+end
+`;
+      const result = extractFromSource('macros.jl', code);
+      const macroFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'mytime');
+      expect(macroFn).toBeDefined();
+    });
+
+    it('should extract one-line assignment functions', () => {
+      const code = 'has_key(d, k) = (k in keys(d))';
+      const result = extractFromSource('short.jl', code);
+      expect(result.nodes.find((n) => n.name === 'has_key' && n.kind === 'function')).toBeDefined();
+    });
+  });
+
+  describe('Struct and abstract extraction', () => {
+    it('should extract struct definitions without block wrapper', () => {
+      const code = `
+struct Point
+ x::Float64
+ y::Float64
+end
+
+mutable struct Counter
+ value::Int
+end
+`;
+      const result = extractFromSource('types.jl', code);
+      const structs = result.nodes.filter((n) => n.kind === 'struct');
+      expect(structs.find((s) => s.name === 'Point')).toBeDefined();
+      expect(structs.find((s) => s.name === 'Counter')).toBeDefined();
+    });
+
+    it('should extract abstract type definitions', () => {
+      const code = `
+abstract type Animal end
+abstract type Shape end
+`;
+      const result = extractFromSource('abstract.jl', code);
+      const abstracts = result.nodes.filter((n) => n.kind === 'interface');
+      expect(abstracts.find((a) => a.name === 'Animal')).toBeDefined();
+      expect(abstracts.find((a) => a.name === 'Shape')).toBeDefined();
+    });
+  });
+
+  describe('Module extraction', () => {
+    it('should extract module and nested definitions', () => {
+      const code = `
+module SampleGraph
+export greet
+
+function greet(name::String)
+  println("Hello")
+end
+end
+`;
+      const result = extractFromSource('mymodule.jl', code);
+      expect(result.nodes.find((n) => n.kind === 'module' && n.name === 'SampleGraph')).toBeDefined();
+      expect(
+        result.nodes.find(
+          (n) => (n.kind === 'function' || n.kind === 'method') && n.name === 'greet'
+        )
+      ).toBeDefined();
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should extract import and using statements', () => {
+      const code = `
+import LinearAlgebra
+import Base.Math: sin, cos
+using Statistics
+using DataFrames: DataFrame
+`;
+      const result = extractFromSource('imports.jl', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('LinearAlgebra');
+      expect(imports).toContain('Statistics');
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should extract function calls inside bodies without block', () => {
+      const code = `
+function run(g)
+  out_neighbors(g, v)
+  sorted = topological_sort(cons)
+end
+`;
+      const result = extractFromSource('run.jl', code);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('out_neighbors');
+      expect(calls).toContain('topological_sort');
+    });
+  });
+});
+
+// =============================================================================
 // Luau (typed superset of Lua — https://luau.org)
 // =============================================================================
 

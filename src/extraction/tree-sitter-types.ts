@@ -120,6 +120,12 @@ export interface LanguageExtractor {
 
   // --- Existing hooks ---
 
+  /**
+   * Override name extraction when the name is not a direct `nameField` child.
+   * Return null to fall back to default field-based lookup.
+   */
+  getName?: (node: SyntaxNode, source: string) => string | null;
+
   /** Extract signature from node */
   getSignature?: (node: SyntaxNode, source: string) => string | undefined;
   /** Extract visibility from node */
