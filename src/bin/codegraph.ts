@@ -1213,11 +1213,9 @@ program
 /**
  * codegraph callers <symbol>
  *
- * Motivation: MCP is powerful but it couples the intelligence layer too tightly
- * to the agent runtime — every new capability requires the agent to be running.
- * We believe the CLI should be a first-class citizen that matches MCP feature
- * parity, so developers can use codegraph in scripts, CI pipelines, git hooks,
- * and any other context where spinning up an MCP server is impractical.
+ * CLI parity with the MCP graph tools (codegraph_callers/callees/impact) so the
+ * traversal queries work in scripts, CI, and git hooks without a running MCP
+ * server.
  */
 program
   .command('callers <symbol>')

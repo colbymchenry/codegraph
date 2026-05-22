@@ -340,10 +340,6 @@ At the start of a session, ask the user if they'd like to initialize CodeGraph:
 
 ## CLI Reference
 
-> **Why CLI parity with MCP matters**
->
-> MCP is a great transport for agent runtimes, but it couples capabilities too tightly to the agent process. Developers working in scripts, CI pipelines, git hooks, or editor-agnostic workflows shouldn't need a running MCP server to access the same graph intelligence. The commands below are designed to match MCP feature parity so the CLI is a first-class citizen alongside the MCP server.
-
 ```bash
 codegraph                         # Run interactive installer
 codegraph install                 # Run installer (explicit)
