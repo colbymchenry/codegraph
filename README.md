@@ -232,6 +232,7 @@ npm install -g @colbymchenry/codegraph
       "mcp__codegraph__codegraph_callees",
       "mcp__codegraph__codegraph_impact",
       "mcp__codegraph__codegraph_node",
+      "mcp__codegraph__codegraph_explore",
       "mcp__codegraph__codegraph_status",
       "mcp__codegraph__codegraph_files"
     ]
@@ -387,6 +388,7 @@ When running as an MCP server, CodeGraph exposes these tools to Claude Code:
 | `codegraph_callees` | Find what a function calls |
 | `codegraph_impact` | Analyze what code is affected by changing a symbol |
 | `codegraph_node` | Get details about a specific symbol (optionally with source code) |
+| `codegraph_explore` | Explore source for several related symbols in one capped call |
 | `codegraph_files` | Get indexed file structure (faster than filesystem scanning) |
 | `codegraph_status` | Check index health and statistics |
 
