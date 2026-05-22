@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock } from '../src/utils';
+import { FileLock, validateProjectPath } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -176,6 +176,36 @@ describe('Path Traversal Prevention', () => {
   });
 });
 
+describe('validateProjectPath — sensitive directory blocking', () => {
+  // POSIX-only: on Windows '/etc' resolves to C:\etc (non-existent), not a
+  // sensitive dir — the Windows case is covered by the win32-gated test below.
+  it.runIf(process.platform !== 'win32')('blocks POSIX system directories (exact match)', () => {
+    expect(validateProjectPath('/')).toMatch(/sensitive system directory/i);
+    expect(validateProjectPath('/etc')).toMatch(/sensitive system directory/i);
+  });
+
+  it('allows a normal, existing directory', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-validate-'));
+    try {
+      expect(validateProjectPath(dir)).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // SENSITIVE_PATHS stores the Windows entries lowercase and validateProjectPath
+  // matches via resolved.toLowerCase(), so 'C:\\Windows' and 'c:\\windows' are
+  // both blocked. path.resolve is platform-specific, so this only runs on Windows.
+  it.runIf(process.platform === 'win32')(
+    'blocks Windows system directories regardless of case',
+    () => {
+      expect(validateProjectPath('C:\\Windows')).toMatch(/sensitive system directory/i);
+      expect(validateProjectPath('c:\\windows')).toMatch(/sensitive system directory/i);
+      expect(validateProjectPath('C:\\WINDOWS\\System32')).toMatch(/sensitive system directory/i);
+    }
+  );
+});
+
 describe('MCP Input Validation', () => {
   let testDir: string;
   let cg: CodeGraph;
@@ -239,6 +269,20 @@ describe('MCP Input Validation', () => {
     expect(result.content[0].text).toContain('non-empty string');
   });
 
+  it('should truncate oversized codegraph_context output', async () => {
+    const oversizedContext = Array.from({ length: 400 }, (_, i) => `line-${i} ${'x'.repeat(80)}`).join('\n');
+    const fakeCg = {
+      buildContext: async () => oversizedContext,
+    };
+    const fakeHandler = new ToolHandler(fakeCg as unknown as CodeGraph);
+
+    const result = await fakeHandler.execute('codegraph_context', { task: 'find example' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text.length).toBeLessThan(oversizedContext.length);
+    expect(result.content[0].text).toContain('... (output truncated)');
+  });
+
   it('should reject non-string symbol in codegraph_impact', async () => {
     const result = await handler.execute('codegraph_impact', { symbol: [] });
     expect(result.isError).toBe(true);
@@ -263,6 +307,34 @@ describe('MCP Input Validation', () => {
     const result = await handler.execute('codegraph_search', { query: 'example', limit: -5 });
     expect(result.isError).toBeFalsy();
   });
+
+  // #230: getCodeGraph must reject a sensitive system directory passed as
+  // projectPath before opening it. The error surfaces through execute()'s
+  // catch as an isError result. /etc is sensitive on POSIX; C:\Windows on
+  // Windows (path.resolve is platform-specific, so each case is gated).
+  it.runIf(process.platform !== 'win32')(
+    'rejects a sensitive POSIX projectPath (/etc) via the MCP handler',
+    async () => {
+      const result = await handler.execute('codegraph_search', {
+        query: 'example',
+        projectPath: '/etc',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/sensitive system directory/i);
+    }
+  );
+
+  it.runIf(process.platform === 'win32')(
+    'rejects a sensitive Windows projectPath (C:\\Windows) via the MCP handler',
+    async () => {
+      const result = await handler.execute('codegraph_search', {
+        query: 'example',
+        projectPath: 'C:\\Windows',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/sensitive system directory/i);
+    }
+  );
 });
 
 describe('Atomic Writes', () => {

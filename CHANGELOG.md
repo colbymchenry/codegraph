@@ -7,7 +7,7 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.4] - 2026-05-22
 
 ### Fixed
 - **Orphaned `codegraph serve --mcp` processes after a parent SIGKILL.** When
@@ -22,6 +22,83 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   [#277](https://github.com/colbymchenry/codegraph/issues/277).
 
 ### Added
+- **Release archives now ship with a `SHA256SUMS` file**, and the npm launcher
+  verifies the bundle it downloads against it — a mismatch aborts before
+  anything runs. Releases published before this change have no checksum file, so
+  the verification is skipped (not failed) when none is available.
+
+### Fixed
+- **`codegraph: no prebuilt bundle for <platform>` after installing through a
+  registry mirror.** Installing `@colbymchenry/codegraph` from a registry that
+  hadn't mirrored the matching per-platform package — most often the
+  npmmirror/cnpm mirrors, but any lazily-syncing mirror or corporate proxy can
+  do it — left every command failing with `no prebuilt bundle for <platform>`.
+  The runtime ships as a per-platform `optionalDependency`, and npm treats an
+  optional package it can't fetch as a success and silently skips it, so the
+  bundle simply went missing. The launcher now self-heals: when the platform
+  bundle isn't installed, it downloads the same archive from GitHub Releases
+  (cached under `~/.codegraph/bundles/` for next time) and runs that — so a
+  global install works even on a mirror that never carried the platform package.
+  Set `CODEGRAPH_NO_DOWNLOAD=1` to disable the network fallback, or
+  `CODEGRAPH_DOWNLOAD_BASE=<url>` to point it at your own mirror of the release
+  archives; the standalone `install.sh` remains the no-Node alternative. Resolves
+  [#303](https://github.com/colbymchenry/codegraph/issues/303).
+- **`install.sh` failing with `403` / "could not resolve latest version" on
+  shared or cloud hosts.** The standalone installer resolved the latest release
+  through the GitHub API, whose unauthenticated limit is 60 requests/hour per IP
+  — routinely exhausted on cloud devboxes and CI where many users share an
+  address, returning `403` (issue #325). It now resolves the version from the
+  `releases/latest` web redirect, which isn't rate-limited (and still falls back
+  to the API). `CODEGRAPH_VERSION` also accepts a bare `0.9.4` in addition to
+  `v0.9.4`. Resolves
+  [#325](https://github.com/colbymchenry/codegraph/issues/325).
+
+## [0.9.3] - 2026-05-22
+
+### Added
+- **`codegraph uninstall` command.** Cleanly removes CodeGraph from every agent
+  it's configured on — Claude Code, Cursor, Codex CLI, opencode, and Hermes
+  Agent — in one step. It asks up front whether to remove the global config
+  (`~/.claude`, `~/.codex`, …) or just this project's local config (no flags
+  required), then prints exactly which agents it touched so you can see what
+  changed. `--location`, `--target`, and `--yes` are accepted for scripted /
+  non-interactive use. It removes only what `install` wrote (MCP server entry,
+  instructions block, permissions) and leaves your `.codegraph/` index alone
+  (use `codegraph uninit` for that). Resolves
+  [#313](https://github.com/colbymchenry/codegraph/issues/313) — previously the
+  only cleanup path was an npm `preuninstall` hook that the published bundle
+  never shipped, so `npm uninstall -g` left every agent pointing at a CodeGraph
+  MCP server that no longer existed.
+
+### Fixed
+- **`Fatal process out of memory: Zone` crash while indexing large projects.**
+  On Node.js 22 and 24 — including CodeGraph's own bundled runtime — running
+  `codegraph index` / `codegraph init` on a large multi-language repo could
+  abort the entire process partway through parsing with
+  `Fatal process out of memory: Zone`, even with tens of GB of RAM free (the
+  failure is in a V8-internal compilation arena, not the JS heap). The cause is
+  V8's "turboshaft" optimizing WASM compiler exhausting its Zone budget while
+  compiling tree-sitter's large WebAssembly grammars on a background thread.
+  CodeGraph now runs with V8's `--liftoff-only`, which keeps grammar compilation
+  on the baseline compiler and never reaches the optimizing tier, eliminating
+  the crash; indexing output is otherwise unchanged. The bundled launcher passes
+  the flag directly, and any other launch path (from source, `npx`, a globally
+  linked dev build) re-execs once with it automatically. Resolves
+  [#298](https://github.com/colbymchenry/codegraph/issues/298) and
+  [#293](https://github.com/colbymchenry/codegraph/issues/293). (Node 25 stays
+  blocked — its variant of this V8 bug is not resolved by `--liftoff-only`.)
+- **Cursor uninstall left an orphaned `.cursor/rules/codegraph.mdc`.** It
+  stripped the rule body but left the file and its `description: CodeGraph …`
+  frontmatter behind. The dedicated rules file is now deleted outright on
+  uninstall, while any content you added outside CodeGraph's markers is kept.
+
+## [0.9.2] - 2026-05-21
+
+### Added
+- **Installer target: Hermes Agent (Nous Research).** `codegraph install` now
+  supports Hermes Agent — it writes the `mcp_servers.codegraph` entry and ensures
+  `platform_toolsets.cli` includes `mcp-codegraph` in `$HERMES_HOME/config.yaml`,
+  so Hermes can drive the CodeGraph knowledge graph like the other agents.
 - **Framework support: Drupal 8/9/10/11** — CodeGraph now detects Drupal
   projects (via a `drupal/*` dependency in `composer.json`) and adds three
   levels of intelligence:
@@ -54,6 +131,15 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   those names; now `.gitignore` is the single source of truth. Resolves
   [#283](https://github.com/colbymchenry/codegraph/issues/283).
 
+### Fixed
+- **Windows: `npm i -g @colbymchenry/codegraph` then any `codegraph` command
+  failed with `spawnSync …\codegraph.cmd EINVAL`.** The npm launcher spawned the
+  bundle's `.cmd` file directly, which modern Node refuses to do on Windows
+  (the CVE-2024-27980 hardening — seen on Node 24). The launcher now invokes the
+  bundled `node.exe` against the app directly, so `codegraph` works on Windows
+  regardless of your Node version. Resolves
+  [#289](https://github.com/colbymchenry/codegraph/issues/289).
+
 ### Removed
 - **`.codegraph/config.json` and the entire config surface.** Every field was
   either inert or now redundant with `.gitignore`:
@@ -72,6 +158,15 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exports are gone. Existing `.codegraph/config.json` files are simply ignored.
   The `.codegraphignore` marker is no longer supported — use `.gitignore`.
 
+### Security
+- **MCP session marker no longer follows symlinks** (CWE-59). Every
+  `codegraph_context` call writes a `codegraph-consulted-*` marker into the
+  system temp dir; the previous write followed symlinks, so on a multi-user
+  system another local user could pre-plant that path as a symlink and redirect
+  the write onto a victim-writable file. The marker is now opened with
+  `O_NOFOLLOW` and mode `0600`, and a planted symlink is refused rather than
+  followed. Resolves [#280](https://github.com/colbymchenry/codegraph/issues/280).
+
 ## [0.9.1] - 2026-05-21
 
 ### Fixed
@@ -83,6 +178,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   find its bundle. The release pipeline now verifies every package reached the
   registry (and is idempotent), so a release can't pass green-but-broken again.
 
+[0.9.4]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.4
+[0.9.3]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.3
+[0.9.2]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.2
 [0.9.1]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.1
 
 ## [0.9.0] - 2026-05-21

@@ -21,7 +21,7 @@ import {
   getTarget,
   resolveTargetFlag,
 } from './targets/registry';
-import type { AgentTarget, Location, WriteResult } from './targets/types';
+import type { AgentTarget, Location, TargetId, WriteResult } from './targets/types';
 import { getGlyphs } from '../ui/glyphs';
 // Import the lightweight submodules directly (not the ../sync barrel, which
 // re-exports FileWatcher and would transitively pull in ../extraction — the
@@ -215,6 +215,167 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     ? `Done! Restart your agent${targets.length > 1 ? 's' : ''} to use CodeGraph.`
     : 'Done!';
   clack.outro(finalNote);
+}
+
+export interface RunUninstallerOptions {
+  /**
+   * Comma-separated target list, or `auto` / `all` / `none`. Defaults
+   * to `all` — uninstall sweeps every known agent and reports which
+   * ones it actually touched, so the user doesn't have to know where
+   * they configured it.
+   */
+  target?: string;
+  /** Skip the location prompt; use this value directly. */
+  location?: Location;
+  /** Non-interactive: location=global, target=all, no prompts. */
+  yes?: boolean;
+}
+
+export type UninstallStatus = 'removed' | 'not-configured' | 'unsupported';
+
+/**
+ * Per-target outcome of an uninstall sweep. `removed` means we deleted
+ * at least one thing; `not-configured` means the agent had no codegraph
+ * config at this location (nothing to do); `unsupported` means the
+ * agent has no config concept for this location (e.g. Codex is
+ * global-only, so a `local` uninstall skips it).
+ */
+export interface UninstallReport {
+  id: TargetId;
+  displayName: string;
+  status: UninstallStatus;
+  /** Absolute paths we actually edited/removed (action === 'removed'). */
+  removedPaths: string[];
+  /** Verbatim notes from the target (rare for uninstall). */
+  notes: string[];
+}
+
+/**
+ * Pure uninstall sweep — no prompts, no I/O beyond the targets' own
+ * file edits. Exposed (and unit-tested) separately from the clack UI in
+ * `runUninstaller` so the aggregation logic can be asserted directly.
+ *
+ * Each target's `uninstall()` is already safe to call when nothing was
+ * installed (it returns `not-found` actions), so this is safe to run
+ * across every target unconditionally.
+ */
+export function uninstallTargets(
+  targets: readonly AgentTarget[],
+  location: Location,
+): UninstallReport[] {
+  return targets.map((target) => {
+    if (!target.supportsLocation(location)) {
+      const only: Location = location === 'local' ? 'global' : 'local';
+      return {
+        id: target.id,
+        displayName: target.displayName,
+        status: 'unsupported' as const,
+        removedPaths: [],
+        notes: [`no ${location} config — this agent is ${only}-only`],
+      };
+    }
+    const result = target.uninstall(location);
+    const removedPaths = result.files
+      .filter((f) => f.action === 'removed')
+      .map((f) => f.path);
+    return {
+      id: target.id,
+      displayName: target.displayName,
+      status: removedPaths.length > 0 ? ('removed' as const) : ('not-configured' as const),
+      removedPaths,
+      notes: result.notes ?? [],
+    };
+  });
+}
+
+/**
+ * Interactive uninstaller — the inverse of `runInstallerWithOptions`.
+ * Asks global-vs-local first (unless `--location`/`--yes` is given),
+ * then sweeps every agent target (or the `--target` subset) and prints
+ * one block per agent so the user sees exactly which providers it hit.
+ *
+ * Removes only what install wrote (MCP server entry, instructions
+ * block, permissions) — never the `.codegraph/` index, which `codegraph
+ * uninit` owns.
+ */
+export async function runUninstaller(opts: RunUninstallerOptions): Promise<void> {
+  const clack = await importESM('@clack/prompts');
+
+  clack.intro(`CodeGraph v${getVersion()} — uninstall`);
+
+  const useDefaults = opts.yes === true;
+
+  // Step 1: which location — asked FIRST, the one decision the user
+  // must make. Global sweeps ~/.claude, ~/.codex, etc.; local sweeps
+  // the configs in this project directory.
+  let location: Location;
+  if (opts.location) {
+    location = opts.location;
+  } else if (useDefaults) {
+    location = 'global';
+  } else {
+    const sel = await clack.select({
+      message: 'Remove CodeGraph from all your projects, or just this one?',
+      options: [
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes' },
+        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc' },
+      ],
+      initialValue: 'global' as const,
+    });
+    if (clack.isCancel(sel)) {
+      clack.cancel('Uninstall cancelled.');
+      process.exit(0);
+    }
+    location = sel;
+  }
+
+  // Step 2: which agents. Default is every agent, so the user doesn't
+  // have to remember where they installed it — unconfigured agents are
+  // reported as "nothing to remove" and left untouched. An explicit
+  // --target subsets this.
+  let targets: AgentTarget[];
+  if (opts.target !== undefined) {
+    targets = resolveTargetFlag(opts.target, location);
+  } else {
+    targets = [...ALL_TARGETS];
+  }
+  if (targets.length === 0) {
+    clack.outro('No agent targets selected — nothing to do.');
+    return;
+  }
+
+  // Step 3: sweep + per-agent feedback.
+  const reports = uninstallTargets(targets, location);
+  const removed = reports.filter((r) => r.status === 'removed');
+
+  for (const r of reports) {
+    if (r.status === 'removed') {
+      for (const p of r.removedPaths) {
+        clack.log.success(`${r.displayName}: removed ${tildify(p)}`);
+      }
+    } else if (r.status === 'not-configured') {
+      clack.log.info(`${r.displayName}: not configured — nothing to remove`);
+    } else {
+      clack.log.info(`${r.displayName}: skipped — ${r.notes[0] ?? 'unsupported location'}`);
+    }
+  }
+
+  // Step 4: for local uninstall, the index dir is separate — point at
+  // `uninit` so the user knows it's still there (and how to remove it).
+  if (location === 'local' && fs.existsSync(path.join(process.cwd(), '.codegraph'))) {
+    clack.log.info('The .codegraph/ index for this project is still here. Run `codegraph uninit` to delete it.');
+  }
+
+  // Step 5: summary.
+  if (removed.length > 0) {
+    const names = removed.map((r) => r.displayName).join(', ');
+    clack.outro(
+      `Removed CodeGraph from ${removed.length} agent${removed.length > 1 ? 's' : ''}: ${names}. ` +
+      `Restart ${removed.length > 1 ? 'them' : 'it'} to apply.`,
+    );
+  } else {
+    clack.outro(`CodeGraph was not configured in any ${location} agent — nothing to remove.`);
+  }
 }
 
 /**

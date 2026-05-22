@@ -40,6 +40,9 @@ npm-debug.log*
 # Local Claude settings
 .claude/settings.local.json
 
+# Parallels Windows VM SSH/connection config (local machine, see CLAUDE.md)
+.parallels
+
 # CodeGraph data directories (in test projects)
 .codegraph/
 
