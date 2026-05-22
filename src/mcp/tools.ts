@@ -11,6 +11,7 @@ import {
   constants as fsConstants,
   closeSync,
   existsSync,
+  lstatSync,
   openSync,
   readFileSync,
   writeSync,
@@ -224,6 +225,16 @@ function markSessionConsulted(sessionId: string): void {
   try {
     const hash = createHash('md5').update(sessionId).digest('hex').slice(0, 16);
     const markerPath = join(tmpdir(), `codegraph-consulted-${hash}`);
+    // Refuse to follow a pre-planted symlink at the marker path (CWE-59).
+    // O_NOFOLLOW (below) is the atomic, TOCTOU-free guard on POSIX, but it is
+    // `undefined` on Windows (libuv ignores it), so the bitwise-OR silently
+    // drops it and openSync would follow the link. This lstat check closes that
+    // gap cross-platform; ENOENT (path is free) falls through to create it.
+    try {
+      if (lstatSync(markerPath).isSymbolicLink()) return;
+    } catch {
+      // No existing entry (or stat failed) — nothing to refuse; proceed.
+    }
     // O_NOFOLLOW makes openSync throw ELOOP if markerPath is already a symlink.
     // O_CREAT + O_TRUNC keep the original "create-or-overwrite" semantics, and
     // mode 0o600 prevents readback by other local users (the marker payload is
