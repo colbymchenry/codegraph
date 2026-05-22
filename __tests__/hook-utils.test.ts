@@ -95,8 +95,7 @@ describe('chmodExecutable', () => {
     if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
   });
 
-  it('sets 0o755 executable bit on POSIX', () => {
-    if (process.platform === 'win32') return;
+  it.skipIf(process.platform === 'win32')('sets 0o755 executable bit on POSIX', () => {
     fs.writeFileSync(tmp, '#!/bin/sh\n', { mode: 0o644 });
     chmodExecutable(tmp);
     expect(fs.statSync(tmp).mode & 0o111).not.toBe(0);
