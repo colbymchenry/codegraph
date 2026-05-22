@@ -43,20 +43,6 @@ npm i -g @colbymchenry/codegraph
 
 <sub>CodeGraph bundles its own runtime — nothing to compile, no native build, works the same everywhere. The interactive installer auto-configures your agent(s) — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent.</sub>
 
-## Supported Platforms
-
-- Windows (PowerShell installer or npm)
-- macOS (shell installer or npm)
-- Linux (shell installer or npm)
-
-## Supported Agents
-
-- Claude Code
-- Cursor
-- Codex CLI
-- opencode
-- Hermes Agent
-
 ### Initialize Projects
 
 ```bash
@@ -460,6 +446,30 @@ What that means in practice:
 > Committed files that aren't gitignored *are* indexed, even under `vendor/` or a
 > committed `dist/`. If you commit a dependency or build directory you don't want
 > in the graph, add it to `.gitignore`.
+
+## Supported Platforms
+
+Every release ships a self-contained build (bundled Node runtime — nothing to
+compile) for all three desktop OSes, on both Intel/AMD (x64) and ARM (arm64):
+
+| Platform | Architectures | Install |
+|----------|---------------|---------|
+| Windows | x64, arm64 | PowerShell installer or npm |
+| macOS | x64, arm64 | shell installer or npm |
+| Linux | x64, arm64 | shell installer or npm |
+
+See [Get Started](#get-started) for the one-line install commands.
+
+## Supported Agents
+
+The interactive installer auto-detects and configures each of these — wiring up
+the MCP server and writing its instructions file:
+
+- **Claude Code**
+- **Cursor**
+- **Codex CLI**
+- **opencode**
+- **Hermes Agent**
 
 ## Supported Languages
 
