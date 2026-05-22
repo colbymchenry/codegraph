@@ -35,7 +35,7 @@ try {
   process.exit(1);
 }
 
-var res = childProcess.spawnSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
+var res = childProcess.spawnSync(binPath, process.argv.slice(2), { stdio: 'inherit', shell: process.platform === 'win32' });
 if (res.error) {
   process.stderr.write('codegraph: ' + res.error.message + '\n');
   process.exit(1);

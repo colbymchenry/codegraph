@@ -60,6 +60,13 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exports are gone. Existing `.codegraph/config.json` files are simply ignored.
   The `.codegraphignore` marker is no longer supported — use `.gitignore`.
 
+### Fixed
+- **Windows `EINVAL` via npm/npx.** The thin-installer shim used `spawnSync` to
+  launch the bundled `codegraph.cmd` on Windows, which throws `EINVAL` when
+  `shell: true` is omitted (Node.js requires a shell to execute `.cmd` batch
+  files). Windows installs via `npm i -g` or `npx` now work. Resolves
+  [#289](https://github.com/colbymchenry/codegraph/issues/289).
+
 ## [0.9.1] - 2026-05-21
 
 ### Fixed
