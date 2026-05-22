@@ -307,6 +307,34 @@ describe('MCP Input Validation', () => {
     const result = await handler.execute('codegraph_search', { query: 'example', limit: -5 });
     expect(result.isError).toBeFalsy();
   });
+
+  // #230: getCodeGraph must reject a sensitive system directory passed as
+  // projectPath before opening it. The error surfaces through execute()'s
+  // catch as an isError result. /etc is sensitive on POSIX; C:\Windows on
+  // Windows (path.resolve is platform-specific, so each case is gated).
+  it.runIf(process.platform !== 'win32')(
+    'rejects a sensitive POSIX projectPath (/etc) via the MCP handler',
+    async () => {
+      const result = await handler.execute('codegraph_search', {
+        query: 'example',
+        projectPath: '/etc',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/sensitive system directory/i);
+    }
+  );
+
+  it.runIf(process.platform === 'win32')(
+    'rejects a sensitive Windows projectPath (C:\\Windows) via the MCP handler',
+    async () => {
+      const result = await handler.execute('codegraph_search', {
+        query: 'example',
+        projectPath: 'C:\\Windows',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/sensitive system directory/i);
+    }
+  );
 });
 
 describe('Atomic Writes', () => {

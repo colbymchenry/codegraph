@@ -579,10 +579,16 @@ export class ToolHandler {
       return this.projectCache.get(projectPath)!;
     }
 
-    // Validate the path is safe before opening
-    const pathError = validateProjectPath(projectPath);
-    if (pathError) {
-      throw new Error(pathError);
+    // Reject sensitive system directories before opening. Only validate a
+    // path that actually exists — a nested or not-yet-created sub-path of a
+    // real project must still be allowed to resolve UP to its .codegraph/
+    // root below (issue #238), so we don't run the existence-checking
+    // validator on paths that are meant to walk up.
+    if (existsSync(projectPath)) {
+      const pathError = validateProjectPath(projectPath);
+      if (pathError) {
+        throw new Error(pathError);
+      }
     }
 
     // Walk up parent directories to find nearest .codegraph/
