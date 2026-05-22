@@ -26,6 +26,7 @@ import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized } from '../directory';
+import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 
@@ -692,6 +693,11 @@ program
   .option('-j, --json', 'Output as JSON')
   .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
+    // The directory the user actually ran from, before walking up to the index
+    // root. Used to detect when the resolved index lives in a different git
+    // working tree (e.g. a nested worktree borrowing the main checkout's index).
+    const startPath = path.resolve(pathArg || process.cwd());
+    const worktreeMismatch = detectWorktreeIndexMismatch(startPath, projectPath);
 
     try {
       if (!isInitialized(projectPath)) {
@@ -731,6 +737,9 @@ program
             modified: changes.modified.length,
             removed: changes.removed.length,
           },
+          worktreeMismatch: worktreeMismatch
+            ? { worktreeRoot: worktreeMismatch.worktreeRoot, indexRoot: worktreeMismatch.indexRoot }
+            : null,
         }));
         cg.destroy();
         return;
@@ -740,6 +749,9 @@ program
 
       // Project info
       console.log(chalk.cyan('Project:'), projectPath);
+      if (worktreeMismatch) {
+        warn(worktreeMismatchWarning(worktreeMismatch));
+      }
       console.log();
 
       // Index stats

@@ -5,6 +5,7 @@
  */
 
 import CodeGraph, { findNearestCodeGraphRoot } from '../index';
+import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind } from '../types';
 import { createHash } from 'crypto';
 import {
@@ -1954,14 +1955,26 @@ export class ToolHandler {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const stats = cg.getStats();
 
+    // Warn when this index actually belongs to a different git working tree
+    // (e.g. the server resolved up from a nested worktree to the main checkout).
+    // Queries then reflect that tree's branch, not the worktree being edited.
+    const startPath =
+      (args.projectPath as string | undefined) ?? this.defaultProjectHint ?? process.cwd();
+    const mismatch = detectWorktreeIndexMismatch(startPath, cg.getProjectRoot());
+
     const lines: string[] = [
       '## CodeGraph Status',
       '',
+    ];
+    if (mismatch) {
+      lines.push(`> ⚠ ${worktreeMismatchWarning(mismatch).replace(/\n/g, '\n> ')}`, '');
+    }
+    lines.push(
       `**Files indexed:** ${stats.fileCount}`,
       `**Total nodes:** ${stats.nodeCount}`,
       `**Total edges:** ${stats.edgeCount}`,
       `**Database size:** ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`,
-    ];
+    );
 
     // Surface the active SQLite backend (node:sqlite, Node's built-in real
     // SQLite — full WAL + FTS5, no native build).
