@@ -9,10 +9,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory, shouldIncludeFile } from '../src/extraction';
+import { extractFromSource, scanDirectory } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars } from '../src/extraction/grammars';
 import { normalizePath } from '../src/utils';
-import { DEFAULT_CONFIG } from '../src/types';
 
 beforeAll(async () => {
   await initGrammars();
@@ -3003,39 +3002,57 @@ describe('Directory Exclusion', () => {
     cleanupTempDir(tempDir);
   });
 
-  it('should exclude node_modules directories', () => {
-    // Create structure: src/index.ts + node_modules/pkg/index.js
+  it('should exclude directories listed in .gitignore', () => {
+    // Create structure: src/index.ts + node_modules/pkg/index.js, gitignore node_modules
     const srcDir = path.join(tempDir, 'src');
     const nmDir = path.join(tempDir, 'node_modules', 'pkg');
     fs.mkdirSync(srcDir, { recursive: true });
     fs.mkdirSync(nmDir, { recursive: true });
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
     fs.writeFileSync(path.join(nmDir, 'index.js'), 'module.exports = {};');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'node_modules/\n');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files).toContain('src/index.ts');
     expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
   });
 
-  it('should exclude nested node_modules directories', () => {
-    // Create structure: packages/app/node_modules/pkg/index.js
+  it('should exclude nested node_modules via a root .gitignore', () => {
+    // A trailing-slash pattern with no leading slash matches at any depth.
     const srcDir = path.join(tempDir, 'packages', 'app', 'src');
     const nmDir = path.join(tempDir, 'packages', 'app', 'node_modules', 'pkg');
     fs.mkdirSync(srcDir, { recursive: true });
     fs.mkdirSync(nmDir, { recursive: true });
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
     fs.writeFileSync(path.join(nmDir, 'index.js'), 'module.exports = {};');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'node_modules/\n');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files).toContain('packages/app/src/index.ts');
     expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
   });
 
-  it('should exclude .git directories', () => {
+  it('should apply a nested .gitignore only to its own subtree', () => {
+    const appSrc = path.join(tempDir, 'app', 'src');
+    fs.mkdirSync(appSrc, { recursive: true });
+    fs.writeFileSync(path.join(appSrc, 'keep.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(appSrc, 'skip.ts'), 'export const b = 2;');
+    fs.writeFileSync(path.join(tempDir, 'app', '.gitignore'), 'src/skip.ts\n');
+    // A sibling with the same name outside app/ must NOT be ignored.
+    const otherDir = path.join(tempDir, 'other', 'src');
+    fs.mkdirSync(otherDir, { recursive: true });
+    fs.writeFileSync(path.join(otherDir, 'skip.ts'), 'export const c = 3;');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('app/src/keep.ts');
+    expect(files).not.toContain('app/src/skip.ts');
+    expect(files).toContain('other/src/skip.ts');
+  });
+
+  it('should always skip .git directories', () => {
     const srcDir = path.join(tempDir, 'src');
     const gitDir = path.join(tempDir, '.git', 'objects');
     fs.mkdirSync(srcDir, { recursive: true });
@@ -3043,8 +3060,7 @@ describe('Directory Exclusion', () => {
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
     fs.writeFileSync(path.join(gitDir, 'pack.ts'), 'export const y = 2;');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files).toContain('src/index.ts');
     expect(files.every((f) => !f.includes('.git'))).toBe(true);
@@ -3055,28 +3071,11 @@ describe('Directory Exclusion', () => {
     fs.mkdirSync(srcDir, { recursive: true });
     fs.writeFileSync(path.join(srcDir, 'Button.tsx'), 'export function Button() {}');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     expect(files.length).toBe(1);
     expect(files[0]).toBe('src/components/Button.tsx');
     expect(files[0]).not.toContain('\\');
-  });
-
-  it('should respect .codegraphignore marker', () => {
-    const srcDir = path.join(tempDir, 'src');
-    const vendorDir = path.join(tempDir, 'vendor');
-    fs.mkdirSync(srcDir, { recursive: true });
-    fs.mkdirSync(vendorDir, { recursive: true });
-    fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
-    fs.writeFileSync(path.join(vendorDir, 'lib.ts'), 'export const y = 2;');
-    fs.writeFileSync(path.join(vendorDir, '.codegraphignore'), '');
-
-    const config = { ...DEFAULT_CONFIG, rootDir: tempDir };
-    const files = scanDirectory(tempDir, config);
-
-    expect(files).toContain('src/index.ts');
-    expect(files.every((f) => !f.includes('vendor'))).toBe(true);
   });
 });
 
@@ -3124,8 +3123,7 @@ describe('Git Submodules', () => {
     );
     git(mainDir, 'commit', '-q', '-m', 'add submodule');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: mainDir };
-    const files = scanDirectory(mainDir, config);
+    const files = scanDirectory(mainDir);
 
     expect(files).toContain('app.ts');
     expect(files).toContain('libs/lib/lib.ts');
@@ -3173,8 +3171,7 @@ describe('Nested non-submodule git repos', () => {
     git(path.join(root, 'sub_repo2'), 'init', '-q');
     fs.writeFileSync(path.join(sub2, 'two.ts'), 'export const two = 2;');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: root };
-    const files = scanDirectory(root, config);
+    const files = scanDirectory(root);
 
     // Both committed and untracked source from the nested repos must be found.
     expect(files).toContain('sub_repo1/src/one.ts');
@@ -3197,8 +3194,7 @@ describe('Nested non-submodule git repos', () => {
     fs.writeFileSync(path.join(sub, 'real.ts'), 'export const real = 1;');
     fs.writeFileSync(path.join(sub, 'generated.ts'), 'export const generated = 1;');
 
-    const config = { ...DEFAULT_CONFIG, rootDir: root };
-    const files = scanDirectory(root, config);
+    const files = scanDirectory(root);
 
     expect(files).toContain('sub_repo/src/real.ts');
     expect(files).not.toContain('sub_repo/src/generated.ts');
@@ -3720,5 +3716,182 @@ class Svc {
     // The decorated symbol must be `method`, not the constructor or class.
     const decoratedNode = result.nodes.find((n) => n.id === decorMethod!.fromNodeId);
     expect(decoratedNode?.name).toBe('method');
+  });
+});
+
+// =============================================================================
+// Lua
+// =============================================================================
+
+describe('Lua Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Lua files', () => {
+      expect(detectLanguage('init.lua')).toBe('lua');
+      expect(detectLanguage('src/util.lua')).toBe('lua');
+    });
+
+    it('should report Lua as supported', () => {
+      expect(isLanguageSupported('lua')).toBe(true);
+      expect(getSupportedLanguages()).toContain('lua');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract global and local functions', () => {
+      const code = `
+function configure(opts) return opts end
+local function helper(x) return x * 2 end
+`;
+      const result = extractFromSource('init.lua', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('configure');
+      expect(funcs).toContain('helper');
+      const configure = result.nodes.find((n) => n.name === 'configure');
+      expect(configure?.language).toBe('lua');
+      expect(configure?.signature).toBe('(opts)');
+    });
+
+    it('should split table/method functions into a receiver and method name', () => {
+      const code = `
+function M.connect(host, port) return host end
+function M:send(data) return self end
+`;
+      const result = extractFromSource('init.lua', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const connect = methods.find((m) => m.name === 'connect');
+      expect(connect?.qualifiedName).toBe('M::connect');
+      const send = methods.find((m) => m.name === 'send');
+      expect(send?.qualifiedName).toBe('M::send');
+    });
+  });
+
+  describe('Variable extraction', () => {
+    it('should extract local variable declarations', () => {
+      const code = `
+local M = {}
+local count = 0
+`;
+      const result = extractFromSource('mod.lua', code);
+      const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+      expect(vars).toContain('M');
+      expect(vars).toContain('count');
+    });
+  });
+
+  describe('Import extraction (require)', () => {
+    it('should extract require() in local declarations and bare calls', () => {
+      const code = `
+local socket = require("socket")
+local http = require "resty.http"
+require("side.effect")
+`;
+      const result = extractFromSource('net.lua', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('socket');
+      expect(imports).toContain('resty.http');
+      expect(imports).toContain('side.effect');
+
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'socket'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    // Regression: the tree-sitter-wasms Lua grammar (ABI 13) corrupts the shared
+    // WASM heap under web-tree-sitter 0.25, dropping nested calls/imports on every
+    // parse after the first. We vendor the ABI-15 grammar instead — this guards it
+    // by extracting several sources in sequence and asserting the LAST still works.
+    it('should keep extracting require across many sequential parses', () => {
+      let last;
+      for (let i = 0; i < 8; i++) {
+        last = extractFromSource(`f${i}.lua`, `local m = require("module.${i}")\nreturn m\n`);
+      }
+      const imports = last!.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('module.7');
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should record intra-file calls as resolvable references', () => {
+      const code = `
+local function helper(x) return x end
+local function run(y) return helper(y) end
+`;
+      const result = extractFromSource('calls.lua', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'helper'
+      );
+      expect(call).toBeDefined();
+    });
+  });
+});
+
+// =============================================================================
+// Luau (typed superset of Lua — https://luau.org)
+// =============================================================================
+
+describe('Luau Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Luau files', () => {
+      expect(detectLanguage('init.luau')).toBe('luau');
+      expect(detectLanguage('src/Client.luau')).toBe('luau');
+    });
+
+    it('should report Luau as supported', () => {
+      expect(isLanguageSupported('luau')).toBe(true);
+      expect(getSupportedLanguages()).toContain('luau');
+    });
+  });
+
+  describe('Type aliases', () => {
+    it('should extract `type` and `export type` definitions', () => {
+      const code = `
+export type Vector = { x: number, y: number }
+type Handler = (msg: string) -> boolean
+`;
+      const result = extractFromSource('types.luau', code);
+      const aliases = result.nodes.filter((n) => n.kind === 'type_alias');
+      const vector = aliases.find((a) => a.name === 'Vector');
+      expect(vector).toBeDefined();
+      expect(vector?.isExported).toBe(true);
+      const handler = aliases.find((a) => a.name === 'Handler');
+      expect(handler).toBeDefined();
+      expect(handler?.isExported).toBe(false);
+    });
+  });
+
+  describe('Typed functions and methods', () => {
+    it('should capture typed signatures and split methods by receiver', () => {
+      const code = `
+function configure(opts: { debug: boolean }): boolean
+	return opts.debug
+end
+function Client:fetch(path: string): Response
+	return path
+end
+`;
+      const result = extractFromSource('client.luau', code);
+      const configure = result.nodes.find((n) => n.kind === 'function' && n.name === 'configure');
+      expect(configure?.language).toBe('luau');
+      expect(configure?.signature).toBe('(opts: { debug: boolean }): boolean');
+      const fetch = result.nodes.find((n) => n.kind === 'method' && n.name === 'fetch');
+      expect(fetch?.qualifiedName).toBe('Client::fetch');
+    });
+  });
+
+  describe('Imports and variables', () => {
+    it('should extract string and Roblox instance-path require imports', () => {
+      const code = `
+local http = require("http")
+local Signal = require(script.Parent.Signal)
+local count = 0
+`;
+      const result = extractFromSource('mod.luau', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('http'); // string require
+      expect(imports).toContain('Signal'); // Roblox instance-path require
+      const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+      expect(vars).toContain('count');
+    });
   });
 });

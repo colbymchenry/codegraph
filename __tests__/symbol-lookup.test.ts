@@ -25,8 +25,8 @@ beforeAll(async () => {
 
 function hasSqliteBindings(): boolean {
   try {
-    const Database = require('better-sqlite3');
-    const db = new Database(':memory:');
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(':memory:');
     db.close();
     return true;
   } catch {

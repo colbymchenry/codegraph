@@ -9,8 +9,7 @@
  */
 
 import * as fs from 'fs';
-import { CodeGraphConfig } from '../types';
-import { shouldIncludeFile } from '../extraction';
+import { isSourceFile } from '../extraction';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
 import { watchDisabledReason } from './watch-policy';
@@ -44,7 +43,7 @@ export interface WatchOptions {
  * Design goals:
  * - Minimal resource usage (native OS file events, no polling)
  * - Debounced to avoid thrashing on rapid saves
- * - Filters against CodeGraph include/exclude patterns
+ * - Filters to supported source files by extension
  * - Ignores .codegraph/ directory changes
  */
 export class FileWatcher {
@@ -55,7 +54,6 @@ export class FileWatcher {
   private stopped = false;
 
   private readonly projectRoot: string;
-  private readonly config: CodeGraphConfig;
   private readonly debounceMs: number;
   private readonly syncFn: () => Promise<{ filesChanged: number; durationMs: number }>;
   private readonly onSyncComplete?: WatchOptions['onSyncComplete'];
@@ -63,12 +61,10 @@ export class FileWatcher {
 
   constructor(
     projectRoot: string,
-    config: CodeGraphConfig,
     syncFn: () => Promise<{ filesChanged: number; durationMs: number }>,
     options: WatchOptions = {}
   ) {
     this.projectRoot = projectRoot;
-    this.config = config;
     this.syncFn = syncFn;
     this.debounceMs = options.debounceMs ?? 2000;
     this.onSyncComplete = options.onSyncComplete;
@@ -112,8 +108,8 @@ export class FileWatcher {
             return;
           }
 
-          // Filter against include/exclude patterns
-          if (!shouldIncludeFile(normalized, this.config)) {
+          // Only sync changes to files we can actually parse.
+          if (!isSourceFile(normalized)) {
             return;
           }
 

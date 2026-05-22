@@ -116,19 +116,28 @@ When asked for an entry for a new version:
 
 ### Release flow (the user runs these)
 
+Releases are built and published by the **GitHub Actions "Release" workflow**
+(`.github/workflows/release.yml`). It bundles a Node runtime per platform
+(`scripts/build-bundle.sh`) and publishes both the GitHub Release and the npm
+thin-installer (`scripts/pack-npm.sh`: a shim package + per-platform packages).
+Publishing manually is **wrong** now — a plain `npm publish` ships the root
+package (non-bundled), which breaks anyone on Node < 22.5.
+
 After the changelog entry is written and `package.json` is bumped:
 
 ```bash
 git add package.json package-lock.json CHANGELOG.md
 git commit -m "release: X.Y.Z (<one-line summary>)"
 git push
-npm publish
-./scripts/release.sh   # idempotent: tags vX.Y.Z, pushes, creates GitHub Release with notes from CHANGELOG.md
 ```
 
-`scripts/release.sh` is safe to re-run after a partial failure — it skips steps already done (tag exists locally, tag on origin, release published). It extracts release notes from `CHANGELOG.md` by matching the `## [X.Y.Z]` block.
+Then trigger **Actions → Release → Run workflow** (on `main`). It reads the
+version from `package.json`, builds every platform bundle on one runner, creates
+the GitHub Release with notes from the matching `CHANGELOG.md` section, and
+publishes to npm. Requires the `NPM_TOKEN` repo secret.
 
-**Do not run `npm publish`, `git push`, `git tag`, or `./scripts/release.sh` yourself** — these are publish actions on shared state. Write the file, hand the user the commands.
+**Do not run `npm publish`, `git push`, or `git tag` yourself** — these are
+publish actions on shared state. Write the files, hand the user the commands.
 
 ## House rules
 

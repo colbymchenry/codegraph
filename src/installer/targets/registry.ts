@@ -13,6 +13,7 @@ import { cursorTarget } from './cursor';
 import { codexTarget } from './codex';
 import { devinTarget } from './devin';
 import { opencodeTarget } from './opencode';
+import { hermesTarget } from './hermes';
 
 export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   claudeTarget,
@@ -20,6 +21,7 @@ export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   codexTarget,
   devinTarget,
   opencodeTarget,
+  hermesTarget,
 ]);
 
 export function getTarget(id: string): AgentTarget | undefined {

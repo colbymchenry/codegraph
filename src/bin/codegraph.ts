@@ -7,6 +7,7 @@
  * Usage:
  *   codegraph                    Run interactive installer (when no args)
  *   codegraph install            Run interactive installer
+ *   codegraph uninstall          Remove CodeGraph from your agents
  *   codegraph init [path]        Initialize CodeGraph in a project
  *   codegraph uninit [path]      Remove CodeGraph from a project
  *   codegraph index [path]       Index all files in the project
@@ -25,7 +26,8 @@ import { getCodeGraphDir, isInitialized } from '../directory';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 
-import { buildNode25BlockBanner } from './node-version-check';
+import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
+import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -63,6 +65,23 @@ if (nodeMajor >= 25) {
   }
   // Override active — banner shown for visibility, continuing.
 }
+// Enforce the supported Node floor. `engines` in package.json only *warns* on
+// install (unless engine-strict), so hard-block here to actually keep users off
+// unsupported versions. Mirrors the 25+ block above. See package.json `engines`.
+if (nodeMajor < MIN_NODE_MAJOR) {
+  process.stderr.write(buildNodeTooOldBanner(nodeVersion) + '\n');
+  if (!process.env.CODEGRAPH_ALLOW_UNSAFE_NODE) {
+    process.exit(1);
+  }
+  // Override active — banner shown for visibility, continuing.
+}
+
+// Re-exec with V8's `--liftoff-only` if it isn't already set, so tree-sitter's
+// large WASM grammars never hit the turboshaft Zone OOM (`Fatal process out of
+// memory: Zone`) on Node >= 22. No-op under the bundled launcher, which already
+// passes the flag. Must run before any grammar (in the parse worker, which
+// inherits this process's flags) is compiled. See ../extraction/wasm-runtime-flags.
+relaunchWithWasmRuntimeFlagsIfNeeded(__filename);
 
 // Check if running with no arguments - run installer
 if (process.argv.length === 2) {
@@ -689,6 +708,7 @@ program
       const stats = cg.getStats();
       const changes = cg.getChangedFiles();
       const backend = cg.getBackend();
+      const journalMode = cg.getJournalMode();
 
       // JSON output mode
       if (options.json) {
@@ -700,6 +720,7 @@ program
           edgeCount: stats.edgeCount,
           dbSizeBytes: stats.dbSizeBytes,
           backend,
+          journalMode,
           nodesByKind: stats.nodesByKind,
           languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
           pendingChanges: {
@@ -724,14 +745,18 @@ program
       console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);
       console.log(`  Edges:     ${formatNumber(stats.edgeCount)}`);
       console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
-      // Surface the active SQLite backend so users can spot the silent
-      // WASM fallback (5-10x slower). better-sqlite3 is in
-      // `optionalDependencies`, so `npm install` succeeds without it
-      // when the native build fails.
-      const backendLabel = backend === 'native'
-        ? chalk.green('native')
-        : chalk.yellow(`wasm ${getGlyphs().dash} slower fallback; run \`npm rebuild better-sqlite3\``);
+      // Surface the active SQLite backend (node:sqlite — Node's built-in real
+      // SQLite, full WAL + FTS5, no native build).
+      const backendLabel = chalk.green(`node:sqlite ${getGlyphs().dash} built-in (full WAL)`);
       console.log(`  Backend:   ${backendLabel}`);
+      // Effective journal mode: 'wal' means concurrent reads never block on a
+      // writer; anything else means they can ("database is locked"). node:sqlite
+      // supports WAL everywhere, so a non-wal mode means the filesystem can't
+      // (network mounts, WSL2 /mnt). See issue #238.
+      const journalLabel = journalMode === 'wal'
+        ? chalk.green('wal')
+        : chalk.yellow(`${journalMode || 'unknown'} ${getGlyphs().dash} WAL inactive; reads can block on writes`);
+      console.log(`  Journal:   ${journalLabel}`);
       console.log();
 
       // Node breakdown
@@ -1325,7 +1350,7 @@ program
  */
 program
   .command('install')
-  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode)')
+  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "auto"|"all"|"none". Default: prompt')
   .option('-l, --location <where>', 'Install location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
@@ -1374,6 +1399,42 @@ program
         target: opts.target,
         location: opts.location as 'global' | 'local' | undefined,
         autoAllow,
+        yes: opts.yes,
+      });
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph uninstall
+ *
+ * Inverse of `install`. Removes the codegraph MCP server entry,
+ * instructions block, and permissions from every agent (or a
+ * `--target` subset). Prompts global-vs-local when not given. Does NOT
+ * delete the `.codegraph/` index — that's `codegraph uninit`.
+ */
+program
+  .command('uninstall')
+  .description('Remove codegraph from your agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
+  .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "all". Default: all')
+  .option('-l, --location <where>', 'Uninstall location: "global" or "local". Default: prompt')
+  .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=all')
+  .action(async (opts: {
+    target?: string;
+    location?: string;
+    yes?: boolean;
+  }) => {
+    const { runUninstaller } = await import('../installer');
+    if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
+      error(`--location must be "global" or "local" (got "${opts.location}").`);
+      process.exit(1);
+    }
+    try {
+      await runUninstaller({
+        target: opts.target,
+        location: opts.location as 'global' | 'local' | undefined,
         yes: opts.yes,
       });
     } catch (err) {

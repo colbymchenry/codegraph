@@ -7,7 +7,6 @@
 
 import * as path from 'path';
 import {
-  CodeGraphConfig,
   Node,
   Edge,
   FileRecord,
@@ -25,7 +24,6 @@ import {
 } from './types';
 import { DatabaseConnection, getDatabasePath } from './db';
 import { QueryBuilder } from './db/queries';
-import { loadConfig, saveConfig, createDefaultConfig } from './config';
 import {
   isInitialized,
   createDirectory,
@@ -53,7 +51,6 @@ import { FileWatcher, WatchOptions } from './sync';
 // Re-export types for consumers
 export * from './types';
 export { getDatabasePath } from './db';
-export { getConfigPath } from './config';
 export {
   getCodeGraphDir,
   isInitialized,
@@ -85,9 +82,6 @@ export { MCPServer } from './mcp';
  * Options for initializing a new CodeGraph project
  */
 export interface InitOptions {
-  /** Custom configuration overrides */
-  config?: Partial<CodeGraphConfig>;
-
   /** Whether to run initial indexing after init */
   index?: boolean;
 
@@ -128,7 +122,6 @@ export interface IndexOptions {
 export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
-  private config: CodeGraphConfig;
   private projectRoot: string;
   private orchestrator: ExtractionOrchestrator;
   private resolver: ReferenceResolver;
@@ -148,17 +141,15 @@ export class CodeGraph {
   private constructor(
     db: DatabaseConnection,
     queries: QueryBuilder,
-    config: CodeGraphConfig,
     projectRoot: string
   ) {
     this.db = db;
     this.queries = queries;
-    this.config = config;
     this.projectRoot = projectRoot;
     this.fileLock = new FileLock(
       path.join(projectRoot, '.codegraph', 'codegraph.lock')
     );
-    this.orchestrator = new ExtractionOrchestrator(projectRoot, config, queries);
+    this.orchestrator = new ExtractionOrchestrator(projectRoot, queries);
     this.resolver = createResolver(projectRoot, queries);
     this.graphManager = new GraphQueryManager(queries);
     this.traverser = new GraphTraverser(queries);
@@ -194,19 +185,12 @@ export class CodeGraph {
     // Create directory structure
     createDirectory(resolvedRoot);
 
-    // Create and save configuration
-    const config = createDefaultConfig(resolvedRoot);
-    if (options.config) {
-      Object.assign(config, options.config);
-    }
-    saveConfig(resolvedRoot, config);
-
     // Initialize database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    const instance = new CodeGraph(db, queries, config, resolvedRoot);
+    const instance = new CodeGraph(db, queries, resolvedRoot);
 
     // Run initial indexing if requested
     if (options.index) {
@@ -219,7 +203,7 @@ export class CodeGraph {
   /**
    * Initialize synchronously (without indexing)
    */
-  static initSync(projectRoot: string, options: Omit<InitOptions, 'index' | 'onProgress'> = {}): CodeGraph {
+  static initSync(projectRoot: string): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if already initialized
@@ -230,19 +214,12 @@ export class CodeGraph {
     // Create directory structure
     createDirectory(resolvedRoot);
 
-    // Create and save configuration
-    const config = createDefaultConfig(resolvedRoot);
-    if (options.config) {
-      Object.assign(config, options.config);
-    }
-    saveConfig(resolvedRoot, config);
-
     // Initialize database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, config, resolvedRoot);
+    return new CodeGraph(db, queries, resolvedRoot);
   }
 
   /**
@@ -267,15 +244,12 @@ export class CodeGraph {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
-    // Load configuration
-    const config = loadConfig(resolvedRoot);
-
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    const instance = new CodeGraph(db, queries, config, resolvedRoot);
+    const instance = new CodeGraph(db, queries, resolvedRoot);
 
     // Sync if requested
     if (options.sync) {
@@ -302,15 +276,12 @@ export class CodeGraph {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
-    // Load configuration
-    const config = loadConfig(resolvedRoot);
-
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, config, resolvedRoot);
+    return new CodeGraph(db, queries, resolvedRoot);
   }
 
   /**
@@ -328,32 +299,6 @@ export class CodeGraph {
     // Release file lock if held
     this.fileLock.release();
     this.db.close();
-  }
-
-  // ===========================================================================
-  // Configuration
-  // ===========================================================================
-
-  /**
-   * Get the current configuration
-   */
-  getConfig(): CodeGraphConfig {
-    return { ...this.config };
-  }
-
-  /**
-   * Update configuration
-   */
-  updateConfig(updates: Partial<CodeGraphConfig>): void {
-    Object.assign(this.config, updates);
-    saveConfig(this.projectRoot, this.config);
-    // Recreate orchestrator and resolver with new config
-    this.orchestrator = new ExtractionOrchestrator(
-      this.projectRoot,
-      this.config,
-      this.queries
-    );
-    this.resolver = createResolver(this.projectRoot, this.queries);
   }
 
   /**
@@ -515,7 +460,6 @@ export class CodeGraph {
 
     this.watcher = new FileWatcher(
       this.projectRoot,
-      this.config,
       async () => {
         const result = await this.sync();
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
@@ -613,13 +557,22 @@ export class CodeGraph {
   }
 
   /**
-   * Active SQLite backend for this project's connection. `wasm` means
-   * the native better-sqlite3 install failed and the WASM fallback is
-   * serving requests at 5-10x the latency. Surfaced via `codegraph
-   * status` and the `codegraph_status` MCP tool.
+   * Active SQLite backend for this project's connection (`node-sqlite` — Node's
+   * built-in real-SQLite module). Surfaced via `codegraph status` and the
+   * `codegraph_status` MCP tool alongside the effective journal mode.
    */
   getBackend(): import('./db').SqliteBackend {
     return this.db.getBackend();
+  }
+
+  /**
+   * The journal mode actually in effect ('wal', 'delete', …). 'wal' means
+   * readers never block on a concurrent writer; anything else means they can,
+   * which is the precondition for the "database is locked" failures in issue
+   * #238. Surfaced via `codegraph status` and the `codegraph_status` MCP tool.
+   */
+  getJournalMode(): string {
+    return this.db.getJournalMode();
   }
 
   // ===========================================================================

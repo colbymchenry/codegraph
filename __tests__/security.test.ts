@@ -15,9 +15,7 @@ import * as os from 'os';
 import { FileLock } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
-import { shouldIncludeFile, scanDirectory } from '../src/extraction';
-import { shouldIncludeFile as configShouldInclude } from '../src/config';
-import { CodeGraphConfig, DEFAULT_CONFIG } from '../src/types';
+import { scanDirectory, isSourceFile } from '../src/extraction';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
 
@@ -298,58 +296,24 @@ describe('Atomic Writes', () => {
   });
 });
 
-describe('Glob Matching (picomatch)', () => {
-  const makeConfig = (include: string[], exclude: string[]): CodeGraphConfig => ({
-    ...DEFAULT_CONFIG,
-    rootDir: '/test',
-    include,
-    exclude,
+describe('Source file detection (isSourceFile)', () => {
+  it('selects files by supported extension', () => {
+    expect(isSourceFile('src/index.ts')).toBe(true);
+    expect(isSourceFile('src/deep/nested/file.ts')).toBe(true);
+    expect(isSourceFile('src/component.tsx')).toBe(true);
+    expect(isSourceFile('lib/util.js')).toBe(true);
+    expect(isSourceFile('src/main.py')).toBe(true);
   });
 
-  it('should match standard glob patterns in extraction', () => {
-    const config = makeConfig(['**/*.ts'], ['node_modules/**']);
-
-    expect(shouldIncludeFile('src/index.ts', config)).toBe(true);
-    expect(shouldIncludeFile('src/deep/nested/file.ts', config)).toBe(true);
-    expect(shouldIncludeFile('src/index.js', config)).toBe(false);
-    expect(shouldIncludeFile('node_modules/lib/index.ts', config)).toBe(false);
+  it('rejects unsupported extensions and extensionless files', () => {
+    expect(isSourceFile('src/component.css')).toBe(false);
+    expect(isSourceFile('README.md')).toBe(false);
+    expect(isSourceFile('Makefile')).toBe(false);
+    expect(isSourceFile('.gitignore')).toBe(false);
   });
 
-  it('should match standard glob patterns in config', () => {
-    const config = makeConfig(['**/*.py'], ['__pycache__/**']);
-
-    expect(configShouldInclude('src/main.py', config)).toBe(true);
-    expect(configShouldInclude('src/main.ts', config)).toBe(false);
-    expect(configShouldInclude('__pycache__/module.py', config)).toBe(false);
-  });
-
-  it('should handle complex glob patterns correctly', () => {
-    const config = makeConfig(['src/**/*.{ts,tsx}', 'lib/**/*.js'], []);
-
-    expect(shouldIncludeFile('src/component.ts', config)).toBe(true);
-    expect(shouldIncludeFile('src/component.tsx', config)).toBe(true);
-    expect(shouldIncludeFile('lib/util.js', config)).toBe(true);
-    expect(shouldIncludeFile('src/component.css', config)).toBe(false);
-  });
-
-  it('should handle patterns that previously caused ReDoS', () => {
-    // This pattern would cause catastrophic backtracking with hand-rolled regex
-    const evilPattern = '**/**/**/**/**/**/**/**/**/**/**/**/**/**/a';
-    const config = makeConfig([evilPattern], []);
-
-    const start = Date.now();
-    // This should return quickly, not hang
-    shouldIncludeFile('x/x/x/x/x/x/x/x/x/x/x/x/x/x/b', config);
-    const elapsed = Date.now() - start;
-
-    // Should complete in under 100ms, not seconds
-    expect(elapsed).toBeLessThan(100);
-  });
-
-  it('should handle dot files correctly', () => {
-    const config = makeConfig(['**/*.ts'], []);
-
-    expect(shouldIncludeFile('.hidden/index.ts', config)).toBe(true);
+  it('matches regardless of leading dot directories', () => {
+    expect(isSourceFile('.hidden/index.ts')).toBe(true);
   });
 });
 
@@ -464,15 +428,9 @@ describe('Symlink Cycle Detection', () => {
       return;
     }
 
-    const config: CodeGraphConfig = {
-      ...DEFAULT_CONFIG,
-      rootDir: tempDir,
-      include: ['**/*.ts'],
-      exclude: [],
-    };
 
     // This should complete without hanging
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     // Should find the real file but not loop infinitely
     expect(files).toContain('src/index.ts');
@@ -496,14 +454,8 @@ describe('Symlink Cycle Detection', () => {
       return;
     }
 
-    const config: CodeGraphConfig = {
-      ...DEFAULT_CONFIG,
-      rootDir: tempDir,
-      include: ['**/*.ts'],
-      exclude: [],
-    };
 
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     // Should find files from both the real dir and via the symlink
     // But deduplicate since they resolve to the same real path
@@ -521,15 +473,100 @@ describe('Symlink Cycle Detection', () => {
       return;
     }
 
-    const config: CodeGraphConfig = {
-      ...DEFAULT_CONFIG,
-      rootDir: tempDir,
-      include: ['**/*.ts'],
-      exclude: [],
-    };
 
     // Should not throw
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
     expect(files).toContain('src/valid.ts');
+  });
+});
+
+describe('Session marker symlink resistance', () => {
+  // The marker write lives in src/mcp/tools.ts behind handleContext. We exercise
+  // it end-to-end via ToolHandler.execute so the test exercises the same code
+  // path Claude Code drives. The session id is per-test so other parallel test
+  // runs can't collide with the marker file we plant a symlink at.
+  const SESSION_ID = `cg-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const crypto = require('crypto') as typeof import('crypto');
+  const hash = crypto.createHash('md5').update(SESSION_ID).digest('hex').slice(0, 16);
+  const markerPath = path.join(os.tmpdir(), `codegraph-consulted-${hash}`);
+
+  let projectDir: string;
+  let victimDir: string;
+  let victimFile: string;
+
+  beforeEach(async () => {
+    projectDir = createTempDir();
+    victimDir = createTempDir();
+    victimFile = path.join(victimDir, 'private.txt');
+    fs.writeFileSync(victimFile, 'SECRET-DO-NOT-OVERWRITE\n');
+    if (fs.existsSync(markerPath)) fs.unlinkSync(markerPath);
+
+    // A real .codegraph/ has to exist for handleContext to get past the
+    // "not initialized" guard — index a tiny fixture so the call reaches the
+    // marker write step rather than short-circuiting on missing project state.
+    fs.writeFileSync(path.join(projectDir, 'a.ts'), 'export const x = 1;\n');
+    const cg = await CodeGraph.init(projectDir);
+    await cg.indexAll();
+    cg.close();
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(markerPath)) fs.unlinkSync(markerPath);
+    cleanupTempDir(projectDir);
+    cleanupTempDir(victimDir);
+  });
+
+  it('does not follow a pre-planted symlink at the marker path', async () => {
+    // Skip on platforms where the user can't create symlinks (Windows without
+    // dev mode + admin). The CWE-59 risk we're guarding against doesn't apply
+    // when symlinks aren't creatable, so the skip is correct, not a gap.
+    try {
+      fs.symlinkSync(victimFile, markerPath);
+    } catch {
+      return;
+    }
+
+    const cg = await CodeGraph.open(projectDir);
+    const handler = new ToolHandler(cg);
+    process.env.CLAUDE_SESSION_ID = SESSION_ID;
+    try {
+      await handler.execute('codegraph_context', { task: 'find x' });
+    } finally {
+      delete process.env.CLAUDE_SESSION_ID;
+      cg.close();
+    }
+
+    // The victim file's contents must be untouched — the old writeFileSync
+    // path would have followed the symlink and written an ISO timestamp here.
+    expect(fs.readFileSync(victimFile, 'utf8')).toBe('SECRET-DO-NOT-OVERWRITE\n');
+
+    // And the marker path itself must still be the symlink we planted —
+    // no fallback path that quietly unlinked + recreated it (which would
+    // also work, but is a behavior we don't want to silently rely on).
+    expect(fs.lstatSync(markerPath).isSymbolicLink()).toBe(true);
+  });
+
+  it('writes the marker file with 0o600 perms on a clean path', async () => {
+    // No symlink planted — happy path. Verifies the new openSync(mode: 0o600)
+    // call is what actually lands on disk (regression guard for the perm
+    // tightening that came with the O_NOFOLLOW fix).
+    const cg = await CodeGraph.open(projectDir);
+    const handler = new ToolHandler(cg);
+    process.env.CLAUDE_SESSION_ID = SESSION_ID;
+    try {
+      await handler.execute('codegraph_context', { task: 'find x' });
+    } finally {
+      delete process.env.CLAUDE_SESSION_ID;
+      cg.close();
+    }
+
+    expect(fs.existsSync(markerPath)).toBe(true);
+    // chmod's low 9 bits — strip the file-type bits for a clean compare.
+    // Windows can't enforce 0o600 in the POSIX sense; skip the assertion
+    // there since the underlying OS will normalize the mode anyway.
+    if (process.platform !== 'win32') {
+      const mode = fs.statSync(markerPath).mode & 0o777;
+      expect(mode).toBe(0o600);
+    }
   });
 });

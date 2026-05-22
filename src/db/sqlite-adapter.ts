@@ -1,8 +1,13 @@
 /**
  * SQLite Adapter
  *
- * Provides a unified interface over better-sqlite3 (native) and
- * node-sqlite3-wasm (WASM fallback) for universal cross-platform support.
+ * Thin wrapper over Node's built-in `node:sqlite` (`DatabaseSync`), exposed
+ * through a small better-sqlite3-shaped interface so the rest of the codebase
+ * is storage-agnostic.
+ *
+ * CodeGraph ships with a bundled Node runtime, so `node:sqlite` (real SQLite,
+ * with WAL + FTS5) is always available — there is no native build step and no
+ * wasm fallback. When run from source instead, it requires Node >= 22.5.
  */
 
 export interface SqliteStatement {
@@ -14,123 +19,34 @@ export interface SqliteStatement {
 export interface SqliteDatabase {
   prepare(sql: string): SqliteStatement;
   exec(sql: string): void;
-  pragma(str: string): any;
+  pragma(str: string, options?: { simple?: boolean }): any;
   transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T;
   close(): void;
   readonly open: boolean;
 }
 
-export type SqliteBackend = 'native' | 'wasm';
-
 /**
- * One-line summary of the recovery steps shown when WASM fallback is
- * active. Single source of truth so the recipe can't drift between the
- * stderr banner and the MCP status formatter.
+ * The active SQLite backend. Only one now (`node:sqlite`); kept as a named type
+ * so `codegraph status` and the per-instance reporting have a stable shape.
  */
-export const WASM_FALLBACK_FIX_RECIPE =
-  '`xcode-select --install` (macOS) or `apt install build-essential` (Debian/Ubuntu), ' +
-  'then `npm rebuild better-sqlite3`, or `npm install better-sqlite3 --save` to force-include it.';
+export type SqliteBackend = 'node-sqlite';
 
 /**
- * Multi-line banner shown to stderr when `createDatabase` falls back to
- * WASM. Replaces a one-line `console.warn` that MCP transports (which
- * take stdout for the protocol) typically swallow, leaving users on a
- * 5-10x slower backend with no signal.
+ * Wraps Node's built-in `node:sqlite` (`DatabaseSync`) to match the
+ * better-sqlite3 interface the rest of the code expects.
  *
- * Exported for unit testing — pinning the recipe content prevents
- * future edits from silently stripping the recovery commands.
+ * node:sqlite is real SQLite compiled into Node, so it supports WAL, FTS5,
+ * mmap, and `@named` params natively — the only shims needed are the
+ * better-sqlite3 conveniences node:sqlite omits: a `.pragma()` helper, a
+ * `.transaction()` helper, and `open` (node:sqlite exposes `isOpen`).
  */
-export function buildWasmFallbackBanner(nativeError?: string): string {
-  const sep = '─'.repeat(72);
-  const lines = [
-    sep,
-    '[CodeGraph] WASM SQLite fallback active (better-sqlite3 unavailable)',
-    sep,
-    'Indexing and sync will be 5-10x slower than the native backend.',
-    '',
-    'Fix on macOS:',
-    '  xcode-select --install        # install C build tools',
-    '  npm rebuild better-sqlite3    # rebuild native binding for current Node',
-    '',
-    'Fix on Linux:',
-    '  sudo apt install build-essential python3 make    # Debian/Ubuntu',
-    '  # or: sudo yum groupinstall "Development Tools"  # RHEL/Fedora',
-    '  npm rebuild better-sqlite3',
-    '',
-    'Or force-include as a hard dependency on any platform:',
-    '  npm install better-sqlite3 --save',
-    '',
-    'Verify after fix: `codegraph status` should show `Backend: native`.',
-  ];
-  if (nativeError) {
-    lines.push('', `Native load error: ${nativeError}`);
-  }
-  lines.push(sep);
-  return lines.join('\n');
-}
-
-/**
- * Translate @named parameters (better-sqlite3 style) to positional ? params
- * for node-sqlite3-wasm, which only supports positional binding.
- *
- * Returns the rewritten SQL and an ordered list of parameter names.
- * If no named params are found, returns null for paramOrder (positional mode).
- */
-function translateNamedParams(sql: string): { sql: string; paramOrder: string[] | null } {
-  const paramOrder: string[] = [];
-  const rewritten = sql.replace(/@(\w+)/g, (_match, name: string) => {
-    paramOrder.push(name);
-    return '?';
-  });
-  if (paramOrder.length === 0) {
-    return { sql, paramOrder: null };
-  }
-  return { sql: rewritten, paramOrder };
-}
-
-/**
- * Convert better-sqlite3-style params to a positional array for node-sqlite3-wasm.
- *
- * Handles three calling conventions:
- * - Named object: run({ id: '1', name: 'a' }) → positional array via paramOrder
- * - Positional args: run('a', 'b') → ['a', 'b']
- * - No args: run() → undefined
- */
-function resolveParams(params: any[], paramOrder: string[] | null): any {
-  if (params.length === 0) return undefined;
-
-  // If paramOrder exists and first arg is a plain object, do named→positional translation
-  if (paramOrder && params.length === 1 && params[0] !== null && typeof params[0] === 'object' && !Array.isArray(params[0]) && !(params[0] instanceof Buffer) && !(params[0] instanceof Uint8Array)) {
-    const obj = params[0];
-    return paramOrder.map(name => obj[name]);
-  }
-
-  // Positional: single value or already an array
-  if (params.length === 1) return params[0];
-  return params;
-}
-
-/**
- * Wraps node-sqlite3-wasm to match the better-sqlite3 interface.
- *
- * Key differences handled:
- * - better-sqlite3 uses @named params; node-sqlite3-wasm uses positional ? only
- * - better-sqlite3 uses variadic args: stmt.run(a, b, c)
- * - node-sqlite3-wasm uses a single array/object: stmt.run([a, b, c])
- * - node-sqlite3-wasm has `isOpen` instead of `open`
- * - node-sqlite3-wasm doesn't have a `pragma()` method
- * - node-sqlite3-wasm doesn't have a `transaction()` method
- */
-class WasmDatabaseAdapter implements SqliteDatabase {
+class NodeSqliteAdapter implements SqliteDatabase {
   private _db: any;
-  // Track raw WASM statements so we can finalize them on close.
-  // node-sqlite3-wasm won't release its file lock if statements are left open.
-  private _openStmts = new Set<any>();
 
   constructor(dbPath: string) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { Database } = require('node-sqlite3-wasm');
-    this._db = new Database(dbPath);
+    const { DatabaseSync } = require('node:sqlite');
+    this._db = new DatabaseSync(dbPath);
   }
 
   get open(): boolean {
@@ -138,25 +54,23 @@ class WasmDatabaseAdapter implements SqliteDatabase {
   }
 
   prepare(sql: string): SqliteStatement {
-    const { sql: rewrittenSql, paramOrder } = translateNamedParams(sql);
-    const stmt = this._db.prepare(rewrittenSql);
-    this._openStmts.add(stmt);
+    // node:sqlite matches better-sqlite3's calling convention (variadic
+    // positional args, or a single object for @named params), so params forward
+    // through unchanged.
+    const stmt = this._db.prepare(sql);
     return {
       run(...params: any[]) {
-        const resolved = resolveParams(params, paramOrder);
-        const result = resolved !== undefined ? stmt.run(resolved) : stmt.run();
+        const r = stmt.run(...params);
         return {
-          changes: result?.changes ?? 0,
-          lastInsertRowid: result?.lastInsertRowid ?? 0,
+          changes: Number(r?.changes ?? 0),
+          lastInsertRowid: r?.lastInsertRowid ?? 0,
         };
       },
       get(...params: any[]) {
-        const resolved = resolveParams(params, paramOrder);
-        return resolved !== undefined ? stmt.get(resolved) : stmt.get();
+        return stmt.get(...params);
       },
       all(...params: any[]) {
-        const resolved = resolveParams(params, paramOrder);
-        return resolved !== undefined ? stmt.all(resolved) : stmt.all();
+        return stmt.all(...params);
       },
     };
   }
@@ -165,41 +79,21 @@ class WasmDatabaseAdapter implements SqliteDatabase {
     this._db.exec(sql);
   }
 
-  pragma(str: string): any {
+  pragma(str: string, options?: { simple?: boolean }): any {
     const trimmed = str.trim();
-
-    // Write pragma: "key = value"
+    // Write pragma ("key = value"): node:sqlite is real SQLite, so every pragma
+    // (WAL, mmap, synchronous, …) applies as-is.
     if (trimmed.includes('=')) {
-      const eqIdx = trimmed.indexOf('=');
-      const key = trimmed.substring(0, eqIdx).trim();
-      const value = trimmed.substring(eqIdx + 1).trim();
-
-      // WAL is not supported in WASM SQLite — use DELETE journal mode
-      if (key === 'journal_mode' && value.toUpperCase() === 'WAL') {
-        this._db.exec('PRAGMA journal_mode = DELETE');
-        return;
-      }
-
-      // mmap is not available in WASM — silently skip
-      if (key === 'mmap_size') {
-        return;
-      }
-
-      // synchronous = NORMAL is unsafe without WAL — use FULL
-      if (key === 'synchronous' && value.toUpperCase() === 'NORMAL') {
-        this._db.exec('PRAGMA synchronous = FULL');
-        return;
-      }
-
-      this._db.exec(`PRAGMA ${key} = ${value}`);
+      this._db.exec(`PRAGMA ${trimmed}`);
       return;
     }
-
-    // Read pragma: "key" — return the value
-    const stmt = this._db.prepare(`PRAGMA ${trimmed}`);
-    const result = stmt.get();
-    stmt.finalize();
-    return result;
+    // Read pragma. Default: the row object (e.g. { journal_mode: 'wal' }).
+    // `{ simple: true }` returns just the single column value, like better-sqlite3.
+    const row = this._db.prepare(`PRAGMA ${trimmed}`).get();
+    if (options?.simple) {
+      return row && typeof row === 'object' ? Object.values(row)[0] : row;
+    }
+    return row;
   }
 
   transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T {
@@ -217,51 +111,29 @@ class WasmDatabaseAdapter implements SqliteDatabase {
   }
 
   close(): void {
-    // Finalize all tracked statements before closing.
-    // node-sqlite3-wasm won't release its directory-based file lock
-    // if any prepared statements remain open.
-    for (const stmt of this._openStmts) {
-      try { stmt.finalize(); } catch { /* already finalized */ }
-    }
-    this._openStmts.clear();
-    this._db.close();
+    // node:sqlite's DatabaseSync.close() throws if already closed; make it
+    // idempotent to match better-sqlite3 (callers may close more than once).
+    if (this._db.isOpen) this._db.close();
   }
 }
 
 /**
- * Create a database connection. Tries native better-sqlite3 first,
- * falls back to node-sqlite3-wasm. Returns the active backend
- * alongside the db so each `DatabaseConnection` can report its own
- * backend per-instance — MCP can open multiple project DBs in one
- * process (`tools.ts` getCodeGraph cache), so a process-global would
- * race / overwrite.
+ * Create a database connection backed by `node:sqlite`.
+ *
+ * Returns the active backend alongside the db so each `DatabaseConnection` can
+ * report it per-instance — MCP can open multiple project DBs in one process, so
+ * a process-global would race.
  */
 export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: SqliteBackend } {
-  let nativeError: string | undefined;
-  let wasmError: string | undefined;
-
-  // Try native better-sqlite3 first
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const Database = require('better-sqlite3');
-    const db = new Database(dbPath);
-    return { db: db as SqliteDatabase, backend: 'native' };
+    return { db: new NodeSqliteAdapter(dbPath), backend: 'node-sqlite' };
   } catch (error) {
-    nativeError = error instanceof Error ? error.message : String(error);
+    const msg = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      'Failed to open SQLite via the built-in node:sqlite module.\n' +
+      'CodeGraph requires node:sqlite (Node.js 22.5+). Install the self-contained\n' +
+      'CodeGraph release (it bundles a compatible Node), or run on Node 22.5+.\n' +
+      `Underlying error: ${msg}`
+    );
   }
-
-  // Fall back to WASM
-  try {
-    const db = new WasmDatabaseAdapter(dbPath);
-    console.warn(buildWasmFallbackBanner(nativeError));
-    return { db, backend: 'wasm' };
-  } catch (error) {
-    wasmError = error instanceof Error ? error.message : String(error);
-  }
-
-  throw new Error(
-    `Failed to load any SQLite backend.\n` +
-    `  Native (better-sqlite3): ${nativeError}\n` +
-    `  WASM (node-sqlite3-wasm): ${wasmError}`
-  );
 }
