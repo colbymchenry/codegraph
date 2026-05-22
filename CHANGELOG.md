@@ -7,6 +7,31 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-05-22
+
+### Added
+- **Release archives now ship with a `SHA256SUMS` file**, and the npm launcher
+  verifies the bundle it downloads against it — a mismatch aborts before
+  anything runs. Releases published before this change have no checksum file, so
+  the verification is skipped (not failed) when none is available.
+
+### Fixed
+- **`codegraph: no prebuilt bundle for <platform>` after installing through a
+  registry mirror.** Installing `@colbymchenry/codegraph` from a registry that
+  hadn't mirrored the matching per-platform package — most often the
+  npmmirror/cnpm mirrors, but any lazily-syncing mirror or corporate proxy can
+  do it — left every command failing with `no prebuilt bundle for <platform>`.
+  The runtime ships as a per-platform `optionalDependency`, and npm treats an
+  optional package it can't fetch as a success and silently skips it, so the
+  bundle simply went missing. The launcher now self-heals: when the platform
+  bundle isn't installed, it downloads the same archive from GitHub Releases
+  (cached under `~/.codegraph/bundles/` for next time) and runs that — so a
+  global install works even on a mirror that never carried the platform package.
+  Set `CODEGRAPH_NO_DOWNLOAD=1` to disable the network fallback, or
+  `CODEGRAPH_DOWNLOAD_BASE=<url>` to point it at your own mirror of the release
+  archives; the standalone `install.sh` remains the no-Node alternative. Resolves
+  [#303](https://github.com/colbymchenry/codegraph/issues/303).
+
 ## [0.9.3] - 2026-05-22
 
 ### Added
@@ -132,6 +157,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   find its bundle. The release pipeline now verifies every package reached the
   registry (and is idempotent), so a release can't pass green-but-broken again.
 
+[0.9.4]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.4
 [0.9.3]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.3
 [0.9.2]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.2
 [0.9.1]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.1
