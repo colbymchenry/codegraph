@@ -35,6 +35,9 @@ export { generateNodeId } from './tree-sitter-helpers';
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
+  const hookName = extractor.resolveName?.(node, source);
+  if (hookName) return hookName;
+
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
   if (nameNode) {
@@ -893,12 +896,12 @@ export class TreeSitterExtractor {
     const visibility = this.extractor.getVisibility?.(node);
     const isStatic = this.extractor.isStatic?.(node) ?? false;
 
-    // Property name is a direct identifier child
-    const nameNode = getChildByField(node, 'name')
-      || node.namedChildren.find(c => c.type === 'identifier');
-    if (!nameNode) return;
-
-    const name = getNodeText(nameNode, this.source);
+    const hookName = this.extractor.extractPropertyName?.(node, this.source);
+    const nameNode = hookName
+      ? null
+      : getChildByField(node, 'name') || node.namedChildren.find(c => c.type === 'identifier');
+    const name = hookName ?? (nameNode ? getNodeText(nameNode, this.source) : null);
+    if (!name) return;
 
     // Get property type from the type child (first named child that isn't modifier or identifier)
     const typeNode = node.namedChildren.find(
@@ -1463,6 +1466,23 @@ export class TreeSitterExtractor {
           calleeName = `${receiverName}.${methodName}`;
         }
       }
+    } else if (node.type === 'message_expression') {
+      const methodField = getChildByField(node, 'method');
+      if (methodField) {
+        const methodName = getNodeText(methodField, this.source);
+        const receiverField = getChildByField(node, 'receiver');
+        const SKIP_RECEIVERS = new Set(['self', 'super']);
+        if (receiverField && receiverField.type !== 'message_expression') {
+          const receiverName = getNodeText(receiverField, this.source);
+          if (receiverName && !SKIP_RECEIVERS.has(receiverName)) {
+            calleeName = `${receiverName}.${methodName}`;
+          } else {
+            calleeName = methodName;
+          }
+        } else {
+          calleeName = methodName;
+        }
+      }
     } else {
       const func = getChildByField(node, 'function') || node.namedChild(0);
 
@@ -1770,6 +1790,42 @@ export class TreeSitterExtractor {
    * Extract inheritance relationships
    */
   private extractInheritance(node: SyntaxNode, classId: string): void {
+    // Objective-C @interface MyClass : NSObject <ProtoA, ProtoB>
+    if (node.type === 'class_interface') {
+      const superclass = getChildByField(node, 'superclass');
+      if (superclass) {
+        const name = getNodeText(superclass, this.source);
+        this.unresolvedReferences.push({
+          fromNodeId: classId,
+          referenceName: name,
+          referenceKind: 'extends',
+          line: superclass.startPosition.row + 1,
+          column: superclass.startPosition.column,
+        });
+      }
+      for (let j = 0; j < node.namedChildCount; j++) {
+        const argList = node.namedChild(j);
+        if (argList?.type !== 'parameterized_arguments') continue;
+        for (let k = 0; k < argList.namedChildCount; k++) {
+          const typeName = argList.namedChild(k);
+          if (!typeName) continue;
+          const typeId = typeName.namedChildren.find(
+            (c: SyntaxNode) => c.type === 'type_identifier' || c.type === 'identifier'
+          );
+          if (!typeId) continue;
+          const protocolName = getNodeText(typeId, this.source);
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: protocolName,
+            referenceKind: 'implements',
+            line: typeId.startPosition.row + 1,
+            column: typeId.startPosition.column,
+          });
+        }
+      }
+      return;
+    }
+
     // Look for extends/implements clauses
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);

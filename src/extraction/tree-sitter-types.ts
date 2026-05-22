@@ -120,6 +120,12 @@ export interface LanguageExtractor {
 
   // --- Existing hooks ---
 
+  /** Override symbol name extraction (e.g. ObjC multi-part selectors). */
+  resolveName?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /** Extract property name when the generic name walk fails (e.g. ObjC @property). */
+  extractPropertyName?: (node: SyntaxNode, source: string) => string | null;
+
   /** Extract signature from node */
   getSignature?: (node: SyntaxNode, source: string) => string | undefined;
   /** Extract visibility from node */

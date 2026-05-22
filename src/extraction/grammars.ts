@@ -37,6 +37,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   scala: 'tree-sitter-scala.wasm',
   lua: 'tree-sitter-lua.wasm',
   luau: 'tree-sitter-luau.wasm',
+  objc: 'tree-sitter-objc.wasm',
 };
 
 /**
@@ -92,6 +93,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.sc': 'scala',
   '.lua': 'lua',
   '.luau': 'luau',
+  '.m': 'objc',
+  '.mm': 'objc',
 };
 
 /**
@@ -228,9 +231,10 @@ export function detectLanguage(filePath: string, source?: string): Language {
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
   const lang = EXTENSION_MAP[ext] || 'unknown';
 
-  // .h files could be C or C++ — check source content for C++ features
+  // .h files could be C, C++, or Objective-C — check source content
   if (lang === 'c' && ext === '.h' && source) {
     if (looksLikeCpp(source)) return 'cpp';
+    if (looksLikeObjc(source)) return 'objc';
   }
 
   return lang;
@@ -243,6 +247,14 @@ export function detectLanguage(filePath: string, source?: string): Language {
 function looksLikeCpp(source: string): boolean {
   const sample = source.substring(0, 8192);
   return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
+}
+
+/**
+ * Heuristic: does a .h file contain Objective-C constructs?
+ */
+function looksLikeObjc(source: string): boolean {
+  const sample = source.substring(0, 8192);
+  return /@(?:interface|implementation|protocol|synthesize)\b/.test(sample);
 }
 
 /**
@@ -342,6 +354,7 @@ export function getLanguageDisplayName(language: Language): string {
     scala: 'Scala',
     lua: 'Lua',
     luau: 'Luau',
+    objc: 'Objective-C',
     yaml: 'YAML',
     twig: 'Twig',
     unknown: 'Unknown',

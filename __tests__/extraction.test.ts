@@ -93,6 +93,14 @@ describe('Language Detection', () => {
     expect(detectLanguage('main.dart')).toBe('dart');
   });
 
+  it('should detect Objective-C files', () => {
+    expect(detectLanguage('AppDelegate.m')).toBe('objc');
+    expect(detectLanguage('ViewController.mm')).toBe('objc');
+    const objcHeader = '@interface Foo : NSObject\n@end\n';
+    expect(detectLanguage('Foo.h', objcHeader)).toBe('objc');
+    expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -3898,5 +3906,105 @@ local count = 0
       const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
       expect(vars).toContain('count');
     });
+  });
+});
+
+// =============================================================================
+// Objective-C
+// =============================================================================
+
+describe('Objective-C Extraction', () => {
+  const sample = `
+#import <Foundation/Foundation.h>
+#import "MyClass.h"
+
+@interface MyClass : NSObject <NSCopying>
+@property (nonatomic, copy) NSString *name;
+- (void)greet;
+- (void)doThing:(id)x with:(id)y;
++ (instancetype)shared;
+@end
+
+@implementation MyClass
+
+- (void)greet {
+    NSLog(@"Hello");
+    [self doWork];
+}
+
+- (void)doThing:(id)x with:(id)y {
+    [self notify:x];
+}
+
++ (instancetype)shared {
+    return [[MyClass alloc] init];
+}
+
+@end
+
+void helperFunction(int count) {
+    MyClass *obj = [MyClass shared];
+    [obj greet];
+}
+`;
+
+  it('should extract classes, methods, functions, and imports', () => {
+    const result = extractFromSource('App.m', sample);
+
+    const classes = result.nodes.filter((n) => n.kind === 'class');
+    expect(classes.filter((c) => c.name === 'MyClass')).toHaveLength(1);
+
+    const methods = result.nodes.filter((n) => n.kind === 'method');
+    expect(methods.map((m) => m.name).sort()).toEqual(['doThing:with:', 'greet', 'shared']);
+
+    const shared = methods.find((m) => m.name === 'shared');
+    expect(shared?.isStatic).toBe(true);
+
+    const properties = result.nodes.filter((n) => n.kind === 'property');
+    expect(properties.some((p) => p.name === 'name')).toBe(true);
+
+    const functions = result.nodes.filter((n) => n.kind === 'function');
+    expect(functions.some((f) => f.name === 'helperFunction')).toBe(true);
+
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toContain('Foundation/Foundation.h');
+    expect(imports).toContain('MyClass.h');
+  });
+
+  it('should record inheritance and protocol conformance', () => {
+    const result = extractFromSource('App.m', sample);
+    const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+    const implementsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+    expect(extendsRefs.map((r) => r.referenceName)).toContain('NSObject');
+    expect(implementsRefs.map((r) => r.referenceName)).toContain('NSCopying');
+  });
+
+  it('should record message sends and C calls', () => {
+    const result = extractFromSource('App.m', sample);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toEqual(expect.arrayContaining(['NSLog', 'doWork', 'MyClass.shared', 'obj.greet']));
+  });
+
+  it('should not classify pure C headers with @end in comments as objc', () => {
+    const cHeader = '/* @end of file */\n#ifndef STDIO_H\nvoid printf(const char *);\n#endif\n';
+    expect(detectLanguage('stdio.h', cHeader)).toBe('c');
+  });
+
+  it('should extract protocol declarations', () => {
+    const code = `
+@protocol DataSource <NSObject>
+- (NSInteger)numberOfItems;
+@end
+`;
+    const result = extractFromSource('DataSource.h', code);
+    const protocol = result.nodes.find((n) => n.kind === 'protocol' && n.name === 'DataSource');
+    expect(protocol).toBeDefined();
+  });
+
+  it('should report Objective-C as supported', () => {
+    expect(isLanguageSupported('objc')).toBe(true);
+    expect(getSupportedLanguages()).toContain('objc');
   });
 });

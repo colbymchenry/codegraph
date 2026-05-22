@@ -69,5 +69,10 @@
     { "name": "Knit", "repo": "https://github.com/Sleitnick/Knit", "size": "Small", "files": "~10", "question": "How does Knit register services and expose them to clients?" },
     { "name": "vide", "repo": "https://github.com/centau/vide", "size": "Small", "files": "~40", "question": "How does vide track reactive sources and re-run effects when state changes?" },
     { "name": "Fusion", "repo": "https://github.com/dphfox/Fusion", "size": "Medium", "files": "~115", "question": "How does Fusion build and update its reactive UI graph from state objects?" }
+  ],
+  "Objective-C": [
+    { "name": "Masonry", "repo": "https://github.com/SnapKit/Masonry", "size": "Small", "files": "~50", "question": "How does Masonry build and activate Auto Layout constraints from its block DSL?" },
+    { "name": "FMDB", "repo": "https://github.com/ccgus/fmdb", "size": "Medium", "files": "~80", "question": "How does FMDB execute a prepared SQL statement and bind parameters?" },
+    { "name": "SDWebImage", "repo": "https://github.com/SDWebImage/SDWebImage", "size": "Large", "files": "~400", "question": "How does SDWebImage download, cache, and decode an image for a UIImageView?" }
   ]
 }
