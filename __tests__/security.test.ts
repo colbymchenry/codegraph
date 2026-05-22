@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock } from '../src/utils';
+import { FileLock, validateProjectPath } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -174,6 +174,36 @@ describe('Path Traversal Prevention', () => {
     const code = await cg.getCode('does-not-exist');
     expect(code).toBeNull();
   });
+});
+
+describe('validateProjectPath — sensitive directory blocking', () => {
+  // POSIX-only: on Windows '/etc' resolves to C:\etc (non-existent), not a
+  // sensitive dir — the Windows case is covered by the win32-gated test below.
+  it.runIf(process.platform !== 'win32')('blocks POSIX system directories (exact match)', () => {
+    expect(validateProjectPath('/')).toMatch(/sensitive system directory/i);
+    expect(validateProjectPath('/etc')).toMatch(/sensitive system directory/i);
+  });
+
+  it('allows a normal, existing directory', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-validate-'));
+    try {
+      expect(validateProjectPath(dir)).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // SENSITIVE_PATHS stores the Windows entries lowercase and validateProjectPath
+  // matches via resolved.toLowerCase(), so 'C:\\Windows' and 'c:\\windows' are
+  // both blocked. path.resolve is platform-specific, so this only runs on Windows.
+  it.runIf(process.platform === 'win32')(
+    'blocks Windows system directories regardless of case',
+    () => {
+      expect(validateProjectPath('C:\\Windows')).toMatch(/sensitive system directory/i);
+      expect(validateProjectPath('c:\\windows')).toMatch(/sensitive system directory/i);
+      expect(validateProjectPath('C:\\WINDOWS\\System32')).toMatch(/sensitive system directory/i);
+    }
+  );
 });
 
 describe('MCP Input Validation', () => {
