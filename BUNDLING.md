@@ -50,7 +50,9 @@ linux/amd64`).
    bundles ship as per-platform `optionalDependencies`
    (`@colbymchenry/codegraph-<target>` with `os`/`cpu`), so npm installs only the
    matching one. The shim — run by the user's Node — execs the bundle, so the
-   real work runs on the bundled Node 24. Works even on old Node.
+   real work runs on the bundled Node 24. Works even on old Node. On Windows it
+   invokes the bundled `node.exe` against the app entry directly (not the `.cmd`
+   launcher) — modern Node throws `EINVAL` when asked to spawn a `.cmd`/`.bat`.
 3. **Windows** ([`install.ps1`](install.ps1)) — `irm … | iex`; same flow as
    install.sh (detect arch, pull the `.zip` from Releases, add to PATH).
 4. **Homebrew / Scoop** — TODO (tap + cask pointing at the Release archives).

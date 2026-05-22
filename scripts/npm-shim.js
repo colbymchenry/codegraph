@@ -19,11 +19,23 @@ var childProcess = require('child_process');
 
 var target = process.platform + '-' + process.arch; // e.g. darwin-arm64, linux-x64
 var pkg = '@colbymchenry/codegraph-' + target;
-var launcher = process.platform === 'win32' ? 'bin/codegraph.cmd' : 'bin/codegraph';
+var isWindows = process.platform === 'win32';
 
-var binPath;
+// On Windows the bundle's launcher is a .cmd batch file. Modern Node refuses to
+// spawn .cmd/.bat directly — spawnSync throws EINVAL (the CVE-2024-27980
+// hardening, observed on Node 24). So on Windows we skip the .cmd and invoke the
+// bundled node.exe against the app entry point directly. On unix the bin launcher
+// is a shell script that spawns cleanly.
+var command, args;
 try {
-  binPath = require.resolve(pkg + '/' + launcher);
+  if (isWindows) {
+    command = require.resolve(pkg + '/node.exe');
+    var entry = require.resolve(pkg + '/lib/dist/bin/codegraph.js');
+    args = [entry].concat(process.argv.slice(2));
+  } else {
+    command = require.resolve(pkg + '/bin/codegraph');
+    args = process.argv.slice(2);
+  }
 } catch (e) {
   process.stderr.write(
     'codegraph: no prebuilt bundle for ' + target + '.\n' +
@@ -35,7 +47,7 @@ try {
   process.exit(1);
 }
 
-var res = childProcess.spawnSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
+var res = childProcess.spawnSync(command, args, { stdio: 'inherit' });
 if (res.error) {
   process.stderr.write('codegraph: ' + res.error.message + '\n');
   process.exit(1);

@@ -7,9 +7,13 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.2] - 2026-05-21
 
 ### Added
+- **Installer target: Hermes Agent (Nous Research).** `codegraph install` now
+  supports Hermes Agent — it writes the `mcp_servers.codegraph` entry and ensures
+  `platform_toolsets.cli` includes `mcp-codegraph` in `$HERMES_HOME/config.yaml`,
+  so Hermes can drive the CodeGraph knowledge graph like the other agents.
 - **Framework support: Drupal 8/9/10/11** — CodeGraph now detects Drupal
   projects (via a `drupal/*` dependency in `composer.json`) and adds three
   levels of intelligence:
@@ -42,6 +46,15 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   those names; now `.gitignore` is the single source of truth. Resolves
   [#283](https://github.com/colbymchenry/codegraph/issues/283).
 
+### Fixed
+- **Windows: `npm i -g @colbymchenry/codegraph` then any `codegraph` command
+  failed with `spawnSync …\codegraph.cmd EINVAL`.** The npm launcher spawned the
+  bundle's `.cmd` file directly, which modern Node refuses to do on Windows
+  (the CVE-2024-27980 hardening — seen on Node 24). The launcher now invokes the
+  bundled `node.exe` against the app directly, so `codegraph` works on Windows
+  regardless of your Node version. Resolves
+  [#289](https://github.com/colbymchenry/codegraph/issues/289).
+
 ### Removed
 - **`.codegraph/config.json` and the entire config surface.** Every field was
   either inert or now redundant with `.gitignore`:
@@ -60,6 +73,15 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exports are gone. Existing `.codegraph/config.json` files are simply ignored.
   The `.codegraphignore` marker is no longer supported — use `.gitignore`.
 
+### Security
+- **MCP session marker no longer follows symlinks** (CWE-59). Every
+  `codegraph_context` call writes a `codegraph-consulted-*` marker into the
+  system temp dir; the previous write followed symlinks, so on a multi-user
+  system another local user could pre-plant that path as a symlink and redirect
+  the write onto a victim-writable file. The marker is now opened with
+  `O_NOFOLLOW` and mode `0600`, and a planted symlink is refused rather than
+  followed. Resolves [#280](https://github.com/colbymchenry/codegraph/issues/280).
+
 ## [0.9.1] - 2026-05-21
 
 ### Fixed
@@ -71,6 +93,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   find its bundle. The release pipeline now verifies every package reached the
   registry (and is idempotent), so a release can't pass green-but-broken again.
 
+[0.9.2]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.2
 [0.9.1]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.1
 
 ## [0.9.0] - 2026-05-21
