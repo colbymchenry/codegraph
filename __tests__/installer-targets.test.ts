@@ -363,6 +363,33 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).toContain('custom:\n  keep: true');
   });
 
+  it('kiro: writes to .kiro/settings/mcp.json (nested settings dir, not .kiro root)', () => {
+    const kiro = getTarget('kiro')!;
+    const local = kiro.install('local', { autoAllow: false });
+    expect(local.files[0].path.replace(/\\/g, '/')).toMatch(/\/\.kiro\/settings\/mcp\.json$/);
+    expect(fs.existsSync(path.join(tmpCwd, '.kiro', 'mcp.json'))).toBe(false);
+
+    const global = kiro.install('global', { autoAllow: false });
+    expect(global.files[0].path.replace(/\\/g, '/')).toMatch(/\/\.kiro\/settings\/mcp\.json$/);
+    expect(fs.existsSync(path.join(tmpHome, '.kiro', 'mcp.json'))).toBe(false);
+  });
+
+  it('kiro: install writes mcpServers.codegraph and uninstall strips it cleanly', () => {
+    const kiro = getTarget('kiro')!;
+    kiro.install('local', { autoAllow: false });
+    const file = path.join(tmpCwd, '.kiro', 'settings', 'mcp.json');
+    const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(after.mcpServers.codegraph).toEqual({
+      type: 'stdio',
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+    });
+
+    kiro.uninstall('local');
+    const final = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(final.mcpServers).toBeUndefined();
+  });
+
   it('opencode: uninstall removes only mcp.codegraph, preserves comments and siblings', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
@@ -616,6 +643,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('codex')?.id).toBe('codex');
     expect(getTarget('opencode')?.id).toBe('opencode');
     expect(getTarget('hermes')?.id).toBe('hermes');
+    expect(getTarget('kiro')?.id).toBe('kiro');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
