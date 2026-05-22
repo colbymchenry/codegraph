@@ -101,6 +101,26 @@ Tests live in `__tests__/` and mirror the module they cover. Notable ones beyond
 
 Tests create temp dirs with `fs.mkdtempSync` and clean up in `afterEach`. They write real files and exercise real SQLite — there is no DB mocking.
 
+### Windows-gated tests
+
+Behavior that differs by platform (path resolution, drive letters, `SENSITIVE_PATHS`, `%APPDATA%` config dirs, CRLF) must be gated, not assumed. Use `it.runIf(process.platform === 'win32')(...)` for Windows-only assertions and `it.runIf(process.platform !== 'win32')(...)` for POSIX-only ones — e.g. `/etc` is sensitive on POSIX but resolves to `C:\etc` (non-existent) on Windows, so an ungated `/etc` assertion fails on Windows. Validate the Windows side for real (see below); don't merge a Windows-gated test you haven't seen run.
+
+## Windows validation (Parallels + SSH)
+
+For any Windows-specific PR, bug, or implementation, validate it on the real Windows VM rather than guessing. Connection details live in the gitignored **`.parallels`** file at the repo root (VM name, guest IP, SSH user/key). `prlctl exec` needs Parallels Pro and is unavailable, so SSH is the bridge.
+
+- Connect / run from the Mac host: `ssh <user>@<guest_ip> "..."`. For multi-line work, pipe PowerShell over stdin and **refresh PATH from the registry** first (sshd's session has a stale PATH after winget installs):
+  ```
+  ssh colby@10.211.55.3 "powershell -NoProfile -ExecutionPolicy Bypass -Command -" <<'PS'
+  $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+  Set-Location C:\dev\codegraph
+  PS
+  ```
+- Clone fresh into a **Windows-local** path (`C:\dev\codegraph`) and `npm ci` there — never run npm against the shared Mac repo, since `esbuild`/`rollup` ship platform-specific binaries.
+- Guest toolchain (winget): Node LTS, Git, and the **VC++ ARM64 redistributable** (required by `@rollup/rollup-win32-arm64-msvc`, which vitest pulls in).
+- Fetch a contributor PR head straight from their fork to dodge `pull/<n>/head` lag: `git fetch <fork-url> <branch>` then `git checkout -f FETCH_HEAD`.
+- Known pre-existing Windows failure: `security.test.ts > Session marker symlink resistance > does not follow a pre-planted symlink` (symlink creation needs privileges on Windows). Unrelated to current work; don't let it mask new regressions.
+
 ## Releases
 
 Released to npm and mirrored as [GitHub Releases](https://github.com/colbymchenry/codegraph/releases). `CHANGELOG.md` is the source of truth; GitHub Release notes are extracted from it.
@@ -116,19 +136,28 @@ When asked for an entry for a new version:
 
 ### Release flow (the user runs these)
 
+Releases are built and published by the **GitHub Actions "Release" workflow**
+(`.github/workflows/release.yml`). It bundles a Node runtime per platform
+(`scripts/build-bundle.sh`) and publishes both the GitHub Release and the npm
+thin-installer (`scripts/pack-npm.sh`: a shim package + per-platform packages).
+Publishing manually is **wrong** now — a plain `npm publish` ships the root
+package (non-bundled), which breaks anyone on Node < 22.5.
+
 After the changelog entry is written and `package.json` is bumped:
 
 ```bash
 git add package.json package-lock.json CHANGELOG.md
 git commit -m "release: X.Y.Z (<one-line summary>)"
 git push
-npm publish
-./scripts/release.sh   # idempotent: tags vX.Y.Z, pushes, creates GitHub Release with notes from CHANGELOG.md
 ```
 
-`scripts/release.sh` is safe to re-run after a partial failure — it skips steps already done (tag exists locally, tag on origin, release published). It extracts release notes from `CHANGELOG.md` by matching the `## [X.Y.Z]` block.
+Then trigger **Actions → Release → Run workflow** (on `main`). It reads the
+version from `package.json`, builds every platform bundle on one runner, creates
+the GitHub Release with notes from the matching `CHANGELOG.md` section, and
+publishes to npm. Requires the `NPM_TOKEN` repo secret.
 
-**Do not run `npm publish`, `git push`, `git tag`, or `./scripts/release.sh` yourself** — these are publish actions on shared state. Write the file, hand the user the commands.
+**Do not run `npm publish`, `git push`, or `git tag` yourself** — these are
+publish actions on shared state. Write the files, hand the user the commands.
 
 ## House rules
 

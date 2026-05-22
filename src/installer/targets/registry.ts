@@ -12,12 +12,14 @@ import { claudeTarget } from './claude';
 import { cursorTarget } from './cursor';
 import { codexTarget } from './codex';
 import { opencodeTarget } from './opencode';
+import { hermesTarget } from './hermes';
 
 export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   claudeTarget,
   cursorTarget,
   codexTarget,
   opencodeTarget,
+  hermesTarget,
 ]);
 
 export function getTarget(id: string): AgentTarget | undefined {

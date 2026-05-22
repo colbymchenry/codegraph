@@ -10,7 +10,7 @@ import * as path from 'path';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'yaml' | 'twig' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -35,6 +35,8 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   dart: 'tree-sitter-dart.wasm',
   pascal: 'tree-sitter-pascal.wasm',
   scala: 'tree-sitter-scala.wasm',
+  lua: 'tree-sitter-lua.wasm',
+  luau: 'tree-sitter-luau.wasm',
 };
 
 /**
@@ -61,6 +63,16 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.hxx': 'cpp',
   '.cs': 'csharp',
   '.php': 'php',
+  // Drupal-specific PHP file extensions
+  '.module': 'php',
+  '.install': 'php',
+  '.theme': 'php',
+  '.inc': 'php',
+  // YAML (used for Drupal routing files; no symbol extraction, file-level tracking only)
+  '.yml': 'yaml',
+  '.yaml': 'yaml',
+  // Twig templates (file-level tracking only, no symbol extraction)
+  '.twig': 'twig',
   '.rb': 'ruby',
   '.rake': 'ruby',
   '.swift': 'swift',
@@ -78,7 +90,20 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.fmx': 'pascal',
   '.scala': 'scala',
   '.sc': 'scala',
+  '.lua': 'lua',
+  '.luau': 'luau',
 };
+
+/**
+ * Whether a file is one CodeGraph can parse, based purely on its extension.
+ * This is the single source of truth for "should we index this file" — derived
+ * from EXTENSION_MAP so parser support and indexing selection never drift.
+ */
+export function isSourceFile(filePath: string): boolean {
+  const dot = filePath.lastIndexOf('.');
+  if (dot < 0) return false;
+  return filePath.slice(dot).toLowerCase() in EXTENSION_MAP;
+}
 
 /**
  * Caches for loaded grammars and parsers
@@ -125,8 +150,12 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
   for (const lang of toLoad) {
     const wasmFile = WASM_GRAMMAR_FILES[lang];
     try {
-      // Pascal and Scala ship their own WASMs (not in tree-sitter-wasms)
-      const wasmPath = (lang === 'pascal' || lang === 'scala')
+      // Some grammars ship their own WASMs (not in tree-sitter-wasms, or the
+      // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
+      // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
+      // 0.25 (drops nested calls/imports on every file after the first); we
+      // vendor the upstream ABI-15 wasm instead.
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -207,6 +236,8 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'vue') return true; // custom extractor (script block delegation)
   if (language === 'liquid') return true; // custom regex extractor
+  if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver
+  if (language === 'twig') return true; // file-level tracking only
   if (language === 'unknown') return false;
   return language in WASM_GRAMMAR_FILES;
 }
@@ -216,6 +247,7 @@ export function isLanguageSupported(language: Language): boolean {
  */
 export function isGrammarLoaded(language: Language): boolean {
   if (language === 'svelte' || language === 'vue' || language === 'liquid') return true;
+  if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
   return languageCache.has(language);
 }
 
@@ -291,6 +323,10 @@ export function getLanguageDisplayName(language: Language): string {
     liquid: 'Liquid',
     pascal: 'Pascal / Delphi',
     scala: 'Scala',
+    lua: 'Lua',
+    luau: 'Luau',
+    yaml: 'YAML',
+    twig: 'Twig',
     unknown: 'Unknown',
   };
   return names[language] || language;

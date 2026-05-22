@@ -6,6 +6,7 @@
 
 import { FrameworkResolver, ResolutionContext } from '../types';
 import type { Language } from '../../types';
+import { drupalResolver } from './drupal';
 import { laravelResolver } from './laravel';
 import { expressResolver } from './express';
 import { nestjsResolver } from './nestjs';
@@ -26,6 +27,7 @@ import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   // PHP
   laravelResolver,
+  drupalResolver,
   // JavaScript/TypeScript
   expressResolver,
   nestjsResolver,
@@ -105,6 +107,7 @@ export function registerFrameworkResolver(resolver: FrameworkResolver): void {
 }
 
 // Re-export framework resolvers
+export { drupalResolver } from './drupal';
 export { laravelResolver, FACADE_MAPPINGS } from './laravel';
 export { expressResolver } from './express';
 export { nestjsResolver } from './nestjs';

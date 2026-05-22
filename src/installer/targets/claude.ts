@@ -114,6 +114,15 @@ class ClaudeCodeTarget implements AgentTarget {
       files.push(writePermissionsEntry(loc));
     }
 
+    // 2b. Strip stale auto-sync hooks left by a pre-0.8 install. Those
+    // versions wrote `codegraph mark-dirty` / `sync-if-dirty` hooks to
+    // settings.json; both subcommands are gone from the CLI, so the
+    // Stop hook now fails every turn with "unknown command
+    // 'sync-if-dirty'". Cleaning up on install makes an upgrade
+    // self-healing. Only surfaced when something was actually removed.
+    const hookCleanup = cleanupLegacyHooks(loc);
+    if (hookCleanup.action === 'removed') files.push(hookCleanup);
+
     // 3. CLAUDE.md instructions
     files.push(writeInstructionsEntry(loc));
 
@@ -167,6 +176,14 @@ class ClaudeCodeTarget implements AgentTarget {
     } else {
       files.push({ path: settingsPath, action: 'not-found' });
     }
+
+    // 2b. Strip any stale auto-sync hooks a pre-0.8 install left in
+    // settings.json. The hook-cleanup step was lost when the installer
+    // moved to the per-target architecture; restoring it here means
+    // uninstall — and the npm `preuninstall` hook that drives it — fully
+    // reverses a legacy install.
+    const hookCleanup = cleanupLegacyHooks(loc);
+    if (hookCleanup.action === 'removed') files.push(hookCleanup);
 
     // 3. Instructions
     const instr = instructionsPath(loc);
@@ -238,6 +255,85 @@ function cleanupLegacyLocalMcp(): WriteResult['files'][number] | null {
   } else {
     writeJsonFile(file, config);
   }
+  return { path: file, action: 'removed' };
+}
+
+/**
+ * True when a Claude Code hook `command` is one of the auto-sync hooks
+ * a pre-0.8 install wrote. Those installers added
+ * `PostToolUse(Edit|Write) → codegraph mark-dirty` and
+ * `Stop → codegraph sync-if-dirty` (local builds used the
+ * `npx @colbymchenry/codegraph …` form, which still contains the
+ * `codegraph <subcommand>` substring). Both subcommands were later
+ * removed from the CLI, so the Stop hook fails every turn with
+ * "unknown command 'sync-if-dirty'". Matching on the codegraph-scoped
+ * subcommand keeps unrelated user hooks (e.g. GitKraken's
+ * `gk ai hook run`) untouched.
+ */
+function isLegacyCodegraphHookCommand(command: unknown): boolean {
+  if (typeof command !== 'string') return false;
+  return (
+    command.includes('codegraph mark-dirty') ||
+    command.includes('codegraph sync-if-dirty')
+  );
+}
+
+/**
+ * Remove stale codegraph auto-sync hooks from Claude `settings.json`.
+ *
+ * Surgical at the individual-command level: only entries matching
+ * `isLegacyCodegraphHookCommand` are dropped, so a sibling hook sharing
+ * a matcher group (or the Stop event) with ours survives. We prune a
+ * matcher group only once its `hooks` array is empty, an event only
+ * once it has no groups left, and `hooks` itself only once every event
+ * is gone — and none of that runs unless we actually removed a
+ * codegraph command, so a settings.json with no legacy hooks is left
+ * byte-for-byte untouched and reported `unchanged`.
+ *
+ * Exported so it can be unit-tested directly and reused by both
+ * `install` (an upgrade self-heals) and `uninstall`.
+ */
+export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] {
+  const file = settingsJsonPath(loc);
+  if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
+
+  const settings = readJsonFile(file);
+  const hooks = settings.hooks;
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) {
+    return { path: file, action: 'unchanged' };
+  }
+
+  // Pass 1: drop the legacy command(s) from inside every matcher group.
+  let removedAny = false;
+  for (const event of Object.keys(hooks)) {
+    const groups = hooks[event];
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!group || !Array.isArray(group.hooks)) continue;
+      const before = group.hooks.length;
+      group.hooks = group.hooks.filter(
+        (h: any) => !isLegacyCodegraphHookCommand(h?.command),
+      );
+      if (group.hooks.length !== before) removedAny = true;
+    }
+  }
+
+  if (!removedAny) return { path: file, action: 'unchanged' };
+
+  // Pass 2: prune empty matcher groups, then events with no groups
+  // left, then an empty top-level `hooks`. Guarded by `removedAny` so
+  // we never restructure a settings.json that had no codegraph hooks.
+  for (const event of Object.keys(hooks)) {
+    const groups = hooks[event];
+    if (!Array.isArray(groups)) continue;
+    hooks[event] = groups.filter(
+      (g: any) => !(g && Array.isArray(g.hooks) && g.hooks.length === 0),
+    );
+    if (hooks[event].length === 0) delete hooks[event];
+  }
+  if (Object.keys(hooks).length === 0) delete settings.hooks;
+
+  writeJsonFile(file, settings);
   return { path: file, action: 'removed' };
 }
 

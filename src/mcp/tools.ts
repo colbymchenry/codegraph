@@ -7,14 +7,37 @@
 import CodeGraph, { findNearestCodeGraphRoot } from '../index';
 import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind } from '../types';
 import { createHash } from 'crypto';
-import { writeFileSync, readFileSync, existsSync } from 'fs';
-import { clamp, validatePathWithinRoot } from '../utils';
+import {
+  constants as fsConstants,
+  closeSync,
+  existsSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  writeSync,
+} from 'fs';
+import { clamp, validatePathWithinRoot, validateProjectPath } from '../utils';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { WASM_FALLBACK_FIX_RECIPE } from '../db';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
+
+/**
+ * Maximum length for free-form string inputs (query, task, symbol).
+ * Bounds memory and CPU when a buggy or hostile MCP client sends a
+ * huge payload — without this an attacker could ship a 100MB string
+ * and force a full FTS5 scan / OOM the server. 10 000 characters is
+ * far beyond any realistic legitimate query.
+ */
+const MAX_INPUT_LENGTH = 10_000;
+
+/**
+ * Maximum length for path-like string inputs (projectPath, path
+ * filter, glob pattern). Paths beyond a few thousand chars are
+ * never legitimate and signal abuse or a bug upstream.
+ */
+const MAX_PATH_LENGTH = 4_096;
 
 /**
  * Rust path roots that have no file-system equivalent — `crate` is the
@@ -187,14 +210,46 @@ function numberSourceLines(slice: string, firstLineNumber: number): string {
 /**
  * Mark a Claude session as having consulted MCP tools.
  * This enables Grep/Glob/Bash commands that would otherwise be blocked.
+ *
+ * Why the explicit openSync + O_NOFOLLOW dance instead of plain writeFileSync:
+ * tmpdir() is world-writable on Linux (mode 1777), so on a shared multi-user
+ * machine any other local user can pre-create `codegraph-consulted-<hash>` as
+ * a symlink pointing at a file the victim owns. The old `writeFileSync` would
+ * happily follow that link and overwrite the target's contents with the ISO
+ * timestamp string (CWE-59). The session-id hash provides the predictability
+ * gate, but it's defense-in-depth: if a session id ever surfaces in logs,
+ * argv, or telemetry the attack becomes trivial, and the right fix is to not
+ * follow links from /tmp paths in the first place.
  */
 function markSessionConsulted(sessionId: string): void {
   try {
     const hash = createHash('md5').update(sessionId).digest('hex').slice(0, 16);
     const markerPath = join(tmpdir(), `codegraph-consulted-${hash}`);
-    writeFileSync(markerPath, new Date().toISOString(), 'utf8');
+    // Refuse to follow a pre-planted symlink at the marker path (CWE-59).
+    // O_NOFOLLOW (below) is the atomic, TOCTOU-free guard on POSIX, but it is
+    // `undefined` on Windows (libuv ignores it), so the bitwise-OR silently
+    // drops it and openSync would follow the link. This lstat check closes that
+    // gap cross-platform; ENOENT (path is free) falls through to create it.
+    try {
+      if (lstatSync(markerPath).isSymbolicLink()) return;
+    } catch {
+      // No existing entry (or stat failed) — nothing to refuse; proceed.
+    }
+    // O_NOFOLLOW makes openSync throw ELOOP if markerPath is already a symlink.
+    // O_CREAT + O_TRUNC keep the original "create-or-overwrite" semantics, and
+    // mode 0o600 prevents readback by other local users (the marker payload is
+    // benign, but narrowing the exposure costs nothing).
+    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
+    const fd = openSync(markerPath, flags, 0o600);
+    try {
+      writeSync(fd, new Date().toISOString());
+    } finally {
+      closeSync(fd);
+    }
   } catch {
-    // Silently fail - don't break MCP on marker write failure
+    // Silently fail - don't break MCP on marker write failure. ELOOP from a
+    // planted symlink lands here too, which is the intended behavior: refuse
+    // to write rather than overwrite an attacker-chosen target.
   }
 }
 
@@ -535,11 +590,34 @@ export class ToolHandler {
       return this.projectCache.get(projectPath)!;
     }
 
+    // Reject sensitive system directories before opening. Only validate a
+    // path that actually exists — a nested or not-yet-created sub-path of a
+    // real project must still be allowed to resolve UP to its .codegraph/
+    // root below (issue #238), so we don't run the existence-checking
+    // validator on paths that are meant to walk up.
+    if (existsSync(projectPath)) {
+      const pathError = validateProjectPath(projectPath);
+      if (pathError) {
+        throw new Error(pathError);
+      }
+    }
+
     // Walk up parent directories to find nearest .codegraph/
     const resolvedRoot = findNearestCodeGraphRoot(projectPath);
 
     if (!resolvedRoot) {
       throw new Error(`CodeGraph not initialized in ${projectPath}. Run 'codegraph init' in that project first.`);
+    }
+
+    // If the path resolves to the default project, reuse the already-open
+    // default instance rather than opening a SECOND connection to the same DB.
+    // A duplicate connection serializes reads against the watcher's auto-sync
+    // writes; on the wasm backend (no WAL) that surfaces as intermittent
+    // "database is locked" on concurrent tool calls. See issue #238. Deliberately
+    // not cached under projectPath — the server owns and closes the default
+    // instance, so routing it through projectCache.closeAll() would double-close it.
+    if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
+      return this.cg;
     }
 
     // Check if we already have this resolved root cached (different path, same project)
@@ -570,11 +648,45 @@ export class ToolHandler {
   }
 
   /**
-   * Validate that a value is a non-empty string
+   * Validate that a value is a non-empty string within length bounds.
+   *
+   * The `maxLength` cap protects against MCP clients that ship huge
+   * payloads (10MB+ query strings either by accident or maliciously).
+   * Without this, a single oversized input can pin the FTS5 index or
+   * exhaust memory before any real work runs.
    */
-  private validateString(value: unknown, name: string): string | ToolResult {
+  private validateString(
+    value: unknown,
+    name: string,
+    maxLength: number = MAX_INPUT_LENGTH
+  ): string | ToolResult {
     if (typeof value !== 'string' || value.length === 0) {
       return this.errorResult(`${name} must be a non-empty string`);
+    }
+    if (value.length > maxLength) {
+      return this.errorResult(
+        `${name} exceeds maximum length of ${maxLength} characters (got ${value.length})`
+      );
+    }
+    return value;
+  }
+
+  /**
+   * Validate an optional path-like string input. Returns the value if
+   * valid (or undefined), or a ToolResult with the error.
+   */
+  private validateOptionalPath(
+    value: unknown,
+    name: string
+  ): string | undefined | ToolResult {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'string') {
+      return this.errorResult(`${name} must be a string`);
+    }
+    if (value.length > MAX_PATH_LENGTH) {
+      return this.errorResult(
+        `${name} exceeds maximum length of ${MAX_PATH_LENGTH} characters (got ${value.length})`
+      );
     }
     return value;
   }
@@ -584,6 +696,25 @@ export class ToolHandler {
    */
   async execute(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
     try {
+      // Cross-cutting input validation. All tools accept an optional
+      // `projectPath` and most accept either `query`, `task`, or
+      // `symbol` — bound their lengths centrally so individual handlers
+      // can stay focused on tool-specific logic.
+      const pathCheck = this.validateOptionalPath(args.projectPath, 'projectPath');
+      if (typeof pathCheck === 'object' && pathCheck !== undefined) {
+        return pathCheck;
+      }
+      // The `path` and `pattern` properties used by codegraph_files are
+      // also path-shaped — apply the same cap.
+      if (args.path !== undefined) {
+        const check = this.validateOptionalPath(args.path, 'path');
+        if (typeof check === 'object' && check !== undefined) return check;
+      }
+      if (args.pattern !== undefined) {
+        const check = this.validateOptionalPath(args.pattern, 'pattern');
+        if (typeof check === 'object' && check !== undefined) return check;
+      }
+
       switch (toolName) {
         case 'codegraph_search':
           return await this.handleSearch(args);
@@ -667,11 +798,11 @@ export class ToolHandler {
 
     // buildContext returns string when format is 'markdown'
     if (typeof context === 'string') {
-      return this.textResult(context + reminder);
+      return this.textResult(this.truncateOutput(context + reminder));
     }
 
     // If it returns TaskContext, format it
-    return this.textResult(this.formatTaskContext(context) + reminder);
+    return this.textResult(this.truncateOutput(this.formatTaskContext(context) + reminder));
   }
 
   /**
@@ -1321,16 +1452,21 @@ export class ToolHandler {
       `**Database size:** ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`,
     ];
 
-    // Surface the active SQLite backend. Without this, users on the
-    // silent WASM fallback (better-sqlite3 install failed) see "slow"
-    // indexing and DB-lock errors with no signal of why.
-    const backend = cg.getBackend();
-    if (backend === 'native') {
-      lines.push(`**Backend:** native (better-sqlite3)`);
+    // Surface the active SQLite backend (node:sqlite, Node's built-in real
+    // SQLite — full WAL + FTS5, no native build).
+    lines.push(`**Backend:** node:sqlite (Node built-in) — full WAL + FTS5`);
+
+    // Effective journal mode. 'wal' ⇒ concurrent reads never block on a writer;
+    // anything else ⇒ they can ("database is locked"). node:sqlite supports WAL
+    // everywhere, so a non-wal mode means the filesystem can't (network/
+    // virtualized mounts, WSL2 /mnt). See issue #238.
+    const journalMode = cg.getJournalMode();
+    if (journalMode === 'wal') {
+      lines.push(`**Journal mode:** wal (concurrent reads safe)`);
     } else {
       lines.push(
-        `**Backend:** ⚠ wasm (better-sqlite3 unavailable) — ` +
-        `5-10x slower than native. Fix: ${WASM_FALLBACK_FIX_RECIPE}`
+        `**Journal mode:** ⚠ ${journalMode || 'unknown'} — WAL not active, so reads ` +
+        `can block on a concurrent write (WAL appears unsupported on this filesystem)`
       );
     }
 
