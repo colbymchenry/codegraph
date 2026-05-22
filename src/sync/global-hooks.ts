@@ -43,7 +43,7 @@ function autoInitBlock(): string {
  * defaults to ~/.git-templates and writes it to git global config so
  * future git clone/git init operations pick it up.
  *
- * Always creates <templateDir>/hooks/ if it does not exist.
+ * Creates <templateDir>/hooks/ when writeConfig is true (install path only).
  */
 export function resolveTemplateDir(opts: { writeConfig?: boolean } = {}): {
   dir: string;
