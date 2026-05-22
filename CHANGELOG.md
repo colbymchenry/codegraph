@@ -7,6 +7,29 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-05-22
+
+### Added
+- **`codegraph uninstall` command.** Cleanly removes CodeGraph from every agent
+  it's configured on — Claude Code, Cursor, Codex CLI, opencode, and Hermes
+  Agent — in one step. It asks up front whether to remove the global config
+  (`~/.claude`, `~/.codex`, …) or just this project's local config (no flags
+  required), then prints exactly which agents it touched so you can see what
+  changed. `--location`, `--target`, and `--yes` are accepted for scripted /
+  non-interactive use. It removes only what `install` wrote (MCP server entry,
+  instructions block, permissions) and leaves your `.codegraph/` index alone
+  (use `codegraph uninit` for that). Resolves
+  [#313](https://github.com/colbymchenry/codegraph/issues/313) — previously the
+  only cleanup path was an npm `preuninstall` hook that the published bundle
+  never shipped, so `npm uninstall -g` left every agent pointing at a CodeGraph
+  MCP server that no longer existed.
+
+### Fixed
+- **Cursor uninstall left an orphaned `.cursor/rules/codegraph.mdc`.** It
+  stripped the rule body but left the file and its `description: CodeGraph …`
+  frontmatter behind. The dedicated rules file is now deleted outright on
+  uninstall, while any content you added outside CodeGraph's markers is kept.
+
 ## [0.9.2] - 2026-05-21
 
 ### Added
@@ -93,6 +116,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   find its bundle. The release pipeline now verifies every package reached the
   registry (and is idempotent), so a release can't pass green-but-broken again.
 
+[0.9.3]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.3
 [0.9.2]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.2
 [0.9.1]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.1
 

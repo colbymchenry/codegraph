@@ -7,6 +7,7 @@
  * Usage:
  *   codegraph                    Run interactive installer (when no args)
  *   codegraph install            Run interactive installer
+ *   codegraph uninstall          Remove CodeGraph from your agents
  *   codegraph init [path]        Initialize CodeGraph in a project
  *   codegraph uninit [path]      Remove CodeGraph from a project
  *   codegraph index [path]       Index all files in the project
@@ -1390,6 +1391,42 @@ program
         target: opts.target,
         location: opts.location as 'global' | 'local' | undefined,
         autoAllow,
+        yes: opts.yes,
+      });
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph uninstall
+ *
+ * Inverse of `install`. Removes the codegraph MCP server entry,
+ * instructions block, and permissions from every agent (or a
+ * `--target` subset). Prompts global-vs-local when not given. Does NOT
+ * delete the `.codegraph/` index — that's `codegraph uninit`.
+ */
+program
+  .command('uninstall')
+  .description('Remove codegraph from your agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
+  .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "all". Default: all')
+  .option('-l, --location <where>', 'Uninstall location: "global" or "local". Default: prompt')
+  .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=all')
+  .action(async (opts: {
+    target?: string;
+    location?: string;
+    yes?: boolean;
+  }) => {
+    const { runUninstaller } = await import('../installer');
+    if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
+      error(`--location must be "global" or "local" (got "${opts.location}").`);
+      process.exit(1);
+    }
+    try {
+      await runUninstaller({
+        target: opts.target,
+        location: opts.location as 'global' | 'local' | undefined,
         yes: opts.yes,
       });
     } catch (err) {
