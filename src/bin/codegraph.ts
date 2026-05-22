@@ -1398,6 +1398,19 @@ program
     }
   });
 
+/**
+ * codegraph auto-init-repos [--remove]
+ */
+program
+  .command('auto-init-repos')
+  .description('Install (or remove) a global git template hook that auto-initializes CodeGraph in every new git clone')
+  .option('--remove', 'Remove the auto-init hook from the git template directory')
+  .action(async (opts: { remove?: boolean }) => {
+    const clack = await importESM('@clack/prompts');
+    const { autoInitReposAction } = await import('./auto-init-repos-action');
+    await autoInitReposAction(opts, clack);
+  });
+
 // Parse and run
 program.parse();
 
