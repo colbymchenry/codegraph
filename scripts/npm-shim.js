@@ -19,11 +19,20 @@ var childProcess = require('child_process');
 
 var target = process.platform + '-' + process.arch; // e.g. darwin-arm64, linux-x64
 var pkg = '@colbymchenry/codegraph-' + target;
-var launcher = process.platform === 'win32' ? 'bin/codegraph.cmd' : 'bin/codegraph';
 
-var binPath;
+// Invoke the bundled Node binary directly instead of the platform package's
+// bin/codegraph[.cmd] wrapper. Node's CVE-2024-27980 mitigation refuses to
+// spawn .cmd/.bat files without `shell: true`, so spawning the .cmd launcher
+// on Windows returned EINVAL before any CLI logic could run. The wrappers
+// themselves just exec `<pkg>/node[.exe] <pkg>/lib/dist/bin/codegraph.js`, so
+// we bypass them entirely.
+var nodeBin = process.platform === 'win32' ? 'node.exe' : 'node';
+var entryScript = 'lib/dist/bin/codegraph.js';
+
+var nodePath, scriptPath;
 try {
-  binPath = require.resolve(pkg + '/' + launcher);
+  nodePath = require.resolve(pkg + '/' + nodeBin);
+  scriptPath = require.resolve(pkg + '/' + entryScript);
 } catch (e) {
   process.stderr.write(
     'codegraph: no prebuilt bundle for ' + target + '.\n' +
@@ -35,7 +44,11 @@ try {
   process.exit(1);
 }
 
-var res = childProcess.spawnSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
+var res = childProcess.spawnSync(
+  nodePath,
+  [scriptPath].concat(process.argv.slice(2)),
+  { stdio: 'inherit' }
+);
 if (res.error) {
   process.stderr.write('codegraph: ' + res.error.message + '\n');
   process.exit(1);
