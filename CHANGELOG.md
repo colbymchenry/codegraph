@@ -7,6 +7,22 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Terraform / HCL support** (`.tf`, `.tfvars`, `.hcl`) — CodeGraph now indexes
+  Terraform configurations. Each top-level block becomes a graph node:
+  `resource`/`data` blocks → `class` (qualified `resource.<type>.<name>` /
+  `data.<type>.<name>`), `module` → `module`, `variable` → `variable`,
+  `output` → `export`, `provider`/`terraform` → `namespace`, and each
+  attribute inside a `locals { ... }` block becomes its own `constant`. The
+  extractor walks attribute expressions to emit references for `var.*`,
+  `local.*`, `data.*.*`, `module.*`, and `<provider_prefix>_<type>.<name>`
+  chains, and records each `module` block's `source` string as an `imports`
+  reference. Grammar vendored from
+  [`@tree-sitter-grammars/tree-sitter-hcl`](https://www.npmjs.com/package/@tree-sitter-grammars/tree-sitter-hcl)
+  (ABI 14).
+
 ## [0.9.4] - 2026-05-22
 
 ### Fixed

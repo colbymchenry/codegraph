@@ -93,6 +93,11 @@ describe('Language Detection', () => {
     expect(detectLanguage('main.dart')).toBe('dart');
   });
 
+  it('should detect Terraform files', () => {
+    expect(detectLanguage('main.tf')).toBe('terraform');
+    expect(detectLanguage('infra/prod.tfvars')).toBe('terraform');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -3892,6 +3897,110 @@ local count = 0
       expect(imports).toContain('Signal'); // Roblox instance-path require
       const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
       expect(vars).toContain('count');
+    });
+  });
+});
+
+describe('Terraform Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Terraform files', () => {
+      expect(detectLanguage('main.tf')).toBe('terraform');
+      expect(detectLanguage('environments/prod.tfvars')).toBe('terraform');
+    });
+
+    it('should report Terraform as supported', () => {
+      expect(isLanguageSupported('terraform')).toBe(true);
+      expect(getSupportedLanguages()).toContain('terraform');
+    });
+  });
+
+  describe('Block extraction', () => {
+    it('should extract resource, data, module, variable, output, and locals', () => {
+      const code = `
+variable "region" {
+  type    = string
+  default = "us-east-1"
+}
+
+locals {
+  bucket_name = "demo-bucket"
+  tag         = "prod"
+}
+
+data "aws_ami" "ubuntu" {
+  most_recent = true
+}
+
+resource "aws_instance" "web" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = "t3.micro"
+}
+
+module "vpc" {
+  source = "terraform-aws-modules/vpc/aws"
+  cidr   = "10.0.0.0/16"
+}
+
+output "instance_ip" {
+  value = aws_instance.web.private_ip
+}
+`;
+      const result = extractFromSource('main.tf', code);
+
+      const variable = result.nodes.find((n) => n.kind === 'variable' && n.name === 'region');
+      expect(variable?.qualifiedName).toBe('var.region');
+      expect(variable?.language).toBe('terraform');
+
+      const constants = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.qualifiedName);
+      expect(constants).toContain('local.bucket_name');
+      expect(constants).toContain('local.tag');
+
+      const data = result.nodes.find((n) => n.kind === 'class' && n.name === 'ubuntu');
+      expect(data?.qualifiedName).toBe('data.aws_ami.ubuntu');
+
+      const resource = result.nodes.find((n) => n.kind === 'class' && n.name === 'web');
+      expect(resource?.qualifiedName).toBe('resource.aws_instance.web');
+
+      const module = result.nodes.find((n) => n.kind === 'module' && n.name === 'vpc');
+      expect(module?.qualifiedName).toBe('module.vpc');
+
+      const output = result.nodes.find((n) => n.kind === 'export' && n.name === 'instance_ip');
+      expect(output?.qualifiedName).toBe('output.instance_ip');
+    });
+
+    it('should emit references for var/local/data/resource/module chains', () => {
+      const code = `
+variable "env" { default = "prod" }
+locals { name = "x" }
+data "aws_ami" "u" {}
+resource "aws_instance" "web" {
+  ami  = data.aws_ami.u.id
+  tags = { Name = local.name, Env = var.env }
+}
+output "ip" { value = aws_instance.web.private_ip }
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('data.aws_ami.u');
+      expect(refs).toContain('local.name');
+      expect(refs).toContain('var.env');
+      expect(refs).toContain('resource.aws_instance.web');
+    });
+
+    it('should record the module source as an imports reference', () => {
+      const code = `
+module "vpc" {
+  source = "terraform-aws-modules/vpc/aws"
+  cidr   = "10.0.0.0/16"
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const moduleNode = result.nodes.find((n) => n.kind === 'module' && n.name === 'vpc');
+      expect(moduleNode).toBeDefined();
+      const importRef = result.unresolvedReferences.find(
+        (r) => r.fromNodeId === moduleNode!.id && r.referenceKind === 'imports'
+      );
+      expect(importRef?.referenceName).toBe('terraform-aws-modules/vpc/aws');
     });
   });
 });
