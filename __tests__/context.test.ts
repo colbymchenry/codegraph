@@ -325,6 +325,35 @@ export const testCases = [
       expect(markdown).toContain('```typescript');
     });
 
+    it('should avoid related class code blocks for method-focused context', async () => {
+      const result = await cg.buildContext('processCheckout', {
+        format: 'json',
+        includeCode: true,
+        maxCodeBlocks: 10,
+        traversalDepth: 2,
+      });
+
+      const parsed = JSON.parse(result as string);
+      const codeBlocks = parsed.codeBlocks as Array<{
+        nodeName: string;
+        nodeKind: string;
+        filePath: string;
+        startLine: number;
+      }>;
+      const entryKeys = new Set(
+        parsed.entryPoints.map((node: { name: string; filePath: string; startLine: number }) =>
+          `${node.name}:${node.filePath}:${node.startLine}`
+        )
+      );
+      const relatedClassBlocks = codeBlocks.filter((block) =>
+        block.nodeKind === 'class' &&
+        !entryKeys.has(`${block.nodeName}:${block.filePath}:${block.startLine}`)
+      );
+
+      expect(codeBlocks.some((block) => block.nodeName === 'processCheckout')).toBe(true);
+      expect(relatedClassBlocks).toHaveLength(0);
+    });
+
     it('should exclude code blocks when requested', async () => {
       const result = await cg.buildContext('payment', {
         format: 'markdown',

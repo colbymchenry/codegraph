@@ -166,7 +166,7 @@ function matchesGenericSplitSymbol(name: string): boolean {
  */
 const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
   maxNodes: 20,           // Reduced from 50 - most tasks don't need 50 symbols
-  maxCodeBlocks: 5,       // Reduced from 10 - only show most relevant code
+  maxCodeBlocks: 3,       // Reduced from 10 - only show most relevant code
   maxCodeBlockSize: 1500, // Reduced from 2000
   includeCode: true,
   format: 'markdown',
@@ -1009,7 +1009,9 @@ export class ContextBuilder {
   ): Promise<CodeBlock[]> {
     const blocks: CodeBlock[] = [];
 
-    // Prioritize entry points, then functions/methods
+    // Prioritize entry points, then functions/methods. Entry point classes are
+    // still included via the roots above, but related classes are usually large
+    // containers whose location is enough for context output.
     const priorityNodes: Node[] = [];
 
     // First: entry points
@@ -1024,15 +1026,6 @@ export class ContextBuilder {
     for (const node of subgraph.nodes.values()) {
       if (!subgraph.roots.includes(node.id)) {
         if (node.kind === 'function' || node.kind === 'method') {
-          priorityNodes.push(node);
-        }
-      }
-    }
-
-    // Then: classes
-    for (const node of subgraph.nodes.values()) {
-      if (!subgraph.roots.includes(node.id)) {
-        if (node.kind === 'class') {
           priorityNodes.push(node);
         }
       }
