@@ -252,12 +252,32 @@ export function scanDirectory(
   rootDir: string,
   onProgress?: (current: number, file: string) => void
 ): string[] {
-  // Fast path: use git to get all visible files (respects .gitignore everywhere)
+  // Fast path: use git to get all visible files (respects .gitignore everywhere).
+  // Then apply .codegraphignore as a second-pass filter on the git file list.
   const gitFiles = getGitVisibleFiles(rootDir);
+
+  // Load root .codegraphignore for second-pass filtering in git fast path.
+  let rootCgIgnore: Ignore | null = null;
+  try {
+    const cgiPath = path.join(rootDir, '.codegraphignore');
+    if (fs.existsSync(cgiPath)) {
+      rootCgIgnore = ignore().add(fs.readFileSync(cgiPath, 'utf-8'));
+    }
+  } catch {
+    // Unreadable — treat as absent.
+  }
+
+  const isIgnoredByCodegraph = (filePath: string): boolean => {
+    if (!rootCgIgnore) return false;
+    // git ls-files returns paths relative to root, same as .codegraphignore patterns.
+    return rootCgIgnore.ignores(filePath);
+  };
+
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
+      if (isIgnoredByCodegraph(filePath)) continue;
       if (isSourceFile(filePath)) {
         files.push(filePath);
         count++;
@@ -280,10 +300,28 @@ export async function scanDirectoryAsync(
   onProgress?: (current: number, file: string) => void
 ): Promise<string[]> {
   const gitFiles = getGitVisibleFiles(rootDir);
+
+  // Load root .codegraphignore for second-pass filtering in git fast path.
+  let rootCgIgnore: Ignore | null = null;
+  try {
+    const cgiPath = path.join(rootDir, '.codegraphignore');
+    if (fs.existsSync(cgiPath)) {
+      rootCgIgnore = ignore().add(fs.readFileSync(cgiPath, 'utf-8'));
+    }
+  } catch {
+    // Unreadable — treat as absent.
+  }
+
+  const isIgnoredByCodegraph = (filePath: string): boolean => {
+    if (!rootCgIgnore) return false;
+    return rootCgIgnore.ignores(filePath);
+  };
+
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
+      if (isIgnoredByCodegraph(filePath)) continue;
       if (isSourceFile(filePath)) {
         files.push(filePath);
         count++;
@@ -322,12 +360,27 @@ function scanDirectoryWalk(
 
   const loadIgnore = (dir: string): ScopedIgnore | null => {
     try {
+      // Load .gitignore (always applied by git itself).
+      // Also load .codegraphignore if present — allows excluding files
+      // from the CodeGraph index without affecting git tracking. When both
+      // exist, patterns from both are OR'd together (ignored if matched by either).
       const giPath = path.join(dir, '.gitignore');
-      if (fs.existsSync(giPath)) {
-        return { dir, ig: ignore().add(fs.readFileSync(giPath, 'utf-8')) };
+      const cgiPath = path.join(dir, '.codegraphignore');
+      const hasGitignore = fs.existsSync(giPath);
+      const hasCodegraphignore = fs.existsSync(cgiPath);
+
+      if (hasGitignore || hasCodegraphignore) {
+        const ig = ignore();
+        if (hasGitignore) {
+          ig.add(fs.readFileSync(giPath, 'utf-8'));
+        }
+        if (hasCodegraphignore) {
+          ig.add(fs.readFileSync(cgiPath, 'utf-8'));
+        }
+        return { dir, ig };
       }
     } catch {
-      // Unreadable .gitignore — treat as absent.
+      // Unreadable ignore file — treat as absent.
     }
     return null;
   };
