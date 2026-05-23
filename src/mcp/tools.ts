@@ -16,7 +16,7 @@ import {
   readFileSync,
   writeSync,
 } from 'fs';
-import { clamp, validatePathWithinRoot, validateProjectPath } from '../utils';
+import { clamp, isPathWithinRootReal, validatePathWithinRoot, validateProjectPath } from '../utils';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -1110,7 +1110,12 @@ export class ToolHandler {
       if (totalChars > budget.maxOutputChars * 0.9) break;
 
       const absPath = validatePathWithinRoot(projectRoot, filePath);
-      if (!absPath || !existsSync(absPath)) continue;
+      // The logical `validatePathWithinRoot` check lets a symlinked `filePath`
+      // whose real target escapes the project pass; the subsequent
+      // `readFileSync` would then ship the external file's bytes back to the
+      // agent. `isPathWithinRootReal` does the realpath comparison.
+      // Same CWE-59 class as the #280 session-marker fix (different mechanic).
+      if (!absPath || !existsSync(absPath) || !isPathWithinRootReal(absPath, projectRoot)) continue;
 
       let fileContent: string;
       try {

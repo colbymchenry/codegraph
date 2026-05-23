@@ -642,3 +642,131 @@ describe('Session marker symlink resistance', () => {
     }
   });
 });
+
+describe('codegraph_context source-emission symlink escape resistance', () => {
+  // The MCP source-returning loop in src/mcp/tools.ts re-reads each matched
+  // file via fs.readFileSync(absPath) and ships the bytes back to the agent.
+  // If an attacker can plant an in-tree symlink whose name passes isSourceFile
+  // (e.g. evil.ts) but whose realpath escapes the project root, the read
+  // follows the link and the project-external file's contents reach the agent.
+  // validatePathWithinRoot is a logical path-prefix check only and lets such a
+  // path through; isPathWithinRootReal (already present in src/utils.ts) does
+  // the realpath comparison that closes the escape. Same CWE-59 class as the
+  // session-marker write-side fix.
+  let projectDir: string;
+  let outsideDir: string;
+
+  beforeEach(() => {
+    projectDir = createTempDir();
+    outsideDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(projectDir);
+    cleanupTempDir(outsideDir);
+  });
+
+  it('does not re-read an in-tree symlink whose target escapes the project root when emitting source', async () => {
+    // Threat model: the escape target is a real .ts file the indexer can
+    // parse, so it ends up in the DB just like any in-tree file. The bug we
+    // guard against is the source-emission *re-read* — the read-time
+    // `fs.readFileSync(absPath)` follows the symlink and surfaces the real
+    // target's body to the agent. We use a sentinel in the function BODY (not
+    // the export name / signature), so the value cannot leak via the
+    // index-time symbol-signature metadata path — only via a re-read of the
+    // file's contents on the codegraph_context call.
+    const sentinelSymbol = 'EscapedSentinel_42_DoNotLeak';
+    const sentinelValue = 'leaked-only-via-re-read-zzz';
+    const secretFile = path.join(outsideDir, 'secret.ts');
+    fs.writeFileSync(
+      secretFile,
+      `export function ${sentinelSymbol}(): string {\n  return '${sentinelValue}';\n}\n`
+    );
+
+    // Legit in-tree file so the project has at least one real source entry.
+    fs.writeFileSync(path.join(projectDir, 'a.ts'), 'export const x = 1;\n');
+
+    // Plant the escape symlink at a logically-in-tree path. The walker still
+    // adds it (escape-target rejection at the walker layer is a separate
+    // concern outside this PR's scope), so the path ends up in the DB and is
+    // a live candidate for source emission on the next codegraph_context call.
+    try {
+      fs.symlinkSync(secretFile, path.join(projectDir, 'evil.ts'), 'file');
+    } catch {
+      // Skip on platforms where the user can't create symlinks (Windows
+      // without dev mode + admin) — the escape we're guarding against doesn't
+      // apply when symlinks aren't creatable.
+      return;
+    }
+
+    const cg = await CodeGraph.init(projectDir);
+    await cg.indexAll();
+
+    const handler = new ToolHandler(cg);
+    let resultText: string;
+    try {
+      // Task chosen to surface the sentinel symbol — the search query lands
+      // on the symlinked file, and (pre-fix) the source-emission re-read would
+      // then ship the escape target's function body back to the agent.
+      const result = await handler.execute('codegraph_context', { task: sentinelSymbol });
+      resultText = result.content.map((c) => c.text).join('\n');
+    } finally {
+      cg.close();
+    }
+
+    // Positive control: the symbol/file must still be referenced in the
+    // response (otherwise the negative assertion below could trivially pass
+    // because the search missed entirely, the budget dropped the node, etc).
+    expect(resultText).toContain(sentinelSymbol);
+    expect(resultText).toContain('evil.ts');
+
+    // Core assertion: post-fix path silently skips re-read for paths whose
+    // realpath escapes — the agent must not see the secret file's body bytes.
+    expect(resultText).not.toContain(sentinelValue);
+  });
+
+  it('does not re-read an in-tree symlink that escapes the project root in codegraph_explore source emission', async () => {
+    // Same threat as the codegraph_context test above, but exercised through
+    // codegraph_explore's separate source-emission loop in src/mcp/tools.ts.
+    // Both read sites share the same logical-only `validatePathWithinRoot`
+    // pattern and were fixed by the same `isPathWithinRootReal` addition.
+    const sentinelSymbol = 'EscapedSentinelExplore_42_DoNotLeak';
+    const sentinelValue = 'leaked-only-via-explore-zzz';
+    const secretFile = path.join(outsideDir, 'secret.ts');
+    fs.writeFileSync(
+      secretFile,
+      `export function ${sentinelSymbol}(): string {\n  return '${sentinelValue}';\n}\n`
+    );
+
+    fs.writeFileSync(path.join(projectDir, 'a.ts'), 'export const x = 1;\n');
+
+    try {
+      fs.symlinkSync(secretFile, path.join(projectDir, 'evil.ts'), 'file');
+    } catch {
+      return;
+    }
+
+    const cg = await CodeGraph.init(projectDir);
+    await cg.indexAll();
+
+    const handler = new ToolHandler(cg);
+    let resultText: string;
+    try {
+      const result = await handler.execute('codegraph_explore', { query: sentinelSymbol });
+      resultText = result.content.map((c) => c.text).join('\n');
+    } finally {
+      cg.close();
+    }
+
+    // Positive control: the symlinked file was indexed and matched — otherwise
+    // the body-leak assertion below could pass for an unrelated reason
+    // (search miss, budget drop, etc.). The header / found-count strings come
+    // straight from the explore handler before any source emission.
+    expect(resultText).toContain(sentinelSymbol);
+    expect(resultText).toMatch(/Found \d+ symbols? across \d+ files?/);
+
+    // Core assertion: post-fix path silently skips re-read for paths whose
+    // realpath escapes — the agent must not see the secret file's body bytes.
+    expect(resultText).not.toContain(sentinelValue);
+  });
+});
