@@ -177,7 +177,15 @@ function childRange(lines: string[], parent: LineRange, child: string): LineRang
   for (let i = start + 1; i < parent.end; i++) {
     const line = lines[i] ?? '';
     if (line.trim() === '') continue;
-    if (/^  \S/.test(line)) {
+    // YAML allows both:
+    //   cli:
+    //   - file
+    // and:
+    //   cli:
+    //     - file
+    // A line beginning with "  -" is still part of the current child, not
+    // the next platform key. Only a sibling mapping key ends this child.
+    if (/^  [A-Za-z_][A-Za-z0-9_-]*:\s*(?:#.*)?$/.test(line)) {
       end = i;
       break;
     }
@@ -248,6 +256,14 @@ function removeCodeGraphMcpServer(content: string): string {
   return joinLines(lines);
 }
 
+function listItemIndent(lines: string[], range: LineRange, fallback: string): string {
+  for (const line of lines.slice(range.start + 1, range.end)) {
+    const match = /^(\s*)-\s+/.exec(line);
+    if (match) return match[1] ?? fallback;
+  }
+  return fallback;
+}
+
 function upsertCodeGraphToolset(content: string): string {
   const lines = splitLines(content);
   const parent = topLevelRange(lines, 'platform_toolsets');
@@ -261,7 +277,7 @@ function upsertCodeGraphToolset(content: string): string {
   }
 
   if (!cli) {
-    lines.splice(parent.end, 0, '  cli:', '    - hermes-cli', '    - mcp-codegraph');
+    lines.splice(parent.end, 0, '  cli:', '  - hermes-cli', '  - mcp-codegraph');
     return joinLines(lines);
   }
 
@@ -270,7 +286,8 @@ function upsertCodeGraphToolset(content: string): string {
     .some((line) => line.trim() === '- mcp-codegraph');
   if (hasEntry) return joinLines(lines);
 
-  lines.splice(cli.end, 0, '    - mcp-codegraph');
+  const indent = listItemIndent(lines, cli, '  ');
+  lines.splice(cli.end, 0, `${indent}- mcp-codegraph`);
   return joinLines(lines);
 }
 
