@@ -156,6 +156,34 @@ function matchesGenericSplitSymbol(name: string): boolean {
   return false;
 }
 
+function splitIdentifierTerms(value: string): string[] {
+  return value
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .split(/[^a-zA-Z0-9]+/)
+    .map((term) => term.toLowerCase())
+    .filter((term) => term.length >= 3);
+}
+
+function extractSnippetFocusTerms(query: string, rootNames: string[]): string[] {
+  const rootTerms = new Set<string>();
+  for (const name of rootNames) {
+    rootTerms.add(name.toLowerCase());
+    for (const term of splitIdentifierTerms(name)) {
+      rootTerms.add(term);
+    }
+  }
+
+  const focusTerms = new Set<string>();
+  for (const term of splitIdentifierTerms(query)) {
+    if (rootTerms.has(term)) continue;
+    if (GENERIC_SPLIT_SYMBOLS.has(term)) continue;
+    if (term === 'test' || term === 'tests' || term === 'spec' || term === 'specs') continue;
+    focusTerms.add(term);
+  }
+  return Array.from(focusTerms);
+}
+
 /**
  * Default options for context building
  *
@@ -166,7 +194,7 @@ function matchesGenericSplitSymbol(name: string): boolean {
  */
 const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
   maxNodes: 20,           // Reduced from 50 - most tasks don't need 50 symbols
-  maxCodeBlocks: 3,       // Reduced from 10 - only show most relevant code
+  maxCodeBlocks: 2,       // Reduced from 10 - only show most relevant code
   maxCodeBlockSize: 1500, // Reduced from 2000
   includeCode: true,
   format: 'markdown',
@@ -254,7 +282,7 @@ export class ContextBuilder {
 
     // Extract code blocks for key nodes
     const codeBlocks = opts.includeCode
-      ? await this.extractCodeBlocks(subgraph, opts.maxCodeBlocks, opts.maxCodeBlockSize)
+      ? await this.extractCodeBlocks(query, subgraph, opts.maxCodeBlocks, opts.maxCodeBlockSize)
       : [];
 
     // Get related files
@@ -1003,11 +1031,15 @@ export class ContextBuilder {
    * Extract code blocks for key nodes in the subgraph
    */
   private async extractCodeBlocks(
+    query: string,
     subgraph: Subgraph,
     maxBlocks: number,
     maxBlockSize: number
   ): Promise<CodeBlock[]> {
     const blocks: CodeBlock[] = [];
+    const snippets = await this.extractQuerySnippets(query, subgraph, maxBlockSize);
+    const snippetSlots = snippets.length > 0 && maxBlocks > 1 ? 1 : 0;
+    const regularLimit = Math.max(0, maxBlocks - snippetSlots);
 
     // Prioritize entry points, then functions/methods. Entry point classes are
     // still included via the roots above, but related classes are usually large
@@ -1031,12 +1063,21 @@ export class ContextBuilder {
       }
     }
 
+    const duplicateNames = new Map<string, number>();
+    for (const node of priorityNodes) {
+      duplicateNames.set(node.name, (duplicateNames.get(node.name) ?? 0) + 1);
+    }
+
     // Extract code for priority nodes
     for (const node of priorityNodes) {
-      if (blocks.length >= maxBlocks) break;
+      if (blocks.length >= regularLimit) break;
 
       const code = await this.extractNodeCode(node);
       if (code) {
+        if (this.isLikelyDelegatingWrapper(node, code, duplicateNames)) {
+          continue;
+        }
+
         // Truncate if too long. Language-neutral marker (no `//` — not a
         // comment in Python, Ruby, etc.); this renders inside a fenced
         // source block whose language varies.
@@ -1055,7 +1096,107 @@ export class ContextBuilder {
       }
     }
 
-    return blocks;
+    return [
+      ...blocks,
+      ...snippets.slice(0, Math.max(0, maxBlocks - blocks.length)),
+    ];
+  }
+
+  private isLikelyDelegatingWrapper(
+    node: Node,
+    code: string,
+    duplicateNames: Map<string, number>
+  ): boolean {
+    if ((duplicateNames.get(node.name) ?? 0) < 2) return false;
+    if (node.kind !== 'function' && node.kind !== 'method') return false;
+    if (code.length > 350) return false;
+    return /\breturn\s+this\.[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\s*\(/.test(code);
+  }
+
+  private async extractQuerySnippets(
+    query: string,
+    subgraph: Subgraph,
+    maxBlockSize: number
+  ): Promise<CodeBlock[]> {
+    const rootNames = subgraph.roots
+      .map((id) => subgraph.nodes.get(id)?.name)
+      .filter((name): name is string => Boolean(name));
+    const rootNeedles = [...new Set(rootNames.map((name) => name.toLowerCase()))];
+    const focusTerms = extractSnippetFocusTerms(query, rootNames);
+    if (rootNeedles.length === 0 || focusTerms.length === 0) {
+      return [];
+    }
+
+    let best:
+      | {
+          score: number;
+          filePath: string;
+          language: CodeBlock['language'];
+          startLine: number;
+          endLine: number;
+          content: string;
+        }
+      | null = null;
+
+    for (const file of this.queries.getAllFiles()) {
+      const fullPath = validatePathWithinRoot(this.projectRoot, file.path);
+      if (!fullPath || !fs.existsSync(fullPath)) continue;
+      if (file.size > 200_000) continue;
+
+      let content: string;
+      try {
+        content = fs.readFileSync(fullPath, 'utf-8');
+      } catch {
+        continue;
+      }
+
+      const lower = content.toLowerCase();
+      if (!rootNeedles.some((needle) => lower.includes(needle))) continue;
+      if (!focusTerms.some((term) => lower.includes(term))) continue;
+
+      const lines = content.split(/\r?\n/);
+      for (let idx = 0; idx < lines.length; idx++) {
+        const lineLower = lines[idx]!.toLowerCase();
+        if (!rootNeedles.some((needle) => lineLower.includes(needle))) continue;
+
+        const startIdx = Math.max(0, idx - 4);
+        const endIdx = Math.min(lines.length - 1, idx + 7);
+        const window = lines.slice(startIdx, endIdx + 1).join('\n');
+        const windowLower = window.toLowerCase();
+        const termHits = focusTerms.filter((term) => windowLower.includes(term)).length;
+        if (termHits === 0) continue;
+
+        let score = termHits * 20;
+        if (!isTestFile(file.path)) score += 5;
+        if (focusTerms.some((term) => lower.includes(`.command('${term}`) || lower.includes(`.command("${term}`))) {
+          score += 15;
+        }
+
+        const trimmed = window.length > Math.min(maxBlockSize, 900)
+          ? window.slice(0, Math.min(maxBlockSize, 900)) + '\n... (truncated) ...'
+          : window;
+
+        if (!best || score > best.score) {
+          best = {
+            score,
+            filePath: file.path,
+            language: file.language,
+            startLine: startIdx + 1,
+            endLine: endIdx + 1,
+            content: trimmed,
+          };
+        }
+      }
+    }
+
+    if (!best) return [];
+    return [{
+      content: best.content,
+      filePath: best.filePath,
+      startLine: best.startLine,
+      endLine: best.endLine,
+      language: best.language,
+    }];
   }
 
   /**

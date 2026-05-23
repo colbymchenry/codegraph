@@ -59,7 +59,7 @@ export function formatContextAsMarkdown(context: TaskContext): string {
   if (context.codeBlocks.length > 0) {
     lines.push('### Code\n');
     for (const block of context.codeBlocks) {
-      const nodeName = block.node?.name ?? 'Unknown';
+      const nodeName = block.node?.name ?? 'Snippet';
       lines.push(`#### ${nodeName} (${block.filePath}:${block.startLine})\n`);
       lines.push('```' + block.language);
       lines.push(block.content);
