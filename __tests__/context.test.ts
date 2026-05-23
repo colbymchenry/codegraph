@@ -354,6 +354,22 @@ export const testCases = [
       expect(relatedClassBlocks).toHaveLength(0);
     });
 
+    it('should include a compact snippet when a focus term shares a file with the symbol', async () => {
+      const result = await cg.buildContext('getFileDependents affected tests', {
+        format: 'markdown',
+        includeCode: true,
+        maxCodeBlocks: 2,
+      });
+
+      const markdown = result as string;
+
+      expect(markdown).toContain('#### getFileDependents');
+      expect(markdown).toContain('#### Snippet');
+      expect(markdown).toContain('function affected');
+      expect(markdown).toContain('return getFileDependents(filePath)');
+      expect(markdown).not.toContain('class LRUCache');
+    });
+
     it('should exclude code blocks when requested', async () => {
       const result = await cg.buildContext('payment', {
         format: 'markdown',
