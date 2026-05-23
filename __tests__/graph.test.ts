@@ -281,6 +281,19 @@ export { main };
       expect(Array.isArray(callers)).toBe(true);
     });
 
+    it('should get instantiating callers of a class', () => {
+      const nodes = cg.getNodesByKind('class');
+      const derivedClass = nodes.find((n) => n.name === 'DerivedClass');
+
+      if (!derivedClass) {
+        return;
+      }
+
+      const callers = cg.getCallers(derivedClass.id);
+
+      expect(callers.some((c) => c.node.name === 'main' && c.edge.kind === 'instantiates')).toBe(true);
+    });
+
     it('should get callees of a function', () => {
       const nodes = cg.getNodesByKind('function');
       const processValue = nodes.find((n) => n.name === 'processValue');
