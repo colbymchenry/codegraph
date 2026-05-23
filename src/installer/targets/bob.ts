@@ -1,7 +1,7 @@
 /**
  * IBM Bob target.
  *
- *   - MCP server entry to `~/.bob/mcp_settings.json` (global) or
+ *   - MCP server entry to `~/.bob/settings/mcp_settings.json` (global) or
  *     `./.bob/mcp.json` (local). Uses the standard
  *     `{ mcpServers: { codegraph: {...} } }` shape, same as Claude
  *     and Cursor.
@@ -46,7 +46,7 @@ import {
 
 function mcpConfigPath(loc: Location): string {
   return loc === 'global'
-    ? path.join(os.homedir(), '.bob', 'mcp_settings.json')
+    ? path.join(os.homedir(), '.bob', 'settings', 'mcp_settings.json')
     : path.join(process.cwd(), '.bob', 'mcp.json');
 }
 
@@ -70,7 +70,7 @@ class BobTarget implements AgentTarget {
     const config = readJsonFile(cfgPath);
     const alreadyConfigured = !!config.mcpServers?.codegraph;
     const installed = loc === 'global'
-      ? fs.existsSync(path.join(os.homedir(), '.bob'))
+      ? fs.existsSync(path.join(os.homedir(), '.bob', 'settings'))
       : fs.existsSync(path.join(process.cwd(), '.bob'));
     return { installed, alreadyConfigured, configPath: cfgPath };
   }
