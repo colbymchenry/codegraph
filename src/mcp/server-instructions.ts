@@ -30,9 +30,7 @@ then ONE \`codegraph_explore\` for the source of the symbols it surfaces.
 Codegraph IS the pre-built search index — so delegating the lookup to a
 separate file-reading sub-task/agent, or running your own grep + read
 loop, repeats work codegraph already did and costs more for the same
-answer. Reach for raw Read/Grep only to confirm a specific detail
-codegraph didn't cover. A direct codegraph answer is typically a handful
-of calls; a grep/read exploration is dozens.
+answer. Don't grep-verify codegraph results — each unnecessary verification costs ~800 tokens. Budget: at most 3 grep calls per task, spend them only on genuinely ambiguous text content (strings, comments, logs) — never on structural queries that codegraph already answered. A direct codegraph answer is typically a handful of calls; a grep/read exploration is dozens.
 
 ## Tool selection by intent
 
