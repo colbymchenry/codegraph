@@ -20,6 +20,8 @@ describe('Context Builder', () => {
     // Create a sample codebase
     const srcDir = path.join(testDir, 'src');
     fs.mkdirSync(srcDir);
+    const evalDir = path.join(testDir, '__tests__', 'evaluation');
+    fs.mkdirSync(evalDir, { recursive: true });
 
     // Create a payment service file
     fs.writeFileSync(
@@ -135,6 +137,46 @@ export function validateEmail(email: string): boolean {
 `
     );
 
+    fs.writeFileSync(
+      path.join(srcDir, 'affected.ts'),
+      `
+export function getFileDependents(filePath: string): string[] {
+  return [filePath];
+}
+
+export function affected(filePath: string): string[] {
+  return getFileDependents(filePath);
+}
+`
+    );
+
+    fs.writeFileSync(
+      path.join(srcDir, 'cache.ts'),
+      `
+export class LRUCache {
+  private values = new Map<string, string>();
+
+  get(key: string): string | undefined {
+    return this.values.get(key);
+  }
+
+  getDb(): Map<string, string> {
+    return this.values;
+  }
+}
+`
+    );
+
+    fs.writeFileSync(
+      path.join(evalDir, 'test-cases.ts'),
+      `
+export const testCases = [
+  { id: 'search-class-exact', query: 'PaymentService' },
+  { id: 'context-affected', query: 'affected tests' },
+];
+`
+    );
+
     // Initialize CodeGraph
     cg = CodeGraph.initSync(testDir, {
       config: {
@@ -192,6 +234,22 @@ export function validateEmail(email: string): boolean {
             name.toLowerCase().includes('checkout')
         )
       ).toBe(true);
+    });
+
+    it('should avoid generic split-term entry points when an exact compound symbol matches', async () => {
+      const result = await cg.findRelevantContext('getFileDependents affected tests', {
+        searchLimit: 3,
+        maxNodes: 12,
+      });
+
+      const entryNames = result.roots
+        .map((id) => result.nodes.get(id)?.name)
+        .filter(Boolean);
+
+      expect(entryNames).toContain('getFileDependents');
+      expect(entryNames).not.toContain('get');
+      expect(entryNames).not.toContain('getDb');
+      expect(entryNames).not.toContain('testCases');
     });
 
     it('should include edges in the result', async () => {
