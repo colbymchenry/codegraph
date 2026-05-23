@@ -131,6 +131,31 @@ function extractSymbolsFromQuery(query: string): string[] {
   return Array.from(symbols).filter(s => !commonWords.has(s.toLowerCase()));
 }
 
+const GENERIC_SPLIT_SYMBOLS = new Set([
+  'get', 'set', 'add', 'run', 'build', 'create', 'find', 'list', 'load',
+  'save', 'read', 'write', 'delete', 'remove', 'update', 'handle', 'process',
+  'init', 'open', 'close', 'test', 'tests', 'testcase', 'testcases', 'spec',
+  'specs',
+]);
+
+function isSpecificCompoundSymbol(symbol: string): boolean {
+  return symbol.length >= 6 && /[A-Z_.:]/.test(symbol);
+}
+
+function matchesGenericSplitSymbol(name: string): boolean {
+  const lower = name.toLowerCase();
+  for (const generic of GENERIC_SPLIT_SYMBOLS) {
+    if (lower === generic) return true;
+    if (lower.startsWith(generic) && name.length > generic.length) {
+      const next = name[generic.length]!;
+      if (next === '_' || next === '-' || /[A-Z]/.test(next)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /**
  * Default options for context building
  *
@@ -431,6 +456,19 @@ export class ContextBuilder {
           }))
           .sort((a, b) => b.score - a.score)
           .slice(0, opts.searchLimit * 2);
+
+        const exactMatchFiles = new Set(exactMatches.map((r) => r.node.filePath));
+        const hasSpecificExactMatch = exactMatches.some((r) =>
+          symbolsFromQuery.some((symbol) =>
+            isSpecificCompoundSymbol(symbol) &&
+            r.node.name.toLowerCase() === symbol.toLowerCase()
+          )
+        );
+        if (hasSpecificExactMatch && exactMatchFiles.size > 0) {
+          textResults = textResults.filter((r) => {
+            return !matchesGenericSplitSymbol(r.node.name) || exactMatchFiles.has(r.node.filePath);
+          });
+        }
       }
       logDebug('Text search results', { count: textResults.length });
     } catch (error) {
