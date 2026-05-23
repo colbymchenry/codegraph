@@ -28,6 +28,7 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { MarkdownExtractor } from './markdown-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -224,6 +225,7 @@ export class TreeSitterExtractor {
   private errors: ExtractionError[] = [];
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
+  private referenceKeys: Set<string> = new Set();
   private methodIndex: Map<string, string> | null = null; // lookup key → node ID for Pascal defProc lookup
   // Function-as-value capture (#756): per-language spec + candidates collected
   // during the walk, gated & flushed into unresolvedReferences at end-of-file
@@ -538,6 +540,8 @@ export class TreeSitterExtractor {
         return;
       }
     }
+
+    this.extractMarkdownPathReferencesFromStringNode(node);
 
     // Pascal-specific AST handling
     if (this.language === 'pascal') {
@@ -937,6 +941,103 @@ export class TreeSitterExtractor {
       get nodeStack() { return self.nodeStack; },
       get nodes() { return self.nodes; },
     };
+  }
+
+  /**
+   * Extract Markdown path references from code string literals.
+   *
+   * This creates code -> documentation edges such as:
+   *   open("docs/guide.md#install") -> docs/guide.md#install
+   *   fs.readFileSync("../README.md") -> README.md
+   */
+  private extractMarkdownPathReferencesFromStringNode(node: SyntaxNode, ownerId?: string): void {
+    if (!isMarkdownPathStringNode(node.type)) return;
+
+    const fromNodeId = ownerId ?? this.currentReferenceOwnerId();
+    if (!fromNodeId) return;
+
+    const text = getNodeText(node, this.source);
+    for (const candidate of extractMarkdownPathCandidates(text)) {
+      const normalized = this.normalizeMarkdownPathReference(candidate.referenceName);
+      if (!normalized) continue;
+      this.addReference(
+        fromNodeId,
+        normalized,
+        'references',
+        node.startPosition.row + 1,
+        node.startPosition.column + candidate.column
+      );
+    }
+  }
+
+  private extractMarkdownPathReferencesFromSubtree(node: SyntaxNode | null | undefined, ownerId: string): void {
+    if (!node) return;
+    this.extractMarkdownPathReferencesFromStringNode(node, ownerId);
+
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child) {
+        this.extractMarkdownPathReferencesFromSubtree(child, ownerId);
+      }
+    }
+  }
+
+  private currentReferenceOwnerId(): string | null {
+    if (this.nodeStack.length > 0) {
+      return this.nodeStack[this.nodeStack.length - 1] ?? null;
+    }
+    return this.nodes.find((n) => n.kind === 'file')?.id ?? null;
+  }
+
+  private addReference(
+    fromNodeId: string,
+    referenceName: string,
+    referenceKind: Edge['kind'],
+    line: number,
+    column: number
+  ): void {
+    const key = `${fromNodeId}:${referenceKind}:${referenceName}:${line}:${column}`;
+    if (this.referenceKeys.has(key)) return;
+    this.referenceKeys.add(key);
+    this.unresolvedReferences.push({
+      fromNodeId,
+      referenceName,
+      referenceKind,
+      line,
+      column,
+      filePath: this.filePath,
+      language: this.language,
+    });
+  }
+
+  private normalizeMarkdownPathReference(referenceName: string): string | null {
+    const trimmed = referenceName.trim().replace(/\\/g, '/');
+    if (!trimmed || /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return null;
+
+    const hashIndex = trimmed.indexOf('#');
+    const pathPartWithQuery = hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed;
+    const anchor = hashIndex >= 0 ? trimmed.slice(hashIndex) : '';
+    const queryIndex = pathPartWithQuery.indexOf('?');
+    const rawPath = queryIndex >= 0 ? pathPartWithQuery.slice(0, queryIndex) : pathPartWithQuery;
+    const cleanPath = decodePath(rawPath);
+
+    if (!/\.(md|mdx|markdown)$/i.test(cleanPath)) return null;
+
+    const baseDir = path.posix.dirname(this.filePath.replace(/\\/g, '/'));
+    let normalizedPath: string;
+    if (cleanPath.startsWith('/')) {
+      normalizedPath = path.posix.normalize(cleanPath.replace(/^\/+/, ''));
+    } else if (cleanPath.startsWith('./') || cleanPath.startsWith('../')) {
+      normalizedPath = path.posix.normalize(path.posix.join(baseDir === '.' ? '' : baseDir, cleanPath));
+    } else {
+      normalizedPath = path.posix.normalize(cleanPath);
+    }
+
+    if (!normalizedPath || normalizedPath === '.' || normalizedPath === '..' || normalizedPath.startsWith('../')) {
+      return null;
+    }
+
+    return `${normalizedPath}${anchor}`;
   }
 
   /**
@@ -1403,6 +1504,7 @@ export class TreeSitterExtractor {
       // type annotation (#381). The generic walker handles TS-style
       // `type_annotation` children; the C# branch walks the `type` field.
       this.extractTypeAnnotations(node, propNode.id);
+      this.extractMarkdownPathReferencesFromSubtree(node, propNode.id);
     }
     return propNode;
   }
@@ -1449,12 +1551,15 @@ export class TreeSitterExtractor {
           if (!nameNode) continue;
           const name = getNodeText(nameNode, this.source);
           const signature = typeText ? `${typeText} $${name}` : `$${name}`;
-          this.createNode('field', name, elem, {
+          const fieldNode = this.createNode('field', name, elem, {
             docstring,
             signature,
             visibility,
             isStatic,
           });
+          if (fieldNode) {
+            this.extractMarkdownPathReferencesFromSubtree(elem, fieldNode.id);
+          }
         }
         return;
       }
@@ -1494,6 +1599,7 @@ export class TreeSitterExtractor {
           // and the language-aware path in `extractTypeAnnotations` descends
           // into that wrapper (#381).
           this.extractTypeAnnotations(node, fieldNode.id);
+          this.extractMarkdownPathReferencesFromSubtree(decl, fieldNode.id);
         }
       }
     } else {
@@ -1502,11 +1608,14 @@ export class TreeSitterExtractor {
         || node.namedChildren.find(c => c.type === 'identifier');
       if (nameNode) {
         const name = getNodeText(nameNode, this.source);
-        this.createNode('field', name, node, {
+        const fieldNode = this.createNode('field', name, node, {
           docstring,
           visibility,
           isStatic,
         });
+        if (fieldNode) {
+          this.extractMarkdownPathReferencesFromSubtree(node, fieldNode.id);
+        }
       }
     }
   }
@@ -1663,6 +1772,7 @@ export class TreeSitterExtractor {
             // Extract type annotation references (e.g., const x: ITextModel = ...)
             if (varNode) {
               this.extractVariableTypeAnnotation(child, varNode.id);
+              this.extractMarkdownPathReferencesFromSubtree(valueNode, varNode.id);
             }
 
             // Exported const object-of-functions — extract each function-valued
@@ -1719,10 +1829,13 @@ export class TreeSitterExtractor {
         const initValue = right ? getNodeText(right, this.source).slice(0, 100) : undefined;
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
-        this.createNode(kind, name, node, {
+        const varNode = this.createNode(kind, name, node, {
           docstring,
           signature: initSignature,
         });
+        if (varNode) {
+          this.extractMarkdownPathReferencesFromSubtree(right, varNode.id);
+        }
       }
     } else if (this.language === 'go') {
       // Go: var_declaration, short_var_declaration, const_declaration
@@ -1744,6 +1857,9 @@ export class TreeSitterExtractor {
             docstring,
             signature: initSignature,
           });
+          if (varNode) {
+            this.extractMarkdownPathReferencesFromSubtree(valueNode, varNode.id);
+          }
         }
         // Walk the initializer so composite literals and calls in a
         // package-level `var Query Binding = queryBinding{}` (a registry of
@@ -1778,10 +1894,13 @@ export class TreeSitterExtractor {
             const initValue = right ? getNodeText(right, this.source).slice(0, 100) : undefined;
             const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
-            this.createNode('variable', name, node, {
+            const varNode = this.createNode('variable', name, node, {
               docstring,
               signature: initSignature,
             });
+            if (varNode) {
+              this.extractMarkdownPathReferencesFromSubtree(right, varNode.id);
+            }
           }
         }
       }
@@ -1800,7 +1919,10 @@ export class TreeSitterExtractor {
         const valueNode = values[i];
         const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
-        this.createNode(kind, name, nameNode, { docstring, signature: initSignature, isExported });
+        const varNode = this.createNode(kind, name, nameNode, { docstring, signature: initSignature, isExported });
+        if (varNode) {
+          this.extractMarkdownPathReferencesFromSubtree(valueNode, varNode.id);
+        }
       });
     } else {
       // Generic fallback for other languages
@@ -1813,10 +1935,13 @@ export class TreeSitterExtractor {
             : extractName(child, this.source, this.extractor);
 
           if (name && name !== '<anonymous>') {
-            this.createNode(kind, name, child, {
+            const varNode = this.createNode(kind, name, child, {
               docstring,
               isExported,
             });
+            if (varNode) {
+              this.extractMarkdownPathReferencesFromSubtree(child, varNode.id);
+            }
           }
         }
       }
@@ -3381,6 +3506,8 @@ export class TreeSitterExtractor {
         if (ownerId) this.extractVariableTypeAnnotation(node, ownerId);
       }
 
+      this.extractMarkdownPathReferencesFromStringNode(node);
+
       // Nested NAMED functions inside a body — function declarations and named
       // function expressions like `.on('mount', function onmount(){})` — become
       // their own nodes so the graph can link to them (callback handlers, local
@@ -4731,6 +4858,48 @@ export class TreeSitterExtractor {
   }
 }
 
+const MARKDOWN_PATH_STRING_NODE_TYPES = new Set([
+  'string',
+  'string_literal',
+  'template_string',
+  'raw_string_literal',
+  'interpreted_string_literal',
+  'interpolated_string_expression',
+]);
+
+function isMarkdownPathStringNode(nodeType: string): boolean {
+  return MARKDOWN_PATH_STRING_NODE_TYPES.has(nodeType);
+}
+
+function extractMarkdownPathCandidates(text: string): Array<{ referenceName: string; column: number }> {
+  const candidates: Array<{ referenceName: string; column: number }> = [];
+  const pattern = /((?:\.{1,2}[\\/]+|[A-Za-z0-9_.@-]+[\\/]+|[\\/]+)?(?:[A-Za-z0-9_.@-]+[\\/]+)*[A-Za-z0-9_.@-]+\.(?:md|mdx|markdown)(?:\?[^'"`\s)>,;]*)?(?:#[^'"`\s)>,;]*)?)/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(text)) !== null) {
+    const referenceName = match[1];
+    if (!referenceName) continue;
+
+    const prefix = text.slice(Math.max(0, match.index - 16), match.index);
+    if (/:\/{2}$/i.test(prefix)) continue;
+
+    candidates.push({
+      referenceName,
+      column: match.index,
+    });
+  }
+
+  return candidates;
+}
+
+function decodePath(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 
 /**
  * Extract nodes and edges from source code.
@@ -4774,6 +4943,10 @@ export function extractFromSource(
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
     // file node so the watcher tracks it without emitting symbols.
     const extractor = new MyBatisExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'markdown') {
+    // Use custom extractor for Markdown documentation structure and references
+    const extractor = new MarkdownExtractor(filePath, source);
     result = extractor.extract();
   } else if (isFileLevelOnlyLanguage(detectedLanguage)) {
     // No symbol extraction at this stage — files are tracked at the file-record

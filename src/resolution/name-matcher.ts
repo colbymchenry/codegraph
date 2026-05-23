@@ -15,16 +15,20 @@ export function matchByFilePath(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  const normalizedName = ref.referenceName.replace(/\\/g, '/');
+  const [pathAndSymbol, anchor] = splitAnchor(normalizedName);
+  const [pathWithoutAnchor, symbolName] = splitFileSymbol(pathAndSymbol);
   // Path-like (`a/b.liquid`) OR a bare filename ending in a short extension
   // (`Foo.h` — an Objective-C `#import "Foo.h"`, resolved to the header by
   // basename). A bare ref WITHOUT an extension is a symbol name, not a file, so
-  // leave it to the symbol-matching strategies.
-  if (!ref.referenceName.includes('/') && !/\.[A-Za-z][A-Za-z0-9]{0,3}$/.test(ref.referenceName)) {
+  // leave it to the symbol-matching strategies. The anchor/symbol suffix is
+  // already split off above, so `docs/guide.md#section` is judged on the path.
+  if (!pathWithoutAnchor.includes('/') && !/\.[A-Za-z][A-Za-z0-9]{0,3}$/.test(pathWithoutAnchor)) {
     return null;
   }
 
   // Extract the filename from the path
-  const fileName = ref.referenceName.split('/').pop();
+  const fileName = pathWithoutAnchor.split('/').pop();
   if (!fileName) return null;
 
   // Search for file nodes with this name
@@ -33,8 +37,32 @@ export function matchByFilePath(
 
   if (fileNodes.length === 0) return null;
 
+  if (symbolName) {
+    const symbol = findSymbolInReferencedFile(pathWithoutAnchor, symbolName, fileNodes, context);
+    if (symbol) {
+      return {
+        original: ref,
+        targetNodeId: symbol.id,
+        confidence: 0.99,
+        resolvedBy: 'file-path',
+      };
+    }
+  }
+
+  if (anchor) {
+    const anchored = findAnchoredMarkdownSection(pathWithoutAnchor, anchor, fileNodes, context);
+    if (anchored) {
+      return {
+        original: ref,
+        targetNodeId: anchored.id,
+        confidence: 0.98,
+        resolvedBy: 'file-path',
+      };
+    }
+  }
+
   // Prefer exact path match on qualified_name
-  const exactMatch = fileNodes.find(n => n.qualifiedName === ref.referenceName || n.filePath === ref.referenceName);
+  const exactMatch = fileNodes.find(n => n.qualifiedName === pathWithoutAnchor || n.filePath === pathWithoutAnchor);
   if (exactMatch) {
     return {
       original: ref,
@@ -52,7 +80,7 @@ export function matchByFilePath(
   // bare-filename import) resolves relative to the including file, not to an
   // arbitrary same-named header elsewhere in the tree.
   const suffixMatches = fileNodes.filter(
-    n => n.qualifiedName.endsWith(ref.referenceName) || n.filePath.endsWith(ref.referenceName)
+    n => n.qualifiedName.endsWith(pathWithoutAnchor) || n.filePath.endsWith(pathWithoutAnchor)
   );
   if (suffixMatches.length > 0) {
     return {
@@ -74,6 +102,97 @@ export function matchByFilePath(
   }
 
   return null;
+}
+
+function splitAnchor(referenceName: string): [string, string | null] {
+  const hash = referenceName.indexOf('#');
+  if (hash < 0) return [referenceName, null];
+  return [referenceName.slice(0, hash), referenceName.slice(hash + 1)];
+}
+
+function splitFileSymbol(referenceName: string): [string, string | null] {
+  const marker = referenceName.indexOf('::');
+  if (marker < 0) return [referenceName, null];
+  return [referenceName.slice(0, marker), referenceName.slice(marker + 2)];
+}
+
+function findSymbolInReferencedFile(
+  pathWithoutAnchor: string,
+  symbolName: string,
+  fileNodes: Node[],
+  context: ResolutionContext
+): Node | null {
+  const candidateFiles = fileNodes.filter(
+    (n) => n.qualifiedName === pathWithoutAnchor || n.filePath === pathWithoutAnchor ||
+      n.qualifiedName.endsWith(pathWithoutAnchor) || n.filePath.endsWith(pathWithoutAnchor)
+  );
+  const filesToSearch = candidateFiles.length > 0 ? candidateFiles : fileNodes.length === 1 ? fileNodes : [];
+
+  for (const fileNode of filesToSearch) {
+    const nodesInFile = context.getNodesInFile(fileNode.filePath);
+    const normalizedSymbol = symbolName.replace(/\//g, '.');
+    const exact = nodesInFile.find((n) =>
+      n.name === normalizedSymbol ||
+      n.qualifiedName === `${fileNode.filePath}::${normalizedSymbol}` ||
+      n.qualifiedName.endsWith(`::${normalizedSymbol}`) ||
+      n.qualifiedName.endsWith(`.${normalizedSymbol}`)
+    );
+    if (exact) return exact;
+
+    const lastPart = normalizedSymbol.split(/[.:]/).pop();
+    if (!lastPart) continue;
+    const byLastPart = nodesInFile.find((n) =>
+      n.name === lastPart &&
+      (n.kind === 'function' || n.kind === 'method' || n.kind === 'class' || n.kind === 'module' ||
+        n.kind === 'constant' || n.kind === 'variable')
+    );
+    if (byLastPart) return byLastPart;
+  }
+
+  return null;
+}
+
+function findAnchoredMarkdownSection(
+  pathWithoutAnchor: string,
+  anchor: string,
+  fileNodes: Node[],
+  context: ResolutionContext
+): Node | null {
+  const normalizedAnchor = normalizeMarkdownAnchor(anchor);
+  const candidateFiles = fileNodes.filter(
+    (n) => n.qualifiedName === pathWithoutAnchor || n.filePath === pathWithoutAnchor ||
+      n.qualifiedName.endsWith(pathWithoutAnchor) || n.filePath.endsWith(pathWithoutAnchor)
+  );
+
+  for (const fileNode of candidateFiles) {
+    const sectionQualifiedName = `${fileNode.filePath}#${normalizedAnchor}`;
+    const exact = context
+      .getNodesByQualifiedName(sectionQualifiedName)
+      .find((n) => n.kind === 'module' && n.language === 'markdown');
+    if (exact) return exact;
+
+    const section = context
+      .getNodesInFile(fileNode.filePath)
+      .find((n) => n.kind === 'module' && n.language === 'markdown' && n.qualifiedName === sectionQualifiedName);
+    if (section) return section;
+  }
+
+  return null;
+}
+
+function normalizeMarkdownAnchor(anchor: string): string {
+  try {
+    anchor = decodeURIComponent(anchor);
+  } catch {
+    // Keep the original anchor if it is not valid URI encoding.
+  }
+
+  return anchor
+    .toLowerCase()
+    .replace(/<[^>]+>/g, '')
+    .replace(/[^\p{L}\p{N}\s-]/gu, '')
+    .trim()
+    .replace(/\s+/g, '-') || 'section';
 }
 
 /**

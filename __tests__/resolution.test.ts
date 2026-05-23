@@ -268,6 +268,137 @@ describe('Resolution Module', () => {
       expect(result).not.toBeNull();
       expect(result?.targetNodeId).toBe('method:user.ts:User.save:15');
     });
+
+    it('should resolve Markdown file references by filename, path, and anchor suffix', () => {
+      const mockNodes: Node[] = [
+        {
+          id: 'file:README.md',
+          kind: 'file',
+          name: 'README.md',
+          qualifiedName: 'README.md',
+          filePath: 'README.md',
+          language: 'markdown',
+          startLine: 1,
+          endLine: 10,
+          startColumn: 0,
+          endColumn: 0,
+          updatedAt: Date.now(),
+        },
+        {
+          id: 'file:docs/setup.md',
+          kind: 'file',
+          name: 'setup.md',
+          qualifiedName: 'docs/setup.md',
+          filePath: 'docs/setup.md',
+          language: 'markdown',
+          startLine: 1,
+          endLine: 10,
+          startColumn: 0,
+          endColumn: 0,
+          updatedAt: Date.now(),
+        },
+        {
+          id: 'module:docs/setup.md:install:1',
+          kind: 'module',
+          name: 'Install',
+          qualifiedName: 'docs/setup.md#install',
+          filePath: 'docs/setup.md',
+          language: 'markdown',
+          startLine: 1,
+          endLine: 10,
+          startColumn: 0,
+          endColumn: 9,
+          updatedAt: Date.now(),
+        },
+      ];
+
+      const context: ResolutionContext = {
+        getNodesInFile: () => mockNodes,
+        getNodesByName: (name) => mockNodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: (qualifiedName) => mockNodes.filter((n) => n.qualifiedName === qualifiedName),
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => ['README.md', 'docs/setup.md'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+
+      const readmeRef = {
+        fromNodeId: 'module:docs/setup.md:install:1',
+        referenceName: 'README.md',
+        referenceKind: 'imports' as const,
+        line: 1,
+        column: 0,
+        filePath: 'docs/setup.md',
+        language: 'markdown' as const,
+      };
+      const setupRef = {
+        ...readmeRef,
+        referenceName: 'docs/setup.md#install',
+        filePath: 'README.md',
+      };
+
+      expect(matchReference(readmeRef, context)?.targetNodeId).toBe('file:README.md');
+      expect(matchReference(setupRef, context)?.targetNodeId).toBe('module:docs/setup.md:install:1');
+    });
+
+    it('should resolve Markdown file-symbol references to symbols in the referenced file', () => {
+      const mockNodes: Node[] = [
+        {
+          id: 'file:scripts/csv_search.py',
+          kind: 'file',
+          name: 'csv_search.py',
+          qualifiedName: 'scripts/csv_search.py',
+          filePath: 'scripts/csv_search.py',
+          language: 'python',
+          startLine: 1,
+          endLine: 100,
+          startColumn: 0,
+          endColumn: 0,
+          updatedAt: Date.now(),
+        },
+        {
+          id: 'function:scripts/csv_search.py:run_p4:40',
+          kind: 'function',
+          name: 'run_p4',
+          qualifiedName: 'scripts/csv_search.py::run_p4',
+          filePath: 'scripts/csv_search.py',
+          language: 'python',
+          startLine: 40,
+          endLine: 55,
+          startColumn: 0,
+          endColumn: 0,
+          updatedAt: Date.now(),
+        },
+      ];
+
+      const context: ResolutionContext = {
+        getNodesInFile: (filePath) => mockNodes.filter((n) => n.filePath === filePath),
+        getNodesByName: (name) => mockNodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: (qualifiedName) => mockNodes.filter((n) => n.qualifiedName === qualifiedName),
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => ['scripts/csv_search.py'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+
+      const ref = {
+        fromNodeId: 'constant:phases/phase4.md:P4-S1:10',
+        referenceName: 'phases/scripts/csv_search.py::run_p4',
+        referenceKind: 'references' as const,
+        line: 10,
+        column: 20,
+        filePath: 'phases/phase4.md',
+        language: 'markdown' as const,
+      };
+
+      expect(matchReference(ref, context)?.targetNodeId).toBe('function:scripts/csv_search.py:run_p4:40');
+    });
   });
 
   describe('Import Resolver', () => {
