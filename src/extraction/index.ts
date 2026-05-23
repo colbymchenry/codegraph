@@ -838,7 +838,15 @@ export class ExtractionOrchestrator {
         } else if (result.errors.some((e) => e.severity === 'error')) {
           filesErrored++;
         } else {
-          filesSkipped++;
+          // Files with no symbols but no errors (e.g. yaml, twig) are tracked
+          // at the file level — count them as indexed so the CLI doesn't
+          // misleadingly report "No files found to index".
+          const lang = detectLanguage(filePath, content);
+          if (lang === 'yaml' || lang === 'twig') {
+            filesIndexed++;
+          } else {
+            filesSkipped++;
+          }
         }
       }
     }
@@ -1004,7 +1012,12 @@ export class ExtractionOrchestrator {
       } else if (result.errors.some((e) => e.severity === 'error')) {
         filesErrored++;
       } else {
-        filesSkipped++;
+        const tracked = this.queries.getFileByPath(filePath);
+        if (tracked && (tracked.language === 'yaml' || tracked.language === 'twig')) {
+          filesIndexed++;
+        } else {
+          filesSkipped++;
+        }
       }
     }
 
