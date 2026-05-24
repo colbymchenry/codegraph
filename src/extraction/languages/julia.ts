@@ -87,6 +87,12 @@ function extractFunctionSignature(signatureNode: SyntaxNode, source: string): st
  * (for subtype declarations like `Foo <: Bar`), etc.
  */
 function extractTypeName(typeHeadNode: SyntaxNode, source: string): string | null {
+  if (typeHeadNode.type === 'type_head') {
+    // Unwrap the type_head wrapper — recurse into its first named child
+    const inner = typeHeadNode.namedChild(0);
+    if (inner) return extractTypeName(inner, source);
+    return getNodeText(typeHeadNode, source);
+  }
   if (typeHeadNode.type === 'identifier') {
     return getNodeText(typeHeadNode, source);
   }

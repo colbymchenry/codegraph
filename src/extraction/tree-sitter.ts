@@ -1184,6 +1184,23 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, name, nameNode, { docstring, signature: initSignature, isExported });
       });
+    } else if (this.language === 'julia') {
+      // Julia: const_statement → assignment → identifier (name) [op] value
+      const assignment = node.namedChild(0);
+      if (assignment) {
+        const nameNode = assignment.namedChild(0);
+        if (nameNode?.type === 'identifier') {
+          const name = getNodeText(nameNode, this.source);
+          const valueNode = assignment.namedChildCount > 1
+            ? assignment.namedChild(assignment.namedChildCount - 1)
+            : null;
+          const initValue = valueNode && valueNode !== nameNode
+            ? getNodeText(valueNode, this.source).slice(0, 100)
+            : undefined;
+          const initSignature = initValue ? `= ${initValue}` : undefined;
+          this.createNode('constant', name, nameNode, { docstring, signature: initSignature, isExported });
+        }
+      }
     } else {
       // Generic fallback for other languages
       // Try to find identifier children
