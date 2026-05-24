@@ -39,6 +39,7 @@ function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
       CODEGRAPH_NO_RELAUNCH: '1',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEGRAPH_NO_RELAUNCH: '1' },
   }) as ChildProcessWithoutNullStreams;
 }
 
@@ -118,8 +119,13 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
   });
 
   afterEach(async () => {
-    await stopChild(child);
-    child = null;
+    if (child) {
+      if (!child.killed) child.kill('SIGKILL');
+      if (child.exitCode === null) {
+        await new Promise<void>(resolve => child!.once('close', resolve));
+      }
+      child = null;
+    }
     fs.rmSync(cwdDir, { recursive: true, force: true });
     fs.rmSync(projectDir, { recursive: true, force: true });
   });
