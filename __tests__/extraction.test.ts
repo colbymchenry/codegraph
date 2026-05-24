@@ -252,7 +252,7 @@ describe('Godot Resource Extraction', () => {
 [gd_scene load_steps=2 format=3]
 
 [ext_resource type="Script" path="res://player_controller.gd" id="1_script"]
-[ext_resource type="PackedScene" path="res://status_icon.tscn" id="2_status"]
+[ext_resource type="PackedScene" path="res://status_icon_template.tscn" id="2_status"]
 
 [node name="Player" type="Node2D"]
 script = ExtResource("1_script")
@@ -270,8 +270,13 @@ script = ExtResource("1_script")
     expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'StatusIcon')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'import' && n.name === 'res://player_controller.gd')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://player_controller.gd')).toBe(true);
-    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://status_icon.tscn')).toBe(true);
-    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://status_icon.tscn' && result.nodes.some((n) => n.id === r.fromNodeId && n.name === 'StatusIcon'))).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://status_icon_template.tscn')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusIconTemplate')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusIcon')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://status_icon_template.tscn' && result.nodes.some((n) => n.id === r.fromNodeId && n.name === 'StatusIcon'))).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusIconTemplate' && result.nodes.some((n) => n.id === r.fromNodeId && n.name === 'StatusIcon'))).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusIcon' && result.nodes.some((n) => n.id === r.fromNodeId && n.name === 'StatusIcon'))).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === '_on_sprite_pressed')).toBe(true);
     expect(result.edges.some((e) => e.kind === 'references' && e.metadata?.method === '_on_sprite_pressed')).toBe(true);
   });

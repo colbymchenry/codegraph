@@ -89,7 +89,7 @@ export class GodotResourceExtractor {
         if (!attrs.has('parent') && !this.rootNode) this.rootNode = node;
         this.nodesByScenePath.set(scenePath, node);
         this.addNodeContainment(fileNodeId, node, attrs.get('parent'));
-        this.extractNodeInstanceReference(node.id, attrs, line, lineNumber);
+        this.extractNodeInstanceReference(node, attrs, line, lineNumber);
         currentOwner = node;
       } else if (type === 'ext_resource') {
         const resourcePath = attrs.get('path');
@@ -130,7 +130,7 @@ export class GodotResourceExtractor {
     this.extractInlineResourcePaths(fileNodeId);
   }
 
-  private extractNodeInstanceReference(ownerId: string, attrs: Map<string, string>, line: string, lineNumber: number): void {
+  private extractNodeInstanceReference(owner: Node, attrs: Map<string, string>, line: string, lineNumber: number): void {
     const instance = attrs.get('instance');
     if (!instance) return;
 
@@ -140,7 +140,9 @@ export class GodotResourceExtractor {
     const resourcePath = this.extResources.get(extResourceMatch[1]!);
     if (!resourcePath) return;
 
-    this.addReference(ownerId, resourcePath, 'references', lineNumber, line.indexOf('instance='));
+    this.addReference(owner.id, resourcePath, 'references', lineNumber, line.indexOf('instance='));
+    this.addGodotResourceAliasReference(owner.id, resourcePath, 'references', lineNumber, line.indexOf('instance='));
+    this.addGodotInstanceNameAliasReference(owner, 'references', lineNumber, line.indexOf('instance='));
   }
 
   private extractSectionProperty(owner: Node, line: string, lineNumber: number): void {
@@ -149,6 +151,7 @@ export class GodotResourceExtractor {
       const resourcePath = this.extResources.get(scriptMatch[1]!);
       if (resourcePath) {
         this.addReference(owner.id, resourcePath, 'references', lineNumber, line.indexOf('ExtResource'));
+        this.addGodotResourceAliasReference(owner.id, resourcePath, 'references', lineNumber, line.indexOf('ExtResource'));
       }
       return;
     }
@@ -282,6 +285,43 @@ export class GodotResourceExtractor {
       filePath: this.filePath,
       language: 'godot_resource',
     });
+  }
+
+  private addGodotResourceAliasReference(
+    fromNodeId: string,
+    resourcePath: string,
+    referenceKind: UnresolvedReference['referenceKind'],
+    line: number,
+    column: number
+  ): void {
+    const alias = this.godotClassNameFromResourcePath(resourcePath);
+    if (!alias) return;
+    this.addReference(fromNodeId, alias, referenceKind, line, column);
+  }
+
+  private godotClassNameFromResourcePath(resourcePath: string): string | null {
+    const withoutProtocol = resourcePath.replace(/^res:\/\//, '');
+    const ext = path.extname(withoutProtocol);
+    if (ext !== '.gd' && ext !== '.tscn') return null;
+
+    const baseName = path.basename(withoutProtocol, ext);
+    const words = baseName.split(/[^A-Za-z0-9]+/).filter(Boolean);
+    const alias = words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join('');
+    return alias || null;
+  }
+
+  private addGodotInstanceNameAliasReference(
+    owner: Node,
+    referenceKind: UnresolvedReference['referenceKind'],
+    line: number,
+    column: number
+  ): void {
+    if (!this.isLikelyGodotClassName(owner.name)) return;
+    this.addReference(owner.id, owner.name, referenceKind, line, column);
+  }
+
+  private isLikelyGodotClassName(name: string): boolean {
+    return /^[A-Z][A-Za-z0-9]*$/.test(name);
   }
 
   private getLineNumber(index: number): number {
