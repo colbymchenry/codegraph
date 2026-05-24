@@ -144,6 +144,7 @@ class_name PlayerController
 
 signal health_changed(value: int)
 const MAX_HP := 100
+const DYNAMIC_UI_SOUND_CONTROLLER_NAME := "MainDynamicUISoundController"
 const TEMPLATE_PATH := "MarginContainer/StatusFlow/StatusIconTemplate"
 const CARD_ROW_PATH := "RewardList/CardRewardTemplate"
 @onready var sprite := $Sprite2D
@@ -158,6 +159,7 @@ func _ready() -> void:
   var template = $MarginContainer/StatusFlow/StatusIconTemplate
   var template_from_const = get_node_or_null(TEMPLATE_PATH)
   var row_from_const = get_node_or_null(CARD_ROW_PATH)
+  var sound_controller = get_node_or_null(DYNAMIC_UI_SOUND_CONTROLLER_NAME)
   var track = get_node("%TrackPanel")
   var row_name := "CardReward%d" % reward_index
   var extra_row = get_node_or_null("CardReward%d" % reward_index)
@@ -188,12 +190,14 @@ func _on_health_changed(value: int) -> void:
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === '_ready')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'setup_player')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'MAX_HP')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'DYNAMIC_UI_SOUND_CONTROLLER_NAME')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'TEMPLATE_PATH')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'CARD_ROW_PATH')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'sprite')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'move_ratio')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'shared_counter')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'health_changed')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'MainDynamicUISoundController')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'CardReward')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'LootCardRewardButton')).toBe(true);
 
@@ -215,6 +219,7 @@ func _on_health_changed(value: int) -> void:
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardRewardTemplate')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'RewardList/CardRewardTemplate')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/RewardList/CardRewardTemplate')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'MainDynamicUISoundController')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'TrackPanel')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/TrackPanel')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardReward')).toBe(true);

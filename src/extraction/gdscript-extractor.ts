@@ -225,7 +225,14 @@ export class GDScriptExtractor {
         this.addContains(scopes[scopes.length - 1]!.id, node.id);
         if (kind === 'constant') {
           const stringValueMatch = trimmed.match(/:=?\s*["']([^"']+)["']/);
-          if (stringValueMatch) this.stringConstants.set(varMatch[2]!, stringValueMatch[1]!);
+          if (stringValueMatch) {
+            const constName = varMatch[2]!;
+            const stringValue = stringValueMatch[1]!;
+            this.stringConstants.set(constName, stringValue);
+            if (/_NAME$/.test(constName) && this.isSimpleNodeName(stringValue)) {
+              this.addDynamicNodeNameDeclaration(stringValue, rawLine, trimmed, lineNumber, scopes[scopes.length - 1]!.id);
+            }
+          }
         }
       }
 
@@ -500,6 +507,10 @@ export class GDScriptExtractor {
     const stripped = nodePath.replace(/%d/g, '');
     if (!/^[A-Z_][A-Za-z0-9_]*(?:\/[A-Z_][A-Za-z0-9_]*)*$/.test(stripped)) return null;
     return stripped;
+  }
+
+  private isSimpleNodeName(value: string): boolean {
+    return /^[A-Z_][A-Za-z0-9_]*$/.test(value);
   }
 
   private createDeclarationNode(kind: NodeKind, name: string, rawLine: string, line: number, indent: number): Node {
