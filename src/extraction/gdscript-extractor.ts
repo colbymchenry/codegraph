@@ -229,8 +229,17 @@ export class GDScriptExtractor {
       .filter((node) => (node.kind === 'function' || node.kind === 'method') && node.language === 'gdscript')
       .map((node) => ({ id: node.id, indent: this.indentOf(this.lines[node.startLine - 1] ?? ''), kind: node.kind, startLine: node.startLine } as FunctionScope))
       .sort((a, b) => a.startLine - b.startLine);
+    const declarationByLine = new Map<number, Node>();
+    for (const node of this.nodes) {
+      if ((node.kind === 'variable' || node.kind === 'constant') && node.language === 'gdscript') {
+        declarationByLine.set(node.startLine, node);
+      }
+    }
 
     const ownerForLine = (line: number, indent: number): string => {
+      const sameLineDeclaration = declarationByLine.get(line);
+      if (sameLineDeclaration) return sameLineDeclaration.id;
+
       let owner = scriptClass?.id ?? fileNode.id;
       for (const scope of functionScopes) {
         if (scope.startLine < line && scope.indent < indent) {
@@ -258,6 +267,8 @@ export class GDScriptExtractor {
         this.addReference(owner, resourceMatch[1]!, 'references', lineNumber, resourceMatch.index);
       }
 
+      this.extractNodePathReferences(owner, code, lineNumber, scriptClass);
+
       const memberCallRegex = /(?:\b([A-Za-z_]\w*)|([$%][A-Za-z_]\w*(?:\/[A-Za-z_]\w*)*))\s*\.\s*([A-Za-z_]\w*)\s*\(/g;
       let memberCallMatch;
       while ((memberCallMatch = memberCallRegex.exec(code)) !== null) {
@@ -281,6 +292,32 @@ export class GDScriptExtractor {
         ) continue;
         this.addReference(owner, name, 'calls', lineNumber, callMatch.index);
       }
+    }
+  }
+
+  private extractNodePathReferences(owner: string, code: string, lineNumber: number, scriptClass: Node | null): void {
+    const shorthandRegex = /[$%]([A-Za-z_]\w*(?:\/[A-Za-z_]\w*)*)/g;
+    let shorthandMatch;
+    while ((shorthandMatch = shorthandRegex.exec(code)) !== null) {
+      this.addNodePathReference(owner, shorthandMatch[1]!, lineNumber, shorthandMatch.index, scriptClass);
+    }
+
+    const getNodeRegex = /\b(?:get_node|get_node_or_null|has_node)\s*\(\s*["']([^"']+)["']\s*\)/g;
+    let getNodeMatch;
+    while ((getNodeMatch = getNodeRegex.exec(code)) !== null) {
+      this.addNodePathReference(owner, getNodeMatch[1]!, lineNumber, getNodeMatch.index, scriptClass);
+    }
+  }
+
+  private addNodePathReference(owner: string, nodePath: string, lineNumber: number, column: number, scriptClass: Node | null): void {
+    const cleaned = nodePath.replace(/^[$%]/, '');
+    const name = this.nodePathReceiverName(cleaned);
+    this.addReference(owner, name, 'references', lineNumber, column);
+    if (cleaned.includes('/')) {
+      this.addReference(owner, cleaned, 'references', lineNumber, column);
+    }
+    if (scriptClass && cleaned) {
+      this.addReference(owner, `${scriptClass.name}/${cleaned}`, 'references', lineNumber, column);
     }
   }
 

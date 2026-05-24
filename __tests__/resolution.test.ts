@@ -151,6 +151,58 @@ describe('Resolution Module', () => {
       expect(text).toContain('main.gd');
     });
 
+    it('should resolve GDScript node path references to Godot scene nodes', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'status_view.gd'),
+        [
+          'extends Control',
+          '@onready var _template: Control = $MarginContainer/StatusFlow/StatusIconTemplate',
+          '@onready var _track: Control = get_node("%TrackPanel")',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'status_view.tscn'),
+        [
+          '[gd_scene load_steps=2 format=3]',
+          '[ext_resource type="Script" path="res://status_view.gd" id="1_status"]',
+          '[node name="StatusView" type="Control"]',
+          'script = ExtResource("1_status")',
+          '[node name="MarginContainer" type="MarginContainer" parent="."]',
+          '[node name="StatusFlow" type="HFlowContainer" parent="MarginContainer"]',
+          '[node name="StatusIconTemplate" type="Control" parent="MarginContainer/StatusFlow"]',
+          '[node name="TrackPanel" type="Control" parent="."]',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'other_view.tscn'),
+        [
+          '[gd_scene format=3]',
+          '[node name="OtherView" type="Control"]',
+          '[node name="StatusIconTemplate" type="Control" parent="."]',
+          '[node name="TrackPanel" type="Control" parent="."]',
+          '',
+        ].join('\n')
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      const handler = new ToolHandler(cg);
+
+      const templateResult = await handler.execute('codegraph_callers', {
+        symbol: 'StatusIconTemplate',
+        projectPath: tempDir,
+      });
+      const trackResult = await handler.execute('codegraph_callers', {
+        symbol: 'TrackPanel',
+        projectPath: tempDir,
+      });
+
+      expect(templateResult.content[0]?.text ?? '').toContain('_template');
+      expect(trackResult.content[0]?.text ?? '').toContain('_track');
+    });
+
     it('should prefer same-module candidates over cross-module matches', () => {
       // Simulates a Python monorepo where multiple apps define navigate()
       const candidateA: Node = {
