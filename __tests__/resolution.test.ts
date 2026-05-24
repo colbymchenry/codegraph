@@ -16,6 +16,7 @@ import { resolveImportPath, extractImportMappings } from '../src/resolution/impo
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
 import { QueryBuilder } from '../src/db/queries';
 import { DatabaseConnection } from '../src/db';
+import { ToolHandler } from '../src/mcp/tools';
 
 describe('Resolution Module', () => {
   let tempDir: string;
@@ -123,6 +124,31 @@ describe('Resolution Module', () => {
       expect(result).not.toBeNull();
       expect(result?.targetNodeId).toBe('file:core/cards/card_resource.gd');
       expect(result?.resolvedBy).toBe('file-path');
+    });
+
+    it('should find MCP callers when queried with a Godot res:// path', async () => {
+      fs.mkdirSync(path.join(tempDir, 'runtime'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'runtime/run_state.gd'),
+        'class_name RunState\nextends RefCounted\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'main.gd'),
+        'const RunStateScript := preload("res://runtime/run_state.gd")\n'
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      const handler = new ToolHandler(cg);
+
+      const result = await handler.execute('codegraph_callers', {
+        symbol: 'res://runtime/run_state.gd',
+        projectPath: tempDir,
+      });
+
+      const text = result.content[0]?.text ?? '';
+      expect(result.isError).not.toBe(true);
+      expect(text).toContain('main.gd');
     });
 
     it('should prefer same-module candidates over cross-module matches', () => {
