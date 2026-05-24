@@ -29,6 +29,8 @@ const KEYWORDS = new Set([
   'super',
 ]);
 
+const ANNOTATION_PREFIX = '(?:(?:@\\w+(?:\\([^)]*\\))?)\\s+)*';
+
 /**
  * Lightweight GDScript extractor.
  *
@@ -95,12 +97,12 @@ export class GDScriptExtractor {
   }
 
   private extractScriptClass(fileNode: Node): Node | null {
-    const classNameMatch = this.source.match(/^\s*class_name\s+([A-Za-z_]\w*)/m);
+    const classNameMatch = this.source.match(new RegExp(`^\\s*${ANNOTATION_PREFIX}class_name\\s+([A-Za-z_]\\w*)`, 'm'));
     if (!classNameMatch) return null;
 
     const index = classNameMatch.index ?? 0;
     const line = this.getLineNumber(index);
-    const column = index - this.getLineStart(line) + classNameMatch[0].indexOf('class_name');
+    const column = index - this.getLineStart(line) + classNameMatch[0].indexOf(classNameMatch[1]!);
     const name = classNameMatch[1]!;
     const node = this.createNode('class', name, `${this.filePath}::${name}`, line, column, line, column + classNameMatch[0].trimEnd().length);
     this.addContains(fileNode.id, node.id);
@@ -122,9 +124,9 @@ export class GDScriptExtractor {
       }
 
       const trimmed = code.trim();
-      if (trimmed.startsWith('class_name ')) continue;
+      if (new RegExp(`^${ANNOTATION_PREFIX}class_name\\s+`).test(trimmed)) continue;
 
-      const classMatch = trimmed.match(/^class\s+([A-Za-z_]\w*)\s*:?/);
+      const classMatch = trimmed.match(new RegExp(`^${ANNOTATION_PREFIX}class\\s+([A-Za-z_]\\w*)\\s*(?:extends\\s+[^:]+)?\\s*:?`));
       if (classMatch) {
         const node = this.createDeclarationNode('class', classMatch[1]!, rawLine, lineNumber, indent);
         this.addContains(scopes[scopes.length - 1]!.id, node.id);
@@ -148,18 +150,18 @@ export class GDScriptExtractor {
         continue;
       }
 
-      const funcMatch = trimmed.match(/^(?:static\s+)?func\s+([A-Za-z_]\w*)\s*(\([^)]*\))?(?:\s*->\s*([^:]+))?/);
+      const funcMatch = trimmed.match(new RegExp(`^${ANNOTATION_PREFIX}(?:static\\s+)?func\\s+([A-Za-z_]\\w*)\\s*(\\([^)]*\\))?(?:\\s*->\\s*([^:]+))?`));
       if (funcMatch) {
         const insideClass = scopes.some((scope) => scope.kind === 'class');
         const node = this.createDeclarationNode(insideClass ? 'method' : 'function', funcMatch[1]!, rawLine, lineNumber, indent);
         node.signature = `${funcMatch[2] || '()'}${funcMatch[3] ? ` -> ${funcMatch[3].trim()}` : ''}`;
-        node.isStatic = trimmed.startsWith('static ');
+        node.isStatic = /\bstatic\s+func\b/.test(trimmed);
         this.addContains(scopes[scopes.length - 1]!.id, node.id);
         scopes.push({ id: node.id, indent, kind: node.kind });
         continue;
       }
 
-      const varMatch = trimmed.match(/^(?:@onready\s+)?(?:export\s+)?(var|const)\s+([A-Za-z_]\w*)/);
+      const varMatch = trimmed.match(new RegExp(`^${ANNOTATION_PREFIX}(?:static\\s+)?(var|const)\\s+([A-Za-z_]\\w*)`));
       if (varMatch) {
         const kind: NodeKind = varMatch[1] === 'const' ? 'constant' : 'variable';
         const node = this.createDeclarationNode(kind, varMatch[2]!, rawLine, lineNumber, indent);
@@ -192,7 +194,7 @@ export class GDScriptExtractor {
       const indent = this.indentOf(rawLine);
       const owner = ownerForLine(lineNumber, indent);
 
-      const extendsMatch = code.match(/^\s*extends\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z_][\w.]*))/);
+      const extendsMatch = code.match(new RegExp(`^\\s*${ANNOTATION_PREFIX}(?:(?:class_name|class)\\s+[A-Za-z_]\\w*\\s+)?extends\\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z_][\\w.]*))`));
       if (extendsMatch) {
         this.addReference(owner, extendsMatch[1] || extendsMatch[2] || extendsMatch[3]!, 'extends', lineNumber, code.indexOf('extends'));
       }

@@ -145,6 +145,8 @@ class_name PlayerController
 signal health_changed(value: int)
 const MAX_HP := 100
 @onready var sprite := $Sprite2D
+@export_range(0.0, 1.0, 0.1) var move_ratio := 0.5
+static var shared_counter := 0
 
 func _ready() -> void:
   var enemy = preload("res://enemy.gd")
@@ -163,11 +165,36 @@ func setup_player() -> void:
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'setup_player')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'MAX_HP')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'sprite')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'move_ratio')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'shared_counter')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'health_changed')).toBe(true);
 
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'Node')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://enemy.gd')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'setup_player')).toBe(true);
+  });
+
+  it('should extract annotated class_name and inline extends declarations', () => {
+    const code = `
+@tool class_name EditorPanel extends MarginContainer
+
+@rpc("any_peer") func sync_state() -> void:
+  emit_changed()
+
+class InnerPanel extends Control:
+  func render() -> void:
+    pass
+`;
+    const result = extractFromSource('editor_panel.gd', code);
+
+    expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'EditorPanel')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'sync_state')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'InnerPanel')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'render')).toBe(true);
+
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'MarginContainer')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'Control')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'emit_changed')).toBe(true);
   });
 });
 
