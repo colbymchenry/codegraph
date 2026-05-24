@@ -6,6 +6,8 @@
 
 **~35% cheaper · ~70% fewer tool calls · 100% local**
 
+### [Documentation & Website →](https://colbymchenry.github.io/codegraph/)
+
 [![npm version](https://img.shields.io/npm/v/@colbymchenry/codegraph.svg)](https://www.npmjs.com/package/@colbymchenry/codegraph)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Self-contained](https://img.shields.io/badge/Node.js-bundled%20%C2%B7%20none%20required-brightgreen.svg)](https://nodejs.org/)
