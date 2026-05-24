@@ -236,10 +236,7 @@ export class GDScriptExtractor {
       }
     }
 
-    const ownerForLine = (line: number, indent: number): string => {
-      const sameLineDeclaration = declarationByLine.get(line);
-      if (sameLineDeclaration) return sameLineDeclaration.id;
-
+    const functionOwnerForLine = (line: number, indent: number): string => {
       let owner = scriptClass?.id ?? fileNode.id;
       for (const scope of functionScopes) {
         if (scope.startLine < line && scope.indent < indent) {
@@ -249,12 +246,20 @@ export class GDScriptExtractor {
       return owner;
     };
 
+    const ownerForLine = (line: number, indent: number): string => {
+      const sameLineDeclaration = declarationByLine.get(line);
+      if (sameLineDeclaration) return sameLineDeclaration.id;
+
+      return functionOwnerForLine(line, indent);
+    };
+
     for (let i = 0; i < this.lines.length; i++) {
       const lineNumber = i + 1;
       const rawLine = this.lines[i] ?? '';
       const code = this.stripComment(rawLine);
       const indent = this.indentOf(rawLine);
       const owner = ownerForLine(lineNumber, indent);
+      const functionOwner = functionOwnerForLine(lineNumber, indent);
 
       const extendsMatch = code.match(new RegExp(`^\\s*${ANNOTATION_PREFIX}(?:(?:class_name|class)\\s+[A-Za-z_]\\w*\\s+)?extends\\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z_][\\w.]*))`));
       if (extendsMatch) {
@@ -268,6 +273,8 @@ export class GDScriptExtractor {
       }
 
       this.extractNodePathReferences(owner, code, lineNumber, scriptClass);
+      this.extractSignalReferences(functionOwner, code, lineNumber);
+      this.extractCallableReferences(functionOwner, code, lineNumber);
 
       const memberCallRegex = /(?:\b([A-Za-z_]\w*)|([$%][A-Za-z_]\w*(?:\/[A-Za-z_]\w*)*))\s*\.\s*([A-Za-z_]\w*)\s*\(/g;
       let memberCallMatch;
@@ -292,6 +299,92 @@ export class GDScriptExtractor {
         ) continue;
         this.addReference(owner, name, 'calls', lineNumber, callMatch.index);
       }
+    }
+  }
+
+  private extractSignalReferences(owner: string, code: string, lineNumber: number): void {
+    this.extractSignalConnectReferences(owner, code, lineNumber);
+    this.extractSignalEmitReferences(owner, code, lineNumber);
+  }
+
+  private extractSignalConnectReferences(owner: string, code: string, lineNumber: number): void {
+    const memberConnectRegex = /\b(?:([A-Za-z_]\w*)|([$%][A-Za-z_]\w*(?:\/[A-Za-z_]\w*)*))\s*\.\s*([A-Za-z_]\w*)\s*\.\s*connect\s*\(/g;
+    let memberConnectMatch;
+    while ((memberConnectMatch = memberConnectRegex.exec(code)) !== null) {
+      const receiver = memberConnectMatch[1] || this.nodePathReceiverName(memberConnectMatch[2]!);
+      const signalName = memberConnectMatch[3]!;
+      this.addReference(owner, signalName, 'references', lineNumber, memberConnectMatch.index);
+      this.addReference(owner, `${receiver}.${signalName}`, 'references', lineNumber, memberConnectMatch.index);
+
+      const argsStart = memberConnectRegex.lastIndex;
+      const argsEnd = this.findCallEnd(code, argsStart - 1);
+      if (argsEnd > argsStart) {
+        this.addCallableTargetReferences(owner, code.slice(argsStart, argsEnd), lineNumber, argsStart);
+      }
+    }
+
+    const bareConnectRegex = /\b([A-Za-z_]\w*)\s*\.\s*connect\s*\(/g;
+    let bareConnectMatch;
+    while ((bareConnectMatch = bareConnectRegex.exec(code)) !== null) {
+      const signalName = bareConnectMatch[1]!;
+      if (signalName === 'node') continue;
+      this.addReference(owner, signalName, 'references', lineNumber, bareConnectMatch.index);
+
+      const argsStart = bareConnectRegex.lastIndex;
+      const argsEnd = this.findCallEnd(code, argsStart - 1);
+      if (argsEnd > argsStart) {
+        this.addCallableTargetReferences(owner, code.slice(argsStart, argsEnd), lineNumber, argsStart);
+      }
+    }
+
+    const legacyConnectRegex = /\bconnect\s*\(\s*(?:&)?["']([^"']+)["']\s*,/g;
+    let legacyConnectMatch;
+    while ((legacyConnectMatch = legacyConnectRegex.exec(code)) !== null) {
+      this.addReference(owner, legacyConnectMatch[1]!, 'references', lineNumber, legacyConnectMatch.index);
+
+      const argsStart = legacyConnectRegex.lastIndex;
+      const argsEnd = this.findCallEnd(code, code.indexOf('(', legacyConnectMatch.index));
+      if (argsEnd > argsStart) {
+        this.addCallableTargetReferences(owner, code.slice(argsStart, argsEnd), lineNumber, argsStart);
+      }
+    }
+  }
+
+  private extractSignalEmitReferences(owner: string, code: string, lineNumber: number): void {
+    const memberEmitRegex = /\b([A-Za-z_]\w*)\s*\.\s*emit\s*\(/g;
+    let memberEmitMatch;
+    while ((memberEmitMatch = memberEmitRegex.exec(code)) !== null) {
+      this.addReference(owner, memberEmitMatch[1]!, 'calls', lineNumber, memberEmitMatch.index);
+    }
+
+    const emitSignalRegex = /\bemit_signal\s*\(\s*(?:&)?["']([^"']+)["']/g;
+    let emitSignalMatch;
+    while ((emitSignalMatch = emitSignalRegex.exec(code)) !== null) {
+      this.addReference(owner, emitSignalMatch[1]!, 'calls', lineNumber, emitSignalMatch.index);
+    }
+  }
+
+  private addCallableTargetReferences(owner: string, args: string, lineNumber: number, argsColumn: number): void {
+    const callableRegex = /\bCallable\s*\(\s*(?:self|this|[A-Za-z_]\w*)\s*,\s*["']([A-Za-z_]\w*)["']\s*\)/g;
+    let callableMatch;
+    while ((callableMatch = callableRegex.exec(args)) !== null) {
+      this.addReference(owner, callableMatch[1]!, 'calls', lineNumber, argsColumn + callableMatch.index);
+    }
+
+    const directHandlerMatch = args.match(/^\s*([A-Za-z_]\w*)\b/);
+    if (directHandlerMatch) {
+      const name = directHandlerMatch[1]!;
+      if (!KEYWORDS.has(name) && !GODOT_BUILT_IN_CALLS.has(name) && name !== 'func') {
+        this.addReference(owner, name, 'calls', lineNumber, argsColumn + args.indexOf(name));
+      }
+    }
+  }
+
+  private extractCallableReferences(owner: string, code: string, lineNumber: number): void {
+    const callableRegex = /\bCallable\s*\(\s*(?:self|this|[A-Za-z_]\w*)\s*,\s*["']([A-Za-z_]\w*)["']\s*\)/g;
+    let callableMatch;
+    while ((callableMatch = callableRegex.exec(code)) !== null) {
+      this.addReference(owner, callableMatch[1]!, 'calls', lineNumber, callableMatch.index);
     }
   }
 
@@ -381,6 +474,25 @@ export class GDScriptExtractor {
       if (char === '#' && !inSingle && !inDouble) return line.slice(0, i);
     }
     return line;
+  }
+
+  private findCallEnd(code: string, openingParenIndex: number): number {
+    let depth = 0;
+    let inSingle = false;
+    let inDouble = false;
+    for (let i = openingParenIndex; i < code.length; i++) {
+      const char = code[i];
+      const prev = code[i - 1];
+      if (char === "'" && !inDouble && prev !== '\\') inSingle = !inSingle;
+      if (char === '"' && !inSingle && prev !== '\\') inDouble = !inDouble;
+      if (inSingle || inDouble) continue;
+      if (char === '(') depth += 1;
+      if (char === ')') {
+        depth -= 1;
+        if (depth === 0) return i;
+      }
+    }
+    return code.length;
   }
 
   private getLineNumber(index: number): number {

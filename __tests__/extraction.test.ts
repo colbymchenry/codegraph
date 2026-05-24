@@ -155,10 +155,19 @@ func _ready() -> void:
   %StatusPanel.refresh()
   var template = $MarginContainer/StatusFlow/StatusIconTemplate
   var track = get_node("%TrackPanel")
+  $Sprite2D.pressed.connect(_on_sprite_pressed)
+  connect("health_changed", Callable(self, "_on_health_changed"))
   setup_player()
 
 func setup_player() -> void:
   health_changed.emit(MAX_HP)
+  emit_signal("health_changed", MAX_HP)
+
+func _on_sprite_pressed() -> void:
+  pass
+
+func _on_health_changed(value: int) -> void:
+  pass
 `;
     const result = extractFromSource('player_controller.gd', code);
 
@@ -179,6 +188,11 @@ func setup_player() -> void:
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'Sprite2D.play')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'StatusPanel.refresh')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'health_changed.emit')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'health_changed')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'Sprite2D.pressed')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'pressed')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === '_on_sprite_pressed')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === '_on_health_changed')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'Sprite2D')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusPanel')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusIconTemplate')).toBe(true);
