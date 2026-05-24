@@ -215,3 +215,12 @@ button[data-open-modal] {
 	color: var(--cg-ink);
 	text-underline-offset: 3px;
 }
+
+/* On wide screens Starlight right-aligns the content against the TOC
+   (margin-inline: auto 0), piling all the empty space on the left. Center the
+   content within its pane so it sits balanced between the sidebar and the TOC. */
+@media (min-width: 72rem) {
+	.main-pane {
+		--sl-content-margin-inline: auto;
+	}
+}
