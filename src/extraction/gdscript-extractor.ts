@@ -85,6 +85,7 @@ export class GDScriptExtractor {
   private unresolvedReferences: UnresolvedReference[] = [];
   private errors: ExtractionError[] = [];
   private stringConstants = new Map<string, string>();
+  private dynamicNodeNames = new Set<string>();
 
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
@@ -229,18 +230,12 @@ export class GDScriptExtractor {
 
       const dynamicNodeNameMatch = trimmed.match(/\b[A-Za-z_]\w*\s*\.\s*name\s*=\s*["']([A-Za-z_]\w*)["']/);
       if (dynamicNodeNameMatch) {
-        const nodeName = dynamicNodeNameMatch[1]!;
-        const node = this.createNode(
-          'component',
-          nodeName,
-          `${this.filePath}::dynamic_node:${nodeName}:${lineNumber}`,
-          lineNumber,
-          rawLine.indexOf(nodeName),
-          lineNumber,
-          rawLine.length
-        );
-        node.signature = trimmed;
-        this.addContains(scopes[scopes.length - 1]!.id, node.id);
+        this.addDynamicNodeNameDeclaration(dynamicNodeNameMatch[1]!, rawLine, trimmed, lineNumber, scopes[scopes.length - 1]!.id);
+      }
+
+      const formattedNodeName = this.extractFormattedNodePathBase(trimmed);
+      if (formattedNodeName) {
+        this.addDynamicNodeNameDeclaration(formattedNodeName, rawLine, trimmed, lineNumber, scopes[scopes.length - 1]!.id);
       }
     }
   }
@@ -422,6 +417,24 @@ export class GDScriptExtractor {
       this.addNodePathReference(owner, getNodeMatch[1]!, lineNumber, getNodeMatch.index, scriptClass);
     }
 
+    const getNodeFormattedRegex = /\b(?:get_node|get_node_or_null|has_node)\s*\(\s*["']([^"']*%d[^"']*)["']\s*%/g;
+    let getNodeFormattedMatch;
+    while ((getNodeFormattedMatch = getNodeFormattedRegex.exec(code)) !== null) {
+      const formattedNodePath = this.formattedNodePathBase(getNodeFormattedMatch[1]!);
+      if (formattedNodePath) {
+        this.addNodePathReference(owner, formattedNodePath, lineNumber, getNodeFormattedMatch.index, scriptClass);
+      }
+    }
+
+    const formattedNodePathVariableRegex = /\b[A-Za-z_]\w*(?:_name|_path)\s*:=?\s*["']([^"']*%d[^"']*)["']\s*%/g;
+    let formattedNodePathVariableMatch;
+    while ((formattedNodePathVariableMatch = formattedNodePathVariableRegex.exec(code)) !== null) {
+      const formattedNodePath = this.formattedNodePathBase(formattedNodePathVariableMatch[1]!);
+      if (formattedNodePath) {
+        this.addNodePathReference(owner, formattedNodePath, lineNumber, formattedNodePathVariableMatch.index, scriptClass);
+      }
+    }
+
     const getNodeConstantRegex = /\b(?:get_node|get_node_or_null|has_node)\s*\(\s*([A-Za-z_]\w*)\s*\)/g;
     let getNodeConstantMatch;
     while ((getNodeConstantMatch = getNodeConstantRegex.exec(code)) !== null) {
@@ -442,6 +455,39 @@ export class GDScriptExtractor {
     if (scriptClass && cleaned) {
       this.addReference(owner, `${scriptClass.name}/${cleaned}`, 'references', lineNumber, column);
     }
+  }
+
+  private addDynamicNodeNameDeclaration(name: string, rawLine: string, signature: string, lineNumber: number, owner: string): void {
+    if (this.dynamicNodeNames.has(name)) return;
+    this.dynamicNodeNames.add(name);
+    const node = this.createNode(
+      'component',
+      name,
+      `${this.filePath}::dynamic_node:${name}:${lineNumber}`,
+      lineNumber,
+      rawLine.indexOf(name),
+      lineNumber,
+      rawLine.length
+    );
+    node.signature = signature;
+    this.addContains(owner, node.id);
+  }
+
+  private extractFormattedNodePathBase(code: string): string | null {
+    if (!/\b(?:get_node|get_node_or_null|has_node)\s*\(/.test(code) && !/\b[A-Za-z_]\w*\s*:=?\s*["'][^"']*%d/.test(code)) {
+      return null;
+    }
+
+    const formattedStringMatch = code.match(/["']([^"']*%d[^"']*)["']\s*%/);
+    if (!formattedStringMatch) return null;
+    return this.formattedNodePathBase(formattedStringMatch[1]!);
+  }
+
+  private formattedNodePathBase(nodePath: string): string | null {
+    if (!nodePath.includes('%d')) return null;
+    const stripped = nodePath.replace(/%d/g, '');
+    if (!/^[A-Z_][A-Za-z0-9_]*(?:\/[A-Z_][A-Za-z0-9_]*)*$/.test(stripped)) return null;
+    return stripped;
   }
 
   private createDeclarationNode(kind: NodeKind, name: string, rawLine: string, line: number, indent: number): Node {

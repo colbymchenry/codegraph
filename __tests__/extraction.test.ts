@@ -159,6 +159,8 @@ func _ready() -> void:
   var template_from_const = get_node_or_null(TEMPLATE_PATH)
   var row_from_const = get_node_or_null(CARD_ROW_PATH)
   var track = get_node("%TrackPanel")
+  var row_name := "CardReward%d" % reward_index
+  var extra_row = get_node_or_null("CardReward%d" % reward_index)
   var reward_button = get_node_or_null("LootCardRewardButton")
   reward_button = Button.new()
   reward_button.name = "LootCardRewardButton"
@@ -191,6 +193,7 @@ func _on_health_changed(value: int) -> void:
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'move_ratio')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'shared_counter')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'health_changed')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'CardReward')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'LootCardRewardButton')).toBe(true);
 
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'Node')).toBe(true);
@@ -213,6 +216,8 @@ func _on_health_changed(value: int) -> void:
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/RewardList/CardRewardTemplate')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'TrackPanel')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/TrackPanel')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardReward')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/CardReward')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'LootCardRewardButton')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'Color')).toBe(false);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'setup_player')).toBe(true);
