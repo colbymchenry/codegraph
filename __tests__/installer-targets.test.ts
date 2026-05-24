@@ -589,6 +589,67 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.readFileSync(file, 'utf-8')).toBe(firstPass);
   });
 
+  it('ibm-bob: global install writes ~/.bob/mcp_settings.json and ~/.bob/AGENTS.md', () => {
+    const bob = getTarget('ibm-bob')!;
+    const result = bob.install('global', { autoAllow: false });
+    const cfgPath = path.join(tmpHome, '.bob', 'mcp_settings.json');
+    const agentsPath = path.join(tmpHome, '.bob', 'AGENTS.md');
+    expect(result.files.some((f) => f.path === cfgPath)).toBe(true);
+    expect(result.files.some((f) => f.path === agentsPath)).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+    expect(cfg.mcpServers.codegraph.command).toBe('codegraph');
+    expect(cfg.mcpServers.codegraph.args).toEqual(['serve', '--mcp']);
+    const agentsBody = fs.readFileSync(agentsPath, 'utf-8');
+    expect(agentsBody).toContain('<!-- CODEGRAPH_START -->');
+    expect(agentsBody).toContain('<!-- CODEGRAPH_END -->');
+  });
+
+  it('ibm-bob: local install writes ./.bob/mcp.json and ./.bob/AGENTS.md in cwd', () => {
+    const bob = getTarget('ibm-bob')!;
+    const result = bob.install('local', { autoAllow: false });
+    const cfgPath = path.join(tmpCwd, '.bob', 'mcp.json');
+    const agentsPath = path.join(tmpCwd, '.bob', 'AGENTS.md');
+    expect(result.files.some((f) => f.path === cfgPath)).toBe(true);
+    expect(result.files.some((f) => f.path === agentsPath)).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('ibm-bob: uninstall removes codegraph from mcp_settings.json but preserves siblings', () => {
+    const bob = getTarget('ibm-bob')!;
+    const dir = path.join(tmpHome, '.bob');
+    fs.mkdirSync(dir, { recursive: true });
+    const cfgPath = path.join(dir, 'mcp_settings.json');
+    fs.writeFileSync(cfgPath, JSON.stringify(
+      { mcpServers: { other: { type: 'stdio', command: 'other-server', args: [] } } }, null, 2,
+    ) + '\n');
+
+    bob.install('global', { autoAllow: false });
+    const afterInstall = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+    expect(afterInstall.mcpServers.codegraph).toBeDefined();
+    expect(afterInstall.mcpServers.other).toBeDefined();
+
+    bob.uninstall('global');
+    const afterUninstall = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+    expect(afterUninstall.mcpServers?.codegraph).toBeUndefined();
+    expect(afterUninstall.mcpServers.other).toBeDefined();
+  });
+
+  it('ibm-bob: AGENTS.md install preserves pre-existing user content outside markers', () => {
+    const bob = getTarget('ibm-bob')!;
+    const dir = path.join(tmpHome, '.bob');
+    fs.mkdirSync(dir, { recursive: true });
+    const agentsPath = path.join(dir, 'AGENTS.md');
+    fs.writeFileSync(agentsPath, '# My Bob instructions\n\nAlways be concise.\n');
+
+    bob.install('global', { autoAllow: false });
+    const body = fs.readFileSync(agentsPath, 'utf-8');
+    expect(body).toContain('# My Bob instructions');
+    expect(body).toContain('Always be concise.');
+    expect(body).toContain('<!-- CODEGRAPH_START -->');
+  });
+
   it('claude: uninstall strips stale hooks written in the npx form (local)', () => {
     const claude = getTarget('claude')!;
     const file = seedSettings('local', {
@@ -616,6 +677,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('cursor')?.id).toBe('cursor');
     expect(getTarget('codex')?.id).toBe('codex');
     expect(getTarget('opencode')?.id).toBe('opencode');
+    expect(getTarget('ibm-bob')?.id).toBe('ibm-bob');
     expect(getTarget('hermes')?.id).toBe('hermes');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
