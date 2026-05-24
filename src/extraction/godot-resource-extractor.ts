@@ -67,14 +67,14 @@ export class GodotResourceExtractor {
   }
 
   private extractSections(fileNodeId: string): void {
-    let currentNode: Node | null = null;
+    let currentOwner: Node | null = null;
 
     for (let i = 0; i < this.lines.length; i++) {
       const line = this.lines[i] ?? '';
       const lineNumber = i + 1;
       const section = line.match(/^\[([A-Za-z_]+)([^\]]*)\]/);
       if (!section) {
-        if (currentNode) this.extractNodeProperty(currentNode, line, lineNumber);
+        if (currentOwner) this.extractSectionProperty(currentOwner, line, lineNumber);
         continue;
       }
 
@@ -89,7 +89,7 @@ export class GodotResourceExtractor {
         if (!attrs.has('parent') && !this.rootNode) this.rootNode = node;
         this.nodesByScenePath.set(scenePath, node);
         this.addNodeContainment(fileNodeId, node, attrs.get('parent'));
-        currentNode = node;
+        currentOwner = node;
       } else if (type === 'ext_resource') {
         const resourcePath = attrs.get('path');
         const id = attrs.get('id');
@@ -99,33 +99,53 @@ export class GodotResourceExtractor {
         node.signature = line.trim();
         this.addContains(fileNodeId, node.id);
         this.addReference(fileNodeId, resourcePath, 'references', lineNumber, line.indexOf(resourcePath));
-        currentNode = null;
+        currentOwner = null;
       } else if (type === 'sub_resource') {
         const id = attrs.get('id') || `line:${lineNumber}`;
         const resourceType = attrs.get('type') || 'sub_resource';
         const node = this.createNode('component', id, `${this.filePath}::sub_resource:${id}`, lineNumber, 0, line.length);
         node.signature = `[sub_resource type="${resourceType}" id="${id}"]`;
         this.addContains(fileNodeId, node.id);
-        currentNode = null;
+        currentOwner = node;
+      } else if (type === 'resource') {
+        const node = this.createNode('component', 'resource', `${this.filePath}::resource`, lineNumber, 0, line.length);
+        node.signature = line.trim();
+        this.addContains(fileNodeId, node.id);
+        currentOwner = node;
+      } else if (type === 'gd_resource') {
+        const scriptClass = attrs.get('script_class');
+        if (scriptClass) {
+          this.addReference(fileNodeId, scriptClass, 'references', lineNumber, line.indexOf(scriptClass));
+        }
+        currentOwner = null;
       } else if (type === 'connection') {
         this.extractConnection(fileNodeId, attrs, line, lineNumber);
-        currentNode = null;
+        currentOwner = null;
       } else {
-        currentNode = null;
+        currentOwner = null;
       }
     }
 
     this.extractInlineResourcePaths(fileNodeId);
   }
 
-  private extractNodeProperty(node: Node, line: string, lineNumber: number): void {
+  private extractSectionProperty(owner: Node, line: string, lineNumber: number): void {
     const scriptMatch = line.match(/^\s*script\s*=\s*ExtResource\("([^"]+)"\)/);
-    if (!scriptMatch) return;
+    if (scriptMatch) {
+      const resourcePath = this.extResources.get(scriptMatch[1]!);
+      if (resourcePath) {
+        this.addReference(owner.id, resourcePath, 'references', lineNumber, line.indexOf('ExtResource'));
+      }
+      return;
+    }
 
-    const resourcePath = this.extResources.get(scriptMatch[1]!);
-    if (!resourcePath) return;
+    const idMatch = line.match(/^\s*(id|content_id|card_id|relic_id|enemy_id|event_id|status_id|encounter_id|pool_id)\s*=\s*&?"([^"]+)"/);
+    if (!idMatch) return;
 
-    this.addReference(node.id, resourcePath, 'references', lineNumber, line.indexOf('ExtResource'));
+    const value = idMatch[2]!;
+    const node = this.createNode('constant', value, `${this.filePath}::${idMatch[1]}:${value}`, lineNumber, line.indexOf(value), line.length);
+    node.signature = line.trim();
+    this.addContains(owner.id, node.id);
   }
 
   private extractConnection(fileNodeId: string, attrs: Map<string, string>, line: string, lineNumber: number): void {

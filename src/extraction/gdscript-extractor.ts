@@ -27,9 +27,48 @@ const KEYWORDS = new Set([
   'preload',
   'load',
   'super',
+  'func',
+  'signal',
 ]);
 
 const ANNOTATION_PREFIX = '(?:(?:@\\w+(?:\\([^)]*\\))?)\\s+)*';
+
+const GODOT_BUILT_IN_CALLS = new Set([
+  'AABB',
+  'Array',
+  'Basis',
+  'Callable',
+  'Color',
+  'Dictionary',
+  'NodePath',
+  'PackedByteArray',
+  'PackedColorArray',
+  'PackedFloat32Array',
+  'PackedFloat64Array',
+  'PackedInt32Array',
+  'PackedInt64Array',
+  'PackedScene',
+  'PackedStringArray',
+  'PackedVector2Array',
+  'PackedVector3Array',
+  'Plane',
+  'Projection',
+  'Quaternion',
+  'Rect2',
+  'Rect2i',
+  'RID',
+  'Signal',
+  'String',
+  'StringName',
+  'Transform2D',
+  'Transform3D',
+  'Vector2',
+  'Vector2i',
+  'Vector3',
+  'Vector3i',
+  'Vector4',
+  'Vector4i',
+]);
 
 /**
  * Lightweight GDScript extractor.
@@ -219,12 +258,27 @@ export class GDScriptExtractor {
         this.addReference(owner, resourceMatch[1]!, 'references', lineNumber, resourceMatch.index);
       }
 
+      const memberCallRegex = /(?:\b([A-Za-z_]\w*)|([$%][A-Za-z_]\w*(?:\/[A-Za-z_]\w*)*))\s*\.\s*([A-Za-z_]\w*)\s*\(/g;
+      let memberCallMatch;
+      while ((memberCallMatch = memberCallRegex.exec(code)) !== null) {
+        const receiver = memberCallMatch[1] || this.nodePathReceiverName(memberCallMatch[2]!);
+        const method = memberCallMatch[3]!;
+        if (KEYWORDS.has(method)) continue;
+        this.addReference(owner, `${receiver}.${method}`, 'calls', lineNumber, memberCallMatch.index);
+      }
+
       const callRegex = /\b([A-Za-z_]\w*)\s*\(/g;
       let callMatch;
       while ((callMatch = callRegex.exec(code)) !== null) {
         const name = callMatch[1]!;
         const prefix = code.slice(Math.max(0, callMatch.index - 8), callMatch.index);
-        if (KEYWORDS.has(name) || /\bfunc\s+$/.test(prefix) || /\bsignal\s+$/.test(prefix)) continue;
+        if (
+          KEYWORDS.has(name) ||
+          GODOT_BUILT_IN_CALLS.has(name) ||
+          /\.\s*$/.test(prefix) ||
+          /\bfunc\s+$/.test(prefix) ||
+          /\bsignal\s+$/.test(prefix)
+        ) continue;
         this.addReference(owner, name, 'calls', lineNumber, callMatch.index);
       }
     }
@@ -309,5 +363,11 @@ export class GDScriptExtractor {
     const words = base.split(/[^A-Za-z0-9]+/).filter(Boolean);
     const pascal = words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join('');
     return pascal || path.basename(this.filePath);
+  }
+
+  private nodePathReceiverName(nodePath: string): string {
+    const cleaned = nodePath.replace(/^[$%]/, '');
+    const lastSegment = cleaned.split('/').filter(Boolean).pop();
+    return lastSegment || cleaned || nodePath;
   }
 }

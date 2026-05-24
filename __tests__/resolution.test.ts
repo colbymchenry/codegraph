@@ -82,6 +82,49 @@ describe('Resolution Module', () => {
       expect(result?.resolvedBy).toBe('exact-match');
     });
 
+    it('should match Godot res:// file path references', () => {
+      const fileNode: Node = {
+        id: 'file:core/cards/card_resource.gd',
+        kind: 'file',
+        name: 'card_resource.gd',
+        qualifiedName: 'core/cards/card_resource.gd',
+        filePath: 'core/cards/card_resource.gd',
+        language: 'gdscript',
+        startLine: 1,
+        endLine: 10,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      };
+
+      const context: ResolutionContext = {
+        getNodesInFile: () => [fileNode],
+        getNodesByName: (name) => name === 'card_resource.gd' ? [fileNode] : [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => ['core/cards/card_resource.gd'],
+      };
+
+      const ref = {
+        fromNodeId: 'file:data/cards/ace.tres',
+        referenceName: 'res://core/cards/card_resource.gd',
+        referenceKind: 'references' as const,
+        line: 4,
+        column: 10,
+        filePath: 'data/cards/ace.tres',
+        language: 'godot_resource' as const,
+      };
+
+      const result = matchReference(ref, context);
+
+      expect(result).not.toBeNull();
+      expect(result?.targetNodeId).toBe('file:core/cards/card_resource.gd');
+      expect(result?.resolvedBy).toBe('file-path');
+    });
+
     it('should prefer same-module candidates over cross-module matches', () => {
       // Simulates a Python monorepo where multiple apps define navigate()
       const candidateA: Node = {

@@ -150,6 +150,9 @@ static var shared_counter := 0
 
 func _ready() -> void:
   var enemy = preload("res://enemy.gd")
+  var tint = Color(1, 0, 0)
+  $Sprite2D.play()
+  %StatusPanel.refresh()
   setup_player()
 
 func setup_player() -> void:
@@ -171,6 +174,10 @@ func setup_player() -> void:
 
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'Node')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://enemy.gd')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'Sprite2D.play')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'StatusPanel.refresh')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'health_changed.emit')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'Color')).toBe(false);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'setup_player')).toBe(true);
   });
 
@@ -238,6 +245,26 @@ script = ExtResource("1_script")
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://player_controller.gd')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === '_on_sprite_pressed')).toBe(true);
     expect(result.edges.some((e) => e.kind === 'references' && e.metadata?.method === '_on_sprite_pressed')).toBe(true);
+  });
+
+  it('should extract Godot resource scripts and content ids', () => {
+    const code = `
+[gd_resource type="Resource" script_class="CardResource" format=3]
+
+[ext_resource type="Script" path="res://core/cards/card_resource.gd" id="1_card"]
+
+[resource]
+script = ExtResource("1_card")
+id = &"ace"
+card_id = &"knife"
+`;
+    const result = extractFromSource('data/cards/ace.tres', code);
+
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'resource')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'ace')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'knife')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardResource')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://core/cards/card_resource.gd')).toBe(true);
   });
 });
 
