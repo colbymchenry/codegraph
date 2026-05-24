@@ -37,6 +37,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   scala: 'tree-sitter-scala.wasm',
   lua: 'tree-sitter-lua.wasm',
   luau: 'tree-sitter-luau.wasm',
+  hlsl: 'tree-sitter-hlsl.wasm',
 };
 
 /**
@@ -92,6 +93,11 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.sc': 'scala',
   '.lua': 'lua',
   '.luau': 'luau',
+  // Shader files (HLSL grammar with USF/USH/GLSL aliases)
+  '.hlsl': 'hlsl',
+  '.usf': 'hlsl',
+  '.ush': 'hlsl',
+  '.glsl': 'hlsl',
 };
 
 /**
@@ -169,7 +175,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
       // 0.25 (drops nested calls/imports on every file after the first); we
       // vendor the upstream ABI-15 wasm instead.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'hlsl')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -342,6 +348,7 @@ export function getLanguageDisplayName(language: Language): string {
     scala: 'Scala',
     lua: 'Lua',
     luau: 'Luau',
+    hlsl: 'HLSL / Shader',
     yaml: 'YAML',
     twig: 'Twig',
     unknown: 'Unknown',
