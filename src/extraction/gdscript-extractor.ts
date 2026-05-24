@@ -87,6 +87,7 @@ export class GDScriptExtractor {
   private stringConstants = new Map<string, string>();
   private dynamicNodeNames = new Set<string>();
   private nodePathAliases = new Map<string, Map<string, string>>();
+  private nodeLookupHelperArgumentIndex = new Map<string, number>();
 
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
@@ -253,6 +254,7 @@ export class GDScriptExtractor {
       .filter((node) => (node.kind === 'function' || node.kind === 'method') && node.language === 'gdscript')
       .map((node) => ({ id: node.id, indent: this.indentOf(this.lines[node.startLine - 1] ?? ''), kind: node.kind, startLine: node.startLine } as FunctionScope))
       .sort((a, b) => a.startLine - b.startLine);
+    this.extractNodeLookupHelpers(functionScopes);
     const declarationByLine = new Map<number, Node>();
     for (const node of this.nodes) {
       if ((node.kind === 'variable' || node.kind === 'constant') && node.language === 'gdscript') {
@@ -465,6 +467,92 @@ export class GDScriptExtractor {
       if (!nodePath) continue;
       this.addNodePathReference(owner, nodePath, lineNumber, getNodeConstantMatch.index, scriptClass);
     }
+
+    const helperCallRegex = /\b([A-Za-z_]\w*)\s*\(([^)]*)\)/g;
+    let helperCallMatch;
+    while ((helperCallMatch = helperCallRegex.exec(code)) !== null) {
+      const helperName = helperCallMatch[1]!;
+      const argumentIndex = this.nodeLookupHelperArgumentIndex.get(helperName);
+      if (argumentIndex === undefined) continue;
+      const args = this.splitCallArguments(helperCallMatch[2]!);
+      const stringArg = args[argumentIndex]?.match(/^\s*["']([^"']+)["']\s*$/);
+      if (!stringArg) continue;
+      this.addNodePathReference(owner, stringArg[1]!, lineNumber, helperCallMatch.index, scriptClass);
+    }
+  }
+
+  private extractNodeLookupHelpers(functionScopes: FunctionScope[]): void {
+    if (this.nodeLookupHelperArgumentIndex.size > 0) return;
+
+    for (let i = 0; i < functionScopes.length; i++) {
+      const scope = functionScopes[i]!;
+      const node = this.nodes.find((candidate) => candidate.id === scope.id);
+      if (!node) continue;
+
+      const functionLine = this.stripComment(this.lines[scope.startLine - 1] ?? '');
+      const params = this.extractFunctionParameterNames(functionLine);
+      if (params.length === 0) continue;
+
+      const endLineExclusive = this.functionBodyEndLine(scope, functionScopes, i);
+      const body = this.lines
+        .slice(scope.startLine, endLineExclusive - 1)
+        .map((line) => this.stripComment(line))
+        .join('\n');
+
+      for (let paramIndex = 0; paramIndex < params.length; paramIndex++) {
+        const paramName = params[paramIndex]!;
+        const escaped = this.escapeRegExp(paramName);
+        const directLookupRegex = new RegExp(`\\b(?:get_node|get_node_or_null|has_node|find_child)\\s*\\(\\s*${escaped}\\b`);
+        const projectLookupRegex = new RegExp(`\\b_find_node\\s*\\([^,\\n]+,\\s*${escaped}\\b`);
+        if (directLookupRegex.test(body) || projectLookupRegex.test(body)) {
+          this.nodeLookupHelperArgumentIndex.set(node.name, paramIndex);
+          break;
+        }
+      }
+    }
+  }
+
+  private extractFunctionParameterNames(functionLine: string): string[] {
+    const match = functionLine.match(/\bfunc\s+[A-Za-z_]\w*\s*\(([^)]*)\)/);
+    if (!match) return [];
+    return this.splitCallArguments(match[1]!)
+      .map((arg) => (arg.trim().match(/^([A-Za-z_]\w*)/) || [])[1])
+      .filter((name): name is string => Boolean(name));
+  }
+
+  private functionBodyEndLine(scope: FunctionScope, functionScopes: FunctionScope[], scopeIndex: number): number {
+    for (let i = scopeIndex + 1; i < functionScopes.length; i++) {
+      const next = functionScopes[i]!;
+      if (next.indent <= scope.indent) return next.startLine;
+    }
+    return this.lines.length + 1;
+  }
+
+  private splitCallArguments(args: string): string[] {
+    const result: string[] = [];
+    let start = 0;
+    let depth = 0;
+    let inSingle = false;
+    let inDouble = false;
+    for (let i = 0; i < args.length; i++) {
+      const char = args[i];
+      const prev = args[i - 1];
+      if (char === "'" && !inDouble && prev !== '\\') inSingle = !inSingle;
+      if (char === '"' && !inSingle && prev !== '\\') inDouble = !inDouble;
+      if (inSingle || inDouble) continue;
+      if (char === '(' || char === '[' || char === '{') depth += 1;
+      if (char === ')' || char === ']' || char === '}') depth -= 1;
+      if (char === ',' && depth === 0) {
+        result.push(args.slice(start, i));
+        start = i + 1;
+      }
+    }
+    result.push(args.slice(start));
+    return result;
+  }
+
+  private escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   private addNodePathReference(owner: string, nodePath: string, lineNumber: number, column: number, scriptClass: Node | null): void {
