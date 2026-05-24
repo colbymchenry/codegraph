@@ -93,6 +93,16 @@ describe('Language Detection', () => {
     expect(detectLanguage('main.dart')).toBe('dart');
   });
 
+  it('should detect GDScript files', () => {
+    expect(detectLanguage('player.gd')).toBe('gdscript');
+  });
+
+  it('should detect Godot resource files', () => {
+    expect(detectLanguage('main.tscn')).toBe('godot_resource');
+    expect(detectLanguage('card.tres')).toBe('godot_resource');
+    expect(detectLanguage('project.godot')).toBe('godot_resource');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -121,6 +131,64 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('gdscript');
+    expect(languages).toContain('godot_resource');
+  });
+});
+
+describe('GDScript Extraction', () => {
+  it('should extract GDScript classes, methods, variables, and references', () => {
+    const code = `
+extends Node
+class_name PlayerController
+
+signal health_changed(value: int)
+const MAX_HP := 100
+@onready var sprite := $Sprite2D
+
+func _ready() -> void:
+  var enemy = preload("res://enemy.gd")
+  setup_player()
+
+func setup_player() -> void:
+  health_changed.emit(MAX_HP)
+`;
+    const result = extractFromSource('player_controller.gd', code);
+
+    const classNode = result.nodes.find((n) => n.kind === 'class' && n.name === 'PlayerController');
+    expect(classNode).toBeDefined();
+    expect(classNode?.language).toBe('gdscript');
+
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === '_ready')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'setup_player')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'MAX_HP')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'sprite')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'health_changed')).toBe(true);
+
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'Node')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://enemy.gd')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'setup_player')).toBe(true);
+  });
+});
+
+describe('Godot Resource Extraction', () => {
+  it('should extract Godot scene nodes and external resource references', () => {
+    const code = `
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://player_controller.gd" id="1_script"]
+
+[node name="Player" type="Node2D"]
+script = ExtResource("1_script")
+
+[node name="Sprite2D" type="Sprite2D" parent="."]
+`;
+    const result = extractFromSource('player.tscn', code);
+
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'Player')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'Sprite2D')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'import' && n.name === 'res://player_controller.gd')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://player_controller.gd')).toBe(true);
   });
 });
 

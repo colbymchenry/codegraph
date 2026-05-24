@@ -10,7 +10,7 @@ import * as path from 'path';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'yaml' | 'twig' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'gdscript' | 'godot_resource' | 'yaml' | 'twig' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -92,6 +92,10 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.sc': 'scala',
   '.lua': 'lua',
   '.luau': 'luau',
+  '.gd': 'gdscript',
+  '.tscn': 'godot_resource',
+  '.tres': 'godot_resource',
+  '.godot': 'godot_resource',
 };
 
 /**
@@ -236,6 +240,8 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'vue') return true; // custom extractor (script block delegation)
   if (language === 'liquid') return true; // custom regex extractor
+  if (language === 'gdscript') return true; // custom Godot/GDScript extractor
+  if (language === 'godot_resource') return true; // custom Godot scene/resource extractor
   if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver
   if (language === 'twig') return true; // file-level tracking only
   if (language === 'unknown') return false;
@@ -246,7 +252,7 @@ export function isLanguageSupported(language: Language): boolean {
  * Check if a grammar has been loaded and is ready for parsing.
  */
 export function isGrammarLoaded(language: Language): boolean {
-  if (language === 'svelte' || language === 'vue' || language === 'liquid') return true;
+  if (language === 'svelte' || language === 'vue' || language === 'liquid' || language === 'gdscript' || language === 'godot_resource') return true;
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
   return languageCache.has(language);
 }
@@ -255,7 +261,7 @@ export function isGrammarLoaded(language: Language): boolean {
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid', 'gdscript', 'godot_resource'];
 }
 
 /**
@@ -325,6 +331,8 @@ export function getLanguageDisplayName(language: Language): string {
     scala: 'Scala',
     lua: 'Lua',
     luau: 'Luau',
+    gdscript: 'GDScript',
+    godot_resource: 'Godot Resource',
     yaml: 'YAML',
     twig: 'Twig',
     unknown: 'Unknown',
