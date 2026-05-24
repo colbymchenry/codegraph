@@ -51,6 +51,7 @@ of calls; a grep/read exploration is dozens.
 - **Onboarding**: \`codegraph_context\` first. If still unclear, \`codegraph_explore\` for breadth, then \`codegraph_node\` on specific symbols.
 - **Refactor planning**: \`codegraph_search\` → \`codegraph_callers\` → \`codegraph_impact\`. The blast-radius answer comes from impact, not from walking callers manually.
 - **Debugging a regression**: \`codegraph_callers\` of the suspected symbol; widen with \`codegraph_impact\` if an unexpected call appears.
+- **Godot projects**: \`res://...\` resource paths and scene node names are valid symbols for callers/callees/impact queries.
 
 ## Anti-patterns
 

@@ -196,8 +196,7 @@ export class GodotResourceExtractor {
       return;
     }
 
-    const parentPath = this.normalizeScenePath(parent || '.');
-    const parentNode = parentPath === '.' ? this.rootNode : this.nodesByScenePath.get(parentPath);
+    const parentNode = this.resolveSceneNode(parent || '.');
     this.addContains(parentNode?.id ?? fileNodeId, node.id);
   }
 

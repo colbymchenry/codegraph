@@ -325,6 +325,33 @@ script = ExtResource("1_script")
     expect(result.edges.some((e) => e.kind === 'references' && e.metadata?.method === '_on_sprite_pressed')).toBe(true);
   });
 
+  it('should preserve nested Godot scene node containment', () => {
+    const code = `
+[gd_scene format=3]
+
+[node name="StatusView" type="Control"]
+[node name="MarginContainer" type="MarginContainer" parent="."]
+[node name="StatusFlow" type="HFlowContainer" parent="MarginContainer"]
+[node name="StatusIconTemplate" type="Control" parent="MarginContainer/StatusFlow"]
+`;
+    const result = extractFromSource('status_view.tscn', code);
+    const nodeByName = new Map(result.nodes.map((node) => [node.name, node]));
+
+    const contains = (sourceName: string, targetName: string): boolean => {
+      const source = nodeByName.get(sourceName);
+      const target = nodeByName.get(targetName);
+      return Boolean(source && target && result.edges.some((edge) => (
+        edge.kind === 'contains' &&
+        edge.source === source.id &&
+        edge.target === target.id
+      )));
+    };
+
+    expect(contains('StatusView', 'MarginContainer')).toBe(true);
+    expect(contains('MarginContainer', 'StatusFlow')).toBe(true);
+    expect(contains('StatusFlow', 'StatusIconTemplate')).toBe(true);
+  });
+
   it('should extract Godot resource scripts and content ids', () => {
     const code = `
 [gd_resource type="Resource" script_class="CardResource" format=3]
