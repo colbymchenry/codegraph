@@ -860,6 +860,10 @@ export class ToolHandler {
     const seen = new Set<string>();
     const allCallers: Node[] = [];
     for (const node of allMatches.nodes) {
+      if (this.isGodotSceneInstanceComponent(node) && !seen.has(node.id)) {
+        seen.add(node.id);
+        allCallers.push(node);
+      }
       for (const c of cg.getCallers(node.id)) {
         if (!seen.has(c.node.id)) {
           seen.add(c.node.id);
@@ -874,6 +878,13 @@ export class ToolHandler {
 
     const formatted = this.formatNodeList(allCallers.slice(0, limit), `Callers of ${symbol}`) + allMatches.note;
     return this.textResult(this.truncateOutput(formatted));
+  }
+
+  private isGodotSceneInstanceComponent(node: Node): boolean {
+    return node.kind === 'component'
+      && node.language === 'godot_resource'
+      && node.filePath.endsWith('.tscn')
+      && (node.signature ?? '').includes('instance=ExtResource');
   }
 
   /**

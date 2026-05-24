@@ -203,6 +203,47 @@ describe('Resolution Module', () => {
       expect(trackResult.content[0]?.text ?? '').toContain('_track');
     });
 
+    it('should include Godot scene instances when querying callers by instance node name', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'battle_status.gd'),
+        'class_name BattleStatusView\nextends Control\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'battle_status.tscn'),
+        [
+          '[gd_scene load_steps=2 format=3]',
+          '[ext_resource type="Script" path="res://battle_status.gd" id="1_status_script"]',
+          '[node name="BattleStatusView" type="Control"]',
+          'script = ExtResource("1_status_script")',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'control_middle.tscn'),
+        [
+          '[gd_scene load_steps=2 format=3]',
+          '[ext_resource type="PackedScene" path="res://battle_status.tscn" id="1_status_scene"]',
+          '[node name="ControlMiddle" type="Control"]',
+          '[node name="BattleStatusView" parent="." instance=ExtResource("1_status_scene")]',
+          '',
+        ].join('\n')
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      const handler = new ToolHandler(cg);
+
+      const result = await handler.execute('codegraph_callers', {
+        symbol: 'BattleStatusView',
+        projectPath: tempDir,
+      });
+
+      const text = result.content[0]?.text ?? '';
+      expect(result.isError).not.toBe(true);
+      expect(text).toContain('control_middle.tscn:4');
+      expect(text).toContain('BattleStatusView (component)');
+    });
+
     it('should prefer same-module candidates over cross-module matches', () => {
       // Simulates a Python monorepo where multiple apps define navigate()
       const candidateA: Node = {

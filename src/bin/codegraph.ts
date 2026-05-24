@@ -68,6 +68,7 @@ type CliSearchNode = {
   filePath: string;
   qualifiedName: string;
   startLine?: number;
+  signature?: string;
 };
 
 function nodeMatchesSymbol(node: CliSearchNode, symbol: string): boolean {
@@ -90,6 +91,11 @@ function findCliSymbolMatches(
   }
   const exactMatches = matches.filter((match) => nodeMatchesSymbol(match.node, normalizedSymbol));
   return exactMatches.length > 0 ? exactMatches : matches;
+}
+
+function isGodotSceneInstanceComponent(node: CliSearchNode): boolean {
+  const signature = 'signature' in node && typeof node.signature === 'string' ? node.signature : '';
+  return node.kind === 'component' && node.filePath.endsWith('.tscn') && signature.includes('instance=ExtResource');
 }
 
 const importESM = new Function('specifier', 'return import(specifier)') as
@@ -1292,6 +1298,10 @@ program
       for (const match of matches) {
         const exactMatch = nodeMatchesSymbol(match.node, symbol);
         if (!exactMatch && matches.length > 1) continue;
+        if (exactMatch && isGodotSceneInstanceComponent(match.node) && !seen.has(match.node.id)) {
+          seen.add(match.node.id);
+          allCallers.push({ name: match.node.name, kind: match.node.kind, filePath: match.node.filePath, startLine: match.node.startLine });
+        }
         for (const c of cg.getCallers(match.node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
