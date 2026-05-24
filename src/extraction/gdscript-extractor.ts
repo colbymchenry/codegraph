@@ -425,6 +425,18 @@ export class GDScriptExtractor {
       this.addNodePathReference(owner, getNodeMatch[1]!, lineNumber, getNodeMatch.index, scriptClass);
     }
 
+    const findChildRegex = /\bfind_child\s*\(\s*["']([^"']+)["']/g;
+    let findChildMatch;
+    while ((findChildMatch = findChildRegex.exec(code)) !== null) {
+      this.addNodePathReference(owner, findChildMatch[1]!, lineNumber, findChildMatch.index, scriptClass);
+    }
+
+    const projectFindNodeRegex = /\b_find_node\s*\(\s*[^,\n]+,\s*["']([^"']+)["']/g;
+    let projectFindNodeMatch;
+    while ((projectFindNodeMatch = projectFindNodeRegex.exec(code)) !== null) {
+      this.addNodePathReference(owner, projectFindNodeMatch[1]!, lineNumber, projectFindNodeMatch.index, scriptClass);
+    }
+
     const getNodeFormattedRegex = /\b(?:get_node|get_node_or_null|has_node)\s*\(\s*["']([^"']*%d[^"']*)["']\s*%/g;
     let getNodeFormattedMatch;
     while ((getNodeFormattedMatch = getNodeFormattedRegex.exec(code)) !== null) {

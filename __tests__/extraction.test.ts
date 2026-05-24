@@ -161,6 +161,8 @@ func _ready() -> void:
   var row_from_const = get_node_or_null(CARD_ROW_PATH)
   var sound_controller = get_node_or_null(DYNAMIC_UI_SOUND_CONTROLLER_NAME)
   var track = get_node("%TrackPanel")
+  var title_label = card_view.find_child("CardTitle", true, false)
+  var controller_from_helper = _find_node(root, "MainDynamicUISoundController")
   var row_name := "CardReward%d" % reward_index
   var extra_row = get_node_or_null("CardReward%d" % reward_index)
   var existing = get_node_or_null(row_name)
@@ -219,7 +221,8 @@ func _on_health_changed(value: int) -> void:
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardRewardTemplate')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'RewardList/CardRewardTemplate')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/RewardList/CardRewardTemplate')).toBe(true);
-    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'MainDynamicUISoundController')).toBe(true);
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'references' && r.referenceName === 'MainDynamicUISoundController')).toHaveLength(2);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardTitle')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'TrackPanel')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/TrackPanel')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardReward')).toBe(true);
