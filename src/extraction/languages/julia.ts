@@ -10,6 +10,7 @@ import type { LanguageExtractor } from '../tree-sitter-types';
  *   call_expression               → `function foo(args...) end`
  *   typed_expression              → `function foo(x)::T end` (return type annotation on sig)
  *   where_expression              → `function foo(x::T) where T end`
+ *   field_expression              → `function Base.getindex(x) end` (qualified name)
  */
 function extractFunctionName(signatureNode: SyntaxNode, source: string): string | null {
   // Unwrap the tree-sitter 'signature' wrapper node
@@ -18,7 +19,7 @@ function extractFunctionName(signatureNode: SyntaxNode, source: string): string 
     if (inner) return extractFunctionName(inner, source);
     return getNodeText(signatureNode, source);
   }
-  if (signatureNode.type === 'identifier') {
+  if (signatureNode.type === 'identifier' || signatureNode.type === 'field_expression') {
     return getNodeText(signatureNode, source);
   }
   if (signatureNode.type === 'call_expression') {
@@ -83,7 +84,7 @@ function extractFunctionSignature(signatureNode: SyntaxNode, source: string): st
 
 /**
  * Extract the name from a Julia type_head node (used in struct/abstract definitions).
- * type_head can be: identifier, call_expression (for parametric types), binary_expression
+ * type_head can be: identifier, parametrized_type_expression (Foo{T}), binary_expression
  * (for subtype declarations like `Foo <: Bar`), etc.
  */
 function extractTypeName(typeHeadNode: SyntaxNode, source: string): string | null {
@@ -114,6 +115,51 @@ function extractTypeName(typeHeadNode: SyntaxNode, source: string): string | nul
   return getNodeText(typeHeadNode, source);
 }
 
+/**
+ * Extract field name from a struct field node.
+ *   identifier          → plain untyped field:  `label`
+ *   typed_expression    → typed field:           `x::Float64`
+ *   assignment          → field with default:    `x::Int = 1` or `flag = false`
+ */
+function extractFieldName(node: SyntaxNode): string | null {
+  if (node.type === 'identifier') return node.text;
+  if (node.type === 'typed_expression') return node.firstNamedChild?.text ?? null;
+  if (node.type === 'assignment') {
+    const lhs = node.firstNamedChild;
+    if (lhs?.type === 'typed_expression') return lhs.firstNamedChild?.text ?? null;
+    if (lhs?.type === 'identifier') return lhs.text;
+  }
+  return null;
+}
+
+/**
+ * Extract field type annotation from a struct field node.
+ */
+function extractFieldType(node: SyntaxNode, source: string): string | undefined {
+  if (node.type === 'typed_expression') {
+    const typeNode = node.namedChild(1);
+    return typeNode ? getNodeText(typeNode, source).trim() : undefined;
+  }
+  if (node.type === 'assignment') {
+    const lhs = node.firstNamedChild;
+    if (lhs?.type === 'typed_expression') {
+      const typeNode = lhs.namedChild(1);
+      return typeNode ? getNodeText(typeNode, source).trim() : undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * True when node is a direct struct body field (not the type_head).
+ */
+function isStructField(node: SyntaxNode): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  // Fields live inside the block body of a struct_definition
+  return parent.type === 'block' && parent.parent?.type === 'struct_definition';
+}
+
 export const juliaExtractor: LanguageExtractor = {
   functionTypes: ['function_definition', 'macro_definition'],
   classTypes: [],
@@ -138,11 +184,9 @@ export const juliaExtractor: LanguageExtractor = {
    */
   getName: (node, source) => {
     if (node.type === 'function_definition' || node.type === 'macro_definition') {
-      // signature is always the second named child after the 'function'/'macro' keyword
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (!child) continue;
-        // The signature node is the first non-keyword named child
         if (child.type !== 'block') {
           return extractFunctionName(child, source);
         }
@@ -151,7 +195,6 @@ export const juliaExtractor: LanguageExtractor = {
     }
 
     if (node.type === 'struct_definition') {
-      // Find type_head child
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (!child) continue;
@@ -163,14 +206,13 @@ export const juliaExtractor: LanguageExtractor = {
     }
 
     if (node.type === 'abstract_definition') {
-      // abstract type <type_head> end — first named child is type_head
       const typeHead = node.namedChild(0);
       if (typeHead) return extractTypeName(typeHead, source);
       return null;
     }
 
     if (node.type === 'module_definition') {
-      const nameNode = node.childForFieldName('name');
+      const nameNode = node.childForFieldName('name') ?? node.namedChild(0);
       if (nameNode) return getNodeText(nameNode, source);
       return null;
     }
@@ -203,15 +245,131 @@ export const juliaExtractor: LanguageExtractor = {
     return null;
   },
 
+  /**
+   * Custom visitor to handle:
+   * 1. Short-form function definitions: `add(x, y) = x + y`
+   * 2. `include("file.jl")` as relative file import
+   * 3. Struct field declarations inside struct bodies
+   * 4. `module_definition` as a namespace node
+   */
+  visitNode: (node, ctx) => {
+    const source = ctx.source;
+
+    // ── Struct fields ──────────────────────────────────────────────────────────
+    // Extract typed and untyped fields from struct bodies.
+    // `typed_expression` (x::Float64) and bare `identifier` (label) as direct
+    // children of a struct block; `assignment` handles default values (@with_kw).
+    if (
+      (node.type === 'typed_expression' || node.type === 'identifier' || node.type === 'assignment') &&
+      isStructField(node)
+    ) {
+      const fieldName = extractFieldName(node);
+      if (fieldName) {
+        const fieldType = extractFieldType(node, source);
+        const sig = fieldType ? `${fieldName}::${fieldType}` : fieldName;
+        ctx.createNode('field', fieldName, node, { signature: sig });
+      }
+      return true;
+    }
+
+    // ── Short-form function definitions ────────────────────────────────────────
+    // `add(x, y) = x + y`              → LHS is call_expression
+    // `f(x::T) where T = x`            → LHS is where_expression wrapping call_expression
+    if (node.type === 'assignment') {
+      const lhs = node.namedChild(0);
+
+      // Unwrap where_expression: `f(x::T) where T = ...`
+      let callExpr = lhs;
+      let whereClause = '';
+      if (callExpr?.type === 'where_expression') {
+        const whereType = callExpr.namedChild(1);
+        if (whereType) whereClause = ' where ' + getNodeText(whereType, source);
+        callExpr = callExpr.namedChild(0) ?? null;
+      }
+
+      if (callExpr?.type === 'call_expression') {
+        const nameNode = callExpr.namedChild(0);
+        const funcName = nameNode ? getNodeText(nameNode, source) : null;
+        if (!funcName) return false; // malformed — let default dispatch walk children
+        const argsNode = callExpr.namedChild(1);
+        const sig = argsNode ? getNodeText(argsNode, source) + whereClause : undefined;
+        ctx.createNode('function', funcName, node, { signature: sig });
+        // Visit RHS for calls
+        const rhs = node.namedChild(node.namedChildCount - 1);
+        if (rhs && rhs !== lhs) ctx.visitNode(rhs);
+        return true;
+      }
+      // Plain assignment at top level (x = 42) — not extracted, but don't re-dispatch
+      // its children as function/import/call candidates (they'll be visited anyway via
+      // the default child-walk below returning false).
+      return false;
+    }
+
+    // ── include("file.jl") as relative file import ─────────────────────────────
+    // Julia uses include() for relative file composition, not import/using.
+    if (node.type === 'call_expression') {
+      const callee = node.namedChild(0);
+      if (callee?.type === 'identifier' && callee.text === 'include') {
+        const args = node.namedChild(1);
+        const strLit = args?.namedChildren.find((n) => n.type === 'string_literal');
+        const content = strLit?.namedChildren.find((n) => n.type === 'content');
+        const filePath = content?.text?.trim();
+        if (filePath && filePath.length < 512 && !filePath.includes('\0')) {
+          // Use the basename without extension as the module name (matches how
+          // the file will be indexed). Emit an `imports` reference so the resolver
+          // can wire up cross-file edges via suffix matching.
+          const baseName = filePath.replace(/\.jl$/i, '').replace(/.*[\\/]/, '');
+          ctx.createNode('import', baseName, node, {
+            signature: `include("${filePath}")`,
+          });
+          const parentId = ctx.nodeStack.length > 0
+            ? ctx.nodeStack[ctx.nodeStack.length - 1]
+            : undefined;
+          if (parentId) {
+            ctx.addUnresolvedReference({
+              fromNodeId: parentId,
+              referenceName: baseName,
+              referenceKind: 'imports',
+              line: node.startPosition.row + 1,
+              column: node.startPosition.column,
+            });
+          }
+          return true;
+        }
+      }
+      // Not include() — fall through to default call extraction
+      return false;
+    }
+
+    // ── module_definition as namespace ─────────────────────────────────────────
+    // Extract `module Foo ... end` as a 'module' kind (maps to NodeKind 'namespace').
+    if (node.type === 'module_definition') {
+      const nameNode = node.childForFieldName('name') ?? node.namedChild(0);
+      if (!nameNode) return false;
+      const modName = getNodeText(nameNode, source);
+      const modNode = ctx.createNode('namespace', modName, node, {});
+      if (modNode) {
+        ctx.pushScope(modNode.id);
+        // Visit all children inside the module body
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child && child !== nameNode) ctx.visitNode(child);
+        }
+        ctx.popScope();
+      }
+      return true;
+    }
+
+    return false;
+  },
+
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();
 
-    // Extract the module name from `import Foo` / `import Foo.Bar` / `using Foo`
-    // The first named child is typically an identifier or import_path or selected_import
     const firstChild = node.namedChild(0);
     if (!firstChild) return { moduleName: importText, signature: importText };
 
-    // selected_import: `using Foo: bar, baz` → module is `Foo`
+    // selected_import: `using Foo: bar, baz` or `import Foo: bar` → module is `Foo`
     if (firstChild.type === 'selected_import') {
       const pathNode = firstChild.namedChild(0);
       if (pathNode) {
