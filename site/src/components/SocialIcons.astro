@@ -1,13 +1,18 @@
 ---
-// Keep Starlight's default social icons (the GitHub link) and append a live
-// star-count pill, matching the landing page nav.
+// Docs-header right cluster: Docs + Languages text links, Starlight's default
+// social icons (the GitHub link), and a live star-count pill — same order as
+// the landing nav (Docs · Languages · GitHub · Star). Done here, in the slot we
+// already own, to avoid a full header rebuild that could break search/mobile.
 import Default from '@astrojs/starlight/components/SocialIcons.astro';
 import { getStarsLabel } from '../lib/github';
 
 const stars = await getStarsLabel();
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 const repo = 'https://github.com/colbymchenry/codegraph';
 ---
 
+<a class="cg-navlink" href={`${base}/getting-started/introduction/`}>Docs</a>
+<a class="cg-navlink" href={`${base}/reference/languages/`}>Languages</a>
 <Default {...Astro.props} />
 <a
 	class="cg-star"
@@ -20,6 +25,19 @@ const repo = 'https://github.com/colbymchenry/codegraph';
 </a>
 
 <style>
+	.cg-navlink {
+		font-family: var(--sl-font);
+		font-size: 0.9rem;
+		font-weight: 500;
+		line-height: 1;
+		color: var(--cg-ink);
+		text-decoration: none;
+		white-space: nowrap;
+	}
+	.cg-navlink:hover {
+		text-decoration: underline;
+		text-underline-offset: 4px;
+	}
 	.cg-star {
 		display: inline-flex;
 		align-items: center;
@@ -42,8 +60,9 @@ const repo = 'https://github.com/colbymchenry/codegraph';
 	.cg-star-glyph {
 		font-size: 0.85em;
 	}
-	/* Don't crowd the compact mobile header. */
+	/* Keep the compact mobile header clean — the sidebar covers navigation there. */
 	@media (max-width: 50rem) {
+		.cg-navlink,
 		.cg-star {
 			display: none;
 		}
