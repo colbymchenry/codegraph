@@ -19,9 +19,28 @@ import {
 import { matchReference } from './name-matcher';
 import { resolveViaImport, extractImportMappings, extractReExports } from './import-resolver';
 import { detectFrameworks } from './frameworks';
+import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
+import { LRUCache } from './lru-cache';
+
+/**
+ * Cache size limits. Each per-resolver cache is bounded so memory
+ * stays flat on large codebases (20k+ files). Sizes were chosen to
+ * cover the working set for typical resolution batches without
+ * exceeding a few hundred MB worst-case. Override via the env var
+ * `CODEGRAPH_RESOLVER_CACHE_SIZE` (single integer applied to all
+ * caches) when tuning for very large or very small projects.
+ */
+const DEFAULT_CACHE_LIMIT = 5_000;
+function resolveCacheLimit(): number {
+  const raw = process.env.CODEGRAPH_RESOLVER_CACHE_SIZE;
+  if (!raw) return DEFAULT_CACHE_LIMIT;
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  return DEFAULT_CACHE_LIMIT;
+}
 
 // Re-export types
 export * from './types';
@@ -121,13 +140,16 @@ export class ReferenceResolver {
   private queries: QueryBuilder;
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
-  private nodeCache: Map<string, Node[]> = new Map(); // per-file node cache (bounded)
-  private fileCache: Map<string, string | null> = new Map(); // per-file content cache (bounded)
-  private importMappingCache: Map<string, ImportMapping[]> = new Map();
-  private reExportCache: Map<string, ReExport[]> = new Map();
-  private nameCache: Map<string, Node[]> = new Map(); // name → nodes cache
-  private lowerNameCache: Map<string, Node[]> = new Map(); // lower(name) → nodes cache
-  private qualifiedNameCache: Map<string, Node[]> = new Map(); // qualified_name → nodes cache
+  // All per-resolver caches are LRU-bounded. Previously these were
+  // unbounded Maps that grew with every distinct lookup and OOM'd on
+  // codebases with 20k+ files (see issue: unbounded cache growth).
+  private nodeCache: LRUCache<string, Node[]>; // per-file node cache
+  private fileCache: LRUCache<string, string | null>; // per-file content cache
+  private importMappingCache: LRUCache<string, ImportMapping[]>;
+  private reExportCache: LRUCache<string, ReExport[]>;
+  private nameCache: LRUCache<string, Node[]>; // name → nodes cache
+  private lowerNameCache: LRUCache<string, Node[]>; // lower(name) → nodes cache
+  private qualifiedNameCache: LRUCache<string, Node[]>; // qualified_name → nodes cache
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
@@ -139,6 +161,19 @@ export class ReferenceResolver {
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
     this.queries = queries;
+
+    const limit = resolveCacheLimit();
+    // The content cache is heavier (full file text), so we give it a
+    // smaller budget than the metadata caches.
+    const contentLimit = Math.max(64, Math.floor(limit / 5));
+    this.nodeCache = new LRUCache(limit);
+    this.fileCache = new LRUCache(contentLimit);
+    this.importMappingCache = new LRUCache(limit);
+    this.reExportCache = new LRUCache(limit);
+    this.nameCache = new LRUCache(limit);
+    this.lowerNameCache = new LRUCache(limit);
+    this.qualifiedNameCache = new LRUCache(limit);
+
     this.context = this.createContext();
   }
 
@@ -459,7 +494,11 @@ export class ReferenceResolver {
     // from './barrel'` where the barrel has `export { signIn as login }
     // from './auth'`) intentionally call a name that has no
     // declaration anywhere — only the renamed upstream symbol does.
-    if (!this.hasAnyPossibleMatch(ref.referenceName) && !this.matchesAnyImport(ref)) {
+    if (
+      !this.hasAnyPossibleMatch(ref.referenceName) &&
+      !this.matchesAnyImport(ref) &&
+      !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
+    ) {
       return null;
     }
 
@@ -647,6 +686,16 @@ export class ReferenceResolver {
       }
     }
 
+    // Dynamic-edge synthesis: now that all base `calls` edges are persisted,
+    // synthesize observer/callback dispatch edges (dispatcher → registered
+    // callbacks) that static parsing leaves out. Best-effort — never fail the
+    // index on it. See docs/design/callback-edge-synthesis.md.
+    try {
+      aggregateStats.byMethod['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
+    } catch {
+      // synthesis is additive and optional; ignore failures
+    }
+
     return {
       resolved: [],
       unresolved: [],
@@ -709,7 +758,13 @@ export class ReferenceResolver {
           }
         }
       }
-      if (PYTHON_BUILT_IN_METHODS.has(name)) {
+      // A bare name colliding with a builtin method (index, get, update, count…)
+      // is only a builtin when NOTHING in the codebase declares it. A declared
+      // symbol with that exact name — e.g. a Flask/FastAPI view `def index()` or
+      // `def get()` — is a real reference target. Mirrors the knownNames guard on
+      // the dotted branch above; without it, every handler named after a builtin
+      // method silently loses its route→handler edge.
+      if (PYTHON_BUILT_IN_METHODS.has(name) && !this.knownNames?.has(name)) {
         return true;
       }
     }

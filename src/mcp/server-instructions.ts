@@ -38,6 +38,7 @@ of calls; a grep/read exploration is dozens.
 
 - **"What is the symbol named X?"** → \`codegraph_search\`
 - **"What's the deal with this task / feature / area?"** → \`codegraph_context\` (PRIMARY — composes search + node + callers + callees in one call)
+- **"How does X reach/become Y? / trace the flow / the path from X to Y"** → \`codegraph_trace\` (ONE call returns the whole call path, including dynamic-dispatch hops — callbacks, React re-render, JSX children — that grep can't follow)
 - **"What calls this?"** → \`codegraph_callers\`
 - **"What does this call?"** → \`codegraph_callees\`
 - **"What would changing this break?"** → \`codegraph_impact\`
@@ -48,6 +49,7 @@ of calls; a grep/read exploration is dozens.
 
 ## Common chains
 
+- **Flow / "how does X reach Y"**: \`codegraph_trace\` from→to FIRST — one call returns the entire path with dynamic-dispatch hops bridged. Then ONE \`codegraph_explore\` for the hop bodies if you need them. Do NOT reconstruct the path with \`codegraph_search\` + \`codegraph_callers\` — that's exactly what trace does in a single call.
 - **Onboarding**: \`codegraph_context\` first. If still unclear, \`codegraph_explore\` for breadth, then \`codegraph_node\` on specific symbols.
 - **Refactor planning**: \`codegraph_search\` → \`codegraph_callers\` → \`codegraph_impact\`. The blast-radius answer comes from impact, not from walking callers manually.
 - **Debugging a regression**: \`codegraph_callers\` of the suspected symbol; widen with \`codegraph_impact\` if an unexpected call appears.

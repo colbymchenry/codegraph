@@ -1151,6 +1151,11 @@ class UserService {
     const privateMethod = methodNodes.find((m) => m.name === '_privateMethod');
     expect(privateMethod).toBeDefined();
     expect(privateMethod?.visibility).toBe('private');
+
+    // Dart models a method body as a SIBLING of the signature, so the method
+    // node must be extended to span its body (not just the signature line) —
+    // required for body-level analysis (callees, the callback synthesizer).
+    expect(findById!.endLine).toBeGreaterThan(findById!.startLine);
   });
 
   it('should extract top-level function declarations', () => {

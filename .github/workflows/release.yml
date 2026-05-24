@@ -36,6 +36,13 @@ jobs:
           done
           ls -lh release
 
+      - name: Generate SHA256SUMS
+        # Published as a release asset; the npm launcher verifies downloaded
+        # bundles against it (basenames only, so its path.basename match works).
+        run: |
+          ( cd release && sha256sum codegraph-* > SHA256SUMS )
+          cat release/SHA256SUMS
+
       - name: Resolve version
         id: ver
         run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
@@ -58,9 +65,9 @@ jobs:
           TAG="v${{ steps.ver.outputs.version }}"
           # Idempotent: create the release once, otherwise (re-run) refresh assets.
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release/codegraph-* --clobber
+            gh release upload "$TAG" release/codegraph-* release/SHA256SUMS --clobber
           else
-            gh release create "$TAG" release/codegraph-* --title "$TAG" --notes-file notes.md
+            gh release create "$TAG" release/codegraph-* release/SHA256SUMS --title "$TAG" --notes-file notes.md
           fi
 
       - name: Publish to npm
@@ -95,4 +102,20 @@ jobs:
             done
             [ -n "$ok" ] || { echo "::error::$name@$V never appeared on the registry"; exit 1; }
             echo "verified $name@$V"
+          done
+
+      - name: Sync packages to npmmirror
+        # npmmirror/cnpm mirror lazily and frequently never pull the per-platform
+        # optionalDependencies on their own, so `npm i` there fails with
+        # "no prebuilt bundle" (issue #303). Nudge a sync now so mirror users get
+        # the bundle without waiting. Best-effort — the launcher also self-heals
+        # from GitHub Releases — so a mirror hiccup never fails the release.
+        continue-on-error: true
+        run: |
+          for dir in release/npm/codegraph-* release/npm/main; do
+            name=$(node -p "require('./$dir/package.json').name")
+            enc=$(node -p "encodeURIComponent(require('./$dir/package.json').name)")
+            echo "sync $name"
+            curl -s -X PUT "https://registry.npmmirror.com/-/package/$enc/syncs" || true
+            echo
           done

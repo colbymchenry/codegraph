@@ -70,9 +70,18 @@ rm -f "$STAGE/lib/package-lock.json"
 
 # 4. Vendored Node + launcher (the launcher uses the bundled Node by relative
 #    path, so no system Node is ever needed).
+#
+# `--liftoff-only`: keep tree-sitter's large WASM grammars on V8's Liftoff
+# baseline compiler so they never reach the turboshaft optimizing tier, whose
+# per-compilation Zone arena OOMs the whole process (`Fatal process out of
+# memory: Zone`) on Node >= 22 — even with tens of GB free. The flag is read at
+# V8 engine init so it must be on node's command line; the parse worker inherits
+# it. See issues #293/#298 and src/extraction/wasm-runtime-flags.ts. (The CLI
+# also self-relaunches with this flag when launched without it, so non-bundled
+# runs are covered too; passing it here avoids that extra spawn.)
 if [ "$OSFAM" = "win32" ]; then
   cp "$NODE_BIN" "$STAGE/node.exe"
-  printf '@"%%~dp0..\\node.exe" "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
+  printf '@"%%~dp0..\\node.exe" --liftoff-only "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
     > "$STAGE/bin/codegraph.cmd"
 else
   cp "$NODE_BIN" "$STAGE/node"
@@ -89,7 +98,8 @@ while [ -L "$SELF" ]; do
   esac
 done
 DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
-exec "$DIR/node" "$DIR/lib/dist/bin/codegraph.js" "$@"
+# --liftoff-only: avoid the V8 turboshaft WASM Zone OOM (issues #293/#298).
+exec "$DIR/node" --liftoff-only "$DIR/lib/dist/bin/codegraph.js" "$@"
 LAUNCH
   chmod +x "$STAGE/bin/codegraph"
 fi

@@ -90,29 +90,24 @@ export class GraphTraverser {
         return priority(a) - priority(b);
       });
 
+      // Batch-fetch the unvisited neighbors in one query (was N+1 per BFS step).
+      const wantIds = adjacentEdges
+        .map((e) => (e.source === node.id ? e.target : e.source))
+        .filter((id) => !visited.has(id));
+      const neighborNodes = wantIds.length > 0 ? this.queries.getNodesByIds(wantIds) : new Map();
+
       for (const adjEdge of adjacentEdges) {
-        // Determine next node: for 'both' direction, edges can be either
-        // incoming or outgoing, so pick whichever end is not the current node
         const nextNodeId = adjEdge.source === node.id ? adjEdge.target : adjEdge.source;
+        if (visited.has(nextNodeId)) continue;
 
-        if (visited.has(nextNodeId)) {
-          continue;
-        }
+        const nextNode = neighborNodes.get(nextNodeId);
+        if (!nextNode) continue;
 
-        const nextNode = this.queries.getNodeById(nextNodeId);
-        if (!nextNode) {
-          continue;
-        }
-
-        // Apply node kind filter
         if (opts.nodeKinds && opts.nodeKinds.length > 0 && !opts.nodeKinds.includes(nextNode.kind)) {
           continue;
         }
 
-        // Add node to result
         nodes.set(nextNode.id, nextNode);
-
-        // Queue for further traversal
         queue.push({ node: nextNode, edge: adjEdge, depth: depth + 1 });
       }
     }
@@ -176,19 +171,18 @@ export class GraphTraverser {
     // Get adjacent edges
     const adjacentEdges = this.getAdjacentEdges(node.id, opts.direction, opts.edgeKinds);
 
+    // Batch-fetch unvisited neighbors (was N+1 per DFS step).
+    const wantIds = adjacentEdges
+      .map((e) => (e.source === node.id ? e.target : e.source))
+      .filter((id) => !visited.has(id));
+    const neighborNodes = wantIds.length > 0 ? this.queries.getNodesByIds(wantIds) : new Map();
+
     for (const edge of adjacentEdges) {
-      // Determine next node: for 'both' direction, edges can be either
-      // incoming or outgoing, so pick whichever end is not the current node
       const nextNodeId = edge.source === node.id ? edge.target : edge.source;
+      if (visited.has(nextNodeId)) continue;
 
-      if (visited.has(nextNodeId)) {
-        continue;
-      }
-
-      const nextNode = this.queries.getNodeById(nextNodeId);
-      if (!nextNode) {
-        continue;
-      }
+      const nextNode = neighborNodes.get(nextNodeId);
+      if (!nextNode) continue;
 
       // Apply node kind filter
       if (opts.nodeKinds && opts.nodeKinds.length > 0 && !opts.nodeKinds.includes(nextNode.kind)) {
@@ -255,9 +249,15 @@ export class GraphTraverser {
     visited.add(nodeId);
 
     const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports']);
+    if (incomingEdges.length === 0) return;
+
+    // Batch-fetch all caller nodes in one round-trip instead of one
+    // getNodeById per edge (was N+1 — meaningful on functions with many callers).
+    const sourceIds = incomingEdges.map((e) => e.source);
+    const callerNodes = this.queries.getNodesByIds(sourceIds);
 
     for (const edge of incomingEdges) {
-      const callerNode = this.queries.getNodeById(edge.source);
+      const callerNode = callerNodes.get(edge.source);
       if (callerNode && !visited.has(callerNode.id)) {
         result.push({ node: callerNode, edge });
         this.getCallersRecursive(callerNode.id, maxDepth, currentDepth + 1, result, visited);
@@ -294,9 +294,14 @@ export class GraphTraverser {
     visited.add(nodeId);
 
     const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports']);
+    if (outgoingEdges.length === 0) return;
+
+    // Batch-fetch callee nodes (was N+1 — see getCallersRecursive note).
+    const targetIds = outgoingEdges.map((e) => e.target);
+    const calleeNodes = this.queries.getNodesByIds(targetIds);
 
     for (const edge of outgoingEdges) {
-      const calleeNode = this.queries.getNodeById(edge.target);
+      const calleeNode = calleeNodes.get(edge.target);
       if (calleeNode && !visited.has(calleeNode.id)) {
         result.push({ node: calleeNode, edge });
         this.getCalleesRecursive(calleeNode.id, maxDepth, currentDepth + 1, result, visited);
@@ -388,9 +393,11 @@ export class GraphTraverser {
     visited.add(nodeId);
 
     const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['extends', 'implements']);
+    if (outgoingEdges.length === 0) return;
+    const parents = this.queries.getNodesByIds(outgoingEdges.map((e) => e.target));
 
     for (const edge of outgoingEdges) {
-      const parentNode = this.queries.getNodeById(edge.target);
+      const parentNode = parents.get(edge.target);
       if (parentNode && !nodes.has(parentNode.id)) {
         nodes.set(parentNode.id, parentNode);
         edges.push(edge);
@@ -411,9 +418,11 @@ export class GraphTraverser {
     visited.add(nodeId);
 
     const incomingEdges = this.queries.getIncomingEdges(nodeId, ['extends', 'implements']);
+    if (incomingEdges.length === 0) return;
+    const children = this.queries.getNodesByIds(incomingEdges.map((e) => e.source));
 
     for (const edge of incomingEdges) {
-      const childNode = this.queries.getNodeById(edge.source);
+      const childNode = children.get(edge.source);
       if (childNode && !nodes.has(childNode.id)) {
         nodes.set(childNode.id, childNode);
         edges.push(edge);
@@ -433,12 +442,13 @@ export class GraphTraverser {
 
     // Get all incoming edges (references, calls, type_of, etc.)
     const incomingEdges = this.queries.getIncomingEdges(nodeId);
+    if (incomingEdges.length === 0) return result;
 
+    // Batch-fetch source nodes (was N+1).
+    const sources = this.queries.getNodesByIds(incomingEdges.map((e) => e.source));
     for (const edge of incomingEdges) {
-      const sourceNode = this.queries.getNodeById(edge.source);
-      if (sourceNode) {
-        result.push({ node: sourceNode, edge });
-      }
+      const sourceNode = sources.get(edge.source);
+      if (sourceNode) result.push({ node: sourceNode, edge });
     }
 
     return result;
@@ -496,13 +506,16 @@ export class GraphTraverser {
       const containerKinds = new Set(['class', 'interface', 'struct', 'trait', 'protocol', 'module', 'enum']);
       if (containerKinds.has(focalNode.kind)) {
         const containsEdges = this.queries.getOutgoingEdges(nodeId, ['contains']);
-        for (const edge of containsEdges) {
-          const childNode = this.queries.getNodeById(edge.target);
-          if (childNode && !visited.has(childNode.id)) {
-            nodes.set(childNode.id, childNode);
-            edges.push(edge);
-            // Recurse into children at the same depth (they're part of the same symbol)
-            this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited);
+        if (containsEdges.length > 0) {
+          const children = this.queries.getNodesByIds(containsEdges.map((e) => e.target));
+          for (const edge of containsEdges) {
+            const childNode = children.get(edge.target);
+            if (childNode && !visited.has(childNode.id)) {
+              nodes.set(childNode.id, childNode);
+              edges.push(edge);
+              // Recurse into children at the same depth (they're part of the same symbol)
+              this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited);
+            }
           }
         }
       }
@@ -510,9 +523,11 @@ export class GraphTraverser {
 
     // Get all incoming edges (things that depend on this node)
     const incomingEdges = this.queries.getIncomingEdges(nodeId);
+    if (incomingEdges.length === 0) return;
+    const sources = this.queries.getNodesByIds(incomingEdges.map((e) => e.source));
 
     for (const edge of incomingEdges) {
-      const sourceNode = this.queries.getNodeById(edge.source);
+      const sourceNode = sources.get(edge.source);
       if (sourceNode && !nodes.has(sourceNode.id)) {
         nodes.set(sourceNode.id, sourceNode);
         edges.push(edge);
@@ -564,10 +579,17 @@ export class GraphTraverser {
         nodeId,
         edgeKinds.length > 0 ? edgeKinds : undefined
       );
+      if (outgoingEdges.length === 0) continue;
+
+      // Batch-fetch only the unvisited targets (was N+1 per BFS frontier).
+      const wantIds = outgoingEdges
+        .map((e) => e.target)
+        .filter((id) => !visited.has(id));
+      const nextNodes = wantIds.length > 0 ? this.queries.getNodesByIds(wantIds) : new Map();
 
       for (const edge of outgoingEdges) {
         if (!visited.has(edge.target)) {
-          const nextNode = this.queries.getNodeById(edge.target);
+          const nextNode = nextNodes.get(edge.target);
           if (nextNode) {
             queue.push({
               nodeId: edge.target,
@@ -627,15 +649,15 @@ export class GraphTraverser {
    */
   getChildren(nodeId: string): Node[] {
     const containsEdges = this.queries.getOutgoingEdges(nodeId, ['contains']);
+    if (containsEdges.length === 0) return [];
+
+    // Batch-fetch (was N+1).
+    const childNodes = this.queries.getNodesByIds(containsEdges.map((e) => e.target));
     const children: Node[] = [];
-
     for (const edge of containsEdges) {
-      const childNode = this.queries.getNodeById(edge.target);
-      if (childNode) {
-        children.push(childNode);
-      }
+      const childNode = childNodes.get(edge.target);
+      if (childNode) children.push(childNode);
     }
-
     return children;
   }
 }

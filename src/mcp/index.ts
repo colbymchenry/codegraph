@@ -21,6 +21,7 @@ import { watchDisabledReason } from '../sync';
 import { StdioTransport, JsonRpcRequest, JsonRpcNotification, ErrorCodes } from './transport';
 import { tools, ToolHandler } from './tools';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
+import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
 /**
  * Convert a file:// URI to a filesystem path.
@@ -61,6 +62,51 @@ const PROTOCOL_VERSION = '2024-11-05';
 const ROOTS_LIST_TIMEOUT_MS = 5000;
 
 /**
+ * How often to poll `process.ppid` to detect parent process death (see #277).
+ * 5s is a deliberate trade-off: the failure mode being guarded against is rare
+ * (parent SIGKILL'd), and longer poll = less wakeup overhead while idle.
+ */
+const DEFAULT_PPID_POLL_MS = 5000;
+
+/**
+ * Resolve the PPID watchdog poll interval from an env override. A value of
+ * `0` disables the watchdog entirely (escape hatch for embedded scenarios
+ * where the parent legitimately re-parents the server on purpose). Anything
+ * non-numeric or negative falls back to the default.
+ */
+function parsePpidPollMs(raw: string | undefined): number {
+  if (raw === undefined || raw === '') return DEFAULT_PPID_POLL_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return DEFAULT_PPID_POLL_MS;
+  if (parsed < 0) return DEFAULT_PPID_POLL_MS;
+  return Math.floor(parsed);
+}
+
+/**
+ * Parse the host PID propagated across the `--liftoff-only` re-exec
+ * ({@link HOST_PPID_ENV}). Returns a positive integer PID, or null when
+ * unset/invalid — the direct-launch path, where the watchdog falls back to
+ * `process.ppid` divergence. PIDs of 0/1 are rejected (0 = unknown, 1 = init,
+ * i.e. already orphaned), so the watchdog doesn't latch onto init.
+ */
+function parseHostPpid(raw: string | undefined): number | null {
+  if (raw === undefined || raw === '') return null;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 1) return null;
+  return parsed;
+}
+
+/** True if a process with `pid` currently exists (signal-0 probe). */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Extract the first usable filesystem path from a `roots/list` result.
  * Shape per MCP spec: `{ roots: [{ uri: "file:///path", name?: string }] }`.
  * Returns null if the result is empty or malformed.
@@ -95,6 +141,19 @@ export class MCPServer {
   // Guards the one-shot deferred resolution (roots/list or cwd) so we don't
   // re-issue roots/list on every tool call.
   private rootsAttempted = false;
+  // PPID watchdog — see start(). Captured at construction so we always have a
+  // baseline, even if start() runs after a fork-style reparent.
+  private originalPpid: number = process.ppid;
+  // The MCP host's PID, propagated across the `--liftoff-only` re-exec (see
+  // HOST_PPID_ENV). When set, the watchdog polls it directly: the re-exec
+  // inserts an intermediate process whose *death* — not just our reparenting —
+  // is what we'd otherwise miss. null on the direct (bundled) launch path.
+  private hostPpid: number | null = parseHostPpid(process.env[HOST_PPID_ENV]);
+  private ppidWatchdog: ReturnType<typeof setInterval> | null = null;
+  // Idempotency guard for stop(). Without it, the watchdog can race with the
+  // stdin `end`/`close` handlers (or SIGTERM/SIGINT) and double-close cg and
+  // the transport before process.exit() lands.
+  private stopped = false;
 
   constructor(projectPath?: string) {
     this.projectPath = projectPath || null;
@@ -122,6 +181,38 @@ export class MCPServer {
     // Detect this and shut down gracefully to prevent orphaned processes.
     process.stdin.on('end', () => this.stop());
     process.stdin.on('close', () => this.stop());
+
+    // PPID watchdog (#277). Linux doesn't propagate parent death to children,
+    // so when the MCP host (Claude Code, opencode, …) is SIGKILL'd by the OOM
+    // killer / a force-quit / a container teardown, the child is reparented to
+    // init/systemd and the stdin `end`/`close` events don't always fire. The
+    // server would then linger indefinitely, holding inotify watches, file
+    // descriptors, and the SQLite WAL. Poll `process.ppid` and shut down the
+    // moment it changes from what we observed at startup. Cross-platform:
+    // reparenting changes ppid on Linux *and* macOS; on Windows the value can
+    // also drop to 0 once the parent is gone. When the CLI re-execs itself for
+    // `--liftoff-only`, an intermediate process sits between us and the host and
+    // outlives it, so our own ppid wouldn't change — in that case we poll the
+    // host PID (propagated via HOST_PPID_ENV) for liveness instead. The watchdog
+    // is `.unref()`'d so it never holds the event loop open on its own.
+    const pollMs = parsePpidPollMs(process.env.CODEGRAPH_PPID_POLL_MS);
+    if (pollMs > 0) {
+      this.ppidWatchdog = setInterval(() => {
+        const current = process.ppid;
+        const ppidChanged = current !== this.originalPpid;
+        const hostGone = this.hostPpid !== null && !isProcessAlive(this.hostPpid);
+        if (ppidChanged || hostGone) {
+          const reason = ppidChanged
+            ? `ppid ${this.originalPpid} -> ${current}`
+            : `host pid ${this.hostPpid} exited`;
+          process.stderr.write(
+            `[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`
+          );
+          this.stop();
+        }
+      }, pollMs);
+      this.ppidWatchdog.unref();
+    }
   }
 
   /**
@@ -283,6 +374,12 @@ export class MCPServer {
    * Stop the server
    */
   stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (this.ppidWatchdog) {
+      clearInterval(this.ppidWatchdog);
+      this.ppidWatchdog = null;
+    }
     // Close all cached cross-project connections first
     this.toolHandler.closeAll();
     // Close the main CodeGraph instance

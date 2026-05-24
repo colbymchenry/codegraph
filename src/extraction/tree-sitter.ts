@@ -412,6 +412,20 @@ export class TreeSitterExtractor {
 
     const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1);
 
+    // Some grammars (e.g. Dart) model a function/method body as a *sibling* of
+    // the signature node, so the declaration node's own range is just the
+    // signature line. Extend endLine to the resolved body when it sits beyond
+    // the node so the node spans its body — required for any body-level analysis
+    // (callees, the callback synthesizer's body scan, context slices). Guarded to
+    // only ever extend: for child-body grammars the body is within range (no-op).
+    let endLine = node.endPosition.row + 1;
+    if (kind === 'function' || kind === 'method') {
+      const body = this.extractor?.resolveBody?.(node, this.extractor.bodyField);
+      if (body && body.endPosition.row + 1 > endLine) {
+        endLine = body.endPosition.row + 1;
+      }
+    }
+
     const newNode: Node = {
       id,
       kind,
@@ -420,7 +434,7 @@ export class TreeSitterExtractor {
       filePath: this.filePath,
       language: this.language,
       startLine: node.startPosition.row + 1,
-      endLine: node.endPosition.row + 1,
+      endLine,
       startColumn: node.startPosition.column,
       endColumn: node.endPosition.column,
       updatedAt: Date.now(),
@@ -516,7 +530,7 @@ export class TreeSitterExtractor {
   /**
    * Extract a function
    */
-  private extractFunction(node: SyntaxNode): void {
+  private extractFunction(node: SyntaxNode, nameOverride?: string): void {
     if (!this.extractor) return;
 
     // If the language provides getReceiverType and this function has a receiver
@@ -526,12 +540,17 @@ export class TreeSitterExtractor {
       return;
     }
 
-    let name = extractName(node, this.source, this.extractor);
+    // nameOverride is supplied only for explicitly-named anonymous functions the
+    // caller resolved itself (e.g. arrow values of exported-const object members
+    // — SvelteKit actions). Inline-object arrows reached by the general walker
+    // get no override, so they still fall through to the <anonymous> skip below.
+    let name = nameOverride ?? extractName(node, this.source, this.extractor);
     // For arrow functions and function expressions assigned to variables,
     // resolve the name from the parent variable_declarator.
     // e.g. `export const useAuth = () => { ... }` — the arrow_function node
     // has no `name` field; the name lives on the variable_declarator.
     if (
+      !nameOverride &&
       name === '<anonymous>' &&
       (node.type === 'arrow_function' || node.type === 'function_expression')
     ) {
@@ -1056,6 +1075,25 @@ export class TreeSitterExtractor {
             // Extract type annotation references (e.g., const x: ITextModel = ...)
             if (varNode) {
               this.extractVariableTypeAnnotation(child, varNode.id);
+            }
+
+            // Exported const object-of-functions: `export const actions =
+            // { default: async () => {} }` (SvelteKit form actions / handler maps
+            // / route tables). Extract each function-valued property as a function
+            // named by its key + walk its body so its calls (e.g. api.post) are
+            // captured. Scoped to EXPORTED consts to exclude the inline-object
+            // noise (`ctx.set({...})`) the object-method skip deliberately avoids.
+            if (isExported && valueNode &&
+                (valueNode.type === 'object' || valueNode.type === 'object_expression')) {
+              for (let j = 0; j < valueNode.namedChildCount; j++) {
+                const pair = valueNode.namedChild(j);
+                if (pair?.type !== 'pair') continue;
+                const v = getChildByField(pair, 'value');
+                const k = getChildByField(pair, 'key');
+                if (k && v && (v.type === 'arrow_function' || v.type === 'function_expression')) {
+                  this.extractFunction(v, getNodeText(k, this.source).replace(/^['"`]|['"`]$/g, ''));
+                }
+              }
             }
           }
         }
@@ -1678,6 +1716,21 @@ export class TreeSitterExtractor {
         }
       }
 
+      // Nested NAMED functions inside a body — function declarations and named
+      // function expressions like `.on('mount', function onmount(){})` — become
+      // their own nodes so the graph can link to them (callback handlers, local
+      // helpers). Anonymous arrows/expressions fall through to the default
+      // recursion below, keeping their inner calls attributed to the enclosing
+      // function: this bounds the new nodes to NAMED functions only (no explosion,
+      // no lost edges). extractFunction walks the nested body itself, so we return.
+      if (this.extractor!.functionTypes.includes(nodeType)) {
+        const nestedName = extractName(node, this.source, this.extractor!);
+        if (nestedName && nestedName !== '<anonymous>') {
+          this.extractFunction(node);
+          return;
+        }
+      }
+
       // Extract structural nodes found inside function bodies.
       // Each extract method visits its own children, so we return after extracting.
       if (this.extractor!.classTypes.includes(nodeType)) {
@@ -1741,6 +1794,27 @@ export class TreeSitterExtractor {
               referenceKind: 'extends',
               line: target.startPosition.row + 1,
               column: target.startPosition.column,
+            });
+          }
+        }
+      }
+
+      // C++ base classes: `class Derived : public Base, private Other` →
+      // base_class_clause holds access specifiers + base type(s). Emit an extends
+      // ref per base type (skip the public/private/protected keywords).
+      if (child.type === 'base_class_clause') {
+        for (const t of child.namedChildren) {
+          if (
+            t.type === 'type_identifier' ||
+            t.type === 'qualified_identifier' ||
+            t.type === 'template_type'
+          ) {
+            this.unresolvedReferences.push({
+              fromNodeId: classId,
+              referenceName: getNodeText(t, this.source),
+              referenceKind: 'extends',
+              line: t.startPosition.row + 1,
+              column: t.startPosition.column,
             });
           }
         }
