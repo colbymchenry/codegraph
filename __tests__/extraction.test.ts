@@ -145,6 +145,7 @@ class_name PlayerController
 signal health_changed(value: int)
 const MAX_HP := 100
 const DYNAMIC_UI_SOUND_CONTROLLER_NAME := "MainDynamicUISoundController"
+const WRAPPED_LABEL_NAME := "CardRarity"
 const TEMPLATE_PATH := "MarginContainer/StatusFlow/StatusIconTemplate"
 const CARD_ROW_PATH := "RewardList/CardRewardTemplate"
 @onready var sprite := $Sprite2D
@@ -163,6 +164,11 @@ func _ready() -> void:
   var track = get_node("%TrackPanel")
   var title_label = card_view.find_child("CardTitle", true, false)
   var type_label = _find_label("CardType")
+  var rarity_label = _find_label(WRAPPED_LABEL_NAME)
+  var local_child_name := &"ChildBadge"
+  var child_badge = card_view.find_child(local_child_name, true, false)
+  var local_button_name := "DeckButton"
+  var deck_button = _find_node(root, local_button_name)
   var controller_from_helper = _find_node(root, "MainDynamicUISoundController")
   var row_name := "CardReward%d" % reward_index
   var extra_row = get_node_or_null("CardReward%d" % reward_index)
@@ -197,6 +203,7 @@ func _find_label(label_name: String) -> Label:
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'setup_player')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'MAX_HP')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'DYNAMIC_UI_SOUND_CONTROLLER_NAME')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'WRAPPED_LABEL_NAME')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'TEMPLATE_PATH')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'CARD_ROW_PATH')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'sprite')).toBe(true);
@@ -228,6 +235,9 @@ func _find_label(label_name: String) -> Label:
     expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'references' && r.referenceName === 'MainDynamicUISoundController')).toHaveLength(2);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardTitle')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardType')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardRarity')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'ChildBadge')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'DeckButton')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'TrackPanel')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/TrackPanel')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardReward')).toBe(true);

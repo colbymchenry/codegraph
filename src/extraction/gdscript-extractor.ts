@@ -225,7 +225,7 @@ export class GDScriptExtractor {
         node.signature = trimmed;
         this.addContains(scopes[scopes.length - 1]!.id, node.id);
         if (kind === 'constant') {
-          const stringValueMatch = trimmed.match(/:=?\s*["']([^"']+)["']/);
+          const stringValueMatch = trimmed.match(/:=?\s*&?["']([^"']+)["']/);
           if (stringValueMatch) {
             const constName = varMatch[2]!;
             const stringValue = stringValueMatch[1]!;
@@ -415,6 +415,8 @@ export class GDScriptExtractor {
   }
 
   private extractNodePathReferences(owner: string, code: string, lineNumber: number, scriptClass: Node | null, aliasOwner: string): void {
+    this.extractStringNodePathAlias(aliasOwner, code);
+
     const shorthandRegex = /[$%]([A-Za-z_]\w*(?:\/[A-Za-z_]\w*)*)/g;
     let shorthandMatch;
     while ((shorthandMatch = shorthandRegex.exec(code)) !== null) {
@@ -433,10 +435,26 @@ export class GDScriptExtractor {
       this.addNodePathReference(owner, findChildMatch[1]!, lineNumber, findChildMatch.index, scriptClass);
     }
 
+    const findChildAliasRegex = /\bfind_child\s*\(\s*([A-Za-z_]\w*)\b/g;
+    let findChildAliasMatch;
+    while ((findChildAliasMatch = findChildAliasRegex.exec(code)) !== null) {
+      const nodePath = this.resolveStringAlias(aliasOwner, findChildAliasMatch[1]!);
+      if (!nodePath) continue;
+      this.addNodePathReference(owner, nodePath, lineNumber, findChildAliasMatch.index, scriptClass);
+    }
+
     const projectFindNodeRegex = /\b_find_node\s*\(\s*[^,\n]+,\s*["']([^"']+)["']/g;
     let projectFindNodeMatch;
     while ((projectFindNodeMatch = projectFindNodeRegex.exec(code)) !== null) {
       this.addNodePathReference(owner, projectFindNodeMatch[1]!, lineNumber, projectFindNodeMatch.index, scriptClass);
+    }
+
+    const projectFindNodeAliasRegex = /\b_find_node\s*\(\s*[^,\n]+,\s*([A-Za-z_]\w*)\b/g;
+    let projectFindNodeAliasMatch;
+    while ((projectFindNodeAliasMatch = projectFindNodeAliasRegex.exec(code)) !== null) {
+      const nodePath = this.resolveStringAlias(aliasOwner, projectFindNodeAliasMatch[1]!);
+      if (!nodePath) continue;
+      this.addNodePathReference(owner, nodePath, lineNumber, projectFindNodeAliasMatch.index, scriptClass);
     }
 
     const getNodeFormattedRegex = /\b(?:get_node|get_node_or_null|has_node)\s*\(\s*["']([^"']*%d[^"']*)["']\s*%/g;
@@ -475,10 +493,35 @@ export class GDScriptExtractor {
       const argumentIndex = this.nodeLookupHelperArgumentIndex.get(helperName);
       if (argumentIndex === undefined) continue;
       const args = this.splitCallArguments(helperCallMatch[2]!);
-      const stringArg = args[argumentIndex]?.match(/^\s*["']([^"']+)["']\s*$/);
-      if (!stringArg) continue;
-      this.addNodePathReference(owner, stringArg[1]!, lineNumber, helperCallMatch.index, scriptClass);
+      const nodePath = this.resolveStringArgument(aliasOwner, args[argumentIndex]);
+      if (!nodePath) continue;
+      this.addNodePathReference(owner, nodePath, lineNumber, helperCallMatch.index, scriptClass);
     }
+  }
+
+  private extractStringNodePathAlias(owner: string, code: string): void {
+    const stringAliasRegex = /\b(?:var|const)\s+([A-Za-z_]\w*)\s*(?::\s*[A-Za-z_]\w*)?\s*:=?\s*&?["']([^"']+)["']/g;
+    let stringAliasMatch;
+    while ((stringAliasMatch = stringAliasRegex.exec(code)) !== null) {
+      const value = stringAliasMatch[2]!;
+      if (this.isLikelyNodePath(value)) {
+        this.addNodePathAlias(owner, stringAliasMatch[1]!, value);
+      }
+    }
+  }
+
+  private resolveStringArgument(owner: string, argument: string | undefined): string | null {
+    if (!argument) return null;
+    const literal = argument.match(/^\s*&?["']([^"']+)["']\s*$/);
+    if (literal) return literal[1]!;
+
+    const identifier = argument.match(/^\s*([A-Za-z_]\w*)\s*$/);
+    if (!identifier) return null;
+    return this.resolveStringAlias(owner, identifier[1]!);
+  }
+
+  private resolveStringAlias(owner: string, name: string): string | null {
+    return this.lookupNodePathAlias(owner, name) ?? this.stringConstants.get(name) ?? null;
   }
 
   private extractNodeLookupHelpers(functionScopes: FunctionScope[]): void {
@@ -611,6 +654,10 @@ export class GDScriptExtractor {
 
   private isSimpleNodeName(value: string): boolean {
     return /^[A-Z_][A-Za-z0-9_]*$/.test(value);
+  }
+
+  private isLikelyNodePath(value: string): boolean {
+    return /^[A-Z_][A-Za-z0-9_]*(?:\/[A-Z_][A-Za-z0-9_]*)*$/.test(value);
   }
 
   private createDeclarationNode(kind: NodeKind, name: string, rawLine: string, line: number, indent: number): Node {
