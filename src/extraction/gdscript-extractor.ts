@@ -226,6 +226,22 @@ export class GDScriptExtractor {
           if (stringValueMatch) this.stringConstants.set(varMatch[2]!, stringValueMatch[1]!);
         }
       }
+
+      const dynamicNodeNameMatch = trimmed.match(/\b[A-Za-z_]\w*\s*\.\s*name\s*=\s*["']([A-Za-z_]\w*)["']/);
+      if (dynamicNodeNameMatch) {
+        const nodeName = dynamicNodeNameMatch[1]!;
+        const node = this.createNode(
+          'component',
+          nodeName,
+          `${this.filePath}::dynamic_node:${nodeName}:${lineNumber}`,
+          lineNumber,
+          rawLine.indexOf(nodeName),
+          lineNumber,
+          rawLine.length
+        );
+        node.signature = trimmed;
+        this.addContains(scopes[scopes.length - 1]!.id, node.id);
+      }
     }
   }
 
