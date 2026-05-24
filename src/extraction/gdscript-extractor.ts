@@ -57,7 +57,7 @@ export class GDScriptExtractor {
 
     try {
       const fileNode = this.createFileNode();
-      const scriptClass = this.extractScriptClass(fileNode);
+      const scriptClass = this.extractScriptClass(fileNode) ?? this.extractImplicitScriptClass(fileNode);
       this.extractDeclarations(fileNode, scriptClass);
       this.extractReferences(fileNode, scriptClass);
     } catch (error) {
@@ -105,6 +105,20 @@ export class GDScriptExtractor {
     const column = index - this.getLineStart(line) + classNameMatch[0].indexOf(classNameMatch[1]!);
     const name = classNameMatch[1]!;
     const node = this.createNode('class', name, `${this.filePath}::${name}`, line, column, line, column + classNameMatch[0].trimEnd().length);
+    this.addContains(fileNode.id, node.id);
+    return node;
+  }
+
+  private extractImplicitScriptClass(fileNode: Node): Node | null {
+    const extendsMatch = this.source.match(new RegExp(`^\\s*${ANNOTATION_PREFIX}extends\\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z_][\\w.]*))`, 'm'));
+    if (!extendsMatch) return null;
+
+    const index = extendsMatch.index ?? 0;
+    const line = this.getLineNumber(index);
+    const name = this.scriptClassNameFromPath();
+    const column = index - this.getLineStart(line);
+    const node = this.createNode('class', name, `${this.filePath}::${name}`, line, column, line, column + (this.lines[line - 1]?.trimEnd().length ?? 0));
+    node.signature = `implicit script class extends ${extendsMatch[1] || extendsMatch[2] || extendsMatch[3]}`;
     this.addContains(fileNode.id, node.id);
     return node;
   }
@@ -288,5 +302,12 @@ export class GDScriptExtractor {
       pos += (this.lines[i - 1]?.length ?? 0) + 1;
     }
     return pos;
+  }
+
+  private scriptClassNameFromPath(): string {
+    const base = path.basename(this.filePath, path.extname(this.filePath));
+    const words = base.split(/[^A-Za-z0-9]+/).filter(Boolean);
+    const pascal = words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join('');
+    return pascal || path.basename(this.filePath);
   }
 }

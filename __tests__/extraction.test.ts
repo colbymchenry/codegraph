@@ -196,6 +196,24 @@ class InnerPanel extends Control:
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'Control')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'emit_changed')).toBe(true);
   });
+
+  it('should create an implicit script class for extends-only GDScript files', () => {
+    const code = `
+extends Control
+
+func _ready() -> void:
+  setup()
+
+func setup() -> void:
+  pass
+`;
+    const result = extractFromSource('battle_hud.gd', code);
+
+    expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'BattleHud')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === '_ready')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'setup')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'Control')).toBe(true);
+  });
 });
 
 describe('Godot Resource Extraction', () => {
@@ -209,6 +227,8 @@ describe('Godot Resource Extraction', () => {
 script = ExtResource("1_script")
 
 [node name="Sprite2D" type="Sprite2D" parent="."]
+
+[connection signal="pressed" from="Sprite2D" to="." method="_on_sprite_pressed"]
 `;
     const result = extractFromSource('player.tscn', code);
 
@@ -216,6 +236,8 @@ script = ExtResource("1_script")
     expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'Sprite2D')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'import' && n.name === 'res://player_controller.gd')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://player_controller.gd')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === '_on_sprite_pressed')).toBe(true);
+    expect(result.edges.some((e) => e.kind === 'references' && e.metadata?.method === '_on_sprite_pressed')).toBe(true);
   });
 });
 

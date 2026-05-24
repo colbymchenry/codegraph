@@ -14,6 +14,9 @@ export class GodotResourceExtractor {
   private unresolvedReferences: UnresolvedReference[] = [];
   private referenceKeys = new Set<string>();
   private errors: ExtractionError[] = [];
+  private extResources = new Map<string, string>();
+  private nodesByScenePath = new Map<string, Node>();
+  private rootNode: Node | null = null;
 
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
@@ -64,37 +67,128 @@ export class GodotResourceExtractor {
   }
 
   private extractSections(fileNodeId: string): void {
+    let currentNode: Node | null = null;
+
     for (let i = 0; i < this.lines.length; i++) {
       const line = this.lines[i] ?? '';
       const lineNumber = i + 1;
       const section = line.match(/^\[([A-Za-z_]+)([^\]]*)\]/);
-      if (!section) continue;
+      if (!section) {
+        if (currentNode) this.extractNodeProperty(currentNode, line, lineNumber);
+        continue;
+      }
 
       const type = section[1]!;
       const attrs = this.parseAttributes(section[2] ?? '');
       if (type === 'node') {
         const name = attrs.get('name') || '<unnamed_node>';
         const nodeType = attrs.get('type');
-        const node = this.createNode('component', name, `${this.filePath}::node:${name}`, lineNumber, 0, line.length);
+        const scenePath = this.scenePathForNode(name, attrs.get('parent'));
+        const node = this.createNode('component', name, `${this.filePath}::node:${scenePath}`, lineNumber, 0, line.length);
         node.signature = nodeType ? `[node name="${name}" type="${nodeType}"]` : line.trim();
-        this.addContains(fileNodeId, node.id);
+        if (!attrs.has('parent') && !this.rootNode) this.rootNode = node;
+        this.nodesByScenePath.set(scenePath, node);
+        this.addNodeContainment(fileNodeId, node, attrs.get('parent'));
+        currentNode = node;
       } else if (type === 'ext_resource') {
         const resourcePath = attrs.get('path');
+        const id = attrs.get('id');
         if (!resourcePath) continue;
+        if (id) this.extResources.set(id, resourcePath);
         const node = this.createNode('import', resourcePath, `${this.filePath}::ext_resource:${resourcePath}`, lineNumber, 0, line.length);
         node.signature = line.trim();
         this.addContains(fileNodeId, node.id);
         this.addReference(fileNodeId, resourcePath, 'references', lineNumber, line.indexOf(resourcePath));
+        currentNode = null;
       } else if (type === 'sub_resource') {
         const id = attrs.get('id') || `line:${lineNumber}`;
         const resourceType = attrs.get('type') || 'sub_resource';
         const node = this.createNode('component', id, `${this.filePath}::sub_resource:${id}`, lineNumber, 0, line.length);
         node.signature = `[sub_resource type="${resourceType}" id="${id}"]`;
         this.addContains(fileNodeId, node.id);
+        currentNode = null;
+      } else if (type === 'connection') {
+        this.extractConnection(fileNodeId, attrs, line, lineNumber);
+        currentNode = null;
+      } else {
+        currentNode = null;
       }
     }
 
     this.extractInlineResourcePaths(fileNodeId);
+  }
+
+  private extractNodeProperty(node: Node, line: string, lineNumber: number): void {
+    const scriptMatch = line.match(/^\s*script\s*=\s*ExtResource\("([^"]+)"\)/);
+    if (!scriptMatch) return;
+
+    const resourcePath = this.extResources.get(scriptMatch[1]!);
+    if (!resourcePath) return;
+
+    this.addReference(node.id, resourcePath, 'references', lineNumber, line.indexOf('ExtResource'));
+  }
+
+  private extractConnection(fileNodeId: string, attrs: Map<string, string>, line: string, lineNumber: number): void {
+    const method = attrs.get('method');
+    if (!method) return;
+
+    const fromNode = this.resolveSceneNode(attrs.get('from') || '.');
+    const toNode = this.resolveSceneNode(attrs.get('to') || '.');
+    const ownerId = fromNode?.id ?? fileNodeId;
+    this.addReference(ownerId, method, 'calls', lineNumber, line.indexOf(method));
+
+    if (toNode) {
+      this.edges.push({
+        source: ownerId,
+        target: toNode.id,
+        kind: 'references',
+        line: lineNumber,
+        column: line.indexOf('to='),
+        provenance: 'heuristic',
+        metadata: {
+          signal: attrs.get('signal'),
+          method,
+        },
+      });
+    }
+  }
+
+  private addNodeContainment(fileNodeId: string, node: Node, parent: string | undefined): void {
+    if (!parent) {
+      this.addContains(fileNodeId, node.id);
+      return;
+    }
+
+    const parentPath = this.normalizeScenePath(parent || '.');
+    const parentNode = parentPath === '.' ? this.rootNode : this.nodesByScenePath.get(parentPath);
+    this.addContains(parentNode?.id ?? fileNodeId, node.id);
+  }
+
+  private scenePathForNode(name: string, parent: string | undefined): string {
+    if (!parent) return name;
+
+    const parentPath = this.normalizeScenePath(parent || '.');
+    if (parentPath === '.') return this.rootNode ? `${this.rootNode.name}/${name}` : name;
+    return `${parentPath}/${name}`;
+  }
+
+  private normalizeScenePath(scenePath: string): string {
+    if (!scenePath || scenePath === '.') return '.';
+    return scenePath.replace(/^\.\//, '');
+  }
+
+  private resolveSceneNode(scenePath: string): Node | null {
+    const normalized = this.normalizeScenePath(scenePath);
+    if (normalized === '.') return this.rootNode;
+
+    const direct = this.nodesByScenePath.get(normalized);
+    if (direct) return direct;
+
+    if (this.rootNode) {
+      return this.nodesByScenePath.get(`${this.rootNode.name}/${normalized}`) ?? null;
+    }
+
+    return null;
   }
 
   private extractInlineResourcePaths(fileNodeId: string): void {
