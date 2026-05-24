@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>2026-05-25 CodeGraph 導入分析レポート</title>
+<style>
+:root {
+  --bg: #0f172a;
+  --card: #1e293b;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --heading: #cbd5e1;
+  --accent: #a78bfa;
+  --border: #334155;
+  --code-bg: #0b1220;
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --err: #f87171;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body.diary {
+  margin: 0 auto;
+  padding: 40px 20px 80px;
+  max-width: 960px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif;
+  font-size: 15px;
+  line-height: 1.7;
+}
+body.diary > header { margin-bottom: 28px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
+body.diary > header h1 { margin: 0 0 6px; font-size: 26px; color: var(--accent); font-weight: 600; }
+body.diary > header .subtitle { margin: 0; color: var(--muted); font-size: 14px; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { color: var(--heading); font-weight: 600; }
+code { background: var(--code-bg); padding: 1px 6px; border-radius: 4px; font-size: 13px; }
+pre { background: var(--code-bg); padding: 12px 14px; border-radius: 10px; border: 1px solid var(--border); overflow-x: auto; font-size: 13px; }
+.diary-toc { margin-bottom: 28px; padding: 16px 20px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; }
+.diary-toc h2 { margin: 0 0 12px; font-size: 14px; color: var(--heading); text-transform: uppercase; }
+.diary-toc table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.diary-toc th { text-align: left; padding: 6px 10px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--border); }
+.diary-toc td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.diary-toc tr:last-child td { border-bottom: none; }
+.entry { margin: 22px 0; padding: 20px 24px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; }
+.entry h2 { margin: 0 0 10px; font-size: 20px; color: var(--accent); }
+.entry .meta { margin: 0 0 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border); font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 10px; }
+.entry h3 { margin: 18px 0 8px; font-size: 13px; color: var(--heading); text-transform: uppercase; letter-spacing: 0.3px; }
+.entry h3:first-of-type { margin-top: 0; }
+.entry p, .entry li { margin: 8px 0; }
+.entry ul, .entry ol { padding-left: 22px; }
+.entry table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+.entry th { text-align: left; padding: 8px 10px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--border); }
+.entry td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.entry tr:last-child td { border-bottom: none; }
+.tag { display: inline-block; padding: 2px 8px; font-size: 12px; border-radius: 999px; border: 1px solid var(--border); }
+.tag-scope { border-color: var(--accent); color: var(--accent); }
+.tag-ok { border-color: var(--ok); color: var(--ok); }
+.tag-warn { border-color: var(--warn); color: var(--warn); }
+.tag-err { border-color: var(--err); color: var(--err); }
+.mermaid-note { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body class="diary">
+<header>
+  <h1>CodeGraph 導入分析レポート</h1>
+  <p class="subtitle">対象: matrix9neonebuchadnezzar2199-sketch/codegraph（fork / codegraph-jp 作業ベース） · v0.9.4 · Cursor 連携想定</p>
+</header>
+
+<nav class="diary-toc" aria-label="目次">
+  <h2>目次</h2>
+  <table>
+    <thead><tr><th>時刻</th><th>セクション</th><th>状態</th><th>詳細</th></tr></thead>
+    <tbody>
+      <tr><td>07:34</td><td>1. ツール分析</td><td><span class="tag tag-ok">ok</span></td><td><a href="#sec-analysis">#sec-analysis</a></td></tr>
+      <tr><td>07:34</td><td>2. Cursor 導入効果予測</td><td><span class="tag tag-ok">ok</span></td><td><a href="#sec-cursor-effect">#sec-cursor-effect</a></td></tr>
+      <tr><td>07:34</td><td>3. 品質・i18n 設計</td><td><span class="tag tag-warn">warn</span></td><td><a href="#sec-quality-i18n">#sec-quality-i18n</a></td></tr>
+      <tr><td>07:34</td><td>4. 追加機能提案</td><td><span class="tag tag-ok">ok</span></td><td><a href="#sec-features">#sec-features</a></td></tr>
+    </tbody>
+  </table>
+</nav>
+
+<main>
+
+<section class="entry" id="sec-analysis">
+  <h2>1. 対象ツールの分析</h2>
+  <p class="meta">
+    <span class="date">2026-05-25</span>
+    <span class="tag tag-type">analysis</span>
+    <span class="tag tag-scope">codegraph</span>
+    <span class="tag tag-scope">tool</span>
+  </p>
+
+  <h3>概要</h3>
+  <p><strong>CodeGraph</strong> は、ローカルで tree-sitter によりソースを AST 解析し、シンボル・呼び出し関係・インポート・フレームワークルートを <strong>SQLite ナレッジグラフ</strong>（<code>.codegraph/codegraph.db</code>）に格納するコードインテリジェンス基盤です。Claude Code / <strong>Cursor</strong> / Codex CLI / opencode / Hermes Agent 向けに <strong>MCP サーバー</strong>（<code>codegraph serve --mcp</code>）として公開され、エージェントは grep/Read の反復探索の代わりにグラフ照会で構造質問に答えます。</p>
+  <p>本リポジトリは <a href="https://github.com/colbymchenry/codegraph">colbymchenry/codegraph</a> の fork（説明文: 「コードの地図化」）で、パッケージ名は現状 <code>@colbymchenry/codegraph</code> のままです。日本語化（codegraph-jp）は本レポート §3 の設計対象として扱います。</p>
+
+  <h3>アーキテクチャ</h3>
+  <pre><code>エージェント (Cursor MCP クライアント)
+    │ stdio JSON-RPC
+    ▼
+MCPServer (src/mcp/) — tools.ts が 10 ツールを実装
+    │
+    ▼
+CodeGraph コア (src/index.ts)
+    ├─ ExtractionOrchestrator — tree-sitter WASM + 言語別 extractor
+    ├─ ReferenceResolver — 呼び出し解決・フレームワーク route
+    ├─ GraphTraverser / ContextBuilder
+    └─ DatabaseConnection — schema.sql + FTS5 + WAL
+    │
+    ▼
+.sync/ FileWatcher — OS イベント + 2s デバウンス増分同期</code></pre>
+
+  <h3>主要コンポーネント</h3>
+  <table>
+    <thead><tr><th>領域</th><th>パス</th><th>役割</th></tr></thead>
+    <tbody>
+      <tr><td>CLI</td><td><code>src/bin/codegraph.ts</code></td><td>init/index/sync/query/context、Node 25+ ブロック、WASM フラグ再実行</td></tr>
+      <tr><td>インストーラ</td><td><code>src/installer/</code></td><td>マルチエージェント MCP 設定・指示文テンプレート</td></tr>
+      <tr><td>Cursor 連携</td><td><code>src/installer/targets/cursor.ts</code></td><td><code>~/.cursor/mcp.json</code>、<code>.cursor/rules/codegraph.mdc</code>、<code>--path</code> 注入</td></tr>
+      <tr><td>MCP ツール</td><td><code>src/mcp/tools.ts</code></td><td>search/context/trace/explore/callers/callees/impact/node/files/status</td></tr>
+      <tr><td>抽出</td><td><code>src/extraction/</code> + <code>languages/*</code></td><td>19+ 言語、Vue/Svelte/Liquid 等</td></tr>
+      <tr><td>フレームワーク</td><td><code>src/resolution/frameworks/</code></td><td>Django/Express/Nest/Laravel 等 14+ スタックの route 解決</td></tr>
+      <tr><td>セキュリティ</td><td><code>src/utils.ts</code> + <code>__tests__/security.test.ts</code></td><td>FileLock、パストラバーサル検証、MCP 入力制限</td></tr>
+    </tbody>
+  </table>
+
+  <h3>MCP ツール一覧（エージェント向け API）</h3>
+  <table>
+    <thead><tr><th>ツール</th><th>用途</th><th>Cursor での推奨順</th></tr></thead>
+    <tbody>
+      <tr><td><code>codegraph_context</code></td><td>タスク単位の文脈構築（検索+関連シンボル+スニペット）</td><td>アーキテクチャ質問の第一選択</td></tr>
+      <tr><td><code>codegraph_trace</code></td><td>シンボル間の呼び出し経路（動的ディスパッチ含む）</td><td>フロー追跡</td></tr>
+      <tr><td><code>codegraph_explore</code></td><td>複数シンボルのソースを 1 回で取得（予算付き）</td><td>context の次</td></tr>
+      <tr><td><code>codegraph_search</code></td><td>名前によるシンボル検索</td><td>定義位置の特定</td></tr>
+      <tr><td><code>codegraph_callers</code> / <code>callees</code></td><td>1 ホップの呼び出し関係</td><td>局所影響調査</td></tr>
+      <tr><td><code>codegraph_impact</code></td><td>変更影響半径</td><td>リファクタ前</td></tr>
+      <tr><td><code>codegraph_node</code></td><td>単一シンボル詳細・ソース</td><td>ドリルダウン</td></tr>
+      <tr><td><code>codegraph_files</code></td><td>インデックス済みファイルツリー</td><td>Glob 代替</td></tr>
+      <tr><td><code>codegraph_status</code></td><td>インデックス健全性</td><td>セッション開始時</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Cursor 固有の実装要点</h3>
+  <p>Cursor は MCP 子プロセスの <strong>cwd がワークスペース根でない</strong> かつ initialize で <code>rootUri</code> を送らないため、<code>process.cwd()</code> だけでは <code>.codegraph/</code> を見つけられません。その対策としてインストーラは <code>args</code> に <code>--path</code> を付与します。</p>
+  <ul>
+    <li><strong>global インストール</strong>: <code>--path ${workspaceFolder}</code>（Cursor が展開）</li>
+    <li><strong>local インストール</strong>: インストール時の絶対パス</li>
+    <li><strong>rules</strong>: <code>.cursor/rules/codegraph.mdc</code>（<code>alwaysApply: true</code>）— ネイティブ grep より codegraph を優先させる指示。global では mcp.json のみ、rules は <code>codegraph init</code> でプロジェクトに生成</li>
+  </ul>
+
+  <h3>技術スタック・制約</h3>
+  <ul>
+    <li>ランタイム: Node 20–24（25+ は WASM OOM のためハードブロック、<code>CODEGRAPH_ALLOW_UNSAFE_NODE</code> で上書き可）</li>
+    <li>DB: <code>node:sqlite</code> + WAL（ネットワークドライブではロック問題の可能性）</li>
+    <li>配布: バンドル Node 付きバイナリ + npm シム、<code>.gitignore</code> 尊重、1MB 超ファイルスキップ</li>
+    <li>テスト: Vitest、36 ファイル・800+ ケース（本環境 Windows で 5 件タイムアウト — §3 参照）</li>
+  </ul>
+</section>
+
+<section class="entry" id="sec-cursor-effect">
+  <h2>2. 導入後の効果予測（Cursor 連携想定）</h2>
+  <p class="meta">
+    <span class="date">2026-05-25</span>
+    <span class="tag tag-type">analysis</span>
+    <span class="tag tag-scope">cursor</span>
+  </p>
+
+  <h3>前提（マスター環境）</h3>
+  <ul>
+    <li>Cursor を主エディタとし、プロジェクトごとに <code>.cursor/rules/</code> および MCP（<code>mcp.json</code>）を運用</li>
+    <li>対象リポジトリはマルウェア解析・汎用ツール制作など <strong>中〜大規模</strong>（Python/TS/C 混在）が多い</li>
+    <li>エージェントは構造探索（呼び出し関係・影響範囲）と実装の両方を行う</li>
+  </ul>
+
+  <h3>定量効果（上流ベンチマークの外挿）</h3>
+  <p>公式ベンチ（Claude Opus 4.7 headless、v0.9.4）では、CodeGraph 有効時の中央値で <strong>コスト約 35% 減・トークン約 57% 減・時間約 46% 短縮・ツール呼び出し約 71% 減</strong>。大規模 TS（VS Code）ではファイル Read ゼロで回答するケースが報告されています。</p>
+  <table>
+    <thead><tr><th>マスター側のリポジトリ規模感</th><th>期待される効果</th><th>根拠</th></tr></thead>
+    <tbody>
+      <tr><td>大（数千ファイル、複数言語）</td><td><strong>高</strong> — 探索ターン大幅削減</td><td>VS Code / Django ベンチに近い</td></tr>
+      <tr><td>中（数百〜千ファイル）</td><td><strong>中〜高</strong></td><td>Excalidraw / Tokio 級</td></tr>
+      <tr><td>小（&lt;200 ファイル）</td><td><strong>低〜中</strong></td><td>Gin 級 — ネイティブ grep でも十分な場合あり</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Cursor 特有の定性効果</h3>
+  <ol>
+    <li><strong>コンテキストウィンドウの節約</strong>: <code>codegraph_explore</code> が複数ファイルを 1 MCP 呼び出しにまとめるため、連続 Read よりトークン効率が良い。</li>
+    <li><strong>ルール連携</strong>: <code>codegraph.mdc</code> が常時適用されると、Agent が「grep 先行」を避け、既存の <code>.cursor/rules/*.mdc</code>（解析 OPSEC 等）と併用しやすい。</li>
+    <li><strong>マルウェア解析ワークフロー</strong>: デコンパイル C は CodeGraph 対象外だが、<strong>解析ツール本体（Python/TS）</strong> の改修・YARA 生成パイプライン理解では call graph / impact が有効。検体バイナリはインデックスしない運用と両立。</li>
+    <li><strong>オフライン・機密</strong>: 100% ローカル SQLite のため、顧客案件コードをクラウドに送らない方針と整合（§90-security-ethics と一致）。</li>
+  </ol>
+
+  <h3>導入時の推奨手順（Cursor）</h3>
+  <pre><code># 1. インストール（Windows）
+irm https://raw.githubusercontent.com/matrix9neonebuchadnezzar2199-sketch/codegraph/main/install.ps1 | iex
+# または: npm i -g @colbymchenry/codegraph
+
+# 2. Cursor 向け設定
+codegraph install --target=cursor --location=global --yes
+
+# 3. 各プロジェクト
+cd F:\Cursor\your-tool
+codegraph init -i   # インデックス + .cursor/rules/codegraph.mdc
+
+# 4. Cursor を再起動（MCP 読み込み）</code></pre>
+
+  <h3>リスク・効果を下げる要因</h3>
+  <ul>
+    <li><strong>初回インデックス</strong>: 大リポジトリでは数分〜十数分。完了前は MCP が「not initialized」。</li>
+    <li><strong>rules 未配置</strong>: global のみで <code>init -i</code> していないプロジェクトでは、エージェントが CodeGraph を使わずオーバーヘッドのみ、という README 上の注意と一致。</li>
+    <li><strong>動的言語・メタプログラミング</strong>: 解決できない呼び出しは trace で「動的ディスパッチ」注記 — 完全自動フロー追跡ではない。</li>
+    <li><strong>WSL / ネットワークドライブ</strong>: WAL 無効時は <code>database is locked</code> の可能性（README 記載）。</li>
+  </ul>
+
+  <h3>総合予測</h3>
+  <p>マスターの Cursor 運用（複数ツールリポジトリ・横断ルール・長時間 Agent セッション）では、<strong>構造理解・影響調査フェーズで 30〜50% 程度のトークン/ツールコール削減</strong>が現実的な見込み。字面検索・設定ファイル・ドキュメント編集のみのタスクでは効果は限定的。日本語化後はインストーラと MCP 説明文が読みやすくなり、<strong>導入率（init 実行・rules 維持）</strong>が上がる副次効果が見込める。</p>
+</section>
+
+<section class="entry" id="sec-quality-i18n">
+  <h2>3. コード品質・エラー耐性・完全日本語化（i18n）設計</h2>
+  <p class="meta">
+    <span class="date">2026-05-25</span>
+    <span class="tag tag-type">analysis</span>
+    <span class="tag tag-scope">docs</span>
+    <span class="tag tag-warn">warn</span>
+  </p>
+
+  <h3>品質評価サマリ</h3>
+  <table>
+    <thead><tr><th>観点</th><th>評価</th><th>根拠</th></tr></thead>
+    <tbody>
+      <tr><td>テスト網羅</td><td><span class="tag tag-ok">良好</span></td><td>803 passed / 817 total（2026-05-25 Windows 実行）。security・MCP・installer・framework 統合あり</td></tr>
+      <tr><td>エラー型</td><td><span class="tag tag-ok">良好</span></td><td><code>CodeGraphError</code> 階層 + Logger。握り潰しはテストで抑止</td></tr>
+      <tr><td>並行・ロック</td><td><span class="tag tag-ok">良好</span></td><td>FileLock、WAL、concurrent-locking テスト</td></tr>
+      <tr><td>プラットフォーム</td><td><span class="tag tag-warn">注意</span></td><td>Node 25 禁止、WASM OOM 対策（liftoff-only 再実行）。Windows で mcp-roots 系 5 テストがタイムアウト（stdio モックの環境依存の可能性）</td></tr>
+      <tr><td>依存関係</td><td><span class="tag tag-warn">注意</span></td><td><code>npm audit</code>: moderate 6 / high 2（dev 依存中心の想定 — 本番バンドルへの影響は要確認）</td></tr>
+      <tr><td>i18n</td><td><span class="tag tag-err">未実装</span></td><td>CLI/MCP/インストーラ/エラー文言は英語固定。<code>site/</code> の Docusaurus のみ i18next 依存</td></tr>
+    </tbody>
+  </table>
+
+  <h3>既知のバグ・エラーリスク</h3>
+  <ul>
+    <li><strong>Cursor cwd 問題</strong>: <code>--path</code> 未設定の手動 mcp.json では常に「not initialized」— インストーラ経由必須。</li>
+    <li><strong>Node 25 / 古い Node</strong>: 起動時に明示バナーで exit（意図的）。</li>
+    <li><strong>巨大ファイル・生成物</strong>: .gitignore 外の committed vendor/dist はインデックスされる — 運用で .gitignore 管理。</li>
+    <li><strong>MCP ツール説明の英語長文</strong>: Cursor のツール選択にそのまま載る — 日本語化でトークン削減の副効果は小さいが、人間可読性は向上。</li>
+    <li><strong>Windows CI ギャップ</strong>: mcp-roots タイムアウトは CI 未整備時に regression を見逃す可能性。</li>
+  </ul>
+
+  <h3>完全日本語化 — 設計方針</h3>
+  <p>「完全日本語化」は <strong>ユーザー向け文字列の 100% ロケール化</strong> を指し、シンボル名・ファイルパス・抽出されたソースコードは翻訳対象外とする。</p>
+
+  <h3>文字列レイヤ（推奨分割）</h3>
+  <table>
+    <thead><tr><th>レイヤ</th><th>現状</th><th>ja 化方法</th><th>優先度</th></tr></thead>
+    <tbody>
+      <tr><td>L1 CLI / インストーラ</td><td><code>@clack/prompts</code>、<code>codegraph.ts</code> の console</td><td><code>src/i18n/ja.json</code> + <code>t(key)</code></td><td>P0</td></tr>
+      <tr><td>L2 MCP tool <code>description</code></td><td><code>tools.ts</code> 英語長文</td><td>ロケール別 description オブジェクト、または <code>CODEGRAPH_LANG=ja</code> で切替</td><td>P0（Cursor 効果に直結）</td></tr>
+      <tr><td>L3 エージェント指示</td><td><code>instructions-template.ts</code>、<code>codegraph.mdc</code></td><td><code>instructions-template.ja.ts</code>、インストーラで言語選択</td><td>P0</td></tr>
+      <tr><td>L4 MCP 応答本文</td><td>markdown 英語（budget 文言等）</td><td>formatter 層で <code>locale</code> 引数</td><td>P1</td></tr>
+      <tr><td>L5 README / site</td><td>英語</td><td>README.ja.md、Docusaurus <code>ja</code> locale</td><td>P1</td></tr>
+      <tr><td>L6 エラー <code>message</code></td><td>英語</td><td>error code → メッセージマップ（ログは英語残し可）</td><td>P2</td></tr>
+    </tbody>
+  </table>
+
+  <h3>実装スケッチ</h3>
+  <pre><code>// src/i18n/index.ts（新規）
+export type Locale = 'en' | 'ja';
+export function resolveLocale(): Locale {
+  const env = process.env.CODEGRAPH_LANG?.toLowerCase();
+  if (env === 'ja' || env === 'ja-jp') return 'ja';
+  return 'en';
+}
+export function t(key: string, vars?: Record&lt;string, string&gt;): string { ... }
+
+// インストーラ
+codegraph install --lang=ja --target=cursor
+
+// MCP: initialize 時に clientInfo から推測はせず、明示 env のみ（再現性）</code></pre>
+
+  <h3>フォーク（codegraph-jp）向け追加要件</h3>
+  <ul>
+    <li><code>package.json</code> の <code>name</code> / インストール URL を <code>matrix9neonebuchadnezzar2199-sketch/codegraph</code> に合わせる（現状 upstream npm 名のまま）。</li>
+    <li>デフォルトロケール <code>ja</code>、<code>--lang=en</code> で英語に戻す（後方互換）。</li>
+    <li>Cursor rules の日本語版: 「構造質問は codegraph_* を優先」— 既存 <code>03-ai-behavior</code> ・ OPSEC ルールとの文体統一。</li>
+    <li>翻訳 QA: MCP description はモデルが読むため、<strong>簡潔な日本語</strong>（英語より短くても意味が通る）を優先。長文直訳は避ける。</li>
+  </ul>
+
+  <h3>品質ゲート（日本語化 PR 時）</h3>
+  <ul>
+    <li>既存 Vitest 全 pass（Windows で mcp-roots を <code>skipIf(process.platform==='win32')</code> するか、タイムアウト延長）</li>
+    <li>スナップショット: インストーラが書く <code>codegraph.mdc</code> の ja 版 golden file</li>
+    <li>手動: Cursor で <code>codegraph_status</code> → <code>codegraph_context</code> が日本語説明で表示されること</li>
+  </ul>
+</section>
+
+<section class="entry" id="sec-features">
+  <h2>4. 追加すべき機能の提案</h2>
+  <p class="meta">
+    <span class="date">2026-05-25</span>
+    <span class="tag tag-type">analysis</span>
+    <span class="tag tag-scope">tool</span>
+  </p>
+
+  <h3>優先度付き提案</h3>
+  <table>
+    <thead><tr><th>優先</th><th>機能</th><th>理由（マスター / fork 向け）</th></tr></thead>
+    <tbody>
+      <tr><td>P0</td><td><strong>日本語ロケール（§3 設計）</strong></td><td>fork 目的と一致。Cursor 導入の心理的ハードル低下</td></tr>
+      <tr><td>P0</td><td><strong>fork 用 install.ps1 / npm パッケージ名</strong></td><td>upstream URL ではなく sketch リポジトリを指す</td></tr>
+      <tr><td>P1</td><td><strong>Cursor 向け「初回セットアップ」検出</strong></td><td><code>codegraph_status</code> 失敗時に Agent 向け日本語ヒントを MCP エラー本文で返す</td></tr>
+      <tr><td>P1</td><td><strong>マルチルート / モノレポ</strong></td><td><code>F:\Cursor</code> 横断ツールでは子パッケージごとに <code>.codegraph</code> が分散 — workspace 内の nearest root 可視化ツール</td></tr>
+      <tr><td>P1</td><td><strong><code>codegraph affected</code> の Cursor タスク連携</strong></td><td>変更ファイルからテスト特定 → Agent の「テスト実行」判断を支援（既存 CLI あり、MCP 化）</td></tr>
+      <tr><td>P2</td><td><strong>YARA / ルールファイルの軽量インデックス</strong></td><td>文字列・メタは FTS のみ、tree-sitter 非対応拡張子の扱いを定義（解析ツール向け）</td></tr>
+      <tr><td>P2</td><td><strong>インデックス除外のプロジェクト設定</strong></td><td>ゼロ config 方針と両立する <code>.codegraph/config.toml</code> オプトイン（samples/ 等）</td></tr>
+      <tr><td>P2</td><td><strong>Windows CI</strong></td><td>mcp-roots タイムアウトの再発防止</td></tr>
+      <tr><td>P3</td><td><strong>IDE ステータスバー連携</strong></td><td>インデックス進捗・鮮度を Cursor 外から確認（LSP 不要の JSON ステータスファイル）</td></tr>
+      <tr><td>P3</td><td><strong>CHANGELOG / リリースの日本語要約</strong></td><td>fork 利用者向け</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Cursor + 既存ルールとの統合案</h3>
+  <p>マスターの <code>F:\Cursor\.cursor\rules/</code> に、CodeGraph 利用時と解析データ貼り付け時の境界を 1 本の <code>codegraph-opsec.mdc</code> で明示することを推奨する（例: デコンパイル C は CodeGraph に載せない、IoC は defang opt-in）。CodeGraph 本体ではなく <strong>ワークスペースルール</strong> で実装する方が、upstream マージと両立しやすい。</p>
+
+  <h3>検証</h3>
+  <p>本レポート作成時: <code>npm test</code> — 803 passed, 5 failed（<code>mcp-roots.test.ts</code> 等）。コミットハッシュは push 後に <code>git rev-parse --short HEAD</code> で追記可能。</p>
+</section>
+
+</main>
+<footer style="margin-top:32px;padding-top:16px;border-top:1px solid var(--border);color:var(--muted);font-size:13px;">
+  管理リポジトリ: <a href="https://github.com/matrix9neonebuchadnezzar2199-sketch/codegraph">matrix9neonebuchadnezzar2199-sketch/codegraph</a> · 作成: 2026-05-25 07:34 JST
+</footer>
+</body>
+</html>
