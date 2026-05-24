@@ -89,6 +89,7 @@ export class GodotResourceExtractor {
         if (!attrs.has('parent') && !this.rootNode) this.rootNode = node;
         this.nodesByScenePath.set(scenePath, node);
         this.addNodeContainment(fileNodeId, node, attrs.get('parent'));
+        this.extractNodeInstanceReference(node.id, attrs, line, lineNumber);
         currentOwner = node;
       } else if (type === 'ext_resource') {
         const resourcePath = attrs.get('path');
@@ -127,6 +128,19 @@ export class GodotResourceExtractor {
     }
 
     this.extractInlineResourcePaths(fileNodeId);
+  }
+
+  private extractNodeInstanceReference(ownerId: string, attrs: Map<string, string>, line: string, lineNumber: number): void {
+    const instance = attrs.get('instance');
+    if (!instance) return;
+
+    const extResourceMatch = instance.match(/^ExtResource\("([^"]+)"\)$/);
+    if (!extResourceMatch) return;
+
+    const resourcePath = this.extResources.get(extResourceMatch[1]!);
+    if (!resourcePath) return;
+
+    this.addReference(ownerId, resourcePath, 'references', lineNumber, line.indexOf('instance='));
   }
 
   private extractSectionProperty(owner: Node, line: string, lineNumber: number): void {
