@@ -86,6 +86,7 @@ export class GDScriptExtractor {
   private errors: ExtractionError[] = [];
   private stringConstants = new Map<string, string>();
   private dynamicNodeNames = new Set<string>();
+  private nodePathAliases = new Map<string, Map<string, string>>();
 
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
@@ -288,7 +289,7 @@ export class GDScriptExtractor {
         this.addReference(owner, resourceMatch[1]!, 'references', lineNumber, resourceMatch.index);
       }
 
-      this.extractNodePathReferences(owner, code, lineNumber, scriptClass);
+      this.extractNodePathReferences(owner, code, lineNumber, scriptClass, functionOwner);
       this.extractSignalReferences(functionOwner, code, lineNumber);
       this.extractCallableReferences(functionOwner, code, lineNumber);
 
@@ -404,7 +405,7 @@ export class GDScriptExtractor {
     }
   }
 
-  private extractNodePathReferences(owner: string, code: string, lineNumber: number, scriptClass: Node | null): void {
+  private extractNodePathReferences(owner: string, code: string, lineNumber: number, scriptClass: Node | null, aliasOwner: string): void {
     const shorthandRegex = /[$%]([A-Za-z_]\w*(?:\/[A-Za-z_]\w*)*)/g;
     let shorthandMatch;
     while ((shorthandMatch = shorthandRegex.exec(code)) !== null) {
@@ -431,6 +432,8 @@ export class GDScriptExtractor {
     while ((formattedNodePathVariableMatch = formattedNodePathVariableRegex.exec(code)) !== null) {
       const formattedNodePath = this.formattedNodePathBase(formattedNodePathVariableMatch[1]!);
       if (formattedNodePath) {
+        const variableName = (code.slice(formattedNodePathVariableMatch.index).match(/\b([A-Za-z_]\w*(?:_name|_path))\s*:=?/) || [])[1];
+        if (variableName) this.addNodePathAlias(aliasOwner, variableName, formattedNodePath);
         this.addNodePathReference(owner, formattedNodePath, lineNumber, formattedNodePathVariableMatch.index, scriptClass);
       }
     }
@@ -439,7 +442,7 @@ export class GDScriptExtractor {
     let getNodeConstantMatch;
     while ((getNodeConstantMatch = getNodeConstantRegex.exec(code)) !== null) {
       const constName = getNodeConstantMatch[1]!;
-      const nodePath = this.stringConstants.get(constName);
+      const nodePath = this.lookupNodePathAlias(aliasOwner, constName) ?? this.stringConstants.get(constName);
       if (!nodePath) continue;
       this.addNodePathReference(owner, nodePath, lineNumber, getNodeConstantMatch.index, scriptClass);
     }
@@ -471,6 +474,15 @@ export class GDScriptExtractor {
     );
     node.signature = signature;
     this.addContains(owner, node.id);
+  }
+
+  private addNodePathAlias(owner: string, alias: string, nodePath: string): void {
+    if (!this.nodePathAliases.has(owner)) this.nodePathAliases.set(owner, new Map());
+    this.nodePathAliases.get(owner)!.set(alias, nodePath);
+  }
+
+  private lookupNodePathAlias(owner: string, alias: string): string | undefined {
+    return this.nodePathAliases.get(owner)?.get(alias);
   }
 
   private extractFormattedNodePathBase(code: string): string | null {

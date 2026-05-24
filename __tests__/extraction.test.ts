@@ -161,6 +161,7 @@ func _ready() -> void:
   var track = get_node("%TrackPanel")
   var row_name := "CardReward%d" % reward_index
   var extra_row = get_node_or_null("CardReward%d" % reward_index)
+  var existing = get_node_or_null(row_name)
   var reward_button = get_node_or_null("LootCardRewardButton")
   reward_button = Button.new()
   reward_button.name = "LootCardRewardButton"
@@ -218,6 +219,7 @@ func _on_health_changed(value: int) -> void:
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/TrackPanel')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardReward')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/CardReward')).toBe(true);
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'references' && r.referenceName === 'CardReward')).toHaveLength(3);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'LootCardRewardButton')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'Color')).toBe(false);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'setup_player')).toBe(true);
