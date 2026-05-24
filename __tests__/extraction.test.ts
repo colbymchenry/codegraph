@@ -144,6 +144,8 @@ class_name PlayerController
 
 signal health_changed(value: int)
 const MAX_HP := 100
+const TEMPLATE_PATH := "MarginContainer/StatusFlow/StatusIconTemplate"
+const CARD_ROW_PATH := "RewardList/CardRewardTemplate"
 @onready var sprite := $Sprite2D
 @export_range(0.0, 1.0, 0.1) var move_ratio := 0.5
 static var shared_counter := 0
@@ -154,6 +156,8 @@ func _ready() -> void:
   $Sprite2D.play()
   %StatusPanel.refresh()
   var template = $MarginContainer/StatusFlow/StatusIconTemplate
+  var template_from_const = get_node_or_null(TEMPLATE_PATH)
+  var row_from_const = get_node_or_null(CARD_ROW_PATH)
   var track = get_node("%TrackPanel")
   $Sprite2D.pressed.connect(_on_sprite_pressed)
   connect("health_changed", Callable(self, "_on_health_changed"))
@@ -178,6 +182,8 @@ func _on_health_changed(value: int) -> void:
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === '_ready')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'setup_player')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'MAX_HP')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'TEMPLATE_PATH')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'CARD_ROW_PATH')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'sprite')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'move_ratio')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'shared_counter')).toBe(true);
@@ -198,6 +204,9 @@ func _on_health_changed(value: int) -> void:
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusIconTemplate')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'MarginContainer/StatusFlow/StatusIconTemplate')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/MarginContainer/StatusFlow/StatusIconTemplate')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardRewardTemplate')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'RewardList/CardRewardTemplate')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/RewardList/CardRewardTemplate')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'TrackPanel')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/TrackPanel')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'Color')).toBe(false);

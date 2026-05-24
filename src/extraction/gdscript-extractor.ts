@@ -84,6 +84,7 @@ export class GDScriptExtractor {
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
   private errors: ExtractionError[] = [];
+  private stringConstants = new Map<string, string>();
 
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
@@ -220,6 +221,10 @@ export class GDScriptExtractor {
         const node = this.createDeclarationNode(kind, varMatch[2]!, rawLine, lineNumber, indent);
         node.signature = trimmed;
         this.addContains(scopes[scopes.length - 1]!.id, node.id);
+        if (kind === 'constant') {
+          const stringValueMatch = trimmed.match(/:=?\s*["']([^"']+)["']/);
+          if (stringValueMatch) this.stringConstants.set(varMatch[2]!, stringValueMatch[1]!);
+        }
       }
     }
   }
@@ -399,6 +404,15 @@ export class GDScriptExtractor {
     let getNodeMatch;
     while ((getNodeMatch = getNodeRegex.exec(code)) !== null) {
       this.addNodePathReference(owner, getNodeMatch[1]!, lineNumber, getNodeMatch.index, scriptClass);
+    }
+
+    const getNodeConstantRegex = /\b(?:get_node|get_node_or_null|has_node)\s*\(\s*([A-Za-z_]\w*)\s*\)/g;
+    let getNodeConstantMatch;
+    while ((getNodeConstantMatch = getNodeConstantRegex.exec(code)) !== null) {
+      const constName = getNodeConstantMatch[1]!;
+      const nodePath = this.stringConstants.get(constName);
+      if (!nodePath) continue;
+      this.addNodePathReference(owner, nodePath, lineNumber, getNodeConstantMatch.index, scriptClass);
     }
   }
 
