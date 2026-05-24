@@ -29,6 +29,7 @@ function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
   return spawn(process.execPath, [BIN, 'serve', '--mcp', '--no-watch'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEGRAPH_NO_RELAUNCH: '1' },
   }) as ChildProcessWithoutNullStreams;
 }
 
@@ -84,9 +85,12 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
     projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-proj-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
+  afterEach(async () => {
+    if (child) {
+      if (!child.killed) child.kill('SIGKILL');
+      if (child.exitCode === null) {
+        await new Promise<void>(resolve => child!.once('close', resolve));
+      }
       child = null;
     }
     fs.rmSync(cwdDir, { recursive: true, force: true });
