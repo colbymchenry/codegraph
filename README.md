@@ -263,25 +263,21 @@ CodeGraph builds a semantic knowledge graph of codebases for faster, smarter cod
 
 ### If `.codegraph/` exists in the project
 
-**NEVER call `codegraph_explore` or `codegraph_context` directly in the main session.** These tools return large amounts of source code that fills up main session context. Instead, ALWAYS spawn an Explore agent for any exploration question (e.g., "how does X work?", "explain the Y system", "where is Z implemented?").
+**Answer directly with CodeGraph — don't delegate exploration to a file-reading sub-agent or a grep/read loop.** CodeGraph *is* the pre-built search index; re-deriving its answers with grep + Read repeats work it already did and costs more for the same result. For "how does X work?", architecture, trace, or where-is-X questions, answer in a handful of CodeGraph calls and stop — typically with **zero file reads**. The returned source is complete and authoritative: treat it as already read and do not re-open those files. Reach for raw Read/Grep only to confirm a specific detail CodeGraph didn't cover.
 
-**When spawning Explore agents**, include this instruction in the prompt:
-
-> This project has CodeGraph initialized (.codegraph/ exists). Use `codegraph_explore` as your PRIMARY tool — it returns full source code sections from all relevant files in one call.
->
-> **Rules:**
-> 1. Follow the explore call budget in the `codegraph_explore` tool description — it scales automatically based on project size.
-> 2. Do NOT re-read files that codegraph_explore already returned source code for. The source sections are complete and authoritative.
-> 3. Only fall back to grep/glob/read for files listed under "Additional relevant files" if you need more detail, or if codegraph returned no results.
-
-**The main session may only use these lightweight tools directly** (for targeted lookups before making edits, not for exploration):
+**Tool selection by intent:**
 
 | Tool | Use For |
 |------|---------|
-| `codegraph_search` | Find symbols by name |
-| `codegraph_callers` / `codegraph_callees` | Trace call flow |
+| `codegraph_context` | Map a task / feature / area first — composes search + node + callers + callees in one call |
+| `codegraph_trace` | "How does X reach Y" — the call path, each hop's body inline (follows dynamic-dispatch hops grep can't) |
+| `codegraph_explore` | Survey several related symbols' source in ONE budget-capped call |
+| `codegraph_search` | Find a symbol by name |
+| `codegraph_callers` / `codegraph_callees` | Walk call flow one hop at a time |
 | `codegraph_impact` | Check what's affected before editing |
-| `codegraph_node` | Get a single symbol's details |
+| `codegraph_node` | Get a single symbol's source / signature |
+
+A direct CodeGraph answer is a handful of calls; a grep/read exploration is dozens.
 
 ### If `.codegraph/` does NOT exist
 
@@ -297,34 +293,23 @@ At the start of a session, ask the user if they'd like to initialize CodeGraph:
 ## How It Works
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Claude Code                               │
-│                                                                  │
-│  "Implement user authentication"                                 │
-│           │                                                      │
-│           ▼                                                      │
-│  ┌─────────────────┐      ┌─────────────────┐                   │
-│  │  Explore Agent  │ ──── │  Explore Agent  │                   │
-│  └────────┬────────┘      └────────┬────────┘                   │
-│           │                        │                             │
-└───────────┼────────────────────────┼─────────────────────────────┘
-            │                        │
-            ▼                        ▼
 ┌───────────────────────────────────────────────────────────────────┐
-│                     CodeGraph MCP Server                          │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │
-│  │   Search    │  │   Callers   │  │   Context   │               │
-│  │  "auth"     │  │  "login()"  │  │  for task   │               │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘               │
-│         │                │                │                       │
-│         └────────────────┼────────────────┘                       │
-│                          ▼                                        │
-│              ┌───────────────────────┐                            │
-│              │   SQLite Graph DB     │                            │
-│              │   • 387 symbols       │                            │
-│              │   • 1,204 edges       │                            │
-│              │   • Instant lookups   │                            │
-│              └───────────────────────┘                            │
+│                            Claude Code                            │
+│                                                                   │
+│   "How does a request reach the database?"                        │
+│       calls CodeGraph tools directly — no Explore sub-agent       │
+│                                 │                                 │
+└─────────────────────────────────┬─────────────────────────────────┘
+                                  │
+                                  ▼
+┌───────────────────────────────────────────────────────────────────┐
+│                        CodeGraph MCP Server                       │
+│                                                                   │
+│       context · trace · explore · callers · callees · impact      │
+│                                 │                                 │
+│                                 ▼                                 │
+│                       SQLite knowledge graph                      │
+│          symbols · edges · files · FTS5 full-text search          │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
