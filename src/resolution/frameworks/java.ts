@@ -10,7 +10,7 @@ import { stripCommentsForRegex } from '../strip-comments';
 
 export const springResolver: FrameworkResolver = {
   name: 'spring',
-  languages: ['java'],
+  languages: ['java', 'kotlin'],
 
   detect(context: ResolutionContext): boolean {
     // Check for pom.xml with Spring
@@ -119,21 +119,35 @@ export const springResolver: FrameworkResolver = {
   },
 
   extract(filePath, content) {
-    if (!filePath.endsWith('.java')) return { nodes: [], references: [] };
+    // Spring Boot is used from both Java and Kotlin (identical @GetMapping etc.
+    // annotations); the difference is method syntax — Kotlin `fun name(...)` vs
+    // Java `public X name(...)` — handled in the method regex below.
+    if (!filePath.endsWith('.java') && !filePath.endsWith('.kt')) return { nodes: [], references: [] };
     const nodes: Node[] = [];
     const references: UnresolvedRef[] = [];
     const now = Date.now();
+    const lang: 'java' | 'kotlin' = filePath.endsWith('.kt') ? 'kotlin' : 'java';
     const safe = stripCommentsForRegex(content, 'java');
 
-    // @GetMapping("/path"), @PostMapping(value = "/path"), @RequestMapping("/path")
-    const mappingRegex = /@(GetMapping|PostMapping|PutMapping|PatchMapping|DeleteMapping|RequestMapping)\s*\(\s*(?:value\s*=\s*|path\s*=\s*)?["']([^"']+)["'][^)]*\)/g;
+    // Class-level @RequestMapping prefix (an @RequestMapping whose tail leads to a
+    // `class`). Joined onto each method's path — and, crucially, NOT treated as a
+    // route itself (the old regex did, creating one bogus class route and missing
+    // every BARE method mapping like `@PostMapping` with the path on the class).
+    let classPrefix = '';
+    const cls = /@RequestMapping\s*\(([^)]*)\)\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+|open\s+|data\s+|sealed\s+)*class\b/.exec(safe);
+    if (cls) classPrefix = parseMappingPath(cls[1]!);
+
+    const VERB: Record<string, string> = {
+      GetMapping: 'GET', PostMapping: 'POST', PutMapping: 'PUT', PatchMapping: 'PATCH', DeleteMapping: 'DELETE',
+    };
+    // Verb-specific method mappings — always method-level, BARE or with a path.
+    const mappingRegex = /@(GetMapping|PostMapping|PutMapping|PatchMapping|DeleteMapping)\b\s*(\([^)]*\))?/g;
     let match: RegExpExecArray | null;
     while ((match = mappingRegex.exec(safe)) !== null) {
-      const [, mappingName, routePath] = match;
+      const method = VERB[match[1]!]!;
+      const sub = parseMappingPath((match[2] || '').replace(/^\(|\)$/g, ''));
+      const routePath = joinPath(classPrefix, sub);
       const line = safe.slice(0, match.index).split('\n').length;
-      const method =
-        mappingName === 'RequestMapping' ? 'ANY' : mappingName!.replace(/Mapping$/, '').toUpperCase();
-
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${method}:${routePath}`,
         kind: 'route',
@@ -144,25 +158,56 @@ export const springResolver: FrameworkResolver = {
         endLine: line,
         startColumn: 0,
         endColumn: match[0].length,
-        language: 'java',
+        language: lang,
         updatedAt: now,
       };
       nodes.push(routeNode);
 
-      // Look for the next public/private/protected method after the annotation
-      const tail = safe.slice(match.index + match[0].length);
-      const methodMatch = tail.match(/\b(?:public|private|protected)\s+[^;{]*?\s+(\w+)\s*\(/);
+      // Method it decorates: first declared method after (skip stacked annotations;
+      // Java puts the return type before the name). Bounded so we don't grab a far one.
+      const tail = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
+      const methodMatch = tail.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
       if (methodMatch) {
         references.push({
           fromNodeId: routeNode.id,
-          referenceName: methodMatch[1]!,
+          referenceName: (methodMatch[1] ?? methodMatch[2])!,
           referenceKind: 'references',
           line,
           column: 0,
           filePath,
-          language: 'java',
+          language: lang,
         });
       }
+    }
+
+    // Method-level @RequestMapping (older style: `@RequestMapping(value="/x",
+    // method=RequestMethod.GET)` on a method). The class-level @RequestMapping is
+    // the prefix (handled above) — skip it here so it isn't double-counted.
+    const reqRe = /@RequestMapping\b\s*(\([^)]*\))?/g;
+    while ((match = reqRe.exec(safe)) !== null) {
+      const args = (match[1] || '').replace(/^\(|\)$/g, '');
+      const after = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
+      if (/^\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+|open\s+|data\s+|sealed\s+)*class\b/.test(after)) continue; // class-level prefix
+      const methodMatch = after.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
+      if (!methodMatch) continue;
+      const verbM = args.match(/method\s*=\s*(?:RequestMethod\.)?(\w+)/);
+      const method = verbM ? verbM[1]!.toUpperCase() : 'ANY';
+      const routePath = joinPath(classPrefix, parseMappingPath(args));
+      const line = safe.slice(0, match.index).split('\n').length;
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${method}:${routePath}`,
+        kind: 'route',
+        name: `${method} ${routePath}`,
+        qualifiedName: `${filePath}::route:${routePath}`,
+        filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length, language: lang, updatedAt: now,
+      };
+      nodes.push(routeNode);
+      references.push({
+        fromNodeId: routeNode.id,
+        referenceName: (methodMatch[1] ?? methodMatch[2])!,
+        referenceKind: 'references',
+        line, column: 0, filePath, language: lang,
+      });
     }
 
     return { nodes, references };
@@ -178,6 +223,18 @@ const COMPONENT_DIRS = ['/component/', '/components/', '/config/'];
 
 const CLASS_KINDS = new Set(['class']);
 const SERVICE_KINDS = new Set(['class', 'interface']);
+
+/** Path string from a mapping's args (`"/x"`, `value = "/x"`, `path = "/x"`); '' if bare. */
+function parseMappingPath(args: string): string {
+  const m = args.match(/["']([^"']*)["']/);
+  return m ? m[1]! : '';
+}
+
+/** Join a class-level prefix and a method sub-path into one normalized `/path`. */
+function joinPath(prefix: string, sub: string): string {
+  const parts = [prefix, sub].map((p) => p.replace(/^\/+|\/+$/g, '')).filter(Boolean);
+  return '/' + parts.join('/');
+}
 
 /**
  * Resolve a symbol by name using indexed queries instead of scanning all files.

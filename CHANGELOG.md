@@ -7,6 +7,141 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-05-24
+
+### Added
+- **Framework-aware route resolution — `request → route → handler → service`
+  flows now resolve end-to-end across the supported stacks.** Added or fixed
+  routing for Express (inline arrow handlers → services), Rails, Spring (Java +
+  Kotlin; bare and class-prefixed mappings), Django/DRF (`router.register` →
+  ViewSet), Laravel (`Controller@method`), Flask/FastAPI (decorator stacks,
+  empty-path routers, Flask-RESTful `add_resource`), Gin/chi (group-var routing),
+  ASP.NET (feature-folder + bare attribute routes), Drupal, Rust (Axum chained
+  methods, actix builder API), Vapor (Swift grouped routes), Play (`conf/routes`),
+  Vue/Nuxt SFC templates, Svelte/SvelteKit, and React Router (`<Route>` JSX +
+  object data-router).
+- **Dynamic-dispatch flow synthesis — `codegraph_trace`, `codegraph_callees`, and
+  `codegraph_explore` now follow flows that have no static call edge.** Bridged
+  channels: callback/observer registration, EventEmitter (`on`/`emit`), React
+  re-render (`setState` → `render`) and JSX children, Flutter `setState` → `build`,
+  C++ virtual overrides, and Java/Kotlin interface → implementation dispatch
+  (e.g. Spring `@Autowired svc.list()` → the impl). Each synthesized hop is
+  labeled inline in `trace` with where it was wired up.
+- **`CODEGRAPH_MCP_TOOLS` — trim the exposed MCP tool surface.** Set it to a
+  comma-separated list of tool names (e.g. `trace,search,node,context`) to expose
+  only those codegraph tools over MCP; unset exposes all of them. Names match on
+  the short form, so `trace` and `codegraph_trace` are equivalent. Lets you
+  constrain an agent to a minimal surface (or A/B-test tool selection) without
+  editing the client's MCP config. Inert by default.
+- **Release archives now ship with a `SHA256SUMS` file**, and the npm launcher
+  verifies the bundle it downloads against it — a mismatch aborts before anything
+  runs. Releases published before this change have no checksum file, so the
+  verification is skipped (not failed) when none is available.
+
+### Changed
+- **`codegraph_trace` now returns a self-contained flow dossier.** Each hop on
+  the path is shown with its full body inline (previously just the call-site
+  line), and the destination's own outgoing calls are appended — so one trace
+  call usually answers a "how does X reach Y" flow question without a follow-up
+  `codegraph_explore`/`codegraph_node`/Read. Measured across real repos: fewer
+  tool calls and lower cost than the prior path-only output, with no wall-clock
+  regression.
+- **`codegraph_node` and `codegraph_trace` now emit line-numbered source**
+  (`cat -n` style, matching `codegraph_explore` and Read), so an agent can cite
+  or edit exact lines without re-reading the file just to recover line numbers.
+- **`codegraph_explore` now leads with the execution flow** when its query names
+  the symbols of a flow. Agents call `explore` far more than `trace`, passing a
+  bag of symbol names that usually spans the flow they're investigating
+  (`PmsProductController getList PmsProductService list PmsProductServiceImpl`);
+  `explore` now finds the call path *among those named symbols* — riding
+  synthesized dynamic-dispatch edges (callback / React re-render / JSX child /
+  interface→impl) — and shows it first. So a flow question answered through
+  `explore` gets the trace-quality path without the agent having to switch tools.
+  Scoped to the named symbols (no wrong-feature wandering) and bridge-capped (no
+  god-function fan-out); absent when the query is fuzzy or has no connected chain.
+
+### Fixed
+- **Static-extraction & resolution correctness fixes** underpinning the framework
+  work above: C++ inheritance (`base_class_clause` was unhandled, so C++ `extends`
+  edges were missing), Dart method body ranges (methods were extracted
+  signature-only), a Python builtin-name handler guard (handlers named
+  `index`/`get`/`update` were silently dropped), and an explore output-budget
+  regression that under-returned source on god-file repos.
+- **Orphaned `codegraph serve --mcp` processes after a parent SIGKILL.** When
+  the MCP host (Claude Code, opencode, …) was force-killed — OOM killer, a
+  `kill -9`, a container teardown — the child kept running indefinitely on
+  Linux, holding inotify watches, file descriptors, and the SQLite WAL. The
+  kernel doesn't propagate parent death to children, and the stdin
+  `end`/`close` handlers we relied on don't always fire. The MCP server now
+  polls `process.ppid` and shuts down the moment it changes from the value
+  observed at startup; the poll interval is `CODEGRAPH_PPID_POLL_MS` (default
+  `5000`, `0` disables). Resolves
+  [#277](https://github.com/colbymchenry/codegraph/issues/277).
+
+- **`codegraph: no prebuilt bundle for <platform>` after installing through a
+  registry mirror.** Installing `@colbymchenry/codegraph` from a registry that
+  hadn't mirrored the matching per-platform package — most often the
+  npmmirror/cnpm mirrors, but any lazily-syncing mirror or corporate proxy can
+  do it — left every command failing with `no prebuilt bundle for <platform>`.
+  The runtime ships as a per-platform `optionalDependency`, and npm treats an
+  optional package it can't fetch as a success and silently skips it, so the
+  bundle simply went missing. The launcher now self-heals: when the platform
+  bundle isn't installed, it downloads the same archive from GitHub Releases
+  (cached under `~/.codegraph/bundles/` for next time) and runs that — so a
+  global install works even on a mirror that never carried the platform package.
+  Set `CODEGRAPH_NO_DOWNLOAD=1` to disable the network fallback, or
+  `CODEGRAPH_DOWNLOAD_BASE=<url>` to point it at your own mirror of the release
+  archives; the standalone `install.sh` remains the no-Node alternative. Resolves
+  [#303](https://github.com/colbymchenry/codegraph/issues/303).
+- **`install.sh` failing with `403` / "could not resolve latest version" on
+  shared or cloud hosts.** The standalone installer resolved the latest release
+  through the GitHub API, whose unauthenticated limit is 60 requests/hour per IP
+  — routinely exhausted on cloud devboxes and CI where many users share an
+  address, returning `403` (issue #325). It now resolves the version from the
+  `releases/latest` web redirect, which isn't rate-limited (and still falls back
+  to the API). `CODEGRAPH_VERSION` also accepts a bare `0.9.4` in addition to
+  `v0.9.4`. Resolves
+  [#325](https://github.com/colbymchenry/codegraph/issues/325).
+
+## [0.9.3] - 2026-05-22
+
+### Added
+- **`codegraph uninstall` command.** Cleanly removes CodeGraph from every agent
+  it's configured on — Claude Code, Cursor, Codex CLI, opencode, and Hermes
+  Agent — in one step. It asks up front whether to remove the global config
+  (`~/.claude`, `~/.codex`, …) or just this project's local config (no flags
+  required), then prints exactly which agents it touched so you can see what
+  changed. `--location`, `--target`, and `--yes` are accepted for scripted /
+  non-interactive use. It removes only what `install` wrote (MCP server entry,
+  instructions block, permissions) and leaves your `.codegraph/` index alone
+  (use `codegraph uninit` for that). Resolves
+  [#313](https://github.com/colbymchenry/codegraph/issues/313) — previously the
+  only cleanup path was an npm `preuninstall` hook that the published bundle
+  never shipped, so `npm uninstall -g` left every agent pointing at a CodeGraph
+  MCP server that no longer existed.
+
+### Fixed
+- **`Fatal process out of memory: Zone` crash while indexing large projects.**
+  On Node.js 22 and 24 — including CodeGraph's own bundled runtime — running
+  `codegraph index` / `codegraph init` on a large multi-language repo could
+  abort the entire process partway through parsing with
+  `Fatal process out of memory: Zone`, even with tens of GB of RAM free (the
+  failure is in a V8-internal compilation arena, not the JS heap). The cause is
+  V8's "turboshaft" optimizing WASM compiler exhausting its Zone budget while
+  compiling tree-sitter's large WebAssembly grammars on a background thread.
+  CodeGraph now runs with V8's `--liftoff-only`, which keeps grammar compilation
+  on the baseline compiler and never reaches the optimizing tier, eliminating
+  the crash; indexing output is otherwise unchanged. The bundled launcher passes
+  the flag directly, and any other launch path (from source, `npx`, a globally
+  linked dev build) re-execs once with it automatically. Resolves
+  [#298](https://github.com/colbymchenry/codegraph/issues/298) and
+  [#293](https://github.com/colbymchenry/codegraph/issues/293). (Node 25 stays
+  blocked — its variant of this V8 bug is not resolved by `--liftoff-only`.)
+- **Cursor uninstall left an orphaned `.cursor/rules/codegraph.mdc`.** It
+  stripped the rule body but left the file and its `description: CodeGraph …`
+  frontmatter behind. The dedicated rules file is now deleted outright on
+  uninstall, while any content you added outside CodeGraph's markers is kept.
+
 ## [0.9.2] - 2026-05-21
 
 ### Added
@@ -93,6 +228,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   find its bundle. The release pipeline now verifies every package reached the
   registry (and is idempotent), so a release can't pass green-but-broken again.
 
+[0.9.4]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.4
+[0.9.3]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.3
 [0.9.2]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.2
 [0.9.1]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.1
 

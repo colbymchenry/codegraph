@@ -1,0 +1,457 @@
+---
+import '@fontsource-variable/archivo';
+import '@fontsource/ibm-plex-mono/400.css';
+import '@fontsource/ibm-plex-mono/500.css';
+import '@fontsource/ibm-plex-mono/600.css';
+import '../styles/theme.css';
+import GraphDiagram from '../components/GraphDiagram.astro';
+import { getStarsLabel } from '../lib/github';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const repo = 'https://github.com/colbymchenry/codegraph';
+const npm = 'https://www.npmjs.com/package/@colbymchenry/codegraph';
+const stars = await getStarsLabel();
+const install = 'npx @colbymchenry/codegraph';
+---
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<link rel="icon" href={`${base}/favicon.svg`} type="image/svg+xml" />
+		<title>codegraph — Understand any codebase as a graph</title>
+		<meta
+			name="description"
+			content="A local-first code-intelligence tool that turns any codebase into a queryable knowledge graph for AI coding agents."
+		/>
+		<meta property="og:title" content="codegraph" />
+		<meta property="og:description" content="Understand any codebase as a graph." />
+		<meta property="og:type" content="website" />
+		<meta name="theme-color" content="#f7f6f2" />
+	</head>
+	<body>
+		<div class="frame">
+			<header class="nav">
+				<a class="wordmark" href={`${base}/`}>codegraph</a>
+				<nav class="nav-links">
+					<a href={`${base}/getting-started/introduction`}>Docs</a>
+					<a class="opt" href={`${base}/reference/languages`}>Languages</a>
+					<a href={repo}>GitHub</a>
+					<a class="star" href={`${repo}/stargazers`}>
+						<span class="star-glyph" aria-hidden="true">★</span>{stars}
+					</a>
+				</nav>
+			</header>
+
+			<main>
+				<section class="hero">
+					<div class="hero-left">
+						<h1>Understand any codebase as a graph</h1>
+						<p class="lede">
+							A local-first code-intelligence tool that turns any codebase into a
+							queryable knowledge graph for AI coding agents.
+						</p>
+						<div class="cta">
+							<a class="btn btn-primary" href={`${base}/getting-started/quickstart`}>Get started</a>
+							<a class="btn btn-ghost" href={`${base}/getting-started/introduction`}>View documentation</a>
+						</div>
+						<div class="install" data-install={install}>
+							<code>{install}</code>
+							<button class="copy" type="button" aria-label="Copy install command">
+								<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6">
+									<rect x="9" y="9" width="11" height="11" />
+									<path d="M5 15V5a1 1 0 0 1 1-1h9" />
+								</svg>
+							</button>
+						</div>
+					</div>
+					<div class="hero-right">
+						<GraphDiagram />
+					</div>
+				</section>
+
+				<section class="features">
+					<article class="feature">
+						<svg class="ficon" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5">
+							<rect x="19" y="4" width="10" height="10" />
+							<rect x="4" y="34" width="10" height="10" />
+							<rect x="19" y="34" width="10" height="10" />
+							<rect x="34" y="34" width="10" height="10" />
+							<path d="M24 14v10M9 34v-10h30v10M24 24v10" />
+						</svg>
+						<h2>Tree-sitter parsing</h2>
+						<p>
+							Fast, incremental parsing across 20+ languages — accurate symbols and
+							edges drawn from real ASTs, not guesses.
+						</p>
+					</article>
+					<article class="feature">
+						<svg class="ficon" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5">
+							<rect x="5" y="10" width="38" height="28" />
+							<path d="M13 20l6 4-6 4M26 28h9" />
+						</svg>
+						<h2>MCP server</h2>
+						<p>
+							Expose the graph to Claude Code, Cursor, Codex, opencode, and Hermes
+							over MCP — agents answer in a handful of calls.
+						</p>
+					</article>
+					<article class="feature">
+						<svg class="ficon" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5">
+							<circle cx="16" cy="24" r="10" />
+							<circle cx="16" cy="24" r="3.5" fill="currentColor" stroke="none" />
+							<path d="M16 8v6M16 34v6M2 24h4M26 24h6M32 24l8-6M32 24l8 6" />
+							<circle cx="41" cy="17" r="2.5" />
+							<circle cx="41" cy="31" r="2.5" />
+						</svg>
+						<h2>Impact analysis</h2>
+						<p>
+							Trace callers, callees, and the full impact radius of any symbol
+							before you change a line.
+						</p>
+					</article>
+				</section>
+			</main>
+
+			<footer class="foot">
+				<span class="foot-mark">codegraph</span>
+				<nav class="foot-links">
+					<a href={`${base}/getting-started/introduction`}>Docs</a>
+					<a href={repo}>GitHub</a>
+					<a href={npm}>npm</a>
+					<a href={`${repo}/blob/main/LICENSE`}>MIT</a>
+				</nav>
+			</footer>
+		</div>
+
+		<script>
+			const wrap = document.querySelector('.install');
+			const btn = wrap?.querySelector('.copy');
+			if (wrap && btn) {
+				const original = btn.innerHTML;
+				btn.addEventListener('click', async () => {
+					try {
+						await navigator.clipboard.writeText(wrap.getAttribute('data-install') || '');
+						btn.innerHTML = '<span class="copied">Copied</span>';
+						setTimeout(() => (btn.innerHTML = original), 1400);
+					} catch {
+						/* clipboard blocked — no-op */
+					}
+				});
+			}
+		</script>
+
+		<style>
+			:global(html) {
+				background: var(--cg-paper);
+			}
+			:global(body) {
+				margin: 0;
+				font-family: var(--sl-font);
+				color: var(--cg-ink);
+				overflow-x: hidden;
+			}
+
+			.frame {
+				max-width: 1440px;
+				margin: 0 auto;
+				border: 1px solid var(--cg-rule);
+			}
+
+			/* ---- nav ---- */
+			.nav {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				padding: 1.1rem 2rem;
+				border-bottom: 1px solid var(--cg-rule);
+			}
+			.wordmark {
+				font-weight: 800;
+				font-size: 1.4rem;
+				letter-spacing: -0.035em;
+				color: var(--cg-ink);
+				text-decoration: none;
+			}
+			.nav-links {
+				display: flex;
+				align-items: center;
+				gap: 2rem;
+			}
+			.nav-links a {
+				color: var(--cg-ink);
+				text-decoration: none;
+				font-size: 0.98rem;
+			}
+			.nav-links a:not(.star):hover {
+				text-decoration: underline;
+				text-underline-offset: 4px;
+			}
+			.star {
+				display: inline-flex;
+				align-items: center;
+				gap: 0.4rem;
+				border: 1px solid var(--cg-rule);
+				padding: 0.4rem 0.85rem;
+				font-variant-numeric: tabular-nums;
+			}
+			.star:hover {
+				background: var(--cg-paper-press);
+			}
+			.star-glyph {
+				font-size: 0.85em;
+			}
+
+			/* ---- hero ---- */
+			.hero {
+				display: grid;
+				grid-template-columns: 1.05fr 0.95fr;
+				border-bottom: 1px solid var(--cg-rule);
+			}
+			.hero-left {
+				padding: 4.5rem 3rem 4rem;
+				min-width: 0; /* allow the grid cell to shrink below content width */
+			}
+			.hero-right {
+				border-inline-start: 1px solid var(--cg-rule);
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				padding: 2.5rem;
+				min-width: 0; /* let the SVG scale down instead of widening the page */
+			}
+			h1 {
+				font-size: clamp(2.4rem, 6vw, 4.6rem);
+				line-height: 0.98;
+				font-weight: 800;
+				letter-spacing: -0.04em;
+				margin: 0 0 1.6rem;
+				overflow-wrap: break-word;
+			}
+			.lede {
+				font-size: 1.18rem;
+				line-height: 1.5;
+				color: var(--cg-ink-2);
+				max-width: 34ch;
+				margin: 0 0 2.2rem;
+			}
+			.cta {
+				display: flex;
+				gap: 0.9rem;
+				margin-bottom: 1.6rem;
+				flex-wrap: wrap;
+			}
+			.btn {
+				display: inline-flex;
+				align-items: center;
+				justify-content: center;
+				padding: 0.8rem 1.5rem;
+				font-size: 1rem;
+				font-weight: 600;
+				text-decoration: none;
+				border: 1px solid var(--cg-rule);
+				transition:
+					background 0.12s ease,
+					color 0.12s ease;
+			}
+			.btn-primary {
+				background: var(--cg-ink);
+				color: var(--cg-paper);
+			}
+			.btn-primary:hover {
+				background: transparent;
+				color: var(--cg-ink);
+			}
+			.btn-ghost {
+				background: transparent;
+				color: var(--cg-ink);
+			}
+			.btn-ghost:hover {
+				background: var(--cg-paper-press);
+			}
+			.install {
+				display: inline-flex;
+				align-items: center;
+				gap: 0.5rem;
+				border: 1px solid var(--cg-rule);
+				padding: 0.5rem 0.55rem 0.5rem 0.9rem;
+				font-family: var(--sl-font-mono);
+				font-size: 0.95rem;
+			}
+			.install code {
+				font-family: inherit;
+				background: none;
+				color: var(--cg-ink);
+			}
+			.copy {
+				display: inline-flex;
+				align-items: center;
+				justify-content: center;
+				border: none;
+				background: transparent;
+				cursor: pointer;
+				padding: 0.3rem;
+				color: var(--cg-ink-2);
+			}
+			.copy:hover {
+				color: var(--cg-ink);
+			}
+			.copy :global(.copied) {
+				font-family: var(--sl-font);
+				font-size: 0.8rem;
+				padding: 0 0.2rem;
+			}
+
+			/* ---- features ---- */
+			.features {
+				display: grid;
+				grid-template-columns: repeat(3, 1fr);
+			}
+			.feature {
+				display: grid;
+				grid-template-columns: auto 1px 1fr;
+				column-gap: 1.5rem;
+				align-items: center;
+				padding: 2.6rem 2rem;
+			}
+			.feature + .feature {
+				border-inline-start: 1px solid var(--cg-rule);
+			}
+			/* full-height vertical divider between the icon and the text */
+			.feature::before {
+				content: '';
+				grid-column: 2;
+				grid-row: 1 / 3;
+				align-self: stretch;
+				width: 1px;
+				background: var(--cg-rule);
+			}
+			.ficon {
+				grid-column: 1;
+				grid-row: 1 / 3;
+				align-self: center;
+				width: 64px;
+				height: 64px;
+				color: var(--cg-ink);
+			}
+			.feature h2 {
+				grid-column: 3;
+				grid-row: 1;
+				font-size: 1.3rem;
+				font-weight: 700;
+				margin: 0 0 0.6rem;
+			}
+			.feature p {
+				grid-column: 3;
+				grid-row: 2;
+				font-size: 1rem;
+				line-height: 1.55;
+				color: var(--cg-ink-2);
+				margin: 0;
+				max-width: 34ch;
+			}
+
+			/* ---- footer ---- */
+			.foot {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				padding: 1.4rem 2rem;
+				border-top: 1px solid var(--cg-rule);
+			}
+			.foot-mark {
+				font-weight: 800;
+				letter-spacing: -0.03em;
+			}
+			.foot-links {
+				display: flex;
+				gap: 1.6rem;
+			}
+			.foot-links a {
+				color: var(--cg-ink-2);
+				text-decoration: none;
+				font-size: 0.92rem;
+			}
+			.foot-links a:hover {
+				color: var(--cg-ink);
+				text-decoration: underline;
+				text-underline-offset: 3px;
+			}
+
+			/* ---- restrained entrance ---- */
+			@media (prefers-reduced-motion: no-preference) {
+				.hero-left > * {
+					opacity: 0;
+					transform: translateY(8px);
+					animation: cg-in 0.5s ease forwards;
+				}
+				.hero-left > *:nth-child(1) {
+					animation-delay: 0.04s;
+				}
+				.hero-left > *:nth-child(2) {
+					animation-delay: 0.1s;
+				}
+				.hero-left > *:nth-child(3) {
+					animation-delay: 0.16s;
+				}
+				.hero-left > *:nth-child(4) {
+					animation-delay: 0.22s;
+				}
+				@keyframes cg-in {
+					to {
+						opacity: 1;
+						transform: none;
+					}
+				}
+			}
+
+			/* ---- responsive ---- */
+			@media (max-width: 860px) {
+				.hero {
+					grid-template-columns: 1fr;
+				}
+				.hero-right {
+					border-inline-start: none;
+					border-top: 1px solid var(--cg-rule);
+				}
+				.features {
+					grid-template-columns: 1fr;
+				}
+				.feature + .feature {
+					border-inline-start: none;
+					border-top: 1px solid var(--cg-rule);
+				}
+				.feature {
+					column-gap: 1rem;
+					padding: 2rem 1.25rem;
+				}
+				.ficon {
+					width: 48px;
+					height: 48px;
+				}
+				.nav {
+					padding: 1rem 1.25rem;
+				}
+				.nav-links {
+					gap: 0.85rem;
+					font-size: 0.85rem;
+				}
+				.nav-links .opt {
+					display: none;
+				}
+				.star {
+					display: none; /* count still lives on the GitHub page */
+				}
+				.hero-left {
+					padding: 2.75rem 1.25rem 2.5rem;
+				}
+				.foot {
+					flex-direction: column;
+					gap: 1rem;
+					align-items: flex-start;
+				}
+			}
+		</style>
+	</body>
+</html>

@@ -297,23 +297,64 @@ export const drupalResolver: FrameworkResolver = {
   name: 'drupal',
   languages: ['php', 'yaml'],
 
+  // Drupal route handlers are FQCNs (`\Drupal\…\Class::method`, the single-colon
+  // controller-service form `\Drupal\…\Class:method`, or a bare `\…\FormClass`)
+  // and hook refs are canonical `hook_*` names — none match a declared symbol, so
+  // resolveOne's pre-filter would drop them before resolve() runs. Claim the
+  // shapes resolve() handles (mirrors the Rails `controller#action` claim).
+  claimsReference(name: string): boolean {
+    return (
+      name.startsWith('hook_') ||
+      name.includes('\\') ||
+      /^[A-Za-z_]\w*::?\w+$/.test(name)
+    );
+  },
+
   detect(context: ResolutionContext): boolean {
+    // Primary: composer.json identifies a Drupal project/module/theme/profile.
+    // A contrib module often has an EMPTY `require` (no `drupal/*` dep) but still
+    // declares `"name": "drupal/<module>"` and `"type": "drupal-module"`, so check
+    // those too — checking deps alone misses every standalone contrib module.
     const composer = context.readFile('composer.json');
-    if (!composer) return false;
-    try {
-      const json = JSON.parse(composer) as { require?: Record<string, string>; 'require-dev'?: Record<string, string> };
-      const deps = { ...json.require, ...(json['require-dev'] ?? {}) };
-      return Object.keys(deps).some((k) => k.startsWith('drupal/'));
-    } catch {
-      return false;
+    if (composer) {
+      try {
+        const json = JSON.parse(composer) as {
+          name?: string;
+          type?: string;
+          require?: Record<string, string>;
+          'require-dev'?: Record<string, string>;
+        };
+        if (typeof json.name === 'string' && json.name.startsWith('drupal/')) return true;
+        if (typeof json.type === 'string' && json.type.startsWith('drupal-')) return true;
+        const deps = { ...json.require, ...(json['require-dev'] ?? {}) };
+        if (Object.keys(deps).some((k) => k.startsWith('drupal/'))) return true;
+      } catch {
+        // malformed composer.json — fall through to file-based detection
+      }
     }
+
+    // Fallback (composer-less module, or a non-Drupal composer.json): the
+    // unmistakable Drupal signature is a `*.info.yml` manifest alongside a
+    // Drupal PHP/route file. Require both so a stray `.info.yml` elsewhere
+    // doesn't trigger a false positive.
+    const files = context.getAllFiles();
+    const hasInfoYml = files.some((f) => f.endsWith('.info.yml'));
+    if (!hasInfoYml) return false;
+    return files.some(
+      (f) =>
+        f.endsWith('.routing.yml') ||
+        f.endsWith('.module') ||
+        f.endsWith('.install') ||
+        f.endsWith('.theme')
+    );
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     const name = ref.referenceName;
 
-    // _controller: '\Drupal\module\...\ClassName::methodName'
-    const controllerMatch = name.match(/^\\?(?:Drupal\\[^:]+\\)?([^\\:]+)::(\w+)$/);
+    // _controller: '\Drupal\module\...\ClassName::methodName' (double colon) or the
+    // single-colon controller-service form '\Drupal\...\ClassName:methodName'.
+    const controllerMatch = name.match(/^\\?(?:Drupal\\[^:]+\\)?([^\\:]+):{1,2}(\w+)$/);
     if (controllerMatch) {
       const [, className, methodName] = controllerMatch;
       const classNodes = context.getNodesByName(className!);
@@ -328,8 +369,8 @@ export const drupalResolver: FrameworkResolver = {
       }
     }
 
-    // _form / _entity_form: '\Drupal\module\...\ClassName'  (no ::method)
-    if (name.includes('\\') && !name.includes('::')) {
+    // _form / _entity_form: '\Drupal\module\...\ClassName'  (bare FQCN, no method)
+    if (name.includes('\\') && !name.includes(':')) {
       const className = lastSegment(name);
       if (className) {
         const classNodes = context.getNodesByName(className);

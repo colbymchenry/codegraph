@@ -132,6 +132,14 @@ export interface FrameworkResolver {
   /** Resolve a reference using framework-specific patterns */
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null;
   /**
+   * Opt a reference NAME through the resolver's name-exists pre-filter, even when
+   * no node is named that. Needed for dynamic dispatch where the call target is
+   * an attribute/descriptor, not a declared symbol (e.g. Django's
+   * `self._iterable_class(...)`, React effect callbacks). Returning true lets the
+   * ref reach `resolve()` instead of being dropped for having no name match.
+   */
+  claimsReference?(name: string): boolean;
+  /**
    * Extract framework-specific nodes and references from a file.
    *
    * Returns route nodes, middleware nodes, etc., plus unresolved references

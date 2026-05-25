@@ -347,6 +347,12 @@ export class CodeGraph {
           });
         }
 
+        // Refresh planner stats + checkpoint the WAL after bulk writes.
+        // Cheap and non-blocking; never load-bearing for correctness.
+        if (result.success && result.filesIndexed > 0) {
+          this.db.runMaintenance();
+        }
+
         return result;
       } finally {
         this.fileLock.release();
@@ -426,6 +432,11 @@ export class CodeGraph {
               });
             });
           }
+        }
+
+        // Refresh planner stats + checkpoint the WAL after bulk writes.
+        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
+          this.db.runMaintenance();
         }
 
         return result;

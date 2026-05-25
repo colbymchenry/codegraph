@@ -100,9 +100,23 @@ export const EXTENSION_MAP: Record<string, Language> = {
  * from EXTENSION_MAP so parser support and indexing selection never drift.
  */
 export function isSourceFile(filePath: string): boolean {
+  if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
   return filePath.slice(dot).toLowerCase() in EXTENSION_MAP;
+}
+
+/**
+ * Play Framework routes file: the extensionless `conf/routes` (and included
+ * `conf/*.routes`). No grammar — route extraction is done by the Play framework
+ * resolver, so it's processed through the no-grammar (`yaml`-style) path.
+ */
+export function isPlayRoutesFile(filePath: string): boolean {
+  return (
+    filePath === 'conf/routes' ||
+    filePath.endsWith('/conf/routes') ||
+    filePath.endsWith('.routes')
+  );
 }
 
 /**
@@ -208,6 +222,9 @@ export function getParser(language: Language): Parser | null {
  * Detect language from file extension
  */
 export function detectLanguage(filePath: string, source?: string): Language {
+  // Play `conf/routes` has no grammar — route through the no-symbol path; the
+  // Play framework resolver extracts route nodes from it.
+  if (isPlayRoutesFile(filePath)) return 'yaml';
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
   const lang = EXTENSION_MAP[ext] || 'unknown';
 

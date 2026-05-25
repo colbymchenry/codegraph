@@ -44,12 +44,24 @@ esac
 target="${os}-${arch}"
 
 # 2. Resolve the version (latest release unless pinned).
+#
+# Resolve "latest" from the releases/latest *web* redirect, not the GitHub API:
+# the unauthenticated API is rate-limited to 60 requests/hour per IP and returns
+# 403 once exhausted — routine on shared/cloud hosts and CI (issue #325). The
+# redirect (github.com/<repo>/releases/latest -> .../releases/tag/vX.Y.Z) has no
+# such limit. Fall back to the API if the redirect can't be read.
 version="${CODEGRAPH_VERSION:-}"
+if [ -z "$version" ]; then
+  version="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" \
+    | sed -n 's#.*/releases/tag/##p')"
+fi
 if [ -z "$version" ]; then
   version="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
     | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
 fi
-[ -n "$version" ] || { echo "codegraph: could not resolve latest version; set CODEGRAPH_VERSION." >&2; exit 1; }
+[ -n "$version" ] || { echo "codegraph: could not resolve latest version; set CODEGRAPH_VERSION (e.g. CODEGRAPH_VERSION=v0.9.4)." >&2; exit 1; }
+# Release tags are vX.Y.Z; accept a bare X.Y.Z in CODEGRAPH_VERSION too.
+case "$version" in v*) ;; *) version="v$version" ;; esac
 
 # 3. Download + extract the bundle.
 url="https://github.com/$REPO/releases/download/$version/codegraph-${target}.tar.gz"

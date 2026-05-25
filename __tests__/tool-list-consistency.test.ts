@@ -6,6 +6,7 @@ const repoRoot = path.resolve(__dirname, '..');
 const MCP_TOOLS = [
   'codegraph_search',
   'codegraph_context',
+  'codegraph_trace',
   'codegraph_callers',
   'codegraph_callees',
   'codegraph_impact',
