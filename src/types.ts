@@ -80,6 +80,7 @@ export const LANGUAGES = [
   'swift',
   'kotlin',
   'dart',
+  'arkts',
   'svelte',
   'vue',
   'liquid',

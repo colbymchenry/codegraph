@@ -3899,4 +3899,325 @@ local count = 0
       expect(vars).toContain('count');
     });
   });
+
+  describe('ArkTS Extraction', () => {
+    describe('Language detection', () => {
+      it('should detect ArkTS files', () => {
+        expect(detectLanguage('page.ets')).toBe('arkts');
+        expect(detectLanguage('src/pages/Index.ets')).toBe('arkts');
+        expect(detectLanguage('test/app.test.ets')).toBe('arkts');
+      });
+
+      it('should report ArkTS as supported', () => {
+        expect(isLanguageSupported('arkts')).toBe(true);
+      });
+    });
+
+    describe('Function extraction', () => {
+      it('should extract function declarations', () => {
+        const code = `
+function add(a: number, b: number): number {
+  return a + b;
+}
+function greet(name: string): string {
+  return 'Hello, ' + name;
+}
+`;
+        const result = extractFromSource('utils.ets', code);
+        const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+        expect(functions).toContain('add');
+        expect(functions).toContain('greet');
+      });
+
+      it('should extract @Builder decorated functions', () => {
+        const code = `
+@Builder
+function MyDialog() {
+  Column() {
+    Text('Dialog')
+  }
+}
+`;
+        const result = extractFromSource('builder.ets', code);
+        const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+        expect(functions).toContain('MyDialog');
+      });
+
+      it('should extract function signatures', () => {
+        const code = `
+function process(data: string, count: number): boolean {
+  return data.length > count;
+}
+`;
+        const result = extractFromSource('sig.ets', code);
+        const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'process');
+        expect(fn).toBeDefined();
+        expect(fn!.signature).toContain('data');
+        expect(fn!.signature).toContain('count');
+      });
+    });
+
+    describe('Component (struct) extraction', () => {
+      it('should extract component declarations', () => {
+        const code = `
+@Component
+struct MyComponent {
+  build() {
+    Column() {
+      Text('Hello')
+    }
+  }
+}
+`;
+        const result = extractFromSource('MyComponent.ets', code);
+        const components = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+        expect(components).toContain('MyComponent');
+      });
+
+      it('should extract methods from components', () => {
+        const code = `
+@Component
+struct Counter {
+  @State count: number = 0;
+
+  aboutToAppear() {
+    this.load();
+  }
+
+  build() {
+    Column() {
+      Text(this.count.toString())
+    }
+  }
+
+  load(): void {
+    console.log('loaded');
+  }
+}
+`;
+        const result = extractFromSource('Counter.ets', code);
+        const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+        expect(methods).toContain('aboutToAppear');
+        expect(methods).toContain('build');
+        expect(methods).toContain('load');
+      });
+
+      it('should extract properties as fields from components', () => {
+        const code = `
+@Component
+struct DataView {
+  @State items: string[] = [];
+  @Prop title: string;
+  @Link selected: boolean;
+
+  build() {
+    Column() { }
+  }
+}
+`;
+        const result = extractFromSource('DataView.ets', code);
+        const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+        expect(fields).toContain('items');
+        expect(fields).toContain('title');
+        expect(fields).toContain('selected');
+      });
+    });
+
+    describe('Class extraction', () => {
+      it('should extract class declarations', () => {
+        const code = `
+class UserModel {
+  name: string = '';
+  private age: number = 0;
+
+  getAge(): number {
+    return this.age;
+  }
+}
+`;
+        const result = extractFromSource('UserModel.ets', code);
+        const classes = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+        expect(classes).toContain('UserModel');
+        const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+        expect(fields).toContain('name');
+        expect(fields).toContain('age');
+        const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+        expect(methods).toContain('getAge');
+      });
+    });
+
+    describe('Interface extraction', () => {
+      it('should extract interface declarations', () => {
+        const code = `
+interface DataSource {
+  items: string[];
+  total: number;
+}
+`;
+        const result = extractFromSource('DataSource.ets', code);
+        const interfaces = result.nodes.filter((n) => n.kind === 'interface').map((n) => n.name);
+        expect(interfaces).toContain('DataSource');
+      });
+    });
+
+    describe('Type alias extraction', () => {
+      it('should extract type declarations', () => {
+        const code = `
+type Callback = (name: string) => void;
+type ID = number;
+`;
+        const result = extractFromSource('types.ets', code);
+        const aliases = result.nodes.filter((n) => n.kind === 'type_alias').map((n) => n.name);
+        expect(aliases).toContain('Callback');
+        expect(aliases).toContain('ID');
+      });
+    });
+
+    describe('Enum extraction', () => {
+      it('should extract enum declarations', () => {
+        const code = `
+enum Status {
+  ACTIVE,
+  INACTIVE,
+  PENDING
+}
+`;
+        const result = extractFromSource('Status.ets', code);
+        const enums = result.nodes.filter((n) => n.kind === 'enum').map((n) => n.name);
+        expect(enums).toContain('Status');
+      });
+
+      it('should extract enum members', () => {
+        const code = `
+enum Direction {
+  UP,
+  DOWN,
+  LEFT,
+  RIGHT
+}
+`;
+        const result = extractFromSource('Direction.ets', code);
+        const members = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+        expect(members).toContain('UP');
+        expect(members).toContain('DOWN');
+        expect(members).toContain('LEFT');
+        expect(members).toContain('RIGHT');
+      });
+    });
+
+    describe('Import extraction', () => {
+      it('should extract import declarations', () => {
+        const code = `import { router } from '@ohos.router';
+import { BusinessError } from '@kit.BasicServicesKit';
+import fs from '@ohos.file.fs';
+`;
+        const result = extractFromSource('main.ets', code);
+        const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+        expect(imports).toContain('@ohos.router');
+        expect(imports).toContain('@kit.BasicServicesKit');
+        expect(imports).toContain('@ohos.file.fs');
+      });
+    });
+
+    describe('Call extraction', () => {
+      it('should extract function calls from method bodies', () => {
+        const code = `
+@Component
+struct Logger {
+  build() {
+    Column() {
+      Text('log')
+    }
+  }
+
+  logMessage(msg: string): void {
+    console.log(msg);
+  }
+}
+`;
+        const result = extractFromSource('Logger.ets', code);
+        // build and logMessage should be extractable as methods
+        const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+        expect(methods).toContain('build');
+        expect(methods).toContain('logMessage');
+      });
+    });
+
+    describe('Export handling', () => {
+      it('should extract exported functions', () => {
+        const code = `export function formatDate(date: Date): string {
+  return date.toString();
+}
+`;
+        const result = extractFromSource('format.ets', code);
+        const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'formatDate');
+        expect(fn).toBeDefined();
+        expect(fn!.isExported).toBe(true);
+      });
+
+      it('should extract exported interfaces', () => {
+        const code = `export interface Config {
+  apiUrl: string;
+}
+`;
+        const result = extractFromSource('Config.ets', code);
+        const iface = result.nodes.find((n) => n.kind === 'interface' && n.name === 'Config');
+        expect(iface).toBeDefined();
+        expect(iface!.isExported).toBe(true);
+      });
+
+      it('should extract exported enums', () => {
+        const code = `export enum Color {
+  RED,
+  GREEN,
+  BLUE
+}
+`;
+        const result = extractFromSource('colors.ets', code);
+        const en = result.nodes.find((n) => n.kind === 'enum' && n.name === 'Color');
+        expect(en).toBeDefined();
+        expect(en!.isExported).toBe(true);
+      });
+    });
+
+    describe('Full Indexing', () => {
+      it('should index an ArkTS file', async () => {
+        const dir = createTempDir();
+        try {
+          const src = `import { router } from '@ohos.router';
+
+@Component
+struct MyApp {
+  @State message: string = 'Hello';
+
+  build() {
+    Column() {
+      Text(this.message)
+        .fontSize(24)
+    }
+    .width('100%')
+    .height('100%')
+  }
+}
+`;
+          fs.writeFileSync(path.join(dir, 'MyApp.ets'), src);
+          fs.writeFileSync(path.join(dir, '.gitignore'), 'node_modules\n');
+          const cg = await CodeGraph.init(dir);
+          await cg.indexAll();
+          const nodes = cg.getNodesInFile('MyApp.ets');
+          const classes = nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+          expect(classes).toContain('MyApp');
+          const fields = nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+          expect(fields).toContain('message');
+          const methods = nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+          expect(methods).toContain('build');
+          const imports = nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+          expect(imports).toContain('@ohos.router');
+          cg.close();
+        } finally {
+          cleanupTempDir(dir);
+        }
+      });
+    });
+  });
 });
