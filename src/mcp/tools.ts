@@ -1028,8 +1028,12 @@ export class ToolHandler {
     const toMatches = this.findAllSymbols(cg, to);
     if (toMatches.nodes.length === 0) return this.textResult(`Symbol "${to}" not found in the codebase`);
 
-    // Trace along call edges only — a true call path. Names can map to several
-    // nodes, so try a few from×to candidate pairs until a usable path turns up.
+    // Trace along call + instantiation edges — a true call path, plus the
+    // module-instantiation hierarchy that IS the flow in HDLs (Verilog/SV: how
+    // a top module reaches a leaf module through submodule instances). Both are
+    // precise (tree-sitter) edges, so they don't widen the BFS the way fuzzy
+    // 'references' would. Names can map to several nodes, so try a few from×to
+    // candidate pairs until a usable path turns up.
     //
     // MAX_HOPS guard: a BFS shortest path longer than this on a dense call graph
     // is almost always a spurious wander through unrelated code (django's
@@ -1037,7 +1041,7 @@ export class ToolHandler {
     // the real execution flow — and a confident-but-wrong 15-hop trace is worse
     // than none. Over-cap paths are rejected and reported as "no direct path"
     // (which, on real code, means the flow breaks at dynamic dispatch).
-    const edgeKinds: Edge['kind'][] = ['calls'];
+    const edgeKinds: Edge['kind'][] = ['calls', 'instantiates'];
     const MAX_HOPS = 7;
     const fromTry = fromMatches.nodes.slice(0, 3);
     const toTry = toMatches.nodes.slice(0, 3);

@@ -25,6 +25,7 @@ import { pascalExtractor } from './pascal';
 import { scalaExtractor } from './scala';
 import { luaExtractor } from './lua';
 import { luauExtractor } from './luau';
+import { verilogExtractor } from './verilog';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -47,4 +48,5 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   scala: scalaExtractor,
   lua: luaExtractor,
   luau: luauExtractor,
+  verilog: verilogExtractor,
 };

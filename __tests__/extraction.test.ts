@@ -93,6 +93,13 @@ describe('Language Detection', () => {
     expect(detectLanguage('main.dart')).toBe('dart');
   });
 
+  it('should detect Verilog / SystemVerilog files', () => {
+    expect(detectLanguage('alu.v')).toBe('verilog');
+    expect(detectLanguage('defs.vh')).toBe('verilog');
+    expect(detectLanguage('cpu.sv')).toBe('verilog');
+    expect(detectLanguage('pkg.svh')).toBe('verilog');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -3898,5 +3905,96 @@ local count = 0
       const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
       expect(vars).toContain('count');
     });
+  });
+});
+
+describe('Verilog / SystemVerilog Extraction', () => {
+  it('should report Verilog as supported', () => {
+    expect(isLanguageSupported('verilog')).toBe(true);
+    expect(getSupportedLanguages()).toContain('verilog');
+  });
+
+  it('should extract modules as containers with scoped functions and tasks', () => {
+    const code = `
+module top (input logic clk, output logic [7:0] z);
+  function automatic int square(int n);
+    return n * n;
+  endfunction
+  task automatic do_reset();
+    z = '0;
+  endtask
+endmodule
+`;
+    const result = extractFromSource('top.sv', code);
+
+    const mod = result.nodes.find((n) => n.kind === 'class' && n.name === 'top');
+    expect(mod).toBeDefined();
+    expect(mod?.language).toBe('verilog');
+
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'square');
+    expect(fn).toBeDefined();
+    expect(fn?.qualifiedName).toBe('top::square'); // scoped under the module
+
+    const task = result.nodes.find((n) => n.kind === 'function' && n.name === 'do_reset');
+    expect(task).toBeDefined();
+  });
+
+  it('should emit an instantiates reference from a module to its submodule type', () => {
+    const code = `
+module alu #(parameter int WIDTH = 8) (input logic [WIDTH-1:0] a, output logic [WIDTH-1:0] y);
+endmodule
+
+module top (input logic [7:0] x, output logic [7:0] z);
+  alu #(.WIDTH(8)) u_alu (.a(x), .y(z));
+endmodule
+`;
+    const result = extractFromSource('soc.sv', code);
+
+    const top = result.nodes.find((n) => n.kind === 'class' && n.name === 'top');
+    expect(top).toBeDefined();
+
+    const inst = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'alu'
+    );
+    expect(inst).toBeDefined();
+    expect(inst?.fromNodeId).toBe(top?.id); // the parent module is the source
+
+    // parameter is captured as a constant
+    const param = result.nodes.find((n) => n.kind === 'constant' && n.name === 'WIDTH');
+    expect(param).toBeDefined();
+  });
+
+  it('should extract package typedefs, functions, imports and call edges', () => {
+    const code = `
+package math_pkg;
+  typedef enum logic [1:0] { IDLE, RUN, DONE } state_t;
+  function automatic int add(int a, int b);
+    return a + b;
+  endfunction
+endpackage
+
+module worker (input logic clk);
+  import math_pkg::*;
+  function automatic int caller(int y);
+    return add(y);
+  endfunction
+endmodule
+`;
+    const result = extractFromSource('pkg.sv', code);
+
+    const pkg = result.nodes.find((n) => n.kind === 'class' && n.name === 'math_pkg');
+    expect(pkg).toBeDefined();
+
+    const typedef = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'state_t');
+    expect(typedef).toBeDefined();
+    expect(typedef?.qualifiedName).toBe('math_pkg::state_t');
+
+    const importNode = result.nodes.find((n) => n.kind === 'import' && n.name === 'math_pkg');
+    expect(importNode).toBeDefined();
+
+    const callRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'calls' && r.referenceName === 'add'
+    );
+    expect(callRef).toBeDefined();
   });
 });

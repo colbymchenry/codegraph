@@ -7,6 +7,26 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **CodeGraph now indexes Verilog and SystemVerilog (`.v`, `.vh`, `.sv`, `.svh`).**
+  Modules, interfaces, packages, functions/tasks, parameters, and typedefs are
+  extracted as searchable symbols, and **module instantiations become
+  `instantiates` edges** — so `codegraph_trace`, `codegraph_callers`/
+  `codegraph_callees`, and `codegraph_impact` follow the design hierarchy across
+  files ("trace top → ALU", "what instantiates this module", "what does the top
+  module use"). Package imports and function/task call edges are resolved too.
+  Ports and internal signals are intentionally left out to keep the graph
+  focused on structure.
+
+### Changed
+- **`codegraph_trace`, `codegraph_callers`, and `codegraph_callees` now follow
+  `instantiates` edges** (previously call/reference/import edges only). This
+  surfaces the HDL module-instantiation hierarchy and, in OO languages, the
+  `new X()` construction dependency. `instantiates` is a precise tree-sitter
+  edge, so it doesn't widen traces the way fuzzy matches would.
+
 ## [0.9.4] - 2026-05-24
 
 ### Added
