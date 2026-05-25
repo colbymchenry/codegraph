@@ -12,7 +12,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath } from '../src/utils';
+import {
+  FileLock,
+  validateProjectPath,
+  validatePathWithinRoot,
+  isPathWithinRoot,
+} from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -173,6 +178,102 @@ describe('Path Traversal Prevention', () => {
   it('should return null for non-existent node', async () => {
     const code = await cg.getCode('does-not-exist');
     expect(code).toBeNull();
+  });
+});
+
+describe('Path Traversal Prevention - symlink escapes', () => {
+  let tmpRoot: string;
+  let projectRoot: string;
+  let outsideDir: string;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-pathtest-'));
+    projectRoot = path.join(tmpRoot, 'project');
+    outsideDir = path.join(tmpRoot, 'outside');
+    fs.mkdirSync(projectRoot, { recursive: true });
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, 'secret.txt'), 'sensitive data');
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  it('rejects relative path traversal with ..', () => {
+    expect(validatePathWithinRoot(projectRoot, '../outside/secret.txt')).toBeNull();
+    expect(isPathWithinRoot('../outside/secret.txt', projectRoot)).toBe(false);
+  });
+
+  it('rejects absolute paths outside the root', () => {
+    expect(validatePathWithinRoot(projectRoot, path.join(outsideDir, 'secret.txt'))).toBeNull();
+  });
+
+  it('rejects symlinks inside project that point outside', () => {
+    const linkPath = path.join(projectRoot, 'escape-link');
+    try {
+      fs.symlinkSync(outsideDir, linkPath, 'dir');
+    } catch (err: unknown) {
+      const code = err && typeof err === 'object' && 'code' in err
+        ? (err as NodeJS.ErrnoException).code
+        : undefined;
+      if (code === 'EPERM' || code === 'ENOSYS') {
+        return;
+      }
+      throw err;
+    }
+    const result = validatePathWithinRoot(projectRoot, 'escape-link/secret.txt');
+    expect(result).toBeNull();
+  });
+
+  it('accepts symlinks inside project that point inside', () => {
+    const targetDir = path.join(projectRoot, 'real');
+    fs.mkdirSync(targetDir);
+    fs.writeFileSync(path.join(targetDir, 'file.ts'), 'export {};');
+    const linkPath = path.join(projectRoot, 'alias');
+    try {
+      fs.symlinkSync(targetDir, linkPath, 'dir');
+    } catch (err: unknown) {
+      const code = err && typeof err === 'object' && 'code' in err
+        ? (err as NodeJS.ErrnoException).code
+        : undefined;
+      if (code === 'EPERM' || code === 'ENOSYS') {
+        return;
+      }
+      throw err;
+    }
+    const result = validatePathWithinRoot(projectRoot, 'alias/file.ts');
+    expect(result).not.toBeNull();
+  });
+
+  it('accepts nested valid paths', () => {
+    const subdir = path.join(projectRoot, 'src', 'deep');
+    fs.mkdirSync(subdir, { recursive: true });
+    fs.writeFileSync(path.join(subdir, 'mod.ts'), '');
+    const result = validatePathWithinRoot(projectRoot, 'src/deep/mod.ts');
+    expect(result).not.toBeNull();
+    expect(result).toContain('mod.ts');
+  });
+
+  it('returns null for non-existent paths outside root, accepts non-existent inside root', () => {
+    const inside = validatePathWithinRoot(projectRoot, 'not-yet-created.ts');
+    expect(inside).not.toBeNull();
+
+    const outside = validatePathWithinRoot(projectRoot, '../not-yet-created.ts');
+    expect(outside).toBeNull();
+  });
+
+  it('handles case-insensitive root on Windows', () => {
+    if (process.platform !== 'win32') {
+      return;
+    }
+    const upper = projectRoot.charAt(0).toUpperCase() + projectRoot.slice(1);
+    const lower = projectRoot.charAt(0).toLowerCase() + projectRoot.slice(1);
+    expect(validatePathWithinRoot(upper, 'a.ts')).not.toBeNull();
+    expect(validatePathWithinRoot(lower, 'a.ts')).not.toBeNull();
   });
 });
 

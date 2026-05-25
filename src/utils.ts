@@ -47,21 +47,65 @@ const SENSITIVE_PATHS = new Set([
 ]);
 
 /**
+ * Case-aware path prefix check. Returns true if `child` is `parent` or a
+ * descendant of `parent`. On Windows (and case-insensitive filesystems on
+ * macOS), comparison is case-insensitive.
+ */
+function pathStartsWith(child: string, parent: string): boolean {
+  const normalize = (p: string) => (process.platform === 'win32' ? p.toLowerCase() : p);
+  const c = normalize(child);
+  const p = normalize(parent);
+  return c === p || c.startsWith(p + path.sep);
+}
+
+/**
  * Validate that a resolved file path stays within the project root.
- * Prevents path traversal attacks (e.g. node.filePath = "../../etc/passwd").
  *
- * @param projectRoot - The project root directory
- * @param filePath - The relative file path to validate
+ * Prevents path traversal attacks via both relative escapes (`../../etc/passwd`)
+ * and symlink escapes (a symlink inside the project pointing outside it).
+ *
+ * Resolution strategy:
+ *   1. Logical check via `path.resolve` (cheap, catches `../` sequences)
+ *   2. Physical check via `fs.realpathSync` (catches symlink escapes)
+ *
+ * If `realpathSync` fails (broken symlink, permission denied, file does not
+ * exist yet), ENOENT falls back to the logical result for indexing of paths
+ * not yet on disk. Other errors (ELOOP, EACCES) are rejected conservatively.
+ *
+ * On Windows, comparison is case-insensitive to account for case-insensitive
+ * filesystems where `C:\Proj` and `c:\proj` refer to the same directory.
+ *
+ * @param projectRoot - The project root directory (must exist)
+ * @param filePath - Path to validate (relative to projectRoot, or absolute)
  * @returns The resolved absolute path, or null if it escapes the root
  */
 export function validatePathWithinRoot(projectRoot: string, filePath: string): string | null {
-  const resolved = path.resolve(projectRoot, filePath);
-  const normalizedRoot = path.resolve(projectRoot);
+  const resolvedPath = path.resolve(projectRoot, filePath);
+  const resolvedRoot = path.resolve(projectRoot);
 
-  if (!resolved.startsWith(normalizedRoot + path.sep) && resolved !== normalizedRoot) {
+  // Step 1: Logical check
+  if (!pathStartsWith(resolvedPath, resolvedRoot)) {
     return null;
   }
-  return resolved;
+
+  // Step 2: Physical check via realpath (catches symlink escapes)
+  try {
+    const realPath = fs.realpathSync(resolvedPath);
+    const realRoot = fs.realpathSync(resolvedRoot);
+    if (!pathStartsWith(realPath, realRoot)) {
+      return null;
+    }
+    return realPath;
+  } catch (err: unknown) {
+    const code = err && typeof err === 'object' && 'code' in err
+      ? (err as NodeJS.ErrnoException).code
+      : undefined;
+    // ENOENT: path not on disk yet — logical check already passed
+    if (code === 'ENOENT') {
+      return resolvedPath;
+    }
+    return null;
+  }
 }
 
 /**
@@ -108,42 +152,16 @@ export function validateProjectPath(dirPath: string): string | null {
 /**
  * Check if a file path resolves to a location within the given root directory.
  *
- * Prevents path traversal attacks by ensuring the resolved absolute path
- * starts with the resolved root path. Handles '..' sequences, symlink-like
- * relative paths, and platform-specific separators.
+ * Equivalent to `validatePathWithinRoot(rootDir, filePath) !== null` but
+ * returns a boolean. Use when you only need to gate on safety without
+ * needing the resolved path.
  *
  * @param filePath - The path to check (can be relative or absolute)
  * @param rootDir - The root directory that filePath must stay within
  * @returns true if filePath resolves to a location within rootDir
  */
 export function isPathWithinRoot(filePath: string, rootDir: string): boolean {
-  const resolvedPath = path.resolve(rootDir, filePath);
-  const resolvedRoot = path.resolve(rootDir);
-  return resolvedPath.startsWith(resolvedRoot + path.sep) || resolvedPath === resolvedRoot;
-}
-
-/**
- * Like isPathWithinRoot but also resolves symlinks via fs.realpathSync.
- *
- * This catches symlink escapes where the logical path appears to be within
- * root but the real path on disk points elsewhere. Falls back to logical
- * path checking if realpath resolution fails (e.g. broken symlink).
- */
-export function isPathWithinRootReal(filePath: string, rootDir: string): boolean {
-  // First do the cheap logical check
-  if (!isPathWithinRoot(filePath, rootDir)) {
-    return false;
-  }
-
-  // Then verify with realpath to catch symlink escapes
-  try {
-    const realPath = fs.realpathSync(path.resolve(rootDir, filePath));
-    const realRoot = fs.realpathSync(rootDir);
-    return realPath.startsWith(realRoot + path.sep) || realPath === realRoot;
-  } catch {
-    // If realpath fails (broken symlink, permissions), fall back to logical check
-    return true;
-  }
+  return validatePathWithinRoot(rootDir, filePath) !== null;
 }
 
 /**
