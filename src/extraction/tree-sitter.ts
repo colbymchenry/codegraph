@@ -1589,35 +1589,58 @@ export class TreeSitterExtractor {
   private extractDecoratorsFor(declNode: SyntaxNode, decoratedId: string): void {
     const consider = (n: SyntaxNode | null): void => {
       if (!n) return;
+      // C# attributes are wrapped in `attribute_list`. A single list can hold
+      // multiple comma-separated attributes (`[Foo, Bar]`), and a declaration
+      // typically has several attribute_list siblings (`[Foo][Bar]`).
+      // Unwrap and recurse into each contained `attribute` so the rest of the
+      // routine can treat it like any other decorator/annotation form.
+      if (n.type === 'attribute_list') {
+        for (let i = 0; i < n.namedChildCount; i++) {
+          consider(n.namedChild(i));
+        }
+        return;
+      }
       // `marker_annotation` is Java's grammar for arg-less annotations
       // (`@Override`, `@Deprecated`); without including it, every
       // such Java annotation would be silently skipped.
+      // `attribute` is C#'s grammar for a single bracketed attribute
+      // (`[HasPermission("factura.crear")]`); its name lives in the
+      // `name` field as an `identifier` or `qualified_name`.
       if (
         n.type !== 'decorator' &&
         n.type !== 'annotation' &&
-        n.type !== 'marker_annotation'
+        n.type !== 'marker_annotation' &&
+        n.type !== 'attribute'
       ) {
         return;
       }
+      // C# `attribute` exposes the name via a field — short path, no
+      // need to walk children. Falls through to the generic walker
+      // below for everything else.
+      let target: SyntaxNode | null = null;
+      if (n.type === 'attribute') {
+        target = getChildByField(n, 'name');
+      }
       // Find the leading identifier: skip the `@` punct, unwrap
       // a call_expression if the decorator is invoked with args.
-      let target: SyntaxNode | null = null;
-      for (let i = 0; i < n.namedChildCount; i++) {
-        const child = n.namedChild(i);
-        if (!child) continue;
-        if (child.type === 'call_expression') {
-          const fn = getChildByField(child, 'function') ?? child.namedChild(0);
-          if (fn) target = fn;
-          if (target) break;
-        }
-        if (
-          child.type === 'identifier' ||
-          child.type === 'member_expression' ||
-          child.type === 'scoped_identifier' ||
-          child.type === 'navigation_expression'
-        ) {
-          target = child;
-          break;
+      if (!target) {
+        for (let i = 0; i < n.namedChildCount; i++) {
+          const child = n.namedChild(i);
+          if (!child) continue;
+          if (child.type === 'call_expression') {
+            const fn = getChildByField(child, 'function') ?? child.namedChild(0);
+            if (fn) target = fn;
+            if (target) break;
+          }
+          if (
+            child.type === 'identifier' ||
+            child.type === 'member_expression' ||
+            child.type === 'scoped_identifier' ||
+            child.type === 'navigation_expression'
+          ) {
+            target = child;
+            break;
+          }
         }
       }
       if (!target) return;
