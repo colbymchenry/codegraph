@@ -26,10 +26,12 @@ export interface SqliteDatabase {
 }
 
 /**
- * The active SQLite backend. Only one now (`node:sqlite`); kept as a named type
- * so `codegraph status` and the per-instance reporting have a stable shape.
+ * The active SQLite backend.
+ * `better-sqlite3` is preferred when available (always has FTS5, faster on some
+ * platforms). Falls back to `node:sqlite` (the bundled release always ships a
+ * Node binary built with SQLITE_ENABLE_FTS5).
  */
-export type SqliteBackend = 'node-sqlite';
+export type SqliteBackend = 'better-sqlite3' | 'node-sqlite';
 
 /**
  * Wraps Node's built-in `node:sqlite` (`DatabaseSync`) to match the
@@ -118,21 +120,35 @@ class NodeSqliteAdapter implements SqliteDatabase {
 }
 
 /**
- * Create a database connection backed by `node:sqlite`.
+ * Create a database connection, preferring better-sqlite3 (always has FTS5)
+ * and falling back to node:sqlite (requires a Node build with FTS5 enabled —
+ * the bundled CodeGraph release guarantees this).
  *
  * Returns the active backend alongside the db so each `DatabaseConnection` can
  * report it per-instance — MCP can open multiple project DBs in one process, so
  * a process-global would race.
  */
 export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: SqliteBackend } {
+  // Prefer better-sqlite3 when available (dev installs, or user has it globally).
+  // It always ships with FTS5; node:sqlite only has it when Node was compiled with
+  // SQLITE_ENABLE_FTS5 (the bundled release), which the system Node may not be.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const BetterSqlite3 = require('better-sqlite3');
+    const db: SqliteDatabase = new BetterSqlite3(dbPath) as unknown as SqliteDatabase;
+    return { db, backend: 'better-sqlite3' };
+  } catch {
+    // better-sqlite3 not installed — fall through to node:sqlite
+  }
+
   try {
     return { db: new NodeSqliteAdapter(dbPath), backend: 'node-sqlite' };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     throw new Error(
-      'Failed to open SQLite via the built-in node:sqlite module.\n' +
-      'CodeGraph requires node:sqlite (Node.js 22.5+). Install the self-contained\n' +
-      'CodeGraph release (it bundles a compatible Node), or run on Node 22.5+.\n' +
+      'Failed to open SQLite. Install the self-contained CodeGraph release (it bundles\n' +
+      'a Node binary with FTS5), or run `npm install better-sqlite3` in your local\n' +
+      'graph-vector checkout to satisfy the FTS5 requirement from source.\n' +
       `Underlying error: ${msg}`
     );
   }

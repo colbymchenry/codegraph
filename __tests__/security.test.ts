@@ -378,10 +378,11 @@ describe('Source file detection (isSourceFile)', () => {
   });
 
   it('rejects unsupported extensions and extensionless files', () => {
-    expect(isSourceFile('src/component.css')).toBe(false);
-    expect(isSourceFile('README.md')).toBe(false);
+    expect(isSourceFile('src/component.css')).toBe(true);  // css is now supported
+    expect(isSourceFile('README.md')).toBe(true);           // markdown is now supported
     expect(isSourceFile('Makefile')).toBe(false);
     expect(isSourceFile('.gitignore')).toBe(false);
+    expect(isSourceFile('notes.txt')).toBe(false);
   });
 
   it('matches regardless of leading dot directories', () => {

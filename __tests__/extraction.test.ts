@@ -94,8 +94,8 @@ describe('Language Detection', () => {
   });
 
   it('should return unknown for unsupported extensions', () => {
-    expect(detectLanguage('styles.css')).toBe('unknown');
-    expect(detectLanguage('data.json')).toBe('unknown');
+    expect(detectLanguage('notes.txt')).toBe('unknown');
+    expect(detectLanguage('Makefile')).toBe('unknown');
   });
 });
 

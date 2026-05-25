@@ -10,7 +10,10 @@ import * as path from 'path';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'yaml' | 'twig' | 'unknown'>;
+export type GrammarLanguage = Exclude<
+  Language,
+  'svelte' | 'vue' | 'liquid' | 'twig' | 'markdown' | 'gotemplate' | 'css' | 'scss' | 'sass' | 'unknown'
+>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -37,6 +40,8 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   scala: 'tree-sitter-scala.wasm',
   lua: 'tree-sitter-lua.wasm',
   luau: 'tree-sitter-luau.wasm',
+  yaml: 'tree-sitter-yaml.wasm',
+  json: 'tree-sitter-json.wasm',
 };
 
 /**
@@ -68,9 +73,18 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.install': 'php',
   '.theme': 'php',
   '.inc': 'php',
-  // YAML (used for Drupal routing files; no symbol extraction, file-level tracking only)
   '.yml': 'yaml',
   '.yaml': 'yaml',
+  '.json': 'json',
+  '.md': 'markdown',
+  '.markdown': 'markdown',
+  '.html': 'gotemplate',
+  '.gohtml': 'gotemplate',
+  '.tmpl': 'gotemplate',
+  '.gotmpl': 'gotemplate',
+  '.css': 'css',
+  '.scss': 'scss',
+  '.sass': 'sass',
   // Twig templates (file-level tracking only, no symbol extraction)
   '.twig': 'twig',
   '.rb': 'ruby',
@@ -250,11 +264,15 @@ function looksLikeCpp(source: string): boolean {
  * Returns true if the grammar exists, even if not yet loaded.
  */
 export function isLanguageSupported(language: Language): boolean {
-  if (language === 'svelte') return true; // custom extractor (script block delegation)
-  if (language === 'vue') return true; // custom extractor (script block delegation)
-  if (language === 'liquid') return true; // custom regex extractor
-  if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver
-  if (language === 'twig') return true; // file-level tracking only
+  if (language === 'svelte') return true;
+  if (language === 'vue') return true;
+  if (language === 'liquid') return true;
+  if (language === 'markdown') return true;   // custom extractor
+  if (language === 'gotemplate') return true; // custom extractor
+  if (language === 'css') return true;        // custom extractor
+  if (language === 'scss') return true;       // custom extractor
+  if (language === 'sass') return true;       // custom extractor
+  if (language === 'twig') return true;       // file-level tracking only
   if (language === 'unknown') return false;
   return language in WASM_GRAMMAR_FILES;
 }
@@ -263,8 +281,19 @@ export function isLanguageSupported(language: Language): boolean {
  * Check if a grammar has been loaded and is ready for parsing.
  */
 export function isGrammarLoaded(language: Language): boolean {
-  if (language === 'svelte' || language === 'vue' || language === 'liquid') return true;
-  if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
+  if (
+    language === 'svelte' ||
+    language === 'vue' ||
+    language === 'liquid' ||
+    language === 'markdown' ||
+    language === 'gotemplate' ||
+    language === 'css' ||
+    language === 'scss' ||
+    language === 'sass'
+  ) {
+    return true;
+  }
+  if (language === 'twig') return true; // file-level tracking only
   return languageCache.has(language);
 }
 
@@ -272,7 +301,11 @@ export function isGrammarLoaded(language: Language): boolean {
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid'];
+  return [
+    ...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]),
+    'svelte', 'vue', 'liquid',
+    'markdown', 'gotemplate', 'css', 'scss', 'sass',
+  ];
 }
 
 /**
@@ -343,7 +376,13 @@ export function getLanguageDisplayName(language: Language): string {
     lua: 'Lua',
     luau: 'Luau',
     yaml: 'YAML',
+    json: 'JSON',
     twig: 'Twig',
+    markdown: 'Hugo Markdown',
+    gotemplate: 'Hugo Template',
+    css: 'CSS',
+    scss: 'SCSS',
+    sass: 'Sass',
     unknown: 'Unknown',
   };
   return names[language] || language;

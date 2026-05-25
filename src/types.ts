@@ -88,7 +88,13 @@ export const LANGUAGES = [
   'lua',
   'luau',
   'yaml',
+  'json',
   'twig',
+  'markdown',
+  'gotemplate',
+  'css',
+  'scss',
+  'sass',
   'unknown',
 ] as const;
 

@@ -25,6 +25,8 @@ import { pascalExtractor } from './pascal';
 import { scalaExtractor } from './scala';
 import { luaExtractor } from './lua';
 import { luauExtractor } from './luau';
+import { yamlExtractor } from './yaml';
+import { jsonExtractor } from './json';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -47,4 +49,6 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   scala: scalaExtractor,
   lua: luaExtractor,
   luau: luauExtractor,
+  yaml: yamlExtractor,
+  json: jsonExtractor,
 };
