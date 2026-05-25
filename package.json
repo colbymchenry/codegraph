@@ -47,6 +47,7 @@
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^20.19.30",
     "@types/picomatch": "^4.0.2",
+    "tree-sitter-julia": "^0.23.1",
     "typescript": "^5.0.0",
     "vitest": "^2.1.9"
   },
