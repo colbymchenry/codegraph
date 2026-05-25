@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>2026-05-25 B1 パス検証統一パッチ</title>
+<style>
+:root { --bg:#0f172a; --card:#1e293b; --text:#e2e8f0; --muted:#94a3b8; --accent:#a78bfa; --border:#334155; --code-bg:#0b1220; --ok:#34d399; }
+body { margin:0 auto; padding:40px 20px; max-width:960px; background:var(--bg); color:var(--text); font-family:system-ui,"Yu Gothic",Meiryo,sans-serif; font-size:15px; line-height:1.7; }
+h1 { color:var(--accent); font-size:24px; }
+h2 { font-size:16px; color:var(--muted); margin-top:28px; }
+code, pre { background:var(--code-bg); border-radius:6px; font-size:13px; }
+pre { padding:12px; overflow-x:auto; border:1px solid var(--border); }
+table { width:100%; border-collapse:collapse; margin:12px 0; }
+th, td { border-bottom:1px solid var(--border); padding:8px; text-align:left; }
+.tag-ok { color:var(--ok); }
+a { color:var(--accent); }
+</style>
+</head>
+<body>
+<h1>B1 パス検証統一パッチ（実施記録）</h1>
+<p>ブランチ: <code>fix/path-validation-unify</code> · ベース: v0.9.4 · PR想定: <code>fix(security): unify path validation with realpath-based check</code></p>
+
+<h2>実施内容</h2>
+<ul>
+<li><code>validatePathWithinRoot</code> を logical + <code>realpathSync</code> の二段検証に差し替え</li>
+<li><code>pathStartsWith</code> 追加（Windows は case-insensitive）</li>
+<li><code>isPathWithinRoot</code> を薄いラッパに変更</li>
+<li>未使用の <code>isPathWithinRootReal</code> を削除</li>
+<li><code>__tests__/security.test.ts</code> に symlink escape 系 7 ケース追加</li>
+</ul>
+
+<h2>変更ファイル</h2>
+<pre>src/utils.ts
+__tests__/security.test.ts
+docs/2026-05-25_b1-path-validation-patch.html
+docs/index.html</pre>
+
+<h2>検証結果</h2>
+<table>
+<tr><th>項目</th><th>結果</th></tr>
+<tr><td><code>npm run build</code></td><td class="tag-ok">成功</td></tr>
+<tr><td><code>vitest run __tests__/security.test.ts</code></td><td class="tag-ok">44 passed / 2 skipped</td></tr>
+<tr><td><code>git grep isPathWithinRootReal</code></td><td class="tag-ok">0 件</td></tr>
+<tr><td><code>npm test</code> 全体（Windows）</td><td>810 pass / 5 fail（<code>mcp-roots</code> 既知・本パッチ無関係）</td></tr>
+</table>
+
+<h2>完了チェックリスト</h2>
+<ul>
+<li>✅ diff が utils + security.test（+ docs）に限定</li>
+<li>✅ build 成功</li>
+<li>✅ security テスト全緑</li>
+<li>✅ isPathWithinRootReal 削除確認</li>
+<li>✅ Conventional Commits 形式でコミット</li>
+</ul>
+
+<h2>関連ドキュメント</h2>
+<ul>
+<li><a href="2026-05-25_codegraph-jp_導入分析レポート.html">導入分析レポート</a></li>
+</ul>
+
+<p><small>記録日: 2026-05-25</small></p>
+</body>
+</html>
