@@ -7,6 +7,22 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Dagger 2 / Hilt `@Provides` / `@Binds` binding edges.** The whole-graph
+  synthesizer now emits `interface → impl` `references` edges for every
+  Dagger module binding it can verify (Java + Kotlin). `@Binds` abstract
+  methods are accepted unconditionally; `@Provides` requires a pure-identity
+  body (`return impl;` / `= impl`) to avoid claiming factory methods that
+  happen to share the Interface(Impl) signature shape. Lets `callers` /
+  `context` / `trace` follow a DI flow across the Dagger binding boundary
+  without depending on the generic `class X implements Y` heuristic — and
+  stays clean on factory-heavy codebases (validated: Plaid 0 false
+  positives, janishar/android-mvp-architecture 12/12 in-project bindings).
+  Registers a `daggerResolver` in the framework registry so
+  `detectFrameworks` can report Dagger usage.
+
 ## [0.9.4] - 2026-05-24
 
 ### Added
