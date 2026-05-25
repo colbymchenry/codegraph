@@ -37,6 +37,7 @@ import {
   SyncResult,
   extractFromSource,
   initGrammars,
+  validateIoBatchSizeOptions,
   validatePathFilterOptions,
 } from './extraction';
 import {
@@ -59,7 +60,14 @@ export {
   CODEGRAPH_DIR,
 } from './directory';
 export { IndexProgress, IndexResult, SyncResult } from './extraction';
-export { PathFilterOptions, validatePathFilterOptions } from './extraction';
+export {
+  DEFAULT_FILE_IO_BATCH_SIZE,
+  MAX_FILE_IO_BATCH_SIZE,
+  IoBatchSizeOptions,
+  PathFilterOptions,
+  validateIoBatchSizeOptions,
+  validatePathFilterOptions,
+} from './extraction';
 export { detectLanguage, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './extraction';
 export { ResolutionResult } from './resolution';
 export {
@@ -95,6 +103,9 @@ export interface InitOptions {
 
   /** Gitignore-style patterns to include while initial indexing */
   include?: string[];
+
+  /** Number of files to read in parallel during initial indexing */
+  ioBatchSize?: number;
 }
 
 /**
@@ -126,6 +137,9 @@ export interface IndexOptions {
 
   /** Gitignore-style patterns to include in indexing */
   include?: string[];
+
+  /** Number of files to read in parallel during indexing */
+  ioBatchSize?: number;
 }
 
 /**
@@ -190,6 +204,7 @@ export class CodeGraph {
   static async init(projectRoot: string, options: InitOptions = {}): Promise<CodeGraph> {
     if (options.index) {
       validatePathFilterOptions(options);
+      validateIoBatchSizeOptions(options);
     }
 
     await initGrammars();
@@ -216,6 +231,7 @@ export class CodeGraph {
         onProgress: options.onProgress,
         exclude: options.exclude,
         include: options.include,
+        ioBatchSize: options.ioBatchSize,
       });
     }
 
@@ -341,6 +357,7 @@ export class CodeGraph {
    */
   async indexAll(options: IndexOptions = {}): Promise<IndexResult> {
     validatePathFilterOptions(options);
+    validateIoBatchSizeOptions(options);
 
     return this.indexMutex.withLock(async () => {
       try {
@@ -353,7 +370,7 @@ export class CodeGraph {
           options.onProgress,
           options.signal,
           options.verbose,
-          { exclude: options.exclude, include: options.include }
+          { exclude: options.exclude, include: options.include, ioBatchSize: options.ioBatchSize }
         );
 
         // Resolve references to create call/import/extends edges
@@ -416,6 +433,7 @@ export class CodeGraph {
    */
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
     validatePathFilterOptions(options);
+    validateIoBatchSizeOptions(options);
 
     return this.indexMutex.withLock(async () => {
       try {
@@ -426,7 +444,7 @@ export class CodeGraph {
       try {
         const result = await this.orchestrator.sync(
           options.onProgress,
-          { exclude: options.exclude, include: options.include }
+          { exclude: options.exclude, include: options.include, ioBatchSize: options.ioBatchSize }
         );
 
         // Resolve references if files were updated

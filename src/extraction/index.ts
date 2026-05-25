@@ -28,7 +28,8 @@ import type { ResolutionContext } from '../resolution/types';
  * Number of files to read in parallel during indexing.
  * File reads are I/O-bound; batching overlaps I/O wait with CPU parse work.
  */
-const FILE_IO_BATCH_SIZE = 10;
+export const DEFAULT_FILE_IO_BATCH_SIZE = 10;
+export const MAX_FILE_IO_BATCH_SIZE = 1024;
 
 // PARSER_RESET_INTERVAL moved to parse-worker.ts (runs in worker thread)
 
@@ -94,6 +95,43 @@ export interface SyncResult {
 export interface PathFilterOptions {
   exclude?: string[];
   include?: string[];
+}
+
+/**
+ * Options for tuning extraction I/O batching.
+ */
+export interface IoBatchSizeOptions {
+  ioBatchSize?: number;
+}
+
+/**
+ * Extraction options shared by full indexing and sync indexing.
+ */
+export interface ExtractionOptions extends PathFilterOptions, IoBatchSizeOptions {}
+
+function formatIoBatchSizeValue(value: unknown): string {
+  return typeof value === 'string' ? `"${value}"` : String(value);
+}
+
+export function validateIoBatchSizeOptions(options?: IoBatchSizeOptions): void {
+  const value = options?.ioBatchSize as unknown;
+  if (value === undefined) return;
+
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < 1 ||
+    value > MAX_FILE_IO_BATCH_SIZE
+  ) {
+    throw new Error(
+      `Invalid ioBatchSize: expected a positive integer between 1 and ${MAX_FILE_IO_BATCH_SIZE}, got ${formatIoBatchSizeValue(value)}`
+    );
+  }
+}
+
+function getIoBatchSize(options?: IoBatchSizeOptions): number {
+  validateIoBatchSizeOptions(options);
+  return options?.ioBatchSize ?? DEFAULT_FILE_IO_BATCH_SIZE;
 }
 
 /**
@@ -563,9 +601,10 @@ export class ExtractionOrchestrator {
     onProgress?: (progress: IndexProgress) => void,
     signal?: AbortSignal,
     verbose?: boolean,
-    filterOptions?: PathFilterOptions
+    options?: ExtractionOptions
   ): Promise<IndexResult> {
-    validatePathFilterOptions(filterOptions);
+    validatePathFilterOptions(options);
+    const ioBatchSize = getIoBatchSize(options);
     await initGrammars();
     const startTime = Date.now();
     const errors: ExtractionError[] = [];
@@ -596,7 +635,7 @@ export class ExtractionOrchestrator {
           currentFile: file,
         });
       },
-      filterOptions
+      options
     );
 
     // Detect frameworks once per indexAll run using the scanned file list.
@@ -787,7 +826,7 @@ export class ExtractionOrchestrator {
       });
     }
 
-    for (let i = 0; i < files.length; i += FILE_IO_BATCH_SIZE) {
+    for (let i = 0; i < files.length; i += ioBatchSize) {
       if (signal?.aborted) {
         if (parseWorker) (parseWorker as import('worker_threads').Worker).terminate().catch(() => {});
         return {
@@ -802,7 +841,7 @@ export class ExtractionOrchestrator {
         };
       }
 
-      const batch = files.slice(i, i + FILE_IO_BATCH_SIZE);
+      const batch = files.slice(i, i + ioBatchSize);
 
       // Read files in parallel (with path validation before any I/O)
       const fileContents = await Promise.all(
@@ -1284,9 +1323,10 @@ export class ExtractionOrchestrator {
    */
   async sync(
     onProgress?: (progress: IndexProgress) => void,
-    filterOptions?: PathFilterOptions
+    options?: ExtractionOptions
   ): Promise<SyncResult> {
-    validatePathFilterOptions(filterOptions);
+    validatePathFilterOptions(options);
+    validateIoBatchSizeOptions(options);
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
     let filesChecked = 0;
@@ -1303,7 +1343,7 @@ export class ExtractionOrchestrator {
     });
 
     const filesToIndex: string[] = [];
-    const useFullScan = hasPathFilterOptions(filterOptions);
+    const useFullScan = hasPathFilterOptions(options);
     const gitChanges = useFullScan ? null : getGitChangedFiles(this.rootDir);
 
     if (gitChanges) {
@@ -1350,7 +1390,7 @@ export class ExtractionOrchestrator {
       }
     } else {
       // === Fallback: full scan (non-git project or git failure) ===
-      const currentFiles = new Set(scanDirectory(this.rootDir, undefined, filterOptions));
+      const currentFiles = new Set(scanDirectory(this.rootDir, undefined, options));
       filesChecked = currentFiles.size;
 
       // Keep framework detection scoped to the same filtered file list. This

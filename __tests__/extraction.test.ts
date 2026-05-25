@@ -2921,6 +2921,55 @@ export function multiply(a: number, b: number): number {
     cg.close();
   });
 
+  it('should index multiple files with ioBatchSize 1', async () => {
+    const srcDir = path.join(tempDir, 'src');
+    fs.mkdirSync(srcDir);
+
+    fs.writeFileSync(
+      path.join(srcDir, 'math.ts'),
+      `export function add(a: number, b: number) { return a + b; }`
+    );
+
+    fs.writeFileSync(
+      path.join(srcDir, 'string.ts'),
+      `export function capitalize(s: string) { return s.toUpperCase(); }`
+    );
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll({ ioBatchSize: 1 });
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(cg.getFiles().map((f) => f.path).sort()).toEqual(['src/math.ts', 'src/string.ts']);
+
+    cg.close();
+  });
+
+  it('should preserve indexing results with a large ioBatchSize', async () => {
+    const srcDir = path.join(tempDir, 'src');
+    fs.mkdirSync(srcDir);
+
+    fs.writeFileSync(
+      path.join(srcDir, 'math.ts'),
+      `export function add(a: number, b: number) { return a + b; }`
+    );
+
+    fs.writeFileSync(
+      path.join(srcDir, 'string.ts'),
+      `export function capitalize(s: string) { return s.toUpperCase(); }`
+    );
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll({ ioBatchSize: 100 });
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(cg.getNodesInFile('src/math.ts').some((n) => n.name === 'add')).toBe(true);
+    expect(cg.getNodesInFile('src/string.ts').some((n) => n.name === 'capitalize')).toBe(true);
+
+    cg.close();
+  });
+
   it('should track file hashes for incremental updates', async () => {
     // Create initial file
     const srcDir = path.join(tempDir, 'src');
@@ -3083,6 +3132,19 @@ export function multiply(a: number, b: number): number {
     expect(cg.getFiles()).toHaveLength(0);
 
     cg.close();
+  });
+
+  it('should reject invalid ioBatchSize values before indexing', async () => {
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'app.ts'), 'export const app = 1;');
+
+    for (const ioBatchSize of [0, -5, 'abc', 1025]) {
+      const cg = CodeGraph.initSync(tempDir);
+      await expect(cg.indexAll({ ioBatchSize } as any)).rejects.toThrow(/Invalid ioBatchSize/);
+      expect(cg.getFiles()).toHaveLength(0);
+      cg.close();
+      cleanupTempDir(path.join(tempDir, '.codegraph'));
+    }
   });
 
   it('should apply path filters during sync', async () => {
