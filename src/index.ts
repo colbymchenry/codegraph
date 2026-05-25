@@ -37,6 +37,7 @@ import {
   SyncResult,
   extractFromSource,
   initGrammars,
+  validatePathFilterOptions,
 } from './extraction';
 import {
   ReferenceResolver,
@@ -58,6 +59,7 @@ export {
   CODEGRAPH_DIR,
 } from './directory';
 export { IndexProgress, IndexResult, SyncResult } from './extraction';
+export { PathFilterOptions, validatePathFilterOptions } from './extraction';
 export { detectLanguage, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './extraction';
 export { ResolutionResult } from './resolution';
 export {
@@ -87,6 +89,12 @@ export interface InitOptions {
 
   /** Progress callback for indexing */
   onProgress?: (progress: IndexProgress) => void;
+
+  /** Gitignore-style patterns to exclude while initial indexing */
+  exclude?: string[];
+
+  /** Gitignore-style patterns to include while initial indexing */
+  include?: string[];
 }
 
 /**
@@ -112,6 +120,12 @@ export interface IndexOptions {
 
   /** Enable verbose logging (worker lifecycle, memory, timeouts) */
   verbose?: boolean;
+
+  /** Gitignore-style patterns to exclude from indexing */
+  exclude?: string[];
+
+  /** Gitignore-style patterns to include in indexing */
+  include?: string[];
 }
 
 /**
@@ -174,6 +188,10 @@ export class CodeGraph {
    * @returns A new CodeGraph instance
    */
   static async init(projectRoot: string, options: InitOptions = {}): Promise<CodeGraph> {
+    if (options.index) {
+      validatePathFilterOptions(options);
+    }
+
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
 
@@ -194,7 +212,11 @@ export class CodeGraph {
 
     // Run initial indexing if requested
     if (options.index) {
-      await instance.indexAll({ onProgress: options.onProgress });
+      await instance.indexAll({
+        onProgress: options.onProgress,
+        exclude: options.exclude,
+        include: options.include,
+      });
     }
 
     return instance;
@@ -318,6 +340,8 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async indexAll(options: IndexOptions = {}): Promise<IndexResult> {
+    validatePathFilterOptions(options);
+
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
@@ -325,7 +349,12 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
-        const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
+        const result = await this.orchestrator.indexAll(
+          options.onProgress,
+          options.signal,
+          options.verbose,
+          { exclude: options.exclude, include: options.include }
+        );
 
         // Resolve references to create call/import/extends edges
         if (result.success && result.filesIndexed > 0) {
@@ -386,6 +415,8 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
+    validatePathFilterOptions(options);
+
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
@@ -393,7 +424,10 @@ export class CodeGraph {
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
       }
       try {
-        const result = await this.orchestrator.sync(options.onProgress);
+        const result = await this.orchestrator.sync(
+          options.onProgress,
+          { exclude: options.exclude, include: options.include }
+        );
 
         // Resolve references if files were updated
         if (result.filesAdded > 0 || result.filesModified > 0) {

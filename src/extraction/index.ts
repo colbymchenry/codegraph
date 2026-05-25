@@ -86,6 +86,17 @@ export interface SyncResult {
 }
 
 /**
+ * User-provided path filters for indexing.
+ *
+ * Patterns use gitignore semantics. Excludes are applied first; when includes
+ * are present, only included paths survive after the exclude pass.
+ */
+export interface PathFilterOptions {
+  exclude?: string[];
+  include?: string[];
+}
+
+/**
  * Calculate SHA256 hash of file contents
  */
 export function hashContent(content: string): string {
@@ -98,6 +109,60 @@ export function hashContent(content: string): string {
  * symbols. 1 MB covers essentially all hand-written source.
  */
 const MAX_FILE_SIZE = 1024 * 1024;
+
+function normalizeFilterPatterns(kind: 'exclude' | 'include', patterns?: string[]): string[] {
+  if (!patterns || patterns.length === 0) return [];
+
+  return patterns.map((pattern) => {
+    if (typeof pattern !== 'string' || pattern.trim().length === 0) {
+      throw new Error(`Invalid ${kind} pattern: pattern must not be empty`);
+    }
+    if (pattern.includes('\0')) {
+      throw new Error(`Invalid ${kind} pattern "${pattern}": pattern must not contain NUL bytes`);
+    }
+    return normalizePath(pattern);
+  });
+}
+
+function createIgnoreMatcher(kind: 'exclude' | 'include', patterns?: string[]): Ignore | null {
+  const normalized = normalizeFilterPatterns(kind, patterns);
+  if (normalized.length === 0) return null;
+
+  const matcher = ignore();
+  for (const pattern of normalized) {
+    try {
+      matcher.add(pattern);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Invalid ${kind} pattern "${pattern}": ${message}`);
+    }
+  }
+  return matcher;
+}
+
+function hasPathFilterOptions(options?: PathFilterOptions): boolean {
+  return Boolean(options?.exclude?.length || options?.include?.length);
+}
+
+function createPathFilter(options?: PathFilterOptions): (relativePath: string) => boolean {
+  const excludeMatcher = createIgnoreMatcher('exclude', options?.exclude);
+  const includeMatcher = createIgnoreMatcher('include', options?.include);
+
+  if (!excludeMatcher && !includeMatcher) {
+    return () => true;
+  }
+
+  return (relativePath: string): boolean => {
+    const normalized = normalizePath(relativePath);
+    if (excludeMatcher?.ignores(normalized)) return false;
+    if (includeMatcher && !includeMatcher.ignores(normalized)) return false;
+    return true;
+  };
+}
+
+export function validatePathFilterOptions(options?: PathFilterOptions): void {
+  createPathFilter(options);
+}
 
 /**
  * Collect git-visible files (tracked + untracked, .gitignore-respected) from the
@@ -250,15 +315,18 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
  */
 export function scanDirectory(
   rootDir: string,
-  onProgress?: (current: number, file: string) => void
+  onProgress?: (current: number, file: string) => void,
+  filterOptions?: PathFilterOptions
 ): string[] {
+  const pathFilter = createPathFilter(filterOptions);
+
   // Fast path: use git to get all visible files (respects .gitignore everywhere)
   const gitFiles = getGitVisibleFiles(rootDir);
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath)) {
+      if (isSourceFile(filePath) && pathFilter(filePath)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -268,7 +336,7 @@ export function scanDirectory(
   }
 
   // Fallback: walk filesystem for non-git projects
-  return scanDirectoryWalk(rootDir, onProgress);
+  return scanDirectoryWalk(rootDir, onProgress, pathFilter);
 }
 
 /**
@@ -277,14 +345,16 @@ export function scanDirectory(
  */
 export async function scanDirectoryAsync(
   rootDir: string,
-  onProgress?: (current: number, file: string) => void
+  onProgress?: (current: number, file: string) => void,
+  filterOptions?: PathFilterOptions
 ): Promise<string[]> {
+  const pathFilter = createPathFilter(filterOptions);
   const gitFiles = getGitVisibleFiles(rootDir);
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath)) {
+      if (isSourceFile(filePath) && pathFilter(filePath)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -297,7 +367,7 @@ export async function scanDirectoryAsync(
     return files;
   }
 
-  return scanDirectoryWalk(rootDir, onProgress);
+  return scanDirectoryWalk(rootDir, onProgress, pathFilter);
 }
 
 /**
@@ -305,7 +375,8 @@ export async function scanDirectoryAsync(
  */
 function scanDirectoryWalk(
   rootDir: string,
-  onProgress?: (current: number, file: string) => void
+  onProgress?: (current: number, file: string) => void,
+  pathFilter: (relativePath: string) => boolean = () => true
 ): string[] {
   const files: string[] = [];
   let count = 0;
@@ -385,7 +456,7 @@ function scanDirectoryWalk(
               walk(fullPath, active);
             }
           } else if (stat.isFile()) {
-            if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath)) {
+            if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath) && pathFilter(relativePath)) {
               files.push(relativePath);
               count++;
               onProgress?.(count, relativePath);
@@ -402,7 +473,7 @@ function scanDirectoryWalk(
           walk(fullPath, active);
         }
       } else if (entry.isFile()) {
-        if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath)) {
+        if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath) && pathFilter(relativePath)) {
           files.push(relativePath);
           count++;
           onProgress?.(count, relativePath);
@@ -491,8 +562,10 @@ export class ExtractionOrchestrator {
   async indexAll(
     onProgress?: (progress: IndexProgress) => void,
     signal?: AbortSignal,
-    verbose?: boolean
+    verbose?: boolean,
+    filterOptions?: PathFilterOptions
   ): Promise<IndexResult> {
+    validatePathFilterOptions(filterOptions);
     await initGrammars();
     const startTime = Date.now();
     const errors: ExtractionError[] = [];
@@ -513,14 +586,18 @@ export class ExtractionOrchestrator {
       total: 0,
     });
 
-    const files = await scanDirectoryAsync(this.rootDir, (current, file) => {
-      onProgress?.({
-        phase: 'scanning',
-        current,
-        total: 0,
-        currentFile: file,
-      });
-    });
+    const files = await scanDirectoryAsync(
+      this.rootDir,
+      (current, file) => {
+        onProgress?.({
+          phase: 'scanning',
+          current,
+          total: 0,
+          currentFile: file,
+        });
+      },
+      filterOptions
+    );
 
     // Detect frameworks once per indexAll run using the scanned file list.
     // Names are passed to each parse call so framework-specific extractors
@@ -1205,7 +1282,11 @@ export class ExtractionOrchestrator {
    * Sync with current file state.
    * Uses git status as a fast path when available, falling back to full scan.
    */
-  async sync(onProgress?: (progress: IndexProgress) => void): Promise<SyncResult> {
+  async sync(
+    onProgress?: (progress: IndexProgress) => void,
+    filterOptions?: PathFilterOptions
+  ): Promise<SyncResult> {
+    validatePathFilterOptions(filterOptions);
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
     let filesChecked = 0;
@@ -1222,7 +1303,8 @@ export class ExtractionOrchestrator {
     });
 
     const filesToIndex: string[] = [];
-    const gitChanges = getGitChangedFiles(this.rootDir);
+    const useFullScan = hasPathFilterOptions(filterOptions);
+    const gitChanges = useFullScan ? null : getGitChangedFiles(this.rootDir);
 
     if (gitChanges) {
       // === Git fast path ===
@@ -1268,8 +1350,14 @@ export class ExtractionOrchestrator {
       }
     } else {
       // === Fallback: full scan (non-git project or git failure) ===
-      const currentFiles = new Set(scanDirectory(this.rootDir));
+      const currentFiles = new Set(scanDirectory(this.rootDir, undefined, filterOptions));
       filesChecked = currentFiles.size;
+
+      // Keep framework detection scoped to the same filtered file list. This
+      // avoids excluded fixtures or vendored files influencing per-file
+      // framework extractors during a filtered sync.
+      this.detectedFrameworkNames = null;
+      this.ensureDetectedFrameworks([...currentFiles]);
 
       // Build Map for O(1) lookups instead of .find() per file
       const trackedFiles = this.queries.getAllFiles();
