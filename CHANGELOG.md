@@ -7,6 +7,26 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Shared MCP daemon — running multiple AI agents in the same project no
+  longer multiplies the inotify, SQLite, and indexing cost.** The first
+  `codegraph serve --mcp` per project becomes a per-project daemon listening
+  on `.codegraph/daemon.sock` (named pipe on Windows). Subsequent invocations
+  for the same project attach as thin stdio↔socket proxies — one file
+  watcher, one SQLite connection, one tree-sitter warm-up no matter how many
+  Claude Code / Cursor / Codex / opencode sessions you point at the repo.
+  Two concurrent sessions on a large monorepo used to consume ~880k of the
+  Linux 1,048,576 per-user inotify budget; they now share ~440k. The daemon
+  lingers for `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` (default 300s) after the
+  last client disconnects so back-to-back sessions don't repay startup cost.
+  Resolves issue #411.
+- **`CODEGRAPH_NO_DAEMON=1` — opt out of the shared daemon.** Restores the
+  pre-issue-#411 behavior of one independent server process per client.
+  Useful for debugging or for environments that don't permit local
+  IPC sockets.
+
 ## [0.9.5] - 2026-05-25
 
 ### Fixed

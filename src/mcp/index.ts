@@ -13,53 +13,32 @@
  * const server = new MCPServer('/path/to/project');
  * await server.start();
  * ```
+ *
+ * Three runtime modes (decided in {@link MCPServer.start}):
+ *
+ * - **Direct** — one process serves one MCP client over stdio. Today's
+ *   behavior; used when no shareable daemon is reachable or the user opted
+ *   out via `CODEGRAPH_NO_DAEMON=1`.
+ * - **Daemon** — accept N concurrent MCP clients over a Unix-domain socket /
+ *   named pipe, sharing one CodeGraph + watcher + SQLite handle. See
+ *   {@link ./daemon.ts} and issue #411 for the rationale.
+ * - **Proxy** — pure stdio↔socket pipe to an existing daemon. See
+ *   {@link ./proxy.ts}.
  */
 
-import * as path from 'path';
-import CodeGraph, { findNearestCodeGraphRoot } from '../index';
-import { watchDisabledReason } from '../sync';
-import { StdioTransport, JsonRpcRequest, JsonRpcNotification, ErrorCodes } from './transport';
-import { tools, ToolHandler } from './tools';
-import { SERVER_INSTRUCTIONS } from './server-instructions';
+import { findNearestCodeGraphRoot } from '../index';
+import { StdioTransport } from './transport';
+import { MCPEngine } from './engine';
+import { MCPSession } from './session';
+import {
+  Daemon,
+  clearStaleDaemonLock,
+  isProcessAlive,
+  tryAcquireDaemonLock,
+} from './daemon';
+import { runProxy } from './proxy';
+import { getDaemonSocketPath } from './daemon-paths';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
-
-/**
- * Convert a file:// URI to a filesystem path.
- * Handles URL encoding and Windows drive letter paths.
- */
-function fileUriToPath(uri: string): string {
-  try {
-    const url = new URL(uri);
-    let filePath = decodeURIComponent(url.pathname);
-    // On Windows, file:///C:/path produces pathname /C:/path — strip leading /
-    if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(filePath)) {
-      filePath = filePath.slice(1);
-    }
-    return path.resolve(filePath);
-  } catch {
-    // Fallback for non-standard URIs
-    return uri.replace(/^file:\/\/\/?/, '');
-  }
-}
-
-/**
- * MCP Server Info
- */
-const SERVER_INFO = {
-  name: 'codegraph',
-  version: '0.1.0',
-};
-
-/**
- * MCP Protocol Version
- */
-const PROTOCOL_VERSION = '2024-11-05';
-
-/**
- * How long to wait for the client's `roots/list` response before giving up
- * and falling back to the process cwd.
- */
-const ROOTS_LIST_TIMEOUT_MS = 5000;
 
 /**
  * How often to poll `process.ppid` to detect parent process death (see #277).
@@ -67,6 +46,21 @@ const ROOTS_LIST_TIMEOUT_MS = 5000;
  * (parent SIGKILL'd), and longer poll = less wakeup overhead while idle.
  */
 const DEFAULT_PPID_POLL_MS = 5000;
+
+/**
+ * Max retries when a stale-lock takeover races other candidates. After this
+ * many failed acquire+probe rounds we give up and fall back to direct mode —
+ * something is wedged enough that adding our own daemon to the mix would only
+ * make it worse.
+ */
+const TAKEOVER_MAX_RETRIES = 3;
+
+/**
+ * Brief sleep between takeover retries so a freshly-spawned daemon has time
+ * to bind its socket. 100ms is well under any realistic startup, so a
+ * legitimate races resolves on the first or second retry.
+ */
+const TAKEOVER_RETRY_DELAY_MS = 100;
 
 /**
  * Resolve the PPID watchdog poll interval from an env override. A value of
@@ -96,28 +90,22 @@ function parseHostPpid(raw: string | undefined): number | null {
   return parsed;
 }
 
-/** True if a process with `pid` currently exists (signal-0 probe). */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+/** Whether `CODEGRAPH_NO_DAEMON` was set to a truthy value. */
+function daemonOptOutSet(): boolean {
+  const raw = process.env.CODEGRAPH_NO_DAEMON;
+  if (!raw) return false;
+  return raw !== '0' && raw.toLowerCase() !== 'false';
 }
 
 /**
- * Extract the first usable filesystem path from a `roots/list` result.
- * Shape per MCP spec: `{ roots: [{ uri: "file:///path", name?: string }] }`.
- * Returns null if the result is empty or malformed.
+ * Resolve the project root the daemon machinery should key on. Returns
+ * `null` when no `.codegraph/` is reachable from the candidate path — in
+ * that case the caller must run in direct mode, since the daemon lockfile
+ * and socket both live under `.codegraph/`.
  */
-function firstRootPath(result: unknown): string | null {
-  if (!result || typeof result !== 'object') return null;
-  const roots = (result as { roots?: unknown }).roots;
-  if (!Array.isArray(roots) || roots.length === 0) return null;
-  const first = roots[0] as { uri?: unknown };
-  if (typeof first?.uri !== 'string') return null;
-  return fileUriToPath(first.uri);
+function resolveDaemonRoot(explicitPath: string | null): string | null {
+  const candidate = explicitPath ?? process.cwd();
+  return findNearestCodeGraphRoot(candidate);
 }
 
 /**
@@ -125,281 +113,85 @@ function firstRootPath(result: unknown): string | null {
  *
  * Implements the Model Context Protocol to expose CodeGraph
  * functionality as tools that can be called by AI assistants.
+ *
+ * Backwards-compatible constructor and `start()` signature with the
+ * pre-issue-#411 implementation: callers continue to do
+ * `new MCPServer(path).start()`. Internally we now pick from direct / proxy /
+ * daemon at start time.
  */
 export class MCPServer {
-  private transport: StdioTransport;
-  private cg: CodeGraph | null = null;
-  private toolHandler: ToolHandler;
   private projectPath: string | null;
-  // In-flight background init kicked off from handleInitialize. Tracked so the
-  // sync retry path doesn't race against it (double-opening the SQLite file).
-  private initPromise: Promise<void> | null = null;
-  // Whether the client advertised the MCP `roots` capability during initialize.
-  // If so, and no explicit project path was given, we ask it for the workspace
-  // root via roots/list rather than guessing from the (often wrong) cwd.
-  private clientSupportsRoots = false;
-  // Guards the one-shot deferred resolution (roots/list or cwd) so we don't
-  // re-issue roots/list on every tool call.
-  private rootsAttempted = false;
-  // PPID watchdog — see start(). Captured at construction so we always have a
+  // Direct-mode-only state. In daemon mode the per-connection session lives
+  // inside the Daemon class; in proxy mode there is no session at all.
+  private session: MCPSession | null = null;
+  private engine: MCPEngine | null = null;
+  private daemon: Daemon | null = null;
+  private ppidWatchdog: ReturnType<typeof setInterval> | null = null;
+  // PPID watchdog baseline — captured at construction so we always have a
   // baseline, even if start() runs after a fork-style reparent.
   private originalPpid: number = process.ppid;
-  // The MCP host's PID, propagated across the `--liftoff-only` re-exec (see
-  // HOST_PPID_ENV). When set, the watchdog polls it directly: the re-exec
-  // inserts an intermediate process whose *death* — not just our reparenting —
-  // is what we'd otherwise miss. null on the direct (bundled) launch path.
   private hostPpid: number | null = parseHostPpid(process.env[HOST_PPID_ENV]);
-  private ppidWatchdog: ReturnType<typeof setInterval> | null = null;
-  // Idempotency guard for stop(). Without it, the watchdog can race with the
-  // stdin `end`/`close` handlers (or SIGTERM/SIGINT) and double-close cg and
-  // the transport before process.exit() lands.
+  // Idempotency guard for stop().
   private stopped = false;
+  private mode: 'unstarted' | 'direct' | 'proxy' | 'daemon' = 'unstarted';
 
   constructor(projectPath?: string) {
     this.projectPath = projectPath || null;
-    this.transport = new StdioTransport();
-    // Create ToolHandler eagerly — cross-project queries work even without a default project
-    this.toolHandler = new ToolHandler(null);
   }
 
   /**
-   * Start the MCP server
+   * Start the MCP server.
    *
-   * Note: CodeGraph initialization is deferred until the initialize request
-   * is received, which includes the rootUri from the client.
+   * Decision order:
+   *   1. If `CODEGRAPH_NO_DAEMON=1` → direct mode (unchanged behavior).
+   *   2. If no `.codegraph/` reachable → direct mode (daemon needs a lockfile
+   *      and socket location, which both live under `.codegraph/`).
+   *   3. Try to attach to an existing daemon as a proxy.
+   *   4. Otherwise become the daemon ourselves.
+   *
+   * On any unexpected failure in steps 3–4 we transparently fall back to
+   * direct mode — a misbehaving daemon must never block a session from
+   * starting.
    */
   async start(): Promise<void> {
-    // Start listening for messages immediately - don't check initialization yet
-    // We'll get the project path from the initialize request's rootUri
-    this.transport.start(this.handleMessage.bind(this));
-
-    // Keep the process running
-    process.on('SIGINT', () => this.stop());
-    process.on('SIGTERM', () => this.stop());
-
-    // When the parent process (Claude Code) exits, stdin closes.
-    // Detect this and shut down gracefully to prevent orphaned processes.
-    process.stdin.on('end', () => this.stop());
-    process.stdin.on('close', () => this.stop());
-
-    // PPID watchdog (#277). Linux doesn't propagate parent death to children,
-    // so when the MCP host (Claude Code, opencode, …) is SIGKILL'd by the OOM
-    // killer / a force-quit / a container teardown, the child is reparented to
-    // init/systemd and the stdin `end`/`close` events don't always fire. The
-    // server would then linger indefinitely, holding inotify watches, file
-    // descriptors, and the SQLite WAL. Poll `process.ppid` and shut down the
-    // moment it changes from what we observed at startup. Cross-platform:
-    // reparenting changes ppid on Linux *and* macOS; on Windows the value can
-    // also drop to 0 once the parent is gone. When the CLI re-execs itself for
-    // `--liftoff-only`, an intermediate process sits between us and the host and
-    // outlives it, so our own ppid wouldn't change — in that case we poll the
-    // host PID (propagated via HOST_PPID_ENV) for liveness instead. The watchdog
-    // is `.unref()`'d so it never holds the event loop open on its own.
-    const pollMs = parsePpidPollMs(process.env.CODEGRAPH_PPID_POLL_MS);
-    if (pollMs > 0) {
-      this.ppidWatchdog = setInterval(() => {
-        const current = process.ppid;
-        const ppidChanged = current !== this.originalPpid;
-        const hostGone = this.hostPpid !== null && !isProcessAlive(this.hostPpid);
-        if (ppidChanged || hostGone) {
-          const reason = ppidChanged
-            ? `ppid ${this.originalPpid} -> ${current}`
-            : `host pid ${this.hostPpid} exited`;
-          process.stderr.write(
-            `[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`
-          );
-          this.stop();
-        }
-      }, pollMs);
-      this.ppidWatchdog.unref();
-    }
-  }
-
-  /**
-   * Try to initialize CodeGraph for the default project.
-   *
-   * Walks up parent directories to find the nearest .codegraph/ folder,
-   * similar to how git finds .git/ directories.
-   *
-   * If initialization fails, the error is recorded but the server continues
-   * to work — cross-project queries and retries on subsequent tool calls
-   * are still possible.
-   */
-  private async tryInitializeDefault(projectPath: string): Promise<void> {
-    // Record where we searched so a later "not initialized" error can name it.
-    this.toolHandler.setDefaultProjectHint(projectPath);
-
-    // Walk up parent directories to find nearest .codegraph/
-    const resolvedRoot = findNearestCodeGraphRoot(projectPath);
-
-    if (!resolvedRoot) {
-      this.projectPath = projectPath;
-      return;
+    // Direct mode if the user opted out. Done first so debugging is simple:
+    // setting the env var is sufficient to get the pre-#411 behavior.
+    if (daemonOptOutSet()) {
+      return this.startDirect('CODEGRAPH_NO_DAEMON set');
     }
 
-    this.projectPath = resolvedRoot;
+    const root = resolveDaemonRoot(this.projectPath);
+    if (!root) {
+      // No initialized project found — daemon mode has nowhere to put its
+      // socket. This is the fresh-checkout / outside-project case; behave
+      // exactly as before.
+      return this.startDirect('no .codegraph/ root found');
+    }
 
+    // Try the daemon attach/spawn dance.
     try {
-      this.cg = await CodeGraph.open(resolvedRoot);
-      this.toolHandler.setDefaultCodeGraph(this.cg);
-      this.startWatching();
-      this.catchUpSync();
-    } catch (err) {
-      // Log the error so transient failures are diagnosable (see issue #47)
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`[CodeGraph MCP] Failed to open project at ${resolvedRoot}: ${msg}\n`);
-    }
-  }
-
-  /**
-   * Retry initialization of the default project if it previously failed.
-   * Called lazily on tool calls that need the default project.
-   * Re-walks parent directories each time so it picks up projects
-   * initialized after the MCP server started.
-   *
-   * Awaits any in-flight background init (kicked off by handleInitialize) so
-   * we never open the SQLite file twice concurrently.
-   */
-  private async retryInitIfNeeded(): Promise<void> {
-    // Wait for the background init started during handleInitialize, if any.
-    if (this.initPromise) {
-      try { await this.initPromise; } catch { /* errored init falls through to retry */ }
-    }
-
-    // Already initialized successfully
-    if (this.toolHandler.hasDefaultCodeGraph()) return;
-
-    // No explicit path was given at initialize. Resolve it now, exactly once:
-    // ask the client via roots/list (if it advertised roots), else use cwd.
-    // Deferring to here lets a roots answer override the wrong cwd, and the
-    // one-shot guard means we never re-issue roots/list per tool call.
-    if (!this.projectPath && !this.rootsAttempted) {
-      this.rootsAttempted = true;
-      this.initPromise = (
-        this.clientSupportsRoots
-          ? this.initFromRoots()
-          : this.tryInitializeDefault(process.cwd())
-      ).finally(() => { this.initPromise = null; });
-      try { await this.initPromise; } catch { /* fall through to last-resort below */ }
-      if (this.toolHandler.hasDefaultCodeGraph()) return;
-    }
-
-    // Last resort: re-walk from the best candidate we have. Picks up projects
-    // initialized after the server started, and covers clients that sent no
-    // usable initialize signal at all.
-    const candidate = this.projectPath ?? process.cwd();
-    this.toolHandler.setDefaultProjectHint(candidate);
-    const resolvedRoot = findNearestCodeGraphRoot(candidate);
-    if (!resolvedRoot) return;
-
-    try {
-      // Close any previously failed instance to avoid leaking resources
-      if (this.cg) {
-        try { this.cg.close(); } catch { /* ignore */ }
-        this.cg = null;
+      const mode = await this.startDaemonOrProxy(root);
+      if (mode === 'fallback') {
+        return this.startDirect('daemon attach/start failed; fallback to direct');
       }
-      this.cg = CodeGraph.openSync(resolvedRoot);
-      this.projectPath = resolvedRoot;
-      this.toolHandler.setDefaultCodeGraph(this.cg);
-      this.startWatching();
-      this.catchUpSync();
-    } catch {
-      // Still failing — will retry on next tool call
-    }
-  }
-
-  /**
-   * Resolve the project root via the MCP `roots/list` request and initialize
-   * from the first root the client reports. Falls back to the process cwd if
-   * the client returns no usable root or doesn't answer in time. See issue #196.
-   */
-  private async initFromRoots(): Promise<void> {
-    let target = process.cwd();
-    try {
-      const result = await this.transport.request('roots/list', undefined, ROOTS_LIST_TIMEOUT_MS);
-      const rootPath = firstRootPath(result);
-      if (rootPath) {
-        target = rootPath;
-      } else {
-        process.stderr.write('[CodeGraph MCP] Client returned no workspace roots; falling back to process cwd.\n');
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`[CodeGraph MCP] roots/list request failed (${msg}); falling back to process cwd.\n`);
-    }
-    await this.tryInitializeDefault(target);
-  }
-
-  /**
-   * Start file watching on the active CodeGraph instance.
-   * Logs sync activity to stderr for diagnostics.
-   */
-  private startWatching(): void {
-    if (!this.cg) return;
-
-    // When the watcher is intentionally disabled (e.g. WSL2 /mnt drives, or
-    // CODEGRAPH_NO_WATCH=1), say so explicitly and tell the user how to keep
-    // the graph fresh — otherwise the silent staleness is hard to diagnose.
-    const disabledReason = watchDisabledReason(this.projectPath ?? process.cwd());
-    if (disabledReason) {
-      process.stderr.write(
-        `[CodeGraph MCP] File watcher disabled — ${disabledReason}. ` +
-        `The graph will not auto-update; run \`codegraph sync\` (or install the git sync hooks via \`codegraph init\`) to refresh.\n`
-      );
+      this.mode = mode;
+      this.installSignalHandlers();
+      this.installPpidWatchdog();
       return;
-    }
-
-    const started = this.cg.watch({
-      onSyncComplete: (result) => {
-        if (result.filesChanged > 0) {
-          process.stderr.write(
-            `[CodeGraph MCP] Auto-synced ${result.filesChanged} file(s) in ${result.durationMs}ms\n`
-          );
-        }
-      },
-      onSyncError: (err) => {
-        process.stderr.write(`[CodeGraph MCP] Auto-sync error: ${err.message}\n`);
-      },
-    });
-
-    if (started) {
-      process.stderr.write('[CodeGraph MCP] File watcher active — graph will auto-sync on changes\n');
-    } else {
-      // start() can also return false when recursive fs.watch isn't supported.
-      process.stderr.write(
-        '[CodeGraph MCP] File watcher unavailable on this platform — run `codegraph sync` to refresh the graph after changes.\n'
-      );
+    } catch (err) {
+      // Belt-and-braces: if anything throws inside the daemon machinery,
+      // never wedge the user — fall back to a working direct-mode session.
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[CodeGraph MCP] Daemon path failed (${msg}); falling back to direct mode.\n`);
+      return this.startDirect('daemon path threw');
     }
   }
 
   /**
-   * Reconcile the index with the current filesystem once, right after connect —
-   * catches edits, adds, deletes, and `git pull`/`checkout` changes made while
-   * no watcher was running. Runs in the background so it never delays the
-   * `initialize` response; `sync()` is incremental (a stat pre-filter skips
-   * unchanged files) and mutex-guarded, so it can't collide with the live
-   * watcher or a git-hook sync. Runs even when the watcher is unavailable
-   * (e.g. WSL2 /mnt drives), where catch-up matters most.
-   */
-  private catchUpSync(): void {
-    const cg = this.cg;
-    if (!cg) return;
-    void cg
-      .sync()
-      .then((result) => {
-        const changed = result.filesAdded + result.filesModified + result.filesRemoved;
-        if (changed > 0) {
-          process.stderr.write(`[CodeGraph MCP] Caught up ${changed} file(s) changed since last run\n`);
-        }
-      })
-      .catch((err) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[CodeGraph MCP] Catch-up sync failed: ${msg}\n`);
-      });
-  }
-
-  /**
-   * Stop the server
+   * Stop the server. In daemon mode this triggers graceful shutdown of every
+   * connected session; in proxy mode the proxy's own resolve handler exits
+   * the process and `stop()` is a no-op; in direct mode this mirrors the
+   * pre-#411 behavior (close cg, exit).
    */
   stop(): void {
     if (this.stopped) return;
@@ -408,181 +200,154 @@ export class MCPServer {
       clearInterval(this.ppidWatchdog);
       this.ppidWatchdog = null;
     }
-    // Close all cached cross-project connections first
-    this.toolHandler.closeAll();
-    // Close the main CodeGraph instance
-    if (this.cg) {
-      this.cg.close();
-      this.cg = null;
+    if (this.daemon) {
+      void this.daemon.stop('stop()');
+      // Daemon.stop calls process.exit; nothing else to do.
+      return;
     }
-    this.transport.stop();
+    if (this.session) {
+      this.session.stop();
+      this.session = null;
+    }
+    if (this.engine) {
+      this.engine.stop();
+      this.engine = null;
+    }
     process.exit(0);
   }
 
-  /**
-   * Handle incoming JSON-RPC messages
-   */
-  private async handleMessage(message: JsonRpcRequest | JsonRpcNotification): Promise<void> {
-    // Check if it's a request (has id) or notification (no id)
-    const isRequest = 'id' in message;
-
-    switch (message.method) {
-      case 'initialize':
-        if (isRequest) {
-          await this.handleInitialize(message as JsonRpcRequest);
-        }
-        break;
-
-      case 'initialized':
-        // Notification that client has finished initialization
-        // No action needed - the client is ready
-        break;
-
-      case 'tools/list':
-        if (isRequest) {
-          await this.handleToolsList(message as JsonRpcRequest);
-        }
-        break;
-
-      case 'tools/call':
-        if (isRequest) {
-          await this.handleToolsCall(message as JsonRpcRequest);
-        }
-        break;
-
-      case 'ping':
-        if (isRequest) {
-          this.transport.sendResult((message as JsonRpcRequest).id, {});
-        }
-        break;
-
-      default:
-        if (isRequest) {
-          this.transport.sendError(
-            (message as JsonRpcRequest).id,
-            ErrorCodes.MethodNotFound,
-            `Method not found: ${message.method}`
-          );
-        }
+  /** Single-process stdio MCP session — the pre-issue-#411 code path. */
+  private async startDirect(reason: string): Promise<void> {
+    if (reason && process.env.CODEGRAPH_MCP_DEBUG) {
+      process.stderr.write(`[CodeGraph MCP] Direct mode: ${reason}.\n`);
     }
-  }
-
-  /**
-   * Handle initialize request
-   */
-  private async handleInitialize(request: JsonRpcRequest): Promise<void> {
-    const params = request.params as {
-      rootUri?: string;
-      workspaceFolders?: Array<{ uri: string; name: string }>;
-      capabilities?: { roots?: unknown };
-    } | undefined;
-
-    // Does the client support the MCP `roots` protocol? If so, and we have no
-    // explicit path, we ask it for the workspace root after the handshake
-    // instead of falling back to the (frequently wrong) cwd. See issue #196.
-    this.clientSupportsRoots = !!params?.capabilities?.roots;
-
-    // Explicit project signal, strongest first: a client-provided rootUri /
-    // workspaceFolders (LSP-style, non-standard but some clients send it), else
-    // the --path the server was launched with. cwd is NOT used here — we defer
-    // it so a roots/list answer can win over it.
-    let explicitPath: string | null = null;
-    if (params?.rootUri) {
-      explicitPath = fileUriToPath(params.rootUri);
-    } else if (params?.workspaceFolders?.[0]?.uri) {
-      explicitPath = fileUriToPath(params.workspaceFolders[0].uri);
-    } else if (this.projectPath) {
-      explicitPath = this.projectPath;
-    }
-
-    // Respond to the handshake BEFORE doing any heavy initialization. Loading
-    // the SQLite DB and the tree-sitter WASM runtime can take many seconds on
-    // slow filesystems (Docker Desktop VirtioFS on macOS, WSL2). Clients like
-    // Claude Code time out the handshake at ~30s, which manifested as
-    // "MCP tools never appear" — the child was alive and had received the
-    // initialize but was still awaiting initGrammars(). See issue #172.
-    //
-    // We accept the client's protocol version but respond with our supported
-    // version. The `instructions` field is surfaced by MCP clients in the
-    // agent's system prompt automatically — it's the right place for the
-    // universal tool-selection playbook, ahead of individual tool descriptions.
-    this.transport.sendResult(request.id, {
-      protocolVersion: PROTOCOL_VERSION,
-      capabilities: {
-        tools: {},
-      },
-      serverInfo: SERVER_INFO,
-      instructions: SERVER_INSTRUCTIONS,
+    this.engine = new MCPEngine();
+    const transport = new StdioTransport();
+    this.session = new MCPSession(transport, this.engine, {
+      explicitProjectPath: this.projectPath,
     });
 
-    // If we know the project dir, kick off init in the background now. Tool
-    // calls that arrive before it finishes fall through to `retryInitIfNeeded`,
-    // which waits for this promise rather than racing it with a second open.
-    //
-    // If we DON'T know it (no rootUri, no --path), defer: the first tool call
-    // resolves it via roots/list (when the client supports roots) or cwd. This
-    // is the fix for issue #196 — clients that launch the server outside the
-    // project and don't pass a rootUri previously got a misleading "not
-    // initialized" error on every call.
-    if (explicitPath) {
-      this.initPromise = this.tryInitializeDefault(explicitPath).finally(() => {
-        this.initPromise = null;
-      });
+    if (this.projectPath) {
+      // Background init so the initialize response stays fast (#172).
+      void this.engine.ensureInitialized(this.projectPath);
     }
+
+    this.session.start();
+
+    // Detect parent-process death — same logic as pre-refactor. When stdin
+    // closes we go through StdioTransport's `process.exit(0)` already, but
+    // SIGKILL of the parent doesn't reliably close stdin on Linux (#277).
+    process.stdin.on('end', () => this.stop());
+    process.stdin.on('close', () => this.stop());
+
+    this.mode = 'direct';
+    this.installSignalHandlers();
+    this.installPpidWatchdog();
   }
 
   /**
-   * Handle tools/list request
+   * Try to attach as proxy or start as daemon. Returns 'proxy' / 'daemon' on
+   * success, 'fallback' if the caller should retry in direct mode.
    */
-  private async handleToolsList(request: JsonRpcRequest): Promise<void> {
-    await this.retryInitIfNeeded();
-    this.transport.sendResult(request.id, {
-      tools: this.toolHandler.getTools(),
-    });
+  private async startDaemonOrProxy(root: string): Promise<'proxy' | 'daemon' | 'fallback'> {
+    for (let attempt = 0; attempt < TAKEOVER_MAX_RETRIES; attempt++) {
+      const lock = tryAcquireDaemonLock(root);
+
+      if (lock.kind === 'acquired') {
+        const daemon = new Daemon(root, { lockFd: lock.lockFd });
+        await daemon.start();
+        // The MCP host launched us over stdio and is waiting for our
+        // `initialize` response — attach it as the daemon's first session
+        // so we never silently drop the launcher. Subsequent invocations
+        // discover us via the socket and proxy in.
+        daemon.attachStdioLauncherSession();
+        this.daemon = daemon;
+        return 'daemon';
+      }
+
+      // Lock is taken — that *should* mean a daemon is alive. Probe.
+      const socketPath = lock.existing?.socketPath || getDaemonSocketPath(root);
+      const probe = await runProxy(socketPath);
+      if (probe.outcome === 'proxied') {
+        // runProxy only returns when the connection has CLOSED — meaning we
+        // already piped stdio and are now exiting. From here we should not
+        // start anything else. The process is expected to terminate
+        // naturally after this function returns.
+        return 'proxy';
+      }
+
+      // Proxy didn't attach. Possible causes:
+      //   (a) Daemon is mid-startup and hasn't bound the socket yet — retry.
+      //   (b) Daemon crashed but lockfile leaked — clear it and retry.
+      //   (c) Daemon is alive but version-mismatched — fall back to direct.
+      if (probe.reason === 'version mismatch') {
+        return 'fallback';
+      }
+
+      if (lock.existing && lock.existing.pid > 0 && isProcessAlive(lock.existing.pid)) {
+        // Daemon process is alive but its socket isn't accepting — probably
+        // (a). Sleep briefly and try again.
+        await sleep(TAKEOVER_RETRY_DELAY_MS);
+        continue;
+      }
+
+      // Dead pid (or unreadable lockfile): clear it and retry. If we lose
+      // the next race to another candidate, that's fine — they'll be the
+      // new daemon and we'll proxy through them.
+      clearStaleDaemonLock(lock.pidPath);
+      await sleep(TAKEOVER_RETRY_DELAY_MS);
+    }
+
+    // Repeated failures — something is very wrong (perms?). Direct mode it is.
+    return 'fallback';
+  }
+
+  /** Standard SIGINT/SIGTERM handlers that route to our `stop()`. */
+  private installSignalHandlers(): void {
+    process.on('SIGINT', () => this.stop());
+    process.on('SIGTERM', () => this.stop());
   }
 
   /**
-   * Handle tools/call request
+   * PPID watchdog. The daemon mode owns its own lifecycle (idle timeout +
+   * client refcount), so we deliberately do NOT enable the PPID watchdog
+   * there — otherwise the very first proxy that spawned the daemon would
+   * drag it down when it exited. Direct mode and proxy mode both enable it.
    */
-  private async handleToolsCall(request: JsonRpcRequest): Promise<void> {
-    const params = request.params as {
-      name: string;
-      arguments?: Record<string, unknown>;
-    };
-
-    if (!params || !params.name) {
-      this.transport.sendError(
-        request.id,
-        ErrorCodes.InvalidParams,
-        'Missing tool name'
-      );
-      return;
-    }
-
-    const toolName = params.name;
-    const toolArgs = params.arguments || {};
-
-    // Validate tool exists
-    const tool = tools.find(t => t.name === toolName);
-    if (!tool) {
-      this.transport.sendError(
-        request.id,
-        ErrorCodes.InvalidParams,
-        `Unknown tool: ${toolName}`
-      );
-      return;
-    }
-
-    // If the default project isn't initialized yet, retry in case it was
-    // initialized after the MCP server started (e.g. user ran codegraph init)
-    await this.retryInitIfNeeded();
-
-    const result = await this.toolHandler.execute(toolName, toolArgs);
-
-    this.transport.sendResult(request.id, result);
+  private installPpidWatchdog(): void {
+    if (this.mode === 'daemon') return;
+    if (this.mode === 'proxy') return; // proxy.ts installs its own.
+    const pollMs = parsePpidPollMs(process.env.CODEGRAPH_PPID_POLL_MS);
+    if (pollMs <= 0) return;
+    this.ppidWatchdog = setInterval(() => {
+      const current = process.ppid;
+      const ppidChanged = current !== this.originalPpid;
+      const hostGone = this.hostPpid !== null && !isProcessAlive(this.hostPpid);
+      if (ppidChanged || hostGone) {
+        const reason = ppidChanged
+          ? `ppid ${this.originalPpid} -> ${current}`
+          : `host pid ${this.hostPpid} exited`;
+        process.stderr.write(
+          `[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`
+        );
+        this.stop();
+      }
+    }, pollMs);
+    this.ppidWatchdog.unref();
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  // Deliberately NOT unref'd. During the daemon takeover retry loop we may
+  // be between processes — no socket bound yet, no transport, no listener
+  // pinning the event loop. An unref'd timer would let Node drain the loop
+  // and exit silently before we get a chance to try again.
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
 // Export for use in CLI
 export { StdioTransport } from './transport';
 export { tools, ToolHandler } from './tools';
+// Surface a few daemon-mode bits for tests + diagnostics.
+export { Daemon } from './daemon';
+export { CodeGraphPackageVersion } from './version';
