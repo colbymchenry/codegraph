@@ -243,6 +243,7 @@ export class MCPServer {
       this.cg = await CodeGraph.open(resolvedRoot);
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
+      this.catchUpSync();
     } catch (err) {
       // Log the error so transient failures are diagnosable (see issue #47)
       const msg = err instanceof Error ? err.message : String(err);
@@ -301,6 +302,7 @@ export class MCPServer {
       this.projectPath = resolvedRoot;
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
+      this.catchUpSync();
     } catch {
       // Still failing — will retry on next tool call
     }
@@ -368,6 +370,32 @@ export class MCPServer {
         '[CodeGraph MCP] File watcher unavailable on this platform — run `codegraph sync` to refresh the graph after changes.\n'
       );
     }
+  }
+
+  /**
+   * Reconcile the index with the current filesystem once, right after connect —
+   * catches edits, adds, deletes, and `git pull`/`checkout` changes made while
+   * no watcher was running. Runs in the background so it never delays the
+   * `initialize` response; `sync()` is incremental (a stat pre-filter skips
+   * unchanged files) and mutex-guarded, so it can't collide with the live
+   * watcher or a git-hook sync. Runs even when the watcher is unavailable
+   * (e.g. WSL2 /mnt drives), where catch-up matters most.
+   */
+  private catchUpSync(): void {
+    const cg = this.cg;
+    if (!cg) return;
+    void cg
+      .sync()
+      .then((result) => {
+        const changed = result.filesAdded + result.filesModified + result.filesRemoved;
+        if (changed > 0) {
+          process.stderr.write(`[CodeGraph MCP] Caught up ${changed} file(s) changed since last run\n`);
+        }
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[CodeGraph MCP] Catch-up sync failed: ${msg}\n`);
+      });
   }
 
   /**

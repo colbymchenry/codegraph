@@ -1202,8 +1202,12 @@ export class ExtractionOrchestrator {
   }
 
   /**
-   * Sync with current file state.
-   * Uses git status as a fast path when available, falling back to full scan.
+   * Sync the index with the current file state.
+   *
+   * Change detection is filesystem-based, never git: a (size, mtime) stat
+   * pre-filter skips unchanged files, then a content-hash compare confirms real
+   * changes. This works in non-git projects and catches committed changes from
+   * `git pull`/`checkout`/`merge`/`rebase` that `git status` cannot see.
    */
   async sync(onProgress?: (progress: IndexProgress) => void): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
@@ -1222,93 +1226,75 @@ export class ExtractionOrchestrator {
     });
 
     const filesToIndex: string[] = [];
-    const gitChanges = getGitChangedFiles(this.rootDir);
+    // === Filesystem reconcile (git-independent) ===
+    // The source of truth for "what changed" is the filesystem vs the indexed
+    // state — never git. We enumerate the current source files and reconcile
+    // each against the DB. A cheap (size, mtime) stat pre-filter skips unchanged
+    // files without reading or hashing them, so the expensive read+hash+parse
+    // only runs for files that actually changed. This catches edits/adds/deletes
+    // whether or not the project uses git, and crucially also catches committed
+    // changes from `git pull`/`checkout`/`merge`/`rebase` — which `git status`
+    // cannot see, because the working tree is clean afterward.
+    const currentFiles = scanDirectory(this.rootDir);
+    filesChecked = currentFiles.length;
+    const currentSet = new Set(currentFiles);
 
-    if (gitChanges) {
-      // === Git fast path ===
-      // Only inspect the files git reports as changed instead of scanning everything.
-      filesChecked = gitChanges.modified.length + gitChanges.added.length + gitChanges.deleted.length;
+    const trackedFiles = this.queries.getAllFiles();
+    const trackedMap = new Map<string, FileRecord>();
+    for (const f of trackedFiles) {
+      trackedMap.set(f.path, f);
+    }
 
-      // Handle deleted files
-      for (const filePath of gitChanges.deleted) {
-        const tracked = this.queries.getFileByPath(filePath);
-        if (tracked) {
-          this.queries.deleteFile(filePath);
-          filesRemoved++;
-        }
+    // Removals: tracked in the DB but no longer a present source file. Check the
+    // filesystem directly — `scanDirectory` (via `git ls-files`) still lists a
+    // file deleted from disk but not yet staged, so set membership alone misses it.
+    for (const tracked of trackedFiles) {
+      if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
+        this.queries.deleteFile(tracked.path);
+        filesRemoved++;
       }
+    }
 
-      // Handle modified + added files — read + hash only these. Untracked
-      // (`??`) files stay untracked in git even after we index them, so they
-      // can't be trusted as "new": re-hash and compare against the DB exactly
-      // like modified files. Otherwise every sync re-indexes them and status
-      // reports them as pending forever. (See issue #206.)
-      for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
-        const fullPath = path.join(this.rootDir, filePath);
-        let content: string;
+    // Adds / modifications.
+    for (const filePath of currentFiles) {
+      const fullPath = path.join(this.rootDir, filePath);
+      const tracked = trackedMap.get(filePath);
+
+      // Cheap pre-filter: an already-indexed file whose size AND mtime both match
+      // the DB is unchanged — skip it without reading or hashing. (A content
+      // change that preserves both exactly is the blind spot every mtime-based
+      // incremental tool accepts; `index --force` is the escape hatch. Git bumps
+      // mtime on every file it writes during checkout/merge, so pulls are caught.)
+      if (tracked) {
         try {
-          content = fs.readFileSync(fullPath, 'utf-8');
+          const stat = fs.statSync(fullPath);
+          if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
+            continue;
+          }
         } catch (error) {
-          logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
+          logDebug('Skipping unstattable file during sync', { filePath, error: String(error) });
           continue;
         }
-
-        const contentHash = hashContent(content);
-        const tracked = this.queries.getFileByPath(filePath);
-
-        if (!tracked) {
-          filesToIndex.push(filePath);
-          changedFilePaths.push(filePath);
-          filesAdded++;
-        } else if (tracked.contentHash !== contentHash) {
-          filesToIndex.push(filePath);
-          changedFilePaths.push(filePath);
-          filesModified++;
-        }
-      }
-    } else {
-      // === Fallback: full scan (non-git project or git failure) ===
-      const currentFiles = new Set(scanDirectory(this.rootDir));
-      filesChecked = currentFiles.size;
-
-      // Build Map for O(1) lookups instead of .find() per file
-      const trackedFiles = this.queries.getAllFiles();
-      const trackedMap = new Map<string, FileRecord>();
-      for (const f of trackedFiles) {
-        trackedMap.set(f.path, f);
       }
 
-      // Find files to remove (in DB but not on disk)
-      for (const tracked of trackedFiles) {
-        if (!currentFiles.has(tracked.path)) {
-          this.queries.deleteFile(tracked.path);
-          filesRemoved++;
-        }
+      // New, or size/mtime changed — read + hash to confirm a real content change.
+      let content: string;
+      try {
+        content = fs.readFileSync(fullPath, 'utf-8');
+      } catch (error) {
+        logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
+        continue;
       }
+      const contentHash = hashContent(content);
 
-      // Find files to add or update
-      for (const filePath of currentFiles) {
-        const fullPath = path.join(this.rootDir, filePath);
-        let content: string;
-        try {
-          content = fs.readFileSync(fullPath, 'utf-8');
-        } catch (error) {
-          logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
-          continue;
-        }
-
-        const contentHash = hashContent(content);
-        const tracked = trackedMap.get(filePath);
-
-        if (!tracked) {
-          filesToIndex.push(filePath);
-          changedFilePaths.push(filePath);
-          filesAdded++;
-        } else if (tracked.contentHash !== contentHash) {
-          filesToIndex.push(filePath);
-          changedFilePaths.push(filePath);
-          filesModified++;
-        }
+      if (!tracked) {
+        filesToIndex.push(filePath);
+        changedFilePaths.push(filePath);
+        filesAdded++;
+      } else if (tracked.contentHash !== contentHash) {
+        filesToIndex.push(filePath);
+        changedFilePaths.push(filePath);
+        filesModified++;
       }
     }
 
