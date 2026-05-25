@@ -338,6 +338,149 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
  * (reachability-correct); capped per class, gated to JVM languages.
  */
 const IFACE_OVERRIDE_LANGS = new Set(['java', 'kotlin']);
+
+/**
+ * Phase 5.6: Dagger 2 / Hilt `@Provides` / `@Binds` bindings. A Dagger module
+ *
+ *   @Module class Foo { @Provides DataManager m(AppDataManager impl) { return impl; } }
+ *
+ * declares at runtime "anywhere you ask for DataManager, you get AppDataManager."
+ * Statically, the only link is the method's signature — there's no `implements`
+ * declaration to mine. Without this pass an injected-via-DI flow stops at the
+ * interface method and a multi-impl interface picks an arbitrary impl via the
+ * generic interface-override pass. This synthesizer is *binding-precise*: only
+ * the impl named in the @Provides/@Binds method gets the edge.
+ *
+ * Emits `interface → impl` `references` edges with `synthesizedBy:'dagger-provides'`,
+ * keyed by binding line so dupes across modules collapse cleanly.
+ */
+const DAGGER_LANGS = new Set(['java', 'kotlin']);
+const MODULE_ANNOTATION_RE = /@Module\b/;
+const BINDS_ANNOTATION_RE = /@Binds\b/;
+const ANY_BINDING_ANNOTATION_RE = /@(?:Provides|Binds)\b/;
+// Require an actual Dagger import in the file to avoid claiming `@Module`
+// declarations from unrelated libraries (Guice, NestJS shims, custom test
+// helpers) as Dagger modules.
+const DAGGER_IMPORT_PRESENT_RE = /^import\s+dagger\./m;
+// Kotlin method head: fun name(p: ParamType[, …]): ReturnType. We capture
+// the first param's name (group 1) along with its type (group 2) so the
+// body-identity check below can verify the method *really* returns it.
+const KOTLIN_BINDING_HEAD_RE =
+  /\bfun\s+\w+\s*\(\s*(\w+)\s*:\s*([\w.<>?]+)[\s\S]*?\)\s*:\s*([\w.<>?]+)/;
+// Java method head: [modifiers] ReturnType name([@Anno ]ParamType paramName[, …]).
+const JAVA_BINDING_HEAD_RE =
+  /(?:^|\s)(?:public|private|protected|abstract|static|final|default|\s)*\b([\w.<>]+)\s+\w+\s*\(\s*(?:@\w+(?:\([^)]*\))?\s+)?([\w.<>]+)\s+(\w+)\s*[,)]/;
+
+/** Strip generic parameters and dotted qualifiers down to the bare type name. */
+function bareTypeName(t: string): string {
+  const noGeneric = t.replace(/<.*$/, '');
+  const noNullable = noGeneric.replace(/\?$/, '');
+  const noDot = noNullable.split('.').pop() ?? noNullable;
+  return noDot;
+}
+
+/** Extract (return type, first param type, first param name) from a method head. */
+function parseBindingHead(
+  headSrc: string,
+  language: string
+): { returnType: string; paramType: string; paramName: string } | null {
+  if (language === 'kotlin') {
+    const km = KOTLIN_BINDING_HEAD_RE.exec(headSrc);
+    if (!km) return null;
+    return { paramName: km[1]!, paramType: km[2]!, returnType: km[3]! };
+  }
+  const jm = JAVA_BINDING_HEAD_RE.exec(headSrc);
+  if (!jm) return null;
+  return { returnType: jm[1]!, paramType: jm[2]!, paramName: jm[3]! };
+}
+
+/**
+ * Does the method body look like a pure identity (`return paramName;` in
+ * Java, `= paramName` or `return paramName` in Kotlin)?  Pure-identity
+ * `@Provides` methods are equivalent to `@Binds` — they declare a real
+ * interface-to-impl binding.  Methods that do anything else (factory
+ * calls, ViewModelProviders, configuration) are NOT bindings, even if
+ * their parameter happens to be a subtype of their return type.
+ */
+function isPureIdentityBody(content: string, m: Node, paramName: string): boolean {
+  const body = sliceLines(content, m.startLine, m.endLine);
+  if (!body) return false;
+  const escaped = paramName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(?:return\\s+|=\\s*)${escaped}(?=\\s*[;\\n}]|\\s*$)`);
+  return re.test(body);
+}
+
+function daggerProvidesBindingEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  for (const cls of queries.getNodesByKind('class')) {
+    if (!DAGGER_LANGS.has(cls.language)) continue;
+    const content = ctx.readFile(cls.filePath);
+    if (!content || !DAGGER_IMPORT_PRESENT_RE.test(content)) continue;
+    const classSrc = sliceLines(content, cls.startLine, cls.endLine);
+    if (!classSrc || !MODULE_ANNOTATION_RE.test(classSrc)) continue;
+
+    const methods = queries
+      .getOutgoingEdges(cls.id, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n && n.kind === 'method');
+
+    for (const m of methods) {
+      // A single window covers both the annotations and the signature head.
+      // Tree-sitter's `method_declaration.startPosition` is fickle on Java:
+      // sometimes it lands on the first annotation (`@Provides` line),
+      // sometimes on the return-type line below the annotations. Reading a
+      // few lines on either side handles both, plus multi-line parameter
+      // lists. Decorator extraction doesn't populate `decorators` for JVM
+      // annotations, so we scan the source directly.
+      const window = sliceLines(content, Math.max(1, m.startLine - 3), m.startLine + 4);
+      if (!window || !ANY_BINDING_ANNOTATION_RE.test(window)) continue;
+
+      const parsed = parseBindingHead(window, m.language);
+      if (!parsed) continue;
+      const returnType = bareTypeName(parsed.returnType);
+      const paramType = bareTypeName(parsed.paramType);
+      if (!returnType || !paramType || returnType === paramType) continue;
+
+      // `@Binds` is abstract — declaration alone IS the binding. `@Provides`
+      // needs body-level verification: only count it as a binding when the
+      // body literally returns the parameter (`return impl;` / `= impl`).
+      // Factory shapes like `provideX(dep): X { return ViewModelProviders.of(...) }`
+      // share the Interface(Impl) signature shape but are NOT bindings.
+      const isBinds = BINDS_ANNOTATION_RE.test(window);
+      if (!isBinds && !isPureIdentityBody(content, m, parsed.paramName)) continue;
+
+      const ifaceCandidates = ctx
+        .getNodesByName(returnType)
+        .filter((n) => (n.kind === 'interface' || n.kind === 'class') && DAGGER_LANGS.has(n.language));
+      const implCandidates = ctx
+        .getNodesByName(paramType)
+        .filter((n) => n.kind === 'class' && DAGGER_LANGS.has(n.language));
+      if (ifaceCandidates.length === 0 || implCandidates.length === 0) continue;
+
+      const iface = ifaceCandidates[0]!;
+      const impl = implCandidates[0]!;
+      if (iface.id === impl.id) continue;
+
+      const key = `${iface.id}>${impl.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      edges.push({
+        source: iface.id,
+        target: impl.id,
+        kind: 'references',
+        line: m.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'dagger-provides', via: m.name, registeredAt: `${m.filePath}:${m.startLine}` },
+      });
+    }
+  }
+
+  return edges;
+}
+
 function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -534,10 +677,11 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const flutterEdges = flutterBuildEdges(queries, ctx);
   const cppEdges = cppOverrideEdges(queries);
   const ifaceEdges = interfaceOverrideEdges(queries);
+  const daggerEdges = daggerProvidesBindingEdges(queries, ctx);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
-  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges, ...ifaceEdges]) {
+  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges, ...ifaceEdges, ...daggerEdges]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
     seen.add(key);
