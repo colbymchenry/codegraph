@@ -248,7 +248,9 @@ export class GraphTraverser {
     }
     visited.add(nodeId);
 
-    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports']);
+    // 'instantiates' surfaces the module-instantiation hierarchy (HDLs) and
+    // `new X()` dependencies — "what instantiates this".
+    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates']);
     if (incomingEdges.length === 0) return;
 
     // Batch-fetch all caller nodes in one round-trip instead of one
@@ -293,7 +295,9 @@ export class GraphTraverser {
     }
     visited.add(nodeId);
 
-    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports']);
+    // 'instantiates' surfaces the module-instantiation hierarchy (HDLs) and
+    // `new X()` dependencies — "what this instantiates".
+    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates']);
     if (outgoingEdges.length === 0) return;
 
     // Batch-fetch callee nodes (was N+1 — see getCallersRecursive note).

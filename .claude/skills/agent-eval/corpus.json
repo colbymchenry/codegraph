@@ -69,5 +69,10 @@
     { "name": "Knit", "repo": "https://github.com/Sleitnick/Knit", "size": "Small", "files": "~10", "question": "How does Knit register services and expose them to clients?" },
     { "name": "vide", "repo": "https://github.com/centau/vide", "size": "Small", "files": "~40", "question": "How does vide track reactive sources and re-run effects when state changes?" },
     { "name": "Fusion", "repo": "https://github.com/dphfox/Fusion", "size": "Medium", "files": "~115", "question": "How does Fusion build and update its reactive UI graph from state objects?" }
+  ],
+  "Verilog": [
+    { "name": "picorv32", "repo": "https://github.com/YosysHQ/picorv32", "size": "Small", "files": "~80", "question": "How does the picorv32_axi module reach the multiplier coprocessor through its submodule instantiation hierarchy?" },
+    { "name": "ibex", "repo": "https://github.com/lowRISC/ibex", "size": "Large", "files": "~1900", "question": "How does ibex_top reach the instruction decoder through its module instantiation chain?" },
+    { "name": "cva6", "repo": "https://github.com/openhwgroup/cva6", "size": "Large", "files": "~2500", "question": "How does the cva6 core reach the load-store unit through its submodule instantiation hierarchy?" }
   ]
 }

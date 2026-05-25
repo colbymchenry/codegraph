@@ -1028,17 +1028,27 @@ export class ToolHandler {
     const toMatches = this.findAllSymbols(cg, to);
     if (toMatches.nodes.length === 0) return this.textResult(`Symbol "${to}" not found in the codebase`);
 
-    // Trace along call edges only — a true call path. Names can map to several
-    // nodes, so try a few from×to candidate pairs until a usable path turns up.
+    // Trace along call + instantiation edges — a true call path, plus the
+    // module-instantiation hierarchy that IS the flow in HDLs (Verilog/SV: how
+    // a top module reaches a leaf module through submodule instances). Both are
+    // precise (tree-sitter) edges, so they don't widen the BFS the way fuzzy
+    // 'references' would. Names can map to several nodes, so try a few from×to
+    // candidate pairs until a usable path turns up.
     //
-    // MAX_HOPS guard: a BFS shortest path longer than this on a dense call graph
-    // is almost always a spurious wander through unrelated code (django's
-    // `_fetch_all → … → execute_sql` BFS detours through prefetch/filter), not
-    // the real execution flow — and a confident-but-wrong 15-hop trace is worse
-    // than none. Over-cap paths are rejected and reported as "no direct path"
-    // (which, on real code, means the flow breaks at dynamic dispatch).
-    const edgeKinds: Edge['kind'][] = ['calls'];
-    const MAX_HOPS = 7;
+    // Hop guard, applied per edge kind. A long BFS shortest path on a dense CALL
+    // graph is almost always a spurious wander through unrelated code (django's
+    // `_fetch_all → … → execute_sql` detours through prefetch/filter), not the
+    // real flow — so cap the wander-prone CALL hops. Module-instantiation
+    // hierarchies are tree-like, so a deep `instantiates` chain is a legit SoC
+    // topology (deep wrappers / generated hierarchies) — don't penalize its
+    // depth; only a generous total-length sanity bound applies. Over-cap paths
+    // are rejected and reported as "no direct path" (on real code: a dynamic-
+    // dispatch break). (`p` includes the start node, so total hops = p.length-1.)
+    const edgeKinds: Edge['kind'][] = ['calls', 'instantiates'];
+    const MAX_CALL_HOPS = 7;
+    const MAX_TOTAL_HOPS = 20;
+    const callHops = (p: Array<{ node: Node; edge: Edge | null }>) =>
+      p.filter((h) => h.edge?.kind === 'calls').length;
     const fromTry = fromMatches.nodes.slice(0, 3);
     const toTry = toMatches.nodes.slice(0, 3);
     let path: Array<{ node: Node; edge: Edge | null }> | null = null;
@@ -1047,7 +1057,7 @@ export class ToolHandler {
       for (const t of toTry) {
         const p = cg.findPath(f.id, t.id, edgeKinds);
         if (!p || p.length <= 1) continue;
-        if (p.length <= MAX_HOPS) { path = p; break; }
+        if (callHops(p) <= MAX_CALL_HOPS && p.length - 1 <= MAX_TOTAL_HOPS) { path = p; break; }
         if (!overCap || p.length < overCap.length) overCap = p;
       }
       if (path) break;
