@@ -47,6 +47,13 @@ import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions } from './sync';
+import * as fs from 'fs';
+import {
+  RemoteGraphClient,
+  BranchDiffIndexer,
+  OverlayQueryEngine,
+} from './overlay';
+import type { RemoteGraphConfig } from './overlay';
 
 // Re-export types for consumers
 export * from './types';
@@ -77,6 +84,12 @@ export {
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
 export { FileWatcher, WatchOptions } from './sync';
 export { MCPServer } from './mcp';
+export {
+  RemoteGraphClient,
+  BranchDiffIndexer,
+  OverlayQueryEngine,
+} from './overlay';
+export type { RemoteGraphConfig, BranchDiffResult } from './overlay';
 
 /**
  * Options for initializing a new CodeGraph project
@@ -137,6 +150,9 @@ export class CodeGraph {
 
   // File watcher for auto-sync on file changes
   private watcher: FileWatcher | null = null;
+
+  // Remote graph client (non-null only in overlay mode)
+  private remoteClient: RemoteGraphClient | null = null;
 
   private constructor(
     db: DatabaseConnection,
@@ -292,13 +308,118 @@ export class CodeGraph {
   }
 
   /**
-   * Close the CodeGraph instance and release resources
+   * Open a CodeGraph project in overlay mode.
+   *
+   * Instead of indexing the entire repository locally, this method:
+   * 1. Fetches a pre-built base graph from a remote source (CI artifact,
+   *    shared filesystem, HTTP server).
+   * 2. Detects files changed on the current feature branch relative to
+   *    the base branch using `git diff`.
+   * 3. Indexes only the changed files into a lightweight local overlay
+   *    database.
+   * 4. Returns a CodeGraph instance whose queries seamlessly merge the
+   *    remote base graph with the local overlay, so the LLM sees a
+   *    complete, up-to-date view.
+   *
+   * This is the team-friendly workflow: CI builds the main-branch graph
+   * once, every developer downloads it and layers on their branch diffs.
+   *
+   * Falls back gracefully: if no files changed, the base graph is
+   * returned as-is. The existing local-only CodeGraph API is unaffected.
+   *
+   * @param projectRoot   - Path to the project root (git repo)
+   * @param remoteConfig  - Remote base graph configuration
+   * @param options        - Indexing options (progress callback, etc.)
+   * @returns A CodeGraph instance with overlay-merged queries
+   *
+   * @example
+   * ```ts
+   * const cg = await CodeGraph.openOverlay('/path/to/repo', {
+   *   url: 'https://ci.example.com/codegraph/main.db',
+   *   baseBranch: 'main',
+   * });
+   * // All queries now merge the base graph + local branch changes
+   * const results = cg.searchNodes('AuthService');
+   * cg.close();
+   * ```
+   */
+  static async openOverlay(
+    projectRoot: string,
+    remoteConfig: RemoteGraphConfig,
+    _options: IndexOptions = {}
+  ): Promise<CodeGraph> {
+    await initGrammars();
+    const resolvedRoot = path.resolve(projectRoot);
+
+    // Ensure .codegraph directory exists
+    if (!isInitialized(resolvedRoot)) {
+      createDirectory(resolvedRoot);
+    }
+
+    // Step 1: Fetch remote base graph
+    const cacheDir =
+      remoteConfig.cacheDir || path.join(resolvedRoot, '.codegraph');
+    const client = new RemoteGraphClient({ ...remoteConfig, cacheDir });
+    await client.fetch();
+    const baseQueries = client.open();
+
+    // Step 2: Detect changed files on the feature branch
+    const diffIndexer = new BranchDiffIndexer(resolvedRoot);
+    const diff = diffIndexer.getChangedFiles(remoteConfig.baseBranch);
+    const overlayFiles = new Set([...diff.added, ...diff.modified]);
+    const deletedFiles = new Set(diff.deleted);
+
+    // Step 3: Initialize local overlay database
+    const overlayDbPath = path.join(resolvedRoot, '.codegraph', 'overlay.db');
+    // Remove stale overlay DB so we start fresh
+    if (fs.existsSync(overlayDbPath)) {
+      fs.unlinkSync(overlayDbPath);
+    }
+    const overlayDb = DatabaseConnection.initialize(overlayDbPath);
+    // Disable FK enforcement on the overlay DB: its edges legitimately
+    // reference nodes that live in the base DB, not in the local overlay.
+    overlayDb.getDb().pragma('foreign_keys = OFF');
+
+    // Step 4: Create overlay query engine (merges base + overlay)
+    const engine = new OverlayQueryEngine(
+      overlayDb.getDb(),
+      baseQueries,
+      overlayFiles,
+      deletedFiles
+    );
+
+    // Step 5: Create CodeGraph instance wired to the overlay engine
+    const instance = new CodeGraph(overlayDb, engine, resolvedRoot);
+    instance.remoteClient = client;
+
+    // Step 6: Index changed files into the overlay database
+    if (overlayFiles.size > 0) {
+      const absolutePaths = [...overlayFiles].map((f) =>
+        path.resolve(resolvedRoot, f)
+      );
+      await instance.indexFiles(absolutePaths);
+      // Resolve references using the merged engine so cross-boundary
+      // calls (overlay → base) are correctly linked
+      instance.resolveReferences();
+    }
+
+    return instance;
+  }
+
+  /**
+   * Close the CodeGraph instance and release resources.
+   * In overlay mode, also closes the remote base graph connection.
    */
   close(): void {
     this.unwatch();
     // Release file lock if held
     this.fileLock.release();
     this.db.close();
+    // Close remote graph client if in overlay mode
+    if (this.remoteClient) {
+      this.remoteClient.close();
+      this.remoteClient = null;
+    }
   }
 
   /**
