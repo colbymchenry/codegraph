@@ -3997,4 +3997,35 @@ endmodule
     );
     expect(callRef).toBeDefined();
   });
+
+  it('should extract every package in a multi-package import statement', () => {
+    const code = `
+package a_pkg;
+  function automatic int fa(); return 1; endfunction
+endpackage
+
+package b_pkg;
+  function automatic int fb(); return 2; endfunction
+endpackage
+
+module worker (input logic clk);
+  import a_pkg::*, b_pkg::*;
+  function automatic int caller();
+    return fa() + fb();
+  endfunction
+endmodule
+`;
+    const result = extractFromSource('multi.sv', code);
+
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toContain('a_pkg');
+    expect(imports).toContain('b_pkg'); // the second import must not be dropped
+
+    // call edges still resolve when multiple imports share one statement
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toContain('fa');
+    expect(calls).toContain('fb');
+  });
 });

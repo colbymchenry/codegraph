@@ -24,8 +24,10 @@ import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
  *  - function/task subroutine calls (`tf_call`) → `calls` references.
  *
  * Package imports go through the generic import path (`importTypes` +
- * `extractImport`). Ports and internal signals are intentionally NOT extracted
- * — they would explode the node count without aiding structural queries.
+ * `extractImport`), targeting each `package_import_item` so every package in a
+ * multi-import (`import a::*, b::*;`) gets its own node. Ports and internal
+ * signals are intentionally NOT extracted — they would explode the node count
+ * without aiding structural queries.
  */
 
 // Header wrappers that carry a module/interface/program name.
@@ -53,6 +55,16 @@ function firstSimpleIdentifier(node: SyntaxNode): SyntaxNode | null {
     if (c && c.type === 'simple_identifier') return c;
   }
   return null;
+}
+
+/**
+ * Keep the trailing segment of a qualified name (`pkg::mod` → `mod`,
+ * `obj.method` → `method`) so cross-file name matching behaves the same for
+ * calls and instantiations (declarations are stored unqualified).
+ */
+function trailingSegment(name: string): string {
+  const sep = Math.max(name.lastIndexOf('::'), name.lastIndexOf('.'));
+  return sep >= 0 ? name.slice(sep).replace(/^[:.]+/, '') : name;
 }
 
 function visitNamedChildren(node: SyntaxNode, ctx: ExtractorContext): void {
@@ -129,7 +141,9 @@ function handleInstantiation(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const typeNode = getChildByField(node, 'instance_type') ?? firstSimpleIdentifier(node);
   if (typeNode && ctx.nodeStack.length > 0) {
     const fromId = ctx.nodeStack[ctx.nodeStack.length - 1];
-    const moduleName = getNodeText(typeNode, ctx.source).trim();
+    // Normalize qualified types (`pkg::mod`) to the trailing segment, matching
+    // handleCall, so a `pkg::mod` instance still resolves to a `mod` declaration.
+    const moduleName = trailingSegment(getNodeText(typeNode, ctx.source).trim());
     if (fromId && moduleName) {
       ctx.addUnresolvedReference({
         fromNodeId: fromId,
@@ -172,10 +186,7 @@ function handleCall(node: SyntaxNode, ctx: ExtractorContext): boolean {
     const fromId = ctx.nodeStack[ctx.nodeStack.length - 1];
     const callee = firstChildOfType(node, ['hierarchical_identifier']) ?? firstSimpleIdentifier(node);
     if (fromId && callee) {
-      let name = getNodeText(callee, ctx.source).trim();
-      // Keep the trailing segment of qualified calls (`pkg::f`, `obj.method`).
-      const sep = Math.max(name.lastIndexOf('::'), name.lastIndexOf('.'));
-      if (sep >= 0) name = name.slice(sep).replace(/^[:.]+/, '');
+      const name = trailingSegment(getNodeText(callee, ctx.source).trim());
       if (name) {
         ctx.addUnresolvedReference({
           fromNodeId: fromId,
@@ -202,7 +213,9 @@ export const verilogExtractor: LanguageExtractor = {
   structTypes: [],
   enumTypes: [],
   typeAliasTypes: [],
-  importTypes: ['package_import_declaration'],
+  // Target the per-item node, not the whole declaration, so every package in a
+  // multi-import (`import a::*, b::*;`) is indexed — one import node per item.
+  importTypes: ['package_import_item'],
   callTypes: [],
   variableTypes: [],
   nameField: 'name',
@@ -236,9 +249,9 @@ export const verilogExtractor: LanguageExtractor = {
   },
 
   extractImport: (node, source) => {
-    // package_import_declaration → package_import_item → simple_identifier (pkg)
-    const item = firstChildOfType(node, ['package_import_item']) ?? node;
-    const id = firstSimpleIdentifier(item);
+    // `node` is a package_import_item (`pkg::*` / `pkg::name`); the package name
+    // is its first simple_identifier. One item → one import node.
+    const id = firstSimpleIdentifier(node);
     if (!id) return null;
     return {
       moduleName: getNodeText(id, source),
