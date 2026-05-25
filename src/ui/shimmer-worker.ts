@@ -13,7 +13,14 @@ import type { ShimmerWorkerMessage } from './types';
 // so UTF-8 bytes hit the console raw and mojibake on OEM codepages.
 // `getGlyphs()` returns ASCII fallbacks on Windows to avoid this (#168).
 function writeStdout(s: string): void {
-  writeSync(1, s);
+  if (
+    process.platform === 'win32' &&
+    (process.env.WT_SESSION || process.env.TERM_PROGRAM === 'vscode')
+  ) {
+    process.stdout.write(s);
+  } else {
+    writeSync(1, s);
+  }
 }
 
 const G = getGlyphs();
