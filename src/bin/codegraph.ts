@@ -285,6 +285,80 @@ type IndexResult = {
   durationMs: number;
 };
 
+type PathFilterCliOptions = {
+  exclude?: string[];
+  include?: string[];
+};
+
+type IoBatchSizeCliOptions = {
+  ioBatchSize?: string;
+};
+
+function collectPathPattern(value: string, previous: string[] = []): string[] {
+  previous.push(value);
+  return previous;
+}
+
+function toPathFilterOptions(options: PathFilterCliOptions): { exclude?: string[]; include?: string[] } {
+  return {
+    exclude: options.exclude,
+    include: options.include,
+  };
+}
+
+function parseIoBatchSize(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`Invalid --io-batch-size: expected a positive integer between 1 and 1024, got "${value}"`);
+  }
+
+  const parsed = Number(value);
+  if (parsed < 1 || parsed > 1024) {
+    throw new Error(`Invalid --io-batch-size: expected a positive integer between 1 and 1024, got "${value}"`);
+  }
+
+  return parsed;
+}
+
+function toIndexOptions(options: PathFilterCliOptions & IoBatchSizeCliOptions): {
+  exclude?: string[];
+  include?: string[];
+  ioBatchSize?: number;
+} {
+  return {
+    ...toPathFilterOptions(options),
+    ioBatchSize: parseIoBatchSize(options.ioBatchSize),
+  };
+}
+
+function validatePathFiltersOrExit(
+  validate: (options?: { exclude?: string[]; include?: string[] }) => void,
+  options: PathFilterCliOptions
+): void {
+  try {
+    validate(toPathFilterOptions(options));
+  } catch (err) {
+    error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+}
+
+function validateIndexOptionsOrExit(
+  validatePathFilters: (options?: { exclude?: string[]; include?: string[] }) => void,
+  validateIoBatchSize: (options?: { ioBatchSize?: number }) => void,
+  options: PathFilterCliOptions & IoBatchSizeCliOptions
+): void {
+  try {
+    validatePathFilters(toPathFilterOptions(options));
+    const ioBatchSize = parseIoBatchSize(options.ioBatchSize);
+    validateIoBatchSize({ ioBatchSize });
+  } catch (err) {
+    error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+}
+
 /**
  * Print indexing results using clack log methods
  */
@@ -417,8 +491,10 @@ program
   .command('init [path]')
   .description('Initialize CodeGraph in a project directory')
   .option('-i, --index', 'Run initial indexing after initialization')
+  .option('--exclude <pattern>', 'Gitignore-style path pattern to exclude during initial indexing (repeatable)', collectPathPattern, [])
+  .option('--include <pattern>', 'Gitignore-style path pattern to include during initial indexing (repeatable)', collectPathPattern, [])
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean }) => {
+  .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean } & PathFilterCliOptions) => {
     const projectPath = path.resolve(pathArg || process.cwd());
     const clack = await importESM('@clack/prompts');
 
@@ -445,7 +521,8 @@ program
         return;
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
+      const { default: CodeGraph, validatePathFilterOptions } = await loadCodeGraph();
+      validatePathFiltersOrExit(validatePathFilterOptions, options);
       const cg = await CodeGraph.init(projectPath, { index: false });
       clack.log.success(`Initialized in ${projectPath}`);
 
@@ -470,12 +547,14 @@ program
           result = await cg.indexAll({
             onProgress: createVerboseProgress(),
             verbose: true,
+            ...toPathFilterOptions(options),
           });
         } else {
           process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
           const progress = createShimmerProgress();
           result = await cg.indexAll({
             onProgress: progress.onProgress,
+            ...toPathFilterOptions(options),
           });
           await progress.stop();
         }
@@ -557,11 +636,14 @@ program
  */
 program
   .command('index [path]')
-  .description('Index all files in the project')
+  .description('Index all files in the project. Tune --io-batch-size lower to reduce RAM, or higher for faster disks.')
   .option('-f, --force', 'Force full re-index even if already indexed')
   .option('-q, --quiet', 'Suppress progress output')
+  .option('--exclude <pattern>', 'Gitignore-style path pattern to exclude from indexing (repeatable)', collectPathPattern, [])
+  .option('--include <pattern>', 'Gitignore-style path pattern to include in indexing (repeatable)', collectPathPattern, [])
+  .option('--io-batch-size <n>', 'Number of files to read in parallel during parsing (default: 10, max: 1024)')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
+  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean } & PathFilterCliOptions & IoBatchSizeCliOptions) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -571,13 +653,15 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
+      const { default: CodeGraph, validateIoBatchSizeOptions, validatePathFilterOptions } = await loadCodeGraph();
+      validateIndexOptionsOrExit(validatePathFilterOptions, validateIoBatchSizeOptions, options);
       const cg = await CodeGraph.open(projectPath);
+      const indexOptions = toIndexOptions(options);
 
       if (options.quiet) {
         // Quiet mode: no UI, just run
         if (options.force) cg.clear();
-        const result = await cg.indexAll();
+        const result = await cg.indexAll(indexOptions);
         if (!result.success) process.exit(1);
         cg.destroy();
         return;
@@ -597,12 +681,14 @@ program
         result = await cg.indexAll({
           onProgress: createVerboseProgress(),
           verbose: true,
+          ...indexOptions,
         });
       } else {
         process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
         const progress = createShimmerProgress();
         result = await cg.indexAll({
           onProgress: progress.onProgress,
+          ...indexOptions,
         });
         await progress.stop();
       }
@@ -628,7 +714,10 @@ program
   .command('sync [path]')
   .description('Sync changes since last index')
   .option('-q, --quiet', 'Suppress output (for git hooks)')
-  .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
+  .option('--exclude <pattern>', 'Gitignore-style path pattern to exclude from sync indexing (repeatable)', collectPathPattern, [])
+  .option('--include <pattern>', 'Gitignore-style path pattern to include in sync indexing (repeatable)', collectPathPattern, [])
+  .option('--io-batch-size <n>', 'Number of files to read in parallel during parsing (default: 10, max: 1024)')
+  .action(async (pathArg: string | undefined, options: { quiet?: boolean } & PathFilterCliOptions & IoBatchSizeCliOptions) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -639,11 +728,13 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
+      const { default: CodeGraph, validateIoBatchSizeOptions, validatePathFilterOptions } = await loadCodeGraph();
+      validateIndexOptionsOrExit(validatePathFilterOptions, validateIoBatchSizeOptions, options);
       const cg = await CodeGraph.open(projectPath);
+      const indexOptions = toIndexOptions(options);
 
       if (options.quiet) {
-        await cg.sync();
+        await cg.sync(indexOptions);
         cg.destroy();
         return;
       }
@@ -656,6 +747,7 @@ program
 
       const result = await cg.sync({
         onProgress: progress.onProgress,
+        ...indexOptions,
       });
 
       await progress.stop();
