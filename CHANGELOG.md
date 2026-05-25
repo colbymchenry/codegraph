@@ -7,6 +7,22 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-05-25
+
+### Fixed
+- **The index now stays in sync after `git pull`, branch switches, and edits made
+  outside your editor.** Incremental sync detected changes via `git status`, which
+  only sees *uncommitted* edits — so code pulled or checked out (which leaves a
+  clean working tree) was silently missed until a full `codegraph index -f`.
+  Change detection is now filesystem-based and git-independent: a `(size, mtime)`
+  stat pre-filter skips unchanged files, then a content hash confirms the rest. It
+  reconciles committed changes from `pull`/`checkout`/`merge`/`rebase`, plain edits
+  in non-git projects, and deletions alike.
+- **The MCP server catches up on connect.** When your editor connects, codegraph
+  reconciles anything that changed while it wasn't running (e.g. a `git pull` from
+  the terminal), so the first query reflects the current code instead of a stale
+  snapshot — rather than waiting for the next live edit.
+
 ## [0.9.4] - 2026-05-24
 
 ### Added
@@ -228,6 +244,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   find its bundle. The release pipeline now verifies every package reached the
   registry (and is idempotent), so a release can't pass green-but-broken again.
 
+[0.9.5]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.5
 [0.9.4]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.4
 [0.9.3]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.3
 [0.9.2]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.2
