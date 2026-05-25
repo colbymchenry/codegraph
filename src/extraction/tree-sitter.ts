@@ -35,6 +35,11 @@ export { generateNodeId } from './tree-sitter-helpers';
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
+  if (extractor.getName) {
+    const customName = extractor.getName(node, source);
+    if (customName) return customName;
+  }
+
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
   if (nameNode) {
@@ -781,8 +786,8 @@ export class TreeSitterExtractor {
   private extractStruct(node: SyntaxNode): void {
     if (!this.extractor) return;
 
-    // Skip forward declarations and type references (no body = not a definition)
-    const body = getChildByField(node, this.extractor.bodyField);
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
     if (!body) return;
 
     const name = extractName(node, this.source, this.extractor);
