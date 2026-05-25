@@ -154,7 +154,11 @@ function handleInstantiation(node: SyntaxNode, ctx: ExtractorContext): boolean {
       });
     }
   }
-  // Port-connection expressions rarely hold user calls worth tracking; skip them.
+  // Walk children so function calls inside parameter overrides (`.WIDTH(f(x))`)
+  // and port connections (`.a(helper(sig))`) still emit `calls` references. An
+  // instantiation's subtree is bounded (just its own connections), so this can't
+  // explode the walk the way a god-function fan-out would.
+  visitNamedChildren(node, ctx);
   return true;
 }
 

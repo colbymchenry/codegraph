@@ -4028,4 +4028,30 @@ endmodule
     expect(calls).toContain('fa');
     expect(calls).toContain('fb');
   });
+
+  it('should capture function calls inside instantiation port/param expressions', () => {
+    const code = `
+module sub #(parameter int W = 8) (input logic [W-1:0] a);
+endmodule
+
+module top (input logic [7:0] x);
+  function automatic int dbl(int v); return v * 2; endfunction
+  function automatic int wid(); return 8; endfunction
+  sub #(.W(wid())) u_sub (.a(dbl(x)));
+endmodule
+`;
+    const result = extractFromSource('inst_calls.sv', code);
+
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toContain('dbl'); // call inside a port connection
+    expect(calls).toContain('wid'); // call inside a parameter override
+
+    // the instantiation edge itself is still emitted
+    const inst = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'sub'
+    );
+    expect(inst).toBeDefined();
+  });
 });
