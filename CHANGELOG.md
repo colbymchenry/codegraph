@@ -22,6 +22,15 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reconciles anything that changed while it wasn't running (e.g. a `git pull` from
   the terminal), so the first query reflects the current code instead of a stale
   snapshot — rather than waiting for the next live edit.
+- **Dependency, build, and cache directories are now excluded by default** —
+  `node_modules`, `vendor`, `dist`, `build`, `target`, `.venv`, `__pycache__`,
+  `Pods`, `.next`, and the like across every supported language/framework — so
+  `context` and `search` reflect your code instead of third-party noise, even in a
+  project with no `.gitignore` (#407). The defaults apply uniformly, including to
+  committed files (vendoring a dependency into the repo doesn't make it project
+  code). To index one anyway, add a `.gitignore` negation (e.g. `!vendor/`).
+  First-party-prone names like `packages/`, `lib/`, `app/`, and `src/` are never on
+  the default list.
 
 ## [0.9.4] - 2026-05-24
 

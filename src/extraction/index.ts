@@ -100,6 +100,84 @@ export function hashContent(content: string): string {
 const MAX_FILE_SIZE = 1024 * 1024;
 
 /**
+ * Directory names that are dependency, build, cache, or tooling output across the
+ * languages/frameworks CodeGraph supports — curated from the canonical
+ * github/gitignore templates. Excluded by default so the graph reflects your code,
+ * not third-party noise, without requiring a `.gitignore` (issue #407). The
+ * exclusion applies uniformly (git or not, tracked or not); the only opt-in is an
+ * explicit `.gitignore` negation (e.g. `!vendor/`). First-party-prone or generic
+ * names (`packages`, `lib`, `app`, `bin`, `src`, `deps`, `env`, `tmp`, `storage`,
+ * `Library`) are deliberately NOT listed, to avoid ever hiding real source.
+ *
+ * Only dirs that actually contain *indexable source* (or are enormous) earn a slot
+ * — IDE/state dirs like `.idea`/`.vs` are omitted because CodeGraph indexes only
+ * recognized source extensions, so they produce no symbols regardless.
+ */
+const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
+  // JS / TS — dependency directories
+  'node_modules', 'bower_components', 'jspm_packages', 'web_modules',
+  '.yarn', '.pnpm-store',
+  // JS / TS — framework & bundler build / cache / deploy output
+  '.next', '.nuxt', '.svelte-kit', '.turbo', '.vite', '.parcel-cache', '.angular',
+  '.docusaurus', 'storybook-static', '.vinxi', '.nitro', 'out-tsc',
+  '.vercel', '.netlify', '.wrangler',
+  // Build output (common across ecosystems)
+  'dist', 'build', 'out', '.output',
+  // Test / coverage
+  'coverage', '.nyc_output',
+  // Python
+  '__pycache__', '__pypackages__', '.venv', 'venv', '.pixi', '.pdm-build',
+  '.mypy_cache', '.pytest_cache', '.ruff_cache', '.tox', '.nox', '.hypothesis',
+  '.ipynb_checkpoints', '.eggs',
+  // Rust / JVM (Maven, Gradle, Scala)
+  'target', '.gradle',
+  // .NET
+  'obj',
+  // Vendored deps (Go, PHP/Composer, Ruby/Bundler)
+  'vendor',
+  // Swift / iOS
+  '.build', 'Pods', 'Carthage', 'DerivedData', '.swiftpm',
+  // Dart / Flutter
+  '.dart_tool', '.pub-cache',
+  // Native (Android NDK, C/C++ deps)
+  '.cxx', '.externalNativeBuild', 'vcpkg_installed',
+  // Scala tooling
+  '.bloop', '.metals',
+  // Lua / Luau (LuaRocks)
+  'lua_modules', '.luarocks',
+  // Delphi / RAD Studio IDE backups (duplicate .pas source — would double-count)
+  '__history', '__recovery',
+  // Generic cache
+  '.cache',
+]);
+
+/** Gitignore-style patterns for the `ignore` matcher: the dirs above plus a few globs. */
+const DEFAULT_IGNORE_PATTERNS: string[] = [
+  ...Array.from(DEFAULT_IGNORE_DIRS, (d) => `${d}/`),
+  '*.egg-info/',     // Python packaging metadata
+  'cmake-build-*/',  // CLion / CMake build trees
+  'bazel-*/',        // Bazel output symlink trees
+];
+
+/**
+ * An `ignore` matcher seeded with the built-in defaults, merged with the project's
+ * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default. Shared
+ * by both enumeration paths so behavior is identical with or without git — and so
+ * the defaults apply to tracked files too (committing a dependency dir doesn't make
+ * it project code; the explicit `.gitignore` negation is the only opt-in).
+ */
+function buildDefaultIgnore(rootDir: string): Ignore {
+  const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
+  try {
+    const rootGitignore = path.join(rootDir, '.gitignore');
+    if (fs.existsSync(rootGitignore)) ig.add(fs.readFileSync(rootGitignore, 'utf-8'));
+  } catch {
+    // Unreadable root .gitignore — the built-in defaults still apply.
+  }
+  return ig;
+}
+
+/**
  * Collect git-visible files (tracked + untracked, .gitignore-respected) from the
  * git repository rooted at `repoDir`, adding each to `files` with `prefix`
  * prepended so paths stay relative to the original scan root.
@@ -183,7 +261,11 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
 
     const files = new Set<string>();
     collectGitFiles(rootDir, '', files);
-    return files;
+    // Apply built-in default ignores uniformly — to tracked files too, since
+    // committing a dependency/build dir doesn't make it project code. A
+    // `.gitignore` negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
+    const ig = buildDefaultIgnore(rootDir);
+    return new Set([...files].filter((f) => !ig.ignores(f)));
   } catch {
     return null;
   }
@@ -358,7 +440,9 @@ function scanDirectoryWalk(
     visitedDirs.add(realDir);
 
     // This directory's own .gitignore (if present) applies to everything below it.
-    const own = loadIgnore(dir);
+    // The root's .gitignore is already merged into the seeded base matcher (so a
+    // negation there can override a built-in default), so skip it here.
+    const own = dir === rootDir ? null : loadIgnore(dir);
     const active = own ? [...matchers, own] : matchers;
 
     let entries: fs.Dirent[];
@@ -411,7 +495,9 @@ function scanDirectoryWalk(
     }
   }
 
-  walk(rootDir, []);
+  // Seed a base matcher with the built-in default ignores (merged with the root
+  // .gitignore so a negation can override). Nested .gitignores still layer per-dir.
+  walk(rootDir, [{ dir: rootDir, ig: buildDefaultIgnore(rootDir) }]);
   return files;
 }
 
