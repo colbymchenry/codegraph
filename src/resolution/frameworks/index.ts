@@ -16,6 +16,7 @@ import { vueResolver } from './vue';
 import { djangoResolver, flaskResolver, fastapiResolver } from './python';
 import { railsResolver } from './ruby';
 import { springResolver } from './java';
+import { daggerResolver } from './dagger';
 import { playResolver } from './play';
 import { goResolver } from './go';
 import { rustResolver } from './rust';
@@ -43,6 +44,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   railsResolver,
   // Java
   springResolver,
+  daggerResolver,
   playResolver,
   // Go
   goResolver,
@@ -119,6 +121,7 @@ export { vueResolver } from './vue';
 export { djangoResolver, flaskResolver, fastapiResolver } from './python';
 export { railsResolver } from './ruby';
 export { springResolver } from './java';
+export { daggerResolver } from './dagger';
 export { playResolver } from './play';
 export { goResolver } from './go';
 export { rustResolver } from './rust';
