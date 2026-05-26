@@ -165,6 +165,10 @@ export function unrelatedProviderHelper(): string {
   return ['agent.trace-mode', 'billing.webhook.created'];
 }
 
+export function message(): string {
+  return 'generic helper';
+}
+
 export function resolveFeatureGate(key: string): boolean {
   if (key === 'agent.trace-mode') {
     return true;
@@ -179,6 +183,21 @@ export function lookupWebhookHandler(event: string): string {
     default:
       return 'ignoreWebhook';
   }
+}
+
+export function activeProviderHasEnvApiKey(provider: string): boolean {
+  return provider === 'siliconflow' && Boolean(process.env.SILICONFLOW_API_KEY);
+}
+
+export function providerEnvVars(): string[] {
+  return ['SILICONFLOW_API_KEY', 'DEEPSEEK_API_KEY'];
+}
+
+export function env_var_for(provider: string): string {
+  if (provider === 'siliconflow') {
+    return 'SILICONFLOW_API_KEY';
+  }
+  return 'DEEPSEEK_API_KEY';
 }
 `
     );
@@ -281,6 +300,17 @@ export function lookupWebhookHandler(event: string): string {
       expect(entryNames).toContain('genericAliasRegistry');
     });
 
+    it('should not over-boost generic lowercase word symbols over source-text matches', async () => {
+      const result = await cg.findRelevantContext('agent.trace-mode feature gate message history', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+
+      const entryNames = result.roots.map((id) => result.nodes.get(id)?.name);
+      expect(entryNames[0]).toBe('resolveFeatureGate');
+      expect(entryNames).toContain('message');
+    });
+
     it('should rank a webhook handler function above a generic alias registry', async () => {
       const result = await cg.findRelevantContext('billing.webhook.created webhook handler', {
         searchLimit: 3,
@@ -290,6 +320,18 @@ export function lookupWebhookHandler(event: string): string {
       const entryNames = result.roots.map((id) => result.nodes.get(id)?.name);
       expect(entryNames[0]).toBe('lookupWebhookHandler');
       expect(entryNames).toContain('genericAliasRegistry');
+    });
+
+    it('should rank an exact symbol match above broader source-text matches', async () => {
+      const result = await cg.findRelevantContext('env_var_for provider picker SILICONFLOW_API_KEY', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+
+      const entryNames = result.roots.map((id) => result.nodes.get(id)?.name);
+      expect(entryNames[0]).toBe('env_var_for');
+      expect(entryNames).toContain('activeProviderHasEnvApiKey');
+      expect(entryNames).toContain('providerEnvVars');
     });
   });
 

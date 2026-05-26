@@ -136,6 +136,8 @@ const SOURCE_TEXT_MAX_TOKENS = 8;
 const SOURCE_TEXT_OCCURRENCES_PER_TOKEN = 3;
 const SOURCE_TEXT_BASE_SCORE = 160;
 const SOURCE_TEXT_TEST_PENALTY = 130;
+const SOURCE_TEXT_EXACT_NODE_NAME_BONUS = 700;
+const EXACT_SYMBOL_MATCH_BONUS = 700;
 
 function extractCodeLikeSourceTokens(query: string): string[] {
   const tokens = new Set<string>();
@@ -157,6 +159,12 @@ function isCodeLikeSourceToken(token: string): boolean {
   if (!/[-_./:@]/.test(cleaned)) return false;
   if (/^https?:\/\//i.test(cleaned)) return false;
   return true;
+}
+
+function isSpecificExactSymbol(symbol: string): boolean {
+  const cleaned = symbol.trim();
+  if (isCodeLikeSourceToken(cleaned)) return true;
+  return /[a-z][A-Z]/.test(cleaned) || /[A-Z][a-z]/.test(cleaned) || /^[A-Z0-9_]{2,}$/.test(cleaned);
 }
 
 function lineNumberAtIndex(content: string, index: number): number {
@@ -473,6 +481,14 @@ export class ContextBuilder {
           limit: Math.ceil(opts.searchLimit * 5),
           kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
         });
+
+        const exactSymbolNames = new Set(
+          symbolsFromQuery.filter(isSpecificExactSymbol).map(s => s.toLowerCase())
+        );
+        exactMatches = exactMatches.map(r => exactSymbolNames.has(r.node.name.toLowerCase())
+          ? { ...r, score: r.score + EXACT_SYMBOL_MATCH_BONUS }
+          : r
+        );
 
         // Co-location boost: when multiple extracted symbols appear in the same file,
         // those results are much more likely to be what the user is looking for.
@@ -1146,11 +1162,14 @@ export class ContextBuilder {
               .toLowerCase();
             const termHitBonus =
               queryTerms.filter((term) => nodeText.includes(term.toLowerCase())).length * 20;
+            const exactNodeNameBonus =
+              tokenLower === node.name.toLowerCase() ? SOURCE_TEXT_EXACT_NODE_NAME_BONUS : 0;
             const baseScore =
               SOURCE_TEXT_BASE_SCORE +
               kindBonus(node.kind) +
               scorePathRelevance(node.filePath, query) +
               termHitBonus +
+              exactNodeNameBonus +
               Math.min(token.length, 40) / 4 -
               testPenalty;
             const existing = byNode.get(node.id);
