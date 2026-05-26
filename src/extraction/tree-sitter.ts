@@ -671,6 +671,11 @@ export class TreeSitterExtractor {
       // in inline objects). These are ephemeral and create noise (e.g., Svelte context
       // objects: `ctx.set({ get view() { ... } })`).
       if (node.parent?.type === 'object' || node.parent?.type === 'object_expression') {
+        const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+          ?? getChildByField(node, this.extractor.bodyField);
+        if (body) {
+          this.visitFunctionBody(body, '');
+        }
         return;
       }
       // Not inside a class-like node and no receiver type, treat as function
@@ -1078,6 +1083,12 @@ export class TreeSitterExtractor {
             // Extract type annotation references (e.g., const x: ITextModel = ...)
             if (varNode) {
               this.extractVariableTypeAnnotation(child, varNode.id);
+            }
+
+            if (valueNode &&
+                valueNode.type !== 'object' &&
+                valueNode.type !== 'object_expression') {
+              this.visitFunctionBody(valueNode, '');
             }
 
             // Exported const object-of-functions: `export const actions =

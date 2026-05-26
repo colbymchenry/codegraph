@@ -3568,6 +3568,53 @@ function increment(): void {
     }
   });
 
+  it('should extract calls from top-level <script setup> initializers', () => {
+    const code = `<template>
+  <div>{{ token }}</div>
+</template>
+
+<script setup lang="ts">
+import { getTokenMp } from './api/upload';
+
+const token = getTokenMp();
+</script>
+`;
+    const result = extractFromSource('Issue425Setup.vue', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('should extract calls from Vue Options API object methods', () => {
+    const code = `<template>
+  <button @click="save">Save</button>
+</template>
+
+<script>
+import { getTokenMp } from './api/upload';
+
+export default {
+  methods: {
+    save() {
+      return getTokenMp();
+    }
+  },
+  setup() {
+    return getTokenMp();
+  }
+}
+</script>
+`;
+    const result = extractFromSource('Issue425Options.vue', code);
+
+    const calls = result.unresolvedReferences.filter(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(calls).toHaveLength(2);
+  });
+
   it('should extract from both <script> and <script setup> blocks', () => {
     const code = `<template>
   <div>{{ msg }}</div>
