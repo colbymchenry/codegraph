@@ -5,7 +5,12 @@
  */
 
 import CodeGraph, { findNearestCodeGraphRoot } from '../index';
-import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
+import {
+  detectWorktreeIndexMismatch,
+  worktreeMismatchWarning,
+  worktreeMismatchNotice,
+  type WorktreeIndexMismatch,
+} from '../sync/worktree';
 import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind } from '../types';
 import { createHash } from 'crypto';
 import {
@@ -533,6 +538,12 @@ export class ToolHandler {
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
+  // Per-start-path cache of the git worktree/index mismatch (issue #155). The
+  // mismatch is a fixed property of (where the request came from → which
+  // .codegraph/ it resolves to), so the up-to-two `git rev-parse` spawns run
+  // once and every later tool call reuses the result — never shelling out to
+  // git on the hot path. `undefined` = not computed yet; `null` = no mismatch.
+  private worktreeMismatchCache: Map<string, WorktreeIndexMismatch | null> = new Map();
 
   constructor(private cg: CodeGraph | null) {}
 
@@ -697,6 +708,7 @@ export class ToolHandler {
       cg.close();
     }
     this.projectCache.clear();
+    this.worktreeMismatchCache.clear();
   }
 
   /**
@@ -744,6 +756,53 @@ export class ToolHandler {
   }
 
   /**
+   * Cached git worktree/index mismatch for a tool call's effective project.
+   *
+   * The "effective project" is what the request targets: an explicit
+   * `projectPath` arg, else the directory the server resolved its default
+   * project from (`defaultProjectHint`), else cwd. Memoized per start path —
+   * see `worktreeMismatchCache`. Best-effort: if the project can't be resolved
+   * (e.g. nothing initialized yet), it reports "no mismatch" so a tool is never
+   * broken by this check.
+   */
+  private worktreeMismatchFor(projectPath?: string): WorktreeIndexMismatch | null {
+    const startPath = projectPath ?? this.defaultProjectHint ?? process.cwd();
+    const cached = this.worktreeMismatchCache.get(startPath);
+    if (cached !== undefined) return cached;
+
+    let mismatch: WorktreeIndexMismatch | null = null;
+    try {
+      mismatch = detectWorktreeIndexMismatch(startPath, this.getCodeGraph(projectPath).getProjectRoot());
+    } catch {
+      // No resolvable project (or any other resolution error) → nothing to warn.
+      mismatch = null;
+    }
+    this.worktreeMismatchCache.set(startPath, mismatch);
+    return mismatch;
+  }
+
+  /**
+   * Prefix a successful read-tool result with a compact worktree-mismatch
+   * notice when the resolved index belongs to a different git working tree than
+   * the caller's (issue #155). Without this, an agent in a nested worktree
+   * silently trusts main-branch results. No-op on error results and when there
+   * is no mismatch. `codegraph_status` is excluded — it embeds its own verbose
+   * warning — so it stays out of this path.
+   */
+  private withWorktreeNotice(result: ToolResult, projectPath?: string): ToolResult {
+    if (result.isError) return result;
+    const mismatch = this.worktreeMismatchFor(projectPath);
+    if (!mismatch) return result;
+
+    const notice = worktreeMismatchNotice(mismatch);
+    const [first, ...rest] = result.content;
+    if (first && first.type === 'text') {
+      return { ...result, content: [{ type: 'text', text: `${notice}\n\n${first.text}` }, ...rest] };
+    }
+    return result;
+  }
+
+  /**
    * Execute a tool by name
    */
   async execute(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
@@ -772,30 +831,35 @@ export class ToolHandler {
         if (typeof check === 'object' && check !== undefined) return check;
       }
 
+      // Read tools resolve through a single result variable so the worktree
+      // mismatch notice can be prefixed in one place (issue #155). status is
+      // returned directly — it embeds its own verbose warning.
+      let result: ToolResult;
       switch (toolName) {
         case 'codegraph_search':
-          return await this.handleSearch(args);
+          result = await this.handleSearch(args); break;
         case 'codegraph_context':
-          return await this.handleContext(args);
+          result = await this.handleContext(args); break;
         case 'codegraph_callers':
-          return await this.handleCallers(args);
+          result = await this.handleCallers(args); break;
         case 'codegraph_callees':
-          return await this.handleCallees(args);
+          result = await this.handleCallees(args); break;
         case 'codegraph_impact':
-          return await this.handleImpact(args);
+          result = await this.handleImpact(args); break;
         case 'codegraph_explore':
-          return await this.handleExplore(args);
+          result = await this.handleExplore(args); break;
         case 'codegraph_node':
-          return await this.handleNode(args);
+          result = await this.handleNode(args); break;
         case 'codegraph_status':
           return await this.handleStatus(args);
         case 'codegraph_files':
-          return await this.handleFiles(args);
+          result = await this.handleFiles(args); break;
         case 'codegraph_trace':
-          return await this.handleTrace(args);
+          result = await this.handleTrace(args); break;
         default:
           return this.errorResult(`Unknown tool: ${toolName}`);
       }
+      return this.withWorktreeNotice(result, args.projectPath as string | undefined);
     } catch (err) {
       return this.errorResult(`Tool execution failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1958,9 +2022,9 @@ export class ToolHandler {
     // Warn when this index actually belongs to a different git working tree
     // (e.g. the server resolved up from a nested worktree to the main checkout).
     // Queries then reflect that tree's branch, not the worktree being edited.
-    const startPath =
-      (args.projectPath as string | undefined) ?? this.defaultProjectHint ?? process.cwd();
-    const mismatch = detectWorktreeIndexMismatch(startPath, cg.getProjectRoot());
+    // status shows the verbose, multi-line form; the read tools get the compact
+    // one-liner via withWorktreeNotice. Both share the cached detection.
+    const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined);
 
     const lines: string[] = [
       '## CodeGraph Status',

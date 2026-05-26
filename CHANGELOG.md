@@ -35,6 +35,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   standalone until it idles out — they never mix versions over the socket.
 
 ### Fixed
+- **Git worktrees no longer silently borrow another tree's index (#155).**
+  When a worktree is nested inside the main checkout — exactly what agent
+  tools that place worktrees under gitignored paths like
+  `.claude/worktrees/<name>/` do — running CodeGraph from that worktree used
+  to walk *up* to the main checkout's `.codegraph/` and silently return that
+  tree's code (usually a different branch). Symbols changed only in the
+  worktree were invisible and nothing told you. Now `codegraph status` (CLI +
+  MCP) calls out the conflict explicitly, and every MCP read tool
+  (`codegraph_search`/`context`/`trace`/`callers`/`callees`/`impact`/
+  `explore`/`node`/`files`) prefixes a one-line notice naming the borrowed
+  index and the fix (`codegraph init -i` in the worktree). Detection is
+  best-effort (no git / not a repo / monorepo subdir → no warning) and runs
+  once per session per start path, so it never costs more than a single pair
+  of `git rev-parse` invocations.
 - **The file watcher no longer exhausts the OS file-watch budget on large
   repos (#276).** It used to register a recursive watch over the *entire*
   project — `node_modules/`, build output, caches and all — and filter only

@@ -90,6 +90,20 @@ export function worktreeMismatchWarning(m: WorktreeIndexMismatch): string {
   );
 }
 
+/**
+ * Compact, single-line variant for prefixing a tool's result. Read tools
+ * return their answer inline, so the heads-up has to ride on the same payload
+ * the agent is already reading — a multi-line block would bury the result.
+ */
+export function worktreeMismatchNotice(m: WorktreeIndexMismatch): string {
+  return (
+    `⚠ CodeGraph results below come from a different git worktree (${m.indexRoot}), ` +
+    `not where you're working (${m.worktreeRoot}) — they may reflect another branch, ` +
+    `and symbols changed only here are missing. Run "codegraph init -i" here for a ` +
+    `worktree-local index.`
+  );
+}
+
 /** Resolve symlinks where possible so tmp/realpath quirks don't break equality. */
 function realpath(p: string): string {
   try {

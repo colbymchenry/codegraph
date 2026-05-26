@@ -28,5 +28,6 @@ export {
   gitWorktreeRoot,
   detectWorktreeIndexMismatch,
   worktreeMismatchWarning,
+  worktreeMismatchNotice,
   type WorktreeIndexMismatch,
 } from './worktree';
