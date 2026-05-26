@@ -100,6 +100,7 @@ describe('Integration: full pipeline', () => {
       const statsAfterIndex = cg.getStats();
       expect(statsAfterIndex.fileCount).toBeGreaterThanOrEqual(MODULE_COUNT);
       expect(statsAfterIndex.nodeCount).toBeGreaterThan(MODULE_COUNT * 2);
+      expect(indexResult.edgesCreated).toBe(statsAfterIndex.edgeCount);
 
       // ── resolveReferences ────────────────────────────────────────
       // Many call-site edges are wired up during extraction itself, so

@@ -375,6 +375,8 @@ describe('Source file detection (isSourceFile)', () => {
     expect(isSourceFile('src/component.tsx')).toBe(true);
     expect(isSourceFile('lib/util.js')).toBe(true);
     expect(isSourceFile('src/main.py')).toBe(true);
+    expect(isSourceFile('scripts/player.gd')).toBe(true);
+    expect(isSourceFile('scenes/main.tscn')).toBe(true);
   });
 
   it('rejects unsupported extensions and extensionless files', () => {

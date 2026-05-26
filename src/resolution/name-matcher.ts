@@ -15,10 +15,11 @@ export function matchByFilePath(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  if (!ref.referenceName.includes('/')) return null;
+  const referencePath = normalizePathReference(ref.referenceName);
+  if (!referencePath.includes('/')) return null;
 
   // Extract the filename from the path
-  const fileName = ref.referenceName.split('/').pop();
+  const fileName = referencePath.split('/').pop();
   if (!fileName) return null;
 
   // Search for file nodes with this name
@@ -28,7 +29,7 @@ export function matchByFilePath(
   if (fileNodes.length === 0) return null;
 
   // Prefer exact path match on qualified_name
-  const exactMatch = fileNodes.find(n => n.qualifiedName === ref.referenceName || n.filePath === ref.referenceName);
+  const exactMatch = fileNodes.find(n => n.qualifiedName === referencePath || n.filePath === referencePath);
   if (exactMatch) {
     return {
       original: ref,
@@ -39,7 +40,7 @@ export function matchByFilePath(
   }
 
   // Fall back to suffix match (e.g., ref="snippets/foo.liquid" matches "src/snippets/foo.liquid")
-  const suffixMatch = fileNodes.find(n => n.qualifiedName.endsWith(ref.referenceName) || n.filePath.endsWith(ref.referenceName));
+  const suffixMatch = fileNodes.find(n => n.qualifiedName.endsWith(referencePath) || n.filePath.endsWith(referencePath));
   if (suffixMatch) {
     return {
       original: ref,
@@ -60,6 +61,11 @@ export function matchByFilePath(
   }
 
   return null;
+}
+
+function normalizePathReference(referenceName: string): string {
+  if (referenceName.startsWith('res://')) return referenceName.slice('res://'.length);
+  return referenceName;
 }
 
 /**
@@ -110,8 +116,8 @@ export function matchByQualifiedName(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  // Check if the reference name looks qualified (contains :: or .)
-  if (!ref.referenceName.includes('::') && !ref.referenceName.includes('.')) {
+  // Check if the reference name looks qualified (contains ::, ., or a path segment)
+  if (!ref.referenceName.includes('::') && !ref.referenceName.includes('.') && !ref.referenceName.includes('/')) {
     return null;
   }
 
@@ -127,7 +133,7 @@ export function matchByQualifiedName(
   }
 
   // Try partial qualified name match
-  const parts = ref.referenceName.split(/[:.]/);
+  const parts = ref.referenceName.split(/[:.\/]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
     const partialCandidates = context.getNodesByName(lastName);

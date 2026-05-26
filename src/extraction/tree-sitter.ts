@@ -23,6 +23,8 @@ import { LiquidExtractor } from './liquid-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
+import { GDScriptExtractor } from './gdscript-extractor';
+import { GodotResourceExtractor } from './godot-resource-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -2608,6 +2610,14 @@ export function extractFromSource(
   } else if (detectedLanguage === 'liquid') {
     // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'gdscript') {
+    // Use custom extractor for GDScript
+    const extractor = new GDScriptExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'godot_resource') {
+    // Use custom extractor for Godot text scenes/resources
+    const extractor = new GodotResourceExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'yaml' || detectedLanguage === 'twig') {
     // No symbol extraction — file is tracked at the file-record level only.

@@ -87,6 +87,8 @@ export const LANGUAGES = [
   'scala',
   'lua',
   'luau',
+  'gdscript',
+  'godot_resource',
   'yaml',
   'twig',
   'unknown',

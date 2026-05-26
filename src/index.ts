@@ -353,6 +353,12 @@ export class CodeGraph {
           this.db.runMaintenance();
         }
 
+        if (result.success && result.filesIndexed > 0) {
+          const stats = this.queries.getStats();
+          result.nodesCreated = stats.nodeCount;
+          result.edgesCreated = stats.edgeCount;
+        }
+
         return result;
       } finally {
         this.fileLock.release();
