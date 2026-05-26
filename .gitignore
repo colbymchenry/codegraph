@@ -54,3 +54,6 @@ test-languages/
 
 nul
 release/
+
+# Nix
+result
