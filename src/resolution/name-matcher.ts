@@ -263,6 +263,66 @@ function inferCppReceiverType(
 }
 
 /**
+ * Java/Kotlin: infer a receiver's declared type by walking field declarations
+ * in the class enclosing the call site. The field's `signature` is already in
+ * the form "<TypeName> <fieldName>" (set by tree-sitter.ts extractField), so we
+ * pull the type from there. Handles Spring `@Resource UserBO userbo;` /
+ * `@Autowired private UserService userService;` where the receiver field name
+ * doesn't match the class name by Java naming convention.
+ *
+ * Returns the bare type name (generics stripped, dotted package stripped) or
+ * null when no matching field is in the enclosing class.
+ */
+function inferJavaFieldReceiverType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const inFile = context.getNodesInFile(ref.filePath);
+  if (inFile.length === 0) return null;
+
+  // Find the class enclosing the call line (tightest match by latest start).
+  let enclosing: Node | null = null;
+  for (const n of inFile) {
+    if (n.kind !== 'class' && n.kind !== 'interface') continue;
+    if (n.language !== ref.language) continue;
+    const end = n.endLine ?? n.startLine;
+    if (n.startLine <= ref.line && end >= ref.line) {
+      if (!enclosing || n.startLine >= enclosing.startLine) enclosing = n;
+    }
+  }
+  if (!enclosing) return null;
+
+  const enclosingEnd = enclosing.endLine ?? enclosing.startLine;
+  const field = inFile.find(
+    (n) =>
+      n.kind === 'field' &&
+      n.name === receiverName &&
+      n.language === ref.language &&
+      n.startLine >= enclosing.startLine &&
+      (n.endLine ?? n.startLine) <= enclosingEnd,
+  );
+  if (!field || !field.signature) return null;
+
+  // Signature shape: "<TypeName> <fieldName>" (extractField). Pull the type,
+  // strip generics + dotted package, drop array/varargs markers.
+  const beforeName = field.signature.slice(
+    0,
+    field.signature.lastIndexOf(field.name),
+  );
+  const typeRaw = beforeName.trim();
+  if (!typeRaw) return null;
+
+  const typeNoGenerics = typeRaw.replace(/<[^>]*>/g, '').trim();
+  const typeNoArray = typeNoGenerics.replace(/\[\s*\]/g, '').replace(/\.\.\.$/, '').trim();
+  const parts = typeNoArray.split(/[.\s]+/).filter(Boolean);
+  const lastPart = parts[parts.length - 1];
+  if (!lastPart) return null;
+  if (!/^[A-Z]/.test(lastPart)) return null; // primitives / lowercase → skip
+  return lastPart;
+}
+
+/**
  * Try to resolve by method name on a class/object
  */
 export function matchMethodCall(
@@ -282,6 +342,28 @@ export function matchMethodCall(
 
   if (ref.language === 'cpp' && dotMatch) {
     const inferredType = inferCppReceiverType(objectOrClass!, ref, context);
+    if (inferredType) {
+      const typedMatch = resolveMethodOnType(
+        inferredType,
+        methodName!,
+        ref,
+        context,
+        0.9,
+        'instance-method',
+      );
+      if (typedMatch) {
+        return typedMatch;
+      }
+    }
+  }
+
+  // Java/Kotlin: receiver may be a field whose name doesn't match the type by
+  // Java naming convention (`userbo` → class `UserBO`, abbreviated). Look up
+  // the field in the enclosing class to get its declared type, then resolve
+  // the method on that type. Covers Spring `@Resource`/`@Autowired` field
+  // injection where the field type is the concrete bean class.
+  if ((ref.language === 'java' || ref.language === 'kotlin') && dotMatch) {
+    const inferredType = inferJavaFieldReceiverType(objectOrClass!, ref, context);
     if (inferredType) {
       const typedMatch = resolveMethodOnType(
         inferredType,

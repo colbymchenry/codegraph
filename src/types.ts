@@ -90,6 +90,8 @@ export const LANGUAGES = [
   'objc',
   'yaml',
   'twig',
+  'xml',
+  'properties',
   'unknown',
 ] as const;
 

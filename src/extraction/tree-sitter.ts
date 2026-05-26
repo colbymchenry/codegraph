@@ -23,6 +23,7 @@ import { LiquidExtractor } from './liquid-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
+import { MyBatisExtractor } from './mybatis-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -1453,7 +1454,23 @@ export class TreeSitterExtractor {
     if (nameField && objectField && (node.type === 'method_invocation' || node.type === 'member_call_expression' || node.type === 'scoped_call_expression')) {
       // Method call with explicit receiver: receiver.method() / $receiver->method() / ClassName::method()
       const methodName = getNodeText(nameField, this.source);
-      let receiverName = getNodeText(objectField, this.source);
+      // Java `this.userbo.toLogin2()` parses as method_invocation(object=field_access(this, userbo)).
+      // Without unwrapping, receiverName is `this.userbo` and the name-matcher's
+      // single-dot receiver regex fails. Pull out the immediate field after `this.`
+      // so the receiver is the field name (`userbo`), which the resolver can then
+      // look up in the enclosing class's field declarations.
+      let receiverName: string;
+      if (objectField.type === 'field_access') {
+        const inner = getChildByField(objectField, 'object');
+        const fld = getChildByField(objectField, 'field');
+        if (inner && fld && (inner.type === 'this' || inner.type === 'this_expression')) {
+          receiverName = getNodeText(fld, this.source);
+        } else {
+          receiverName = getNodeText(objectField, this.source);
+        }
+      } else {
+        receiverName = getNodeText(objectField, this.source);
+      }
       // Strip PHP $ prefix from variable names
       receiverName = receiverName.replace(/^\$/, '');
 
@@ -2687,10 +2704,16 @@ export function extractFromSource(
     // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
     result = extractor.extract();
-  } else if (detectedLanguage === 'yaml' || detectedLanguage === 'twig') {
-    // No symbol extraction — file is tracked at the file-record level only.
-    // Framework extractors (e.g. Drupal routing resolver) run below and may
-    // add route nodes / references for yaml files such as *.routing.yml.
+  } else if (detectedLanguage === 'xml') {
+    // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
+    // file node so the watcher tracks it without emitting symbols.
+    const extractor = new MyBatisExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'yaml' || detectedLanguage === 'twig' || detectedLanguage === 'properties') {
+    // No symbol extraction at this stage — files are tracked at the file-record
+    // level only. Framework extractors (Drupal routing yml, Spring `@Value`
+    // resolution against application.yml/application.properties) run later and
+    // add per-file nodes/references when they apply.
     result = { nodes: [], edges: [], unresolvedReferences: [], errors: [], durationMs: 0 };
   } else if (
     detectedLanguage === 'pascal' &&
