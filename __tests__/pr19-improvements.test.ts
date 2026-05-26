@@ -164,6 +164,52 @@ export const useAuth = () => {
     expect(callNames).toContain('generateToken');
   });
 
+  it('should extract unresolved references from anonymous callback bodies', () => {
+    const code = `
+Deno.serve(async (request) => {
+  const result = await confirmPayment(request);
+  return json(result);
+});
+
+it('runs crawler', async () => {
+  await runCrawl();
+});
+`;
+    const result = extractFromSource('callbacks.ts', code);
+
+    const anonymousFunctions = result.nodes.filter(
+      (n) => n.kind === 'function' && n.name === '<anonymous>'
+    );
+    expect(anonymousFunctions).toHaveLength(0);
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const callNames = calls.map((c) => c.referenceName);
+    expect(callNames).toContain('confirmPayment');
+    expect(callNames).toContain('json');
+    expect(callNames).toContain('runCrawl');
+  });
+
+  it('should extract project file references from file read calls', () => {
+    const code = `
+import { readFileSync } from 'fs';
+
+test('checks source contract', () => {
+  const source = readFileSync("supabase/functions/_shared/payment.ts", "utf8");
+  const page = Deno.readTextFileSync('app/app/page.tsx');
+  const dynamic = readFileSync(\`src/\${name}.ts\`, "utf8");
+  const remote = readFileSync("https://example.com/file.ts", "utf8");
+});
+`;
+    const result = extractFromSource('payment.test.ts', code);
+
+    const fileRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports');
+    const refNames = fileRefs.map((r) => r.referenceName);
+    expect(refNames).toContain('supabase/functions/_shared/payment.ts');
+    expect(refNames).toContain('app/app/page.tsx');
+    expect(refNames).not.toContain('https://example.com/file.ts');
+    expect(refNames.some((name) => name.includes('${'))).toBe(false);
+  });
+
   it('should extract unresolved references from function expression bodies', () => {
     const code = `
 export const processData = function(input: string): string {

@@ -122,6 +122,15 @@ const INSTANTIATION_KINDS: ReadonlySet<string> = new Set([
   'instance_creation_expression',    // some grammars
 ]);
 
+const FILE_READ_CALL_NAMES: ReadonlySet<string> = new Set([
+  'readFileSync',
+  'readFile',
+  'readTextFile',
+  'readTextFileSync',
+]);
+
+const PROJECT_FILE_EXT_RE = /\.(?:[cm]?[jt]sx?|json|ya?ml|sql|md|css|scss|html)$/i;
+
 /**
  * TreeSitterExtractor - Main extraction class
  */
@@ -562,7 +571,18 @@ export class TreeSitterExtractor {
         }
       }
     }
-    if (name === '<anonymous>') return; // Skip anonymous functions
+    if (name === '<anonymous>') {
+      // Anonymous callbacks still contain real calls. Do not create a
+      // synthetic symbol, but do walk the body under the current scope so
+      // top-level wrappers like `Deno.serve(async () => handler())` and
+      // test callbacks like `it(..., async () => run())` preserve call edges.
+      const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+        ?? getChildByField(node, this.extractor.bodyField);
+      if (body) {
+        this.visitFunctionBody(body, '');
+      }
+      return;
+    }
 
     // Check for misparse artifacts (e.g. C++ macros causing "namespace detail" functions)
     // Skip the node but still visit the body for calls and structural nodes
@@ -1517,7 +1537,52 @@ export class TreeSitterExtractor {
         line: node.startPosition.row + 1,
         column: node.startPosition.column,
       });
+      this.extractFilePathArgumentReferences(node, callerId, calleeName);
     }
+  }
+
+  private extractFilePathArgumentReferences(node: SyntaxNode, callerId: string, calleeName: string): void {
+    const callName = calleeName.split(/[.:]/).pop() ?? calleeName;
+    if (!FILE_READ_CALL_NAMES.has(callName)) return;
+
+    const args = getChildByField(node, 'arguments');
+    if (!args) return;
+
+    for (let i = 0; i < args.namedChildCount; i++) {
+      const arg = args.namedChild(i);
+      if (!arg) continue;
+      const filePath = this.getStaticStringLiteral(arg);
+      if (!filePath || !this.looksLikeProjectFilePath(filePath)) continue;
+
+      this.unresolvedReferences.push({
+        fromNodeId: callerId,
+        referenceName: filePath.replace(/\\/g, '/').replace(/^\.\//, ''),
+        referenceKind: 'imports',
+        line: arg.startPosition.row + 1,
+        column: arg.startPosition.column,
+      });
+    }
+  }
+
+  private getStaticStringLiteral(node: SyntaxNode): string | null {
+    const text = getNodeText(node, this.source).trim();
+    if (
+      (text.startsWith('"') && text.endsWith('"')) ||
+      (text.startsWith("'") && text.endsWith("'"))
+    ) {
+      return text.slice(1, -1);
+    }
+    if (text.startsWith('`') && text.endsWith('`') && !text.includes('${')) {
+      return text.slice(1, -1);
+    }
+    return null;
+  }
+
+  private looksLikeProjectFilePath(value: string): boolean {
+    if (!value || value.includes('\0')) return false;
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return false;
+    if (!PROJECT_FILE_EXT_RE.test(value)) return false;
+    return value.includes('/') || value.includes('\\') || value.startsWith('.');
   }
 
   /**

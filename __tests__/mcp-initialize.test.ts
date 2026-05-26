@@ -99,6 +99,20 @@ function waitFor<T>(
   });
 }
 
+function stopServer(child: ChildProcessWithoutNullStreams | null): Promise<void> {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, 5000);
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill('SIGKILL');
+  });
+}
+
 describe('MCP initialize handshake (issue #172)', () => {
   let tempDir: string;
   let child: ChildProcessWithoutNullStreams | null = null;
@@ -107,12 +121,10 @@ describe('MCP initialize handshake (issue #172)', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-init-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
-      child = null;
-    }
-    fs.rmSync(tempDir, { recursive: true, force: true });
+  afterEach(async () => {
+    await stopServer(child);
+    child = null;
+    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it('responds to initialize quickly when no .codegraph exists in cwd', async () => {

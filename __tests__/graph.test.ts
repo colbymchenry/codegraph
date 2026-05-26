@@ -281,6 +281,36 @@ export { main };
       expect(Array.isArray(callers)).toBe(true);
     });
 
+    it('should include top-level anonymous callback bodies as file callers', async () => {
+      const callbacksPath = path.join(testDir, 'src', 'callbacks.ts');
+      fs.writeFileSync(
+        callbacksPath,
+        `
+import { formatValue } from './utils';
+
+Deno.serve(async (request) => {
+  return formatValue(1);
+});
+
+it('formats a value', async () => {
+  expect(formatValue(2)).toBe('2.00');
+});
+`
+      );
+
+      await cg.sync();
+      cg.resolveReferences();
+
+      const nodes = cg.getNodesByKind('function');
+      const formatValue = nodes.find((n) => n.name === 'formatValue');
+      expect(formatValue).toBeDefined();
+
+      const callers = cg.getCallers(formatValue!.id);
+      expect(callers.some(
+        (c) => c.node.kind === 'file' && c.node.filePath === 'src/callbacks.ts'
+      )).toBe(true);
+    });
+
     it('should get callees of a function', () => {
       const nodes = cg.getNodesByKind('function');
       const processValue = nodes.find((n) => n.name === 'processValue');
@@ -385,6 +415,26 @@ export { main };
       const dependents = cg.getFileDependents('src/utils.ts');
 
       expect(Array.isArray(dependents)).toBe(true);
+    });
+
+    it('should treat static file-read string paths as file dependents', async () => {
+      fs.writeFileSync(
+        path.join(testDir, 'src', 'source-contract.test.ts'),
+        `
+import { readFileSync } from 'fs';
+
+test('source contract', () => {
+  const source = readFileSync("src/utils.ts", "utf8");
+  expect(source).toContain('formatValue');
+});
+`
+      );
+
+      await cg.sync();
+      cg.resolveReferences();
+
+      const dependents = cg.getFileDependents('src/utils.ts');
+      expect(dependents).toContain('src/source-contract.test.ts');
     });
   });
 
