@@ -205,6 +205,22 @@ export interface User {
     });
   });
 
+  it('should extract type references from interface property signatures', () => {
+    const code = `
+import type { IPage } from '../PromoterList';
+import type { IOrderField } from '../types';
+
+interface Hprops {
+  value?: Partial<IPage> & Partial<IOrderField>;
+}
+`;
+    const result = extractFromSource('HeaderFilter.ts', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(refs.some((r) => r.referenceName === 'IPage')).toBe(true);
+    expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
+  });
+
   it('should track function calls', () => {
     const code = `
 function main() {

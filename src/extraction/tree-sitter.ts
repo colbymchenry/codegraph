@@ -386,6 +386,21 @@ export class TreeSitterExtractor {
     else if (nodeType === 'impl_item') {
       this.extractRustImplItem(node);
     }
+    // TypeScript interface property_signature: extract type references from the
+    // type annotation (e.g. `value?: Partial<IPage>`) so the resolver can build
+    // a `references` edge from the interface to the named type.
+    // No property node is created — only unresolved references.
+    else if (
+      nodeType === 'property_signature' &&
+      this.isInsideClassLikeNode() &&
+      this.TYPE_ANNOTATION_LANGUAGES.has(this.language)
+    ) {
+      const parentId = this.nodeStack[this.nodeStack.length - 1];
+      if (parentId) {
+        this.extractTypeAnnotations(node, parentId);
+      }
+      // don't skipChildren — nested signatures still need traversal
+    }
 
     // Visit children (unless the extract method already visited them)
     if (!skipChildren) {
