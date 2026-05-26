@@ -1266,6 +1266,20 @@ export class ExtractionOrchestrator {
           filesModified++;
         }
       }
+
+      // Cross-check: files tracked in the DB but not reported by git status may
+      // still have been removed — e.g. the deletion was committed to git, or
+      // the file was added to .gitignore after indexing. Verify remaining DB
+      // records against the filesystem to keep the index in sync. Mirrors the
+      // same check in the fallback full-scan path below.
+      const remainingTracked = this.queries.getAllFiles();
+      for (const tracked of remainingTracked) {
+        const fullPath = path.join(this.rootDir, tracked.path);
+        if (!fs.existsSync(fullPath)) {
+          this.queries.deleteFile(tracked.path);
+          filesRemoved++;
+        }
+      }
     } else {
       // === Fallback: full scan (non-git project or git failure) ===
       const currentFiles = new Set(scanDirectory(this.rootDir));
