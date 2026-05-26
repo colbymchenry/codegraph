@@ -50,6 +50,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  julia: 'tree-sitter-julia.wasm',
 };
 
 /**
@@ -170,6 +171,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  '.jl': 'julia',
 };
 
 /**
@@ -226,6 +228,7 @@ export function isPlayRoutesFile(filePath: string): boolean {
     filePath.endsWith('.routes')
   );
 }
+
 
 /**
  * Caches for loaded grammars and parsers
@@ -655,6 +658,7 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    julia: 'Julia',
     unknown: 'Unknown',
   };
   return names[language] || language;

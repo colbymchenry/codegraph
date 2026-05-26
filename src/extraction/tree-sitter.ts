@@ -98,6 +98,11 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
 function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
   const hookName = extractor.resolveName?.(node, source);
   if (hookName) return hookName;
+  // Language-specific name extraction hook
+  if (extractor.getName) {
+    const customName = extractor.getName(node, source);
+    if (customName !== null) return customName || '<anonymous>';
+  }
 
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
@@ -1874,6 +1879,9 @@ export class TreeSitterExtractor {
     // complete definitions with no body block. (#831)
     const body = getChildByField(node, this.extractor.bodyField);
     if (!body && node.type !== 'record_declaration') return;
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    if (!body) return;
 
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
