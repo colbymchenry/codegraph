@@ -21,6 +21,7 @@ import { goResolver } from './go';
 import { rustResolver } from './rust';
 import { aspnetResolver } from './csharp';
 import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
+import { flutterResolver, flutterRouterResolver, flutterStateResolver } from './flutter';
 
 /**
  * All registered framework resolvers
@@ -54,6 +55,10 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   swiftUIResolver,
   uikitResolver,
   vaporResolver,
+  // Dart / Flutter
+  flutterResolver,
+  flutterRouterResolver,
+  flutterStateResolver,
 ];
 
 /**
@@ -124,3 +129,4 @@ export { goResolver } from './go';
 export { rustResolver } from './rust';
 export { aspnetResolver } from './csharp';
 export { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
+export { flutterResolver, flutterRouterResolver, flutterStateResolver } from './flutter';
