@@ -112,6 +112,12 @@ export interface IndexOptions {
 
   /** Enable verbose logging (worker lifecycle, memory, timeouts) */
   verbose?: boolean;
+
+  /**
+   * Skip the mtime/size pre-filter and always read+hash every file.
+   * Useful on network drives (SMB/CIFS) where mtime is not reliably updated.
+   */
+  force?: boolean;
 }
 
 /**
@@ -393,7 +399,7 @@ export class CodeGraph {
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
       }
       try {
-        const result = await this.orchestrator.sync(options.onProgress);
+        const result = await this.orchestrator.sync(options.onProgress, options.force);
 
         // Resolve references if files were updated
         if (result.filesAdded > 0 || result.filesModified > 0) {

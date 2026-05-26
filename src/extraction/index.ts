@@ -1295,7 +1295,7 @@ export class ExtractionOrchestrator {
    * changes. This works in non-git projects and catches committed changes from
    * `git pull`/`checkout`/`merge`/`rebase` that `git status` cannot see.
    */
-  async sync(onProgress?: (progress: IndexProgress) => void): Promise<SyncResult> {
+  async sync(onProgress?: (progress: IndexProgress) => void, force?: boolean): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
     let filesChecked = 0;
@@ -1346,12 +1346,9 @@ export class ExtractionOrchestrator {
       const fullPath = path.join(this.rootDir, filePath);
       const tracked = trackedMap.get(filePath);
 
-      // Cheap pre-filter: an already-indexed file whose size AND mtime both match
-      // the DB is unchanged — skip it without reading or hashing. (A content
-      // change that preserves both exactly is the blind spot every mtime-based
-      // incremental tool accepts; `index --force` is the escape hatch. Git bumps
-      // mtime on every file it writes during checkout/merge, so pulls are caught.)
-      if (tracked) {
+      // Cheap pre-filter: skip files whose size AND mtime both match the DB.
+      // Bypassed with force=true (e.g. network drives where mtime is unreliable).
+      if (tracked && !force) {
         try {
           const stat = fs.statSync(fullPath);
           if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {

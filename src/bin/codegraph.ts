@@ -628,8 +628,9 @@ program
 program
   .command('sync [path]')
   .description('Sync changes since last index')
+  .option('-f, --force', 'Skip mtime/size pre-filter and hash every file (useful on network drives)')
   .option('-q, --quiet', 'Suppress output (for git hooks)')
-  .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
+  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -644,7 +645,7 @@ program
       const cg = await CodeGraph.open(projectPath);
 
       if (options.quiet) {
-        await cg.sync();
+        await cg.sync({ force: options.force });
         cg.destroy();
         return;
       }
@@ -657,6 +658,7 @@ program
 
       const result = await cg.sync({
         onProgress: progress.onProgress,
+        force: options.force,
       });
 
       await progress.stop();
