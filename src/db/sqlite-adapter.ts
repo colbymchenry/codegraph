@@ -43,10 +43,16 @@ export type SqliteBackend = 'node-sqlite';
 class NodeSqliteAdapter implements SqliteDatabase {
   private _db: any;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, options: { nolock?: boolean } = {}) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { DatabaseSync } = require('node:sqlite');
-    this._db = new DatabaseSync(dbPath);
+    // On network filesystems (CIFS/NFS) fcntl() locks are unreliable.
+    // nolock=1 bypasses SQLite's file-locking protocol entirely; safe when
+    // only one process accesses the database at a time (codegraph's typical use).
+    const openPath = options.nolock
+      ? `file://${dbPath}?nolock=1&mode=rwc`
+      : dbPath;
+    this._db = new DatabaseSync(openPath);
   }
 
   get open(): boolean {
@@ -123,10 +129,13 @@ class NodeSqliteAdapter implements SqliteDatabase {
  * Returns the active backend alongside the db so each `DatabaseConnection` can
  * report it per-instance — MCP can open multiple project DBs in one process, so
  * a process-global would race.
+ *
+ * Pass `{ nolock: true }` when the database lives on a network filesystem
+ * (CIFS/NFS) where fcntl() locking is unreliable.
  */
-export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: SqliteBackend } {
+export function createDatabase(dbPath: string, options: { nolock?: boolean } = {}): { db: SqliteDatabase; backend: SqliteBackend } {
   try {
-    return { db: new NodeSqliteAdapter(dbPath), backend: 'node-sqlite' };
+    return { db: new NodeSqliteAdapter(dbPath, options), backend: 'node-sqlite' };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     throw new Error(
