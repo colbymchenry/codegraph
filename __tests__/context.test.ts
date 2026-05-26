@@ -135,6 +135,27 @@ export function validateEmail(email: string): boolean {
 `
     );
 
+    // Create a provider config file with code-like string aliases that are not
+    // symbol names. Context search should still route these aliases to the
+    // enclosing implementation instead of returning no useful entry point.
+    fs.writeFileSync(
+      path.join(srcDir, 'provider-config.ts'),
+      `export function normalizeModelForProvider(model: string): string {
+  switch (model) {
+    case 'deepseek-r1':
+    case 'deepseek-reasoner':
+      return 'deepseek-ai/DeepSeek-V4-Pro';
+    default:
+      return model;
+  }
+}
+
+export function unrelatedProviderHelper(): string {
+  return 'not-this-one';
+}
+`
+    );
+
     // Initialize CodeGraph
     cg = CodeGraph.initSync(testDir, {
       config: {
@@ -209,6 +230,17 @@ export function validateEmail(email: string): boolean {
       });
 
       expect(result.nodes.size).toBeLessThanOrEqual(5);
+    });
+
+    it('should use code-like source text as a fallback entry point', async () => {
+      const result = await cg.findRelevantContext('deepseek-r1', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+
+      const nodeNames = Array.from(result.nodes.values()).map((n) => n.name);
+      expect(nodeNames).toContain('normalizeModelForProvider');
+      expect(nodeNames).not.toContain('unrelatedProviderHelper');
     });
   });
 
