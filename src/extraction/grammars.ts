@@ -341,6 +341,9 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
+  // Julia: not shipped by tree-sitter-wasms; we vendor the prebuilt
+  // tree-sitter-julia.wasm from PR #373 (kongdd:julia).
+  'julia',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */

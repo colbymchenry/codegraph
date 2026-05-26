@@ -11463,3 +11463,85 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
   });
 });
+
+// =============================================================================
+// Julia
+// =============================================================================
+
+describe('Julia Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Julia files', () => {
+      expect(detectLanguage('main.jl')).toBe('julia');
+      expect(detectLanguage('src/math/utils.jl')).toBe('julia');
+    });
+
+    it('should report Julia as supported', () => {
+      expect(isLanguageSupported('julia')).toBe(true);
+      expect(getSupportedLanguages()).toContain('julia');
+    });
+  });
+
+  describe('Function/type/import extraction', () => {
+    it('should extract function signature with return type and where clause', () => {
+      const code = `
+function distance(p::Point{T}, q::Point{T})::T where T
+  return norm([p.x - q.x, p.y - q.y])
+end
+`;
+      const result = extractFromSource('geom.jl', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'distance');
+      expect(fn).toBeDefined();
+      expect(fn?.language).toBe('julia');
+      expect(fn?.signature).toContain('(p::Point{T}, q::Point{T})');
+      expect(fn?.signature).toContain('::T');
+      expect(fn?.signature).toContain('where T');
+    });
+
+    it('should extract struct and abstract type names', () => {
+      const code = `
+abstract type Shape end
+
+struct Point{T}
+  x::T
+  y::T
+end
+`;
+      const result = extractFromSource('types.jl', code);
+      const iface = result.nodes.find((n) => n.kind === 'interface' && n.name === 'Shape');
+      const struct = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Point');
+      expect(iface).toBeDefined();
+      expect(struct).toBeDefined();
+    });
+
+    it('should extract using/import statements and emit import references', () => {
+      const code = `
+using LinearAlgebra
+import Base: show
+`;
+      const result = extractFromSource('imports.jl', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('LinearAlgebra');
+      expect(imports).toContain('Base');
+
+      const importRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'LinearAlgebra'
+      );
+      expect(importRef).toBeDefined();
+    });
+
+    it('should extract function calls as unresolved call references', () => {
+      const code = `
+helper(x) = x * 2
+
+function run(y)
+  return helper(y)
+end
+`;
+      const result = extractFromSource('calls.jl', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'helper'
+      );
+      expect(call).toBeDefined();
+    });
+  });
+});
