@@ -170,6 +170,16 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/design/mixed-ios-and-react-native-bridging.md`.
 
 ### Fixed
+- **TypeScript interface members now produce `references` edges to their
+  annotated types (#432).** Types that appeared only in an interface's
+  property or method signatures — e.g. `value?: Partial<IPage>` or
+  `fetchPage(arg: IPage): IOrderField` — were being silently dropped at
+  extraction time, so `codegraph_impact`/`codegraph_callers` on the named
+  type missed every consumer that imported it just to use it in an
+  interface shape. The walker now extracts type annotations from both
+  `property_signature` and `method_signature` nodes inside class-like
+  parents (interfaces, classes), and the resolver wires the resulting
+  references the same way it wires field and parameter types elsewhere.
 - **Git worktrees no longer silently borrow another tree's index (#155).**
   When a worktree is nested inside the main checkout — exactly what agent
   tools that place worktrees under gitignored paths like

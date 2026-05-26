@@ -221,6 +221,22 @@ interface Hprops {
     expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
   });
 
+  it('should extract type references from interface method signatures', () => {
+    const code = `
+import type { IPage } from '../PromoterList';
+import type { IOrderField } from '../types';
+
+interface MethodForm {
+  fetchPage(arg: IPage): IOrderField;
+}
+`;
+    const result = extractFromSource('MethodForm.ts', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(refs.some((r) => r.referenceName === 'IPage')).toBe(true);
+    expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
+  });
+
   it('should track function calls', () => {
     const code = `
 function main() {
