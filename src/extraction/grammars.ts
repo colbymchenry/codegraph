@@ -37,6 +37,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   scala: 'tree-sitter-scala.wasm',
   lua: 'tree-sitter-lua.wasm',
   luau: 'tree-sitter-luau.wasm',
+  julia: 'tree-sitter-julia.wasm',
 };
 
 /**
@@ -92,6 +93,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.sc': 'scala',
   '.lua': 'lua',
   '.luau': 'luau',
+  '.jl': 'julia',
 };
 
 /**
@@ -118,6 +120,7 @@ export function isPlayRoutesFile(filePath: string): boolean {
     filePath.endsWith('.routes')
   );
 }
+
 
 /**
  * Caches for loaded grammars and parsers
@@ -344,6 +347,7 @@ export function getLanguageDisplayName(language: Language): string {
     luau: 'Luau',
     yaml: 'YAML',
     twig: 'Twig',
+    julia: 'Julia',
     unknown: 'Unknown',
   };
   return names[language] || language;
