@@ -34,6 +34,28 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already attached to the old daemon keep using it while new sessions run
   standalone until it idles out — they never mix versions over the socket.
 
+- **Per-file staleness banner — codegraph responses now tell the agent which
+  files are pending re-index (#403).** When the file watcher has seen edits
+  since the last successful sync, MCP tool responses (`codegraph_search`,
+  `context`, `callers`, `callees`, `impact`, `trace`, `explore`, `node`,
+  `files`) prepend a `⚠️` banner naming the stale files referenced in that
+  response, with their edit age and indexing state; pending files elsewhere in
+  the project appear as a small footer. The agent is told which specific files
+  to Read directly; the rest of the response is fresh and codegraph stays
+  authoritative for it. No artificial wait, no static "wait ~500ms" guess —
+  the cost is zero when nothing's pending. `codegraph_status` also surfaces a
+  `### Pending sync:` section so an agent can ask "is the index caught up?" in
+  one call.
+- **`CODEGRAPH_WATCH_DEBOUNCE_MS` env var lets you tune the file-watcher quiet
+  window (#403).** Default stays at 2000ms; workspaces with bursty writes
+  (formatter-on-save chains, multi-file refactors, large generated outputs)
+  can raise it (e.g. `5000` or `10000`) without touching their agent's command
+  line. Clamped to `[100ms, 60s]`; out-of-range or non-numeric values fall
+  back to the default and the active value is logged to stderr on watcher
+  startup so it's discoverable. Pairs with the staleness banner above: the
+  banner stays accurate at any debounce value because it's per-file, not a
+  static "wait N ms" instruction.
+
 ### Fixed
 - **Git worktrees no longer silently borrow another tree's index (#155).**
   When a worktree is nested inside the main checkout — exactly what agent

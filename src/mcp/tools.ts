@@ -11,6 +11,7 @@ import {
   worktreeMismatchNotice,
   type WorktreeIndexMismatch,
 } from '../sync/worktree';
+import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind } from '../types';
 import { createHash } from 'crypto';
 import {
@@ -24,7 +25,7 @@ import {
 } from 'fs';
 import { clamp, validatePathWithinRoot, validateProjectPath } from '../utils';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve as resolvePath } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -262,6 +263,48 @@ function markSessionConsulted(sessionId: string): void {
     // planted symlink lands here too, which is the intended behavior: refuse
     // to write rather than overwrite an attacker-chosen target.
   }
+}
+
+/**
+ * Per-file staleness banner emitted at the top of a tool response when the
+ * file watcher has pending events for files referenced by the response.
+ * The agent uses this to fall back to Read for those specific files
+ * without waiting for the debounced sync (issue #403).
+ */
+export function formatStaleBanner(stale: PendingFile[]): string {
+  const now = Date.now();
+  const lines = stale.map((p) => {
+    const ageMs = Math.max(0, now - p.lastSeenMs);
+    const label = p.indexing ? 'indexing in progress' : 'pending sync';
+    return `  - ${p.path} (edited ${ageMs}ms ago, ${label})`;
+  });
+  return (
+    '⚠️ Some files referenced below were edited since the last index sync — ' +
+    'their codegraph entries may be stale:\n' +
+    lines.join('\n') +
+    '\nFor accurate content of those specific files, Read them directly. ' +
+    'The rest of this response is fresh.'
+  );
+}
+
+/**
+ * Compact footer listing pending files that are NOT referenced in this
+ * response. Gives the agent a complete project-wide freshness picture
+ * without bloating the main banner.
+ */
+export function formatStaleFooter(stale: PendingFile[]): string {
+  const MAX = 5;
+  const now = Date.now();
+  const shown = stale.slice(0, MAX);
+  const lines = shown.map((p) => {
+    const ageMs = Math.max(0, now - p.lastSeenMs);
+    return `  - ${p.path} (edited ${ageMs}ms ago)`;
+  });
+  const more = stale.length > MAX ? `\n  - …and ${stale.length - MAX} more` : '';
+  return (
+    `(Note: ${stale.length} file(s) elsewhere in this project are pending index ` +
+    `sync but were not referenced above:\n${lines.join('\n')}${more})`
+  );
 }
 
 /**
@@ -803,6 +846,84 @@ export class ToolHandler {
   }
 
   /**
+   * Annotate a successful read-tool result with per-file staleness — the
+   * non-blocking answer to issue #403. The file watcher tracks every event
+   * it sees per path; here we intersect "files referenced in this response"
+   * against that pending set and prepend a compact banner so the agent can
+   * fall back to Read for those *specific* files without waiting for the
+   * debounced sync to fire. Other pending files in the project (not
+   * referenced by this response) get a small footer so the agent has a
+   * complete picture without bloating the banner.
+   *
+   * Cost when nothing is pending — the common case — is one boolean check.
+   * No I/O, no parsing of markdown beyond a per-pending-file substring scan.
+   */
+  private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
+    if (result.isError) return result;
+
+    let cg: CodeGraph;
+    try {
+      cg = this.getCodeGraph(projectPath);
+    } catch {
+      return result; // no default project — leave as is
+    }
+
+    // Cross-project `projectPath` calls open a cached CodeGraph WITHOUT a
+    // watcher (watchers are only attached to the default session project).
+    // When the cross-project path happens to be the same project as the
+    // default cg, the cached instance is the wrong one — its pendingFiles is
+    // permanently empty. Detect the equal-path case and prefer the default
+    // cg so the staleness signal still fires when an agent passes the
+    // explicit projectPath form of its own project.
+    if (this.cg && cg !== this.cg) {
+      try {
+        const sameProject =
+          resolvePath(this.cg.getProjectRoot()) === resolvePath(cg.getProjectRoot());
+        if (sameProject) cg = this.cg;
+      } catch {
+        /* getProjectRoot may throw on a closed instance — leave cg as is */
+      }
+    }
+
+    // Defensive: some test fakes inject a partial CodeGraph stub without the
+    // newer pending-files API. Treat missing/throwing as "no pending files."
+    let pending: PendingFile[] = [];
+    try {
+      pending = cg.getPendingFiles?.() ?? [];
+    } catch {
+      return result;
+    }
+    if (pending.length === 0) return result;
+
+    const [first, ...rest] = result.content;
+    if (!first || first.type !== 'text') return result;
+
+    const text = first.text;
+    const inResponse: PendingFile[] = [];
+    const elsewhere: PendingFile[] = [];
+    for (const p of pending) {
+      // Substring match against the project-relative POSIX path — that's
+      // exactly the format both the watcher and every codegraph response
+      // emit, so a plain includes() is sufficient and avoids regex pitfalls.
+      if (text.includes(p.path)) inResponse.push(p);
+      else elsewhere.push(p);
+    }
+
+    let banner = '';
+    if (inResponse.length > 0) {
+      banner = formatStaleBanner(inResponse);
+    }
+    let footer = '';
+    if (elsewhere.length > 0) {
+      footer = formatStaleFooter(elsewhere);
+    }
+    if (!banner && !footer) return result;
+
+    const composed = [banner, text, footer].filter(Boolean).join('\n\n');
+    return { ...result, content: [{ type: 'text', text: composed }, ...rest] };
+  }
+
+  /**
    * Execute a tool by name
    */
   async execute(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
@@ -831,9 +952,12 @@ export class ToolHandler {
         if (typeof check === 'object' && check !== undefined) return check;
       }
 
-      // Read tools resolve through a single result variable so the worktree
-      // mismatch notice can be prefixed in one place (issue #155). status is
-      // returned directly — it embeds its own verbose warning.
+      // Read tools resolve through a single result variable so cross-cutting
+      // notices — worktree-index mismatch (issue #155) and per-file
+      // staleness (issue #403) — can be applied in one place. status embeds
+      // its own verbose worktree warning but still flows through the
+      // staleness wrapper so its pending-files section stays consistent
+      // with what the read tools surface.
       let result: ToolResult;
       switch (toolName) {
         case 'codegraph_search':
@@ -851,6 +975,9 @@ export class ToolHandler {
         case 'codegraph_node':
           result = await this.handleNode(args); break;
         case 'codegraph_status':
+          // status embeds the pending-files list as a first-class section
+          // (see handleStatus), so we skip the auto-banner wrapper here to
+          // avoid duplicating the same info at the top of the response.
           return await this.handleStatus(args);
         case 'codegraph_files':
           result = await this.handleFiles(args); break;
@@ -859,7 +986,8 @@ export class ToolHandler {
         default:
           return this.errorResult(`Unknown tool: ${toolName}`);
       }
-      return this.withWorktreeNotice(result, args.projectPath as string | undefined);
+      const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
+      return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
       return this.errorResult(`Tool execution failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -2016,7 +2144,18 @@ export class ToolHandler {
    * Handle codegraph_status
    */
   private async handleStatus(args: Record<string, unknown>): Promise<ToolResult> {
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    let cg = this.getCodeGraph(args.projectPath as string | undefined);
+    // Same trick as withStalenessNotice — when an explicit projectPath
+    // resolves to the same project as the default session cg, prefer the
+    // default so getPendingFiles() (only populated by the default's watcher)
+    // is non-empty when there are pending edits.
+    if (this.cg && cg !== this.cg) {
+      try {
+        if (resolvePath(this.cg.getProjectRoot()) === resolvePath(cg.getProjectRoot())) {
+          cg = this.cg;
+        }
+      } catch { /* closed instance — leave as is */ }
+    }
     const stats = cg.getStats();
 
     // Warn when this index actually belongs to a different git working tree
@@ -2070,6 +2209,21 @@ export class ToolHandler {
     for (const [lang, count] of Object.entries(stats.filesByLanguage)) {
       if ((count as number) > 0) {
         lines.push(`- ${lang}: ${count}`);
+      }
+    }
+
+    // Per-file freshness — the inverse of the auto-prepended staleness banner
+    // (issue #403). Surfacing it inside `status` gives the agent a single
+    // place to ask "is the index caught up?" rather than inferring from
+    // banners on other tool calls.
+    const pending = cg.getPendingFiles();
+    if (pending.length > 0) {
+      lines.push('', '### Pending sync:');
+      const now = Date.now();
+      for (const p of pending) {
+        const ageMs = Math.max(0, now - p.lastSeenMs);
+        const label = p.indexing ? 'indexing in progress' : 'pending sync';
+        lines.push(`- ${p.path} (edited ${ageMs}ms ago, ${label})`);
       }
     }
 

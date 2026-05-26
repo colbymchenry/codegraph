@@ -185,7 +185,18 @@ export class MCPEngine {
       return;
     }
 
+    // Optional override for the debounce window via env var (issue #403).
+    // Useful for workspaces with bursty writes (formatter-on-save chains,
+    // large generated outputs) where the 2s default fires too often. Clamped
+    // to [100ms, 60s]; out-of-range / non-numeric values fall back to the
+    // FileWatcher default. We log the active value so it's discoverable.
+    const debounceMs = parseDebounceEnv(process.env.CODEGRAPH_WATCH_DEBOUNCE_MS);
+    if (debounceMs !== undefined) {
+      process.stderr.write(`[CodeGraph MCP] File watcher debounce: ${debounceMs}ms (CODEGRAPH_WATCH_DEBOUNCE_MS)\n`);
+    }
+
     const started = this.cg.watch({
+      debounceMs,
       onSyncComplete: (result) => {
         if (result.filesChanged > 0) {
           process.stderr.write(
@@ -229,4 +240,25 @@ export class MCPEngine {
         process.stderr.write(`[CodeGraph MCP] Catch-up sync failed: ${msg}\n`);
       });
   }
+}
+
+/**
+ * Parse and clamp the CODEGRAPH_WATCH_DEBOUNCE_MS env override.
+ *
+ * Issue #403: workspaces with bursty writes (formatter-on-save, multi-file
+ * refactors) sometimes want a longer quiet window before sync. Returns
+ * `undefined` for unset / empty / non-numeric / out-of-range values so the
+ * FileWatcher default (2000ms) takes over — never throws.
+ *
+ * Clamp range: 100ms (faster would mean a sync per keystroke) to 60s (longer
+ * and the watcher feels broken). Out-of-range values are treated as "ignore
+ * this misconfiguration" rather than capped, since silently capping a 0 or
+ * a typoed value would mask a real config bug.
+ */
+export function parseDebounceEnv(raw: string | undefined): number | undefined {
+  if (!raw || !raw.trim()) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return undefined;
+  if (n < 100 || n > 60000) return undefined;
+  return n;
 }

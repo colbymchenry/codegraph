@@ -46,7 +46,7 @@ import {
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
-import { FileWatcher, WatchOptions } from './sync';
+import { FileWatcher, WatchOptions, PendingFile } from './sync';
 
 // Re-export types for consumers
 export * from './types';
@@ -75,7 +75,7 @@ export {
   defaultLogger,
 } from './errors';
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
-export { FileWatcher, WatchOptions } from './sync';
+export { FileWatcher, WatchOptions, PendingFile } from './sync';
 export { MCPServer } from './mcp';
 
 /**
@@ -497,6 +497,31 @@ export class CodeGraph {
    */
   isWatching(): boolean {
     return this.watcher?.isActive() ?? false;
+  }
+
+  /**
+   * Files seen by the file watcher since the last successful sync —
+   * the per-file "stale" signal MCP tools attach to responses so an agent
+   * can fall back to {@link Read} for just the affected file without
+   * waiting for a debounced sync to complete (issue #403).
+   *
+   * Returns an empty list when the watcher isn't active, or no events have
+   * arrived. Each entry includes `firstSeenMs` and `lastSeenMs` (wall-clock
+   * `Date.now()` values) so callers can render "edited Nms ago", plus an
+   * `indexing` flag indicating whether the in-flight sync (if any) will
+   * absorb that file.
+   */
+  getPendingFiles(): PendingFile[] {
+    return this.watcher?.getPendingFiles() ?? [];
+  }
+
+  /**
+   * Resolves once the file watcher has finished its initial chokidar scan.
+   * Useful for tests that need a deterministic boundary before asserting on
+   * `getPendingFiles()`. Resolves immediately when no watcher is active.
+   */
+  waitUntilWatcherReady(timeoutMs?: number): Promise<void> {
+    return this.watcher ? this.watcher.waitUntilReady(timeoutMs) : Promise.resolve();
   }
 
   /**

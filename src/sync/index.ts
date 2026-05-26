@@ -13,7 +13,7 @@
  * - Incremental reindexing (in extraction module)
  */
 
-export { FileWatcher, WatchOptions } from './watcher';
+export { FileWatcher, WatchOptions, PendingFile } from './watcher';
 export { watchDisabledReason, detectWsl } from './watch-policy';
 export {
   installGitSyncHook,

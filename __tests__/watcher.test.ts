@@ -198,6 +198,94 @@ describe('FileWatcher', () => {
     });
   });
 
+  describe('pending file tracking (#403)', () => {
+    it('should expose edited paths via getPendingFiles before sync fires', async () => {
+      // Slow debounce — events arrive but sync hasn't run yet.
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 2000 });
+      watcher.start();
+      // Deterministic boundary: wait for chokidar's initial scan to complete
+      // so any late initial-scan events have fired before we assert. A bare
+      // sleep is flaky under test-parallelism load.
+      await watcher.waitUntilReady();
+
+      expect(watcher.getPendingFiles()).toEqual([]);
+
+      fs.writeFileSync(path.join(testDir, 'src', 'pending.ts'), 'export const p = 1;');
+
+      // Allow chokidar to emit, but DON'T let the 2s debounce fire.
+      await waitFor(() => watcher.getPendingFiles().length > 0, 3000);
+
+      const pending = watcher.getPendingFiles();
+      const paths = pending.map((p) => p.path);
+      expect(paths).toContain('src/pending.ts');
+      const entry = pending.find((p) => p.path === 'src/pending.ts')!;
+      expect(entry.firstSeenMs).toBeGreaterThan(0);
+      expect(entry.lastSeenMs).toBeGreaterThanOrEqual(entry.firstSeenMs);
+      // No sync running yet → indexing flag is false.
+      expect(entry.indexing).toBe(false);
+
+      watcher.stop();
+    });
+
+    it('should clear an entry only after a successful sync absorbing that edit', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 200 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      fs.writeFileSync(path.join(testDir, 'src', 'fresh.ts'), 'export const f = 1;');
+
+      // Watcher saw the change → pendingFiles has the entry. Longer windows
+      // here because chokidar event delivery on macOS slows under heavy
+      // parallel test-suite load (4× slower than isolation).
+      await waitFor(() => watcher.getPendingFiles().some((p) => p.path === 'src/fresh.ts'), 8000);
+
+      // Wait through debounce + sync; the entry should drop out.
+      await waitFor(() => syncFn.mock.calls.length > 0, 8000);
+      await waitFor(() => !watcher.getPendingFiles().some((p) => p.path === 'src/fresh.ts'), 8000);
+
+      expect(watcher.getPendingFiles()).toEqual([]);
+      watcher.stop();
+    });
+
+    it('should keep entries unchanged when sync fails (rescheduled work sees the same set)', async () => {
+      // First post-settle sync rejects, second resolves. The initial-scan
+      // sync (triggered by chokidar's pre-existing add events) is allowed to
+      // resolve cleanly so it doesn't consume one of our scripted outcomes.
+      const syncFn = vi
+        .fn()
+        .mockResolvedValueOnce({ filesChanged: 0, durationMs: 1 }) // initial scan
+        .mockRejectedValueOnce(new Error('boom'))                  // first real edit fails
+        .mockResolvedValueOnce({ filesChanged: 1, durationMs: 10 }); // retry succeeds
+      const onSyncError = vi.fn();
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 200, onSyncError });
+      watcher.start();
+      // Wait through chokidar `ready` AND the initial-scan-triggered sync, so
+      // the next sync corresponds to the explicit edit below.
+      await watcher.waitUntilReady();
+      await waitFor(() => syncFn.mock.calls.length >= 1, 5000);
+      await new Promise((r) => setTimeout(r, 100));
+
+      fs.writeFileSync(path.join(testDir, 'src', 'will-fail.ts'), 'export const wf = 1;');
+
+      // Wait for the sync that handles the explicit edit to reject.
+      await waitFor(() => onSyncError.mock.calls.length > 0, 5000);
+
+      // The file is STILL in pendingFiles — failure didn't drop it.
+      const after = watcher.getPendingFiles();
+      expect(after.some((p) => p.path === 'src/will-fail.ts')).toBe(true);
+
+      // Retry resolves; entry clears.
+      await waitFor(
+        () => !watcher.getPendingFiles().some((p) => p.path === 'src/will-fail.ts'),
+        5000,
+      );
+
+      watcher.stop();
+    });
+  });
+
   describe('callbacks', () => {
     it('should call onSyncComplete after successful sync', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 2, durationMs: 50 });
