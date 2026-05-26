@@ -156,6 +156,33 @@ export function unrelatedProviderHelper(): string {
 `
     );
 
+    // Create a config-key fixture where code-like strings appear both in
+    // purpose-built functions and a generic alias registry. The purpose-built
+    // functions should rank first when the query provides semantic words.
+    fs.writeFileSync(
+      path.join(srcDir, 'runtime-config.ts'),
+      `export function genericAliasRegistry(): string[] {
+  return ['agent.trace-mode', 'billing.webhook.created'];
+}
+
+export function resolveFeatureGate(key: string): boolean {
+  if (key === 'agent.trace-mode') {
+    return true;
+  }
+  return false;
+}
+
+export function lookupWebhookHandler(event: string): string {
+  switch (event) {
+    case 'billing.webhook.created':
+      return 'handleBillingCreated';
+    default:
+      return 'ignoreWebhook';
+  }
+}
+`
+    );
+
     // Initialize CodeGraph
     cg = CodeGraph.initSync(testDir, {
       config: {
@@ -241,6 +268,28 @@ export function unrelatedProviderHelper(): string {
       const nodeNames = Array.from(result.nodes.values()).map((n) => n.name);
       expect(nodeNames).toContain('normalizeModelForProvider');
       expect(nodeNames).not.toContain('unrelatedProviderHelper');
+    });
+
+    it('should rank a feature flag function above a generic alias registry', async () => {
+      const result = await cg.findRelevantContext('agent.trace-mode feature gate', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+
+      const entryNames = result.roots.map((id) => result.nodes.get(id)?.name);
+      expect(entryNames[0]).toBe('resolveFeatureGate');
+      expect(entryNames).toContain('genericAliasRegistry');
+    });
+
+    it('should rank a webhook handler function above a generic alias registry', async () => {
+      const result = await cg.findRelevantContext('billing.webhook.created webhook handler', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+
+      const entryNames = result.roots.map((id) => result.nodes.get(id)?.name);
+      expect(entryNames[0]).toBe('lookupWebhookHandler');
+      expect(entryNames).toContain('genericAliasRegistry');
     });
   });
 
