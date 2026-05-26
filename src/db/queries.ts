@@ -21,6 +21,8 @@ import { safeJsonParse } from '../utils';
 import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 
+const SQLITE_PARAM_CHUNK_SIZE = 500;
+
 /**
  * Database row types (snake_case from SQLite)
  */
@@ -419,9 +421,8 @@ export class QueryBuilder {
     // Chunk under SQLite's parameter limit (default 999, raised to 32766
     // in better-sqlite3 builds — chunk at 500 for safety across both
     // backends and to keep the query plan simple).
-    const CHUNK = 500;
-    for (let i = 0; i < misses.length; i += CHUNK) {
-      const chunk = misses.slice(i, i + CHUNK);
+    for (let i = 0; i < misses.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = misses.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const rows = this.db
         .prepare(`SELECT * FROM nodes WHERE id IN (${placeholders})`)
@@ -432,6 +433,25 @@ export class QueryBuilder {
         this.cacheNode(node);
       }
     }
+    return out;
+  }
+
+  private getExistingNodeIds(ids: readonly string[]): Set<string> {
+    const out = new Set<string>();
+    if (ids.length === 0) return out;
+
+    const uniqueIds = [...new Set(ids)];
+    for (let i = 0; i < uniqueIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = uniqueIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT id FROM nodes WHERE id IN (${placeholders})`)
+        .all(...chunk) as { id: string }[];
+      for (const row of rows) {
+        out.add(row.id);
+      }
+    }
+
     return out;
   }
 
@@ -1039,8 +1059,20 @@ export class QueryBuilder {
    * Insert multiple edges in a transaction
    */
   insertEdges(edges: Edge[]): void {
+    if (edges.length === 0) return;
+
     this.db.transaction(() => {
+      const endpointIds = new Set<string>();
       for (const edge of edges) {
+        endpointIds.add(edge.source);
+        endpointIds.add(edge.target);
+      }
+      const existingNodeIds = this.getExistingNodeIds([...endpointIds]);
+
+      for (const edge of edges) {
+        if (!existingNodeIds.has(edge.source) || !existingNodeIds.has(edge.target)) {
+          continue;
+        }
         this.insertEdge(edge);
       }
     })();

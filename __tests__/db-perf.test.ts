@@ -7,6 +7,7 @@
  *      doesn't serve a stale cached row on next `getNodeById`.
  *   3. `runMaintenance` runs `PRAGMA optimize` + `wal_checkpoint(PASSIVE)`
  *      after indexAll/sync without throwing.
+ *   4. `insertEdges` validates endpoints from the DB, not stale node cache.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -125,6 +126,51 @@ describe('insertNode cache invalidation', () => {
     q.insertNode({ ...original, name: 'newName', updatedAt: Date.now() });
     const afterReplace = q.getNodeById('n1');
     expect(afterReplace!.name).toBe('newName');
+  });
+});
+
+describe('insertEdges endpoint validation', () => {
+  let dir: string;
+  let db: DatabaseConnection;
+  let q: QueryBuilder;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-perf-edges-'));
+    db = DatabaseConnection.initialize(path.join(dir, 'test.db'));
+    q = new QueryBuilder(db.getDb());
+  });
+
+  afterEach(() => {
+    db.close();
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('skips edges with missing endpoints instead of failing the whole batch', () => {
+    q.insertNodes([makeNode('source'), makeNode('target'), makeNode('other')]);
+
+    expect(() =>
+      q.insertEdges([
+        { source: 'source', target: 'target', kind: 'calls' },
+        { source: 'source', target: 'missing-target', kind: 'calls' },
+        { source: 'missing-source', target: 'other', kind: 'references' },
+      ])
+    ).not.toThrow();
+
+    const edges = q.getOutgoingEdges('source');
+    expect(edges).toHaveLength(1);
+    expect(edges[0]).toMatchObject({ source: 'source', target: 'target', kind: 'calls' });
+  });
+
+  it('does not trust stale cached nodes when validating edge endpoints', () => {
+    q.insertNodes([makeNode('source'), makeNode('target')]);
+    expect(q.getNodeById('target')!.id).toBe('target');
+
+    db.getDb().prepare('DELETE FROM nodes WHERE id = ?').run('target');
+
+    expect(() =>
+      q.insertEdges([{ source: 'source', target: 'target', kind: 'calls' }])
+    ).not.toThrow();
+    expect(q.getOutgoingEdges('source')).toEqual([]);
   });
 });
 
