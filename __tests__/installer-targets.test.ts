@@ -635,6 +635,86 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).toContain('custom:\n  keep: true');
   });
 
+  // Regression for #456: PyYAML's default block style writes list items at the
+  // SAME indent as the parent key (`cli:` and its `- hermes-cli` are both at
+  // indent 2). The pre-fix line-based patcher mistook that first list item for
+  // the next sibling key, truncated the cli block, and spliced `- mcp-codegraph`
+  // at indent 4 BEFORE the existing items — producing unparseable YAML.
+  it('hermes: install preserves PyYAML-default list-at-same-indent style (issue #456)', () => {
+    const hermes = getTarget('hermes')!;
+    const config = path.join(tmpHome, '.hermes', 'config.yaml');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    const original = [
+      'model:',
+      '  default: gpt-4o',
+      'platform_toolsets:',
+      '  cli:',
+      '  - hermes-cli',
+      '  - browser',
+      '  - clarify',
+      '  - terminal',
+      '  - web',
+      '  telegram:',
+      '  - hermes-telegram',
+      '  discord:',
+      '  - hermes-discord',
+      '',
+    ].join('\n');
+    fs.writeFileSync(config, original);
+
+    hermes.install('global', { autoAllow: true });
+    const body = fs.readFileSync(config, 'utf-8');
+
+    // mcp-codegraph appended at the same 2-space indent as existing items
+    expect(body).toContain('\n  - mcp-codegraph\n');
+    // hermes-cli preserved
+    expect(body).toContain('\n  - hermes-cli\n');
+    // Sibling sections kept their indent — `telegram:` is still a key under
+    // platform_toolsets, not promoted up.
+    expect(body).toContain('\n  telegram:\n  - hermes-telegram\n');
+    expect(body).toContain('\n  discord:\n  - hermes-discord\n');
+    // No list items leaked to the platform_toolsets level (indent 0).
+    expect(body).not.toMatch(/^- browser/m);
+    expect(body).not.toMatch(/^- hermes-telegram/m);
+
+    // The whole platform_toolsets block extracted by line search should
+    // start with `cli:` and not contain a stray 4-space `mcp-codegraph`
+    // appearing before the rest of the existing items.
+    expect(body).toContain('  cli:\n  - hermes-cli\n  - browser');
+
+    // Idempotent
+    const second = hermes.install('global', { autoAllow: true });
+    expect(second.files[0]?.action).toBe('unchanged');
+  });
+
+  it('hermes: uninstall reverses the install on a PyYAML-default config', () => {
+    const hermes = getTarget('hermes')!;
+    const config = path.join(tmpHome, '.hermes', 'config.yaml');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    const original = [
+      'platform_toolsets:',
+      '  cli:',
+      '  - hermes-cli',
+      '  - browser',
+      '  telegram:',
+      '  - hermes-telegram',
+      '',
+    ].join('\n');
+    fs.writeFileSync(config, original);
+
+    hermes.install('global', { autoAllow: true });
+    const installed = fs.readFileSync(config, 'utf-8');
+    expect(installed).toContain('- mcp-codegraph');
+    expect(installed).toContain('codegraph:');
+
+    hermes.uninstall('global');
+    const body = fs.readFileSync(config, 'utf-8');
+    expect(body).not.toContain('mcp-codegraph');
+    expect(body).not.toContain('command: codegraph');
+    expect(body).toContain('  cli:\n  - hermes-cli\n  - browser');
+    expect(body).toContain('  telegram:\n  - hermes-telegram');
+  });
+
   it('opencode: uninstall removes only mcp.codegraph, preserves comments and siblings', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
