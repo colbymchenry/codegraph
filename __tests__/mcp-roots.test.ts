@@ -16,7 +16,7 @@
  * mocking — so they also exercise the new bidirectional request/response path.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
+import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -26,9 +26,20 @@ const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
 function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
   // --no-watch keeps the test deterministic and avoids watcher startup noise.
-  return spawn(process.execPath, [BIN, 'serve', '--mcp', '--no-watch'], {
+  return spawn(process.execPath, ['--liftoff-only', BIN, 'serve', '--mcp', '--no-watch'], {
     cwd,
+    env: {
+      ...process.env,
+      // These tests validate MCP handshake/project-resolution behavior. On
+      // Node >=25 the CLI exits early unless explicitly overridden, which
+      // would make stdout appear "silent" and fail the handshake assertions.
+      CODEGRAPH_ALLOW_UNSAFE_NODE: '1',
+      // We already pass `--liftoff-only` explicitly above; disable CLI
+      // self-relaunch so the test controls a single child process PID.
+      CODEGRAPH_NO_RELAUNCH: '1',
+    },
     stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEGRAPH_NO_RELAUNCH: '1' },
   }) as ChildProcessWithoutNullStreams;
 }
 
@@ -74,6 +85,29 @@ function send(child: ChildProcessWithoutNullStreams, msg: object): void {
 
 const CLIENT_INFO = { name: 'test', version: '0.0.0' };
 
+async function stopChild(child: ChildProcessWithoutNullStreams | null): Promise<void> {
+  if (!child) return;
+  const pid = child.pid;
+  if (pid === undefined) return;
+
+  if (process.platform === 'win32') {
+    // On Windows, ChildProcess.kill('SIGKILL') is not a real SIGKILL and may
+    // leave descendants alive. Kill the full process tree deterministically.
+    try { spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' }); } catch { /* ignore */ }
+  } else if (!child.killed) {
+    try { child.kill('SIGKILL'); } catch { /* ignore */ }
+  }
+
+  await new Promise<void>((resolve) => {
+    if (child.exitCode !== null) return resolve();
+    const timer = setTimeout(resolve, 2000);
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
 describe('MCP project resolution via roots/list (issue #196)', () => {
   let cwdDir: string;     // where the server is launched — has NO .codegraph
   let projectDir: string; // the real indexed project the client reports
@@ -84,9 +118,12 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
     projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-proj-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
+  afterEach(async () => {
+    if (child) {
+      if (!child.killed) child.kill('SIGKILL');
+      if (child.exitCode === null) {
+        await new Promise<void>(resolve => child!.once('close', resolve));
+      }
       child = null;
     }
     fs.rmSync(cwdDir, { recursive: true, force: true });

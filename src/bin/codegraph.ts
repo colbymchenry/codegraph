@@ -62,7 +62,7 @@ const importESM = new Function('specifier', 'return import(specifier)') as
 // who patched V8 themselves or want to test a future fix.
 const nodeVersion = process.versions.node;
 const nodeMajor = parseInt(nodeVersion.split('.')[0] ?? '0', 10);
-if (nodeMajor >= 25) {
+if (nodeMajor === 25) {
   process.stderr.write(buildNode25BlockBanner(nodeVersion) + '\n');
   if (!process.env.CODEGRAPH_ALLOW_UNSAFE_NODE) {
     process.exit(1);

@@ -35,6 +35,12 @@ export { generateNodeId } from './tree-sitter-helpers';
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
+  // Language-specific name extraction hook
+  if (extractor.getName) {
+    const customName = extractor.getName(node, source);
+    if (customName !== null) return customName || '<anonymous>';
+  }
+
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
   if (nameNode) {
@@ -782,7 +788,8 @@ export class TreeSitterExtractor {
     if (!this.extractor) return;
 
     // Skip forward declarations and type references (no body = not a definition)
-    const body = getChildByField(node, this.extractor.bodyField);
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
     if (!body) return;
 
     const name = extractName(node, this.source, this.extractor);
@@ -1177,6 +1184,23 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, name, nameNode, { docstring, signature: initSignature, isExported });
       });
+    } else if (this.language === 'julia') {
+      // Julia: const_statement → assignment → identifier (name) [op] value
+      const assignment = node.namedChild(0);
+      if (assignment) {
+        const nameNode = assignment.namedChild(0);
+        if (nameNode?.type === 'identifier') {
+          const name = getNodeText(nameNode, this.source);
+          const valueNode = assignment.namedChildCount > 1
+            ? assignment.namedChild(assignment.namedChildCount - 1)
+            : null;
+          const initValue = valueNode && valueNode !== nameNode
+            ? getNodeText(valueNode, this.source).slice(0, 100)
+            : undefined;
+          const initSignature = initValue ? `= ${initValue}` : undefined;
+          this.createNode('constant', name, nameNode, { docstring, signature: initSignature, isExported });
+        }
+      }
     } else {
       // Generic fallback for other languages
       // Try to find identifier children

@@ -11,7 +11,7 @@
  * contract that initialize is fast regardless of how much work init does.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
+import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -20,8 +20,18 @@ import { CodeGraph } from '../src';
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
 function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
-  return spawn(process.execPath, [BIN, 'serve', '--mcp'], {
+  return spawn(process.execPath, ['--liftoff-only', BIN, 'serve', '--mcp'], {
     cwd,
+    env: {
+      ...process.env,
+      // Keep the MCP handshake tests exercising the protocol behavior even on
+      // environments running Node >=25, where the CLI otherwise exits before
+      // serving due to the WASM safety guard.
+      CODEGRAPH_ALLOW_UNSAFE_NODE: '1',
+      // We already pass `--liftoff-only` explicitly above; disable CLI
+      // self-relaunch so the test controls a single child process PID.
+      CODEGRAPH_NO_RELAUNCH: '1',
+    },
     stdio: ['pipe', 'pipe', 'pipe'],
     // Pin to direct (in-process) mode. #172 is a contract about the in-process
     // server's init ordering — the "File watcher active" log this test observes
@@ -99,6 +109,29 @@ function waitFor<T>(
   });
 }
 
+async function stopChild(child: ChildProcessWithoutNullStreams | null): Promise<void> {
+  if (!child) return;
+  const pid = child.pid;
+  if (pid === undefined) return;
+
+  if (process.platform === 'win32') {
+    // On Windows, ChildProcess.kill('SIGKILL') is not a real SIGKILL and may
+    // leave descendants alive. Kill the full process tree deterministically.
+    try { spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' }); } catch { /* ignore */ }
+  } else if (!child.killed) {
+    try { child.kill('SIGKILL'); } catch { /* ignore */ }
+  }
+
+  await new Promise<void>((resolve) => {
+    if (child.exitCode !== null) return resolve();
+    const timer = setTimeout(resolve, 2000);
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
 describe('MCP initialize handshake (issue #172)', () => {
   let tempDir: string;
   let child: ChildProcessWithoutNullStreams | null = null;
@@ -107,11 +140,9 @@ describe('MCP initialize handshake (issue #172)', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-init-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
-      child = null;
-    }
+  afterEach(async () => {
+    await stopChild(child);
+    child = null;
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 

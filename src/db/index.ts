@@ -6,11 +6,66 @@
 
 import { SqliteDatabase, SqliteBackend, createDatabase } from './sqlite-adapter';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
 
 export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
+
+/**
+ * Detect whether a file path lives on a network filesystem (CIFS/NFS/etc.).
+ *
+ * On Linux, reads /proc/mounts and finds the deepest matching mount point.
+ * On macOS, checks for /Volumes/ paths (network mounts land there by default).
+ * On Windows, UNC paths (\\server\share) are always network.
+ *
+ * Returns false on any parse error so the caller degrades gracefully.
+ */
+function isNetworkFilesystem(filePath: string): boolean {
+  const platform = os.platform();
+  const resolved = path.resolve(filePath);
+
+  if (platform === 'linux') {
+    try {
+      const mounts = fs.readFileSync('/proc/mounts', 'utf-8');
+      let bestMount = '';
+      let bestFsType = '';
+      for (const line of mounts.split('\n')) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 3) continue;
+        const mountPoint = parts[1] as string;
+        const fsType = parts[2] as string;
+        if (resolved.startsWith(mountPoint + '/') || resolved === mountPoint) {
+          if (mountPoint.length > bestMount.length) {
+            bestMount = mountPoint;
+            bestFsType = fsType;
+          }
+        }
+      }
+      const networkTypes = new Set([
+        'cifs', 'smbfs', 'smb2', 'nfs', 'nfs4', 'nfs3',
+        'davfs', 'fuse.sshfs', 'fuse.rclone', 'fuse.s3fs',
+        'ncpfs', 'afs', 'coda', 'glusterfs', 'lustre',
+      ]);
+      return networkTypes.has(bestFsType.toLowerCase());
+    } catch {
+      return false;
+    }
+  }
+
+  if (platform === 'darwin') {
+    // Network mounts typically appear under /Volumes or /net
+    return resolved.startsWith('/Volumes/') || resolved.startsWith('/net/');
+  }
+
+  if (platform === 'win32') {
+    // UNC paths: \\server\share\...
+    return resolved.startsWith('\\\\');
+  }
+
+  return false;
+}
 
 /**
  * Apply connection-level PRAGMAs. Shared by `initialize` and `open` so the two
@@ -25,15 +80,36 @@ export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
  * 2-minute wait presented as a frozen, hung agent. With WAL, reads never block
  * on a writer, so this timeout only governs cross-process write contention
  * (e.g. the git-hook `codegraph sync` running while the MCP server writes).
+ *
+ * On network filesystems (CIFS/NFS/…) WAL mode is skipped: those mounts do
+ * not support the shared-memory files (-wal/-shm) that WAL requires, and
+ * mmap I/O is unreliable over the network. MEMORY journal avoids all disk
+ * I/O for journaling; synchronous=OFF is safe because the index is fully
+ * rebuildable from source.
  */
-function configureConnection(db: SqliteDatabase): void {
-  db.pragma('busy_timeout = 5000');      // MUST be first — see above
+function configureConnection(db: SqliteDatabase, dbPath: string): void {
+  const networkFs = isNetworkFilesystem(dbPath);
+
+  // busy_timeout MUST come first — lets subsequent pragmas wait out any lock
+  db.pragma(networkFs ? 'busy_timeout = 30000' : 'busy_timeout = 5000');
   db.pragma('foreign_keys = ON');
-  db.pragma('journal_mode = WAL');       // node:sqlite supports WAL on every platform
-  db.pragma('synchronous = NORMAL');     // safe with WAL mode
+
+  if (networkFs) {
+    // WAL needs shared-memory files unsupported on most network mounts.
+    // MEMORY journal avoids all file I/O for journaling (DELETE journal still
+    // tries to create a -journal file on disk, which fails on CIFS/NFS).
+    // synchronous=OFF is safe here: the index is fully rebuildable from source.
+    db.pragma('journal_mode = MEMORY');
+    db.pragma('synchronous = OFF');
+    // skip mmap — unreliable on network filesystems
+  } else {
+    db.pragma('journal_mode = WAL');     // node:sqlite supports WAL on every platform
+    db.pragma('synchronous = NORMAL');   // safe with WAL mode
+    db.pragma('mmap_size = 268435456');  // 256 MB memory-mapped I/O
+  }
+
   db.pragma('cache_size = -64000');      // 64 MB page cache
   db.pragma('temp_store = MEMORY');      // temp tables in memory
-  db.pragma('mmap_size = 268435456');    // 256 MB memory-mapped I/O
 }
 
 /**
@@ -61,9 +137,10 @@ export class DatabaseConnection {
     }
 
     // Create and configure database
-    const { db, backend } = createDatabase(dbPath);
+    const nolock = isNetworkFilesystem(dbPath);
+    const { db, backend } = createDatabase(dbPath, { nolock });
 
-    configureConnection(db);
+    configureConnection(db, dbPath);
 
     // Run schema initialization
     const schemaPath = path.join(__dirname, 'schema.sql');
@@ -89,9 +166,10 @@ export class DatabaseConnection {
       throw new Error(`Database not found: ${dbPath}`);
     }
 
-    const { db, backend } = createDatabase(dbPath);
+    const nolock = isNetworkFilesystem(dbPath);
+    const { db, backend } = createDatabase(dbPath, { nolock });
 
-    configureConnection(db);
+    configureConnection(db, dbPath);
 
     // Check and run migrations if needed
     const conn = new DatabaseConnection(db, dbPath, backend);

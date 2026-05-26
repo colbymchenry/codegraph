@@ -37,6 +37,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   scala: 'tree-sitter-scala.wasm',
   lua: 'tree-sitter-lua.wasm',
   luau: 'tree-sitter-luau.wasm',
+  julia: 'tree-sitter-julia.wasm',
 };
 
 /**
@@ -92,6 +93,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.sc': 'scala',
   '.lua': 'lua',
   '.luau': 'luau',
+  '.jl': 'julia',
 };
 
 /**
@@ -118,6 +120,7 @@ export function isPlayRoutesFile(filePath: string): boolean {
     filePath.endsWith('.routes')
   );
 }
+
 
 /**
  * Caches for loaded grammars and parsers
@@ -169,7 +172,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
       // 0.25 (drops nested calls/imports on every file after the first); we
       // vendor the upstream ABI-15 wasm instead.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'julia')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -344,6 +347,7 @@ export function getLanguageDisplayName(language: Language): string {
     luau: 'Luau',
     yaml: 'YAML',
     twig: 'Twig',
+    julia: 'Julia',
     unknown: 'Unknown',
   };
   return names[language] || language;
