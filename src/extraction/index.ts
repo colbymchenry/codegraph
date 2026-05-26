@@ -166,7 +166,7 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
  * the defaults apply to tracked files too (committing a dependency dir doesn't make
  * it project code; the explicit `.gitignore` negation is the only opt-in).
  */
-function buildDefaultIgnore(rootDir: string): Ignore {
+export function buildDefaultIgnore(rootDir: string): Ignore {
   const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
   try {
     const rootGitignore = path.join(rootDir, '.gitignore');

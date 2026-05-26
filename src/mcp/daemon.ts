@@ -280,20 +280,24 @@ export type AcquireResult =
   | { kind: 'taken'; existing: DaemonLockInfo | null; pidPath: string };
 
 /**
- * Atomically create the daemon pidfile AND write its full record in the same
- * call. Returns either an `acquired` result (the caller is now the daemon-elect
- * and may construct a {@link Daemon}) or a `taken` result.
+ * Atomically create the daemon pidfile with its full record already in place.
+ * Returns either an `acquired` result (the caller is the daemon-elect and may
+ * construct a {@link Daemon}) or a `taken` result.
  *
- * must-fix 1 (issue #411 review): the original implementation created the
- * pidfile empty under an `O_EXCL` fd and only wrote the body later, after
- * `server.listen` resolved. A second candidate that read the pidfile during
- * that millisecond-wide window saw an empty file, decoded it as `null`, treated
- * it as stale, and `unlink`'d the lock the first daemon still held — producing
- * two daemons (two watchers, two writers) on concurrent startup, exactly the
- * multi-agent scenario the feature targets. Writing the complete record before
- * returning the handle closes that window: a concurrent reader always sees a
- * valid pid+version+socketPath, never an empty file. The socket path is
- * deterministic from the project root, so it's known here.
+ * must-fix 1 (issue #411 review): the lockfile must appear in ONE atomic step,
+ * already complete — never empty, even momentarily. The first attempt at this
+ * (`O_EXCL` create then a separate `writeSync`) left a microsecond window where
+ * the file existed but was empty; under concurrent daemon startup a third
+ * candidate could read that empty file, decode it as `null`, and `unlink` the
+ * winner's lock → two daemons (two watchers, two writers). The window was
+ * normally too small to hit, but the chokidar watcher's extra startup time made
+ * concurrent daemons overlap enough to reproduce it reliably.
+ *
+ * The fix writes the complete record to a private temp file, then hard-links it
+ * into place: `link()` is atomic AND exclusive (EEXIST if the target exists), so
+ * the pidfile becomes visible in one step already containing a full record.
+ * Whoever links first wins; everyone else gets EEXIST and reads a complete file.
+ * There is no empty-file window at all.
  */
 export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
   const pidPath = getDaemonPidPath(projectRoot);
@@ -301,34 +305,36 @@ export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
   // thing to touch it on a fresh-clone-but-already-initialized checkout.
   fs.mkdirSync(path.dirname(pidPath), { recursive: true });
 
+  const info: DaemonLockInfo = {
+    pid: process.pid,
+    version: CodeGraphPackageVersion,
+    socketPath: getDaemonSocketPath(projectRoot),
+    startedAt: Date.now(),
+  };
+
+  // Temp name is pid-scoped so racing candidates never collide on it.
+  const tmp = `${pidPath}.${process.pid}.tmp`;
+  let acquired = false;
   try {
-    // `wx` = O_CREAT | O_EXCL | O_WRONLY: atomic "create only if absent".
-    const fd = fs.openSync(pidPath, 'wx', 0o600);
-    const info: DaemonLockInfo = {
-      pid: process.pid,
-      version: CodeGraphPackageVersion,
-      socketPath: getDaemonSocketPath(projectRoot),
-      startedAt: Date.now(),
-    };
+    fs.writeFileSync(tmp, encodeLockInfo(info), { mode: 0o600 });
     try {
-      // Synchronous write immediately after the create — no await in between —
-      // so the empty-file window is a single fs.writeSync, not an I/O-bound
-      // `server.listen`. Combined with the pid-verified `clearStaleDaemonLock`
-      // below, concurrent candidates can never delete a live daemon's lock.
-      fs.writeSync(fd, encodeLockInfo(info));
-    } finally {
-      fs.closeSync(fd);
+      fs.linkSync(tmp, pidPath); // atomic + exclusive
+      acquired = true;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     }
-    return { kind: 'acquired', pidPath, info };
-  } catch (err: unknown) {
-    const e = err as NodeJS.ErrnoException;
-    if (e.code !== 'EEXIST') throw err;
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* temp already gone */ }
   }
 
+  if (acquired) return { kind: 'acquired', pidPath, info };
+
+  // Taken. Because the pidfile was link'd atomically it always holds a complete
+  // record — `existing` is null only for a genuinely corrupt leftover, never a
+  // mid-write race.
   let existing: DaemonLockInfo | null = null;
   try {
-    const raw = fs.readFileSync(pidPath, 'utf8');
-    existing = decodeLockInfo(raw);
+    existing = decodeLockInfo(fs.readFileSync(pidPath, 'utf8'));
   } catch { /* unreadable lockfile — treat as malformed */ }
   return { kind: 'taken', existing, pidPath };
 }

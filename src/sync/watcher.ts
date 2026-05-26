@@ -1,20 +1,24 @@
 /**
  * File Watcher
  *
- * Watches the project directory for file changes and triggers
- * debounced sync operations to keep the code graph up-to-date.
+ * Watches the project directory for file changes and triggers debounced sync
+ * operations to keep the code graph up-to-date.
  *
- * Uses chokidar under the hood, which provides cross-platform file
- * watching with built-in filtering to avoid registering unnecessary
- * inotify watches (fixes #276: fs.watch recursive exhausts kernel
- * watch budget on large repos).
+ * Uses chokidar, whose `ignored` callback filters directories BEFORE they are
+ * watched — so we never register inotify watches on excluded trees like
+ * node_modules/, dist/, .git/ (fixes #276: recursive fs.watch exhausted the
+ * kernel watch budget on large repos). The ignore decision reuses the indexer's
+ * `buildDefaultIgnore` (built-in default-ignore dirs + the project's .gitignore)
+ * so the watcher watches exactly the set the indexer indexes — in particular,
+ * node_modules/build/cache dirs are excluded even when the repo has no
+ * .gitignore (#407), which a .gitignore-only filter would miss.
  */
 
-import * as fs from 'fs';
 import * as path from 'path';
+import type { Stats } from 'fs';
 import chokidar, { FSWatcher } from 'chokidar';
-import ignore, { Ignore } from 'ignore';
-import { isSourceFile } from '../extraction';
+import type { Ignore } from 'ignore';
+import { isSourceFile, buildDefaultIgnore } from '../extraction';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
 import { watchDisabledReason } from './watch-policy';
@@ -42,55 +46,15 @@ export interface WatchOptions {
 }
 
 /**
- * Represents a .gitignore file loaded from a specific directory.
- * Rules in a .gitignore are relative to that directory, mirroring
- * how git applies .gitignore files at every level.
- */
-interface ScopedIgnore {
-  dir: string;
-  ig: Ignore;
-}
-
-/**
- * Load .gitignore files from projectRoot upward through parent
- * directories. Returns a list ordered from root to projectRoot
- * so nested rules (closest to the project) are checked first.
- */
-function loadGitignoreChain(projectRoot: string): ScopedIgnore[] {
-  const matchers: ScopedIgnore[] = [];
-  let dir = projectRoot;
-
-  // Determine the filesystem root (e.g. '/' on Linux)
-  const root = path.parse(dir).root;
-
-  while (dir !== root) {
-    const giPath = path.join(dir, '.gitignore');
-    try {
-      if (fs.existsSync(giPath)) {
-        matchers.unshift({
-          dir,
-          ig: ignore().add(fs.readFileSync(giPath, 'utf-8')),
-        });
-      }
-    } catch {
-      // Unreadable .gitignore — treat as absent
-    }
-    dir = path.dirname(dir);
-  }
-
-  return matchers;
-}
-
-/**
  * FileWatcher monitors a project directory for changes and triggers
  * debounced sync operations via a provided callback.
  *
  * Design goals:
- * - Minimal resource usage (chokidar with .gitignore-aware filtering
- *   avoids registering inotify watches on excluded directories)
+ * - Minimal resource usage (chokidar filters excluded directories before
+ *   registering an inotify watch — see module docs / #276)
  * - Debounced to avoid thrashing on rapid saves
  * - Filters to supported source files by extension
- * - Ignores .codegraph/ directory changes
+ * - Ignores .codegraph/ and .git/ regardless of .gitignore
  */
 export class FileWatcher {
   private watcher: FSWatcher | null = null;
@@ -98,7 +62,10 @@ export class FileWatcher {
   private hasChanges = false;
   private syncing = false;
   private stopped = false;
-  private gitignoreMatchers: ScopedIgnore[] = [];
+  // The shared ignore matcher (built-in defaults + project .gitignore), built
+  // once at start(). Same source of truth the indexer uses, so watcher scope
+  // can never diverge from index scope.
+  private ignoreMatcher: Ignore | null = null;
 
   private readonly projectRoot: string;
   private readonly debounceMs: number;
@@ -136,84 +103,36 @@ export class FileWatcher {
       return false;
     }
 
-    // Load .gitignore rules from project root upward.
-    // These drive chokidar's `ignored` callback so we never register
-    // inotify watches on excluded directories (like node_modules/, .git/,
-    // dist/, .next/, etc.), avoiding kernel watch-budget exhaustion (#276).
-    this.gitignoreMatchers = loadGitignoreChain(this.projectRoot);
+    // Reuse the indexer's ignore set so the watcher and indexer agree on scope.
+    // chokidar only registers an inotify watch on directories that pass this
+    // filter — that's the #276 fix.
+    this.ignoreMatcher = buildDefaultIgnore(this.projectRoot);
 
     try {
       this.watcher = chokidar.watch(this.projectRoot, {
-        // Core fix for #276: filter directories BEFORE they are watched.
-        // chokidar calls this for every file and directory it encounters,
-        // and only registers an underlying fs.watch on those that pass.
-        // This drops per-instance inotify watch count from hundreds of
-        // thousands (on a monorepo) to hundreds — only the directories
-        // that actually contain tracked source code.
-        ignored: (testPath: string) => {
-          const rel = normalizePath(path.relative(this.projectRoot, testPath));
-
-          // Always ignore .codegraph/ (our own DB writes) and .git/
-          if (
-            rel === '.codegraph' ||
-            rel.startsWith('.codegraph/') ||
-            rel === '.git' ||
-            rel.startsWith('.git/')
-          ) {
-            return true;
-          }
-
-          // Check .gitignore rules
-          for (const { dir, ig } of this.gitignoreMatchers) {
-            let matcherRel = normalizePath(path.relative(dir, testPath));
-            if (!matcherRel || matcherRel.startsWith('..')) continue;
-
-            // For directory-only .gitignore rules (e.g. "build/"),
-            // append a trailing slash so the ignore package matches them.
-            try {
-              const stat = fs.statSync(testPath);
-              if (stat.isDirectory()) matcherRel += '/';
-            } catch {
-              // If we can't stat, assume it's a file — don't append '/'
-            }
-
-            if (ig.ignores(matcherRel)) return true;
-          }
-
-          return false;
-        },
+        // chokidar calls this for every path it encounters and only watches
+        // those that pass — so excluded trees (node_modules/, dist/, .git/, …)
+        // never get an inotify watch in the first place.
+        ignored: (testPath: string, stats?: Stats) => this.shouldIgnore(testPath, stats),
       });
 
-      // Wire up the file-change handler. chokidar emits 'all' for every
-      // event type; we only care about files that were actually changed.
+      // chokidar emits 'all' for every event type; we only sync source files.
       this.watcher.on('all', (_event: string, filePath: string) => {
         if (this.stopped) return;
 
         const normalized = normalizePath(path.relative(this.projectRoot, filePath));
 
-        // Defense in depth: filter again even though `ignored` should
-        // have prevented watches on these directories. Events can still
-        // arrive during watcher setup or from symlink traversal.
-        if (
-          normalized === '.codegraph' ||
-          normalized.startsWith('.codegraph/') ||
-          normalized === '.git' ||
-          normalized.startsWith('.git/')
-        ) {
-          return;
-        }
-
-        // Only sync changes to files we can actually parse.
-        if (!isSourceFile(normalized)) {
-          return;
-        }
+        // Defense in depth: `ignored` should already keep these out, but events
+        // can still arrive during setup or via symlink traversal.
+        if (this.isAlwaysIgnored(normalized)) return;
+        if (!isSourceFile(normalized)) return;
 
         logDebug('File change detected', { file: normalized });
         this.hasChanges = true;
         this.scheduleSync();
       });
 
-      // Handle watcher errors gracefully
+      // Handle watcher errors gracefully — don't crash, the user can restart.
       this.watcher.on('error', (err: unknown) => {
         logWarn('File watcher error', { error: String(err) });
       });
@@ -221,10 +140,35 @@ export class FileWatcher {
       logDebug('File watcher started', { projectRoot: this.projectRoot, debounceMs: this.debounceMs });
       return true;
     } catch (err) {
-      // Watcher setup failed (e.g., permission denied, missing directory)
+      // Watcher setup failed (e.g., permission denied, missing directory).
       logWarn('Could not start file watcher', { error: String(err) });
       return false;
     }
+  }
+
+  /** Our own dirs are always ignored, regardless of .gitignore. */
+  private isAlwaysIgnored(rel: string): boolean {
+    return (
+      rel === '.codegraph' || rel.startsWith('.codegraph/') ||
+      rel === '.git' || rel.startsWith('.git/')
+    );
+  }
+
+  /**
+   * chokidar `ignored` predicate — true for any path that should NOT be watched.
+   * Uses chokidar's provided `stats` to decide directory-vs-file so a dir-only
+   * rule like `build/` matches, without an extra `statSync` per path.
+   */
+  private shouldIgnore(testPath: string, stats?: Stats): boolean {
+    const rel = normalizePath(path.relative(this.projectRoot, testPath));
+    if (!rel || rel === '.' || rel.startsWith('..')) return false; // root / outside
+    if (this.isAlwaysIgnored(rel)) return true;
+    if (!this.ignoreMatcher) return false;
+    if (stats) {
+      return this.ignoreMatcher.ignores(stats.isDirectory() ? rel + '/' : rel);
+    }
+    // Stats unknown: test both forms so a directory match isn't missed.
+    return this.ignoreMatcher.ignores(rel) || this.ignoreMatcher.ignores(rel + '/');
   }
 
   /**
@@ -244,7 +188,7 @@ export class FileWatcher {
     }
 
     this.hasChanges = false;
-    this.gitignoreMatchers = [];
+    this.ignoreMatcher = null;
     logDebug('File watcher stopped');
   }
 

@@ -34,6 +34,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already attached to the old daemon keep using it while new sessions run
   standalone until it idles out — they never mix versions over the socket.
 
+### Fixed
+- **The file watcher no longer exhausts the OS file-watch budget on large
+  repos (#276).** It used to register a recursive watch over the *entire*
+  project — `node_modules/`, build output, caches and all — and filter only
+  after the fact. On Linux that meant hundreds of thousands of inotify watches
+  per project; enough that a second project, or codegraph alongside your editor
+  / `next dev`, could hit the per-user ceiling and fail with "OS file watch
+  limit reached." The watcher now excludes the same directories the indexer
+  ignores (the built-in default-ignore set **plus** your `.gitignore`) *before*
+  registering a watch — so on a repo with a 900-directory `node_modules` the
+  watch count drops from ~1,200 to ~14, even when the project has no
+  `.gitignore`. (Stacks with the shared daemon from #411: one watcher across
+  agents, and now that watcher is small.)
+
 ## [0.9.5] - 2026-05-25
 
 ### Fixed

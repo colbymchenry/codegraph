@@ -166,6 +166,36 @@ describe('FileWatcher', () => {
 
       watcher.stop();
     });
+
+    it('should not watch node_modules even without a .gitignore (#276/#417)', async () => {
+      // No .gitignore in testDir — exclusion relies on the built-in
+      // default-ignore set the indexer uses (buildDefaultIgnore), which a
+      // .gitignore-only filter would miss.
+      fs.mkdirSync(path.join(testDir, 'node_modules', 'dep', 'lib'), { recursive: true });
+      fs.writeFileSync(path.join(testDir, 'node_modules', 'dep', 'index.ts'), 'export const dep = 1;');
+
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 200 });
+      watcher.start();
+
+      // Let the watcher settle past any residual crawl events.
+      await new Promise((r) => setTimeout(r, 400));
+      syncFn.mockClear();
+
+      // A source-extension edit INSIDE node_modules must NOT trigger a sync —
+      // the directory was never watched.
+      fs.writeFileSync(path.join(testDir, 'node_modules', 'dep', 'lib', 'extra.ts'), 'export const e = 2;');
+      await new Promise((r) => setTimeout(r, 600));
+      expect(syncFn).not.toHaveBeenCalled();
+
+      // Positive control: a real source edit still triggers sync, proving the
+      // watcher is live (not merely inert).
+      fs.writeFileSync(path.join(testDir, 'src', 'live.ts'), 'export const live = 3;');
+      await waitFor(() => syncFn.mock.calls.length > 0, 5000);
+      expect(syncFn).toHaveBeenCalled();
+
+      watcher.stop();
+    });
   });
 
   describe('callbacks', () => {
