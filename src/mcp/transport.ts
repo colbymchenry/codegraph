@@ -15,7 +15,6 @@
  */
 
 import * as readline from 'readline';
-import type { Readable, Writable } from 'stream';
 import type { Socket } from 'net';
 
 /**
@@ -404,51 +403,5 @@ export class SocketTransport extends LineBasedJsonRpcTransport {
       try { h(); } catch { /* never let a close-handler take the daemon down */ }
     }
     this.closeHandlers = [];
-  }
-}
-
-/**
- * Adapter that lets the proxy mode reuse {@link LineBasedJsonRpcTransport}'s
- * line buffering for arbitrary `Readable`/`Writable` pairs. Not currently used
- * by sessions — kept here for symmetry with the existing stdio/socket pair if
- * future work needs a third carrier.
- */
-export class StreamPairTransport extends LineBasedJsonRpcTransport {
-  private buffer = '';
-
-  constructor(
-    private input: Readable,
-    private output: Writable,
-    private prefix: string = 'cg-stream',
-  ) {
-    super();
-  }
-
-  start(handler: MessageHandler): void {
-    this.messageHandler = handler;
-    this.input.setEncoding?.('utf8');
-    this.input.on('data', (chunk: string | Buffer) => {
-      this.buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-      let idx;
-      while ((idx = this.buffer.indexOf('\n')) !== -1) {
-        const line = this.buffer.slice(0, idx);
-        this.buffer = this.buffer.slice(idx + 1);
-        void this.handleLine(line);
-      }
-    });
-  }
-
-  stop(): void {
-    if (this.stopped) return;
-    this.stopped = true;
-    this.rejectPending('Transport stopped');
-  }
-
-  protected write(line: string): void {
-    this.output.write(line + '\n');
-  }
-
-  protected idPrefix(): string {
-    return this.prefix;
   }
 }

@@ -23,6 +23,14 @@ function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
   return spawn(process.execPath, [BIN, 'serve', '--mcp'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
+    // Pin to direct (in-process) mode. #172 is a contract about the in-process
+    // server's init ordering — the "File watcher active" log this test observes
+    // is emitted in-process. In daemon mode the watcher runs in the detached
+    // daemon (logging to .codegraph/daemon.log, not the child's stderr); the
+    // same response-before-init guarantee lives in the shared session code and
+    // is covered by mcp-daemon.test.ts. Direct mode also avoids leaking a
+    // detached daemon from this suite.
+    env: { ...process.env, CODEGRAPH_NO_DAEMON: '1' },
   }) as ChildProcessWithoutNullStreams;
 }
 

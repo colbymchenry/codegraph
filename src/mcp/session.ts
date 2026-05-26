@@ -17,13 +17,15 @@ import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } fro
 import { MCPEngine } from './engine';
 import { tools } from './tools';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
+import { CodeGraphPackageVersion } from './version';
 
 /**
- * MCP Server Info — kept on the session because some clients log it.
+ * MCP Server Info — kept on the session because some clients log it. The
+ * version tracks the real package version (was a hard-coded '0.1.0').
  */
 const SERVER_INFO = {
   name: 'codegraph',
-  version: '0.1.0',
+  version: CodeGraphPackageVersion,
 };
 
 /** MCP Protocol Version (latest the server claims). */

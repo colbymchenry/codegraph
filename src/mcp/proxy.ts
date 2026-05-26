@@ -90,7 +90,10 @@ export async function runProxy(
 
   startPpidWatchdog(socket);
   await pipeUntilClose(socket);
-  return { outcome: 'proxied' };
+  // Host disconnected (or the daemon went away). The proxy's only job is the
+  // pipe; exit now so we don't linger — process.stdin's 'data' listener would
+  // otherwise keep the event loop alive and leave a zombie launcher behind.
+  process.exit(0);
 }
 
 /**
@@ -208,7 +211,7 @@ function startPpidWatchdog(socket: net.Socket): void {
       const reason = ppidChanged
         ? `ppid ${originalPpid} -> ${current}`
         : `host pid ${hostPpid} exited`;
-      process.stderr.write(`[CodeGraph MCP] proxy parent exited (${reason}); detaching.\n`);
+      process.stderr.write(`[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`);
       try { socket.destroy(); } catch { /* ignore */ }
       process.exit(0);
     }

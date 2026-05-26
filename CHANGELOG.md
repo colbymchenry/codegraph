@@ -11,21 +11,28 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - **Shared MCP daemon — running multiple AI agents in the same project no
-  longer multiplies the inotify, SQLite, and indexing cost.** The first
-  `codegraph serve --mcp` per project becomes a per-project daemon listening
-  on `.codegraph/daemon.sock` (named pipe on Windows). Subsequent invocations
-  for the same project attach as thin stdio↔socket proxies — one file
-  watcher, one SQLite connection, one tree-sitter warm-up no matter how many
-  Claude Code / Cursor / Codex / opencode sessions you point at the repo.
-  Two concurrent sessions on a large monorepo used to consume ~880k of the
-  Linux 1,048,576 per-user inotify budget; they now share ~440k. The daemon
-  lingers for `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` (default 300s) after the
-  last client disconnects so back-to-back sessions don't repay startup cost.
-  Resolves issue #411.
-- **`CODEGRAPH_NO_DAEMON=1` — opt out of the shared daemon.** Restores the
-  pre-issue-#411 behavior of one independent server process per client.
-  Useful for debugging or for environments that don't permit local
-  IPC sockets.
+  longer multiplies the file-watch, SQLite, and indexing cost.** Point more
+  than one `codegraph serve --mcp` at a project (two Claude Code windows, an
+  agent in a git worktree, `/loop` alongside an interactive session, parallel
+  sub-agents) and they now share **one** background daemon per project: a
+  single file watcher (one inotify set on Linux), one SQLite connection, and
+  one tree-sitter warm-up — instead of N independent copies. Measured on Linux:
+  three agents register **~3× fewer inotify watches** sharing one watcher
+  versus three standalone servers. Resolves issue #411. (Composable with the
+  per-watcher pruning in #276/#346 — that shrinks each watch set; this shares
+  one across agents.)
+- The daemon runs as a **detached background process** that outlives any single
+  session, so closing one editor or terminal never severs the others. Each
+  `serve --mcp` your agent host launches is a thin stdio↔socket proxy to it (a
+  Unix-domain socket, or a named pipe on Windows). When the last client
+  disconnects the daemon lingers for `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS`
+  (default `300000`) so back-to-back sessions skip the startup cost, then exits
+  and removes its lockfile — an OOM-killed or force-quit host can't leak it.
+- **`CODEGRAPH_NO_DAEMON=1`** opts out, restoring one independent server per
+  client (handy for debugging or sandboxes that disallow local IPC sockets).
+  The daemon is also version-pinned: after you upgrade codegraph, sessions
+  already attached to the old daemon keep using it while new sessions run
+  standalone until it idles out — they never mix versions over the socket.
 
 ## [0.9.5] - 2026-05-25
 

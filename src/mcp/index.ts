@@ -14,19 +14,31 @@
  * await server.start();
  * ```
  *
- * Three runtime modes (decided in {@link MCPServer.start}):
+ * Runtime modes (decided in {@link MCPServer.start}):
  *
- * - **Direct** — one process serves one MCP client over stdio. Today's
- *   behavior; used when no shareable daemon is reachable or the user opted
- *   out via `CODEGRAPH_NO_DAEMON=1`.
- * - **Daemon** — accept N concurrent MCP clients over a Unix-domain socket /
- *   named pipe, sharing one CodeGraph + watcher + SQLite handle. See
- *   {@link ./daemon.ts} and issue #411 for the rationale.
- * - **Proxy** — pure stdio↔socket pipe to an existing daemon. See
- *   {@link ./proxy.ts}.
+ * - **Direct** — one process serves one MCP client over stdio. The pre-#411
+ *   behavior; used when the user opts out (`CODEGRAPH_NO_DAEMON=1`), no
+ *   `.codegraph/` is reachable, or the daemon machinery fails for any reason.
+ * - **Proxy** — what an MCP host actually talks to when sharing is on: a thin
+ *   stdio↔socket pipe to the shared daemon. The proxy carries the #277 PPID
+ *   watchdog, so a SIGKILL'd host reaps its proxy promptly. See {@link ./proxy.ts}.
+ * - **Daemon** — a *detached* background process (its own session/process
+ *   group) that serves N proxies over a Unix-domain socket / named pipe,
+ *   sharing one CodeGraph + watcher + SQLite handle. Spawned on demand; never a
+ *   child of any host, so it survives individual sessions and is reaped by
+ *   client-refcount + idle timeout. See {@link ./daemon.ts} and issue #411.
+ *
+ * The detached-daemon + always-proxy split is the fix for the review finding
+ * that the original in-process daemon (a) was the first host's child, so closing
+ * that terminal severed every other client, and (b) disabled the PPID watchdog,
+ * regressing #277 (orphaned daemons on host SIGKILL).
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+import { spawn, StdioOptions } from 'child_process';
 import { findNearestCodeGraphRoot } from '../index';
+import { getCodeGraphDir } from '../directory';
 import { StdioTransport } from './transport';
 import { MCPEngine } from './engine';
 import { MCPSession } from './session';
@@ -48,19 +60,30 @@ import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 const DEFAULT_PPID_POLL_MS = 5000;
 
 /**
- * Max retries when a stale-lock takeover races other candidates. After this
- * many failed acquire+probe rounds we give up and fall back to direct mode —
- * something is wedged enough that adding our own daemon to the mix would only
- * make it worse.
+ * Env var that marks a process as the *detached daemon* itself (set by
+ * {@link spawnDetachedDaemon} when it re-invokes the CLI). Without it a
+ * `serve --mcp` invocation is a launcher that connects-or-spawns; with it, the
+ * process IS the daemon and must never try to spawn another (infinite spawn).
  */
-const TAKEOVER_MAX_RETRIES = 3;
+const DAEMON_INTERNAL_ENV = 'CODEGRAPH_DAEMON_INTERNAL';
 
 /**
- * Brief sleep between takeover retries so a freshly-spawned daemon has time
- * to bind its socket. 100ms is well under any realistic startup, so a
- * legitimate races resolves on the first or second retry.
+ * Retries for the detached daemon arbitrating the O_EXCL lock against a racing
+ * sibling. Tiny — the lock resolves on the first round in practice; the retries
+ * only cover clearing a genuinely stale (dead-pid) lockfile.
  */
+const TAKEOVER_MAX_RETRIES = 5;
 const TAKEOVER_RETRY_DELAY_MS = 100;
+
+/**
+ * How long a launcher waits for a freshly-spawned daemon to bind its socket
+ * before giving up and running in-process. The daemon binds the socket *before*
+ * the (backgrounded) engine/grammar warm-up, so this only needs to cover node
+ * process startup. 60 × 100ms = 6s of headroom for a cold/slow box; on the
+ * common path the socket appears within a few rounds.
+ */
+const DAEMON_CONNECT_MAX_RETRIES = 60;
+const DAEMON_CONNECT_RETRY_DELAY_MS = 100;
 
 /**
  * Resolve the PPID watchdog poll interval from an env override. A value of
@@ -97,15 +120,77 @@ function daemonOptOutSet(): boolean {
   return raw !== '0' && raw.toLowerCase() !== 'false';
 }
 
+/** Whether this process was spawned to BE the detached daemon. */
+function daemonInternalSet(): boolean {
+  const raw = process.env[DAEMON_INTERNAL_ENV];
+  return !!raw && raw !== '0' && raw.toLowerCase() !== 'false';
+}
+
 /**
  * Resolve the project root the daemon machinery should key on. Returns
  * `null` when no `.codegraph/` is reachable from the candidate path — in
  * that case the caller must run in direct mode, since the daemon lockfile
  * and socket both live under `.codegraph/`.
+ *
+ * The result is canonicalized with `realpathSync` so every client converges on
+ * the same socket/lock path regardless of how it expressed the path: a client
+ * launched with cwd under a symlink (e.g. macOS `/var` → `/private/var`, where
+ * spawned `process.cwd()` is already realpath'd) and one that passed a
+ * symlinked `rootUri` would otherwise hash to different sockets and silently
+ * fail to share the daemon.
  */
 function resolveDaemonRoot(explicitPath: string | null): string | null {
   const candidate = explicitPath ?? process.cwd();
-  return findNearestCodeGraphRoot(candidate);
+  const root = findNearestCodeGraphRoot(candidate);
+  if (!root) return null;
+  try { return fs.realpathSync(root); } catch { return root; }
+}
+
+/**
+ * Spawn the shared daemon as a fully detached background process: its own
+ * session/process group (so a SIGHUP/SIGINT to the launcher's terminal can't
+ * reach it) with stdio decoupled from the launcher (logs to
+ * `.codegraph/daemon.log`). Re-invokes the *same* CLI faithfully across dev and
+ * bundled launches by reusing `process.argv[0]` (the right node), the current
+ * `process.execArgv` (carries `--liftoff-only`, so the daemon never re-execs)
+ * and `process.argv[1]` (this script). The spawned process self-arbitrates the
+ * O_EXCL lock, so racing launchers may each spawn one — losers exit and every
+ * launcher proxies through the single winner.
+ */
+function spawnDetachedDaemon(root: string): void {
+  const scriptPath = process.argv[1];
+  if (!scriptPath) {
+    // No resolvable CLI entry point to re-invoke — let the caller fall back to
+    // direct mode rather than spawn something broken.
+    throw new Error('cannot resolve CLI script path to spawn the daemon');
+  }
+
+  let logFd: number | null = null;
+  let stdio: StdioOptions = 'ignore';
+  try {
+    logFd = fs.openSync(path.join(getCodeGraphDir(root), 'daemon.log'), 'a');
+    stdio = ['ignore', logFd, logFd];
+  } catch {
+    stdio = 'ignore'; // no log file — discard daemon output rather than fail
+  }
+  try {
+    const child = spawn(
+      process.execPath,
+      [...process.execArgv, scriptPath, 'serve', '--mcp', '--path', root],
+      {
+        detached: true,
+        stdio,
+        windowsHide: true,
+        env: { ...process.env, [DAEMON_INTERNAL_ENV]: '1' },
+      },
+    );
+    child.unref();
+  } finally {
+    // The child holds its own dup of the log fd now; the launcher doesn't need it.
+    if (logFd !== null) {
+      try { fs.closeSync(logFd); } catch { /* ignore */ }
+    }
+  }
 }
 
 /**
@@ -121,7 +206,7 @@ function resolveDaemonRoot(explicitPath: string | null): string | null {
  */
 export class MCPServer {
   private projectPath: string | null;
-  // Direct-mode-only state. In daemon mode the per-connection session lives
+  // Direct-mode-only state. In daemon mode the per-connection sessions live
   // inside the Daemon class; in proxy mode there is no session at all.
   private session: MCPSession | null = null;
   private engine: MCPEngine | null = null;
@@ -143,19 +228,24 @@ export class MCPServer {
    * Start the MCP server.
    *
    * Decision order:
-   *   1. If `CODEGRAPH_NO_DAEMON=1` → direct mode (unchanged behavior).
-   *   2. If no `.codegraph/` reachable → direct mode (daemon needs a lockfile
-   *      and socket location, which both live under `.codegraph/`).
-   *   3. Try to attach to an existing daemon as a proxy.
-   *   4. Otherwise become the daemon ourselves.
+   *   1. `CODEGRAPH_NO_DAEMON=1` → direct mode (unchanged pre-#411 behavior).
+   *   2. `CODEGRAPH_DAEMON_INTERNAL=1` → we ARE the detached daemon; listen.
+   *   3. No `.codegraph/` reachable → direct mode (the daemon's lockfile and
+   *      socket both live under `.codegraph/`).
+   *   4. Otherwise connect to (or spawn) the shared daemon and proxy to it.
    *
-   * On any unexpected failure in steps 3–4 we transparently fall back to
-   * direct mode — a misbehaving daemon must never block a session from
-   * starting.
+   * On any unexpected failure in step 4 we transparently fall back to direct
+   * mode — a misbehaving daemon must never block a session from starting.
    */
   async start(): Promise<void> {
-    // Direct mode if the user opted out. Done first so debugging is simple:
-    // setting the env var is sufficient to get the pre-#411 behavior.
+    // The detached daemon process itself. Checked before the opt-out so the
+    // daemon honors the same env it was spawned with (it never sets NO_DAEMON).
+    if (daemonInternalSet()) {
+      return this.startDaemonProcess();
+    }
+
+    // Direct mode if the user opted out. Setting the env var is sufficient to
+    // get the pre-#411 single-process behavior.
     if (daemonOptOutSet()) {
       return this.startDirect('CODEGRAPH_NO_DAEMON set');
     }
@@ -163,20 +253,19 @@ export class MCPServer {
     const root = resolveDaemonRoot(this.projectPath);
     if (!root) {
       // No initialized project found — daemon mode has nowhere to put its
-      // socket. This is the fresh-checkout / outside-project case; behave
-      // exactly as before.
+      // socket. The fresh-checkout / outside-project case; behave as before.
       return this.startDirect('no .codegraph/ root found');
     }
 
-    // Try the daemon attach/spawn dance.
     try {
-      const mode = await this.startDaemonOrProxy(root);
+      const mode = await this.connectOrSpawnDaemon(root);
       if (mode === 'fallback') {
-        return this.startDirect('daemon attach/start failed; fallback to direct');
+        return this.startDirect('daemon unavailable; fallback to direct');
       }
-      this.mode = mode;
-      this.installSignalHandlers();
-      this.installPpidWatchdog();
+      // 'proxy': connectOrSpawnDaemon ran the stdio↔socket pipe to completion
+      // (it only returns once the host disconnected). The process is now
+      // expected to terminate naturally — the proxy installed its own watchdog.
+      this.mode = 'proxy';
       return;
     } catch (err) {
       // Belt-and-braces: if anything throws inside the daemon machinery,
@@ -189,9 +278,8 @@ export class MCPServer {
 
   /**
    * Stop the server. In daemon mode this triggers graceful shutdown of every
-   * connected session; in proxy mode the proxy's own resolve handler exits
-   * the process and `stop()` is a no-op; in direct mode this mirrors the
-   * pre-#411 behavior (close cg, exit).
+   * connected session; in direct mode it mirrors the pre-#411 behavior (close
+   * cg, exit). Proxy mode never routes through here — the proxy exits itself.
    */
   stop(): void {
     if (this.stopped) return;
@@ -246,77 +334,89 @@ export class MCPServer {
   }
 
   /**
-   * Try to attach as proxy or start as daemon. Returns 'proxy' / 'daemon' on
-   * success, 'fallback' if the caller should retry in direct mode.
+   * Run as the detached shared daemon (process spawned with
+   * `CODEGRAPH_DAEMON_INTERNAL=1`). Arbitrate the O_EXCL lock, then either
+   * become the daemon (bind the socket, serve forever) or — if a live daemon
+   * already holds the lock — exit so we don't leak a redundant process.
+   *
+   * No PPID watchdog and no stdin handlers: the daemon is detached on purpose
+   * and reaps itself via client-refcount + idle timeout (see {@link Daemon}).
    */
-  private async startDaemonOrProxy(root: string): Promise<'proxy' | 'daemon' | 'fallback'> {
+  private async startDaemonProcess(): Promise<void> {
+    const root = resolveDaemonRoot(this.projectPath) ?? this.projectPath ?? process.cwd();
     for (let attempt = 0; attempt < TAKEOVER_MAX_RETRIES; attempt++) {
       const lock = tryAcquireDaemonLock(root);
 
       if (lock.kind === 'acquired') {
-        const daemon = new Daemon(root, { lockFd: lock.lockFd });
+        const daemon = new Daemon(root);
         await daemon.start();
-        // The MCP host launched us over stdio and is waiting for our
-        // `initialize` response — attach it as the daemon's first session
-        // so we never silently drop the launcher. Subsequent invocations
-        // discover us via the socket and proxy in.
-        daemon.attachStdioLauncherSession();
         this.daemon = daemon;
-        return 'daemon';
+        this.mode = 'daemon';
+        return; // the net.Server keeps the process alive
       }
 
-      // Lock is taken — that *should* mean a daemon is alive. Probe.
-      const socketPath = lock.existing?.socketPath || getDaemonSocketPath(root);
-      const probe = await runProxy(socketPath);
-      if (probe.outcome === 'proxied') {
-        // runProxy only returns when the connection has CLOSED — meaning we
-        // already piped stdio and are now exiting. From here we should not
-        // start anything else. The process is expected to terminate
-        // naturally after this function returns.
-        return 'proxy';
+      // Taken. If the holder is alive, another daemon already serves (or is
+      // binding) — we're redundant; exit cleanly so the launcher proxies to it.
+      const existing = lock.existing;
+      if (existing && existing.pid > 0 && isProcessAlive(existing.pid)) {
+        process.stderr.write(
+          `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
+        );
+        process.exit(0);
       }
 
-      // Proxy didn't attach. Possible causes:
-      //   (a) Daemon is mid-startup and hasn't bound the socket yet — retry.
-      //   (b) Daemon crashed but lockfile leaked — clear it and retry.
-      //   (c) Daemon is alive but version-mismatched — fall back to direct.
-      if (probe.reason === 'version mismatch') {
-        return 'fallback';
-      }
-
-      if (lock.existing && lock.existing.pid > 0 && isProcessAlive(lock.existing.pid)) {
-        // Daemon process is alive but its socket isn't accepting — probably
-        // (a). Sleep briefly and try again.
-        await sleep(TAKEOVER_RETRY_DELAY_MS);
-        continue;
-      }
-
-      // Dead pid (or unreadable lockfile): clear it and retry. If we lose
-      // the next race to another candidate, that's fine — they'll be the
-      // new daemon and we'll proxy through them.
-      clearStaleDaemonLock(lock.pidPath);
+      // Holder is dead (or the record is unreadable) — clear it (pid-verified,
+      // so we never delete a live daemon's lock) and retry the acquire.
+      clearStaleDaemonLock(lock.pidPath, existing?.pid);
       await sleep(TAKEOVER_RETRY_DELAY_MS);
     }
 
-    // Repeated failures — something is very wrong (perms?). Direct mode it is.
+    process.stderr.write('[CodeGraph daemon] Could not acquire the daemon lock; exiting.\n');
+    process.exit(0);
+  }
+
+  /**
+   * Become a proxy to the shared daemon, spawning the daemon first if none is
+   * reachable. Returns 'proxy' once the proxied session has run to completion
+   * (the host disconnected), or 'fallback' if the caller should run in-process.
+   */
+  private async connectOrSpawnDaemon(root: string): Promise<'proxy' | 'fallback'> {
+    const socketPath = getDaemonSocketPath(root);
+
+    // Fast path: a daemon may already be listening. On success runProxy pipes
+    // stdio until the host disconnects, so a 'proxied' outcome means this
+    // process has finished its entire job.
+    let probe = await runProxy(socketPath);
+    if (probe.outcome === 'proxied') return 'proxy';
+    if (probe.reason === 'version mismatch') return 'fallback';
+
+    // No reachable daemon — spawn one (detached) and wait for it to bind.
+    spawnDetachedDaemon(root);
+
+    for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
+      await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
+      probe = await runProxy(socketPath);
+      if (probe.outcome === 'proxied') return 'proxy';
+      if (probe.reason === 'version mismatch') return 'fallback';
+    }
+
+    // Daemon never came up in time — run in-process so the user is never blocked.
     return 'fallback';
   }
 
-  /** Standard SIGINT/SIGTERM handlers that route to our `stop()`. */
+  /** Standard SIGINT/SIGTERM handlers that route to our `stop()` (direct mode). */
   private installSignalHandlers(): void {
     process.on('SIGINT', () => this.stop());
     process.on('SIGTERM', () => this.stop());
   }
 
   /**
-   * PPID watchdog. The daemon mode owns its own lifecycle (idle timeout +
-   * client refcount), so we deliberately do NOT enable the PPID watchdog
-   * there — otherwise the very first proxy that spawned the daemon would
-   * drag it down when it exited. Direct mode and proxy mode both enable it.
+   * PPID watchdog (#277) — direct mode only. Daemon mode is detached on purpose
+   * and reaps via idle timeout; proxy mode installs its own watchdog inside
+   * {@link runProxy}. So this only ever runs for an in-process direct session.
    */
   private installPpidWatchdog(): void {
-    if (this.mode === 'daemon') return;
-    if (this.mode === 'proxy') return; // proxy.ts installs its own.
+    if (this.mode !== 'direct') return;
     const pollMs = parsePpidPollMs(process.env.CODEGRAPH_PPID_POLL_MS);
     if (pollMs <= 0) return;
     this.ppidWatchdog = setInterval(() => {
@@ -338,10 +438,10 @@ export class MCPServer {
 }
 
 function sleep(ms: number): Promise<void> {
-  // Deliberately NOT unref'd. During the daemon takeover retry loop we may
-  // be between processes — no socket bound yet, no transport, no listener
-  // pinning the event loop. An unref'd timer would let Node drain the loop
-  // and exit silently before we get a chance to try again.
+  // Deliberately NOT unref'd. During the daemon connect/takeover retry loop we
+  // may be between processes — no socket bound yet, no transport, no listener
+  // pinning the event loop. An unref'd timer would let Node drain the loop and
+  // exit silently before we get a chance to try again.
   return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
