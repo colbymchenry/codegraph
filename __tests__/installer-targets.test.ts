@@ -617,6 +617,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('codex')?.id).toBe('codex');
     expect(getTarget('opencode')?.id).toBe('opencode');
     expect(getTarget('hermes')?.id).toBe('hermes');
+    expect(getTarget('kimi')?.id).toBe('kimi');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
