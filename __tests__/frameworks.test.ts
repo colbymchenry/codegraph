@@ -1332,3 +1332,447 @@ export class UsersController {
     expect(references.map((r) => r.referenceName)).toEqual(['real']);
   });
 });
+
+// ===========================================================================
+// Flutter
+// ===========================================================================
+
+import {
+  flutterResolver,
+  flutterRouterResolver,
+  flutterStateResolver,
+} from '../src/resolution/frameworks/flutter';
+
+const flutterBaseContext = {
+  getNodesInFile: () => [],
+  getNodesByName: () => [],
+  getNodesByQualifiedName: () => [],
+  getNodesByKind: () => [],
+  fileExists: () => false,
+  readFile: () => null,
+  getProjectRoot: () => '/test',
+  getAllFiles: () => [],
+  getNodesByLowerName: () => [],
+  getImportMappings: () => [],
+};
+
+describe('flutterResolver.detect', () => {
+  it('detects a pubspec.yaml declaring the flutter SDK', () => {
+    const context = {
+      ...flutterBaseContext,
+      readFile: (p: string) =>
+        p === 'pubspec.yaml'
+          ? `name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n`
+          : null,
+    };
+    expect(flutterResolver.detect(context as any)).toBe(true);
+  });
+
+  it('detects a .dart file that imports package:flutter when pubspec is absent', () => {
+    const context = {
+      ...flutterBaseContext,
+      getAllFiles: () => ['lib/main.dart'],
+      readFile: (p: string) =>
+        p === 'lib/main.dart' ? `import 'package:flutter/material.dart';\n` : null,
+    };
+    expect(flutterResolver.detect(context as any)).toBe(true);
+  });
+
+  it('returns false for a Dart-only (non-Flutter) project', () => {
+    const context = {
+      ...flutterBaseContext,
+      getAllFiles: () => ['lib/server.dart'],
+      readFile: (p: string) => {
+        if (p === 'pubspec.yaml') return `name: server\ndependencies:\n  shelf: ^1.0.0\n`;
+        if (p === 'lib/server.dart') return `import 'package:shelf/shelf.dart';\n`;
+        return null;
+      },
+    };
+    expect(flutterResolver.detect(context as any)).toBe(false);
+  });
+});
+
+describe('flutterResolver.resolve', () => {
+  it('marks package:flutter/* imports as framework-provided with confidence 1.0', () => {
+    const ref = {
+      fromNodeId: 'file:lib/main.dart',
+      referenceName: 'package:flutter/material.dart',
+      referenceKind: 'imports' as const,
+      line: 1,
+      column: 0,
+      filePath: 'lib/main.dart',
+      language: 'dart' as const,
+    };
+    const result = flutterResolver.resolve(ref, flutterBaseContext as any);
+    expect(result?.resolvedBy).toBe('framework');
+    expect(result?.confidence).toBe(1.0);
+    expect(result?.targetNodeId).toBe(ref.fromNodeId);
+  });
+
+  it('short-circuits built-in widget names (Scaffold) to framework-provided', () => {
+    const ref = {
+      fromNodeId: 'class:lib/home.dart:HomeScreen:5',
+      referenceName: 'Scaffold',
+      referenceKind: 'calls' as const,
+      line: 10,
+      column: 4,
+      filePath: 'lib/home.dart',
+      language: 'dart' as const,
+    };
+    const result = flutterResolver.resolve(ref, flutterBaseContext as any);
+    expect(result?.resolvedBy).toBe('framework');
+    expect(result?.confidence).toBe(1.0);
+  });
+
+  it('resolves a PascalCase user widget to its class node, preferring /lib/widgets/', () => {
+    const myButton: Node = {
+      id: 'class:lib/widgets/my_button.dart:MyButton:3',
+      kind: 'class',
+      name: 'MyButton',
+      qualifiedName: 'lib/widgets/my_button.dart::MyButton',
+      filePath: 'lib/widgets/my_button.dart',
+      language: 'dart',
+      startLine: 3,
+      endLine: 3,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: Date.now(),
+    };
+    const context = {
+      ...flutterBaseContext,
+      getNodesByName: (n: string) => (n === 'MyButton' ? [myButton] : []),
+    };
+    const ref = {
+      fromNodeId: 'class:lib/screens/home.dart:HomeScreen:5',
+      referenceName: 'MyButton',
+      referenceKind: 'calls' as const,
+      line: 8,
+      column: 4,
+      filePath: 'lib/screens/home.dart',
+      language: 'dart' as const,
+    };
+    const result = flutterResolver.resolve(ref, context as any);
+    expect(result?.targetNodeId).toBe(myButton.id);
+    expect(result?.resolvedBy).toBe('framework');
+    expect(result?.confidence).toBe(0.85);
+  });
+
+  it('pairs a State<X> reference to its widget class via candidates', () => {
+    const widget: Node = {
+      id: 'widget:lib/counter.dart:Counter:3',
+      kind: 'component',
+      name: 'Counter',
+      qualifiedName: 'lib/counter.dart::Counter',
+      filePath: 'lib/counter.dart',
+      language: 'dart',
+      startLine: 3,
+      endLine: 3,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: Date.now(),
+    };
+    const context = {
+      ...flutterBaseContext,
+      getNodesByName: (n: string) => (n === 'Counter' ? [widget] : []),
+    };
+    const ref = {
+      fromNodeId: 'state:lib/counter.dart:_CounterState:10',
+      referenceName: 'State',
+      referenceKind: 'extends' as const,
+      line: 10,
+      column: 0,
+      filePath: 'lib/counter.dart',
+      language: 'dart' as const,
+      candidates: ['Counter'],
+    };
+    const result = flutterResolver.resolve(ref, context as any);
+    expect(result?.targetNodeId).toBe(widget.id);
+    expect(result?.resolvedBy).toBe('framework');
+    expect(result?.confidence).toBe(0.9);
+  });
+});
+
+describe('flutterResolver.extract', () => {
+  it('emits a component node for a StatelessWidget subclass', () => {
+    const src = `
+import 'package:flutter/material.dart';
+
+class HomeScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) => Scaffold(body: Text('hi'));
+}
+`;
+    const { nodes } = flutterResolver.extract!('lib/screens/home.dart', src);
+    const component = nodes.find((n) => n.name === 'HomeScreen');
+    expect(component?.kind).toBe('component');
+    expect(component?.language).toBe('dart');
+  });
+
+  it('emits a component node for a StatefulWidget and pairs its State class', () => {
+    const src = `
+class Counter extends StatefulWidget {
+  @override
+  _CounterState createState() => _CounterState();
+}
+
+class _CounterState extends State<Counter> {
+  @override
+  Widget build(BuildContext context) => Container();
+}
+`;
+    const { nodes, references } = flutterResolver.extract!('lib/counter.dart', src);
+    expect(nodes.map((n) => n.name).sort()).toEqual(['Counter', '_CounterState']);
+    expect(nodes.every((n) => n.kind === 'component')).toBe(true);
+    expect(references).toHaveLength(1);
+    expect(references[0].referenceName).toBe('State');
+    expect(references[0].referenceKind).toBe('extends');
+    expect(references[0].candidates).toEqual(['Counter']);
+  });
+
+  it('emits a class node for the runApp root widget', () => {
+    const src = `
+import 'package:flutter/material.dart';
+
+void main() {
+  runApp(MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) => MaterialApp(home: Container());
+}
+`;
+    const { nodes } = flutterResolver.extract!('lib/main.dart', src);
+    expect(nodes.find((n) => n.name === 'MyApp' && n.kind === 'class')).toBeDefined();
+    expect(nodes.find((n) => n.name === 'MyApp' && n.kind === 'component')).toBeDefined();
+  });
+
+  it('skips runApp() for built-in widgets (no double-counting Material/Cupertino)', () => {
+    // Edge case: runApp(MaterialApp(...)) — don't emit a node for MaterialApp.
+    const src = `void main() { runApp(MaterialApp(home: Container())); }\n`;
+    const { nodes } = flutterResolver.extract!('lib/main.dart', src);
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('ignores commented-out widget classes', () => {
+    const src = `
+// class Fake extends StatelessWidget {}
+/* class AlsoFake extends StatefulWidget {} */
+class Real extends StatelessWidget {}
+`;
+    const { nodes } = flutterResolver.extract!('lib/real.dart', src);
+    expect(nodes.map((n) => n.name)).toEqual(['Real']);
+  });
+});
+
+describe('flutterRouterResolver.extract', () => {
+  it('extracts named routes from a MaterialApp routes: map', () => {
+    const src = `
+MaterialApp(
+  home: HomeScreen(),
+  routes: {
+    '/login': (ctx) => LoginScreen(),
+    '/profile': (ctx) => ProfileScreen(),
+  },
+);
+`;
+    const { nodes, references } = flutterRouterResolver.extract!('lib/app.dart', src);
+    expect(nodes.map((n) => n.name).sort()).toEqual(['/login', '/profile']);
+    expect(nodes.every((n) => n.kind === 'route')).toBe(true);
+    expect(references.map((r) => r.referenceName).sort()).toEqual(['LoginScreen', 'ProfileScreen']);
+  });
+
+  it('extracts a flat GoRoute path → builder mapping', () => {
+    const src = `
+final router = GoRouter(
+  routes: [
+    GoRoute(path: '/users', builder: (c, s) => UsersScreen()),
+  ],
+);
+`;
+    const { nodes, references } = flutterRouterResolver.extract!('lib/router.dart', src);
+    expect(nodes.map((n) => n.name)).toEqual(['/users']);
+    expect(references.map((r) => r.referenceName)).toEqual(['UsersScreen']);
+  });
+
+  it('joins nested GoRoute paths via parent prefix', () => {
+    const src = `
+final router = GoRouter(
+  routes: [
+    GoRoute(
+      path: '/users',
+      builder: (c, s) => UsersScreen(),
+      routes: [
+        GoRoute(path: ':id', builder: (c, s) => UserDetailScreen()),
+      ],
+    ),
+  ],
+);
+`;
+    const { nodes, references } = flutterRouterResolver.extract!('lib/router.dart', src);
+    expect(nodes.map((n) => n.name).sort()).toEqual(['/users', '/users/:id']);
+    expect(references.map((r) => r.referenceName).sort()).toEqual([
+      'UserDetailScreen',
+      'UsersScreen',
+    ]);
+  });
+
+  it('resolves a route handler reference to a screen class', () => {
+    const profileScreen: Node = {
+      id: 'class:lib/screens/profile.dart:ProfileScreen:3',
+      kind: 'class',
+      name: 'ProfileScreen',
+      qualifiedName: 'lib/screens/profile.dart::ProfileScreen',
+      filePath: 'lib/screens/profile.dart',
+      language: 'dart',
+      startLine: 3,
+      endLine: 3,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: Date.now(),
+    };
+    const context = {
+      ...flutterBaseContext,
+      getNodesByName: (n: string) => (n === 'ProfileScreen' ? [profileScreen] : []),
+    };
+    const ref = {
+      fromNodeId: 'route:lib/app.dart:5:/profile',
+      referenceName: 'ProfileScreen',
+      referenceKind: 'references' as const,
+      line: 5,
+      column: 0,
+      filePath: 'lib/app.dart',
+      language: 'dart' as const,
+    };
+    const result = flutterRouterResolver.resolve(ref, context as any);
+    expect(result?.targetNodeId).toBe(profileScreen.id);
+    expect(result?.confidence).toBe(0.85);
+  });
+
+  it('flutter: skips // and /* */ commented routes', () => {
+    const src = `
+// MaterialApp(routes: { '/fake': (c) => FakeScreen() });
+/* GoRoute(path: '/also-fake', builder: (c, s) => OtherFake()) */
+MaterialApp(
+  routes: {
+    '/real': (ctx) => RealScreen(),
+  },
+);
+`;
+    const { nodes, references } = flutterRouterResolver.extract!('lib/app.dart', src);
+    expect(nodes.map((n) => n.name)).toEqual(['/real']);
+    expect(references.map((r) => r.referenceName)).toEqual(['RealScreen']);
+  });
+});
+
+describe('flutterStateResolver.detect', () => {
+  it('detects flutter_bloc in pubspec.yaml', () => {
+    const context = {
+      ...flutterBaseContext,
+      readFile: (p: string) =>
+        p === 'pubspec.yaml' ? `dependencies:\n  flutter_bloc: ^8.0.0\n` : null,
+    };
+    expect(flutterStateResolver.detect(context as any)).toBe(true);
+  });
+
+  it('detects riverpod', () => {
+    const context = {
+      ...flutterBaseContext,
+      readFile: (p: string) =>
+        p === 'pubspec.yaml' ? `dependencies:\n  flutter_riverpod: ^2.0.0\n` : null,
+    };
+    expect(flutterStateResolver.detect(context as any)).toBe(true);
+  });
+
+  it('returns false when no state-management package is present', () => {
+    const context = {
+      ...flutterBaseContext,
+      readFile: (p: string) =>
+        p === 'pubspec.yaml' ? `dependencies:\n  flutter:\n    sdk: flutter\n` : null,
+    };
+    expect(flutterStateResolver.detect(context as any)).toBe(false);
+  });
+});
+
+describe('flutterStateResolver.resolve', () => {
+  it('marks context.read as framework-provided when bloc is present', () => {
+    const context = {
+      ...flutterBaseContext,
+      readFile: (p: string) =>
+        p === 'pubspec.yaml' ? `dependencies:\n  flutter_bloc: ^8.0.0\n` : null,
+    };
+    const ref = {
+      fromNodeId: 'method:lib/home.dart:build:10',
+      referenceName: 'context.read',
+      referenceKind: 'calls' as const,
+      line: 12,
+      column: 4,
+      filePath: 'lib/home.dart',
+      language: 'dart' as const,
+    };
+    const result = flutterStateResolver.resolve(ref, context as any);
+    expect(result?.resolvedBy).toBe('framework');
+    expect(result?.confidence).toBe(1.0);
+  });
+
+  it('resolves a *Bloc class name to /lib/bloc/, preferring conventional dir', () => {
+    const userBloc: Node = {
+      id: 'class:lib/bloc/user_bloc.dart:UserBloc:5',
+      kind: 'class',
+      name: 'UserBloc',
+      qualifiedName: 'lib/bloc/user_bloc.dart::UserBloc',
+      filePath: 'lib/bloc/user_bloc.dart',
+      language: 'dart',
+      startLine: 5,
+      endLine: 5,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: Date.now(),
+    };
+    const context = {
+      ...flutterBaseContext,
+      getNodesByName: (n: string) => (n === 'UserBloc' ? [userBloc] : []),
+      readFile: (p: string) =>
+        p === 'pubspec.yaml' ? `dependencies:\n  flutter_bloc: ^8.0.0\n` : null,
+    };
+    const ref = {
+      fromNodeId: 'class:lib/home.dart:HomeScreen:5',
+      referenceName: 'UserBloc',
+      referenceKind: 'references' as const,
+      line: 12,
+      column: 4,
+      filePath: 'lib/home.dart',
+      language: 'dart' as const,
+    };
+    const result = flutterStateResolver.resolve(ref, context as any);
+    expect(result?.targetNodeId).toBe(userBloc.id);
+    expect(result?.confidence).toBe(0.8);
+  });
+
+  it('does not match bloc patterns when bloc is not in pubspec', () => {
+    const context = {
+      ...flutterBaseContext,
+      readFile: () => null,
+    };
+    const ref = {
+      fromNodeId: 'x',
+      referenceName: 'context.read',
+      referenceKind: 'calls' as const,
+      line: 1,
+      column: 1,
+      filePath: 'lib/x.dart',
+      language: 'dart' as const,
+    };
+    expect(flutterStateResolver.resolve(ref, context as any)).toBeNull();
+  });
+});
+
+import { getFrameworkResolver } from '../src/resolution/frameworks';
+
+describe('flutter resolvers registered in framework registry', () => {
+  it('exposes flutter, flutter-router, and flutter-state via getFrameworkResolver', () => {
+    expect(getFrameworkResolver('flutter')?.languages).toEqual(['dart']);
+    expect(getFrameworkResolver('flutter-router')?.languages).toEqual(['dart']);
+    expect(getFrameworkResolver('flutter-state')?.languages).toEqual(['dart']);
+  });
+});
