@@ -3981,4 +3981,80 @@ end
       expect(call).toBeDefined();
     });
   });
+
+  describe('Short-form function definitions', () => {
+    it('should extract short assignment-form functions', () => {
+      const code = `
+add(x, y) = x + y
+distance(a::Point, b::Point) = sqrt((a.x - b.x)^2)
+`;
+      const result = extractFromSource('short.jl', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('add');
+      expect(funcs).toContain('distance');
+      const add = result.nodes.find((n) => n.name === 'add');
+      expect(add?.signature).toBe('(x, y)');
+    });
+  });
+
+  describe('Struct field extraction', () => {
+    it('should extract typed and untyped fields from struct body', () => {
+      const code = `
+struct Point
+  x::Float64
+  y::Float64
+  label
+end
+`;
+      const result = extractFromSource('structs.jl', code);
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fields).toContain('x');
+      expect(fields).toContain('y');
+      expect(fields).toContain('label');
+      const x = result.nodes.find((n) => n.kind === 'field' && n.name === 'x');
+      expect(x?.signature).toBe('x::Float64');
+    });
+  });
+
+  describe('include() as relative import', () => {
+    it('should convert include("file.jl") to an import node', () => {
+      const code = `include("utils.jl")`;
+      const result = extractFromSource('app.jl', code);
+      const imp = result.nodes.find((n) => n.kind === 'import' && n.name === 'utils');
+      expect(imp).toBeDefined();
+      expect(imp?.signature).toBe('include("utils.jl")');
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'utils'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
+
+  describe('Module extraction', () => {
+    it('should extract module_definition as a namespace node', () => {
+      const code = `
+module MyPkg
+  function foo() end
+end
+`;
+      const result = extractFromSource('pkg.jl', code);
+      const mod = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'MyPkg');
+      expect(mod).toBeDefined();
+      const foo = result.nodes.find((n) => n.kind === 'function' && n.name === 'foo');
+      expect(foo).toBeDefined();
+    });
+  });
+
+  describe('Qualified method names', () => {
+    it('should extract Base.getindex-style qualified function names', () => {
+      const code = `
+function Base.getindex(x::Vector{T}, i::Int) where T
+  return x[i]
+end
+`;
+      const result = extractFromSource('ext.jl', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'Base.getindex');
+      expect(fn).toBeDefined();
+    });
+  });
 });
