@@ -341,8 +341,8 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).toContain('model:\n  default: qwen-3.7');
     expect(body).toContain('mcp_servers:\n  other:\n    command: other');
     expect(body).toContain('  codegraph:\n    command: codegraph');
-    expect(body).toContain('    - hermes-cli');
-    expect(body).toContain('    - mcp-codegraph');
+    expect(body).toContain('  - hermes-cli');
+    expect(body).toContain('  - mcp-codegraph');
     expect(body).toContain('  discord:\n    - hermes-discord');
 
     const second = hermes.install('global', { autoAllow: true });
