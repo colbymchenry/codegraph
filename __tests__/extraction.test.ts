@@ -2056,6 +2056,27 @@ end
       expect(names).toContain('vector');
       expect(names).toContain('config.h');
     });
+
+    it('should create unresolved references for local includes', () => {
+      const code = `#include "myheader.h"`;
+      const result = extractFromSource('main.cpp', code);
+
+      const importRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'myheader.h'
+      );
+      expect(importRef).toBeDefined();
+      expect(importRef?.line).toBe(1);
+    });
+
+    it('should create unresolved references for system includes', () => {
+      const code = `#include <iostream>`;
+      const result = extractFromSource('main.cpp', code);
+
+      const importRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'iostream'
+      );
+      expect(importRef).toBeDefined();
+    });
   });
 
   describe('Dart imports', () => {

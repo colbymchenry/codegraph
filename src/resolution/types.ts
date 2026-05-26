@@ -115,6 +115,13 @@ export interface ResolutionContext {
    * without modification.
    */
   listDirectories?(relativePath: string): string[];
+  /**
+   * C/C++ include search directories (relative to project root),
+   * extracted from compile_commands.json or discovered by heuristic.
+   * Used by resolveCppIncludePath to search -I directories when
+   * relative resolution fails. Optional so existing callers compile.
+   */
+  getCppIncludeDirs?(): string[];
 }
 
 /**

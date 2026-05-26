@@ -4,6 +4,7 @@
  * Resolves import paths to actual files and symbols.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
@@ -21,6 +22,8 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   go: ['.go'],
   rust: ['.rs', '/mod.rs'],
   java: ['.java'],
+  c: ['.h', '.c'],
+  cpp: ['.h', '.hpp', '.hxx', '.cpp', '.cc', '.cxx'],
   csharp: ['.cs'],
   php: ['.php'],
   ruby: ['.rb'],
@@ -53,8 +56,55 @@ export function resolveImportPath(
   }
 
   // Handle absolute/aliased imports (like @/ or src/)
-  return resolveAliasedImport(importPath, projectRoot, language, context);
+  const aliased = resolveAliasedImport(importPath, projectRoot, language, context);
+  if (aliased) return aliased;
+
+  // C/C++ include directory search: when neither relative nor aliased
+  // resolution found a match, search -I directories from
+  // compile_commands.json or heuristic probing.
+  if (language === 'c' || language === 'cpp') {
+    return resolveCppIncludePath(importPath, language, context);
+  }
+
+  return null;
 }
+
+/**
+ * C and C++ standard library header names (without delimiters).
+ * Used by isExternalImport to filter system includes from resolution.
+ */
+const C_CPP_STDLIB_HEADERS = new Set([
+  // C standard library headers
+  'assert.h', 'complex.h', 'ctype.h', 'errno.h', 'fenv.h', 'float.h',
+  'inttypes.h', 'iso646.h', 'limits.h', 'locale.h', 'math.h', 'setjmp.h',
+  'signal.h', 'stdalign.h', 'stdarg.h', 'stdatomic.h', 'stdbool.h',
+  'stddef.h', 'stdint.h', 'stdio.h', 'stdlib.h', 'stdnoreturn.h',
+  'string.h', 'tgmath.h', 'threads.h', 'time.h', 'uchar.h', 'wchar.h',
+  'wctype.h',
+  // C++ C-library wrappers (cname form)
+  'cassert', 'ccomplex', 'cctype', 'cerrno', 'cfenv', 'cfloat',
+  'cinttypes', 'ciso646', 'climits', 'clocale', 'cmath', 'csetjmp',
+  'csignal', 'cstdalign', 'cstdarg', 'cstdbool', 'cstddef', 'cstdint',
+  'cstdio', 'cstdlib', 'cstring', 'ctgmath', 'ctime', 'cuchar',
+  'cwchar', 'cwctype',
+  // C++ STL headers
+  'algorithm', 'any', 'array', 'atomic', 'barrier', 'bit', 'bitset',
+  'charconv', 'chrono', 'codecvt', 'compare', 'complex', 'concepts',
+  'condition_variable', 'coroutine', 'deque', 'exception', 'execution',
+  'expected', 'filesystem', 'format', 'forward_list', 'fstream',
+  'functional', 'future', 'generator', 'initializer_list', 'iomanip',
+  'ios', 'iosfwd', 'iostream', 'istream', 'iterator', 'latch',
+  'limits', 'list', 'locale', 'map', 'mdspan', 'memory', 'memory_resource',
+  'mutex', 'new', 'numbers', 'numeric', 'optional', 'ostream', 'print',
+  'queue', 'random', 'ranges', 'ratio', 'regex', 'scoped_allocator',
+  'semaphore', 'set', 'shared_mutex', 'source_location', 'span',
+  'spanstream', 'sstream', 'stack', 'stacktrace', 'stdexcept',
+  'stdfloat', 'stop_token', 'streambuf', 'string', 'string_view',
+  'strstream', 'syncstream', 'system_error', 'thread', 'tuple',
+  'type_traits', 'typeindex', 'typeinfo', 'unordered_map',
+  'unordered_set', 'utility', 'valarray', 'variant', 'vector',
+  'version',
+]);
 
 /**
  * Check if an import is external (npm package, etc.)
@@ -121,6 +171,16 @@ function isExternalImport(
     }
     // Anything else is the Go standard library or a third-party module.
     return true;
+  }
+
+  if (language === 'c' || language === 'cpp') {
+    // C/C++ standard library headers — both C-style (<stdio.h>) and
+    // C++-style (<cstdio>, <vector>) forms. Checked against the import
+    // path (which the extractor strips of <> or "" delimiters).
+    if (C_CPP_STDLIB_HEADERS.has(importPath)) return true;
+    // C++ headers without .h extension (e.g. "vector", "string")
+    const withoutExt = importPath.replace(/\.h$/, '');
+    if (C_CPP_STDLIB_HEADERS.has(withoutExt)) return true;
   }
 
   return false;
@@ -217,6 +277,214 @@ function resolveAliasedImport(
 }
 
 /**
+ * C/C++ include directory cache (keyed by project root).
+ * Loaded once per resolver instance, shared across calls.
+ */
+const cppIncludeDirCache = new Map<string, string[]>();
+
+/**
+ * Clear the C/C++ include directory cache (call between indexing runs)
+ */
+export function clearCppIncludeDirCache(): void {
+  cppIncludeDirCache.clear();
+}
+
+/**
+ * Discover C/C++ include search directories for a project.
+ *
+ * Strategy:
+ * 1. Look for compile_commands.json (Clang compilation database) in the
+ *    project root and common build subdirectories. Parse -I and -isystem
+ *    flags from compiler commands.
+ * 2. If no compilation database is found, probe for common convention
+ *    directories (include/, src/, lib/, api/) and top-level directories
+ *    containing .h/.hpp files.
+ *
+ * Returns paths relative to projectRoot.
+ */
+export function loadCppIncludeDirs(projectRoot: string): string[] {
+  const cached = cppIncludeDirCache.get(projectRoot);
+  if (cached !== undefined) return cached;
+
+  const dirs = loadCppIncludeDirsFromCompileDB(projectRoot)
+    || loadCppIncludeDirsHeuristic(projectRoot);
+
+  cppIncludeDirCache.set(projectRoot, dirs);
+  return dirs;
+}
+
+/**
+ * Try to load include directories from compile_commands.json.
+ * Returns null if no compilation database is found (so the heuristic
+ * fallback can run). Returns an array (possibly empty) otherwise.
+ */
+function loadCppIncludeDirsFromCompileDB(projectRoot: string): string[] | null {
+  const candidates = [
+    path.join(projectRoot, 'compile_commands.json'),
+    path.join(projectRoot, 'build', 'compile_commands.json'),
+    path.join(projectRoot, 'cmake-build-debug', 'compile_commands.json'),
+    path.join(projectRoot, 'cmake-build-release', 'compile_commands.json'),
+    path.join(projectRoot, 'out', 'compile_commands.json'),
+  ];
+
+  let dbPath: string | undefined;
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) {
+        dbPath = c;
+        break;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  if (!dbPath) return null;
+
+  try {
+    const content = fs.readFileSync(dbPath, 'utf-8');
+    const entries = JSON.parse(content) as Array<{
+      directory: string;
+      command?: string;
+      arguments?: string[];
+    }>;
+    if (!Array.isArray(entries)) return null;
+
+    const dirSet = new Set<string>();
+    for (const entry of entries) {
+      const dir = entry.directory || projectRoot;
+      const args = entry.arguments || (entry.command ? shlexSplit(entry.command) : []);
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i]!;
+        let includeDir: string | undefined;
+        // -I<dir> (no space)
+        if (arg.startsWith('-I') && arg.length > 2) {
+          includeDir = arg.substring(2);
+        }
+        // -isystem <dir> (space-separated)
+        else if ((arg === '-isystem' || arg === '-I') && i + 1 < args.length) {
+          includeDir = args[i + 1];
+          i++; // skip next arg
+        }
+        if (includeDir) {
+          // Normalize: resolve relative to the compilation directory
+          const absPath = path.isAbsolute(includeDir)
+            ? includeDir
+            : path.resolve(dir, includeDir);
+          const relPath = path.relative(projectRoot, absPath).replace(/\\/g, '/');
+          // Skip system directories and paths outside the project
+          // (relative paths starting with .. or absolute paths like
+          // /usr/include or C:\usr on Windows)
+          if (!relPath.startsWith('..') && relPath.length > 0 && !path.isAbsolute(relPath)) {
+            dirSet.add(relPath);
+          }
+        }
+      }
+    }
+    return Array.from(dirSet);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Minimal shlex-style split for compiler command strings.
+ * Handles double-quoted and single-quoted arguments.
+ */
+function shlexSplit(cmd: string): string[] {
+  const result: string[] = [];
+  let i = 0;
+  while (i < cmd.length) {
+    // Skip whitespace
+    while (i < cmd.length && /\s/.test(cmd[i]!)) i++;
+    if (i >= cmd.length) break;
+    const ch = cmd[i]!;
+    if (ch === '"') {
+      i++;
+      let arg = '';
+      while (i < cmd.length && cmd[i] !== '"') {
+        if (cmd[i] === '\\' && i + 1 < cmd.length) { i++; arg += cmd[i]; }
+        else { arg += cmd[i]; }
+        i++;
+      }
+      i++; // closing quote
+      result.push(arg);
+    } else if (ch === "'") {
+      i++;
+      let arg = '';
+      while (i < cmd.length && cmd[i] !== "'") { arg += cmd[i]; i++; }
+      i++; // closing quote
+      result.push(arg);
+    } else {
+      let arg = '';
+      while (i < cmd.length && !/\s/.test(cmd[i]!)) { arg += cmd[i]; i++; }
+      result.push(arg);
+    }
+  }
+  return result;
+}
+
+/**
+ * Heuristic include directory discovery when no compile_commands.json exists.
+ * Checks common convention directories and scans top-level dirs for headers.
+ */
+function loadCppIncludeDirsHeuristic(projectRoot: string): string[] {
+  const dirs: string[] = [];
+  const conventionDirs = ['include', 'src', 'lib', 'api', 'inc'];
+
+  try {
+    const entries = fs.readdirSync(projectRoot, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const name = entry.name;
+      // Convention directories
+      if (conventionDirs.includes(name.toLowerCase())) {
+        dirs.push(name);
+        continue;
+      }
+      // Any top-level directory containing .h or .hpp files
+      try {
+        const subFiles = fs.readdirSync(path.join(projectRoot, name));
+        if (subFiles.some(f => /\.(h|hpp|hxx|hh)$/i.test(f))) {
+          dirs.push(name);
+        }
+      } catch {
+        // ignore permission errors
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return dirs;
+}
+
+/**
+ * Resolve a C/C++ include path by searching include directories.
+ * Called as a fallback after relative and aliased resolution fail.
+ */
+function resolveCppIncludePath(
+  importPath: string,
+  language: Language,
+  context: ResolutionContext
+): string | null {
+  const includeDirs = context.getCppIncludeDirs?.() ?? [];
+  const extensions = EXTENSION_RESOLUTION[language] ?? [];
+
+  for (const dir of includeDirs) {
+    const normalizedDir = dir.replace(/\\/g, '/');
+    for (const ext of extensions) {
+      const candidate = normalizedDir + '/' + importPath + ext;
+      if (context.fileExists(candidate)) return candidate;
+    }
+    // Try as-is (already has extension)
+    const candidate = normalizedDir + '/' + importPath;
+    if (context.fileExists(candidate)) return candidate;
+  }
+
+  return null;
+}
+
+/**
  * Extract import mappings from a file
  */
 export function extractImportMappings(
@@ -236,6 +504,8 @@ export function extractImportMappings(
     mappings.push(...extractJavaImports(content));
   } else if (language === 'php') {
     mappings.push(...extractPHPImports(content));
+  } else if (language === 'c' || language === 'cpp') {
+    mappings.push(...extractCppImports(content));
   }
 
   return mappings;
@@ -511,6 +781,38 @@ function extractPHPImports(content: string): ImportMapping[] {
   return mappings;
 }
 
+/**
+ * Extract C/C++ import mappings from #include directives.
+ *
+ * #include brings all symbols from the included header into scope
+ * (namespace import), so each mapping uses isNamespace: true and
+ * exportedName: '*'. The localName is set to the header's basename
+ * without extension so that symbol references like `MyClass` can
+ * match against any include that might provide it.
+ */
+function extractCppImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+
+  // Match both #include <...> and #include "..."
+  const includeRegex = /^\s*#\s*include\s+[<"]([^>"]+)[>"]/gm;
+  let match;
+
+  while ((match = includeRegex.exec(content)) !== null) {
+    const modulePath = match[1]!;
+    // Basename without extension for localName matching
+    const basename = modulePath.split('/').pop()!.replace(/\.(h|hpp|hxx|hh|inl|ipp|cxx|cc|cpp)$/,'');
+    mappings.push({
+      localName: basename || modulePath,
+      exportedName: '*',
+      source: modulePath,
+      isDefault: false,
+      isNamespace: true,
+    });
+  }
+
+  return mappings;
+}
+
 // Cache import mappings per file to avoid re-reading and re-parsing
 const importMappingCache = new Map<string, ImportMapping[]>();
 
@@ -519,6 +821,7 @@ const importMappingCache = new Map<string, ImportMapping[]>();
  */
 export function clearImportMappingCache(): void {
   importMappingCache.clear();
+  cppIncludeDirCache.clear();
 }
 
 /**

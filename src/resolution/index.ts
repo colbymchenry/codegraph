@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference } from './name-matcher';
-import { resolveViaImport, extractImportMappings, extractReExports } from './import-resolver';
+import { resolveViaImport, extractImportMappings, extractReExports, loadCppIncludeDirs } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
@@ -129,6 +129,49 @@ const PASCAL_BUILT_INS = new Set([
   'TList', 'TStringList', 'TStrings', 'TStream', 'TMemoryStream', 'TFileStream',
   'Exception', 'EAbort', 'EConvertError', 'EAccessViolation',
   'IInterface', 'IUnknown',
+]);
+
+const C_BUILT_INS = new Set([
+  // Standard C library functions
+  'printf', 'fprintf', 'sprintf', 'snprintf', 'scanf', 'fscanf', 'sscanf',
+  'malloc', 'calloc', 'realloc', 'free',
+  'memcpy', 'memmove', 'memset', 'memcmp', 'memchr',
+  'strlen', 'strcpy', 'strncpy', 'strcat', 'strncat', 'strcmp', 'strncmp',
+  'strstr', 'strchr', 'strrchr', 'strtok', 'strdup',
+  'fopen', 'fclose', 'fread', 'fwrite', 'fgets', 'fputs', 'fputc', 'fgetc',
+  'feof', 'ferror', 'fflush', 'fseek', 'ftell', 'rewind',
+  'exit', 'abort', 'atexit', 'atoi', 'atol', 'atof', 'strtol', 'strtoul', 'strtod',
+  'qsort', 'bsearch',
+  'abs', 'labs', 'rand', 'srand',
+  'sin', 'cos', 'tan', 'sqrt', 'pow', 'log', 'log10', 'exp', 'ceil', 'floor', 'fabs',
+  'time', 'clock', 'difftime', 'mktime', 'localtime', 'gmtime', 'strftime', 'asctime',
+  'assert', 'errno',
+  'perror', 'remove', 'rename', 'tmpfile', 'tmpnam',
+  'getenv', 'system',
+  'signal', 'raise',
+  'setjmp', 'longjmp',
+  'va_start', 'va_end', 'va_arg', 'va_copy',
+  'NULL', 'EOF', 'BUFSIZ', 'FILENAME_MAX', 'RAND_MAX', 'EXIT_SUCCESS', 'EXIT_FAILURE',
+  'size_t', 'ptrdiff_t', 'wchar_t', 'intptr_t', 'uintptr_t',
+  'int8_t', 'int16_t', 'int32_t', 'int64_t',
+  'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+  'FILE', 'FILE',
+  // POSIX additions commonly seen
+  'stat', 'lstat', 'fstat', 'open', 'close', 'read', 'write', 'pipe',
+  'fork', 'exec', 'waitpid', 'getpid', 'getppid', 'kill', 'sleep', 'usleep',
+  'pthread_create', 'pthread_join', 'pthread_mutex_lock', 'pthread_mutex_unlock',
+  'dlopen', 'dlsym', 'dlclose',
+]);
+
+const CPP_BUILT_INS = new Set([
+  // iostream objects (often used without std:: prefix via using)
+  'cout', 'cin', 'cerr', 'clog', 'endl', 'flush', 'ws',
+  'std', // the namespace itself when used as std::something
+  // Common C++ keywords that leak as references
+  'nullptr', 'true', 'false', 'this', 'sizeof', 'alignof', 'typeid',
+  'static_cast', 'dynamic_cast', 'reinterpret_cast', 'const_cast',
+  'make_unique', 'make_shared', 'make_pair',
+  'move', 'forward', 'swap',
 ]);
 
 /**
@@ -391,6 +434,10 @@ export class ReferenceResolver {
         const reExports = extractReExports(content, language);
         this.reExportCache.set(filePath, reExports);
         return reExports;
+      },
+
+      getCppIncludeDirs: () => {
+        return loadCppIncludeDirs(this.projectRoot);
       },
     };
   }
@@ -830,6 +877,16 @@ export class ReferenceResolver {
       if (PASCAL_BUILT_INS.has(name)) {
         return true;
       }
+    }
+
+    // C/C++ standard library symbols (printf, malloc, std::vector, etc.)
+    if (ref.language === 'c' || ref.language === 'cpp') {
+      // Bare C standard library functions and macros
+      if (C_BUILT_INS.has(name)) return true;
+      // C++ std:: namespace prefix
+      if (name.startsWith('std::')) return true;
+      // C++ iostream manipulators and objects used without std::
+      if (CPP_BUILT_INS.has(name)) return true;
     }
 
     return false;
