@@ -55,6 +55,8 @@
     { "name": "grpc", "repo": "https://github.com/grpc/grpc", "size": "Large", "files": "~3000", "question": "How does gRPC dispatch an incoming RPC to its handler?" }
   ],
   "Dart": [
+    { "name": "navigation_and_routing", "repo": "https://github.com/flutter/samples", "subdir": "navigation_and_routing", "size": "Small", "files": "~17", "question": "How does navigating to /books/popular show the BooksScreen?" },
+    { "name": "compass_app", "repo": "https://github.com/flutter/samples", "subdir": "compass_app/app", "size": "Medium", "files": "~129", "question": "How does the booking flow reach BookingScreen from the home tab?" },
     { "name": "flutter", "repo": "https://github.com/flutter/flutter", "size": "Large", "files": "~6000", "question": "How does Flutter build and lay out a widget tree?" }
   ],
   "Svelte": [

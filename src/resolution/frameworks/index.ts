@@ -25,6 +25,7 @@ import { swiftObjcBridgeResolver } from './swift-objc';
 import { reactNativeBridgeResolver } from './react-native';
 import { expoModulesResolver } from './expo-modules';
 import { fabricViewResolver } from './fabric';
+import { flutterResolver, flutterRouterResolver, flutterStateResolver } from './flutter';
 
 /**
  * All registered framework resolvers
@@ -66,6 +67,10 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   expoModulesResolver,
   // React Native Fabric / Codegen view components — TS spec → component nodes
   fabricViewResolver,
+  // Dart / Flutter
+  flutterResolver,
+  flutterRouterResolver,
+  flutterStateResolver,
 ];
 
 /**
@@ -140,3 +145,4 @@ export { swiftObjcBridgeResolver } from './swift-objc';
 export { reactNativeBridgeResolver } from './react-native';
 export { expoModulesResolver } from './expo-modules';
 export { fabricViewResolver } from './fabric';
+export { flutterResolver, flutterRouterResolver, flutterStateResolver } from './flutter';
