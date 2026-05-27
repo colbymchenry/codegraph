@@ -79,7 +79,7 @@ function getRovoDevMcpEntry(): { command: string; args: string[] } {
 class RovoDevTarget implements AgentTarget {
   readonly id = 'rovodev' as const;
   readonly displayName = 'Rovo Dev';
-  readonly docsUrl = 'https://support.atlassian.com/rovo/docs/use-rovo-dev-cli/';
+  readonly docsUrl = 'https://www.atlassian.com/software/rovo-dev';
 
   /** Rovo Dev only has a global config — no per-project MCP concept. */
   supportsLocation(loc: Location): boolean {
