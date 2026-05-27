@@ -79,7 +79,7 @@ function getRovoDevMcpEntry(): { command: string; args: string[] } {
 class RovoDevTarget implements AgentTarget {
   readonly id = 'rovodev' as const;
   readonly displayName = 'Rovo Dev';
-  readonly docsUrl = 'https://www.atlassian.com/software/rovo';
+  readonly docsUrl = 'https://developer.atlassian.com/cloud/rovo/rovo-dev/';
 
   /** Rovo Dev only has a global config — no per-project MCP concept. */
   supportsLocation(loc: Location): boolean {
@@ -97,7 +97,16 @@ class RovoDevTarget implements AgentTarget {
     return { installed, alreadyConfigured, configPath };
   }
 
-  install(_loc: Location, _opts: InstallOptions): WriteResult {
+  install(loc: Location, _opts: InstallOptions): WriteResult {
+    // Rovo Dev has no per-project MCP concept — only global is supported.
+    // supportsLocation('local') returns false so the orchestrator will
+    // never call install for local, but guard explicitly for safety.
+    if (loc !== 'global') {
+      return {
+        files: [],
+        notes: ['Rovo Dev has no project-local config — re-run with --location=global to install.'],
+      };
+    }
     const files: WriteResult['files'] = [];
     files.push(writeMcpEntry());
     files.push(writeInstructionsEntry());
