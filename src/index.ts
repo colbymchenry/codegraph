@@ -633,6 +633,16 @@ export class CodeGraph {
   }
 
   /**
+   * Wall-clock ms (UTC) of the most recent file `indexed_at` write, or `null`
+   * when the project has no tracked files. Surfaced as `lastIndexedAt` by
+   * `codegraph status --json` so CI scripts can assert index freshness without
+   * shelling out to SQL — see issue #329.
+   */
+  getLastIndexedAt(): number | null {
+    return this.queries.getLastIndexedAt();
+  }
+
+  /**
    * Active SQLite backend for this project's connection (`node-sqlite` — Node's
    * built-in real-SQLite module). Surfaced via `codegraph status` and the
    * `codegraph_status` MCP tool alongside the effective journal mode.

@@ -702,7 +702,11 @@ program
     try {
       if (!isInitialized(projectPath)) {
         if (options.json) {
-          console.log(JSON.stringify({ initialized: false, projectPath }));
+          console.log(JSON.stringify({
+            codegraphVersion: packageJson.version,
+            initialized: false,
+            projectPath,
+          }));
           return;
         }
         console.log(chalk.bold('\nCodeGraph Status\n'));
@@ -721,7 +725,9 @@ program
 
       // JSON output mode
       if (options.json) {
+        const lastIndexedAt = cg.getLastIndexedAt();
         console.log(JSON.stringify({
+          codegraphVersion: packageJson.version,
           initialized: true,
           projectPath,
           fileCount: stats.fileCount,
@@ -732,6 +738,11 @@ program
           journalMode,
           nodesByKind: stats.nodesByKind,
           languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
+          // ms-since-epoch of the most recent file `indexed_at` write, or null
+          // when no files are tracked. CI can pair this with the ISO field
+          // below or compare against `Date.now()` for staleness checks.
+          lastIndexedAt,
+          lastIndexedAtIso: lastIndexedAt !== null ? new Date(lastIndexedAt).toISOString() : null,
           pendingChanges: {
             added: changes.added.length,
             modified: changes.modified.length,

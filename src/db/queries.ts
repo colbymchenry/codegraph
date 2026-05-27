@@ -1506,6 +1506,19 @@ export class QueryBuilder {
     };
   }
 
+  /**
+   * Wall-clock ms (UTC) of the most recent file `indexed_at` write, or `null`
+   * when no files are tracked. Used by `codegraph status --json` (and any
+   * library consumer) to assert index freshness without scanning every file
+   * row — see issue #329.
+   */
+  getLastIndexedAt(): number | null {
+    const row = this.db
+      .prepare('SELECT MAX(indexed_at) AS last FROM files')
+      .get() as { last: number | null } | undefined;
+    return row?.last ?? null;
+  }
+
   // ===========================================================================
   // Project Metadata
   // ===========================================================================

@@ -10,6 +10,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`codegraph status --json` now reports the CLI version and a real last-indexed timestamp for CI/scripting (#329).** Three new fields are surfaced in the JSON output that previously only existed (when at all) in the human-readable form:
+  - `codegraphVersion` — the running CLI's version (matches `package.json`), included in both the initialized and not-initialized branches so CI can pin against a known version without an extra `codegraph --version` call.
+  - `lastIndexedAt` — ms-since-epoch of the most recent file `indexed_at` write, computed via `MAX(indexed_at)` over the `files` table (one indexed query, no per-file scan). `null` when the project has no tracked files.
+  - `lastIndexedAtIso` — the same instant in ISO-8601, for log/human consumers; mirrors `lastIndexedAt` exactly (or `null`).
+
+  Surfaces the same value via a new public API method, `CodeGraph.getLastIndexedAt(): number | null`, for library consumers that want index-freshness checks without shelling out to the CLI. Closes #329.
 - **Java / Kotlin imports now resolve by fully-qualified name.** Extraction
   wraps every top-level declaration of a `.kt` / `.java` file in a `namespace`
   node carrying the file's `package` (so a class `Bar` in
