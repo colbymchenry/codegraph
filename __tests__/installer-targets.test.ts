@@ -468,6 +468,78 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(paths.some((p) => p.endsWith('/.kiro/steering/codegraph.md'))).toBe(true);
   });
 
+  it('rovodev: install writes mcp.json and AGENTS.md', () => {
+    const rovodev = getTarget('rovodev')!;
+    const result = rovodev.install('global', { autoAllow: true });
+
+    const mcpJson = path.join(tmpHome, '.rovodev', 'mcp.json');
+    const agentsMd = path.join(tmpHome, '.rovodev', 'AGENTS.md');
+
+    expect(result.files.some((f) => f.path === mcpJson)).toBe(true);
+    expect(result.files.some((f) => f.path === agentsMd)).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(mcpJson, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ command: 'codegraph', args: ['serve', '--mcp'] });
+    // No `type` field — Rovo Dev assumes stdio transport.
+    expect(cfg.mcpServers.codegraph.type).toBeUndefined();
+
+    const md = fs.readFileSync(agentsMd, 'utf-8');
+    expect(md).toContain('codegraph_callers');
+    expect(md).toContain('CodeGraph MCP server');
+  });
+
+  it('rovodev: install preserves a pre-existing sibling MCP server in mcp.json', () => {
+    const rovodev = getTarget('rovodev')!;
+    const mcpJson = path.join(tmpHome, '.rovodev', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcpJson), { recursive: true });
+    fs.writeFileSync(mcpJson, JSON.stringify({
+      mcpServers: { 'ops-sherpa': { command: 'npx', args: ['@atlassian/ops-sherpa'] } },
+    }, null, 2) + '\n');
+
+    rovodev.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(mcpJson, 'utf-8'));
+    expect(after.mcpServers['ops-sherpa']).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('rovodev: uninstall strips codegraph but leaves sibling MCP server intact', () => {
+    const rovodev = getTarget('rovodev')!;
+    const mcpJson = path.join(tmpHome, '.rovodev', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcpJson), { recursive: true });
+    fs.writeFileSync(mcpJson, JSON.stringify({
+      mcpServers: { 'ops-sherpa': { command: 'npx', args: ['@atlassian/ops-sherpa'] } },
+    }, null, 2) + '\n');
+
+    rovodev.install('global', { autoAllow: true });
+    rovodev.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(mcpJson, 'utf-8'));
+    expect(after.mcpServers['ops-sherpa']).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+  });
+
+  it('rovodev: uninstall strips the CodeGraph section from AGENTS.md but preserves user content', () => {
+    const rovodev = getTarget('rovodev')!;
+    const agentsMd = path.join(tmpHome, '.rovodev', 'AGENTS.md');
+    fs.mkdirSync(path.dirname(agentsMd), { recursive: true });
+    fs.writeFileSync(agentsMd, '# My guidelines\n\nDo not assume.\n');
+
+    rovodev.install('global', { autoAllow: true });
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toContain('CodeGraph MCP server');
+
+    rovodev.uninstall('global');
+    const after = fs.readFileSync(agentsMd, 'utf-8');
+    expect(after).toContain('My guidelines');
+    expect(after).not.toContain('CodeGraph MCP server');
+  });
+
+  it('rovodev: supportsLocation returns false for local', () => {
+    const rovodev = getTarget('rovodev')!;
+    expect(rovodev.supportsLocation('local')).toBe(false);
+    expect(rovodev.supportsLocation('global')).toBe(true);
+  });
+
   it('antigravity: install writes to LEGACY ~/.gemini/antigravity/mcp_config.json when no migration marker', () => {
     const antigravity = getTarget('antigravity')!;
     antigravity.install('global', { autoAllow: true });
