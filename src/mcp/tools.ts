@@ -2248,9 +2248,20 @@ export class ToolHandler {
       return this.textResult('No files indexed. Run `codegraph index` first.');
     }
 
-    // Filter by path prefix
-    let files = pathFilter
-      ? allFiles.filter(f => f.path.startsWith(pathFilter) || f.path.startsWith('./' + pathFilter))
+    // Filter by path prefix. Stored paths are project-relative POSIX (e.g.
+    // "src/foo.ts"), but agents commonly pass project-root variants like "/",
+    // ".", "./", "" or Windows-style "src\foo" — and prefixes with leading
+    // "/", "./" or "\". Normalize all of those before matching so the agent
+    // gets results instead of falling back to Read/Glob (see #426).
+    const normalizedFilter = pathFilter
+      ? pathFilter
+          .replace(/\\/g, '/')
+          .replace(/^(?:\.?\/+)+/, '')
+          .replace(/^\.$/, '')
+          .replace(/\/+$/, '')
+      : '';
+    let files = normalizedFilter
+      ? allFiles.filter(f => f.path === normalizedFilter || f.path.startsWith(normalizedFilter + '/'))
       : allFiles;
 
     // Filter by glob pattern

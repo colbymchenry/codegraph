@@ -9,6 +9,97 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Java / Kotlin imports now resolve by fully-qualified name.** Extraction
+  wraps every top-level declaration of a `.kt` / `.java` file in a `namespace`
+  node carrying the file's `package` (so a class `Bar` in
+  `package com.example.foo` is indexed with qualifiedName
+  `com.example.foo::Bar`), and `import com.example.foo.Bar` looks the target
+  up through that index — regardless of whether the class lives in `Bar.kt`,
+  `Models.kt`, or a top-level function. Disambiguates same-name classes
+  across packages (the central failure mode of the previous name-matcher
+  fallback in multi-module Spring / Android codebases), works across the
+  Java↔Kotlin interop boundary, and lays groundwork for binding-precise
+  Dagger2 / Hilt resolution. Wildcard imports (`com.example.*`) still go
+  through name-matcher.
+- **Java / C# anonymous classes (`new T() { ... }`) are now extracted as
+  first-class class nodes with their overrides.** Previously, an anonymous
+  subclass returned from a factory or lambda — `return new BaseIter() {
+  @Override int separatorStart(int s) { ... } };` — produced only an
+  `instantiates` edge: the override methods were invisible to the graph and
+  Phase 5.5 interface-impl synthesis had no class to bridge. The anon class
+  now lands as `<TypeName$anon@line>` with an `extends` reference to the
+  named base/interface, scoped under the enclosing method, and its
+  `method_declaration` members become normal method nodes. The interface→impl
+  synthesizer then bridges the base's abstract methods to the anonymous
+  overrides automatically. Concrete effect on `google/guava` (3,227 .java
+  files): 3,608 anonymous classes extracted, +2,534 interface-impl edges
+  reach overrides hidden in `new T() { ... }` blocks (including lambda
+  bodies). An agent investigating `Splitter.SplittingIterator.separatorStart`
+  now sees the four anonymous overrides in its trail without a Read.
+
+### Fixed
+- **`codegraph index` / `init -i` summary now reports the true edge count.**
+  The per-file counter in the orchestrator only saw extraction-phase edges,
+  so resolution and synthesizer edges (often >50% of the graph on
+  cross-file-heavy repos like Spring multi-module Java) were missing from
+  the `X nodes, Y edges` line. Snapshotting the DB before/after the full
+  pipeline now reports the actual additions. Example: indexing
+  `macrozheng/mall` previously reported `20 047 edges` while the DB held
+  `45 629`.
+
+## [0.9.6] - 2026-05-27
+
+- **C/C++ `#include` resolution — bare-basename includes now connect to the
+  actual header file, not a phantom import node (#453).** Path-prefixed
+  includes (`#include "common/args.h"`) already resolved via file-path
+  suffix matching, but bare-basename includes (`#include "uint256.h"` from a
+  caller in another directory) used to leave only a phantom edge to a
+  floating `import` node owned by the including file. The resolver now walks
+  C/C++ include search directories — pulled from `compile_commands.json`
+  (`-I`/`-isystem` flags) when present, otherwise discovered by probing
+  conventional dirs (`include/`, `src/`, `lib/`, `api/`, `inc/`) plus any
+  top-level directory containing `.h`/`.hpp` files — and resolves the
+  include to a real file node, producing a true file→file `imports` edge.
+  System headers (`<stdio.h>`, `<vector>`, `<iostream>`, ~80 C and ~80 C++
+  stdlib names) are filtered before the scan so they don't false-resolve
+  via heuristic dir matching. C/C++ built-in symbols (`std::*` unconditionally,
+  plus `printf`/`malloc`/`cout`/`make_shared`/etc. when **no user-defined
+  symbol with that name exists**) are filtered from name-matching too —
+  C/C++ projects routinely shadow stdlib names (custom allocators, stream
+  wrappers, logging libs), so the filter only fires when there's no real
+  definition to bind to. Measured on bitcoin-core (1,989 indexed files):
+  C/C++ file→file `imports` edges 6,027 → 8,086 (**+34%**), false-positive
+  call edges from `std::move`/`std::swap` etc. into similarly-named user
+  methods −2,154 (**−3.6%** of C/C++ `calls`).
+- **Enterprise Spring / MyBatis flow now traces end-to-end (#389).** Three gaps that previously forced agents back to grep on large Spring/MyBatis codebases are closed:
+  - **MyBatis XML mapper indexing + Java↔XML bridge.** `*.xml` files containing `<mapper namespace="...">` are now first-class: each `<select|insert|update|delete id="X">` and `<sql id="X">` becomes a method-shaped node qualified as `<namespace>::<id>`, and a new synthesizer (`mybatis-java-xml`) links the matching Java mapper interface method → its XML statement with a `calls` edge. `<include refid="...">` to a `<sql>` fragment in the same mapper also resolves. Non-mapper XML (`pom.xml`, `web.xml`, `log4j.xml`, etc.) emits just a file node — no symbol noise. Validated on macrozheng/mall-tiny: all 6 custom-SQL Java mapper methods reach their XML counterparts; `trace(UmsRoleController.listResource, UmsResourceMapper::getResourceListByRoleId-xml)` connects in 4 hops across controller → service-iface → impl → mapper-iface → XML.
+  - **Spring `@Value`/`@ConfigurationProperties` config-key linkage.** `application.{yml,yaml,properties}` (+ profile variants `application-dev.yml`, `bootstrap.yml`, etc.) is parsed during indexing, with one `constant` node per leaf key qualified by its dotted path (`app.cache.name.user-token`). `@Value("${app.cache.name.user-token}")` and `@ConfigurationProperties(prefix = "app.cache")` references in Java/Kotlin emit binding nodes that resolve to the matching key (or, for `@ConfigurationProperties`, a key under the prefix). Spring's **relaxed binding** applies (kebab `cache-list` ↔ camel `cacheList` ↔ snake `cache_list` ↔ `CACHE_LIST`), so a Java `@Value("${app.retryCount}")` finds `app.retry-count` in `application.properties`. `${key:default}` form is supported; the default is stripped before lookup.
+  - **Field-injected concrete-bean trace.** A Spring controller's `@Resource(name="userBO") private UserBO userbo;` followed by `this.userbo.toLogin2(...)` now resolves through to `UserBO.toLogin2` even when the field type is a concrete class whose name doesn't match the field by Java naming convention (`userbo` → `UserBO`). The fix is two layered changes in the language layer (Java only): (a) the call extractor unwraps `this.<field>` receivers (previously surfaced as `this.userbo.toLogin2` and dropped through every name-matcher strategy); (b) the resolver looks up the receiver name in the enclosing class's field declarations and uses the declared type to resolve the method. This generalizes beyond Spring — any Java code using `this.field.method()` now resolves correctly.
+
+### Fixed
+- **Java/Kotlin imports now disambiguate same-name classes across modules (#314).** A Maven multi-module project where `dao/converter/FooConverter` and `service/converter/FooConverter` both expose a `convert` method used to resolve via file-path proximity — picking whichever class was closer to the caller, which is wrong any time the caller lives in an equidistant cross-cutting module. The import resolver had no Java branch at all (`extractImportMappings` returned `[]` for `.java`/`.kt`), so the FQN signal Java imports carry — `import com.example.dao.converter.FooConverter;` — was being thrown away. New `extractJavaImports` parses regular and `import static` directives. `resolveViaImport` now has a Java/Kotlin cross-file branch that converts the imported FQN to a file-path suffix (`com/example/dao/converter/FooConverter.java`) and resolves the symbol against the file whose path matches. For the `@Autowired private FooConverter fooConverter; fooConverter.convert(...)` field-receiver pattern (Spring's typical shape), `matchMethodCall` now passes the imported FQN to `resolveMethodOnType` so when multiple `FooConverter::convert` candidates exist, the import — not iteration order — picks the right one. Validated end-to-end on a synthetic two-module repro: swapping only the `import` line on the caller (with identical field declaration and call site) switches the resolved target between dao and service correctly. On spring-petclinic, +15 newly import-resolved Java edges with no regression in `calls`/`imports`/`extends`.
+- **TypeScript `type` aliases with object shapes no longer cause cross-module false-positive call edges (#359).** Receiver-typed `handle.stop()` where `handle: RecorderHandle` and `RecorderHandle = { stop: () => Promise<void> }` used to attach the call edge to an unrelated `class Foo { stop() {} }` in a sibling directory via path-proximity matching, because the type alias had no `stop` node — only the look-alike class did. The fix surfaces type-alias object-shape members (and intersection-type members) as first-class `property`/`method` nodes under the alias: `type X = { foo: T; bar(): T }` now produces `X::foo` and `X::bar` in the graph. Function-typed properties (`stop: () => Promise<void>`) are emitted as `method` kind so `obj.stop()` resolves to them; non-function properties remain `property` kind. With the alias's members in the graph, the existing camelCase receiver-name word overlap (`recorder` ↔ `RecorderHandle`) routes the call to the correct alias member instead of the wrong class. Anonymous nested object types inside generic arguments (`Promise<{ ok: true }>`) intentionally don't produce phantom members — only immediate `object_type` / `intersection_type` operands of the alias value are walked. Measured on excalidraw/excalidraw (314 .ts files): **+776 new property nodes** + **+1,008 method nodes from type-alias members** + **+226 newly accurate `calls` edges** pointing at alias members (some shifted from incorrect class targets, some previously unresolved).
+- **C# now produces `references` edges for parameter, return, property, and field types (#381).** Indexing any C# project used to yield **zero** `references` edges, so `codegraph_callers SomeDto` returned no results even when the DTO was used as a parameter or return type across the codebase, and `codegraph_callees` on a service class only saw its `using` imports. Two root causes: `csharp.ts` was missing `returnField`, and the type-leaf walker only matched `type_identifier` nodes — but C# tree-sitter emits `identifier`/`predefined_type`/`qualified_name`/`generic_name` instead. The fix adds the missing extractor field, routes C# through a dedicated type walker that only descends into known type-position fields (so parameter NAMES like `request` in `Build(UserDto request)` never mis-emit as type refs), and hooks `extractField`/`extractProperty` to invoke the walker. Measured on dotnet/eShop (527 `.cs` files): C# `references` edges go from **35 → 925** (+26x), with no regression in `calls`/`imports`/`instantiates`/`extends`/`implements`.
+- **Go cross-package qualified calls (`pkga.FuncX(...)`) now resolve to the right package (#388).** On a Go monorepo with a layered package layout (handler/service/domain/dao), `codegraph_callers`, `_callees`, `_impact`, and `_trace` used to return ~0-1 results where grep finds hundreds to thousands of real call sites — the central value proposition of CodeGraph silently degraded on entire Go codebases. Root cause: the import resolver flagged every Go import path without `/internal/` as third-party (because it had no idea what the project's own module path was), so cross-package calls fell through to name-matching with path-proximity scoring, which on real codebases picks ~one accidental candidate per call site. The Go branch now reads the project's `go.mod`, treats `<module-path>/...` imports as in-module, and looks up the qualified symbol in the imported package's directory; same-name functions in *different* packages no longer collide. As a side fix, Go nodes now correctly carry `is_exported=1` for capitalized identifiers (the resolver needs this to filter candidates). Measured on gRPC-Go (1,031 `.go` files, layered packages): cross-package `calls` edges go from 10,880 → 19,929 (**+83%**), total `calls` from 23,803 → 34,105 (**+43%**), with no false-positive resolution of stdlib calls (`fmt.Println` etc. stay external).
+- **`codegraph_files` now returns the whole project when an agent passes `path="/"`, `"."`, `"./"`, `""`, or a Windows-style `"\\"` — instead of "No files found matching the criteria."** Indexed file paths are stored as project-relative POSIX (e.g. `src/foo.ts`), but the path filter used a plain `startsWith`, so a leading slash or any of the other root-ish shapes an agent might guess matched nothing and pushed the agent back to Read/Glob — the exact opencode + Gemini Flash regression reported on Windows 11. Subdirectory filters are now equally forgiving: `"/src"`, `"./src"`, `"src/"`, `"src\\components"`, etc. all resolve correctly. Sibling-prefix bleed (`"src"` was previously matching `src-utils/...`) is also fixed — the filter now requires either an exact match or a `<filter>/` boundary. Closes #426.
+- **File watcher no longer marks edited files as fresh when another process holds the index lock.** When a second writer (concurrent `codegraph index`, a git hook, another MCP daemon) held `.codegraph/codegraph.lock`, `CodeGraph.sync()` returned a zero-shape no-op instead of throwing. The file watcher took that as a successful sync and cleared `pendingFiles` — so the per-file staleness signal MCP tools surface to agents (issue #403) dropped immediately, even though the edit was never indexed. `CodeGraph.watch()` now converts that no-op into a typed `LockUnavailableError` thrown into the watcher; the existing retry path preserves `pendingFiles` and reschedules until the lock becomes available. The error is logged at debug only (no `onSyncError` callback) so a long-running external indexer doesn't spam stderr every debounce cycle. Closes #449.
+- **TS/JS top-level initializer calls and inline-object-method calls are no longer dropped.** Calls inside a top-level variable initializer (`const token = getTokenMp()`) and inside methods of an inline object literal (`{ methods: { save() { getTokenMp() } } }`) were never walked by the variable / method-definition extractors, so `getTokenMp` showed up nowhere in `codegraph_callers`. The variable extractor now walks any non-object initializer value for calls; the method-definition extractor still avoids creating synthetic nodes for inline-object methods (the noise reason is unchanged) but now walks their bodies so the calls inside aren't lost. Surfaces in plain `.ts`/`.js` files (top-level `const x = foo()`) and in Vue SFCs (`<script setup>` initializers + classic Options API `methods: {...}` / `setup()`), where the bug was originally reported. Closes #425.
+- **Watch sync no longer aborts with `FOREIGN KEY constraint failed`.** PR #62 plugged this FK violation at the extraction layer (empty-named nodes whose containment edges had no target), but the same violation kept reappearing on v0.9.5 during the daemon's *watch sync* — not on initial index. Once an agent's daemon had been running long enough to accumulate edits, a resolver lookup that crossed a framework-specific cache could hand back a node whose row had been removed by a recent file rewrite, and the FK check then aborted the entire resolution batch, leaving the user's daemon log filling with `Watch sync failed { error: 'FOREIGN KEY constraint failed' }`. `QueryBuilder.insertEdges` now validates every batch's endpoints against the `nodes` table directly (one fresh `SELECT id IN (...)` per batch, no cache) and silently skips edges with missing source or target — so a stale lookup result drops one edge instead of aborting the whole sync. Surfaces as a fresh `codegraph init`/`index` cycle now surviving its first watch-sync cycle without the FK error, and the daemon recovering naturally instead of compounding into further failures. Closes #455.
+- **Hermes Agent: `codegraph install --target hermes` no longer corrupts `~/.hermes/config.yaml`.** Hermes serializes its config with PyYAML's default block style, which writes list items at the *same* indent as the parent mapping key (`cli:` and `- hermes-cli` both at column 2). The previous line-based YAML patcher mistook that first `  - hermes-cli` for the next sibling key, truncated the `cli:` block, and then spliced `- mcp-codegraph` at indent 4 *before* the existing items — leaving subsequent entries (`- browser`, `- clarify`, …) and even other platforms (`telegram:`, `discord:`) appearing at the `platform_toolsets:` level, which is no longer parseable YAML. The installer now recognizes the same-indent list style, finds the real end of the block at the next sibling key, and appends `- mcp-codegraph` at whatever indent the existing items already use. Re-installing on an already-corrupted file (or a 4-space-nested config that worked before) still produces a clean, parseable result. Closes #456.
+- **NestJS: `RouterModule.register([...])` route prefixes now propagate to controller routes.** Previously a controller declared inside a module wired through NestJS's `RouterModule` (a common pattern for modular apps with nested route prefixes) was indexed with its raw `@Controller(...) + @Get(...)` path — so `UsersController` under `RouterModule.register([{ path: 'admin', module: AdminModule, children: [{ path: 'users', module: UsersModule }] }])` showed up as `GET /` instead of `GET /admin/users`. The new cross-file pass walks every `*.module.{ts,js}` for `RouterModule.register/forRoot/forChild([...])` (recursive `children`) and `@Module({ controllers: [...] })`, then prepends the correct prefix to each affected route — including non-empty `@Controller` paths and method-level params (`/admin/users/:id`). The route node's `id` is preserved across the update so existing route→handler edges stay intact, and the pass is idempotent so incremental sync recovers when `app.module.ts` itself is edited. Closes #459.
+- **C++ callers now resolve through typed member pointers (#445/#454).** `codegraph callers CDetect::Processing` previously returned nothing for call sites like `m_cpAlg->Processing()` because (a) `field_expression` calls weren't kept as receiver-qualified references, (b) out-of-line method definitions (`int CDetect::Processing() {...}` in `.cpp` while the class is in `.hpp` — typical C++ layout) weren't surfaced as class methods, and (c) the resolver had no way to bridge a `Type* receiver` declaration to its method calls. Calls through typed object pointers, references, and stack values now resolve to the right class's method, including the common ambiguous-name case (two classes with a shared method name) and call sites embedded in `return ptr->m()` or `Type x = ptr->m()` forms. Measured on bitcoin-core (1306 .cpp files): +6.1% C++ caller edges resolved end-to-end.
+
+### Added
+- **Installer targets for Gemini CLI and the Antigravity IDE.** `codegraph install` (and the interactive prompt) now detect and configure two more agents out of the box:
+  - **Gemini CLI** (also covers the rebranded Antigravity CLI) — writes `mcpServers.codegraph` to `~/.gemini/settings.json` (global) or `./.gemini/settings.json` (local), and the codegraph usage block into `~/.gemini/GEMINI.md` / `./GEMINI.md`. Existing top-level settings (e.g. `security.auth`) and sibling MCP servers are preserved.
+  - **Antigravity IDE** — writes `mcpServers.codegraph` to Antigravity's unified MCP config at `~/.gemini/config/mcp_config.json` (post-migration, signalled by the `.migrated` marker Antigravity itself drops). Falls back to the legacy `~/.gemini/antigravity/mcp_config.json` for users on a pre-migration Antigravity build. On install, a stale codegraph entry in the legacy path is migrated to the new file automatically. Uninstall sweeps both. Antigravity-managed sibling fields (e.g. the `"disabled": true` flag the IDE adds when a user disables a server through the UI) are preserved across re-installs.
+  - The Antigravity entry omits the `type: "stdio"` field the other targets use — Antigravity rejects entries that carry it.
+  - On macOS, the Antigravity entry resolves `codegraph` to its absolute path at install time (e.g. an nvm-managed `~/.nvm/.../bin/codegraph`). macOS GUI apps launched from Dock/Finder get a stripped PATH that doesn't include nvm, so a bare command name fails to spawn — even when `which codegraph` works in your shell. Linux GUI apps inherit user PATH and Windows uses env `PATH` directly, so both keep the bare command.
+  - The IDE shares `GEMINI.md` with Gemini CLI, so the two targets compose naturally when both are installed; the antigravity target deliberately doesn't touch `GEMINI.md` so uninstalling Antigravity alone leaves CLI instructions intact.
+
+  Both targets are tested on the same parameterized contract as the existing five agents (idempotent install, sibling preservation, install/uninstall round-trip), with extra coverage for migration-marker detection, legacy → unified entry migration, sibling `disabled` field preservation, and the cross-target case where Gemini CLI and Antigravity IDE coexist in the same `~/.gemini/`. Closes #399.
+- **Installer target for Kiro (CLI + IDE).** `codegraph install` now detects and configures Kiro out of the box on macOS, Linux, and Windows. Writes `mcpServers.codegraph` to `~/.kiro/settings/mcp.json` (global) or `./.kiro/settings/mcp.json` (local), and the codegraph usage block into a dedicated `~/.kiro/steering/codegraph.md` / `./.kiro/steering/codegraph.md` — Kiro's steering system loads every `*.md` file in `steering/` as agent context, so a dedicated file is the natural surface (no marker-based merging required). Sibling MCP servers in `mcp.json` and unrelated steering files (`product.md`, `tech.md`, etc.) are preserved across install / uninstall. Tested on the same parameterized contract as the other agent targets (idempotent install, sibling preservation, install/uninstall round-trip). Closes #385.
 ## [0.9.5] - 2026-05-25
 
 ### Added
@@ -172,6 +263,16 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/design/mixed-ios-and-react-native-bridging.md`.
 
 ### Fixed
+- **TypeScript interface members now produce `references` edges to their
+  annotated types (#432).** Types that appeared only in an interface's
+  property or method signatures — e.g. `value?: Partial<IPage>` or
+  `fetchPage(arg: IPage): IOrderField` — were being silently dropped at
+  extraction time, so `codegraph_impact`/`codegraph_callers` on the named
+  type missed every consumer that imported it just to use it in an
+  interface shape. The walker now extracts type annotations from both
+  `property_signature` and `method_signature` nodes inside class-like
+  parents (interfaces, classes), and the resolver wires the resulting
+  references the same way it wires field and parameter types elsewhere.
 - **Git worktrees no longer silently borrow another tree's index (#155).**
   When a worktree is nested inside the main checkout — exactly what agent
   tools that place worktrees under gitignored paths like
@@ -859,3 +960,4 @@ Thank you.
   ```
 
 [0.7.6]: https://github.com/colbymchenry/codegraph/releases/tag/v0.7.6
+[0.9.6]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.6

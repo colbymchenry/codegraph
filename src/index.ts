@@ -46,7 +46,7 @@ import {
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
-import { FileWatcher, WatchOptions, PendingFile } from './sync';
+import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 
 // Re-export types for consumers
 export * from './types';
@@ -75,7 +75,7 @@ export {
   defaultLogger,
 } from './errors';
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
-export { FileWatcher, WatchOptions, PendingFile } from './sync';
+export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 export { MCPServer } from './mcp';
 
 /**
@@ -325,6 +325,7 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
+        const before = this.queries.getNodeAndEdgeCount();
         const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
 
         // Re-detect frameworks now that the index is populated. The resolver
@@ -336,6 +337,9 @@ export class CodeGraph {
         // chance to see the actual project before resolution runs.
         if (result.success && result.filesIndexed > 0) {
           this.resolver.initialize();
+          // Cross-file finalization (e.g. NestJS RouterModule prefixes). Runs
+          // before resolution so updated names show up in subsequent reads.
+          this.resolver.runPostExtract();
         }
 
         // Resolve references to create call/import/extends edges
@@ -362,6 +366,15 @@ export class CodeGraph {
         // Cheap and non-blocking; never load-bearing for correctness.
         if (result.success && result.filesIndexed > 0) {
           this.db.runMaintenance();
+        }
+
+        // The orchestrator only sees extraction-phase counts; resolution and
+        // synthesizer edges (often >50% of the graph on JVM repos) come later.
+        // Recompute against the DB so the CLI summary reports the true totals.
+        if (result.success && result.filesIndexed > 0) {
+          const after = this.queries.getNodeAndEdgeCount();
+          result.nodesCreated = after.nodes - before.nodes;
+          result.edgesCreated = after.edges - before.edges;
         }
 
         return result;
@@ -405,6 +418,14 @@ export class CodeGraph {
       }
       try {
         const result = await this.orchestrator.sync(options.onProgress);
+
+        // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
+        // every sync that touched files so edits to `app.module.ts` propagate
+        // to controllers in unchanged files. The pass is idempotent and cheap
+        // (regex over *.module.ts only).
+        if (result.filesAdded > 0 || result.filesModified > 0) {
+          this.resolver.runPostExtract();
+        }
 
         // Resolve references if files were updated
         if (result.filesAdded > 0 || result.filesModified > 0) {
@@ -484,6 +505,14 @@ export class CodeGraph {
       this.projectRoot,
       async () => {
         const result = await this.sync();
+        // sync() returns this exact zero-shape iff it failed to acquire the
+        // file lock (a real empty sync always has filesChecked > 0 because
+        // scanDirectory ran). Surface that to the watcher as a typed error
+        // so it keeps pendingFiles + reschedules instead of clearing them
+        // (#449).
+        if (result.filesChecked === 0 && result.durationMs === 0) {
+          throw new LockUnavailableError();
+        }
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
         return { filesChanged, durationMs: result.durationMs };
       },

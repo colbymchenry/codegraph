@@ -20,6 +20,7 @@ export type Location = 'global' | 'local';
  * registry. Keep these short and lowercase.
  */
 export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'kimi';
+export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro';
 
 /**
  * Result of `target.detect(location)`.

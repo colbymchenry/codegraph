@@ -46,6 +46,20 @@ export interface WatchOptions {
 }
 
 /**
+ * Thrown by a `syncFn` to signal that the underlying sync couldn't acquire
+ * the cross-process write lock (#449). The watcher treats this as "no
+ * progress" — preserves `pendingFiles`, skips `onSyncComplete`, and the
+ * `finally` block reschedules. Quiet (debug-only) because a long-running
+ * external indexer can hit this every debounce cycle.
+ */
+export class LockUnavailableError extends Error {
+  constructor(message = 'CodeGraph file lock unavailable; another process is writing') {
+    super(message);
+    this.name = 'LockUnavailableError';
+  }
+}
+
+/**
  * Per-file pending entry — tracks a source file the watcher saw an event for
  * but hasn't yet synced into the index. Exposed via {@link FileWatcher.getPendingFiles}
  * so MCP tool responses can mark stale results without forcing a wait.
@@ -352,11 +366,20 @@ export class FileWatcher {
       }
       this.onSyncComplete?.(result);
     } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      logWarn('Watch sync failed', { error: error.message });
+      if (err instanceof LockUnavailableError) {
+        // Lock-failure no-op (another writer holds the lock). pendingFiles
+        // stays intact and the `finally` block reschedules. Debug-only —
+        // a long external index would otherwise spam stderr every cycle.
+        logDebug('Watch sync skipped: file lock unavailable', {
+          pendingFiles: this.pendingFiles.size,
+        });
+      } else {
+        const error = err instanceof Error ? err : new Error(String(err));
+        logWarn('Watch sync failed', { error: error.message });
+        this.onSyncError?.(error);
+      }
       // Failure: leave pendingFiles untouched. Every edit it tracks is
       // still unindexed; the rescheduled sync sees the same set.
-      this.onSyncError?.(error);
     } finally {
       this.syncing = false;
 

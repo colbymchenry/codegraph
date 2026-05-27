@@ -205,6 +205,38 @@ export interface User {
     });
   });
 
+  it('should extract type references from interface property signatures', () => {
+    const code = `
+import type { IPage } from '../PromoterList';
+import type { IOrderField } from '../types';
+
+interface Hprops {
+  value?: Partial<IPage> & Partial<IOrderField>;
+}
+`;
+    const result = extractFromSource('HeaderFilter.ts', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(refs.some((r) => r.referenceName === 'IPage')).toBe(true);
+    expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
+  });
+
+  it('should extract type references from interface method signatures', () => {
+    const code = `
+import type { IPage } from '../PromoterList';
+import type { IOrderField } from '../types';
+
+interface MethodForm {
+  fetchPage(arg: IPage): IOrderField;
+}
+`;
+    const result = extractFromSource('MethodForm.ts', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(refs.some((r) => r.referenceName === 'IPage')).toBe(true);
+    expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
+  });
+
   it('should track function calls', () => {
     const code = `
 function main() {
@@ -485,6 +517,20 @@ export const authMachine = createMachine({
     const varNode = result.nodes.find((n) => n.kind === 'constant' && n.name === 'authMachine');
     expect(varNode).toBeDefined();
     expect(varNode?.isExported).toBe(true);
+  });
+
+  it('should extract calls from a top-level variable initializer (issue #425)', () => {
+    const code = `
+import { getTokenMp } from './api/upload';
+
+const token = getTokenMp();
+`;
+    const result = extractFromSource('app.ts', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(call).toBeDefined();
   });
 });
 
@@ -767,6 +813,130 @@ public class Calculator {
     const methodNode = result.nodes.find((n) => n.kind === 'method' && n.name === 'add');
     expect(methodNode).toBeDefined();
     expect(methodNode?.isStatic).toBe(true);
+  });
+
+  it('wraps top-level declarations in a namespace from package_declaration', () => {
+    const code = `
+package com.example.foo;
+
+public class Bar {
+    public String greet() { return "hi"; }
+}
+`;
+    const result = extractFromSource('Bar.java', code);
+
+    const ns = result.nodes.find((n) => n.kind === 'namespace');
+    expect(ns?.name).toBe('com.example.foo');
+
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('com.example.foo::Bar');
+
+    const greet = result.nodes.find((n) => n.kind === 'method' && n.name === 'greet');
+    expect(greet?.qualifiedName).toBe('com.example.foo::Bar::greet');
+  });
+
+  it('does not wrap when no package is declared', () => {
+    const code = `
+public class Bar {
+    public String greet() { return "hi"; }
+}
+`;
+    const result = extractFromSource('Bar.java', code);
+    expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('Bar');
+  });
+
+  it('extracts anonymous-class overrides from `new T() { ... }`', () => {
+    // The pattern that breaks the trace through `strategy.foo()` in
+    // libraries like guava's Splitter: the lambda-returned anonymous
+    // class overrides abstract methods on the base, but without
+    // extracting those overrides the interface→impl synthesizer has
+    // nothing to bridge.
+    const code = `
+package com.example;
+
+abstract class Base {
+  abstract int compute(int x);
+}
+
+public class Factory {
+  public Base make() {
+    return new Base() {
+      @Override
+      int compute(int x) { return x + 1; }
+    };
+  }
+}
+`;
+    const result = extractFromSource('Factory.java', code);
+
+    const anon = result.nodes.find((n) => n.kind === 'class' && /Base\$anon@/.test(n.name));
+    expect(anon, 'anonymous Base subclass should be extracted as a class').toBeDefined();
+
+    const compute = result.nodes.find(
+      (n) => n.kind === 'method' && n.name === 'compute' && n.qualifiedName.includes('$anon@')
+    );
+    expect(compute, 'override method should be a method on the anon class').toBeDefined();
+    expect(compute!.qualifiedName).toContain('Factory::make::<Base$anon@');
+    expect(compute!.qualifiedName.endsWith('::compute')).toBe(true);
+
+    // Anon class must extend Base so Phase 5.5 (interface-impl) can bridge.
+    const extendsRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'extends' && r.referenceName === 'Base' && r.fromNodeId === anon!.id
+    );
+    expect(extendsRef, 'anon class should carry an `extends Base` reference').toBeDefined();
+
+    // The enclosing `make` method still emits an instantiates edge to Base —
+    // anon extraction must not swallow that signal.
+    const instantiatesRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'Base'
+    );
+    expect(instantiatesRef, 'enclosing method should still instantiate Base').toBeDefined();
+  });
+
+  it('extracts anonymous-class overrides inside a lambda body', () => {
+    // The exact guava pattern: a lambda is passed to a constructor, and the
+    // lambda body returns `new T() { @Override ... }`. The anon class must
+    // still surface even though it sits inside a lambda_expression node.
+    const code = `
+package com.example;
+
+interface Strategy {
+  java.util.Iterator<String> iterator(String s);
+}
+
+abstract class BaseIter implements java.util.Iterator<String> {
+  abstract int separatorStart(int start);
+}
+
+public class Splitter {
+  private final Strategy strategy;
+  public Splitter(Strategy s) { this.strategy = s; }
+
+  public static Splitter on(char c) {
+    return new Splitter((seq) ->
+        new BaseIter() {
+          @Override
+          int separatorStart(int start) { return start + 1; }
+          @Override public boolean hasNext() { return false; }
+          @Override public String next() { return null; }
+        });
+  }
+}
+`;
+    const result = extractFromSource('Splitter.java', code);
+
+    const anon = result.nodes.find((n) => n.kind === 'class' && /BaseIter\$anon@/.test(n.name));
+    expect(anon, 'anon BaseIter inside the lambda body should be extracted').toBeDefined();
+
+    const sepStart = result.nodes.find(
+      (n) =>
+        n.kind === 'method' &&
+        n.name === 'separatorStart' &&
+        n.qualifiedName.includes('$anon@')
+    );
+    expect(sepStart, 'override inside the lambda-returned anon class should be a method node').toBeDefined();
   });
 });
 
@@ -1126,6 +1296,54 @@ interface WebSocket {
     expect(methodNames).toContain('request');
     expect(methodNames).toContain('send');
     expect(methodNames).toContain('cancel');
+  });
+
+  it('wraps top-level declarations in a namespace from package_header', () => {
+    const code = `
+package com.example.foo
+
+class Bar {
+  fun greet(): String = "hi"
+}
+
+fun util(): Int = 42
+`;
+    const result = extractFromSource('Bar.kt', code);
+
+    const ns = result.nodes.find((n) => n.kind === 'namespace');
+    expect(ns?.name).toBe('com.example.foo');
+
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('com.example.foo::Bar');
+
+    const greet = result.nodes.find((n) => n.kind === 'method' && n.name === 'greet');
+    expect(greet?.qualifiedName).toBe('com.example.foo::Bar::greet');
+
+    const util = result.nodes.find((n) => n.kind === 'function' && n.name === 'util');
+    expect(util?.qualifiedName).toBe('com.example.foo::util');
+  });
+
+  it('handles a single-segment package', () => {
+    const code = `
+package foo
+
+class Bar
+`;
+    const result = extractFromSource('Bar.kt', code);
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('foo::Bar');
+  });
+
+  it('does not wrap when no package is declared', () => {
+    const code = `
+class Bar {
+  fun greet() = "hi"
+}
+`;
+    const result = extractFromSource('Bar.kt', code);
+    expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('Bar');
   });
 });
 
@@ -2023,6 +2241,27 @@ end
       expect(names).toContain('iostream');
       expect(names).toContain('vector');
       expect(names).toContain('config.h');
+    });
+
+    it('should create unresolved references for local includes', () => {
+      const code = `#include "myheader.h"`;
+      const result = extractFromSource('main.cpp', code);
+
+      const importRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'myheader.h'
+      );
+      expect(importRef).toBeDefined();
+      expect(importRef?.line).toBe(1);
+    });
+
+    it('should create unresolved references for system includes', () => {
+      const code = `#include <iostream>`;
+      const result = extractFromSource('main.cpp', code);
+
+      const importRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'iostream'
+      );
+      expect(importRef).toBeDefined();
     });
   });
 
@@ -3566,6 +3805,53 @@ function increment(): void {
     for (const node of result.nodes) {
       expect(node.language).toBe('vue');
     }
+  });
+
+  it('should extract calls from top-level <script setup> initializers', () => {
+    const code = `<template>
+  <div>{{ token }}</div>
+</template>
+
+<script setup lang="ts">
+import { getTokenMp } from './api/upload';
+
+const token = getTokenMp();
+</script>
+`;
+    const result = extractFromSource('Issue425Setup.vue', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('should extract calls from Vue Options API object methods', () => {
+    const code = `<template>
+  <button @click="save">Save</button>
+</template>
+
+<script>
+import { getTokenMp } from './api/upload';
+
+export default {
+  methods: {
+    save() {
+      return getTokenMp();
+    }
+  },
+  setup() {
+    return getTokenMp();
+  }
+}
+</script>
+`;
+    const result = extractFromSource('Issue425Options.vue', code);
+
+    const calls = result.unresolvedReferences.filter(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(calls).toHaveLength(2);
   });
 
   it('should extract from both <script> and <script setup> blocks', () => {

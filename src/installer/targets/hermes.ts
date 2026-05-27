@@ -188,6 +188,63 @@ function childRange(lines: string[], parent: LineRange, child: string): LineRang
   return { start, end };
 }
 
+/**
+ * Block-range for a 2-space-indented child whose value is a YAML block list.
+ *
+ * Unlike `childRange`, this handles PyYAML's default `default_flow_style=False`
+ * serialization, where list items sit at the SAME indent as the parent key:
+ *
+ *     cli:
+ *     - hermes-cli       # indent 2 — belongs to cli, not a sibling
+ *     - browser
+ *
+ * `childRange`'s `^  \S` heuristic mistakes that first `  - hermes-cli` line
+ * for the next sibling key and truncates the block, causing inserts to land
+ * before the existing items at a different indent (issue #456). This helper
+ * recognizes a `  - ` line as part of the block instead, and reports back
+ * the actual indent used by existing items so the inserter matches it.
+ */
+function listChildBlock(
+  lines: string[],
+  parent: LineRange,
+  child: string,
+): (LineRange & { itemIndent: string }) | null {
+  const startPattern = new RegExp(`^  ${escapeRegExp(child)}:\\s*(?:#.*)?$`);
+  let start = -1;
+  for (let i = parent.start + 1; i < parent.end; i++) {
+    if (startPattern.test(lines[i] ?? '')) {
+      start = i;
+      break;
+    }
+  }
+  if (start === -1) return null;
+
+  let end = parent.end;
+  for (let i = start + 1; i < parent.end; i++) {
+    const line = lines[i] ?? '';
+    if (line.trim() === '') continue;
+    const indentMatch = line.match(/^( *)/);
+    const indent = indentMatch?.[1]?.length ?? 0;
+    if (indent >= 4) continue;
+    if (indent === 2 && /^  - /.test(line)) continue;
+    end = i;
+    break;
+  }
+  while (end > start + 1 && (lines[end - 1] ?? '').trim() === '') {
+    end--;
+  }
+
+  let itemIndent = '    ';
+  for (let i = start + 1; i < end; i++) {
+    const m = (lines[i] ?? '').match(/^( +)- /);
+    if (m && m[1]) {
+      itemIndent = m[1];
+      break;
+    }
+  }
+  return { start, end, itemIndent };
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -251,7 +308,7 @@ function removeCodeGraphMcpServer(content: string): string {
 function upsertCodeGraphToolset(content: string): string {
   const lines = splitLines(content);
   const parent = topLevelRange(lines, 'platform_toolsets');
-  const cli = parent ? childRange(lines, parent, 'cli') : null;
+  const cli = parent ? listChildBlock(lines, parent, 'cli') : null;
 
   if (!parent) {
     if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
@@ -270,14 +327,14 @@ function upsertCodeGraphToolset(content: string): string {
     .some((line) => line.trim() === '- mcp-codegraph');
   if (hasEntry) return joinLines(lines);
 
-  lines.splice(cli.end, 0, '    - mcp-codegraph');
+  lines.splice(cli.end, 0, `${cli.itemIndent}- mcp-codegraph`);
   return joinLines(lines);
 }
 
 function removeCodeGraphToolset(content: string): string {
   const lines = splitLines(content);
   const parent = topLevelRange(lines, 'platform_toolsets');
-  const cli = parent ? childRange(lines, parent, 'cli') : null;
+  const cli = parent ? listChildBlock(lines, parent, 'cli') : null;
   if (!cli) return content;
 
   const hasEntry = lines

@@ -29,6 +29,19 @@ jobs:
           # Default checkout is detached at a SHA; we need an actual branch
           # so the CHANGELOG-promote commit knows where to push.
           ref: ${{ github.ref }}
+          # Authenticate as the maintainer (admin), not as github-actions[bot].
+          # The "Require PR approval for main branch" ruleset only lets the
+          # Admin repo role bypass — and GitHub blocks adding the GitHub
+          # Actions integration to bypass_actors on user-owned (non-org)
+          # repos with "Actor GitHub Actions integration must be part of
+          # the ruleset source or owner organization." So the auto-promote
+          # and auto-sync `git push origin HEAD:main` steps below both fail
+          # under the default GITHUB_TOKEN. Using a fine-grained PAT owned
+          # by the admin makes the push go through cleanly. Set the
+          # RELEASE_PAT secret with: contents:write on this repo, no other
+          # scopes. Rotate per your token policy; the workflow only runs
+          # on manual dispatch so the blast radius is small.
+          token: ${{ secrets.RELEASE_PAT }}
       - uses: actions/setup-node@v6
         with:
           node-version: 22

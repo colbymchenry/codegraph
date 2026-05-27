@@ -12,7 +12,8 @@ import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
 import { matchReference } from '../src/resolution/name-matcher';
-import { resolveImportPath, extractImportMappings } from '../src/resolution/import-resolver';
+import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache } from '../src/resolution/import-resolver';
+import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
 import { QueryBuilder } from '../src/db/queries';
 import { DatabaseConnection } from '../src/db';
@@ -353,6 +354,116 @@ from ..services import auth_service
     });
   });
 
+  describe('JVM FQN Import Resolution', () => {
+    // Build a ResolutionContext stub whose getNodesByQualifiedName answers
+    // from a fixed table — the only context method resolveJvmImport touches.
+    const makeContext = (byQName: Record<string, Node[]>): ResolutionContext => ({
+      getNodesInFile: () => [],
+      getNodesByName: () => [],
+      getNodesByQualifiedName: (q) => byQName[q] ?? [],
+      getNodesByKind: () => [],
+      fileExists: () => false,
+      readFile: () => null,
+      getProjectRoot: () => '',
+      getAllFiles: () => [],
+    });
+    const node = (id: string, name: string, qualifiedName: string, kind: Node['kind'] = 'class', language: Node['language'] = 'kotlin'): Node => ({
+      id, kind, name, qualifiedName,
+      filePath: 'Models.kt', language,
+      startLine: 1, endLine: 1, startColumn: 0, endColumn: 0,
+      updatedAt: 0,
+    });
+    const importRef = (referenceName: string, language: Node['language'] = 'kotlin'): UnresolvedRef => ({
+      fromNodeId: 'caller',
+      referenceName,
+      referenceKind: 'imports',
+      line: 1, column: 0,
+      filePath: 'Caller.kt',
+      language,
+    });
+
+    it('resolves a Kotlin class import by FQN regardless of filename', () => {
+      const target = node('n1', 'Bar', 'com.example.foo::Bar');
+      const ctx = makeContext({ 'com.example.foo::Bar': [target] });
+      const result = resolveJvmImport(importRef('com.example.foo.Bar'), ctx);
+      expect(result?.targetNodeId).toBe('n1');
+      expect(result?.resolvedBy).toBe('import');
+    });
+
+    it('resolves a Kotlin top-level function import by FQN', () => {
+      const util = node('n2', 'util', 'com.example.foo::util', 'function');
+      const ctx = makeContext({ 'com.example.foo::util': [util] });
+      const result = resolveJvmImport(importRef('com.example.foo.util'), ctx);
+      expect(result?.targetNodeId).toBe('n2');
+    });
+
+    it('resolves a Java import by FQN', () => {
+      const target = node('n3', 'Bar', 'com.example.foo::Bar', 'class', 'java');
+      const ctx = makeContext({ 'com.example.foo::Bar': [target] });
+      const result = resolveJvmImport(importRef('com.example.foo.Bar', 'java'), ctx);
+      expect(result?.targetNodeId).toBe('n3');
+    });
+
+    it('resolves cross-language: Kotlin importing a Java class', () => {
+      // The Kotlin file declares `import com.example.JavaBar` — the target is
+      // a Java class node. JVM interop means the resolver doesn't care about
+      // the source language of the target, only that the FQN matches.
+      const target = node('n4', 'JavaBar', 'com.example::JavaBar', 'class', 'java');
+      const ctx = makeContext({ 'com.example::JavaBar': [target] });
+      const result = resolveJvmImport(importRef('com.example.JavaBar'), ctx);
+      expect(result?.targetNodeId).toBe('n4');
+    });
+
+    it('disambiguates a name collision across packages', () => {
+      // Two classes named `Bar` in different packages. Each import resolves
+      // to the one whose FQN matches — not to "whichever was found first".
+      const barA = node('n5a', 'Bar', 'com.example.alpha::Bar');
+      const barB = node('n5b', 'Bar', 'com.example.beta::Bar');
+      const ctx = makeContext({
+        'com.example.alpha::Bar': [barA],
+        'com.example.beta::Bar': [barB],
+      });
+      expect(resolveJvmImport(importRef('com.example.alpha.Bar'), ctx)?.targetNodeId).toBe('n5a');
+      expect(resolveJvmImport(importRef('com.example.beta.Bar'), ctx)?.targetNodeId).toBe('n5b');
+    });
+
+    it('returns null for wildcard imports', () => {
+      const ctx = makeContext({});
+      expect(resolveJvmImport(importRef('com.example.foo.*'), ctx)).toBeNull();
+    });
+
+    it('returns null for unqualified names', () => {
+      // A single-segment name has no package; nothing to look up by FQN.
+      const ctx = makeContext({ 'Bar': [node('n6', 'Bar', 'Bar')] });
+      expect(resolveJvmImport(importRef('Bar'), ctx)).toBeNull();
+    });
+
+    it('returns null for non-JVM languages', () => {
+      const target = node('n7', 'Bar', 'com.example::Bar');
+      const ctx = makeContext({ 'com.example::Bar': [target] });
+      expect(resolveJvmImport(importRef('com.example.Bar', 'typescript'), ctx)).toBeNull();
+    });
+
+    it('returns null for non-imports reference kinds', () => {
+      // The resolver intentionally only acts on `imports` refs; ordinary
+      // `calls`/`extends` refs fall through to the framework + name-matcher
+      // strategies.
+      const target = node('n8', 'Bar', 'com.example::Bar');
+      const ctx = makeContext({ 'com.example::Bar': [target] });
+      const ref: UnresolvedRef = {
+        fromNodeId: 'caller', referenceName: 'com.example.Bar',
+        referenceKind: 'calls', line: 1, column: 0,
+        filePath: 'Caller.kt', language: 'kotlin',
+      };
+      expect(resolveJvmImport(ref, ctx)).toBeNull();
+    });
+
+    it('returns null when the FQN is not in the index', () => {
+      const ctx = makeContext({});
+      expect(resolveJvmImport(importRef('com.example.Unknown'), ctx)).toBeNull();
+    });
+  });
+
   describe('Framework Detection', () => {
     it('should detect React framework', () => {
       const context: ResolutionContext = {
@@ -645,6 +756,298 @@ def bootstrap():
       );
       expect(callsToUserService).toHaveLength(0);
     });
+
+    it('resolves Go cross-package qualified calls via go.mod module path (#388)', async () => {
+      // Pre-#388, every `pkga.FuncX(...)` call in a Go monorepo was flagged
+      // external (isExternalImport returned true for any non-`/internal/`
+      // import without `.`-prefix) and resolution fell through to name-match
+      // with path proximity — recall on cross-package callers was ~<1%.
+      fs.writeFileSync(
+        path.join(tempDir, 'go.mod'),
+        'module github.com/example/myproject\n\ngo 1.21\n'
+      );
+
+      const pkgaDir = path.join(tempDir, 'pkga');
+      const pkgbDir = path.join(tempDir, 'pkgb');
+      const pkgcDir = path.join(tempDir, 'pkgc');
+      fs.mkdirSync(pkgaDir);
+      fs.mkdirSync(pkgbDir);
+      fs.mkdirSync(pkgcDir);
+
+      // Same-name exported function in two packages — only the imported one
+      // should resolve. Exercises disambiguation, not just connectivity.
+      fs.writeFileSync(
+        path.join(pkgaDir, 'conv.go'),
+        'package pkga\nfunc Convert(x int) int { return x * 2 }\n'
+      );
+      fs.writeFileSync(
+        path.join(pkgbDir, 'conv.go'),
+        'package pkgb\nfunc Convert(x int) int { return x + 1 }\n'
+      );
+      fs.writeFileSync(
+        path.join(pkgcDir, 'use.go'),
+        `package pkgc
+
+import "github.com/example/myproject/pkga"
+
+func UsePkga() {
+  pkga.Convert(5)
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const usePkga = cg.getNodesByKind('function').filter((n) => n.name ==='UsePkga')[0];
+      expect(usePkga).toBeDefined();
+
+      const outgoing = cg.getOutgoingEdges(usePkga!.id);
+      const callEdges = outgoing.filter((e) => e.kind === 'calls');
+      expect(callEdges).toHaveLength(1);
+
+      const target = cg.getNode(callEdges[0]!.target);
+      expect(target?.name).toBe('Convert');
+      // Critical: the resolver must pick the imported pkga's Convert,
+      // not pkgb's. With the broken (pre-fix) resolver this lands on
+      // whichever Convert happens to be cheaper under path proximity.
+      expect(target?.filePath.replace(/\\/g, '/')).toBe('pkga/conv.go');
+    });
+
+    it('resolves Go aliased imports across packages (#388)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'go.mod'),
+        'module github.com/example/myproject\n\ngo 1.21\n'
+      );
+      fs.mkdirSync(path.join(tempDir, 'pkgb'));
+      fs.mkdirSync(path.join(tempDir, 'pkgd'));
+
+      fs.writeFileSync(
+        path.join(tempDir, 'pkgb', 'lib.go'),
+        'package pkgb\nfunc Compute(x int) int { return x }\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'pkgd', 'use.go'),
+        `package pkgd
+
+import (
+  "fmt"
+  alias "github.com/example/myproject/pkgb"
+)
+
+func UseAliased() {
+  fmt.Println("hi")
+  alias.Compute(3)
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const useAliased = cg.getNodesByKind('function').filter((n) => n.name ==='UseAliased')[0];
+      expect(useAliased).toBeDefined();
+      const calls = cg.getOutgoingEdges(useAliased!.id).filter((e) => e.kind === 'calls');
+      // fmt.Println is stdlib — must stay external. alias.Compute must resolve.
+      expect(calls).toHaveLength(1);
+      const target = cg.getNode(calls[0]!.target);
+      expect(target?.name).toBe('Compute');
+      expect(target?.filePath.replace(/\\/g, '/')).toBe('pkgb/lib.go');
+    });
+
+    it('TS type_alias object-shape members resolve method calls (#359)', async () => {
+      // Pre-#359, `recorder.stop()` (recorder: RecorderHandle) attached
+      // to `StdioMcpClient.stop` in a sibling directory via path-proximity
+      // because the type_alias had no `stop` node — only the unrelated
+      // class did. Now type_alias produces member nodes (property/method),
+      // so the camelCase receiver↔type word overlap pulls the call to
+      // `RecorderHandle::stop` instead of the look-alike class.
+      fs.mkdirSync(path.join(tempDir, 'voice'));
+      fs.mkdirSync(path.join(tempDir, 'codegraph'));
+
+      fs.writeFileSync(
+        path.join(tempDir, 'voice', 'recorder.ts'),
+        `export type RecorderHandle = {
+  wavPath: string;
+  stop: () => Promise<{ ok: true }>;
+};
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'voice', 'controller.ts'),
+        `import type { RecorderHandle } from "./recorder";
+export async function finaliseRecording(recorder: RecorderHandle) {
+  return await recorder.stop();
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'codegraph', 'stdio-client.ts'),
+        `export class StdioMcpClient {
+  private stopped = false;
+  async stop(): Promise<void> { this.stopped = true; }
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const handleStop = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'RecorderHandle::stop');
+      expect(handleStop).toBeDefined();
+
+      const clientStop = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'StdioMcpClient::stop');
+      expect(clientStop).toBeDefined();
+
+      const handleCallers = cg.getIncomingEdges(handleStop!.id).filter((e) => e.kind === 'calls');
+      const clientCallers = cg.getIncomingEdges(clientStop!.id).filter((e) => e.kind === 'calls');
+      expect(handleCallers.length).toBeGreaterThanOrEqual(1);
+      // The class method must have NO callers — voice/'s call must NOT
+      // mis-attribute. A non-empty list would mean the false-positive
+      // path is still firing.
+      expect(clientCallers).toHaveLength(0);
+
+      // Function-typed property surfaces as a `method` node, not `property`,
+      // because `stop()` semantics at the call site are method semantics.
+      expect(handleStop!.kind).toBe('method');
+    });
+
+    it('Java import disambiguates same-name classes across modules (#314)', async () => {
+      // Pre-#314 the import resolver had no Java branch at all, so a
+      // multi-module Maven repo where `dao/converter/FooConverter` and
+      // `service/converter/FooConverter` both export a `convert` method
+      // resolved by file-path proximity — picking whichever class was
+      // closer to the caller, which is wrong any time the caller lives
+      // in an equidistant cross-cutting module.
+      const daoDir = path.join(tempDir, 'dao/src/main/java/com/example/dao/converter');
+      const serviceDir = path.join(tempDir, 'service/src/main/java/com/example/service/converter');
+      const webDir = path.join(tempDir, 'web/src/main/java/com/example/web');
+      fs.mkdirSync(daoDir, { recursive: true });
+      fs.mkdirSync(serviceDir, { recursive: true });
+      fs.mkdirSync(webDir, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(daoDir, 'FooConverter.java'),
+        `package com.example.dao.converter;
+public class FooConverter { public String convert(String x) { return "dao:" + x; } }
+`
+      );
+      fs.writeFileSync(
+        path.join(serviceDir, 'FooConverter.java'),
+        `package com.example.service.converter;
+public class FooConverter { public String convert(String x) { return "svc:" + x; } }
+`
+      );
+      // The caller imports the SERVICE version — even though dao is
+      // alphabetically/lexically first in the candidate list, the
+      // import must trump that order.
+      fs.writeFileSync(
+        path.join(webDir, 'Handler.java'),
+        `package com.example.web;
+
+import com.example.service.converter.FooConverter;
+
+public class Handler {
+  private FooConverter fooConverter;
+  public String use() { return fooConverter.convert("input"); }
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const use = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'com.example.web::Handler::use');
+      expect(use).toBeDefined();
+      const calls = cg.getOutgoingEdges(use!.id).filter((e) => e.kind === 'calls');
+      expect(calls.length).toBeGreaterThanOrEqual(1);
+
+      const target = cg.getNode(calls[0]!.target);
+      expect(target?.name).toBe('convert');
+      expect(target?.filePath.replace(/\\/g, '/')).toBe(
+        'service/src/main/java/com/example/service/converter/FooConverter.java'
+      );
+    });
+
+    it('C# extracts references from method/property/field types (#381)', async () => {
+      // Pre-#381, every C# project produced ZERO `references` edges:
+      // csharp.ts was missing returnField, and the type-leaf walker
+      // only recognized TS/Java's `type_identifier` nodes — C# uses
+      // `identifier`/`predefined_type`/`qualified_name`/`generic_name`.
+      const srcDir = path.join(tempDir, 'src');
+      fs.mkdirSync(srcDir, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(srcDir, 'Dtos.cs'),
+        `namespace MyApp;
+public class SessionInfoDto { public string Id { get; set; } = ""; }
+public class UserDto { public string Name { get; set; } = ""; }
+`
+      );
+      fs.writeFileSync(
+        path.join(srcDir, 'Service.cs'),
+        `using System.Threading.Tasks;
+namespace MyApp;
+public class DataExporter
+{
+  public SessionInfoDto Build(UserDto user, SessionInfoDto session) { return session; }
+  public Task<SessionInfoDto> BuildAsync(UserDto user) { return Task.FromResult(new SessionInfoDto()); }
+  public SessionInfoDto Latest { get; set; } = new();
+  private UserDto _cached;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const sessionDto = cg
+        .getNodesByKind('class')
+        .find((n) => n.name === 'SessionInfoDto');
+      const userDto = cg
+        .getNodesByKind('class')
+        .find((n) => n.name === 'UserDto');
+      expect(sessionDto).toBeDefined();
+      expect(userDto).toBeDefined();
+
+      const sessionIncoming = cg
+        .getIncomingEdges(sessionDto!.id)
+        .filter((e) => e.kind === 'references');
+      const userIncoming = cg
+        .getIncomingEdges(userDto!.id)
+        .filter((e) => e.kind === 'references');
+
+      // SessionInfoDto: Build return, Build param, BuildAsync return (inside Task<>), Latest property.
+      // UserDto: Build param, BuildAsync param, _cached field.
+      expect(sessionIncoming.length).toBeGreaterThanOrEqual(4);
+      expect(userIncoming.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it('Go: leaves stdlib calls (fmt.Println, etc.) external', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'go.mod'),
+        'module github.com/example/myproject\n\ngo 1.21\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'main.go'),
+        `package main
+
+import "fmt"
+
+func main() {
+  fmt.Println("hi")
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const mainFn = cg.getNodesByKind('function').filter((n) => n.name ==='main')[0];
+      const calls = cg.getOutgoingEdges(mainFn!.id).filter((e) => e.kind === 'calls');
+      // No spurious in-project edge — fmt.* must stay unresolved/external.
+      expect(calls).toHaveLength(0);
+    });
   });
 
   describe('Name Matcher: kind bias for new ref kinds', () => {
@@ -844,6 +1247,360 @@ def bootstrap():
       expect(signInNode).toBeDefined();
       const callers = cg.getCallers(signInNode!.id);
       expect(callers.some((c) => c.node.filePath === 'src/main.ts')).toBe(true);
+    });
+  });
+
+  describe('C/C++ Import Resolution', () => {
+    afterEach(() => {
+      clearCppIncludeDirCache();
+    });
+
+    it('should resolve C include to header in same directory', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: (p) => p === 'utils.h',
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => ['utils.h', 'main.c'],
+      };
+
+      const result = resolveImportPath(
+        'utils.h',
+        'main.c',
+        'c',
+        context
+      );
+
+      expect(result).toBe('utils.h');
+    });
+
+    it('should resolve C++ include with .hpp extension', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: (p) => p === 'include/myclass.hpp',
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => ['include/myclass.hpp', 'src/main.cpp'],
+        getCppIncludeDirs: () => ['include'],
+      };
+
+      const result = resolveImportPath(
+        'myclass.hpp',
+        'src/main.cpp',
+        'cpp',
+        context
+      );
+
+      expect(result).toBe('include/myclass.hpp');
+    });
+
+    it('should resolve include with subdirectory path', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: (p) => p === 'utils/helpers.h',
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => ['utils/helpers.h', 'main.c'],
+      };
+
+      const result = resolveImportPath(
+        'utils/helpers.h',
+        'main.c',
+        'c',
+        context
+      );
+
+      expect(result).toBe('utils/helpers.h');
+    });
+
+    it('should resolve include via include directories', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: (p) => p === 'include/myheader.h',
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => ['include/myheader.h', 'src/main.cpp'],
+        getCppIncludeDirs: () => ['include'],
+      };
+
+      const result = resolveImportPath(
+        'myheader.h',
+        'src/main.cpp',
+        'cpp',
+        context
+      );
+
+      expect(result).toBe('include/myheader.h');
+    });
+
+    it('should resolve include trying multiple extensions', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        // myclass.h does not exist, but myclass.hpp does
+        fileExists: (p) => p === 'include/myclass.hpp',
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => ['include/myclass.hpp', 'src/main.cpp'],
+        getCppIncludeDirs: () => ['include'],
+      };
+
+      const result = resolveImportPath(
+        'myclass',
+        'src/main.cpp',
+        'cpp',
+        context
+      );
+
+      expect(result).toBe('include/myclass.hpp');
+    });
+
+    it('should return null for system headers', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      };
+
+      // C standard library header
+      expect(resolveImportPath('stdio.h', 'main.c', 'c', context)).toBeNull();
+      // C++ standard library header
+      expect(resolveImportPath('vector', 'main.cpp', 'cpp', context)).toBeNull();
+      // C++ C-wrapper header
+      expect(resolveImportPath('cstdio', 'main.cpp', 'cpp', context)).toBeNull();
+    });
+
+    it('should return null for single-component third-party paths that cannot be resolved', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+        getCppIncludeDirs: () => [],
+      };
+
+      // Third-party bare header without path — not resolvable, returns null
+      const result = resolveImportPath(
+        'openssl/ssl.h',
+        'main.cpp',
+        'cpp',
+        context
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it('should not filter project headers with path separators', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: (p) => p === 'mylib/utils.h',
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => ['mylib/utils.h'],
+      };
+
+      // Path with separator should NOT be filtered as external
+      const result = resolveImportPath(
+        'mylib/utils.h',
+        'main.c',
+        'c',
+        context
+      );
+
+      expect(result).toBe('mylib/utils.h');
+    });
+
+    it('should extract C/C++ import mappings from #include directives', () => {
+      const code = `#include <iostream>
+#include "myheader.h"
+#include "utils/helpers.hpp"`;
+
+      const mappings = extractImportMappings('main.cpp', code, 'cpp');
+
+      expect(mappings.length).toBe(3);
+      expect(mappings[0]).toEqual({
+        localName: 'iostream',
+        exportedName: '*',
+        source: 'iostream',
+        isDefault: false,
+        isNamespace: true,
+      });
+      expect(mappings[1]).toEqual({
+        localName: 'myheader',
+        exportedName: '*',
+        source: 'myheader.h',
+        isDefault: false,
+        isNamespace: true,
+      });
+      expect(mappings[2]).toEqual({
+        localName: 'helpers',
+        exportedName: '*',
+        source: 'utils/helpers.hpp',
+        isDefault: false,
+        isNamespace: true,
+      });
+    });
+
+    it('should discover include directories from compile_commands.json', () => {
+      // Create a temp project with compile_commands.json
+      const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-test-'));
+      try {
+        const compileDb = [
+          {
+            directory: tempProject,
+            command: 'g++ -Iinclude -Isrc/lib -isystem /usr/include -c src/main.cpp',
+            file: 'src/main.cpp',
+          },
+        ];
+        fs.writeFileSync(
+          path.join(tempProject, 'compile_commands.json'),
+          JSON.stringify(compileDb)
+        );
+        // Create the include dirs so they exist
+        fs.mkdirSync(path.join(tempProject, 'include'), { recursive: true });
+        fs.mkdirSync(path.join(tempProject, 'src', 'lib'), { recursive: true });
+
+        clearCppIncludeDirCache();
+        const dirs = loadCppIncludeDirs(tempProject);
+
+        // Should find include and src/lib (relative to project root)
+        // /usr/include is absolute and outside project, should be excluded
+        expect(dirs).toContain('include');
+        expect(dirs).toContain('src/lib');
+        expect(dirs.some(d => d.includes('usr'))).toBe(false);
+      } finally {
+        fs.rmSync(tempProject, { recursive: true });
+      }
+    });
+
+    it('should fall back to heuristic include dirs when no compile_commands.json', () => {
+      const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-test-'));
+      try {
+        // Create include/ and src/ directories with headers
+        fs.mkdirSync(path.join(tempProject, 'include'), { recursive: true });
+        fs.writeFileSync(path.join(tempProject, 'include', 'types.h'), '');
+        fs.mkdirSync(path.join(tempProject, 'src'), { recursive: true });
+        fs.writeFileSync(path.join(tempProject, 'src', 'main.cpp'), '');
+        // Create a directory without headers — should not be included
+        fs.mkdirSync(path.join(tempProject, 'docs'), { recursive: true });
+
+        clearCppIncludeDirCache();
+        const dirs = loadCppIncludeDirs(tempProject);
+
+        expect(dirs).toContain('include');
+        expect(dirs).toContain('src');
+        expect(dirs).not.toContain('docs');
+      } finally {
+        fs.rmSync(tempProject, { recursive: true });
+      }
+    });
+
+    // Documents the cross-language `.h` behavior. Objective-C and C++ share
+    // the `.h` extension, so in a mixed iOS-style project an Obj-C header
+    // dir gets claimed as a C/C++ include dir too. That's intentional — a
+    // C++ file legitimately can `#include "Foo.h"` against an Obj-C header
+    // (Obj-C++ / .mm callers), and false-positive inclusion is far cheaper
+    // than missing real resolutions. The test pins this so a later
+    // "exclude objc dirs" refactor breaks loudly and reviewers see the
+    // trade-off explicitly.
+    it('heuristic claims any top-level dir containing .h files, including Obj-C', () => {
+      const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-test-'));
+      try {
+        // C++ side: an `cppmod` dir with a .hpp (C++-only extension)
+        fs.mkdirSync(path.join(tempProject, 'cppmod'), { recursive: true });
+        fs.writeFileSync(path.join(tempProject, 'cppmod', 'shared.hpp'), '');
+        // Obj-C side: an `iosmod` dir with .h + .m (no .cpp/.hpp).
+        fs.mkdirSync(path.join(tempProject, 'iosmod'), { recursive: true });
+        fs.writeFileSync(path.join(tempProject, 'iosmod', 'View.h'), '');
+        fs.writeFileSync(path.join(tempProject, 'iosmod', 'View.m'), '');
+
+        clearCppIncludeDirCache();
+        const dirs = loadCppIncludeDirs(tempProject);
+
+        // Both included — Obj-C dirs are intentionally allowed.
+        expect(dirs).toContain('cppmod');
+        expect(dirs).toContain('iosmod');
+      } finally {
+        fs.rmSync(tempProject, { recursive: true });
+      }
+    });
+
+    // End-to-end: ensure `#include "X.h"` produces a file→file `imports` edge
+    // in the actual indexing pipeline (not just a phantom file→import-node
+    // edge). This pins the include-dir resolution path so the headline PR
+    // feature can't silently regress to a no-op in the indexing flow.
+    it('connects #include to the real header file via include-dir scan (end-to-end)', async () => {
+      const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-e2e-'));
+      try {
+        fs.mkdirSync(path.join(tempProject, 'include'), { recursive: true });
+        fs.mkdirSync(path.join(tempProject, 'src'), { recursive: true });
+        fs.writeFileSync(
+          path.join(tempProject, 'include', 'utils.h'),
+          `#ifndef UTILS_H\n#define UTILS_H\nint add(int, int);\n#endif\n`
+        );
+        fs.writeFileSync(
+          path.join(tempProject, 'src', 'main.cpp'),
+          `#include "utils.h"\n#include <vector>\nint main(){ return add(1,2); }\n`
+        );
+
+        clearCppIncludeDirCache();
+        cg = await CodeGraph.init(tempProject, { index: true });
+
+        // Sanity: file nodes exist for the header and the cpp.
+        const allFiles = cg.getStats();
+        expect(allFiles.fileCount).toBe(2);
+
+        // The `#include "utils.h"` edge should target the real
+        // `include/utils.h` file node — not a floating `import` node
+        // living inside main.cpp.
+        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        const rows = db.getDb().prepare(`
+          select dst.kind as dstKind, dst.file_path as dstPath
+          from edges e
+          join nodes src on e.source = src.id
+          join nodes dst on e.target = dst.id
+          where e.kind = 'imports'
+            and src.kind = 'file'
+            and src.file_path = 'src/main.cpp'
+        `).all() as Array<{ dstKind: string; dstPath: string }>;
+        const resolvedToHeader = rows.find(
+          (r) => r.dstKind === 'file' && r.dstPath === 'include/utils.h'
+        );
+        expect(resolvedToHeader, 'main.cpp → include/utils.h imports edge missing').toBeDefined();
+        // `<vector>` should NOT produce a file edge — it's a stdlib header.
+        const stdlibFile = rows.find(
+          (r) => r.dstKind === 'file' && r.dstPath && r.dstPath.endsWith('vector')
+        );
+        expect(stdlibFile).toBeUndefined();
+      } finally {
+        fs.rmSync(tempProject, { recursive: true, force: true });
+      }
     });
   });
 });
