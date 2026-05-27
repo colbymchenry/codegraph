@@ -486,6 +486,20 @@ export const authMachine = createMachine({
     expect(varNode).toBeDefined();
     expect(varNode?.isExported).toBe(true);
   });
+
+  it('should extract calls from a top-level variable initializer (issue #425)', () => {
+    const code = `
+import { getTokenMp } from './api/upload';
+
+const token = getTokenMp();
+`;
+    const result = extractFromSource('app.ts', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(call).toBeDefined();
+  });
 });
 
 describe('File Node Extraction', () => {
