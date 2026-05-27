@@ -24,6 +24,7 @@
 import type { Edge, Node } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
+import { angularMetadataEdges, angularSelectorEdges, angularTemplateEdges } from './frameworks/angular';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -859,6 +860,9 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const rnEventEdgesList = rnEventEdges(ctx);
   const fabricNativeEdges = fabricNativeImplEdges(ctx);
   const mybatisEdges = mybatisJavaXmlEdges(queries);
+  const angularMeta = angularMetadataEdges(ctx);
+  const angularSel = angularSelectorEdges(ctx);
+  const angularTpl = angularTemplateEdges(ctx);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -874,8 +878,17 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...rnEventEdgesList,
     ...fabricNativeEdges,
     ...mybatisEdges,
+    ...angularMeta,
+    ...angularSel,
+    ...angularTpl,
   ]) {
-    const key = `${e.source}>${e.target}`;
+    // Key on channel as well as endpoints — two synthesizers may both link the
+    // same pair through different mechanisms (Angular: imports + selector +
+    // template), and the metadata is what tells the agent which one. Within a
+    // single synthesizer each channel is already deduped, so this only changes
+    // behavior at the cross-synthesizer merge boundary.
+    const channel = (e.metadata && typeof e.metadata.synthesizedBy === 'string') ? e.metadata.synthesizedBy : '';
+    const key = `${e.source}>${e.target}>${channel}`;
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(e);

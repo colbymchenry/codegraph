@@ -1597,3 +1597,383 @@ export class UsersController {
     expect(references.map((r) => r.referenceName)).toEqual(['real']);
   });
 });
+
+import { angularResolver, __internal as angularInternal } from '../src/resolution/frameworks/angular';
+
+describe('angularResolver — decorator scanning helpers', () => {
+  it('extracts bare identifiers from a metadata array field', () => {
+    const args = `{ declarations: [FooComponent, BarComponent], imports: [CommonModule] }`;
+    expect(angularInternal.extractFieldArrayIdentifiers(args, 'declarations')).toEqual([
+      'FooComponent',
+      'BarComponent',
+    ]);
+    expect(angularInternal.extractFieldArrayIdentifiers(args, 'imports')).toEqual([
+      'CommonModule',
+    ]);
+  });
+
+  it('prefers useClass over the DI token in provider objects', () => {
+    const args = `{ providers: [{ provide: TOKEN, useClass: FooService }] }`;
+    expect(angularInternal.extractFieldArrayIdentifiers(args, 'providers')).toEqual([
+      'FooService',
+    ]);
+  });
+
+  it('falls back to the DI token when only useValue/useFactory is given', () => {
+    const args = `{ providers: [{ provide: API_URL, useValue: 'https://x' }] }`;
+    expect(angularInternal.extractFieldArrayIdentifiers(args, 'providers')).toEqual([
+      'API_URL',
+    ]);
+  });
+
+  it('strips trailing .forRoot(...) / .forChild(...) module calls', () => {
+    const args = `{ imports: [RouterModule.forRoot(routes), SharedModule.forChild()] }`;
+    expect(angularInternal.extractFieldArrayIdentifiers(args, 'imports')).toEqual([
+      'RouterModule',
+      'SharedModule',
+    ]);
+  });
+
+  it('silently drops spreads and complex expressions', () => {
+    const args = `{ declarations: [...COMMON_DECLARATIONS, FooComponent, env.prod ? A : B] }`;
+    expect(angularInternal.extractFieldArrayIdentifiers(args, 'declarations')).toEqual([
+      'FooComponent',
+    ]);
+  });
+
+  it('isStandaloneComponent recognizes standalone: true', () => {
+    expect(angularInternal.isStandaloneComponent(`{ standalone: true, imports: [] }`)).toBe(true);
+    expect(angularInternal.isStandaloneComponent(`{ standalone: false }`)).toBe(false);
+  });
+
+  it('treats v17+ implicit-standalone (imports: present, no standalone field) as standalone', () => {
+    expect(angularInternal.isStandaloneComponent(`{ imports: [CommonModule] }`)).toBe(true);
+  });
+
+  it('does not flag a classic NgModule-only component as standalone', () => {
+    expect(angularInternal.isStandaloneComponent(`{ selector: 'app-foo', templateUrl: './foo.html' }`)).toBe(false);
+  });
+
+  it('extracts string-literal field values', () => {
+    const args = `{ selector: 'app-foo', templateUrl: './foo.component.html' }`;
+    expect(angularInternal.extractFieldString(args, 'selector')).toBe('app-foo');
+    expect(angularInternal.extractFieldString(args, 'templateUrl')).toBe('./foo.component.html');
+  });
+
+  it('returns null for non-literal field values (template: `inline...`) safely', () => {
+    // backtick literal IS captured (template: `<div>...</div>`)
+    const args1 = `{ template: \`<div></div>\` }`;
+    expect(angularInternal.extractFieldString(args1, 'template')).toBe('<div></div>');
+    // computed value isn't
+    const args2 = `{ template: getTemplate() }`;
+    expect(angularInternal.extractFieldString(args2, 'template')).toBe(null);
+  });
+
+  it('classAfterDecorator finds the class through stacked decorators + modifiers', () => {
+    const src = `@NgModule({}) @Other() export abstract class AdminModule {}`;
+    const end = src.indexOf(')') + 1; // end of first decorator's args
+    const cls = angularInternal.classAfterDecorator(src, end);
+    expect(cls?.className).toBe('AdminModule');
+  });
+
+  it('classAfterDecorator returns null when no class follows (e.g. function decorator)', () => {
+    const src = `@SomeDecorator() function notAClass() {}`;
+    const end = src.indexOf(')') + 1;
+    expect(angularInternal.classAfterDecorator(src, end)).toBe(null);
+  });
+
+  it('resolveTemplatePath handles ./ and ../', () => {
+    expect(
+      angularInternal.resolveTemplatePath('src/app/foo.component.ts', './foo.component.html', '/proj')
+    ).toBe('src/app/foo.component.html');
+    expect(
+      angularInternal.resolveTemplatePath('src/app/foo/foo.component.ts', '../templates/foo.html', '/proj')
+    ).toBe('src/app/templates/foo.html');
+  });
+
+  it('splits selector lists and extracts tag + attribute variants', () => {
+    expect(angularInternal.splitSelectorList('app-foo, [appFoo]')).toEqual(['app-foo', '[appFoo]']);
+    expect(angularInternal.extractTagFromSelector('app-foo')).toBe('app-foo');
+    expect(angularInternal.extractTagFromSelector('a[href]')).toBe(null);
+    expect(angularInternal.extractTagFromSelector('[appFoo]')).toBe(null);
+    expect(angularInternal.extractAttributeFromSelector('button[appFoo]')).toBe('appFoo');
+  });
+
+  it('indexes compound selectors without degrading them to bare HTML tags', () => {
+    const owner = {
+      id: 'dir',
+      name: 'Dir',
+      qualifiedName: 'dir.ts::Dir',
+      kind: 'class',
+      filePath: 'dir.ts',
+      language: 'typescript',
+      startLine: 1,
+      endLine: 1,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: 1,
+    } as const;
+
+    const entries = angularInternal.selectorEntriesForVariant(
+      'img[src], a[href], i.anticon, [nz-icon], app-card',
+      owner
+    );
+    expect(entries.map((e) => e.key)).toEqual([
+      'tagattr:img[src]',
+      'tagattr:a[href]',
+      'tagclass:i.anticon',
+      'attr:nz-icon',
+      'tag:app-card',
+    ]);
+  });
+
+  it('parses template tag attributes for selector matching', () => {
+    const parsed = angularInternal.parseTemplateTagAttributes(
+      ` [nz-icon] class="anticon anticon-user" href="/x" [src]="iconUrl"`
+    );
+    expect([...parsed.attrs].sort()).toEqual(['class', 'href', 'nz-icon', 'src'].sort());
+    expect([...parsed.classes].sort()).toEqual(['anticon', 'anticon-user'].sort());
+  });
+
+  it('findClassDecorators captures NgModule args even with nested objects', () => {
+    const src = `@NgModule({ providers: [{ provide: X, useFactory: () => new Y() }], declarations: [F] }) export class M {}`;
+    const hits = angularInternal.findClassDecorators(src, ['NgModule']);
+    expect(hits).toHaveLength(1);
+    expect(hits[0].name).toBe('NgModule');
+    // The full args were captured (balanced-paren reader didn't truncate at the inner `()`).
+    expect(hits[0].args.includes('declarations:')).toBe(true);
+  });
+});
+
+describe('angularResolver.extract — router config', () => {
+  it('emits a route node + component reference for `const routes: Routes = [...]`', () => {
+    const src = `
+import { Routes } from '@angular/router';
+import { AdminComponent } from './admin.component';
+export const routes: Routes = [
+  { path: 'admin', component: AdminComponent },
+];
+`;
+    const { nodes, references } = angularResolver.extract!('app.routes.ts', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].kind).toBe('route');
+    expect(nodes[0].name).toBe('/admin');
+    expect(references).toHaveLength(1);
+    expect(references[0].referenceName).toBe('AdminComponent');
+    expect(references[0].fromNodeId).toBe(nodes[0].id);
+    expect(references[0].referenceKind).toBe('references');
+  });
+
+  it('emits route + lazy-module ref for `loadChildren: () => import(...).then(m=>m.X)`', () => {
+    const src = `
+import { Routes } from '@angular/router';
+const routes: Routes = [
+  { path: 'admin', loadChildren: () => import('./admin').then(m => m.AdminModule) },
+];
+`;
+    const { nodes, references } = angularResolver.extract!('routing.ts', src);
+    expect(nodes).toHaveLength(1);
+    expect(references).toHaveLength(1);
+    expect(references[0].referenceName).toBe('AdminModule');
+  });
+
+  it('emits route + lazy-component ref for `loadComponent`', () => {
+    const src = `
+const routes: Routes = [
+  { path: 'page', loadComponent: () => import('./page').then(m => m.PageComponent) },
+];
+`;
+    const { nodes, references } = angularResolver.extract!('app.routes.ts', src);
+    expect(nodes).toHaveLength(1);
+    expect(references).toHaveLength(1);
+    expect(references[0].referenceName).toBe('PageComponent');
+  });
+
+  it('handles RouterModule.forRoot([...]) and forChild([...])', () => {
+    const src = `
+@NgModule({
+  imports: [
+    RouterModule.forRoot([
+      { path: '', component: HomeComponent },
+      { path: 'about', component: AboutComponent },
+    ]),
+  ],
+})
+export class AppRoutingModule {}
+`;
+    const { nodes, references } = angularResolver.extract!('app-routing.module.ts', src);
+    expect(nodes.map((n) => n.name).sort()).toEqual(['/', '/about']);
+    expect(references.map((r) => r.referenceName).sort()).toEqual(['AboutComponent', 'HomeComponent']);
+  });
+
+  it('joins parent path onto children: [...] recursively', () => {
+    const src = `
+const routes: Routes = [
+  {
+    path: 'admin',
+    component: AdminLayout,
+    children: [
+      { path: 'users', component: UsersComponent },
+      { path: 'reports', component: ReportsComponent },
+    ],
+  },
+];
+`;
+    const { nodes, references } = angularResolver.extract!('app.routes.ts', src);
+    expect(nodes.map((n) => n.name).sort()).toEqual(['/admin', '/admin/reports', '/admin/users']);
+    // Three component refs in total — parent + two children.
+    expect(references.map((r) => r.referenceName).sort()).toEqual([
+      'AdminLayout',
+      'ReportsComponent',
+      'UsersComponent',
+    ]);
+  });
+
+  it('handles provideRouter([...]) standalone-bootstrap form', () => {
+    const src = `
+import { provideRouter } from '@angular/router';
+bootstrapApplication(App, {
+  providers: [
+    provideRouter([
+      { path: 'dash', component: DashComponent },
+    ]),
+  ],
+});
+`;
+    const { nodes, references } = angularResolver.extract!('main.ts', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].name).toBe('/dash');
+    expect(references[0].referenceName).toBe('DashComponent');
+  });
+
+  it('returns empty result for unrelated TS files (cheap gate)', () => {
+    const { nodes, references } = angularResolver.extract!('utils.ts', 'export function add(a, b) { return a + b; }\n');
+    expect(nodes).toEqual([]);
+    expect(references).toEqual([]);
+  });
+});
+
+describe('angularResolver — router-config helpers', () => {
+  it('extracts component identifier from a route object', () => {
+    const obj = `{ path: 'admin', component: AdminComponent }`;
+    expect(angularInternal.extractFieldIdent(obj, 'component')).toBe('AdminComponent');
+  });
+
+  it('extractLazyImportTarget reads `() => import(...).then(m => m.X)` form', () => {
+    const obj = `{ path: 'admin', loadChildren: () => import('./admin').then(m => m.AdminModule) }`;
+    expect(angularInternal.extractLazyImportTarget(obj, 'loadChildren')).toBe('AdminModule');
+  });
+
+  it('extractLazyImportTarget reads destructured `({ X }) => X` form', () => {
+    const obj = `{ path: 'p', loadComponent: () => import('./p').then(({ PageComponent }) => PageComponent) }`;
+    expect(angularInternal.extractLazyImportTarget(obj, 'loadComponent')).toBe('PageComponent');
+  });
+
+  it('extractLazyImportTarget reads `(await import(...)).X` async form', () => {
+    const obj = `{ path: 'p', loadChildren: async () => (await import('./p')).PMod }`;
+    expect(angularInternal.extractLazyImportTarget(obj, 'loadChildren')).toBe('PMod');
+  });
+
+  it('joinRoutePath composes parent + sub correctly', () => {
+    expect(angularInternal.joinRoutePath('', 'admin')).toBe('/admin');
+    expect(angularInternal.joinRoutePath('/admin', 'users')).toBe('/admin/users');
+    expect(angularInternal.joinRoutePath('/admin/', '/users')).toBe('/users'); // absolute child
+    expect(angularInternal.joinRoutePath('/admin', '')).toBe('/admin');         // index child
+  });
+});
+
+describe('angularResolver — Phase 6 helpers (guard / resolver extraction)', () => {
+  it('extractFieldObjectValueIdentifiers reads `resolve: { k: V, k2: V2 }`', () => {
+    const obj = `{ path: 'x', resolve: { user: UserResolver, role: RoleResolver } }`;
+    expect(angularInternal.extractFieldObjectValueIdentifiers(obj, 'resolve')).toEqual([
+      'UserResolver',
+      'RoleResolver',
+    ]);
+  });
+
+  it('extractFieldObjectValueIdentifiers drops string-literal values', () => {
+    const obj = `{ resolve: { user: UserResolver, role: 'admin' } }`;
+    expect(angularInternal.extractFieldObjectValueIdentifiers(obj, 'resolve')).toEqual([
+      'UserResolver',
+    ]);
+  });
+
+  it('extractFieldObjectValueIdentifiers returns [] when field is missing or not an object', () => {
+    expect(angularInternal.extractFieldObjectValueIdentifiers(`{ resolve: SomeArray }`, 'resolve')).toEqual([]);
+    expect(angularInternal.extractFieldObjectValueIdentifiers(`{ path: 'x' }`, 'resolve')).toEqual([]);
+  });
+
+  it('ROUTE_GUARD_FIELDS list includes the 5 canonical guard fields', () => {
+    expect(angularInternal.ROUTE_GUARD_FIELDS).toEqual([
+      'canActivate',
+      'canActivateChild',
+      'canDeactivate',
+      'canMatch',
+      'canLoad',
+    ]);
+  });
+});
+
+describe('angularResolver.extract — Phase 6 guards and resolvers', () => {
+  it('emits route → guard references for canActivate / canMatch', () => {
+    const src = `
+const routes: Routes = [
+  { path: 'admin', component: A, canActivate: [AuthGuard, RoleGuard], canMatch: [FeatureGuard] },
+];
+`;
+    const { nodes, references } = angularResolver.extract!('app.routes.ts', src);
+    expect(nodes).toHaveLength(1);
+    const names = references.map((r) => r.referenceName).sort();
+    expect(names).toEqual(['A', 'AuthGuard', 'FeatureGuard', 'RoleGuard']);
+  });
+
+  it('emits route → resolver references for resolve: { k: V }', () => {
+    const src = `
+const routes: Routes = [
+  { path: 'profile', component: P, resolve: { user: UserResolver, settings: SettingsResolver } },
+];
+`;
+    const { references } = angularResolver.extract!('app.routes.ts', src);
+    const names = references.map((r) => r.referenceName).sort();
+    expect(names).toEqual(['P', 'SettingsResolver', 'UserResolver']);
+  });
+});
+
+describe('angularResolver.detect', () => {
+  function fakeContext(files: Record<string, string>): import('../src/resolution/types').ResolutionContext {
+    return {
+      getNodesInFile: () => [],
+      getNodesByName: () => [],
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      fileExists: (p) => p in files,
+      readFile: (p) => files[p] ?? null,
+      getProjectRoot: () => '/proj',
+      getAllFiles: () => Object.keys(files),
+      getNodesByLowerName: () => [],
+      getImportMappings: () => [],
+    };
+  }
+
+  it('detects via @angular/* in package.json', () => {
+    const ctx = fakeContext({
+      'package.json': JSON.stringify({ dependencies: { '@angular/core': '17.0.0' } }),
+    });
+    expect(angularResolver.detect(ctx)).toBe(true);
+  });
+
+  it('detects via decorator usage in conventional files when package.json is missing', () => {
+    const ctx = fakeContext({
+      'src/app/foo.component.ts': `import { Component } from '@angular/core';\n@Component({ selector: 'foo' }) export class FooComponent {}\n`,
+    });
+    expect(angularResolver.detect(ctx)).toBe(true);
+  });
+
+  it('does NOT match an unrelated TS project', () => {
+    const ctx = fakeContext({
+      'package.json': JSON.stringify({ dependencies: { lodash: '*' } }),
+      'src/lib.ts': 'export function add(a: number, b: number) { return a + b; }\n',
+    });
+    expect(angularResolver.detect(ctx)).toBe(false);
+  });
+});
