@@ -124,6 +124,11 @@ describe('Installer targets — contract', () => {
               delete seed.mcpServers;
               seed.mcp = { other: { type: 'local', command: ['x'], enabled: true } };
             }
+            // reasonix uses `mcp` as a string array.
+            if (target.id === 'reasonix') {
+              delete seed.mcpServers;
+              seed.mcp = ['other=command x'];
+            }
             fs.writeFileSync(jsonPath, JSON.stringify(seed, null, 2) + '\n');
 
             target.install(location, { autoAllow: true });
@@ -132,6 +137,9 @@ describe('Installer targets — contract', () => {
             if (target.id === 'opencode') {
               expect(after.mcp.other).toBeDefined();
               expect(after.mcp.codegraph).toBeDefined();
+            } else if (target.id === 'reasonix') {
+              expect(after.mcp).toContain('other=command x');
+              expect(after.mcp).toContain('codegraph=codegraph serve --mcp');
             } else {
               expect(after.mcpServers.other).toBeDefined();
               expect(after.mcpServers.codegraph).toBeDefined();
@@ -1039,6 +1047,158 @@ describe('Installer targets — partial-state idempotency', () => {
   });
 });
 
+describe('Installer targets — reasonix', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('rx-home');
+    tmpCwd = mkTmpDir('rx-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it('installs codegraph MCP entry into the mcp string array in config.json', () => {
+    const target = getTarget('reasonix')!;
+    expect(target.detect('global').alreadyConfigured).toBe(false);
+
+    const result = target.install('global', { autoAllow: true });
+
+    const configFile = path.join(tmpHome, '.reasonix', 'config.json');
+    expect(result.files.some((f) => f.path === configFile)).toBe(true);
+    expect(fs.existsSync(configFile)).toBe(true);
+
+    const config = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
+    expect(Array.isArray(config.mcp)).toBe(true);
+    expect(config.mcp).toContain('codegraph=codegraph serve --mcp');
+    expect(target.detect('global').alreadyConfigured).toBe(true);
+  });
+
+  it('re-running install is idempotent (unchanged)', () => {
+    const target = getTarget('reasonix')!;
+    target.install('global', { autoAllow: true });
+    const second = target.install('global', { autoAllow: true });
+    for (const file of second.files) {
+      expect(file.action).toBe('unchanged');
+    }
+  });
+
+  it('install preserves pre-existing sibling MCP entries', () => {
+    const target = getTarget('reasonix')!;
+    const configFile = path.join(tmpHome, '.reasonix', 'config.json');
+    fs.mkdirSync(path.dirname(configFile), { recursive: true });
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({ mcp: ['filesystem=npx -y @modelcontextprotocol/server-filesystem /tmp'] }, null, 2) + '\n',
+    );
+
+    target.install('global', { autoAllow: true });
+
+    const config = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
+    expect(config.mcp).toContain('filesystem=npx -y @modelcontextprotocol/server-filesystem /tmp');
+    expect(config.mcp).toContain('codegraph=codegraph serve --mcp');
+  });
+
+  it('install writes REASONIX.md with the codegraph instructions block', () => {
+    const target = getTarget('reasonix')!;
+    target.install('global', { autoAllow: true });
+
+    const reaosnixMd = path.join(tmpHome, '.reasonix', 'REASONIX.md');
+    expect(fs.existsSync(reaosnixMd)).toBe(true);
+    const body = fs.readFileSync(reaosnixMd, 'utf-8');
+    expect(body).toContain('<!-- CODEGRAPH_START -->');
+    expect(body).toContain('<!-- CODEGRAPH_END -->');
+    expect(body).toContain('codegraph_callers');
+  });
+
+  it('REASONIX.md preserves pre-existing user content outside markers', () => {
+    const target = getTarget('reasonix')!;
+    const reaosnixMd = path.join(tmpHome, '.reasonix', 'REASONIX.md');
+    fs.mkdirSync(path.dirname(reaosnixMd), { recursive: true });
+    fs.writeFileSync(reaosnixMd, '# My Reasonix setup\n\nAlways use Chinese.\n');
+
+    target.install('global', { autoAllow: true });
+
+    const body = fs.readFileSync(reaosnixMd, 'utf-8');
+    expect(body).toContain('# My Reasonix setup');
+    expect(body).toContain('Always use Chinese.');
+    expect(body).toContain('<!-- CODEGRAPH_START -->');
+  });
+
+  it('uninstall removes the codegraph MCP entry from config.json', () => {
+    const target = getTarget('reasonix')!;
+    const configFile = path.join(tmpHome, '.reasonix', 'config.json');
+    fs.mkdirSync(path.dirname(configFile), { recursive: true });
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        mcp: [
+          'filesystem=npx -y @modelcontextprotocol/server-filesystem /tmp',
+          'codegraph=codegraph serve --mcp',
+        ],
+      }, null, 2) + '\n',
+    );
+
+    target.uninstall('global');
+
+    const config = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
+    expect(config.mcp).not.toContain('codegraph=codegraph serve --mcp');
+    expect(config.mcp).toContain('filesystem=npx -y @modelcontextprotocol/server-filesystem /tmp');
+    expect(target.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('uninstall strips the codegraph block from REASONIX.md but preserves user content', () => {
+    const target = getTarget('reasonix')!;
+    const reaosnixMd = path.join(tmpHome, '.reasonix', 'REASONIX.md');
+    fs.mkdirSync(path.dirname(reaosnixMd), { recursive: true });
+    fs.writeFileSync(reaosnixMd, '# My Reasonix setup\n\nAlways use Chinese.\n');
+
+    target.install('global', { autoAllow: true });
+    target.uninstall('global');
+
+    const body = fs.readFileSync(reaosnixMd, 'utf-8');
+    expect(body).toContain('# My Reasonix setup');
+    expect(body).toContain('Always use Chinese.');
+    expect(body).not.toContain('CODEGRAPH_START');
+    expect(body).not.toContain('codegraph_callers');
+  });
+
+  it('local install writes to ./.reasonix/config.json and ./REASONIX.md', () => {
+    const target = getTarget('reasonix')!;
+    const result = target.install('local', { autoAllow: true });
+
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.reasonix/config.json'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/REASONIX.md') && !p.includes('.reasonix'))).toBe(true);
+  });
+
+  it('printConfig returns non-empty output without writing files', () => {
+    const target = getTarget('reasonix')!;
+    const before = [
+      ...listAllFiles(tmpHome),
+      ...listAllFiles(tmpCwd),
+    ];
+    const out = target.printConfig('global');
+    expect(out.length).toBeGreaterThan(0);
+    expect(out).toContain('codegraph');
+    const after = [
+      ...listAllFiles(tmpHome),
+      ...listAllFiles(tmpCwd),
+    ];
+    expect(after.sort()).toEqual(before.sort());
+  });
+});
+
 describe('Installer targets — registry', () => {
   it('getTarget returns the right target for each id', () => {
     expect(getTarget('claude')?.id).toBe('claude');
@@ -1049,6 +1209,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('gemini')?.id).toBe('gemini');
     expect(getTarget('antigravity')?.id).toBe('antigravity');
     expect(getTarget('kiro')?.id).toBe('kiro');
+    expect(getTarget('reasonix')?.id).toBe('reasonix');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
