@@ -29,6 +29,7 @@ import { getCodeGraphDir, isInitialized } from '../directory';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
+import { CODEGRAPH_INSTALL_COMMAND_ENV } from '../installer/targets/shared';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
@@ -1626,16 +1627,19 @@ program
   .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "auto"|"all"|"none". Default: prompt')
   .option('-l, --location <where>', 'Install location: "global" or "local". Default: prompt')
+  .option('-c, --command <path>', 'Custom MCP command to write into agent configs (for a fork, wrapper, or absolute path)')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
   .option('--no-permissions', 'Skip writing the auto-allow permissions list (Claude Code only)')
   .option('--print-config <id>', 'Print MCP config snippet for the named agent and exit (no file writes)')
   .action(async (opts: {
     target?: string;
     location?: string;
+    command?: string;
     yes?: boolean;
     permissions?: boolean;
     printConfig?: string;
   }) => {
+    const customCommand = opts.command?.trim();
     if (opts.printConfig) {
       const { getTarget, listTargetIds } = await import('../installer/targets/registry');
       const target = getTarget(opts.printConfig);
@@ -1645,7 +1649,21 @@ program
         process.exit(1);
       }
       const loc = (opts.location === 'local' ? 'local' : 'global') as 'global' | 'local';
-      process.stdout.write(target.printConfig(loc));
+      const previousInstallCommand = process.env[CODEGRAPH_INSTALL_COMMAND_ENV];
+      if (customCommand) {
+        process.env[CODEGRAPH_INSTALL_COMMAND_ENV] = customCommand;
+      } else {
+        delete process.env[CODEGRAPH_INSTALL_COMMAND_ENV];
+      }
+      try {
+        process.stdout.write(target.printConfig(loc));
+      } finally {
+        if (previousInstallCommand === undefined) {
+          delete process.env[CODEGRAPH_INSTALL_COMMAND_ENV];
+        } else {
+          process.env[CODEGRAPH_INSTALL_COMMAND_ENV] = previousInstallCommand;
+        }
+      }
       return;
     }
 
@@ -1672,6 +1690,7 @@ program
         target: opts.target,
         location: opts.location as 'global' | 'local' | undefined,
         autoAllow,
+        command: customCommand,
         yes: opts.yes,
       });
     } catch (err) {

@@ -24,6 +24,7 @@ The installer will:
 codegraph install --yes                              # auto-detect agents, install global
 codegraph install --target=cursor,claude --yes       # explicit target list
 codegraph install --target=auto --location=local     # detected agents, project-local
+codegraph install --command /abs/path/to/codegraph   # write a fork/wrapper path into MCP configs
 codegraph install --print-config codex               # print snippet, no file writes
 ```
 
@@ -31,9 +32,12 @@ codegraph install --print-config codex               # print snippet, no file wr
 |---|---|---|
 | `--target` | `auto`, `all`, `none`, or csv (`claude,cursor,…`) | prompt |
 | `--location` | `global`, `local` | prompt |
+| `--command <path>` | custom MCP command to write (fork, wrapper, absolute path) | `codegraph` |
 | `--yes` | (boolean) | prompt every step |
 | `--no-permissions` | (boolean) skip Claude auto-allow list | permissions on |
 | `--print-config <id>` | dump snippet for one agent and exit | — |
+
+Use `--command` when you want agents to launch a fork checkout or wrapper script instead of the default `codegraph` binary on `PATH`.
 
 ## 2. Restart your agent
 

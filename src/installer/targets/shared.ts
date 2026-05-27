@@ -11,6 +11,19 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+export const CODEGRAPH_INSTALL_COMMAND_ENV = 'CODEGRAPH_INSTALL_COMMAND';
+
+/**
+ * Resolve the MCP command the installer should write into agent configs.
+ *
+ * Default is the bare `codegraph` binary on PATH. Power users can override
+ * it for a local fork checkout, wrapper script, or custom launcher.
+ */
+export function getInstallCommand(): string {
+  const configured = process.env[CODEGRAPH_INSTALL_COMMAND_ENV]?.trim();
+  return configured && configured.length > 0 ? configured : 'codegraph';
+}
+
 /**
  * The MCP-server config block codegraph injects. Same shape across
  * all JSON-shaped agent configs (Claude, Cursor, opencode), only the
@@ -19,7 +32,7 @@ import * as path from 'path';
 export function getMcpServerConfig(): { type: string; command: string; args: string[] } {
   return {
     type: 'stdio',
-    command: 'codegraph',
+    command: getInstallCommand(),
     args: ['serve', '--mcp'],
   };
 }

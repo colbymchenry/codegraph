@@ -22,6 +22,7 @@ import {
   resolveTargetFlag,
 } from './targets/registry';
 import type { AgentTarget, Location, TargetId, WriteResult } from './targets/types';
+import { CODEGRAPH_INSTALL_COMMAND_ENV } from './targets/shared';
 import { getGlyphs } from '../ui/glyphs';
 // Import the lightweight submodules directly (not the ../sync barrel, which
 // re-exports FileWatcher and would transitively pull in ../extraction — the
@@ -74,6 +75,8 @@ export interface RunInstallerOptions {
    * autoAllow=true, target=auto. For scripting / CI.
    */
   yes?: boolean;
+  /** Custom executable or launcher to write as the MCP command. */
+  command?: string;
 }
 
 /**
@@ -87,6 +90,15 @@ export async function runInstaller(): Promise<void> {
 
 export async function runInstallerWithOptions(opts: RunInstallerOptions): Promise<void> {
   const clack = await importESM('@clack/prompts');
+  const previousInstallCommand = process.env[CODEGRAPH_INSTALL_COMMAND_ENV];
+  const customCommand = opts.command?.trim();
+  if (customCommand) {
+    process.env[CODEGRAPH_INSTALL_COMMAND_ENV] = customCommand;
+  } else {
+    delete process.env[CODEGRAPH_INSTALL_COMMAND_ENV];
+  }
+
+  try {
 
   clack.intro(`CodeGraph v${getVersion()}`);
 
@@ -106,7 +118,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
 
   // Step 2: install the codegraph npm package on PATH (always offered;
   // matches existing behavior). Skipped when --yes (assume present).
-  if (!useDefaults) {
+  if (!useDefaults && !customCommand) {
     const shouldInstallGlobally = await clack.confirm({
       message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
       initialValue: true,
@@ -128,6 +140,8 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     } else {
       clack.log.info('Skipped CLI install — agents will not be able to launch the MCP server without it');
     }
+  } else if (customCommand) {
+    clack.log.info(`Using custom MCP command: ${customCommand}`);
   }
 
   // Step 3: where the per-agent config files should land.
@@ -215,6 +229,13 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     ? `Done! Restart your agent${targets.length > 1 ? 's' : ''} to use CodeGraph.`
     : 'Done!';
   clack.outro(finalNote);
+  } finally {
+    if (previousInstallCommand === undefined) {
+      delete process.env[CODEGRAPH_INSTALL_COMMAND_ENV];
+    } else {
+      process.env[CODEGRAPH_INSTALL_COMMAND_ENV] = previousInstallCommand;
+    }
+  }
 }
 
 export interface RunUninstallerOptions {

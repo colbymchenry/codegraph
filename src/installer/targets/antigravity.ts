@@ -65,6 +65,7 @@ import {
   WriteResult,
 } from './types';
 import {
+  getInstallCommand,
   jsonDeepEqual,
   readJsonFile,
   writeJsonFile,
@@ -118,6 +119,8 @@ function preferredMcpConfigPath(): string {
  * nvm-managed tools like ours.
  */
 function resolveCodegraphCommand(): string {
+  const configured = getInstallCommand();
+  if (configured !== 'codegraph') return configured;
   if (process.platform !== 'darwin') return 'codegraph';
   try {
     const resolved = execSync('command -v codegraph || which codegraph', {
