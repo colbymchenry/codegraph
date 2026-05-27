@@ -3,7 +3,7 @@ title: Installation
 description: Install CodeGraph and configure your AI coding agents.
 ---
 
-## 1. Run the installer
+## 1. Run the   installer
 
 ```bash
 npx @colbymchenry/codegraph
@@ -11,7 +11,7 @@ npx @colbymchenry/codegraph
 
 The installer will:
 
-- Ask which agent(s) to configure — auto-detecting installed ones from **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, and **Kiro**.
+- Ask which agent(s) to configure — auto-detecting installed ones from **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**, and **pi**.
 - Prompt to install `codegraph` on your `PATH` (so agents can launch the MCP server).
 - Ask whether configs apply to all your projects or just this one.
 - Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`). Cursor and Kiro get the MCP config only. Removed cleanly by `codegraph uninstall`.
@@ -28,17 +28,17 @@ codegraph install --target=auto --location=local     # detected agents, project-
 codegraph install --print-config codex               # print snippet, no file writes
 ```
 
-| Flag | Values | Default |
-|---|---|---|
-| `--target` | `auto`, `all`, `none`, or csv (`claude,cursor,…`) | prompt |
-| `--location` | `global`, `local` | prompt |
-| `--yes` | (boolean) | prompt every step |
-| `--no-permissions` | (boolean) skip Claude auto-allow list | permissions on |
-| `--print-config <id>` | dump snippet for one agent and exit | — |
+| Flag                  | Values                                            | Default           |
+| --------------------- | ------------------------------------------------- | ----------------- |
+| `--target`            | `auto`, `all`, `none`, or csv (`claude,cursor,…`) | prompt            |
+| `--location`          | `global`, `local`                                 | prompt            |
+| `--yes`               | (boolean)                                         | prompt every step |
+| `--no-permissions`    | (boolean) skip Claude auto-allow list             | permissions on    |
+| `--print-config <id>` | dump snippet for one agent and exit               | —                 |
 
 ## 2. Restart your agent
 
-Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro) for the MCP server to load.
+Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro / pi) for the MCP server to load.
 
 ## 3. Initialize projects
 
@@ -53,11 +53,11 @@ codegraph init
 
 Every release ships a self-contained build (bundled Node runtime — nothing to compile) for all three desktop OSes, on both x64 and arm64:
 
-| Platform | Architectures | Install |
-|---|---|---|
-| Windows | x64, arm64 | PowerShell installer or npm |
-| macOS | x64, arm64 | shell installer or npm |
-| Linux | x64, arm64 | shell installer or npm |
+| Platform | Architectures | Install                     |
+| -------- | ------------- | --------------------------- |
+| Windows  | x64, arm64    | PowerShell installer or npm |
+| macOS    | x64, arm64    | shell installer or npm      |
+| Linux    | x64, arm64    | shell installer or npm      |
 
 ## Uninstall
 

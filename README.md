@@ -6,7 +6,7 @@ Already installed? Run `codegraph upgrade`
 
 Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
-### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, Kiro, and GitHub Copilot with Semantic Code Intelligence
+### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, Kiro, GitHub Copilot, and pi with Semantic Code Intelligence
 
 **The fastest complete code graph · surgical context · built for how agents actually work · 100% local**
 
@@ -36,6 +36,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 [![Antigravity](https://img.shields.io/badge/Antigravity-supported-blueviolet.svg)](#supported-agents)
 [![Kiro](https://img.shields.io/badge/Kiro-supported-blueviolet.svg)](#supported-agents)
 [![GitHub Copilot](https://img.shields.io/badge/GitHub_Copilot-supported-blueviolet.svg)](#supported-agents)
+[![pi](https://img.shields.io/badge/pi-supported-blueviolet.svg)](#supported-agents)
 
 <br>
 
@@ -376,7 +377,7 @@ npx @colbymchenry/codegraph
 ```
 
 The installer will:
-- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**, **GitHub Copilot** (VS Code, Copilot CLI, JetBrains IDEs)
+- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**, **GitHub Copilot** (VS Code, Copilot CLI, JetBrains IDEs), **pi** (via its `AGENTS.md` — pi has no MCP client)
 - Prompt to install `codegraph` on your PATH (so agents can launch the MCP server)
 - Ask whether configs apply to all your projects or just this one
 - Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`) — that's how subagents and non-MCP agents learn the `codegraph explore` command, since the MCP server's own guidance only reaches the main agent. Removed cleanly by `codegraph uninstall`.
@@ -405,7 +406,7 @@ codegraph install --print-config copilot-vscode      # same, for Copilot in VS C
 
 ### 2. Restart Your Agent
 
-Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro / VS Code, the Copilot CLI, or your JetBrains IDE for GitHub Copilot) for the MCP server to load.
+Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro / VS Code, the Copilot CLI, or your JetBrains IDE for GitHub Copilot; or start a new pi session) for changes to take effect.
 
 ### 3. Initialize Projects
 
@@ -764,6 +765,7 @@ is written):
 - **Antigravity IDE**
 - **Kiro**
 - **GitHub Copilot** — Copilot Chat in VS Code (`copilot-vscode`), the Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`)
+- **pi** — non-MCP harness; the installer writes a CLI-oriented CodeGraph section into `~/.pi/agent/AGENTS.md` (or `./AGENTS.md`) so pi's agent invokes `codegraph explore` etc. via its `bash` tool
 
 ## Supported Languages
 
@@ -862,7 +864,7 @@ MIT
 
 <div align="center">
 
-**Made for AI coding agents — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub Copilot**
+**Made for AI coding agents — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot, and pi**
 
 [Report Bug](https://github.com/colbymchenry/codegraph/issues) · [Request Feature](https://github.com/colbymchenry/codegraph/issues)
 
