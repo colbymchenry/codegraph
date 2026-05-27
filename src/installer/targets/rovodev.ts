@@ -1,14 +1,17 @@
 /**
- * Rovo Dev target. Writes the codegraph MCP server entry to
- * `~/.rovodev/mcp.json` — the single file Rovo Dev CLI reads to
- * discover and launch MCP servers.
+ * Rovo Dev target. Writes:
+ *
+ *   - MCP server entry to `~/.rovodev/mcp.json` — the file Rovo Dev
+ *     CLI reads to discover and launch MCP servers.
+ *   - Instructions to `~/.rovodev/AGENTS.md` — Rovo Dev's global
+ *     personal memory file, loaded into every session.
  *
  * Rovo Dev only supports a global install location (there is no
  * per-project MCP config concept in the CLI as of 2026-05). The
  * `local` location is therefore not supported and the installer will
  * skip it with a clear message.
  *
- * Config format reference:
+ * MCP config format reference:
  *   {
  *     "mcpServers": {
  *       "<name>": {
@@ -35,8 +38,15 @@ import {
 import {
   jsonDeepEqual,
   readJsonFile,
+  removeMarkedSection,
+  replaceOrAppendMarkedSection,
   writeJsonFile,
 } from './shared';
+import {
+  CODEGRAPH_SECTION_END,
+  CODEGRAPH_SECTION_START,
+  INSTRUCTIONS_TEMPLATE,
+} from '../instructions-template';
 
 /** Path to Rovo Dev's MCP server registry. */
 function mcpJsonPath(): string {
@@ -46,6 +56,11 @@ function mcpJsonPath(): string {
 /** Path to the Rovo Dev config directory — used for install detection. */
 function rovodevConfigDir(): string {
   return path.join(os.homedir(), '.rovodev');
+}
+
+/** Path to Rovo Dev's global personal memory/instructions file. */
+function instructionsPath(): string {
+  return path.join(os.homedir(), '.rovodev', 'AGENTS.md');
 }
 
 /**
@@ -85,15 +100,17 @@ class RovoDevTarget implements AgentTarget {
   install(_loc: Location, _opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
     files.push(writeMcpEntry());
+    files.push(writeInstructionsEntry());
     const notes: string[] = ['Restart Rovo Dev (or reload MCP servers) to apply.'];
     return { files, notes };
   }
 
   uninstall(_loc: Location): WriteResult {
     const files: WriteResult['files'] = [];
+
+    // 1. MCP server entry
     const configPath = mcpJsonPath();
     const config = readJsonFile(configPath);
-
     if (config.mcpServers?.codegraph) {
       delete config.mcpServers.codegraph;
       if (Object.keys(config.mcpServers).length === 0) {
@@ -104,6 +121,11 @@ class RovoDevTarget implements AgentTarget {
     } else {
       files.push({ path: configPath, action: 'not-found' });
     }
+
+    // 2. Instructions
+    const instr = instructionsPath();
+    const action = removeMarkedSection(instr, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
+    files.push({ path: instr, action });
 
     return { files };
   }
@@ -119,8 +141,31 @@ class RovoDevTarget implements AgentTarget {
   }
 
   describePaths(_loc: Location): string[] {
-    return [mcpJsonPath()];
+    return [mcpJsonPath(), instructionsPath()];
   }
+}
+
+/**
+ * Idempotent write of the codegraph instructions block into
+ * ~/.rovodev/AGENTS.md. Uses marker-based section replacement so any
+ * existing user content in the file is preserved verbatim.
+ */
+function writeInstructionsEntry(): WriteResult['files'][number] {
+  const file = instructionsPath();
+  const dir = path.dirname(file);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+  const action = replaceOrAppendMarkedSection(
+    file,
+    INSTRUCTIONS_TEMPLATE,
+    CODEGRAPH_SECTION_START,
+    CODEGRAPH_SECTION_END,
+  );
+  const mapped: 'created' | 'updated' | 'unchanged' =
+    action === 'created' ? 'created'
+      : action === 'unchanged' ? 'unchanged'
+        : 'updated';
+  return { path: file, action: mapped };
 }
 
 /**
