@@ -60,6 +60,7 @@ describe('Installer targets — contract', () => {
   let tmpCwd: string;
   let origCwd: string;
   let homeRestore: { restore: () => void };
+  let prevInstallCommand: string | undefined;
 
   beforeEach(() => {
     tmpHome = mkTmpDir('home');
@@ -67,9 +68,13 @@ describe('Installer targets — contract', () => {
     origCwd = process.cwd();
     process.chdir(tmpCwd);
     homeRestore = setHome(tmpHome);
+    prevInstallCommand = process.env.CODEGRAPH_INSTALL_COMMAND;
+    delete process.env.CODEGRAPH_INSTALL_COMMAND;
   });
 
   afterEach(() => {
+    if (prevInstallCommand === undefined) delete process.env.CODEGRAPH_INSTALL_COMMAND;
+    else process.env.CODEGRAPH_INSTALL_COMMAND = prevInstallCommand;
     homeRestore.restore();
     process.chdir(origCwd);
     fs.rmSync(tmpHome, { recursive: true, force: true });
@@ -164,6 +169,7 @@ describe('Installer targets — partial-state idempotency', () => {
   let tmpCwd: string;
   let origCwd: string;
   let homeRestore: { restore: () => void };
+  let prevInstallCommand: string | undefined;
 
   beforeEach(() => {
     tmpHome = mkTmpDir('home');
@@ -171,9 +177,13 @@ describe('Installer targets — partial-state idempotency', () => {
     origCwd = process.cwd();
     process.chdir(tmpCwd);
     homeRestore = setHome(tmpHome);
+    prevInstallCommand = process.env.CODEGRAPH_INSTALL_COMMAND;
+    delete process.env.CODEGRAPH_INSTALL_COMMAND;
   });
 
   afterEach(() => {
+    if (prevInstallCommand === undefined) delete process.env.CODEGRAPH_INSTALL_COMMAND;
+    else process.env.CODEGRAPH_INSTALL_COMMAND = prevInstallCommand;
     homeRestore.restore();
     process.chdir(origCwd);
     fs.rmSync(tmpHome, { recursive: true, force: true });
@@ -197,6 +207,44 @@ describe('Installer targets — partial-state idempotency', () => {
     // Third install — both unchanged (full idempotency restored).
     const third = codex.install('global', { autoAllow: false });
     for (const f of third.files) expect(f.action).toBe('unchanged');
+  });
+
+  it('codex: custom install command is written into config.toml', () => {
+    process.env.CODEGRAPH_INSTALL_COMMAND = '/tmp/codegraph-fork/bin/codegraph.js';
+    const codex = getTarget('codex')!;
+
+    codex.install('global', { autoAllow: false });
+
+    const configToml = path.join(tmpHome, '.codex', 'config.toml');
+    const body = fs.readFileSync(configToml, 'utf-8');
+    expect(body).toContain('command = "/tmp/codegraph-fork/bin/codegraph.js"');
+    expect(body).toContain('args = ["serve", "--mcp"]');
+  });
+
+  it('cursor: custom install command keeps the workspace --path wiring', () => {
+    process.env.CODEGRAPH_INSTALL_COMMAND = '/tmp/codegraph-fork/bin/codegraph.js';
+    const cursor = getTarget('cursor')!;
+
+    cursor.install('global', { autoAllow: false });
+
+    const mcpJson = path.join(tmpHome, '.cursor', 'mcp.json');
+    const cfg = JSON.parse(fs.readFileSync(mcpJson, 'utf-8'));
+    expect(cfg.mcpServers.codegraph.command).toBe('/tmp/codegraph-fork/bin/codegraph.js');
+    expect(cfg.mcpServers.codegraph.args).toEqual(['serve', '--mcp', '--path', '${workspaceFolder}']);
+  });
+
+  it('antigravity: custom install command overrides platform command resolution', () => {
+    process.env.CODEGRAPH_INSTALL_COMMAND = '/tmp/codegraph-fork/bin/codegraph.js';
+    const antigravity = getTarget('antigravity')!;
+
+    antigravity.install('global', { autoAllow: false });
+
+    const mcpJson = path.join(tmpHome, '.gemini', 'antigravity', 'mcp_config.json');
+    const cfg = JSON.parse(fs.readFileSync(mcpJson, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({
+      command: '/tmp/codegraph-fork/bin/codegraph.js',
+      args: ['serve', '--mcp'],
+    });
   });
 
   it('opencode: prefers .jsonc when both .json and .jsonc exist', () => {

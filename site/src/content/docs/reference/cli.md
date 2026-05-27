@@ -6,6 +6,7 @@ description: Every CodeGraph command and the flags it accepts.
 ```bash
 codegraph                         # Run interactive installer
 codegraph install                 # Run installer (explicit)
+codegraph install --command /abs/path/to/codegraph
 codegraph uninstall               # Remove CodeGraph from your agents (inverse of install)
 codegraph init [path]             # Initialize in a project (--index to also index)
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
@@ -23,6 +24,10 @@ codegraph serve --mcp             # Start MCP server
 ```
 
 ## Query commands
+
+## install
+
+Use `codegraph install --command /abs/path/to/codegraph` when you want agent configs to launch a fork checkout, wrapper script, or other non-default executable instead of the bare `codegraph` command on `PATH`.
 
 `query`, `callers`, `callees`, and `impact` all accept `--json` for machine-readable output.
 
