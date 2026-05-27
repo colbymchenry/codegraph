@@ -9,7 +9,28 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
+- **C/C++ `#include` resolution — bare-basename includes now connect to the
+  actual header file, not a phantom import node (#453).** Path-prefixed
+  includes (`#include "common/args.h"`) already resolved via file-path
+  suffix matching, but bare-basename includes (`#include "uint256.h"` from a
+  caller in another directory) used to leave only a phantom edge to a
+  floating `import` node owned by the including file. The resolver now walks
+  C/C++ include search directories — pulled from `compile_commands.json`
+  (`-I`/`-isystem` flags) when present, otherwise discovered by probing
+  conventional dirs (`include/`, `src/`, `lib/`, `api/`, `inc/`) plus any
+  top-level directory containing `.h`/`.hpp` files — and resolves the
+  include to a real file node, producing a true file→file `imports` edge.
+  System headers (`<stdio.h>`, `<vector>`, `<iostream>`, ~80 C and ~80 C++
+  stdlib names) are filtered before the scan so they don't false-resolve
+  via heuristic dir matching. C/C++ built-in symbols (`std::*` unconditionally,
+  plus `printf`/`malloc`/`cout`/`make_shared`/etc. when **no user-defined
+  symbol with that name exists**) are filtered from name-matching too —
+  C/C++ projects routinely shadow stdlib names (custom allocators, stream
+  wrappers, logging libs), so the filter only fires when there's no real
+  definition to bind to. Measured on bitcoin-core (1,989 indexed files):
+  C/C++ file→file `imports` edges 6,027 → 8,086 (**+34%**), false-positive
+  call edges from `std::move`/`std::swap` etc. into similarly-named user
+  methods −2,154 (**−3.6%** of C/C++ `calls`).
 - **Enterprise Spring / MyBatis flow now traces end-to-end (#389).** Three gaps that previously forced agents back to grep on large Spring/MyBatis codebases are closed:
   - **MyBatis XML mapper indexing + Java↔XML bridge.** `*.xml` files containing `<mapper namespace="...">` are now first-class: each `<select|insert|update|delete id="X">` and `<sql id="X">` becomes a method-shaped node qualified as `<namespace>::<id>`, and a new synthesizer (`mybatis-java-xml`) links the matching Java mapper interface method → its XML statement with a `calls` edge. `<include refid="...">` to a `<sql>` fragment in the same mapper also resolves. Non-mapper XML (`pom.xml`, `web.xml`, `log4j.xml`, etc.) emits just a file node — no symbol noise. Validated on macrozheng/mall-tiny: all 6 custom-SQL Java mapper methods reach their XML counterparts; `trace(UmsRoleController.listResource, UmsResourceMapper::getResourceListByRoleId-xml)` connects in 4 hops across controller → service-iface → impl → mapper-iface → XML.
   - **Spring `@Value`/`@ConfigurationProperties` config-key linkage.** `application.{yml,yaml,properties}` (+ profile variants `application-dev.yml`, `bootstrap.yml`, etc.) is parsed during indexing, with one `constant` node per leaf key qualified by its dotted path (`app.cache.name.user-token`). `@Value("${app.cache.name.user-token}")` and `@ConfigurationProperties(prefix = "app.cache")` references in Java/Kotlin emit binding nodes that resolve to the matching key (or, for `@ConfigurationProperties`, a key under the prefix). Spring's **relaxed binding** applies (kebab `cache-list` ↔ camel `cacheList` ↔ snake `cache_list` ↔ `CACHE_LIST`), so a Java `@Value("${app.retryCount}")` finds `app.retry-count` in `application.properties`. `${key:default}` form is supported; the default is stripped before lookup.

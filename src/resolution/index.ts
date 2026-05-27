@@ -155,7 +155,7 @@ const C_BUILT_INS = new Set([
   'size_t', 'ptrdiff_t', 'wchar_t', 'intptr_t', 'uintptr_t',
   'int8_t', 'int16_t', 'int32_t', 'int64_t',
   'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
-  'FILE', 'FILE',
+  'FILE',
   // POSIX additions commonly seen
   'stat', 'lstat', 'fstat', 'open', 'close', 'read', 'write', 'pipe',
   'fork', 'exec', 'waitpid', 'getpid', 'getppid', 'kill', 'sleep', 'usleep',
@@ -879,14 +879,22 @@ export class ReferenceResolver {
       }
     }
 
-    // C/C++ standard library symbols (printf, malloc, std::vector, etc.)
+    // C/C++ standard library symbols (printf, malloc, std::vector, etc.).
+    // Names that collide with user-defined symbols are NOT filtered —
+    // C and C++ projects routinely shadow stdlib names (custom allocators
+    // define `malloc`/`free`, stream wrappers define `read`/`write`/`open`,
+    // containers define `move`/`swap`, logging libs wrap `printf`). Killing
+    // those resolutions makes the graph wrong, not cleaner. We only filter
+    // when there's no user node with this name — then name-matching would
+    // produce zero edges anyway and the filter just short-circuits work.
     if (ref.language === 'c' || ref.language === 'cpp') {
-      // Bare C standard library functions and macros
-      if (C_BUILT_INS.has(name)) return true;
-      // C++ std:: namespace prefix
+      // C++ std:: namespace prefix — safe to filter unconditionally,
+      // since `std::foo` is never a user-defined qualified name in
+      // tree-sitter output.
       if (name.startsWith('std::')) return true;
-      // C++ iostream manipulators and objects used without std::
-      if (CPP_BUILT_INS.has(name)) return true;
+      if (C_BUILT_INS.has(name) || CPP_BUILT_INS.has(name)) {
+        return !this.hasAnyPossibleMatch(name);
+      }
     }
 
     return false;

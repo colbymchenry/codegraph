@@ -952,6 +952,30 @@ export function resolveViaImport(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // C/C++ #include references — resolve directly to the included file
+  // (file→file edge), bypassing symbol lookup. The extractor emits these
+  // with `referenceKind: 'imports'` and `referenceName: <include path>`
+  // (e.g. "uint256.h" or "common/args.h"). Without this branch the
+  // include-dir scan path inside resolveImportPath never produces an
+  // edge — resolveViaImport's symbol lookup below would search the
+  // resolved file for a symbol named like the file extension and fail.
+  if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports') {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNodes = context.getNodesByName(basename).filter((n) => n.kind === 'file');
+    const fileNode = fileNodes.find((n) => n.filePath === resolvedPath);
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
+    return null;
+  }
+
   // Use cached import mappings (avoids re-reading and re-parsing per ref)
   const imports = context.getImportMappings(ref.filePath, ref.language);
   if (imports.length === 0 && !context.readFile(ref.filePath)) {
