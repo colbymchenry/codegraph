@@ -11,6 +11,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- **`codegraph index --max-file-size <size>` (also on `init` and `sync`) lets CI override the 1 MiB skip threshold (#369).** The previous compile-time `MAX_FILE_SIZE = 1 MiB` constant is now `DEFAULT_MAX_FILE_SIZE` and falls back unchanged when no override is given — so existing workflows behave identically. The flag accepts both raw byte counts (`1048576`) and human-readable sizes with binary multipliers (`500kb`, `2 MB`, `1.5GB`, `700KiB`); both decimal and IEC suffixes resolve to the binary base (×1024) to match what `du`/`ls -lh` report and the 1 MiB default the codebase has always used. Invalid values exit with a clear error (`Invalid --max-file-size value: …`) rather than silently coercing. Library consumers get the same control via `CodeGraph.indexAll({ maxFileSize })` / `sync({ maxFileSize })`. Closes #369.
+
 - `codegraph status --json` now also reports the running CLI `version`, the index directory (`indexPath`), and a `lastIndexed` timestamp (ISO-8601, or null when nothing's indexed yet), so CI and scripts can pin the CLI version and check index freshness from a single command. A matching `CodeGraph.getLastIndexedAt()` library method exposes the same freshness check without shelling out. Thanks @12122J and @eddieran. (#329)
 
 ### Fixes

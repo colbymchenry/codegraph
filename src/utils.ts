@@ -175,6 +175,53 @@ export function normalizePath(filePath: string): string {
 }
 
 /**
+ * Parse a human-readable file-size string into a byte count.
+ *
+ * Accepts a non-negative number (`"1048576"` → 1 048 576) or a number with a
+ * unit suffix (`"500kb"`, `"2 MB"`, `"1.5gb"`, `"700 KiB"`). Whitespace is
+ * tolerated and the suffix is case-insensitive. Both decimal (KB/MB/GB) and
+ * binary (KiB/MiB/GiB) units are supported; we use the binary base (×1024)
+ * for both since that matches the existing 1 MiB default and is what filesystem
+ * tools (`du`, `ls -lh`) typically report.
+ *
+ * Returns `null` for any input that doesn't parse as a non-negative size
+ * (empty, NaN, negative, unknown unit) — callers should report a user-friendly
+ * error so the CLI fails fast instead of silently coercing.
+ *
+ * Used by `codegraph index --max-file-size <size>` — see issue #369.
+ */
+export function parseFileSize(input: string): number | null {
+  if (typeof input !== 'string') return null;
+  const trimmed = input.trim();
+  if (trimmed === '') return null;
+
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*([a-z]*)$/i);
+  if (!match) return null;
+
+  const value = parseFloat(match[1]!);
+  if (!Number.isFinite(value) || value < 0) return null;
+
+  const unit = match[2]!.toLowerCase();
+  const multipliers: Record<string, number> = {
+    '': 1,            // plain bytes
+    'b': 1,
+    'k': 1024,
+    'kb': 1024,
+    'kib': 1024,
+    'm': 1024 * 1024,
+    'mb': 1024 * 1024,
+    'mib': 1024 * 1024,
+    'g': 1024 * 1024 * 1024,
+    'gb': 1024 * 1024 * 1024,
+    'gib': 1024 * 1024 * 1024,
+  };
+  const multiplier = multipliers[unit];
+  if (multiplier === undefined) return null;
+
+  return Math.floor(value * multiplier);
+}
+
+/**
  * Cross-process file lock using a lock file with PID tracking.
  *
  * Prevents multiple processes (e.g., git hooks, CLI, MCP server) from

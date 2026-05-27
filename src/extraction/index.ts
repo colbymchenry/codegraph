@@ -93,11 +93,14 @@ export function hashContent(content: string): string {
 }
 
 /**
- * Skip files larger than this (bytes). Generated bundles, minified JS, and
- * vendored blobs blow the WASM heap and the worker-recycle budget for no useful
- * symbols. 1 MB covers essentially all hand-written source.
+ * Default file-size ceiling (bytes). Files above this are skipped at index
+ * time with a `size_exceeded` warning, because generated bundles, minified
+ * JS, and vendored blobs blow the WASM heap and the worker-recycle budget
+ * for no useful symbols, and 1 MiB covers essentially all hand-written
+ * source. Overridable per call via `IndexOptions.maxFileSize` (and the
+ * `codegraph index --max-file-size` CLI flag) — see issue #369.
  */
-const MAX_FILE_SIZE = 1024 * 1024;
+export const DEFAULT_MAX_FILE_SIZE = 1024 * 1024;
 
 /**
  * Directory names that are dependency, build, cache, or tooling output across the
@@ -595,7 +598,8 @@ export class ExtractionOrchestrator {
   async indexAll(
     onProgress?: (progress: IndexProgress) => void,
     signal?: AbortSignal,
-    verbose?: boolean
+    verbose?: boolean,
+    maxFileSize: number = DEFAULT_MAX_FILE_SIZE
   ): Promise<IndexResult> {
     await initGrammars();
     const startTime = Date.now();
@@ -885,16 +889,16 @@ export class ExtractionOrchestrator {
           continue;
         }
 
-        // Honour MAX_FILE_SIZE. Without this check, vendored generated
-        // headers, minified bundles, and other multi-MB files get indexed,
-        // wasting WASM heap and the worker recycle budget on inputs with no
-        // useful symbols. The single-file extractFile path already enforces
-        // this; the bulk path used to silently skip the check.
-        if (stats.size > MAX_FILE_SIZE) {
+        // Honour the configured max-file-size. Without this check, vendored
+        // generated headers, minified bundles, and other multi-MB files get
+        // indexed, wasting WASM heap and the worker recycle budget on inputs
+        // with no useful symbols. The single-file extractFile path already
+        // enforces this; the bulk path used to silently skip the check.
+        if (stats.size > maxFileSize) {
           processed++;
           filesSkipped++;
           errors.push({
-            message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
+            message: `File exceeds max size (${stats.size} > ${maxFileSize})`,
             filePath,
             severity: 'warning',
             code: 'size_exceeded',
@@ -1140,7 +1144,10 @@ export class ExtractionOrchestrator {
   /**
    * Index a single file
    */
-  async indexFile(relativePath: string): Promise<ExtractionResult> {
+  async indexFile(
+    relativePath: string,
+    maxFileSize: number = DEFAULT_MAX_FILE_SIZE
+  ): Promise<ExtractionResult> {
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
 
     if (!fullPath) {
@@ -1176,7 +1183,7 @@ export class ExtractionOrchestrator {
       };
     }
 
-    return this.indexFileWithContent(relativePath, content, stats);
+    return this.indexFileWithContent(relativePath, content, stats, maxFileSize);
   }
 
   /**
@@ -1186,7 +1193,8 @@ export class ExtractionOrchestrator {
   async indexFileWithContent(
     relativePath: string,
     content: string,
-    stats: fs.Stats
+    stats: fs.Stats,
+    maxFileSize: number = DEFAULT_MAX_FILE_SIZE
   ): Promise<ExtractionResult> {
     // Prevent path traversal
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
@@ -1202,14 +1210,14 @@ export class ExtractionOrchestrator {
     }
 
     // Check file size
-    if (stats.size > MAX_FILE_SIZE) {
+    if (stats.size > maxFileSize) {
       return {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
         errors: [
           {
-            message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
+            message: `File exceeds max size (${stats.size} > ${maxFileSize})`,
             filePath: relativePath,
             severity: 'warning',
             code: 'size_exceeded',
@@ -1326,7 +1334,10 @@ export class ExtractionOrchestrator {
    * changes. This works in non-git projects and catches committed changes from
    * `git pull`/`checkout`/`merge`/`rebase` that `git status` cannot see.
    */
-  async sync(onProgress?: (progress: IndexProgress) => void): Promise<SyncResult> {
+  async sync(
+    onProgress?: (progress: IndexProgress) => void,
+    maxFileSize: number = DEFAULT_MAX_FILE_SIZE
+  ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
     let filesChecked = 0;
@@ -1436,7 +1447,7 @@ export class ExtractionOrchestrator {
         currentFile: filePath,
       });
 
-      const result = await this.indexFile(filePath);
+      const result = await this.indexFile(filePath, maxFileSize);
       nodesUpdated += result.nodes.length;
     }
 
