@@ -120,6 +120,12 @@ export interface LanguageExtractor {
 
   // --- Existing hooks ---
 
+  /** Override symbol name extraction (e.g. ObjC multi-part selectors). */
+  resolveName?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /** Extract property name when the generic name walk fails (e.g. ObjC @property). */
+  extractPropertyName?: (node: SyntaxNode, source: string) => string | null;
+
   /** Extract signature from node */
   getSignature?: (node: SyntaxNode, source: string) => string | undefined;
   /** Extract visibility from node */
@@ -206,4 +212,16 @@ export interface LanguageExtractor {
    * Returns the callee name if this node is a bare call, or undefined if not.
    */
   extractBareCall?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
+   * Node types representing a file-level package/namespace declaration
+   * (e.g. Kotlin `package_header`, Java `package_declaration`). When set,
+   * the core wraps every top-level declaration in an implicit `namespace`
+   * node carrying the FQN, so cross-file import resolution can match by
+   * qualifiedName instead of filename (Kotlin filename ≠ class name).
+   */
+  packageTypes?: string[];
+
+  /** Extract the dotted package name from a package declaration node. */
+  extractPackage?: (node: SyntaxNode, source: string) => string | null;
 }

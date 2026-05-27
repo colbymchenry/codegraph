@@ -46,6 +46,19 @@ export const WASM_RUNTIME_FLAGS: readonly string[] = ['--liftoff-only'];
  */
 const RELAUNCH_GUARD_ENV = 'CODEGRAPH_WASM_RELAUNCHED';
 
+/**
+ * Env var carrying the *host* PID (the relauncher's own parent) across the
+ * re-exec. Without `--liftoff-only` the CLI re-execs itself once, inserting an
+ * intermediate process between the MCP host and the server. That intermediate
+ * stays alive (blocked in spawnSync) even after the host is killed, so the
+ * server's PPID watchdog can't detect the host's death by watching its own
+ * `process.ppid`. Passing the host PID through lets the watchdog poll it
+ * directly. Unset on the no-re-exec path (bundled launcher / flag already
+ * present), where the server is already a direct child of the host. See
+ * src/mcp/index.ts (#277).
+ */
+export const HOST_PPID_ENV = 'CODEGRAPH_HOST_PPID';
+
 /** True when every required WASM runtime flag is already present in `execArgv`. */
 export function processHasWasmRuntimeFlags(
   execArgv: readonly string[] = process.execArgv
@@ -84,7 +97,7 @@ export function relaunchWithWasmRuntimeFlagsIfNeeded(scriptPath: string): void {
   const argv = buildRelaunchArgv(scriptPath, process.argv.slice(2));
   const result = spawnSync(process.execPath, argv, {
     stdio: 'inherit',
-    env: { ...process.env, [RELAUNCH_GUARD_ENV]: '1' },
+    env: { ...process.env, [RELAUNCH_GUARD_ENV]: '1', [HOST_PPID_ENV]: String(process.ppid) },
   });
 
   if (result.error) {

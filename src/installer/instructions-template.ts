@@ -34,6 +34,7 @@ Use codegraph for **structural** questions — what calls what, what would break
 | "Where is X defined?" / "Find symbol named X" | \`codegraph_search\` |
 | "What calls function Y?" | \`codegraph_callers\` |
 | "What does Y call?" | \`codegraph_callees\` |
+| "How does X reach/become Y? / trace the flow from X to Y" | \`codegraph_trace\` (one call = the whole path, incl. callback/React/JSX dynamic hops) |
 | "What would break if I changed Z?" | \`codegraph_impact\` |
 | "Show me Y's signature / source / docstring" | \`codegraph_node\` |
 | "Give me focused context for a task/area" | \`codegraph_context\` |
@@ -43,12 +44,12 @@ Use codegraph for **structural** questions — what calls what, what would break
 
 ### Rules of thumb
 
-- **Answer directly — don't delegate exploration.** For "how does X work" / architecture / trace questions, answer with 2-3 codegraph calls: \`codegraph_context\` first, then ONE \`codegraph_explore\` for the source of the symbols it surfaces. Codegraph IS the pre-built index, so spawning a separate file-reading sub-task/agent — or running a grep + read loop — repeats work codegraph already did and costs more for the same answer.
+- **Answer directly — don't delegate exploration.** For "how does X work" / architecture questions, answer with 2-3 codegraph calls: \`codegraph_context\` first, then ONE \`codegraph_explore\` for the source of the symbols it surfaces. For a specific **flow** ("how does X reach Y") start with \`codegraph_trace\` from→to — one call returns the whole path with dynamic hops bridged — then ONE \`codegraph_explore\` for the bodies; don't rebuild the path with \`codegraph_search\` + \`codegraph_callers\`. Codegraph IS the pre-built index, so spawning a separate file-reading sub-task/agent — or running a grep + read loop — repeats work codegraph already did and costs more for the same answer.
 - **Trust codegraph results.** They come from a full AST parse. Do NOT re-verify them with grep — that's slower, less accurate, and wastes context.
 - **Don't grep first** when looking up a symbol by name. \`codegraph_search\` is faster and returns kind + location + signature in one call.
 - **Don't chain \`codegraph_search\` + \`codegraph_node\`** when you just want context — \`codegraph_context\` is one call.
 - **Don't loop \`codegraph_node\` over many symbols** — one \`codegraph_explore\` call returns several symbols' source grouped in a single capped call, while each separate node/Read call re-reads the whole context and costs far more.
-- **Index lag**: the file watcher debounces ~500ms behind writes; don't re-query immediately after editing a file in the same turn.
+- **Index lag — check the staleness banner, don't guess a wait.** When a codegraph response starts with "⚠️ Some files referenced below were edited since the last index sync…", the listed files are pending re-index — Read those specific files for accurate content. Files NOT in that banner are fresh and codegraph is authoritative for them. \`codegraph_status\` also lists pending files under "Pending sync".
 
 ### If \`.codegraph/\` doesn't exist
 

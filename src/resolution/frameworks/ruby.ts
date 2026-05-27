@@ -12,6 +12,13 @@ export const railsResolver: FrameworkResolver = {
   name: 'rails',
   languages: ['ruby'],
 
+  // `controller#action` route refs name no declared symbol, so resolveOne's
+  // pre-filter would drop them before resolve() runs. Claim them (like the django
+  // `_iterable_class` hook) so they reach Pattern 0.
+  claimsReference(name: string): boolean {
+    return /^[\w/]+#\w+$/.test(name);
+  },
+
   detect(context: ResolutionContext): boolean {
     // Check for Gemfile with rails
     const gemfile = context.readFile('Gemfile');
@@ -32,6 +39,18 @@ export const railsResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Pattern 0: route action `controller#action` (from RESTful `resources` or an
+    // explicit route) → the action method in that controller. Precise — avoids the
+    // bare-`action` ambiguity (every controller has an `index`/`show`).
+    const ca = ref.referenceName.match(/^([\w/]+)#(\w+)$/);
+    if (ca) {
+      const result = resolveControllerAction(ca[1]!, ca[2]!, context);
+      if (result) {
+        return { original: ref, targetNodeId: result, confidence: 0.85, resolvedBy: 'framework' };
+      }
+      return null;
+    }
+
     // Pattern 1: Model references (ActiveRecord)
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
       const result = resolveModel(ref.referenceName, context);
@@ -99,7 +118,7 @@ export const railsResolver: FrameworkResolver = {
     const routeRegex = /\b(get|post|put|patch|delete|match)\s+['"]([^'"]+)['"]\s*(?:,\s*to:\s*|=>\s*)['"]([^#'"]+)#([^'"]+)['"]/g;
     let match: RegExpExecArray | null;
     while ((match = routeRegex.exec(safe)) !== null) {
-      const [, method, routePath, _controller, action] = match;
+      const [, method, routePath, ctrl, action] = match;
       const line = safe.slice(0, match.index).split('\n').length;
       const upper = method!.toUpperCase();
       const routeNode: Node = {
@@ -119,7 +138,7 @@ export const railsResolver: FrameworkResolver = {
 
       references.push({
         fromNodeId: routeNode.id,
-        referenceName: action!,
+        referenceName: `${ctrl}#${action}`, // precise controller#action, not bare action
         referenceKind: 'references',
         line,
         column: 0,
@@ -128,11 +147,93 @@ export const railsResolver: FrameworkResolver = {
       });
     }
 
+    // RESTful resources: `resources :articles` / `resource :user` (the dominant
+    // Rails routing) generate a controller action per REST verb. The old resolver
+    // only saw explicit `get '/x' => 'c#a'` routes, so resource-routed apps had
+    // ZERO route nodes. Expand each into its actions → `controller#action` refs.
+    const resRegex = /\b(resources?)\s+:(\w+)([^\n]*)/g;
+    while ((match = resRegex.exec(safe)) !== null) {
+      const plural = match[1] === 'resources';
+      const resName = match[2]!;
+      const tail = match[3] || '';
+      let actions = plural ? PLURAL_ACTIONS : SINGULAR_ACTIONS;
+      const only = tail.match(/only:\s*\[([^\]]*)\]/);
+      const except = tail.match(/except:\s*\[([^\]]*)\]/);
+      const symList = (s: string) => new Set(s.split(',').map((x) => x.trim().replace(/^:/, '')));
+      if (only) { const s = symList(only[1]!); actions = actions.filter((a) => s.has(a)); }
+      else if (except) { const s = symList(except[1]!); actions = actions.filter((a) => !s.has(a)); }
+      // `resources :articles` → ArticlesController; `resource :user` → UsersController.
+      const ctrl = plural ? resName : pluralize(resName);
+      const line = safe.slice(0, match.index).split('\n').length;
+      for (const action of actions) {
+        const spec = RESTFUL_ROUTES[action]!;
+        const path = spec.path(resName);
+        const routeNode: Node = {
+          id: `route:${filePath}:${line}:${spec.method}:${ctrl}#${action}`,
+          kind: 'route',
+          name: `${spec.method} ${path}`,
+          qualifiedName: `${filePath}::route:${ctrl}#${action}`,
+          filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length,
+          language: 'ruby', updatedAt: now,
+        };
+        nodes.push(routeNode);
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: `${ctrl}#${action}`,
+          referenceKind: 'references',
+          line, column: 0, filePath, language: 'ruby',
+        });
+      }
+    }
+
     return { nodes, references };
   },
 };
 
 // Helper functions
+
+// RESTful action → HTTP verb + path. `resources` gets all seven; a singular
+// `resource` omits `index`.
+const RESTFUL_ROUTES: Record<string, { method: string; path: (r: string) => string }> = {
+  index:   { method: 'GET',    path: (r) => `/${r}` },
+  create:  { method: 'POST',   path: (r) => `/${r}` },
+  new:     { method: 'GET',    path: (r) => `/${r}/new` },
+  show:    { method: 'GET',    path: (r) => `/${r}/:id` },
+  edit:    { method: 'GET',    path: (r) => `/${r}/:id/edit` },
+  update:  { method: 'PATCH',  path: (r) => `/${r}/:id` },
+  destroy: { method: 'DELETE', path: (r) => `/${r}/:id` },
+};
+const PLURAL_ACTIONS = ['index', 'create', 'new', 'show', 'edit', 'update', 'destroy'];
+const SINGULAR_ACTIONS = ['create', 'new', 'show', 'edit', 'update', 'destroy'];
+
+/** Naive ActiveSupport-style pluralize — covers the common resource names. */
+function pluralize(w: string): string {
+  if (/[^aeiou]y$/.test(w)) return w.slice(0, -1) + 'ies';
+  if (/(s|x|z|ch|sh)$/.test(w)) return w + 'es';
+  return w + 's';
+}
+
+/** snake_case → CamelCase (`user_profiles` → `UserProfiles`). */
+function camelize(s: string): string {
+  return s.split('_').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join('');
+}
+
+/** Resolve a `controller#action` route ref to the action method in that controller. */
+function resolveControllerAction(ctrlPath: string, action: string, context: ResolutionContext): string | null {
+  // Rails convention: `articles` → app/controllers/articles_controller.rb.
+  const direct = `app/controllers/${ctrlPath}_controller.rb`;
+  if (context.fileExists(direct)) {
+    const m = context.getNodesInFile(direct).find((n) => (n.kind === 'method' || n.kind === 'function') && n.name === action);
+    if (m) return m.id;
+  }
+  // Fall back: controller class by name, then the action method in its file.
+  const cls = camelize(ctrlPath.split('/').pop()!) + 'Controller';
+  for (const ctrl of context.getNodesByName(cls).filter((n) => n.kind === 'class')) {
+    const m = context.getNodesInFile(ctrl.filePath).find((n) => (n.kind === 'method' || n.kind === 'function') && n.name === action);
+    if (m) return m.id;
+  }
+  return null;
+}
 
 function resolveModel(name: string, context: ResolutionContext): string | null {
   // Try direct file path lookup first (Rails convention: CamelCase -> snake_case.rb)

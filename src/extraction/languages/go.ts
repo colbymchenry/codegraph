@@ -36,6 +36,18 @@ export const goExtractor: LanguageExtractor = {
     if (typeChild.type === 'interface_type') return 'interface';
     return undefined;
   },
+  isExported: (node, source) => {
+    // Go: a symbol is exported when its identifier starts with an uppercase letter.
+    // Look at the `name` field directly (works for function_declaration,
+    // method_declaration, type_spec, and var_spec / const_spec via extractor flow).
+    const nameNode = getChildByField(node, 'name');
+    if (nameNode) {
+      const text = getNodeText(nameNode, source);
+      const first = text.charCodeAt(0);
+      return first >= 65 && first <= 90; // A-Z
+    }
+    return false;
+  },
   getReceiverType: (node, source) => {
     // Go method_declaration has a "receiver" field: func (sl *scrapeLoop) run(...)
     // The receiver is a parameter_list containing a parameter_declaration
