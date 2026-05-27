@@ -29,7 +29,7 @@ npx vitest run __tests__/extraction.test.ts -t "TypeScript"
 
 `copy-assets` (called from `build`) copies `src/db/schema.sql` and all `src/extraction/wasm/*.wasm` files into `dist/`. **Any new SQL or grammar wasm must be copied or it won't ship.**
 
-Node engines: `>=18.0.0 <25.0.0`. There is a hard exit on Node 25.x (see `src/bin/node-version-check.ts`).
+Node engines: `>=20.0.0 <25.0.0`. There is a hard exit on Node 25.x (see `src/bin/node-version-check.ts`).
 
 ## Architecture
 
