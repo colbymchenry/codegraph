@@ -100,6 +100,21 @@ function extractSymbolsFromQuery(query: string): string[] {
     }
   }
 
+  // Extract non-ASCII identifier runs (Hangul, CJK, Cyrillic, Greek, …).
+  // Every pattern above relies on [a-zA-Z] and the ASCII word boundary \b, so
+  // a query like "로그인" or "认证" yields zero symbols and context comes back
+  // empty. Pull runs of Unicode letters/digits and keep only those that
+  // actually contain a non-ASCII letter — purely additive (ASCII-only tokens
+  // stay owned by the patterns above). FTS already indexes/​prefix-matches
+  // these tokens (unicode61), so an extracted name flows straight into search.
+  const unicodePattern = /[\p{L}\p{N}_]+/gu;
+  while ((match = unicodePattern.exec(query)) !== null) {
+    const token = match[0];
+    if (token.length >= 2 && /[^\x00-\x7F]/.test(token)) {
+      symbols.add(token);
+    }
+  }
+
   // Filter out common English words that aren't likely symbol names
   const commonWords = new Set([
     'the', 'and', 'for', 'with', 'from', 'this', 'that', 'have', 'been',

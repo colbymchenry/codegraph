@@ -39,6 +39,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now sees the four anonymous overrides in its trail without a Read.
 
 ### Fixed
+- **`codegraph context` (and the `codegraph_context` MCP tool) now works for
+  non-ASCII queries.** A task description in Korean, Japanese, Chinese, or any
+  other non-Latin script — e.g. `codegraph context "로그인"` — used to return
+  an empty context (just the header + the query) even though `codegraph query`
+  found the symbols fine. The keyword extractors that feed context were built
+  entirely from ASCII patterns (`[a-zA-Z]` + the ASCII `\b` word boundary), so
+  they pulled zero keywords out of a non-ASCII description and searched for
+  nothing. Both extractors now also pick up runs of Unicode letters and hand
+  them to the existing FTS path (which already tokenizes non-ASCII via
+  `unicode61`); ASCII extraction is unchanged. A Korean class/function/method
+  query now surfaces the matching symbols and their code blocks.
 - **`codegraph index` / `init -i` summary now reports the true edge count.**
   The per-file counter in the orchestrator only saw extraction-phase edges,
   so resolution and synthesizer edges (often >50% of the graph on
