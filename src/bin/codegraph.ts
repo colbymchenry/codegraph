@@ -29,6 +29,7 @@ import { getCodeGraphDir, isInitialized } from '../directory';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
+import { normalizePath } from '../utils';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
@@ -1097,7 +1098,7 @@ program
   .description('Build context for a task (outputs markdown)')
   .option('-p, --path <path>', 'Project path')
   .option('-n, --max-nodes <number>', 'Maximum nodes to include', '50')
-  .option('-c, --max-code <number>', 'Maximum code blocks', '10')
+  .option('-c, --max-code <number>', 'Maximum code blocks', '2')
   .option('--no-code', 'Exclude code blocks')
   .option('-f, --format <format>', 'Output format (markdown, json)', 'markdown')
   .action(async (task: string, options: {
@@ -1120,7 +1121,7 @@ program
 
       const context = await cg.buildContext(task, {
         maxNodes: parseInt(options.maxNodes || '50', 10),
-        maxCodeBlocks: parseInt(options.maxCode || '10', 10),
+        maxCodeBlocks: parseInt(options.maxCode || '2', 10),
         includeCode: options.code !== false,
         format: options.format as 'markdown' | 'json',
       });
@@ -1516,6 +1517,8 @@ program
         const stdinFiles = stdinData.split('\n').map(f => f.trim()).filter(Boolean);
         changedFiles.push(...stdinFiles);
       }
+
+      changedFiles = changedFiles.map(normalizePath);
 
       if (changedFiles.length === 0) {
         if (!options.quiet) info('No files provided. Use file arguments or --stdin.');
