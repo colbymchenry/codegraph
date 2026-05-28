@@ -81,13 +81,13 @@ When Claude Code explores a codebase, it spawns **Explore agents** that scan fil
 
 ### Benchmark Results
 
-Tested across **7 real-world open-source codebases** spanning 7 languages, comparing an agent (Claude Code, headless) answering one architecture question **with** and **without** CodeGraph. Each cell is the savings at the **median of 4 runs per arm**. _Re-validated on **v0.9.4** (2026-05-24)._
+Tested across **7 real-world open-source codebases** spanning 7 languages, comparing an agent (Claude Code, headless) answering one architecture question **with** and **without** CodeGraph. Each cell is the savings at the **median of 4 runs per arm**. _Re-validated on **v0.9.4** (2026-05-24); the **VS Code** row refreshed on **v0.9.7** + Opus 4.8 (2026-05-28)._
 
-> **Average: 35% cheaper · 57% fewer tokens · 46% faster · 71% fewer tool calls**
+> **Average: 35% cheaper · 55% fewer tokens · 41% faster · 68% fewer tool calls**
 
 | Codebase | Language | Cost | Tokens | Time | Tool calls |
 |----------|----------|------|--------|------|------------|
-| **VS Code** | TypeScript · ~10k files | 26% cheaper | 78% fewer | 52% faster | 85% fewer |
+| **VS Code** | TypeScript · ~10k files | 26% cheaper | 63% fewer | 20% faster | 69% fewer |
 | **Excalidraw** | TypeScript · ~640 | 52% cheaper | 90% fewer | 73% faster | 96% fewer |
 | **Django** | Python · ~3k | 12% cheaper | 36% fewer | 19% faster | 53% fewer |
 | **Tokio** | Rust · ~790 | 82% cheaper | 86% fewer | 71% faster | 92% fewer |
@@ -116,7 +116,7 @@ The gains scale with codebase size: on large repos the agent answers from the in
 **Raw medians — WITH → WITHOUT:**
 | Codebase | Cost | Tokens | Time | Tool calls |
 |----------|------|--------|------|------------|
-| VS Code | $0.60 → $0.80 | 601k → 2.8M | 1m 10s → 2m 26s | 8 → 55 |
+| VS Code | $0.66 → $0.89 | 672k → 1.8M | 1m 49s → 2m 16s | 5 → 16 |
 | Excalidraw | $0.43 → $0.90 | 344k → 3.5M | 48s → 2m 58s | 3 → 79 |
 | Django | $0.59 → $0.67 | 739k → 1.2M | 1m 19s → 1m 38s | 9 → 19 |
 | Tokio | $0.42 → $2.41 | 379k → 2.6M | 53s → 3m 2s | 4 → 53 |
