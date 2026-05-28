@@ -167,6 +167,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   calls pay nothing. Most visible on the "deleted everything between
   sessions" case, where MCP now returns the correct empty index instead
   of stale rows. Validated end-to-end on a 10,640-file VS Code index.
+- **Windows: black console windows no longer flash on every file save / MCP
+  reconnect (#485, #510, #530).** v0.9.5 moved the MCP server to a detached
+  shared daemon (#411). Detached processes have no inherited console on
+  Windows, so any console-subsystem child they spawn (the daemon's `git`
+  invocations during auto-sync, the WASM-runtime `node` re-exec, the
+  installer's `npm` shell-out) is created with a fresh console window
+  visible to the user unless the spawn passes `windowsHide: true` (which
+  libuv translates to `STARTF_USESHOWWINDOW | SW_HIDE`, so the window is
+  created hidden and never flashes). All ten `spawnSync` / `execFileSync` /
+  `execSync` call sites across extraction, sync, installer, and the
+  WASM-flags relaunch now pass `windowsHide: true`. macOS/Linux ignore the
+  option, so this is a no-op elsewhere. The daemon launcher itself
+  (`src/mcp/index.ts`) already passed the flag — these children had been
+  missed.
 - **`codegraph index` / `init -i` summary now reports the true edge count.**
   The per-file counter in the orchestrator only saw extraction-phase edges,
   so resolution and synthesizer edges (often >50% of the graph on
