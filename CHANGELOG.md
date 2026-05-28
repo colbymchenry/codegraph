@@ -48,6 +48,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `macrozheng/mall` previously reported `20 047 edges` while the DB held
   `45 629`.
 
+### Changed
+- Claude Code: removed the duplicate `<!-- CODEGRAPH_START -->` block from `CLAUDE.md` — identical instructions are delivered automatically via the MCP `initialize` response (`SERVER_INSTRUCTIONS`) every session, making the CLAUDE.md copy redundant and costing ~1500 unnecessary tokens per turn. Re-running `codegraph install` strips the block from existing installs. Other targets (Cursor, Codex, opencode, Gemini, Kiro) are unchanged.
+
 ## [0.9.6] - 2026-05-27
 
 - **C/C++ `#include` resolution — bare-basename includes now connect to the

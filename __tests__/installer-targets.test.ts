@@ -1018,6 +1018,59 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.readFileSync(file, 'utf-8')).toBe(firstPass);
   });
 
+  it('claude: install does not write CLAUDE.md instructions block', () => {
+    const claude = getTarget('claude')!;
+    const claudeMd = path.join(tmpHome, '.claude', 'CLAUDE.md');
+
+    claude.install('global', { autoAllow: false });
+
+    if (fs.existsSync(claudeMd)) {
+      const content = fs.readFileSync(claudeMd, 'utf-8');
+      expect(content).not.toContain('<!-- CODEGRAPH_START -->');
+    }
+  });
+
+  it('claude: install strips existing CLAUDE.md codegraph block (migration path)', () => {
+    const claude = getTarget('claude')!;
+    const claudeDir = path.join(tmpHome, '.claude');
+    const claudeMd = path.join(claudeDir, 'CLAUDE.md');
+
+    fs.mkdirSync(claudeDir, { recursive: true });
+    fs.writeFileSync(claudeMd, [
+      '# My personal Claude instructions',
+      '',
+      'Always respond concisely.',
+      '',
+      '<!-- CODEGRAPH_START -->',
+      '## CodeGraph',
+      '',
+      'Old codegraph content here.',
+      '<!-- CODEGRAPH_END -->',
+      '',
+      '## Another personal section',
+      '',
+      'Keep this.',
+      '',
+    ].join('\n'));
+
+    const result = claude.install('global', { autoAllow: false });
+
+    // Block is gone, user content outside the markers is preserved.
+    const content = fs.readFileSync(claudeMd, 'utf-8');
+    expect(content).not.toContain('<!-- CODEGRAPH_START -->');
+    expect(content).not.toContain('<!-- CODEGRAPH_END -->');
+    expect(content).not.toContain('Old codegraph content here.');
+    expect(content).toContain('# My personal Claude instructions');
+    expect(content).toContain('Always respond concisely.');
+    expect(content).toContain('## Another personal section');
+    expect(content).toContain('Keep this.');
+
+    // Removal is surfaced in result.files.
+    const instrEntry = result.files.find((f) => f.path === claudeMd);
+    expect(instrEntry).toBeDefined();
+    expect(instrEntry!.action).toBe('removed');
+  });
+
   it('claude: uninstall strips stale hooks written in the npx form (local)', () => {
     const claude = getTarget('claude')!;
     const file = seedSettings('local', {
