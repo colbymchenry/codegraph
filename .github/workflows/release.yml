@@ -18,7 +18,9 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # create the GitHub Release + tag, push the CHANGELOG promote
+  contents: write       # create the GitHub Release + tag, push the CHANGELOG promote
+  id-token: write       # OIDC for npm provenance + build-provenance attestation (no secrets)
+  attestations: write   # store signed build-provenance attestations for the release archives
 
 jobs:
   release:
@@ -127,6 +129,22 @@ jobs:
           ( cd release && sha256sum codegraph-* > SHA256SUMS )
           cat release/SHA256SUMS
 
+      - name: Attest build provenance
+        # Cryptographically ties every release archive + the SHA256SUMS file to
+        # THIS workflow run, signed via Sigstore using the job's OIDC identity —
+        # no secret/key to manage or rotate. This is the authenticity layer the
+        # SHA256SUMS file alone can't provide: a hash published next to the
+        # artifact it describes proves integrity, not provenance (an attacker who
+        # can replace the archive can replace the hash). Verify a downloaded
+        # bundle with:
+        #   gh attestation verify codegraph-<target>.tar.gz --repo ${{ github.repository }}
+        # Opt-in for consumers, so it never breaks the dependency-free curl|sh path.
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release/codegraph-*
+            release/SHA256SUMS
+
       - name: Release notes from CHANGELOG.md
         # The [<version>] block was guaranteed-populated by the
         # "Promote" step above, so the [Unreleased] fallback should
@@ -167,7 +185,12 @@ jobs:
               echo "skip $name@$V (already published)"
             else
               echo "publishing $name@$V"
-              ( cd "$dir" && npm publish --access public )
+              # --provenance: npm generates a signed Sigstore provenance statement
+              # (via the job's OIDC identity) linking the published tarball to this
+              # source repo + workflow run. Requires the id-token:write permission
+              # above and a `repository` field in each package.json (added by
+              # pack-npm.sh). Visible as the "Provenance" badge on npmjs.com.
+              ( cd "$dir" && npm publish --access public --provenance )
             fi
           done
 

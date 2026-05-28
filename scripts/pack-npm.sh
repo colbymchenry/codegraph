@@ -62,6 +62,10 @@ for archive in "${archives[@]}"; do
         name: `${process.env.SCOPE}/codegraph-${process.env.TARGET}`,
         version: process.env.VERSION,
         description: `CodeGraph self-contained bundle for ${process.env.TARGET}`,
+        // repository is REQUIRED for `npm publish --provenance` (release.yml):
+        // npm matches it against the building repo to mint the Sigstore
+        // provenance statement; publish fails without it.
+        repository: { type: "git", url: "git+https://github.com/colbymchenry/codegraph.git" },
         os: [process.env.OSV], cpu: [process.env.ARCHV],
         files: [process.env.NODEFILE, "lib", "bin"],
         license: "MIT"
@@ -85,6 +89,8 @@ VERSION="$VERSION" SCOPE="$SCOPE" TARGETS="${targets[*]}" \
       version: process.env.VERSION,
       description: "Local-first code intelligence for AI agents (MCP). Self-contained — bundles its own runtime.",
       bin: { codegraph: "npm-shim.js" },
+      // Required for `npm publish --provenance` (see release.yml).
+      repository: { type: "git", url: "git+https://github.com/colbymchenry/codegraph.git" },
       optionalDependencies: opt,
       files: ["npm-shim.js","README.md"],
       license: "MIT"

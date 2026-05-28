@@ -64,10 +64,31 @@ triggered. Reads the version from `package.json`, builds every platform bundle o
 one runner, creates the GitHub Release (notes from `CHANGELOG.md`), and publishes
 the npm shim + per-platform packages. Requires the `NPM_TOKEN` repo secret.
 
+## Supply-chain authenticity
+
+Every release is signed via [Sigstore](https://www.sigstore.dev/) using the
+release job's OIDC identity — no maintainer keys to manage or rotate:
+
+- **GitHub Release archives + `SHA256SUMS`** carry a build-provenance attestation
+  (`actions/attest-build-provenance`). Verify a download before trusting it:
+
+  ```bash
+  gh attestation verify codegraph-linux-x64.tar.gz --repo colbymchenry/codegraph
+  ```
+
+  This is the authenticity layer `SHA256SUMS` alone can't provide: a checksum
+  published next to the artifact it describes proves integrity, not provenance —
+  anyone who can replace the archive can replace the hash. The attestation ties
+  the bytes to a specific workflow run in this repo. Verification is **opt-in**,
+  so the dependency-free `curl | sh` path keeps working unchanged.
+
+- **npm packages** are published with `--provenance`, so npmjs.com shows a
+  "Provenance" badge linking each tarball to its source commit + build.
+
 Still TODO:
-- **Code signing** — the main gap for "download & run": macOS Gatekeeper needs a
-  Developer ID + notarization; Windows needs Authenticode. Homebrew softens the
-  macOS case (handles quarantine).
+- **OS code signing** — for "download & run" UX (separate from provenance):
+  macOS Gatekeeper needs a Developer ID + notarization; Windows needs
+  Authenticode. Homebrew softens the macOS case (handles quarantine).
 - Retire the now-vestigial Node-version gate in `src/bin/codegraph.ts` — the
   bundle always runs Node 24, and the npm shim does no tree-sitter work.
 - Re-wire `npm uninstall` cleanup (the agent-config `preuninstall`) through the
