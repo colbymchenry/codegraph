@@ -1097,7 +1097,7 @@ program
   .description('Build context for a task (outputs markdown)')
   .option('-p, --path <path>', 'Project path')
   .option('-n, --max-nodes <number>', 'Maximum nodes to include', '50')
-  .option('-c, --max-code <number>', 'Maximum code blocks', '10')
+  .option('-c, --max-code <number>', 'Maximum code blocks', '2')
   .option('--no-code', 'Exclude code blocks')
   .option('-f, --format <format>', 'Output format (markdown, json)', 'markdown')
   .action(async (task: string, options: {
@@ -1120,7 +1120,7 @@ program
 
       const context = await cg.buildContext(task, {
         maxNodes: parseInt(options.maxNodes || '50', 10),
-        maxCodeBlocks: parseInt(options.maxCode || '10', 10),
+        maxCodeBlocks: parseInt(options.maxCode || '2', 10),
         includeCode: options.code !== false,
         format: options.format as 'markdown' | 'json',
       });

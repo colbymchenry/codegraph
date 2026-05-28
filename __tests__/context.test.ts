@@ -20,6 +20,8 @@ describe('Context Builder', () => {
     // Create a sample codebase
     const srcDir = path.join(testDir, 'src');
     fs.mkdirSync(srcDir);
+    const evalDir = path.join(testDir, '__tests__', 'evaluation');
+    fs.mkdirSync(evalDir, { recursive: true });
 
     // Create a payment service file
     fs.writeFileSync(
@@ -135,6 +137,46 @@ export function validateEmail(email: string): boolean {
 `
     );
 
+    fs.writeFileSync(
+      path.join(srcDir, 'affected.ts'),
+      `
+export function getFileDependents(filePath: string): string[] {
+  return [filePath];
+}
+
+export function affected(filePath: string): string[] {
+  return getFileDependents(filePath);
+}
+`
+    );
+
+    fs.writeFileSync(
+      path.join(srcDir, 'cache.ts'),
+      `
+export class LRUCache {
+  private values = new Map<string, string>();
+
+  get(key: string): string | undefined {
+    return this.values.get(key);
+  }
+
+  getDb(): Map<string, string> {
+    return this.values;
+  }
+}
+`
+    );
+
+    fs.writeFileSync(
+      path.join(evalDir, 'test-cases.ts'),
+      `
+export const testCases = [
+  { id: 'search-class-exact', query: 'PaymentService' },
+  { id: 'context-affected', query: 'affected tests' },
+];
+`
+    );
+
     // Initialize CodeGraph
     cg = CodeGraph.initSync(testDir, {
       config: {
@@ -192,6 +234,22 @@ export function validateEmail(email: string): boolean {
             name.toLowerCase().includes('checkout')
         )
       ).toBe(true);
+    });
+
+    it('should avoid generic split-term entry points when an exact compound symbol matches', async () => {
+      const result = await cg.findRelevantContext('getFileDependents affected tests', {
+        searchLimit: 3,
+        maxNodes: 12,
+      });
+
+      const entryNames = result.roots
+        .map((id) => result.nodes.get(id)?.name)
+        .filter(Boolean);
+
+      expect(entryNames).toContain('getFileDependents');
+      expect(entryNames).not.toContain('get');
+      expect(entryNames).not.toContain('getDb');
+      expect(entryNames).not.toContain('testCases');
     });
 
     it('should include edges in the result', async () => {
@@ -265,6 +323,51 @@ export function validateEmail(email: string): boolean {
       // Should contain code blocks
       expect(markdown).toContain('### Code');
       expect(markdown).toContain('```typescript');
+    });
+
+    it('should avoid related class code blocks for method-focused context', async () => {
+      const result = await cg.buildContext('processCheckout', {
+        format: 'json',
+        includeCode: true,
+        maxCodeBlocks: 10,
+        traversalDepth: 2,
+      });
+
+      const parsed = JSON.parse(result as string);
+      const codeBlocks = parsed.codeBlocks as Array<{
+        nodeName: string;
+        nodeKind: string;
+        filePath: string;
+        startLine: number;
+      }>;
+      const entryKeys = new Set(
+        parsed.entryPoints.map((node: { name: string; filePath: string; startLine: number }) =>
+          `${node.name}:${node.filePath}:${node.startLine}`
+        )
+      );
+      const relatedClassBlocks = codeBlocks.filter((block) =>
+        block.nodeKind === 'class' &&
+        !entryKeys.has(`${block.nodeName}:${block.filePath}:${block.startLine}`)
+      );
+
+      expect(codeBlocks.some((block) => block.nodeName === 'processCheckout')).toBe(true);
+      expect(relatedClassBlocks).toHaveLength(0);
+    });
+
+    it('should include a compact snippet when a focus term shares a file with the symbol', async () => {
+      const result = await cg.buildContext('getFileDependents affected tests', {
+        format: 'markdown',
+        includeCode: true,
+        maxCodeBlocks: 2,
+      });
+
+      const markdown = result as string;
+
+      expect(markdown).toContain('#### getFileDependents');
+      expect(markdown).toContain('#### Snippet');
+      expect(markdown).toContain('function affected');
+      expect(markdown).toContain('return getFileDependents(filePath)');
+      expect(markdown).not.toContain('class LRUCache');
     });
 
     it('should exclude code blocks when requested', async () => {
