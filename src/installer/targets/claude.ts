@@ -124,7 +124,16 @@ class ClaudeCodeTarget implements AgentTarget {
     if (hookCleanup.action === 'removed') files.push(hookCleanup);
 
     // 3. CLAUDE.md instructions
-    files.push(writeInstructionsEntry(loc));
+    // Claude Code receives identical guidance via SERVER_INSTRUCTIONS in
+    // the MCP initialize response every session — writing it to CLAUDE.md
+    // duplicates ~1500 tokens per turn. Strip the block if a legacy install
+    // left one, so upgrading users stop paying the cost automatically.
+    const instr = instructionsPath(loc);
+    const instrAction = removeMarkedSection(instr, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
+    if (instrAction === 'removed') {
+      files.push({ path: instr, action: 'removed' });
+    }
+    // 'not-found' / 'kept': nothing to report.
 
     return { files };
   }
