@@ -149,6 +149,38 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   banner stays accurate at any debounce value because it's per-file, not a
   static "wait N ms" instruction.
 
+- **Angular framework support — modules, selectors, templates, routes, and
+  control-flow blocks are now statically extracted and wired into the knowledge
+  graph.** Closes the static-extraction holes for Angular projects so
+  `trace`/`explore`/`impact` work without falling back to `Read`. All
+  synthesized edges carry `provenance:'heuristic'` and a
+  `metadata.synthesizedBy:'angular-*'` channel tag. Six phases:
+  **(1) NgModule + standalone @Component metadata** —
+  `@NgModule({ declarations, imports, providers, exports, bootstrap })` and
+  standalone `@Component({ imports })` emit class→class edges.
+  **(2) Selector → component/directive** — `<app-foo>` tag selectors,
+  `[appHighlight]` bracketed attributes, bare attribute directives, and
+  compound selectors (`a[href]`, `i.anticon`) are matched against a
+  per-project selector index built from `@Component` / `@Directive` metadata;
+  generic HTML tags miss the gate and drop silently.
+  **(3) Template binding → owner-class member** — `(event)="handler($event)"`,
+  `[prop]="expr"`, `[(banana)]="x"` two-way binding, `*ngFor` / `*ngIf` /
+  `*ngSwitch` structural directives, and `{{ interpolation }}` are resolved to
+  methods/properties inside the owner class.
+  **(4) Router configs** — `Routes` / `Route[]` arrays, `RouterModule.forRoot` /
+  `forChild`, `provideRouter`, nested `children: [...]`, and
+  `loadChildren` / `loadComponent` dynamic-import forms (`.then(m => m.X)`,
+  destructured `({ X }) => X`, `async (await import()).X`).
+  **(5) Angular 17+ control-flow blocks** — `@if` / `@else if`, `@for` /
+  `@switch` / `@case`, `@defer`, and `@let` (v18+ template variables) with a
+  balanced-paren reader for nested expressions.
+  **(6) Route guards / resolvers** — `canActivate` / `canActivateChild` /
+  `canDeactivate` / `canMatch` / `canLoad` arrays and `resolve: { key: Resolver }`
+  objects. Validated on a 4,296-file Angular+Vue hybrid project (1,512
+  component HTML templates): 22,672 Angular synthesized edges (12.4% of total),
+  covering NgModule wiring, selector matching (including directives), template
+  bindings, and route→component references.
+
 - **Objective-C indexing — `.m`, `.mm`, and content-sniffed `.h` files now
   parse with full structural extraction (#165).** Adds a tree-sitter-objc
   extractor that produces `class` nodes for `@interface` / `@implementation`

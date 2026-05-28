@@ -805,3 +805,567 @@ describe('Java anonymous-class override synthesis — end-to-end', () => {
     cg.close();
   });
 });
+describe('Angular end-to-end framework extraction', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('synthesizes NgModule declarations / imports / providers edges to their target classes', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-angular-ngmodule-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({
+        name: 'ng-fixture',
+        dependencies: { '@angular/core': '17.0.0', '@angular/common': '17.0.0' },
+      })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src/app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/bookmark.service.ts'),
+      `import { Injectable } from '@angular/core';\n` +
+        `@Injectable({ providedIn: 'root' })\n` +
+        `export class BookmarkService {\n` +
+        `  list() { return []; }\n` +
+        `}\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/bookmarks.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `@Component({ selector: 'app-bookmarks', template: '<div>x</div>' })\n` +
+        `export class BookmarksComponent {}\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/shared.module.ts'),
+      `import { NgModule } from '@angular/core';\n` +
+        `@NgModule({})\n` +
+        `export class SharedModule {}\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/bookmarks.module.ts'),
+      `import { NgModule } from '@angular/core';\n` +
+        `import { BookmarksComponent } from './bookmarks.component';\n` +
+        `import { BookmarkService } from './bookmark.service';\n` +
+        `import { SharedModule } from './shared.module';\n` +
+        `@NgModule({\n` +
+        `  declarations: [BookmarksComponent],\n` +
+        `  imports: [SharedModule],\n` +
+        `  providers: [BookmarkService],\n` +
+        `})\n` +
+        `export class BookmarksModule {}\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const classes = cg.getNodesByKind('class');
+    const bookmarksModule = classes.find((n) => n.name === 'BookmarksModule');
+    const bookmarksComponent = classes.find((n) => n.name === 'BookmarksComponent');
+    const bookmarkService = classes.find((n) => n.name === 'BookmarkService');
+    const sharedModule = classes.find((n) => n.name === 'SharedModule');
+    expect(bookmarksModule, 'BookmarksModule class node').toBeDefined();
+    expect(bookmarksComponent, 'BookmarksComponent class node').toBeDefined();
+    expect(bookmarkService, 'BookmarkService class node').toBeDefined();
+    expect(sharedModule, 'SharedModule class node').toBeDefined();
+
+    const outgoing = cg.getOutgoingEdges(bookmarksModule!.id);
+    const synthesized = outgoing.filter((e) => e.provenance === 'heuristic');
+
+    const declares = synthesized.find((e) => e.target === bookmarksComponent!.id);
+    expect(declares, 'BookmarksModule → BookmarksComponent (declarations)').toBeDefined();
+    expect(declares!.metadata?.synthesizedBy).toBe('angular-declarations');
+
+    const imports = synthesized.find((e) => e.target === sharedModule!.id);
+    expect(imports, 'BookmarksModule → SharedModule (imports)').toBeDefined();
+    expect(imports!.metadata?.synthesizedBy).toBe('angular-imports');
+
+    const providers = synthesized.find((e) => e.target === bookmarkService!.id);
+    expect(providers, 'BookmarksModule → BookmarkService (providers)').toBeDefined();
+    expect(providers!.metadata?.synthesizedBy).toBe('angular-providers');
+
+    cg.close();
+  });
+
+  it('synthesizes <child-selector> → component edges from inline templates', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-angular-selector-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({ name: 'ng-sel', dependencies: { '@angular/core': '17.0.0' } })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src/app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/icon.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `@Component({ selector: 'app-icon', standalone: true, template: '<span></span>' })\n` +
+        `export class IconComponent {}\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/card.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `import { IconComponent } from './icon.component';\n` +
+        `@Component({\n` +
+        `  selector: 'app-card', standalone: true, imports: [IconComponent],\n` +
+        `  template: '<div class="card"><app-icon></app-icon></div>',\n` +
+        `})\n` +
+        `export class CardComponent {}\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const card = cg.getNodesByKind('class').find((n) => n.name === 'CardComponent');
+    const icon = cg.getNodesByKind('class').find((n) => n.name === 'IconComponent');
+    expect(card && icon).toBeTruthy();
+
+    const sel = cg
+      .getOutgoingEdges(card!.id)
+      .find((e) => e.target === icon!.id && e.metadata?.synthesizedBy === 'angular-selector');
+    expect(sel, 'CardComponent → IconComponent via <app-icon> in template').toBeDefined();
+    expect(sel!.metadata?.via).toBe('app-icon');
+
+    cg.close();
+  });
+
+  it('synthesizes templateUrl-based selector edges (.html sibling)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-angular-tplurl-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({ name: 'ng-tplurl', dependencies: { '@angular/core': '17.0.0' } })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src/app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/badge.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `@Component({ selector: 'app-badge', standalone: true, template: '<i></i>' })\n` +
+        `export class BadgeComponent {}\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/header.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `import { BadgeComponent } from './badge.component';\n` +
+        `@Component({\n` +
+        `  selector: 'app-header', standalone: true, imports: [BadgeComponent],\n` +
+        `  templateUrl: './header.component.html',\n` +
+        `})\n` +
+        `export class HeaderComponent {}\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/header.component.html'),
+      `<header>\n  <h1>App</h1>\n  <app-badge></app-badge>\n</header>\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const header = cg.getNodesByKind('class').find((n) => n.name === 'HeaderComponent');
+    const badge = cg.getNodesByKind('class').find((n) => n.name === 'BadgeComponent');
+    expect(header && badge).toBeTruthy();
+
+    const sel = cg
+      .getOutgoingEdges(header!.id)
+      .find((e) => e.target === badge!.id && e.metadata?.synthesizedBy === 'angular-selector');
+    expect(sel, 'HeaderComponent → BadgeComponent via external templateUrl').toBeDefined();
+
+    cg.close();
+  });
+
+  it('synthesizes attribute-directive [appHighlight] selector edges', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-angular-attr-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({ name: 'ng-attr', dependencies: { '@angular/core': '17.0.0' } })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src/app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/highlight.directive.ts'),
+      `import { Directive } from '@angular/core';\n` +
+        `@Directive({ selector: '[appHighlight]', standalone: true })\n` +
+        `export class HighlightDirective {}\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/host.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `import { HighlightDirective } from './highlight.directive';\n` +
+        `@Component({\n` +
+        `  selector: 'app-host', standalone: true, imports: [HighlightDirective],\n` +
+        `  template: '<p appHighlight>x</p>',\n` +
+        `})\n` +
+        `export class HostComponent {}\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const host = cg.getNodesByKind('class').find((n) => n.name === 'HostComponent');
+    const dir = cg.getNodesByKind('class').find((n) => n.name === 'HighlightDirective');
+    expect(host && dir).toBeTruthy();
+
+    const sel = cg
+      .getOutgoingEdges(host!.id)
+      .find((e) => e.target === dir!.id && e.metadata?.synthesizedBy === 'angular-selector');
+    expect(sel, 'HostComponent → HighlightDirective via [appHighlight]').toBeDefined();
+    expect(sel!.metadata?.via).toBe('[appHighlight]');
+
+    cg.close();
+  });
+
+  it('synthesizes template-binding → owner-class-member edges (event / interpolation / structural)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-angular-tpl-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({ name: 'ng-tpl', dependencies: { '@angular/core': '17.0.0' } })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src/app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/form.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `@Component({\n` +
+        `  selector: 'app-form', standalone: true,\n` +
+        `  template: \`\n` +
+        `    <h2>{{ userName }}</h2>\n` +
+        `    <button (click)="onSubmit()" [disabled]="isDisabled">Save</button>\n` +
+        `    <li *ngFor="let item of items">{{ item }}</li>\n` +
+        `  \`,\n` +
+        `})\n` +
+        `export class FormComponent {\n` +
+        `  userName = 'alice';\n` +
+        `  items: string[] = [];\n` +
+        `  isDisabled = false;\n` +
+        `  onSubmit() { /* ... */ }\n` +
+        `}\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const form = cg.getNodesByKind('class').find((n) => n.name === 'FormComponent');
+    expect(form, 'FormComponent class node').toBeDefined();
+
+    const tplEdges = cg
+      .getOutgoingEdges(form!.id)
+      .filter((e) => e.metadata?.synthesizedBy === 'angular-template');
+
+    // Collect the names of every node a template edge points at. The TS extractor
+    // emits class fields as `method` (per typescript.ts methodTypes) — we union
+    // every reasonable member kind to avoid being too narrow.
+    const memberNodes = [
+      ...cg.getNodesByKind('method'),
+      ...cg.getNodesByKind('property'),
+      ...cg.getNodesByKind('field'),
+      ...cg.getNodesByKind('variable'),
+    ];
+    const targetNames = new Set<string>();
+    for (const e of tplEdges) {
+      const node = memberNodes.find((n) => n.id === e.target);
+      if (node) targetNames.add(node.name);
+    }
+    expect(targetNames.has('onSubmit'), 'event binding → onSubmit').toBe(true);
+    expect(targetNames.has('userName'), 'interpolation → userName').toBe(true);
+    expect(targetNames.has('isDisabled'), 'property binding → isDisabled').toBe(true);
+    expect(targetNames.has('items'), 'structural *ngFor → items').toBe(true);
+
+    cg.close();
+  });
+
+  it('emits route nodes and route→component / route→lazy-module references end-to-end', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-angular-routes-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({
+        name: 'ng-routes',
+        dependencies: { '@angular/core': '17.0.0', '@angular/router': '17.0.0' },
+      })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src/app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/home.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `@Component({ selector: 'app-home', standalone: true, template: '<h1>home</h1>' })\n` +
+        `export class HomeComponent {}\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/admin.module.ts'),
+      `import { NgModule } from '@angular/core';\n` +
+        `@NgModule({})\n` +
+        `export class AdminModule {}\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/app.routes.ts'),
+      `import { Routes } from '@angular/router';\n` +
+        `import { HomeComponent } from './home.component';\n` +
+        `export const routes: Routes = [\n` +
+        `  { path: '', component: HomeComponent },\n` +
+        `  { path: 'admin', loadChildren: () => import('./admin.module').then(m => m.AdminModule) },\n` +
+        `];\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const routes = cg.getNodesByKind('route');
+    const root = routes.find((n) => n.name === '/');
+    const admin = routes.find((n) => n.name === '/admin');
+    expect(root, '/ route node').toBeDefined();
+    expect(admin, '/admin route node').toBeDefined();
+
+    const home = cg.getNodesByKind('class').find((n) => n.name === 'HomeComponent');
+    const adminMod = cg.getNodesByKind('class').find((n) => n.name === 'AdminModule');
+    expect(home && adminMod).toBeTruthy();
+
+    const rootToHome = cg.getOutgoingEdges(root!.id).find((e) => e.target === home!.id);
+    expect(rootToHome, 'route(/) → HomeComponent').toBeDefined();
+    expect(rootToHome!.kind).toBe('references');
+
+    const adminToMod = cg.getOutgoingEdges(admin!.id).find((e) => e.target === adminMod!.id);
+    expect(adminToMod, 'route(/admin) → AdminModule (lazy)').toBeDefined();
+    expect(adminToMod!.kind).toBe('references');
+
+    cg.close();
+  });
+
+  it('joins nested children paths into a single route URL', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-angular-children-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({
+        name: 'ng-children',
+        dependencies: { '@angular/core': '17.0.0', '@angular/router': '17.0.0' },
+      })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src/app'), { recursive: true });
+    for (const name of ['AdminLayout', 'UsersComponent', 'ReportsComponent']) {
+      const file = name.replace(/Component$|Layout$/, (s) => s === 'Layout' ? '.layout' : '.component').toLowerCase();
+      fs.writeFileSync(
+        path.join(tmpDir, 'src/app', `${file}.ts`),
+        `import { Component } from '@angular/core';\n` +
+          `@Component({ selector: 'x', standalone: true, template: '' })\n` +
+          `export class ${name} {}\n`
+      );
+    }
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/app.routes.ts'),
+      `import { Routes } from '@angular/router';\n` +
+        `import { AdminLayout } from './adminlayout.layout';\n` +
+        `import { UsersComponent } from './userscomponent.component';\n` +
+        `import { ReportsComponent } from './reportscomponent.component';\n` +
+        `export const routes: Routes = [\n` +
+        `  {\n` +
+        `    path: 'admin',\n` +
+        `    component: AdminLayout,\n` +
+        `    children: [\n` +
+        `      { path: 'users', component: UsersComponent },\n` +
+        `      { path: 'reports', component: ReportsComponent },\n` +
+        `    ],\n` +
+        `  },\n` +
+        `];\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const routeNames = cg.getNodesByKind('route').map((n) => n.name).sort();
+    expect(routeNames).toEqual(['/admin', '/admin/reports', '/admin/users']);
+
+    cg.close();
+  });
+
+  it('catches Angular 17 block syntax: @if / @for / @switch', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ng17-blocks-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({ name: 'p', dependencies: { '@angular/core': '17.0.0' } })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/list.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `@Component({ selector: 'l', standalone: true, template: \`\n` +
+        `  @if (loading) { <p>...</p> }\n` +
+        `  @for (item of products; track item.id) { <li>{{ item.name }}</li> }\n` +
+        `  @switch (mode) {\n` +
+        `    @case ('a') { <a></a> }\n` +
+        `    @default { <b></b> }\n` +
+        `  }\n` +
+        `\` })\n` +
+        `export class ListComponent {\n` +
+        `  loading = true;\n` +
+        `  products: any[] = [];\n` +
+        `  mode = 'a';\n` +
+        `}\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    const list = cg.getNodesByKind('class').find((n) => n.name === 'ListComponent')!;
+    const edges = cg.getOutgoingEdges(list.id).filter((e) => e.metadata?.synthesizedBy === 'angular-template');
+
+    const memberNodes = [
+      ...cg.getNodesByKind('method'),
+      ...cg.getNodesByKind('property'),
+      ...cg.getNodesByKind('field'),
+      ...cg.getNodesByKind('variable'),
+    ];
+    const captured = new Set<string>();
+    for (const e of edges) {
+      const n = memberNodes.find((m) => m.id === e.target);
+      if (n) captured.add(n.name);
+    }
+    expect(captured.has('loading'), '@if(loading) → loading').toBe(true);
+    expect(captured.has('products'), '@for(item of products) → products').toBe(true);
+    expect(captured.has('mode'), '@switch(mode) → mode').toBe(true);
+
+    cg.close();
+  });
+
+  it('catches @let v18 template variable expressions', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ng18-let-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({ name: 'p', dependencies: { '@angular/core': '18.0.0' } })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/page.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `@Component({ selector: 'p', standalone: true, template: \`\n` +
+        `  @let displayName = user.name;\n` +
+        `  <h1>{{ displayName }}</h1>\n` +
+        `\` })\n` +
+        `export class PageComponent {\n` +
+        `  user = { name: 'a' };\n` +
+        `}\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    const page = cg.getNodesByKind('class').find((n) => n.name === 'PageComponent')!;
+    const edges = cg.getOutgoingEdges(page.id).filter((e) => e.metadata?.synthesizedBy === 'angular-template');
+    const memberNodes = [...cg.getNodesByKind('method'), ...cg.getNodesByKind('property'), ...cg.getNodesByKind('field'), ...cg.getNodesByKind('variable')];
+    const captured = new Set<string>();
+    for (const e of edges) {
+      const n = memberNodes.find((m) => m.id === e.target);
+      if (n) captured.add(n.name);
+    }
+    // `user` is the only class member referenced (displayName is a template-local).
+    expect(captured.has('user'), '@let displayName = user.name → user').toBe(true);
+
+    cg.close();
+  });
+
+  it('emits route → guard / resolver references for canActivate / canMatch / resolve', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ng-guards-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({
+        name: 'p',
+        dependencies: { '@angular/core': '17.0.0', '@angular/router': '17.0.0' },
+      })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/auth.guard.ts'),
+      `import { Injectable } from '@angular/core';\n` +
+        `@Injectable({ providedIn: 'root' })\n` +
+        `export class AuthGuard { canActivate() { return true; } }\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/role.guard.ts'),
+      `import { Injectable } from '@angular/core';\n` +
+        `@Injectable({ providedIn: 'root' })\n` +
+        `export class RoleGuard { canActivate() { return true; } }\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/user.resolver.ts'),
+      `import { Injectable } from '@angular/core';\n` +
+        `@Injectable({ providedIn: 'root' })\n` +
+        `export class UserResolver { resolve() { return null; } }\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/home.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `@Component({ selector: 'h', standalone: true, template: '' })\n` +
+        `export class HomeComponent {}\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app.routes.ts'),
+      `import { Routes } from '@angular/router';\n` +
+        `import { HomeComponent } from './home.component';\n` +
+        `import { AuthGuard } from './auth.guard';\n` +
+        `import { RoleGuard } from './role.guard';\n` +
+        `import { UserResolver } from './user.resolver';\n` +
+        `export const routes: Routes = [\n` +
+        `  {\n` +
+        `    path: 'home',\n` +
+        `    component: HomeComponent,\n` +
+        `    canActivate: [AuthGuard, RoleGuard],\n` +
+        `    resolve: { user: UserResolver },\n` +
+        `  },\n` +
+        `];\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const route = cg.getNodesByKind('route').find((n) => n.name === '/home')!;
+    const authGuard = cg.getNodesByKind('class').find((n) => n.name === 'AuthGuard')!;
+    const roleGuard = cg.getNodesByKind('class').find((n) => n.name === 'RoleGuard')!;
+    const userResolver = cg.getNodesByKind('class').find((n) => n.name === 'UserResolver')!;
+
+    const out = cg.getOutgoingEdges(route.id);
+    expect(out.find((e) => e.target === authGuard.id), 'route → AuthGuard').toBeDefined();
+    expect(out.find((e) => e.target === roleGuard.id), 'route → RoleGuard').toBeDefined();
+    expect(out.find((e) => e.target === userResolver.id), 'route → UserResolver').toBeDefined();
+
+    // impact-style query: AuthGuard should know it's used by /home.
+    expect(cg.getCallers(authGuard.id).length, 'callers(AuthGuard) ≥ 1').toBeGreaterThanOrEqual(1);
+
+    cg.close();
+  });
+
+  it('synthesizes standalone-component imports edges (Angular v17+ shape)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-angular-standalone-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({
+        name: 'ng-standalone-fixture',
+        dependencies: { '@angular/core': '17.0.0' },
+      })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'src/app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/icon.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `@Component({ selector: 'app-icon', standalone: true, template: '<span></span>' })\n` +
+        `export class IconComponent {}\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/app/page.component.ts'),
+      `import { Component } from '@angular/core';\n` +
+        `import { IconComponent } from './icon.component';\n` +
+        `@Component({\n` +
+        `  selector: 'app-page', standalone: true,\n` +
+        `  imports: [IconComponent],\n` +
+        `  template: '<app-icon></app-icon>',\n` +
+        `})\n` +
+        `export class PageComponent {}\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const classes = cg.getNodesByKind('class');
+    const page = classes.find((n) => n.name === 'PageComponent');
+    const icon = classes.find((n) => n.name === 'IconComponent');
+    expect(page).toBeDefined();
+    expect(icon).toBeDefined();
+
+    const edge = cg
+      .getOutgoingEdges(page!.id)
+      .find((e) => e.target === icon!.id && e.provenance === 'heuristic');
+    expect(edge, 'PageComponent → IconComponent (standalone imports)').toBeDefined();
+    expect(edge!.metadata?.synthesizedBy).toBe('angular-imports');
+
+    cg.close();
+  });
+});
