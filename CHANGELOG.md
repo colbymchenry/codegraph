@@ -154,6 +154,24 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bodies). An agent investigating `Splitter.SplittingIterator.separatorStart`
   now sees the four anonymous overrides in its trail without a Read.
 
+### Changed
+- **The installer no longer writes a `## CodeGraph` instructions block into
+  your agent's instructions file** (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`,
+  Cursor's `.cursor/rules/codegraph.mdc`, or Kiro's steering doc). That block
+  duplicated, almost verbatim, the usage guidance the MCP server already
+  emits in its `initialize` response — so every agent that surfaces MCP
+  instructions (Claude Code does) read the same playbook twice each turn
+  (#529). The MCP server instructions are now the single source of truth.
+  `codegraph install` stops writing the block, and **the next time you run
+  `codegraph install` (or `codegraph uninstall`) it strips a block a previous
+  version wrote**, preserving everything else in the file (and deleting Cursor
+  `.mdc` / Kiro steering files that were ours outright). Note: simply upgrading
+  the npm package does not remove an existing block — re-run the installer to
+  clean it up. The leftover block is harmless meanwhile (just redundant with
+  the MCP instructions). If you'd added your own notes inside the
+  `<!-- CODEGRAPH_START -->`/`<!-- CODEGRAPH_END -->` markers, move them outside
+  the markers first — only the marked block is removed.
+
 ### Fixed
 - **MCP tools no longer return rows for files deleted while no server was
   running.** The post-open catch-up sync that reconciles the index against

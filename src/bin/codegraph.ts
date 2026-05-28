@@ -429,15 +429,6 @@ program
       if (isInitialized(projectPath)) {
         clack.log.warn(`Already initialized in ${projectPath}`);
         clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
-        // Re-run agent surface wiring so re-running `init` is the
-        // documented way to recover a project that's missing its
-        // Cursor rules file (or future per-agent project surfaces).
-        try {
-          const { wireProjectSurfacesForGlobalAgents } = await import('../installer');
-          for (const { target, file } of wireProjectSurfacesForGlobalAgents()) {
-            clack.log.success(`${target.displayName}: ${file.action} ${file.path}`);
-          }
-        } catch { /* non-fatal */ }
         try {
           const { offerWatchFallback } = await import('../installer');
           await offerWatchFallback(clack, projectPath);
@@ -449,20 +440,6 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.init(projectPath, { index: false });
       clack.log.success(`Initialized in ${projectPath}`);
-
-      // Bootstrap project-local surfaces for any agent that's
-      // configured globally (Cursor needs ./.cursor/rules/codegraph.mdc
-      // to actually prefer codegraph over native grep). Silent when
-      // there's nothing to write.
-      try {
-        const { wireProjectSurfacesForGlobalAgents } = await import('../installer');
-        for (const { target, file } of wireProjectSurfacesForGlobalAgents()) {
-          clack.log.success(`${target.displayName}: ${file.action} ${file.path}`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        clack.log.warn(`Skipped wiring project-local agent surfaces: ${msg}`);
-      }
 
       if (options.index) {
         let result: IndexResult;

@@ -236,7 +236,7 @@ The installer will:
 - Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**
 - Prompt to install `codegraph` on your PATH (so agents can launch the MCP server)
 - Ask whether configs apply to all your projects or just this one
-- Write each chosen agent's MCP server config + an instructions file (e.g. `CLAUDE.md`, `.cursor/rules/codegraph.mdc`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`)
+- Write each chosen agent's MCP server config (the codegraph usage guide is delivered by the MCP server itself, so no instructions file is added to `CLAUDE.md` / `AGENTS.md` / etc.)
 - Set up auto-allow permissions when Claude Code is one of the targets
 - Initialize your current project (local installs only)
 
@@ -268,7 +268,7 @@ cd your-project
 codegraph init -i
 ```
 
-Builds the per-project knowledge graph index. Also wires up any project-local agent surfaces (e.g. Cursor's `.cursor/rules/codegraph.mdc`) so a single global `codegraph install` works in every project you open — no need to re-run the installer per project.
+Builds the per-project knowledge graph index. A single global `codegraph install` works in every project you open — no need to re-run the installer per project.
 
 That's it — your agent will use CodeGraph tools automatically when a `.codegraph/` directory exists.
 
@@ -314,39 +314,16 @@ npm install -g @colbymchenry/codegraph
 </details>
 
 <details>
-<summary><strong>Global Instructions Reference</strong></summary>
+<summary><strong>Agent Tool Guidance</strong></summary>
 
-The installer automatically adds these instructions to `~/.claude/CLAUDE.md`:
+CodeGraph's MCP server delivers its usage guidance to your agent **automatically**, in the MCP `initialize` response — there's no instructions file to manage and nothing is added to your `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`. In short, it tells the agent to:
 
-```markdown
-## CodeGraph
+- **Answer structural questions directly with CodeGraph** — it *is* the pre-built index, so a grep/read loop just repeats work it already did. Treat the returned source as already read.
+- **Pick the tool by intent:** `codegraph_context` to map an area, `codegraph_trace` for "how does X reach Y", `codegraph_explore` to survey several symbols, `codegraph_search` to find a symbol, `codegraph_callers`/`codegraph_callees` to walk call flow, `codegraph_impact` before editing, `codegraph_node` for one symbol's source.
+- **Trust the results — don't re-verify with grep**, and check the staleness banner after edits.
+- If `.codegraph/` doesn't exist yet, offer to run `codegraph init -i`.
 
-CodeGraph builds a semantic knowledge graph of codebases for faster, smarter code exploration.
-
-### If `.codegraph/` exists in the project
-
-**Answer directly with CodeGraph — don't delegate exploration to a file-reading sub-agent or a grep/read loop.** CodeGraph *is* the pre-built search index; re-deriving its answers with grep + Read repeats work it already did and costs more for the same result. For "how does X work?", architecture, trace, or where-is-X questions, answer in a handful of CodeGraph calls and stop — typically with **zero file reads**. The returned source is complete and authoritative: treat it as already read and do not re-open those files. Reach for raw Read/Grep only to confirm a specific detail CodeGraph didn't cover.
-
-**Tool selection by intent:**
-
-| Tool | Use For |
-|------|---------|
-| `codegraph_context` | Map a task / feature / area first — composes search + node + callers + callees in one call |
-| `codegraph_trace` | "How does X reach Y" — the call path, each hop's body inline (follows dynamic-dispatch hops grep can't) |
-| `codegraph_explore` | Survey several related symbols' source in ONE budget-capped call |
-| `codegraph_search` | Find a symbol by name |
-| `codegraph_callers` / `codegraph_callees` | Walk call flow one hop at a time |
-| `codegraph_impact` | Check what's affected before editing |
-| `codegraph_node` | Get a single symbol's source / signature |
-
-A direct CodeGraph answer is a handful of calls; a grep/read exploration is dozens.
-
-### If `.codegraph/` does NOT exist
-
-At the start of a session, ask the user if they'd like to initialize CodeGraph:
-
-"I notice this project doesn't have CodeGraph initialized. Would you like me to run `codegraph init -i` to build a code knowledge graph?"
-```
+The exact text is `src/mcp/server-instructions.ts` — the single source of truth.
 
 </details>
 
@@ -517,7 +494,8 @@ See [Get Started](#get-started) for the one-line install commands.
 ## Supported Agents
 
 The interactive installer auto-detects and configures each of these — wiring up
-the MCP server and writing its instructions file:
+the MCP server (which delivers its own usage guidance, so no instructions file
+is written):
 
 - **Claude Code**
 - **Cursor**
