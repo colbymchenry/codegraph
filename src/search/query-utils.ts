@@ -137,12 +137,21 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
   // Replace underscores and dots with spaces (snake_case, dot.notation)
   const normalised = camelSplit.replace(/[_.]+/g, ' ');
 
-  // Split on any non-alphanumeric character
-  const words = normalised.split(/[^a-zA-Z0-9]+/).filter(Boolean);
+  // Split on separators while preserving Unicode letters/digits. The old
+  // /[^a-zA-Z0-9]+/ split treated every Hangul/CJK character as a separator,
+  // so a non-ASCII query (e.g. "로그인 처리") tokenized to nothing and text
+  // search ran with no terms. \p{L}\p{N} (u flag) keeps those runs intact;
+  // ASCII behavior is unchanged ([a-zA-Z0-9] ⊂ [\p{L}\p{N}], and every ASCII
+  // separator — space, punctuation, _, . — is still a separator).
+  const words = normalised.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
 
   for (const word of words) {
     const lower = word.toLowerCase();
-    if (lower.length < 3) continue;
+    // Hangul/CJK pack a full morpheme into each character, so a 2-char
+    // non-ASCII token (e.g. "인증") is as meaningful as a longer English word.
+    // Keep the 3-char floor for ASCII to suppress noise like "abc"/"xyz".
+    const minLen = /[^\x00-\x7F]/.test(lower) ? 2 : 3;
+    if (lower.length < minLen) continue;
     if (STOP_WORDS.has(lower)) continue;
     tokens.add(lower);
   }

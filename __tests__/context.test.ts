@@ -336,6 +336,79 @@ export function validateEmail(email: string): boolean {
     });
   });
 
+  describe('Non-ASCII (Korean) queries', () => {
+    let krDir: string;
+    let krCg: CodeGraph;
+
+    beforeEach(async () => {
+      krDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-context-kr-'));
+      const srcDir = path.join(krDir, 'src');
+      fs.mkdirSync(srcDir);
+
+      // Source with Korean (non-ASCII) identifiers — the patterns that used to
+      // drive keyword extraction were all [a-zA-Z]-based, so context returned
+      // empty for these even though symbol search found them.
+      fs.writeFileSync(
+        path.join(srcDir, 'auth.ts'),
+        `export function 로그인(사용자명: string): boolean {
+  return 인증확인(사용자명);
+}
+
+export function 인증확인(사용자명: string): boolean {
+  return 사용자명.length > 0;
+}
+
+export class 사용자관리자 {
+  생성하기(이름: string): string {
+    return 이름;
+  }
+}
+`
+      );
+
+      krCg = CodeGraph.initSync(krDir, {
+        config: { include: ['**/*.ts'], exclude: [] },
+      });
+      await krCg.indexAll();
+    });
+
+    afterEach(() => {
+      if (krCg) krCg.destroy();
+      if (fs.existsSync(krDir)) {
+        fs.rmSync(krDir, { recursive: true, force: true });
+      }
+    });
+
+    it('finds relevant nodes for a Korean query', async () => {
+      const result = await krCg.findRelevantContext('로그인');
+
+      expect(result.nodes.size).toBeGreaterThan(0);
+      const names = Array.from(result.nodes.values()).map((n) => n.name);
+      expect(names).toContain('로그인');
+    });
+
+    it('surfaces Korean symbols in built context (was empty before fix)', async () => {
+      const result = (await krCg.buildContext('로그인', {
+        format: 'markdown',
+      })) as string;
+
+      // Regression guard for the reported bug: the markdown used to contain
+      // only the header + query, with zero symbols.
+      expect(result).toContain('로그인');
+      expect(result).toContain('### Entry Points');
+    });
+
+    it('surfaces a Korean class and method from a multi-word Korean query', async () => {
+      const result = (await krCg.buildContext('사용자관리자 생성하기', {
+        format: 'json',
+      })) as string;
+      const parsed = JSON.parse(result);
+      const names = parsed.nodes.map((n: { name: string }) => n.name);
+
+      expect(names).toContain('사용자관리자');
+    });
+  });
+
   describe('Edge cases', () => {
     it('should handle empty query', async () => {
       const result = await cg.buildContext('', { format: 'markdown' });
