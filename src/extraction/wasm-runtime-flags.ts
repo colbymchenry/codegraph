@@ -97,6 +97,7 @@ export function relaunchWithWasmRuntimeFlagsIfNeeded(scriptPath: string): void {
   const argv = buildRelaunchArgv(scriptPath, process.argv.slice(2));
   const result = spawnSync(process.execPath, argv, {
     stdio: 'inherit',
+    windowsHide: true,
     env: { ...process.env, [RELAUNCH_GUARD_ENV]: '1', [HOST_PPID_ENV]: String(process.ppid) },
   });
 
