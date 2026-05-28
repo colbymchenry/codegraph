@@ -62,6 +62,14 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cxx': 'cpp',
   '.hpp': 'cpp',
   '.hxx': 'cpp',
+  // CUDA (.cu / .cuh) — superset of C++; tree-sitter-cpp parses most CUDA
+  // (function defs, classes, templates). __global__/__device__/__host__
+  // qualifiers are absorbed as attributes. The one CUDA-specific construct
+  // tree-sitter-cpp doesn't model is the `<<<grid,block>>>` triple-bracket
+  // kernel-launch operator; `cuda-kernel-launch-postprocess.ts` bridges that
+  // gap by emitting host→kernel 'calls' refs in a second pass.
+  '.cu': 'cpp',
+  '.cuh': 'cpp',
   '.cs': 'csharp',
   '.php': 'php',
   // Drupal-specific PHP file extensions
