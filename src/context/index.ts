@@ -24,7 +24,7 @@ import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
-import { validatePathWithinRoot } from '../utils';
+import { isPathWithinRootReal, validatePathWithinRoot } from '../utils';
 import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants } from '../search/query-utils';
 
 /**
@@ -1043,7 +1043,15 @@ export class ContextBuilder {
   private async extractNodeCode(node: Node): Promise<string | null> {
     const filePath = validatePathWithinRoot(this.projectRoot, node.filePath);
 
-    if (!filePath || !fs.existsSync(filePath)) {
+    // The logical `validatePathWithinRoot` check lets a symlinked
+    // `node.filePath` whose real target escapes the project pass; the
+    // subsequent `readFileSync` would then ship the external file's bytes back
+    // to the agent. `isPathWithinRootReal` does the realpath comparison.
+    // Same CWE-59 class as the #280 session-marker fix (different mechanic).
+    if (!filePath || !fs.existsSync(filePath) || !isPathWithinRootReal(filePath, this.projectRoot)) {
+      if (filePath) {
+        logDebug('Skipping source emission for path that escapes project root', { filePath, projectRoot: this.projectRoot });
+      }
       return null;
     }
 
