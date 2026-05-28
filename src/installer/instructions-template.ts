@@ -48,6 +48,7 @@ Use codegraph for **structural** questions — what calls what, what would break
 - **Trust codegraph results.** They come from a full AST parse. Do NOT re-verify them with grep — that's slower, less accurate, and wastes context.
 - **Don't grep first** when looking up a symbol by name. \`codegraph_search\` is faster and returns kind + location + signature in one call.
 - **Don't chain \`codegraph_search\` + \`codegraph_node\`** when you just want context — \`codegraph_context\` is one call.
+- **Write \`codegraph_context\` queries with concrete anchors**, not vague natural language. Include class names, method names, annotations, or framework keywords: e.g. \`EventPublisher DomainEvent StreamBridge @Async\` instead of \`find async event publishing code\`. Vague queries return unrelated symbols; concrete anchors hit the right nodes immediately.
 - **Don't loop \`codegraph_node\` over many symbols** — one \`codegraph_explore\` call returns several symbols' source grouped in a single capped call, while each separate node/Read call re-reads the whole context and costs far more.
 - **Index lag — check the staleness banner, don't guess a wait.** When a codegraph response starts with "⚠️ Some files referenced below were edited since the last index sync…", the listed files are pending re-index — Read those specific files for accurate content. Files NOT in that banner are fresh and codegraph is authoritative for them. \`codegraph_status\` also lists pending files under "Pending sync".
 
