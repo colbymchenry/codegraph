@@ -419,14 +419,15 @@ program
   .description('Initialize CodeGraph in a project directory and build the initial index')
   .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean }) => {
+  .option('--data-dir <path>', 'Store CodeGraph data in a custom directory instead of <projectRoot>/.codegraph/')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean; dataDir?: string }) => {
     const projectPath = path.resolve(pathArg || process.cwd());
     const clack = await importESM('@clack/prompts');
 
     clack.intro('Initializing CodeGraph');
 
     try {
-      if (isInitialized(projectPath)) {
+      if (isInitialized(projectPath, options.dataDir)) {
         clack.log.warn(`Already initialized in ${projectPath}`);
         clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
         try {
@@ -438,8 +439,8 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.init(projectPath, { index: false });
-      clack.log.success(`Initialized in ${projectPath}`);
+      const cg = await CodeGraph.init(projectPath, { index: false, dataDir: options.dataDir });
+      clack.log.success(`Initialized in ${projectPath}${options.dataDir ? ` (data: ${options.dataDir})` : ''}`);
 
       // Indexing runs by default now. The legacy -i/--index flag is still
       // accepted (so existing muscle memory and scripts don't break) but is a
@@ -480,11 +481,12 @@ program
   .command('uninit [path]')
   .description('Remove CodeGraph from a project (deletes .codegraph/ directory)')
   .option('-f, --force', 'Skip confirmation prompt')
-  .action(async (pathArg: string | undefined, options: { force?: boolean }) => {
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
+  .action(async (pathArg: string | undefined, options: { force?: boolean; dataDir?: string }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
-      if (!isInitialized(projectPath)) {
+      if (!isInitialized(projectPath, options.dataDir)) {
         warn(`CodeGraph is not initialized in ${projectPath}`);
         return;
       }
@@ -508,7 +510,7 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = CodeGraph.openSync(projectPath);
+      const cg = CodeGraph.openSync(projectPath, options.dataDir);
       cg.uninitialize();
 
       // Clean up any git sync hooks we installed (no-op if none / not a repo).
@@ -536,18 +538,19 @@ program
   .option('-f, --force', 'Force full re-index even if already indexed')
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
+  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean; dataDir?: string }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
-      if (!isInitialized(projectPath)) {
+      if (!isInitialized(projectPath, options.dataDir)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         info('Run "codegraph init" first');
         process.exit(1);
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, { dataDir: options.dataDir });
 
       if (options.quiet) {
         // Quiet mode: no UI, just run
@@ -603,11 +606,12 @@ program
   .command('sync [path]')
   .description('Sync changes since last index')
   .option('-q, --quiet', 'Suppress output (for git hooks)')
-  .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
+  .action(async (pathArg: string | undefined, options: { quiet?: boolean; dataDir?: string }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
-      if (!isInitialized(projectPath)) {
+      if (!isInitialized(projectPath, options.dataDir)) {
         if (!options.quiet) {
           error(`CodeGraph not initialized in ${projectPath}`);
         }
@@ -615,7 +619,7 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, { dataDir: options.dataDir });
 
       if (options.quiet) {
         await cg.sync();
@@ -665,7 +669,8 @@ program
   .command('status [path]')
   .description('Show index status and statistics')
   .option('-j, --json', 'Output as JSON')
-  .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
+  .action(async (pathArg: string | undefined, options: { json?: boolean; dataDir?: string }) => {
     const projectPath = resolveProjectPath(pathArg);
     // The directory the user actually ran from, before walking up to the index
     // root. Used to detect when the resolved index lives in a different git
@@ -674,7 +679,7 @@ program
     const worktreeMismatch = detectWorktreeIndexMismatch(startPath, projectPath);
 
     try {
-      if (!isInitialized(projectPath)) {
+      if (!isInitialized(projectPath, options.dataDir)) {
         if (options.json) {
           console.log(JSON.stringify({ initialized: false, projectPath }));
           return;
@@ -687,7 +692,7 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, { dataDir: options.dataDir });
       const stats = cg.getStats();
       const changes = cg.getChangedFiles();
       const backend = cg.getBackend();
@@ -804,11 +809,12 @@ program
   .option('-l, --limit <number>', 'Maximum results', '10')
   .option('-k, --kind <kind>', 'Filter by node kind (function, class, etc.)')
   .option('-j, --json', 'Output as JSON')
-  .action(async (search: string, options: { path?: string; limit?: string; kind?: string; json?: boolean }) => {
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
+  .action(async (search: string, options: { path?: string; limit?: string; kind?: string; json?: boolean; dataDir?: string }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
-      if (!isInitialized(projectPath)) {
+      if (!isInitialized(projectPath, options.dataDir)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         process.exit(1);
       }
@@ -879,6 +885,7 @@ program
   .option('--max-depth <number>', 'Maximum directory depth for tree format')
   .option('--no-metadata', 'Hide file metadata (language, symbol count)')
   .option('-j, --json', 'Output as JSON')
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
   .action(async (options: {
     path?: string;
     filter?: string;
@@ -887,17 +894,18 @@ program
     maxDepth?: string;
     metadata?: boolean;
     json?: boolean;
+    dataDir?: string;
   }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
-      if (!isInitialized(projectPath)) {
+      if (!isInitialized(projectPath, options.dataDir)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         process.exit(1);
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, { dataDir: options.dataDir });
       let files = cg.getFiles();
 
       if (files.length === 0) {
@@ -1084,23 +1092,25 @@ program
   .option('-c, --max-code <number>', 'Maximum code blocks', '10')
   .option('--no-code', 'Exclude code blocks')
   .option('-f, --format <format>', 'Output format (markdown, json)', 'markdown')
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
   .action(async (task: string, options: {
     path?: string;
     maxNodes?: string;
     maxCode?: string;
     code?: boolean;
     format?: string;
+    dataDir?: string;
   }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
-      if (!isInitialized(projectPath)) {
+      if (!isInitialized(projectPath, options.dataDir)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         process.exit(1);
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, { dataDir: options.dataDir });
 
       const context = await cg.buildContext(task, {
         maxNodes: parseInt(options.maxNodes || '50', 10),
@@ -1128,7 +1138,8 @@ program
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
-  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
+  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean; dataDir?: string }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
 
     // Commander sets watch=false when --no-watch is passed. Route it through
@@ -1219,17 +1230,18 @@ program
   .option('-p, --path <path>', 'Project path')
   .option('-l, --limit <number>', 'Maximum results', '20')
   .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
+  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean; dataDir?: string }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
-      if (!isInitialized(projectPath)) {
+      if (!isInitialized(projectPath, options.dataDir)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         process.exit(1);
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, { dataDir: options.dataDir });
       const limit = parseInt(options.limit || '20', 10);
 
       const matches = cg.searchNodes(symbol, { limit: 50 });
@@ -1298,17 +1310,18 @@ program
   .option('-p, --path <path>', 'Project path')
   .option('-l, --limit <number>', 'Maximum results', '20')
   .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
+  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean; dataDir?: string }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
-      if (!isInitialized(projectPath)) {
+      if (!isInitialized(projectPath, options.dataDir)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         process.exit(1);
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, { dataDir: options.dataDir });
       const limit = parseInt(options.limit || '20', 10);
 
       const matches = cg.searchNodes(symbol, { limit: 50 });
@@ -1376,17 +1389,18 @@ program
   .option('-p, --path <path>', 'Project path')
   .option('-d, --depth <number>', 'Traversal depth', '2')
   .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; depth?: string; json?: boolean }) => {
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
+  .action(async (symbol: string, options: { path?: string; depth?: string; json?: boolean; dataDir?: string }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
-      if (!isInitialized(projectPath)) {
+      if (!isInitialized(projectPath, options.dataDir)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         process.exit(1);
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, { dataDir: options.dataDir });
       const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
 
       const matches = cg.searchNodes(symbol, { limit: 50 });
@@ -1483,11 +1497,12 @@ program
   .option('-f, --filter <glob>', 'Custom glob filter for test files (e.g. "e2e/*.spec.ts")')
   .option('-j, --json', 'Output as JSON')
   .option('-q, --quiet', 'Only output file paths, no decoration')
-  .action(async (fileArgs: string[], options: { path?: string; stdin?: boolean; depth?: string; filter?: string; json?: boolean; quiet?: boolean }) => {
+  .option('--data-dir <path>', 'Custom CodeGraph data directory (must match the one used during init)')
+  .action(async (fileArgs: string[], options: { path?: string; stdin?: boolean; depth?: string; filter?: string; json?: boolean; quiet?: boolean; dataDir?: string }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
-      if (!isInitialized(projectPath)) {
+      if (!isInitialized(projectPath, options.dataDir)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         process.exit(1);
       }
@@ -1507,7 +1522,7 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await CodeGraph.open(projectPath, { dataDir: options.dataDir });
       const maxDepth = parseInt(options.depth || '5', 10);
 
       // Common test file patterns
