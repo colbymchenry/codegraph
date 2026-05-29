@@ -3382,6 +3382,52 @@ describe('Git Submodules', () => {
   });
 });
 
+describe('Non-ASCII (CJK) paths', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  it('should index source files under directories with non-ASCII names', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    // git defaults to core.quotePath=true, which octal-escapes and double-quotes
+    // any path byte outside ASCII. Reading `git ls-files` output without
+    // disabling that mangles the path (e.g. `"src/\344\270\255/Foo.cs"`),
+    // breaking extension detection so the file is silently dropped.
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+
+    // English control file (always worked) + a committed file under a CJK dir.
+    const enDir = path.join(tempDir, 'src', 'english');
+    const cjkDir = path.join(tempDir, 'src', '中文目录');
+    fs.mkdirSync(enDir, { recursive: true });
+    fs.mkdirSync(cjkDir, { recursive: true });
+    fs.writeFileSync(path.join(enDir, 'Foo.cs'), 'public class Foo {}');
+    fs.writeFileSync(path.join(cjkDir, 'Bar.cs'), 'public class Bar {}');
+    git(tempDir, 'add', '-A');
+    git(tempDir, 'commit', '-q', '-m', 'init');
+
+    // An untracked file under a CJK dir goes through the `git ls-files -o` path.
+    fs.writeFileSync(path.join(cjkDir, 'Baz.cs'), 'public class Baz {}');
+
+    const files = scanDirectory(tempDir);
+
+    // All three .cs files must be found...
+    expect(files.filter((f) => f.endsWith('.cs')).length).toBe(3);
+    // ...and no returned path may carry git's quoting artifacts.
+    expect(files.every((f) => !f.includes('"') && !f.includes('\\'))).toBe(true);
+  });
+});
+
 describe('Nested non-submodule git repos', () => {
   let tempDir: string;
 

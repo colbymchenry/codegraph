@@ -198,7 +198,7 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): v
   // Without this, monorepos using submodules index 0 files. (See issue #147.)
   // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
   // can't be combined with -o, so untracked files are gathered separately below.
-  const tracked = execFileSync('git', ['ls-files', '-c', '--recurse-submodules'], gitOpts);
+  const tracked = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-c', '--recurse-submodules'], gitOpts);
   for (const line of tracked.split('\n')) {
     const trimmed = line.trim();
     if (trimmed) {
@@ -209,7 +209,7 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): v
   // Untracked files (submodules manage their own untracked state). Embedded git
   // repos surface here as a single "subdir/" entry that git refuses to descend
   // into — recurse into those as their own repos so their source gets indexed.
-  const untracked = execFileSync('git', ['ls-files', '-o', '--exclude-standard'], gitOpts);
+  const untracked = execFileSync('git', ['-c', 'core.quotePath=false', 'ls-files', '-o', '--exclude-standard'], gitOpts);
   for (const line of untracked.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -290,7 +290,7 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
   try {
     const output = execFileSync(
       'git',
-      ['status', '--porcelain', '--no-renames'],
+      ['-c', 'core.quotePath=false', 'status', '--porcelain', '--no-renames'],
       { cwd: rootDir, encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );
 

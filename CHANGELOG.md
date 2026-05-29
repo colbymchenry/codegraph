@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Source files under directories with non-ASCII names (e.g. CJK / Chinese folder names) are no longer silently skipped during indexing. `git ls-files` and `git status` octal-escape and quote any path with non-ASCII bytes by default (`core.quotePath`), which mangled the path so extension detection dropped the file; those commands now run with `core.quotePath=false`. Projects organized by non-English folder names now index in full instead of only their all-ASCII paths.
+
 ## [0.9.7] - 2026-05-28
 
 ### New Features
