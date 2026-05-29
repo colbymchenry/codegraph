@@ -17,6 +17,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- The MCP server no longer hangs on startup when the parser fails to load a language grammar. Previously a grammar-load crash could wedge the shared background daemon, so every editor session that connected to it hung waiting to initialize — on any project, large or small. The parser now falls back to in-process parsing instead of hanging, and a stuck startup reconcile can no longer block the first query indefinitely (tunable via `CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS`).
 - Indexing a project that contains only config-style files (YAML, Twig, or `.properties`) no longer misleadingly reports "No files found to index" — these files are tracked at the file level and are now counted as indexed. Thanks @luojiyin1987 (#357).
 
 ## [0.9.7] - 2026-05-28
