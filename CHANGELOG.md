@@ -9,6 +9,30 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **Common Lisp** (`.lisp`, `.lsp`, `.cl`, `.asd`, and `.el` for Emacs Lisp). Coverage spans the full standard surface plus the common CCL/CL extensions:
+  - `defun`/`defmacro`/`defgeneric` → function nodes with lambda-list signatures; `defmethod` → method with CLOS receiver-typed qualified name (`account::deposit`), contains-edge from its class, and qualifier-aware qnames for `:before`/`:after`/`:around` overloads (`account::deposit::before`); `(defmethod (setf foo) …)` → separate method named `(setf foo)`.
+  - `defclass`/`define-condition` → class node with `extends` edges to superclasses, slot definitions as `field` nodes contained by the class, `:accessor`/`:reader`/`:writer` synthesized as `function` nodes (so `account-id` is searchable), `:initform` value forms walked for nested calls, and `(:default-initargs …)` option values walked too.
+  - `defstruct` → struct with slot fields (bare and `(name default)` forms; defaults walked for calls).
+  - `deftype`, `defvar`/`defparameter`/`defglobal`, `defconstant`/`defconst`/`define-constant`.
+  - `defsetf` / `define-setf-expander` / `define-modify-macro` / `define-symbol-macro` / `define-compiler-macro` / `define-method-combination` → all surface their named symbol as searchable function nodes.
+  - `defpackage` → namespace (with `#:`/`:` decoration stripped) plus full option decomposition: `(:use …)` and `(:import-from …)` become `import` nodes with `imports` edges from the namespace; `(:export …)` becomes `export` nodes; `(:nicknames …)` is preserved in the namespace signature.
+  - **Function-to-function call edges** with context-aware suppression:
+    - Binding-form names in `let`/`let*`/`do`/`do*`/`dolist`/`dotimes`/`do-symbols`/`multiple-value-bind`/`destructuring-bind`/`with-slots`/`with-accessors`/`with-open-file`/`with-output-to-string`/`prog`/`prog*`/… do not appear as calls, while their value subforms ARE walked.
+    - Declaration specifiers in `(declare …)`/`(declaim …)`/`(proclaim …)` (`fixnum`/`type`/`ignore`/`optimize`/`special`/…) are suppressed entirely.
+    - `(cond …)` and `(case …)` clauses correctly distinguish literal keys (incl. the `t` default) from the test/form positions.
+    - `(funcall #'name …)` and `(apply #'name …)` resolve to the underlying `name` rather than `funcall`/`apply` itself; bodies of inline `(lambda …)` forms are walked.
+    - CCL's vinsn-emission macros `(! vinsn-name …)` and `(!! vinsn-name …)` resolve to the underlying vinsn target.
+    - `(check-type place TYPE-SPEC)` and `(assert test (places…) …)` walk the test/place/datum forms but suppress the type-spec and places-list as call sources.
+    - `catch`/`throw`/`progv`/`with-condition-restarts` and other control forms don't emit head-as-call edges.
+  - **Local functions**: `flet`/`labels`/`macrolet` bindings promoted to `function` nodes scoped under the enclosing function.
+  - **Package-qualified call resolution**: `(pkg:fn …)` and `(pkg::fn …)` (parsed as `package_lit`) resolve to the bare-named target in the index, matching how nodes are stored without their package prefix. Class supers (`(defclass dog (animals:mammal) …)`) and defmethod specializers (`(defmethod feed ((d animals:dog) …))`) are normalized the same way.
+  - **User-defined DSL macros**: top-level `def*` forms (CCL examples: `def-x86-opcode`, `define-arm-vinsn`, `defcommand`, `defarm64-p2`, `deftest`, `define-arm64-subprim-call-vinsn`) surface their named symbol as a `function` node. Both `(def-foo NAME …)` and `(def-foo (NAME :opt) …)` shapes are recognized. Scoped to top-level positions so `(defer-action handler)` inside a function body remains a regular call. The leading lambda-list / spec list is skipped during body walking so spec elements aren't mistaken for calls; remaining body forms walk normally.
+  - **Hand-rolled s-expression parser (no tree-sitter grammar).** Lisp is parsed by a dedicated tokenizer + recursive-descent s-expression parser rather than a tree-sitter grammar. S-expressions are trivially tokenisable, so this needs **zero source preprocessing**: the atom reader consumes everything up to whitespace or a structural delimiter, which handles `^`, `{ } [ ]`, backslash escapes (`\+`, `\:`, `\(`), package-qualified symbols (`pkg:sym`), reader conditionals (`#+`/`#-`), `#'`/`#\`/`#x` dispatch, nested `#| … |#` block comments, format-directive strings, and mid-symbol `#` (`ccl.bug#252a`) — all correctly, with no special-casing. This replaces an earlier tree-sitter-based path that required ~12 grammar-workaround preprocessing rules.
+
+  **Validated on the Clozure ANSI regression suite (`ccl-tests`, 867 files / 170k lines): zero parse errors, 24,751 nodes, and 99.97% of top-level `deftest` forms extracted** (the residual are deftests nested inside test-framework fixtures or quasiquote macro templates — not top-level definitions). Cross-validated against CCL's own diagnostic tools (`tools/vinsn-xref.py`, `tools/parity-audit.py`) on the ARM64 port: identical caller results for sampled compiler-backend vinsns (e.g. `save-values` → its 3 call sites).
+
 ### Fixes
 
 - Indexing a project that contains only config-style files (YAML, Twig, or `.properties`) no longer misleadingly reports "No files found to index" — these files are tracked at the file level and are now counted as indexed. Thanks @luojiyin1987 (#357).

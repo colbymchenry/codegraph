@@ -138,7 +138,7 @@ The gains scale with codebase size: on large repos the agent answers from the in
 | **Full-Text Search** | Find code by name instantly across your entire codebase, powered by FTS5 |
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
-| **20+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Objective-C, Swift, Kotlin, Dart, Lua, Luau, Svelte, Liquid, Pascal/Delphi |
+| **20+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Objective-C, Swift, Kotlin, Dart, Lua, Luau, Common Lisp, Svelte, Liquid, Pascal/Delphi |
 | **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 14 frameworks |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
@@ -532,6 +532,7 @@ is written):
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX form files) |
 | Lua | `.lua` | Full support (functions, methods with receivers, local variables, `require` imports, call edges) |
 | Luau | `.luau` | Full support (everything in Lua, plus `type`/`export type` aliases, typed signatures, and Roblox instance-path `require`) |
+| Common Lisp | `.lisp`, `.lsp`, `.cl`, `.asd`, `.el` | Full support: `defun`/`defmacro`/`defgeneric` as functions; `defmethod` as method with CLOS receiver-typed qualified name (`account::deposit`) and contains-edge from its class; `defclass`/`define-condition` slots as `field` nodes (with `:accessor`/`:reader`/`:writer` surfaced as function nodes, `:initform` walked for nested calls) and `extends` edges to superclasses; `defstruct` slots as fields with defaults walked; `deftype`, `defvar`/`defparameter`/`defconstant`; `defpackage` namespaces with `#:`/`:` decoration stripped; `(require …)` / `(use-package …)` / `(asdf:load-system …)` imports; context-aware function-to-function call edges suppressing binding-form names (`let`/`let*`/`do`/`dolist`/`multiple-value-bind`/`with-slots`/`with-accessors`/`with-open-file`/…) and declaration specifiers (`fixnum`/`type`/`ignore` inside `declare`); `cond`/`case` clauses with literal-key recognition (including the `t` default); `(funcall #'name …)` and `(apply #'name …)` resolved to the underlying target; `flet`/`labels` local functions promoted to function nodes; and a heuristic for user DSL macros (top-level `def*` forms like `def-x86-opcode`, `define-arm-vinsn`, `defcommand`, `deftest` surface their named symbol). Parsed by a dedicated hand-rolled s-expression tokenizer + recursive-descent parser (no tree-sitter grammar, no source preprocessing) — handles all CL/elisp reader syntax directly. Validated on the Clozure ANSI suite: 0 parse errors, 99.97% of top-level `deftest` forms extracted. |
 
 ## Troubleshooting
 

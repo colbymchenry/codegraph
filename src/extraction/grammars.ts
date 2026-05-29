@@ -10,7 +10,7 @@ import * as path from 'path';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'lisp' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -93,6 +93,13 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.sc': 'scala',
   '.lua': 'lua',
   '.luau': 'luau',
+  // Common Lisp (parser also covers `.el` reasonably well — the
+  // tree-sitter-commonlisp grammar accepts Emacs-Lisp surface syntax).
+  '.lisp': 'lisp',
+  '.lsp': 'lisp',
+  '.cl': 'lisp',
+  '.asd': 'lisp',
+  '.el': 'lisp',
   '.m': 'objc',
   '.mm': 'objc',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
@@ -272,6 +279,7 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'vue') return true; // custom extractor (script block delegation)
   if (language === 'liquid') return true; // custom regex extractor
+  if (language === 'lisp') return true; // custom hand-rolled s-expression extractor
   if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver
   if (language === 'twig') return true; // file-level tracking only
   if (language === 'xml') return true; // MyBatis mapper extractor
@@ -284,7 +292,7 @@ export function isLanguageSupported(language: Language): boolean {
  * Check if a grammar has been loaded and is ready for parsing.
  */
 export function isGrammarLoaded(language: Language): boolean {
-  if (language === 'svelte' || language === 'vue' || language === 'liquid') return true;
+  if (language === 'svelte' || language === 'vue' || language === 'liquid' || language === 'lisp') return true;
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
   if (language === 'xml' || language === 'properties') return true; // no WASM grammar needed
   return languageCache.has(language);
@@ -307,7 +315,7 @@ export function isFileLevelOnlyLanguage(language: Language): boolean {
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid', 'lisp'];
 }
 
 /**
@@ -377,6 +385,7 @@ export function getLanguageDisplayName(language: Language): string {
     scala: 'Scala',
     lua: 'Lua',
     luau: 'Luau',
+    lisp: 'Common Lisp',
     objc: 'Objective-C',
     yaml: 'YAML',
     twig: 'Twig',

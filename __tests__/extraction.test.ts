@@ -4260,6 +4260,1023 @@ local count = 0
 });
 
 // =============================================================================
+// Common Lisp (covers .lisp, .lsp, .cl, .asd, and .el)
+// =============================================================================
+
+describe('Common Lisp Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Common Lisp files', () => {
+      expect(detectLanguage('foo.lisp')).toBe('lisp');
+      expect(detectLanguage('foo.lsp')).toBe('lisp');
+      expect(detectLanguage('foo.cl')).toBe('lisp');
+      expect(detectLanguage('my-system.asd')).toBe('lisp');
+      expect(detectLanguage('init.el')).toBe('lisp');
+    });
+
+    it('should report Lisp as supported', () => {
+      expect(isLanguageSupported('lisp')).toBe(true);
+      expect(getSupportedLanguages()).toContain('lisp');
+    });
+  });
+
+  describe('Defining-form extraction', () => {
+    it('should extract defun / defmacro / defgeneric as functions, with signatures', () => {
+      const code = `
+(defun greet (name &key (greeting "Hello"))
+  "Greet NAME."
+  (format t "~A, ~A!" greeting name))
+
+(defmacro with-config ((var) &body body)
+  \`(let ((,var *config*)) ,@body))
+
+(defgeneric deposit (account amount))
+`;
+      const result = extractFromSource('app.lisp', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('greet');
+      expect(funcs).toContain('with-config');
+      expect(funcs).toContain('deposit');
+
+      const greet = result.nodes.find((n) => n.name === 'greet');
+      expect(greet?.language).toBe('lisp');
+      expect(greet?.signature).toBe('(name &key (greeting "Hello"))');
+    });
+
+    it('should extract defmethod as a method with receiver-typed qualified name', () => {
+      const code = `
+(defclass account () ())
+(defmethod deposit ((account account) amount)
+  (incf (slot-value account 'balance) amount))
+`;
+      const result = extractFromSource('clos.lisp', code);
+      const method = result.nodes.find((n) => n.kind === 'method' && n.name === 'deposit');
+      expect(method).toBeDefined();
+      expect(method?.qualifiedName).toBe('account::deposit');
+    });
+
+    it('should extract defvar / defparameter as variables, defconstant as a constant', () => {
+      const code = `
+(defvar *config* nil)
+(defparameter *default-port* 8080)
+(defconstant +max-retries+ 5)
+`;
+      const result = extractFromSource('vars.lisp', code);
+      const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+      const consts = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name);
+      expect(vars).toContain('*config*');
+      expect(vars).toContain('*default-port*');
+      expect(consts).toContain('+max-retries+');
+    });
+
+    it('should extract defclass with extends references to superclasses', () => {
+      const code = `
+(defclass animal () ())
+(defclass dog (animal) ())
+`;
+      const result = extractFromSource('clos.lisp', code);
+      const classes = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(classes).toContain('animal');
+      expect(classes).toContain('dog');
+
+      const extendsRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'extends' && r.referenceName === 'animal'
+      );
+      expect(extendsRef).toBeDefined();
+    });
+
+    it('should extract defstruct (both `defstruct NAME` and `defstruct (NAME ...)` forms)', () => {
+      const code = `
+(defstruct point x y)
+(defstruct (rect (:conc-name r-)) width height)
+`;
+      const result = extractFromSource('structs.lisp', code);
+      const structs = result.nodes.filter((n) => n.kind === 'struct').map((n) => n.name);
+      expect(structs).toContain('point');
+      expect(structs).toContain('rect');
+    });
+
+    it('should extract defpackage as a namespace, stripping the #: / : prefix', () => {
+      const code = `
+(defpackage #:my-app
+  (:use #:cl)
+  (:export #:run))
+`;
+      const result = extractFromSource('package.lisp', code);
+      const pkgs = result.nodes.filter((n) => n.kind === 'namespace').map((n) => n.name);
+      expect(pkgs).toContain('my-app');
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should record function-to-function calls as unresolved references on the caller', () => {
+      const code = `
+(defun helper (x) (* x 2))
+(defun run (y) (helper y))
+`;
+      const result = extractFromSource('calls.lisp', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'helper'
+      );
+      expect(call).toBeDefined();
+      // The caller should be the `run` function, not the file node.
+      const run = result.nodes.find((n) => n.name === 'run');
+      expect(call?.fromNodeId).toBe(run?.id);
+    });
+
+    it('should skip control-flow special forms (let / if / when / cond / loop) as calls', () => {
+      const code = `
+(defun foo (x)
+  (let ((y (+ x 1)))
+    (if (> y 10) y (* y 2))))
+`;
+      const result = extractFromSource('control.lisp', code);
+      const heads = new Set(
+        result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls')
+          .map((r) => r.referenceName)
+      );
+      expect(heads.has('let')).toBe(false);
+      expect(heads.has('if')).toBe(false);
+    });
+
+    it('should not treat let / let* binding NAMES as calls, but still walk their VALUES', () => {
+      const code = `
+(defun run ()
+  (let ((acc (make-instance 'account :id 1))
+        (port (compute-port)))
+    (deposit acc 100)
+    acc))
+`;
+      const result = extractFromSource('bindings.lisp', code);
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+
+      // Binding names are not calls.
+      expect(callNames).not.toContain('acc');
+      expect(callNames).not.toContain('port');
+      // But their value forms ARE walked — make-instance, compute-port, deposit
+      // must all surface as call edges from `run`.
+      expect(callNames).toContain('make-instance');
+      expect(callNames).toContain('compute-port');
+      expect(callNames).toContain('deposit');
+    });
+
+    it('should not treat dolist / dotimes binding names as calls', () => {
+      const code = `
+(defun loop-demo (items)
+  (dolist (item items)
+    (process item))
+  (dotimes (i 10)
+    (record i)))
+`;
+      const result = extractFromSource('loops.lisp', code);
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callNames).not.toContain('item');
+      expect(callNames).not.toContain('i');
+      expect(callNames).toContain('process');
+      expect(callNames).toContain('record');
+    });
+  });
+
+  describe('Slot extraction (defclass / defstruct)', () => {
+    it('should extract defclass slots as field nodes contained by the class', () => {
+      const code = `
+(defclass account ()
+  ((id     :initarg :id     :accessor account-id)
+   (owner  :initarg :owner  :accessor account-owner)
+   (amount :initform 0      :accessor account-amount)))
+`;
+      const result = extractFromSource('clos.lisp', code);
+      const fields = result.nodes.filter((n) => n.kind === 'field');
+      const fieldNames = fields.map((f) => f.name);
+      expect(fieldNames).toContain('id');
+      expect(fieldNames).toContain('owner');
+      expect(fieldNames).toContain('amount');
+
+      // Each field's qualifiedName should carry the class scope, and a
+      // `contains` edge must run from the class to the field.
+      const accountClass = result.nodes.find((n) => n.kind === 'class' && n.name === 'account');
+      const id = fields.find((f) => f.name === 'id');
+      expect(id?.qualifiedName).toBe('account::id');
+      const containsEdge = result.edges.find(
+        (e) => e.kind === 'contains' && e.source === accountClass?.id && e.target === id?.id
+      );
+      expect(containsEdge).toBeDefined();
+    });
+
+    it('should not emit spurious call edges for defclass slot subforms', () => {
+      const code = `
+(defclass account ()
+  ((id     :initarg :id     :accessor account-id)
+   (amount :initform 0)))
+`;
+      const result = extractFromSource('clos.lisp', code);
+      const callNames = new Set(
+        result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls')
+          .map((r) => r.referenceName)
+      );
+      // Slot names and option keywords must never look like calls.
+      expect(callNames.has('id')).toBe(false);
+      expect(callNames.has('amount')).toBe(false);
+    });
+
+    it('should walk :initform values for nested calls', () => {
+      const code = `
+(defclass widget ()
+  ((created-at :initform (current-time))))
+`;
+      const result = extractFromSource('clos.lisp', code);
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'current-time'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    it('should extract defstruct slots as field nodes (bare and (name default) forms)', () => {
+      const code = `
+(defstruct point
+  x
+  (y 0)
+  (z (compute-default-z)))
+`;
+      const result = extractFromSource('struct.lisp', code);
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((f) => f.name);
+      expect(fields).toContain('x');
+      expect(fields).toContain('y');
+      expect(fields).toContain('z');
+
+      // The default form (compute-default-z) must produce a call edge.
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'compute-default-z'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
+
+  describe('Local function extraction (flet / labels)', () => {
+    it('should promote flet local-function bindings to function nodes', () => {
+      const code = `
+(defun outer (x)
+  (flet ((double (n) (* n 2))
+         (triple (n) (* n 3)))
+    (+ (double x) (triple x))))
+`;
+      const result = extractFromSource('flet.lisp', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('outer');
+      expect(funcs).toContain('double');
+      expect(funcs).toContain('triple');
+
+      // Locals must be contained by the enclosing function, not by the file.
+      const outer = result.nodes.find((n) => n.name === 'outer');
+      const double = result.nodes.find((n) => n.name === 'double');
+      const edge = result.edges.find(
+        (e) => e.kind === 'contains' && e.source === outer?.id && e.target === double?.id
+      );
+      expect(edge).toBeDefined();
+    });
+
+    it('should also handle labels (the mutually-recursive flet variant)', () => {
+      const code = `
+(defun outer ()
+  (labels ((helper (n) (if (zerop n) 0 (1+ (helper (1- n))))))
+    (helper 10)))
+`;
+      const result = extractFromSource('labels.lisp', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('helper');
+    });
+  });
+
+  describe('Method-to-class containment', () => {
+    it('should attach the defmethod contains edge to the class when both are in the same file', () => {
+      const code = `
+(defclass account () ())
+(defmethod deposit ((account account) amount)
+  (incf (slot-value account 'balance) amount))
+`;
+      const result = extractFromSource('clos.lisp', code);
+      const klass = result.nodes.find((n) => n.kind === 'class' && n.name === 'account');
+      const method = result.nodes.find((n) => n.kind === 'method' && n.name === 'deposit');
+      expect(klass).toBeDefined();
+      expect(method).toBeDefined();
+
+      // Crucially: the contains edge runs from the CLASS to the method, not
+      // from the file. (Mirrors how Go/Rust receiver-typed methods are wired.)
+      const containsFromClass = result.edges.find(
+        (e) => e.kind === 'contains' && e.source === klass!.id && e.target === method!.id
+      );
+      expect(containsFromClass).toBeDefined();
+
+      // No double-containment: the file should not also list the method.
+      const fileNode = result.nodes.find((n) => n.kind === 'file');
+      const containsFromFile = result.edges.find(
+        (e) => e.kind === 'contains' && e.source === fileNode?.id && e.target === method!.id
+      );
+      expect(containsFromFile).toBeUndefined();
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should extract (require ...) as import nodes with parent-scoped references', () => {
+      const code = `
+(require :cl-ppcre)
+(require "sb-bsd-sockets")
+`;
+      const result = extractFromSource('deps.lisp', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('cl-ppcre');
+      expect(imports).toContain('sb-bsd-sockets');
+
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'cl-ppcre'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
+
+  describe('Funcall / apply target resolution', () => {
+    it('should resolve (funcall #\'name ...) to the wrapped target, not "funcall"', () => {
+      const code = `
+(defun caller ()
+  (funcall #'my-fn 1 2))
+`;
+      const result = extractFromSource('funcall.lisp', code);
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callNames).toContain('my-fn');
+      expect(callNames).not.toContain('funcall');
+    });
+
+    it('should resolve (apply #\'name ...) the same way', () => {
+      const code = `
+(defun caller (args)
+  (apply #'my-fn args))
+`;
+      const result = extractFromSource('apply.lisp', code);
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callNames).toContain('my-fn');
+      expect(callNames).not.toContain('apply');
+    });
+
+    it('should NOT emit a call edge when funcall target is a variable (unknown static target)', () => {
+      const code = `
+(defun caller (handler)
+  (funcall handler 1))
+`;
+      const result = extractFromSource('funcall-var.lisp', code);
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callNames).not.toContain('funcall');
+      expect(callNames).not.toContain('handler');
+    });
+
+    it('should walk inline-lambda bodies so their calls reach the enclosing function', () => {
+      const code = `
+(defun caller ()
+  (funcall (lambda (n) (compute-it n)) 5))
+`;
+      const result = extractFromSource('funcall-lambda.lisp', code);
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callNames).toContain('compute-it');
+      expect(callNames).not.toContain('funcall');
+    });
+  });
+
+  describe('Declarations (declare / declaim / proclaim)', () => {
+    it('should not emit call edges for declaration specifiers', () => {
+      const code = `
+(defun foo (x y z)
+  (declare (fixnum x y z)
+           (type integer x)
+           (ignore z)
+           (optimize speed (safety 0))
+           (special *config*))
+  (+ x y))
+`;
+      const result = extractFromSource('declare.lisp', code);
+      const callNames = new Set(
+        result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls')
+          .map((r) => r.referenceName)
+      );
+      // None of the declaration heads should appear as a call.
+      for (const head of ['declare', 'fixnum', 'type', 'ignore', 'optimize', 'safety', 'special']) {
+        expect(callNames.has(head)).toBe(false);
+      }
+      // The body's `+` is a real call though.
+      expect(callNames.has('+')).toBe(true);
+    });
+
+    it('should also skip (declaim ...) and (proclaim ...)', () => {
+      const code = `
+(declaim (ftype (function (integer) integer) my-fn))
+(proclaim '(special *my-var*))
+`;
+      const result = extractFromSource('declaim.lisp', code);
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callNames).not.toContain('ftype');
+      expect(callNames).not.toContain('function');
+      expect(callNames).not.toContain('special');
+    });
+  });
+
+  describe('Cond / case clauses', () => {
+    it('should not treat `t` as a call inside cond clauses', () => {
+      const code = `
+(defun classify (x)
+  (cond ((> x 0) (positive))
+        ((< x 0) (negative))
+        (t (zero))))
+`;
+      const result = extractFromSource('cond.lisp', code);
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callNames).not.toContain('t');
+      // The real calls — including test expressions — must still surface.
+      expect(callNames).toContain('>');
+      expect(callNames).toContain('<');
+      expect(callNames).toContain('positive');
+      expect(callNames).toContain('negative');
+      expect(callNames).toContain('zero');
+    });
+
+    it('should not treat case clause keys as calls (literals or lists of literals)', () => {
+      const code = `
+(defun dispatch (op)
+  (case op
+    (:add (do-add))
+    (:sub (do-sub))
+    ((:mul :div) (do-mul-div))
+    (t (default))))
+`;
+      const result = extractFromSource('case.lisp', code);
+      const callNames = new Set(
+        result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls')
+          .map((r) => r.referenceName)
+      );
+      // Keys must not be calls.
+      expect(callNames.has('t')).toBe(false);
+      // Forms inside each clause must be.
+      expect(callNames.has('do-add')).toBe(true);
+      expect(callNames.has('do-sub')).toBe(true);
+      expect(callNames.has('do-mul-div')).toBe(true);
+      expect(callNames.has('default')).toBe(true);
+    });
+  });
+
+  describe('User-defined DSL macros (def-* / define-* / def*)', () => {
+    it('should surface (def-x86-opcode NAME ...) as a function node named NAME', () => {
+      const code = `
+(def-x86-opcode mov (dest src) #x88)
+(define-arm-vinsn jump-known-function (() ((target :lisp))) :pseudo)
+(defcommand foo (args) "doc" (do-it args))
+`;
+      const result = extractFromSource('dsl.lisp', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('mov');
+      expect(funcs).toContain('jump-known-function');
+      expect(funcs).toContain('foo');
+    });
+
+    it('should not emit spurious call edges from inside DSL spec lists', () => {
+      const code = `
+(define-arm-vinsn jump (() ((target :lisp))) :pseudo)
+`;
+      const result = extractFromSource('dsl-spec.lisp', code);
+      const callNames = new Set(
+        result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls')
+          .map((r) => r.referenceName)
+      );
+      // `target` lives only in the spec list — it's not a call.
+      expect(callNames.has('target')).toBe(false);
+      // Neither is the type keyword's value.
+      expect(callNames.has(':lisp')).toBe(false);
+    });
+
+    it('should NOT apply the def-fallback inside a function body (would corrupt real calls)', () => {
+      // `(defer-action handler)` is a regular function call whose name happens
+      // to start with `def`. Inside a defun body, it must stay a call — not be
+      // misinterpreted as a defining macro that would create a node named
+      // "handler".
+      const code = `
+(defun outer (handler)
+  (defer-action handler))
+`;
+      const result = extractFromSource('def-in-body.lisp', code);
+      const fnNames = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      // Should NOT have created a function named "handler".
+      expect(fnNames).not.toContain('handler');
+      // The defer-action call edge should be there.
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callNames).toContain('defer-action');
+    });
+  });
+
+  describe('Defclass accessor / option extraction', () => {
+    it('should emit a function node for each :accessor / :reader / :writer', () => {
+      const code = `
+(defclass account ()
+  ((id     :initarg :id     :accessor account-id)
+   (owner  :initarg :owner  :reader account-owner)
+   (amount :initform 0      :writer set-account-amount)))
+`;
+      const result = extractFromSource('clos-accessors.lisp', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toContain('account-id');
+      expect(fns).toContain('account-owner');
+      expect(fns).toContain('set-account-amount');
+    });
+
+    it('should walk (:default-initargs :key (compute-form)) option values for nested calls', () => {
+      const code = `
+(defclass widget ()
+  ((id :initarg :id))
+  (:default-initargs :id (next-id))
+  (:documentation "A widget."))
+`;
+      const result = extractFromSource('clos-options.lisp', code);
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'next-id'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
+
+  describe('Print-unreadable-object data list', () => {
+    it('should not treat the data-list args (obj, stream) as calls', () => {
+      const code = `
+(defmethod print-object ((w widget) stream)
+  (print-unreadable-object (w stream :type t :identity t)
+    (format stream "widget ~A" (widget-id w))))
+`;
+      const result = extractFromSource('print-unreadable.lisp', code);
+      const callNames = new Set(
+        result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls')
+          .map((r) => r.referenceName)
+      );
+      // Object/stream variables in the data list are NOT calls.
+      expect(callNames.has('w')).toBe(false);
+      // But body calls still register.
+      expect(callNames.has('format')).toBe(true);
+      expect(callNames.has('widget-id')).toBe(true);
+    });
+  });
+
+  describe('Extra control / special forms (catch / throw / progv / prog / prog*)', () => {
+    it('should not emit calls for catch / throw / progv / with-condition-restarts heads', () => {
+      const code = `
+(defun foo (x)
+  (catch 'tag
+    (throw 'tag (compute x))))
+
+(defun bar (vars vals)
+  (progv vars vals
+    (do-it)))
+`;
+      const result = extractFromSource('catch-throw.lisp', code);
+      const callNames = new Set(
+        result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls')
+          .map((r) => r.referenceName)
+      );
+      expect(callNames.has('catch')).toBe(false);
+      expect(callNames.has('throw')).toBe(false);
+      expect(callNames.has('progv')).toBe(false);
+      // Genuine inner calls still surface.
+      expect(callNames.has('compute')).toBe(true);
+      expect(callNames.has('do-it')).toBe(true);
+    });
+
+    it('should treat prog / prog* like let (binding clause + body)', () => {
+      const code = `
+(defun foo ()
+  (prog ((a (init-a)) (b (init-b)))
+    (use a b)))
+`;
+      const result = extractFromSource('prog.lisp', code);
+      const callNames = new Set(
+        result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls')
+          .map((r) => r.referenceName)
+      );
+      // Binding names suppressed, init forms walked, body forms walked.
+      expect(callNames.has('a')).toBe(false);
+      expect(callNames.has('b')).toBe(false);
+      expect(callNames.has('prog')).toBe(false);
+      expect(callNames.has('init-a')).toBe(true);
+      expect(callNames.has('init-b')).toBe(true);
+      expect(callNames.has('use')).toBe(true);
+    });
+  });
+
+  describe('Previously silent-skipped standard def-forms (A3)', () => {
+    it('should surface defsetf / define-modify-macro / define-symbol-macro / define-compiler-macro / define-setf-expander as function nodes', () => {
+      const code = `
+(defsetf my-field set-my-field)
+(define-modify-macro my-incf () 1+)
+(define-symbol-macro pi-x2 (* 2 pi))
+(define-compiler-macro fast-add (a b) (list '+ a b))
+(define-setf-expander my-place (obj) (values))
+`;
+      const result = extractFromSource('def-misc.lisp', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('my-field');
+      expect(funcs).toContain('my-incf');
+      expect(funcs).toContain('pi-x2');
+      expect(funcs).toContain('fast-add');
+      expect(funcs).toContain('my-place');
+    });
+  });
+
+  describe('Setf-methods and CLOS qualifiers', () => {
+    it('should extract (defmethod (setf foo) …) as a separately-named method', () => {
+      const code = `
+(defclass widget () ((id :initarg :id)))
+
+(defmethod widget-id ((w widget))
+  (slot-value w 'id))
+
+(defmethod (setf widget-id) (new-val (w widget))
+  (setf (slot-value w 'id) new-val))
+`;
+      const result = extractFromSource('setf-method.lisp', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const getter = methods.find((m) => m.name === 'widget-id');
+      const setter = methods.find((m) => m.name === '(setf widget-id)');
+      expect(getter).toBeDefined();
+      expect(setter).toBeDefined();
+      expect(getter?.qualifiedName).toBe('widget::widget-id');
+      expect(setter?.qualifiedName).toBe('widget::(setf widget-id)');
+    });
+
+    it('should distinguish :before / :after / :around method qualifiers in the qualifiedName', () => {
+      const code = `
+(defclass account () ())
+
+(defmethod deposit ((a account) amount) (primary a amount))
+(defmethod deposit :before ((a account) amount) (before-hook a))
+(defmethod deposit :after ((a account) amount) (after-hook a))
+(defmethod deposit :around ((a account) amount) (around-hook (call-next-method)))
+`;
+      const result = extractFromSource('qualified.lisp', code);
+      const qns = result.nodes
+        .filter((n) => n.kind === 'method' && n.name === 'deposit')
+        .map((n) => n.qualifiedName)
+        .sort();
+      expect(qns).toEqual([
+        'account::deposit',
+        'account::deposit::after',
+        'account::deposit::around',
+        'account::deposit::before',
+      ]);
+    });
+  });
+
+  describe('Defpackage option decomposition (F)', () => {
+    it('should decompose :use / :import-from / :export into import and export nodes', () => {
+      const code = `
+(defpackage #:my-app
+  (:nicknames #:app)
+  (:use #:cl #:alexandria)
+  (:import-from #:cl-ppcre #:scan #:scan-to-strings)
+  (:export #:run #:greet))
+`;
+      const result = extractFromSource('package.lisp', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'my-app');
+      expect(ns).toBeDefined();
+      // Nicknames stashed on the signature so they're visible at a glance.
+      expect(ns?.signature).toContain('app');
+
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name).sort();
+      // :use packages
+      expect(imports).toContain('cl');
+      expect(imports).toContain('alexandria');
+      // :import-from package + each imported symbol
+      expect(imports).toContain('cl-ppcre');
+      expect(imports).toContain('scan');
+      expect(imports).toContain('scan-to-strings');
+
+      const exports = result.nodes.filter((n) => n.kind === 'export').map((n) => n.name).sort();
+      expect(exports).toEqual(['greet', 'run']);
+
+      // Imports references should connect the namespace to its dependencies.
+      const refToCl = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'cl' && r.fromNodeId === ns?.id
+      );
+      expect(refToCl).toBeDefined();
+    });
+  });
+
+  describe('Assert / check-type spurious-edge suppression (E)', () => {
+    it('should NOT emit a call to type-spec heads inside check-type', () => {
+      const code = `
+(defun foo (x)
+  (check-type x (integer 0 100))
+  (check-type x (or null string)))
+`;
+      const result = extractFromSource('checktype.lisp', code);
+      const callNames = new Set(
+        result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls')
+          .map((r) => r.referenceName)
+      );
+      expect(callNames.has('integer')).toBe(false);
+      // `or` is in CONTROL_HEADS so it was already filtered, but double-check.
+      expect(callNames.has('or')).toBe(false);
+    });
+
+    it('should NOT treat assert places-list members as calls; should walk test and message args', () => {
+      const code = `
+(defun foo (x)
+  (assert (> x 0) (x) "x must be positive, got: ~A" (some-side-effect x))
+  (+ x 1))
+`;
+      const result = extractFromSource('assert.lisp', code);
+      const callNames = new Set(
+        result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls')
+          .map((r) => r.referenceName)
+      );
+      // `x` in the places list is NOT a call.
+      expect(callNames.has('x')).toBe(false);
+      // Test expression IS walked.
+      expect(callNames.has('>')).toBe(true);
+      // Datum/arg forms ARE walked.
+      expect(callNames.has('some-side-effect')).toBe(true);
+      // Outer body call still surfaces.
+      expect(callNames.has('+')).toBe(true);
+    });
+  });
+
+  describe('CCL vinsn-emission macros (!)', () => {
+    it('should resolve (! vinsn-name args) to a call to vinsn-name (not "!")', () => {
+      const code = `
+(defun emitter ()
+  (! save-values)
+  (!! make-stack-block 10))
+`;
+      const result = extractFromSource('emit.lisp', code);
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callNames).toContain('save-values');
+      expect(callNames).toContain('make-stack-block');
+      expect(callNames).not.toContain('!');
+      expect(callNames).not.toContain('!!');
+    });
+  });
+
+  describe('User-defmacro with body walking', () => {
+    it('should walk body forms of a def-macro (skipping only the leading lambda-list)', () => {
+      // CCL-style: (defarm64-p2 NAME ALIAS (params) body…) — name comes
+      // first, then an alias sym, then a params list, then real body forms.
+      // The extractor must skip only the (params) list (first list_lit) so
+      // body call edges are captured.
+      const code = `
+(defarm64-p2 my-emitter my-alias (seg vreg xfer forms)
+  (process-forms seg forms)
+  (! save-values))
+`;
+      const result = extractFromSource('arm64-p2.lisp', code);
+      const fn = result.nodes.find((n) => n.name === 'my-emitter');
+      expect(fn).toBeDefined();
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls' && r.fromNodeId === fn?.id)
+        .map((r) => r.referenceName);
+      // Body calls land on the macro node.
+      expect(callNames).toContain('process-forms');
+      expect(callNames).toContain('save-values'); // via (! save-values)
+      // Param names from the SKIPPED first list_lit are NOT calls.
+      expect(callNames).not.toContain('seg');
+      expect(callNames).not.toContain('vreg');
+      expect(callNames).not.toContain('forms');
+    });
+
+    it('should also handle the (def-foo (NAME :opt) value) variant where NAME lives inside a list', () => {
+      // CCL: (define-arm64-subprim-call-vinsn (save-values) .SPsave-values)
+      const code = `
+(define-arm64-subprim-call-vinsn (foo) .SPfoo)
+(define-arm64-vinsn (bar :options ((:fpr-bb))) (() ()) :pseudo)
+`;
+      const result = extractFromSource('subprim.lisp', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('foo');
+      expect(funcs).toContain('bar');
+    });
+  });
+
+  describe('Grammar workaround: `^` as a sym head (G)', () => {
+    it('should parse and extract a defun that uses (^ …) as a macrolet shorthand', () => {
+      // The tree-sitter-commonlisp grammar treats bare `^` as a reader-macro
+      // prefix (meta_lit), so files using `^` as a sym head — common in
+      // CCL's compiler backend macrolets — would otherwise produce
+      // cascading ERROR spans that hide most of the file's symbols.
+      const code = `
+(defun outer ()
+  (macrolet ((^ (x) (do-it x)))
+    (^ 42)))
+`;
+      const result = extractFromSource('caret.lisp', code);
+      // The defun parses cleanly (no errors), and its body call edge to
+      // do-it is recorded — proving the preprocessing pass worked.
+      expect(result.errors).toEqual([]);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'outer');
+      expect(fn).toBeDefined();
+    });
+
+    it('should parse `lambda`/`defun` used as parameter names', () => {
+      // The ANSI conformance suite (misc.lsp) passes `lambda` as an ordinary
+      // parameter; the grammar otherwise reads `(lambda` as a new lambda
+      // form and cascades errors through the file.
+      const code = `
+(defun call-compiled (lambda &rest args)
+  (apply-compiled lambda args))
+(defun apply-compiled (lambda args)
+  (apply lambda args))
+`;
+      const result = extractFromSource('lambda-param.lisp', code);
+      expect(result.errors).toEqual([]);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toContain('call-compiled');
+      expect(fns).toContain('apply-compiled');
+    });
+
+    it('should parse reader conditionals (#+/#-) without dropping the wrapped form', () => {
+      const code = `
+(defun pick ()
+  #+sbcl (sbcl-path)
+  #-sbcl (other-path)
+  #+(or ccl clisp) (ccl-path))
+`;
+      const result = extractFromSource('readercond.lisp', code);
+      expect(result.errors).toEqual([]);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      // Both branches' forms are walked (we index all feature branches).
+      expect(calls).toContain('sbcl-path');
+      expect(calls).toContain('other-path');
+      expect(calls).toContain('ccl-path');
+    });
+
+    it('should parse `loop` clauses that contain reader conditionals', () => {
+      const code = `
+(defun looper (lst)
+  (loop for x in lst
+        when (oddp x)
+          collect (double x)
+        finally (return :done)))
+`;
+      const result = extractFromSource('loop.lisp', code);
+      expect(result.errors).toEqual([]);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('double');
+    });
+
+    it('should parse array literals (#0a / #2a) and symbol names with { } [ ]', () => {
+      const code = `
+(deftest array.1 (typep #0aX (quote array)) t)
+(deftest array.2 (typep #2a((1 2)(3 4)) (quote array)) t)
+(deftest format.^.{.1 (do-fmt) t)
+(deftest format.^.[.2 (do-fmt2) t)
+`;
+      const result = extractFromSource('arrays.lisp', code);
+      expect(result.errors).toEqual([]);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      // deftest names preserved verbatim (getNodeText reads the original).
+      expect(fns).toContain('array.1');
+      expect(fns).toContain('format.^.{.1');
+      expect(fns).toContain('format.^.[.2');
+    });
+
+    it('should parse format-directive strings (~{ ~1{ ~^ ~}) as plain literals', () => {
+      const code = `
+(deftest fmt.1 (format nil "~{X ~A~^ Y ~A~}" args) "")
+(deftest fmt.2 (format nil "~1{~A~^~A~}" args) "")
+(deftest fmt.3 (format nil "~{~[X~;Y~;~0^~]~}" args) "")
+`;
+      const result = extractFromSource('fmt.lisp', code);
+      expect(result.errors).toEqual([]);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toContain('fmt.1');
+      expect(fns).toContain('fmt.2');
+      expect(fns).toContain('fmt.3');
+    });
+
+    it('should parse block comments containing parens before closing parens', () => {
+      // The grammar mishandles `(or X #|(a (b))|#))))`; we blank block
+      // comments entirely so the surrounding forms still parse.
+      const code = `
+(defun memoize-p (val)
+  (if (or (truthy val)
+          (and (acode-p val)
+               (let* ((op (operator val)))
+                 (or (eq op (kind fixnum)) #|(eq op (kind immediate))|#))))
+    nil t))
+(defun next-fn (x) x)
+`;
+      const result = extractFromSource('blockcomment.lisp', code);
+      expect(result.errors).toEqual([]);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toContain('memoize-p');
+      expect(fns).toContain('next-fn');
+    });
+
+    it('should parse backslash-escaped symbol names and not strip at an escaped colon', () => {
+      const code = `
+(deftest \\+.1 (foo) t)
+(deftest format.\\:{.6 (bar) t)
+`;
+      const result = extractFromSource('escaped.lisp', code);
+      expect(result.errors).toEqual([]);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      // Names preserved verbatim; the escaped colon is NOT a package separator.
+      expect(fns).toContain('\\+.1');
+      expect(fns).toContain('format.\\:{.6');
+    });
+
+    it('should keep a mid-symbol `#` (e.g. ccl.bug#252a) instead of eating it as a dispatch macro', () => {
+      const code = `
+(deftest ccl.bug#252a (foo) t)
+`;
+      const result = extractFromSource('hash.lisp', code);
+      expect(result.errors).toEqual([]);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toContain('ccl.bug#252a');
+    });
+  });
+
+  describe('Package-qualified names (B)', () => {
+    it('should normalize (pkg:fn …) call sites to the base symbol', () => {
+      const code = `
+(defun caller ()
+  (myapp:do-it 1)
+  (cl:format t "hi"))
+`;
+      const result = extractFromSource('pkg.lisp', code);
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      // Base symbol after stripping the `pkg:` prefix.
+      expect(callNames).toContain('do-it');
+      expect(callNames).toContain('format');
+      // Should NOT carry the prefix.
+      expect(callNames).not.toContain('myapp:do-it');
+      expect(callNames).not.toContain('cl:format');
+    });
+
+    it('should also strip the prefix inside (funcall #\'pkg:fn …)', () => {
+      const code = `
+(defun caller ()
+  (funcall #'myapp:helper 1))
+`;
+      const result = extractFromSource('pkg-funcall.lisp', code);
+      const callNames = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callNames).toContain('helper');
+      expect(callNames).not.toContain('myapp:helper');
+    });
+
+    it('should strip the prefix on defmethod receiver specialisers and class supers', () => {
+      const code = `
+(defclass dog (animals:mammal) ())
+(defmethod feed ((d animals:dog) food) (do-feed d food))
+`;
+      const result = extractFromSource('pkg-clos.lisp', code);
+      const extendsRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'extends' && r.referenceName === 'mammal'
+      );
+      expect(extendsRef).toBeDefined();
+      // Receiver type was stripped to `dog`, so the method's qn uses bare class name.
+      const method = result.nodes.find((n) => n.kind === 'method' && n.name === 'feed');
+      expect(method?.qualifiedName).toBe('dog::feed');
+    });
+  });
+});
+
+// =============================================================================
 // Objective-C
 // =============================================================================
 
