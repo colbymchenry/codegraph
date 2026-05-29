@@ -1086,17 +1086,28 @@ function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext):
 }
 
 /**
- * PHP @property PHPDoc → reference edges. Classes annotated with
+ * PHP @property PHPDoc → reference + calls edges. Classes annotated with
  * `@property TypeName $propName` declare dynamic properties resolved
  * through `__get()`. This is the standard PHP mechanism for service
  * locators, DI containers, and ORMs (e.g. MPF Ctx, Doctrine entities).
  *
- * For each PHP class/interface with @property annotations, emit
- * `references` edges to the declared types so the graph captures the
- * dependency, and `calls` edges from each method in the class that calls
- * a method matching one on the @property target (bridging the __get
- * indirection). Precision gates: only non-primitive types that resolve
- * to a class/interface/trait node; capped per class.
+ * Phase 1: emit `references` edges from the annotated class to the
+ * declared @property types (class→class dependency).
+ *
+ * Phase 2: scan all PHP method bodies for chained property calls
+ * (`->propName->methodName(`) and variable-dereference patterns
+ * (`$var = ...->propName; $var->method(`), then synthesize method→method
+ * `calls` edges through the @property mapping. This bridges the __get()
+ * magic-method indirection that tree-sitter cannot statically resolve.
+ *
+ * Precision gates: propName must exist in the @property map, methodName
+ * must exist on the target type, comments/strings stripped before matching.
+ *
+ * Known limitation: no receiver-type verification — a non-@property field
+ * with the same name as an @property would also match. The propMap lookup
+ * makes this unlikely in practice (requires same propName + same methodName
+ * on the target type), and `heuristic` provenance lets downstream consumers
+ * distinguish these edges from static ones.
  */
 const PHP_PROPERTY_RE = /(@property(?:-read|-write)?)\s+(\\?[A-Za-z_][\w\\|]*)\s+\$(\w+)/g;
 const PHP_PRIMITIVE_TYPES = new Set([
@@ -1106,6 +1117,33 @@ const PHP_PRIMITIVE_TYPES = new Set([
 ]);
 
 const PHP_PROP_CALL_RE = /->(\w+)\s*->\s*(\w+)\s*\(/g;
+// Assignment: `$var = ...->propName;` (property access, not method call)
+const PHP_PROP_ASSIGN_RE = /\$(\w+)\s*=\s*[^;]*->(\w+)\s*;/g;
+// Variable method call: `$var->method(`
+const PHP_VAR_CALL_RE = /\$(\w+)->(\w+)\s*\(/g;
+
+/** Blank PHP string interiors so regex matching doesn't produce false hits. */
+function blankPhpStrings(src: string): string {
+  const out = src.split('');
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    if (src[i] === '"' || src[i] === "'") {
+      const quote = src[i]!;
+      i++; // skip opening quote
+      while (i < n && src[i] !== quote) {
+        if (src[i] === '\\' && i + 1 < n) { out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
+        if (src[i] === '\n') break;
+        out[i] = ' ';
+        i++;
+      }
+      if (i < n && src[i] === quote) i++; // skip closing quote
+    } else {
+      i++;
+    }
+  }
+  return out.join('');
+}
 
 function phpPhpdocPropertyEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
@@ -1177,9 +1215,11 @@ function phpPhpdocPropertyEdges(queries: QueryBuilder, ctx: ResolutionContext): 
     }
   }
 
-  // Phase 2: scan all PHP methods for `->propName->methodName(` and synthesize
-  // method→method calls edges through the @property indirection.
+  // Phase 2: scan all PHP methods for property-chain calls and variable-
+  // dereference patterns, synthesize method→method calls edges.
   if (propMap.size > 0) {
+    const propNames = new Set(propMap.keys());
+
     // Pre-index target class methods by (targetTypeName, methodName) for O(1) lookup.
     const targetMethodIndex = new Map<string, Node[]>();
     for (const entries of propMap.values()) {
@@ -1201,6 +1241,30 @@ function phpPhpdocPropertyEdges(queries: QueryBuilder, ctx: ResolutionContext): 
       }
     }
 
+    const addCallEdge = (method: Node, calledMethod: string, propEntries: Array<{ targetTypeName: string; annotation: string }>) => {
+      for (const { targetTypeName, annotation } of propEntries) {
+        const targets = targetMethodIndex.get(`${targetTypeName}::${calledMethod}`);
+        if (!targets) continue;
+        for (const target of targets) {
+          if (target.id === method.id) continue;
+          const key = `${method.id}>${target.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: method.id,
+            target: target.id,
+            kind: 'calls',
+            line: method.startLine,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'php-phpdoc-property',
+              via: `${annotation} → ${calledMethod}`,
+            },
+          });
+        }
+      }
+    };
+
     for (const file of ctx.getAllFiles()) {
       if (!file.endsWith('.php')) continue;
       const content = ctx.readFile(file);
@@ -1209,37 +1273,42 @@ function phpPhpdocPropertyEdges(queries: QueryBuilder, ctx: ResolutionContext): 
       const methods = nodesInFile.filter((n) => n.kind === 'method' && n.language === 'php');
 
       for (const method of methods) {
-        const src = sliceLines(content, method.startLine, method.endLine);
-        if (!src) continue;
+        const rawSrc = sliceLines(content, method.startLine, method.endLine);
+        if (!rawSrc) continue;
 
+        // P3: skip methods that don't mention any known @property name.
+        let hasProp = false;
+        for (const name of propNames) {
+          if (rawSrc.includes(name)) { hasProp = true; break; }
+        }
+        if (!hasProp) continue;
+
+        // P0: strip comments and string interiors to avoid false matches.
+        const src = blankPhpStrings(stripCommentsForRegex(rawSrc, 'php'));
+
+        // Pattern A: direct chain `->propName->methodName(`
         PHP_PROP_CALL_RE.lastIndex = 0;
         let cm: RegExpExecArray | null;
         while ((cm = PHP_PROP_CALL_RE.exec(src))) {
-          const calledProp = cm[1]!;
-          const calledMethod = cm[2]!;
-          const propEntries = propMap.get(calledProp);
-          if (!propEntries) continue;
+          const propEntries = propMap.get(cm[1]!);
+          if (propEntries) addCallEdge(method, cm[2]!, propEntries);
+        }
 
-          for (const { targetTypeName, annotation } of propEntries) {
-            const targets = targetMethodIndex.get(`${targetTypeName}::${calledMethod}`);
-            if (!targets) continue;
-            for (const target of targets) {
-              if (target.id === method.id) continue;
-              const key = `${method.id}>${target.id}`;
-              if (seen.has(key)) continue;
-              seen.add(key);
-              edges.push({
-                source: method.id,
-                target: target.id,
-                kind: 'calls',
-                line: method.startLine,
-                provenance: 'heuristic',
-                metadata: {
-                  synthesizedBy: 'php-phpdoc-property',
-                  via: `${annotation} → ${calledMethod}`,
-                },
-              });
-            }
+        // Pattern B: variable dereference `$var = ...->propName; ... $var->method(`
+        const varToProp = new Map<string, string>();
+        PHP_PROP_ASSIGN_RE.lastIndex = 0;
+        let am: RegExpExecArray | null;
+        while ((am = PHP_PROP_ASSIGN_RE.exec(src))) {
+          if (propNames.has(am[2]!)) varToProp.set(am[1]!, am[2]!);
+        }
+        if (varToProp.size > 0) {
+          PHP_VAR_CALL_RE.lastIndex = 0;
+          let vm: RegExpExecArray | null;
+          while ((vm = PHP_VAR_CALL_RE.exec(src))) {
+            const propName = varToProp.get(vm[1]!);
+            if (!propName) continue;
+            const propEntries = propMap.get(propName);
+            if (propEntries) addCallEdge(method, vm[2]!, propEntries);
           }
         }
       }

@@ -656,6 +656,115 @@ class ChargeController {
     expect(match.edge_kind).toBe('calls');
   });
 
+  it('synthesizes calls edges for variable-dereference pattern ($var = ...->propName; $var->method())', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'ctx.php'),
+      `<?php
+/**
+ * @property User_Factory $user_factory
+ */
+class Ctx {
+    public function __get($name) { return null; }
+}
+`,
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'user_factory.php'),
+      `<?php
+class User_Factory {
+    public function findByUid($uid) { return null; }
+    public function create($data) { return null; }
+}
+`,
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'controller.php'),
+      `<?php
+class VarController {
+    public function show($uid) {
+        $factory = $this->ctx->user_factory;
+        $user = $factory->findByUid($uid);
+        return $user;
+    }
+}
+`,
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+
+    const db = (cg as any).db.db;
+    const rows = db
+      .prepare(
+        `SELECT s.name source_name, t.name target_name
+         FROM edges e
+         JOIN nodes s ON s.id = e.source
+         JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'php-phpdoc-property'
+           AND e.kind = 'calls'`,
+      )
+      .all();
+    cg.close?.();
+
+    const match = (rows as any[]).find(
+      (r) => r.source_name === 'show' && r.target_name === 'findByUid',
+    );
+    expect(match).toBeTruthy();
+  });
+
+  it('does not match @property calls inside comments or strings', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'ctx.php'),
+      `<?php
+/**
+ * @property User_Factory $user_factory
+ */
+class Ctx {
+    public function __get($name) { return null; }
+}
+`,
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'user_factory.php'),
+      `<?php
+class User_Factory {
+    public function findByUid($uid) { return null; }
+}
+`,
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'controller.php'),
+      `<?php
+class CommentController {
+    public function action() {
+        // $this->user_factory->findByUid() is deprecated
+        $note = "use \\$this->user_factory->findByUid() instead";
+        return null;
+    }
+}
+`,
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+
+    const db = (cg as any).db.db;
+    const rows = db
+      .prepare(
+        `SELECT COUNT(*) cnt FROM edges e
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'php-phpdoc-property'
+           AND e.kind = 'calls'`,
+      )
+      .all();
+    cg.close?.();
+
+    expect((rows[0] as any).cnt).toBe(0);
+  });
+
   it('does not create calls edges when method name does not exist on target class', async () => {
     fs.writeFileSync(
       path.join(dir, 'ctx.php'),
