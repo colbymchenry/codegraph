@@ -15,7 +15,7 @@
 
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext, FrameworkExtractionResult } from '../types';
 
-const PROPERTY_RE = /@property(?:-read|-write)?\s+([A-Za-z_][\w\\|]*)\s+\$(\w+)/g;
+const PROPERTY_RE = /(@property(?:-read|-write)?)\s+(\\?[A-Za-z_][\w\\|]*)\s+\$(\w+)/g;
 const PRIMITIVE_TYPES = new Set([
   'string', 'int', 'integer', 'float', 'double', 'bool', 'boolean',
   'array', 'null', 'void', 'mixed', 'object', 'callable', 'iterable',
@@ -26,15 +26,16 @@ const PRIMITIVE_TYPES = new Set([
  * Parse @property annotations from a PHPDoc block.
  * Returns tuples of [typeName, propertyName].
  */
-function parsePropertyAnnotations(docblock: string): Array<{ type: string; prop: string }> {
-  const results: Array<{ type: string; prop: string }> = [];
+function parsePropertyAnnotations(docblock: string): Array<{ type: string; prop: string; annotation: string }> {
+  const results: Array<{ type: string; prop: string; annotation: string }> = [];
   PROPERTY_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = PROPERTY_RE.exec(docblock))) {
-    const rawType = m[1]!;
+    const annotation = m[1]!;
+    const rawType = m[2]!;
     const simpleName = rawType.split('|')[0]!.split('\\').pop()!;
     if (simpleName && !PRIMITIVE_TYPES.has(simpleName.toLowerCase())) {
-      results.push({ type: simpleName, prop: m[2]! });
+      results.push({ type: simpleName, prop: m[3]!, annotation });
     }
   }
   return results;

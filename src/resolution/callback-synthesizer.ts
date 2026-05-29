@@ -1098,7 +1098,7 @@ function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext):
  * indirection). Precision gates: only non-primitive types that resolve
  * to a class/interface/trait node; capped per class.
  */
-const PHP_PROPERTY_RE = /@property(?:-read|-write)?\s+([A-Za-z_][\w\\|]*)\s+\$(\w+)/g;
+const PHP_PROPERTY_RE = /(@property(?:-read|-write)?)\s+(\\?[A-Za-z_][\w\\|]*)\s+\$(\w+)/g;
 const PHP_PRIMITIVE_TYPES = new Set([
   'string', 'int', 'integer', 'float', 'double', 'bool', 'boolean',
   'array', 'null', 'void', 'mixed', 'object', 'callable', 'iterable',
@@ -1135,7 +1135,9 @@ function phpPhpdocPropertyEdges(queries: QueryBuilder, ctx: ResolutionContext): 
       let added = 0;
       while ((m = PHP_PROPERTY_RE.exec(docblock))) {
         if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
-        const rawType = m[1]!;
+        const annotation = m[1]!;
+        const rawType = m[2]!;
+        const propName = m[3]!;
         const simpleName = rawType.split('|')[0]!.split('\\').pop()!;
         if (!simpleName || PHP_PRIMITIVE_TYPES.has(simpleName.toLowerCase())) continue;
 
@@ -1155,7 +1157,7 @@ function phpPhpdocPropertyEdges(queries: QueryBuilder, ctx: ResolutionContext): 
             provenance: 'heuristic',
             metadata: {
               synthesizedBy: 'php-phpdoc-property',
-              via: `@property ${rawType} $${m[2]}`,
+              via: `${annotation} ${rawType} $${propName}`,
             },
           });
           added++;
