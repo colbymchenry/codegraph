@@ -375,11 +375,13 @@ describe('Source file detection (isSourceFile)', () => {
     expect(isSourceFile('src/component.tsx')).toBe(true);
     expect(isSourceFile('lib/util.js')).toBe(true);
     expect(isSourceFile('src/main.py')).toBe(true);
+    expect(isSourceFile('README.md')).toBe(true);
+    expect(isSourceFile('docs/guide.mdx')).toBe(true);
+    expect(isSourceFile('security/ir.model.access.csv')).toBe(true);
   });
 
   it('rejects unsupported extensions and extensionless files', () => {
     expect(isSourceFile('src/component.css')).toBe(false);
-    expect(isSourceFile('README.md')).toBe(false);
     expect(isSourceFile('Makefile')).toBe(false);
     expect(isSourceFile('.gitignore')).toBe(false);
   });
