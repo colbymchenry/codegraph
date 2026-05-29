@@ -24,6 +24,9 @@ import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { OdooExtractor } from './odoo-extractor';
+import { CsvExtractor } from './csv-extractor';
+import { MarkdownExtractor } from './markdown-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -3068,9 +3071,22 @@ export function extractFromSource(
     const extractor = new LiquidExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'xml') {
-    // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
-    // file node so the watcher tracks it without emitting symbols.
-    const extractor = new MyBatisExtractor(filePath, source);
+    // Dispatch: Odoo data files first, then MyBatis mapper XML.
+    // Non-matching XML returns just a file node (no symbols emitted).
+    const odooExtractor = new OdooExtractor(filePath, source);
+    if (odooExtractor.isOdooFile()) {
+      result = odooExtractor.extract();
+    } else {
+      const extractor = new MyBatisExtractor(filePath, source);
+      result = extractor.extract();
+    }
+  } else if (detectedLanguage === 'csv') {
+    // Odoo ir.model.access.csv → access-rule nodes; other CSV → file node only.
+    const extractor = new CsvExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'markdown') {
+    // Generic heading extraction for any Markdown / MDX file.
+    const extractor = new MarkdownExtractor(filePath, source);
     result = extractor.extract();
   } else if (isFileLevelOnlyLanguage(detectedLanguage)) {
     // No symbol extraction at this stage — files are tracked at the file-record

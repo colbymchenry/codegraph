@@ -92,6 +92,8 @@ export const LANGUAGES = [
   'twig',
   'xml',
   'properties',
+  'csv',
+  'markdown',
   'unknown',
 ] as const;
 
