@@ -10,13 +10,13 @@
  *   4. `insertEdges` validates endpoints from the DB, not stale node cache.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { DatabaseConnection } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
-import { Node } from '../src/types';
+import { EdgeKind, Node } from '../src/types';
 
 function makeNode(id: string, name = id): Node {
   return {
@@ -171,6 +171,89 @@ describe('insertEdges endpoint validation', () => {
       q.insertEdges([{ source: 'source', target: 'target', kind: 'calls' }])
     ).not.toThrow();
     expect(q.getOutgoingEdges('source')).toEqual([]);
+  });
+});
+
+describe('unresolved reference chunking', () => {
+  let dir: string;
+  let db: DatabaseConnection;
+  let q: QueryBuilder;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-perf-unresolved-'));
+    db = DatabaseConnection.initialize(path.join(dir, 'test.db'));
+    q = new QueryBuilder(db.getDb());
+  });
+
+  afterEach(() => {
+    db.close();
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('gets unresolved references for more files than SQLite accepts in one IN list', () => {
+    const count = 1500;
+    const nodes = Array.from({ length: count }, (_, i) =>
+      makeNode(`node-${i}`, `node${i}`)
+    );
+    const filePaths = nodes.map((_, i) => `src/file-${i}.ts`);
+
+    q.insertNodes(nodes.map((node, i) => ({ ...node, filePath: filePaths[i] })));
+    q.insertUnresolvedRefsBatch(
+      nodes.map((node, i) => ({
+        fromNodeId: node.id,
+        referenceName: `target${i}`,
+        referenceKind: 'calls' as EdgeKind,
+        line: 1,
+        column: 0,
+        filePath: filePaths[i],
+        language: 'typescript',
+      }))
+    );
+
+    const prepareSpy = vi.spyOn(db.getDb(), 'prepare');
+    const refs = q.getUnresolvedReferencesByFiles(filePaths);
+    const selectCalls = prepareSpy.mock.calls
+      .map(([sql]) => String(sql))
+      .filter((sql) => sql.includes('FROM unresolved_refs WHERE file_path IN'));
+    const maxPlaceholders = Math.max(
+      ...selectCalls.map((sql) => (sql.match(/\?/g) ?? []).length)
+    );
+
+    expect(refs).toHaveLength(count);
+    expect(refs.map((ref) => ref.filePath).sort()).toEqual([...filePaths].sort());
+    expect(maxPlaceholders).toBeLessThanOrEqual(500);
+  });
+
+  it('deletes resolved references for more nodes than SQLite accepts in one IN list', () => {
+    const count = 1500;
+    const nodes = Array.from({ length: count }, (_, i) =>
+      makeNode(`node-${i}`, `node${i}`)
+    );
+
+    q.insertNodes(nodes);
+    q.insertUnresolvedRefsBatch(
+      nodes.map((node, i) => ({
+        fromNodeId: node.id,
+        referenceName: `target${i}`,
+        referenceKind: 'calls' as EdgeKind,
+        line: 1,
+        column: 0,
+        filePath: `src/file-${i}.ts`,
+        language: 'typescript',
+      }))
+    );
+
+    const prepareSpy = vi.spyOn(db.getDb(), 'prepare');
+    q.deleteResolvedReferences(nodes.map((node) => node.id));
+    const deleteCalls = prepareSpy.mock.calls
+      .map(([sql]) => String(sql))
+      .filter((sql) => sql.includes('DELETE FROM unresolved_refs WHERE from_node_id IN'));
+    const maxPlaceholders = Math.max(
+      ...deleteCalls.map((sql) => (sql.match(/\?/g) ?? []).length)
+    );
+
+    expect(q.getUnresolvedReferences()).toEqual([]);
+    expect(maxPlaceholders).toBeLessThanOrEqual(500);
   });
 });
 

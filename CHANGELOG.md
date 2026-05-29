@@ -17,6 +17,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - Indexing a project that contains only config-style files (YAML, Twig, or `.properties`) no longer misleadingly reports "No files found to index" — these files are tracked at the file level and are now counted as indexed. Thanks @luojiyin1987 (#357).
+- Syncing very large repositories no longer fails with "too many SQL variables" while resolving changed files; CodeGraph now batches those lookups so large codebases can complete normally. (#540)
 
 ## [0.9.7] - 2026-05-28
 
