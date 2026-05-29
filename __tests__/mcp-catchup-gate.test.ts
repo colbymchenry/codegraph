@@ -119,4 +119,21 @@ describe('MCP catch-up gate', () => {
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toMatch(/survivor/);
   });
+
+  it('a gate that never settles does not hang the first tool call (timeout fallback)', async () => {
+    // Defense in depth for the daemon init-hang: if catch-up never settles for
+    // any reason, the first call must still serve (best-effort) after the
+    // bounded wait instead of hanging forever. Tiny override keeps it fast.
+    process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS = '50';
+    try {
+      handler.setCatchUpGate(new Promise<void>(() => { /* never settles */ }));
+      const start = Date.now();
+      const res = await handler.execute('codegraph_search', { query: 'survivor' });
+      expect(Date.now() - start).toBeLessThan(5000);
+      expect(res.isError).toBeFalsy();
+      expect(res.content[0].text).toMatch(/survivor/);
+    } finally {
+      delete process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
+    }
+  });
 });
