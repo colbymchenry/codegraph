@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Go: Gin middleware chains now connect end-to-end in `codegraph_trace` and `codegraph_explore` — following a request reaches the middleware and route handlers registered via `.Use()` / `.GET()` instead of dead-ending where the framework dispatches the chain dynamically.
+
 ## [0.9.7] - 2026-05-28
 
 ### New Features
