@@ -347,7 +347,7 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
 // and are added below; their concrete-side nodes can be a `struct` (Swift)
 // or an `object` (Scala) so the loop also iterates those kinds.
 const IFACE_OVERRIDE_LANGS = new Set([
-  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala',
+  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'php',
 ]);
 function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
   const edges: Edge[] = [];
@@ -1086,10 +1086,92 @@ function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext):
 }
 
 /**
+ * PHP @property PHPDoc → reference edges. Classes annotated with
+ * `@property TypeName $propName` declare dynamic properties resolved
+ * through `__get()`. This is the standard PHP mechanism for service
+ * locators, DI containers, and ORMs (e.g. MPF Ctx, Doctrine entities).
+ *
+ * For each PHP class/interface with @property annotations, emit
+ * `references` edges to the declared types so the graph captures the
+ * dependency, and `calls` edges from each method in the class that calls
+ * a method matching one on the @property target (bridging the __get
+ * indirection). Precision gates: only non-primitive types that resolve
+ * to a class/interface/trait node; capped per class.
+ */
+const PHP_PROPERTY_RE = /@property(?:-read|-write)?\s+([A-Za-z_][\w\\|]*)\s+\$(\w+)/g;
+const PHP_PRIMITIVE_TYPES = new Set([
+  'string', 'int', 'integer', 'float', 'double', 'bool', 'boolean',
+  'array', 'null', 'void', 'mixed', 'object', 'callable', 'iterable',
+  'self', 'static', 'parent', 'never', 'true', 'false', 'resource',
+]);
+
+function phpPhpdocPropertyEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  const classKinds: Array<'class' | 'interface' | 'trait'> = ['class', 'interface', 'trait'];
+  for (const kind of classKinds) {
+    for (const cls of queries.getNodesByKind(kind)) {
+      if (cls.language !== 'php') continue;
+      const content = ctx.readFile(cls.filePath);
+      if (!content) continue;
+
+      const lines = content.split('\n');
+      let docblock = '';
+      for (let i = (cls.startLine ?? 1) - 2; i >= 0; i--) {
+        const line = lines[i]!.trim();
+        if (line === '' && docblock === '') continue;
+        if (line.startsWith('*') || line.startsWith('/**') || line === '*/') {
+          docblock = lines[i]! + '\n' + docblock;
+          if (line.startsWith('/**')) break;
+        } else {
+          break;
+        }
+      }
+      if (!docblock) continue;
+
+      PHP_PROPERTY_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      let added = 0;
+      while ((m = PHP_PROPERTY_RE.exec(docblock))) {
+        if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+        const rawType = m[1]!;
+        const simpleName = rawType.split('|')[0]!.split('\\').pop()!;
+        if (!simpleName || PHP_PRIMITIVE_TYPES.has(simpleName.toLowerCase())) continue;
+
+        const targets = ctx.getNodesByName(simpleName).filter(
+          (n) => (n.kind === 'class' || n.kind === 'interface' || n.kind === 'trait') && n.language === 'php',
+        );
+        for (const target of targets) {
+          if (target.id === cls.id) continue;
+          const key = `${cls.id}>${target.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: cls.id,
+            target: target.id,
+            kind: 'references',
+            line: cls.startLine,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'php-phpdoc-property',
+              via: `@property ${rawType} $${m[2]}`,
+            },
+          });
+          added++;
+        }
+      }
+    }
+  }
+  return edges;
+}
+
+/**
  * Synthesize dispatcher→callback edges (field observers + EventEmitters +
  * React re-render + JSX children + Vue templates + RN event channel +
- * Fabric native-impl + MyBatis Java↔XML + Gin middleware chain). Returns the
- * count added. Never throws into indexing — callers wrap in try/catch.
+ * Fabric native-impl + MyBatis Java↔XML + Gin middleware chain +
+ * PHP @property PHPDoc). Returns the count added. Never throws into
+ * indexing — callers wrap in try/catch.
  */
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
   const fieldEdges = fieldChannelEdges(queries, ctx);
@@ -1105,6 +1187,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const fabricNativeEdges = fabricNativeImplEdges(ctx);
   const mybatisEdges = mybatisJavaXmlEdges(queries);
   const ginEdges = ginMiddlewareChainEdges(queries, ctx);
+  const phpPhpdocEdges = phpPhpdocPropertyEdges(queries, ctx);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -1122,6 +1205,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...fabricNativeEdges,
     ...mybatisEdges,
     ...ginEdges,
+    ...phpPhpdocEdges,
   ]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
