@@ -1093,6 +1093,31 @@ export class TreeSitterExtractor {
         }
       }
     } else {
+      // Python class-level assignment: `field_name = fields.XXX(...)` or `_name = 'model'`
+      // Tree-sitter Python uses left/right fields on `assignment` nodes.
+      const leftNode = node.childForFieldName('left');
+      const rightNode = node.childForFieldName('right');
+      if (leftNode && leftNode.type === 'identifier') {
+        const name = getNodeText(leftNode, this.source);
+        const rightText = rightNode ? getNodeText(rightNode, this.source) : '';
+        // Only index Odoo fields and model meta attributes to avoid noise from
+        // arbitrary class-level constants in non-Odoo Python code.
+        const isOdooField = rightText.startsWith('fields.');
+        const isModelMeta = name.startsWith('_') && (
+          name === '_name' || name === '_inherit' || name === '_inherits' ||
+          name === '_description' || name === '_table' || name === '_order' ||
+          name === '_rec_name' || name === '_sql_constraints' || name === '_check_company_auto'
+        );
+        if (isOdooField || isModelMeta) {
+          const signature = rightText.slice(0, 120);
+          this.createNode('field', name, node, {
+            docstring,
+            signature,
+            isStatic,
+          });
+          return;
+        }
+      }
       // Fallback: try to find an identifier child directly
       const nameNode = getChildByField(node, 'name')
         || node.namedChildren.find(c => c.type === 'identifier');

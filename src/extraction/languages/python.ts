@@ -12,6 +12,8 @@ export const pythonExtractor: LanguageExtractor = {
   importTypes: ['import_statement', 'import_from_statement'],
   callTypes: ['call'],
   variableTypes: ['assignment'], // Python uses assignment for variable declarations
+  // Class-level assignments: Odoo fields (fields.XXX) and model meta (_name, _inherit, ...)
+  fieldTypes: ['assignment'],
   nameField: 'name',
   bodyField: 'body',
   paramsField: 'parameters',
