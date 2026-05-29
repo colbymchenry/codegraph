@@ -1021,6 +1021,7 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(stopCommands.some((c: string) => c.includes('gk') && c.includes('ai hook run'))).toBe(true);
     // Permissions still written as normal alongside the cleanup.
     expect(after.permissions?.allow).toContain('mcp__codegraph__codegraph_search');
+    expect(after.permissions?.allow).toContain('mcp__codegraph__codegraph_files');
   });
 
   it('claude: cleanupLegacyHooks preserves a sibling hook sharing our matcher group', () => {
