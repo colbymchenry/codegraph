@@ -40,6 +40,14 @@ const FILE_IO_BATCH_SIZE = 10;
 const PARSE_TIMEOUT_MS = 10_000;
 
 /**
+ * Backstop for the one-time grammar-load handshake with a fresh worker. The
+ * worker normally answers `grammars-loaded` in well under a second; this only
+ * fires if it goes silent without crashing. Worker crash/exit during load is
+ * caught immediately (no need to wait this out) — see `ensureWorker`.
+ */
+const GRAMMAR_LOAD_TIMEOUT_MS = 30_000;
+
+/**
  * Number of files to parse before recycling the worker thread.
  * WASM linear memory can grow but NEVER shrink (WebAssembly spec limitation).
  * The only way to reclaim tree-sitter's WASM heap is to destroy the entire
@@ -47,6 +55,60 @@ const PARSE_TIMEOUT_MS = 10_000;
  * This interval balances memory usage against the cost of reloading grammars.
  */
 const WORKER_RECYCLE_INTERVAL = 250;
+
+/**
+ * Minimal shape of a parse worker needed for the grammar-load handshake. The
+ * real `worker_threads.Worker` satisfies it; tests pass a fake EventEmitter.
+ */
+export interface GrammarLoadWorker {
+  on(event: string, cb: (...args: any[]) => void): void;
+  off(event: string, cb: (...args: any[]) => void): void;
+  once(event: string, cb: (...args: any[]) => void): void;
+  postMessage(msg: unknown): void;
+}
+
+/**
+ * Await a fresh worker's one-time grammar-load handshake, settling on the FIRST
+ * of: `grammars-loaded` (resolve) / `grammars-load-failed` / worker `error` /
+ * worker `exit` / timeout (all reject). Listeners are always removed and the
+ * timer cleared on settle.
+ *
+ * Regression guard (daemon-init-hang fix): the bare `once('message')` this
+ * replaced only resolved on `grammars-loaded` and never settled when the worker
+ * DIED loading grammars (a tree-sitter WASM abort). The caller's await — and the
+ * in-process `indexMutex` it runs under — then hung forever, which in a
+ * long-lived MCP daemon wedged initialization for every client that connected.
+ */
+export function awaitWorkerGrammarLoad(
+  worker: GrammarLoadWorker,
+  languages: Language[],
+  timeoutMs: number = GRAMMAR_LOAD_TIMEOUT_MS
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.off('message', onMessage);
+      worker.off('error', onError);
+      worker.off('exit', onExit);
+      if (err) reject(err); else resolve();
+    };
+    const onMessage = (msg: { type: string; error?: string }) => {
+      if (msg.type === 'grammars-loaded') finish();
+      else if (msg.type === 'grammars-load-failed') finish(new Error(`worker failed to load grammars: ${msg.error ?? 'unknown error'}`));
+    };
+    const onError = (err: Error) => finish(err);
+    const onExit = (code: number) => finish(new Error(`worker exited (code ${code}) before grammars loaded`));
+    const timer = setTimeout(() => finish(new Error(`grammar load timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer.unref?.();
+    worker.on('message', onMessage);
+    worker.once('error', onError);
+    worker.once('exit', onExit);
+    worker.postMessage({ type: 'load-grammars', languages });
+  });
+}
 
 /**
  * Progress callback for indexing operations
@@ -682,6 +744,22 @@ export class ExtractionOrchestrator {
       await loadGrammarsForLanguages(neededLanguages);
     }
 
+    // Set true if the worker becomes unusable mid-run (e.g. it crashed while
+    // loading grammars). From then on we parse in-process so a broken worker
+    // degrades to slower-but-correct parsing instead of hanging the run.
+    let workerDisabled = false;
+    // Grammars are already loaded on the main thread only when we never spawned
+    // a worker. The in-process fallback lazily loads them on first use.
+    let mainGrammarsLoaded = !useWorker;
+
+    async function parseInProcess(filePath: string, content: string): Promise<ExtractionResult> {
+      if (!mainGrammarsLoaded) {
+        await loadGrammarsForLanguages(neededLanguages); // idempotent — skips already-loaded
+        mainGrammarsLoaded = true;
+      }
+      return extractFromSource(filePath, content, detectLanguage(filePath, content), frameworkNames);
+    }
+
     // --- Worker lifecycle management ---
     // The worker can crash (OOM in WASM) or hang on pathological files.
     // We track pending parse promises and handle both cases:
@@ -738,23 +816,33 @@ export class ExtractionOrchestrator {
     async function ensureWorker(): Promise<import('worker_threads').Worker> {
       if (parseWorker) return parseWorker;
       log('Spawning new parse worker...');
-      parseWorker = new WorkerClass!(parseWorkerPath);
-      attachWorkerHandlers(parseWorker);
+      const w = new WorkerClass!(parseWorkerPath);
+      parseWorker = w;
+      attachWorkerHandlers(w);
 
-      // Load grammars in the new worker
-      await new Promise<void>((resolve, reject) => {
-        parseWorker!.once('message', (msg: { type: string }) => {
-          if (msg.type === 'grammars-loaded') resolve();
-          else reject(new Error(`Unexpected message: ${msg.type}`));
-        });
-        parseWorker!.postMessage({ type: 'load-grammars', languages: neededLanguages });
-      });
+      // Wait for grammars to load — bounded, and rejects (never hangs) if the
+      // worker dies mid-load. See `awaitWorkerGrammarLoad`.
+      try {
+        await awaitWorkerGrammarLoad(w, neededLanguages);
+      } catch (err) {
+        // Worker is unusable — tear it down and let the caller degrade.
+        if (parseWorker === w) parseWorker = null;
+        try { void w.terminate(); } catch { /* ignore */ }
+        throw err instanceof Error ? err : new Error(String(err));
+      }
 
-      return parseWorker;
+      return w;
     }
 
     if (WorkerClass) {
-      await ensureWorker();
+      try {
+        await ensureWorker();
+      } catch (err) {
+        workerDisabled = true;
+        logWarn('Parse worker failed to start — falling back to in-process parsing', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     /**
@@ -773,14 +861,8 @@ export class ExtractionOrchestrator {
     }
 
     async function requestParse(filePath: string, content: string): Promise<ExtractionResult> {
-      if (!WorkerClass) {
-        // In-process fallback
-        return extractFromSource(
-          filePath,
-          content,
-          detectLanguage(filePath, content),
-          frameworkNames
-        );
+      if (!WorkerClass || workerDisabled) {
+        return parseInProcess(filePath, content);
       }
 
       // Recycle the worker before the next parse if we've hit the threshold.
@@ -790,7 +872,19 @@ export class ExtractionOrchestrator {
         await recycleWorker();
       }
 
-      const worker = await ensureWorker();
+      let worker: import('worker_threads').Worker;
+      try {
+        worker = await ensureWorker();
+      } catch (err) {
+        // The worker died (e.g. crashed while loading grammars) — degrade to
+        // in-process parsing for the rest of this run rather than failing every
+        // file or hanging on a worker that will never answer.
+        workerDisabled = true;
+        logWarn('Parse worker unavailable — falling back to in-process parsing', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return parseInProcess(filePath, content);
+      }
       const id = nextId++;
       workerParseCount++;
 

@@ -57,8 +57,19 @@ const parseCounts = new Map<Language, number>();
 
 parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[] }) => {
   if (msg.type === 'load-grammars') {
-    await loadGrammarsForLanguages(msg.languages!);
-    parentPort!.postMessage({ type: 'grammars-loaded' });
+    try {
+      await loadGrammarsForLanguages(msg.languages!);
+      parentPort!.postMessage({ type: 'grammars-loaded' });
+    } catch (err) {
+      // Don't die silently: a JS-level grammar-load failure must be reported so
+      // the parent degrades to in-process parsing instead of waiting forever
+      // for a 'grammars-loaded' that will never come. (A hard WASM abort kills
+      // the worker outright — the parent's 'exit'/'error' guard covers that.)
+      parentPort!.postMessage({
+        type: 'grammars-load-failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   } else if (msg.type === 'parse') {
     const { id, filePath, content, frameworkNames } = msg;
     try {
