@@ -138,7 +138,7 @@ The gains scale with codebase size: on large repos the agent answers from the in
 | **Full-Text Search** | Find code by name instantly across your entire codebase, powered by FTS5 |
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
-| **20+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Objective-C, Swift, Kotlin, Dart, Lua, Luau, Svelte, Liquid, Pascal/Delphi |
+| **20+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Objective-C, Swift, Kotlin, Dart, Lean, Lua, Luau, Svelte, Liquid, Pascal/Delphi |
 | **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 14 frameworks |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
@@ -465,7 +465,7 @@ nothing to wire up per language.
 What it skips out of the box:
 
 - **Dependency, build, and cache directories** — `node_modules`, `vendor`,
-  `dist`, `build`, `target`, `.venv`, `Pods`, `.next`, and the like across every
+  `dist`, `build`, `target`, `.lake`, `.venv`, `Pods`, `.next`, and the like across every
   [supported stack](#supported-languages) — so the graph is your code, not
   third-party noise. This holds even with no `.gitignore`.
 - **Anything in your `.gitignore`** — honored in git repos via git, and in
@@ -526,12 +526,20 @@ is written):
 | Kotlin | `.kt`, `.kts` | Full support |
 | Scala | `.scala`, `.sc` | Full support (classes, traits, methods, type aliases, Scala 3 enums) |
 | Dart | `.dart` | Full support |
+| Lean | `.lean` | Static extraction with optional Lean/Lake LSP definition resolution |
 | Svelte | `.svelte` | Full support (script extraction, Svelte 5 runes, SvelteKit routes) |
 | Vue | `.vue` | Full support (script + script-setup extraction, Nuxt page/API/middleware routes) |
 | Liquid | `.liquid` | Full support |
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX form files) |
 | Lua | `.lua` | Full support (functions, methods with receivers, local variables, `require` imports, call edges) |
 | Luau | `.luau` | Full support (everything in Lua, plus `type`/`export type` aliases, typed signatures, and Roblox instance-path `require`) |
+
+Lean files index without requiring a local Lean toolchain. When available,
+CodeGraph tries `lake env lean --server` (or `lean --server`) for better
+definition edges. Set `CODEGRAPH_LEAN_SEMANTICS=off` to force static-only
+indexing, or override the command with `CODEGRAPH_LEAN_LSP_COMMAND`;
+`CODEGRAPH_LEAN_LSP_TIMEOUT_MS` and `CODEGRAPH_LEAN_LSP_REF_LIMIT` bound the
+best-effort LSP pass.
 
 ## Troubleshooting
 
@@ -546,7 +554,7 @@ is written):
 
 **MCP server not connecting** — Ensure the project is initialized/indexed, verify the path in your MCP config, and check that `codegraph serve --mcp` works from the command line.
 
-**Missing symbols** — The MCP server auto-syncs on save (wait a couple seconds). Run `codegraph sync` manually if needed. Check that the file's language is supported and isn't inside a `.gitignore`d or default-excluded directory (e.g. `node_modules`, `dist`).
+**Missing symbols** — The MCP server auto-syncs on save (wait a couple seconds). Run `codegraph sync` manually if needed. Check that the file's language is supported and isn't inside a `.gitignore`d or default-excluded directory (e.g. `node_modules`, `dist`, `.lake`).
 
 ## Star History
 

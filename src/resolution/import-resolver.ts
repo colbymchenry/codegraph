@@ -28,6 +28,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   php: ['.php'],
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
+  lean: ['.lean'],
 };
 
 /**
@@ -59,6 +60,10 @@ export function resolveImportPath(
   const aliased = resolveAliasedImport(importPath, projectRoot, language, context);
   if (aliased) return aliased;
 
+  if (language === 'lean') {
+    return resolveLeanModulePath(importPath, context);
+  }
+
   // C/C++ include directory search: when neither relative nor aliased
   // resolution found a match, search -I directories from
   // compile_commands.json or heuristic probing.
@@ -67,6 +72,22 @@ export function resolveImportPath(
   }
 
   return null;
+}
+
+function resolveLeanModulePath(
+  moduleName: string,
+  context: ResolutionContext
+): string | null {
+  const modulePath = moduleName.replace(/\./g, '/') + '.lean';
+  if (context.fileExists(modulePath)) return modulePath;
+
+  const suffix = '/' + modulePath;
+  const matches = context
+    .getAllFiles()
+    .map((file) => file.replace(/\\/g, '/'))
+    .filter((file) => file.endsWith(suffix));
+
+  return matches.length === 1 ? matches[0]! : null;
 }
 
 /**
@@ -987,6 +1008,22 @@ export function resolveViaImport(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  if (ref.language === 'lean' && ref.referenceKind === 'imports') {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath.replace(/\\/g, '/') === resolvedPath);
+    if (!fileNode) return null;
+    return {
+      original: ref,
+      targetNodeId: fileNode.id,
+      confidence: 0.9,
+      resolvedBy: 'import',
+    };
+  }
+
   // C/C++ #include references — resolve directly to the included file
   // (file→file edge), bypassing symbol lookup. The extractor emits these
   // with `referenceKind: 'imports'` and `referenceName: <include path>`

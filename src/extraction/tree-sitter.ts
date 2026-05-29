@@ -24,6 +24,7 @@ import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { LeanExtractor } from './lean-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -3066,6 +3067,11 @@ export function extractFromSource(
   } else if (detectedLanguage === 'liquid') {
     // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'lean') {
+    // Lean namespaces are flat sibling commands in the grammar, so a custom
+    // extractor reconstructs namespace scope while still using tree-sitter.
+    const extractor = new LeanExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'xml') {
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a

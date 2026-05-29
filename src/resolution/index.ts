@@ -22,6 +22,7 @@ import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
+import { resolveLeanLspBatch } from './lean-lsp-resolver';
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
@@ -465,14 +466,16 @@ export class ReferenceResolver {
       column: ref.column,
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
+      candidates: ref.candidates,
     }));
 
+    const leanLspResolved = resolveLeanLspBatch(refs, this.context);
     const total = refs.length;
     let lastReportedPercent = -1;
 
     for (let i = 0; i < refs.length; i++) {
       const ref = refs[i]!; // Array index is guaranteed to be in bounds
-      const result = this.resolveOne(ref);
+      const result = leanLspResolved.get(i) ?? this.resolveOne(ref);
 
       if (result) {
         resolved.push(result);
@@ -589,6 +592,7 @@ export class ReferenceResolver {
     // from './auth'`) intentionally call a name that has no
     // declaration anywhere — only the renamed upstream symbol does.
     if (
+      ref.referenceKind !== 'imports' &&
       !this.hasAnyPossibleMatch(ref.referenceName) &&
       !this.matchesAnyImport(ref) &&
       !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))

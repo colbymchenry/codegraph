@@ -146,6 +146,50 @@ export function matchByQualifiedName(
   return null;
 }
 
+/**
+ * Try extractor-provided qualified-name candidates before broad name matching.
+ * Languages such as Lean can cheaply enumerate lexical candidates from the
+ * current namespace plus active `open` / `import` declarations. Those are more
+ * precise than path-proximity when several files define the same simple name.
+ */
+export function matchByCandidates(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (!ref.candidates || ref.candidates.length === 0) return null;
+
+  const seen = new Set<string>();
+  for (const candidateName of ref.candidates) {
+    if (seen.has(candidateName)) continue;
+    seen.add(candidateName);
+
+    const candidates = context
+      .getNodesByQualifiedName(candidateName)
+      .filter((node) => node.language === ref.language || ref.language === 'unknown');
+    if (candidates.length === 1) {
+      return {
+        original: ref,
+        targetNodeId: candidates[0]!.id,
+        confidence: 0.97,
+        resolvedBy: 'qualified-name',
+      };
+    }
+    if (candidates.length > 1) {
+      const bestMatch = findBestMatch(ref, candidates, context);
+      if (bestMatch) {
+        return {
+          original: ref,
+          targetNodeId: bestMatch.id,
+          confidence: 0.9,
+          resolvedBy: 'qualified-name',
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
 function resolveMethodOnType(
   typeName: string,
   methodName: string,
@@ -692,19 +736,23 @@ export function matchReference(
   result = matchByFilePath(ref, context);
   if (result) return result;
 
-  // 1. Qualified name match (highest confidence)
+  // 1. Extractor-provided qualified-name candidates
+  result = matchByCandidates(ref, context);
+  if (result) return result;
+
+  // 2. Qualified name match (highest confidence)
   result = matchByQualifiedName(ref, context);
   if (result) return result;
 
-  // 2. Method call pattern
+  // 3. Method call pattern
   result = matchMethodCall(ref, context);
   if (result) return result;
 
-  // 3. Exact name match
+  // 4. Exact name match
   result = matchByExactName(ref, context);
   if (result) return result;
 
-  // 4. Fuzzy match (lowest confidence)
+  // 5. Fuzzy match (lowest confidence)
   result = matchFuzzy(ref, context);
   if (result) return result;
 

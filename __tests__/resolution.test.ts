@@ -268,6 +268,55 @@ describe('Resolution Module', () => {
       expect(result).not.toBeNull();
       expect(result?.targetNodeId).toBe('method:user.ts:User.save:15');
     });
+
+    it('should prefer extractor-provided qualified candidates', () => {
+      const preferred: Node = {
+        id: 'func:src/Demo/Helpers.lean:helper:3',
+        kind: 'function',
+        name: 'helper',
+        qualifiedName: 'Demo.Helpers.helper',
+        filePath: 'src/Demo/Helpers.lean',
+        language: 'lean',
+        startLine: 3,
+        endLine: 3,
+        startColumn: 0,
+        endColumn: 30,
+        updatedAt: Date.now(),
+      };
+      const unrelated: Node = {
+        ...preferred,
+        id: 'func:src/Other.lean:helper:3',
+        qualifiedName: 'Other.helper',
+        filePath: 'src/Other.lean',
+      };
+
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => name === 'helper' ? [unrelated, preferred] : [],
+        getNodesByQualifiedName: (qualifiedName) => qualifiedName === 'Demo.Helpers.helper' ? [preferred] : [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => ['src/Demo/Helpers.lean', 'src/Other.lean'],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+
+      const result = matchReference({
+        fromNodeId: 'func:src/Main.lean:caller:10',
+        referenceName: 'helper',
+        referenceKind: 'calls',
+        line: 10,
+        column: 8,
+        filePath: 'src/Main.lean',
+        language: 'lean',
+        candidates: ['Demo.Helpers.helper', 'Other.helper'],
+      }, context);
+
+      expect(result?.targetNodeId).toBe(preferred.id);
+      expect(result?.resolvedBy).toBe('qualified-name');
+    });
   });
 
   describe('Import Resolver', () => {
@@ -351,6 +400,40 @@ from ..services import auth_service
       expect(mappings.length).toBeGreaterThan(0);
       expect(mappings.some((m) => m.localName === 'helper')).toBe(true);
       expect(mappings.some((m) => m.localName === 'User')).toBe(true);
+    });
+
+    it('should resolve Lean module imports by exact path or one unique suffix match', () => {
+      const makeContext = (files: string[], exists: (p: string) => boolean): ResolutionContext => ({
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: exists,
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => files,
+      });
+
+      expect(resolveImportPath(
+        'Foo.Bar',
+        'Main.lean',
+        'lean',
+        makeContext(['Foo/Bar.lean'], (p) => p === 'Foo/Bar.lean')
+      )).toBe('Foo/Bar.lean');
+
+      expect(resolveImportPath(
+        'Foo.Bar',
+        'src/Main.lean',
+        'lean',
+        makeContext(['src/Foo/Bar.lean'], () => false)
+      )).toBe('src/Foo/Bar.lean');
+
+      expect(resolveImportPath(
+        'Foo.Bar',
+        'src/Main.lean',
+        'lean',
+        makeContext(['src/Foo/Bar.lean', 'vendor/Foo/Bar.lean'], () => false)
+      )).toBeNull();
     });
   });
 

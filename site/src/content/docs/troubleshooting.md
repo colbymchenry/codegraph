@@ -24,4 +24,4 @@ Ensure the project is initialized/indexed, verify the path in your MCP config, a
 
 ## Missing symbols
 
-The MCP server auto-syncs on save (wait a couple of seconds). Run `codegraph sync` manually if needed. Check that the file's language is [supported](/codegraph/reference/languages/) and isn't excluded by `.gitignore`.
+The MCP server auto-syncs on save (wait a couple of seconds). Run `codegraph sync` manually if needed. Check that the file's language is [supported](/codegraph/reference/languages/) and isn't excluded by `.gitignore` or a default-excluded directory such as `node_modules`, `dist`, or `.lake`.
