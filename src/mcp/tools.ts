@@ -256,6 +256,19 @@ function adaptiveExploreEnabled(): boolean {
 }
 
 /**
+ * Upper bound (ms) on how long the first tool call waits for the catch-up gate
+ * before serving best-effort. Defense in depth: a catch-up sync that never
+ * settles must not hang the first call — and, in the shared daemon, every
+ * client. Override via `CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS`; default 120s (well
+ * above any real incremental reconcile).
+ */
+function catchUpGateTimeoutMs(): number {
+  const raw = process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
+  const n = raw ? Number.parseInt(raw, 10) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : 120_000;
+}
+
+/**
  * Prefix each line of a source slice with its 1-based line number, matching
  * the Read tool's `cat -n` convention (number + tab) so the agent treats it
  * the same way it treats Read output.
@@ -1042,7 +1055,18 @@ export class ToolHandler {
       if (this.catchUpGate) {
         const gate = this.catchUpGate;
         this.catchUpGate = null;
-        try { await gate; } catch { /* engine already logged */ }
+        // Bound the wait: a catch-up sync that never settles (for any reason)
+        // must not wedge the first call. On timeout we proceed best-effort over
+        // possibly-stale data — the same outcome the rejection-swallow accepts.
+        try {
+          await Promise.race([
+            gate,
+            new Promise<void>((resolve) => {
+              const t = setTimeout(resolve, catchUpGateTimeoutMs());
+              t.unref?.();
+            }),
+          ]);
+        } catch { /* engine already logged */ }
       }
       // Honor the optional tool allowlist (CODEGRAPH_MCP_TOOLS): a trimmed
       // surface rejects ablated tools defensively even if a client cached them.
