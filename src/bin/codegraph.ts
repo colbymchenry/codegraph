@@ -416,8 +416,8 @@ function writeErrorLog(projectPath: string, errors: Array<{ message: string; fil
  */
 program
   .command('init [path]')
-  .description('Initialize CodeGraph in a project directory')
-  .option('-i, --index', 'Run initial indexing after initialization')
+  .description('Initialize CodeGraph in a project directory and build the initial index')
+  .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean }) => {
     const projectPath = path.resolve(pathArg || process.cwd());
@@ -441,27 +441,24 @@ program
       const cg = await CodeGraph.init(projectPath, { index: false });
       clack.log.success(`Initialized in ${projectPath}`);
 
-      if (options.index) {
-        let result: IndexResult;
-
-        if (options.verbose) {
-          result = await cg.indexAll({
-            onProgress: createVerboseProgress(),
-            verbose: true,
-          });
-        } else {
-          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-          const progress = createShimmerProgress();
-          result = await cg.indexAll({
-            onProgress: progress.onProgress,
-          });
-          await progress.stop();
-        }
-
-        printIndexResult(clack, result, projectPath);
+      // Indexing runs by default now. The legacy -i/--index flag is still
+      // accepted (so existing muscle memory and scripts don't break) but is a
+      // no-op — initializing always builds the initial index.
+      let result: IndexResult;
+      if (options.verbose) {
+        result = await cg.indexAll({
+          onProgress: createVerboseProgress(),
+          verbose: true,
+        });
       } else {
-        clack.log.info('Run "codegraph index" to index the project');
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+        const progress = createShimmerProgress();
+        result = await cg.indexAll({
+          onProgress: progress.onProgress,
+        });
+        await progress.stop();
       }
+      printIndexResult(clack, result, projectPath);
 
       try {
         const { offerWatchFallback } = await import('../installer');
