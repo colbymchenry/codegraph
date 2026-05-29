@@ -24,6 +24,7 @@ import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { LispExtractor } from './lisp-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -3066,6 +3067,11 @@ export function extractFromSource(
   } else if (detectedLanguage === 'liquid') {
     // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'lisp') {
+    // Hand-rolled s-expression extractor — no tree-sitter grammar (see
+    // lisp-extractor.ts for why). Parses all CL/elisp reader syntax directly.
+    const extractor = new LispExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'xml') {
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
