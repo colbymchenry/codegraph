@@ -492,6 +492,221 @@ class Orphan {
 });
 
 // ---------------------------------------------------------------------------
+// End-to-end: phpPhpdocPropertyEdges — method→method calls edges
+// ---------------------------------------------------------------------------
+
+describe('PHP @property PHPDoc method→method calls edges (end-to-end)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'php-phpdoc-calls-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('synthesizes calls edges when a method calls ->propName->method()', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'ctx.php'),
+      `<?php
+/**
+ * @property User_Factory $user_factory
+ * @property Order_Service $order_service
+ */
+class Ctx {
+    public function __get($name) {
+        return $this->services[$name];
+    }
+}
+`,
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'user_factory.php'),
+      `<?php
+class User_Factory {
+    public function findByUid($uid) {
+        return null;
+    }
+    public function create($data) {
+        return null;
+    }
+}
+`,
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'order_service.php'),
+      `<?php
+class Order_Service {
+    public function getOrders($uid) {
+        return [];
+    }
+}
+`,
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'controller.php'),
+      `<?php
+class UserController {
+    public function show($uid) {
+        $user = $this->ctx->user_factory->findByUid($uid);
+        return $user;
+    }
+    public function listOrders($uid) {
+        return $this->ctx->order_service->getOrders($uid);
+    }
+}
+`,
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+
+    const db = (cg as any).db.db;
+    const callsRows = db
+      .prepare(
+        `SELECT s.name source_name, s.kind source_kind, t.name target_name, t.kind target_kind,
+                e.kind edge_kind, e.provenance,
+                json_extract(e.metadata,'$.synthesizedBy') synthesizedBy,
+                json_extract(e.metadata,'$.via') via
+         FROM edges e
+         JOIN nodes s ON s.id = e.source
+         JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'php-phpdoc-property'
+           AND e.kind = 'calls'`,
+      )
+      .all();
+    cg.close?.();
+
+    expect(callsRows.length).toBeGreaterThanOrEqual(2);
+
+    const callPairs = callsRows.map((r: any) => `${r.source_name}->${r.target_name}`);
+    expect(callPairs).toContain('show->findByUid');
+    expect(callPairs).toContain('listOrders->getOrders');
+
+    for (const row of callsRows as any[]) {
+      expect(row.source_kind).toBe('method');
+      expect(row.target_kind).toBe('method');
+      expect(row.edge_kind).toBe('calls');
+      expect(row.provenance).toBe('heuristic');
+      expect(row.via).toMatch(/@property/);
+    }
+  });
+
+  it('synthesizes calls edges for chained property access ($this->ctx->factory->method())', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'pay.php'),
+      `<?php
+/**
+ * @property Pay_Firstcharge $firstcharge
+ */
+class Pay {
+    public function __get($name) { return null; }
+}
+`,
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'pay_firstcharge.php'),
+      `<?php
+class Pay_Firstcharge {
+    public function showFirstCharge($uid) {
+        return true;
+    }
+}
+`,
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'controller.php'),
+      `<?php
+class ChargeController {
+    public function charge($uid) {
+        return $this->ctx->pay->firstcharge->showFirstCharge($uid);
+    }
+}
+`,
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+
+    const db = (cg as any).db.db;
+    const rows = db
+      .prepare(
+        `SELECT s.name source_name, t.name target_name, e.kind edge_kind,
+                json_extract(e.metadata,'$.synthesizedBy') synthesizedBy
+         FROM edges e
+         JOIN nodes s ON s.id = e.source
+         JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'php-phpdoc-property'
+           AND e.kind = 'calls'`,
+      )
+      .all();
+    cg.close?.();
+
+    expect(rows.length).toBeGreaterThanOrEqual(1);
+    const match = (rows as any[]).find(
+      (r) => r.source_name === 'charge' && r.target_name === 'showFirstCharge',
+    );
+    expect(match).toBeTruthy();
+    expect(match.edge_kind).toBe('calls');
+  });
+
+  it('does not create calls edges when method name does not exist on target class', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'ctx.php'),
+      `<?php
+/**
+ * @property Cache_Service $cache
+ */
+class Ctx {
+    public function __get($name) { return null; }
+}
+`,
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'cache_service.php'),
+      `<?php
+class Cache_Service {
+    public function get($key) { return null; }
+}
+`,
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'controller.php'),
+      `<?php
+class MyController {
+    public function action() {
+        $this->cache->nonExistentMethod();
+    }
+}
+`,
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+
+    const db = (cg as any).db.db;
+    const rows = db
+      .prepare(
+        `SELECT COUNT(*) cnt FROM edges e
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'php-phpdoc-property'
+           AND e.kind = 'calls'`,
+      )
+      .all();
+    cg.close?.();
+
+    expect((rows[0] as any).cnt).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // End-to-end: PHP interface override bridging (IFACE_OVERRIDE_LANGS)
 // ---------------------------------------------------------------------------
 
