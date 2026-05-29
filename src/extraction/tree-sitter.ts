@@ -15,7 +15,7 @@ import {
   ExtractionError,
   UnresolvedReference,
 } from '../types';
-import { getParser, detectLanguage, isLanguageSupported } from './grammars';
+import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
 import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
@@ -3072,7 +3072,7 @@ export function extractFromSource(
     // file node so the watcher tracks it without emitting symbols.
     const extractor = new MyBatisExtractor(filePath, source);
     result = extractor.extract();
-  } else if (detectedLanguage === 'yaml' || detectedLanguage === 'twig' || detectedLanguage === 'properties') {
+  } else if (isFileLevelOnlyLanguage(detectedLanguage)) {
     // No symbol extraction at this stage — files are tracked at the file-record
     // level only. Framework extractors (Drupal routing yml, Spring `@Value`
     // resolution against application.yml/application.properties) run later and

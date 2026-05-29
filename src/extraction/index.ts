@@ -17,7 +17,7 @@ import {
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
-import { detectLanguage, isSourceFile, isLanguageSupported, initGrammars, loadGrammarsForLanguages } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
@@ -942,11 +942,11 @@ export class ExtractionOrchestrator {
         } else if (result.errors.some((e) => e.severity === 'error')) {
           filesErrored++;
         } else {
-          // Files with no symbols but no errors (e.g. yaml, twig) are tracked
-          // at the file level — count them as indexed so the CLI doesn't
-          // misleadingly report "No files found to index".
+          // Files with no symbols but no errors (yaml, twig, properties) are
+          // tracked at the file level — count them as indexed so the CLI
+          // doesn't misleadingly report "No files found to index".
           const lang = detectLanguage(filePath, content);
-          if (lang === 'yaml' || lang === 'twig') {
+          if (isFileLevelOnlyLanguage(lang)) {
             filesIndexed++;
           } else {
             filesSkipped++;
@@ -1117,7 +1117,7 @@ export class ExtractionOrchestrator {
         filesErrored++;
       } else {
         const tracked = this.queries.getFileByPath(filePath);
-        if (tracked && (tracked.language === 'yaml' || tracked.language === 'twig')) {
+        if (tracked && isFileLevelOnlyLanguage(tracked.language)) {
           filesIndexed++;
         } else {
           filesSkipped++;
