@@ -572,6 +572,10 @@ is written):
 - **Antigravity IDE**
 - **Kiro**
 
+> **Note on Codex support:** CodeGraph currently supports **Codex CLI** via
+> `~/.codex/config.toml` (global config). If you're using a separate **Codex VS
+> Code extension**, that setup path is not documented here yet.
+
 ## Supported Languages
 
 | Language | Extension | Status |
