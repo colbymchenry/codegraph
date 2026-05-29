@@ -105,6 +105,15 @@ export const EXTENSION_MAP: Record<string, Language> = {
 };
 
 /**
+ * All file extensions that CodeGraph treats as source files.
+ * Derived from EXTENSION_MAP so the `specify` command (and any other
+ * caller that needs an extension list) never drift from the indexing logic.
+ */
+export function getSupportedExtensions(): string[] {
+  return [...Object.keys(EXTENSION_MAP)];
+}
+
+/**
  * Whether a file is one CodeGraph can parse, based purely on its extension.
  * This is the single source of truth for "should we index this file" — derived
  * from EXTENSION_MAP so parser support and indexing selection never drift.

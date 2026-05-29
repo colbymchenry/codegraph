@@ -606,6 +606,16 @@ export class CodeGraph {
   }
 
   /**
+   * Resolve references scoped to specific files only.
+   * Faster than resolveReferencesBatched for small file sets since it
+   * loads unresolved refs only from the given file paths.
+   */
+  async resolveReferencesScoped(filePaths: string[]): Promise<ResolutionResult> {
+    const unresolvedRefs = this.queries.getUnresolvedReferencesByFiles(filePaths);
+    return this.resolver.resolveAndPersist(unresolvedRefs);
+  }
+
+  /**
    * Get detected frameworks in the project
    */
   getDetectedFrameworks(): string[] {
