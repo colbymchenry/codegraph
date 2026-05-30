@@ -630,7 +630,14 @@ export class TreeSitterExtractor {
         }
       }
     }
-    if (name === '<anonymous>') return; // Skip anonymous functions
+    if (name === '<anonymous>') {
+      const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+        ?? getChildByField(node, this.extractor.bodyField);
+      if (body) {
+        this.visitFunctionBody(body, '');
+      }
+      return; // Skip anonymous function nodes, but keep their body visible.
+    }
 
     // Check for misparse artifacts (e.g. C++ macros causing "namespace detail" functions)
     // Skip the node but still visit the body for calls and structural nodes
@@ -2020,19 +2027,12 @@ export class TreeSitterExtractor {
         }
       }
 
-      // Nested NAMED functions inside a body — function declarations and named
-      // function expressions like `.on('mount', function onmount(){})` — become
-      // their own nodes so the graph can link to them (callback handlers, local
-      // helpers). Anonymous arrows/expressions fall through to the default
-      // recursion below, keeping their inner calls attributed to the enclosing
-      // function: this bounds the new nodes to NAMED functions only (no explosion,
-      // no lost edges). extractFunction walks the nested body itself, so we return.
+      // Nested functions are handled by extractFunction. It creates nodes for
+      // named functions and variable-assigned callbacks, while true anonymous
+      // functions are skipped after their bodies remain visible to the walker.
       if (this.extractor!.functionTypes.includes(nodeType)) {
-        const nestedName = extractName(node, this.source, this.extractor!);
-        if (nestedName && nestedName !== '<anonymous>') {
-          this.extractFunction(node);
-          return;
-        }
+        this.extractFunction(node);
+        return;
       }
 
       // Extract structural nodes found inside function bodies.
