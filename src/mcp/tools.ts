@@ -441,7 +441,7 @@ export const tools: ToolDefinition[] = [
       properties: {
         task: {
           type: 'string',
-          description: 'Description of the task, bug, or feature to build context for',
+          description: 'Short keywords or symbol names to build context for (e.g., "auth signIn UserService"). Keyword-based search, so prefer terse queries over full sentences.',
         },
         maxNodes: {
           type: 'number',
