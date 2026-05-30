@@ -14,6 +14,8 @@ import {
   FileRecord,
   ExtractionResult,
   ExtractionError,
+  Node,
+  ReferenceFact,
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
@@ -80,9 +82,14 @@ export interface SyncResult {
   filesAdded: number;
   filesModified: number;
   filesRemoved: number;
+  filesReindexed: number;
+  filesAffected: number;
   nodesUpdated: number;
   durationMs: number;
   changedFilePaths?: string[];
+  affectedFilePaths?: string[];
+  resolutionMode: 'changed-only' | 'affected-set' | 'full';
+  detectionMode: 'fast-path' | 'full-verify';
 }
 
 /**
@@ -1267,6 +1274,7 @@ export class ExtractionOrchestrator {
     if (existingFile) {
       this.queries.deleteFile(filePath);
     }
+    this.queries.deleteReferenceFactsByFile(filePath);
 
     // Filter out nodes with missing required fields before insertion.
     // This prevents FK violations when edges reference nodes that would
@@ -1301,6 +1309,7 @@ export class ExtractionOrchestrator {
         }));
       if (refsWithContext.length > 0) {
         this.queries.insertUnresolvedRefsBatch(refsWithContext);
+        this.queries.insertReferenceFactsBatch(refsWithContext as ReferenceFact[]);
       }
     }
 
@@ -1335,6 +1344,8 @@ export class ExtractionOrchestrator {
     let filesRemoved = 0;
     let nodesUpdated = 0;
     const changedFilePaths: string[] = [];
+    let resolutionMode: SyncResult['resolutionMode'] = 'changed-only';
+    const detectionMode: SyncResult['detectionMode'] = 'fast-path';
 
     onProgress?.({
       phase: 'scanning',
@@ -1343,6 +1354,7 @@ export class ExtractionOrchestrator {
     });
 
     const filesToIndex: string[] = [];
+    const oldNodesByChangedFile = new Map<string, Node[]>();
     // === Filesystem reconcile (git-independent) ===
     // The source of truth for "what changed" is the filesystem vs the indexed
     // state — never git. We enumerate the current source files and reconcile
@@ -1367,6 +1379,8 @@ export class ExtractionOrchestrator {
     // file deleted from disk but not yet staged, so set membership alone misses it.
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
+        this.queries.deleteUnresolvedByFile(tracked.path);
+        this.queries.deleteReferenceFactsByFile(tracked.path);
         this.queries.deleteFile(tracked.path);
         filesRemoved++;
       }
@@ -1409,15 +1423,53 @@ export class ExtractionOrchestrator {
         changedFilePaths.push(filePath);
         filesAdded++;
       } else if (tracked.contentHash !== contentHash) {
+        oldNodesByChangedFile.set(filePath, this.queries.getNodesByFile(filePath));
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
         filesModified++;
       }
     }
 
+    const affectedFileSet = new Set<string>(changedFilePaths);
+    if (changedFilePaths.length > 0) {
+      const exportedNames = new Set<string>();
+      for (const filePath of changedFilePaths) {
+        for (const node of oldNodesByChangedFile.get(filePath) ?? []) {
+          if (node.isExported) exportedNames.add(node.name);
+        }
+      }
+      for (const filePath of filesToIndex) {
+        const fullPath = path.join(this.rootDir, filePath);
+        try {
+          const content = fs.readFileSync(fullPath, 'utf-8');
+          const language = detectLanguage(filePath, content);
+          if (!isLanguageSupported(language)) continue;
+          const frameworkNames = this.ensureDetectedFrameworks();
+          const result = extractFromSource(filePath, content, language, frameworkNames);
+          for (const node of result.nodes) {
+            if (node.isExported) exportedNames.add(node.name);
+          }
+        } catch {
+          // Best-effort; affected set can stay conservative if a file is unreadable.
+        }
+      }
+      for (const filePath of this.queries.getReferencingFilesByNames([...exportedNames])) {
+        affectedFileSet.add(filePath);
+      }
+    }
+
+    const affectedFilePaths = [...affectedFileSet]
+      .filter((filePath) => currentSet.has(filePath) && !filesToIndex.includes(filePath))
+      .sort();
+    if (affectedFilePaths.length > 0) {
+      resolutionMode = 'affected-set';
+    }
+
+    const reindexedFilePaths = [...new Set([...filesToIndex, ...affectedFilePaths])];
+
     // Load only grammars needed for changed files
-    if (filesToIndex.length > 0) {
-      const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f)))];
+    if (reindexedFilePaths.length > 0) {
+      const neededLanguages = [...new Set(reindexedFilePaths.map((f) => detectLanguage(f)))];
       // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded
       if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
         neededLanguages.push('cpp');
@@ -1426,15 +1478,43 @@ export class ExtractionOrchestrator {
     }
 
     // Index changed files
-    const total = filesToIndex.length;
-    for (let i = 0; i < filesToIndex.length; i++) {
-      const filePath = filesToIndex[i]!;
+    const total = reindexedFilePaths.length;
+    for (let i = 0; i < reindexedFilePaths.length; i++) {
+      const filePath = reindexedFilePaths[i]!;
       onProgress?.({
         phase: 'parsing',
         current: i + 1,
         total,
         currentFile: filePath,
       });
+
+      // Affected-only files keep their structural graph; only resolver/synthesized
+      // edges and reference facts need a refresh.
+      if (!filesToIndex.includes(filePath)) {
+        this.queries.deleteEdgesByProvenanceAndFiles(['resolver', 'heuristic'], [filePath]);
+        this.queries.deleteUnresolvedByFile(filePath);
+        this.queries.deleteReferenceFactsByFile(filePath);
+        const fullPath = path.join(this.rootDir, filePath);
+        try {
+          const content = fs.readFileSync(fullPath, 'utf-8');
+          const language = detectLanguage(filePath, content);
+          if (isLanguageSupported(language)) {
+            const frameworkNames = this.ensureDetectedFrameworks();
+            const parsed = extractFromSource(filePath, content, language, frameworkNames);
+            const refsWithContext = parsed.unresolvedReferences.map((ref) => ({
+              ...ref,
+              filePath: ref.filePath ?? filePath,
+              language: ref.language ?? language,
+            }));
+            this.queries.insertReferenceFactsBatch(refsWithContext as ReferenceFact[]);
+            // Keep unresolved_refs aligned with the resolution batch input.
+            this.queries.insertUnresolvedRefsBatch(refsWithContext);
+          }
+        } catch {
+          continue;
+        }
+        continue;
+      }
 
       const result = await this.indexFile(filePath);
       nodesUpdated += result.nodes.length;
@@ -1445,9 +1525,14 @@ export class ExtractionOrchestrator {
       filesAdded,
       filesModified,
       filesRemoved,
+      filesReindexed: reindexedFilePaths.length,
+      filesAffected: affectedFilePaths.length,
       nodesUpdated,
       durationMs: Date.now() - startTime,
       changedFilePaths: changedFilePaths.length > 0 ? changedFilePaths : undefined,
+      affectedFilePaths: affectedFilePaths.length > 0 ? affectedFilePaths : undefined,
+      resolutionMode,
+      detectionMode,
     };
   }
 

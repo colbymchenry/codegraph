@@ -189,7 +189,7 @@ export interface Edge {
   column?: number;
 
   /** How this edge was created */
-  provenance?: 'tree-sitter' | 'scip' | 'heuristic';
+  provenance?: 'tree-sitter' | 'scip' | 'heuristic' | 'resolver';
 }
 
 /**
@@ -294,6 +294,12 @@ export interface UnresolvedReference {
   /** Possible qualified names it might resolve to */
   candidates?: string[];
 }
+
+/**
+ * A persisted reference fact extracted from source, kept even after resolution
+ * so future syncs can re-resolve affected files when target symbols change.
+ */
+export interface ReferenceFact extends UnresolvedReference {}
 
 // =============================================================================
 // Query Types

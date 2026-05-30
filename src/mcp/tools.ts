@@ -2687,6 +2687,8 @@ export class ToolHandler {
       );
     }
 
+    lines.push(`**Sync detection:** fast-path (mtime/size prefilter + content hash confirm)`);
+
     lines.push('', '### Nodes by Kind:');
 
     for (const [kind, count] of Object.entries(stats.nodesByKind)) {

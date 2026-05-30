@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 /**
  * Migration definition
@@ -62,6 +62,33 @@ const migrations: Migration[] = [
       db.exec(`
         DROP INDEX IF EXISTS idx_edges_source;
         DROP INDEX IF EXISTS idx_edges_target;
+      `);
+    },
+  },
+  {
+    version: 5,
+    description: 'Add persisted reference facts for affected-file incremental re-resolution',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS reference_facts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          from_node_id TEXT NOT NULL,
+          reference_name TEXT NOT NULL,
+          reference_kind TEXT NOT NULL,
+          line INTEGER NOT NULL,
+          col INTEGER NOT NULL,
+          candidates TEXT,
+          file_path TEXT NOT NULL DEFAULT '',
+          language TEXT NOT NULL DEFAULT 'unknown',
+          FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_reference_facts_from_node ON reference_facts(from_node_id);
+        CREATE INDEX IF NOT EXISTS idx_reference_facts_name ON reference_facts(reference_name);
+        CREATE INDEX IF NOT EXISTS idx_reference_facts_file_path ON reference_facts(file_path);
+        CREATE INDEX IF NOT EXISTS idx_reference_facts_from_name ON reference_facts(from_node_id, reference_name);
+        INSERT INTO reference_facts (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language)
+        SELECT from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language
+        FROM unresolved_refs;
       `);
     },
   },

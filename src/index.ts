@@ -414,7 +414,18 @@ export class CodeGraph {
       try {
         this.fileLock.acquire();
       } catch {
-        return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+        return {
+          filesChecked: 0,
+          filesAdded: 0,
+          filesModified: 0,
+          filesRemoved: 0,
+          filesReindexed: 0,
+          filesAffected: 0,
+          nodesUpdated: 0,
+          durationMs: 0,
+          resolutionMode: 'changed-only',
+          detectionMode: 'fast-path',
+        };
       }
       try {
         const result = await this.orchestrator.sync(options.onProgress);
@@ -423,15 +434,18 @@ export class CodeGraph {
         // every sync that touched files so edits to `app.module.ts` propagate
         // to controllers in unchanged files. The pass is idempotent and cheap
         // (regex over *.module.ts only).
-        if (result.filesAdded > 0 || result.filesModified > 0) {
+        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesAffected > 0) {
           this.resolver.runPostExtract();
         }
 
         // Resolve references if files were updated
-        if (result.filesAdded > 0 || result.filesModified > 0) {
-          if (result.changedFilePaths) {
-            // Scope resolution to changed files (git fast path — bounded set)
-            const unresolvedRefs = this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths);
+        if (result.filesReindexed > 0) {
+          const resolutionFiles = result.affectedFilePaths
+            ? [...new Set([...(result.changedFilePaths ?? []), ...result.affectedFilePaths])]
+            : result.changedFilePaths;
+
+          if (resolutionFiles && resolutionFiles.length > 0) {
+            const unresolvedRefs = this.queries.getReferenceFactsByFiles(resolutionFiles);
 
             options.onProgress?.({
               phase: 'resolving',
@@ -446,6 +460,7 @@ export class CodeGraph {
                 total,
               });
             });
+            this.resolver.synthesizeHeuristicEdges();
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
@@ -467,7 +482,7 @@ export class CodeGraph {
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
-        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
+        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0 || result.filesAffected > 0) {
           this.db.runMaintenance();
         }
 

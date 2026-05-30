@@ -9,6 +9,7 @@ import {
   Node,
   Edge,
   FileRecord,
+  ReferenceFact,
   UnresolvedReference,
   NodeKind,
   EdgeKind,
@@ -98,6 +99,18 @@ interface FileRow {
 }
 
 interface UnresolvedRefRow {
+  id: number;
+  from_node_id: string;
+  reference_name: string;
+  reference_kind: string;
+  line: number;
+  col: number;
+  candidates: string | null;
+  file_path: string;
+  language: string;
+}
+
+interface ReferenceFactRow {
   id: number;
   from_node_id: string;
   reference_name: string;
@@ -199,8 +212,13 @@ export class QueryBuilder {
     getFileByPath?: SqliteStatement;
     getAllFiles?: SqliteStatement;
     insertUnresolved?: SqliteStatement;
+    insertReferenceFact?: SqliteStatement;
     deleteUnresolvedByNode?: SqliteStatement;
+    deleteUnresolvedByFile?: SqliteStatement;
+    deleteReferenceFactsByFile?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
+    getReferenceFactsByFiles?: SqliteStatement;
+    getReferencingFilesByNames?: SqliteStatement;
     getNodesByName?: SqliteStatement;
     getNodesByQualifiedNameExact?: SqliteStatement;
     getNodesByLowerName?: SqliteStatement;
@@ -1269,6 +1287,23 @@ export class QueryBuilder {
     this.stmts.deleteEdgesBySource.run(sourceId);
   }
 
+  deleteEdgesByProvenanceAndFiles(
+    provenances: ReadonlyArray<NonNullable<Edge['provenance']>>,
+    filePaths: readonly string[]
+  ): void {
+    if (provenances.length === 0 || filePaths.length === 0) return;
+    const filePlaceholders = filePaths.map(() => '?').join(',');
+    const provPlaceholders = provenances.map(() => '?').join(',');
+    this.db.prepare(
+      `DELETE FROM edges
+       WHERE provenance IN (${provPlaceholders})
+         AND (
+           source IN (SELECT id FROM nodes WHERE file_path IN (${filePlaceholders}))
+           OR target IN (SELECT id FROM nodes WHERE file_path IN (${filePlaceholders}))
+         )`
+    ).run(...provenances, ...filePaths, ...filePaths);
+  }
+
   /**
    * Get outgoing edges from a node
    */
@@ -1443,6 +1478,26 @@ export class QueryBuilder {
     });
   }
 
+  insertReferenceFact(ref: ReferenceFact): void {
+    if (!this.stmts.insertReferenceFact) {
+      this.stmts.insertReferenceFact = this.db.prepare(`
+        INSERT INTO reference_facts (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language)
+        VALUES (@fromNodeId, @referenceName, @referenceKind, @line, @col, @candidates, @filePath, @language)
+      `);
+    }
+
+    this.stmts.insertReferenceFact.run({
+      fromNodeId: ref.fromNodeId,
+      referenceName: ref.referenceName,
+      referenceKind: ref.referenceKind,
+      line: ref.line,
+      col: ref.column,
+      candidates: ref.candidates ? JSON.stringify(ref.candidates) : null,
+      filePath: ref.filePath ?? '',
+      language: ref.language ?? 'unknown',
+    });
+  }
+
   /**
    * Insert multiple unresolved references in a transaction
    */
@@ -1451,6 +1506,16 @@ export class QueryBuilder {
     const insert = this.db.transaction(() => {
       for (const ref of refs) {
         this.insertUnresolvedRef(ref);
+      }
+    });
+    insert();
+  }
+
+  insertReferenceFactsBatch(refs: ReferenceFact[]): void {
+    if (refs.length === 0) return;
+    const insert = this.db.transaction(() => {
+      for (const ref of refs) {
+        this.insertReferenceFact(ref);
       }
     });
     insert();
@@ -1466,6 +1531,24 @@ export class QueryBuilder {
       );
     }
     this.stmts.deleteUnresolvedByNode.run(nodeId);
+  }
+
+  deleteUnresolvedByFile(filePath: string): void {
+    if (!this.stmts.deleteUnresolvedByFile) {
+      this.stmts.deleteUnresolvedByFile = this.db.prepare(
+        'DELETE FROM unresolved_refs WHERE file_path = ?'
+      );
+    }
+    this.stmts.deleteUnresolvedByFile.run(filePath);
+  }
+
+  deleteReferenceFactsByFile(filePath: string): void {
+    if (!this.stmts.deleteReferenceFactsByFile) {
+      this.stmts.deleteReferenceFactsByFile = this.db.prepare(
+        'DELETE FROM reference_facts WHERE file_path = ?'
+      );
+    }
+    this.stmts.deleteReferenceFactsByFile.run(filePath);
   }
 
   /**
@@ -1589,11 +1672,43 @@ export class QueryBuilder {
     }));
   }
 
+  getReferenceFactsByFiles(filePaths: string[]): ReferenceFact[] {
+    if (filePaths.length === 0) return [];
+
+    const placeholders = filePaths.map(() => '?').join(',');
+    const rows = this.db
+      .prepare(`SELECT * FROM reference_facts WHERE file_path IN (${placeholders})`)
+      .all(...filePaths) as ReferenceFactRow[];
+
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+    }));
+  }
+
+  getReferencingFilesByNames(names: readonly string[]): string[] {
+    if (names.length === 0) return [];
+    const placeholders = names.map(() => '?').join(',');
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT file_path FROM reference_facts WHERE reference_name IN (${placeholders})`
+      )
+      .all(...names) as Array<{ file_path: string }>;
+    return rows.map((row) => row.file_path);
+  }
+
   /**
    * Delete all unresolved references (after resolution)
    */
   clearUnresolvedReferences(): void {
     this.db.exec('DELETE FROM unresolved_refs');
+    this.db.exec('DELETE FROM reference_facts');
   }
 
   /**
@@ -1727,6 +1842,7 @@ export class QueryBuilder {
     this.nodeCache.clear();
     this.db.transaction(() => {
       this.db.exec('DELETE FROM unresolved_refs');
+      this.db.exec('DELETE FROM reference_facts');
       this.db.exec('DELETE FROM edges');
       this.db.exec('DELETE FROM nodes');
       this.db.exec('DELETE FROM files');
