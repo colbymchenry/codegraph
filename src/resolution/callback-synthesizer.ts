@@ -1415,6 +1415,11 @@ function mybatisJavaXmlEdges(queries: QueryBuilder): Edge[] {
 
   for (const xml of queries.iterateNodesByKind('method')) {
     if (xml.language !== 'xml') continue;
+    // Only real mapper statements (<select|insert|update|delete>) map to a Java
+    // interface method. `<sql>` fragments and `<resultMap>`s share the method-node
+    // shape but are not mapper methods, so an `id` that happens to match a Java
+    // method name must NOT be bridged to them.
+    if (xml.signature === '<sql>' || xml.signature?.startsWith('<resultMap>')) continue;
     // Qualified name: `<namespace>::<id>`. Extract the simple class name.
     const colonIdx = xml.qualifiedName.lastIndexOf('::');
     if (colonIdx < 0) continue;

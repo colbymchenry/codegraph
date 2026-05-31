@@ -464,6 +464,77 @@ describe('Java end-to-end — field-injected bean trace (issue #389)', () => {
     cg.close();
   });
 
+  it('indexes MyBatis <resultMap> and links statements that reference it (#592)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mybatis-rm-'));
+    const javaDir = path.join(tmpDir, 'src/main/java/com/example/dao');
+    const xmlDir = path.join(tmpDir, 'src/main/resources/mappers');
+    fs.mkdirSync(javaDir, { recursive: true });
+    fs.mkdirSync(xmlDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'pom.xml'),
+      '<project><dependencies><dependency><groupId>org.mybatis</groupId><artifactId>mybatis</artifactId></dependency></dependencies></project>\n'
+    );
+    // Java method `userResult` deliberately collides with the resultMap id,
+    // to prove the Java↔XML bridge does NOT wrongly link to the result map.
+    fs.writeFileSync(
+      path.join(javaDir, 'UserMapper.java'),
+      'package com.example.dao;\n' +
+        'public interface UserMapper {\n' +
+        '  Object findById(int id);\n' +
+        '  Object userResult();\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(xmlDir, 'UserMapper.xml'),
+      '<?xml version="1.0" encoding="UTF-8"?>\n' +
+        '<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">\n' +
+        '<mapper namespace="com.example.dao.UserMapper">\n' +
+        '  <resultMap id="userResult" type="User">\n' +
+        '    <id column="id" property="id"/>\n' +
+        '    <result column="email" property="email"/>\n' +
+        '  </resultMap>\n' +
+        '  <select id="findById" resultMap="userResult">\n' +
+        '    SELECT id, email FROM users WHERE id = #{id}\n' +
+        '  </select>\n' +
+        '</mapper>\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const methods = cg.getNodesByKind('method');
+    const resultMap = methods.find((n) => n.name === 'userResult' && n.language === 'xml');
+    const findById = methods.find((n) => n.name === 'findById' && n.language === 'xml');
+    expect(resultMap, '<resultMap id="userResult"> should be indexed').toBeDefined();
+    expect(resultMap!.qualifiedName).toBe('com.example.dao.UserMapper::userResult');
+    expect(resultMap!.signature).toBe('<resultMap> type=User');
+    expect(findById).toBeDefined();
+
+    // <select resultMap="userResult"> -> <resultMap id="userResult"> edge.
+    const rmEdge = cg.getOutgoingEdges(findById!.id).find((e) => e.target === resultMap!.id);
+    expect(rmEdge, 'statement should reference the result map it uses').toBeDefined();
+
+    // The guard must not over-match: the real <select id="findById"> still
+    // bridges to its Java mapper method.
+    const javaFindById = methods.find((n) => n.name === 'findById' && n.language === 'java');
+    expect(javaFindById).toBeDefined();
+    const realBridge = cg
+      .getOutgoingEdges(javaFindById!.id)
+      .find((e) => e.target === findById!.id);
+    expect(realBridge, 'Java findById should still bridge to its XML <select>').toBeDefined();
+
+    // The Java↔XML bridge must NOT link the same-named Java method to the
+    // result map (result maps are not mapper methods).
+    const javaUserResult = methods.find((n) => n.name === 'userResult' && n.language === 'java');
+    expect(javaUserResult).toBeDefined();
+    const bogusBridge = cg
+      .getOutgoingEdges(javaUserResult!.id)
+      .find((e) => e.target === resultMap!.id);
+    expect(bogusBridge, 'Java method must not bridge to a result map').toBeUndefined();
+
+    cg.close();
+  });
+
   it('binds @Value / @ConfigurationProperties to YAML + .properties keys (incl. relaxed binding)', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-spring-config-'));
     const javaDir = path.join(tmpDir, 'src/main/java/com/example');

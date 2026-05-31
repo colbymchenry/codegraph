@@ -109,7 +109,7 @@ export class MyBatisExtractor {
     // tags (`<if>`, `<foreach>`, `<include>`), so we scan with a regex that
     // pairs an opening tag to its matching close — the simple form below works
     // because MyBatis statement elements are not themselves nested.
-    const stmtRegex = /<(select|insert|update|delete|sql)\b([^>]*)>([\s\S]*?)<\/\1>/g;
+    const stmtRegex = /<(select|insert|update|delete|sql|resultMap)\b([^>]*)>([\s\S]*?)<\/\1>/g;
     let m: RegExpExecArray | null;
     while ((m = stmtRegex.exec(body)) !== null) {
       const elemType = m[1]!;
@@ -123,6 +123,7 @@ export class MyBatisExtractor {
       const endLine = this.getLineNumber(absoluteIndex + m[0].length);
       const qualified = `${namespace}::${id}`;
       const isSqlFragment = elemType === 'sql';
+      const isResultMap = elemType === 'resultMap';
       const nodeId = generateNodeId(this.filePath, 'method', qualified, startLine);
       const node: Node = {
         id: nodeId,
@@ -159,11 +160,36 @@ export class MyBatisExtractor {
           column: 0,
         });
       }
+
+      // resultMap="X" on a statement → reference to the <resultMap id="X">
+      // node, so callers/impact can answer "which statements use this result
+      // map" (mirrors the <include refid> link above). A qualified `ns.X`
+      // points at another mapper's result map.
+      if (!isResultMap && !isSqlFragment) {
+        const rmId = /\bresultMap\s*=\s*"([^"]+)"/.exec(attrs)?.[1]?.trim();
+        if (rmId) {
+          const rmQualified = rmId.includes('.') ? rmId.replace(/\./g, '::') : `${namespace}::${rmId}`;
+          this.unresolvedReferences.push({
+            fromNodeId: nodeId,
+            referenceName: rmQualified,
+            referenceKind: 'references',
+            line: startLine,
+            column: 0,
+          });
+        }
+      }
     }
   }
 
+  // NOTE: the `<sql>` and `<resultMap>` signature prefixes are load-bearing —
+  // the Java↔XML bridge (`mybatisJavaXmlEdges`) uses them to skip non-statement
+  // nodes. Keep them in sync if this changes.
   private buildSignature(elemType: string, attrs: string, isSqlFragment: boolean): string {
     if (isSqlFragment) return '<sql>';
+    if (elemType === 'resultMap') {
+      const type = /\btype\s*=\s*"([^"]+)"/.exec(attrs)?.[1];
+      return type ? `<resultMap> type=${type}` : '<resultMap>';
+    }
     const verb = elemType.toUpperCase();
     const result = /\bresultType\s*=\s*"([^"]+)"/.exec(attrs)?.[1];
     const param = /\bparameterType\s*=\s*"([^"]+)"/.exec(attrs)?.[1];
