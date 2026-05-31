@@ -880,6 +880,14 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(cfg.mcpServers.codegraph).toBeDefined();
   });
 
+  it('claude: auto-allow includes codegraph_files (#565)', () => {
+    const claude = getTarget('claude')!;
+    claude.install('local', { autoAllow: true });
+
+    const settings = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.claude', 'settings.json'), 'utf-8'));
+    expect(settings.permissions.allow).toContain('mcp__codegraph__codegraph_files');
+  });
+
   it('claude: install does NOT create a CLAUDE.md instructions file (#529)', () => {
     const claude = getTarget('claude')!;
     const result = claude.install('local', { autoAllow: false });

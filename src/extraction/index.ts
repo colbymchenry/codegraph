@@ -160,6 +160,22 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
 ];
 
 /**
+ * Git quotes non-ASCII path bytes by default (e.g. CJK segments become octal
+ * escapes wrapped in quotes). We parse git path output as UTF-8 strings, so all
+ * path-emitting commands must disable that quoting or source files under
+ * non-ASCII directories fail extension detection.
+ */
+const GIT_PATH_OUTPUT_ARGS = ['-c', 'core.quotePath=false'];
+
+function gitPathLines(output: string): string[] {
+  const lines = output.split('\n');
+  if (lines[lines.length - 1] === '') {
+    lines.pop();
+  }
+  return lines.filter((line) => line.length > 0);
+}
+
+/**
  * An `ignore` matcher seeded with the built-in defaults, merged with the project's
  * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default. Shared
  * by both enumeration paths so behavior is identical with or without git — and so
@@ -198,32 +214,27 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): v
   // Without this, monorepos using submodules index 0 files. (See issue #147.)
   // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
   // can't be combined with -o, so untracked files are gathered separately below.
-  const tracked = execFileSync('git', ['ls-files', '-c', '--recurse-submodules'], gitOpts);
-  for (const line of tracked.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed) {
-      files.add(normalizePath(prefix + trimmed));
-    }
+  const tracked = execFileSync('git', [...GIT_PATH_OUTPUT_ARGS, 'ls-files', '-c', '--recurse-submodules'], gitOpts);
+  for (const filePath of gitPathLines(tracked)) {
+    files.add(normalizePath(prefix + filePath));
   }
 
   // Untracked files (submodules manage their own untracked state). Embedded git
   // repos surface here as a single "subdir/" entry that git refuses to descend
   // into — recurse into those as their own repos so their source gets indexed.
-  const untracked = execFileSync('git', ['ls-files', '-o', '--exclude-standard'], gitOpts);
-  for (const line of untracked.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (trimmed.endsWith('/')) {
+  const untracked = execFileSync('git', [...GIT_PATH_OUTPUT_ARGS, 'ls-files', '-o', '--exclude-standard'], gitOpts);
+  for (const filePath of gitPathLines(untracked)) {
+    if (filePath.endsWith('/')) {
       // git only emits a trailing-slash directory entry for an embedded repo.
       // Guard with a .git check anyway, and skip anything else exactly as git
       // itself skips it (we never descend into a non-repo opaque dir).
-      const childDir = path.join(repoDir, trimmed);
+      const childDir = path.join(repoDir, filePath);
       if (fs.existsSync(path.join(childDir, '.git'))) {
-        collectGitFiles(childDir, prefix + trimmed, files);
+        collectGitFiles(childDir, prefix + filePath, files);
       }
       continue;
     }
-    files.add(normalizePath(prefix + trimmed));
+    files.add(normalizePath(prefix + filePath));
   }
 }
 
@@ -240,9 +251,9 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     // `git ls-files` returns nothing — fall back to filesystem walk.
     const gitRoot = execFileSync(
       'git',
-      ['rev-parse', '--show-toplevel'],
+      [...GIT_PATH_OUTPUT_ARGS, 'rev-parse', '--show-toplevel'],
       { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
-    ).trim();
+    ).trimEnd();
 
     if (path.resolve(gitRoot) !== path.resolve(rootDir)) {
       try {
@@ -290,7 +301,7 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
   try {
     const output = execFileSync(
       'git',
-      ['status', '--porcelain', '--no-renames'],
+      [...GIT_PATH_OUTPUT_ARGS, 'status', '--porcelain', '--no-renames'],
       { cwd: rootDir, encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );
 
@@ -298,7 +309,7 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
     const added: string[] = [];
     const deleted: string[] = [];
 
-    for (const line of output.split('\n')) {
+    for (const line of gitPathLines(output)) {
       if (line.length < 4) continue; // Minimum: "XY file"
 
       const statusCode = line.substring(0, 2);
@@ -462,6 +473,10 @@ function scanDirectoryWalk(
 
       if (entry.isSymbolicLink()) {
         try {
+          if (!validatePathWithinRoot(rootDir, relativePath)) {
+            logDebug('Skipping symlink outside root', { path: fullPath });
+            continue;
+          }
           const realTarget = fs.realpathSync(fullPath);
           const stat = fs.statSync(realTarget);
           if (stat.isDirectory()) {

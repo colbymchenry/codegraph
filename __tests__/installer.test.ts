@@ -18,6 +18,7 @@ import * as os from 'os';
 import {
   writeMcpConfig,
 } from '../src/installer/config-writer';
+import { atomicWriteFileSync } from '../src/installer/targets/shared';
 
 function createTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-installer-test-'));
@@ -99,6 +100,22 @@ describe('Installer Config Writer', () => {
       expect(content.mcpServers.codegraph).toBeDefined();
       expect(content.mcpServers.other).toBeDefined();
       expect(content.customField).toBe('preserved');
+      expect(fs.existsSync(mcpJson + '.backup')).toBe(true);
+      const backup = JSON.parse(fs.readFileSync(mcpJson + '.backup', 'utf-8'));
+      expect(backup.mcpServers.codegraph).toBeUndefined();
+      expect(backup.mcpServers.other).toBeDefined();
+    });
+
+    it('should create numbered backups instead of overwriting an existing backup', () => {
+      const file = path.join(tempDir, 'settings.json');
+      fs.writeFileSync(file, '{"version":1}\n');
+
+      atomicWriteFileSync(file, '{"version":2}\n');
+      atomicWriteFileSync(file, '{"version":3}\n');
+
+      expect(fs.readFileSync(file, 'utf-8')).toContain('"version":3');
+      expect(fs.readFileSync(file + '.backup', 'utf-8')).toContain('"version":1');
+      expect(fs.readFileSync(file + '.backup.1', 'utf-8')).toContain('"version":2');
     });
   });
 });

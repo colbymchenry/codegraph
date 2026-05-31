@@ -46,9 +46,29 @@ const SENSITIVE_PATHS = new Set([
   'c:\\', 'c:\\windows', 'c:\\windows\\system32',
 ]);
 
+function isResolvedPathWithinRoot(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function nearestExistingPath(absPath: string): string | null {
+  let current = absPath;
+
+  while (!fs.existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+
+  return current;
+}
+
 /**
  * Validate that a resolved file path stays within the project root.
  * Prevents path traversal attacks (e.g. node.filePath = "../../etc/passwd").
+ * Also resolves existing files and parent directories to catch symlink escapes.
  *
  * @param projectRoot - The project root directory
  * @param filePath - The relative file path to validate
@@ -58,9 +78,35 @@ export function validatePathWithinRoot(projectRoot: string, filePath: string): s
   const resolved = path.resolve(projectRoot, filePath);
   const normalizedRoot = path.resolve(projectRoot);
 
-  if (!resolved.startsWith(normalizedRoot + path.sep) && resolved !== normalizedRoot) {
+  if (!isResolvedPathWithinRoot(normalizedRoot, resolved)) {
     return null;
   }
+
+  try {
+    const realRoot = fs.realpathSync(normalizedRoot);
+    const realPath = fs.realpathSync(resolved);
+    if (!isResolvedPathWithinRoot(realRoot, realPath)) {
+      return null;
+    }
+    return resolved;
+  } catch {
+    // If the target does not exist, still validate the nearest existing parent
+    // so writes/reads under a symlinked directory cannot escape the root.
+    try {
+      const realRoot = fs.realpathSync(normalizedRoot);
+      const existingPath = nearestExistingPath(resolved);
+      if (existingPath) {
+        const realExistingPath = fs.realpathSync(existingPath);
+        if (!isResolvedPathWithinRoot(realRoot, realExistingPath)) {
+          return null;
+        }
+      }
+    } catch {
+      // Preserve the historical behavior for inaccessible/nonexistent roots
+      // after the lexical containment check above.
+    }
+  }
+
   return resolved;
 }
 
@@ -119,7 +165,7 @@ export function validateProjectPath(dirPath: string): string | null {
 export function isPathWithinRoot(filePath: string, rootDir: string): boolean {
   const resolvedPath = path.resolve(rootDir, filePath);
   const resolvedRoot = path.resolve(rootDir);
-  return resolvedPath.startsWith(resolvedRoot + path.sep) || resolvedPath === resolvedRoot;
+  return isResolvedPathWithinRoot(resolvedRoot, resolvedPath);
 }
 
 /**
