@@ -869,6 +869,14 @@ func UseAliased() {
         'package repro\n\nfunc (w *Widget) Bar() string { return "bar:" + w.name }\n'
       );
       fs.writeFileSync(
+        path.join(tempDir, 'repro', 'status.go'),
+        'package repro\n\ntype Status string\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'repro', 'status_extra.go'),
+        'package repro\n\nfunc (s Status) String() string { return string(s) }\n'
+      );
+      fs.writeFileSync(
         path.join(tempDir, 'other', 'widget.go'),
         'package other\n\ntype Widget struct{ id int }\n'
       );
@@ -877,10 +885,12 @@ func UseAliased() {
 
       const widget = cg.getNodesByKind('struct').find((n) => n.name === 'Widget' && n.filePath === 'repro/widget.go');
       const otherWidget = cg.getNodesByKind('struct').find((n) => n.name === 'Widget' && n.filePath === 'other/widget.go');
+      const status = cg.getNodesByKind('type_alias').find((n) => n.name === 'Status' && n.filePath === 'repro/status.go');
       const methods = cg.getNodesByKind('method').filter((n) => n.qualifiedName.startsWith('Widget::'));
       const methodNames = methods.map((n) => n.name).sort();
       expect(widget).toBeDefined();
       expect(otherWidget).toBeDefined();
+      expect(status).toBeDefined();
       expect(methodNames).toEqual(['Bar', 'Foo']);
 
       const containedMethodNames = cg.getOutgoingEdges(widget!.id)
@@ -895,6 +905,12 @@ func UseAliased() {
         .map((edge) => cg.getNode(edge.target)?.name)
         .filter(Boolean);
       expect(otherContainedMethodNames).toEqual([]);
+
+      const statusContainedMethodNames = cg.getOutgoingEdges(status!.id)
+        .filter((edge) => edge.kind === 'contains')
+        .map((edge) => cg.getNode(edge.target)?.name)
+        .filter(Boolean);
+      expect(statusContainedMethodNames).toEqual(['String']);
     });
 
     it('TS type_alias object-shape members resolve method calls (#359)', async () => {

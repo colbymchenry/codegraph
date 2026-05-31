@@ -267,7 +267,7 @@ export class ReferenceResolver {
     if (methods.length === 0) return 0;
 
     const ownersByName = new Map<string, Node[]>();
-    for (const kind of ['struct', 'class', 'enum', 'trait'] as const) {
+    for (const kind of ['struct', 'class', 'enum', 'trait', 'type_alias'] as const) {
       for (const owner of this.queries.getNodesByKind(kind)) {
         if (owner.language !== 'go') continue;
         const existing = ownersByName.get(owner.name) ?? [];
