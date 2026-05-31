@@ -4387,3 +4387,120 @@ void helperFunction(int count) {
     expect(getSupportedLanguages()).toContain('objc');
   });
 });
+
+describe('Astro Extraction', () => {
+  it('should detect Astro files', () => {
+    expect(detectLanguage('src/pages/index.astro')).toBe('astro');
+    expect(detectLanguage('components/Header.astro')).toBe('astro');
+    expect(isLanguageSupported('astro')).toBe(true);
+    expect(getSupportedLanguages()).toContain('astro');
+  });
+
+  it('should extract a component node for every .astro file', () => {
+    const code = `---
+const { title } = Astro.props;
+---
+<h1>{title}</h1>
+`;
+    const result = extractFromSource('Heading.astro', code);
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Heading');
+    expect(componentNode?.language).toBe('astro');
+    expect(componentNode?.isExported).toBe(true);
+  });
+
+  it('should extract functions from the frontmatter block', () => {
+    const code = `---
+import Layout from './Layout.astro';
+
+interface Props {
+  title: string;
+}
+
+function formatDate(date: Date): string {
+  return date.toLocaleDateString();
+}
+
+const { title } = Astro.props;
+---
+<Layout title={title}>
+  <p>{formatDate(new Date())}</p>
+</Layout>
+`;
+    const result = extractFromSource('Page.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Page');
+
+    const funcNode = result.nodes.find((n) => n.kind === 'function' && n.name === 'formatDate');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.language).toBe('astro');
+  });
+
+  it('should extract imports from the frontmatter block', () => {
+    const code = `---
+import Header from '../components/Header.astro';
+import { getCollection } from 'astro:content';
+---
+<Header />
+`;
+    const result = extractFromSource('Blog.astro', code);
+
+    const importNodes = result.nodes.filter((n) => n.kind === 'import');
+    expect(importNodes.length).toBeGreaterThanOrEqual(1);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports');
+    expect(refs.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('should capture child component references from the template', () => {
+    const code = `---
+import Header from './Header.astro';
+import Footer from './Footer.astro';
+---
+<html>
+  <body>
+    <Header />
+    <main><slot /></main>
+    <Footer />
+  </body>
+</html>
+`;
+    const result = extractFromSource('Layout.astro', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    const refNames = refs.map((r) => r.referenceName);
+    expect(refNames).toContain('Header');
+    expect(refNames).toContain('Footer');
+  });
+
+  it('should mark all extracted symbols as astro language', () => {
+    const code = `---
+function helper() { return 42; }
+const x = 1;
+---
+<p>{helper()}</p>
+`;
+    const result = extractFromSource('Component.astro', code);
+    const nonFileNodes = result.nodes.filter((n) => n.kind !== 'file');
+    for (const node of nonFileNodes) {
+      expect(node.language).toBe('astro');
+    }
+  });
+
+  it('should handle .astro files with no frontmatter', () => {
+    const code = `<html>
+  <body>
+    <h1>Hello</h1>
+  </body>
+</html>
+`;
+    const result = extractFromSource('Static.astro', code);
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Static');
+    expect(result.errors).toHaveLength(0);
+  });
+});

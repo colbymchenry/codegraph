@@ -20,6 +20,7 @@ import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } f
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { LiquidExtractor } from './liquid-extractor';
+import { AstroExtractor } from './astro-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
@@ -3055,8 +3056,12 @@ export function extractFromSource(
 
   let result: ExtractionResult;
 
+  // Use custom extractor for Astro
+  if (detectedLanguage === 'astro') {
+    const extractor = new AstroExtractor(filePath, source);
+    result = extractor.extract();
   // Use custom extractor for Svelte
-  if (detectedLanguage === 'svelte') {
+  } else if (detectedLanguage === 'svelte') {
     const extractor = new SvelteExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'vue') {

@@ -94,5 +94,10 @@
     { "name": "react-native-segmented-control", "repo": "https://github.com/react-native-segmented-control/segmented-control", "size": "Small", "files": "~25", "question": "How does JSX `<SegmentedControl onChange={cb}/>` reach the native onChange handler on iOS/Android?" },
     { "name": "react-native-screens", "repo": "https://github.com/software-mansion/react-native-screens", "size": "Medium", "files": "~1200", "question": "How does JSX `<ScreenStack>` reach the native RNSScreenStackView component?" },
     { "name": "react-native-skia", "repo": "https://github.com/Shopify/react-native-skia", "size": "Large", "files": "~1000", "question": "How does a `<SkiaPictureView/>` JSX usage reach the iOS / Android native renderer?" }
+  ],
+  "Astro": [
+    { "name": "astro-paper", "repo": "https://github.com/satnaing/astro-paper", "size": "Small", "files": "~175", "question": "How does a blog post's frontmatter data flow from the content collection to the SEO and layout components?" },
+    { "name": "astrowind", "repo": "https://github.com/onwidget/astrowind", "size": "Medium", "files": "~176", "question": "How does the Hero component receive and pass its props down to child components?" },
+    { "name": "astro-docs", "repo": "https://github.com/withastro/docs", "size": "Large", "files": "~3191", "question": "How does the navigation sidebar get populated from the content collections and page metadata?" }
   ]
 }

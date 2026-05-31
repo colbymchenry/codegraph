@@ -10,7 +10,7 @@ import * as path from 'path';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'astro' | 'svelte' | 'vue' | 'liquid' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -80,6 +80,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.kt': 'kotlin',
   '.kts': 'kotlin',
   '.dart': 'dart',
+  '.astro': 'astro',
   '.liquid': 'liquid',
   '.svelte': 'svelte',
   '.vue': 'vue',
@@ -269,6 +270,7 @@ function looksLikeObjc(source: string): boolean {
  * Returns true if the grammar exists, even if not yet loaded.
  */
 export function isLanguageSupported(language: Language): boolean {
+  if (language === 'astro') return true; // custom extractor (frontmatter delegation to TypeScript)
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'vue') return true; // custom extractor (script block delegation)
   if (language === 'liquid') return true; // custom regex extractor
@@ -284,7 +286,7 @@ export function isLanguageSupported(language: Language): boolean {
  * Check if a grammar has been loaded and is ready for parsing.
  */
 export function isGrammarLoaded(language: Language): boolean {
-  if (language === 'svelte' || language === 'vue' || language === 'liquid') return true;
+  if (language === 'astro' || language === 'svelte' || language === 'vue' || language === 'liquid') return true;
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
   if (language === 'xml' || language === 'properties') return true; // no WASM grammar needed
   return languageCache.has(language);
@@ -307,7 +309,7 @@ export function isFileLevelOnlyLanguage(language: Language): boolean {
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'astro', 'svelte', 'vue', 'liquid'];
 }
 
 /**
@@ -370,6 +372,7 @@ export function getLanguageDisplayName(language: Language): string {
     swift: 'Swift',
     kotlin: 'Kotlin',
     dart: 'Dart',
+    astro: 'Astro',
     svelte: 'Svelte',
     vue: 'Vue',
     liquid: 'Liquid',
