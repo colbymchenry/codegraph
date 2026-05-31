@@ -441,7 +441,7 @@ export const tools: ToolDefinition[] = [
       properties: {
         task: {
           type: 'string',
-          description: 'Description of the task, bug, or feature to build context for',
+          description: 'Short keywords or symbol paths to search for (e.g. "AuthService/login" or "payment webhook handler"). Use concise terms — the search is FTS5-based, so verbose sentences dilute results with noise words.',
         },
         maxNodes: {
           type: 'number',
