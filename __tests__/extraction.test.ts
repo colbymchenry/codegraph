@@ -1748,6 +1748,38 @@ void publicFunction() {}
   });
 });
 
+describe('C/C++ Extraction', () => {
+  // Regression for #515: an export/visibility macro before the return type
+  // (e.g. AX_VIN_GLB_API in the Axera SDK) makes tree-sitter-c misparse the
+  // function, absorbing its name as the `type` field and indexing it under the
+  // garbage name `(params)`. We recover the real name from the `type` field.
+  it('recovers a function name decorated with a leading export macro (C)', () => {
+    const code = `typedef int AX_S32;\nAX_VIN_GLB_API AX_S32 AX_VIN_Init(AX_VOID) {\n  return 0;\n}`;
+    const result = extractFromSource('vin.c', code);
+    const functionNames = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(functionNames).toContain('AX_VIN_Init');
+    // Before the fix the function was indexed under its parameter list.
+    expect(functionNames).not.toContain('(AX_VOID)');
+  });
+
+  it('does not affect plain function definitions without a macro', () => {
+    const code = `int compute(int a) {\n  return a;\n}`;
+    const result = extractFromSource('calc.c', code);
+    const functionNames = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(functionNames).toContain('compute');
+  });
+
+  it('does not hijack a redundant-parens declarator (no misfire)', () => {
+    // `int (foo)(void)` keeps a function_declarator, so the recovery must not
+    // fire and must not pull the name from the `int` return type.
+    const code = `int (foo)(void) {\n  return 0;\n}`;
+    const result = extractFromSource('redundant.c', code);
+    const functionNames = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(functionNames.some((n) => n.includes('foo'))).toBe(true);
+    expect(functionNames).not.toContain('int');
+  });
+});
+
 describe('Import Extraction', () => {
   describe('TypeScript/JavaScript imports', () => {
     it('should extract default imports', () => {

@@ -2,6 +2,35 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+// A leading export/visibility macro followed by a typedef'd return type — e.g.
+// `AX_VIN_GLB_API AX_S32 AX_VIN_Init(AX_VOID) { ... }`, common in C SDKs that
+// gate symbols behind `__attribute__((visibility))` / `__declspec(dllexport)`
+// macros — confuses tree-sitter-c because both the macro and the return type
+// are unknown identifiers in type position. The grammar peels `MACRO RET` off as
+// a separate (broken) `declaration` and parses the real function with its NAME
+// absorbed as the `type` field and the parameter list wrapped in a bare
+// `parenthesized_declarator` instead of a `function_declarator`. Without
+// recovery the function is indexed under the garbage name `(params)` and the
+// real symbol can't be found. Detect that exact shape and recover the true name
+// from the `type` field.
+//
+// Deliberately narrow: well-formed code (`int (foo)(void)`, function-pointer
+// returns) keeps a `function_declarator` as the declarator, so this never fires
+// on valid declarations. Macro + *primitive* or *pointer* return types
+// (`AX_API int F(...)`, `AX_API char* F(...)`) and the C++ grammar already parse
+// to a `function_declarator` and extract correctly via the normal path, so they
+// don't reach here.
+function recoverMacroDecoratedFunctionName(node: SyntaxNode, source: string): string | undefined {
+  if (node.type !== 'function_definition') return undefined;
+  const declarator = getChildByField(node, 'declarator');
+  if (!declarator || declarator.type !== 'parenthesized_declarator') return undefined;
+  const typeField = getChildByField(node, 'type');
+  if (typeField?.type === 'type_identifier') {
+    return getNodeText(typeField, source).trim();
+  }
+  return undefined;
+}
+
 /**
  * Find the function NAME's `qualified_identifier` (`Foo::bar`) inside a
  * declarator, skipping the `parameter_list` — a parameter with a qualified type
@@ -111,6 +140,7 @@ export const cExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   getReturnType: extractCppReturnType,
+  resolveName: recoverMacroDecoratedFunctionName,
   resolveTypeAliasKind: (node, _source) => {
     // C typedef: `typedef enum { ... } name;` or `typedef struct { ... } name;`
     // The inner enum_specifier/struct_specifier is anonymous, but we want the typedef name
