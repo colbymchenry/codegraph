@@ -1160,6 +1160,13 @@ export function resolveViaImport(
     // any side-effect `import pkg.mod`). Map the dotted path to its file.
     const pyModResult = resolvePythonAbsoluteModule(ref, context);
     if (pyModResult) return pyModResult;
+    // Python module-attribute calls: `mod.helper(...)` where `mod` is a
+    // submodule bound via `from pkg import mod` or `import pkg.mod as mod`.
+    // The generic chain below maps the receiver to the *package*, not the
+    // submodule file, so the member lookup misses and the edge is dropped
+    // (issue #578 — same root-cause class as Go #388).
+    const pyAttrResult = resolvePythonModuleAttributeReference(ref, imports, context);
+    if (pyAttrResult) return pyAttrResult;
   }
 
   // Rust qualified path: resolve the module prefix of `crate::m::Item` /
@@ -1706,6 +1713,72 @@ function resolveGoCrossPackageReference(
           resolvedBy: 'import',
         };
       }
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve a Python module-attribute call: `mod.helper(...)` where the
+ * receiver `mod` is a submodule bound by `from pkg import mod` or
+ * `import pkg.mod as mod`. The member (`helper`) lives in the submodule
+ * file (`pkg/mod.py`), not in the package the generic chain resolves the
+ * import source to — so without this the `calls` edge is silently dropped
+ * (issue #578). Mirrors the Go cross-package resolver (#388): map the
+ * receiver to a module path, then find the member by name filtered to the
+ * file at that path.
+ */
+function resolvePythonModuleAttributeReference(
+  ref: UnresolvedRef,
+  imports: ImportMapping[],
+  context: ResolutionContext
+): ResolvedRef | null {
+  // Qualified call only: receiver before `.`, member after. A bare
+  // reference (no dot) is an in-file/bare-import call handled elsewhere.
+  const dotIdx = ref.referenceName.indexOf('.');
+  if (dotIdx <= 0) return null;
+  const receiver = ref.referenceName.substring(0, dotIdx);
+  const memberName = ref.referenceName.substring(dotIdx + 1);
+  // Only single-level member access (`mod.helper`). Deeper chains like
+  // `mod.sub.helper` would need package-walk logic; bail rather than risk
+  // a wrong edge.
+  if (!memberName || memberName.includes('.')) return null;
+
+  for (const imp of imports) {
+    // Keyed on the import binding only. If a local variable / parameter
+    // shadows the import name (`from pkg import mod; mod = X(); mod.f()`)
+    // this can't tell the shadow from the module and may over-attribute —
+    // same assumption the Go/Java resolvers make; rare in practice.
+    if (imp.localName !== receiver) continue;
+
+    // The dotted module path the receiver refers to:
+    //   `import pkg.mod as m`  → namespace import, source IS the module
+    //   `from pkg import mod`  → the submodule is `<source>.<exportedName>`
+    const moduleDotted = imp.isNamespace
+      ? imp.source
+      : `${imp.source}.${imp.exportedName}`;
+    const stem = moduleDotted.replace(/\./g, '/');
+
+    // Match the member declared in the file the import resolves to. The
+    // root-relative file-path stem (drop the `.py` suffix and a trailing
+    // `/__init__` so `pkg/mod.py` and `pkg/mod/__init__.py` both compare
+    // as `pkg/mod`) must equal the import's dotted path. The exact match
+    // is the disambiguation signal: a same-named member in a different
+    // module won't share the stem, so it can't be picked by mistake.
+    //
+    // No `isExported` filter: Python has no export keyword — every
+    // module-level def is importable (Go gates on capitalization, Python
+    // doesn't), and `isExported` is false for Python function nodes.
+    const match = context.getNodesByName(memberName).find((n) => {
+      if (n.language !== 'python') return false;
+      const fileStem = n.filePath
+        .replace(/\\/g, '/')
+        .replace(/\.py$/, '')
+        .replace(/\/__init__$/, '');
+      return fileStem === stem;
+    });
+    if (match) {
+      return { original: ref, targetNodeId: match.id, confidence: 0.9, resolvedBy: 'import' };
     }
   }
   return null;

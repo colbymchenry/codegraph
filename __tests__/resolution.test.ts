@@ -853,6 +853,114 @@ func UseAliased() {
       expect(target?.filePath.replace(/\\/g, '/')).toBe('pkgb/lib.go');
     });
 
+    it('resolves Python module-attribute calls (`mod.helper()` after `from pkg import mod`) (#578)', async () => {
+      // Pre-#578, a call through a module object — `mod.helper(...)` where
+      // `mod` was bound via `from pkg import mod` — produced no `calls`
+      // edge: the resolver mapped `mod` to the package, not the submodule
+      // file, so the member lookup missed. Same root-cause class as Go #388.
+      const pkgDir = path.join(tempDir, 'pkg');
+      fs.mkdirSync(pkgDir, { recursive: true });
+      fs.writeFileSync(path.join(pkgDir, '__init__.py'), '');
+      fs.writeFileSync(path.join(pkgDir, 'mod.py'), 'def helper(x):\n    return x\n');
+      fs.writeFileSync(
+        path.join(tempDir, 'caller.py'),
+        'from pkg import mod\n\n\ndef use_helper():\n    return mod.helper(1)\n'
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const useHelper = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'use_helper');
+      expect(useHelper).toBeDefined();
+
+      const calls = cg
+        .getOutgoingEdges(useHelper!.id)
+        .filter((e) => e.kind === 'calls');
+      expect(calls).toHaveLength(1);
+      const target = cg.getNode(calls[0]!.target);
+      expect(target?.name).toBe('helper');
+      expect(target?.filePath.replace(/\\/g, '/')).toBe('pkg/mod.py');
+    });
+
+    it('resolves Python aliased module-attribute calls (`import pkg.mod as m`) (#578)', async () => {
+      const pkgDir = path.join(tempDir, 'pkg');
+      fs.mkdirSync(pkgDir, { recursive: true });
+      fs.writeFileSync(path.join(pkgDir, '__init__.py'), '');
+      fs.writeFileSync(path.join(pkgDir, 'mod.py'), 'def helper(x):\n    return x\n');
+      fs.writeFileSync(
+        path.join(tempDir, 'caller.py'),
+        'import pkg.mod as m\n\n\ndef use_helper():\n    return m.helper(2)\n'
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const useHelper = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'use_helper');
+      expect(useHelper).toBeDefined();
+
+      const calls = cg
+        .getOutgoingEdges(useHelper!.id)
+        .filter((e) => e.kind === 'calls');
+      expect(calls).toHaveLength(1);
+      const target = cg.getNode(calls[0]!.target);
+      expect(target?.name).toBe('helper');
+      expect(target?.filePath.replace(/\\/g, '/')).toBe('pkg/mod.py');
+    });
+
+    it('Python bare-name import `from pkg.mod import helper` still resolves (no #578 regression)', async () => {
+      // Baseline the #578 fix must not regress: the bare-name call shape
+      // already created an edge before the module-attribute branch existed.
+      const pkgDir = path.join(tempDir, 'pkg');
+      fs.mkdirSync(pkgDir, { recursive: true });
+      fs.writeFileSync(path.join(pkgDir, '__init__.py'), '');
+      fs.writeFileSync(path.join(pkgDir, 'mod.py'), 'def helper(x):\n    return x\n');
+      fs.writeFileSync(
+        path.join(tempDir, 'caller.py'),
+        'from pkg.mod import helper\n\n\ndef use_helper():\n    return helper(1)\n'
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const useHelper = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'use_helper');
+      const callTargets = cg
+        .getOutgoingEdges(useHelper!.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.target)?.name);
+      expect(callTargets).toContain('helper');
+    });
+
+    it('Python module-attribute call disambiguates same-named members across modules (#578)', async () => {
+      // Two modules export a same-named `helper`; the call through `a.mod`
+      // must land on a/mod.py's helper, not b/mod.py's — the exact module
+      // path is the disambiguation signal (no wrong edge).
+      for (const p of ['a', 'b']) {
+        const d = path.join(tempDir, p);
+        fs.mkdirSync(d, { recursive: true });
+        fs.writeFileSync(path.join(d, '__init__.py'), '');
+        fs.writeFileSync(path.join(d, 'mod.py'), `def helper(x):\n    return ${p === 'a' ? 'x' : 'x + 1'}\n`);
+      }
+      fs.writeFileSync(
+        path.join(tempDir, 'caller.py'),
+        'from a import mod\n\n\ndef use_helper():\n    return mod.helper(1)\n'
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const useHelper = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'use_helper');
+      const calls = cg
+        .getOutgoingEdges(useHelper!.id)
+        .filter((e) => e.kind === 'calls');
+      // Exactly one edge, to a/mod.py — not b/mod.py, and not both.
+      expect(calls).toHaveLength(1);
+      expect(cg.getNode(calls[0]!.target)?.filePath.replace(/\\/g, '/')).toBe('a/mod.py');
+    });
+
     it('TS type_alias object-shape members resolve method calls (#359)', async () => {
       // Pre-#359, `recorder.stop()` (recorder: RecorderHandle) attached
       // to `StdioMcpClient.stop` in a sibling directory via path-proximity
