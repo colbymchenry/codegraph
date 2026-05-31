@@ -494,6 +494,71 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(paths.some((p) => p.endsWith('/.kiro/steering/codegraph.md'))).toBe(false);
   });
 
+  it('copilot: local install writes ./.mcp.json with "mcpServers" key', () => {
+    const copilot = getTarget('copilot')!;
+    const result = copilot.install('local', { autoAllow: true });
+    const mcpPath = path.join(tmpCwd, '.mcp.json');
+    expect(result.files.some((f) => f.path === mcpPath)).toBe(true);
+    expect(fs.existsSync(mcpPath)).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(mcpPath, 'utf-8'));
+    // Copilot CLI uses "mcpServers" (same as Claude/Cursor).
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+    expect(cfg.mcpServers.codegraph.type).toBe('stdio');
+    expect(cfg.mcpServers.codegraph.command).toBeDefined();
+    expect(cfg.mcpServers.codegraph.args).toEqual(['serve', '--mcp']);
+  });
+
+  it('copilot: global install writes to ~/.copilot/mcp-config.json', () => {
+    const copilot = getTarget('copilot')!;
+    const result = copilot.install('global', { autoAllow: true });
+    const mcpPath = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    expect(result.files.some((f) => f.path === mcpPath)).toBe(true);
+    expect(fs.existsSync(mcpPath)).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(mcpPath, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+    expect(cfg.mcpServers.codegraph.type).toBe('stdio');
+  });
+
+  it('copilot: install preserves a pre-existing sibling MCP server in .mcp.json', () => {
+    const copilot = getTarget('copilot')!;
+    const mcpPath = path.join(tmpCwd, '.mcp.json');
+    fs.mkdirSync(path.dirname(mcpPath), { recursive: true });
+    fs.writeFileSync(mcpPath, JSON.stringify({
+      mcpServers: { other: { type: 'stdio', command: 'uvx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+
+    copilot.install('local', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(mcpPath, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('copilot: uninstall strips codegraph but leaves sibling MCP servers intact', () => {
+    const copilot = getTarget('copilot')!;
+    const mcpPath = path.join(tmpCwd, '.mcp.json');
+    fs.mkdirSync(path.dirname(mcpPath), { recursive: true });
+    fs.writeFileSync(mcpPath, JSON.stringify({
+      mcpServers: { other: { type: 'stdio', command: 'uvx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+
+    copilot.install('local', { autoAllow: true });
+    copilot.uninstall('local');
+
+    const after = JSON.parse(fs.readFileSync(mcpPath, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+  });
+
+  it('copilot: printConfig returns mcpServers format', () => {
+    const copilot = getTarget('copilot')!;
+    const output = copilot.printConfig('local');
+    expect(output).toContain('"mcpServers"');
+    expect(output).toContain('codegraph');
+  });
+
   it('antigravity: install writes to LEGACY ~/.gemini/antigravity/mcp_config.json when no migration marker', () => {
     const antigravity = getTarget('antigravity')!;
     antigravity.install('global', { autoAllow: true });
@@ -1098,6 +1163,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('gemini')?.id).toBe('gemini');
     expect(getTarget('antigravity')?.id).toBe('antigravity');
     expect(getTarget('kiro')?.id).toBe('kiro');
+    expect(getTarget('copilot')?.id).toBe('copilot');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
