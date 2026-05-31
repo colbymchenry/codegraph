@@ -38,7 +38,42 @@ export function getCodeGraphPermissions(): string[] {
     'mcp__codegraph__codegraph_impact',
     'mcp__codegraph__codegraph_node',
     'mcp__codegraph__codegraph_status',
+    'mcp__codegraph__codegraph_files',
   ];
+}
+
+/**
+ * Best-effort backup for an existing user config before we overwrite it.
+ * Keeps the historical `<path>.backup` name for the first backup, then uses
+ * numbered siblings so later writes never destroy an earlier restore point.
+ */
+export function backupFileSync(filePath: string): string | null {
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  let backupPath = filePath + '.backup';
+  try {
+    if (
+      fs.existsSync(backupPath) &&
+      fs.readFileSync(backupPath).equals(fs.readFileSync(filePath))
+    ) {
+      return backupPath;
+    }
+  } catch {
+    // If comparison fails, still try to create a numbered backup below.
+  }
+
+  for (let i = 1; fs.existsSync(backupPath); i++) {
+    backupPath = `${filePath}.backup.${i}`;
+  }
+
+  try {
+    fs.copyFileSync(filePath, backupPath);
+    return backupPath;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -58,9 +93,7 @@ export function readJsonFile(filePath: string): Record<string, any> {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`  Warning: Could not parse ${path.basename(filePath)}: ${msg}`);
     console.warn(`  A backup will be created before overwriting.`);
-    try {
-      fs.copyFileSync(filePath, filePath + '.backup');
-    } catch { /* ignore backup failure */ }
+    backupFileSync(filePath);
     return {};
   }
 }
@@ -78,6 +111,7 @@ export function atomicWriteFileSync(filePath: string, content: string): void {
   }
   const tmpPath = filePath + '.tmp.' + process.pid;
   try {
+    backupFileSync(filePath);
     fs.writeFileSync(tmpPath, content);
     fs.renameSync(tmpPath, filePath);
   } catch (err) {

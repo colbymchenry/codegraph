@@ -373,6 +373,7 @@ describe('Source file detection (isSourceFile)', () => {
     expect(isSourceFile('src/index.ts')).toBe(true);
     expect(isSourceFile('src/deep/nested/file.ts')).toBe(true);
     expect(isSourceFile('src/component.tsx')).toBe(true);
+    expect(isSourceFile('entry/src/main/ets/pages/Index.ets')).toBe(true);
     expect(isSourceFile('lib/util.js')).toBe(true);
     expect(isSourceFile('src/main.py')).toBe(true);
   });

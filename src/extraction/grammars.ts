@@ -45,6 +45,11 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
  */
 export const EXTENSION_MAP: Record<string, Language> = {
   '.ts': 'typescript',
+  // ArkTS (`.ets`) is a TypeScript superset used by HarmonyOS/OpenHarmony.
+  // The TypeScript grammar handles its common syntax well enough for first-pass
+  // indexing, and keeps extension selection aligned with custom .ets=typescript
+  // workarounds users were already applying.
+  '.ets': 'typescript',
   '.tsx': 'tsx',
   '.js': 'javascript',
   '.mjs': 'javascript',
