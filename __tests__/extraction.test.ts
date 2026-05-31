@@ -350,6 +350,51 @@ export const fetchData = async () => {
       isExported: true,
     });
   });
+
+  it('should traverse anonymous AMD and CommonJS callback bodies without anonymous nodes', () => {
+    const code = `
+define(['dep'], function(dep) {
+  function amdHandler() {
+    return dep.load();
+  }
+
+  const amdCallback = () => dep.ready();
+  register(amdHandler);
+});
+
+require(['legacy'], function(legacy) {
+  function commonHandler() {
+    return normalize(legacy.read());
+  }
+
+  var commonCallback = function() {
+    return legacy.ready();
+  };
+  boot(commonHandler);
+});
+`;
+    const result = extractFromSource('legacy-module.js', code);
+
+    const functionNames = result.nodes
+      .filter((n) => n.kind === 'function')
+      .map((n) => n.name);
+    expect(functionNames).toContain('amdHandler');
+    expect(functionNames).toContain('amdCallback');
+    expect(functionNames).toContain('commonHandler');
+    expect(functionNames).toContain('commonCallback');
+    expect(functionNames).not.toContain('<anonymous>');
+
+    const callNames = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(callNames).toContain('register');
+    expect(callNames).toContain('boot');
+    expect(callNames).toContain('dep.load');
+    expect(callNames).toContain('dep.ready');
+    expect(callNames).toContain('normalize');
+    expect(callNames).toContain('legacy.read');
+    expect(callNames).toContain('legacy.ready');
+  });
 });
 
 describe('Type Alias Extraction', () => {
