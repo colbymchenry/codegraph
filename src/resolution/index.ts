@@ -256,8 +256,71 @@ export class ReferenceResolver {
         });
       }
     }
+    updated += this.linkGoReceiverMethodOwners();
     if (updated > 0) this.clearCaches();
     return updated;
+  }
+
+  private linkGoReceiverMethodOwners(): number {
+    const methods = this.queries.getNodesByKind('method')
+      .filter((node) => node.language === 'go' && node.qualifiedName.includes('::'));
+    if (methods.length === 0) return 0;
+
+    const ownersByName = new Map<string, Node[]>();
+    for (const kind of ['struct', 'class', 'enum', 'trait'] as const) {
+      for (const owner of this.queries.getNodesByKind(kind)) {
+        if (owner.language !== 'go') continue;
+        const existing = ownersByName.get(owner.name) ?? [];
+        existing.push(owner);
+        ownersByName.set(owner.name, existing);
+      }
+    }
+
+    const packageNameCache = new Map<string, string | null>();
+    const packageName = (filePath: string): string | null => {
+      if (packageNameCache.has(filePath)) return packageNameCache.get(filePath)!;
+      const source = this.context.readFile(filePath);
+      const match = source?.match(/^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)/m);
+      const name = match?.[1] ?? null;
+      packageNameCache.set(filePath, name);
+      return name;
+    };
+
+    const edges: Edge[] = [];
+    for (const method of methods) {
+      const receiverType = method.qualifiedName.split('::', 1)[0];
+      if (!receiverType) continue;
+
+      const alreadyOwned = this.queries.getIncomingEdges(method.id, ['contains'])
+        .some((edge) => {
+          const source = this.queries.getNodeById(edge.source);
+          return source && source.language === 'go' && source.name === receiverType;
+        });
+      if (alreadyOwned) continue;
+
+      const methodDir = path.dirname(method.filePath);
+      const methodPackage = packageName(method.filePath);
+      if (!methodPackage) continue;
+
+      const owner = (ownersByName.get(receiverType) ?? []).find((candidate) =>
+        path.dirname(candidate.filePath) === methodDir &&
+        packageName(candidate.filePath) === methodPackage
+      );
+      if (!owner) continue;
+
+      edges.push({
+        source: owner.id,
+        target: method.id,
+        kind: 'contains',
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'go-receiver-owner' },
+      });
+    }
+
+    if (edges.length > 0) {
+      this.queries.insertEdges(edges);
+    }
+    return edges.length;
   }
 
   /**

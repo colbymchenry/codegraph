@@ -657,6 +657,34 @@ func (s *Service) GetUser(id string) (*User, error) {
     expect(methodNode).toBeDefined();
     expect(methodNode?.name).toBe('GetUser');
   });
+
+  it('should attach generic receiver methods to their Go type', () => {
+    const code = `
+package main
+
+type Stack[T any] struct {
+    items []T
+}
+
+func (s *Stack[T]) Push(v T) {
+    s.items = append(s.items, v)
+}
+`;
+    const result = extractFromSource('stack.go', code);
+
+    const stack = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Stack');
+    const push = result.nodes.find((n) => n.kind === 'method' && n.name === 'Push');
+    expect(stack).toBeDefined();
+    expect(push).toBeDefined();
+    expect(push?.qualifiedName).toContain('Stack::Push');
+    expect(result.edges).toContainEqual(
+      expect.objectContaining({
+        source: stack!.id,
+        target: push!.id,
+        kind: 'contains',
+      })
+    );
+  });
 });
 
 describe('Rust Extraction', () => {
