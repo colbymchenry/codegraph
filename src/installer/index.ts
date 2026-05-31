@@ -257,35 +257,79 @@ export interface UninstallReport {
  *
  * Each target's `uninstall()` is already safe to call when nothing was
  * installed (it returns `not-found` actions), so this is safe to run
- * across every target unconditionally.
+ * across every target unconditionally.  We still gate on `detect()`
+ * for targets that share a config file (e.g. `.mcp.json` is used by
+ * both Claude Code and Copilot CLI for local installs) — without the
+ * gate, one agent's uninstall would strip the other agent's entry
+ * from the shared file.
+ *
+ * When a shared config file has its codegraph entry removed, other
+ * targets that also write to that same file are marked "removed" as
+ * well — because the entry they rely on no longer exists.  A note
+ * explains the cascade so the user understands what happened.
  */
 export function uninstallTargets(
   targets: readonly AgentTarget[],
   location: Location,
 ): UninstallReport[] {
-  return targets.map((target) => {
+  // Track config paths that had their codegraph entry removed.
+  // When multiple targets share a file (e.g. .mcp.json), removing
+  // the entry for one target removes it for all of them.
+  const removedConfigPaths = new Set<string>();
+  const reports: UninstallReport[] = [];
+
+  for (const target of targets) {
     if (!target.supportsLocation(location)) {
       const only: Location = location === 'local' ? 'global' : 'local';
-      return {
+      reports.push({
         id: target.id,
         displayName: target.displayName,
         status: 'unsupported' as const,
         removedPaths: [],
         notes: [`no ${location} config — this agent is ${only}-only`],
-      };
+      });
+      continue;
     }
+    if (!target.detect(location).installed) {
+      reports.push({
+        id: target.id,
+        displayName: target.displayName,
+        status: 'not-configured' as const,
+        removedPaths: [],
+        notes: [],
+      });
+      continue;
+    }
+
+    // Check if a prior target already removed the entry from this
+    // target's config file (shared-file cascade).
+    const cfgPath = target.detect(location).configPath;
+    if (cfgPath && removedConfigPaths.has(cfgPath)) {
+      reports.push({
+        id: target.id,
+        displayName: target.displayName,
+        status: 'removed' as const,
+        removedPaths: [cfgPath],
+        notes: [`shared config file (${cfgPath}) — entry was already removed by a previous uninstall`],
+      });
+      continue;
+    }
+
     const result = target.uninstall(location);
     const removedPaths = result.files
       .filter((f) => f.action === 'removed')
       .map((f) => f.path);
-    return {
+    for (const p of removedPaths) removedConfigPaths.add(p);
+    reports.push({
       id: target.id,
       displayName: target.displayName,
       status: removedPaths.length > 0 ? ('removed' as const) : ('not-configured' as const),
       removedPaths,
       notes: result.notes ?? [],
-    };
-  });
+    });
+  }
+
+  return reports;
 }
 
 /**
@@ -317,7 +361,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot' },
         { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc, ./.gemini, ./.kiro' },
       ],
       initialValue: 'global' as const,
@@ -353,10 +397,37 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
       for (const p of r.removedPaths) {
         clack.log.success(`${r.displayName}: removed ${tildify(p)}`);
       }
+      if (r.notes.length > 0) {
+        for (const n of r.notes) {
+          clack.log.warn(`${r.displayName}: ${n}`);
+        }
+      }
     } else if (r.status === 'not-configured') {
       clack.log.info(`${r.displayName}: not configured — nothing to remove`);
     } else {
       clack.log.info(`${r.displayName}: skipped — ${r.notes[0] ?? 'unsupported location'}`);
+    }
+  }
+
+  // Step 3b: warn about shared-config cascade.  When multiple targets
+  // write to the same file (e.g. .mcp.json is shared by Claude Code,
+  // Cursor, and Copilot CLI for local installs), removing the
+  // codegraph entry for one target also removes it for the others.
+  const removedPaths = new Set(removed.flatMap((r) => r.removedPaths));
+  if (removedPaths.size > 0) {
+    const affected = ALL_TARGETS.filter((t) => {
+      if (reports.some((r) => r.id === t.id && r.status === 'removed')) return false;
+      if (!t.supportsLocation(location)) return false;
+      const det = t.detect(location);
+      return det.installed && det.configPath && removedPaths.has(det.configPath);
+    });
+    if (affected.length > 0) {
+      const names = affected.map((t) => t.displayName).join(', ');
+      const files = [...removedPaths].map((p) => tildify(p)).join(', ');
+      clack.log.warn(
+        `Shared config: ${files} is also used by ${names}. ` +
+        `The codegraph entry was removed from that file — those agents will need re-installing.`,
+      );
     }
   }
 

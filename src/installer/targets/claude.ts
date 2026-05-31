@@ -86,9 +86,15 @@ class ClaudeCodeTarget implements AgentTarget {
     // For "installed" we infer from the existence of either the dir
     // (global) or the project marker file (local). Cheap and avoids
     // shelling out to `claude --version`.
+    // For local: .mcp.json is shared infrastructure (Copilot CLI
+    // also writes to it), so we CANNOT use it as a Claude-specific
+    // detection signal.  Only .claude/ is Claude's own marker.
+    // Copilot has no equivalent local dir, so it keeps .mcp.json
+    // as its detection signal.  The shared-config cascade in
+    // uninstallTargets handles the conflict when both are installed.
     const installed = loc === 'global'
       ? fs.existsSync(configDir(loc)) || fs.existsSync(mcpPath)
-      : fs.existsSync(mcpPath) || fs.existsSync(configDir(loc));
+      : fs.existsSync(configDir(loc));
     return { installed, alreadyConfigured, configPath: mcpPath };
   }
 
