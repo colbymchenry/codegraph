@@ -3382,6 +3382,44 @@ describe('Directory Exclusion', () => {
     expect(files.every((f) => !f.includes('.git'))).toBe(true);
   });
 
+  it('should index git-visible files under non-ASCII directories (issue #541)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (...args: string[]) =>
+      execFileSync('git', args, { cwd: tempDir, stdio: 'pipe' });
+
+    git('init', '-q');
+    fs.mkdirSync(path.join(tempDir, 'src', 'english'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'src', '中文目录'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'src', 'english', 'Foo.cs'),
+      'namespace Demo;\npublic class Foo { public void Bar() {} }\n',
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'src', '中文目录', 'Baz.cs'),
+      'namespace Demo;\npublic class Baz { public void Qux() {} }\n',
+    );
+    git('add', '-A');
+
+    const scanned = scanDirectory(tempDir).sort();
+    expect(scanned).toEqual(['src/english/Foo.cs', 'src/中文目录/Baz.cs']);
+
+    const cg = CodeGraph.initSync(tempDir);
+    try {
+      const result = await cg.indexAll();
+      expect(result.filesIndexed).toBe(2);
+      expect(cg.getFiles().map((f) => f.path).sort()).toEqual(scanned);
+
+      fs.writeFileSync(
+        path.join(tempDir, 'src', '中文目录', 'Baz.cs'),
+        'namespace Demo;\npublic class Baz { public void Qux() {} public void Zap() {} }\n',
+      );
+      const changed = cg.getChangedFiles();
+      expect([...changed.added, ...changed.modified]).toContain('src/中文目录/Baz.cs');
+    } finally {
+      cg.close();
+    }
+  });
+
   it('should return forward-slash paths on all platforms', () => {
     const srcDir = path.join(tempDir, 'src', 'components');
     fs.mkdirSync(srcDir, { recursive: true });

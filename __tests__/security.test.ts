@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath } from '../src/utils';
+import { FileLock, validatePathWithinRoot, validateProjectPath } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -173,6 +173,72 @@ describe('Path Traversal Prevention', () => {
   it('should return null for non-existent node', async () => {
     const code = await cg.getCode('does-not-exist');
     expect(code).toBeNull();
+  });
+
+  it('should reject symlinked files that resolve outside the project root', () => {
+    const outsideDir = createTempDir();
+    try {
+      const outsideFile = path.join(outsideDir, 'secret.ts');
+      fs.writeFileSync(outsideFile, 'export const secret = "outside";\n');
+
+      const linkPath = path.join(testDir, 'src', 'secret.ts');
+      try {
+        fs.symlinkSync(outsideFile, linkPath, 'file');
+      } catch {
+        return;
+      }
+
+      expect(validatePathWithinRoot(testDir, 'src/secret.ts')).toBeNull();
+    } finally {
+      cleanupTempDir(outsideDir);
+    }
+  });
+
+  it('should reject paths beneath symlinked directories outside the project root', () => {
+    const outsideDir = createTempDir();
+    try {
+      const linkPath = path.join(testDir, 'src', 'external');
+      try {
+        fs.symlinkSync(outsideDir, linkPath, 'dir');
+      } catch {
+        return;
+      }
+
+      expect(validatePathWithinRoot(testDir, 'src/external/new-file.ts')).toBeNull();
+    } finally {
+      cleanupTempDir(outsideDir);
+    }
+  });
+
+  it('should allow symlinked files that resolve inside the project root', () => {
+    const linkPath = path.join(testDir, 'src', 'hello-link.ts');
+    try {
+      fs.symlinkSync(path.join(testDir, 'src', 'hello.ts'), linkPath, 'file');
+    } catch {
+      return;
+    }
+
+    expect(validatePathWithinRoot(testDir, 'src/hello-link.ts')).toBe(linkPath);
+  });
+
+  it('should not index symlinked files that resolve outside the project root', async () => {
+    const outsideDir = createTempDir();
+    try {
+      const outsideFile = path.join(outsideDir, 'secret.ts');
+      fs.writeFileSync(outsideFile, 'export const secret = "outside";\n');
+
+      try {
+        fs.symlinkSync(outsideFile, path.join(testDir, 'src', 'secret.ts'), 'file');
+      } catch {
+        return;
+      }
+
+      const result = await cg.indexAll();
+      expect(result.success).toBe(true);
+      expect(cg.getFiles().map((file) => file.path)).not.toContain('src/secret.ts');
+    } finally {
+      cleanupTempDir(outsideDir);
+    }
   });
 });
 
@@ -549,6 +615,28 @@ describe('Symlink Cycle Detection', () => {
     // Should not throw
     const files = scanDirectory(tempDir);
     expect(files).toContain('src/valid.ts');
+  });
+
+  it('should skip symlinks that resolve outside the root', () => {
+    const srcDir = path.join(tempDir, 'src');
+    fs.mkdirSync(srcDir);
+    fs.writeFileSync(path.join(srcDir, 'valid.ts'), 'export const valid = true;\n');
+
+    const outsideDir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(outsideDir, 'secret.ts'), 'export const secret = true;\n');
+      try {
+        fs.symlinkSync(outsideDir, path.join(srcDir, 'external'), 'dir');
+      } catch {
+        return;
+      }
+
+      const files = scanDirectory(tempDir);
+      expect(files).toContain('src/valid.ts');
+      expect(files).not.toContain('src/external/secret.ts');
+    } finally {
+      cleanupTempDir(outsideDir);
+    }
   });
 });
 

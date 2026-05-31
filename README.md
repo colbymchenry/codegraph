@@ -544,6 +544,80 @@ add a negation — `!vendor/`. The defaults apply uniformly, so committing a
 dependency or build directory doesn't force it into the graph; the `.gitignore`
 negation is the explicit opt-in.
 
+## Contributing
+
+Set up a local checkout from your fork:
+
+```bash
+git clone git@github.com:<your-user>/codegraph.git
+cd codegraph
+git remote add upstream https://github.com/colbymchenry/codegraph.git
+npm install
+npm run build
+```
+
+To point the global `codegraph` command at your local build while developing:
+
+```bash
+npm link
+codegraph --version
+```
+
+To switch back to the published package:
+
+```bash
+npm unlink -g @colbymchenry/codegraph
+npm i -g @colbymchenry/codegraph@latest
+```
+
+You can also run the local build without changing the global command:
+
+```bash
+npm run cli -- status
+```
+
+Useful development commands:
+
+```bash
+npm run dev          # TypeScript watch build
+npm test             # full test suite
+npm test -- <file>   # focused test file
+npm run test:watch   # Vitest watch mode
+```
+
+### macOS Source Builds and FTS5
+
+The self-contained release and npm package use CodeGraph's bundled runtime, so
+end users do not need to manage SQLite or FTS5. Contributors running directly
+from source use their local Node runtime instead. On macOS, some official Node
+22.x and 23.x builds include `node:sqlite` without FTS5 enabled, which makes
+indexing fail with `no such module: fts5`.
+
+Use Node 24.x for local development on macOS if you see that error:
+
+```bash
+nvm install 24
+nvm use 24
+npm install
+npm run build
+```
+
+Quick FTS5 check before indexing:
+
+```bash
+node - <<'NODE'
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(':memory:');
+db.exec('CREATE VIRTUAL TABLE cg_fts_check USING fts5(value)');
+db.close();
+console.log('FTS5 available');
+NODE
+```
+
+PR hygiene: do not bump `package.json` versions unless you are preparing a
+release, and do not update `package-lock.json` unless your change modifies
+dependencies.
+
 ## Supported Platforms
 
 Every release ships a self-contained build (bundled Node runtime — nothing to
