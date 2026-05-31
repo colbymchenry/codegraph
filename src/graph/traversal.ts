@@ -492,7 +492,8 @@ export class GraphTraverser {
     currentDepth: number,
     nodes: Map<string, Node>,
     edges: Edge[],
-    visited: Set<string>
+    visited: Set<string>,
+    suppressContainerChildren: boolean = false
   ): void {
     if (currentDepth >= maxDepth || visited.has(nodeId)) {
       return;
@@ -500,9 +501,11 @@ export class GraphTraverser {
     visited.add(nodeId);
 
     // For container nodes (classes, interfaces, structs, etc.), also traverse
-    // into their children so that callers of contained methods appear in impact
+    // into their children so that callers of contained methods appear in impact.
+    // If the container was reached through a child -> parent contains edge,
+    // keep the parent but do not fan back out to unrelated sibling children.
     const focalNode = this.queries.getNodeById(nodeId);
-    if (focalNode) {
+    if (focalNode && !suppressContainerChildren) {
       const containerKinds = new Set(['class', 'interface', 'struct', 'trait', 'protocol', 'module', 'enum']);
       if (containerKinds.has(focalNode.kind)) {
         const containsEdges = this.queries.getOutgoingEdges(nodeId, ['contains']);
@@ -531,7 +534,15 @@ export class GraphTraverser {
       if (sourceNode && !nodes.has(sourceNode.id)) {
         nodes.set(sourceNode.id, sourceNode);
         edges.push(edge);
-        this.getImpactRecursive(sourceNode.id, maxDepth, currentDepth + 1, nodes, edges, visited);
+        this.getImpactRecursive(
+          sourceNode.id,
+          maxDepth,
+          currentDepth + 1,
+          nodes,
+          edges,
+          visited,
+          edge.kind === 'contains'
+        );
       }
     }
   }
