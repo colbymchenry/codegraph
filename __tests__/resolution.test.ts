@@ -913,6 +913,34 @@ func UseAliased() {
       expect(statusContainedMethodNames).toEqual(['String']);
     });
 
+    it('links Go receiver methods after indexing selected files (#583)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'go.mod'),
+        'module github.com/example/myproject\n\ngo 1.21\n'
+      );
+      fs.mkdirSync(path.join(tempDir, 'repro'));
+      fs.writeFileSync(
+        path.join(tempDir, 'repro', 'widget.go'),
+        'package repro\n\ntype Widget struct{ name string }\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'repro', 'widget_extra.go'),
+        'package repro\n\nfunc (w *Widget) Bar() string { return "bar:" + w.name }\n'
+      );
+
+      cg = CodeGraph.initSync(tempDir);
+      const result = await cg.indexFiles(['repro/widget.go', 'repro/widget_extra.go']);
+      expect(result.success).toBe(true);
+
+      const widget = cg.getNodesByKind('struct').find((n) => n.name === 'Widget' && n.filePath === 'repro/widget.go');
+      expect(widget).toBeDefined();
+      const containedMethodNames = cg.getOutgoingEdges(widget!.id)
+        .filter((edge) => edge.kind === 'contains')
+        .map((edge) => cg.getNode(edge.target)?.name)
+        .filter(Boolean);
+      expect(containedMethodNames).toEqual(['Bar']);
+    });
+
     it('TS type_alias object-shape members resolve method calls (#359)', async () => {
       // Pre-#359, `recorder.stop()` (recorder: RecorderHandle) attached
       // to `StdioMcpClient.stop` in a sibling directory via path-proximity
