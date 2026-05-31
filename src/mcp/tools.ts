@@ -402,8 +402,8 @@ const projectPathProperty: PropertySchema = {
 /**
  * All CodeGraph MCP tools
  *
- * Designed for minimal context usage - use codegraph_context as the primary tool,
- * and only use other tools for targeted follow-up queries.
+ * Designed for minimal context usage - use codegraph_context with short,
+ * concrete search terms, and only use other tools for targeted follow-up queries.
  *
  * All tools support cross-project queries via the optional `projectPath` parameter.
  */
@@ -435,13 +435,13 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_context',
-    description: 'PRIMARY TOOL — call FIRST for any "how does X work"/architecture/bug question. Returns entry points + related symbols + key code in one call; usually answers without further search/Read/Grep. Provides CODE context, not product requirements.',
+    description: 'Comprehensive code context for short, concrete keywords/symbols/path fragments. Pass terse search terms like "UserService login" or "bondIncome/workflow/callback", not a full natural-language task description.',
     inputSchema: {
       type: 'object',
       properties: {
         task: {
           type: 'string',
-          description: 'Description of the task, bug, or feature to build context for',
+          description: 'Short keyword query: symbol names, route/path fragments, API names, or 2-5 concrete terms. Do not pass a verbose natural-language task sentence.',
         },
         maxNodes: {
           type: 'number',

@@ -33,6 +33,7 @@ function cleanupTempDir(dir: string): void {
 describe('Language Detection', () => {
   it('should detect TypeScript files', () => {
     expect(detectLanguage('src/index.ts')).toBe('typescript');
+    expect(detectLanguage('entry/src/main/ets/pages/Index.ets')).toBe('typescript');
     expect(detectLanguage('components/Button.tsx')).toBe('tsx');
   });
 
