@@ -29,6 +29,7 @@ import {
   createDirectory,
   removeDirectory,
   validateDirectory,
+  getCodeGraphDir,
 } from './directory';
 import {
   ExtractionOrchestrator,
@@ -87,6 +88,12 @@ export interface InitOptions {
 
   /** Progress callback for indexing */
   onProgress?: (progress: IndexProgress) => void;
+
+  /**
+   * Custom directory for CodeGraph data (default: `<projectRoot>/.codegraph/`).
+   * Accepts an absolute path or a path relative to `projectRoot`.
+   */
+  dataDir?: string;
 }
 
 /**
@@ -98,6 +105,12 @@ export interface OpenOptions {
 
   /** Whether to run in read-only mode */
   readOnly?: boolean;
+
+  /**
+   * Custom directory for CodeGraph data (default: `<projectRoot>/.codegraph/`).
+   * Must match the `dataDir` used during `init`.
+   */
+  dataDir?: string;
 }
 
 /**
@@ -123,6 +136,7 @@ export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
   private projectRoot: string;
+  private dataDir: string | undefined;
   private orchestrator: ExtractionOrchestrator;
   private resolver: ReferenceResolver;
   private graphManager: GraphQueryManager;
@@ -141,13 +155,15 @@ export class CodeGraph {
   private constructor(
     db: DatabaseConnection,
     queries: QueryBuilder,
-    projectRoot: string
+    projectRoot: string,
+    dataDir?: string
   ) {
     this.db = db;
     this.queries = queries;
     this.projectRoot = projectRoot;
+    this.dataDir = dataDir;
     this.fileLock = new FileLock(
-      path.join(projectRoot, '.codegraph', 'codegraph.lock')
+      path.join(getCodeGraphDir(projectRoot, dataDir), 'codegraph.lock')
     );
     this.orchestrator = new ExtractionOrchestrator(projectRoot, queries);
     this.resolver = createResolver(projectRoot, queries);
@@ -176,21 +192,22 @@ export class CodeGraph {
   static async init(projectRoot: string, options: InitOptions = {}): Promise<CodeGraph> {
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
+    const { dataDir } = options;
 
     // Check if already initialized
-    if (isInitialized(resolvedRoot)) {
+    if (isInitialized(resolvedRoot, dataDir)) {
       throw new Error(`CodeGraph already initialized in ${resolvedRoot}`);
     }
 
     // Create directory structure
-    createDirectory(resolvedRoot);
+    createDirectory(resolvedRoot, dataDir);
 
     // Initialize database
-    const dbPath = getDatabasePath(resolvedRoot);
+    const dbPath = getDatabasePath(resolvedRoot, dataDir);
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    const instance = new CodeGraph(db, queries, resolvedRoot);
+    const instance = new CodeGraph(db, queries, resolvedRoot, dataDir);
 
     // Run initial indexing if requested
     if (options.index) {
@@ -203,23 +220,23 @@ export class CodeGraph {
   /**
    * Initialize synchronously (without indexing)
    */
-  static initSync(projectRoot: string): CodeGraph {
+  static initSync(projectRoot: string, dataDir?: string): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if already initialized
-    if (isInitialized(resolvedRoot)) {
+    if (isInitialized(resolvedRoot, dataDir)) {
       throw new Error(`CodeGraph already initialized in ${resolvedRoot}`);
     }
 
     // Create directory structure
-    createDirectory(resolvedRoot);
+    createDirectory(resolvedRoot, dataDir);
 
     // Initialize database
-    const dbPath = getDatabasePath(resolvedRoot);
+    const dbPath = getDatabasePath(resolvedRoot, dataDir);
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, resolvedRoot);
+    return new CodeGraph(db, queries, resolvedRoot, dataDir);
   }
 
   /**
@@ -232,24 +249,25 @@ export class CodeGraph {
   static async open(projectRoot: string, options: OpenOptions = {}): Promise<CodeGraph> {
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
+    const { dataDir } = options;
 
     // Check if initialized
-    if (!isInitialized(resolvedRoot)) {
+    if (!isInitialized(resolvedRoot, dataDir)) {
       throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
     }
 
     // Validate directory structure
-    const validation = validateDirectory(resolvedRoot);
+    const validation = validateDirectory(resolvedRoot, dataDir);
     if (!validation.valid) {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
     // Open database
-    const dbPath = getDatabasePath(resolvedRoot);
+    const dbPath = getDatabasePath(resolvedRoot, dataDir);
     const db = DatabaseConnection.open(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    const instance = new CodeGraph(db, queries, resolvedRoot);
+    const instance = new CodeGraph(db, queries, resolvedRoot, dataDir);
 
     // Sync if requested
     if (options.sync) {
@@ -262,26 +280,26 @@ export class CodeGraph {
   /**
    * Open synchronously (without sync)
    */
-  static openSync(projectRoot: string): CodeGraph {
+  static openSync(projectRoot: string, dataDir?: string): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if initialized
-    if (!isInitialized(resolvedRoot)) {
+    if (!isInitialized(resolvedRoot, dataDir)) {
       throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
     }
 
     // Validate directory structure
-    const validation = validateDirectory(resolvedRoot);
+    const validation = validateDirectory(resolvedRoot, dataDir);
     if (!validation.valid) {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
     // Open database
-    const dbPath = getDatabasePath(resolvedRoot);
+    const dbPath = getDatabasePath(resolvedRoot, dataDir);
     const db = DatabaseConnection.open(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, resolvedRoot);
+    return new CodeGraph(db, queries, resolvedRoot, dataDir);
   }
 
   /**
@@ -1032,7 +1050,7 @@ export class CodeGraph {
    */
   uninitialize(): void {
     this.close();
-    removeDirectory(this.projectRoot);
+    removeDirectory(this.projectRoot, this.dataDir);
   }
 }
 

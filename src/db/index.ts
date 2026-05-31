@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
+import { getCodeGraphDir } from '../directory';
 
 export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
 
@@ -237,8 +238,8 @@ export class DatabaseConnection {
 export const DATABASE_FILENAME = 'codegraph.db';
 
 /**
- * Get the default database path for a project
+ * Get the database path for a project
  */
-export function getDatabasePath(projectRoot: string): string {
-  return path.join(projectRoot, '.codegraph', DATABASE_FILENAME);
+export function getDatabasePath(projectRoot: string, dataDir?: string): string {
+  return path.join(getCodeGraphDir(projectRoot, dataDir), DATABASE_FILENAME);
 }

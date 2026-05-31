@@ -13,9 +13,16 @@ import * as path from 'path';
 export const CODEGRAPH_DIR = '.codegraph';
 
 /**
- * Get the .codegraph directory path for a project
+ * Get the CodeGraph data directory path for a project.
+ *
+ * By default this is `<projectRoot>/.codegraph/`. Pass `dataDir` to store
+ * CodeGraph data in a custom location instead (absolute path, or relative to
+ * `projectRoot`).
  */
-export function getCodeGraphDir(projectRoot: string): string {
+export function getCodeGraphDir(projectRoot: string, dataDir?: string): string {
+  if (dataDir) {
+    return path.isAbsolute(dataDir) ? dataDir : path.resolve(projectRoot, dataDir);
+  }
   return path.join(projectRoot, CODEGRAPH_DIR);
 }
 
@@ -23,8 +30,8 @@ export function getCodeGraphDir(projectRoot: string): string {
  * Check if a project has been initialized with CodeGraph
  * Requires both .codegraph/ directory AND codegraph.db to exist
  */
-export function isInitialized(projectRoot: string): boolean {
-  const codegraphDir = getCodeGraphDir(projectRoot);
+export function isInitialized(projectRoot: string, dataDir?: string): boolean {
+  const codegraphDir = getCodeGraphDir(projectRoot, dataDir);
   if (!fs.existsSync(codegraphDir) || !fs.statSync(codegraphDir).isDirectory()) {
     return false;
   }
@@ -67,8 +74,8 @@ export function findNearestCodeGraphRoot(startPath: string): string | null {
  * Create the .codegraph directory structure
  * Note: Only throws if codegraph.db already exists, not just if .codegraph/ exists.
  */
-export function createDirectory(projectRoot: string): void {
-  const codegraphDir = getCodeGraphDir(projectRoot);
+export function createDirectory(projectRoot: string, dataDir?: string): void {
+  const codegraphDir = getCodeGraphDir(projectRoot, dataDir);
   const dbPath = path.join(codegraphDir, 'codegraph.db');
 
   // Only throw if CodeGraph is actually initialized (db exists)
@@ -108,8 +115,8 @@ cache/
 /**
  * Remove the .codegraph directory
  */
-export function removeDirectory(projectRoot: string): void {
-  const codegraphDir = getCodeGraphDir(projectRoot);
+export function removeDirectory(projectRoot: string, dataDir?: string): void {
+  const codegraphDir = getCodeGraphDir(projectRoot, dataDir);
 
   if (!fs.existsSync(codegraphDir)) {
     return;
@@ -136,8 +143,8 @@ export function removeDirectory(projectRoot: string): void {
 /**
  * Get all files in the .codegraph directory
  */
-export function listDirectoryContents(projectRoot: string): string[] {
-  const codegraphDir = getCodeGraphDir(projectRoot);
+export function listDirectoryContents(projectRoot: string, dataDir?: string): string[] {
+  const codegraphDir = getCodeGraphDir(projectRoot, dataDir);
 
   if (!fs.existsSync(codegraphDir)) {
     return [];
@@ -171,8 +178,8 @@ export function listDirectoryContents(projectRoot: string): string[] {
 /**
  * Get the total size of the .codegraph directory in bytes
  */
-export function getDirectorySize(projectRoot: string): number {
-  const codegraphDir = getCodeGraphDir(projectRoot);
+export function getDirectorySize(projectRoot: string, dataDir?: string): number {
+  const codegraphDir = getCodeGraphDir(projectRoot, dataDir);
 
   if (!fs.existsSync(codegraphDir)) {
     return 0;
@@ -207,12 +214,12 @@ export function getDirectorySize(projectRoot: string): number {
 /**
  * Ensure a subdirectory exists within .codegraph
  */
-export function ensureSubdirectory(projectRoot: string, subdirName: string): string {
+export function ensureSubdirectory(projectRoot: string, subdirName: string, dataDir?: string): string {
   if (subdirName.includes('..') || subdirName.includes(path.sep) || subdirName.includes('/')) {
     throw new Error(`Invalid subdirectory name: ${subdirName}`);
   }
 
-  const subdirPath = path.join(getCodeGraphDir(projectRoot), subdirName);
+  const subdirPath = path.join(getCodeGraphDir(projectRoot, dataDir), subdirName);
 
   if (!fs.existsSync(subdirPath)) {
     fs.mkdirSync(subdirPath, { recursive: true });
@@ -224,12 +231,12 @@ export function ensureSubdirectory(projectRoot: string, subdirName: string): str
 /**
  * Check if the .codegraph directory has valid structure
  */
-export function validateDirectory(projectRoot: string): {
+export function validateDirectory(projectRoot: string, dataDir?: string): {
   valid: boolean;
   errors: string[];
 } {
   const errors: string[] = [];
-  const codegraphDir = getCodeGraphDir(projectRoot);
+  const codegraphDir = getCodeGraphDir(projectRoot, dataDir);
 
   if (!fs.existsSync(codegraphDir)) {
     errors.push('CodeGraph directory does not exist');

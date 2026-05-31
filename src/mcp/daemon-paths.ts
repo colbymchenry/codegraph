@@ -36,11 +36,11 @@ function projectHash(projectRoot: string): string {
  * proxy should connect to) for `projectRoot`. Deterministic given a project
  * root, so independent processes converge without coordination.
  */
-export function getDaemonSocketPath(projectRoot: string): string {
+export function getDaemonSocketPath(projectRoot: string, dataDir?: string): string {
   if (process.platform === 'win32') {
     return `\\\\.\\pipe\\codegraph-${projectHash(projectRoot)}`;
   }
-  const inProject = path.join(getCodeGraphDir(projectRoot), 'daemon.sock');
+  const inProject = path.join(getCodeGraphDir(projectRoot, dataDir), 'daemon.sock');
   if (inProject.length <= POSIX_SOCKET_PATH_LIMIT) return inProject;
   // Long project paths (deep monorepos, Bazel out dirs) need tmpdir fallback
   // or `bind` returns EADDRINUSE / ENAMETOOLONG. Hash keeps it project-scoped.
@@ -48,8 +48,8 @@ export function getDaemonSocketPath(projectRoot: string): string {
 }
 
 /** Absolute path to the daemon pid lockfile for `projectRoot`. */
-export function getDaemonPidPath(projectRoot: string): string {
-  return path.join(getCodeGraphDir(projectRoot), 'daemon.pid');
+export function getDaemonPidPath(projectRoot: string, dataDir?: string): string {
+  return path.join(getCodeGraphDir(projectRoot, dataDir), 'daemon.pid');
 }
 
 /** Structured contents of the pid lockfile. */
