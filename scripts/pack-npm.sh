@@ -62,6 +62,14 @@ for archive in "${archives[@]}"; do
         name: `${process.env.SCOPE}/codegraph-${process.env.TARGET}`,
         version: process.env.VERSION,
         description: `CodeGraph self-contained bundle for ${process.env.TARGET}`,
+        main: "lib/dist/index.js",
+        types: "lib/dist/index.d.ts",
+        exports: {
+          ".": {
+            types: "./lib/dist/index.d.ts",
+            default: "./lib/dist/index.js"
+          }
+        },
         os: [process.env.OSV], cpu: [process.env.ARCHV],
         files: [process.env.NODEFILE, "lib", "bin"],
         license: "MIT"
@@ -70,6 +78,50 @@ for archive in "${archives[@]}"; do
   targets+=("$target")
   echo "[pack-npm] ${SCOPE}/codegraph-${target}@${VERSION}"
 done
+
+# Copy type declarations from the first platform bundle into the main shim so
+# consumers can `import type { ... } from "@colbymchenry/codegraph"` without
+# hard-coding a platform-specific package path.
+first_pkgdir="$NPM/codegraph-${targets[0]}"
+if [ -d "$first_pkgdir/lib/dist" ]; then
+  mkdir -p "$NPM/main/lib/dist"
+  # copy only declaration files (no runtime JS — the shim execs the binary)
+  find "$first_pkgdir/lib/dist" -type f \( -name '*.d.ts' -o -name '*.d.ts.map' \) -print0 | while IFS= read -r -d '' f; do
+    rel="${f#$first_pkgdir/lib/dist/}"
+    mkdir -p "$NPM/main/lib/dist/$(dirname "$rel")"
+    cp "$f" "$NPM/main/lib/dist/$rel"
+  done
+fi
+if [ ! -f "$NPM/main/lib/dist/index.d.ts" ]; then
+  echo "[pack-npm] error: type declarations missing from main shim" >&2
+  exit 1
+fi
+
+# Runtime proxy so consumers can `require()` or dynamically `import()`
+# `@colbymchenry/codegraph` without hard-coding a platform-specific package
+# path. Named imports (e.g. `import { CodeGraph }`) work under Node.js native
+# ESM interop but may require bundler-specific configuration in Vite/Rollup.
+cat > "$NPM/main/index.js" <<'PROXY'
+// Auto-generated runtime proxy — forwards to the platform-specific bundle.
+const pkg = require('./package.json');
+const scope = pkg.name.split('/')[0];
+const target = process.platform + '-' + process.arch;
+const depName = scope + '/codegraph-' + target;
+try {
+  module.exports = require(depName);
+} catch (err) {
+  if (err.code !== 'MODULE_NOT_FOUND') throw err;
+  const e = new Error(
+    'No prebuilt CodeGraph bundle for ' + target + '.\n' +
+    'Expected the optional package ' + depName + ' to be installed.\n' +
+    'Try reinstalling:  npm i ' + pkg.name + '\n' +
+    'Or use the standalone installer (no Node required):\n' +
+    '  curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh'
+  );
+  e.code = 'CODEGRAPH_PLATFORM_MISSING';
+  throw e;
+}
+PROXY
 
 # Main shim package.
 cp "$ROOT/scripts/npm-shim.js" "$NPM/main/npm-shim.js"
@@ -84,9 +136,18 @@ VERSION="$VERSION" SCOPE="$SCOPE" TARGETS="${targets[*]}" \
       name: `${process.env.SCOPE}/codegraph`,
       version: process.env.VERSION,
       description: "Local-first code intelligence for AI agents (MCP). Self-contained — bundles its own runtime.",
+      main: "index.js",
+      types: "lib/dist/index.d.ts",
+      exports: {
+        ".": {
+          types: "./lib/dist/index.d.ts",
+          require: "./index.js",
+          default: "./index.js"
+        }
+      },
       bin: { codegraph: "npm-shim.js" },
       optionalDependencies: opt,
-      files: ["npm-shim.js","README.md"],
+      files: ["index.js","npm-shim.js","README.md","lib"],
       license: "MIT"
     }, null, 2) + "\n");
   ' "$NPM/main/package.json"
