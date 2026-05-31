@@ -309,6 +309,56 @@ export { main };
       expect(impact.nodes.size).toBeGreaterThan(0);
       expect(impact.nodes.has(formatValue.id)).toBe(true);
     });
+
+    it('should not include sibling methods reached through parent contains edges', async () => {
+      const impactDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-impact-sibling-test-'));
+      let impactGraph: CodeGraph | undefined;
+
+      try {
+        const srcDir = path.join(impactDir, 'src');
+        fs.mkdirSync(srcDir, { recursive: true });
+
+        fs.writeFileSync(
+          path.join(srcDir, 'ImpactTest.cs'),
+          `
+public class TestClass {
+    public static void NoReferences()
+    {
+        return;
+    }
+
+    public static void SisterFunction()
+    {
+        return;
+    }
+}
+`
+        );
+
+        impactGraph = CodeGraph.initSync(impactDir, {
+          config: {
+            include: ['src/**/*.cs'],
+            exclude: [],
+          },
+        });
+
+        await impactGraph.indexAll();
+        impactGraph.resolveReferences();
+
+        const noReferences = impactGraph.getNodesByKind('method').find((n) => n.name === 'NoReferences');
+        expect(noReferences).toBeDefined();
+
+        const impact = impactGraph.getImpactRadius(noReferences!.id, 2);
+        const impactedNames = Array.from(impact.nodes.values()).map((n) => n.name);
+
+        expect(impactedNames).toContain('NoReferences');
+        expect(impactedNames).toContain('TestClass');
+        expect(impactedNames).not.toContain('SisterFunction');
+      } finally {
+        impactGraph?.destroy();
+        fs.rmSync(impactDir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('findPath()', () => {
