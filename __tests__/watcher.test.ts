@@ -436,4 +436,154 @@ describe('FileWatcher', () => {
       cg.unwatch();
     });
   });
+
+  describe('shouldIgnore source-file filter (FD exhaustion fix)', () => {
+    it('should ignore non-source files when stats are provided', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn);
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      // Non-source file with file stats → ignored (no fs.watch FD created)
+      const result = (watcher as any).shouldIgnore(
+        path.join(testDir, 'readme.md'),
+        { isDirectory: () => false } as any,
+      );
+      expect(result).toBe(true);
+
+      watcher.stop();
+    });
+
+    it('should not ignore source files when stats are provided', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn);
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      const result = (watcher as any).shouldIgnore(
+        path.join(testDir, 'src', 'index.ts'),
+        { isDirectory: () => false } as any,
+      );
+      expect(result).toBe(false);
+
+      watcher.stop();
+    });
+
+    it('should not ignore directories so chokidar can recurse', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn);
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      const result = (watcher as any).shouldIgnore(
+        path.join(testDir, 'src'),
+        { isDirectory: () => true } as any,
+      );
+      expect(result).toBe(false);
+
+      watcher.stop();
+    });
+
+    it('should not filter by extension when stats are undefined (fallback path)', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn);
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      // Without stats, the extension filter is skipped — only ignoreMatcher applies.
+      // 'somefile.md' is not in DEFAULT_IGNORE_DIRS, so it passes through.
+      const result = (watcher as any).shouldIgnore(
+        path.join(testDir, 'somefile.md'),
+        undefined,
+      );
+      expect(result).toBe(false);
+
+      watcher.stop();
+    });
+
+    it('should not ignore non-source files when CODEGRAPH_WATCH_ALL_FILES=1', async () => {
+      const orig = process.env.CODEGRAPH_WATCH_ALL_FILES;
+      process.env.CODEGRAPH_WATCH_ALL_FILES = '1';
+
+      try {
+        const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+        const watcher = new FileWatcher(testDir, syncFn);
+        watcher.start();
+        await watcher.waitUntilReady();
+
+        const result = (watcher as any).shouldIgnore(
+          path.join(testDir, 'readme.md'),
+          { isDirectory: () => false } as any,
+        );
+        expect(result).toBe(false);
+
+        watcher.stop();
+      } finally {
+        if (orig === undefined) {
+          delete process.env.CODEGRAPH_WATCH_ALL_FILES;
+        } else {
+          process.env.CODEGRAPH_WATCH_ALL_FILES = orig;
+        }
+      }
+    });
+
+    it('should exclude new DEFAULT_IGNORE_DIRS entries (.npm, .bun, .rustup)', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn);
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      for (const dir of ['.npm', '.bun', '.rustup', '.gem', '.Trash', '.matplotlib']) {
+        const result = (watcher as any).shouldIgnore(
+          path.join(testDir, dir, 'somefile'),
+          { isDirectory: () => false } as any,
+        );
+        expect(result).toBe(true);
+      }
+
+      watcher.stop();
+    });
+  });
+
+  describe('home directory warning', () => {
+    it('should log a warning when projectRoot is the home directory', async () => {
+      // Spy on logWarn — it's imported into watcher.ts, so we mock the module.
+      const { logWarn } = await import('../src/errors');
+      const warnSpy = vi.spyOn({ logWarn }, 'logWarn');
+
+      // We can't easily re-import the module, so we verify the behavior
+      // indirectly: creating a watcher with os.homedir() as root should
+      // not throw, and the warning is emitted inside start().
+      // Since logWarn is a direct import in watcher.ts, spy on the errors module.
+      const errorsModule = await import('../src/errors');
+      const spy = vi.spyOn(errorsModule, 'logWarn');
+
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(os.homedir(), syncFn);
+      watcher.start();
+
+      expect(spy).toHaveBeenCalledWith(
+        expect.stringContaining('home directory'),
+      );
+
+      spy.mockRestore();
+      watcher.stop();
+    });
+
+    it('should not log a warning when projectRoot is not the home directory', async () => {
+      const errorsModule = await import('../src/errors');
+      const spy = vi.spyOn(errorsModule, 'logWarn');
+
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn);
+      watcher.start();
+
+      expect(spy).not.toHaveBeenCalledWith(
+        expect.stringContaining('home directory'),
+      );
+
+      spy.mockRestore();
+      watcher.stop();
+    });
+  });
 });

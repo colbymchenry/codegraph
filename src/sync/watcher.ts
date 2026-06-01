@@ -15,6 +15,7 @@
  */
 
 import * as path from 'path';
+import * as os from 'os';
 import type { Stats } from 'fs';
 import chokidar, { FSWatcher } from 'chokidar';
 import type { Ignore } from 'ignore';
@@ -112,6 +113,7 @@ export class FileWatcher {
   private syncStartedMs = 0;
   private syncing = false;
   private stopped = false;
+  private watchAllFiles = false;
   /**
    * False until chokidar fires its `ready` event. Gates `pendingFiles`
    * insertion so the initial crawl's `add` events (one per pre-existing
@@ -171,6 +173,12 @@ export class FileWatcher {
     // chokidar only registers an inotify watch on directories that pass this
     // filter — that's the #276 fix.
     this.ignoreMatcher = buildDefaultIgnore(this.projectRoot);
+    this.watchAllFiles = process.env.CODEGRAPH_WATCH_ALL_FILES === '1';
+    const homeDir = normalizePath(os.homedir());
+    if (normalizePath(this.projectRoot) === homeDir) {
+      logWarn('Watching entire home directory — this may exhaust file descriptors. ' +
+        'Consider using --path to scope to a specific project.');
+    }
 
     try {
       this.watcher = chokidar.watch(this.projectRoot, {
@@ -259,7 +267,12 @@ export class FileWatcher {
     if (this.isAlwaysIgnored(rel)) return true;
     if (!this.ignoreMatcher) return false;
     if (stats) {
-      return this.ignoreMatcher.ignores(stats.isDirectory() ? rel + '/' : rel);
+      if (this.ignoreMatcher.ignores(stats.isDirectory() ? rel + '/' : rel)) return true;
+      // Skip non-source files to avoid unnecessary fs.watch() FDs (fixes FD
+      // exhaustion when the project root contains many non-source files — e.g.
+      // home directory). Directories must pass through so chokidar can recurse.
+      // Set CODEGRAPH_WATCH_ALL_FILES=1 to disable this filter (escape hatch).
+      if (!stats.isDirectory() && !this.watchAllFiles && !isSourceFile(testPath)) return true;
     }
     // Stats unknown: test both forms so a directory match isn't missed.
     return this.ignoreMatcher.ignores(rel) || this.ignoreMatcher.ignores(rel + '/');
