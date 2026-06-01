@@ -228,6 +228,98 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): v
 }
 
 /**
+ * Maximum depth to descend through an *ignored* non-repo directory while hunting
+ * for embedded git repos. Wrapper dirs that hold sibling clones (e.g.
+ * `services/<name>/`) keep the repos a level or two down; a small cap avoids
+ * walking deep into large ignored artifact trees that contain no repo at all.
+ */
+const IGNORED_EMBEDDED_REPO_MAX_DEPTH = 4;
+
+/**
+ * Recurse into an ignored directory looking for embedded git repos. If `absDir`
+ * is itself a repo, index it via collectGitFiles (which honors that repo's own
+ * .gitignore and recurses its embedded repos). Otherwise descend a bounded
+ * number of levels — wrapper dirs like `services/` hold sibling clones such as
+ * `services/<name>/` that are the actual repos.
+ */
+function findEmbeddedReposUnder(
+  absDir: string,
+  prefix: string,
+  files: Set<string>,
+  visited: Set<string>,
+  depth: number
+): void {
+  let real: string;
+  try {
+    real = fs.realpathSync(absDir);
+  } catch {
+    return; // unreadable or dangling symlink
+  }
+  if (visited.has(real)) return;
+  visited.add(real);
+
+  if (fs.existsSync(path.join(absDir, '.git'))) {
+    collectGitFiles(absDir, prefix, files);
+    return;
+  }
+  if (depth >= IGNORED_EMBEDDED_REPO_MAX_DEPTH) return;
+
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(absDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    // Dirent reflects the link itself, so a symlinked directory reports
+    // isDirectory() === false — this also skips links, avoiding cycles.
+    if (!entry.isDirectory()) continue;
+    // Never hunt inside dependency/build dirs or hidden tooling dirs.
+    if (entry.name.startsWith('.') || DEFAULT_IGNORE_DIRS.has(entry.name)) continue;
+    findEmbeddedReposUnder(
+      path.join(absDir, entry.name),
+      prefix + entry.name + '/',
+      files,
+      visited,
+      depth + 1
+    );
+  }
+}
+
+/**
+ * Find embedded git repos that the super-repo's own .gitignore hides.
+ *
+ * collectGitFiles only recurses into embedded repos that surface as *untracked*
+ * entries (`git ls-files -o`). When the super-repo's .gitignore excludes the
+ * nested clone — common when a workspace holds independent repos it doesn't want
+ * cluttering its own `git status` — the repo never appears there and its source
+ * is invisible. List ignored directories explicitly and recurse into any that is,
+ * or contains, a git repo. Each embedded repo still honors its OWN .gitignore.
+ * (See issue #193 for the untracked case this complements.)
+ */
+function collectIgnoredEmbeddedRepos(rootDir: string, files: Set<string>, visited: Set<string>): void {
+  let output: string;
+  try {
+    output = execFileSync(
+      'git',
+      ['ls-files', '-o', '-i', '--exclude-standard', '--directory'],
+      { cwd: rootDir, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    );
+  } catch {
+    return; // not a git repo or git failure — nothing to add
+  }
+  for (const line of output.split('\n')) {
+    const trimmed = line.trim();
+    // `--directory` collapses each ignored directory to a single "dir/" entry;
+    // ignored files (no trailing slash) can never be a repo, so skip them.
+    if (!trimmed.endsWith('/')) continue;
+    const name = path.basename(trimmed.replace(/\/+$/, ''));
+    if (name.startsWith('.') || DEFAULT_IGNORE_DIRS.has(name)) continue;
+    findEmbeddedReposUnder(path.join(rootDir, trimmed), normalizePath(trimmed), files, visited, 0);
+  }
+}
+
+/**
  * Get all files visible to git (tracked + untracked but not ignored).
  * Respects .gitignore at all levels (root, subdirectories) and descends into
  * embedded (nested, non-submodule) git repos. Returns null on failure
@@ -265,7 +357,23 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     // committing a dependency/build dir doesn't make it project code. A
     // `.gitignore` negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
     const ig = buildDefaultIgnore(rootDir);
-    return new Set([...files].filter((f) => !ig.ignores(f)));
+    const visible = new Set([...files].filter((f) => !ig.ignores(f)));
+
+    // Embedded git repos hidden by the super-repo's own .gitignore are
+    // independent projects, not third-party noise — index them too. Their files
+    // are filtered ONLY by the built-in defaults (node_modules, …), NOT the
+    // super-repo's .gitignore: that exclusion is the parent's tracking hygiene,
+    // and each embedded repo already honored its own .gitignore in collectGitFiles.
+    const embedded = new Set<string>();
+    collectIgnoredEmbeddedRepos(rootDir, embedded, new Set<string>());
+    if (embedded.size > 0) {
+      const defaultsOnly = ignore().add(DEFAULT_IGNORE_PATTERNS);
+      for (const f of embedded) {
+        if (!defaultsOnly.ignores(f)) visible.add(f);
+      }
+    }
+
+    return visible;
   } catch {
     return null;
   }

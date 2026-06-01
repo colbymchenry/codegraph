@@ -3515,6 +3515,87 @@ describe('Nested non-submodule git repos', () => {
     expect(files).toContain('sub_repo/src/real.ts');
     expect(files).not.toContain('sub_repo/src/generated.ts');
   });
+
+  it('should index an embedded repo the super-repo .gitignore excludes', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    git(root, 'config', 'user.email', 'test@test.com');
+    git(root, 'config', 'user.name', 'Test');
+    // The workspace ignores its nested clones to keep its own `git status` clean.
+    fs.writeFileSync(path.join(root, '.gitignore'), 'sub_repo/\n');
+
+    const sub = path.join(root, 'sub_repo', 'src');
+    fs.mkdirSync(sub, { recursive: true });
+    git(path.join(root, 'sub_repo'), 'init', '-q');
+    fs.writeFileSync(path.join(sub, 'hidden.ts'), 'export const hidden = 1;');
+
+    const files = scanDirectory(root);
+
+    // Excluded from the super-repo's tracking, but still its own repo → indexed.
+    expect(files).toContain('sub_repo/src/hidden.ts');
+  });
+
+  it('should index repos inside an ignored wrapper directory', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    git(root, 'config', 'user.email', 'test@test.com');
+    git(root, 'config', 'user.name', 'Test');
+    // `services/` is a plain wrapper dir (not a repo) holding sibling clones,
+    // and the super-repo ignores the whole subtree.
+    fs.writeFileSync(path.join(root, '.gitignore'), 'services/\n');
+
+    const walletSrc = path.join(root, 'services', 'wallet', 'src');
+    fs.mkdirSync(walletSrc, { recursive: true });
+    git(path.join(root, 'services', 'wallet'), 'init', '-q');
+    fs.writeFileSync(path.join(walletSrc, 'wallet.ts'), 'export const wallet = 1;');
+
+    const balanceSrc = path.join(root, 'services', 'balance', 'src');
+    fs.mkdirSync(balanceSrc, { recursive: true });
+    git(path.join(root, 'services', 'balance'), 'init', '-q');
+    fs.writeFileSync(path.join(balanceSrc, 'balance.ts'), 'export const balance = 1;');
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('services/wallet/src/wallet.ts');
+    expect(files).toContain('services/balance/src/balance.ts');
+  });
+
+  it("should still honor a hidden embedded repo's own .gitignore", async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    git(root, 'config', 'user.email', 'test@test.com');
+    git(root, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(root, '.gitignore'), 'sub_repo/\n');
+
+    const sub = path.join(root, 'sub_repo', 'src');
+    fs.mkdirSync(sub, { recursive: true });
+    git(path.join(root, 'sub_repo'), 'init', '-q');
+    // The embedded repo's OWN .gitignore must still apply — the super-repo
+    // hiding it must not switch off its internal ignore rules.
+    fs.writeFileSync(path.join(root, 'sub_repo', '.gitignore'), 'src/generated.ts\n');
+    fs.writeFileSync(path.join(sub, 'real.ts'), 'export const real = 1;');
+    fs.writeFileSync(path.join(sub, 'generated.ts'), 'export const generated = 1;');
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('sub_repo/src/real.ts');
+    expect(files).not.toContain('sub_repo/src/generated.ts');
+  });
 });
 
 // =============================================================================
