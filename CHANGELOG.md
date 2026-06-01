@@ -11,8 +11,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- Odoo XML views, data files, and menus are now fully indexed — `<menuitem>`, `<field>`, `<filter>`, `<xpath>`, `<act_window>`, `<function>`, and embedded Python in server actions and cron jobs all produce nodes and references, so an agent can trace which views reference a model, which menus trigger an action, and which xpath expressions patch a field.
+- Odoo Python ORM patterns are now extracted from model definitions: relational field comodels (`Many2one`, `One2many`, `Many2many`), `Selection` key lists, `_inherit`/`_inherits`, `_rec_name`/`_order`/`_sql_constraints`, `self.create`/`self.write` dict keys, `self.mapped` path segments, and `@api.depends`/`@api.returns` decorator args — giving an agent a precise field-level graph without reading model source.
+- Odoo `ir.model.access.csv` and model-data CSV files are now indexed: access rules produce `ir.model.access::rule_id` method nodes, and data CSVs emit a model ref plus one field ref per column header.
+- OWL components now expose their service dependencies: `useService('name')` calls are extracted as `service::name` references, connecting frontend JS/TS components to their backend service contracts.
+- Odoo framework resolver: `env['ir.config_parameter'].get_param('key')` emits `config_param::key`, `env['ir.sequence'].next_by_code('code')` emits `ir.sequence::code`, and `__manifest__.py` `data`/`demo`/`auto_install` arrays emit import edges to the referenced files and modules.
 - `codegraph init` now builds the initial index by default — you no longer need the `-i`/`--index` flag (it's still accepted, so existing commands and scripts keep working). (#483)
 - Go: Gin middleware chains now connect end-to-end in `codegraph_trace` and `codegraph_explore` — following a request reaches the middleware and route handlers registered via `.Use()` / `.GET()` instead of dead-ending where the framework dispatches the chain dynamically.
+
+### Fixes
+
+- Odoo ORM call patterns (`self.write`, `self.create`, `self.mapped`) inside method bodies now emit their field and path refs correctly — the tree-sitter visitor was calling the language-specific hook for field-level nodes but not for call nodes inside method bodies, so dict keys and dotted paths went unextracted.
 
 ### Fixes
 
