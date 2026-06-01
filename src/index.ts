@@ -50,7 +50,12 @@ import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './
 
 // Re-export types for consumers
 export * from './types';
-export { getDatabasePath } from './db';
+// Storage building blocks for embedded/SDK consumers that drive the graph
+// directly (open a DB, run prepared queries) rather than through the CodeGraph
+// facade. Exposed from the package entry so they no longer require deep imports
+// into dist/ (issue #354).
+export { getDatabasePath, DatabaseConnection } from './db';
+export { QueryBuilder } from './db/queries';
 export {
   getCodeGraphDir,
   isInitialized,
