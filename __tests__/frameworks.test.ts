@@ -245,6 +245,14 @@ describe('expressResolver.extract', () => {
     const { nodes, references } = expressResolver.extract!('routes.ts', src);
     expect(references[0].referenceName).toBe('list');
   });
+
+  it('extracts routes from .mts files as TypeScript', () => {
+    const src = `app.get('/users', listUsers);\n`;
+    const { nodes, references } = expressResolver.extract!('routes.mts', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].language).toBe('typescript');
+    expect(references[0].language).toBe('typescript');
+  });
 });
 
 import { nestjsResolver } from '../src/resolution/frameworks/nestjs';
@@ -326,6 +334,21 @@ export class BController {
 `;
     const { nodes } = nestjsResolver.extract!('multi.controller.ts', src);
     expect(nodes.map((n) => n.name)).toEqual(['GET /a/x', 'GET /b/y']);
+  });
+
+  it('extracts HTTP routes from .mts controllers as TypeScript', () => {
+    const src = `
+@Controller('users')
+export class UsersController {
+  @Get()
+  findAll() { return []; }
+}
+`;
+    const { nodes, references } = nestjsResolver.extract!('users.controller.mts', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].name).toBe('GET /users');
+    expect(nodes[0].language).toBe('typescript');
+    expect(references[0].language).toBe('typescript');
   });
 });
 
@@ -451,6 +474,18 @@ describe('nestjsResolver.detect', () => {
       getAllFiles: () => ['src/users.controller.ts'],
       readFile: (p: string) =>
         p === 'src/users.controller.ts'
+          ? `@Controller('users')\nexport class UsersController {}`
+          : null,
+    };
+    expect(nestjsResolver.detect(context as any)).toBe(true);
+  });
+
+  it('detects @Controller in a *.controller.mts file when package.json is absent', () => {
+    const context = {
+      ...baseContext,
+      getAllFiles: () => ['src/users.controller.mts'],
+      readFile: (p: string) =>
+        p === 'src/users.controller.mts'
           ? `@Controller('users')\nexport class UsersController {}`
           : null,
     };

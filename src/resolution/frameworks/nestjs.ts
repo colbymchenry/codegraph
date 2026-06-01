@@ -41,6 +41,7 @@ type JsLang = 'typescript' | 'javascript';
 
 const HTTP_METHODS = ['Get', 'Post', 'Put', 'Patch', 'Delete', 'Head', 'Options', 'All'];
 const GQL_OPS = ['Query', 'Mutation', 'Subscription'];
+const NEST_FILE_PATTERN = /\.(?:controller|module|resolver|gateway)\.(?:[mc]?js|[mc]?ts)$/;
 
 export const nestjsResolver: FrameworkResolver = {
   name: 'nestjs',
@@ -64,13 +65,7 @@ export const nestjsResolver: FrameworkResolver = {
     // Fallback: NestJS-specific decorators in conventionally named files.
     const allFiles = context.getAllFiles();
     for (const file of allFiles) {
-      if (
-        file.endsWith('.controller.ts') ||
-        file.endsWith('.controller.js') ||
-        file.endsWith('.module.ts') ||
-        file.endsWith('.resolver.ts') ||
-        file.endsWith('.gateway.ts')
-      ) {
+      if (NEST_FILE_PATTERN.test(file)) {
         const content = context.readFile(file);
         if (
           content &&
@@ -111,7 +106,7 @@ export const nestjsResolver: FrameworkResolver = {
   },
 
   extract(filePath, content) {
-    if (!/\.(m?js|tsx?|cjs)$/.test(filePath)) return { nodes: [], references: [] };
+    if (!/\.(?:[mc]?js|[mc]?ts|tsx)$/.test(filePath)) return { nodes: [], references: [] };
     const nodes: Node[] = [];
     const references: UnresolvedRef[] = [];
     const now = Date.now();
@@ -512,7 +507,7 @@ function lineAt(safe: string, index: number): number {
 }
 
 function detectLanguage(filePath: string): JsLang {
-  if (filePath.endsWith('.ts') || filePath.endsWith('.tsx')) return 'typescript';
+  if (/\.(?:[mc]?ts|tsx)$/.test(filePath)) return 'typescript';
   return 'javascript';
 }
 

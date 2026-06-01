@@ -45,6 +45,8 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
  */
 export const EXTENSION_MAP: Record<string, Language> = {
   '.ts': 'typescript',
+  '.mts': 'typescript',
+  '.cts': 'typescript',
   '.tsx': 'tsx',
   '.js': 'javascript',
   '.mjs': 'javascript',

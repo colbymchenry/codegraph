@@ -14,9 +14,9 @@ import { applyAliases } from './path-aliases';
  * Extension resolution order by language
  */
 const EXTENSION_RESOLUTION: Record<string, string[]> = {
-  typescript: ['.ts', '.tsx', '.d.ts', '.js', '.jsx', '/index.ts', '/index.tsx', '/index.js'],
+  typescript: ['.ts', '.mts', '.cts', '.tsx', '.d.ts', '.js', '.jsx', '/index.ts', '/index.mts', '/index.cts', '/index.tsx', '/index.js'],
   javascript: ['.js', '.jsx', '.mjs', '.cjs', '/index.js', '/index.jsx'],
-  tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js'],
+  tsx: ['.tsx', '.ts', '.mts', '.cts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.mts', '/index.cts', '/index.js'],
   jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
   python: ['.py', '/__init__.py'],
   go: ['.go'],

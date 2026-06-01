@@ -315,6 +315,28 @@ describe('Resolution Module', () => {
       expect(result).toBe('src/helpers.ts');
     });
 
+    it('should resolve explicit TypeScript module extensions', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: (p) => p === 'src/components/utils.mts' || p === 'src/components/utils/index.mts',
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => ['src/components/utils.mts', 'src/components/utils/index.mts'],
+      };
+
+      const result = resolveImportPath(
+        './utils',
+        'src/components/Button.mts',
+        'typescript',
+        context
+      );
+
+      expect(result).toBe('src/components/utils.mts');
+    });
+
     it('should extract JS/TS import mappings', () => {
       const content = `
 import { foo } from './foo';

@@ -132,7 +132,7 @@ export const expressResolver: FrameworkResolver = {
   },
 
   extract(filePath, content) {
-    if (!/\.(m?js|tsx?|cjs)$/.test(filePath)) return { nodes: [], references: [] };
+    if (!/\.(?:[mc]?js|[mc]?ts|tsx)$/.test(filePath)) return { nodes: [], references: [] };
     const nodes: Node[] = [];
     const references: UnresolvedRef[] = [];
     const now = Date.now();
@@ -329,7 +329,7 @@ function resolveServiceMethod(
  * Detect language from file extension
  */
 function detectLanguage(filePath: string): 'typescript' | 'javascript' {
-  if (filePath.endsWith('.ts') || filePath.endsWith('.tsx')) {
+  if (/\.(?:[mc]?ts|tsx)$/.test(filePath)) {
     return 'typescript';
   }
   return 'javascript';

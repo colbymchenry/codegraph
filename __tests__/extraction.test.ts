@@ -33,6 +33,8 @@ function cleanupTempDir(dir: string): void {
 describe('Language Detection', () => {
   it('should detect TypeScript files', () => {
     expect(detectLanguage('src/index.ts')).toBe('typescript');
+    expect(detectLanguage('src/server.mts')).toBe('typescript');
+    expect(detectLanguage('src/server.cts')).toBe('typescript');
     expect(detectLanguage('components/Button.tsx')).toBe('tsx');
   });
 
@@ -3168,6 +3170,27 @@ export function multiply(a: number, b: number): number {
     cg.close();
   });
 
+  it('should index TypeScript ESM files with .mts extension', async () => {
+    const srcDir = path.join(tempDir, 'src');
+    fs.mkdirSync(srcDir);
+
+    fs.writeFileSync(
+      path.join(srcDir, 'server.mts'),
+      `export function esmHandler() { return 1; }`
+    );
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll();
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(1);
+
+    const nodes = cg.getNodesInFile('src/server.mts');
+    expect(nodes.some((n) => n.name === 'esmHandler')).toBe(true);
+
+    cg.close();
+  });
+
   it('should track file hashes for incremental updates', async () => {
     // Create initial file
     const srcDir = path.join(tempDir, 'src');
@@ -3392,6 +3415,20 @@ describe('Directory Exclusion', () => {
     expect(files.length).toBe(1);
     expect(files[0]).toBe('src/components/Button.tsx');
     expect(files[0]).not.toContain('\\');
+  });
+
+  it('should include explicit TypeScript module extensions during scanning', () => {
+    const srcDir = path.join(tempDir, 'src');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(path.join(srcDir, 'server.mts'), 'export const server = true;');
+    fs.writeFileSync(path.join(srcDir, 'worker.cts'), 'export const worker = true;');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toEqual(expect.arrayContaining([
+      'src/server.mts',
+      'src/worker.cts',
+    ]));
   });
 });
 
