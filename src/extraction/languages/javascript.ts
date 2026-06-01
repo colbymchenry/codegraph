@@ -162,6 +162,25 @@ export function owlVisitNode(node: SyntaxNode, ctx: ExtractorContext): boolean {
       }
     }
 
+    // T2-T: useService('service_name') → service ref
+    if (funcText === 'useService') {
+      const firstArg = argsNode.namedChildren[0];
+      if (firstArg?.type === 'string') {
+        const serviceName = getNodeText(firstArg, ctx.source).replace(/['"]/g, '');
+        if (serviceName) {
+          ctx.addUnresolvedReference({
+            fromNodeId,
+            referenceName: `service::${serviceName}`,
+            referenceKind: 'references',
+            line,
+            column: node.startPosition.column,
+            filePath: ctx.filePath,
+            language: 'javascript',
+          });
+        }
+      }
+    }
+
     return false;
   }
 

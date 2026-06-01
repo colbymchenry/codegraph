@@ -48,14 +48,16 @@ export class OdooExtractor {
     try {
       this.extractRecords(fileNode.id);
       this.extractTemplates(fileNode.id);
-      this.extractShorthand(fileNode.id, 'menuitem', 'ir.ui.menu');
-      this.extractShorthand(fileNode.id, 'act_window', 'ir.actions.act_window');
-      this.extractShorthand(fileNode.id, 'report', 'ir.actions.report');
+      this.extractShorthand(fileNode.id, 'menuitem', 'ir.ui.menu', ['action', 'parent', 'groups']);
+      this.extractShorthand(fileNode.id, 'act_window', 'ir.actions.act_window', ['src_model']);
+      this.extractShorthand(fileNode.id, 'report', 'ir.actions.report', ['model', 'file']);
       this.extractShorthand(fileNode.id, 'act_server', 'ir.actions.server');
       this.extractShorthand(fileNode.id, 'act_client', 'ir.actions.client');
       this.extractShorthand(fileNode.id, 'url', 'ir.actions.url');
       this.extractTCall(fileNode.id);
       this.extractGenericRef(fileNode.id);
+      this.extractFieldTextContent(fileNode.id);
+      this.extractFunctionTag(fileNode.id);
     } catch (error) {
       this.errors.push({
         message: `Odoo extraction error: ${error instanceof Error ? error.message : String(error)}`,
@@ -181,6 +183,101 @@ export class OdooExtractor {
             column: 0,
           });
         }
+        // T1-E: <label for="field_name"> → field ref
+        const labelRef = /<label\b[^>]*\bfor\s*=\s*"([^"]+)"/g;
+        let lr: RegExpExecArray | null;
+        while ((lr = labelRef.exec(archContent)) !== null) {
+          this.unresolvedReferences.push({
+            fromNodeId: nodeId,
+            referenceName: lr[1]!,
+            referenceKind: 'references',
+            line: this.getLineNumber(archOffset + lr.index),
+            column: 0,
+          });
+        }
+        // T2-C: <field groups="X"> → group ref
+        const fieldGroups = /<field\b[^>]*\bgroups\s*=\s*"([^"]+)"/g;
+        let fg: RegExpExecArray | null;
+        while ((fg = fieldGroups.exec(archContent)) !== null) {
+          this.unresolvedReferences.push({
+            fromNodeId: nodeId,
+            referenceName: fg[1]!,
+            referenceKind: 'references',
+            line: this.getLineNumber(archOffset + fg.index),
+            column: 0,
+          });
+        }
+        // T1-G: <filter name="X"> → ir.filters node + optional group_by field ref
+        const filterRegex = /<filter\b([^>]*?)(?:\/>|>)/g;
+        let fil: RegExpExecArray | null;
+        while ((fil = filterRegex.exec(archContent)) !== null) {
+          const filterAttrs = fil[1] ?? '';
+          const fNameMatch = /\bname\s*=\s*"([^"]+)"/.exec(filterAttrs);
+          if (!fNameMatch) continue;
+          const filterName = fNameMatch[1]!;
+          const filterLine = this.getLineNumber(archOffset + fil.index);
+          const filterNodeId = generateNodeId(this.filePath, 'method', `ir.filters::${filterName}`, filterLine);
+          this.nodes.push({
+            id: filterNodeId,
+            kind: 'method',
+            name: filterName,
+            qualifiedName: `ir.filters::${filterName}`,
+            filePath: this.filePath,
+            language: 'xml',
+            startLine: filterLine,
+            endLine: filterLine,
+            startColumn: 0,
+            endColumn: 0,
+            updatedAt: Date.now(),
+          });
+          this.edges.push({ source: nodeId, target: filterNodeId, kind: 'contains' });
+          const ctxMatch = /\bcontext\s*=\s*"([^"]+)"/.exec(filterAttrs);
+          if (ctxMatch) {
+            const gbMatch = /['"]group_by['"]\s*:\s*['"]([^'"]+)['"]/.exec(ctxMatch[1]!);
+            if (gbMatch) {
+              this.unresolvedReferences.push({
+                fromNodeId: filterNodeId,
+                referenceName: gbMatch[1]!,
+                referenceKind: 'references',
+                line: filterLine,
+                column: 0,
+              });
+            }
+          }
+        }
+        // T2-O: <xpath expr="//field[@name='X']"> or //button[@name='X'] → refs
+        const xpathRef = /<xpath\b[^>]*\bexpr\s*=\s*"([^"]+)"/g;
+        let xp: RegExpExecArray | null;
+        while ((xp = xpathRef.exec(archContent)) !== null) {
+          const expr = xp[1]!;
+          const fieldInXpath = /\/\/field\[@name=['"]([^'"]+)['"]\]/.exec(expr);
+          if (fieldInXpath) {
+            this.unresolvedReferences.push({ fromNodeId: nodeId, referenceName: fieldInXpath[1]!, referenceKind: 'references', line: this.getLineNumber(archOffset + xp.index), column: 0 });
+          }
+          const btnInXpath = /\/\/button\[@name=['"]([^'"]+)['"]\]/.exec(expr);
+          if (btnInXpath) {
+            this.unresolvedReferences.push({ fromNodeId: nodeId, referenceName: btnInXpath[1]!, referenceKind: 'references', line: this.getLineNumber(archOffset + xp.index), column: 0 });
+          }
+        }
+      }
+      // T2-B: <field name="code"> embedded Python in ir.actions.server / ir.cron
+      if (['ir.actions.server', 'ir.cron'].includes(model)) {
+        const codeFieldRegex = /<field\s+name\s*=\s*"code"\s*>([\s\S]*?)<\/field>/g;
+        let cf: RegExpExecArray | null;
+        while ((cf = codeFieldRegex.exec(body)) !== null) {
+          const codeContent = cf[1]!;
+          const codeOffset = bodyOffset + cf.index + cf[0].indexOf(codeContent);
+          const envModel = /self\.env\[['"]([a-z][a-z0-9_.]+)['"]\]/g;
+          let em: RegExpExecArray | null;
+          while ((em = envModel.exec(codeContent)) !== null) {
+            this.unresolvedReferences.push({ fromNodeId: nodeId, referenceName: em[1]!, referenceKind: 'references', line: this.getLineNumber(codeOffset + em.index), column: 0 });
+          }
+          const envRef = /env\.ref\(['"]([^'"]+)['"]/g;
+          let er: RegExpExecArray | null;
+          while ((er = envRef.exec(codeContent)) !== null) {
+            this.unresolvedReferences.push({ fromNodeId: nodeId, referenceName: er[1]!, referenceKind: 'references', line: this.getLineNumber(codeOffset + er.index), column: 0 });
+          }
+        }
       }
     }
   }
@@ -228,7 +325,7 @@ export class OdooExtractor {
     }
   }
 
-  private extractShorthand(fileNodeId: string, tag: string, namespace: string): void {
+  private extractShorthand(fileNodeId: string, tag: string, namespace: string, refAttrs?: string[]): void {
     const regex = new RegExp(`<${tag}\\b([^>]*?)(?:\\/>|>)`, 'g');
     let m: RegExpExecArray | null;
     while ((m = regex.exec(this.source)) !== null) {
@@ -263,6 +360,21 @@ export class OdooExtractor {
       };
       this.nodes.push(node);
       this.edges.push({ source: fileNodeId, target: nodeId, kind: 'contains' });
+      // T1-C / T2-P: emit unresolved refs for specified attribute values (action, parent, groups, src_model, etc.)
+      if (refAttrs) {
+        for (const attrName of refAttrs) {
+          const attrMatch = new RegExp(`\\b${attrName}\\s*=\\s*"([^"]+)"`).exec(attrs);
+          if (attrMatch) {
+            this.unresolvedReferences.push({
+              fromNodeId: nodeId,
+              referenceName: attrMatch[1]!,
+              referenceKind: 'references',
+              line: startLine,
+              column: 0,
+            });
+          }
+        }
+      }
     }
   }
 
@@ -295,6 +407,47 @@ export class OdooExtractor {
         line: this.getLineNumber(m.index),
         column: 0,
       });
+    }
+  }
+
+  /** T1-F: <field name="res_model|model|...">dotted.model.name</field> → model ref */
+  private extractFieldTextContent(fileNodeId: string): void {
+    const modelFieldNames = ['res_model', 'src_model', 'model', 'model_name'];
+    const pattern = new RegExp(
+      `<field\\s+name\\s*=\\s*"(${modelFieldNames.join('|')})"\\s*>([^<]+)<\\/field>`,
+      'g'
+    );
+    const modelPattern = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]+)+$/;
+    let m: RegExpExecArray | null;
+    while ((m = pattern.exec(this.source)) !== null) {
+      const value = m[2]!.trim();
+      if (modelPattern.test(value)) {
+        this.unresolvedReferences.push({
+          fromNodeId: fileNodeId,
+          referenceName: value,
+          referenceKind: 'references',
+          line: this.getLineNumber(m.index),
+          column: 0,
+        });
+      }
+    }
+  }
+
+  /** T2-Q: <function model="M" name="N"> → model + method refs */
+  private extractFunctionTag(fileNodeId: string): void {
+    const regex = /<function\b([^>]*)>/g;
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(this.source)) !== null) {
+      const attrs = m[1] ?? '';
+      const modelMatch = /\bmodel\s*=\s*"([^"]+)"/.exec(attrs);
+      const nameMatch = /\bname\s*=\s*"([^"]+)"/.exec(attrs);
+      const line = this.getLineNumber(m.index);
+      if (modelMatch) {
+        this.unresolvedReferences.push({ fromNodeId: fileNodeId, referenceName: modelMatch[1]!, referenceKind: 'references', line, column: 0 });
+      }
+      if (nameMatch) {
+        this.unresolvedReferences.push({ fromNodeId: fileNodeId, referenceName: nameMatch[1]!, referenceKind: 'references', line, column: 0 });
+      }
     }
   }
 

@@ -39,6 +39,14 @@ export class CsvExtractor {
     return normalized.startsWith('id,name,model_id:id,group_id:id,perm_read');
   }
 
+  /** T2-A: Detect model data CSV by filename (e.g. tipo.detraccion.csv → model tipo.detraccion) */
+  isModelDataFile(): boolean {
+    const basename = this.filePath.replace(/\\/g, '/').split('/').pop() ?? '';
+    if (!basename.endsWith('.csv')) return false;
+    const stem = basename.slice(0, -4);
+    return stem.includes('.') && stem !== 'ir.model.access' && /^[a-z][a-z0-9.]+$/.test(stem);
+  }
+
   extract(): ExtractionResult {
     const startTime = Date.now();
     const fileNode = this.createFileNode();
@@ -46,6 +54,8 @@ export class CsvExtractor {
     try {
       if (this.isOdooAccessFile()) {
         this.extractOdooAccessRules(fileNode.id);
+      } else if (this.isModelDataFile()) {
+        this.extractModelDataFile(fileNode.id);
       }
       // Non-Odoo CSV: file node only — no symbols
     } catch (error) {
@@ -83,6 +93,33 @@ export class CsvExtractor {
     };
     this.nodes.push(node);
     return node;
+  }
+
+  private extractModelDataFile(fileNodeId: string): void {
+    const basename = this.filePath.replace(/\\/g, '/').split('/').pop() ?? '';
+    const modelName = basename.slice(0, -4); // e.g. 'tipo.detraccion'
+    // Emit ref to the model this file populates
+    this.unresolvedReferences.push({
+      fromNodeId: fileNodeId,
+      referenceName: modelName,
+      referenceKind: 'references',
+      line: 1,
+      column: 0,
+    });
+    // Emit field refs from header columns (skip id, :id, /id suffixes)
+    const firstLine = this.source.split('\n')[0]?.trim() ?? '';
+    const headers = this.parseCsvLine(firstLine);
+    for (const header of headers) {
+      const clean = header.replace(/['"]/g, '').trim();
+      if (!clean || clean === 'id' || clean.endsWith(':id') || clean.endsWith('/id')) continue;
+      this.unresolvedReferences.push({
+        fromNodeId: fileNodeId,
+        referenceName: clean,
+        referenceKind: 'references',
+        line: 1,
+        column: 0,
+      });
+    }
   }
 
   private extractOdooAccessRules(fileNodeId: string): void {

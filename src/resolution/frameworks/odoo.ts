@@ -108,6 +108,22 @@ function extractPythonPatterns(
     });
   }
 
+  // T2-L: env['ir.config_parameter'].get_param/set_param('key') → config_param ref
+  const configParam = /env\[['"]ir\.config_parameter['"]\]\.(?:get_param|set_param)\s*\(\s*['"]([^'"]+)['"]/g;
+  while ((m = configParam.exec(safe)) !== null) {
+    const key = m[1]!;
+    const line = safe.slice(0, m.index).split('\n').length;
+    references.push({ fromNodeId: `file:${filePath}`, referenceName: `config_param::${key}`, referenceKind: 'references', line, column: 0, filePath, language: 'python' });
+  }
+
+  // T2-M: env['ir.sequence'].next_by_code('code') → ir.sequence ref
+  const seqCode = /env\[['"]ir\.sequence['"]\]\.next_by_code\s*\(\s*['"]([^'"]+)['"]/g;
+  while ((m = seqCode.exec(safe)) !== null) {
+    const code = m[1]!;
+    const line = safe.slice(0, m.index).split('\n').length;
+    references.push({ fromNodeId: `file:${filePath}`, referenceName: `ir.sequence::${code}`, referenceKind: 'references', line, column: 0, filePath, language: 'python' });
+  }
+
   // @route('/path', ...) or @http.route('/path', ...)
   const routeDecorator = /@(?:http\.)?route\s*\(\s*['"]([^'"]+)['"]/g;
   while ((m = routeDecorator.exec(safe)) !== null) {
@@ -156,6 +172,28 @@ function extractManifestPatterns(
         filePath,
         language: 'python',
       });
+    }
+  }
+
+  // T2-N: data / demo arrays → imports refs per file path
+  for (const key of ['data', 'demo']) {
+    const listMatch = new RegExp(`['"]${key}['"]\\s*:\\s*\\[([^\\]]+)\\]`, 's').exec(content);
+    if (listMatch) {
+      const line = content.slice(0, listMatch.index).split('\n').length;
+      const items = listMatch[1]!.match(/['"]([^'"]+)['"]/g) ?? [];
+      for (const item of items) {
+        references.push({ fromNodeId: `file:${filePath}`, referenceName: item.slice(1, -1), referenceKind: 'imports', line, column: 0, filePath, language: 'python' });
+      }
+    }
+  }
+
+  // T2-N: auto_install → imports refs per module
+  const autoInstall = /['"]auto_install['"]\s*:\s*\[([^\]]+)\]/s.exec(content);
+  if (autoInstall) {
+    const line = content.slice(0, autoInstall.index).split('\n').length;
+    const items = autoInstall[1]!.match(/['"]([^'"]+)['"]/g) ?? [];
+    for (const item of items) {
+      references.push({ fromNodeId: `file:${filePath}`, referenceName: item.slice(1, -1), referenceKind: 'imports', line, column: 0, filePath, language: 'python' });
     }
   }
 
