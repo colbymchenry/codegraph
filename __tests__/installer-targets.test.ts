@@ -1203,6 +1203,44 @@ describe('Installer targets — TOML serializer (Codex backbone)', () => {
     expect(content.match(/\[\[foo\]\]/g)?.length).toBe(2);
     expect(content).toContain('[mcp_servers.codegraph]');
   });
+
+  it('upsert preserves a following array-of-tables sibling [[foo]]', () => {
+    const existing = [
+      '[mcp_servers.codegraph]',
+      'command = "old-codegraph"',
+      'args = ["old"]',
+      '',
+      '[[foo]]',
+      'name = "a"',
+      '',
+      '[[foo]]',
+      'name = "b"',
+      '',
+    ].join('\n');
+    const block = buildTomlTable('mcp_servers.codegraph', { command: 'codegraph', args: ['serve'] });
+    const { content, action } = upsertTomlTable(existing, 'mcp_servers.codegraph', block);
+    expect(action).toBe('replaced');
+    expect(content.match(/\[\[foo\]\]/g)?.length).toBe(2);
+    expect(content).toContain('name = "a"');
+    expect(content).toContain('name = "b"');
+  });
+
+  it('removeTomlTable preserves a following array-of-tables sibling [[foo]]', () => {
+    const existing = [
+      '[mcp_servers.codegraph]',
+      'command = "codegraph"',
+      'args = ["serve"]',
+      '',
+      '[[foo]]',
+      'name = "keep-me"',
+      '',
+    ].join('\n');
+    const { content, action } = removeTomlTable(existing, 'mcp_servers.codegraph');
+    expect(action).toBe('removed');
+    expect(content).toContain('[[foo]]');
+    expect(content).toContain('name = "keep-me"');
+    expect(content).not.toContain('mcp_servers.codegraph');
+  });
 });
 
 describe('Installer — uninstallTargets sweep (codegraph uninstall)', () => {

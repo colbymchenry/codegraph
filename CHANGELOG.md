@@ -18,6 +18,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - Indexing a project that contains only config-style files (YAML, Twig, or `.properties`) no longer misleadingly reports "No files found to index" — these files are tracked at the file level and are now counted as indexed. Thanks @luojiyin1987 (#357).
+- Codex installs and uninstalls now preserve TOML array-of-table sections that appear after the CodeGraph MCP entry, so unrelated user configuration is no longer removed.
 
 ## [0.9.7] - 2026-05-28
 

@@ -7,13 +7,13 @@
  *
  * Strategy: treat the file as text. Find the `[mcp_servers.codegraph]`
  * header line, splice it (and the lines that follow it until the next
- * `[...]` header or EOF) in or out. Everything outside that block is
- * preserved verbatim, byte-for-byte.
+ * `[...]` or `[[...]]` header or EOF) in or out. Everything outside
+ * that block is preserved verbatim, byte-for-byte.
  *
  * Limitations (acceptable for our narrow use):
- *   - Only handles top-level table headers; not array-of-tables or
- *     subtables nested inside `[mcp_servers]` itself (we always write
- *     the full dotted key `[mcp_servers.codegraph]`).
+ *   - Only edits top-level table headers. Array-of-tables and subtables
+ *     nested inside `[mcp_servers]` are preserved as opaque siblings
+ *     (we always write the full dotted key `[mcp_servers.codegraph]`).
  *   - Doesn't validate sibling TOML — if the file is malformed
  *     elsewhere, our injection won't fix it but won't make it worse.
  *   - Quotes string values with double quotes; escapes `\` and `"`.
@@ -133,22 +133,11 @@ function findHeaderIndex(content: string, headerLine: string): number {
 }
 
 /**
- * Find the byte index of the next top-level `[...]` table header
- * (excluding array-of-tables `[[...]]`) starting from `from`, or
- * return content length when none.
+ * Find the byte index of the next top-level `[...]` or `[[...]]`
+ * table header starting from `from`, or return content length when
+ * none.
  */
 function findNextTableHeader(content: string, from: number): number {
-  // Look for "\n[" but skip "\n[[" (array of tables).
-  let i = from;
-  while (i < content.length) {
-    const nlIdx = content.indexOf('\n[', i);
-    if (nlIdx === -1) return content.length;
-    if (content[nlIdx + 2] === '[') {
-      // [[...]] — keep searching past it.
-      i = nlIdx + 2;
-      continue;
-    }
-    return nlIdx + 1;
-  }
-  return content.length;
+  const nlIdx = content.indexOf('\n[', from);
+  return nlIdx === -1 ? content.length : nlIdx + 1;
 }
