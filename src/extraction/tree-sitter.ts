@@ -2018,6 +2018,11 @@ export class TreeSitterExtractor {
 
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);
+        // Invoke language-specific hook so patterns like self.write({...})
+        // and self.mapped('a.b') can emit semantic refs from method bodies.
+        if (this.extractor!.visitNode) {
+          this.extractor!.visitNode(node, this.makeExtractorContext());
+        }
       } else if (INSTANTIATION_KINDS.has(nodeType)) {
         // `new Foo()` inside a function body — emit an `instantiates`
         // reference. Without this branch the body walker only knew
