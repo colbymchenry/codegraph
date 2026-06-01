@@ -39,6 +39,17 @@ curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install
 irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
 ```
 
+### MCP sanitization (optional)
+
+```bash
+codegraph serve --mcp --sanitize
+codegraph serve --mcp --sanitize-hook /absolute/path/to/sanitize-hook.cjs
+```
+
+- `--sanitize` enables built-in redaction for common PII/secrets in tool responses (email, phone, SSN, credit cards, common API keys).
+- `--sanitize-hook` loads a custom sanitizer module in the MCP response pipeline (module must export a function that accepts text and returns sanitized text).
+- Env equivalents: `CODEGRAPH_SANITIZE=1`, `CODEGRAPH_SANITIZE_HOOK=/absolute/path/to/hook.cjs`.
+
 Already have Node? Use npm instead (works on any version):
 
 ```bash
@@ -447,6 +458,7 @@ codegraph callees <symbol>        # Find what a function/method calls (--limit, 
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
 codegraph affected [files...]     # Find test files affected by changes (see below)
 codegraph serve --mcp             # Start MCP server
+codegraph serve --mcp --sanitize  # Enable built-in PII redaction on MCP tool output
 ```
 
 ### `codegraph affected`

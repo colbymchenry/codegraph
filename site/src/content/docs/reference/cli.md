@@ -20,7 +20,18 @@ codegraph callees <symbol>        # Find what a function/method calls (--limit, 
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
 codegraph affected [files...]     # Find test files affected by changes
 codegraph serve --mcp             # Start MCP server
+codegraph serve --mcp --sanitize  # Enable built-in PII redaction
 ```
+
+## MCP sanitization
+
+```bash
+codegraph serve --mcp --sanitize
+codegraph serve --mcp --sanitize-hook /absolute/path/to/sanitize-hook.cjs
+```
+
+- `--sanitize` enables built-in redaction for common PII/secrets in MCP tool responses.
+- `--sanitize-hook` loads a custom sanitizer module into the MCP response pipeline (module must export a function that accepts text and returns sanitized text).
 
 ## Query commands
 

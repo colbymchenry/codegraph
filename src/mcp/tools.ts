@@ -37,6 +37,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { tmpdir } from 'os';
 import * as pathModule from 'path';
 import { join, resolve as resolvePath } from 'path';
+import { sanitizeToolResult } from './sanitization';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -1115,7 +1116,7 @@ export class ToolHandler {
           // status embeds the pending-files list as a first-class section
           // (see handleStatus), so we skip the auto-banner wrapper here to
           // avoid duplicating the same info at the top of the response.
-          return await this.handleStatus(args);
+          result = await this.handleStatus(args); break;
         case 'codegraph_files':
           result = await this.handleFiles(args); break;
         case 'codegraph_trace':
@@ -1123,8 +1124,13 @@ export class ToolHandler {
         default:
           return this.errorResult(`Unknown tool: ${toolName}`);
       }
-      const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
-      return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
+      const wrapped = toolName === 'codegraph_status'
+        ? result
+        : this.withStalenessNotice(
+          this.withWorktreeNotice(result, args.projectPath as string | undefined),
+          args.projectPath as string | undefined
+        );
+      return await sanitizeToolResult(wrapped);
     } catch (err) {
       return this.errorResult(`Tool execution failed: ${err instanceof Error ? err.message : String(err)}`);
     }

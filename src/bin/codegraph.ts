@@ -1128,13 +1128,23 @@ program
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
-  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
+  .option('--sanitize', 'Enable built-in PII sanitization for MCP tool responses')
+  .option('--sanitize-hook <modulePath>', 'Path to a custom sanitizer hook module (exports a function)')
+  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean; sanitize?: boolean; sanitizeHook?: string }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
 
     // Commander sets watch=false when --no-watch is passed. Route it through
     // the same env-var chokepoint the watcher and MCP server already honor.
     if (options.watch === false) {
       process.env.CODEGRAPH_NO_WATCH = '1';
+    }
+    if (options.sanitize) {
+      process.env.CODEGRAPH_SANITIZE = '1';
+    }
+    if (options.sanitizeHook) {
+      process.env.CODEGRAPH_SANITIZE_HOOK = path.isAbsolute(options.sanitizeHook)
+        ? options.sanitizeHook
+        : path.resolve(options.sanitizeHook);
     }
 
     try {

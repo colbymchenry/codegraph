@@ -9,6 +9,16 @@ CodeGraph runs as a [Model Context Protocol](https://modelcontextprotocol.io/) s
 codegraph serve --mcp
 ```
 
+Optional privacy hardening:
+
+```bash
+codegraph serve --mcp --sanitize
+codegraph serve --mcp --sanitize-hook /absolute/path/to/sanitize-hook.cjs
+```
+
+- `--sanitize` enables built-in redaction for common PII/secrets in MCP tool output.
+- `--sanitize-hook` loads a custom sanitizer module in the response pipeline (module exports a function that accepts text and returns sanitized text).
+
 Agents configured by the installer launch this automatically. When a `.codegraph/` index exists, the agent uses the tools below.
 
 ## Tools

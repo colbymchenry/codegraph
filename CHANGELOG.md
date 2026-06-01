@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph serve --mcp` now supports privacy hardening before tool output reaches your agent: `--sanitize` enables built-in redaction for common PII/secrets (emails, phones, SSNs, credit cards, and common API keys), and `--sanitize-hook <module>` adds a custom response-sanitization hook for organization-specific policies or external sanitizers.
 
 ## [0.9.8] - 2026-06-01
 
