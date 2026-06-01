@@ -1163,10 +1163,12 @@ program
         console.error('Available tools:');
         console.error(chalk.cyan('  codegraph_search') + '    - Search for code symbols');
         console.error(chalk.cyan('  codegraph_context') + '   - Build context for a task');
+        console.error(chalk.cyan('  codegraph_trace') + '     - Trace call paths between symbols');
         console.error(chalk.cyan('  codegraph_callers') + '   - Find callers of a symbol');
         console.error(chalk.cyan('  codegraph_callees') + '   - Find what a symbol calls');
         console.error(chalk.cyan('  codegraph_impact') + '    - Analyze impact of changes');
         console.error(chalk.cyan('  codegraph_node') + '      - Get symbol details');
+        console.error(chalk.cyan('  codegraph_explore') + '   - Explore related source');
         console.error(chalk.cyan('  codegraph_files') + '     - Get project file structure');
         console.error(chalk.cyan('  codegraph_status') + '    - Get index status');
       }
