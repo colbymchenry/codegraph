@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { JAVA_HTTP_CLIENT_REF_PREFIX, parseJavaHttpClientReference } from '../../extraction/java-http-client';
 
 export const springResolver: FrameworkResolver = {
   name: 'spring',
@@ -17,7 +18,7 @@ export const springResolver: FrameworkResolver = {
     // name carries the `:prefix` sentinel — there's no declared symbol with
     // that exact spelling, so the resolver's name-existence pre-filter would
     // drop it. Opt those through.
-    return name.endsWith(':prefix');
+    return name.endsWith(':prefix') || name.startsWith(JAVA_HTTP_CLIENT_REF_PREFIX);
   },
 
   detect(context: ResolutionContext): boolean {
@@ -58,6 +59,11 @@ export const springResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    const httpCall = parseJavaHttpClientReference(ref.referenceName);
+    if (httpCall) {
+      return resolveJavaHttpClientCall(ref, httpCall.method, httpCall.pathExpression, context);
+    }
+
     // Spring config-key references — `@Value("${key}")` (single leaf) and
     // `@ConfigurationProperties(prefix="X")` (entire subtree, marked with the
     // `:prefix` suffix in extractSpringValueBindings). Lookup goes through
@@ -509,6 +515,211 @@ function parseMappingPath(args: string): string {
 function joinPath(prefix: string, sub: string): string {
   const parts = [prefix, sub].map((p) => p.replace(/^\/+|\/+$/g, '')).filter(Boolean);
   return '/' + parts.join('/');
+}
+
+function resolveJavaHttpClientCall(
+  ref: UnresolvedRef,
+  method: string,
+  pathExpression: string,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const candidatePaths = inferHttpPaths(pathExpression, ref, context);
+  if (candidatePaths.length === 0) return null;
+
+  let best: { node: Node; confidence: number } | null = null;
+  const routes = context
+    .getNodesByKind('route')
+    .filter((n) => n.language === 'java' || n.language === 'kotlin');
+
+  for (const candidatePath of candidatePaths) {
+    for (const route of routes) {
+      const confidence = scoreHttpRouteMatch(method, candidatePath, route);
+      if (confidence <= 0) continue;
+      if (!best || confidence > best.confidence) {
+        best = { node: route, confidence };
+      }
+    }
+  }
+
+  if (!best) return null;
+  return {
+    original: ref,
+    targetNodeId: best.node.id,
+    confidence: best.confidence,
+    resolvedBy: 'framework',
+  };
+}
+
+function inferHttpPaths(
+  expression: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  seen = new Set<string>(),
+): string[] {
+  const key = `${ref.filePath}:${expression}`;
+  if (seen.has(key) || seen.size > 8) return [];
+  seen.add(key);
+
+  const direct = pathsFromStringLiterals(expression);
+  if (direct.length > 0) return direct;
+
+  const variableName = expression.match(/^[A-Za-z_]\w*$/)?.[0];
+  if (variableName) {
+    const assigned = findAssignedExpression(variableName, ref, context);
+    if (assigned) return inferHttpPaths(assigned, ref, context, seen);
+  }
+
+  const methodName = extractTerminalMethodName(expression);
+  if (methodName) {
+    const paths: string[] = [];
+    for (const methodNode of context.getNodesByName(methodName)) {
+      if (methodNode.kind !== 'method' && methodNode.kind !== 'function') continue;
+      if (methodNode.language !== 'java' && methodNode.language !== 'kotlin') continue;
+      const body = sliceNodeText(methodNode, context);
+      if (!body) continue;
+      for (const returned of extractReturnExpressions(body, methodNode.language)) {
+        paths.push(...inferHttpPaths(returned, { ...ref, filePath: methodNode.filePath }, context, seen));
+      }
+    }
+    return unique(paths);
+  }
+
+  return [];
+}
+
+function pathsFromStringLiterals(expression: string): string[] {
+  const literals = collectStringLiterals(expression);
+  if (literals.length === 0) return [];
+
+  const direct = literals
+    .map(stringToHttpPath)
+    .filter((p): p is string => !!p);
+  if (direct.length > 0) return unique(direct);
+
+  const joined = literals.join('');
+  const joinedPath = stringToHttpPath(joined);
+  return joinedPath ? [joinedPath] : [];
+}
+
+function collectStringLiterals(expression: string): string[] {
+  const literals: string[] = [];
+  const re = /(["'])(?:\\.|(?!\1).)*\1/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(expression)) !== null) {
+    literals.push(unescapeJavaString(m[0]!.slice(1, -1)));
+  }
+  return literals;
+}
+
+function stringToHttpPath(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === '/') return '/';
+  try {
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
+      const url = new URL(trimmed);
+      return normalizeHttpPath(url.pathname || '/');
+    }
+  } catch {
+    // Fall through to path-shaped handling.
+  }
+  if (trimmed.startsWith('/')) return normalizeHttpPath(trimmed);
+  if (trimmed.includes('/')) return normalizeHttpPath('/' + trimmed.replace(/^\/+/, ''));
+  return null;
+}
+
+function extractTerminalMethodName(expression: string): string | null {
+  const m = expression.match(/(?:^|\.)([A-Za-z_]\w*)\s*\([^()]*\)\s*$/);
+  return m ? m[1]! : null;
+}
+
+function findAssignedExpression(
+  variableName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const content = context.readFile(ref.filePath);
+  if (!content) return null;
+  const before = content.split(/\r?\n/).slice(0, Math.max(ref.line, 1)).join('\n');
+  const escaped = variableName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(?:\\b(?:String|URI|URL|var|val)\\s+)?${escaped}\\s*=\\s*([^;\\n]+)`, 'g');
+  let m: RegExpExecArray | null;
+  let last: string | null = null;
+  while ((m = re.exec(before)) !== null) {
+    last = m[1]!.trim();
+  }
+  return last;
+}
+
+function extractReturnExpressions(body: string, language: string): string[] {
+  const expressions: string[] = [];
+  const returnRe = /\breturn\s+([^;}\n]+)\s*;?/g;
+  let m: RegExpExecArray | null;
+  while ((m = returnRe.exec(body)) !== null) {
+    expressions.push(m[1]!.trim());
+  }
+  if (language === 'kotlin' && expressions.length === 0) {
+    const eq = body.match(/=\s*([^\n{}]+)/);
+    if (eq) expressions.push(eq[1]!.trim());
+  }
+  return expressions;
+}
+
+function sliceNodeText(node: Node, context: ResolutionContext): string | null {
+  const content = context.readFile(node.filePath);
+  if (!content) return null;
+  const lines = content.split(/\r?\n/);
+  return lines.slice(Math.max(node.startLine - 1, 0), node.endLine).join('\n');
+}
+
+function scoreHttpRouteMatch(method: string, candidatePath: string, route: Node): number {
+  const parsed = parseRouteName(route.name);
+  if (!parsed) return 0;
+  if (parsed.method !== method && parsed.method !== 'ANY') return 0;
+
+  const candidate = normalizeHttpPath(candidatePath);
+  const routePath = normalizeHttpPath(parsed.path);
+  const anyPenalty = parsed.method === 'ANY' ? 0.05 : 0;
+
+  if (candidate === routePath) return 0.93 - anyPenalty;
+  if (routePath !== '/' && candidate.endsWith(routePath)) return 0.84 - anyPenalty;
+  if (routePath !== '/' && routePath.endsWith(candidate)) return 0.8 - anyPenalty;
+  if (routePatternMatches(routePath, candidate)) return 0.82 - anyPenalty;
+  return 0;
+}
+
+function parseRouteName(name: string): { method: string; path: string } | null {
+  const m = name.match(/^([A-Z]+)\s+(.+)$/);
+  if (!m) return null;
+  return { method: m[1]!, path: m[2]! };
+}
+
+function routePatternMatches(routePath: string, candidatePath: string): boolean {
+  const escaped = routePath
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\\\{[^/]+\\\}/g, '[^/]+')
+    .replace(/:[A-Za-z_]\w*/g, '[^/]+');
+  return new RegExp(`^${escaped}$`).test(candidatePath);
+}
+
+function normalizeHttpPath(path: string): string {
+  const noQuery = path.split(/[?#]/, 1)[0] || '/';
+  const withSlash = noQuery.startsWith('/') ? noQuery : '/' + noQuery;
+  const collapsed = withSlash.replace(/\/+/g, '/');
+  return collapsed.length > 1 ? collapsed.replace(/\/+$/, '') : collapsed;
+}
+
+function unescapeJavaString(value: string): string {
+  return value
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'")
+    .replace(/\\\\/g, '\\');
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)];
 }
 
 /**

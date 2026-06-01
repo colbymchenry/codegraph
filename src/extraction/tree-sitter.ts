@@ -24,6 +24,7 @@ import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { isLikelyJavaHttpClientCallText, makeJavaHttpClientRefs } from './java-http-client';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -1741,6 +1742,32 @@ export class TreeSitterExtractor {
         line: node.startPosition.row + 1,
         column: node.startPosition.column,
       });
+    }
+
+    // Java service-to-service calls are usually hidden behind HTTP clients or
+    // company wrappers, so the ordinary callee name (`post`, `execute`, etc.)
+    // is not enough. Emit an additional synthetic reference that the Spring
+    // resolver can map to a matching route node.
+    if (this.language === 'java' || this.language === 'kotlin') {
+      const callText = getNodeText(node, this.source);
+      const parent = node.parent;
+      const parentText = parent && parent.type === node.type ? getNodeText(parent, this.source) : '';
+      const nestedInLargerHttpCall =
+        parentText.length > callText.length &&
+        parentText.includes(callText) &&
+        isLikelyJavaHttpClientCallText(parentText);
+      if (!nestedInLargerHttpCall) {
+        this.unresolvedReferences.push(
+          ...makeJavaHttpClientRefs(
+            callText,
+            callerId,
+            node.startPosition.row + 1,
+            node.startPosition.column,
+            this.filePath,
+            this.language,
+          ),
+        );
+      }
     }
   }
 

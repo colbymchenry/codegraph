@@ -607,6 +607,114 @@ describe('Java end-to-end — field-injected bean trace (issue #389)', () => {
   });
 });
 
+describe('Java end-to-end — outbound HTTP service calls', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('connects a company RestClient POST call to the matching Spring route', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-java-http-'));
+    const javaDir = path.join(tmpDir, 'src/main/java/com/example');
+    fs.mkdirSync(javaDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'pom.xml'),
+      '<project><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency></dependencies></project>\n'
+    );
+    fs.writeFileSync(
+      path.join(javaDir, 'CallerService.java'),
+      'package com.example;\n' +
+        'class CallerService {\n' +
+        '  private Core core = new Core();\n' +
+        '  public void syncUser(String fromUserJson) {\n' +
+        '    RestClient.post(core.getConsumeUrl()).params(fromUserJson).execute(Response.class);\n' +
+        '  }\n' +
+        '}\n' +
+        'class Core {\n' +
+        '  public String getConsumeUrl() { return "http://user-service/api/users/consume"; }\n' +
+        '}\n' +
+        'class RestClient { static RestClient post(String url) { return new RestClient(); } RestClient params(String body) { return this; } Response execute(Class<Response> type) { return new Response(); } }\n' +
+        'class Response {}\n'
+    );
+    fs.writeFileSync(
+      path.join(javaDir, 'UserController.java'),
+      'package com.example;\n' +
+        'import org.springframework.web.bind.annotation.PostMapping;\n' +
+        'import org.springframework.web.bind.annotation.RequestMapping;\n' +
+        'import org.springframework.web.bind.annotation.RestController;\n' +
+        '@RestController\n' +
+        '@RequestMapping("/api/users")\n' +
+        'class UserController {\n' +
+        '  @PostMapping("/consume")\n' +
+        '  public Response consume() { return new Response(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const syncUser = cg.getNodesByKind('method').find((n) => n.name === 'syncUser');
+    const route = cg.getNodesByKind('route').find((n) => n.name === 'POST /api/users/consume');
+    const consume = cg.getNodesByKind('method').find((n) => n.name === 'consume');
+    expect(syncUser).toBeDefined();
+    expect(route).toBeDefined();
+    expect(consume).toBeDefined();
+
+    const callerToRoute = cg.getOutgoingEdges(syncUser!.id).find((e) => e.target === route!.id);
+    expect(callerToRoute, 'RestClient.post(core.getConsumeUrl()) should call the matching route').toBeDefined();
+    expect(callerToRoute!.kind).toBe('calls');
+
+    const routeToHandler = cg.getOutgoingEdges(route!.id).find((e) => e.target === consume!.id);
+    expect(routeToHandler, 'route should still link to its controller handler').toBeDefined();
+    expect(routeToHandler!.kind).toBe('references');
+
+    cg.close();
+  });
+
+  it('connects RestTemplate POST calls with literal URLs to Spring routes', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-java-resttemplate-'));
+    const javaDir = path.join(tmpDir, 'src/main/java/com/example');
+    fs.mkdirSync(javaDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'pom.xml'),
+      '<project><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency></dependencies></project>\n'
+    );
+    fs.writeFileSync(
+      path.join(javaDir, 'Client.java'),
+      'package com.example;\n' +
+        'class Client {\n' +
+        '  private RestTemplate restTemplate = new RestTemplate();\n' +
+        '  public void send() { restTemplate.postForObject("/orders/create", "{}", Response.class); }\n' +
+        '}\n' +
+        'class RestTemplate { Response postForObject(String url, String body, Class<Response> type) { return new Response(); } }\n' +
+        'class Response {}\n'
+    );
+    fs.writeFileSync(
+      path.join(javaDir, 'OrderController.java'),
+      'package com.example;\n' +
+        'import org.springframework.web.bind.annotation.PostMapping;\n' +
+        'class OrderController {\n' +
+        '  @PostMapping("/orders/create")\n' +
+        '  public Response create() { return new Response(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const send = cg.getNodesByKind('method').find((n) => n.name === 'send');
+    const route = cg.getNodesByKind('route').find((n) => n.name === 'POST /orders/create');
+    expect(send).toBeDefined();
+    expect(route).toBeDefined();
+
+    const callerToRoute = cg.getOutgoingEdges(send!.id).find((e) => e.target === route!.id);
+    expect(callerToRoute, 'postForObject literal URL should call the matching route').toBeDefined();
+
+    cg.close();
+  });
+});
+
 describe('JVM FQN imports — end-to-end', () => {
   let tmpDir: string | undefined;
   afterEach(() => {
