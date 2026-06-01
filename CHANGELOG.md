@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- The MCP server no longer drops a later response when a client reuses its initialization request ID after the opening handshake completes.
 
 ## [0.9.8] - 2026-06-01
 
