@@ -1,5 +1,6 @@
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
+import { owlVisitNode } from './javascript';
 
 export const typescriptExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration', 'arrow_function', 'function_expression'],
@@ -105,6 +106,8 @@ export const typescriptExtractor: LanguageExtractor = {
     }
     return false;
   },
+  visitNode: owlVisitNode,
+
   extractImport: (node, source) => {
     const sourceField = node.childForFieldName('source');
     if (sourceField) {

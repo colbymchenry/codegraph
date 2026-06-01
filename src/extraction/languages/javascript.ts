@@ -1,5 +1,6 @@
+import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
-import type { LanguageExtractor } from '../tree-sitter-types';
+import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 
 export const javascriptExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration', 'arrow_function', 'function_expression'],
@@ -71,6 +72,8 @@ export const javascriptExtractor: LanguageExtractor = {
     }
     return false;
   },
+  visitNode: owlVisitNode,
+
   extractImport: (node, source) => {
     const sourceField = node.childForFieldName('source');
     if (sourceField) {
@@ -82,3 +85,85 @@ export const javascriptExtractor: LanguageExtractor = {
     return null;
   },
 };
+
+// ---------------------------------------------------------------------------
+// OWL visitNode — shared by javascript + typescript extractors
+// ---------------------------------------------------------------------------
+
+export function owlVisitNode(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const fromNodeId = ctx.nodeStack[ctx.nodeStack.length - 1];
+  if (!fromNodeId) return false;
+  const line = node.startPosition.row + 1;
+
+  // static template = "module.Template" inside OWL Component class
+  if (node.type === 'field_definition') {
+    const nameNode = getChildByField(node, 'name');
+    const valueNode = getChildByField(node, 'value');
+    if (nameNode && valueNode && getNodeText(nameNode, ctx.source) === 'template') {
+      if (valueNode.type === 'string') {
+        const templateName = getNodeText(valueNode, ctx.source).replace(/['"]/g, '');
+        if (templateName) {
+          ctx.addUnresolvedReference({
+            fromNodeId,
+            referenceName: `qweb::${templateName}`,
+            referenceKind: 'references',
+            line,
+            column: node.startPosition.column,
+            filePath: ctx.filePath,
+            language: 'javascript',
+          });
+        }
+      }
+    }
+    return false;
+  }
+
+  // call_expression: patch(Target, {...}) or registry.category(...).add(name, Comp)
+  if (node.type === 'call_expression') {
+    const funcNode = getChildByField(node, 'function');
+    const argsNode = getChildByField(node, 'arguments');
+    if (!funcNode || !argsNode) return false;
+    const funcText = getNodeText(funcNode, ctx.source);
+
+    // patch(TargetClass, { ... })
+    if (funcText === 'patch') {
+      const firstArg = argsNode.namedChildren[0];
+      if (firstArg) {
+        ctx.addUnresolvedReference({
+          fromNodeId,
+          referenceName: getNodeText(firstArg, ctx.source),
+          referenceKind: 'references',
+          line,
+          column: node.startPosition.column,
+          filePath: ctx.filePath,
+          language: 'javascript',
+        });
+      }
+      return false;
+    }
+
+    // registry.category("views").add("list", ListView)
+    if (/\.add$/.test(funcText)) {
+      const args = argsNode.namedChildren;
+      if (args.length >= 2) {
+        const compArg = args[1]!;
+        const compName = getNodeText(compArg, ctx.source);
+        if (/^[A-Z]/.test(compName)) {
+          ctx.addUnresolvedReference({
+            fromNodeId,
+            referenceName: compName,
+            referenceKind: 'references',
+            line,
+            column: node.startPosition.column,
+            filePath: ctx.filePath,
+            language: 'javascript',
+          });
+        }
+      }
+    }
+
+    return false;
+  }
+
+  return false;
+}

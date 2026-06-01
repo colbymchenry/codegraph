@@ -51,6 +51,11 @@ export class OdooExtractor {
       this.extractShorthand(fileNode.id, 'menuitem', 'ir.ui.menu');
       this.extractShorthand(fileNode.id, 'act_window', 'ir.actions.act_window');
       this.extractShorthand(fileNode.id, 'report', 'ir.actions.report');
+      this.extractShorthand(fileNode.id, 'act_server', 'ir.actions.server');
+      this.extractShorthand(fileNode.id, 'act_client', 'ir.actions.client');
+      this.extractShorthand(fileNode.id, 'url', 'ir.actions.url');
+      this.extractTCall(fileNode.id);
+      this.extractGenericRef(fileNode.id);
     } catch (error) {
       this.errors.push({
         message: `Odoo extraction error: ${error instanceof Error ? error.message : String(error)}`,
@@ -133,6 +138,50 @@ export class OdooExtractor {
           column: 0,
         });
       }
+
+      // <field name="arch" type="xml"> nested content → field refs + button(type=object) refs
+      const archRegex = /<field\s+name\s*=\s*"arch"[^>]*>([\s\S]*?)<\/field>/g;
+      let arch: RegExpExecArray | null;
+      while ((arch = archRegex.exec(body)) !== null) {
+        const archContent = arch[1]!;
+        const archOffset = bodyOffset + arch.index + arch[0].indexOf(arch[1]!);
+        // <field name="X"/> or <field name="X" ...>
+        const fieldRef = /<field\b[^>]*\bname\s*=\s*"([^"]+)"/g;
+        let fr: RegExpExecArray | null;
+        while ((fr = fieldRef.exec(archContent)) !== null) {
+          this.unresolvedReferences.push({
+            fromNodeId: nodeId,
+            referenceName: fr[1]!,
+            referenceKind: 'references',
+            line: this.getLineNumber(archOffset + fr.index),
+            column: 0,
+          });
+        }
+        // <button name="method" type="object"> → Python method reference
+        const buttonRef = /<button\b[^>]*\btype\s*=\s*"object"[^>]*\bname\s*=\s*"([^"]+)"/g;
+        let br: RegExpExecArray | null;
+        while ((br = buttonRef.exec(archContent)) !== null) {
+          this.unresolvedReferences.push({
+            fromNodeId: nodeId,
+            referenceName: br[1]!,
+            referenceKind: 'references',
+            line: this.getLineNumber(archOffset + br.index),
+            column: 0,
+          });
+        }
+        // Also catch <button name="X" type="object"> in reverse attr order
+        const buttonRef2 = /<button\b[^>]*\bname\s*=\s*"([^"]+)"[^>]*\btype\s*=\s*"object"/g;
+        let br2: RegExpExecArray | null;
+        while ((br2 = buttonRef2.exec(archContent)) !== null) {
+          this.unresolvedReferences.push({
+            fromNodeId: nodeId,
+            referenceName: br2[1]!,
+            referenceKind: 'references',
+            line: this.getLineNumber(archOffset + br2.index),
+            column: 0,
+          });
+        }
+      }
     }
   }
 
@@ -214,6 +263,38 @@ export class OdooExtractor {
       };
       this.nodes.push(node);
       this.edges.push({ source: fileNodeId, target: nodeId, kind: 'contains' });
+    }
+  }
+
+  /** t-call="module.template" → UnresolvedReference to qweb::template */
+  private extractTCall(fileNodeId: string): void {
+    const regex = /t-call\s*=\s*"([^"]+)"/g;
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(this.source)) !== null) {
+      const templateRef = m[1]!;
+      this.unresolvedReferences.push({
+        fromNodeId: fileNodeId,
+        referenceName: `qweb::${templateRef}`,
+        referenceKind: 'references',
+        line: this.getLineNumber(m.index),
+        column: 0,
+      });
+    }
+  }
+
+  /** Generic ref="module.xml_id" on any <field> element → UnresolvedReference */
+  private extractGenericRef(fileNodeId: string): void {
+    // Skip inherit_id refs (already handled in extractRecords) — match any other field with ref=
+    const regex = /<field\b[^>]*\bname\s*=\s*"(?!inherit_id)[^"]*"[^>]*\bref\s*=\s*"([^"]+)"/g;
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(this.source)) !== null) {
+      this.unresolvedReferences.push({
+        fromNodeId: fileNodeId,
+        referenceName: m[1]!,
+        referenceKind: 'references',
+        line: this.getLineNumber(m.index),
+        column: 0,
+      });
     }
   }
 
