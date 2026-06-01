@@ -46,7 +46,15 @@ npx @colbymchenry/codegraph        # zero-install, or:
 npm i -g @colbymchenry/codegraph
 ```
 
-<sub>CodeGraph bundles its own runtime — nothing to compile, no native build, works the same everywhere. The interactive installer auto-configures your agent(s) — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro.</sub>
+<sub>CodeGraph bundles its own runtime — nothing to compile, no native build, works the same everywhere.</sub>
+
+### Wire Up Your Agent
+
+```bash
+codegraph install
+```
+
+<sub>The interactive installer writes the MCP server config for your agent(s) — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro. If you are using the zero-install npm flow, run `npx @colbymchenry/codegraph` for the same setup. Restart your agent afterwards so it loads the new MCP server.</sub>
 
 ### Initialize Projects
 
@@ -55,7 +63,7 @@ cd your-project
 codegraph init -i
 ```
 
-<sub>`codegraph init` just creates the local `.codegraph/` index directory; adding `-i` (`--index`) also builds the initial graph in the same step. Without `-i`, run `codegraph index` afterwards to populate it.</sub>
+<sub>`codegraph init` just creates the local `.codegraph/` index directory; adding `-i` (`--index`) also builds the initial graph in the same step. It does not install CodeGraph into your agent by itself. Without `-i`, run `codegraph index` afterwards to populate it.</sub>
 
 <div align="center">
 

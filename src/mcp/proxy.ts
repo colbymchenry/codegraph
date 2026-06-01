@@ -230,6 +230,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         routeToDaemon(line); // prime the daemon so it resolves the project (its reply is suppressed below)
       } else if (msg.method === 'tools/list') {
         writeClient({ jsonrpc: '2.0', id: msg.id, result: { tools: getStaticTools() } });
+      } else if (msg.method === 'resources/list') {
+        writeClient({ jsonrpc: '2.0', id: msg.id, result: { resources: [] } });
+      } else if (msg.method === 'prompts/list') {
+        writeClient({ jsonrpc: '2.0', id: msg.id, result: { prompts: [] } });
       } else {
         routeToDaemon(line);
       }

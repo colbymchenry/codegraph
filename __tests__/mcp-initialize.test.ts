@@ -49,6 +49,10 @@ function sendInitialize(child: ChildProcessWithoutNullStreams, projectPath: stri
   child.stdin.write(msg + '\n');
 }
 
+function sendMessage(child: ChildProcessWithoutNullStreams, message: Record<string, unknown>) {
+  child.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
+}
+
 /**
  * Collect stdout lines and stderr text from the child, tagging each piece
  * with a monotonic sequence number. Lets us assert ordering between the
@@ -125,6 +129,30 @@ describe('MCP initialize handshake (issue #172)', () => {
     expect(json.id).toBe(0);
     expect(json.result.protocolVersion).toBeDefined();
     expect(json.result.capabilities.tools).toBeDefined();
+  }, 10000);
+
+  it('answers empty resource and prompt discovery lists', async () => {
+    child = spawnServer(tempDir);
+    const events = tagStreams(child);
+    sendInitialize(child, tempDir);
+    await waitFor(events, (e) => e.stream === 'stdout', 5000);
+
+    sendMessage(child, { id: 1, method: 'resources/list' });
+    sendMessage(child, { id: 2, method: 'prompts/list' });
+
+    const resources = await waitFor(
+      events,
+      (e) => e.stream === 'stdout' && JSON.parse(e.text).id === 1,
+      5000,
+    );
+    const prompts = await waitFor(
+      events,
+      (e) => e.stream === 'stdout' && JSON.parse(e.text).id === 2,
+      5000,
+    );
+
+    expect(JSON.parse(resources.text).result).toEqual({ resources: [] });
+    expect(JSON.parse(prompts.text).result).toEqual({ prompts: [] });
   }, 10000);
 
   it('sends initialize response BEFORE tryInitializeDefault finishes', async () => {

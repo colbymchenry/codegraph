@@ -1,6 +1,6 @@
 /**
  * MCP per-connection session — speaks the JSON-RPC protocol (initialize,
- * tools/list, tools/call) over a single {@link JsonRpcTransport}. It owns
+ * tools/list, tools/call, resources/list, prompts/list) over a single {@link JsonRpcTransport}. It owns
  * per-client state only (which protocol version the client asked for, whether
  * it advertised `roots`, the one-shot roots/list latch); the heavyweight
  * resources (CodeGraph, watcher, ToolHandler) live in the shared
@@ -125,6 +125,12 @@ export class MCPSession {
         break;
       case 'tools/list':
         if (isRequest) await this.handleToolsList(message as JsonRpcRequest);
+        break;
+      case 'resources/list':
+        if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, { resources: [] });
+        break;
+      case 'prompts/list':
+        if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, { prompts: [] });
         break;
       case 'tools/call':
         if (isRequest) await this.handleToolsCall(message as JsonRpcRequest);
