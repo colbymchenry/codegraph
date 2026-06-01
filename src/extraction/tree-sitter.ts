@@ -1633,6 +1633,22 @@ export class TreeSitterExtractor {
         } else {
           receiverName = getNodeText(objectField, this.source);
         }
+      } else if (objectField.type === 'scoped_call_expression') {
+        // PHP fluent static factory: `Cls::staticMethod(...)->chainedMethod(...)`.
+        // Without this branch, getNodeText(objectField) returns the literal
+        // source text of the static call — INCLUDING its argument list — so
+        // calleeName becomes something like `ApiClient::for('cred-123').createOrder`
+        // which no resolver path can match. Emit `Cls::staticMethod` as the
+        // receiver so the chain resolver in name-matcher.ts can look up the
+        // static method's declared return type and resolve the chained call on
+        // `Cls` ONLY when it returns self/static/Cls (#608).
+        const scopeField = getChildByField(objectField, 'scope');
+        const innerNameField = getChildByField(objectField, 'name');
+        if (scopeField && innerNameField) {
+          receiverName = `${getNodeText(scopeField, this.source)}::${getNodeText(innerNameField, this.source)}`;
+        } else {
+          receiverName = getNodeText(objectField, this.source);
+        }
       } else {
         receiverName = getNodeText(objectField, this.source);
       }

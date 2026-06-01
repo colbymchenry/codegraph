@@ -351,12 +351,97 @@ function inferJavaFieldReceiverType(
 }
 
 /**
+ * PHP fluent static factory: `Cls::staticMethod(...)->chainedMethod(...)`
+ * extracts to the synthetic reference `Cls::staticMethod.chainedMethod` (the
+ * `scoped_call_expression` chain-receiver unwrap in tree-sitter.ts). Resolve
+ * by looking up `staticMethod` on `Cls` and checking its declared return
+ * type — only when it returns `self` / `static` / `Cls` is the chained call
+ * guaranteed to land on a `Cls` instance, so only then do we emit the edge.
+ * Statics with other return types (e.g. `Cache::get` returning mixed,
+ * `Cls::query` returning a Builder) drop here so chained ops never
+ * false-resolve onto the wrong class. Closes #608.
+ *
+ * Returns null when the chain pattern doesn't apply, the static method isn't
+ * indexed, or its return type isn't a fluent self/static annotation —
+ * letting subsequent strategies attempt the resolution if applicable.
+ */
+function resolvePhpStaticFactoryChain(
+  scopeClass: string,
+  staticMethod: string,
+  chainedMethod: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  // Find the static method `Cls::staticMethod`. Same qualifiedName shape
+  // resolveMethodOnType already relies on for PHP.
+  const candidates = context.getNodesByName(staticMethod);
+  const want = `${scopeClass}::${staticMethod}`;
+  let staticNode: Node | null = null;
+  for (const cand of candidates) {
+    if (cand.kind !== 'method') continue;
+    if (cand.language !== 'php') continue;
+    if (cand.qualifiedName === want || cand.qualifiedName.endsWith(`::${want}`)) {
+      staticNode = cand;
+      break;
+    }
+  }
+  if (!staticNode || !staticNode.signature) return null;
+
+  // PHP getSignature emits "<returnType> <params>" (mirrors Java). The
+  // return type is the first whitespace-separated token. Empty signature
+  // (no params extracted) means we can't gate — drop.
+  const firstToken = staticNode.signature.trim().split(/\s+/)[0];
+  if (!firstToken) return null;
+  // Strip nullable prefix (`?self` is still fluent for the non-null path).
+  const retType = firstToken.replace(/^\?/, '');
+  // Fluent return-type annotations that guarantee the chain lands on `Cls`.
+  // `self` / `static` resolve to the declaring class; an explicit `Cls`
+  // matches by name. `parent` is intentionally excluded — it resolves to a
+  // (super)class which has its own method set. FQN-prefixed return types
+  // (`\App\Services\ApiClient`) are not handled in this PR — common-case
+  // PHP fluent factories use the bare `self` annotation; FQN forms can be
+  // added as a follow-up if real-world misses surface.
+  if (retType !== 'self' && retType !== 'static' && retType !== scopeClass) {
+    return null;
+  }
+
+  return resolveMethodOnType(
+    scopeClass,
+    chainedMethod,
+    ref,
+    context,
+    0.9,
+    'instance-method',
+  );
+}
+
+/**
  * Try to resolve by method name on a class/object
  */
 export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // PHP fluent static factory: `Cls::staticMethod(...)->chainedMethod(...)`
+  // arrives as `Cls::staticMethod.chainedMethod` from the tree-sitter
+  // chain-receiver unwrap. Try the return-type-gated chain resolver before
+  // the simple dot/colon patterns, since the chain form would otherwise
+  // fall through and miss (`\w+` doesn't include `::`). Closes #608.
+  if (ref.language === 'php') {
+    const chainMatch = ref.referenceName.match(/^(\w+)::(\w+)\.(\w+)$/);
+    if (chainMatch) {
+      const [, scopeClass, staticMethod, chainedMethod] = chainMatch;
+      const chainResult = resolvePhpStaticFactoryChain(
+        scopeClass!, staticMethod!, chainedMethod!, ref, context,
+      );
+      if (chainResult) return chainResult;
+      // Return null here too — once we've recognized the chain shape,
+      // the simple dot/colon patterns can't make sense of it. Falling
+      // through would just waste work.
+      return null;
+    }
+  }
+
   // Parse method call patterns like "obj.method" or "Class::method"
   const dotMatch = ref.referenceName.match(/^(\w+)\.(\w+)$/);
   const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);

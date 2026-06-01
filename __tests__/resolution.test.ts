@@ -1048,6 +1048,94 @@ func main() {
       // No spurious in-project edge — fmt.* must stay unresolved/external.
       expect(calls).toHaveLength(0);
     });
+
+    it('PHP: chained static-factory call resolves when the static returns self (#608)', async () => {
+      // Pre-#608, `ApiClient::for($x)->createOrder(...)` (the canonical Laravel
+      // per-credential client pattern) emitted an unmatchable reference because
+      // the chain receiver was rendered as the full literal text of the inner
+      // static call. Now the extractor unwraps the chain to
+      // `ApiClient::for.createOrder` and the resolver gates on the static
+      // method's `: self` return type before emitting the edge.
+      fs.writeFileSync(
+        path.join(tempDir, 'ApiClient.php'),
+        `<?php
+class ApiClient {
+    public static function for(string $credential): self {
+        return new self;
+    }
+    public function createOrder(array $payload): array {
+        return [];
+    }
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'DispatchOrder.php'),
+        `<?php
+class DispatchOrder {
+    public function handle(): void {
+        $r = ApiClient::for('cred-123')->createOrder([]);
+    }
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const handle = cg.getNodesByKind('method').find((n) => n.name === 'handle');
+      expect(handle).toBeDefined();
+      const calls = cg.getOutgoingEdges(handle!.id).filter((e) => e.kind === 'calls');
+
+      // Two outgoing calls: the inner `ApiClient::for` static and the
+      // chained `ApiClient::createOrder` (the edge that used to drop).
+      const targets = calls.map((e) => cg.getNode(e.target)?.qualifiedName);
+      expect(targets).toContain('ApiClient::createOrder');
+      expect(targets).toContain('ApiClient::for');
+    });
+
+    it('PHP: chain receiver does NOT false-resolve when the static returns a non-self type (#608)', async () => {
+      // The chain resolver's whole purpose is gating on the return type so
+      // chains like `Cache::get($k)->clear()` — where `get` returns array,
+      // not Cache — DON'T spuriously emit a `Cache::clear` edge even though
+      // Cache happens to define a `clear()` method. Without the gate, the
+      // optimistic emission `Cache.clear` would resolve to Cache::clear,
+      // producing a false positive. With the gate, the `: array` return
+      // annotation fails the self/static/Cache check and the edge drops.
+      fs.writeFileSync(
+        path.join(tempDir, 'Cache.php'),
+        `<?php
+class Cache {
+    public static function get(string $key): array {
+        return [];
+    }
+    public function clear(): void {}
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'Caller.php'),
+        `<?php
+class Caller {
+    public function test(): void {
+        Cache::get('k')->clear();
+    }
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const test = cg.getNodesByKind('method').find((n) => n.name === 'test');
+      expect(test).toBeDefined();
+      const calls = cg.getOutgoingEdges(test!.id).filter((e) => e.kind === 'calls');
+      const targets = calls.map((e) => cg.getNode(e.target)?.qualifiedName);
+
+      // `Cache::get` is a real call and still resolves.
+      expect(targets).toContain('Cache::get');
+      // CRITICAL: `Cache::clear` MUST NOT be wired up — the chain receiver
+      // can't be assumed to be a Cache instance when `get` returns array.
+      expect(targets).not.toContain('Cache::clear');
+    });
   });
 
   describe('Name Matcher: kind bias for new ref kinds', () => {
