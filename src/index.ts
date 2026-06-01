@@ -682,6 +682,13 @@ export class CodeGraph {
   }
 
   /**
+   * Get every node in the graph
+   */
+  getAllNodes(): Node[] {
+    return this.queries.getAllNodes();
+  }
+
+  /**
    * Search nodes by text
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
@@ -731,6 +738,14 @@ export class CodeGraph {
    */
   getIncomingEdges(nodeId: string): Edge[] {
     return this.queries.getIncomingEdges(nodeId);
+  }
+
+  /**
+   * Get all edges whose source AND target are both in the given node ID set.
+   * Efficient for export/subgraph operations — one query instead of N.
+   */
+  findEdgesBetweenNodes(nodeIds: string[], edgeKinds?: Edge['kind'][]): Edge[] {
+    return this.queries.findEdgesBetweenNodes(nodeIds, edgeKinds);
   }
 
   // ===========================================================================

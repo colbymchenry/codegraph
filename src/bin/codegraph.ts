@@ -1603,6 +1603,127 @@ program
   });
 
 /**
+ * codegraph export
+ */
+program
+  .command('export')
+  .description('Export the code graph to DOT, Mermaid, Cytoscape JSON, or HTML')
+  .option('-p, --path <path>', 'Project path')
+  .option('-f, --format <format>', 'Output format: dot, mermaid, cytoscape, html', 'dot')
+  .option('-o, --output <file>', 'Write output to file instead of stdout')
+  .option('-k, --kind <kinds>', 'Comma-separated node kinds to include (default: structural kinds)')
+  .option('--all-kinds', 'Include all node kinds (including file, parameter, import, etc.)')
+  .option('--edge-kind <kinds>', 'Comma-separated edge kinds to include (default: all)')
+  .option('-l, --limit <n>', 'Maximum nodes to export', '1000')
+  .option('--title <title>', 'Graph title (used in DOT and HTML output)')
+  .action(async (options: {
+    path?: string;
+    format?: string;
+    output?: string;
+    kind?: string;
+    allKinds?: boolean;
+    edgeKind?: string;
+    limit?: string;
+    title?: string;
+  }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const fmt = (options.format ?? 'dot').toLowerCase();
+      const validFormats = ['dot', 'mermaid', 'cytoscape', 'html'];
+      if (!validFormats.includes(fmt)) {
+        error(`Unknown format "${fmt}". Choose from: ${validFormats.join(', ')}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const limit = parseInt(options.limit ?? '1000', 10);
+
+      // Structural kinds that produce readable graphs by default.
+      const defaultKinds = [
+        'class', 'struct', 'interface', 'trait', 'protocol',
+        'function', 'method',
+        'component', 'route',
+        'enum', 'module', 'namespace', 'type_alias',
+      ] as const;
+
+      let nodes = options.allKinds
+        ? cg.getAllNodes()
+        : options.kind
+          ? ((): import('../types').Node[] => {
+              const requested = options.kind!.split(',').map(k => k.trim()).filter(Boolean);
+              const { NODE_KINDS } = require('../types') as typeof import('../types');
+              const invalid = requested.filter(k => !(NODE_KINDS as readonly string[]).includes(k));
+              if (invalid.length > 0) {
+                error(`Unknown node kind(s): ${invalid.join(', ')}`);
+                process.exit(1);
+              }
+              return requested.flatMap(k => cg.getNodesByKind(k as import('../types').NodeKind));
+            })()
+          : defaultKinds.flatMap(k => cg.getNodesByKind(k));
+
+      // De-duplicate (possible when building from multiple kind queries)
+      const seen = new Set<string>();
+      nodes = nodes.filter(n => { if (seen.has(n.id)) return false; seen.add(n.id); return true; });
+
+      let truncated = false;
+      if (nodes.length > limit) {
+        nodes = nodes.slice(0, limit);
+        truncated = true;
+      }
+
+      const edgeKindFilter = options.edgeKind
+        ? options.edgeKind.split(',').map(k => k.trim()).filter(Boolean) as import('../types').EdgeKind[]
+        : undefined;
+
+      const nodeIds = nodes.map(n => n.id);
+      const edges = cg.findEdgesBetweenNodes(nodeIds, edgeKindFilter);
+
+      const { formatDot, formatMermaid, formatCytoscape, formatHtml } =
+        await import('../export/index');
+
+      const graphTitle = options.title ?? path.basename(projectPath);
+
+      let output: string;
+      switch (fmt) {
+        case 'dot':      output = formatDot(nodes, edges, graphTitle); break;
+        case 'mermaid':  output = formatMermaid(nodes, edges, graphTitle); break;
+        case 'cytoscape': output = formatCytoscape(nodes, edges); break;
+        case 'html':     output = formatHtml(nodes, edges, graphTitle); break;
+        default:         output = formatDot(nodes, edges, graphTitle);
+      }
+
+      if (options.output) {
+        fs.writeFileSync(options.output, output, 'utf-8');
+        if (truncated) {
+          process.stderr.write(
+            chalk.yellow(`Warning: graph truncated to ${limit} nodes. Use --limit to raise the cap.\n`)
+          );
+        }
+        info(`Exported ${nodes.length} nodes and ${edges.length} edges → ${options.output}`);
+      } else {
+        if (truncated) {
+          process.stderr.write(
+            chalk.yellow(`Warning: graph truncated to ${limit} nodes. Use --limit to raise the cap.\n`)
+          );
+        }
+        process.stdout.write(output + '\n');
+      }
+
+      cg.destroy();
+    } catch (err) {
+      error(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
  * codegraph install
  */
 program

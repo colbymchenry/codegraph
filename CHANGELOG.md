@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph export` exports your indexed codebase as a graph in DOT (Graphviz), Mermaid, Cytoscape JSON, or interactive HTML formats — pipe to a file or render in any compatible tool. Filter by node kind, edge kind, and node count with `--kind`, `--edge-kind`, and `--limit`.
 
 ## [0.9.8] - 2026-06-01
 
