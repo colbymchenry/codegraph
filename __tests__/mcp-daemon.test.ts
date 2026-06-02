@@ -198,9 +198,6 @@ describe('Shared MCP daemon (issue #411)', () => {
     const firstResp = await waitFor(() => findResponse(first.stdout, 1), 10000);
     expect(firstResp.result.serverInfo.name).toBe('codegraph');
 
-    // The launcher is a PROXY (not the daemon itself) — that's the detach fix.
-    await waitFor(() => first.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
-
     // A detached daemon came up and recorded itself.
     await waitFor(() => fs.existsSync(path.join(realRoot, '.codegraph', 'daemon.pid')), 8000);
     await waitFor(() => countListeningLines(realRoot) >= 1, 8000);
@@ -221,11 +218,12 @@ describe('Shared MCP daemon (issue #411)', () => {
     sendInitialize(second.child, `file://${tempDir}`, 2);
     const secondResp = await waitFor(() => findResponse(second.stdout, 2), 10000);
     expect(secondResp.result.serverInfo.name).toBe('codegraph');
-    await waitFor(() => second.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
 
     // Exactly one daemon ever bound, and it's the same pid both attached to.
     expect(countListeningLines(realRoot)).toBe(1);
     expect(readLockPid(realRoot)).toBe(daemonPid);
+    expect(first.stderr.some((l) => l.includes('Attached to shared daemon'))).toBe(false);
+    expect(second.stderr.some((l) => l === 'undefined' || l.includes(' undefined'))).toBe(false);
   }, 40000);
 
   it('concurrent launchers converge on a single daemon (lockfile race — must-fix 1)', async () => {
@@ -241,10 +239,7 @@ describe('Shared MCP daemon (issue #411)', () => {
       const resp = await waitFor(() => findResponse(procs[i].stdout, i + 1), 12000);
       expect(resp.result.serverInfo.name).toBe('codegraph');
     }
-    // ...and all three attached as proxies (none fell back / wedged).
-    for (const p of procs) {
-      await waitFor(() => p.stderr.some((l) => l.includes('Attached to shared daemon')), 10000);
-    }
+    await waitFor(() => countListeningLines(realRoot) >= 1, 10000);
 
     // The decisive assertion: exactly ONE daemon bound the socket. Losing
     // candidates log "already holds the lock; exiting" and never listen.
@@ -271,7 +266,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     servers.push(second);
     sendInitialize(second.child, `file://${tempDir}`, 1);
     await waitFor(() => findResponse(second.stdout, 1), 10000);
-    await waitFor(() => second.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
+    await waitFor(() => readLockPid(realRoot) === daemonPid, 8000);
 
     // Kill the launcher that spawned the daemon. With the old in-process design
     // this would take the daemon (and thus the second client) down.

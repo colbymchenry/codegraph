@@ -30,6 +30,7 @@ import type { MCPEngine } from './engine';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
 const DEFAULT_PPID_POLL_MS = 5000;
+const LOG_ATTACH_ENV = 'CODEGRAPH_MCP_LOG_ATTACH';
 
 export interface ProxyResult {
   /**
@@ -40,6 +41,13 @@ export interface ProxyResult {
    */
   outcome: 'proxied' | 'fallback-needed';
   reason?: string;
+}
+
+function logAttachedDaemon(socketPath: string, hello: DaemonHello): void {
+  if (process.env[LOG_ATTACH_ENV] !== '1') return;
+  process.stderr.write(
+    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
+  );
 }
 
 /**
@@ -88,9 +96,7 @@ export async function runProxy(
     return { outcome: 'fallback-needed', reason: 'version mismatch' };
   }
 
-  process.stderr.write(
-    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
-  );
+  logAttachedDaemon(socketPath, hello);
 
   startPpidWatchdog(socket);
   await pipeUntilClose(socket);
@@ -128,9 +134,7 @@ export async function connectWithHello(
     socket.destroy();
     return 'version-mismatch';
   }
-  process.stderr.write(
-    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
-  );
+  logAttachedDaemon(socketPath, hello);
   return socket;
 }
 
