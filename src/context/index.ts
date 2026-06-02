@@ -25,7 +25,7 @@ import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
 import { validatePathWithinRoot } from '../utils';
-import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants } from '../search/query-utils';
+import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, kindBonus } from '../search/query-utils';
 
 /**
  * Extract likely symbol names from a natural language query
@@ -129,6 +129,62 @@ function extractSymbolsFromQuery(query: string): string[] {
   ]);
 
   return Array.from(symbols).filter(s => !commonWords.has(s.toLowerCase()));
+}
+
+const SOURCE_TEXT_MAX_FILE_SIZE = 1_000_000;
+const SOURCE_TEXT_MAX_TOKENS = 8;
+const SOURCE_TEXT_OCCURRENCES_PER_TOKEN = 3;
+const SOURCE_TEXT_BASE_SCORE = 160;
+const SOURCE_TEXT_TEST_PENALTY = 130;
+const SOURCE_TEXT_EXACT_NODE_NAME_BONUS = 700;
+const EXACT_SYMBOL_MATCH_BONUS = 700;
+
+function extractCodeLikeSourceTokens(query: string): string[] {
+  const tokens = new Set<string>();
+  const tokenPattern = /[A-Za-z0-9][A-Za-z0-9_./:@-]{2,}/g;
+  let match: RegExpExecArray | null;
+  while ((match = tokenPattern.exec(query)) !== null) {
+    const token = match[0];
+    if (isCodeLikeSourceToken(token)) {
+      tokens.add(token);
+    }
+  }
+  return Array.from(tokens).slice(0, SOURCE_TEXT_MAX_TOKENS);
+}
+
+function isCodeLikeSourceToken(token: string): boolean {
+  const cleaned = token.trim();
+  if (cleaned.length < 3 || cleaned.length > 120) return false;
+  if (!/[A-Za-z0-9]/.test(cleaned)) return false;
+  if (!/[-_./:@]/.test(cleaned)) return false;
+  if (/^https?:\/\//i.test(cleaned)) return false;
+  return true;
+}
+
+function isSpecificExactSymbol(symbol: string): boolean {
+  const cleaned = symbol.trim();
+  if (isCodeLikeSourceToken(cleaned)) return true;
+  return /[a-z][A-Z]/.test(cleaned) || /[A-Z][a-z]/.test(cleaned) || /^[A-Z0-9_]{2,}$/.test(cleaned);
+}
+
+function lineNumberAtIndex(content: string, index: number): number {
+  let line = 1;
+  for (let i = 0; i < index; i++) {
+    if (content.charCodeAt(i) === 10) line++;
+  }
+  return line;
+}
+
+function isLikelyTestSourceNode(node: Node, lines: string[]): boolean {
+  const nameLower = node.name.toLowerCase();
+  if (/(^|_)(test|tests|spec|should|assert)(_|$)/.test(nameLower)) return true;
+
+  const beforeStart = Math.max(0, node.startLine - 4);
+  const leadingLines = lines
+    .slice(beforeStart, Math.max(0, node.startLine - 1))
+    .join('\n')
+    .toLowerCase();
+  return /#\[test\]|@test\b|\btest\s*\(|\bit\s*\(|\bdescribe\s*\(/.test(leadingLines);
 }
 
 /**
@@ -407,6 +463,9 @@ export class ContextBuilder {
       return { nodes, edges, roots };
     }
 
+    const queryLower = query.toLowerCase();
+    const isTestQuery = queryLower.includes('test') || queryLower.includes('spec');
+
     // === HYBRID SEARCH ===
 
     // Step 1: Extract potential symbol names from query
@@ -422,6 +481,14 @@ export class ContextBuilder {
           limit: Math.ceil(opts.searchLimit * 5),
           kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
         });
+
+        const exactSymbolNames = new Set(
+          symbolsFromQuery.filter(isSpecificExactSymbol).map(s => s.toLowerCase())
+        );
+        exactMatches = exactMatches.map(r => exactSymbolNames.has(r.node.name.toLowerCase())
+          ? { ...r, score: r.score + EXACT_SYMBOL_MATCH_BONUS }
+          : r
+        );
 
         // Co-location boost: when multiple extracted symbols appear in the same file,
         // those results are much more likely to be what the user is looking for.
@@ -547,6 +614,20 @@ export class ContextBuilder {
       logDebug('Text search failed', { query, error: String(error) });
     }
 
+    // Step 3b: source-text fallback for code-like string literals and config keys.
+    // These often matter in provider aliases, feature flags, route names, and
+    // event channels, but they are not symbol names and therefore won't appear
+    // in node-name FTS. Search indexed source files only, then map each matching
+    // line back to the smallest enclosing indexed symbol so context still lands
+    // on implementation code rather than raw grep output.
+    let sourceTextResults: SearchResult[] = [];
+    try {
+      sourceTextResults = this.findSourceTextMatches(query, opts, isTestQuery);
+      logDebug('Source text fallback results', { count: sourceTextResults.length });
+    } catch (error) {
+      logDebug('Source text fallback failed', { query, error: String(error) });
+    }
+
     // Step 4: Merge results, taking the max score when duplicates appear
     // across search channels. Exact matches may have lower scores than FTS
     // results for the same node — use the best score from any channel.
@@ -575,8 +656,16 @@ export class ContextBuilder {
       }
     }
 
-    const queryLower = query.toLowerCase();
-    const isTestQuery = queryLower.includes('test') || queryLower.includes('spec');
+    // Add source-text matches, upgrading scores for duplicates.
+    for (const result of sourceTextResults) {
+      const existing = resultById.get(result.node.id);
+      if (existing) {
+        existing.score = Math.max(existing.score, result.score);
+      } else {
+        resultById.set(result.node.id, result);
+        searchResults.push(result);
+      }
+    }
 
     // Deprioritize test files early so they don't take multi-term boost slots
     if (!isTestQuery) {
@@ -1049,6 +1138,118 @@ export class ContextBuilder {
     }
 
     return { nodes: finalNodes, edges: finalEdges, roots };
+  }
+
+  private findSourceTextMatches(
+    query: string,
+    opts: Required<FindRelevantContextOptions>,
+    isTestQuery: boolean
+  ): SearchResult[] {
+    const tokens = extractCodeLikeSourceTokens(query);
+    if (tokens.length === 0) return [];
+
+    const queryTerms = extractSearchTerms(query, { stems: false });
+    const allowedKinds = opts.nodeKinds.length > 0 ? new Set(opts.nodeKinds) : null;
+    const byNode = new Map<string, { result: SearchResult; matchedTokens: Set<string> }>();
+
+    for (const file of this.queries.getAllFiles()) {
+      if (!isTestQuery && isTestFile(file.path)) continue;
+      if (file.size > SOURCE_TEXT_MAX_FILE_SIZE) continue;
+
+      const fullPath = validatePathWithinRoot(this.projectRoot, file.path);
+      if (!fullPath || !fs.existsSync(fullPath)) continue;
+
+      let content: string;
+      try {
+        content = fs.readFileSync(fullPath, 'utf-8');
+      } catch {
+        continue;
+      }
+
+      const contentLower = content.toLowerCase();
+      const matchedTokens = tokens.filter((token) => contentLower.includes(token.toLowerCase()));
+      if (matchedTokens.length === 0) continue;
+      const lines = content.split(/\r?\n/);
+
+      const fileNodes = this.queries.getNodesByFile(file.path);
+      if (fileNodes.length === 0) continue;
+
+      for (const token of matchedTokens) {
+        const tokenLower = token.toLowerCase();
+        let fromIndex = 0;
+        let occurrenceCount = 0;
+
+        while (occurrenceCount < SOURCE_TEXT_OCCURRENCES_PER_TOKEN) {
+          const index = contentLower.indexOf(tokenLower, fromIndex);
+          if (index === -1) break;
+
+          const line = lineNumberAtIndex(content, index);
+          const node = this.pickSourceTextMatchNode(fileNodes, line, allowedKinds);
+          if (node) {
+            const testPenalty = !isTestQuery && isLikelyTestSourceNode(node, lines) ? SOURCE_TEXT_TEST_PENALTY : 0;
+            const nodeText = lines
+              .slice(Math.max(0, node.startLine - 1), Math.max(0, node.endLine))
+              .join('\n')
+              .toLowerCase();
+            const termHitBonus =
+              queryTerms.filter((term) => nodeText.includes(term.toLowerCase())).length * 20;
+            const exactNodeNameBonus =
+              tokenLower === node.name.toLowerCase() ? SOURCE_TEXT_EXACT_NODE_NAME_BONUS : 0;
+            const baseScore =
+              SOURCE_TEXT_BASE_SCORE +
+              kindBonus(node.kind) +
+              scorePathRelevance(node.filePath, query) +
+              termHitBonus +
+              exactNodeNameBonus +
+              Math.min(token.length, 40) / 4 -
+              testPenalty;
+            const existing = byNode.get(node.id);
+            if (existing) {
+              existing.matchedTokens.add(tokenLower);
+              existing.result.score = Math.max(existing.result.score, baseScore);
+            } else {
+              byNode.set(node.id, {
+                result: { node, score: baseScore },
+                matchedTokens: new Set([tokenLower]),
+              });
+            }
+          }
+
+          occurrenceCount++;
+          fromIndex = index + token.length;
+        }
+      }
+    }
+
+    return Array.from(byNode.values())
+      .map(({ result, matchedTokens }) => ({
+        ...result,
+        score: result.score + matchedTokens.size * 12,
+      }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, opts.searchLimit * 2);
+  }
+
+  private pickSourceTextMatchNode(
+    nodes: Node[],
+    line: number,
+    allowedKinds: Set<NodeKind> | null
+  ): Node | null {
+    const candidates = nodes
+      .filter((node) => node.kind !== 'file')
+      .filter((node) => node.startLine <= line && line <= node.endLine)
+      .filter((node) => !allowedKinds || allowedKinds.has(node.kind))
+      .sort((a, b) => {
+        const aRange = a.endLine - a.startLine;
+        const bRange = b.endLine - b.startLine;
+        return aRange - bRange || a.startLine - b.startLine;
+      });
+
+    if (candidates.length > 0) return candidates[0]!;
+
+    const fileNode = nodes.find((node) => node.kind === 'file');
+    if (fileNode && (!allowedKinds || allowedKinds.has('file'))) return fileNode;
+    return null;
   }
 
   /**

@@ -135,6 +135,73 @@ export function validateEmail(email: string): boolean {
 `
     );
 
+    // Create a provider config file with code-like string aliases that are not
+    // symbol names. Context search should still route these aliases to the
+    // enclosing implementation instead of returning no useful entry point.
+    fs.writeFileSync(
+      path.join(srcDir, 'provider-config.ts'),
+      `export function normalizeModelForProvider(model: string): string {
+  switch (model) {
+    case 'deepseek-r1':
+    case 'deepseek-reasoner':
+      return 'deepseek-ai/DeepSeek-V4-Pro';
+    default:
+      return model;
+  }
+}
+
+export function unrelatedProviderHelper(): string {
+  return 'not-this-one';
+}
+`
+    );
+
+    // Create a config-key fixture where code-like strings appear both in
+    // purpose-built functions and a generic alias registry. The purpose-built
+    // functions should rank first when the query provides semantic words.
+    fs.writeFileSync(
+      path.join(srcDir, 'runtime-config.ts'),
+      `export function genericAliasRegistry(): string[] {
+  return ['agent.trace-mode', 'billing.webhook.created'];
+}
+
+export function message(): string {
+  return 'generic helper';
+}
+
+export function resolveFeatureGate(key: string): boolean {
+  if (key === 'agent.trace-mode') {
+    return true;
+  }
+  return false;
+}
+
+export function lookupWebhookHandler(event: string): string {
+  switch (event) {
+    case 'billing.webhook.created':
+      return 'handleBillingCreated';
+    default:
+      return 'ignoreWebhook';
+  }
+}
+
+export function activeProviderHasEnvApiKey(provider: string): boolean {
+  return provider === 'siliconflow' && Boolean(process.env.SILICONFLOW_API_KEY);
+}
+
+export function providerEnvVars(): string[] {
+  return ['SILICONFLOW_API_KEY', 'DEEPSEEK_API_KEY'];
+}
+
+export function env_var_for(provider: string): string {
+  if (provider === 'siliconflow') {
+    return 'SILICONFLOW_API_KEY';
+  }
+  return 'DEEPSEEK_API_KEY';
+}
+`
+    );
+
     // Initialize CodeGraph
     cg = CodeGraph.initSync(testDir, {
       config: {
@@ -209,6 +276,62 @@ export function validateEmail(email: string): boolean {
       });
 
       expect(result.nodes.size).toBeLessThanOrEqual(5);
+    });
+
+    it('should use code-like source text as a fallback entry point', async () => {
+      const result = await cg.findRelevantContext('deepseek-r1', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+
+      const nodeNames = Array.from(result.nodes.values()).map((n) => n.name);
+      expect(nodeNames).toContain('normalizeModelForProvider');
+      expect(nodeNames).not.toContain('unrelatedProviderHelper');
+    });
+
+    it('should rank a feature flag function above a generic alias registry', async () => {
+      const result = await cg.findRelevantContext('agent.trace-mode feature gate', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+
+      const entryNames = result.roots.map((id) => result.nodes.get(id)?.name);
+      expect(entryNames[0]).toBe('resolveFeatureGate');
+      expect(entryNames).toContain('genericAliasRegistry');
+    });
+
+    it('should not over-boost generic lowercase word symbols over source-text matches', async () => {
+      const result = await cg.findRelevantContext('agent.trace-mode feature gate message history', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+
+      const entryNames = result.roots.map((id) => result.nodes.get(id)?.name);
+      expect(entryNames[0]).toBe('resolveFeatureGate');
+      expect(entryNames).toContain('message');
+    });
+
+    it('should rank a webhook handler function above a generic alias registry', async () => {
+      const result = await cg.findRelevantContext('billing.webhook.created webhook handler', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+
+      const entryNames = result.roots.map((id) => result.nodes.get(id)?.name);
+      expect(entryNames[0]).toBe('lookupWebhookHandler');
+      expect(entryNames).toContain('genericAliasRegistry');
+    });
+
+    it('should rank an exact symbol match above broader source-text matches', async () => {
+      const result = await cg.findRelevantContext('env_var_for provider picker SILICONFLOW_API_KEY', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+
+      const entryNames = result.roots.map((id) => result.nodes.get(id)?.name);
+      expect(entryNames[0]).toBe('env_var_for');
+      expect(entryNames).toContain('activeProviderHasEnvApiKey');
+      expect(entryNames).toContain('providerEnvVars');
     });
   });
 
