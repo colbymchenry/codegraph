@@ -251,6 +251,16 @@ function lastCppSegment(qualified: string): string | null {
 }
 
 /**
+ * Whether a qualified name matches `suffix` at a `::` boundary — exact, or a
+ * deeper namespace (`ns::Foo::bar` matches suffix `Foo::bar`). Crucially does
+ * NOT match `OtherFoo::bar`, which a plain `endsWith('Foo::bar')` would. Mirrors
+ * the boundary check in `resolveMethodOnType`.
+ */
+function cppQualifiedMatchesSuffix(qualifiedName: string, suffix: string): boolean {
+  return qualifiedName === suffix || qualifiedName.endsWith(`::${suffix}`);
+}
+
+/**
  * Infer the type of an `auto` local from the text of its initializer, when the
  * type is syntactically evident (Tier 1) or comes from a self-returning
  * singleton accessor (Tier 2). Returns a bare type name, or null when the
@@ -349,7 +359,7 @@ function cppReturnTypeOf(callee: string, context: ResolutionContext): string | n
       if (last) {
         candidates = context
           .getNodesByName(last)
-          .filter((n) => n.qualifiedName.endsWith(callee));
+          .filter((n) => cppQualifiedMatchesSuffix(n.qualifiedName, callee));
       }
     }
   } else {
@@ -384,7 +394,7 @@ function cppReturnTypeOfMethodOnType(
       (n) =>
         n.kind === 'method' &&
         n.language === 'cpp' &&
-        n.qualifiedName.endsWith(suffix),
+        cppQualifiedMatchesSuffix(n.qualifiedName, suffix),
     );
   for (const m of methods) {
     const rt = parseCppReturnType(m.signature);

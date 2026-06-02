@@ -484,6 +484,60 @@ describe('C++ end-to-end — virtual override synthesis', () => {
     }
   });
 
+  it('does not match a same-suffix class when inferring a chained method return type (Manager vs OtherManager)', async () => {
+    // Regression for the suffix-boundary bug (Codex review, PR #646): the
+    // chained-method return-type lookup matched a qualified name by `endsWith`,
+    // so resolving `view()` on `Manager` could pick `OtherManager::view`
+    // (its name ends with `Manager::view`). OtherManager sorts first and returns
+    // a different type, so without a `::` boundary check the final `render()`
+    // misroutes to that type's class.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      // `other.hpp` sorts before `types.hpp`, so OtherManager indexes first and
+      // would win a naive endsWith('Manager::view') match.
+      fs.writeFileSync(
+        path.join(tmpDir, 'other.hpp'),
+        'class Decoy { public: void render(); };\n' +
+          'class OtherManager { public: Decoy view(); };\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'types.hpp'),
+        'class Panel { public: void render(); };\n' +
+          'class Manager { public: Panel view(); };\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'defs.cpp'),
+        '#include "other.hpp"\n' +
+          '#include "types.hpp"\n' +
+          'void Decoy::render() {}\n' +
+          'Decoy OtherManager::view() { return Decoy(); }\n' +
+          'void Panel::render() {}\n' +
+          'Panel Manager::view() { return Panel(); }\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'app.cpp'),
+        '#include "types.hpp"\n' +
+          'void useManager() { Manager m; m.view().render(); }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const panelRender = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Panel::render');
+      const decoyRender = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Decoy::render');
+      expect(panelRender, 'Panel::render node').toBeDefined();
+      expect(decoyRender, 'Decoy::render node').toBeDefined();
+
+      // Manager::view() returns Panel — resolve render() on Panel, never on the
+      // same-suffix OtherManager::view() (which returns Decoy).
+      expect(cg.getCallers(panelRender!.id).map((c) => c.node.qualifiedName)).toContain('useManager');
+      expect(cg.getCallers(decoyRender!.id).map((c) => c.node.qualifiedName)).not.toContain('useManager');
+    } finally {
+      cg?.close();
+    }
+  });
+
   it('bridges a base virtual method to the subclass override', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
     fs.writeFileSync(
