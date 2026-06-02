@@ -682,6 +682,22 @@ export class QueryBuilder {
   }
 
   /**
+   * Stream every node of a kind one at a time (lazy) instead of materializing
+   * them all like {@link getNodesByKind}. For unbounded kinds (`function`,
+   * `method`) on a symbol-dense project the full array is gigabytes; the
+   * dynamic-edge synthesizers only scan-and-filter, so they iterate to keep
+   * memory O(1) in the node count rather than O(nodes) (#610).
+   */
+  *iterateNodesByKind(kind: NodeKind): IterableIterator<Node> {
+    // Fresh statement per call (not a cached one): an iterator holds an open
+    // cursor, so a shared statement would conflict across overlapping scans.
+    const stmt = this.db.prepare('SELECT * FROM nodes WHERE kind = ?');
+    for (const row of stmt.iterate(kind)) {
+      yield rowToNode(row as NodeRow);
+    }
+  }
+
+  /**
    * Get all nodes in the database
    */
   getAllNodes(): Node[] {

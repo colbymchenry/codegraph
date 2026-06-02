@@ -97,13 +97,23 @@ function enclosingFn(nodesInFile: Node[], line: number): Node | null {
   return best;
 }
 
+/**
+ * Stream method + function nodes lazily. The synthesizers only scan-and-filter
+ * down to a tiny matched subset, so materializing every function/method (which
+ * is gigabytes on a symbol-dense project) just to iterate it once is what OOM'd
+ * #610. Iterating keeps memory O(1) in the node count.
+ */
+function* methodAndFunctionNodes(queries: QueryBuilder): IterableIterator<Node> {
+  yield* queries.iterateNodesByKind('method');
+  yield* queries.iterateNodesByKind('function');
+}
+
 /** Phase 1: field-backed observer channels (registrar/dispatcher share a store). */
 function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
-  const candidates = [...queries.getNodesByKind('method'), ...queries.getNodesByKind('function')];
   const registrars: Array<{ node: Node; field: string }> = [];
   const dispatchers: Array<{ node: Node; field: string }> = [];
 
-  for (const m of candidates) {
+  for (const m of methodAndFunctionNodes(queries)) {
     const isReg = REGISTRAR_NAME.test(m.name);
     const isDisp = DISPATCHER_NAME.test(m.name);
     if (!isReg && !isDisp) continue;
@@ -171,7 +181,6 @@ function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[
  * name shared across unrelated classes can't fan out into noise.
  */
 function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
-  const candidates = [...queries.getNodesByKind('method'), ...queries.getNodesByKind('function')];
   const dispatchers = new Map<string, Array<{ node: Node; line: number }>>(); // field → dispatcher methods + forEach line
   const registrars = new Map<string, Array<{ node: Node; line: number }>>();   // field → registrar methods + append line
 
@@ -182,7 +191,7 @@ function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionContext): 
     registrars.set(field, arr);
   };
 
-  for (const m of candidates) {
+  for (const m of methodAndFunctionNodes(queries)) {
     const content = ctx.readFile(m.filePath);
     const src = content && sliceLines(content, m.startLine, m.endLine);
     if (!src) continue;
@@ -1009,7 +1018,7 @@ function mybatisJavaXmlEdges(queries: QueryBuilder): Edge[] {
   const seen = new Set<string>();
   // Index Java methods by `<ClassName>::<methodName>` for O(1) lookup.
   const javaIndex = new Map<string, Node[]>();
-  for (const m of queries.getNodesByKind('method')) {
+  for (const m of queries.iterateNodesByKind('method')) {
     if (m.language !== 'java' && m.language !== 'kotlin') continue;
     const parts = m.qualifiedName.split('::');
     const last = parts[parts.length - 1];
@@ -1020,7 +1029,7 @@ function mybatisJavaXmlEdges(queries: QueryBuilder): Edge[] {
     if (arr) arr.push(m); else javaIndex.set(key, [m]);
   }
 
-  for (const xml of queries.getNodesByKind('method')) {
+  for (const xml of queries.iterateNodesByKind('method')) {
     if (xml.language !== 'xml') continue;
     // Qualified name: `<namespace>::<id>`. Extract the simple class name.
     const colonIdx = xml.qualifiedName.lastIndexOf('::');
@@ -1116,12 +1125,13 @@ function goHandlerIdent(expr: string): string | null {
 
 function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
   // 1. Find the chain dispatcher(s): a Go method that invokes a `handlers` slice by index.
-  const dispatchers = queries.getNodesByKind('method').filter((n) => {
-    if (n.language !== 'go') return false;
+  const dispatchers: Node[] = [];
+  for (const n of queries.iterateNodesByKind('method')) {
+    if (n.language !== 'go') continue;
     const content = ctx.readFile(n.filePath);
     const src = content && sliceLines(content, n.startLine, n.endLine);
-    return !!src && GIN_DISPATCH_RE.test(src);
-  });
+    if (src && GIN_DISPATCH_RE.test(src)) dispatchers.push(n);
+  }
   if (dispatchers.length === 0) return [];                              // not a gin repo — bail
 
   // 2. Collect handler identifiers registered via gin registration calls
