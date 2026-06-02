@@ -113,6 +113,17 @@ export { main };
 `
     );
 
+    fs.writeFileSync(
+      path.join(srcDir, 'utils.test.ts'),
+      `
+import { processValue } from './utils';
+
+export function testProcessValue(): boolean {
+  return processValue(2) === 2;
+}
+`
+    );
+
     // Initialize and index
     cg = CodeGraph.initSync(testDir, {
       config: {
@@ -379,12 +390,23 @@ export { main };
       const deps = cg.getFileDependencies('src/main.ts');
 
       expect(Array.isArray(deps)).toBe(true);
+      expect(deps).toContain('src/derived.ts');
+      expect(deps).toContain('src/utils.ts');
     });
 
     it('should get file dependents', () => {
       const dependents = cg.getFileDependents('src/utils.ts');
 
       expect(Array.isArray(dependents)).toBe(true);
+      expect(dependents).toContain('src/main.ts');
+      expect(dependents).toContain('src/utils.test.ts');
+    });
+
+    it('should normalize Windows-style file paths for dependents', () => {
+      const dependents = cg.getFileDependents('src\\utils.ts');
+
+      expect(dependents).toContain('src/main.ts');
+      expect(dependents).toContain('src/utils.test.ts');
     });
   });
 

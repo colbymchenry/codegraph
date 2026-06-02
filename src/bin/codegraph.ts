@@ -29,6 +29,7 @@ import { getCodeGraphDir, isInitialized } from '../directory';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
+import { normalizePath } from '../utils';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
@@ -1500,6 +1501,8 @@ program
         const stdinFiles = stdinData.split('\n').map(f => f.trim()).filter(Boolean);
         changedFiles.push(...stdinFiles);
       }
+
+      changedFiles = changedFiles.map(normalizePath);
 
       if (changedFiles.length === 0) {
         if (!options.quiet) info('No files provided. Use file arguments or --stdin.');

@@ -7,6 +7,18 @@
 import { Node, Edge, Context, Subgraph, EdgeKind } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from './traversal';
+import { normalizePath } from '../utils';
+
+const DEPENDENCY_EDGE_KINDS: EdgeKind[] = [
+  'imports',
+  'calls',
+  'references',
+  'extends',
+  'implements',
+  'type_of',
+  'returns',
+  'instantiates',
+];
 
 /**
  * Graph query manager for complex queries
@@ -110,26 +122,39 @@ export class GraphQueryManager {
   /**
    * Get dependencies of a file
    *
-   * Returns all files that this file imports from.
+   * Returns all files that this file imports from or references via resolved symbols.
    *
    * @param filePath - Path to the file
    * @returns Array of file paths this file depends on
    */
   getFileDependencies(filePath: string): string[] {
-    const nodes = this.queries.getNodesByFile(filePath);
+    const normalizedFilePath = normalizePath(filePath);
+    const nodes = this.queries.getNodesByFile(normalizedFilePath);
     const fileNode = nodes.find((n) => n.kind === 'file');
 
-    if (!fileNode) {
+    if (!fileNode && nodes.length === 0) {
       return [];
     }
 
     const dependencies = new Set<string>();
-    const importEdges = this.queries.getOutgoingEdges(fileNode.id, ['imports']);
 
-    for (const edge of importEdges) {
-      const targetNode = this.queries.getNodeById(edge.target);
-      if (targetNode && targetNode.filePath !== filePath) {
-        dependencies.add(targetNode.filePath);
+    if (fileNode) {
+      const importEdges = this.queries.getOutgoingEdges(fileNode.id, ['imports']);
+      for (const edge of importEdges) {
+        const targetNode = this.queries.getNodeById(edge.target);
+        if (targetNode && targetNode.filePath !== normalizedFilePath) {
+          dependencies.add(targetNode.filePath);
+        }
+      }
+    }
+
+    for (const node of nodes) {
+      const outgoingEdges = this.queries.getOutgoingEdges(node.id, DEPENDENCY_EDGE_KINDS);
+      for (const edge of outgoingEdges) {
+        const targetNode = this.queries.getNodeById(edge.target);
+        if (targetNode && targetNode.filePath !== normalizedFilePath) {
+          dependencies.add(targetNode.filePath);
+        }
       }
     }
 
@@ -139,13 +164,14 @@ export class GraphQueryManager {
   /**
    * Get dependents of a file
    *
-   * Returns all files that import from this file.
+   * Returns all files that import from this file or reference its resolved symbols.
    *
    * @param filePath - Path to the file
    * @returns Array of file paths that depend on this file
    */
   getFileDependents(filePath: string): string[] {
-    const nodes = this.queries.getNodesByFile(filePath);
+    const normalizedFilePath = normalizePath(filePath);
+    const nodes = this.queries.getNodesByFile(normalizedFilePath);
     const dependents = new Set<string>();
 
     // Check file-level incoming import edges (file:X imports file:Y)
@@ -154,21 +180,20 @@ export class GraphQueryManager {
       const incomingFileEdges = this.queries.getIncomingEdges(fileNode.id, ['imports']);
       for (const edge of incomingFileEdges) {
         const sourceNode = this.queries.getNodeById(edge.source);
-        if (sourceNode && sourceNode.filePath !== filePath) {
+        if (sourceNode && sourceNode.filePath !== normalizedFilePath) {
           dependents.add(sourceNode.filePath);
         }
       }
     }
 
-    // Also check node-level imports of exported symbols
+    // Also check node-level dependents of symbols in this file. Some language
+    // extractors resolve imports as calls/references rather than file imports.
     for (const node of nodes) {
-      if (node.isExported) {
-        const incomingEdges = this.queries.getIncomingEdges(node.id, ['imports']);
-        for (const edge of incomingEdges) {
-          const sourceNode = this.queries.getNodeById(edge.source);
-          if (sourceNode && sourceNode.filePath !== filePath) {
-            dependents.add(sourceNode.filePath);
-          }
+      const incomingEdges = this.queries.getIncomingEdges(node.id, DEPENDENCY_EDGE_KINDS);
+      for (const edge of incomingEdges) {
+        const sourceNode = this.queries.getNodeById(edge.source);
+        if (sourceNode && sourceNode.filePath !== normalizedFilePath) {
+          dependents.add(sourceNode.filePath);
         }
       }
     }
