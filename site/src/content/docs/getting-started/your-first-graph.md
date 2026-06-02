@@ -9,10 +9,10 @@ Once CodeGraph is installed, building and exploring a graph takes three commands
 
 ```bash
 cd your-project
-codegraph init -i      # initialize + index in one step
+codegraph init         # initialize + index in one step
 ```
 
-`init` creates the `.codegraph/` directory; `-i` (or `--index`) immediately builds the full index. For an existing project you can re-index any time:
+`init` creates the `.codegraph/` directory and immediately builds the full index. The legacy `-i`/`--index` flag is still accepted for older scripts, but it is no longer required. For an existing project you can re-index any time:
 
 ```bash
 codegraph index          # full index

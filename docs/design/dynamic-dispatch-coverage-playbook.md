@@ -147,7 +147,7 @@ question and a real repo (add to `.claude/skills/agent-eval/corpus.json`). Examp
 
 ### Step 2 — Measure the hole (deterministic, no agent)
 ```bash
-rm -rf <repo>/.codegraph && ( cd <repo> && codegraph init -i )
+rm -rf <repo>/.codegraph && ( cd <repo> && codegraph init )
 node scripts/agent-eval/probe-trace.mjs <repo> <from-symbol> <to-symbol>   # does the flow break? where?
 node scripts/agent-eval/probe-node.mjs  <repo> <break-symbol>              # trail: is the next hop missing?
 ```
@@ -214,7 +214,7 @@ were found). Confirm it's dynamic by reading the break symbol's body.
 | `sqlite3 <repo>/.codegraph/codegraph.db` | direct edge/node inspection (provenance, metadata, counts) |
 
 Probe scripts use the built `dist/` — run `npm run build` first. Reindex after any
-extraction or resolution change (`rm -rf <repo>/.codegraph && codegraph init -i`) — the
+extraction or resolution change (`rm -rf <repo>/.codegraph && codegraph init`) — the
 synthesizer/resolvers run at index time. Test fixtures: keep a tiny per-pattern fixture
 (see `/tmp/cb-fixture/bus.js`; **move into `__tests__/`** when shipping).
 

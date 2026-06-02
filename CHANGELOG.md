@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Installation prompts and setup docs now recommend `codegraph init`, matching the current behavior where the initial index is built by default while `-i`/`--index` remains accepted for older scripts.
 
 ## [0.9.9] - 2026-06-02
 

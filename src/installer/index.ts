@@ -208,7 +208,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   }
 
   if (location === 'global') {
-    clack.note('cd your-project\ncodegraph init -i', 'Quick start');
+    clack.note('cd your-project\ncodegraph init', 'Quick start');
   }
 
   const finalNote = targets.length > 0
@@ -455,7 +455,7 @@ async function initializeLocalProject(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     clack.log.error(`Could not load native modules: ${msg}`);
-    clack.log.info('Skipping project initialization. Run "codegraph init -i" later.');
+    clack.log.info('Skipping project initialization. Run "codegraph init" later.');
     return;
   }
 
