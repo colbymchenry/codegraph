@@ -1572,10 +1572,17 @@ export class QueryBuilder {
   getUnresolvedReferencesByFiles(filePaths: string[]): UnresolvedReference[] {
     if (filePaths.length === 0) return [];
 
-    const placeholders = filePaths.map(() => '?').join(',');
-    const rows = this.db
-      .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
-      .all(...filePaths) as UnresolvedRefRow[];
+    const rows: UnresolvedRefRow[] = [];
+    const uniqueFilePaths = [...new Set(filePaths)];
+    for (let i = 0; i < uniqueFilePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = uniqueFilePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      rows.push(
+        ...(this.db
+          .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
+          .all(...chunk) as UnresolvedRefRow[])
+      );
+    }
 
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,
@@ -1601,8 +1608,14 @@ export class QueryBuilder {
    */
   deleteResolvedReferences(fromNodeIds: string[]): void {
     if (fromNodeIds.length === 0) return;
-    const placeholders = fromNodeIds.map(() => '?').join(',');
-    this.db.prepare(`DELETE FROM unresolved_refs WHERE from_node_id IN (${placeholders})`).run(...fromNodeIds);
+    const uniqueNodeIds = [...new Set(fromNodeIds)];
+    for (let i = 0; i < uniqueNodeIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = uniqueNodeIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      this.db
+        .prepare(`DELETE FROM unresolved_refs WHERE from_node_id IN (${placeholders})`)
+        .run(...chunk);
+    }
   }
 
   /**
