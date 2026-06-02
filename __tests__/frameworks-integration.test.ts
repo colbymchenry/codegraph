@@ -538,6 +538,57 @@ describe('C++ end-to-end — virtual override synthesis', () => {
     }
   });
 
+  it('resolves a bare factory call to the free function, not a same-named method', async () => {
+    // Regression for Codex review (PR #646): a bare `make()->draw()` call encodes
+    // as `make().draw`, an unqualified callee. The return-type lookup must use
+    // the free function `make`, not an unrelated `Decoy::make` method that
+    // happens to share the name and sorts first — otherwise draw() misroutes to
+    // whatever that method returns.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'other.hpp'), // sorts first → Decoy::make indexed first
+        'class Decoy { public: void draw(); };\n' +
+          'class Other { public: Decoy make(); };\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'widget.hpp'),
+        'class Widget { public: void draw(); };\n' +
+          'Widget* make();\n' // free function sharing the name `make`
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'defs.cpp'),
+        '#include "other.hpp"\n' +
+          '#include "widget.hpp"\n' +
+          'void Decoy::draw() {}\n' +
+          'Decoy Other::make() { return Decoy(); }\n' +
+          'void Widget::draw() {}\n' +
+          'Widget* make() { return nullptr; }\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'app.cpp'),
+        '#include "widget.hpp"\n' +
+          'void useFree() { make()->draw(); }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const widgetDraw = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Widget::draw');
+      const decoyDraw = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Decoy::draw');
+      expect(widgetDraw, 'Widget::draw node').toBeDefined();
+      expect(decoyDraw, 'Decoy::draw node').toBeDefined();
+
+      // The free function make() returns Widget* — draw() resolves on Widget,
+      // never on Other::make()'s return type (Decoy).
+      expect(cg.getCallers(widgetDraw!.id).map((c) => c.node.qualifiedName)).toContain('useFree');
+      expect(cg.getCallers(decoyDraw!.id).map((c) => c.node.qualifiedName)).not.toContain('useFree');
+    } finally {
+      cg?.close();
+    }
+  });
+
   it('bridges a base virtual method to the subclass override', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
     fs.writeFileSync(

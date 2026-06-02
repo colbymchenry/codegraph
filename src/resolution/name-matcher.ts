@@ -363,9 +363,14 @@ function cppReturnTypeOf(callee: string, context: ResolutionContext): string | n
       }
     }
   } else {
+    // A bare (unqualified) callee like `makeWidget()` is a free function. Do NOT
+    // include same-named *methods* of unrelated classes — `Decoy::makeWidget`
+    // could otherwise supply the return type and misroute the chained call. (A
+    // method invoked via implicit `this` would need caller-class scoping we
+    // don't do; missing it is silent, which beats resolving to the wrong class.)
     candidates = context
       .getNodesByName(callee)
-      .filter((n) => n.kind === 'function' || n.kind === 'method');
+      .filter((n) => n.kind === 'function');
   }
   for (const n of candidates) {
     if (n.language !== 'cpp') continue;
