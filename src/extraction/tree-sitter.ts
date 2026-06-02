@@ -630,7 +630,19 @@ export class TreeSitterExtractor {
         }
       }
     }
-    if (name === '<anonymous>') return; // Skip anonymous functions
+    if (name === '<anonymous>') {
+      // Don't emit a node for the anonymous wrapper itself, but still visit its
+      // body: AMD/RequireJS and CommonJS module wrappers (`define([], function(){…})`,
+      // `(function(){…})()`) hold named inner functions and calls that would
+      // otherwise be lost — the dispatcher set skipChildren, so nothing else
+      // descends into this subtree. (#528)
+      const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+        ?? getChildByField(node, this.extractor.bodyField);
+      if (body) {
+        this.visitFunctionBody(body, '');
+      }
+      return;
+    }
 
     // Check for misparse artifacts (e.g. C++ macros causing "namespace detail" functions)
     // Skip the node but still visit the body for calls and structural nodes
