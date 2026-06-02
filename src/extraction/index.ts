@@ -149,6 +149,14 @@ const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
   '__history', '__recovery',
   // Generic cache
   '.cache',
+  // Package manager / toolchain caches (no source code, often enormous
+  // when the project root is a home directory)
+  '.npm',            // npm cache
+  '.bun',            // Bun package cache
+  '.rustup',         // Rust toolchain (~50K files)
+  '.gem',            // Ruby gems
+  '.Trash',          // macOS Trash
+  '.matplotlib',     // matplotlib font/cache
 ]);
 
 /** Gitignore-style patterns for the `ignore` matcher: the dirs above plus a few globs. */
