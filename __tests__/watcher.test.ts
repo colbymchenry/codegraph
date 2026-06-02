@@ -3,37 +3,38 @@
  *
  * Tests for the file watcher that auto-syncs on changes.
  *
- * **Why `vi.mock('chokidar', ...)`**: real chokidar bindings go through
- * FSEvents (macOS) / inotify (Linux). Under parallel vitest execution those
- * OS-level subsystems serve many test files at once and event-delivery
- * latency becomes non-deterministic — we observed a consistent ~30%
- * failure rate on the pending-file-tracking + staleness-banner tests when
- * running the full suite, vs 0/N when run in isolation. The mock replaces
- * chokidar with a controllable EventEmitter (see
- * `__helpers__/chokidar-mock.ts`): the `ready` event fires on the next
- * microtask, and tests use `triggerFileEvent(...)` to synthesize file
- * events instead of `fs.writeFileSync(...)`. The watcher's actual
- * debounce timer (real `setTimeout`) is left untouched — that's the unit
- * under test.
+ * **Why inert mode + a synthetic event seam**: the watcher now uses Node's
+ * native `fs.watch` (recursive on macOS/Windows, per-directory on Linux).
+ * Under parallel vitest the OS watch subsystems (FSEvents / inotify) serve
+ * many test files at once and event-delivery latency becomes non-deterministic
+ * — a real fs change made in `beforeEach` can even leak into a later "should
+ * NOT sync" assertion. So the unit tests construct the watcher with
+ * `inertForTests: true` (no OS watcher installed) and drive its filter →
+ * pendingFiles → debounce pipeline directly via
+ * `__emitWatchEventForTests(root, relPath)` — deterministic, the same
+ * convergence point a real event reaches. The debounce timer itself is the
+ * real `setTimeout` (the unit under test). One end-to-end test ("auto-sync …
+ * real fs.watch") runs the genuine native watcher against a real file write.
  */
 
-import { vi } from 'vitest';
-// Hoisted: chokidar is replaced by the controllable mock for the whole file.
-vi.mock('chokidar', async () => (await import('./__helpers__/chokidar-mock')).chokidarMockModule);
-
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileWatcher, LockUnavailableError } from '../src/sync/watcher';
+import {
+  FileWatcher,
+  LockUnavailableError,
+  __emitWatchEventForTests,
+  type WatchOptions,
+} from '../src/sync/watcher';
 import CodeGraph from '../src/index';
-import { triggerFileEvent } from './__helpers__/chokidar-mock';
+
+type SyncFn = () => Promise<{ filesChanged: number; durationMs: number }>;
 
 /**
- * Helper to wait for a condition with timeout. Most tests no longer need
- * this because mock chokidar makes the watcher's event handler run
- * synchronously, but it's still useful for assertions that depend on the
- * debounce timer (real setTimeout) firing.
+ * Helper to wait for a condition with timeout. Used for assertions that depend
+ * on the debounce timer (real setTimeout) firing, or on the real watcher's
+ * event delivery in the end-to-end test.
  */
 function waitFor(
   condition: () => boolean,
@@ -54,6 +55,11 @@ function waitFor(
 describe('FileWatcher', () => {
   let testDir: string;
 
+  // Inert by default — unit tests drive events via __emitWatchEventForTests
+  // and never depend on real OS watch delivery.
+  const newWatcher = (syncFn: SyncFn, opts: WatchOptions = {}) =>
+    new FileWatcher(testDir, syncFn, { inertForTests: true, ...opts });
+
   beforeEach(() => {
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-watcher-'));
     // Create a source file so the directory isn't empty
@@ -71,7 +77,7 @@ describe('FileWatcher', () => {
   describe('start/stop lifecycle', () => {
     it('should start and stop without errors', () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, syncFn);
+      const watcher = newWatcher(syncFn);
 
       const started = watcher.start();
       expect(started).toBe(true);
@@ -83,7 +89,7 @@ describe('FileWatcher', () => {
 
     it('should be idempotent on double start', () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, syncFn);
+      const watcher = newWatcher(syncFn);
 
       expect(watcher.start()).toBe(true);
       expect(watcher.start()).toBe(true); // Should not throw
@@ -94,7 +100,7 @@ describe('FileWatcher', () => {
 
     it('should be idempotent on double stop', () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, syncFn);
+      const watcher = newWatcher(syncFn);
 
       watcher.start();
       watcher.stop();
@@ -107,11 +113,11 @@ describe('FileWatcher', () => {
   describe('debounced sync', () => {
     it('should trigger sync after file change', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
-      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 200 });
+      const watcher = newWatcher(syncFn, { debounceMs: 200 });
 
       watcher.start();
       await watcher.waitUntilReady();
-      triggerFileEvent(testDir, 'add', 'src/new.ts');
+      __emitWatchEventForTests(testDir, 'src/new.ts');
 
       // Wait for debounced sync to fire (real timer; 200ms + epsilon).
       await waitFor(() => syncFn.mock.calls.length > 0);
@@ -122,7 +128,7 @@ describe('FileWatcher', () => {
 
     it('should debounce rapid changes into a single sync', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
-      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 400 });
+      const watcher = newWatcher(syncFn, { debounceMs: 400 });
 
       watcher.start();
       await watcher.waitUntilReady();
@@ -131,7 +137,7 @@ describe('FileWatcher', () => {
       // Spacing them tighter than the debounce window proves the debounce
       // collapses them into one syncFn call.
       for (let i = 0; i < 5; i++) {
-        triggerFileEvent(testDir, 'add', `src/file${i}.ts`);
+        __emitWatchEventForTests(testDir, `src/file${i}.ts`);
         await new Promise((r) => setTimeout(r, 50));
       }
 
@@ -148,14 +154,14 @@ describe('FileWatcher', () => {
   describe('filtering', () => {
     it('should ignore files not matching include patterns', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 200 });
+      const watcher = newWatcher(syncFn, { debounceMs: 200 });
 
       watcher.start();
       await watcher.waitUntilReady();
 
-      // Synthesize a non-source-file event — FileWatcher's `isSourceFile`
-      // gate must drop it before scheduling sync.
-      triggerFileEvent(testDir, 'add', 'src/readme.md');
+      // A non-source-file event — FileWatcher's `isSourceFile` gate must drop
+      // it before scheduling sync.
+      __emitWatchEventForTests(testDir, 'src/readme.md');
 
       // Wait a bit longer than debounce — sync should NOT trigger.
       await new Promise((r) => setTimeout(r, 400));
@@ -166,14 +172,14 @@ describe('FileWatcher', () => {
 
     it('should ignore .codegraph directory changes', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 200 });
+      const watcher = newWatcher(syncFn, { debounceMs: 200 });
 
       watcher.start();
       await watcher.waitUntilReady();
 
-      // Synthesize a .codegraph event — FileWatcher's `isAlwaysIgnored`
-      // filter must drop it before scheduling sync.
-      triggerFileEvent(testDir, 'add', '.codegraph/db.sqlite');
+      // A .codegraph event — FileWatcher's `isAlwaysIgnored` filter must drop
+      // it before scheduling sync.
+      __emitWatchEventForTests(testDir, '.codegraph/db.sqlite');
 
       await new Promise((r) => setTimeout(r, 400));
       expect(syncFn).not.toHaveBeenCalled();
@@ -181,26 +187,17 @@ describe('FileWatcher', () => {
       watcher.stop();
     });
 
-    it('should not schedule sync for node_modules paths (FileWatcher-side filter)', async () => {
-      // NOTE: this previously asserted chokidar's `ignored` callback excluded
-      // node_modules from watching at all. With chokidar mocked, that
-      // OS-level behaviour isn't exercised here — what we test is
-      // FileWatcher's own filter chain (`isSourceFile` + `isAlwaysIgnored`).
-      // node_modules paths AREN'T in `isAlwaysIgnored` (they're filtered by
-      // chokidar's `ignored` callback in production), so this test now
-      // verifies a different mechanism: a non-source extension inside
-      // node_modules still drops via `isSourceFile`. The chokidar-level
-      // `ignored` exclusion of `node_modules/` itself is covered by the
-      // ignore-config tests under `src/sync/watcher-ignore.test.ts`-style
-      // unit-level checks, which don't need a live watcher loop.
+    it('should drop ignored/non-source paths but sync real source edits', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 200 });
+      const watcher = newWatcher(syncFn, { debounceMs: 200 });
       watcher.start();
       await watcher.waitUntilReady();
 
-      // A source-extension event whose path is a normal source file still
-      // schedules sync (positive control).
-      triggerFileEvent(testDir, 'add', 'src/live.ts');
+      // node_modules is in the default-ignore set (#407) → dropped by the
+      // ignore matcher even without a .gitignore.
+      __emitWatchEventForTests(testDir, 'node_modules/dep/index.js');
+      // A normal source file still schedules sync (positive control).
+      __emitWatchEventForTests(testDir, 'src/live.ts');
       await waitFor(() => syncFn.mock.calls.length > 0);
       expect(syncFn).toHaveBeenCalled();
 
@@ -210,17 +207,16 @@ describe('FileWatcher', () => {
 
   describe('pending file tracking (#403)', () => {
     it('should expose edited paths via getPendingFiles before sync fires', async () => {
-      // Slow debounce — pending entries are visible until the debounce
-      // fires. With mocked chokidar the event is synchronous, so we can
-      // assert immediately without polling.
+      // Slow debounce — pending entries are visible until the debounce fires.
+      // The synthetic event is synchronous, so we can assert immediately.
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
-      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 2000 });
+      const watcher = newWatcher(syncFn, { debounceMs: 2000 });
       watcher.start();
       await watcher.waitUntilReady();
 
       expect(watcher.getPendingFiles()).toEqual([]);
 
-      triggerFileEvent(testDir, 'add', 'src/pending.ts');
+      __emitWatchEventForTests(testDir, 'src/pending.ts');
 
       const pending = watcher.getPendingFiles();
       const paths = pending.map((p) => p.path);
@@ -236,11 +232,11 @@ describe('FileWatcher', () => {
 
     it('should clear an entry only after a successful sync absorbing that edit', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
-      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 200 });
+      const watcher = newWatcher(syncFn, { debounceMs: 200 });
       watcher.start();
       await watcher.waitUntilReady();
 
-      triggerFileEvent(testDir, 'add', 'src/fresh.ts');
+      __emitWatchEventForTests(testDir, 'src/fresh.ts');
 
       // Watcher saw the change → pendingFiles has the entry IMMEDIATELY.
       expect(watcher.getPendingFiles().some((p) => p.path === 'src/fresh.ts')).toBe(true);
@@ -254,18 +250,18 @@ describe('FileWatcher', () => {
     });
 
     it('should keep entries unchanged when sync fails (rescheduled work sees the same set)', async () => {
-      // With chokidar mocked there's no initial-scan-triggered sync, so
-      // the syncFn outcomes line up 1:1 with explicit events.
+      // No initial-scan-triggered sync, so syncFn outcomes line up 1:1 with
+      // explicit events.
       const syncFn = vi
         .fn()
         .mockRejectedValueOnce(new Error('boom'))                  // first sync rejects
         .mockResolvedValueOnce({ filesChanged: 1, durationMs: 10 }); // retry succeeds
       const onSyncError = vi.fn();
-      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 100, onSyncError });
+      const watcher = newWatcher(syncFn, { debounceMs: 100, onSyncError });
       watcher.start();
       await watcher.waitUntilReady();
 
-      triggerFileEvent(testDir, 'add', 'src/will-fail.ts');
+      __emitWatchEventForTests(testDir, 'src/will-fail.ts');
 
       // Wait for the sync to reject.
       await waitFor(() => onSyncError.mock.calls.length > 0);
@@ -293,7 +289,7 @@ describe('FileWatcher', () => {
         .mockResolvedValueOnce({ filesChanged: 1, durationMs: 10 });
       const onSyncComplete = vi.fn();
       const onSyncError = vi.fn();
-      const watcher = new FileWatcher(testDir, syncFn, {
+      const watcher = newWatcher(syncFn, {
         debounceMs: 100,
         onSyncComplete,
         onSyncError,
@@ -301,7 +297,7 @@ describe('FileWatcher', () => {
       watcher.start();
       await watcher.waitUntilReady();
 
-      triggerFileEvent(testDir, 'add', 'src/locked.ts');
+      __emitWatchEventForTests(testDir, 'src/locked.ts');
 
       await waitFor(() => syncFn.mock.calls.length >= 1);
       expect(watcher.getPendingFiles().some((p) => p.path === 'src/locked.ts')).toBe(true);
@@ -327,14 +323,14 @@ describe('FileWatcher', () => {
     it('should call onSyncComplete after successful sync', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 2, durationMs: 50 });
       const onSyncComplete = vi.fn();
-      const watcher = new FileWatcher(testDir, syncFn, {
+      const watcher = newWatcher(syncFn, {
         debounceMs: 200,
         onSyncComplete,
       });
 
       watcher.start();
       await watcher.waitUntilReady();
-      triggerFileEvent(testDir, 'add', 'src/test.ts');
+      __emitWatchEventForTests(testDir, 'src/test.ts');
 
       await waitFor(() => onSyncComplete.mock.calls.length > 0);
       expect(onSyncComplete).toHaveBeenCalledWith({ filesChanged: 2, durationMs: 50 });
@@ -345,14 +341,14 @@ describe('FileWatcher', () => {
     it('should call onSyncError when sync throws', async () => {
       const syncFn = vi.fn().mockRejectedValue(new Error('sync failed'));
       const onSyncError = vi.fn();
-      const watcher = new FileWatcher(testDir, syncFn, {
+      const watcher = newWatcher(syncFn, {
         debounceMs: 200,
         onSyncError,
       });
 
       watcher.start();
       await watcher.waitUntilReady();
-      triggerFileEvent(testDir, 'add', 'src/test.ts');
+      __emitWatchEventForTests(testDir, 'src/test.ts');
 
       await waitFor(() => onSyncError.mock.calls.length > 0);
       expect(onSyncError).toHaveBeenCalled();
@@ -377,7 +373,7 @@ describe('FileWatcher', () => {
 
       expect(cg.isWatching()).toBe(false);
 
-      const started = cg.watch({ debounceMs: 200 });
+      const started = cg.watch({ debounceMs: 200, inertForTests: true });
       expect(started).toBe(true);
       expect(cg.isWatching()).toBe(true);
 
@@ -391,7 +387,7 @@ describe('FileWatcher', () => {
       });
       await cg.indexAll();
 
-      cg.watch({ debounceMs: 200 });
+      cg.watch({ debounceMs: 200, inertForTests: true });
       expect(cg.isWatching()).toBe(true);
 
       cg.close();
@@ -400,7 +396,9 @@ describe('FileWatcher', () => {
       //  but we verify no errors are thrown)
     });
 
-    it('should auto-sync when files change while watching', async () => {
+    it('should auto-sync when files change while watching (real fs.watch end-to-end)', async () => {
+      // The one test that exercises the genuine native watcher: a real file
+      // write must propagate through fs.watch → debounce → sync into the graph.
       cg = CodeGraph.initSync(testDir, {
         config: { include: ['**/*.ts'], exclude: [] },
       });
@@ -410,24 +408,20 @@ describe('FileWatcher', () => {
       const initialNodes = initialStats.nodeCount;
 
       cg.watch({ debounceMs: 300 });
-      // Wait through CodeGraph's internal watcher startup (the mock
-      // chokidar fires `ready` on the next microtask, but cg.watch wraps
-      // the watcher creation through promise plumbing).
-      await new Promise((r) => setTimeout(r, 50));
+      // Let the watcher install before writing, so the event isn't missed.
+      await new Promise((r) => setTimeout(r, 100));
 
-      // Real fs write so cg.sync() can detect the new file on disk; then
-      // synthesize the event to wake the watcher (debounce + sync).
+      // Real fs write — no synthetic event. The live watcher must catch it.
       fs.writeFileSync(
         path.join(testDir, 'src', 'added.ts'),
         'export function added() { return 42; }'
       );
-      triggerFileEvent(testDir, 'add', 'src/added.ts');
 
-      // Wait for auto-sync to pick it up.
+      // Wait for auto-sync to pick it up (real OS event delivery + debounce).
       await waitFor(() => {
         const stats = cg.getStats();
         return stats.nodeCount > initialNodes;
-      }, 5000);
+      }, 8000);
 
       // The new function should be in the graph.
       const results = cg.searchNodes('added');

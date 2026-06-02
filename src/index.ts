@@ -561,8 +561,8 @@ export class CodeGraph {
   }
 
   /**
-   * Resolves once the file watcher has finished its initial chokidar scan.
-   * Useful for tests that need a deterministic boundary before asserting on
+   * Resolves once the file watcher has installed its watch set. Useful for
+   * tests that need a deterministic boundary before asserting on
    * `getPendingFiles()`. Resolves immediately when no watcher is active.
    */
   waitUntilWatcherReady(timeoutMs?: number): Promise<void> {
