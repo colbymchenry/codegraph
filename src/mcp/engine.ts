@@ -10,9 +10,19 @@
  *   inotify watch set — that's the entire point of issue #411.
  */
 
-import CodeGraph, { findNearestCodeGraphRoot } from '../index';
+import type CodeGraph from '../index';
+import { findNearestCodeGraphRoot } from '../directory';
 import { watchDisabledReason } from '../sync';
 import { ToolHandler } from './tools';
+
+// Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
+// the MCP startup path. It's only needed once a tool actually opens a project —
+// not to answer initialize/tools-list — so deferring it lets `serve --mcp` (and
+// the daemon it spawns) bind + register tools in ~Node-startup time instead of
+// ~800ms, closing the "No such tool available" cold-start race that made headless
+// agents flounder. require() is sync + cached on the CommonJS build.
+const loadCodeGraph = (): typeof import('../index').default =>
+  (require('../index') as typeof import('../index')).default;
 
 export interface MCPEngineOptions {
   /**
@@ -118,7 +128,7 @@ export class MCPEngine {
         try { this.cg.close(); } catch { /* ignore */ }
         this.cg = null;
       }
-      this.cg = CodeGraph.openSync(resolvedRoot);
+      this.cg = loadCodeGraph().openSync(resolvedRoot);
       this.projectPath = resolvedRoot;
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
@@ -147,15 +157,14 @@ export class MCPEngine {
 
     const resolvedRoot = findNearestCodeGraphRoot(searchFrom);
     if (!resolvedRoot) {
-      // No .codegraph/ above searchFrom — that's not an error, sessions may
-      // still discover one later via roots/list.
+      // No .codegraph/ above searchFrom. Sessions may still discover one later via roots/list
       this.projectPath = searchFrom;
       return;
     }
 
     this.projectPath = resolvedRoot;
     try {
-      this.cg = await CodeGraph.open(resolvedRoot);
+      this.cg = await loadCodeGraph().open(resolvedRoot);
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
       this.catchUpSync();
@@ -222,12 +231,17 @@ export class MCPEngine {
   /**
    * Reconcile the index with the current filesystem once, right after open —
    * catches edits, adds, deletes, and `git pull`/`checkout` changes made while
-   * no watcher was running. Background, never awaited.
+   * no watcher was running. Runs in the background, but the returned promise
+   * is pushed into the ToolHandler as a one-shot gate so the *first* tool
+   * call awaits completion before serving (without this, a tool call that
+   * races past sync returns rows for files that no longer exist on disk —
+   * and the per-file staleness banner can't help because `getPendingFiles()`
+   * is populated by the watcher, not by catch-up).
    */
   private catchUpSync(): void {
     const cg = this.cg;
     if (!cg) return;
-    void cg
+    const p = cg
       .sync()
       .then((result) => {
         const changed = result.filesAdded + result.filesModified + result.filesRemoved;
@@ -239,6 +253,7 @@ export class MCPEngine {
         const msg = err instanceof Error ? err.message : String(err);
         process.stderr.write(`[CodeGraph MCP] Catch-up sync failed: ${msg}\n`);
       });
+    this.toolHandler.setCatchUpGate(p);
   }
 }
 

@@ -35,6 +35,7 @@ export function gitWorktreeRoot(dir: string): string | null {
       cwd: dir,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
     }).trim();
     return out ? realpath(out) : null;
   } catch {

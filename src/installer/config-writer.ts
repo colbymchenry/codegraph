@@ -11,13 +11,11 @@
  *   abstraction instead.
  */
 
-import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import {
   writeMcpEntry,
   writePermissionsEntry,
-  writeInstructionsEntry,
 } from './targets/claude';
 import { readJsonFile } from './targets/shared';
 
@@ -25,9 +23,13 @@ export type InstallLocation = 'global' | 'local';
 
 /**
  * Each shim calls ONLY the named per-file helper — writeMcpConfig
- * writes only the MCP JSON, writePermissions only settings.json,
- * writeClaudeMd only CLAUDE.md. The full multi-file install lives
- * in `claudeTarget.install()` which the new orchestrator uses.
+ * writes only the MCP JSON, writePermissions only settings.json. The
+ * full multi-file install lives in `claudeTarget.install()` which the
+ * new orchestrator uses.
+ *
+ * There is no `writeClaudeMd` shim anymore: codegraph stopped writing a
+ * CLAUDE.md instructions block (issue #529) now that the MCP server's
+ * `initialize` instructions are the single source of truth.
  */
 export function writeMcpConfig(location: InstallLocation): void {
   writeMcpEntry(location);
@@ -35,14 +37,6 @@ export function writeMcpConfig(location: InstallLocation): void {
 
 export function writePermissions(location: InstallLocation): void {
   writePermissionsEntry(location);
-}
-
-export function writeClaudeMd(location: InstallLocation): { created: boolean; updated: boolean } {
-  const file = writeInstructionsEntry(location);
-  return {
-    created: file.action === 'created',
-    updated: file.action === 'updated',
-  };
 }
 
 export function hasMcpConfig(location: InstallLocation): boolean {
@@ -63,17 +57,4 @@ export function hasPermissions(location: InstallLocation): boolean {
   const allow = settings.permissions?.allow;
   if (!Array.isArray(allow)) return false;
   return allow.some((p: string) => p.startsWith('mcp__codegraph__'));
-}
-
-export function hasClaudeMdSection(location: InstallLocation): boolean {
-  const file = location === 'global'
-    ? path.join(os.homedir(), '.claude', 'CLAUDE.md')
-    : path.join(process.cwd(), '.claude', 'CLAUDE.md');
-  try {
-    if (!fs.existsSync(file)) return false;
-    const content = fs.readFileSync(file, 'utf-8');
-    return content.includes('<!-- CODEGRAPH_START -->') || content.includes('## CodeGraph');
-  } catch {
-    return false;
-  }
 }

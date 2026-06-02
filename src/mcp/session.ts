@@ -23,13 +23,15 @@ import { CodeGraphPackageVersion } from './version';
  * MCP Server Info — kept on the session because some clients log it. The
  * version tracks the real package version (was a hard-coded '0.1.0').
  */
-const SERVER_INFO = {
+// Exported so the proxy can answer `initialize` locally with the IDENTICAL
+// payload the daemon would send — no drift between the two handshake paths.
+export const SERVER_INFO = {
   name: 'codegraph',
   version: CodeGraphPackageVersion,
 };
 
 /** MCP Protocol Version (latest the server claims). */
-const PROTOCOL_VERSION = '2024-11-05';
+export const PROTOCOL_VERSION = '2024-11-05';
 
 /**
  * How long to wait for the client's `roots/list` response before giving up

@@ -587,6 +587,37 @@ export class ContextBuilder {
       }
     }
 
+    // Iter7 — Core-directory boost. On projects with one file that holds
+    // the dense majority of internal call edges (e.g. sinatra's
+    // `lib/sinatra/base.rb` at 85% of all in-file edges), the agent's
+    // task usually asks about the framework's core. Without this boost,
+    // ranking favors small focused extension files (e.g. text search
+    // picks `sinatra-contrib/lib/sinatra/multi_route.rb`'s 10-line
+    // `route` method over `base.rb`'s `route!` because the extension
+    // file's `route` matches the query verbatim AND the file is small,
+    // dwarfing the longer name `route!` in a 1500-line file). Boost
+    // results that share a directory prefix with the dominant file's
+    // directory so the core file's siblings outrank sibling-package
+    // extensions.
+    try {
+      const dominant = this.queries.getDominantFile?.();
+      if (dominant && dominant.edgeCount >= 3 * dominant.nextEdgeCount) {
+        // Take the directory of the dominant file (everything up to the
+        // last slash). For `lib/sinatra/base.rb` → `lib/sinatra/`.
+        const slash = dominant.filePath.lastIndexOf('/');
+        if (slash > 0) {
+          const coreDir = dominant.filePath.slice(0, slash + 1);
+          for (const result of searchResults) {
+            if (result.node.filePath.startsWith(coreDir)) {
+              result.score += 25;
+            }
+          }
+        }
+      }
+    } catch {
+      // SQL failure — fall through, scoring works without the boost
+    }
+
     // Step 5a: Multi-term co-occurrence re-ranking (applied BEFORE truncation).
     // For multi-word queries like "search execution from request to shard",
     // nodes matching 2+ query terms in their name or path are far more relevant

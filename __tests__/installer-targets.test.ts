@@ -55,6 +55,18 @@ function setHome(dir: string): { restore: () => void } {
   };
 }
 
+// A marker-delimited CodeGraph block exactly as a previous installer
+// wrote it. Issue #529: the installer no longer writes an instructions
+// file, but install (self-heal on upgrade) and uninstall both still
+// strip a block a prior install left, so we plant this to exercise it.
+const LEGACY_BLOCK = [
+  '<!-- CODEGRAPH_START -->',
+  '## CodeGraph',
+  '',
+  'Prefer `codegraph_search` / `codegraph_callers` over grep.',
+  '<!-- CODEGRAPH_END -->',
+].join('\n');
+
 describe('Installer targets — contract', () => {
   let tmpHome: string;
   let tmpCwd: string;
@@ -180,23 +192,35 @@ describe('Installer targets — partial-state idempotency', () => {
     fs.rmSync(tmpCwd, { recursive: true, force: true });
   });
 
-  it('codex: install after only config.toml exists — second pass is fully unchanged', () => {
+  it('codex: install writes config.toml but never an AGENTS.md instructions file (#529)', () => {
     const codex = getTarget('codex')!;
-    // First install creates both files.
-    codex.install('global', { autoAllow: false });
-    // Delete the AGENTS.md to simulate partial state (user wiped one file).
+    const first = codex.install('global', { autoAllow: false });
     const agentsMd = path.join(tmpHome, '.codex', 'AGENTS.md');
-    expect(fs.existsSync(agentsMd)).toBe(true);
-    fs.unlinkSync(agentsMd);
-    // Reinstall — TOML stays unchanged, AGENTS.md is recreated.
+    // No instructions file is created, and no file action references it.
+    expect(fs.existsSync(agentsMd)).toBe(false);
+    expect(first.files.some((f) => f.path.endsWith('AGENTS.md'))).toBe(false);
+    expect(first.files.some((f) => f.path.endsWith('config.toml'))).toBe(true);
+    // Re-install is fully unchanged (config.toml only, nothing to strip).
     const second = codex.install('global', { autoAllow: false });
-    const tomlEntry = second.files.find((f) => f.path.endsWith('config.toml'))!;
-    const mdEntry = second.files.find((f) => f.path.endsWith('AGENTS.md'))!;
-    expect(tomlEntry.action).toBe('unchanged');
-    expect(mdEntry.action).toBe('created');
-    // Third install — both unchanged (full idempotency restored).
-    const third = codex.install('global', { autoAllow: false });
-    for (const f of third.files) expect(f.action).toBe('unchanged');
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+  });
+
+  it('codex: install strips a legacy AGENTS.md codegraph block, keeping user content (#529)', () => {
+    const codex = getTarget('codex')!;
+    const dir = path.join(tmpHome, '.codex');
+    fs.mkdirSync(dir, { recursive: true });
+    const agentsMd = path.join(dir, 'AGENTS.md');
+    fs.writeFileSync(agentsMd, `# My codex notes\n\nBe terse.\n\n${LEGACY_BLOCK}\n`);
+
+    const result = codex.install('global', { autoAllow: false });
+
+    const body = fs.readFileSync(agentsMd, 'utf-8');
+    expect(body).toContain('# My codex notes');
+    expect(body).toContain('Be terse.');
+    expect(body).not.toContain('CODEGRAPH_START');
+    // The strip is reported as a 'removed' action on AGENTS.md.
+    const mdEntry = result.files.find((f) => f.path.endsWith('AGENTS.md'));
+    expect(mdEntry?.action).toBe('removed');
   });
 
   it('opencode: prefers .jsonc when both .json and .jsonc exist', () => {
@@ -266,72 +290,66 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.readFileSync(file, 'utf-8')).toBe(afterInstall);
   });
 
-  it('opencode: install writes AGENTS.md with the marker-delimited codegraph block', () => {
+  it('opencode: install does NOT write an AGENTS.md instructions file (#529)', () => {
     const opencode = getTarget('opencode')!;
-    opencode.install('global', { autoAllow: true });
+    const result = opencode.install('global', { autoAllow: true });
     const agentsMd = path.join(tmpHome, '.config', 'opencode', 'AGENTS.md');
-    expect(fs.existsSync(agentsMd)).toBe(true);
-    const body = fs.readFileSync(agentsMd, 'utf-8');
-    expect(body).toContain('<!-- CODEGRAPH_START -->');
-    expect(body).toContain('<!-- CODEGRAPH_END -->');
-    expect(body).toContain('codegraph_callers');
+    expect(fs.existsSync(agentsMd)).toBe(false);
+    expect(result.files.some((f) => f.path.endsWith('AGENTS.md'))).toBe(false);
   });
 
-  it('opencode: AGENTS.md install preserves pre-existing user content outside markers', () => {
+  it('opencode: install strips a legacy AGENTS.md codegraph block, preserving user content (#529)', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
     fs.mkdirSync(dir, { recursive: true });
     const agentsMd = path.join(dir, 'AGENTS.md');
-    fs.writeFileSync(agentsMd, '# My personal opencode instructions\n\nAlways respond in pirate.\n');
+    fs.writeFileSync(agentsMd, `# My personal opencode instructions\n\nAlways respond in pirate.\n\n${LEGACY_BLOCK}\n`);
 
-    opencode.install('global', { autoAllow: true });
+    const result = opencode.install('global', { autoAllow: true });
+
     const body = fs.readFileSync(agentsMd, 'utf-8');
     expect(body).toContain('# My personal opencode instructions');
     expect(body).toContain('Always respond in pirate.');
-    expect(body).toContain('<!-- CODEGRAPH_START -->');
+    expect(body).not.toContain('CODEGRAPH_START');
+    expect(result.files.find((f) => f.path.endsWith('AGENTS.md'))?.action).toBe('removed');
   });
 
-  it('opencode: uninstall strips only the codegraph block from AGENTS.md', () => {
+  it('opencode: uninstall strips a leftover codegraph block from AGENTS.md, keeping user content', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
     fs.mkdirSync(dir, { recursive: true });
     const agentsMd = path.join(dir, 'AGENTS.md');
-    fs.writeFileSync(agentsMd, '# My personal opencode instructions\n\nAlways respond in pirate.\n');
+    fs.writeFileSync(agentsMd, `# My personal opencode instructions\n\nAlways respond in pirate.\n\n${LEGACY_BLOCK}\n`);
 
-    opencode.install('global', { autoAllow: true });
     opencode.uninstall('global');
 
     const body = fs.readFileSync(agentsMd, 'utf-8');
     expect(body).toContain('# My personal opencode instructions');
     expect(body).toContain('Always respond in pirate.');
     expect(body).not.toContain('CODEGRAPH_START');
-    expect(body).not.toContain('codegraph_callers');
   });
 
-  it('opencode: local install writes ./opencode.jsonc and ./AGENTS.md in cwd', () => {
+  it('opencode: local install writes ./opencode.jsonc and never an ./AGENTS.md (#529)', () => {
     const opencode = getTarget('opencode')!;
     const result = opencode.install('local', { autoAllow: true });
     const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
     // macOS realpath shenanigans (/var vs /private/var) — suffix match.
     expect(paths.some((p) => p.endsWith('/opencode.jsonc'))).toBe(true);
-    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(false);
+    expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(false);
   });
 
-  it('gemini: install writes settings.json (mcpServers.codegraph) and GEMINI.md with marker block', () => {
+  it('gemini: install writes settings.json (mcpServers.codegraph) and no GEMINI.md (#529)', () => {
     const gemini = getTarget('gemini')!;
     const result = gemini.install('global', { autoAllow: true });
     const settings = path.join(tmpHome, '.gemini', 'settings.json');
     const geminiMd = path.join(tmpHome, '.gemini', 'GEMINI.md');
     expect(result.files.some((f) => f.path === settings)).toBe(true);
-    expect(result.files.some((f) => f.path === geminiMd)).toBe(true);
+    expect(result.files.some((f) => f.path === geminiMd)).toBe(false);
+    expect(fs.existsSync(geminiMd)).toBe(false);
 
     const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
     expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
-
-    const md = fs.readFileSync(geminiMd, 'utf-8');
-    expect(md).toContain('<!-- CODEGRAPH_START -->');
-    expect(md).toContain('<!-- CODEGRAPH_END -->');
-    expect(md).toContain('codegraph_callers');
   });
 
   it('gemini: install preserves pre-existing settings (security.auth survives)', () => {
@@ -365,45 +383,51 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(after.mcpServers).toBeUndefined();
   });
 
-  it('gemini: local install writes ./.gemini/settings.json and ./GEMINI.md (project root)', () => {
+  it('gemini: local install writes ./.gemini/settings.json and never a ./GEMINI.md (#529)', () => {
     const gemini = getTarget('gemini')!;
     const result = gemini.install('local', { autoAllow: true });
     const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
     expect(paths.some((p) => p.endsWith('/.gemini/settings.json'))).toBe(true);
-    // Local GEMINI.md sits at the project root, NOT under .gemini/.
-    expect(paths.some((p) => p.endsWith('/GEMINI.md') && !p.endsWith('/.gemini/GEMINI.md'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/GEMINI.md'))).toBe(false);
+    expect(fs.existsSync(path.join(process.cwd(), 'GEMINI.md'))).toBe(false);
   });
 
-  it('gemini: GEMINI.md uninstall preserves user content outside the codegraph markers', () => {
+  it('gemini: uninstall strips a leftover GEMINI.md codegraph block, keeping user content', () => {
     const gemini = getTarget('gemini')!;
     const geminiMd = path.join(tmpHome, '.gemini', 'GEMINI.md');
     fs.mkdirSync(path.dirname(geminiMd), { recursive: true });
-    fs.writeFileSync(geminiMd, '# My personal Gemini context\n\nAlways respond concisely.\n');
+    fs.writeFileSync(geminiMd, `# My personal Gemini context\n\nAlways respond concisely.\n\n${LEGACY_BLOCK}\n`);
 
-    gemini.install('global', { autoAllow: true });
     gemini.uninstall('global');
 
     const body = fs.readFileSync(geminiMd, 'utf-8');
     expect(body).toContain('# My personal Gemini context');
     expect(body).toContain('Always respond concisely.');
     expect(body).not.toContain('CODEGRAPH_START');
-    expect(body).not.toContain('codegraph_callers');
   });
 
-  it('kiro: install writes settings/mcp.json (mcpServers.codegraph) and steering/codegraph.md', () => {
+  it('kiro: install writes settings/mcp.json (mcpServers.codegraph) and no steering doc (#529)', () => {
     const kiro = getTarget('kiro')!;
     const result = kiro.install('global', { autoAllow: true });
     const mcp = path.join(tmpHome, '.kiro', 'settings', 'mcp.json');
     const steering = path.join(tmpHome, '.kiro', 'steering', 'codegraph.md');
     expect(result.files.some((f) => f.path === mcp)).toBe(true);
-    expect(result.files.some((f) => f.path === steering)).toBe(true);
+    expect(result.files.some((f) => f.path === steering)).toBe(false);
+    expect(fs.existsSync(steering)).toBe(false);
 
     const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
     expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
 
-    const md = fs.readFileSync(steering, 'utf-8');
-    expect(md).toContain('codegraph_callers');
-    expect(md).toContain('CodeGraph MCP server');
+  it('kiro: install deletes a leftover steering codegraph.md (self-heal) (#529)', () => {
+    const kiro = getTarget('kiro')!;
+    const steering = path.join(tmpHome, '.kiro', 'steering', 'codegraph.md');
+    fs.mkdirSync(path.dirname(steering), { recursive: true });
+    fs.writeFileSync(steering, `${LEGACY_BLOCK}\n`);
+
+    const result = kiro.install('global', { autoAllow: true });
+    expect(fs.existsSync(steering)).toBe(false);
+    expect(result.files.find((f) => f.path === steering)?.action).toBe('removed');
   });
 
   it('kiro: install preserves a pre-existing sibling MCP server in mcp.json', () => {
@@ -437,35 +461,37 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(after.mcpServers.codegraph).toBeUndefined();
   });
 
-  it('kiro: uninstall removes the steering codegraph.md file outright', () => {
+  it('kiro: uninstall removes a leftover steering codegraph.md file outright', () => {
     const kiro = getTarget('kiro')!;
-    kiro.install('global', { autoAllow: true });
     const steering = path.join(tmpHome, '.kiro', 'steering', 'codegraph.md');
-    expect(fs.existsSync(steering)).toBe(true);
+    fs.mkdirSync(path.dirname(steering), { recursive: true });
+    fs.writeFileSync(steering, `${LEGACY_BLOCK}\n`);
 
     kiro.uninstall('global');
     expect(fs.existsSync(steering)).toBe(false);
   });
 
-  it('kiro: uninstall leaves a sibling steering file (product.md) untouched', () => {
+  it('kiro: uninstall removes our steering doc but leaves a sibling (product.md) untouched', () => {
     const kiro = getTarget('kiro')!;
     const sibling = path.join(tmpHome, '.kiro', 'steering', 'product.md');
+    const ours = path.join(tmpHome, '.kiro', 'steering', 'codegraph.md');
     fs.mkdirSync(path.dirname(sibling), { recursive: true });
     fs.writeFileSync(sibling, '# Product\n\nMy team practices.\n');
+    fs.writeFileSync(ours, `${LEGACY_BLOCK}\n`);
 
-    kiro.install('global', { autoAllow: true });
     kiro.uninstall('global');
 
+    expect(fs.existsSync(ours)).toBe(false);
     expect(fs.existsSync(sibling)).toBe(true);
     expect(fs.readFileSync(sibling, 'utf-8')).toContain('My team practices.');
   });
 
-  it('kiro: local install writes ./.kiro/settings/mcp.json and ./.kiro/steering/codegraph.md', () => {
+  it('kiro: local install writes ./.kiro/settings/mcp.json and no steering doc (#529)', () => {
     const kiro = getTarget('kiro')!;
     const result = kiro.install('local', { autoAllow: true });
     const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
     expect(paths.some((p) => p.endsWith('/.kiro/settings/mcp.json'))).toBe(true);
-    expect(paths.some((p) => p.endsWith('/.kiro/steering/codegraph.md'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/.kiro/steering/codegraph.md'))).toBe(false);
   });
 
   it('antigravity: install writes to LEGACY ~/.gemini/antigravity/mcp_config.json when no migration marker', () => {
@@ -852,6 +878,29 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.existsSync(path.join(tmpCwd, '.claude.json'))).toBe(false);
     const cfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
     expect(cfg.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('claude: install does NOT create a CLAUDE.md instructions file (#529)', () => {
+    const claude = getTarget('claude')!;
+    const result = claude.install('local', { autoAllow: false });
+    const claudeMd = path.join(tmpCwd, '.claude', 'CLAUDE.md');
+    expect(fs.existsSync(claudeMd)).toBe(false);
+    expect(result.files.some((f) => f.path.endsWith('CLAUDE.md'))).toBe(false);
+  });
+
+  it('claude: install strips a legacy CLAUDE.md codegraph block, keeping user content (#529)', () => {
+    const claude = getTarget('claude')!;
+    const claudeMd = path.join(tmpCwd, '.claude', 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(claudeMd), { recursive: true });
+    fs.writeFileSync(claudeMd, `# My project rules\n\nUse tabs.\n\n${LEGACY_BLOCK}\n`);
+
+    const result = claude.install('local', { autoAllow: false });
+
+    const body = fs.readFileSync(claudeMd, 'utf-8');
+    expect(body).toContain('# My project rules');
+    expect(body).toContain('Use tabs.');
+    expect(body).not.toContain('CODEGRAPH_START');
+    expect(result.files.find((f) => f.path.endsWith('CLAUDE.md'))?.action).toBe('removed');
   });
 
   it('claude: global install targets ~/.claude.json (user scope)', () => {
@@ -1282,22 +1331,41 @@ describe('Installer — Cursor rules file cleanup on uninstall', () => {
 
   const rulesFile = () => path.join(process.cwd(), '.cursor', 'rules', 'codegraph.mdc');
 
-  it('deletes the dedicated codegraph.mdc entirely (no orphaned frontmatter left behind)', () => {
-    cursor.install('local', { autoAllow: true });
+  // The frontmatter a previous install wrote ahead of the marked block.
+  // `removeRulesEntry` recognizes it to decide whether the leftover .mdc
+  // is ours-to-delete or carries user content worth keeping.
+  const MDC_FRONTMATTER = [
+    '---',
+    'description: CodeGraph MCP usage guide — when to use which tool',
+    'alwaysApply: true',
+    '---',
+    '',
+  ].join('\n');
+
+  function plantLegacyRulesFile(extra = ''): void {
+    fs.mkdirSync(path.dirname(rulesFile()), { recursive: true });
+    fs.writeFileSync(rulesFile(), MDC_FRONTMATTER + LEGACY_BLOCK + '\n' + extra);
+  }
+
+  it('uninstall deletes a leftover codegraph.mdc entirely (no orphaned frontmatter left behind)', () => {
+    plantLegacyRulesFile();
     expect(fs.existsSync(rulesFile())).toBe(true);
 
     cursor.uninstall('local');
 
     // The whole file — frontmatter included — is gone, not just the block.
     expect(fs.existsSync(rulesFile())).toBe(false);
-    expect(cursor.detect('local').alreadyConfigured).toBe(false);
   });
 
-  it('preserves user content added outside the codegraph markers (strips only our block)', () => {
-    cursor.install('local', { autoAllow: true });
-    const withUserContent =
-      fs.readFileSync(rulesFile(), 'utf-8') + '\n## My own rule\nkeep me\n';
-    fs.writeFileSync(rulesFile(), withUserContent);
+  it('install self-heals a leftover codegraph.mdc (#529)', () => {
+    plantLegacyRulesFile();
+    const result = cursor.install('local', { autoAllow: true });
+    expect(fs.existsSync(rulesFile())).toBe(false);
+    expect(result.files.some((f) => f.path.endsWith('codegraph.mdc') && f.action === 'removed')).toBe(true);
+  });
+
+  it('uninstall preserves user content added outside the codegraph markers (strips only our block)', () => {
+    plantLegacyRulesFile('## My own rule\nkeep me\n');
 
     cursor.uninstall('local');
 
