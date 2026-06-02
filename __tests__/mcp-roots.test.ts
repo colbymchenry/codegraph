@@ -72,6 +72,20 @@ function send(child: ChildProcessWithoutNullStreams, msg: object): void {
   child.stdin.write(JSON.stringify(msg) + '\n');
 }
 
+function stopServer(child: ChildProcessWithoutNullStreams | null): Promise<void> {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, 5000);
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill('SIGKILL');
+  });
+}
+
 const CLIENT_INFO = { name: 'test', version: '0.0.0' };
 
 describe('MCP project resolution via roots/list (issue #196)', () => {
@@ -84,13 +98,11 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
     projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-proj-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
-      child = null;
-    }
-    fs.rmSync(cwdDir, { recursive: true, force: true });
-    fs.rmSync(projectDir, { recursive: true, force: true });
+  afterEach(async () => {
+    await stopServer(child);
+    child = null;
+    fs.rmSync(cwdDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    fs.rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it('resolves the project from the client roots/list when no rootUri is sent', async () => {
