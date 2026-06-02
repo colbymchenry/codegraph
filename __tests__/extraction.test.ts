@@ -3226,6 +3226,70 @@ export function multiply(a: number, b: number): number {
 
     cg.close();
   });
+
+  it('should count file-level tracked YAML files as indexed', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'routes.yml'), 'route: value\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll();
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+    expect(cg.getFiles().map((f) => f.path).sort()).toEqual(['app.yaml', 'routes.yml']);
+
+    cg.close();
+  });
+
+  it('should count file-level tracked YAML/Twig files as indexed in indexFiles()', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexFiles(['app.yaml', 'view.twig']);
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+
+    const tracked = cg.getFiles().map((f) => `${f.path}:${f.language}`).sort();
+    expect(tracked).toEqual(['app.yaml:yaml', 'view.twig:twig']);
+
+    cg.close();
+  });
+
+  it('should count file-level tracked .properties files as indexed', async () => {
+    fs.writeFileSync(path.join(tempDir, 'application.properties'), 'server.port=8080\n');
+    fs.writeFileSync(path.join(tempDir, 'log.properties'), 'log.level=INFO\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll();
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+
+    cg.close();
+  });
+
+  it('should count the full file-level tracked class (yaml/twig/properties) in indexFiles()', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');
+    fs.writeFileSync(path.join(tempDir, 'application.properties'), 'server.port=8080\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexFiles(['app.yaml', 'view.twig', 'application.properties']);
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(3);
+    expect(result.filesSkipped).toBe(0);
+
+    const tracked = cg.getFiles().map((f) => `${f.path}:${f.language}`).sort();
+    expect(tracked).toEqual(['app.yaml:yaml', 'application.properties:properties', 'view.twig:twig']);
+
+    cg.close();
+  });
 });
 
 describe('Path Normalization', () => {

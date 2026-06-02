@@ -291,6 +291,19 @@ export function isGrammarLoaded(language: Language): boolean {
 }
 
 /**
+ * Languages tracked at the file-record level only: parsing emits zero symbol
+ * nodes, but the file is still stored (and framework resolvers may add per-file
+ * references later, e.g. Drupal routing yml, Spring `@Value` against
+ * application.properties). This is the canonical set behind the no-symbol
+ * branch in `tree-sitter.ts`; `xml` is intentionally excluded because its
+ * MyBatis extractor emits a file node. Callers use this to count such files as
+ * indexed rather than skipped, so it must stay in sync with that branch.
+ */
+export function isFileLevelOnlyLanguage(language: Language): boolean {
+  return language === 'yaml' || language === 'twig' || language === 'properties';
+}
+
+/**
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {

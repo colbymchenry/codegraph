@@ -37,13 +37,11 @@ import {
   jsonDeepEqual,
   readJsonFile,
   removeMarkedSection,
-  replaceOrAppendMarkedSection,
   writeJsonFile,
 } from './shared';
 import {
   CODEGRAPH_SECTION_END,
   CODEGRAPH_SECTION_START,
-  INSTRUCTIONS_TEMPLATE,
 } from '../instructions-template';
 
 function configDir(loc: Location): string {
@@ -85,7 +83,13 @@ class GeminiTarget implements AgentTarget {
   install(loc: Location, _opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
     files.push(writeMcpEntry(loc));
-    files.push(writeInstructionsEntry(loc));
+
+    // GEMINI.md is no longer written — the codegraph usage guidance
+    // ships in the MCP server's `initialize` response (issue #529).
+    // Strip a block a previous install left so an upgrade self-heals.
+    const instrCleanup = removeInstructionsEntry(loc);
+    if (instrCleanup.action === 'removed') files.push(instrCleanup);
+
     return { files };
   }
 
@@ -108,9 +112,7 @@ class GeminiTarget implements AgentTarget {
       files.push({ path: file, action: 'not-found' });
     }
 
-    const instr = instructionsPath(loc);
-    const action = removeMarkedSection(instr, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
-    files.push({ path: instr, action });
+    files.push(removeInstructionsEntry(loc));
 
     return { files };
   }
@@ -146,22 +148,15 @@ function writeMcpEntry(loc: Location): WriteResult['files'][number] {
   return { path: file, action };
 }
 
-function writeInstructionsEntry(loc: Location): WriteResult['files'][number] {
+/**
+ * Strip the marker-delimited CodeGraph block from GEMINI.md if a prior
+ * install wrote one. Used by both install (self-heal on upgrade) and
+ * uninstall — see issue #529.
+ */
+function removeInstructionsEntry(loc: Location): WriteResult['files'][number] {
   const file = instructionsPath(loc);
-  const dir = path.dirname(file);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-  const action = replaceOrAppendMarkedSection(
-    file,
-    INSTRUCTIONS_TEMPLATE,
-    CODEGRAPH_SECTION_START,
-    CODEGRAPH_SECTION_END,
-  );
-  const mapped: 'created' | 'updated' | 'unchanged' =
-    action === 'created' ? 'created'
-      : action === 'unchanged' ? 'unchanged'
-        : 'updated';
-  return { path: file, action: mapped };
+  const action = removeMarkedSection(file, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
+  return { path: file, action };
 }
 
 export const geminiTarget: AgentTarget = new GeminiTarget();

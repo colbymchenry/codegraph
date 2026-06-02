@@ -33,10 +33,16 @@ describe('getExploreOutputBudget', () => {
   });
 
   it('uses tier breakpoints matching getExploreBudget so call-count and output-budget agree on a project', () => {
-    // Anything in the same tier should pick the same total-output cap.
-    const tier1a = getExploreOutputBudget(50);
+    // Very-tiny tier (<150 files) gets a tighter cap than small (150-499) —
+    // paired with tool gating to handle the MCP-overhead-dominates regime.
+    const tier0a = getExploreOutputBudget(50);
+    const tier0b = getExploreOutputBudget(149);
+    expect(tier0a.maxOutputChars).toBe(tier0b.maxOutputChars);
+
+    const tier1a = getExploreOutputBudget(150);
     const tier1b = getExploreOutputBudget(499);
     expect(tier1a.maxOutputChars).toBe(tier1b.maxOutputChars);
+    // The <500 explore-call budget covers both very-tiny and small.
     expect(getExploreBudget(50)).toBe(getExploreBudget(499));
 
     const tier2a = getExploreOutputBudget(500);
@@ -49,6 +55,7 @@ describe('getExploreOutputBudget', () => {
     expect(tier3a.maxOutputChars).toBe(tier3b.maxOutputChars);
 
     // And crossing a breakpoint changes the cap.
+    expect(tier0a.maxOutputChars).not.toBe(tier1a.maxOutputChars);
     expect(tier1a.maxOutputChars).not.toBe(tier2a.maxOutputChars);
     expect(tier2a.maxOutputChars).not.toBe(tier3a.maxOutputChars);
   });
@@ -67,8 +74,12 @@ describe('getExploreOutputBudget', () => {
     expect(medium.includeBudgetNote).toBe(true);
   });
 
-  it('keeps the Relationships section on for every tier — it is the cheapest structural signal', () => {
-    expect(getExploreOutputBudget(50).includeRelationships).toBe(true);
+  it('keeps the Relationships section on for medium+ tiers — small tiers drop it to maximize body density', () => {
+    // ITER2: relationships dropped on <500 tiers; on tiny repos the
+    // per-call payload is the cost driver, so even "cheap" structural
+    // signal adds up across follow-up turns. Re-enabled at ≥500 where
+    // body budgets are roomy enough to absorb the 1-2KB overhead.
+    expect(getExploreOutputBudget(50).includeRelationships).toBe(false);
     expect(getExploreOutputBudget(1000).includeRelationships).toBe(true);
     expect(getExploreOutputBudget(10000).includeRelationships).toBe(true);
     expect(getExploreOutputBudget(30000).includeRelationships).toBe(true);
@@ -91,8 +102,11 @@ describe('getExploreOutputBudget', () => {
   });
 
   it('handles the boundary file counts exactly (off-by-one regression guard)', () => {
-    // 499 -> small tier, 500 -> medium tier
-    expect(getExploreOutputBudget(499).maxOutputChars).toBe(getExploreOutputBudget(100).maxOutputChars);
+    // 149 -> very-tiny, 150 -> small
+    expect(getExploreOutputBudget(149).maxOutputChars).toBe(getExploreOutputBudget(50).maxOutputChars);
+    expect(getExploreOutputBudget(150).maxOutputChars).toBe(getExploreOutputBudget(200).maxOutputChars);
+    // 499 -> small, 500 -> medium
+    expect(getExploreOutputBudget(499).maxOutputChars).toBe(getExploreOutputBudget(200).maxOutputChars);
     expect(getExploreOutputBudget(500).maxOutputChars).toBe(getExploreOutputBudget(1000).maxOutputChars);
     // 4999 -> medium, 5000 -> large
     expect(getExploreOutputBudget(4999).maxOutputChars).toBe(getExploreOutputBudget(1000).maxOutputChars);
