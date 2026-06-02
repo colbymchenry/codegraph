@@ -676,7 +676,13 @@ program
     try {
       if (!isInitialized(projectPath)) {
         if (options.json) {
-          console.log(JSON.stringify({ initialized: false, projectPath }));
+          console.log(JSON.stringify({
+            initialized: false,
+            version: packageJson.version,
+            projectPath,
+            indexPath: getCodeGraphDir(projectPath),
+            lastIndexed: null,
+          }));
           return;
         }
         console.log(chalk.bold('\nCodeGraph Status\n'));
@@ -695,9 +701,13 @@ program
 
       // JSON output mode
       if (options.json) {
+        const lastIndexedMs = cg.getLastIndexedAt();
         console.log(JSON.stringify({
           initialized: true,
+          version: packageJson.version,
           projectPath,
+          indexPath: getCodeGraphDir(projectPath),
+          lastIndexed: lastIndexedMs != null ? new Date(lastIndexedMs).toISOString() : null,
           fileCount: stats.fileCount,
           nodeCount: stats.nodeCount,
           edgeCount: stats.edgeCount,

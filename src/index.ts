@@ -577,6 +577,15 @@ export class CodeGraph {
   }
 
   /**
+   * Most recent index timestamp (ms since epoch) across all tracked files, or
+   * null when nothing is indexed yet. Lets library consumers check index
+   * freshness without shelling out to `codegraph status --json`. (#329)
+   */
+  getLastIndexedAt(): number | null {
+    return this.queries.getLastIndexedAt();
+  }
+
+  /**
    * Extract nodes and edges from source code (without storing)
    */
   extractFromSource(filePath: string, source: string): ExtractionResult {
