@@ -853,6 +853,94 @@ func UseAliased() {
       expect(target?.filePath.replace(/\\/g, '/')).toBe('pkgb/lib.go');
     });
 
+    it('links Go receiver methods to owner types across files in the same package (#583)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'go.mod'),
+        'module github.com/example/myproject\n\ngo 1.21\n'
+      );
+      fs.mkdirSync(path.join(tempDir, 'repro'));
+      fs.mkdirSync(path.join(tempDir, 'other'));
+      fs.writeFileSync(
+        path.join(tempDir, 'repro', 'widget.go'),
+        'package repro\n\ntype Widget struct{ name string }\nfunc (w *Widget) Foo() string { return "foo:" + w.name }\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'repro', 'widget_extra.go'),
+        'package repro\n\nfunc (w *Widget) Bar() string { return "bar:" + w.name }\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'repro', 'status.go'),
+        'package repro\n\ntype Status string\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'repro', 'status_extra.go'),
+        'package repro\n\nfunc (s Status) String() string { return string(s) }\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'other', 'widget.go'),
+        'package other\n\ntype Widget struct{ id int }\n'
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const widget = cg.getNodesByKind('struct').find((n) => n.name === 'Widget' && n.filePath === 'repro/widget.go');
+      const otherWidget = cg.getNodesByKind('struct').find((n) => n.name === 'Widget' && n.filePath === 'other/widget.go');
+      const status = cg.getNodesByKind('type_alias').find((n) => n.name === 'Status' && n.filePath === 'repro/status.go');
+      const methods = cg.getNodesByKind('method').filter((n) => n.qualifiedName.startsWith('Widget::'));
+      const methodNames = methods.map((n) => n.name).sort();
+      expect(widget).toBeDefined();
+      expect(otherWidget).toBeDefined();
+      expect(status).toBeDefined();
+      expect(methodNames).toEqual(['Bar', 'Foo']);
+
+      const containedMethodNames = cg.getOutgoingEdges(widget!.id)
+        .filter((edge) => edge.kind === 'contains')
+        .map((edge) => cg.getNode(edge.target)?.name)
+        .filter(Boolean)
+        .sort();
+      expect(containedMethodNames).toEqual(['Bar', 'Foo']);
+
+      const otherContainedMethodNames = cg.getOutgoingEdges(otherWidget!.id)
+        .filter((edge) => edge.kind === 'contains')
+        .map((edge) => cg.getNode(edge.target)?.name)
+        .filter(Boolean);
+      expect(otherContainedMethodNames).toEqual([]);
+
+      const statusContainedMethodNames = cg.getOutgoingEdges(status!.id)
+        .filter((edge) => edge.kind === 'contains')
+        .map((edge) => cg.getNode(edge.target)?.name)
+        .filter(Boolean);
+      expect(statusContainedMethodNames).toEqual(['String']);
+    });
+
+    it('links Go receiver methods after indexing selected files (#583)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'go.mod'),
+        'module github.com/example/myproject\n\ngo 1.21\n'
+      );
+      fs.mkdirSync(path.join(tempDir, 'repro'));
+      fs.writeFileSync(
+        path.join(tempDir, 'repro', 'widget.go'),
+        'package repro\n\ntype Widget struct{ name string }\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'repro', 'widget_extra.go'),
+        'package repro\n\nfunc (w *Widget) Bar() string { return "bar:" + w.name }\n'
+      );
+
+      cg = CodeGraph.initSync(tempDir);
+      const result = await cg.indexFiles(['repro/widget.go', 'repro/widget_extra.go']);
+      expect(result.success).toBe(true);
+
+      const widget = cg.getNodesByKind('struct').find((n) => n.name === 'Widget' && n.filePath === 'repro/widget.go');
+      expect(widget).toBeDefined();
+      const containedMethodNames = cg.getOutgoingEdges(widget!.id)
+        .filter((edge) => edge.kind === 'contains')
+        .map((edge) => cg.getNode(edge.target)?.name)
+        .filter(Boolean);
+      expect(containedMethodNames).toEqual(['Bar']);
+    });
+
     it('TS type_alias object-shape members resolve method calls (#359)', async () => {
       // Pre-#359, `recorder.stop()` (recorder: RecorderHandle) attached
       // to `StdioMcpClient.stop` in a sibling directory via path-proximity
