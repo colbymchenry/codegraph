@@ -181,7 +181,14 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     fs.mkdirSync(src, { recursive: true });
     fs.writeFileSync(
       path.join(src, 'session.ts'),
-      `export class Session {\n  request(): void { fetch('x'); }\n}\nexport function request(): void {}\n`
+      `export class Session {
+  request(): void {
+    const marker = 'SESSION_BODY_MARKER';
+    fetch(marker);
+  }
+}
+export function request(): void {}
+`
     );
 
     const CodeGraph = (await import('../src/index')).default;
@@ -218,5 +225,12 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     expect(text).toMatch(/\(method\)/);
     expect(text).toMatch(/\(function\)/);
     expect((text.match(/\*\*Location:\*\*/g) || []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('codegraph_node includeCode returns container bodies, not only member outlines', async () => {
+    const res = await handler.execute('codegraph_node', { symbol: 'Session', includeCode: true });
+    const text = res.content?.[0]?.text ?? '';
+    expect(text).toContain('SESSION_BODY_MARKER');
+    expect(text).not.toContain('Structural outline only');
   });
 });

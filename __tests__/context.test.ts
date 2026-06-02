@@ -354,21 +354,35 @@ export function validateEmail(email: string): boolean {
       expect(parsed.nodes).toBeDefined();
     });
 
-    it('should truncate long code blocks', async () => {
-      const result = await cg.buildContext('PaymentService', {
+    it('should not drop tail lines from a selected long code block', async () => {
+      const srcDir = path.join(testDir, 'src');
+      const bodyLines = [
+        'export class LongService {',
+        '  run(): string {',
+        "    const start = 'START_MARKER';",
+      ];
+      for (let i = 0; i < 80; i++) {
+        bodyLines.push(`    const filler${i} = '${i}';`);
+      }
+      bodyLines.push("    const finish = 'IMPORTANT_TAIL_MARKER';");
+      bodyLines.push('    return start + finish;');
+      bodyLines.push('  }');
+      bodyLines.push('}');
+      fs.writeFileSync(path.join(srcDir, 'long-service.ts'), bodyLines.join('\n'));
+      await cg.indexAll();
+
+      const result = await cg.buildContext('LongService run', {
         format: 'markdown',
-        maxCodeBlockSize: 100,
+        maxCodeBlockSize: 260,
         includeCode: true,
+        maxCodeBlocks: 1,
       });
 
       const markdown = result as string;
 
-      // Long code blocks should be truncated
-      if (markdown.includes('```typescript')) {
-        // If there's a code block, check for truncation marker if content was long
-        // This test validates the truncation logic works
-        expect(typeof markdown).toBe('string');
-      }
+      expect(markdown).toContain('START_MARKER');
+      expect(markdown).toContain('IMPORTANT_TAIL_MARKER');
+      expect(markdown).toContain('... (truncated middle) ...');
     });
   });
 });

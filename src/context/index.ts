@@ -1236,15 +1236,8 @@ export class ContextBuilder {
 
       const code = await this.extractNodeCode(node);
       if (code) {
-        // Truncate if too long. Language-neutral marker (no `//` — not a
-        // comment in Python, Ruby, etc.); this renders inside a fenced
-        // source block whose language varies.
-        const truncated = code.length > maxBlockSize
-          ? code.slice(0, maxBlockSize) + '\n... (truncated) ...'
-          : code;
-
         blocks.push({
-          content: truncated,
+          content: this.trimCodeBlock(code, maxBlockSize),
           filePath: node.filePath,
           startLine: node.startLine,
           endLine: node.endLine,
@@ -1255,6 +1248,36 @@ export class ContextBuilder {
     }
 
     return blocks;
+  }
+
+  private trimCodeBlock(code: string, maxBlockSize: number): string {
+    if (code.length <= maxBlockSize) {
+      return code;
+    }
+
+    const marker = '\n... (truncated middle) ...\n';
+    if (maxBlockSize <= marker.length + 20) {
+      return code.slice(0, maxBlockSize) + '\n... (truncated) ...';
+    }
+
+    const available = maxBlockSize - marker.length;
+    const headTarget = Math.floor(available / 2);
+    const tailTarget = available - headTarget;
+    const head = this.sliceHeadAtLineBoundary(code, headTarget);
+    const tail = this.sliceTailAtLineBoundary(code, tailTarget);
+    return head.replace(/\n+$/, '') + marker + tail.replace(/^\n+/, '');
+  }
+
+  private sliceHeadAtLineBoundary(code: string, maxChars: number): string {
+    const head = code.slice(0, maxChars);
+    const lineEnd = head.lastIndexOf('\n');
+    return lineEnd > maxChars * 0.5 ? head.slice(0, lineEnd) : head;
+  }
+
+  private sliceTailAtLineBoundary(code: string, maxChars: number): string {
+    const tail = code.slice(Math.max(0, code.length - maxChars));
+    const lineStart = tail.indexOf('\n');
+    return lineStart >= 0 && lineStart < maxChars * 0.5 ? tail.slice(lineStart + 1) : tail;
   }
 
   /**
