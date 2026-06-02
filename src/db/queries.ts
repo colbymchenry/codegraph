@@ -1588,10 +1588,19 @@ export class QueryBuilder {
   getUnresolvedReferencesByFiles(filePaths: string[]): UnresolvedReference[] {
     if (filePaths.length === 0) return [];
 
-    const placeholders = filePaths.map(() => '?').join(',');
-    const rows = this.db
-      .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
-      .all(...filePaths) as UnresolvedRefRow[];
+    // Chunk under SQLite's parameter limit: the first sync of a very large repo
+    // passes every changed file here, which an unbounded `IN (...)` would bind
+    // as one parameter each — exceeding MAX_VARIABLE_NUMBER and aborting with
+    // "too many SQL variables". (#540)
+    const rows: UnresolvedRefRow[] = [];
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const chunkRows = this.db
+        .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
+        .all(...chunk) as UnresolvedRefRow[];
+      rows.push(...chunkRows);
+    }
 
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,

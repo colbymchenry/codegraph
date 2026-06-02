@@ -29,6 +29,8 @@
 
 ## Get Started
 
+### 1. Install the CLI
+
 **No Node.js required** — one command grabs the right build for your OS:
 
 ```bash
@@ -42,13 +44,22 @@ irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | 
 Already have Node? Use npm instead (works on any version):
 
 ```bash
-npx @colbymchenry/codegraph        # zero-install, or:
 npm i -g @colbymchenry/codegraph
 ```
 
-<sub>CodeGraph bundles its own runtime — nothing to compile, no native build, works the same everywhere. The interactive installer auto-configures your agent(s) — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro.</sub>
+<sub>CodeGraph bundles its own runtime — nothing to compile, no native build, works the same everywhere. The installer puts `codegraph` on your PATH but **doesn't change your current shell** — open a new terminal before the next step so the command resolves.</sub>
 
-### Initialize Projects
+### 2. Wire up your agent(s)
+
+In a **new terminal**, run the installer to connect CodeGraph to the agents you use:
+
+```bash
+codegraph install
+```
+
+<sub>Detects and auto-configures Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, and Kiro — wiring the CodeGraph MCP server into each. **This is the step that connects CodeGraph to your agent;** installing the CLI in step 1 does not do it on its own. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs this in one go.)</sub>
+
+### 3. Initialize each project
 
 ```bash
 cd your-project
