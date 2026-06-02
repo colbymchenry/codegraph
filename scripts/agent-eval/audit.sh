@@ -51,7 +51,7 @@ fi
 #    binary that serves it — different versions extract differently).
 echo "→ [3/4] wiping .codegraph and re-indexing with $ACTUAL"
 rm -rf "$REPO/.codegraph"
-( cd "$REPO" && codegraph init -i ) || { echo "indexing failed"; exit 1; }
+( cd "$REPO" && codegraph init ) || { echo "indexing failed"; exit 1; }
 
 # 4. Run the with/without A/B.
 echo "→ [4/4] running A/B harness (mode=$MODE)"

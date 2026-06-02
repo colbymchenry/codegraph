@@ -40,7 +40,7 @@ fi
 # 2. Wipe + index with the binary under test.
 echo "→ wiping .codegraph and indexing"
 rm -rf "$REPO/.codegraph"
-( cd "$REPO" && codegraph init -i ) || { echo "indexing failed"; exit 1; }
+( cd "$REPO" && codegraph init ) || { echo "indexing failed"; exit 1; }
 
 # 3. Verify extraction (cheap guard before the paid A/B).
 echo "→ verifying extraction"

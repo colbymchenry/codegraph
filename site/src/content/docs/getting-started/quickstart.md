@@ -28,7 +28,7 @@ CodeGraph bundles its own runtime — nothing to compile, no native build, works
 
 ```bash
 cd your-project
-codegraph init -i
+codegraph init
 ```
 
 That's it — your agent will use CodeGraph tools automatically when a `.codegraph/` directory exists.

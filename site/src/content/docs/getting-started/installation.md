@@ -43,10 +43,10 @@ Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent /
 
 ```bash
 cd your-project
-codegraph init -i
+codegraph init
 ```
 
-This builds the per-project knowledge graph index and wires up any project-local agent surfaces, so a single global `codegraph install` works in every project you open.
+This creates `.codegraph/` and builds the per-project knowledge graph index, so a single global `codegraph install` works in every project you open.
 
 ## Supported platforms
 

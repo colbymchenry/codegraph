@@ -7,7 +7,7 @@ description: Every CodeGraph command and the flags it accepts.
 codegraph                         # Run interactive installer
 codegraph install                 # Run installer (explicit)
 codegraph uninstall               # Remove CodeGraph from your agents (inverse of install)
-codegraph init [path]             # Initialize in a project (--index to also index)
+codegraph init [path]             # Initialize in a project and build the initial index
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
 codegraph index [path]            # Full index (--force to re-index, --quiet for less output)
 codegraph sync [path]             # Incremental update

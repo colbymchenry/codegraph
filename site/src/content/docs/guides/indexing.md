@@ -7,10 +7,10 @@ description: Full index, incremental sync, and the file watcher.
 
 ```bash
 cd your-project
-codegraph init -i      # initialize + full index
+codegraph init         # initialize + full index
 ```
 
-`init` creates `.codegraph/`; `-i`/`--index` builds the index immediately. To initialize without indexing, drop the flag and run `codegraph index` later.
+`init` creates `.codegraph/` and builds the initial index by default. The legacy `-i`/`--index` flag is still accepted for older scripts, but it is no longer required. Run `codegraph index` any time to rebuild.
 
 ## Full vs. incremental
 

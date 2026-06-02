@@ -11,10 +11,10 @@ A language is NOT verified until an LLM can reliably use CodeGraph's MCP tools t
 ```bash
 npm run build
 rm -rf <codebase_path>/.codegraph
-node dist/bin/codegraph.js init -iv <codebase_path>
+node dist/bin/codegraph.js init -v <codebase_path>
 ```
 
-The `-iv` flag gives verbose output showing extraction progress, node/edge counts, and timing.
+The `-v` flag gives verbose output showing extraction progress, node/edge counts, and timing.
 
 ### 2. Quick sanity check
 
@@ -470,7 +470,7 @@ test().catch(console.error);
 ```bash
 npm run build
 rm -rf <codebase_path>/.codegraph
-node dist/bin/codegraph.js init -iv <codebase_path>
+node dist/bin/codegraph.js init -v <codebase_path>
 # Re-run the failing tests from above
 ```
 

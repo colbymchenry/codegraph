@@ -120,6 +120,6 @@ than faked.
 Canonical harness: `scripts/agent-eval/run-all.sh <repo> "<question>" headless` (with = codegraph-only
 MCP, without = empty MCP), parsed from the stream-json logs. The throwaway matrix driver + parser used
 for this table live in `/tmp/ab-matrix/`: `run.sh` (the `lang|size|repo|question` matrix — each cell does
-`rm -rf .codegraph && codegraph init -i` then both arms), `parse-matrix.mjs` (cells → this table), and
+`rm -rf .codegraph && codegraph init` then both arms), `parse-matrix.mjs` (cells → this table), and
 `compare.mjs` (old-vs-new diff + aggregates). Build `dist/` from the target commit first so the MCP
 server loads the code under test (`codegraph` on PATH is `npm link`ed to the dev `dist/`).
