@@ -290,7 +290,7 @@ export type AcquireResult =
  * the file existed but was empty; under concurrent daemon startup a third
  * candidate could read that empty file, decode it as `null`, and `unlink` the
  * winner's lock → two daemons (two watchers, two writers). The window was
- * normally too small to hit, but the chokidar watcher's extra startup time made
+ * normally too small to hit, but the file watcher's extra startup time made
  * concurrent daemons overlap enough to reproduce it reliably.
  *
  * The fix writes the complete record to a private temp file, then hard-links it

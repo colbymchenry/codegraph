@@ -11,19 +11,14 @@
  * decides whether to Read the specific stale file. These tests exercise
  * the full real path: real CodeGraph index + real ToolHandler.execute().
  *
- * **chokidar is mocked** (see __helpers__/chokidar-mock.ts): the real
- * FSEvents/inotify event delivery is non-deterministic under parallel
- * vitest execution and produced a consistent ~30% failure rate on these
- * tests when run inside the full suite. The mock replaces chokidar with
- * a controllable EventEmitter so the tests synthesize file events
- * deterministically via `triggerFileEvent(...)` instead of waiting on
- * the OS-level watcher to deliver. The watcher's actual debounce timer
- * (real setTimeout) is left untouched.
+ * **Event delivery uses a synthetic seam** (`__emitWatchEventForTests`): the
+ * real native fs.watch (FSEvents/inotify) delivery is non-deterministic under
+ * parallel vitest execution and produced a consistent ~30% failure rate on
+ * these tests when run inside the full suite. The seam drives the watcher's
+ * pending-set pipeline directly so the tests synthesize file events
+ * deterministically. The watcher's actual debounce timer (real setTimeout) is
+ * left untouched.
  */
-
-import { vi } from 'vitest';
-// Hoisted: chokidar is replaced by the controllable mock for this file.
-vi.mock('chokidar', async () => (await import('./__helpers__/chokidar-mock')).chokidarMockModule);
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -31,7 +26,7 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
-import { triggerFileEvent } from './__helpers__/chokidar-mock';
+import { __emitWatchEventForTests } from '../src/sync/watcher';
 
 function waitFor(condition: () => boolean, timeoutMs = 2000, intervalMs = 25): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -83,7 +78,7 @@ describe('MCP staleness banner', () => {
 
   it('prepends a stale banner when the response references a pending file', async () => {
     // Long debounce so the edit lingers in pendingFiles while we query.
-    cg.watch({ debounceMs: 4000 });
+    cg.watch({ debounceMs: 4000, inertForTests: true });
     await cg.waitUntilWatcherReady();
 
     // Real disk write so a later sync (if it fires) sees the new content,
@@ -93,7 +88,7 @@ describe('MCP staleness banner', () => {
       path.join(testDir, 'src', 'alpha-only.ts'),
       'export function alphaOnly() { return 99; }\n',
     );
-    triggerFileEvent(testDir, 'change', 'src/alpha-only.ts');
+    __emitWatchEventForTests(testDir, 'src/alpha-only.ts');
 
     // With mocked chokidar this is synchronous — keep the wait just to
     // exercise the realistic shape (the watcher's `chokidarReady` gate
@@ -114,7 +109,7 @@ describe('MCP staleness banner', () => {
   });
 
   it('uses the footer (not the banner) when pending files are not referenced', async () => {
-    cg.watch({ debounceMs: 4000 });
+    cg.watch({ debounceMs: 4000, inertForTests: true });
     await cg.waitUntilWatcherReady();
 
     // Edit bravo-only.ts but search for the alphaOnly symbol, whose hit is
@@ -124,7 +119,7 @@ describe('MCP staleness banner', () => {
       path.join(testDir, 'src', 'bravo-only.ts'),
       'export function bravoOnly() { return 22; }\n',
     );
-    triggerFileEvent(testDir, 'change', 'src/bravo-only.ts');
+    __emitWatchEventForTests(testDir, 'src/bravo-only.ts');
     await waitFor(() => cg.getPendingFiles().some((p) => p.path === 'src/bravo-only.ts'));
 
     const res = await handler.execute('codegraph_search', { query: 'alphaOnly' });
@@ -136,14 +131,14 @@ describe('MCP staleness banner', () => {
   });
 
   it('drops the banner once the sync completes and clears the pending entry', async () => {
-    cg.watch({ debounceMs: 200 });
+    cg.watch({ debounceMs: 200, inertForTests: true });
     await cg.waitUntilWatcherReady();
 
     fs.writeFileSync(
       path.join(testDir, 'src', 'alpha-only.ts'),
       'export function alphaOnly() { return 7; }\n',
     );
-    triggerFileEvent(testDir, 'change', 'src/alpha-only.ts');
+    __emitWatchEventForTests(testDir, 'src/alpha-only.ts');
     // Wait through debounce (200ms) + sync; pendingFiles drains back to empty.
     await waitFor(() => cg.getPendingFiles().length === 0, 3000);
 
@@ -154,14 +149,14 @@ describe('MCP staleness banner', () => {
   });
 
   it('lists pending files under "Pending sync" in codegraph_status', async () => {
-    cg.watch({ debounceMs: 4000 });
+    cg.watch({ debounceMs: 4000, inertForTests: true });
     await cg.waitUntilWatcherReady();
 
     fs.writeFileSync(
       path.join(testDir, 'src', 'charlie-only.ts'),
       'export function charlieOnly() { return 33; }\n',
     );
-    triggerFileEvent(testDir, 'change', 'src/charlie-only.ts');
+    __emitWatchEventForTests(testDir, 'src/charlie-only.ts');
     await waitFor(() => cg.getPendingFiles().some((p) => p.path === 'src/charlie-only.ts'));
 
     const res = await handler.execute('codegraph_status', {});
