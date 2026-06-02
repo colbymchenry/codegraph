@@ -149,6 +149,34 @@ describe('Sync Module', () => {
         expect(result.filesRemoved).toBe(0);
         expect(result.filesChecked).toBeGreaterThan(0);
       });
+
+      it('should re-resolve affected caller files when an exported symbol is renamed', async () => {
+        fs.writeFileSync(
+          path.join(testDir, 'src', 'api.ts'),
+          `export function hello() { return 'world'; }`
+        );
+        fs.writeFileSync(
+          path.join(testDir, 'src', 'consumer.ts'),
+          `import { hello } from './api';\nexport function run() { return hello(); }`
+        );
+        await cg.sync();
+
+        fs.writeFileSync(
+          path.join(testDir, 'src', 'api.ts'),
+          `export function goodbye() { return 'world'; }`
+        );
+        fs.writeFileSync(
+          path.join(testDir, 'src', 'consumer.ts'),
+          `import { goodbye } from './api';\nexport function run() { return goodbye(); }`
+        );
+
+        const result = await cg.sync();
+
+        expect(result.filesModified).toBeGreaterThanOrEqual(1);
+        expect(result.filesReindexed).toBeGreaterThanOrEqual(result.filesModified);
+        expect(result.resolutionMode).toMatch(/changed-only|affected-set/);
+        expect(cg.searchNodes('goodbye').length).toBeGreaterThan(0);
+      });
     });
   });
 

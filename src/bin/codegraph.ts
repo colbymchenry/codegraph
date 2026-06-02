@@ -639,13 +639,21 @@ program
 
       if (totalChanges === 0) {
         clack.log.info('Already up to date');
+        if (result.filesAffected > 0) {
+          clack.log.info(
+            `Re-resolved ${formatNumber(result.filesAffected)} affected files ` +
+            `(${result.resolutionMode}, ${result.detectionMode})`
+          );
+        }
       } else {
         clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
         const details: string[] = [];
         if (result.filesAdded > 0) details.push(`Added: ${result.filesAdded}`);
         if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
         if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
+        if (result.filesAffected > 0) details.push(`Affected: ${result.filesAffected}`);
         clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
+        clack.log.info(`Resolution: ${result.resolutionMode} ${getGlyphs().dash} Detection: ${result.detectionMode}`);
       }
 
       clack.outro('Done');
@@ -704,6 +712,7 @@ program
           dbSizeBytes: stats.dbSizeBytes,
           backend,
           journalMode,
+          syncDetection: 'fast-path',
           nodesByKind: stats.nodesByKind,
           languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
           pendingChanges: {
@@ -746,6 +755,7 @@ program
         ? chalk.green('wal')
         : chalk.yellow(`${journalMode || 'unknown'} ${getGlyphs().dash} WAL inactive; reads can block on writes`);
       console.log(`  Journal:   ${journalLabel}`);
+      console.log(`  Sync:      fast-path ${getGlyphs().dash} mtime/size prefilter + content hash confirm`);
       console.log();
 
       // Node breakdown

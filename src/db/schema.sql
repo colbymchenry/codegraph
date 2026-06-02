@@ -80,6 +80,21 @@ CREATE TABLE IF NOT EXISTS unresolved_refs (
     FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
+-- Persisted reference facts: extracted references that remain queryable even
+-- after successful resolution, enabling future affected-file re-resolution.
+CREATE TABLE IF NOT EXISTS reference_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_node_id TEXT NOT NULL,
+    reference_name TEXT NOT NULL,
+    reference_kind TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    col INTEGER NOT NULL,
+    candidates TEXT,
+    file_path TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT 'unknown',
+    FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+
 -- =============================================================================
 -- Indexes for Query Performance
 -- =============================================================================
@@ -142,6 +157,10 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_name ON unresolved_refs(reference_name
 CREATE INDEX IF NOT EXISTS idx_unresolved_file_path ON unresolved_refs(file_path);
 CREATE INDEX IF NOT EXISTS idx_unresolved_from_name ON unresolved_refs(from_node_id, reference_name);
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
+CREATE INDEX IF NOT EXISTS idx_reference_facts_from_node ON reference_facts(from_node_id);
+CREATE INDEX IF NOT EXISTS idx_reference_facts_name ON reference_facts(reference_name);
+CREATE INDEX IF NOT EXISTS idx_reference_facts_file_path ON reference_facts(file_path);
+CREATE INDEX IF NOT EXISTS idx_reference_facts_from_name ON reference_facts(from_node_id, reference_name);
 
 -- Project metadata for version/provenance tracking
 CREATE TABLE IF NOT EXISTS project_metadata (
