@@ -25,6 +25,7 @@ import { swiftObjcBridgeResolver } from './swift-objc';
 import { reactNativeBridgeResolver } from './react-native';
 import { expoModulesResolver } from './expo-modules';
 import { fabricViewResolver } from './fabric';
+import { phpPhpdocResolver } from './php-phpdoc';
 
 /**
  * All registered framework resolvers
@@ -33,6 +34,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   // PHP
   laravelResolver,
   drupalResolver,
+  phpPhpdocResolver,
   // JavaScript/TypeScript
   expressResolver,
   nestjsResolver,
@@ -140,3 +142,4 @@ export { swiftObjcBridgeResolver } from './swift-objc';
 export { reactNativeBridgeResolver } from './react-native';
 export { expoModulesResolver } from './expo-modules';
 export { fabricViewResolver } from './fabric';
+export { phpPhpdocResolver } from './php-phpdoc';

@@ -435,7 +435,7 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
 // and are added below; their concrete-side nodes can be a `struct` (Swift)
 // or an `object` (Scala) so the loop also iterates those kinds.
 const IFACE_OVERRIDE_LANGS = new Set([
-  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala',
+  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'php',
 ]);
 function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
   const edges: Edge[] = [];
@@ -1174,10 +1174,244 @@ function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext):
 }
 
 /**
+ * PHP @property PHPDoc → reference + calls edges. Classes annotated with
+ * `@property TypeName $propName` declare dynamic properties resolved
+ * through `__get()`. This is the standard PHP mechanism for service
+ * locators, DI containers, and ORMs (e.g. MPF Ctx, Doctrine entities).
+ *
+ * Phase 1: emit `references` edges from the annotated class to the
+ * declared @property types (class→class dependency).
+ *
+ * Phase 2: scan all PHP method bodies for chained property calls
+ * (`->propName->methodName(`) and variable-dereference patterns
+ * (`$var = ...->propName; $var->method(`), then synthesize method→method
+ * `calls` edges through the @property mapping. This bridges the __get()
+ * magic-method indirection that tree-sitter cannot statically resolve.
+ *
+ * Precision gates: propName must exist in the @property map, methodName
+ * must exist on the target type, comments/strings stripped before matching.
+ *
+ * Known limitation: no receiver-type verification — a non-@property field
+ * with the same name as an @property would also match. The propMap lookup
+ * makes this unlikely in practice (requires same propName + same methodName
+ * on the target type), and `heuristic` provenance lets downstream consumers
+ * distinguish these edges from static ones.
+ */
+const PHP_PROPERTY_RE = /(@property(?:-read|-write)?)\s+(\\?[A-Za-z_][\w\\|]*)\s+\$(\w+)/g;
+const PHP_PRIMITIVE_TYPES = new Set([
+  'string', 'int', 'integer', 'float', 'double', 'bool', 'boolean',
+  'array', 'null', 'void', 'mixed', 'object', 'callable', 'iterable',
+  'self', 'static', 'parent', 'never', 'true', 'false', 'resource',
+]);
+
+const PHP_PROP_CALL_RE = /->(\w+)\s*->\s*(\w+)\s*\(/g;
+// Assignment: `$var = ...->propName;` (property access, not method call)
+const PHP_PROP_ASSIGN_RE = /\$(\w+)\s*=\s*[^;]*->(\w+)\s*;/g;
+// Variable method call: `$var->method(`
+const PHP_VAR_CALL_RE = /\$(\w+)->(\w+)\s*\(/g;
+
+/** Blank PHP string interiors so regex matching doesn't produce false hits. */
+function blankPhpStrings(src: string): string {
+  const out = src.split('');
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    if (src[i] === '"' || src[i] === "'") {
+      const quote = src[i]!;
+      i++; // skip opening quote
+      while (i < n && src[i] !== quote) {
+        if (src[i] === '\\' && i + 1 < n) { out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
+        if (src[i] === '\n') break;
+        out[i] = ' ';
+        i++;
+      }
+      if (i < n && src[i] === quote) i++; // skip closing quote
+    } else {
+      i++;
+    }
+  }
+  return out.join('');
+}
+
+function phpPhpdocPropertyEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  // Phase 1: collect @property declarations → references edges + build prop map for Phase 2.
+  // propMap: propertyName → [{ targetTypeName, annotation }]
+  const propMap = new Map<string, Array<{ targetTypeName: string; annotation: string }>>();
+
+  const classKinds: Array<'class' | 'interface' | 'trait'> = ['class', 'interface', 'trait'];
+  for (const kind of classKinds) {
+    for (const cls of queries.getNodesByKind(kind)) {
+      if (cls.language !== 'php') continue;
+      const content = ctx.readFile(cls.filePath);
+      if (!content) continue;
+
+      const lines = content.split('\n');
+      let docblock = '';
+      for (let i = (cls.startLine ?? 1) - 2; i >= 0; i--) {
+        const line = lines[i]!.trim();
+        if (line === '' && docblock === '') continue;
+        if (line.startsWith('*') || line.startsWith('/**') || line === '*/') {
+          docblock = lines[i]! + '\n' + docblock;
+          if (line.startsWith('/**')) break;
+        } else {
+          break;
+        }
+      }
+      if (!docblock) continue;
+
+      PHP_PROPERTY_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      let added = 0;
+      while ((m = PHP_PROPERTY_RE.exec(docblock))) {
+        if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+        const annotation = m[1]!;
+        const rawType = m[2]!;
+        const propName = m[3]!;
+        const simpleName = rawType.split('|')[0]!.split('\\').pop()!;
+        if (!simpleName || PHP_PRIMITIVE_TYPES.has(simpleName.toLowerCase())) continue;
+
+        const via = `${annotation} ${rawType} $${propName}`;
+        const entries = propMap.get(propName) ?? [];
+        entries.push({ targetTypeName: simpleName, annotation: via });
+        propMap.set(propName, entries);
+
+        const targets = ctx.getNodesByName(simpleName).filter(
+          (n) => (n.kind === 'class' || n.kind === 'interface' || n.kind === 'trait') && n.language === 'php',
+        );
+        for (const target of targets) {
+          if (target.id === cls.id) continue;
+          const key = `${cls.id}>${target.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: cls.id,
+            target: target.id,
+            kind: 'references',
+            line: cls.startLine,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'php-phpdoc-property',
+              via,
+            },
+          });
+          added++;
+        }
+      }
+    }
+  }
+
+  // Phase 2: scan all PHP methods for property-chain calls and variable-
+  // dereference patterns, synthesize method→method calls edges.
+  if (propMap.size > 0) {
+    const propNames = new Set(propMap.keys());
+
+    // Pre-index target class methods by (targetTypeName, methodName) for O(1) lookup.
+    const targetMethodIndex = new Map<string, Node[]>();
+    for (const entries of propMap.values()) {
+      for (const { targetTypeName } of entries) {
+        if (targetMethodIndex.has(targetTypeName)) continue;
+        const targetClasses = ctx.getNodesByName(targetTypeName).filter(
+          (n) => (n.kind === 'class' || n.kind === 'interface' || n.kind === 'trait') && n.language === 'php',
+        );
+        for (const tc of targetClasses) {
+          const methods = queries.getOutgoingEdges(tc.id, ['contains'])
+            .map((e) => queries.getNodeById(e.target))
+            .filter((n): n is Node => !!n && n.kind === 'method');
+          for (const method of methods) {
+            const mKey = `${targetTypeName}::${method.name}`;
+            const arr = targetMethodIndex.get(mKey);
+            if (arr) arr.push(method); else targetMethodIndex.set(mKey, [method]);
+          }
+        }
+      }
+    }
+
+    const addCallEdge = (method: Node, calledMethod: string, propEntries: Array<{ targetTypeName: string; annotation: string }>) => {
+      for (const { targetTypeName, annotation } of propEntries) {
+        const targets = targetMethodIndex.get(`${targetTypeName}::${calledMethod}`);
+        if (!targets) continue;
+        for (const target of targets) {
+          if (target.id === method.id) continue;
+          const key = `${method.id}>${target.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: method.id,
+            target: target.id,
+            kind: 'calls',
+            line: method.startLine,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'php-phpdoc-property',
+              via: `${annotation} → ${calledMethod}`,
+            },
+          });
+        }
+      }
+    };
+
+    for (const file of ctx.getAllFiles()) {
+      if (!file.endsWith('.php')) continue;
+      const content = ctx.readFile(file);
+      if (!content || !content.includes('->')) continue;
+      const nodesInFile = ctx.getNodesInFile(file);
+      const methods = nodesInFile.filter((n) => n.kind === 'method' && n.language === 'php');
+
+      for (const method of methods) {
+        const rawSrc = sliceLines(content, method.startLine, method.endLine);
+        if (!rawSrc) continue;
+
+        // P3: skip methods that don't mention any known @property name.
+        let hasProp = false;
+        for (const name of propNames) {
+          if (rawSrc.includes(name)) { hasProp = true; break; }
+        }
+        if (!hasProp) continue;
+
+        // P0: strip comments and string interiors to avoid false matches.
+        const src = blankPhpStrings(stripCommentsForRegex(rawSrc, 'php'));
+
+        // Pattern A: direct chain `->propName->methodName(`
+        PHP_PROP_CALL_RE.lastIndex = 0;
+        let cm: RegExpExecArray | null;
+        while ((cm = PHP_PROP_CALL_RE.exec(src))) {
+          const propEntries = propMap.get(cm[1]!);
+          if (propEntries) addCallEdge(method, cm[2]!, propEntries);
+        }
+
+        // Pattern B: variable dereference `$var = ...->propName; ... $var->method(`
+        const varToProp = new Map<string, string>();
+        PHP_PROP_ASSIGN_RE.lastIndex = 0;
+        let am: RegExpExecArray | null;
+        while ((am = PHP_PROP_ASSIGN_RE.exec(src))) {
+          if (propNames.has(am[2]!)) varToProp.set(am[1]!, am[2]!);
+        }
+        if (varToProp.size > 0) {
+          PHP_VAR_CALL_RE.lastIndex = 0;
+          let vm: RegExpExecArray | null;
+          while ((vm = PHP_VAR_CALL_RE.exec(src))) {
+            const propName = varToProp.get(vm[1]!);
+            if (!propName) continue;
+            const propEntries = propMap.get(propName);
+            if (propEntries) addCallEdge(method, vm[2]!, propEntries);
+          }
+        }
+      }
+    }
+  }
+
+  return edges;
+}
+
+/**
  * Synthesize dispatcher→callback edges (field observers + EventEmitters +
  * React re-render + JSX children + Vue templates + RN event channel +
- * Fabric native-impl + MyBatis Java↔XML + Gin middleware chain). Returns the
- * count added. Never throws into indexing — callers wrap in try/catch.
+ * Fabric native-impl + MyBatis Java↔XML + Gin middleware chain +
+ * PHP @property PHPDoc). Returns the count added. Never throws into
+ * indexing — callers wrap in try/catch.
  */
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
   const fieldEdges = fieldChannelEdges(queries, ctx);
@@ -1194,6 +1428,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const fabricNativeEdges = fabricNativeImplEdges(ctx);
   const mybatisEdges = mybatisJavaXmlEdges(queries);
   const ginEdges = ginMiddlewareChainEdges(queries, ctx);
+  const phpPhpdocEdges = phpPhpdocPropertyEdges(queries, ctx);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -1212,6 +1447,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...fabricNativeEdges,
     ...mybatisEdges,
     ...ginEdges,
+    ...phpPhpdocEdges,
   ]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
