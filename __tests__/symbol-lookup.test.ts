@@ -190,6 +190,18 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
 export function request(): void {}
 `
     );
+    fs.writeFileSync(
+      path.join(src, 'large-session.ts'),
+      `export class LargeSession {
+  run(): void {
+    const start = 'LARGE_BODY_START_MARKER';
+${Array.from({ length: 650 }, (_, i) => `    const filler${i} = '${'x'.repeat(30)}';`).join('\n')}
+    const tail = 'LARGE_BODY_TAIL_MARKER';
+    console.log(start, tail);
+  }
+}
+`
+    );
 
     const CodeGraph = (await import('../src/index')).default;
     const { ToolHandler } = await import('../src/mcp/tools');
@@ -232,5 +244,16 @@ export function request(): void {}
     const text = res.content?.[0]?.text ?? '';
     expect(text).toContain('SESSION_BODY_MARKER');
     expect(text).not.toContain('Structural outline only');
+  });
+
+  it('codegraph_node trims large container bodies from the middle before final output truncation', async () => {
+    const res = await handler.execute('codegraph_node', { symbol: 'LargeSession', includeCode: true });
+    const text = res.content?.[0]?.text ?? '';
+
+    expect(text).toContain('LARGE_BODY_START_MARKER');
+    expect(text).toContain('LARGE_BODY_TAIL_MARKER');
+    expect(text).toContain('... (truncated middle) ...');
+    expect(text).not.toContain('... (output truncated)');
+    expect(text).toMatch(/LARGE_BODY_TAIL_MARKER[\s\S]*\n```/);
   });
 });

@@ -22,6 +22,7 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile } from '../search/query-utils';
+import { trimCodeBlockMiddle } from '../context/code-block-trim';
 import {
   existsSync,
   readFileSync,
@@ -32,6 +33,9 @@ import { resolve as resolvePath } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
+
+/** Maximum source block length inside codegraph_node before final response trimming. */
+const NODE_CODE_BLOCK_MAX_LENGTH = 11_000;
 
 /**
  * Maximum length for free-form string inputs (query, task, symbol).
@@ -3198,7 +3202,8 @@ export class ToolHandler {
       // Line-numbered (cat -n style, like codegraph_explore and Read) so the
       // agent can cite/edit exact lines without re-Reading the file for them.
       const numbered = node.startLine ? numberSourceLines(code, node.startLine) : code;
-      lines.push('', '```' + node.language, numbered, '```');
+      const bounded = trimCodeBlockMiddle(numbered, NODE_CODE_BLOCK_MAX_LENGTH);
+      lines.push('', '```' + node.language, bounded, '```');
     }
 
     return lines.join('\n');

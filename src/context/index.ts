@@ -27,6 +27,7 @@ import { logDebug } from '../errors';
 import { validatePathWithinRoot } from '../utils';
 import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
+import { trimCodeBlockMiddle } from './code-block-trim';
 
 /**
  * Extract likely symbol names from a natural language query
@@ -1237,7 +1238,7 @@ export class ContextBuilder {
       const code = await this.extractNodeCode(node);
       if (code) {
         blocks.push({
-          content: this.trimCodeBlock(code, maxBlockSize),
+          content: trimCodeBlockMiddle(code, maxBlockSize),
           filePath: node.filePath,
           startLine: node.startLine,
           endLine: node.endLine,
@@ -1248,36 +1249,6 @@ export class ContextBuilder {
     }
 
     return blocks;
-  }
-
-  private trimCodeBlock(code: string, maxBlockSize: number): string {
-    if (code.length <= maxBlockSize) {
-      return code;
-    }
-
-    const marker = '\n... (truncated middle) ...\n';
-    if (maxBlockSize <= marker.length + 20) {
-      return code.slice(0, maxBlockSize) + '\n... (truncated) ...';
-    }
-
-    const available = maxBlockSize - marker.length;
-    const headTarget = Math.floor(available / 2);
-    const tailTarget = available - headTarget;
-    const head = this.sliceHeadAtLineBoundary(code, headTarget);
-    const tail = this.sliceTailAtLineBoundary(code, tailTarget);
-    return head.replace(/\n+$/, '') + marker + tail.replace(/^\n+/, '');
-  }
-
-  private sliceHeadAtLineBoundary(code: string, maxChars: number): string {
-    const head = code.slice(0, maxChars);
-    const lineEnd = head.lastIndexOf('\n');
-    return lineEnd > maxChars * 0.5 ? head.slice(0, lineEnd) : head;
-  }
-
-  private sliceTailAtLineBoundary(code: string, maxChars: number): string {
-    const tail = code.slice(Math.max(0, code.length - maxChars));
-    const lineStart = tail.indexOf('\n');
-    return lineStart >= 0 && lineStart < maxChars * 0.5 ? tail.slice(lineStart + 1) : tail;
   }
 
   /**
