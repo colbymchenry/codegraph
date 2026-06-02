@@ -1102,6 +1102,14 @@ export class ExtractionOrchestrator {
     let totalNodes = 0;
     let totalEdges = 0;
 
+    // Ensure grammars are loaded for the files being indexed
+    const neededLanguages = [...new Set(filePaths.map((f) => detectLanguage(f)))];
+    // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded when c is needed
+    if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
+      neededLanguages.push('cpp');
+    }
+    await loadGrammarsForLanguages(neededLanguages);
+
     for (const filePath of filePaths) {
       const result = await this.indexFile(filePath);
 
@@ -1547,4 +1555,4 @@ export class ExtractionOrchestrator {
 
 // Re-export useful types and functions
 export { extractFromSource } from './tree-sitter';
-export { detectLanguage, isSourceFile, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './grammars';
+export { detectLanguage, isSourceFile, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, getSupportedExtensions, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './grammars';

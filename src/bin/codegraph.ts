@@ -20,6 +20,7 @@
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph affected [files]   Find test files affected by changes
+ *   codegraph specify [files]    Build a knowledge graph for specific files + their transitive import dependencies
  */
 
 import { Command } from 'commander';
@@ -32,6 +33,7 @@ import { getGlyphs } from '../ui/glyphs';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
+import { isSourceFile, getSupportedExtensions } from '../extraction';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -110,12 +112,12 @@ process.on('unhandledRejection', (reason) => {
 
 function main() {
 
-const program = new Command();
-
-// Version from package.json
-const packageJson = JSON.parse(
-  fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf-8')
-);
+// =============================================================================
+// Helper: Normalize a file path to forward-slash relative form (matching DB storage).
+// =============================================================================
+function normalizePath(p: string): string {
+  return p.replace(/\\/g, '/');
+}
 
 // =============================================================================
 // ANSI Color Helpers (avoid chalk ESM issues)
@@ -145,6 +147,13 @@ const chalk = {
   white: (s: string) => `${colors.white}${s}${colors.reset}`,
   gray: (s: string) => `${colors.gray}${s}${colors.reset}`,
 };
+
+const program = new Command();
+
+// Version from package.json
+const packageJson = JSON.parse(
+  fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf-8')
+);
 
 program
   .name('codegraph')
@@ -1598,6 +1607,281 @@ program
       cg.destroy();
     } catch (err) {
       error(`Affected analysis failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph specify [files...] [options]
+ *
+ * Build a knowledge graph for specific files and their transitive
+ * import dependencies — instead of indexing the entire repository.
+ *
+ * Usage:
+ *   codegraph specify src/lib/a.ts src/lib/b.ts          (local install)
+ *   codegraph specify --path /some/project src/lib/a.ts  (specified project root)
+ */
+program
+  .command('specify [files...]')
+  .description('Build a knowledge graph for specific files and their transitive import dependencies')
+  .option('-p, --path <path>', 'Project root path (current dir if omitted)')
+  .option('--depth <number>', 'Max dependency discovery depth (0 = specified files only)', '10')
+  .option('-f, --filter <glob>', 'Only discover files matching this glob (e.g. "src/**/*.ts")')
+  .option('-j, --json', 'Output as JSON')
+  .option('-q, --quiet', 'Only output file paths, no decoration')
+  .action(async (fileArgs: string[], options: { path?: string; depth?: string; filter?: string; json?: boolean; quiet?: boolean }) => {
+    const projectRoot = path.resolve(options.path || process.cwd());
+    const maxDepth = parseInt(options.depth || '10', 10);
+    const globFilter = options.filter ? new RegExp('^' + options.filter.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*/g, '{{GLOBSTAR}}').replace(/\*/g, '[^/]*').replace(/\{\{GLOBSTAR\}\}/g, '.*') + '$') : null;
+
+    try {
+      // 1. Collect user-specified files, resolve to relative paths
+      const specifiedFiles: string[] = [];
+      const errors: string[] = [];
+
+      for (const fileArg of fileArgs) {
+        // Normalize forward slashes to back slashes for reliable Windows path handling
+        const normalized = fileArg.replace(/\//g, '\\');
+        const absolute = path.resolve(normalized);
+        // Check file exists
+        if (!fs.existsSync(absolute)) {
+          errors.push(`File not found: ${fileArg}`);
+          continue;
+        }
+        // Check it's under the project root
+        if (!absolute.startsWith(projectRoot + path.sep) && absolute !== projectRoot) {
+          errors.push(`File outside project root: ${fileArg}`);
+          continue;
+        }
+        const relative = normalizePath(path.relative(projectRoot, absolute));
+        if (!isSourceFile(relative)) {
+          errors.push(`Not a source file (skipped): ${relative}`);
+          continue;
+        }
+        specifiedFiles.push(relative);
+      }
+
+      if (errors.length > 0 && specifiedFiles.length === 0) {
+        for (const e of errors) {
+          error(e);
+        }
+        process.exit(1);
+      }
+
+      if (specifiedFiles.length === 0) {
+        if (!options.quiet) info('No valid files provided. Use file arguments.');
+        process.exit(0);
+      }
+
+      if (!options.quiet) {
+        console.log(chalk.bold('CodeGraph — Specify Files Graph'));
+        console.log(chalk.dim('─────────────────────────────────'));
+        console.log(chalk.blue(`Specified files: ${specifiedFiles.length}`));
+        for (const f of specifiedFiles) {
+          console.log(chalk.cyan(`  ${f}`));
+        }
+      }
+
+      // 2. Initialize CodeGraph (or open existing)
+      let initialized = isInitialized(projectRoot);
+      if (!initialized) {
+        if (!options.quiet) info('Project not initialized — creating temporary index...');
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      let cg: any = null;
+      let wasCreated = false;
+
+      if (!initialized) {
+        cg = await CodeGraph.init(projectRoot, { index: false });
+        wasCreated = true;
+      } else {
+        cg = await CodeGraph.open(projectRoot);
+      }
+
+      // 3. Discover transitive dependencies
+      // Strategy: for each file, extract it via tree-sitter to get its
+      // import module names, then resolve those module names to files on disk.
+      // This reuses the same extraction pipeline (grammars/extractors) as
+      // `indexAll`, so it works for ALL supported languages without ad-hoc regex.
+      const allFiles = new Set<string>(specifiedFiles);
+
+      let currentDepth = 0;
+      let frontier = new Set<string>(specifiedFiles);
+
+      // Helper: resolve an import module name / relative path to a file path
+      function resolveImportToDep(importPath: string, fromFile: string): string | null {
+        const fromDir = path.dirname(path.resolve(projectRoot, fromFile));
+        const resolvedRaw = importPath.startsWith('/')
+          ? importPath
+          : path.resolve(fromDir, importPath);
+
+        // Try with all supported extensions (derived from EXTENSION_MAP for consistency with indexing)
+        const extensions = getSupportedExtensions();
+        for (const ext of extensions) {
+          try {
+            const fullPath = resolvedRaw + ext;
+            if (fs.existsSync(fullPath)) {
+              const stat = fs.statSync(fullPath);
+              if (stat.isFile()) {
+                return normalizePath(path.relative(projectRoot, fullPath));
+              }
+            }
+          } catch {
+            // skip
+          }
+        }
+        // Try directory index files
+        for (const ext of extensions) {
+          try {
+            const indexPath = path.join(resolvedRaw, 'index' + ext);
+            if (fs.existsSync(indexPath)) {
+              return normalizePath(path.relative(projectRoot, indexPath));
+            }
+          } catch {
+            // skip
+          }
+        }
+        return null;
+      }
+
+      // Lazy-load extractFromSource (heavy tree-sitter import)
+      let extractFromSource: any = null;
+      let detectFromSource: any = null;
+      const grammarsLoaded = new Set<string>();
+
+      while (currentDepth < maxDepth) {
+        const nextFrontier = new Set<string>();
+
+        for (const file of frontier) {
+          const absFile = path.resolve(projectRoot, file);
+
+          // Lazy-load the extraction module
+          if (!extractFromSource) {
+            // Use dynamic import with explicit path (Node 22.5+ bans bare directory imports)
+            const mod = await import('../extraction/index.js');
+            extractFromSource = mod.extractFromSource;
+            detectFromSource = mod.detectLanguage;
+          }
+
+          // Ensure grammar is loaded for the file's language
+          const lang = detectFromSource(file);
+          if (lang && !grammarsLoaded.has(lang)) {
+            const { loadGrammarsForLanguages } = await import('../extraction/index.js');
+            await loadGrammarsForLanguages([lang]);
+            grammarsLoaded.add(lang);
+          }
+
+          try {
+            const content = fs.readFileSync(absFile, 'utf-8');
+            // Run full tree-sitter extraction for this single file
+            const extraction = extractFromSource(file, content);
+
+            // Extract import module names from import nodes.
+            // For JS/TS these are relative paths like './utils'; for C/C++ these are
+            // bare include names like 'log/Log.hpp'. We resolve all of them against
+            // the filesystem — system headers and unresolvable includes simply won't
+            // be found (this is a known C++ limitation without compile_commands.json).
+            if (extraction && extraction.nodes) {
+              for (const node of extraction.nodes) {
+                if (node.kind === 'import' && node.name) {
+                  const dep = resolveImportToDep(node.name, file);
+                  if (dep && !allFiles.has(dep)) {
+                    allFiles.add(dep);
+                    nextFrontier.add(dep);
+                  }
+                }
+              }
+            }
+          } catch {
+            // File extraction failed — skip this file
+          }
+        }
+
+        if (nextFrontier.size === 0) break;
+        frontier = nextFrontier;
+        currentDepth++;
+      }
+
+      // Apply glob filter to discovered files (not specified ones)
+      const filesToIndex: string[] = [];
+      for (const file of allFiles) {
+        if (!specifiedFiles.includes(file) && globFilter && !globFilter.test(file)) {
+          continue;
+        }
+        filesToIndex.push(file);
+      }
+
+      if (!options.quiet) {
+        console.log(chalk.blue(`Dependency depth: ${currentDepth}`));
+        console.log(chalk.blue(`Total files in subgraph: ${filesToIndex.length}`));
+      }
+
+      if (filesToIndex.length === 0) {
+        error('No files to index.');
+        cg.destroy();
+        process.exit(1);
+      }
+
+      // 4. Index all files
+      if (!options.quiet) info(`Indexing ${filesToIndex.length} files...`);
+
+      const indexResult = await cg.indexFiles(filesToIndex);
+
+      if (!options.quiet) {
+        console.log(chalk.green(`Indexed: ${indexResult.filesIndexed} files, ${indexResult.nodesCreated} nodes`));
+        if (indexResult.errors.length > 0) {
+          for (const e of indexResult.errors) {
+            console.log(chalk.yellow(`  [${e.severity}] ${e.message}`));
+          }
+        }
+      }
+
+      // 5. Resolve references to create edges
+      if (!options.quiet) info('Resolving references...');
+
+      // Reinitialize resolver so it picks up newly indexed symbols
+      cg.reinitializeResolver();
+
+      // Use the scoped resolution: only resolve refs from our files
+      const resolutionResult = await cg.resolveReferencesScoped(filesToIndex);
+
+      if (!options.quiet) {
+        console.log(chalk.green(`Resolved: ${resolutionResult.stats.resolved} / ${resolutionResult.stats.total} references`));
+      }
+
+      // 6. Output the subgraph
+      if (options.json) {
+        const stats = cg.getStats();
+        const output = {
+          files: filesToIndex,
+          nodes: stats.nodeCount,
+          edges: stats.edgeCount,
+          specifiedFiles,
+          resolution: resolutionResult.stats,
+        };
+        console.log(JSON.stringify(output, null, 2));
+      } else if (options.quiet) {
+        // Only output file paths, one per line
+        console.log(filesToIndex.join('\n'));
+      } else {
+        console.log(chalk.bold('\nSubgraph summary:'));
+        console.log(chalk.gray(`  Files:     ${filesToIndex.length}`));
+        console.log(chalk.gray(`  Nodes:     ${cg.getStats().nodeCount}`));
+        console.log(chalk.gray(`  Edges:     ${cg.getStats().edgeCount}`));
+        console.log(chalk.gray(`  Specified: ${specifiedFiles.length}`));
+      }
+
+      cg.destroy();
+
+      // If we created a temporary index, clean it up
+      if (wasCreated) {
+        const { removeDirectory } = await import('../directory');
+        removeDirectory(projectRoot);
+      }
+
+    } catch (err) {
+      error(`Specify failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });
