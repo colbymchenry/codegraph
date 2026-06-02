@@ -1711,6 +1711,54 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Encode the receiver of a C++ call chained off another call's result into a
+   * `Recv().method` reference the resolver can later type via return types.
+   *
+   *   Foo::instance().method()     → `Foo::instance().method`
+   *   ns::Foo::create().method()   → `Foo::create().method`   (class is the
+   *                                   segment before the accessor)
+   *   makeWidget()->method()       → `makeWidget().method`    (free function)
+   *
+   * Returns null for receiver calls we can't name (e.g. the inner function is
+   * itself a member/field expression), so the caller falls back to a bare
+   * method name. We deliberately do NOT gate on accessor name here — that
+   * decision (return-type vs. self-returning-accessor heuristic) belongs to the
+   * resolver, which alone has the cross-file return-type information.
+   */
+  private cppChainedCallReceiverCallee(receiverCall: SyntaxNode, methodName: string): string | null {
+    const innerFn = getChildByField(receiverCall, 'function');
+    if (!innerFn) return null;
+    // Scoped accessor / factory: `Foo::instance()` / `ns::Foo::create()`.
+    if (innerFn.type === 'qualified_identifier' || innerFn.type === 'scoped_identifier') {
+      const parts = getNodeText(innerFn, this.source).trim().split('::').filter(Boolean);
+      if (parts.length < 2) return null;
+      const accessor = parts[parts.length - 1]!;
+      const klass = parts[parts.length - 2]!;
+      return `${klass}::${accessor}().${methodName}`;
+    }
+    // Free-function factory: `makeWidget()`.
+    if (innerFn.type === 'identifier') {
+      const fn = getNodeText(innerFn, this.source).trim();
+      if (fn) return `${fn}().${methodName}`;
+    }
+    // Single-level member chain: `obj.getThing()` / `obj->getThing()`. Encode
+    // as `obj.getThing().method` (operator normalized to `.`) when the object is
+    // a plain identifier; the resolver infers obj's type then the chained
+    // method's return type. Deeper chains (`a().b().c()`) are left to the bare
+    // fallback — they need a real type environment, not a longer string.
+    if (innerFn.type === 'field_expression') {
+      const obj = getChildByField(innerFn, 'argument');
+      const field = getChildByField(innerFn, 'field');
+      if (obj && obj.type === 'identifier' && field) {
+        const objName = getNodeText(obj, this.source).trim();
+        const midMethod = getNodeText(field, this.source).trim();
+        if (objName && midMethod) return `${objName}.${midMethod}().${methodName}`;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Extract a function call
    */
   private extractCall(node: SyntaxNode): void {
@@ -1831,6 +1879,18 @@ export class TreeSitterExtractor {
               } else {
                 calleeName = methodName;
               }
+            } else if (this.language === 'cpp' && receiver && receiver.type === 'call_expression') {
+              // C++ call chained off another call's result, invoked inline:
+              //   Foo::instance().method()  /  Foo::getInstance()->method()
+              //   makeWidget()->method()    (free-function factory)
+              // tree-sitter gives a field_expression whose receiver is the inner
+              // call_expression. We can't know its return type here (extraction
+              // is per-file), so encode the receiver call as `Recv().method` and
+              // let the resolver recover the type from the callee's return type
+              // (with a self-returning-accessor-name fallback). Better than
+              // dropping the receiver to a bare, ambiguous `method` that
+              // tie-breaks to whichever same-named method indexed first.
+              calleeName = this.cppChainedCallReceiverCallee(receiver, methodName) ?? methodName;
             } else {
               calleeName = methodName;
             }

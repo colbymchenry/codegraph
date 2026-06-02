@@ -266,6 +266,224 @@ describe('C++ end-to-end — virtual override synthesis', () => {
     }
   });
 
+  it('resolves singleton/self-returning accessor calls to the right class when method names collide', async () => {
+    // The frontier this covers: a call whose receiver is itself an accessor
+    // call. `Worker::instance().run()` parses as a field_expression whose
+    // receiver is the `Worker::instance()` call_expression — the old extractor
+    // dropped that receiver and emitted a bare `run`, which then tie-broke to
+    // whichever same-named method indexed first (here Decoy::run). The fix
+    // emits a qualified `Worker::run`; the `auto` forms recover the type from
+    // the initializer (singleton accessor / new / make_unique / make_shared).
+    // Decoy::run exists only to make the bare-name fallback wrong, so a green
+    // test proves the receiver type — not indexing order — drove resolution.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'decoy.hpp'), // sorts before worker.hpp → indexed first
+        'class Decoy { public: void run(); };\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'worker.hpp'),
+        'class Worker {\n' +
+          ' public:\n' +
+          '  static Worker& instance();\n' +
+          '  static Worker* getInstance();\n' +
+          '  void run();\n' +
+          '};\n'
+      );
+      // Out-of-line definitions so each method becomes a real node with a
+      // `Class::method` qualified name (a bodyless in-class declaration is not
+      // a function_definition and produces no method node).
+      fs.writeFileSync(
+        path.join(tmpDir, 'defs.cpp'),
+        '#include "worker.hpp"\n' +
+          '#include "decoy.hpp"\n' +
+          'Worker& Worker::instance() { static Worker w; return w; }\n' +
+          'Worker* Worker::getInstance() { return &instance(); }\n' +
+          'void Worker::run() {}\n' +
+          'void Decoy::run() {}\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'app.cpp'),
+        '#include "worker.hpp"\n' +
+          '#include "decoy.hpp"\n' +
+          '#include <memory>\n' +
+          'void callDirectRef() { Worker::instance().run(); }\n' +
+          'void callDirectPtr() { Worker::getInstance()->run(); }\n' +
+          'void callAutoRef() { auto& w = Worker::instance(); w.run(); }\n' +
+          'void callNew() { auto w = new Worker(); w->run(); }\n' +
+          'void callMakeUnique() { auto w = std::make_unique<Worker>(); w->run(); }\n' +
+          'void callMakeShared() { auto w = std::make_shared<Worker>(); w->run(); }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const workerRun = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'Worker::run');
+      const decoyRun = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'Decoy::run');
+      expect(workerRun, 'Worker::run node').toBeDefined();
+      expect(decoyRun, 'Decoy::run node').toBeDefined();
+
+      const workerCallers = cg.getCallers(workerRun!.id).map((c) => c.node.qualifiedName);
+      for (const fn of ['callDirectRef', 'callDirectPtr', 'callAutoRef', 'callNew', 'callMakeUnique', 'callMakeShared']) {
+        expect(workerCallers, `${fn} should call Worker::run`).toContain(fn);
+      }
+
+      // Decoy::run is never called — none of the singleton calls may misroute.
+      const decoyCallers = cg.getCallers(decoyRun!.id).map((c) => c.node.qualifiedName);
+      expect(decoyCallers).not.toContain('callDirectRef');
+      expect(decoyCallers).not.toContain('callAutoRef');
+      expect(decoyCallers).not.toContain('callNew');
+    } finally {
+      cg?.close();
+    }
+  });
+
+  it('resolves chained/auto calls through the callee return type — factory returning another class, oddly-named accessor, free-function factory', async () => {
+    // The cases a name-based heuristic fundamentally can't reach, now driven by
+    // the captured return type of the receiver call:
+    //   - WidgetFactory::create() returns *Widget* (a different class)
+    //   - Engine::acquire() is a singleton accessor NOT named instance/getInstance
+    //   - openSession() is a free function returning Session*
+    // Decoy shares every method name and sorts first, so a name-only tie would
+    // land there — a green test proves the return type drove resolution.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'decoy.hpp'), // sorts first → wins any name-only tie
+        'class Decoy { public: void draw(); void run(); void log(); };\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'types.hpp'),
+        'class Widget { public: void draw(); };\n' +
+          'class WidgetFactory { public: static Widget create(); };\n' +
+          'class Engine { public: static Engine& acquire(); void run(); };\n' +
+          'class Session { public: void log(); };\n' +
+          'Session* openSession();\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'defs.cpp'),
+        '#include "types.hpp"\n' +
+          '#include "decoy.hpp"\n' +
+          'void Decoy::draw() {}\n' +
+          'void Decoy::run() {}\n' +
+          'void Decoy::log() {}\n' +
+          'void Widget::draw() {}\n' +
+          'Widget WidgetFactory::create() { return Widget(); }\n' +
+          'Engine& Engine::acquire() { static Engine e; return e; }\n' +
+          'void Engine::run() {}\n' +
+          'void Session::log() {}\n' +
+          'Session* openSession() { return nullptr; }\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'app.cpp'),
+        '#include "types.hpp"\n' +
+          'void useFactoryDirect() { WidgetFactory::create().draw(); }\n' +
+          'void useFactoryAuto() { auto w = WidgetFactory::create(); w.draw(); }\n' +
+          'void useOddAccessorDirect() { Engine::acquire().run(); }\n' +
+          'void useOddAccessorAuto() { auto& e = Engine::acquire(); e.run(); }\n' +
+          'void useFreeFactoryDirect() { openSession()->log(); }\n' +
+          'void useFreeFactoryAuto() { auto s = openSession(); s->log(); }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const callersOf = (qn: string) => {
+        const node = cg!.getNodesByKind('method').find((n) => n.qualifiedName === qn);
+        expect(node, `${qn} node`).toBeDefined();
+        return cg!.getCallers(node!.id).map((c) => c.node.qualifiedName);
+      };
+
+      expect(callersOf('Widget::draw')).toEqual(
+        expect.arrayContaining(['useFactoryDirect', 'useFactoryAuto'])
+      );
+      expect(callersOf('Engine::run')).toEqual(
+        expect.arrayContaining(['useOddAccessorDirect', 'useOddAccessorAuto'])
+      );
+      expect(callersOf('Session::log')).toEqual(
+        expect.arrayContaining(['useFreeFactoryDirect', 'useFreeFactoryAuto'])
+      );
+
+      // No call may misroute to the same-named Decoy methods — assert each
+      // use* function individually so a single stray edge fails the test.
+      const useFns = [
+        'useFactoryDirect', 'useFactoryAuto', 'useOddAccessorDirect',
+        'useOddAccessorAuto', 'useFreeFactoryDirect', 'useFreeFactoryAuto',
+      ];
+      for (const decoyMethod of ['Decoy::draw', 'Decoy::run', 'Decoy::log']) {
+        const decoyCallers = callersOf(decoyMethod);
+        for (const fn of useFns) {
+          expect(decoyCallers, `${fn} must not misroute to ${decoyMethod}`).not.toContain(fn);
+        }
+      }
+    } finally {
+      cg?.close();
+    }
+  });
+
+  it('resolves a single-level member chain through the chained method return type', async () => {
+    // `m.view().render()` / `auto p = m.view(); p.render()` — resolve m's type,
+    // then the return type of view() on it, then render() on that. Decoy::render
+    // sorts first and would win a bare-name tie, so landing on Panel::render
+    // proves the chain was followed by type, not name.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'decoy.hpp'),
+        'class Decoy { public: void render(); };\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'types.hpp'),
+        'class Panel { public: void render(); };\n' +
+          'class Manager { public: Panel view(); Panel* viewPtr(); };\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'defs.cpp'),
+        '#include "types.hpp"\n' +
+          '#include "decoy.hpp"\n' +
+          'void Decoy::render() {}\n' +
+          'void Panel::render() {}\n' +
+          'Panel Manager::view() { return Panel(); }\n' +
+          'Panel* Manager::viewPtr() { return nullptr; }\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'app.cpp'),
+        '#include "types.hpp"\n' +
+          'void inlineLocal() { Manager m; m.view().render(); }\n' +
+          'void autoLocal() { Manager m; auto p = m.view(); p.render(); }\n' +
+          'void autoLocalPtr() { Manager m; auto p = m.viewPtr(); p->render(); }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const panelRender = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Panel::render');
+      const decoyRender = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Decoy::render');
+      expect(panelRender, 'Panel::render node').toBeDefined();
+      expect(decoyRender, 'Decoy::render node').toBeDefined();
+
+      const panelCallers = cg.getCallers(panelRender!.id).map((c) => c.node.qualifiedName);
+      expect(panelCallers).toEqual(
+        expect.arrayContaining(['inlineLocal', 'autoLocal', 'autoLocalPtr'])
+      );
+
+      const decoyCallers = cg.getCallers(decoyRender!.id).map((c) => c.node.qualifiedName);
+      for (const fn of ['inlineLocal', 'autoLocal', 'autoLocalPtr']) {
+        expect(decoyCallers, `${fn} must not misroute to Decoy::render`).not.toContain(fn);
+      }
+    } finally {
+      cg?.close();
+    }
+  });
+
   it('bridges a base virtual method to the subclass override', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
     fs.writeFileSync(

@@ -47,6 +47,46 @@ function extractCppReceiverType(node: SyntaxNode, source: string): string | unde
   return undefined;
 }
 
+/**
+ * Build a C/C++ function/method signature as `(<params>) -> <ReturnType>`.
+ *
+ * The `-> <ReturnType>` suffix is the part resolution relies on: the C++
+ * receiver-type inference reads it back to learn what `Foo::instance()` /
+ * `makeWidget()` returns, so `auto x = makeWidget(); x.draw()` and
+ * `Foo::instance().bar()` resolve to the right class without real type
+ * inference. The return type's base lives in the function_definition's `type`
+ * field (`Worker`, `void`, `std::shared_ptr<Foo>`); the `&`/`*` lives on the
+ * declarator and is intentionally dropped (resolution normalizes it away
+ * anyway). Constructors/destructors have no `type` field → params only.
+ */
+function extractCppSignature(node: SyntaxNode, source: string): string | undefined {
+  const typeField = getChildByField(node, 'type');
+
+  // The parameters live on the function_declarator, which may be wrapped in a
+  // pointer_/reference_declarator (e.g. `Worker& Worker::instance()`). Descend
+  // to the first function_declarator and read its `parameters` field.
+  let params: SyntaxNode | null = null;
+  const decl = getChildByField(node, 'declarator');
+  const queue: SyntaxNode[] = decl ? [decl] : [];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (current.type === 'function_declarator') {
+      params = getChildByField(current, 'parameters');
+      break;
+    }
+    for (let i = 0; i < current.namedChildCount; i++) {
+      const child = current.namedChild(i);
+      if (child) queue.push(child);
+    }
+  }
+
+  const paramText = params ? getNodeText(params, source) : '()';
+  if (typeField) {
+    return `${paramText} -> ${getNodeText(typeField, source).trim()}`;
+  }
+  return paramText || undefined;
+}
+
 export const cExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
   classTypes: [],
@@ -109,6 +149,7 @@ export const cppExtractor: LanguageExtractor = {
   paramsField: 'parameters',
   resolveName: extractCppQualifiedMethodName,
   getReceiverType: extractCppReceiverType,
+  getSignature: extractCppSignature,
   getVisibility: (node) => {
     // Check for access specifier in parent
     const parent = node.parent;
