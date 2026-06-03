@@ -11,6 +11,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- `codegraph install` now detects and configures **Factory Droid** (the Factory CLI). Running `codegraph install` on a machine with Droid CLI installs the MCP server entry into `~/.factory/mcp.json` (global) or `.factory/mcp.json` (local), so Droid users no longer need to run `droid mcp add codegraph` manually. Use `--target=droid` to target it explicitly.
 - `codegraph status --json` now also reports the running CLI `version`, the index directory (`indexPath`), and a `lastIndexed` timestamp (ISO-8601, or null when nothing's indexed yet), so CI and scripts can pin the CLI version and check index freshness from a single command. A matching `CodeGraph.getLastIndexedAt()` library method exposes the same freshness check without shelling out. Thanks @12122J and @eddieran. (#329)
 
 ### Fixes

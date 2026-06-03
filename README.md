@@ -2,7 +2,7 @@
 
 # CodeGraph
 
-### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, and Kiro with Semantic Code Intelligence
+### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, Kiro, and Factory Droid with Semantic Code Intelligence
 
 **~16% cheaper · ~58% fewer tool calls · 100% local**
 
@@ -24,6 +24,7 @@
 [![Gemini](https://img.shields.io/badge/Gemini-supported-blueviolet.svg)](#supported-agents)
 [![Antigravity](https://img.shields.io/badge/Antigravity-supported-blueviolet.svg)](#supported-agents)
 [![Kiro](https://img.shields.io/badge/Kiro-supported-blueviolet.svg)](#supported-agents)
+[![Factory Droid](https://img.shields.io/badge/Factory_Droid-supported-blueviolet.svg)](#supported-agents)
 
 </div>
 
@@ -57,7 +58,7 @@ In a **new terminal**, run the installer to connect CodeGraph to the agents you 
 codegraph install
 ```
 
-<sub>Detects and auto-configures Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, and Kiro — wiring the CodeGraph MCP server into each. **This is the step that connects CodeGraph to your agent;** installing the CLI in step 1 does not do it on its own. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs this in one go.)</sub>
+<sub>Detects and auto-configures Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and Factory Droid — wiring the CodeGraph MCP server into each. **This is the step that connects CodeGraph to your agent;** installing the CLI in step 1 does not do it on its own. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs this in one go.)</sub>
 
 ### 3. Initialize each project
 
@@ -310,7 +311,7 @@ npx @colbymchenry/codegraph
 ```
 
 The installer will:
-- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**
+- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**, **Factory Droid**
 - Prompt to install `codegraph` on your PATH (so agents can launch the MCP server)
 - Ask whether configs apply to all your projects or just this one
 - Write each chosen agent's MCP server config (the codegraph usage guide is delivered by the MCP server itself, so no instructions file is added to `CLAUDE.md` / `AGENTS.md` / etc.)
@@ -336,7 +337,7 @@ codegraph install --print-config codex               # print snippet, no file wr
 
 ### 2. Restart Your Agent
 
-Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro) for the MCP server to load.
+Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro / Factory Droid) for the MCP server to load.
 
 ### 3. Initialize Projects
 
@@ -600,6 +601,7 @@ is written):
 - **Gemini CLI**
 - **Antigravity IDE**
 - **Kiro**
+- **Factory Droid**
 
 ## Supported Languages
 
@@ -661,7 +663,7 @@ MIT
 
 <div align="center">
 
-**Made for AI coding agents — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, and Kiro**
+**Made for AI coding agents — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and Factory Droid**
 
 [Report Bug](https://github.com/colbymchenry/codegraph/issues) · [Request Feature](https://github.com/colbymchenry/codegraph/issues)
 

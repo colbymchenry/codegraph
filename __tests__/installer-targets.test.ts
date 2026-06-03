@@ -494,6 +494,52 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(paths.some((p) => p.endsWith('/.kiro/steering/codegraph.md'))).toBe(false);
   });
 
+  it('droid: global install writes ~/.factory/mcp.json (mcpServers.codegraph) and no instructions file (#529)', () => {
+    const droid = getTarget('droid')!;
+    const result = droid.install('global', { autoAllow: true });
+    const mcp = path.join(tmpHome, '.factory', 'mcp.json');
+    expect(fs.existsSync(mcp)).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+    // No markdown instructions file should be written.
+    expect(result.files.every((f) => !f.path.endsWith('.md'))).toBe(true);
+  });
+
+  it('droid: local install writes ./.factory/mcp.json and no instructions file (#529)', () => {
+    const droid = getTarget('droid')!;
+    const result = droid.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.factory/mcp.json'))).toBe(true);
+    expect(result.files.every((f) => !f.path.endsWith('.md'))).toBe(true);
+  });
+
+  it('droid: install preserves pre-existing sibling MCP servers in mcp.json', () => {
+    const droid = getTarget('droid')!;
+    const mcp = path.join(tmpHome, '.factory', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({ mcpServers: { other: { command: 'x' } } }, null, 2) + '\n');
+
+    droid.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('droid: uninstall strips codegraph but leaves sibling MCP servers intact', () => {
+    const droid = getTarget('droid')!;
+    const mcp = path.join(tmpHome, '.factory', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({ mcpServers: { other: { command: 'x' } } }, null, 2) + '\n');
+
+    droid.install('global', { autoAllow: true });
+    droid.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+  });
+
   it('antigravity: install writes to LEGACY ~/.gemini/antigravity/mcp_config.json when no migration marker', () => {
     const antigravity = getTarget('antigravity')!;
     antigravity.install('global', { autoAllow: true });

@@ -146,8 +146,8 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       const sel = await clack.select({
         message: 'Apply agent configs to all your projects, or just this one?',
         options: [
-          { value: 'global' as const, label: 'All projects', hint: '~/.claude, ~/.cursor, etc.' },
-          { value: 'local'  as const, label: 'Just this project', hint: './.claude, ./.cursor, etc.' },
+          { value: 'global' as const, label: 'All projects', hint: '~/.claude, ~/.cursor, ~/.factory, etc.' },
+          { value: 'local'  as const, label: 'Just this project', hint: './.claude, ./.cursor, ./.factory, etc.' },
         ],
         initialValue: 'global' as const,
       });
@@ -317,8 +317,8 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro' },
-        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc, ./.gemini, ./.kiro' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.factory' },
+        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc, ./.gemini, ./.kiro, ./.factory' },
       ],
       initialValue: 'global' as const,
     });
