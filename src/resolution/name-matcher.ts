@@ -343,38 +343,57 @@ export function parseCppReturnType(signature: string | undefined | null): string
 }
 
 /**
+ * The single return type shared by every cpp candidate that has a parseable
+ * one — or null when there are none, or they disagree. Disagreement means the
+ * lookup is ambiguous (e.g. the same class name in two namespaces returning
+ * different types), and guessing would misroute the call — so we stay silent.
+ */
+function uniqueCppReturnType(nodes: Node[]): string | null {
+  const types = new Set<string>();
+  for (const n of nodes) {
+    if (n.language !== 'cpp') continue;
+    const rt = parseCppReturnType(n.signature);
+    if (rt) types.add(rt);
+  }
+  return types.size === 1 ? [...types][0]! : null;
+}
+
+/**
  * Return type (as a bare class name) of a C++ callable named by `callee` — a
- * qualified `Foo::bar` or a bare free function `makeFoo` — read from the
- * resolved node's signature. Null when the callable isn't indexed, has no
- * captured return type, or returns a primitive/void.
+ * qualified `a::Foo::bar` / `Foo::bar`, or a bare free function `makeFoo` — read
+ * from the resolved node's signature. Null when the callable isn't indexed, has
+ * no captured return type, returns a primitive/void, or is ambiguous.
  */
 function cppReturnTypeOf(callee: string, context: ResolutionContext): string | null {
-  let candidates: Node[] = [];
-  if (callee.includes('::')) {
-    candidates = context.getNodesByQualifiedName(callee);
-    if (candidates.length === 0) {
-      // Namespaced definition (`ns::Foo::bar`) won't match the class-qualified
-      // `Foo::bar` exactly — fall back to a suffix match on the bare name.
-      const last = lastCppSegment(callee);
-      if (last) {
-        candidates = context
-          .getNodesByName(last)
-          .filter((n) => cppQualifiedMatchesSuffix(n.qualifiedName, callee));
-      }
-    }
-  } else {
+  if (!callee.includes('::')) {
     // A bare (unqualified) callee like `makeWidget()` is a free function. Do NOT
     // include same-named *methods* of unrelated classes — `Decoy::makeWidget`
     // could otherwise supply the return type and misroute the chained call. (A
     // method invoked via implicit `this` would need caller-class scoping we
     // don't do; missing it is silent, which beats resolving to the wrong class.)
-    candidates = context
-      .getNodesByName(callee)
-      .filter((n) => n.kind === 'function');
+    return uniqueCppReturnType(
+      context.getNodesByName(callee).filter((n) => n.kind === 'function'),
+    );
   }
-  for (const n of candidates) {
-    if (n.language !== 'cpp') continue;
-    const rt = parseCppReturnType(n.signature);
+  // Qualified callee like `a::Factory::create` — match most-specific first so a
+  // class name shared across namespaces is disambiguated by its return type.
+  const last = lastCppSegment(callee);
+  if (!last) return null;
+  const named = context.getNodesByName(last);
+  // 1. Exact qualified name — out-of-line definitions keep the namespace.
+  let rt = uniqueCppReturnType(context.getNodesByQualifiedName(callee));
+  if (rt) return rt;
+  // 2. The full qualifier at a `::` boundary (deeper-nested namespaces).
+  rt = uniqueCppReturnType(named.filter((n) => cppQualifiedMatchesSuffix(n.qualifiedName, callee)));
+  if (rt) return rt;
+  // 3. In-class definitions drop the namespace from the qualified name, so fall
+  //    back to `Class::accessor` — but only when every match agrees on the
+  //    return type. Distinct types means the class name is ambiguous across
+  //    namespaces and we must not guess.
+  const parts = callee.split('::').filter(Boolean);
+  if (parts.length > 2) {
+    const classAccessor = parts.slice(-2).join('::');
+    rt = uniqueCppReturnType(named.filter((n) => cppQualifiedMatchesSuffix(n.qualifiedName, classAccessor)));
     if (rt) return rt;
   }
   return null;
@@ -384,7 +403,8 @@ function cppReturnTypeOf(callee: string, context: ResolutionContext): string | n
  * Return type (bare class name) of method `methodName` declared on C++ class
  * `typeName` — i.e. the type of `objOfTypeName.methodName()`. Strictly scoped to
  * methods whose qualified name ends in `typeName::methodName`, so a same-named
- * method on an unrelated class can't leak in. Inherited methods (defined on a
+ * method on an unrelated class can't leak in. Returns null when the matches
+ * disagree (same class name across namespaces). Inherited methods (defined on a
  * base class) are not followed — a deliberate single-level limit.
  */
 function cppReturnTypeOfMethodOnType(
@@ -393,19 +413,11 @@ function cppReturnTypeOfMethodOnType(
   context: ResolutionContext,
 ): string | null {
   const suffix = `${typeName}::${methodName}`;
-  const methods = context
-    .getNodesByName(methodName)
-    .filter(
-      (n) =>
-        n.kind === 'method' &&
-        n.language === 'cpp' &&
-        cppQualifiedMatchesSuffix(n.qualifiedName, suffix),
-    );
-  for (const m of methods) {
-    const rt = parseCppReturnType(m.signature);
-    if (rt) return rt;
-  }
-  return null;
+  return uniqueCppReturnType(
+    context
+      .getNodesByName(methodName)
+      .filter((n) => n.kind === 'method' && cppQualifiedMatchesSuffix(n.qualifiedName, suffix)),
+  );
 }
 
 function inferCppReceiverType(
@@ -602,9 +614,12 @@ export function matchCppChainedAccessor(
   if (callee.includes('::')) {
     const parts = callee.split('::').filter(Boolean);
     const accessor = parts[parts.length - 1]!;
-    const klass = parts[parts.length - 2];
-    if (klass && CPP_SINGLETON_ACCESSORS.has(accessor.toLowerCase())) {
-      const hit = resolveMethodOnType(klass, method, ref, context, 0.85, 'instance-method');
+    // The owning type is everything before the accessor — keep the namespace
+    // (`a::Factory`), not just the bare class, so resolveMethodOnType doesn't
+    // match a same-named class in another namespace.
+    const ownerType = parts.slice(0, -1).join('::');
+    if (ownerType && CPP_SINGLETON_ACCESSORS.has(accessor.toLowerCase())) {
+      const hit = resolveMethodOnType(ownerType, method, ref, context, 0.85, 'instance-method');
       if (hit) return hit;
     }
   }

@@ -1728,13 +1728,14 @@ export class TreeSitterExtractor {
   private cppChainedCallReceiverCallee(receiverCall: SyntaxNode, methodName: string): string | null {
     const innerFn = getChildByField(receiverCall, 'function');
     if (!innerFn) return null;
-    // Scoped accessor / factory: `Foo::instance()` / `ns::Foo::create()`.
+    // Scoped accessor / factory: `Foo::instance()` / `ns::Foo::create()`. Keep
+    // the FULL qualifier (namespace + class + accessor), so the resolver can
+    // disambiguate a class name shared across namespaces by its return type —
+    // `a::Factory::create` and `b::Factory::create` must not collapse together.
     if (innerFn.type === 'qualified_identifier' || innerFn.type === 'scoped_identifier') {
-      const parts = getNodeText(innerFn, this.source).trim().split('::').filter(Boolean);
-      if (parts.length < 2) return null;
-      const accessor = parts[parts.length - 1]!;
-      const klass = parts[parts.length - 2]!;
-      return `${klass}::${accessor}().${methodName}`;
+      const qualifier = getNodeText(innerFn, this.source).trim();
+      if (qualifier.split('::').filter(Boolean).length < 2) return null;
+      return `${qualifier}().${methodName}`;
     }
     // Free-function factory: `makeWidget()`.
     if (innerFn.type === 'identifier') {

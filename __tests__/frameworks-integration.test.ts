@@ -589,6 +589,62 @@ describe('C++ end-to-end — virtual override synthesis', () => {
     }
   });
 
+  it('disambiguates a factory class name shared across namespaces by its return type', async () => {
+    // Regression for Codex review (PR #646): a chained scoped call kept only the
+    // segment before the accessor, so `a::Factory::create()` and
+    // `b::Factory::create()` both collapsed to `Factory::create` and the first
+    // captured return type won. Encoding the full qualifier lets each resolve to
+    // its own namespace's return type.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'a.hpp'),
+        'class Widget { public: void draw(); };\n' +
+          'namespace a { class Factory { public: Widget create(); }; }\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'b.hpp'),
+        'class Gadget { public: void draw(); };\n' +
+          'namespace b { class Factory { public: Gadget create(); }; }\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'defs.cpp'),
+        '#include "a.hpp"\n' +
+          '#include "b.hpp"\n' +
+          'void Widget::draw() {}\n' +
+          'void Gadget::draw() {}\n' +
+          'Widget a::Factory::create() { return Widget(); }\n' +
+          'Gadget b::Factory::create() { return Gadget(); }\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'app.cpp'),
+        '#include "a.hpp"\n' +
+          '#include "b.hpp"\n' +
+          'void useA() { a::Factory::create().draw(); }\n' +
+          'void useB() { b::Factory::create().draw(); }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const widgetDraw = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Widget::draw');
+      const gadgetDraw = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Gadget::draw');
+      expect(widgetDraw, 'Widget::draw node').toBeDefined();
+      expect(gadgetDraw, 'Gadget::draw node').toBeDefined();
+
+      // a::Factory::create() returns Widget; b::Factory::create() returns Gadget.
+      const widgetCallers = cg.getCallers(widgetDraw!.id).map((c) => c.node.qualifiedName);
+      const gadgetCallers = cg.getCallers(gadgetDraw!.id).map((c) => c.node.qualifiedName);
+      expect(widgetCallers).toContain('useA');
+      expect(widgetCallers).not.toContain('useB');
+      expect(gadgetCallers).toContain('useB');
+      expect(gadgetCallers).not.toContain('useA');
+    } finally {
+      cg?.close();
+    }
+  });
+
   it('bridges a base virtual method to the subclass override', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
     fs.writeFileSync(
