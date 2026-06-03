@@ -682,6 +682,22 @@ export class QueryBuilder {
   }
 
   /**
+   * Stream every node of a kind one at a time (lazy) instead of materializing
+   * them all like {@link getNodesByKind}. For unbounded kinds (`function`,
+   * `method`) on a symbol-dense project the full array is gigabytes; the
+   * dynamic-edge synthesizers only scan-and-filter, so they iterate to keep
+   * memory O(1) in the node count rather than O(nodes) (#610).
+   */
+  *iterateNodesByKind(kind: NodeKind): IterableIterator<Node> {
+    // Fresh statement per call (not a cached one): an iterator holds an open
+    // cursor, so a shared statement would conflict across overlapping scans.
+    const stmt = this.db.prepare('SELECT * FROM nodes WHERE kind = ?');
+    for (const row of stmt.iterate(kind)) {
+      yield rowToNode(row as NodeRow);
+    }
+  }
+
+  /**
    * Get all nodes in the database
    */
   getAllNodes(): Node[] {
@@ -1406,6 +1422,17 @@ export class QueryBuilder {
   }
 
   /**
+   * Most recent index timestamp (ms since epoch) across all tracked files, or
+   * null when nothing is indexed yet. One indexed aggregate, no per-row scan. (#329)
+   */
+  getLastIndexedAt(): number | null {
+    const row = this.db
+      .prepare('SELECT MAX(indexed_at) AS last FROM files')
+      .get() as { last: number | null } | undefined;
+    return row?.last ?? null;
+  }
+
+  /**
    * Get files that need re-indexing (hash changed)
    */
   getStaleFiles(currentHashes: Map<string, string>): FileRecord[] {
@@ -1572,10 +1599,19 @@ export class QueryBuilder {
   getUnresolvedReferencesByFiles(filePaths: string[]): UnresolvedReference[] {
     if (filePaths.length === 0) return [];
 
-    const placeholders = filePaths.map(() => '?').join(',');
-    const rows = this.db
-      .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
-      .all(...filePaths) as UnresolvedRefRow[];
+    // Chunk under SQLite's parameter limit: the first sync of a very large repo
+    // passes every changed file here, which an unbounded `IN (...)` would bind
+    // as one parameter each — exceeding MAX_VARIABLE_NUMBER and aborting with
+    // "too many SQL variables". (#540)
+    const rows: UnresolvedRefRow[] = [];
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const chunkRows = this.db
+        .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
+        .all(...chunk) as UnresolvedRefRow[];
+      rows.push(...chunkRows);
+    }
 
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,

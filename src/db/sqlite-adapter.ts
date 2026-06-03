@@ -14,6 +14,13 @@ export interface SqliteStatement {
   run(...params: any[]): { changes: number; lastInsertRowid: number | bigint };
   get(...params: any[]): any;
   all(...params: any[]): any[];
+  /**
+   * Lazily yield result rows one at a time instead of materializing the whole
+   * set with `all()`. Use for unbounded scans (e.g. every function/method node)
+   * so memory stays O(1) in the row count rather than O(rows) — see #610, where
+   * `all()`-ing every symbol on a dense project spiked the heap into an OOM.
+   */
+  iterate(...params: any[]): IterableIterator<any>;
 }
 
 export interface SqliteDatabase {
@@ -71,6 +78,9 @@ class NodeSqliteAdapter implements SqliteDatabase {
       },
       all(...params: any[]) {
         return stmt.all(...params);
+      },
+      iterate(...params: any[]) {
+        return stmt.iterate(...params);
       },
     };
   }

@@ -132,6 +132,19 @@ export class MCPSession {
       case 'ping':
         if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, {});
         break;
+      case 'resources/list':
+        // We expose no MCP resources, but some clients (opencode, Codex) probe
+        // for them on connect; reply with an empty list instead of a
+        // MethodNotFound error that surfaces as a scary `-32601` log line. (#621)
+        if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, { resources: [] });
+        break;
+      case 'resources/templates/list':
+        if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, { resourceTemplates: [] });
+        break;
+      case 'prompts/list':
+        // Likewise — no prompts exposed, but answer the probe cleanly. (#621)
+        if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, { prompts: [] });
+        break;
       default:
         if (isRequest) {
           this.transport.sendError(

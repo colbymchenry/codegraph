@@ -25,7 +25,8 @@ import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
 import { validatePathWithinRoot } from '../utils';
-import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants } from '../search/query-utils';
+import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
+import { LOW_CONFIDENCE_MARKER } from './markers';
 
 /**
  * Extract likely symbol names from a natural language query
@@ -172,6 +173,11 @@ const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
   nodeKinds: HIGH_VALUE_NODE_KINDS, // Filter out imports/exports by default
 };
 
+// Re-export the low-confidence sentinel (defined in a dependency-free leaf so
+// the MCP layer can import it without pulling this module's deps onto the
+// cold-start path). Builder code below uses the imported binding directly.
+export { LOW_CONFIDENCE_MARKER } from './markers';
+
 /**
  * Context Builder
  *
@@ -259,12 +265,44 @@ export class ContextBuilder {
 
     // Return formatted output or raw context
     if (opts.format === 'markdown') {
-      return formatContextAsMarkdown(context) + this.buildCallPathsSection(subgraph);
+      return formatContextAsMarkdown(context)
+        + this.buildCallPathsSection(subgraph)
+        + (subgraph.confidence === 'low' ? this.buildLowConfidenceNote(entryPoints) : '');
     } else if (opts.format === 'json') {
       return formatContextAsJson(context);
     }
 
     return context;
+  }
+
+  /**
+   * Honest handoff appended when retrieval confidence is low (the query matched
+   * mostly common words). Instead of the usual "this covers the surface" framing
+   * — which, when wrong, sends the agent off to Read/Grep — it admits the
+   * uncertainty and routes the agent to the precise tools (explore with real
+   * symbol names, search, or files to browse the closest areas we *did* surface).
+   */
+  private buildLowConfidenceNote(entryPoints: Node[]): string {
+    const dirs: string[] = [];
+    const seen = new Set<string>();
+    for (const n of entryPoints) {
+      const slash = n.filePath.lastIndexOf('/');
+      const dir = slash > 0 ? n.filePath.slice(0, slash) : n.filePath;
+      if (!seen.has(dir)) { seen.add(dir); dirs.push(dir); }
+      if (dirs.length >= 4) break;
+    }
+    const dirLine = dirs.length
+      ? `\n- \`codegraph_files\` a likely area: ${dirs.map(d => `\`${d}\``).join(', ')}`
+      : '';
+    return `\n\n${LOW_CONFIDENCE_MARKER}\n\n`
+      + 'This query matched mostly on common words, so the entry points above may '
+      + 'be off-target — treat them as a starting point, not a complete answer. '
+      + 'For a reliable result:\n'
+      + '- `codegraph_explore` with the **exact symbol names** you are after '
+      + '(class / function / method names), or\n'
+      + '- `codegraph_search <name>` for one specific symbol'
+      + dirLine
+      + '\n\nDo not assume the list above is comprehensive.';
   }
 
   /**
@@ -653,6 +691,21 @@ export class ContextBuilder {
       // term group is counter-productive.
       const exactMatchIds = new Set(exactMatches.map(r => r.node.id));
 
+      // ...but only exempt exact matches the user *named as an identifier*
+      // (camelCase/snake_case/acronym). A plain dictionary word that happens to
+      // exact-match an unrelated symbol — query "flat object" → a constant named
+      // FLAT — must NOT be exempt, or the +exact-name bonus floats it to the top
+      // of a prose query with zero corroboration from any other term. Classify by
+      // the QUERY token (what the user typed), not the matched symbol's name.
+      const distinctiveTokens = new Set(
+        symbolsFromQuery.filter(isDistinctiveIdentifier).map(s => s.toLowerCase())
+      );
+      const distinctiveExactMatchIds = new Set(
+        exactMatches
+          .filter(r => distinctiveTokens.has(r.node.name.toLowerCase()))
+          .map(r => r.node.id)
+      );
+
       for (const result of searchResults) {
         // Check term matches in name (substring) and path DIRECTORIES (exact).
         // Directory segments must match exactly — "search" matches directory
@@ -672,10 +725,17 @@ export class ContextBuilder {
         if (matchCount >= 2) {
           // Multiplicative boost — 2 terms → 2x, 3 terms → 2.5x
           result.score *= 1 + matchCount * 0.5;
-        } else if (!exactMatchIds.has(result.node.id)) {
-          // Mild dampen for single-term matches — they might be generic
+        } else if (distinctiveExactMatchIds.has(result.node.id)) {
+          // Exact match on a distinctive identifier the user explicitly named —
+          // keep full score (e.g. "LiveEditMode DevServerPreview").
+        } else if (exactMatchIds.has(result.node.id)) {
+          // Exact match on a COMMON word (e.g. "flat" → FLAT): high-scoring noise
+          // inflated by the +exact-name bonus, corroborated by no other query
+          // term. Demote hard so corroborated matches win.
+          result.score *= 0.3;
+        } else {
+          // Mild dampen for generic single-term matches — they might be generic
           // but could also be the right result (e.g., "Protocol" class for an IPC query).
-          // Exempt exact name matches: they are specific symbols the user queried for.
           result.score *= 0.6;
         }
       }
@@ -839,6 +899,35 @@ export class ContextBuilder {
     // Cap to searchLimit so each entry point gets a meaningful traversal budget.
     if (filteredResults.length > opts.searchLimit) {
       filteredResults = filteredResults.slice(0, opts.searchLimit);
+    }
+
+    // Confidence signal for the honest-handoff footer (consumed in buildContext).
+    // A multi-term prose query that resolves only to isolated common-word matches
+    // — no entry point corroborated by 2+ distinct query terms, and none a
+    // distinctive identifier the user explicitly named — is LOW confidence: the
+    // results are best-effort, not a located answer, so the agent should be told
+    // to drill in with explore/trace rather than trust the list as comprehensive.
+    // Single-keyword and symbol-name queries are exempt (their single match IS the
+    // answer), so the handoff never fires on them.
+    let confidence: 'high' | 'low' = 'high';
+    const confTerms = extractSearchTerms(query, { stems: false }).filter(t => t.length >= 3);
+    if (confTerms.length >= 2 && filteredResults.length > 0) {
+      const distinctive = new Set(
+        symbolsFromQuery.filter(isDistinctiveIdentifier).map(s => s.toLowerCase())
+      );
+      const anyStrong = filteredResults.some(r => {
+        if (distinctive.has(r.node.name.toLowerCase())) return true;
+        const nameLower = r.node.name.toLowerCase();
+        const dirSegs = path.dirname(r.node.filePath).toLowerCase().split('/');
+        let hits = 0;
+        for (const t of confTerms) {
+          if (nameLower.includes(t) || dirSegs.includes(t)) {
+            if (++hits >= 2) return true;
+          }
+        }
+        return false;
+      });
+      if (!anyStrong) confidence = 'low';
     }
 
     // Add entry points to subgraph
@@ -1048,7 +1137,7 @@ export class ContextBuilder {
       }
     }
 
-    return { nodes: finalNodes, edges: finalEdges, roots };
+    return { nodes: finalNodes, edges: finalEdges, roots, confidence };
   }
 
   /**

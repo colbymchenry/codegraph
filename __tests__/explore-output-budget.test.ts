@@ -27,9 +27,14 @@ describe('getExploreOutputBudget', () => {
     expect(small.maxOutputChars).toBeLessThanOrEqual(20000);
   });
 
-  it('keeps the historical 35k+ ceiling for medium-large projects so existing benchmarks do not regress', () => {
+  it('caps medium-large projects at the inline tool-result ceiling (~24k) so the result is never externalized', () => {
+    // A bigger single response gets externalized by the host to a file the agent
+    // Reads back (a 35k vscode explore did exactly that in the n=4 A/B) — adding a
+    // read AND cache-write cost. So large repos get MORE CALLS (getExploreBudget),
+    // not a fatter single response; the output cap stays under the inline limit.
     const large = getExploreOutputBudget(10000);
-    expect(large.maxOutputChars).toBeGreaterThanOrEqual(35000);
+    expect(large.maxOutputChars).toBeLessThanOrEqual(25000);
+    expect(large.maxOutputChars).toBeGreaterThanOrEqual(20000);
   });
 
   it('uses tier breakpoints matching getExploreBudget so call-count and output-budget agree on a project', () => {
@@ -54,10 +59,13 @@ describe('getExploreOutputBudget', () => {
     const tier3b = getExploreOutputBudget(14999);
     expect(tier3a.maxOutputChars).toBe(tier3b.maxOutputChars);
 
-    // And crossing a breakpoint changes the cap.
-    expect(tier0a.maxOutputChars).not.toBe(tier1a.maxOutputChars);
-    expect(tier1a.maxOutputChars).not.toBe(tier2a.maxOutputChars);
-    expect(tier2a.maxOutputChars).not.toBe(tier3a.maxOutputChars);
+    // Small tiers step up (13k → 18k → 24k); medium and large SHARE the ~24k
+    // inline ceiling — scaling with repo size now lives in the CALL budget
+    // (getExploreBudget), not in a fatter single response.
+    expect(tier0a.maxOutputChars).not.toBe(tier1a.maxOutputChars); // <150 vs <500
+    expect(tier1a.maxOutputChars).not.toBe(tier2a.maxOutputChars); // <500 vs <5000
+    expect(tier2a.maxOutputChars).toBe(tier3a.maxOutputChars);     // <5000 == <15000 (inline cap)
+    expect(getExploreBudget(5000)).toBeGreaterThan(getExploreBudget(4999)); // calls scale instead
   });
 
   it('gates off "Additional relevant files", completeness signal, and budget note on small projects', () => {

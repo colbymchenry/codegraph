@@ -9,6 +9,14 @@ each one the same way, so cross-symbol *flows* exist in the graph everywhere.
 > synthesizer) is in [`callback-edge-synthesis.md`](./callback-edge-synthesis.md).
 > Full investigation context + findings: auto-memory `project_codegraph_read_displacement`.
 
+> **Update (2026-06-01):** the `codegraph_trace` and `codegraph_context` MCP tools were
+> **removed** — `codegraph_explore` is the single surfacing tool now. Its "Flow" section
+> (`buildFlowFromNamedSymbols`) surfaces the synthesized edges this playbook is about, and
+> you validate coverage with `codegraph_explore` / `scripts/agent-eval/probe-explore.mjs`.
+> Where the text below writes `trace(a, b)` or lists `trace`/`context` among the tools,
+> read it as "the a→b flow, now surfaced and verified via explore." The synthesizers and
+> the coverage matrix are unchanged.
+
 ---
 
 ## 1. The goal (why this matters)

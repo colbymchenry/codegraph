@@ -46,9 +46,15 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
 export const EXTENSION_MAP: Record<string, Language> = {
   '.ts': 'typescript',
   '.tsx': 'tsx',
+  // ESM/CJS TypeScript module extensions — parsed as TS (no JSX). (#366)
+  '.mts': 'typescript',
+  '.cts': 'typescript',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
+  // SAP HANA XS Classic server-side JavaScript. (#556)
+  '.xsjs': 'javascript',
+  '.xsjslib': 'javascript',
   '.jsx': 'jsx',
   '.py': 'python',
   '.pyw': 'python',

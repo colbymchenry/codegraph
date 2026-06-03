@@ -53,9 +53,9 @@ describe('MCP input size limits', () => {
     expect(result.content[0]!.text).toMatch(/maximum length/i);
   });
 
-  it('rejects an oversize task on codegraph_context', async () => {
+  it('rejects an oversize query on codegraph_explore', async () => {
     const huge = 'b'.repeat(50_000);
-    const result = await handler.execute('codegraph_context', { task: huge });
+    const result = await handler.execute('codegraph_explore', { query: huge });
     expect(result.isError).toBe(true);
     expect(result.content[0]!.text).toMatch(/maximum length/i);
   });

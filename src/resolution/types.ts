@@ -100,6 +100,13 @@ export interface ResolutionContext {
    */
   getGoModule?(): import('./go-module').GoModule | null;
   /**
+   * Monorepo workspace member packages, keyed by declared package name.
+   * Returns `null` for single-package repos (no `workspaces` field).
+   * Lets the resolver treat `@scope/ui/sub` as a local import into the
+   * member's directory instead of an external npm package (#629).
+   */
+  getWorkspacePackages?(): import('./workspace-packages').WorkspacePackages | null;
+  /**
    * Re-exports declared by a file (`export { x } from './other'`,
    * `export * from './other'`). Empty array when the file has none.
    * Optional so older callers compile; the import resolver follows
