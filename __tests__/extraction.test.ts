@@ -129,6 +129,7 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('groovy');
   });
 });
 
@@ -4285,6 +4286,126 @@ local count = 0
   });
 });
 
+describe('Groovy Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Groovy files', () => {
+      expect(detectLanguage('build.gradle')).toBe('groovy');
+      expect(detectLanguage('src/Main.groovy')).toBe('groovy');
+      expect(detectLanguage('utils.gvy')).toBe('groovy');
+      expect(detectLanguage('script.gy')).toBe('groovy');
+      expect(detectLanguage('helper.gsh')).toBe('groovy');
+    });
+  });
+
+  it('should extract class declarations', () => {
+    const code = `
+class UserService {
+    private repository
+
+    UserService(repository) {
+        this.repository = repository
+    }
+
+    def getUser(String id) {
+        return repository.findById(id)
+    }
+}
+`;
+    const result = extractFromSource('UserService.groovy', code);
+
+    const classNode = result.nodes.find((n) => n.kind === 'class');
+    expect(classNode).toBeDefined();
+    expect(classNode?.name).toBe('UserService');
+  });
+
+  it('should extract method declarations', () => {
+    const code = `
+class Calculator {
+    static int add(int a, int b) {
+        return a + b
+    }
+}
+`;
+    const result = extractFromSource('Calculator.groovy', code);
+
+    const methodNode = result.nodes.find((n) => n.kind === 'method' && n.name === 'add');
+    expect(methodNode).toBeDefined();
+    expect(methodNode?.isStatic).toBe(true);
+  });
+
+  it('should extract def function declarations', () => {
+    const code = `
+def greet(String name) {
+    return "Hello, \${name}"
+}
+`;
+    const result = extractFromSource('utils.groovy', code);
+
+    const funcNode = result.nodes.find((n) => n.kind === 'function' && n.name === 'greet');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.language).toBe('groovy');
+  });
+
+  it('should extract interface declarations', () => {
+    const code = `
+interface Repository {
+    def findById(String id)
+    def save(Object entity)
+}
+`;
+    const result = extractFromSource('Repository.groovy', code);
+
+    const ifaceNode = result.nodes.find((n) => n.kind === 'interface');
+    expect(ifaceNode).toBeDefined();
+    expect(ifaceNode?.name).toBe('Repository');
+  });
+
+  it('should extract enum declarations', () => {
+    const code = `
+enum Color {
+    RED, GREEN, BLUE
+}
+`;
+    const result = extractFromSource('Color.groovy', code);
+
+    const enumNode = result.nodes.find((n) => n.kind === 'enum');
+    expect(enumNode).toBeDefined();
+    expect(enumNode?.name).toBe('Color');
+  });
+
+  it('should extract imports', () => {
+    const code = `
+import java.util.List
+import groovy.json.JsonSlurper
+`;
+    const result = extractFromSource('App.groovy', code);
+
+    const imports = result.nodes.filter((n) => n.kind === 'import');
+    expect(imports.length).toBe(2);
+    expect(imports.map((n) => n.name)).toContain('java.util.List');
+    expect(imports.map((n) => n.name)).toContain('groovy.json.JsonSlurper');
+  });
+
+  it('should extract visibility modifiers', () => {
+    const code = `
+class Account {
+    private String secret
+    protected String internal
+    public String visible
+}
+`;
+    const result = extractFromSource('Account.groovy', code);
+
+    const fields = result.nodes.filter((n) => n.kind === 'field');
+    const secret = fields.find((n) => n.name === 'secret');
+    const internal = fields.find((n) => n.name === 'internal');
+    const visible = fields.find((n) => n.name === 'visible');
+    expect(secret?.visibility).toBe('private');
+    expect(internal?.visibility).toBe('protected');
+    expect(visible?.visibility).toBe('public');
+  });
+});
+
 // =============================================================================
 // Objective-C
 // =============================================================================
@@ -4364,11 +4485,6 @@ void helperFunction(int count) {
   });
 
   it('should reconstruct multi-keyword selectors at the call site so they resolve to the method definition', () => {
-    // Regression for the gap discovered post-#165: message_expression's
-    // multi-keyword form `[obj a:1 b:2]` was only emitting the first keyword,
-    // so calls never resolved to multi-part method definitions like
-    // `GET:parameters:headers:progress:success:failure:`. The call-site name
-    // must match the method-definition name with full keywords + trailing colons.
     const code = `
 @implementation Caller
 - (void)demo {
@@ -4452,7 +4568,6 @@ func (s Stack[T]) Len() int { return len(s.items) }
     expect(detectLanguage('mod.mts')).toBe('typescript');
     expect(detectLanguage('service.xsjs')).toBe('javascript');
 
-    // End-to-end: a .mts file is parsed as TS, a .xsjs file as JS.
     const ts = extractFromSource('mod.mts', 'export function hello(): number { return 1; }');
     expect(ts.nodes.find((n) => n.name === 'hello' && n.kind === 'function')).toBeDefined();
     const js = extractFromSource('service.xsjs', 'function handleRequest() { return 1; }');
