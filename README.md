@@ -1,12 +1,14 @@
 <div align="center">
 
-# CodeGraph
+<img src="site/public/logo.svg" alt="CodeGraph" width="800">
 
 ### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, and Kiro with Semantic Code Intelligence
 
 **~16% cheaper · ~58% fewer tool calls · 100% local**
 
 ### [Documentation & Website →](https://colbymchenry.github.io/codegraph/)
+
+<a href="https://trendshift.io/repositories/26949" target="_blank"><img src="https://trendshift.io/api/badge/repositories/26949" alt="colbymchenry%2Fcodegraph | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 
 [![npm version](https://img.shields.io/npm/v/@colbymchenry/codegraph.svg)](https://www.npmjs.com/package/@colbymchenry/codegraph)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

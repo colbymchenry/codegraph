@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 250 60" fill="none">
+  <rect x="0" y="0" width="250" height="60" fill="#f7f6f2"/>
+  <line x1="30" y1="14" x2="16" y2="46" stroke="#16150f" stroke-width="3" />
+  <line x1="30" y1="14" x2="44" y2="46" stroke="#16150f" stroke-width="3" />
+  <line x1="16" y1="46" x2="44" y2="46" stroke="#16150f" stroke-width="3" />
+  <circle cx="30" cy="14" r="5.5" fill="#16150f" stroke="#16150f" stroke-width="2" />
+  <circle cx="16" cy="46" r="5.5" fill="#f7f6f2" stroke="#16150f" stroke-width="2" />
+  <circle cx="44" cy="46" r="5.5" fill="#f7f6f2" stroke="#16150f" stroke-width="2" />
+  <text x="60" y="42" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-weight="800" font-size="36" letter-spacing="-1.26" fill="#16150f">codegraph</text>
+</svg>
