@@ -645,6 +645,56 @@ describe('C++ end-to-end — virtual override synthesis', () => {
     }
   });
 
+  it('does not misroute when the chained return type basename is shared across namespaces', async () => {
+    // Regression for Codex review (PR #646): the return type is normalized to a
+    // bare basename, so `a::Factory::create()` returning `a::Widget` and another
+    // `b::Widget` collapse to `Widget`. With two `Widget::draw` owners we can't
+    // tell which one — so the chained call must stay silent, never link to the
+    // wrong namespace's method.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'a.hpp'),
+        'namespace a { class Widget { public: void draw(); }; class Factory { public: Widget create(); }; }\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'b.hpp'),
+        'namespace b { class Widget { public: void draw(); }; }\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'defs.cpp'),
+        '#include "a.hpp"\n' +
+          '#include "b.hpp"\n' +
+          'void a::Widget::draw() {}\n' +
+          'void b::Widget::draw() {}\n' +
+          'a::Widget a::Factory::create() { return a::Widget(); }\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'app.cpp'),
+        '#include "a.hpp"\n' +
+          'void useA() { a::Factory::create().draw(); }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const aDraw = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'a::Widget::draw');
+      const bDraw = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'b::Widget::draw');
+      expect(aDraw, 'a::Widget::draw node').toBeDefined();
+      expect(bDraw, 'b::Widget::draw node').toBeDefined();
+
+      // Ambiguous basename (a::Widget vs b::Widget) — resolution bails, so the
+      // call links to NEITHER. (Without the bail it would link to whichever
+      // sorts first — a::Widget::draw here — so asserting both are absent is the
+      // non-vacuous check.)
+      expect(cg.getCallers(aDraw!.id).map((c) => c.node.qualifiedName)).not.toContain('useA');
+      expect(cg.getCallers(bDraw!.id).map((c) => c.node.qualifiedName)).not.toContain('useA');
+    } finally {
+      cg?.close();
+    }
+  });
+
   it('bridges a base virtual method to the subclass override', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
     fs.writeFileSync(

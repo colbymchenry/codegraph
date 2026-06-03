@@ -577,6 +577,32 @@ function inferJavaFieldReceiverType(
  * callee's return type isn't indexed, e.g. an external accessor) treats a
  * self-returning-accessor *name* as evidence the qualifier is the type.
  */
+/**
+ * Resolve `method` on C++ `typeName`, but only when it lands on a single owner.
+ * `typeName` is an inferred return type whose namespace we may have lost (the
+ * source often writes a bare `Widget`, not `a::Widget`), so if its basename is
+ * shared across namespaces — multiple distinct owners define `method` — we bail
+ * rather than link to whichever was indexed first. Overloads on the *same*
+ * owner are fine (one owner). Used for the return-type-driven chained paths.
+ */
+function resolveUniqueMethodOnType(
+  typeName: string,
+  method: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number,
+): ResolvedRef | null {
+  const want = `${typeName}::${method}`;
+  const owners = new Set(
+    context
+      .getNodesByName(method)
+      .filter((n) => n.kind === 'method' && n.language === 'cpp' && cppQualifiedMatchesSuffix(n.qualifiedName, want))
+      .map((n) => n.qualifiedName.slice(0, -(method.length + 2))),
+  );
+  if (owners.size !== 1) return null; // 0 = not found, >1 = ambiguous across namespaces
+  return resolveMethodOnType(typeName, method, ref, context, confidence, 'instance-method');
+}
+
 export function matchCppChainedAccessor(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -594,7 +620,7 @@ export function matchCppChainedAccessor(
     if (!objType) return null;
     const midType = cppReturnTypeOfMethodOnType(objType, midMethod!, context);
     if (!midType) return null;
-    return resolveMethodOnType(midType, finalMethod!, ref, context, 0.85, 'instance-method');
+    return resolveUniqueMethodOnType(midType, finalMethod!, ref, context, 0.85);
   }
 
   const m = ref.referenceName.match(/^([A-Za-z_][\w:]*)\(\)\.([A-Za-z_]\w*)$/);
@@ -605,7 +631,7 @@ export function matchCppChainedAccessor(
   // Return-type-driven: what does the receiver call actually return?
   const returnType = cppReturnTypeOf(callee, context);
   if (returnType) {
-    const hit = resolveMethodOnType(returnType, method, ref, context, 0.9, 'instance-method');
+    const hit = resolveUniqueMethodOnType(returnType, method, ref, context, 0.9);
     if (hit) return hit;
   }
 
