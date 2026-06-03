@@ -12,7 +12,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath } from '../src/utils';
+import {
+  FileLock,
+  validateProjectPath,
+  validatePathWithinRoot,
+  isPathWithinRoot,
+} from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -173,6 +178,51 @@ describe('Path Traversal Prevention', () => {
   it('should return null for non-existent node', async () => {
     const code = await cg.getCode('does-not-exist');
     expect(code).toBeNull();
+  });
+});
+
+describe('Path-within-root helpers — Windows drive-root regression', () => {
+  // path.resolve('Z:\\') returns 'Z:\\' (already trailing-sep) on Windows,
+  // so the old `resolvedRoot + path.sep` check produced 'Z:\\\\' which no
+  // file path under the drive could start with. This regressed indexing for
+  // any project at a drive root or mapped network drive root.
+  it.runIf(process.platform === 'win32')(
+    'validatePathWithinRoot accepts files under a drive root (Z:\\)',
+    () => {
+      // Skip when Z: is not a real drive on this runner.
+      if (!fs.existsSync('Z:\\')) return;
+      const resolved = validatePathWithinRoot('Z:\\', 'configuration.yaml');
+      expect(resolved).toBe('Z:\\configuration.yaml');
+    }
+  );
+
+  it.runIf(process.platform === 'win32')(
+    'isPathWithinRoot returns true for files under a drive root (Z:\\)',
+    () => {
+      if (!fs.existsSync('Z:\\')) return;
+      expect(isPathWithinRoot('configuration.yaml', 'Z:\\')).toBe(true);
+      expect(isPathWithinRoot('sub/dir/file.ts', 'Z:\\')).toBe(true);
+    }
+  );
+
+  it('validatePathWithinRoot still rejects traversal in a normal subdirectory', () => {
+    const tmp = createTempDir();
+    try {
+      expect(validatePathWithinRoot(tmp, '../escape.txt')).toBeNull();
+      expect(validatePathWithinRoot(tmp, 'inside.txt')).toBe(path.join(tmp, 'inside.txt'));
+    } finally {
+      cleanupTempDir(tmp);
+    }
+  });
+
+  it('isPathWithinRoot still rejects traversal in a normal subdirectory', () => {
+    const tmp = createTempDir();
+    try {
+      expect(isPathWithinRoot('../escape.txt', tmp)).toBe(false);
+      expect(isPathWithinRoot('inside.txt', tmp)).toBe(true);
+    } finally {
+      cleanupTempDir(tmp);
+    }
   });
 });
 

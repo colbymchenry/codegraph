@@ -54,11 +54,22 @@ const SENSITIVE_PATHS = new Set([
  * @param filePath - The relative file path to validate
  * @returns The resolved absolute path, or null if it escapes the root
  */
+/**
+ * Append `path.sep` to a directory unless it already ends with one.
+ *
+ * Drive roots on Windows (e.g. `Z:\`) come back from `path.resolve` with a
+ * trailing separator already; naively appending another would produce `Z:\\`,
+ * which nothing under that root starts with — so every file gets rejected.
+ */
+function ensureTrailingSep(dir: string): string {
+  return dir.endsWith(path.sep) ? dir : dir + path.sep;
+}
+
 export function validatePathWithinRoot(projectRoot: string, filePath: string): string | null {
   const resolved = path.resolve(projectRoot, filePath);
   const normalizedRoot = path.resolve(projectRoot);
 
-  if (!resolved.startsWith(normalizedRoot + path.sep) && resolved !== normalizedRoot) {
+  if (!resolved.startsWith(ensureTrailingSep(normalizedRoot)) && resolved !== normalizedRoot) {
     return null;
   }
   return resolved;
@@ -119,7 +130,7 @@ export function validateProjectPath(dirPath: string): string | null {
 export function isPathWithinRoot(filePath: string, rootDir: string): boolean {
   const resolvedPath = path.resolve(rootDir, filePath);
   const resolvedRoot = path.resolve(rootDir);
-  return resolvedPath.startsWith(resolvedRoot + path.sep) || resolvedPath === resolvedRoot;
+  return resolvedPath.startsWith(ensureTrailingSep(resolvedRoot)) || resolvedPath === resolvedRoot;
 }
 
 /**
