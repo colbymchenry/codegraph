@@ -339,6 +339,42 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(false);
   });
 
+  it.runIf(process.platform === 'win32')('opencode: prefers ~/.config/opencode/ over %APPDATA% when it exists (#535)', () => {
+    const opencode = getTarget('opencode')!;
+    // Simulate Windows layout where APPDATA and ~/.config are different
+    // directories. On Windows, globalConfigDir() should prefer
+    // ~/.config/opencode/ (XDG-style) when it exists, matching
+    // opencode's own behavior (issue #535).
+    const tmpRoaming = fs.mkdtempSync(path.join(os.tmpdir(), 'appdata-'));
+    process.env.APPDATA = tmpRoaming;
+    const configDir = path.join(tmpHome, '.config', 'opencode');
+    fs.mkdirSync(configDir, { recursive: true });
+    const result = opencode.install('global', { autoAllow: true });
+    expect(result.files[0].action).toBe('created');
+    // Must land under ~/.config/opencode, not %APPDATA%/opencode.
+    const normalised = result.files[0].path.replace(/\\/g, '/');
+    expect(normalised).toContain('.config/opencode');
+    expect(normalised).not.toMatch(/appdata-[^/]*\/opencode\/opencode\.jsonc$/);
+    fs.rmSync(tmpRoaming, { recursive: true, force: true });
+  });
+
+  it.runIf(process.platform === 'win32')('opencode: falls back to %APPDATA% when ~/.config/opencode/ does not exist (#535)', () => {
+    const opencode = getTarget('opencode')!;
+    // When ~/.config/opencode/ is absent on Windows, globalConfigDir()
+    // must fall back to %APPDATA%/opencode/ (legacy layout).
+    const tmpRoaming = fs.mkdtempSync(path.join(os.tmpdir(), 'appdata-'));
+    process.env.APPDATA = tmpRoaming;
+    // Explicitly do NOT create ~/.config/opencode — simulates a user
+    // who has never used the XDG-style path.
+    const result = opencode.install('global', { autoAllow: true });
+    expect(result.files[0].action).toBe('created');
+    const normalised = result.files[0].path.replace(/\\/g, '/');
+    const normalisedRoaming = tmpRoaming.replace(/\\/g, '/');
+    expect(normalised).toContain(normalisedRoaming);
+    expect(normalised).not.toContain('.config');
+    fs.rmSync(tmpRoaming, { recursive: true, force: true });
+  });
+
   it('gemini: install writes settings.json (mcpServers.codegraph) and no GEMINI.md (#529)', () => {
     const gemini = getTarget('gemini')!;
     const result = gemini.install('global', { autoAllow: true });

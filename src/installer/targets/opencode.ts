@@ -2,7 +2,8 @@
  * opencode target.
  *
  *   - MCP server entry to `~/.config/opencode/opencode.jsonc` (global,
- *     XDG-style; `%APPDATA%/opencode/opencode.jsonc` on Windows) or
+ *     XDG-style; on Windows, `%APPDATA%/opencode/opencode.jsonc` when
+ *     `~/.config/opencode/` doesn't exist) or
  *     `./opencode.jsonc` (local). Falls back to `opencode.json` when a
  *     `.json` file already exists; defaults new installs to `.jsonc`
  *     because that's what opencode itself creates on first run.
@@ -49,6 +50,10 @@ import {
 
 function globalConfigDir(): string {
   if (process.platform === 'win32') {
+    // opencode itself prefers ~/.config/opencode/ when it exists on
+    // Windows, matching its POSIX behaviour (issue #535).
+    const xdgCandidate = path.join(os.homedir(), '.config', 'opencode');
+    if (fs.existsSync(xdgCandidate)) return xdgCandidate;
     const appData = process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming');
     return path.join(appData, 'opencode');
   }
