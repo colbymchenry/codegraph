@@ -3918,6 +3918,32 @@ export default {
     expect(calls).toHaveLength(2);
   });
 
+  it('should extract component usages from the Vue template (PascalCase + kebab, skipping built-ins) (#629)', () => {
+    const code = `<template>
+  <div class="wrap">
+    <UserCard :user="u" />
+    <my-button>Click</my-button>
+    <Transition><span>x</span></Transition>
+  </div>
+</template>
+
+<script setup lang="ts">
+import UserCard from './UserCard.vue';
+import MyButton from './MyButton.vue';
+</script>
+`;
+    const result = extractFromSource('Host.vue', code);
+    const refs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'references')
+      .map((r) => r.referenceName);
+
+    expect(refs).toContain('UserCard'); // PascalCase tag
+    expect(refs).toContain('MyButton'); // kebab <my-button> → MyButton
+    expect(refs).not.toContain('Transition'); // Vue built-in skipped
+    expect(refs).not.toContain('Div'); // native HTML element skipped
+    expect(refs).not.toContain('Span');
+  });
+
   it('should extract from both <script> and <script setup> blocks', () => {
     const code = `<template>
   <div>{{ msg }}</div>

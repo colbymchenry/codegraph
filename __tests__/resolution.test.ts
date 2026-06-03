@@ -1389,6 +1389,37 @@ func main() {
       const callers = cg.getCallers(runNode!.id);
       expect(callers.some((c) => c.node.filePath === 'src/App.vue')).toBe(true);
     });
+
+    it('follows a Vue component used in a <template> through a default re-export barrel (#629)', async () => {
+      // End-to-end Vue analogue of the Svelte case: the leaf is a `.vue`
+      // component re-exported under an alias (`Thing`) that differs from its
+      // real name (`Widget`), and the consumer uses it ONLY in markup
+      // (`<Thing />`). Requires both the new template-tag extraction AND the
+      // barrel default-export chase to connect the edge.
+      fs.mkdirSync(path.join(tempDir, 'src/lib'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src/lib/Widget.vue'),
+        `<script setup lang="ts">\ndefineProps<{ label?: string }>();\n</script>\n<template><button>x</button></template>\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/lib/index.ts'),
+        `export { default as Thing } from './Widget.vue';\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/App.vue'),
+        `<script setup lang="ts">\nimport { Thing } from './lib';\n</script>\n<template>\n  <Thing />\n</template>\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const widgetNode = cg
+        .getNodesByKind('component')
+        .find((n) => n.name === 'Widget' && n.filePath === 'src/lib/Widget.vue');
+      expect(widgetNode).toBeDefined();
+      const callers = cg.getCallers(widgetNode!.id);
+      expect(callers.some((c) => c.node.filePath === 'src/App.vue')).toBe(true);
+    });
   });
 
   describe('C/C++ Import Resolution', () => {
