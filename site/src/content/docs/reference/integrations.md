@@ -12,6 +12,9 @@ The interactive installer auto-detects and configures each supported agent — w
 - **Codex CLI**
 - **opencode**
 - **Hermes Agent**
+- **Gemini CLI**
+- **Antigravity IDE**
+- **Kiro**
 
 Run `npx @colbymchenry/codegraph` and pick your agent(s); see [Installation](/codegraph/getting-started/installation/) for the non-interactive flags.
 

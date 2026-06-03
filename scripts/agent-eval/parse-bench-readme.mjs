@@ -16,7 +16,7 @@ const REPOS = ['vscode', 'excalidraw', 'django', 'tokio', 'okhttp', 'gin', 'alam
 function parse(file) {
   if (!existsSync(file)) return null;
   const L = readFileSync(file, 'utf8').split('\n').filter(Boolean);
-  let tools = 0, reads = 0, grep = 0, cg = 0, tokens = 0, r = null;
+  let tools = 0, reads = 0, grep = 0, cg = 0, tokens = 0, r = null, raced = false;
   for (const l of L) { let e; try { e = JSON.parse(l); } catch { continue; }
     if (e.type === 'assistant') {
       const u = e.message?.usage;
@@ -30,10 +30,21 @@ function parse(file) {
         else if (/codegraph/.test(n)) cg++;
       }
     }
+    // MCP cold-start race: the headless agent fired before `codegraph serve --mcp`
+    // finished registering its tools, so early calls returned "No such tool
+    // available" and the agent floundered into grep/Read. That measures CodeGraph's
+    // startup latency, NOT its steady-state value — flag the run so the aggregate
+    // can exclude it (an artifact of headless first-turn timing, not the tool).
+    if (e.type === 'user') for (const b of (Array.isArray(e.message?.content) ? e.message.content : [])) {
+      if (b.type === 'tool_result') {
+        const t = Array.isArray(b.content) ? b.content.map(c => c.text || '').join('') : (b.content || '');
+        if (/No such tool available/.test(t)) raced = true;
+      }
+    }
     if (e.type === 'result') r = e;
   }
   if (!r || r.subtype !== 'success') return null;
-  return { dur: r.duration_ms / 1000, tools, reads, grep, cg, tokens, cost: r.total_cost_usd || 0 };
+  return { dur: r.duration_ms / 1000, tools, reads, grep, cg, tokens, cost: r.total_cost_usd || 0, raced };
 }
 const median = (arr) => { const v = [...arr].sort((a, b) => a - b); const n = v.length; return n === 0 ? 0 : n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2; };
 const fmtTime = (s) => s >= 60 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : `${Math.round(s)}s`;
@@ -45,9 +56,14 @@ const savings = { cost: [], tokens: [], time: [], tools: [] };
 for (const repo of REPOS) {
   const dir = join(ROOT, repo);
   const runDirs = existsSync(dir) ? readdirSync(dir).filter(d => /^run\d+$/.test(d)) : [];
-  const W = [], WO = [];
+  // Exclude MCP-cold-start-raced WITH runs by default — they measure a startup
+  // race, not steady-state value. `CG_INCLUDE_RACED=1` keeps them (to see the raw
+  // distribution). The WITHOUT arm has no MCP, so it's never raced.
+  const includeRaced = process.env.CG_INCLUDE_RACED === '1';
+  const W = [], WO = []; let racedExcluded = 0;
   for (const rd of runDirs) {
-    const w = parse(join(dir, rd, 'run-headless-with.jsonl')); if (w) W.push(w);
+    const w = parse(join(dir, rd, 'run-headless-with.jsonl'));
+    if (w) { if (w.raced && !includeRaced) racedExcluded++; else W.push(w); }
     const wo = parse(join(dir, rd, 'run-headless-without.jsonl')); if (wo) WO.push(wo);
   }
   if (!W.length || !WO.length) { console.log(`${repo.padEnd(11)} (incomplete: w=${W.length} wo=${WO.length})`); continue; }
@@ -60,7 +76,8 @@ for (const repo of REPOS) {
     `${(fmtTime(wT) + '→' + fmtTime(woT)).padEnd(22)}` +
     `${(Math.round(wTl) + '→' + Math.round(woTl)).padEnd(12)}` +
     `${(fmtTok(wTok) + '→' + fmtTok(woTok) + ' (' + pct(wTok, woTok) + '%)').padEnd(24)}` +
-    `$${wC.toFixed(2)}→$${woC.toFixed(2)} (${pct(wC, woC)}%)`
+    `$${wC.toFixed(2)}→$${woC.toFixed(2)} (${pct(wC, woC)}%)` +
+    (racedExcluded ? `  [${racedExcluded} raced run${racedExcluded === 1 ? '' : 's'} excluded]` : '')
   );
 }
 const avg = (a) => a.length ? Math.round(a.reduce((s, x) => s + x, 0) / a.length) : 0;

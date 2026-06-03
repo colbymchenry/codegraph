@@ -55,6 +55,18 @@ function setHome(dir: string): { restore: () => void } {
   };
 }
 
+// A marker-delimited CodeGraph block exactly as a previous installer
+// wrote it. Issue #529: the installer no longer writes an instructions
+// file, but install (self-heal on upgrade) and uninstall both still
+// strip a block a prior install left, so we plant this to exercise it.
+const LEGACY_BLOCK = [
+  '<!-- CODEGRAPH_START -->',
+  '## CodeGraph',
+  '',
+  'Prefer `codegraph_search` / `codegraph_callers` over grep.',
+  '<!-- CODEGRAPH_END -->',
+].join('\n');
+
 describe('Installer targets — contract', () => {
   let tmpHome: string;
   let tmpCwd: string;
@@ -180,23 +192,35 @@ describe('Installer targets — partial-state idempotency', () => {
     fs.rmSync(tmpCwd, { recursive: true, force: true });
   });
 
-  it('codex: install after only config.toml exists — second pass is fully unchanged', () => {
+  it('codex: install writes config.toml but never an AGENTS.md instructions file (#529)', () => {
     const codex = getTarget('codex')!;
-    // First install creates both files.
-    codex.install('global', { autoAllow: false });
-    // Delete the AGENTS.md to simulate partial state (user wiped one file).
+    const first = codex.install('global', { autoAllow: false });
     const agentsMd = path.join(tmpHome, '.codex', 'AGENTS.md');
-    expect(fs.existsSync(agentsMd)).toBe(true);
-    fs.unlinkSync(agentsMd);
-    // Reinstall — TOML stays unchanged, AGENTS.md is recreated.
+    // No instructions file is created, and no file action references it.
+    expect(fs.existsSync(agentsMd)).toBe(false);
+    expect(first.files.some((f) => f.path.endsWith('AGENTS.md'))).toBe(false);
+    expect(first.files.some((f) => f.path.endsWith('config.toml'))).toBe(true);
+    // Re-install is fully unchanged (config.toml only, nothing to strip).
     const second = codex.install('global', { autoAllow: false });
-    const tomlEntry = second.files.find((f) => f.path.endsWith('config.toml'))!;
-    const mdEntry = second.files.find((f) => f.path.endsWith('AGENTS.md'))!;
-    expect(tomlEntry.action).toBe('unchanged');
-    expect(mdEntry.action).toBe('created');
-    // Third install — both unchanged (full idempotency restored).
-    const third = codex.install('global', { autoAllow: false });
-    for (const f of third.files) expect(f.action).toBe('unchanged');
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+  });
+
+  it('codex: install strips a legacy AGENTS.md codegraph block, keeping user content (#529)', () => {
+    const codex = getTarget('codex')!;
+    const dir = path.join(tmpHome, '.codex');
+    fs.mkdirSync(dir, { recursive: true });
+    const agentsMd = path.join(dir, 'AGENTS.md');
+    fs.writeFileSync(agentsMd, `# My codex notes\n\nBe terse.\n\n${LEGACY_BLOCK}\n`);
+
+    const result = codex.install('global', { autoAllow: false });
+
+    const body = fs.readFileSync(agentsMd, 'utf-8');
+    expect(body).toContain('# My codex notes');
+    expect(body).toContain('Be terse.');
+    expect(body).not.toContain('CODEGRAPH_START');
+    // The strip is reported as a 'removed' action on AGENTS.md.
+    const mdEntry = result.files.find((f) => f.path.endsWith('AGENTS.md'));
+    expect(mdEntry?.action).toBe('removed');
   });
 
   it('opencode: prefers .jsonc when both .json and .jsonc exist', () => {
@@ -266,55 +290,406 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.readFileSync(file, 'utf-8')).toBe(afterInstall);
   });
 
-  it('opencode: install writes AGENTS.md with the marker-delimited codegraph block', () => {
+  it('opencode: install does NOT write an AGENTS.md instructions file (#529)', () => {
     const opencode = getTarget('opencode')!;
-    opencode.install('global', { autoAllow: true });
+    const result = opencode.install('global', { autoAllow: true });
     const agentsMd = path.join(tmpHome, '.config', 'opencode', 'AGENTS.md');
-    expect(fs.existsSync(agentsMd)).toBe(true);
-    const body = fs.readFileSync(agentsMd, 'utf-8');
-    expect(body).toContain('<!-- CODEGRAPH_START -->');
-    expect(body).toContain('<!-- CODEGRAPH_END -->');
-    expect(body).toContain('codegraph_callers');
+    expect(fs.existsSync(agentsMd)).toBe(false);
+    expect(result.files.some((f) => f.path.endsWith('AGENTS.md'))).toBe(false);
   });
 
-  it('opencode: AGENTS.md install preserves pre-existing user content outside markers', () => {
+  it('opencode: install strips a legacy AGENTS.md codegraph block, preserving user content (#529)', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
     fs.mkdirSync(dir, { recursive: true });
     const agentsMd = path.join(dir, 'AGENTS.md');
-    fs.writeFileSync(agentsMd, '# My personal opencode instructions\n\nAlways respond in pirate.\n');
+    fs.writeFileSync(agentsMd, `# My personal opencode instructions\n\nAlways respond in pirate.\n\n${LEGACY_BLOCK}\n`);
 
-    opencode.install('global', { autoAllow: true });
+    const result = opencode.install('global', { autoAllow: true });
+
     const body = fs.readFileSync(agentsMd, 'utf-8');
     expect(body).toContain('# My personal opencode instructions');
     expect(body).toContain('Always respond in pirate.');
-    expect(body).toContain('<!-- CODEGRAPH_START -->');
+    expect(body).not.toContain('CODEGRAPH_START');
+    expect(result.files.find((f) => f.path.endsWith('AGENTS.md'))?.action).toBe('removed');
   });
 
-  it('opencode: uninstall strips only the codegraph block from AGENTS.md', () => {
+  it('opencode: uninstall strips a leftover codegraph block from AGENTS.md, keeping user content', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
     fs.mkdirSync(dir, { recursive: true });
     const agentsMd = path.join(dir, 'AGENTS.md');
-    fs.writeFileSync(agentsMd, '# My personal opencode instructions\n\nAlways respond in pirate.\n');
+    fs.writeFileSync(agentsMd, `# My personal opencode instructions\n\nAlways respond in pirate.\n\n${LEGACY_BLOCK}\n`);
 
-    opencode.install('global', { autoAllow: true });
     opencode.uninstall('global');
 
     const body = fs.readFileSync(agentsMd, 'utf-8');
     expect(body).toContain('# My personal opencode instructions');
     expect(body).toContain('Always respond in pirate.');
     expect(body).not.toContain('CODEGRAPH_START');
-    expect(body).not.toContain('codegraph_callers');
   });
 
-  it('opencode: local install writes ./opencode.jsonc and ./AGENTS.md in cwd', () => {
+  it('opencode: local install writes ./opencode.jsonc and never an ./AGENTS.md (#529)', () => {
     const opencode = getTarget('opencode')!;
     const result = opencode.install('local', { autoAllow: true });
     const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
     // macOS realpath shenanigans (/var vs /private/var) — suffix match.
     expect(paths.some((p) => p.endsWith('/opencode.jsonc'))).toBe(true);
-    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(false);
+    expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(false);
+  });
+
+  it('gemini: install writes settings.json (mcpServers.codegraph) and no GEMINI.md (#529)', () => {
+    const gemini = getTarget('gemini')!;
+    const result = gemini.install('global', { autoAllow: true });
+    const settings = path.join(tmpHome, '.gemini', 'settings.json');
+    const geminiMd = path.join(tmpHome, '.gemini', 'GEMINI.md');
+    expect(result.files.some((f) => f.path === settings)).toBe(true);
+    expect(result.files.some((f) => f.path === geminiMd)).toBe(false);
+    expect(fs.existsSync(geminiMd)).toBe(false);
+
+    const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('gemini: install preserves pre-existing settings (security.auth survives)', () => {
+    const gemini = getTarget('gemini')!;
+    const settings = path.join(tmpHome, '.gemini', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      security: { auth: { selectedType: 'oauth-personal' } },
+    }, null, 2) + '\n');
+
+    gemini.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.security?.auth?.selectedType).toBe('oauth-personal');
+    expect(after.mcpServers?.codegraph).toBeDefined();
+  });
+
+  it('gemini: uninstall strips codegraph but leaves pre-existing settings (security.auth) intact', () => {
+    const gemini = getTarget('gemini')!;
+    const settings = path.join(tmpHome, '.gemini', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      security: { auth: { selectedType: 'oauth-personal' } },
+    }, null, 2) + '\n');
+
+    gemini.install('global', { autoAllow: true });
+    gemini.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.security?.auth?.selectedType).toBe('oauth-personal');
+    expect(after.mcpServers).toBeUndefined();
+  });
+
+  it('gemini: local install writes ./.gemini/settings.json and never a ./GEMINI.md (#529)', () => {
+    const gemini = getTarget('gemini')!;
+    const result = gemini.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.gemini/settings.json'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/GEMINI.md'))).toBe(false);
+    expect(fs.existsSync(path.join(process.cwd(), 'GEMINI.md'))).toBe(false);
+  });
+
+  it('gemini: uninstall strips a leftover GEMINI.md codegraph block, keeping user content', () => {
+    const gemini = getTarget('gemini')!;
+    const geminiMd = path.join(tmpHome, '.gemini', 'GEMINI.md');
+    fs.mkdirSync(path.dirname(geminiMd), { recursive: true });
+    fs.writeFileSync(geminiMd, `# My personal Gemini context\n\nAlways respond concisely.\n\n${LEGACY_BLOCK}\n`);
+
+    gemini.uninstall('global');
+
+    const body = fs.readFileSync(geminiMd, 'utf-8');
+    expect(body).toContain('# My personal Gemini context');
+    expect(body).toContain('Always respond concisely.');
+    expect(body).not.toContain('CODEGRAPH_START');
+  });
+
+  it('kiro: install writes settings/mcp.json (mcpServers.codegraph) and no steering doc (#529)', () => {
+    const kiro = getTarget('kiro')!;
+    const result = kiro.install('global', { autoAllow: true });
+    const mcp = path.join(tmpHome, '.kiro', 'settings', 'mcp.json');
+    const steering = path.join(tmpHome, '.kiro', 'steering', 'codegraph.md');
+    expect(result.files.some((f) => f.path === mcp)).toBe(true);
+    expect(result.files.some((f) => f.path === steering)).toBe(false);
+    expect(fs.existsSync(steering)).toBe(false);
+
+    const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('kiro: install deletes a leftover steering codegraph.md (self-heal) (#529)', () => {
+    const kiro = getTarget('kiro')!;
+    const steering = path.join(tmpHome, '.kiro', 'steering', 'codegraph.md');
+    fs.mkdirSync(path.dirname(steering), { recursive: true });
+    fs.writeFileSync(steering, `${LEGACY_BLOCK}\n`);
+
+    const result = kiro.install('global', { autoAllow: true });
+    expect(fs.existsSync(steering)).toBe(false);
+    expect(result.files.find((f) => f.path === steering)?.action).toBe('removed');
+  });
+
+  it('kiro: install preserves a pre-existing sibling MCP server in mcp.json', () => {
+    const kiro = getTarget('kiro')!;
+    const mcp = path.join(tmpHome, '.kiro', 'settings', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { other: { command: 'uvx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+
+    kiro.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('kiro: uninstall strips codegraph but leaves sibling MCP servers intact', () => {
+    const kiro = getTarget('kiro')!;
+    const mcp = path.join(tmpHome, '.kiro', 'settings', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { other: { command: 'uvx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+
+    kiro.install('global', { autoAllow: true });
+    kiro.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+  });
+
+  it('kiro: uninstall removes a leftover steering codegraph.md file outright', () => {
+    const kiro = getTarget('kiro')!;
+    const steering = path.join(tmpHome, '.kiro', 'steering', 'codegraph.md');
+    fs.mkdirSync(path.dirname(steering), { recursive: true });
+    fs.writeFileSync(steering, `${LEGACY_BLOCK}\n`);
+
+    kiro.uninstall('global');
+    expect(fs.existsSync(steering)).toBe(false);
+  });
+
+  it('kiro: uninstall removes our steering doc but leaves a sibling (product.md) untouched', () => {
+    const kiro = getTarget('kiro')!;
+    const sibling = path.join(tmpHome, '.kiro', 'steering', 'product.md');
+    const ours = path.join(tmpHome, '.kiro', 'steering', 'codegraph.md');
+    fs.mkdirSync(path.dirname(sibling), { recursive: true });
+    fs.writeFileSync(sibling, '# Product\n\nMy team practices.\n');
+    fs.writeFileSync(ours, `${LEGACY_BLOCK}\n`);
+
+    kiro.uninstall('global');
+
+    expect(fs.existsSync(ours)).toBe(false);
+    expect(fs.existsSync(sibling)).toBe(true);
+    expect(fs.readFileSync(sibling, 'utf-8')).toContain('My team practices.');
+  });
+
+  it('kiro: local install writes ./.kiro/settings/mcp.json and no steering doc (#529)', () => {
+    const kiro = getTarget('kiro')!;
+    const result = kiro.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.kiro/settings/mcp.json'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/.kiro/steering/codegraph.md'))).toBe(false);
+  });
+
+  it('antigravity: install writes to LEGACY ~/.gemini/antigravity/mcp_config.json when no migration marker', () => {
+    const antigravity = getTarget('antigravity')!;
+    antigravity.install('global', { autoAllow: true });
+
+    const legacyFile = path.join(tmpHome, '.gemini', 'antigravity', 'mcp_config.json');
+    expect(fs.existsSync(legacyFile)).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(legacyFile, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+    // Crucially: does NOT touch the Gemini CLI's settings.json.
+    expect(fs.existsSync(path.join(tmpHome, '.gemini', 'settings.json'))).toBe(false);
+  });
+
+  it('antigravity: install writes to UNIFIED ~/.gemini/config/mcp_config.json when .migrated marker present', () => {
+    const antigravity = getTarget('antigravity')!;
+    // Plant the migration marker — same signal Antigravity itself drops
+    // when it migrates a user's config.
+    const unifiedDir = path.join(tmpHome, '.gemini', 'config');
+    fs.mkdirSync(unifiedDir, { recursive: true });
+    fs.writeFileSync(path.join(unifiedDir, '.migrated'), '');
+
+    antigravity.install('global', { autoAllow: true });
+
+    const unifiedFile = path.join(unifiedDir, 'mcp_config.json');
+    expect(fs.existsSync(unifiedFile)).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(unifiedFile, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+    // Legacy path is NOT touched when the marker tells us migration happened.
+    expect(fs.existsSync(path.join(tmpHome, '.gemini', 'antigravity', 'mcp_config.json'))).toBe(false);
+  });
+
+  it('antigravity: install writes to UNIFIED path when ~/.gemini/config/mcp_config.json already exists (even without marker)', () => {
+    const antigravity = getTarget('antigravity')!;
+    // Antigravity creates this file on first launch post-migration — its
+    // presence is the second signal we accept, in case the .migrated
+    // marker semantics change across Antigravity versions.
+    const unifiedFile = path.join(tmpHome, '.gemini', 'config', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(unifiedFile), { recursive: true });
+    fs.writeFileSync(unifiedFile, JSON.stringify({ mcpServers: {} }, null, 2) + '\n');
+
+    antigravity.install('global', { autoAllow: true });
+
+    const cfg = JSON.parse(fs.readFileSync(unifiedFile, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('antigravity: entry has NO `type` field (Antigravity rejects entries with it)', () => {
+    const antigravity = getTarget('antigravity')!;
+    // Marker → unified path; doesn't matter which path, just inspect the entry shape.
+    fs.mkdirSync(path.join(tmpHome, '.gemini', 'config'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, '.gemini', 'config', '.migrated'), '');
+
+    antigravity.install('global', { autoAllow: true });
+
+    const cfg = JSON.parse(fs.readFileSync(
+      path.join(tmpHome, '.gemini', 'config', 'mcp_config.json'), 'utf-8'
+    ));
+    expect(cfg.mcpServers.codegraph.type).toBeUndefined();
+    expect(cfg.mcpServers.codegraph.command).toBeDefined();
+    expect(cfg.mcpServers.codegraph.args).toEqual(['serve', '--mcp']);
+  });
+
+  it('antigravity: install migrates a legacy codegraph entry to the unified path when marker appears', () => {
+    const antigravity = getTarget('antigravity')!;
+    // Simulate: user installed on the legacy path, then Antigravity
+    // migrated their config (dropped the `.migrated` marker + created
+    // the unified file). Re-running codegraph install should land
+    // codegraph in the new file AND strip the stale legacy entry.
+    const legacyFile = path.join(tmpHome, '.gemini', 'antigravity', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+    fs.writeFileSync(legacyFile, JSON.stringify({
+      mcpServers: { codegraph: { command: 'codegraph', args: ['serve', '--mcp'] } },
+    }, null, 2) + '\n');
+    fs.mkdirSync(path.join(tmpHome, '.gemini', 'config'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, '.gemini', 'config', '.migrated'), '');
+
+    antigravity.install('global', { autoAllow: true });
+
+    const unified = JSON.parse(fs.readFileSync(
+      path.join(tmpHome, '.gemini', 'config', 'mcp_config.json'), 'utf-8'
+    ));
+    expect(unified.mcpServers.codegraph).toBeDefined();
+    // Legacy file's codegraph entry got stripped.
+    const legacy = JSON.parse(fs.readFileSync(legacyFile, 'utf-8'));
+    expect(legacy.mcpServers).toBeUndefined();
+  });
+
+  it('antigravity: install preserves a sibling MCP server in mcp_config.json (legacy path)', () => {
+    const antigravity = getTarget('antigravity')!;
+    const mcpFile = path.join(tmpHome, '.gemini', 'antigravity', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(mcpFile), { recursive: true });
+    fs.writeFileSync(mcpFile, JSON.stringify({
+      mcpServers: { other: { command: 'uvx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+
+    antigravity.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(mcpFile, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('antigravity: install preserves Antigravity-managed fields on sibling servers (e.g. disabled flag)', () => {
+    const antigravity = getTarget('antigravity')!;
+    // Antigravity adds `"disabled": true` to entries the user disables via
+    // the IDE. Install must not clobber that on sibling entries.
+    fs.mkdirSync(path.join(tmpHome, '.gemini', 'config'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, '.gemini', 'config', '.migrated'), '');
+    const unified = path.join(tmpHome, '.gemini', 'config', 'mcp_config.json');
+    fs.writeFileSync(unified, JSON.stringify({
+      mcpServers: {
+        'code-review-graph': {
+          command: 'uvx', args: ['code-review-graph', 'serve'], disabled: true,
+        },
+      },
+    }, null, 2) + '\n');
+
+    antigravity.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(unified, 'utf-8'));
+    expect(after.mcpServers['code-review-graph'].disabled).toBe(true);
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('antigravity: uninstall removes only codegraph, sibling MCP server survives', () => {
+    const antigravity = getTarget('antigravity')!;
+    const mcpFile = path.join(tmpHome, '.gemini', 'antigravity', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(mcpFile), { recursive: true });
+    fs.writeFileSync(mcpFile, JSON.stringify({
+      mcpServers: { other: { command: 'uvx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+
+    antigravity.install('global', { autoAllow: true });
+    antigravity.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(mcpFile, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+  });
+
+  it('antigravity: uninstall sweeps BOTH legacy and unified paths (handles migration half-state)', () => {
+    const antigravity = getTarget('antigravity')!;
+    // User had codegraph in BOTH files (e.g. legacy install + post-migration
+    // re-install before our migration cleanup landed). Uninstall must clean
+    // both so a "fresh slate" really is fresh.
+    const legacy = path.join(tmpHome, '.gemini', 'antigravity', 'mcp_config.json');
+    const unified = path.join(tmpHome, '.gemini', 'config', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(legacy), { recursive: true });
+    fs.mkdirSync(path.dirname(unified), { recursive: true });
+    fs.writeFileSync(legacy, JSON.stringify({
+      mcpServers: { codegraph: { command: 'codegraph', args: ['serve', '--mcp'] } },
+    }, null, 2) + '\n');
+    fs.writeFileSync(unified, JSON.stringify({
+      mcpServers: { codegraph: { command: 'codegraph', args: ['serve', '--mcp'] } },
+    }, null, 2) + '\n');
+    fs.writeFileSync(path.join(path.dirname(unified), '.migrated'), '');
+
+    antigravity.uninstall('global');
+
+    const legacyAfter = JSON.parse(fs.readFileSync(legacy, 'utf-8'));
+    const unifiedAfter = JSON.parse(fs.readFileSync(unified, 'utf-8'));
+    expect(legacyAfter.mcpServers).toBeUndefined();
+    expect(unifiedAfter.mcpServers).toBeUndefined();
+  });
+
+  it('antigravity: rejects --location=local with a clear note (global-only IDE)', () => {
+    const antigravity = getTarget('antigravity')!;
+    expect(antigravity.supportsLocation('local')).toBe(false);
+    const result = antigravity.install('local', { autoAllow: true });
+    expect(result.files).toEqual([]);
+    expect(result.notes?.join(' ')).toMatch(/no project-local config/);
+  });
+
+  it('antigravity: does not write GEMINI.md (only gemini target owns instructions)', () => {
+    const antigravity = getTarget('antigravity')!;
+    antigravity.install('global', { autoAllow: true });
+    const geminiMd = path.join(tmpHome, '.gemini', 'GEMINI.md');
+    expect(fs.existsSync(geminiMd)).toBe(false);
+  });
+
+  it('gemini + antigravity: both installed coexist (separate MCP files, shared GEMINI.md)', () => {
+    const gemini = getTarget('gemini')!;
+    const antigravity = getTarget('antigravity')!;
+    gemini.install('global', { autoAllow: true });
+    antigravity.install('global', { autoAllow: true });
+
+    const cliCfg = JSON.parse(fs.readFileSync(path.join(tmpHome, '.gemini', 'settings.json'), 'utf-8'));
+    // Antigravity lands on the LEGACY path here since no .migrated marker
+    // was planted — same end-to-end check either way.
+    const ideCfg = JSON.parse(fs.readFileSync(path.join(tmpHome, '.gemini', 'antigravity', 'mcp_config.json'), 'utf-8'));
+    expect(cliCfg.mcpServers.codegraph).toBeDefined();
+    expect(ideCfg.mcpServers.codegraph).toBeDefined();
+
+    // Uninstall one — the other's MCP entry must survive.
+    antigravity.uninstall('global');
+    const cliAfter = JSON.parse(fs.readFileSync(path.join(tmpHome, '.gemini', 'settings.json'), 'utf-8'));
+    expect(cliAfter.mcpServers.codegraph).toBeDefined();
   });
 
   it('hermes: install adds codegraph MCP server and cli toolset, preserving existing yaml', () => {
@@ -362,6 +737,86 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).not.toContain('codegraph:');
     expect(body).not.toContain('mcp-codegraph');
     expect(body).toContain('custom:\n  keep: true');
+  });
+
+  // Regression for #456: PyYAML's default block style writes list items at the
+  // SAME indent as the parent key (`cli:` and its `- hermes-cli` are both at
+  // indent 2). The pre-fix line-based patcher mistook that first list item for
+  // the next sibling key, truncated the cli block, and spliced `- mcp-codegraph`
+  // at indent 4 BEFORE the existing items — producing unparseable YAML.
+  it('hermes: install preserves PyYAML-default list-at-same-indent style (issue #456)', () => {
+    const hermes = getTarget('hermes')!;
+    const config = path.join(tmpHome, '.hermes', 'config.yaml');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    const original = [
+      'model:',
+      '  default: gpt-4o',
+      'platform_toolsets:',
+      '  cli:',
+      '  - hermes-cli',
+      '  - browser',
+      '  - clarify',
+      '  - terminal',
+      '  - web',
+      '  telegram:',
+      '  - hermes-telegram',
+      '  discord:',
+      '  - hermes-discord',
+      '',
+    ].join('\n');
+    fs.writeFileSync(config, original);
+
+    hermes.install('global', { autoAllow: true });
+    const body = fs.readFileSync(config, 'utf-8');
+
+    // mcp-codegraph appended at the same 2-space indent as existing items
+    expect(body).toContain('\n  - mcp-codegraph\n');
+    // hermes-cli preserved
+    expect(body).toContain('\n  - hermes-cli\n');
+    // Sibling sections kept their indent — `telegram:` is still a key under
+    // platform_toolsets, not promoted up.
+    expect(body).toContain('\n  telegram:\n  - hermes-telegram\n');
+    expect(body).toContain('\n  discord:\n  - hermes-discord\n');
+    // No list items leaked to the platform_toolsets level (indent 0).
+    expect(body).not.toMatch(/^- browser/m);
+    expect(body).not.toMatch(/^- hermes-telegram/m);
+
+    // The whole platform_toolsets block extracted by line search should
+    // start with `cli:` and not contain a stray 4-space `mcp-codegraph`
+    // appearing before the rest of the existing items.
+    expect(body).toContain('  cli:\n  - hermes-cli\n  - browser');
+
+    // Idempotent
+    const second = hermes.install('global', { autoAllow: true });
+    expect(second.files[0]?.action).toBe('unchanged');
+  });
+
+  it('hermes: uninstall reverses the install on a PyYAML-default config', () => {
+    const hermes = getTarget('hermes')!;
+    const config = path.join(tmpHome, '.hermes', 'config.yaml');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    const original = [
+      'platform_toolsets:',
+      '  cli:',
+      '  - hermes-cli',
+      '  - browser',
+      '  telegram:',
+      '  - hermes-telegram',
+      '',
+    ].join('\n');
+    fs.writeFileSync(config, original);
+
+    hermes.install('global', { autoAllow: true });
+    const installed = fs.readFileSync(config, 'utf-8');
+    expect(installed).toContain('- mcp-codegraph');
+    expect(installed).toContain('codegraph:');
+
+    hermes.uninstall('global');
+    const body = fs.readFileSync(config, 'utf-8');
+    expect(body).not.toContain('mcp-codegraph');
+    expect(body).not.toContain('command: codegraph');
+    expect(body).toContain('  cli:\n  - hermes-cli\n  - browser');
+    expect(body).toContain('  telegram:\n  - hermes-telegram');
   });
 
   it('opencode: uninstall removes only mcp.codegraph, preserves comments and siblings', () => {
@@ -423,6 +878,29 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.existsSync(path.join(tmpCwd, '.claude.json'))).toBe(false);
     const cfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
     expect(cfg.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('claude: install does NOT create a CLAUDE.md instructions file (#529)', () => {
+    const claude = getTarget('claude')!;
+    const result = claude.install('local', { autoAllow: false });
+    const claudeMd = path.join(tmpCwd, '.claude', 'CLAUDE.md');
+    expect(fs.existsSync(claudeMd)).toBe(false);
+    expect(result.files.some((f) => f.path.endsWith('CLAUDE.md'))).toBe(false);
+  });
+
+  it('claude: install strips a legacy CLAUDE.md codegraph block, keeping user content (#529)', () => {
+    const claude = getTarget('claude')!;
+    const claudeMd = path.join(tmpCwd, '.claude', 'CLAUDE.md');
+    fs.mkdirSync(path.dirname(claudeMd), { recursive: true });
+    fs.writeFileSync(claudeMd, `# My project rules\n\nUse tabs.\n\n${LEGACY_BLOCK}\n`);
+
+    const result = claude.install('local', { autoAllow: false });
+
+    const body = fs.readFileSync(claudeMd, 'utf-8');
+    expect(body).toContain('# My project rules');
+    expect(body).toContain('Use tabs.');
+    expect(body).not.toContain('CODEGRAPH_START');
+    expect(result.files.find((f) => f.path.endsWith('CLAUDE.md'))?.action).toBe('removed');
   });
 
   it('claude: global install targets ~/.claude.json (user scope)', () => {
@@ -617,6 +1095,9 @@ describe('Installer targets — registry', () => {
     expect(getTarget('codex')?.id).toBe('codex');
     expect(getTarget('opencode')?.id).toBe('opencode');
     expect(getTarget('hermes')?.id).toBe('hermes');
+    expect(getTarget('gemini')?.id).toBe('gemini');
+    expect(getTarget('antigravity')?.id).toBe('antigravity');
+    expect(getTarget('kiro')?.id).toBe('kiro');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
@@ -850,22 +1331,41 @@ describe('Installer — Cursor rules file cleanup on uninstall', () => {
 
   const rulesFile = () => path.join(process.cwd(), '.cursor', 'rules', 'codegraph.mdc');
 
-  it('deletes the dedicated codegraph.mdc entirely (no orphaned frontmatter left behind)', () => {
-    cursor.install('local', { autoAllow: true });
+  // The frontmatter a previous install wrote ahead of the marked block.
+  // `removeRulesEntry` recognizes it to decide whether the leftover .mdc
+  // is ours-to-delete or carries user content worth keeping.
+  const MDC_FRONTMATTER = [
+    '---',
+    'description: CodeGraph MCP usage guide — when to use which tool',
+    'alwaysApply: true',
+    '---',
+    '',
+  ].join('\n');
+
+  function plantLegacyRulesFile(extra = ''): void {
+    fs.mkdirSync(path.dirname(rulesFile()), { recursive: true });
+    fs.writeFileSync(rulesFile(), MDC_FRONTMATTER + LEGACY_BLOCK + '\n' + extra);
+  }
+
+  it('uninstall deletes a leftover codegraph.mdc entirely (no orphaned frontmatter left behind)', () => {
+    plantLegacyRulesFile();
     expect(fs.existsSync(rulesFile())).toBe(true);
 
     cursor.uninstall('local');
 
     // The whole file — frontmatter included — is gone, not just the block.
     expect(fs.existsSync(rulesFile())).toBe(false);
-    expect(cursor.detect('local').alreadyConfigured).toBe(false);
   });
 
-  it('preserves user content added outside the codegraph markers (strips only our block)', () => {
-    cursor.install('local', { autoAllow: true });
-    const withUserContent =
-      fs.readFileSync(rulesFile(), 'utf-8') + '\n## My own rule\nkeep me\n';
-    fs.writeFileSync(rulesFile(), withUserContent);
+  it('install self-heals a leftover codegraph.mdc (#529)', () => {
+    plantLegacyRulesFile();
+    const result = cursor.install('local', { autoAllow: true });
+    expect(fs.existsSync(rulesFile())).toBe(false);
+    expect(result.files.some((f) => f.path.endsWith('codegraph.mdc') && f.action === 'removed')).toBe(true);
+  });
+
+  it('uninstall preserves user content added outside the codegraph markers (strips only our block)', () => {
+    plantLegacyRulesFile('## My own rule\nkeep me\n');
 
     cursor.uninstall('local');
 

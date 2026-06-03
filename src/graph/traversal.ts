@@ -521,8 +521,11 @@ export class GraphTraverser {
       }
     }
 
-    // Get all incoming edges (things that depend on this node)
-    const incomingEdges = this.queries.getIncomingEdges(nodeId);
+    // Get all incoming edges (things that depend on this node). Exclude
+    // `contains`: a container "contains" its members but does not *depend* on
+    // them, so following it upward would climb to the parent class and then
+    // re-expand every sibling member — exploding impact for a leaf symbol. (#536)
+    const incomingEdges = this.queries.getIncomingEdges(nodeId).filter((e) => e.kind !== 'contains');
     if (incomingEdges.length === 0) return;
     const sources = this.queries.getNodesByIds(incomingEdges.map((e) => e.source));
 

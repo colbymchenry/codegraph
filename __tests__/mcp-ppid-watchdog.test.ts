@@ -103,7 +103,12 @@ describe.skipIf(process.platform === 'win32')('MCP PPID watchdog (#277)', () => 
       stdinHolder.unref();
       const child = spawn(process.execPath, [${JSON.stringify(BIN)}, 'serve', '--mcp'], {
         stdio: [stdinHolder.stdout, 'ignore', stderrFd],
-        env: { ...process.env, CODEGRAPH_PPID_POLL_MS: '200' },
+        // Pin to direct (in-process) mode: this test targets the in-process
+        // server's PPID watchdog (#277). The detached-daemon/proxy watchdog is
+        // covered separately in mcp-daemon.test.ts ("daemon survives the first
+        // client dying"). Without this the spawned process becomes a proxy and
+        // also spawns a detached daemon that would outlive the test.
+        env: { ...process.env, CODEGRAPH_PPID_POLL_MS: '200', CODEGRAPH_NO_DAEMON: '1' },
         detached: true,
       });
       child.unref();

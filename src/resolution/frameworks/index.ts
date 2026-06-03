@@ -21,6 +21,10 @@ import { goResolver } from './go';
 import { rustResolver } from './rust';
 import { aspnetResolver } from './csharp';
 import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
+import { swiftObjcBridgeResolver } from './swift-objc';
+import { reactNativeBridgeResolver } from './react-native';
+import { expoModulesResolver } from './expo-modules';
+import { fabricViewResolver } from './fabric';
 
 /**
  * All registered framework resolvers
@@ -54,6 +58,14 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   swiftUIResolver,
   uikitResolver,
   vaporResolver,
+  // Swift ↔ Objective-C cross-language bridging (mixed iOS apps)
+  swiftObjcBridgeResolver,
+  // React Native JS ↔ native bridge (legacy + TurboModules)
+  reactNativeBridgeResolver,
+  // Expo Modules — Function/AsyncFunction/Property DSL on Swift/Kotlin
+  expoModulesResolver,
+  // React Native Fabric / Codegen view components — TS spec → component nodes
+  fabricViewResolver,
 ];
 
 /**
@@ -124,3 +136,7 @@ export { goResolver } from './go';
 export { rustResolver } from './rust';
 export { aspnetResolver } from './csharp';
 export { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
+export { swiftObjcBridgeResolver } from './swift-objc';
+export { reactNativeBridgeResolver } from './react-native';
+export { expoModulesResolver } from './expo-modules';
+export { fabricViewResolver } from './fabric';

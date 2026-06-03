@@ -146,6 +146,210 @@ export function matchByQualifiedName(
   return null;
 }
 
+function resolveMethodOnType(
+  typeName: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number,
+  resolvedBy: ResolvedRef['resolvedBy'],
+  /**
+   * Optional FQN that identifies WHICH class declaration `typeName`
+   * refers to in the caller's file. When multiple candidates share
+   * the same qualifiedName (`FooConverter::convert` in both
+   * `dao/converter/` and `service/converter/`), the FQN's
+   * file-path-suffix picks the right one — the disambiguation
+   * signal Java imports carry but the call site doesn't (#314).
+   */
+  preferredFqn?: string,
+): ResolvedRef | null {
+  // Look up methods by name and match by qualifiedName ending in
+  // `<typeName>::<methodName>`. This works whether the method is defined
+  // in-class (`class Foo { int bar() { ... } }`) or out-of-line in a separate
+  // file (`int Foo::bar() { ... }` in foo.cpp while class Foo is in foo.hpp).
+  // The previous same-file approach missed the latter — the typical C++ layout.
+  const methodCandidates = context.getNodesByName(methodName);
+  const want = `${typeName}::${methodName}`;
+  const matches: Node[] = [];
+  for (const m of methodCandidates) {
+    if (m.kind !== 'method') continue;
+    if (m.language !== ref.language) continue;
+    const qn = m.qualifiedName;
+    if (qn === want || qn.endsWith(`::${want}`)) {
+      matches.push(m);
+    }
+  }
+  if (matches.length === 0) return null;
+
+  if (matches.length > 1 && preferredFqn) {
+    const ext = ref.language === 'kotlin' ? '.kt' : '.java';
+    const fqnPath = preferredFqn.replace(/\./g, '/') + ext;
+    const chosen = matches.find((m) => {
+      const fp = m.filePath.replace(/\\/g, '/');
+      return fp.endsWith(fqnPath) || fp.endsWith('/' + fqnPath);
+    });
+    if (chosen) {
+      return {
+        original: ref,
+        targetNodeId: chosen.id,
+        confidence,
+        resolvedBy,
+      };
+    }
+  }
+
+  return {
+    original: ref,
+    targetNodeId: matches[0]!.id,
+    confidence,
+    resolvedBy,
+  };
+}
+
+// C++ keywords/control-flow tokens that can appear right before a receiver
+// (e.g. `return ptr->m()`) and must NOT be treated as a type.
+const CPP_NON_TYPE_TOKENS = new Set([
+  'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'default',
+  'break', 'continue', 'goto', 'throw', 'new', 'delete', 'co_await', 'co_yield',
+  'co_return', 'static_cast', 'const_cast', 'dynamic_cast', 'reinterpret_cast',
+  'sizeof', 'alignof', 'typeid', 'and', 'or', 'not', 'xor',
+]);
+
+function normalizeCppTypeName(typeName: string): string | null {
+  const normalized = typeName
+    .replace(/\b(const|volatile|mutable|typename|class|struct)\b/g, ' ')
+    .replace(/[&*]+/g, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!normalized) return null;
+  const parts = normalized.split(/::/).filter(Boolean);
+  const last = parts[parts.length - 1];
+  if (!last) return null;
+  if (CPP_NON_TYPE_TOKENS.has(last)) return null;
+  return last;
+}
+
+// Declarator regex: matches `Type receiver`, `Type* receiver`, `Type *receiver`,
+// `Type*receiver`, `Type<X> receiver`, etc., REQUIRING a declarator terminator
+// (`;`, `=`, `,`, `)`, `[`, `{`, `(`, or end-of-line) after the receiver. The
+// terminator rules out uses like `return receiver->m()` where the preceding
+// token is a keyword, not a type.
+function buildDeclaratorRegex(escapedReceiver: string): RegExp {
+  return new RegExp(
+    `([A-Za-z_][\\w:]*(?:\\s*<[^;=(){}]+>)?(?:\\s*[*&]+)?)\\s*\\b${escapedReceiver}\\b\\s*(?=[;=,)\\[{(]|$)`,
+  );
+}
+
+function inferCppReceiverType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const source = context.readFile(ref.filePath);
+  if (!source) return null;
+
+  const lines = source.split(/\r?\n/);
+  const callLineIndex = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
+  const escapedReceiver = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const receiverPattern = new RegExp(`\\b${escapedReceiver}\\b`);
+  const declaratorRegex = buildDeclaratorRegex(escapedReceiver);
+
+  for (let i = callLineIndex; i >= 0; i--) {
+    const line = lines[i];
+    if (!line || !receiverPattern.test(line)) continue;
+
+    const declaratorMatch = line.match(declaratorRegex);
+    if (declaratorMatch) {
+      const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
+      if (normalized) return normalized;
+    }
+  }
+
+  const headerCandidates = [
+    ref.filePath.replace(/\.(?:c|cc|cpp|cxx)$/i, '.h'),
+    ref.filePath.replace(/\.(?:c|cc|cpp|cxx)$/i, '.hpp'),
+    ref.filePath.replace(/\.(?:c|cc|cpp|cxx)$/i, '.hxx'),
+  ].filter((candidate, index, arr) => arr.indexOf(candidate) === index && candidate !== ref.filePath);
+
+  for (const headerPath of headerCandidates) {
+    if (!context.fileExists(headerPath)) continue;
+    const headerSource = context.readFile(headerPath);
+    if (!headerSource) continue;
+
+    for (const line of headerSource.split(/\r?\n/)) {
+      if (!receiverPattern.test(line)) continue;
+      const declaratorMatch = line.match(declaratorRegex);
+      if (!declaratorMatch) continue;
+      const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
+      if (normalized) return normalized;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Java/Kotlin: infer a receiver's declared type by walking field declarations
+ * in the class enclosing the call site. The field's `signature` is already in
+ * the form "<TypeName> <fieldName>" (set by tree-sitter.ts extractField), so we
+ * pull the type from there. Handles Spring `@Resource UserBO userbo;` /
+ * `@Autowired private UserService userService;` where the receiver field name
+ * doesn't match the class name by Java naming convention.
+ *
+ * Returns the bare type name (generics stripped, dotted package stripped) or
+ * null when no matching field is in the enclosing class.
+ */
+function inferJavaFieldReceiverType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const inFile = context.getNodesInFile(ref.filePath);
+  if (inFile.length === 0) return null;
+
+  // Find the class enclosing the call line (tightest match by latest start).
+  let enclosing: Node | null = null;
+  for (const n of inFile) {
+    if (n.kind !== 'class' && n.kind !== 'interface') continue;
+    if (n.language !== ref.language) continue;
+    const end = n.endLine ?? n.startLine;
+    if (n.startLine <= ref.line && end >= ref.line) {
+      if (!enclosing || n.startLine >= enclosing.startLine) enclosing = n;
+    }
+  }
+  if (!enclosing) return null;
+
+  const enclosingEnd = enclosing.endLine ?? enclosing.startLine;
+  const field = inFile.find(
+    (n) =>
+      n.kind === 'field' &&
+      n.name === receiverName &&
+      n.language === ref.language &&
+      n.startLine >= enclosing.startLine &&
+      (n.endLine ?? n.startLine) <= enclosingEnd,
+  );
+  if (!field || !field.signature) return null;
+
+  // Signature shape: "<TypeName> <fieldName>" (extractField). Pull the type,
+  // strip generics + dotted package, drop array/varargs markers.
+  const beforeName = field.signature.slice(
+    0,
+    field.signature.lastIndexOf(field.name),
+  );
+  const typeRaw = beforeName.trim();
+  if (!typeRaw) return null;
+
+  const typeNoGenerics = typeRaw.replace(/<[^>]*>/g, '').trim();
+  const typeNoArray = typeNoGenerics.replace(/\[\s*\]/g, '').replace(/\.\.\.$/, '').trim();
+  const parts = typeNoArray.split(/[.\s]+/).filter(Boolean);
+  const lastPart = parts[parts.length - 1];
+  if (!lastPart) return null;
+  if (!/^[A-Z]/.test(lastPart)) return null; // primitives / lowercase → skip
+  return lastPart;
+}
+
 /**
  * Try to resolve by method name on a class/object
  */
@@ -163,6 +367,51 @@ export function matchMethodCall(
   }
 
   const [, objectOrClass, methodName] = match;
+
+  if (ref.language === 'cpp' && dotMatch) {
+    const inferredType = inferCppReceiverType(objectOrClass!, ref, context);
+    if (inferredType) {
+      const typedMatch = resolveMethodOnType(
+        inferredType,
+        methodName!,
+        ref,
+        context,
+        0.9,
+        'instance-method',
+      );
+      if (typedMatch) {
+        return typedMatch;
+      }
+    }
+  }
+
+  // Java/Kotlin: receiver may be a field whose name doesn't match the type by
+  // Java naming convention (`userbo` → class `UserBO`, abbreviated). Look up
+  // the field in the enclosing class to get its declared type, then resolve
+  // the method on that type. Covers Spring `@Resource`/`@Autowired` field
+  // injection where the field type is the concrete bean class.
+  if ((ref.language === 'java' || ref.language === 'kotlin') && dotMatch) {
+    const inferredType = inferJavaFieldReceiverType(objectOrClass!, ref, context);
+    if (inferredType) {
+      // When two classes share the same simple name, the caller file's
+      // import is the only signal that names WHICH one — pass the
+      // imported FQN so resolveMethodOnType can disambiguate (#314).
+      const imports = context.getImportMappings(ref.filePath, ref.language);
+      const importedFqn = imports.find((i) => i.localName === inferredType)?.source;
+      const typedMatch = resolveMethodOnType(
+        inferredType,
+        methodName!,
+        ref,
+        context,
+        0.9,
+        'instance-method',
+        importedFqn,
+      );
+      if (typedMatch) {
+        return typedMatch;
+      }
+    }
+  }
 
   // Strategy 1: Direct class name match (existing logic)
   const classCandidates = context.getNodesByName(objectOrClass!);

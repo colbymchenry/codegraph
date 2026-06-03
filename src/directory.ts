@@ -83,22 +83,11 @@ export function createDirectory(projectRoot: string): void {
   // Create .gitignore inside .codegraph (if it doesn't exist)
   const gitignorePath = path.join(codegraphDir, '.gitignore');
   if (!fs.existsSync(gitignorePath)) {
-    const gitignoreContent = `# CodeGraph data files
-# These are local to each machine and should not be committed
-
-# Database
-*.db
-*.db-wal
-*.db-shm
-
-# Cache
-cache/
-
-# Logs
-*.log
-
-# Hook markers
-.dirty
+    const gitignoreContent = `# CodeGraph data files — local to each machine, not for committing.
+# Ignore everything in .codegraph/ except this file itself, so transient
+# files (the database, daemon.pid, sockets, logs) never show up in git.
+*
+!.gitignore
 `;
 
     fs.writeFileSync(gitignorePath, gitignoreContent, 'utf-8');
@@ -245,7 +234,7 @@ export function validateDirectory(projectRoot: string): {
   const gitignorePath = path.join(codegraphDir, '.gitignore');
   if (!fs.existsSync(gitignorePath)) {
     try {
-      const gitignoreContent = `# CodeGraph data files\n# These are local to each machine and should not be committed\n\n# Database\n*.db\n*.db-wal\n*.db-shm\n\n# Cache\ncache/\n\n# Logs\n*.log\n\n# Hook markers\n.dirty\n`;
+      const gitignoreContent = `# CodeGraph data files — local to each machine, not for committing.\n# Ignore everything in .codegraph/ except this file itself, so transient\n# files (the database, daemon.pid, sockets, logs) never show up in git.\n*\n!.gitignore\n`;
       fs.writeFileSync(gitignorePath, gitignoreContent, 'utf-8');
     } catch {
       // Non-fatal: warn but don't block

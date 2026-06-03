@@ -20,6 +20,34 @@ import {
 import { safeJsonParse } from '../utils';
 import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
+import { isGeneratedFile } from '../extraction/generated-detection';
+
+/**
+ * Path-only heuristic for files that should not be candidates for
+ * "dominant file" detection: test/spec files and tool-generated files.
+ * Generated files (`*.pb.go`, `*.pulsar.go`, mock outputs, …) often
+ * have huge in-file edge counts that dwarf the real source — etcd's
+ * `rpc.pb.go` has 4× the in-file edges of `server.go`.
+ */
+function isLowValueFile(filePath: string): boolean {
+  const lp = filePath.toLowerCase();
+  return (
+    /(?:^|\/)(tests?|__tests?__|spec)\//.test(lp) ||
+    /_test\.go$/.test(lp) ||
+    /(?:^|\/)test_[^/]+\.py$/.test(lp) ||
+    /_test\.py$/.test(lp) ||
+    /_spec\.rb$/.test(lp) ||
+    /_test\.rb$/.test(lp) ||
+    /\.(test|spec)\.[jt]sx?$/.test(lp) ||
+    /(test|spec|tests)\.(java|kt|scala)$/.test(lp) ||
+    /(tests?|spec)\.cs$/.test(lp) ||
+    /tests?\.swift$/.test(lp) ||
+    /_test\.dart$/.test(lp) ||
+    isGeneratedFile(filePath)
+  );
+}
+
+const SQLITE_PARAM_CHUNK_SIZE = 500;
 
 /**
  * Database row types (snake_case from SQLite)
@@ -180,6 +208,9 @@ export class QueryBuilder {
     getUnresolvedBatch?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
+    getDominantFile?: SqliteStatement;
+    getTopRouteFile?: SqliteStatement;
+    getRoutingManifest?: SqliteStatement;
   } = {};
 
   constructor(db: SqliteDatabase) {
@@ -419,9 +450,8 @@ export class QueryBuilder {
     // Chunk under SQLite's parameter limit (default 999, raised to 32766
     // in better-sqlite3 builds — chunk at 500 for safety across both
     // backends and to keep the query plan simple).
-    const CHUNK = 500;
-    for (let i = 0; i < misses.length; i += CHUNK) {
-      const chunk = misses.slice(i, i + CHUNK);
+    for (let i = 0; i < misses.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = misses.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const rows = this.db
         .prepare(`SELECT * FROM nodes WHERE id IN (${placeholders})`)
@@ -432,6 +462,25 @@ export class QueryBuilder {
         this.cacheNode(node);
       }
     }
+    return out;
+  }
+
+  private getExistingNodeIds(ids: readonly string[]): Set<string> {
+    const out = new Set<string>();
+    if (ids.length === 0) return out;
+
+    const uniqueIds = [...new Set(ids)];
+    for (let i = 0; i < uniqueIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = uniqueIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT id FROM nodes WHERE id IN (${placeholders})`)
+        .all(...chunk) as { id: string }[];
+      for (const row of rows) {
+        out.add(row.id);
+      }
+    }
+
     return out;
   }
 
@@ -470,6 +519,158 @@ export class QueryBuilder {
   }
 
   /**
+   * Find the file that holds the densest concentration of the project's
+   * internal call graph — the "core" file. Used by context-builder to
+   * boost ranking of symbols in that file's directory (so e.g. sinatra
+   * queries surface `lib/sinatra/base.rb`'s `route!` instead of
+   * `sinatra-contrib/lib/sinatra/multi_route.rb`'s `route` extension).
+   *
+   * Returns null if no file has a meaningful concentration (e.g. spread
+   * evenly across many files, or empty index).
+   *
+   * "Internal" = source and target are in the same file. Cross-file
+   * edges aren't useful here — they don't tell us which file is the
+   * functional center.
+   *
+   * Excludes test/spec files from candidacy via path-pattern. The agent's
+   * typical question is "how does X work", not "how is X tested", so
+   * boosting a test file's directory would be a misfire.
+   */
+  getDominantFile(): { filePath: string; edgeCount: number; nextEdgeCount: number } | null {
+    if (!this.stmts.getDominantFile) {
+      // Pull top 20 candidates; we then filter out test/generated files
+      // in code (regex-grade matching that SQL LIKE can't express). The
+      // generated-file filter is critical — without it, etcd's
+      // `api/etcdserverpb/rpc.pb.go` (1916 in-file edges, generated
+      // protobuf stub) outranks the real `server/etcdserver/server.go`
+      // (470 edges) by 4×, and the boost would push the agent toward
+      // generated code.
+      this.stmts.getDominantFile = this.db.prepare(`
+        SELECT n.file_path AS file_path, COUNT(*) AS edge_count
+        FROM edges e
+        JOIN nodes n ON e.source = n.id
+        JOIN nodes m ON e.target = m.id
+        WHERE n.file_path = m.file_path
+        GROUP BY n.file_path
+        ORDER BY edge_count DESC
+        LIMIT 20
+      `);
+    }
+    const rows = this.stmts.getDominantFile.all() as Array<{ file_path: string; edge_count: number }>;
+    const filtered = rows.filter(r => !isLowValueFile(r.file_path));
+    if (filtered.length === 0 || filtered[0]!.edge_count < 20) return null;
+    return {
+      filePath: filtered[0]!.file_path,
+      edgeCount: filtered[0]!.edge_count,
+      nextEdgeCount: filtered[1]?.edge_count ?? 0,
+    };
+  }
+
+  /**
+   * Find the file that holds the densest concentration of the project's
+   * `route` nodes (framework-emitted: Express/Gin/Flask/Rails/Drupal/etc.).
+   * Used by handleContext on small repos to inline the project's routing
+   * config when the agent's query is about request flow — eliminating the
+   * "Glob + Read routes.rb" pattern that beats codegraph on tiny realworld
+   * template repos.
+   *
+   * Excludes test/generated files from candidacy. Returns null if there
+   * are fewer than 3 non-test routes total, or if no file holds at least
+   * 30% of them (diffuse routing → no single answer file).
+   */
+  getTopRouteFile(): { filePath: string; routeCount: number; totalRoutes: number } | null {
+    if (!this.stmts.getTopRouteFile) {
+      this.stmts.getTopRouteFile = this.db.prepare(`
+        SELECT file_path, COUNT(*) AS cnt
+        FROM nodes
+        WHERE kind = 'route'
+        GROUP BY file_path
+        ORDER BY cnt DESC
+        LIMIT 20
+      `);
+    }
+    const rows = this.stmts.getTopRouteFile.all() as Array<{ file_path: string; cnt: number }>;
+    const filtered = rows.filter(r => !isLowValueFile(r.file_path));
+    if (filtered.length === 0) return null;
+    const totalRoutes = filtered.reduce((sum, r) => sum + r.cnt, 0);
+    const top = filtered[0]!;
+    if (totalRoutes < 3 || top.cnt < 3) return null;
+    if (top.cnt / totalRoutes < 0.30) return null;
+    return { filePath: top.file_path, routeCount: top.cnt, totalRoutes };
+  }
+
+  /**
+   * Build a URL → handler manifest from the index. Each route node's
+   * `references` edge points at the function/method that handles the
+   * request. We join them in one pass; the agent gets the canonical
+   * routing answer ("POST /users/login → AuthController#login") without
+   * having to parse the framework's route DSL itself.
+   *
+   * Also returns the file with the most handler endpoints — used as the
+   * "top handler file" to inline source for, so the agent has both the
+   * mapping AND the handler implementations.
+   */
+  getRoutingManifest(limit: number = 40): {
+    entries: Array<{ url: string; handler: string; handlerFile: string; handlerLine: number; handlerKind: string }>;
+    topHandlerFile: string | null;
+    topHandlerFileCount: number;
+    totalRoutes: number;
+  } | null {
+    if (!this.stmts.getRoutingManifest) {
+      // Edge kind varies across framework resolvers: Spring/Rails/
+      // Laravel/Drupal emit `references`, Express emits `calls`. Accept
+      // both — the semantic is the same (route → its handler).
+      this.stmts.getRoutingManifest = this.db.prepare(`
+        SELECT
+          r.name AS url,
+          h.name AS handler,
+          h.file_path AS handler_file,
+          h.start_line AS handler_line,
+          h.kind AS handler_kind
+        FROM nodes r
+        JOIN edges e ON e.source = r.id
+        JOIN nodes h ON e.target = h.id
+        WHERE r.kind = 'route'
+          AND e.kind IN ('references', 'calls')
+          AND h.kind IN ('function', 'method', 'class')
+        ORDER BY r.file_path, r.start_line
+        LIMIT ?
+      `);
+    }
+    const rows = this.stmts.getRoutingManifest.all(limit) as Array<{
+      url: string; handler: string; handler_file: string; handler_line: number; handler_kind: string;
+    }>;
+    // Drop test/generated handlers — same hygiene as elsewhere.
+    const filtered = rows.filter(r => !isLowValueFile(r.handler_file));
+    if (filtered.length < 3) return null;
+    // Identify the file holding the most handlers (the "primary handler file").
+    const fileCounts = new Map<string, number>();
+    for (const r of filtered) {
+      fileCounts.set(r.handler_file, (fileCounts.get(r.handler_file) ?? 0) + 1);
+    }
+    let topHandlerFile: string | null = null;
+    let topHandlerFileCount = 0;
+    for (const [file, count] of fileCounts) {
+      if (count > topHandlerFileCount) {
+        topHandlerFile = file;
+        topHandlerFileCount = count;
+      }
+    }
+    return {
+      entries: filtered.map(r => ({
+        url: r.url,
+        handler: r.handler,
+        handlerFile: r.handler_file,
+        handlerLine: r.handler_line,
+        handlerKind: r.handler_kind,
+      })),
+      topHandlerFile,
+      topHandlerFileCount,
+      totalRoutes: filtered.length,
+    };
+  }
+
+  /**
    * Get all nodes of a specific kind
    */
   getNodesByKind(kind: NodeKind): Node[] {
@@ -478,6 +679,22 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getNodesByKind.all(kind) as NodeRow[];
     return rows.map(rowToNode);
+  }
+
+  /**
+   * Stream every node of a kind one at a time (lazy) instead of materializing
+   * them all like {@link getNodesByKind}. For unbounded kinds (`function`,
+   * `method`) on a symbol-dense project the full array is gigabytes; the
+   * dynamic-edge synthesizers only scan-and-filter, so they iterate to keep
+   * memory O(1) in the node count rather than O(nodes) (#610).
+   */
+  *iterateNodesByKind(kind: NodeKind): IterableIterator<Node> {
+    // Fresh statement per call (not a cached one): an iterator holds an open
+    // cursor, so a shared statement would conflict across overlapping scans.
+    const stmt = this.db.prepare('SELECT * FROM nodes WHERE kind = ?');
+    for (const row of stmt.iterate(kind)) {
+      yield rowToNode(row as NodeRow);
+    }
   }
 
   /**
@@ -1039,8 +1256,20 @@ export class QueryBuilder {
    * Insert multiple edges in a transaction
    */
   insertEdges(edges: Edge[]): void {
+    if (edges.length === 0) return;
+
     this.db.transaction(() => {
+      const endpointIds = new Set<string>();
       for (const edge of edges) {
+        endpointIds.add(edge.source);
+        endpointIds.add(edge.target);
+      }
+      const existingNodeIds = this.getExistingNodeIds([...endpointIds]);
+
+      for (const edge of edges) {
+        if (!existingNodeIds.has(edge.source) || !existingNodeIds.has(edge.target)) {
+          continue;
+        }
         this.insertEdge(edge);
       }
     })();
@@ -1190,6 +1419,17 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getAllFiles.all() as FileRow[];
     return rows.map(rowToFileRecord);
+  }
+
+  /**
+   * Most recent index timestamp (ms since epoch) across all tracked files, or
+   * null when nothing is indexed yet. One indexed aggregate, no per-row scan. (#329)
+   */
+  getLastIndexedAt(): number | null {
+    const row = this.db
+      .prepare('SELECT MAX(indexed_at) AS last FROM files')
+      .get() as { last: number | null } | undefined;
+    return row?.last ?? null;
   }
 
   /**
@@ -1359,10 +1599,19 @@ export class QueryBuilder {
   getUnresolvedReferencesByFiles(filePaths: string[]): UnresolvedReference[] {
     if (filePaths.length === 0) return [];
 
-    const placeholders = filePaths.map(() => '?').join(',');
-    const rows = this.db
-      .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
-      .all(...filePaths) as UnresolvedRefRow[];
+    // Chunk under SQLite's parameter limit: the first sync of a very large repo
+    // passes every changed file here, which an unbounded `IN (...)` would bind
+    // as one parameter each — exceeding MAX_VARIABLE_NUMBER and aborting with
+    // "too many SQL variables". (#540)
+    const rows: UnresolvedRefRow[] = [];
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const chunkRows = this.db
+        .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
+        .all(...chunk) as UnresolvedRefRow[];
+      rows.push(...chunkRows);
+    }
 
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,
@@ -1412,6 +1661,19 @@ export class QueryBuilder {
   // ===========================================================================
   // Statistics
   // ===========================================================================
+
+  /**
+   * Lightweight (nodes, edges) count snapshot. Used around an index/sync
+   * run to compute true additions across extraction + resolution +
+   * synthesis — the per-phase counter in the orchestrator only sees
+   * extraction's contribution, which is why the CLI summary under-reported
+   * the edge count (resolution + synthesizer edges were invisible).
+   */
+  getNodeAndEdgeCount(): { nodes: number; edges: number } {
+    return this.db
+      .prepare('SELECT (SELECT COUNT(*) FROM nodes) AS nodes, (SELECT COUNT(*) FROM edges) AS edges')
+      .get() as { nodes: number; edges: number };
+  }
 
   /**
    * Get graph statistics
