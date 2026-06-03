@@ -2585,7 +2585,20 @@ export class TreeSitterExtractor {
     // Extract parameter type annotations
     const params = getChildByField(node, this.extractor.paramsField || 'parameters');
     if (params) {
-      this.extractTypeRefsFromSubtree(params, nodeId);
+      if (this.language === 'csharp') {
+        // C# grammar uses `identifier` for both type names AND parameter names,
+        // so we cannot recurse the whole parameter_list (it would capture `dto`
+        // from `(FacturaCrearDto dto)`). Iterate parameters and only descend
+        // into the `type` field of each one.
+        for (let i = 0; i < params.namedChildCount; i++) {
+          const p = params.namedChild(i);
+          if (!p) continue;
+          const typeField = getChildByField(p, 'type');
+          if (typeField) this.extractTypeRefsFromSubtree(typeField, nodeId);
+        }
+      } else {
+        this.extractTypeRefsFromSubtree(params, nodeId);
+      }
     }
 
     // Extract return type annotation
@@ -2742,6 +2755,29 @@ export class TreeSitterExtractor {
         });
       }
       return; // type_identifier is a leaf
+    }
+
+    // C#: the grammar does not use `type_identifier`. Type names appear as
+    // `identifier` (simple class name like `Factura`) or `qualified_name`
+    // (`Namespace.Type`). `generic_name` wraps a name + type_argument_list and
+    // should recurse to capture both `List` and the inner `T`. `predefined_type`
+    // (int, string), `nullable_type`, `array_type`, `pointer_type` are wrappers
+    // we recurse through.
+    if (this.language === 'csharp') {
+      if (node.type === 'identifier' || node.type === 'qualified_name') {
+        const typeName = getNodeText(node, this.source);
+        if (typeName && !this.BUILTIN_TYPES.has(typeName)) {
+          this.unresolvedReferences.push({
+            fromNodeId,
+            referenceName: typeName,
+            referenceKind: 'references',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+        }
+        return;
+      }
+      if (node.type === 'predefined_type') return;
     }
 
     // Recurse into children (handles union_type, intersection_type, generic_type, etc.)
