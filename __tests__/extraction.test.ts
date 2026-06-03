@@ -4459,3 +4459,157 @@ func (s Stack[T]) Len() int { return len(s.items) }
     expect(js.nodes.find((n) => n.name === 'handleRequest' && n.kind === 'function')).toBeDefined();
   });
 });
+
+// =============================================================================
+// Groovy
+// =============================================================================
+
+describe('Groovy Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Groovy files', () => {
+      expect(detectLanguage('build.gradle')).toBe('groovy');
+      expect(detectLanguage('src/Main.groovy')).toBe('groovy');
+      expect(detectLanguage('utils.gvy')).toBe('groovy');
+      expect(detectLanguage('script.gy')).toBe('groovy');
+      expect(detectLanguage('helper.gsh')).toBe('groovy');
+    });
+  });
+
+  it('should extract class declarations', () => {
+    const code = `
+class UserService {
+    private repository
+
+    UserService(repository) {
+        this.repository = repository
+    }
+
+    def getUser(String id) {
+        return repository.findById(id)
+    }
+}
+`;
+    const result = extractFromSource('UserService.groovy', code);
+
+    const classNode = result.nodes.find((n) => n.kind === 'class');
+    expect(classNode).toBeDefined();
+    expect(classNode?.name).toBe('UserService');
+  });
+
+  it('should extract method declarations', () => {
+    const code = `
+class Calculator {
+    static int add(int a, int b) {
+        return a + b
+    }
+}
+`;
+    const result = extractFromSource('Calculator.groovy', code);
+
+    const methodNode = result.nodes.find((n) => n.kind === 'method' && n.name === 'add');
+    expect(methodNode).toBeDefined();
+    expect(methodNode?.isStatic).toBe(true);
+  });
+
+  it('should extract def function declarations', () => {
+    const code = `
+def greet(String name) {
+    return "Hello, \${name}"
+}
+`;
+    const result = extractFromSource('utils.groovy', code);
+
+    const funcNode = result.nodes.find((n) => n.kind === 'function' && n.name === 'greet');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.language).toBe('groovy');
+  });
+
+  it('should extract interface declarations', () => {
+    const code = `
+interface Repository {
+    def findById(String id)
+    def save(Object entity)
+}
+`;
+    const result = extractFromSource('Repository.groovy', code);
+
+    const ifaceNode = result.nodes.find((n) => n.kind === 'interface');
+    expect(ifaceNode).toBeDefined();
+    expect(ifaceNode?.name).toBe('Repository');
+  });
+
+  it('should extract enum declarations', () => {
+    const code = `
+enum Color {
+    RED, GREEN, BLUE
+}
+`;
+    const result = extractFromSource('Color.groovy', code);
+
+    const enumNode = result.nodes.find((n) => n.kind === 'enum');
+    expect(enumNode).toBeDefined();
+    expect(enumNode?.name).toBe('Color');
+  });
+
+  it('should extract imports', () => {
+    const code = `
+import java.util.List
+import groovy.json.JsonSlurper
+`;
+    const result = extractFromSource('App.groovy', code);
+
+    const imports = result.nodes.filter((n) => n.kind === 'import');
+    expect(imports.length).toBe(2);
+    expect(imports.map((n) => n.name)).toContain('java.util.List');
+    expect(imports.map((n) => n.name)).toContain('groovy.json.JsonSlurper');
+  });
+
+  it('should extract visibility modifiers', () => {
+    const code = `
+class Account {
+    private String secret
+    protected String internal
+    public String visible
+}
+`;
+    const result = extractFromSource('Account.groovy', code);
+
+    const fields = result.nodes.filter((n) => n.kind === 'field');
+    const secret = fields.find((n) => n.name === 'secret');
+    const internal = fields.find((n) => n.name === 'internal');
+    const visible = fields.find((n) => n.name === 'visible');
+    expect(secret?.visibility).toBe('private');
+    expect(internal?.visibility).toBe('protected');
+    expect(visible?.visibility).toBe('public');
+  });
+
+  it('should extract package declarations', () => {
+    const code = `
+package com.example.service
+
+class UserService {}
+`;
+    const result = extractFromSource('UserService.groovy', code);
+
+    const ns = result.nodes.find((n) => n.kind === 'namespace');
+    expect(ns).toBeDefined();
+    expect(ns?.name).toBe('com.example.service');
+  });
+
+  it('should extract bare calls (juxt_function_call)', () => {
+    const code = `
+def greet(String name) {
+    println "Hello, \${name}"
+}
+`;
+    const result = extractFromSource('utils.groovy', code);
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    expect(calls.some((r) => r.referenceName === 'println')).toBe(true);
+  });
+
+  it('should report Groovy as supported', () => {
+    expect(isLanguageSupported('groovy')).toBe(true);
+    expect(getSupportedLanguages()).toContain('groovy');
+  });
+});
