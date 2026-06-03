@@ -11,6 +11,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- CodeGraph now indexes **Solidity** (`.sol`) — contracts, libraries, interfaces, structs, enums, modifiers, events, errors, and state variables become first-class symbols, with call edges that follow `emit`, `revert`, and library/method calls (including `using` directives). `import` directives resolve to the imported file, so cross-contract questions like "trace `transferFrom` through allowance and balance updates" or "how does `onlyRole` reach the role storage?" work out of the box on real Solidity codebases (validated on solmate, solady, and OpenZeppelin Contracts).
 - `codegraph status --json` now also reports the running CLI `version`, the index directory (`indexPath`), and a `lastIndexed` timestamp (ISO-8601, or null when nothing's indexed yet), so CI and scripts can pin the CLI version and check index freshness from a single command. A matching `CodeGraph.getLastIndexedAt()` library method exposes the same freshness check without shelling out. Thanks @12122J and @eddieran. (#329)
 
 ### Fixes
