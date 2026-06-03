@@ -198,32 +198,32 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): v
   // Without this, monorepos using submodules index 0 files. (See issue #147.)
   // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
   // can't be combined with -o, so untracked files are gathered separately below.
-  const tracked = execFileSync('git', ['ls-files', '-c', '--recurse-submodules'], gitOpts);
-  for (const line of tracked.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed) {
-      files.add(normalizePath(prefix + trimmed));
-    }
+  // -z gives NUL-separated, unquoted output so non-ASCII (e.g. CJK) paths
+  // survive verbatim. Without it git octal-escapes and double-quotes such paths
+  // (the core.quotepath default), and the quoted form never matches a real file
+  // on disk → those files are silently dropped from the index. (#541)
+  const tracked = execFileSync('git', ['ls-files', '-z', '-c', '--recurse-submodules'], gitOpts);
+  for (const rel of tracked.split('\0')) {
+    if (rel) files.add(normalizePath(prefix + rel));
   }
 
   // Untracked files (submodules manage their own untracked state). Embedded git
   // repos surface here as a single "subdir/" entry that git refuses to descend
   // into — recurse into those as their own repos so their source gets indexed.
-  const untracked = execFileSync('git', ['ls-files', '-o', '--exclude-standard'], gitOpts);
-  for (const line of untracked.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (trimmed.endsWith('/')) {
+  const untracked = execFileSync('git', ['ls-files', '-z', '-o', '--exclude-standard'], gitOpts);
+  for (const rel of untracked.split('\0')) {
+    if (!rel) continue;
+    if (rel.endsWith('/')) {
       // git only emits a trailing-slash directory entry for an embedded repo.
       // Guard with a .git check anyway, and skip anything else exactly as git
       // itself skips it (we never descend into a non-repo opaque dir).
-      const childDir = path.join(repoDir, trimmed);
+      const childDir = path.join(repoDir, rel);
       if (fs.existsSync(path.join(childDir, '.git'))) {
-        collectGitFiles(childDir, prefix + trimmed, files);
+        collectGitFiles(childDir, prefix + rel, files);
       }
       continue;
     }
-    files.add(normalizePath(prefix + trimmed));
+    files.add(normalizePath(prefix + rel));
   }
 }
 

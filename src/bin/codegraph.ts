@@ -676,7 +676,13 @@ program
     try {
       if (!isInitialized(projectPath)) {
         if (options.json) {
-          console.log(JSON.stringify({ initialized: false, projectPath }));
+          console.log(JSON.stringify({
+            initialized: false,
+            version: packageJson.version,
+            projectPath,
+            indexPath: getCodeGraphDir(projectPath),
+            lastIndexed: null,
+          }));
           return;
         }
         console.log(chalk.bold('\nCodeGraph Status\n'));
@@ -695,9 +701,13 @@ program
 
       // JSON output mode
       if (options.json) {
+        const lastIndexedMs = cg.getLastIndexedAt();
         console.log(JSON.stringify({
           initialized: true,
+          version: packageJson.version,
           projectPath,
+          indexPath: getCodeGraphDir(projectPath),
+          lastIndexed: lastIndexedMs != null ? new Date(lastIndexedMs).toISOString() : null,
           fileCount: stats.fileCount,
           nodeCount: stats.nodeCount,
           edgeCount: stats.edgeCount,
@@ -1074,52 +1084,6 @@ function printFileTree(
 }
 
 /**
- * codegraph context <task>
- */
-program
-  .command('context <task>')
-  .description('Build context for a task (outputs markdown)')
-  .option('-p, --path <path>', 'Project path')
-  .option('-n, --max-nodes <number>', 'Maximum nodes to include', '50')
-  .option('-c, --max-code <number>', 'Maximum code blocks', '10')
-  .option('--no-code', 'Exclude code blocks')
-  .option('-f, --format <format>', 'Output format (markdown, json)', 'markdown')
-  .action(async (task: string, options: {
-    path?: string;
-    maxNodes?: string;
-    maxCode?: string;
-    code?: boolean;
-    format?: string;
-  }) => {
-    const projectPath = resolveProjectPath(options.path);
-
-    try {
-      if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath}`);
-        process.exit(1);
-      }
-
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
-
-      const context = await cg.buildContext(task, {
-        maxNodes: parseInt(options.maxNodes || '50', 10),
-        maxCodeBlocks: parseInt(options.maxCode || '10', 10),
-        includeCode: options.code !== false,
-        format: options.format as 'markdown' | 'json',
-      });
-
-      // Output the context
-      console.log(context);
-
-      cg.destroy();
-    } catch (err) {
-      error(`Failed to build context: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-  });
-
-/**
  * codegraph serve
  */
 program
@@ -1161,8 +1125,8 @@ program
 }
 `));
         console.error('Available tools:');
+        console.error(chalk.cyan('  codegraph_explore') + '   - Primary: source of the relevant symbols for any question');
         console.error(chalk.cyan('  codegraph_search') + '    - Search for code symbols');
-        console.error(chalk.cyan('  codegraph_context') + '   - Build context for a task');
         console.error(chalk.cyan('  codegraph_callers') + '   - Find callers of a symbol');
         console.error(chalk.cyan('  codegraph_callees') + '   - Find what a symbol calls');
         console.error(chalk.cyan('  codegraph_impact') + '    - Analyze impact of changes');

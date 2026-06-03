@@ -630,7 +630,19 @@ export class TreeSitterExtractor {
         }
       }
     }
-    if (name === '<anonymous>') return; // Skip anonymous functions
+    if (name === '<anonymous>') {
+      // Don't emit a node for the anonymous wrapper itself, but still visit its
+      // body: AMD/RequireJS and CommonJS module wrappers (`define([], function(){…})`,
+      // `(function(){…})()`) hold named inner functions and calls that would
+      // otherwise be lost — the dispatcher set skipChildren, so nothing else
+      // descends into this subtree. (#528)
+      const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+        ?? getChildByField(node, this.extractor.bodyField);
+      if (body) {
+        this.visitFunctionBody(body, '');
+      }
+      return;
+    }
 
     // Check for misparse artifacts (e.g. C++ macros causing "namespace detail" functions)
     // Skip the node but still visit the body for calls and structural nodes
@@ -1105,6 +1117,102 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Extract function-valued properties of an object literal as named function
+   * nodes (named by their property key). Shared by the two object-of-functions
+   * shapes in extractVariable: the object as a direct const value, and the
+   * object returned by a store-initializer call. Handles both `key: () => {}` /
+   * `key: function() {}` pairs and method shorthand `key() {}`.
+   */
+  private extractObjectLiteralFunctions(obj: SyntaxNode): void {
+    for (let i = 0; i < obj.namedChildCount; i++) {
+      const member = obj.namedChild(i);
+      if (!member) continue;
+      if (member.type === 'pair') {
+        const key = getChildByField(member, 'key');
+        const value = getChildByField(member, 'value');
+        if (key && value && (value.type === 'arrow_function' || value.type === 'function_expression')) {
+          this.extractFunction(value, this.objectKeyName(key));
+        }
+      } else if (member.type === 'method_definition') {
+        // Method shorthand: `{ fetchUser() {...} }`. extractMethod deliberately
+        // skips object-literal methods, so route through extractFunction with an
+        // explicit name (method_definition exposes a `body` field, so resolveBody
+        // falls through to it and the node spans the full method).
+        const key = getChildByField(member, 'name');
+        if (key) this.extractFunction(member, this.objectKeyName(key));
+      }
+    }
+  }
+
+  /** Property-key text with surrounding quotes stripped (`'foo'` → `foo`). */
+  private objectKeyName(key: SyntaxNode): string {
+    return getNodeText(key, this.source).replace(/^['"`]|['"`]$/g, '');
+  }
+
+  /**
+   * Given a `call_expression` initializer (`create((set, get) => ({...}))`),
+   * find the object literal RETURNED by a function argument — descending through
+   * nested call_expression arguments so middleware wrappers are unwrapped
+   * (`create(persist((set, get) => ({...}), {...}))`, devtools, immer,
+   * subscribeWithSelector). Returns null when no such object is found — the
+   * common case for ordinary call initializers — so this stays cheap and silent
+   * rather than guessing. Keyed purely on AST shape; no library names.
+   */
+  private findInitializerReturnedObject(callNode: SyntaxNode, depth = 0): SyntaxNode | null {
+    if (depth > 4) return null;
+    const args = getChildByField(callNode, 'arguments');
+    if (!args) return null;
+    for (let i = 0; i < args.namedChildCount; i++) {
+      const arg = args.namedChild(i);
+      if (!arg) continue;
+      if (arg.type === 'arrow_function' || arg.type === 'function_expression') {
+        const obj = this.functionReturnedObject(arg);
+        if (obj) return obj;
+      } else if (arg.type === 'call_expression') {
+        const obj = this.findInitializerReturnedObject(arg, depth + 1);
+        if (obj) return obj;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The object literal a function expression returns — either the `=> ({...})`
+   * arrow form (a parenthesized_expression wrapping an object) or a
+   * `=> { return {...} }` block. Returns null for any other body shape.
+   */
+  private functionReturnedObject(fnNode: SyntaxNode): SyntaxNode | null {
+    const body = getChildByField(fnNode, 'body');
+    if (!body) return null;
+    const asObject = (n: SyntaxNode | null): SyntaxNode | null => {
+      if (!n) return null;
+      if (n.type === 'object' || n.type === 'object_expression') return n;
+      if (n.type === 'parenthesized_expression') {
+        for (let i = 0; i < n.namedChildCount; i++) {
+          const inner = asObject(n.namedChild(i));
+          if (inner) return inner;
+        }
+      }
+      return null;
+    };
+    // `(set, get) => ({...})` — body is the (parenthesized) object directly.
+    const direct = asObject(body);
+    if (direct) return direct;
+    // `(set, get) => { return {...} }` — scan top-level return statements.
+    if (body.type === 'statement_block') {
+      for (let i = 0; i < body.namedChildCount; i++) {
+        const stmt = body.namedChild(i);
+        if (stmt?.type !== 'return_statement') continue;
+        for (let j = 0; j < stmt.namedChildCount; j++) {
+          const obj = asObject(stmt.namedChild(j));
+          if (obj) return obj;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
    * Extract a variable declaration (const, let, var, etc.)
    *
    * Extracts top-level and module-level variable declarations.
@@ -1162,29 +1270,44 @@ export class TreeSitterExtractor {
               this.extractVariableTypeAnnotation(child, varNode.id);
             }
 
+            // Exported const object-of-functions — extract each function-valued
+            // property as a function named by its key + walk its body so its
+            // calls are captured. Two shapes, both keyed on AST shape (not on any
+            // library name):
+            //   `export const actions = { default: async () => {} }` — object is
+            //     the DIRECT value (SvelteKit form actions / handler maps / route
+            //     tables).
+            //   `export const useStore = create((set, get) => ({ fetchUser:
+            //     async () => {} }))` — object is RETURNED by an initializer call,
+            //     possibly through middleware wrappers (persist/devtools/immer).
+            //     Covers Zustand/Redux/Pinia/MobX stores generically. Without
+            //     this, store actions exist only as object-literal properties —
+            //     never nodes — so `node`/`callers` on `fetchUser` return "not
+            //     found" and the agent Reads the store to reconstruct the flow.
+            // Scoped to EXPORTED consts to exclude inline-object noise
+            // (`ctx.set({...})`) the object-method skip deliberately avoids.
+            const objectOfFns =
+              valueNode && (valueNode.type === 'object' || valueNode.type === 'object_expression')
+                ? valueNode
+                : valueNode?.type === 'call_expression'
+                  ? this.findInitializerReturnedObject(valueNode)
+                  : null;
+            const extractObjectMethods = isExported && !!objectOfFns;
+
+            // Visit the initializer body for calls — EXCEPT object literals (their
+            // function-valued properties are extracted below) and the store-factory
+            // call whose returned object we extract method-by-method below (walking
+            // the whole call would re-visit those method arrows and mis-attribute
+            // their inner calls to the file/module scope).
             if (valueNode &&
                 valueNode.type !== 'object' &&
-                valueNode.type !== 'object_expression') {
+                valueNode.type !== 'object_expression' &&
+                !(extractObjectMethods && valueNode.type === 'call_expression')) {
               this.visitFunctionBody(valueNode, '');
             }
 
-            // Exported const object-of-functions: `export const actions =
-            // { default: async () => {} }` (SvelteKit form actions / handler maps
-            // / route tables). Extract each function-valued property as a function
-            // named by its key + walk its body so its calls (e.g. api.post) are
-            // captured. Scoped to EXPORTED consts to exclude the inline-object
-            // noise (`ctx.set({...})`) the object-method skip deliberately avoids.
-            if (isExported && valueNode &&
-                (valueNode.type === 'object' || valueNode.type === 'object_expression')) {
-              for (let j = 0; j < valueNode.namedChildCount; j++) {
-                const pair = valueNode.namedChild(j);
-                if (pair?.type !== 'pair') continue;
-                const v = getChildByField(pair, 'value');
-                const k = getChildByField(pair, 'key');
-                if (k && v && (v.type === 'arrow_function' || v.type === 'function_expression')) {
-                  this.extractFunction(v, getNodeText(k, this.source).replace(/^['"`]|['"`]$/g, ''));
-                }
-              }
+            if (extractObjectMethods && objectOfFns) {
+              this.extractObjectLiteralFunctions(objectOfFns);
             }
           }
         }

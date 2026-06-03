@@ -501,10 +501,10 @@ describe('MCP Tool Improvements', () => {
     expect(typeof ToolHandler).toBe('function');
   });
 
-  it.skipIf(!HAS_SQLITE)('should have findSymbol and truncateOutput as private methods', async () => {
+  it.skipIf(!HAS_SQLITE)('should have findSymbolMatches and truncateOutput as private methods', async () => {
     const { ToolHandler } = await import('../src/mcp/tools');
     const proto = ToolHandler.prototype;
-    expect(typeof (proto as any).findSymbol).toBe('function');
+    expect(typeof (proto as any).findSymbolMatches).toBe('function');
     expect(typeof (proto as any).truncateOutput).toBe('function');
   });
 
@@ -567,20 +567,19 @@ export function getValueFromCache(): number { return 2; }
       await cg.indexAll();
 
       const handler = new ToolHandler(cg);
-      const findSymbol = (handler as any).findSymbol.bind(handler);
+      const findSymbolMatches = (handler as any).findSymbolMatches.bind(handler);
 
-      const match = findSymbol(cg, 'getValue');
-      expect(match).not.toBeNull();
-      expect(match.node.name).toBe('getValue');
-      // Should not have a disambiguation note for single exact match
-      expect(match.note).toBe('');
+      const matches = findSymbolMatches(cg, 'getValue');
+      // Exact-name match wins — a single result, not the partial getValueFromCache.
+      expect(matches.length).toBe(1);
+      expect(matches[0].name).toBe('getValue');
 
       handler.closeAll();
       cg.destroy();
       cleanupTempDir(tmpDir);
     });
 
-    it.skipIf(!HAS_SQLITE)('should note when multiple symbols share the same name', async () => {
+    it.skipIf(!HAS_SQLITE)('should return all definitions when multiple symbols share the same name', async () => {
       const { ToolHandler } = await import('../src/mcp/tools');
       const CodeGraph = (await import('../src/index')).default;
 
@@ -602,20 +601,21 @@ export function handle(): void {}
       await cg.indexAll();
 
       const handler = new ToolHandler(cg);
-      const findSymbol = (handler as any).findSymbol.bind(handler);
+      const findSymbolMatches = (handler as any).findSymbolMatches.bind(handler);
 
-      const match = findSymbol(cg, 'handle');
-      expect(match).not.toBeNull();
-      expect(match.node.name).toBe('handle');
-      // Should have a disambiguation note
-      expect(match.note).toContain('2 symbols named "handle"');
+      // Both same-named definitions are returned (no longer one + a dead-end
+      // note) so codegraph_node can hand back every overload and the agent never
+      // Reads to find the one it wanted.
+      const matches = findSymbolMatches(cg, 'handle');
+      expect(matches.length).toBe(2);
+      expect(matches.every((n: any) => n.name === 'handle')).toBe(true);
 
       handler.closeAll();
       cg.destroy();
       cleanupTempDir(tmpDir);
     });
 
-    it.skipIf(!HAS_SQLITE)('should return null when symbol is not found', async () => {
+    it.skipIf(!HAS_SQLITE)('should return no matches when symbol is not found', async () => {
       const { ToolHandler } = await import('../src/mcp/tools');
       const CodeGraph = (await import('../src/index')).default;
 
@@ -630,10 +630,10 @@ export function handle(): void {}
       await cg.indexAll();
 
       const handler = new ToolHandler(cg);
-      const findSymbol = (handler as any).findSymbol.bind(handler);
+      const findSymbolMatches = (handler as any).findSymbolMatches.bind(handler);
 
-      const match = findSymbol(cg, 'nonExistentSymbol');
-      expect(match).toBeNull();
+      const matches = findSymbolMatches(cg, 'nonExistentSymbol');
+      expect(matches.length).toBe(0);
 
       handler.closeAll();
       cg.destroy();

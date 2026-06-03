@@ -1,11 +1,18 @@
 # Design + status: general callback / observer edge synthesis
 
-**Status:** Phases 1–3 implemented & validated as a **prototype, uncommitted on `main`**
-(as of 2026-05-22). This doc is the handoff for continuing the work.
+**Status:** SHIPPED (the synthesizer in `callback-synthesizer.ts` is merged and on
+`main`). This doc records the original design.
 **Motivation:** close the dynamic-dispatch hole that static extraction leaves for
 observer / event-emitter / signal patterns, where a *dispatcher* invokes callbacks
 registered elsewhere through a shared store — so flows like "how does an update
 reach the screen" actually exist in the graph.
+
+> **Update (2026-06-01):** the `codegraph_trace` and `codegraph_context` MCP tools
+> were since **removed** — `codegraph_explore` is the single surfacing tool now. Its
+> "Flow" section (`buildFlowFromNamedSymbols`) and the `codegraph_node` trail surface
+> these synthesized edges; the `trace(a, b)` notation below means "the a→b flow,"
+> which you now verify with `codegraph_explore` / `probe-explore.mjs` (the
+> `probe-trace.mjs` / `probe-context.mjs` dev probes went away with the tools).
 
 ---
 
@@ -35,11 +42,11 @@ rm -rf /tmp/codegraph-corpus/excalidraw/.codegraph
 sqlite3 /tmp/codegraph-corpus/excalidraw/.codegraph/codegraph.db \
   "select s.name||' → '||t.name||'  '||coalesce(e.metadata,'') from edges e \
    join nodes s on e.source=s.id join nodes t on e.target=t.id where e.provenance='heuristic';"
-# end-to-end trace (uses the dev probes):
-node scripts/agent-eval/probe-trace.mjs /tmp/codegraph-corpus/excalidraw triggerUpdate triggerRender
+# end-to-end flow (the synthesized edge shows up in explore's Flow section + node trail):
+node scripts/agent-eval/probe-explore.mjs /tmp/codegraph-corpus/excalidraw "triggerUpdate triggerRender"
 ```
 Probe scripts (dev-only, in `scripts/agent-eval/`): `probe-node.mjs` (symbol + trail),
-`probe-trace.mjs` (call path), `probe-context.mjs`, `probe-explore.mjs`. EventEmitter
+`probe-explore.mjs` (relevant source + the flow among named symbols). EventEmitter
 fixture lives at `/tmp/cb-fixture/bus.js` (ephemeral — recreate or move into `__tests__/`).
 
 ---
@@ -172,8 +179,9 @@ This is one half of closing dynamic-dispatch coverage. The other artifacts on `m
   pre-filter in `resolution/index.ts`) + django ORM resolver (`frameworks/python.ts`,
   `_iterable_class` → `ModelIterable.__iter__`).
 - **Retrieval/UX changes** (separate from coverage): `explore` whole-small-file + glue
-  fixes, `node`-with-trail, `codegraph_trace`, `context` call-paths — all in
-  `src/mcp/tools.ts` / `src/context/index.ts`.
+  fixes, the `explore` Flow section (`buildFlowFromNamedSymbols`), and `node`-with-trail
+  — all in `src/mcp/tools.ts`. (`codegraph_trace` / `codegraph_context` were later
+  removed; explore is the one surfacing tool.)
 - **Full investigation context + findings:** auto-memory
   `project_codegraph_read_displacement` (why coverage — not prompting/hooks/new-tools —
   is the lever for getting agents to use codegraph over Read).

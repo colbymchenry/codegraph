@@ -180,7 +180,7 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
     const savedPath = process.env.PATH;
     process.env.PATH = '';
     try {
-      const second = await handler.execute('codegraph_context', { task: 'mainOnly' });
+      const second = await handler.execute('codegraph_explore', { query: 'mainOnly' });
       expect(second.content[0].text).toContain('different git worktree');
     } finally {
       process.env.PATH = savedPath;

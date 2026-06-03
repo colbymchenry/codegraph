@@ -56,8 +56,12 @@ export const goExtractor: LanguageExtractor = {
     if (!receiver) return undefined;
     // Find the type identifier inside the receiver
     const text = getNodeText(receiver, source);
-    // Extract type name from patterns like "(sl *Type)", "(sl Type)", "(*Type)", "(Type)"
-    const match = text.match(/\*?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/);
+    // Extract type name from "(sl *Type)", "(sl Type)", "(*Type)", "(Type)" and
+    // generic receivers "(s *Stack[T])". Anchor on the opening "(" and skip an
+    // optional receiver var name; the old `name)`-anchored pattern never matched
+    // the `[T])` suffix, so generic-type methods were orphaned from their type
+    // (no struct→method `contains` edge). (#583)
+    const match = text.match(/\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*([A-Za-z_]\w*)/);
     return match?.[1];
   },
 };
