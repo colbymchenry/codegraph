@@ -26,6 +26,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Go methods declared on generic types (e.g. `func (s *Stack[T]) Push(...)`) are now correctly attached to their type, so callers, callees, and impact include them. (#583)
 - Asking what a symbol impacts no longer drags in every unrelated sibling method of its class — impact now follows real dependencies instead of the structural "contains" relationship, keeping the result focused on what actually depends on the symbol. (#536)
 - CodeGraph's MCP server now answers an agent's `resources/list` and `prompts/list` probes with an empty list instead of an error, clearing the `-32601` messages some clients (opencode, Codex) logged on connect. (#621)
+- Svelte and Vue components used through a barrel file — `export { default as Button } from './Button.svelte'` re-exported from an `index.ts` and imported elsewhere — are no longer falsely reported as having **0 callers**. CodeGraph now follows the default re-export all the way to the component and resolves the imports that `.svelte` / `.vue` files themselves use, so `codegraph_callers` and `codegraph_impact` see every place a component is used. This also covers components imported from another package in a workspace/monorepo (`@scope/ui/widgets`) and bare directory imports (`import { x } from './'`). Previously a live component consumed only through a barrel looked like dead code. Thanks @nakisen. (#629)
 
 ## [0.9.9] - 2026-06-02
 

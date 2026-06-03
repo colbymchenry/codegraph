@@ -22,6 +22,7 @@ import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
+import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
@@ -203,6 +204,8 @@ export class ReferenceResolver {
   private projectAliases: AliasMap | null | undefined = undefined;
   // go.mod module path. Same lazy/immutable convention as projectAliases.
   private goModule: GoModule | null | undefined = undefined;
+  // Monorepo workspace member packages. Same lazy/immutable convention.
+  private workspacePackages: WorkspacePackages | null | undefined = undefined;
 
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
@@ -423,6 +426,13 @@ export class ReferenceResolver {
         return this.goModule;
       },
 
+      getWorkspacePackages: () => {
+        if (this.workspacePackages === undefined) {
+          this.workspacePackages = loadWorkspacePackages(this.projectRoot);
+        }
+        return this.workspacePackages;
+      },
+
       getReExports: (filePath: string, language) => {
         const cached = this.reExportCache.get(filePath);
         if (cached) return cached;
@@ -431,7 +441,15 @@ export class ReferenceResolver {
           this.reExportCache.set(filePath, []);
           return [];
         }
-        const reExports = extractReExports(content, language);
+        // Re-exports are a JS/TS-only construct, and what matters is the
+        // BARREL file's own language — not the consuming reference's. A
+        // `.svelte`/`.vue` consumer threads its own language down the
+        // re-export chase, which would make extractReExports() bail on a
+        // `.ts` index barrel and silently break the chain (#629). Re-key
+        // the parse on the barrel's extension so the chase works no matter
+        // what kind of file imports through it.
+        const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?)$/i.test(filePath);
+        const reExports = extractReExports(content, isJsFamily ? 'typescript' : language);
         this.reExportCache.set(filePath, reExports);
         return reExports;
       },

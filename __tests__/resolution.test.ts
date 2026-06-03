@@ -1248,6 +1248,147 @@ func main() {
       const callers = cg.getCallers(signInNode!.id);
       expect(callers.some((c) => c.node.filePath === 'src/main.ts')).toBe(true);
     });
+
+    it('follows a default re-export of a .svelte component (export { default as Foo } from ./RealButton.svelte) (#629)', async () => {
+      // The ubiquitous Svelte/React component-barrel form. The leaf is a
+      // .svelte component (extracted as kind 'component', the default
+      // export). The re-export ALIAS (`Foo`) deliberately differs from the
+      // component's real name (`RealButton`) so the name-matcher fallback
+      // can't coincidentally connect them — the only path to the edge is
+      // the import-chase, which must match a `component` (not just
+      // function/class) for the default export. Otherwise the
+      // consumer↔component edge is never created and `callers` returns a
+      // false 0.
+      fs.mkdirSync(path.join(tempDir, 'src/lib'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src/lib/RealButton.svelte'),
+        `<script lang="ts">\n  export let label: string = '';\n</script>\n\n<button>{label}</button>\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/lib/index.ts'),
+        `export { default as Foo } from './RealButton.svelte';\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/Bar.svelte'),
+        `<script lang="ts">\n  import { Foo } from './lib';\n</script>\n\n<Foo />\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const fooNode = cg
+        .getNodesByKind('component')
+        .find((n) => n.name === 'RealButton' && n.filePath === 'src/lib/RealButton.svelte');
+      expect(fooNode).toBeDefined();
+      const callers = cg.getCallers(fooNode!.id);
+      expect(callers.some((c) => c.node.filePath === 'src/Bar.svelte')).toBe(true);
+    });
+
+    it('resolves a bare directory import (import { x } from "." / "./") to index.ts (#629)', async () => {
+      // `import { helper } from '.'` (or './') must map to the
+      // directory's index.ts before the re-export chase can run. The
+      // barrel renames `realHelper` → `helper` so the name-matcher can't
+      // mask a path-resolution failure: only the bare-dir resolution +
+      // rename chase can connect the edge.
+      fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src/util.ts'),
+        `export function realHelper(): void {}\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/index.ts'),
+        `export { realHelper as helper } from './util';\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/main.ts'),
+        `import { helper } from '.';\nexport function go(): void { helper(); }\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/main2.ts'),
+        `import { helper } from './';\nexport function go2(): void { helper(); }\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const helperNode = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'realHelper' && n.filePath === 'src/util.ts');
+      expect(helperNode).toBeDefined();
+      const callers = cg.getCallers(helperNode!.id);
+      expect(callers.some((c) => c.node.filePath === 'src/main.ts')).toBe(true);
+      expect(callers.some((c) => c.node.filePath === 'src/main2.ts')).toBe(true);
+    });
+
+    it('resolves a workspace package-subpath barrel (@scope/pkg/sub) to its index (#629)', async () => {
+      // bun/npm/pnpm workspace: `@scope/ui/widgets` → the `ui` package's
+      // `widgets/` subdir index, which re-exports a .svelte component.
+      // Alias `Thing` ≠ component `Widget` defeats the name-matcher, so
+      // only workspace-package resolution can connect the edge.
+      fs.mkdirSync(path.join(tempDir, 'packages/ui/widgets'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'package.json'),
+        JSON.stringify({ name: 'root', private: true, workspaces: ['packages/*'] }, null, 2)
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'packages/ui/package.json'),
+        JSON.stringify({ name: '@scope/ui', version: '1.0.0' }, null, 2)
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'packages/ui/widgets/Widget.svelte'),
+        `<script lang="ts">\n  export let label: string = '';\n</script>\n\n<button>{label}</button>\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'packages/ui/widgets/index.ts'),
+        `export { default as Thing } from './Widget.svelte';\n`
+      );
+      fs.mkdirSync(path.join(tempDir, 'app'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'app/App.svelte'),
+        `<script lang="ts">\n  import { Thing } from '@scope/ui/widgets';\n</script>\n\n<Thing />\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const buttonNode = cg
+        .getNodesByKind('component')
+        .find((n) => n.name === 'Widget' && n.filePath === 'packages/ui/widgets/Widget.svelte');
+      expect(buttonNode).toBeDefined();
+      const callers = cg.getCallers(buttonNode!.id);
+      expect(callers.some((c) => c.node.filePath === 'app/App.svelte')).toBe(true);
+    });
+
+    it('resolves a barrel import from a Vue SFC <script> block (#629)', async () => {
+      // The same import-resolution gaps (no SFC import mappings, no SFC
+      // extension list, barrel parsed in the consumer's language) broke
+      // Vue SFCs too. Guards the resolver-side generalization to `.vue`.
+      // The barrel renames `realRun` → `run` so only the import-chase (not
+      // the name-matcher) can connect the call.
+      fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src/util.ts'),
+        `export function realRun(): void {}\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/index.ts'),
+        `export { realRun as run } from './util';\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/App.vue'),
+        `<script lang="ts">\nimport { run } from './';\nexport default { mounted() { run(); } };\n</script>\n<template><div/></template>\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const runNode = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'realRun' && n.filePath === 'src/util.ts');
+      expect(runNode).toBeDefined();
+      const callers = cg.getCallers(runNode!.id);
+      expect(callers.some((c) => c.node.filePath === 'src/App.vue')).toBe(true);
+    });
   });
 
   describe('C/C++ Import Resolution', () => {

@@ -9,6 +9,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
+import { resolveWorkspaceImport } from './workspace-packages';
 
 /**
  * Extension resolution order by language
@@ -18,6 +19,11 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   javascript: ['.js', '.jsx', '.mjs', '.cjs', '/index.js', '/index.jsx'],
   tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js'],
   jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
+  // SFC consumers import plain TS/JS, sibling components, and barrels
+  // (`./lib` → `./lib/index.ts`). Without a list, relative imports from a
+  // `.svelte`/`.vue` file resolve to nothing, so barrel callers vanish (#629).
+  svelte: ['.ts', '.js', '.svelte', '.tsx', '.jsx', '/index.ts', '/index.js', '/index.svelte'],
+  vue: ['.ts', '.js', '.vue', '.tsx', '.jsx', '/index.ts', '/index.js', '/index.vue'],
   python: ['.py', '/__init__.py'],
   go: ['.go'],
   rust: ['.rs', '/mod.rs'],
@@ -121,6 +127,15 @@ function isExternalImport(
 ): boolean {
   // Relative imports are not external
   if (importPath.startsWith('.')) {
+    return false;
+  }
+
+  // Workspace-member imports (`@scope/ui`, `@scope/ui/widgets`) are LOCAL to
+  // a monorepo even though they look like bare npm specifiers. Consult the
+  // workspace map first so they aren't misclassified as external (#629). The
+  // map is null for single-package repos, so this is a no-op there.
+  const workspaces = context?.getWorkspacePackages?.();
+  if (workspaces && resolveWorkspaceImport(importPath, workspaces)) {
     return false;
   }
 
@@ -251,6 +266,18 @@ function resolveAliasedImport(
     const candidates = applyAliases(importPath, aliasMap, projectRoot);
     for (const c of candidates) {
       const hit = tryWithExt(c);
+      if (hit) return hit;
+    }
+  }
+
+  // 1.5 Workspace packages (`@scope/ui/widgets` → `packages/ui/widgets`).
+  //     Resolves a monorepo member import to the member's directory; the
+  //     extension/index permutations below then find its barrel (#629).
+  const workspaces = context.getWorkspacePackages?.();
+  if (workspaces) {
+    const base = resolveWorkspaceImport(importPath, workspaces);
+    if (base) {
+      const hit = tryWithExt(base);
       if (hit) return hit;
     }
   }
@@ -495,6 +522,16 @@ export function extractImportMappings(
   const mappings: ImportMapping[] = [];
 
   if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx') {
+    mappings.push(...extractJSImports(content));
+  } else if (language === 'svelte' || language === 'vue') {
+    // Svelte/Vue single-file components import via plain ES6 inside their
+    // `<script>` block. Without this, a `.svelte`/`.vue` consumer produces
+    // zero import mappings, so `resolveViaImport` can't run and a barrel
+    // import (`import { Foo } from './lib'`) falls back to name-matching —
+    // which silently fails whenever the re-export alias differs from the
+    // component's real name, yielding a false 0 callers (#629). The ES6
+    // import regex only matches `import … from '…'`, so running it over the
+    // whole SFC (markup + styles included) is safe.
     mappings.push(...extractJSImports(content));
   } else if (language === 'python') {
     mappings.push(...extractPythonImports(content));
@@ -1248,9 +1285,17 @@ function findExportedSymbol(
 
   // 1. Direct hit: the symbol is declared in this file.
   if (want.isDefault) {
-    const direct = nodesInFile.find(
-      (n) => n.isExported && (n.kind === 'function' || n.kind === 'class')
-    );
+    // Svelte/Vue single-file components ARE the module's default export,
+    // but are extracted as kind 'component' (not function/class). Prefer
+    // the component node; fall back to an exported function/class for the
+    // `.ts`/`.tsx` `export default fn`/`class` case. Without the component
+    // branch, an `export { default as X } from './X.svelte'` barrel never
+    // resolves and the component shows a false 0 callers (#629).
+    const direct =
+      nodesInFile.find((n) => n.isExported && n.kind === 'component') ??
+      nodesInFile.find(
+        (n) => n.isExported && (n.kind === 'function' || n.kind === 'class')
+      );
     if (direct) return direct;
   } else if (want.isNamespace && want.memberName) {
     const direct = nodesInFile.find(
