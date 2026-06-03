@@ -1611,6 +1611,11 @@ func main() {
       expect(inferCppTypeFromInitializer('make_shared<Widget>(a, b)')).toBe('Widget');
       expect(inferCppTypeFromInitializer('std::make_unique<ns::Widget>()')).toBe('Widget');
     });
+    it('skips a leading cv-qualifier on the type argument', () => {
+      expect(inferCppTypeFromInitializer('std::make_unique<const Widget>()')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('make_shared<volatile Widget>()')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('static_cast<const Widget*>(p)')).toBe('Widget');
+    });
     it('infers from new expressions', () => {
       expect(inferCppTypeFromInitializer('new Widget()')).toBe('Widget');
       expect(inferCppTypeFromInitializer('new ns::Widget{}')).toBe('Widget');
@@ -1656,6 +1661,10 @@ func main() {
       expect(parseCppReturnType('() -> std::shared_ptr<Foo>')).toBe('Foo');
       expect(parseCppReturnType('() -> unique_ptr<ns::Bar>')).toBe('Bar');
       expect(parseCppReturnType('() -> std::weak_ptr<Baz>')).toBe('Baz');
+    });
+    it('unwraps a cv-qualified smart-pointer pointee to the type, not the qualifier', () => {
+      expect(parseCppReturnType('() -> std::shared_ptr<const Widget>')).toBe('Widget');
+      expect(parseCppReturnType('() -> unique_ptr<volatile Gadget>')).toBe('Gadget');
     });
     it('rejects primitives, void, and missing return types', () => {
       expect(parseCppReturnType('() -> void')).toBeNull();

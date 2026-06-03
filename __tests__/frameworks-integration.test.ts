@@ -695,6 +695,53 @@ describe('C++ end-to-end — virtual override synthesis', () => {
     }
   });
 
+  it('resolves a chained call through a trailing return type', async () => {
+    // Regression for Codex review (PR #646): `auto Factory::create() -> Widget`
+    // has `auto` as its type field and the real return type on the declarator's
+    // trailing-return node. Reading that lets the chained call resolve.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'decoy.hpp'), // sorts first → wins any name-only tie
+        'class Decoy { public: void draw(); };\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'widget.hpp'),
+        'class Widget { public: void draw(); };\n' +
+          'class Factory { public: auto create() -> Widget; };\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'defs.cpp'),
+        '#include "decoy.hpp"\n' +
+          '#include "widget.hpp"\n' +
+          'void Decoy::draw() {}\n' +
+          'void Widget::draw() {}\n' +
+          'auto Factory::create() -> Widget { return Widget(); }\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'app.cpp'),
+        '#include "widget.hpp"\n' +
+          'void useTrailing() { Factory::create().draw(); }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const widgetDraw = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Widget::draw');
+      const decoyDraw = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Decoy::draw');
+      expect(widgetDraw, 'Widget::draw node').toBeDefined();
+      expect(decoyDraw, 'Decoy::draw node').toBeDefined();
+
+      // Factory::create() -> Widget, so draw() resolves on Widget, not the
+      // first-sorted Decoy.
+      expect(cg.getCallers(widgetDraw!.id).map((c) => c.node.qualifiedName)).toContain('useTrailing');
+      expect(cg.getCallers(decoyDraw!.id).map((c) => c.node.qualifiedName)).not.toContain('useTrailing');
+    } finally {
+      cg?.close();
+    }
+  });
+
   it('bridges a base virtual method to the subclass override', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
     fs.writeFileSync(

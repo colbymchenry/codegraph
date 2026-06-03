@@ -274,15 +274,16 @@ export function inferCppTypeFromInitializer(init: string): string | null {
   if (!s) return null;
 
   // make_unique<Foo>() / make_shared<Foo>() (with or without a std:: prefix).
-  let m = s.match(/\bmake_(?:unique|shared)\s*<\s*([A-Za-z_][\w:]*)/);
+  // Skip a leading cv-qualifier on the type argument (`make_unique<const Foo>`).
+  let m = s.match(/\bmake_(?:unique|shared)\s*<\s*(?:(?:const|volatile)\s+)*([A-Za-z_][\w:]*)/);
   if (m) return lastCppSegment(m[1]!);
 
-  // new Foo(...) / new Foo<...>(...) / new Foo{...}
-  m = s.match(/\bnew\s+([A-Za-z_][\w:]*)/);
+  // new Foo(...) / new Foo<...>(...) / new Foo{...} / new const Foo(...)
+  m = s.match(/\bnew\s+(?:(?:const|volatile)\s+)*([A-Za-z_][\w:]*)/);
   if (m) return lastCppSegment(m[1]!);
 
   // static_cast<Foo*>(...) / dynamic_cast / reinterpret_cast / const_cast
-  m = s.match(/\b(?:static|dynamic|reinterpret|const)_cast\s*<\s*([A-Za-z_][\w:]*)/);
+  m = s.match(/\b(?:static|dynamic|reinterpret|const)_cast\s*<\s*(?:(?:const|volatile)\s+)*([A-Za-z_][\w:]*)/);
   if (m) return lastCppSegment(m[1]!);
 
   // Foo::instance() — self-returning singleton accessor (qualifier IS the type).
@@ -321,7 +322,9 @@ const CPP_PRIMITIVE_TYPES: ReadonlySet<string> = new Set([
  */
 function normalizeCppReturnType(raw: string): string | null {
   if (!raw) return null;
-  const smart = raw.match(/\b(?:shared_ptr|unique_ptr|weak_ptr|auto_ptr)\s*<\s*([A-Za-z_][\w:]*)/);
+  // Unwrap smart pointers, skipping a leading cv-qualifier on the pointee
+  // (`shared_ptr<const Widget>` → `Widget`, not `const`).
+  const smart = raw.match(/\b(?:shared_ptr|unique_ptr|weak_ptr|auto_ptr)\s*<\s*(?:(?:const|volatile)\s+)*([A-Za-z_][\w:]*)/);
   if (smart) {
     const inner = lastCppSegment(smart[1]!);
     return inner && !CPP_PRIMITIVE_TYPES.has(inner) ? inner : null;

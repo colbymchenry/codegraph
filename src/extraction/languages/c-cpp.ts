@@ -58,20 +58,33 @@ function extractCppReceiverType(node: SyntaxNode, source: string): string | unde
  * field (`Worker`, `void`, `std::shared_ptr<Foo>`); the `&`/`*` lives on the
  * declarator and is intentionally dropped (resolution normalizes it away
  * anyway). Constructors/destructors have no `type` field → params only.
+ *
+ * Trailing return types (`auto Factory::create() -> Widget`) are handled too:
+ * the `type` field is just the `auto` placeholder, so the real type is read
+ * from the `trailing_return_type` node on the function_declarator instead.
  */
 function extractCppSignature(node: SyntaxNode, source: string): string | undefined {
   const typeField = getChildByField(node, 'type');
 
   // The parameters live on the function_declarator, which may be wrapped in a
   // pointer_/reference_declarator (e.g. `Worker& Worker::instance()`). Descend
-  // to the first function_declarator and read its `parameters` field.
+  // to the first function_declarator and read its `parameters` field — and any
+  // trailing return type while we're there.
   let params: SyntaxNode | null = null;
+  let trailingReturn: SyntaxNode | null = null;
   const decl = getChildByField(node, 'declarator');
   const queue: SyntaxNode[] = decl ? [decl] : [];
   while (queue.length > 0) {
     const current = queue.shift()!;
     if (current.type === 'function_declarator') {
       params = getChildByField(current, 'parameters');
+      for (let i = 0; i < current.namedChildCount; i++) {
+        const child = current.namedChild(i);
+        if (child && child.type === 'trailing_return_type') {
+          trailingReturn = child;
+          break;
+        }
+      }
       break;
     }
     for (let i = 0; i < current.namedChildCount; i++) {
@@ -81,8 +94,16 @@ function extractCppSignature(node: SyntaxNode, source: string): string | undefin
   }
 
   const paramText = params ? getNodeText(params, source) : '()';
-  if (typeField) {
-    return `${paramText} -> ${getNodeText(typeField, source).trim()}`;
+  // Prefer the trailing return type when present (`-> Widget`); the `type` field
+  // is then just the `auto`/`decltype(auto)` placeholder.
+  let returnText: string | null = null;
+  if (trailingReturn) {
+    returnText = getNodeText(trailingReturn, source).replace(/^->\s*/, '').trim();
+  } else if (typeField) {
+    returnText = getNodeText(typeField, source).trim();
+  }
+  if (returnText) {
+    return `${paramText} -> ${returnText}`;
   }
   return paramText || undefined;
 }
