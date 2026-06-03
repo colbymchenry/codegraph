@@ -655,6 +655,12 @@ Want to add another language? See [`docs/ADDING-A-LANGUAGE.md`](docs/ADDING-A-LA
  </picture>
 </a>
 
+## Contributing
+
+Contributions are welcome! See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, testing conventions, and PR guidelines.
+
+Want to add a new language? See [`docs/ADDING-A-LANGUAGE.md`](docs/ADDING-A-LANGUAGE.md) — it walks through sourcing a tree-sitter grammar, probing the AST, choosing an extractor pattern, and the worked examples in the existing extractors.
+
 ## License
 
 MIT
