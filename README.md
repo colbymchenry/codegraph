@@ -74,6 +74,21 @@ codegraph init -i
 
 </div>
 
+### Auto-Initialize Every Clone (Optional)
+
+Run once to install a global git template hook. Every subsequent `git clone` or `git init` will automatically run `codegraph init` and `codegraph index` — no manual step required:
+
+```bash
+codegraph auto-init-repos
+```
+
+Git copies the hook into each new repo's `.git/hooks/post-checkout`. It also appends `.codegraph/` to `.gitignore` so the index never gets committed. To undo:
+
+```bash
+codegraph auto-init-repos --remove
+```
+
+> **Scope:** macOS, Linux, Git for Windows (MINGW). The hook fires on branch checkout only (not `git checkout -- file`). Existing repos are unaffected — only new clones and `git init`s after this command.
 ### Uninstall
 
 Changed your mind? One command removes CodeGraph from every agent it configured:
@@ -456,6 +471,8 @@ codegraph callers <symbol>        # Find what calls a function/method (--limit, 
 codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
 codegraph affected [files...]     # Find test files affected by changes (see below)
+codegraph auto-init-repos         # Install global hook: auto-init every new git clone
+codegraph auto-init-repos --remove # Remove the global hook
 codegraph serve --mcp             # Start MCP server
 ```
 

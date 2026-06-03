@@ -16,6 +16,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
+import { stripMarkerBlock, isEffectivelyEmpty, chmodExecutable } from './hook-utils';
 
 const MARKER_BEGIN = '# >>> codegraph sync hook >>>';
 const MARKER_END = '# <<< codegraph sync hook <<<';
@@ -85,35 +86,6 @@ function markerBlock(): string {
   ].join('\n');
 }
 
-/** Remove our marker block (and the marker lines) from hook content. */
-function stripMarkerBlock(content: string): string {
-  const lines = content.split('\n');
-  const kept: string[] = [];
-  let inBlock = false;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed === MARKER_BEGIN) { inBlock = true; continue; }
-    if (trimmed === MARKER_END) { inBlock = false; continue; }
-    if (!inBlock) kept.push(line);
-  }
-  return kept.join('\n');
-}
-
-/** Whether a hook body is just a shebang / blank lines (i.e. only ever ours). */
-function isEffectivelyEmpty(content: string): boolean {
-  return content
-    .split('\n')
-    .map((l) => l.trim())
-    .every((l) => l.length === 0 || l.startsWith('#!'));
-}
-
-function chmodExecutable(file: string): void {
-  try {
-    fs.chmodSync(file, 0o755);
-  } catch {
-    /* chmod is a no-op / unsupported on some platforms (e.g. Windows) */
-  }
-}
 
 /**
  * Install (or update) the CodeGraph sync hooks in a git repository.
@@ -144,7 +116,7 @@ export function installGitSyncHook(
 
     if (fs.existsSync(file)) {
       // Strip any prior block, then re-append the current one.
-      const base = stripMarkerBlock(fs.readFileSync(file, 'utf8')).replace(/\s*$/, '');
+      const base = stripMarkerBlock(fs.readFileSync(file, 'utf8'), MARKER_BEGIN, MARKER_END).replace(/\s*$/, '');
       content = base.length > 0
         ? `${base}\n\n${block}\n`
         : `#!/bin/sh\n${block}\n`;
@@ -183,7 +155,7 @@ export function removeGitSyncHook(
     const original = fs.readFileSync(file, 'utf8');
     if (!original.includes(MARKER_BEGIN)) continue;
 
-    const stripped = stripMarkerBlock(original);
+    const stripped = stripMarkerBlock(original, MARKER_BEGIN, MARKER_END);
     if (isEffectivelyEmpty(stripped)) {
       fs.unlinkSync(file);
     } else {
