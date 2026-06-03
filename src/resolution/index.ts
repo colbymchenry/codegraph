@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
@@ -664,6 +664,18 @@ export class ReferenceResolver {
     if (importResult) {
       if (importResult.confidence >= 0.9) return importResult;
       candidates.push(importResult);
+    }
+
+    // PHP include/require paths resolve to files via import resolution only.
+    // If that didn't find the file, do NOT fall back to the symbol
+    // name-matcher — it would mis-connect e.g. "inc/db.php" to an unrelated
+    // db.php elsewhere in the tree (a wrong edge is worse than none, #660).
+    if (isPhpIncludePathRef(ref)) {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) =>
+            curr.confidence > best.confidence ? curr : best
+          )
+        : null;
     }
 
     // Strategy 3: Try name matching

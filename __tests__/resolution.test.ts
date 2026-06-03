@@ -12,7 +12,7 @@ import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
 import { matchReference } from '../src/resolution/name-matcher';
-import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache } from '../src/resolution/import-resolver';
+import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
 import { QueryBuilder } from '../src/db/queries';
@@ -1770,6 +1770,138 @@ func main() {
           (r) => r.dstKind === 'file' && r.dstPath && r.dstPath.endsWith('vector')
         );
         expect(stdlibFile).toBeUndefined();
+      } finally {
+        fs.rmSync(tempProject, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('PHP Include Resolution', () => {
+    it('isPhpIncludePathRef distinguishes include paths from namespace use (#660)', () => {
+      const mk = (name: string, over: Partial<UnresolvedRef> = {}): UnresolvedRef => ({
+        fromNodeId: 'f', referenceName: name, referenceKind: 'imports',
+        line: 1, column: 0, filePath: 'x.php', language: 'php', ...over,
+      });
+      // include paths: contain a slash or a file extension
+      expect(isPhpIncludePathRef(mk('lib.php'))).toBe(true);
+      expect(isPhpIncludePathRef(mk('inc/db.php'))).toBe(true);
+      expect(isPhpIncludePathRef(mk('../config.php'))).toBe(true);
+      // namespace use symbols: a bare class (Closure) or FQN — never a path,
+      // so they must NOT be treated as includes (would mis-connect to a
+      // same-named Closure.php / Bar.php file).
+      expect(isPhpIncludePathRef(mk('Closure'))).toBe(false);
+      expect(isPhpIncludePathRef(mk('PDO'))).toBe(false);
+      expect(isPhpIncludePathRef(mk('App\\Foo\\Bar'))).toBe(false);
+      // scoped to PHP imports only
+      expect(isPhpIncludePathRef(mk('lib.php', { language: 'c' }))).toBe(false);
+      expect(isPhpIncludePathRef(mk('lib.php', { referenceKind: 'calls' }))).toBe(false);
+    });
+
+    it('resolves require_once to a file→file imports edge (#660)', async () => {
+      const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-php-e2e-'));
+      try {
+        fs.mkdirSync(path.join(tempProject, 'src'), { recursive: true });
+        fs.writeFileSync(
+          path.join(tempProject, 'src', 'lib.php'),
+          `<?php\nfunction greet() { return "hi"; }\n`
+        );
+        fs.writeFileSync(
+          path.join(tempProject, 'src', 'page.php'),
+          `<?php\nrequire_once("lib.php");\necho greet();\n`
+        );
+
+        cg = await CodeGraph.init(tempProject, { index: true });
+
+        // reporter's repro: page.php's `require_once("lib.php")` must resolve
+        // to the real src/lib.php file node — a file→file `imports` edge, so
+        // callers(lib.php) now includes page.php.
+        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        const rows = db.getDb().prepare(`
+          select dst.kind as dstKind, dst.file_path as dstPath
+          from edges e
+          join nodes src on e.source = src.id
+          join nodes dst on e.target = dst.id
+          where e.kind = 'imports'
+            and src.kind = 'file'
+            and src.file_path = 'src/page.php'
+        `).all() as Array<{ dstKind: string; dstPath: string }>;
+        const resolved = rows.find(
+          (r) => r.dstKind === 'file' && r.dstPath === 'src/lib.php'
+        );
+        expect(resolved, 'page.php → src/lib.php imports edge missing').toBeDefined();
+      } finally {
+        fs.rmSync(tempProject, { recursive: true, force: true });
+      }
+    });
+
+    it('resolves a subdirectory include path to the correct file (#660)', async () => {
+      const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-php-subdir-'));
+      try {
+        fs.mkdirSync(path.join(tempProject, 'inc'), { recursive: true });
+        fs.writeFileSync(
+          path.join(tempProject, 'inc', 'db.php'),
+          `<?php\nfunction query() { return 1; }\n`
+        );
+        fs.writeFileSync(
+          path.join(tempProject, 'index.php'),
+          `<?php\nrequire "inc/db.php";\nquery();\n`
+        );
+
+        cg = await CodeGraph.init(tempProject, { index: true });
+
+        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        const rows = db.getDb().prepare(`
+          select dst.kind as dstKind, dst.file_path as dstPath
+          from edges e
+          join nodes src on e.source = src.id
+          join nodes dst on e.target = dst.id
+          where e.kind = 'imports'
+            and src.kind = 'file'
+            and src.file_path = 'index.php'
+        `).all() as Array<{ dstKind: string; dstPath: string }>;
+        expect(
+          rows.find((r) => r.dstKind === 'file' && r.dstPath === 'inc/db.php'),
+          'index.php → inc/db.php imports edge missing'
+        ).toBeDefined();
+      } finally {
+        fs.rmSync(tempProject, { recursive: true, force: true });
+      }
+    });
+
+    it('does not mis-connect an unresolvable include to a same-named file elsewhere (#660)', async () => {
+      const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-php-misresolve-'));
+      try {
+        // app/page.php's `require "inc/db.php"` resolves relative to app/, where
+        // inc/db.php does NOT exist. A same-named lib/inc/db.php exists elsewhere
+        // but is unrelated — no edge should be created (a wrong edge is worse
+        // than a missing one).
+        fs.mkdirSync(path.join(tempProject, 'app'), { recursive: true });
+        fs.mkdirSync(path.join(tempProject, 'lib', 'inc'), { recursive: true });
+        fs.writeFileSync(
+          path.join(tempProject, 'lib', 'inc', 'db.php'),
+          `<?php\nfunction unrelated() {}\n`
+        );
+        fs.writeFileSync(
+          path.join(tempProject, 'app', 'page.php'),
+          `<?php\nrequire "inc/db.php";\n`
+        );
+
+        cg = await CodeGraph.init(tempProject, { index: true });
+
+        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        const rows = db.getDb().prepare(`
+          select dst.kind as dstKind, dst.file_path as dstPath
+          from edges e
+          join nodes src on e.source = src.id
+          join nodes dst on e.target = dst.id
+          where e.kind = 'imports'
+            and src.kind = 'file'
+            and src.file_path = 'app/page.php'
+        `).all() as Array<{ dstKind: string; dstPath: string }>;
+        expect(
+          rows.find((r) => r.dstKind === 'file' && r.dstPath === 'lib/inc/db.php'),
+          'app/page.php must NOT mis-connect to unrelated lib/inc/db.php'
+        ).toBeUndefined();
       } finally {
         fs.rmSync(tempProject, { recursive: true, force: true });
       }

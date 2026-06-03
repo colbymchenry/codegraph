@@ -2114,6 +2114,43 @@ use Closure;
       expect(names).toContain('Illuminate\\Support\\Str');
       expect(names).toContain('Closure');
     });
+
+    it('should extract include/require (+_once) static paths as imports (#660)', () => {
+      const code = `<?php
+require_once("lib.php");
+include 'other.php';
+require 'r.php';
+include_once("io.php");
+`;
+      const result = extractFromSource('page.php', code);
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('lib.php');
+      expect(names).toContain('other.php');
+      expect(names).toContain('r.php');
+      expect(names).toContain('io.php');
+    });
+
+    it('should skip dynamic include/require with no static path (#660)', () => {
+      const code = `<?php
+require_once(__DIR__ . '/dyn.php');
+include $file;
+include "tpl/{$name}.php";
+`;
+      const result = extractFromSource('page.php', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import');
+      expect(imports).toHaveLength(0);
+    });
+
+    it('should extract include alongside namespace use without interference (#660)', () => {
+      const code = `<?php
+use App\\Service\\Mailer;
+require_once("bootstrap.php");
+`;
+      const result = extractFromSource('page.php', code);
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('App\\Service\\Mailer');
+      expect(names).toContain('bootstrap.php');
+    });
   });
 
   describe('Ruby imports', () => {

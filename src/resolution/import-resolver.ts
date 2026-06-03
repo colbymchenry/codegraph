@@ -530,6 +530,47 @@ function resolveCppIncludePath(
 }
 
 /**
+ * Is this reference a PHP include/require PATH (vs a namespace `use` symbol)?
+ *
+ * include/require emit a file path ("lib.php", "inc/db.php", "../x.php"),
+ * whereas namespace use is an FQN (App\Foo\Bar) or a bare class symbol
+ * (Closure). PHP identifiers contain neither '/' nor '.', so a slash or dot
+ * marks a path-shaped include. Such references resolve to files only — never
+ * to a same-named symbol — so callers must not fall back to the name-matcher.
+ */
+export function isPhpIncludePathRef(ref: UnresolvedRef): boolean {
+  return (
+    ref.language === 'php' &&
+    ref.referenceKind === 'imports' &&
+    (ref.referenceName.includes('/') || ref.referenceName.includes('.'))
+  );
+}
+
+/**
+ * Resolve a PHP include/require path to a project-relative file path.
+ *
+ * PHP resolves includes relative to the including file's directory (the
+ * common case for procedural codebases); php.ini `include_path` is not
+ * modeled. Callers pass an already-extracted static literal path.
+ */
+function resolvePhpIncludePath(
+  includePath: string,
+  fromFile: string,
+  context: ResolutionContext
+): string | null {
+  const projectRoot = context.getProjectRoot();
+  const fromDir = path.dirname(path.join(projectRoot, fromFile));
+  const basePath = path.resolve(fromDir, includePath);
+  const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');
+  if (context.fileExists(relativePath)) return relativePath;
+  // The literal may omit the .php extension (e.g. include "config").
+  for (const ext of EXTENSION_RESOLUTION.php ?? []) {
+    if (context.fileExists(relativePath + ext)) return relativePath + ext;
+  }
+  return null;
+}
+
+/**
  * Extract import mappings from a file
  */
 export function extractImportMappings(
@@ -1119,6 +1160,36 @@ export function resolveViaImport(
         resolvedBy: 'import',
       };
     }
+    return null;
+  }
+
+  // PHP include/require — resolve the static string path to a file→file
+  // edge, mirroring the C/C++ branch above. Distinguish include PATHS from
+  // namespace `use` symbols by shape: an include path contains a slash or a
+  // file extension ("lib.php", "inc/db.php", "../x.php"), whereas a namespace
+  // use is an FQN (App\Foo\Bar) or a bare class symbol (Closure) — PHP
+  // identifiers contain neither '/' nor '.'. Only path-shaped references are
+  // includes; symbol references fall through to the namespace resolution.
+  if (isPhpIncludePathRef(ref)) {
+    const resolvedPath = resolvePhpIncludePath(ref.referenceName, ref.filePath, context);
+    if (resolvedPath) {
+      const basename = resolvedPath.split('/').pop()!;
+      const fileNode = context
+        .getNodesByName(basename)
+        .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+      if (fileNode) {
+        return {
+          original: ref,
+          targetNodeId: fileNode.id,
+          confidence: 0.9,
+          resolvedBy: 'import',
+        };
+      }
+    }
+    // A path-shaped include that doesn't resolve to a known project file is a
+    // dead end. Return unresolved rather than falling through to the symbol
+    // name-matcher, which would mis-connect e.g. "inc/db.php" to an unrelated
+    // db.php elsewhere in the tree — a wrong edge is worse than a missing one.
     return null;
   }
 
