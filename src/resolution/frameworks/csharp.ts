@@ -62,6 +62,32 @@ export const aspnetResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Pattern 0: C# attribute usage. `[HasPermission(...)]` in source
+    // resolves at compile time to a class named `HasPermissionAttribute`
+    // (the .NET convention). Without this rewrite, the name-matcher
+    // matches the unsuffixed name against unrelated methods that happen
+    // to share the bare name (e.g. `TenantContext.HasPermission(string)`).
+    if (
+      ref.referenceKind === 'decorates' &&
+      /^[A-Z]/.test(ref.referenceName) &&
+      !ref.referenceName.endsWith('Attribute')
+    ) {
+      const result = resolveByNameAndKind(
+        ref.referenceName + 'Attribute',
+        CLASS_KINDS,
+        [],
+        context,
+      );
+      if (result) {
+        return {
+          original: ref,
+          targetNodeId: result,
+          confidence: 0.9,
+          resolvedBy: 'framework',
+        };
+      }
+    }
+
     // Pattern 1: Controller references
     if (ref.referenceName.endsWith('Controller')) {
       const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, CONTROLLER_DIRS, context);
