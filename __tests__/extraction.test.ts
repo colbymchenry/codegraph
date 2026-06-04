@@ -4414,6 +4414,74 @@ void helperFunction(int count) {
   });
 });
 
+describe('GLSL Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect GLSL files by all shader extensions', () => {
+      expect(detectLanguage('shader.glsl')).toBe('glsl');
+      expect(detectLanguage('main.vert')).toBe('glsl');
+      expect(detectLanguage('main.frag')).toBe('glsl');
+      expect(detectLanguage('compute.comp')).toBe('glsl');
+      expect(detectLanguage('geometry.geom')).toBe('glsl');
+      expect(detectLanguage('tess.tesc')).toBe('glsl');
+      expect(detectLanguage('tess.tese')).toBe('glsl');
+    });
+
+    it('should report GLSL as supported', () => {
+      expect(isLanguageSupported('glsl')).toBe(true);
+      expect(getSupportedLanguages()).toContain('glsl');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract void and typed functions', () => {
+      const code = `
+void main() {
+  gl_Position = vec4(0.0);
+}
+
+vec3 computeNormal(vec3 a, vec3 b) {
+  return normalize(cross(a, b));
+}
+`;
+      const result = extractFromSource('shader.vert', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toContain('main');
+      expect(fns).toContain('computeNormal');
+      const main = result.nodes.find((n) => n.name === 'main');
+      expect(main?.language).toBe('glsl');
+    });
+  });
+
+  describe('Struct extraction', () => {
+    it('should extract struct definitions', () => {
+      const code = `
+struct Light {
+  vec3 position;
+  vec3 color;
+  float intensity;
+};
+`;
+      const result = extractFromSource('lighting.glsl', code);
+      const structs = result.nodes.filter((n) => n.kind === 'struct').map((n) => n.name);
+      expect(structs).toContain('Light');
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should record intra-file function calls', () => {
+      const code = `
+float square(float x) { return x * x; }
+void main() { float s = square(2.0); gl_Position = vec4(s); }
+`;
+      const result = extractFromSource('shader.frag', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'square'
+      );
+      expect(call).toBeDefined();
+    });
+  });
+});
+
 describe('Regression: issue-specific extraction fixes', () => {
   it('indexes inner functions of an anonymous AMD/CommonJS module wrapper (#528)', () => {
     const code = `

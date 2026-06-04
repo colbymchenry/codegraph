@@ -11,6 +11,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- GLSL shader files (`.glsl`, `.vert`, `.frag`, `.comp`, `.geom`, `.tesc`, `.tese`) are now indexed — functions, structs, and intra-file calls are extracted so you can navigate and query shader code alongside the rest of the project. (#685)
 - `codegraph status --json` now also reports the running CLI `version`, the index directory (`indexPath`), and a `lastIndexed` timestamp (ISO-8601, or null when nothing's indexed yet), so CI and scripts can pin the CLI version and check index freshness from a single command. A matching `CodeGraph.getLastIndexedAt()` library method exposes the same freshness check without shelling out. Thanks @12122J and @eddieran. (#329)
 
 ### Fixes
