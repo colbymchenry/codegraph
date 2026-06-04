@@ -46,9 +46,15 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
 export const EXTENSION_MAP: Record<string, Language> = {
   '.ts': 'typescript',
   '.tsx': 'tsx',
+  // ESM/CJS TypeScript module extensions — parsed as TS (no JSX). (#366)
+  '.mts': 'typescript',
+  '.cts': 'typescript',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
+  // SAP HANA XS Classic server-side JavaScript. (#556)
+  '.xsjs': 'javascript',
+  '.xsjslib': 'javascript',
   '.jsx': 'jsx',
   '.py': 'python',
   '.pyw': 'python',
@@ -288,6 +294,19 @@ export function isGrammarLoaded(language: Language): boolean {
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
   if (language === 'xml' || language === 'properties') return true; // no WASM grammar needed
   return languageCache.has(language);
+}
+
+/**
+ * Languages tracked at the file-record level only: parsing emits zero symbol
+ * nodes, but the file is still stored (and framework resolvers may add per-file
+ * references later, e.g. Drupal routing yml, Spring `@Value` against
+ * application.properties). This is the canonical set behind the no-symbol
+ * branch in `tree-sitter.ts`; `xml` is intentionally excluded because its
+ * MyBatis extractor emits a file node. Callers use this to count such files as
+ * indexed rather than skipped, so it must stay in sync with that branch.
+ */
+export function isFileLevelOnlyLanguage(language: Language): boolean {
+  return language === 'yaml' || language === 'twig' || language === 'properties';
 }
 
 /**

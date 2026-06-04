@@ -34,13 +34,11 @@ import {
   WriteResult,
 } from './types';
 import {
-  atomicWriteFileSync,
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
   writeJsonFile,
 } from './shared';
-import { INSTRUCTIONS_TEMPLATE } from '../instructions-template';
 
 function configDir(loc: Location): string {
   return loc === 'global'
@@ -76,7 +74,14 @@ class KiroTarget implements AgentTarget {
   install(loc: Location, _opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
     files.push(writeMcpEntry(loc));
-    files.push(writeSteeringEntry(loc));
+
+    // The steering doc is no longer written — the codegraph usage
+    // guidance ships in the MCP server's `initialize` response (issue
+    // #529). Delete a `codegraph.md` a previous install created so an
+    // upgrade self-heals.
+    const steeringCleanup = removeSteeringEntry(loc);
+    if (steeringCleanup.action === 'removed') files.push(steeringCleanup);
+
     return {
       files,
       // The IDE-only enable-MCP step is load-bearing: Kiro IDE ships
@@ -144,36 +149,11 @@ function writeMcpEntry(loc: Location): WriteResult['files'][number] {
 }
 
 /**
- * Write the dedicated steering file. Unlike CLAUDE.md / GEMINI.md
- * (shared files where codegraph owns a marker-delimited section),
- * Kiro's steering dir loads every `*.md` as a discrete document — so
- * `codegraph.md` is ours outright. Byte-equality short-circuits
- * idempotent re-runs; mismatched content gets a clean rewrite.
- */
-function writeSteeringEntry(loc: Location): WriteResult['files'][number] {
-  const file = steeringPath(loc);
-  const dir = path.dirname(file);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-  const body = INSTRUCTIONS_TEMPLATE + '\n';
-
-  if (!fs.existsSync(file)) {
-    atomicWriteFileSync(file, body);
-    return { path: file, action: 'created' };
-  }
-  const existing = fs.readFileSync(file, 'utf-8');
-  if (existing === body) {
-    return { path: file, action: 'unchanged' };
-  }
-  atomicWriteFileSync(file, body);
-  return { path: file, action: 'updated' };
-}
-
-/**
  * Delete the steering file we own. If a user has hand-edited the file
  * out of recognition we still remove it — codegraph.md is a name we
  * claim, and a partial install leaving the file behind is worse than
- * a clean delete.
+ * a clean delete. Used by both install (self-heal on upgrade — see
+ * issue #529) and uninstall.
  */
 function removeSteeringEntry(loc: Location): WriteResult['files'][number] {
   const file = steeringPath(loc);

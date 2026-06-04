@@ -103,19 +103,4 @@ export interface AgentTarget {
   printConfig(loc: Location): string;
   /** Filesystem paths this target would write to at this location. */
   describePaths(loc: Location): string[];
-  /**
-   * Optional. Write any project-local surfaces this target needs in
-   * order to work fully when its MCP config is configured globally.
-   * Called by `codegraph init` to bootstrap new projects without
-   * forcing the user to re-run `codegraph install` per project.
-   *
-   * Most targets need nothing here — their global config is complete.
-   * Cursor is the notable exception: its rules system
-   * (`.cursor/rules/*.mdc`) is project-scoped only, and is what makes
-   * Cursor's agent prefer codegraph over its built-in grep.
-   *
-   * Must be idempotent. Targets that have nothing project-local omit
-   * the method entirely.
-   */
-  wireProjectSurfaces?(): WriteResult;
 }

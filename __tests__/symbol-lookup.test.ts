@@ -75,7 +75,8 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — module-qualified lookups (#173)'
   let projectRoot: string;
   let cg: any;
   let handler: any;
-  let findSymbol: (cg: any, s: string) => { node: any; note: string } | null;
+  // findSymbolMatches returns ALL ranked matches; [0] is the resolved/picked one.
+  let findSymbolMatches: (cg: any, s: string) => any[];
   let findAllSymbols: (cg: any, s: string) => { nodes: any[]; note: string };
 
   beforeEach(async () => {
@@ -87,7 +88,7 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — module-qualified lookups (#173)'
     });
     await cg.indexAll();
     handler = new ToolHandler(cg);
-    findSymbol = (handler as any).findSymbol.bind(handler);
+    findSymbolMatches = (handler as any).findSymbolMatches.bind(handler);
     findAllSymbols = (handler as any).findAllSymbols.bind(handler);
   });
 
@@ -98,10 +99,11 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — module-qualified lookups (#173)'
   });
 
   it('resolves `stage_apply::run` to the run in stage_apply.rs (not stage_detect.rs)', () => {
-    const match = findSymbol(cg, 'stage_apply::run');
-    expect(match).not.toBeNull();
-    expect(match!.node.name).toBe('run');
-    expect(match!.node.filePath).toMatch(/configurator\/stage_apply\.rs$/);
+    const matches = findSymbolMatches(cg, 'stage_apply::run');
+    expect(matches.length).toBeGreaterThan(0);
+    expect(matches[0]!.name).toBe('run');
+    // Every match must be in stage_apply.rs — never stage_detect.rs.
+    for (const n of matches) expect(n.filePath).toMatch(/configurator\/stage_apply\.rs$/);
   });
 
   it('rejects `stage_apply::run` for the same-named function in a different module', () => {
@@ -114,29 +116,29 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — module-qualified lookups (#173)'
   });
 
   it('resolves `configurator::stage_apply::run` (multi-level qualifier)', () => {
-    const match = findSymbol(cg, 'configurator::stage_apply::run');
-    expect(match).not.toBeNull();
-    expect(match!.node.name).toBe('run');
-    expect(match!.node.filePath).toMatch(/configurator\/stage_apply\.rs$/);
+    const matches = findSymbolMatches(cg, 'configurator::stage_apply::run');
+    expect(matches.length).toBeGreaterThan(0);
+    expect(matches[0]!.name).toBe('run');
+    expect(matches[0]!.filePath).toMatch(/configurator\/stage_apply\.rs$/);
   });
 
   it('resolves `crate::configurator::stage_apply::run` (Rust path prefix stripped)', () => {
-    const match = findSymbol(cg, 'crate::configurator::stage_apply::run');
-    expect(match).not.toBeNull();
-    expect(match!.node.filePath).toMatch(/configurator\/stage_apply\.rs$/);
+    const matches = findSymbolMatches(cg, 'crate::configurator::stage_apply::run');
+    expect(matches.length).toBeGreaterThan(0);
+    expect(matches[0]!.filePath).toMatch(/configurator\/stage_apply\.rs$/);
   });
 
   it('resolves `configurator/stage_apply` (slash qualifier)', () => {
-    const match = findSymbol(cg, 'configurator/stage_apply/run');
-    expect(match).not.toBeNull();
-    expect(match!.node.filePath).toMatch(/configurator\/stage_apply\.rs$/);
+    const matches = findSymbolMatches(cg, 'configurator/stage_apply/run');
+    expect(matches.length).toBeGreaterThan(0);
+    expect(matches[0]!.filePath).toMatch(/configurator\/stage_apply\.rs$/);
   });
 
   it('does not silently collide bare `run` with `run_due_tasks`', () => {
-    const match = findSymbol(cg, 'run');
-    expect(match).not.toBeNull();
-    // Whatever it picks, it must be an exact-name match, not a partial.
-    expect(match!.node.name).toBe('run');
+    const matches = findSymbolMatches(cg, 'run');
+    expect(matches.length).toBeGreaterThan(0);
+    // Whatever it picks, every match must be an exact-name match, not a partial.
+    for (const n of matches) expect(n.name).toBe('run');
   });
 
   it('aggregates all bare-name `run` matches across modules', () => {
@@ -148,9 +150,22 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — module-qualified lookups (#173)'
     expect(all.note).toMatch(/Aggregated|symbols named "run"/);
   });
 
-  it('still returns null for genuinely unknown qualified lookups', () => {
-    const match = findSymbol(cg, 'stage_apply::nonexistent_fn');
-    expect(match).toBeNull();
+  it('still returns nothing for genuinely unknown qualified lookups', () => {
+    const matches = findSymbolMatches(cg, 'stage_apply::nonexistent_fn');
+    expect(matches.length).toBe(0);
+  });
+
+  it('codegraph_node with a `file` hint pins an overloaded name to that file', async () => {
+    // `run` is defined in BOTH stage_apply.rs and stage_detect.rs. A bare lookup
+    // returns both; the `file` hint narrows to the one the caller saw in a trail.
+    const res = await handler.execute('codegraph_node', {
+      symbol: 'run',
+      includeCode: true,
+      file: 'stage_detect.rs',
+    });
+    const text = res.content?.[0]?.text ?? '';
+    expect(text).toMatch(/stage_detect\.rs/);
+    expect(text).not.toMatch(/stage_apply\.rs/);
   });
 });
 
@@ -158,7 +173,7 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
   let projectRoot: string;
   let cg: any;
   let handler: any;
-  let findSymbol: (cg: any, s: string) => { node: any; note: string } | null;
+  let findSymbolMatches: (cg: any, s: string) => any[];
 
   beforeEach(async () => {
     projectRoot = tmpRoot();
@@ -166,7 +181,7 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     fs.mkdirSync(src, { recursive: true });
     fs.writeFileSync(
       path.join(src, 'session.ts'),
-      `export class Session {\n  request(): void {}\n}\nexport function request(): void {}\n`
+      `export class Session {\n  request(): void { fetch('x'); }\n}\nexport function request(): void {}\n`
     );
 
     const CodeGraph = (await import('../src/index')).default;
@@ -176,7 +191,7 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     });
     await cg.indexAll();
     handler = new ToolHandler(cg);
-    findSymbol = (handler as any).findSymbol.bind(handler);
+    findSymbolMatches = (handler as any).findSymbolMatches.bind(handler);
   });
 
   afterEach(() => {
@@ -186,9 +201,22 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
   });
 
   it('`Session.request` resolves to the method, not the bare function', () => {
-    const match = findSymbol(cg, 'Session.request');
-    expect(match).not.toBeNull();
-    expect(match!.node.kind).toBe('method');
-    expect(match!.node.qualifiedName).toContain('Session::request');
+    const matches = findSymbolMatches(cg, 'Session.request');
+    expect(matches.length).toBeGreaterThan(0);
+    expect(matches[0]!.kind).toBe('method');
+    expect(matches[0]!.qualifiedName).toContain('Session::request');
+  });
+
+  it('codegraph_node on an ambiguous bare name returns ALL overloads with bodies (no guess)', async () => {
+    // `request` is BOTH a method (Session.request) and a free function. The old
+    // behavior returned one + a dead-end "Others:" note, forcing a Read to get
+    // the other overload; now both bodies come back in one call.
+    const res = await handler.execute('codegraph_node', { symbol: 'request', includeCode: true });
+    const text = res.content?.[0]?.text ?? '';
+    expect(text).toContain('2 definitions named "request"');
+    // Both definitions are rendered (method + function), each with a Location.
+    expect(text).toMatch(/\(method\)/);
+    expect(text).toMatch(/\(function\)/);
+    expect((text.match(/\*\*Location:\*\*/g) || []).length).toBeGreaterThanOrEqual(2);
   });
 });

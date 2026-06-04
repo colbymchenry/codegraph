@@ -50,7 +50,12 @@ import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './
 
 // Re-export types for consumers
 export * from './types';
-export { getDatabasePath } from './db';
+// Storage building blocks for embedded/SDK consumers that drive the graph
+// directly (open a DB, run prepared queries) rather than through the CodeGraph
+// facade. Exposed from the package entry so they no longer require deep imports
+// into dist/ (issue #354).
+export { getDatabasePath, DatabaseConnection } from './db';
+export { QueryBuilder } from './db/queries';
 export {
   getCodeGraphDir,
   isInitialized,
@@ -556,8 +561,8 @@ export class CodeGraph {
   }
 
   /**
-   * Resolves once the file watcher has finished its initial chokidar scan.
-   * Useful for tests that need a deterministic boundary before asserting on
+   * Resolves once the file watcher has installed its watch set. Useful for
+   * tests that need a deterministic boundary before asserting on
    * `getPendingFiles()`. Resolves immediately when no watcher is active.
    */
   waitUntilWatcherReady(timeoutMs?: number): Promise<void> {
@@ -569,6 +574,15 @@ export class CodeGraph {
    */
   getChangedFiles(): { added: string[]; modified: string[]; removed: string[] } {
     return this.orchestrator.getChangedFiles();
+  }
+
+  /**
+   * Most recent index timestamp (ms since epoch) across all tracked files, or
+   * null when nothing is indexed yet. Lets library consumers check index
+   * freshness without shelling out to `codegraph status --json`. (#329)
+   */
+  getLastIndexedAt(): number | null {
+    return this.queries.getLastIndexedAt();
   }
 
   /**
@@ -677,10 +691,46 @@ export class CodeGraph {
   }
 
   /**
+   * Get ALL nodes with an exact name (direct index lookup, not FTS-ranked/capped).
+   * Used to enumerate every overload of a heavily-overloaded name so the specific
+   * definition the caller wants is never dropped below a search cut.
+   */
+  getNodesByName(name: string): Node[] {
+    return this.queries.getNodesByName(name);
+  }
+
+  /**
    * Search nodes by text
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
     return this.queries.searchNodes(query, options);
+  }
+
+  /**
+   * Find the project's "primary route file" — the file with the densest
+   * concentration of framework-emitted `route` nodes (≥3 routes, ≥30%
+   * of all non-test routes). Used to inline the routing config in
+   * `codegraph_explore` responses on small realworld template repos
+   * (rails-realworld, laravel-realworld, drupal-admintoolbar, …) where
+   * Glob+Read of `routes.rb`/`urls.py`/etc. otherwise beats codegraph.
+   */
+  getTopRouteFile(): { filePath: string; routeCount: number; totalRoutes: number } | null {
+    return this.queries.getTopRouteFile();
+  }
+
+  /**
+   * Build a URL → handler routing manifest from the index. Each entry
+   * pairs a route node (URL + method) with its handler function/method
+   * via the `references` edge that framework resolvers emit. Returns
+   * null when fewer than 3 valid (non-test) routes exist.
+   */
+  getRoutingManifest(limit?: number): {
+    entries: Array<{ url: string; handler: string; handlerFile: string; handlerLine: number; handlerKind: string }>;
+    topHandlerFile: string | null;
+    topHandlerFileCount: number;
+    totalRoutes: number;
+  } | null {
+    return this.queries.getRoutingManifest(limit);
   }
 
   // ===========================================================================

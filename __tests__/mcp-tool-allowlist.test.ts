@@ -21,28 +21,28 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
     delete process.env[ENV];
     const all = listed();
     expect(all).toContain('codegraph_explore');
-    expect(all).toContain('codegraph_context');
-    expect(all).toContain('codegraph_trace');
-    expect(all.length).toBeGreaterThanOrEqual(10);
+    expect(all).not.toContain('codegraph_context');
+    expect(all).not.toContain('codegraph_trace');
+    expect(all.length).toBeGreaterThanOrEqual(8);
   });
 
   it('filters ListTools to the allowlisted short names', () => {
-    process.env[ENV] = 'trace,search,node';
-    expect(listed()).toEqual(['codegraph_node', 'codegraph_search', 'codegraph_trace']);
+    process.env[ENV] = 'explore,search,node';
+    expect(listed()).toEqual(['codegraph_explore', 'codegraph_node', 'codegraph_search']);
   });
 
   it('accepts fully-qualified codegraph_ names and ignores whitespace', () => {
-    process.env[ENV] = ' codegraph_trace , search ';
-    expect(listed()).toEqual(['codegraph_search', 'codegraph_trace']);
+    process.env[ENV] = ' codegraph_explore , search ';
+    expect(listed()).toEqual(['codegraph_explore', 'codegraph_search']);
   });
 
   it('treats an empty/whitespace value as unset (full surface)', () => {
     process.env[ENV] = '   ';
-    expect(listed().length).toBeGreaterThanOrEqual(10);
+    expect(listed().length).toBeGreaterThanOrEqual(8);
   });
 
   it('rejects a disabled tool on execute (defense in depth)', async () => {
-    process.env[ENV] = 'trace';
+    process.env[ENV] = 'node';
     const res = await new ToolHandler(null).execute('codegraph_explore', {});
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/disabled via CODEGRAPH_MCP_TOOLS/);

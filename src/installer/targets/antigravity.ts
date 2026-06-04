@@ -124,6 +124,7 @@ function resolveCodegraphCommand(): string {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
       shell: '/bin/bash',
+      windowsHide: true,
     }).trim();
     if (resolved && fs.existsSync(resolved)) return resolved;
   } catch {

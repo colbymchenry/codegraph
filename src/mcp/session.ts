@@ -23,13 +23,15 @@ import { CodeGraphPackageVersion } from './version';
  * MCP Server Info — kept on the session because some clients log it. The
  * version tracks the real package version (was a hard-coded '0.1.0').
  */
-const SERVER_INFO = {
+// Exported so the proxy can answer `initialize` locally with the IDENTICAL
+// payload the daemon would send — no drift between the two handshake paths.
+export const SERVER_INFO = {
   name: 'codegraph',
   version: CodeGraphPackageVersion,
 };
 
 /** MCP Protocol Version (latest the server claims). */
-const PROTOCOL_VERSION = '2024-11-05';
+export const PROTOCOL_VERSION = '2024-11-05';
 
 /**
  * How long to wait for the client's `roots/list` response before giving up
@@ -129,6 +131,19 @@ export class MCPSession {
         break;
       case 'ping':
         if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, {});
+        break;
+      case 'resources/list':
+        // We expose no MCP resources, but some clients (opencode, Codex) probe
+        // for them on connect; reply with an empty list instead of a
+        // MethodNotFound error that surfaces as a scary `-32601` log line. (#621)
+        if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, { resources: [] });
+        break;
+      case 'resources/templates/list':
+        if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, { resourceTemplates: [] });
+        break;
+      case 'prompts/list':
+        // Likewise — no prompts exposed, but answer the probe cleanly. (#621)
+        if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, { prompts: [] });
         break;
       default:
         if (isRequest) {

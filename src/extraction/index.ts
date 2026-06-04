@@ -17,7 +17,7 @@ import {
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
-import { detectLanguage, isSourceFile, isLanguageSupported, initGrammars, loadGrammarsForLanguages } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
@@ -191,39 +191,39 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
  * (See issue #193.)
  */
 function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): void {
-  const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'] };
+  const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true };
 
   // Tracked files. --recurse-submodules pulls in files from active submodules,
   // which the index would otherwise represent only as a commit pointer.
   // Without this, monorepos using submodules index 0 files. (See issue #147.)
   // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
   // can't be combined with -o, so untracked files are gathered separately below.
-  const tracked = execFileSync('git', ['ls-files', '-c', '--recurse-submodules'], gitOpts);
-  for (const line of tracked.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed) {
-      files.add(normalizePath(prefix + trimmed));
-    }
+  // -z gives NUL-separated, unquoted output so non-ASCII (e.g. CJK) paths
+  // survive verbatim. Without it git octal-escapes and double-quotes such paths
+  // (the core.quotepath default), and the quoted form never matches a real file
+  // on disk → those files are silently dropped from the index. (#541)
+  const tracked = execFileSync('git', ['ls-files', '-z', '-c', '--recurse-submodules'], gitOpts);
+  for (const rel of tracked.split('\0')) {
+    if (rel) files.add(normalizePath(prefix + rel));
   }
 
   // Untracked files (submodules manage their own untracked state). Embedded git
   // repos surface here as a single "subdir/" entry that git refuses to descend
   // into — recurse into those as their own repos so their source gets indexed.
-  const untracked = execFileSync('git', ['ls-files', '-o', '--exclude-standard'], gitOpts);
-  for (const line of untracked.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (trimmed.endsWith('/')) {
+  const untracked = execFileSync('git', ['ls-files', '-z', '-o', '--exclude-standard'], gitOpts);
+  for (const rel of untracked.split('\0')) {
+    if (!rel) continue;
+    if (rel.endsWith('/')) {
       // git only emits a trailing-slash directory entry for an embedded repo.
       // Guard with a .git check anyway, and skip anything else exactly as git
       // itself skips it (we never descend into a non-repo opaque dir).
-      const childDir = path.join(repoDir, trimmed);
+      const childDir = path.join(repoDir, rel);
       if (fs.existsSync(path.join(childDir, '.git'))) {
-        collectGitFiles(childDir, prefix + trimmed, files);
+        collectGitFiles(childDir, prefix + rel, files);
       }
       continue;
     }
-    files.add(normalizePath(prefix + trimmed));
+    files.add(normalizePath(prefix + rel));
   }
 }
 
@@ -241,7 +241,7 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     const gitRoot = execFileSync(
       'git',
       ['rev-parse', '--show-toplevel'],
-      { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
+      { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     ).trim();
 
     if (path.resolve(gitRoot) !== path.resolve(rootDir)) {
@@ -250,7 +250,7 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
         execFileSync(
           'git',
           ['check-ignore', '-q', path.resolve(rootDir)],
-          { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
+          { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
         );
         // Directory is gitignored by parent repo — fall back to filesystem walk
         return null;
@@ -291,7 +291,7 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
     const output = execFileSync(
       'git',
       ['status', '--porcelain', '--no-renames'],
-      { cwd: rootDir, encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] }
+      { cwd: rootDir, encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );
 
     const modified: string[] = [];
@@ -942,7 +942,15 @@ export class ExtractionOrchestrator {
         } else if (result.errors.some((e) => e.severity === 'error')) {
           filesErrored++;
         } else {
-          filesSkipped++;
+          // Files with no symbols but no errors (yaml, twig, properties) are
+          // tracked at the file level — count them as indexed so the CLI
+          // doesn't misleadingly report "No files found to index".
+          const lang = detectLanguage(filePath, content);
+          if (isFileLevelOnlyLanguage(lang)) {
+            filesIndexed++;
+          } else {
+            filesSkipped++;
+          }
         }
       }
     }
@@ -1108,7 +1116,12 @@ export class ExtractionOrchestrator {
       } else if (result.errors.some((e) => e.severity === 'error')) {
         filesErrored++;
       } else {
-        filesSkipped++;
+        const tracked = this.queries.getFileByPath(filePath);
+        if (tracked && isFileLevelOnlyLanguage(tracked.language)) {
+          filesIndexed++;
+        } else {
+          filesSkipped++;
+        }
       }
     }
 

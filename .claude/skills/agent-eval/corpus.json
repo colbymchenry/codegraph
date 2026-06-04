@@ -11,7 +11,8 @@
   "Go": [
     { "name": "cobra", "repo": "https://github.com/spf13/cobra", "size": "Small", "files": "~50", "question": "How does cobra parse commands and flags?" },
     { "name": "gin", "repo": "https://github.com/gin-gonic/gin", "size": "Medium", "files": "~150", "question": "How does gin route requests through its middleware chain?" },
-    { "name": "terraform", "repo": "https://github.com/hashicorp/terraform", "size": "Large", "files": "~4000", "question": "How does Terraform build and walk the resource dependency graph?" }
+    { "name": "terraform", "repo": "https://github.com/hashicorp/terraform", "size": "Large", "files": "~4000", "question": "How does Terraform build and walk the resource dependency graph?" },
+    { "name": "cosmos-sdk", "repo": "https://github.com/cosmos/cosmos-sdk", "size": "Large", "files": "~5000", "question": "How does a bank module MsgSend message reach the account balance update? Trace the cross-module call path from the bank keeper's Send handler through to the account/balance store update." }
   ],
   "Python": [
     { "name": "click", "repo": "https://github.com/pallets/click", "size": "Small", "files": "~60", "question": "How does click parse command-line arguments into commands?" },

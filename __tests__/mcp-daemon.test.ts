@@ -346,11 +346,12 @@ describe('Shared MCP daemon (issue #411)', () => {
       servers.push(server);
       sendInitialize(server.child, `file://${tempDir}`, 1);
       // Despite the mismatched daemon, the client still gets an initialize
-      // response — the proxy refuses to attach and falls back to direct mode.
+      // response — the proxy answers the handshake locally and, refusing to
+      // attach across the version mismatch, serves the session in-process.
       const resp = await waitFor(() => findResponse(server.stdout, 1), 10000);
       expect(resp.result.serverInfo.name).toBe('codegraph');
       await waitFor(
-        () => server.stderr.some((l) => l.includes('falling back to direct mode')),
+        () => server.stderr.some((l) => l.includes('serving this session in-process')),
         6000,
       );
     } finally {

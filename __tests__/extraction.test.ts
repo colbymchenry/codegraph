@@ -10,7 +10,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory } from '../src/extraction';
-import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars } from '../src/extraction/grammars';
+import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -3226,6 +3226,70 @@ export function multiply(a: number, b: number): number {
 
     cg.close();
   });
+
+  it('should count file-level tracked YAML files as indexed', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'routes.yml'), 'route: value\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll();
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+    expect(cg.getFiles().map((f) => f.path).sort()).toEqual(['app.yaml', 'routes.yml']);
+
+    cg.close();
+  });
+
+  it('should count file-level tracked YAML/Twig files as indexed in indexFiles()', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexFiles(['app.yaml', 'view.twig']);
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+
+    const tracked = cg.getFiles().map((f) => `${f.path}:${f.language}`).sort();
+    expect(tracked).toEqual(['app.yaml:yaml', 'view.twig:twig']);
+
+    cg.close();
+  });
+
+  it('should count file-level tracked .properties files as indexed', async () => {
+    fs.writeFileSync(path.join(tempDir, 'application.properties'), 'server.port=8080\n');
+    fs.writeFileSync(path.join(tempDir, 'log.properties'), 'log.level=INFO\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll();
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+
+    cg.close();
+  });
+
+  it('should count the full file-level tracked class (yaml/twig/properties) in indexFiles()', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');
+    fs.writeFileSync(path.join(tempDir, 'application.properties'), 'server.port=8080\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexFiles(['app.yaml', 'view.twig', 'application.properties']);
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(3);
+    expect(result.filesSkipped).toBe(0);
+
+    const tracked = cg.getFiles().map((f) => `${f.path}:${f.language}`).sort();
+    expect(tracked).toEqual(['app.yaml:yaml', 'application.properties:properties', 'view.twig:twig']);
+
+    cg.close();
+  });
 });
 
 describe('Path Normalization', () => {
@@ -3854,6 +3918,32 @@ export default {
     expect(calls).toHaveLength(2);
   });
 
+  it('should extract component usages from the Vue template (PascalCase + kebab, skipping built-ins) (#629)', () => {
+    const code = `<template>
+  <div class="wrap">
+    <UserCard :user="u" />
+    <my-button>Click</my-button>
+    <Transition><span>x</span></Transition>
+  </div>
+</template>
+
+<script setup lang="ts">
+import UserCard from './UserCard.vue';
+import MyButton from './MyButton.vue';
+</script>
+`;
+    const result = extractFromSource('Host.vue', code);
+    const refs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'references')
+      .map((r) => r.referenceName);
+
+    expect(refs).toContain('UserCard'); // PascalCase tag
+    expect(refs).toContain('MyButton'); // kebab <my-button> → MyButton
+    expect(refs).not.toContain('Transition'); // Vue built-in skipped
+    expect(refs).not.toContain('Div'); // native HTML element skipped
+    expect(refs).not.toContain('Span');
+  });
+
   it('should extract from both <script> and <script setup> blocks', () => {
     const code = `<template>
   <div>{{ msg }}</div>
@@ -4321,5 +4411,51 @@ void helperFunction(int count) {
   it('should report Objective-C as supported', () => {
     expect(isLanguageSupported('objc')).toBe(true);
     expect(getSupportedLanguages()).toContain('objc');
+  });
+});
+
+describe('Regression: issue-specific extraction fixes', () => {
+  it('indexes inner functions of an anonymous AMD/CommonJS module wrapper (#528)', () => {
+    const code = `
+define(['dep'], function (dep) {
+  function innerHelper(x) { return x + 1; }
+  function compute(y) { return innerHelper(y); }
+  return { compute: compute };
+});
+`;
+    const result = extractFromSource('amd-module.js', code);
+    const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(fns).toContain('innerHelper');
+    expect(fns).toContain('compute');
+  });
+
+  it('attaches Go methods on generic receivers to their type (#583)', () => {
+    const code = `
+package main
+
+type Stack[T any] struct { items []T }
+
+func (s *Stack[T]) Push(v T) { s.items = append(s.items, v) }
+func (s Stack[T]) Len() int { return len(s.items) }
+`;
+    const result = extractFromSource('stack.go', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method');
+    expect(methods.find((m) => m.name === 'Push')?.qualifiedName).toBe('Stack::Push');
+    expect(methods.find((m) => m.name === 'Len')?.qualifiedName).toBe('Stack::Len');
+  });
+
+  it('indexes new module extensions: .mts/.cts (TS) and .xsjs/.xsjslib (JS) (#366, #556)', () => {
+    expect(isSourceFile('mod.mts')).toBe(true);
+    expect(isSourceFile('mod.cts')).toBe(true);
+    expect(isSourceFile('service.xsjs')).toBe(true);
+    expect(isSourceFile('lib.xsjslib')).toBe(true);
+    expect(detectLanguage('mod.mts')).toBe('typescript');
+    expect(detectLanguage('service.xsjs')).toBe('javascript');
+
+    // End-to-end: a .mts file is parsed as TS, a .xsjs file as JS.
+    const ts = extractFromSource('mod.mts', 'export function hello(): number { return 1; }');
+    expect(ts.nodes.find((n) => n.name === 'hello' && n.kind === 'function')).toBeDefined();
+    const js = extractFromSource('service.xsjs', 'function handleRequest() { return 1; }');
+    expect(js.nodes.find((n) => n.name === 'handleRequest' && n.kind === 'function')).toBeDefined();
   });
 });

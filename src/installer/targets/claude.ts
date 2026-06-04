@@ -28,19 +28,16 @@ import {
   WriteResult,
 } from './types';
 import {
-  atomicWriteFileSync,
   getCodeGraphPermissions,
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
   removeMarkedSection,
-  replaceOrAppendMarkedSection,
   writeJsonFile,
 } from './shared';
 import {
   CODEGRAPH_SECTION_END,
   CODEGRAPH_SECTION_START,
-  INSTRUCTIONS_TEMPLATE,
 } from '../instructions-template';
 
 function configDir(loc: Location): string {
@@ -123,8 +120,15 @@ class ClaudeCodeTarget implements AgentTarget {
     const hookCleanup = cleanupLegacyHooks(loc);
     if (hookCleanup.action === 'removed') files.push(hookCleanup);
 
-    // 3. CLAUDE.md instructions
-    files.push(writeInstructionsEntry(loc));
+    // 3. CLAUDE.md instructions — no longer written. The codegraph
+    // usage guidance now ships solely in the MCP server's `initialize`
+    // response (see `mcp/server-instructions.ts`), which Claude Code
+    // surfaces in the system prompt automatically. Writing it into
+    // CLAUDE.md as well meant the agent read the same playbook twice
+    // every turn (issue #529). Strip any block a previous install left
+    // behind so an upgrade self-heals — same idiom as the hook cleanup.
+    const instrCleanup = removeInstructionsEntry(loc);
+    if (instrCleanup.action === 'removed') files.push(instrCleanup);
 
     return { files };
   }
@@ -185,10 +189,8 @@ class ClaudeCodeTarget implements AgentTarget {
     const hookCleanup = cleanupLegacyHooks(loc);
     if (hookCleanup.action === 'removed') files.push(hookCleanup);
 
-    // 3. Instructions
-    const instr = instructionsPath(loc);
-    const action = removeMarkedSection(instr, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
-    files.push({ path: instr, action });
+    // 3. Instructions — strip the legacy CodeGraph block if present.
+    files.push(removeInstructionsEntry(loc));
 
     return { files };
   }
@@ -359,48 +361,19 @@ export function writePermissionsEntry(loc: Location): WriteResult['files'][numbe
   return { path: file, action: created ? 'created' : 'updated' };
 }
 
-export function writeInstructionsEntry(loc: Location): WriteResult['files'][number] {
+/**
+ * Strip the marker-delimited CodeGraph block from CLAUDE.md if a prior
+ * install wrote one. Codegraph no longer maintains an instructions file
+ * (issue #529) — the MCP server's `initialize` instructions are the
+ * single source of truth — so both install (self-heal on upgrade) and
+ * uninstall call this. `removeMarkedSection` returns `not-found`/`kept`
+ * when there's nothing to strip; the install caller drops those from
+ * the report so a fresh install stays quiet.
+ */
+export function removeInstructionsEntry(loc: Location): WriteResult['files'][number] {
   const file = instructionsPath(loc);
-  // Ensure config dir exists (for global ~/.claude/).
-  const dir = path.dirname(file);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-  // Honor the legacy "unmarked ## CodeGraph" rewrite path that the
-  // original installer supported (some users hand-pasted a section
-  // before markers existed). Detect first and migrate inline.
-  if (fs.existsSync(file)) {
-    const content = fs.readFileSync(file, 'utf-8');
-    if (!content.includes(CODEGRAPH_SECTION_START)) {
-      const headerMatch = content.match(/\n## CodeGraph\n/);
-      if (headerMatch && headerMatch.index !== undefined) {
-        const sectionStart = headerMatch.index;
-        const after = content.substring(sectionStart + 1);
-        const nextHeader = after.match(/\n## (?!#)/);
-        const sectionEnd = nextHeader && nextHeader.index !== undefined
-          ? sectionStart + 1 + nextHeader.index
-          : content.length;
-        const merged =
-          content.substring(0, sectionStart) +
-          '\n' + INSTRUCTIONS_TEMPLATE +
-          content.substring(sectionEnd);
-        atomicWriteFileSync(file, merged);
-        return { path: file, action: 'updated' };
-      }
-    }
-  }
-
-  const action = replaceOrAppendMarkedSection(
-    file,
-    INSTRUCTIONS_TEMPLATE,
-    CODEGRAPH_SECTION_START,
-    CODEGRAPH_SECTION_END,
-  );
-  // Map the four-state action to WriteResult's action vocabulary.
-  const mapped: 'created' | 'updated' | 'unchanged' =
-    action === 'created' ? 'created'
-      : action === 'unchanged' ? 'unchanged'
-        : 'updated';
-  return { path: file, action: mapped };
+  const action = removeMarkedSection(file, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
+  return { path: file, action };
 }
 
 export const claudeTarget: AgentTarget = new ClaudeCodeTarget();
