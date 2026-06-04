@@ -202,6 +202,17 @@ function isPascalCase(str: string): boolean {
 }
 
 /**
+ * Directory portion of a posix-style path, or '' for a root-level file.
+ * `src/ui/Card.svelte` -> `src/ui`; `App.svelte` -> ''. Used for exact
+ * same-directory comparison (vs a raw `startsWith`, which matches
+ * prefix-sibling directories like `src/ui-kit` for `src/ui`).
+ */
+function dirOf(filePath: string): string {
+  const slash = filePath.lastIndexOf('/');
+  return slash >= 0 ? filePath.slice(0, slash) : '';
+}
+
+/**
  * Resolve a Svelte component reference using name-based lookup
  */
 function resolveComponent(
@@ -215,9 +226,12 @@ function resolveComponent(
 
   if (components.length === 0) return null;
 
-  // Prefer same directory
-  const fromDir = fromFile.substring(0, fromFile.lastIndexOf('/'));
-  const sameDir = components.filter((n) => n.filePath.startsWith(fromDir));
+  // Prefer same directory. Compare directory paths exactly — a raw
+  // `startsWith(fromDir)` would treat a prefix-sibling directory
+  // (`src/ui-kit/` for `src/ui/`) as the same directory and resolve to
+  // the wrong component.
+  const fromDir = dirOf(fromFile);
+  const sameDir = components.filter((n) => dirOf(n.filePath) === fromDir);
   if (sameDir.length > 0) return sameDir[0]!.id;
 
   return components[0]!.id;
