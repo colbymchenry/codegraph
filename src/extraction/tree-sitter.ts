@@ -141,6 +141,7 @@ export class TreeSitterExtractor {
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
   private methodIndex: Map<string, string> | null = null; // lookup key → node ID for Pascal defProc lookup
+  private localVarTypes = new Map<string, string>(); // var name → call prefix (with separator), populated by extractor.buildLocalScope
 
   constructor(filePath: string, source: string, language?: Language) {
     this.filePath = filePath;
@@ -1851,7 +1852,35 @@ export class TreeSitterExtractor {
           // Scoped call: Module::function()
           calleeName = getNodeText(func, this.source);
         } else {
-          calleeName = getNodeText(func, this.source);
+          // Grammars that use receiver + method fields (e.g. Ruby) rather than a
+          // single function field. namedChild(0) is the receiver. When a `method`
+          // field exists:
+          // - identifier receiver: emit resolved prefix (if known) + method, else "receiver.method"
+          // - constant/scope_resolution receiver: emit class name only
+          //   (resolver promotes .new calls on classes to `instantiates`)
+          // - complex receiver (chained call etc.): emit just the method name
+          const methodNode = getChildByField(node, 'method');
+          if (methodNode) {
+            const methodName = getNodeText(methodNode, this.source);
+            if (func.type === 'identifier') {
+              const receiverName = getNodeText(func, this.source);
+              const RUBY_SKIP = new Set(['self', 'super', 'nil']);
+              if (RUBY_SKIP.has(receiverName)) {
+                calleeName = methodName;
+              } else {
+                const resolvedPrefix = this.localVarTypes.get(receiverName);
+                calleeName = resolvedPrefix
+                  ? `${resolvedPrefix}${methodName}`
+                  : `${receiverName}.${methodName}`;
+              }
+            } else if (func.type === 'constant' || func.type === 'scope_resolution') {
+              calleeName = getNodeText(func, this.source);
+            } else {
+              calleeName = methodName;
+            }
+          } else {
+            calleeName = getNodeText(func, this.source);
+          }
         }
       }
     }
@@ -2108,6 +2137,12 @@ export class TreeSitterExtractor {
   private visitFunctionBody(body: SyntaxNode, _functionId: string): void {
     if (!this.extractor) return;
 
+    // Ask the extractor to pre-scan the body for statically-typed locals (e.g. Ruby
+    // `var = SomeClass.new(...)`). Nested bodies each get their own scope; restoring
+    // on exit lets the outer body's remaining nodes still resolve.
+    const savedLocalVarTypes = this.localVarTypes;
+    this.localVarTypes = this.extractor?.buildLocalScope?.(body, this.source) ?? new Map();
+
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
       const nodeType = node.type;
 
@@ -2191,6 +2226,7 @@ export class TreeSitterExtractor {
     };
 
     visitForCallsAndStructure(body);
+    this.localVarTypes = savedLocalVarTypes;
   }
 
   /**

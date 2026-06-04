@@ -38,6 +38,38 @@ export const rubyExtractor: LanguageExtractor = {
     ctx.popScope();
     return true; // handled
   },
+  buildLocalScope: (body, source) => {
+    // Pre-scan the method body for `var = SomeClass.new(...)` assignments so that
+    // subsequent `var.method` calls can be emitted as `SomeClass::method` — a name
+    // the resolver can match directly rather than falling back to `var.method`.
+    //
+    // Map value includes the `::` separator so the engine stays agnostic:
+    //   creator = Payments::Processor.new  →  "creator" → "Payments::Processor::"
+    const scope = new Map<string, string>();
+    const scan = (node: SyntaxNode): void => {
+      if (node.type === 'assignment') {
+        const left = node.childForFieldName('left') ?? node.namedChild(0);
+        const right = node.childForFieldName('right') ?? node.namedChild(1);
+        // Only track: plain local variable on the left, `.new` call on the right
+        if (left?.type === 'identifier' && right?.type === 'call') {
+          const method = right.childForFieldName('method');
+          if (method && getNodeText(method, source) === 'new') {
+            // Receiver must be a bare constant (`Foo`) or namespaced (`Foo::Bar`)
+            const receiver = right.namedChild(0);
+            if (receiver?.type === 'constant' || receiver?.type === 'scope_resolution') {
+              scope.set(getNodeText(left, source), `${getNodeText(receiver, source)}::`);
+            }
+          }
+        }
+      }
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child) scan(child);
+      }
+    };
+    scan(body);
+    return scope;
+  },
   extractBareCall: (node, _source) => {
     // Ruby bare method calls (no parens, no receiver) parse as plain identifiers.
     // e.g., `reset` in a method body is `identifier "reset"` not a `call` node.

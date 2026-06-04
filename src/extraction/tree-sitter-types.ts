@@ -214,6 +214,22 @@ export interface LanguageExtractor {
   extractBareCall?: (node: SyntaxNode, source: string) => string | undefined;
 
   /**
+   * Pre-scan a function body and return a map of local variable name → qualified
+   * call prefix (including separator) for variables whose type is statically known
+   * from a constructor assignment.
+   *
+   * The engine stores this map for the duration of the body traversal. When it
+   * encounters a call whose receiver matches a key, it emits `prefix + methodName`
+   * instead of `receiver.method`, producing a directly resolvable reference.
+   *
+   * The value must include the language's member-access separator so the engine
+   * stays separator-agnostic. Examples:
+   *   Ruby `creator = Payments::Processor.new(…)` → `"Payments::Processor::"`
+   *   Python `obj = payments.Processor(…)`        → `"payments.Processor."`
+   */
+  buildLocalScope?: (body: SyntaxNode, source: string) => Map<string, string>;
+
+  /**
    * Node types representing a file-level package/namespace declaration
    * (e.g. Kotlin `package_header`, Java `package_declaration`). When set,
    * the core wraps every top-level declaration in an implicit `namespace`
