@@ -145,6 +145,16 @@ export interface LanguageExtractor {
   extraClassNodeTypes?: string[];
   /** Whether methods can be top-level without enclosing class (Go: true) */
   methodsAreTopLevel?: boolean;
+  /**
+   * Restrict method-vs-function classification to specific parent scope kinds.
+   * A node listed in both functionTypes and methodTypes is extracted as a
+   * 'method' only when its immediate enclosing scope (the nearest extracted
+   * parent on the node stack) is one of these kinds; otherwise it stays a
+   * 'function'. SystemVerilog uses ['class'] so a subroutine is a method inside
+   * a class but a plain function inside a module. When unset, the broad
+   * class-like check (class/struct/interface/trait/enum/module) is used.
+   */
+  methodScopeKinds?: NodeKind[];
   /** NodeKind to use for interface-like declarations (Rust: 'trait'). Default: 'interface' */
   interfaceKind?: NodeKind;
 

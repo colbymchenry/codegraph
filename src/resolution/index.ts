@@ -600,6 +600,18 @@ export class ReferenceResolver {
       return null;
     }
 
+    // SystemVerilog `this.m`/`super.m` calls need inheritance-aware binding
+    // (super must reach the PARENT class's `m`, not the caller's own), and the
+    // `__sv_create__`/`__sv_connect__` markers carry factory/TLM wiring the
+    // generic matcher can't interpret. Leave all of these unresolved here; the
+    // SV post-passes bind them once the class graph + create-map exist.
+    if (
+      ref.language === 'systemverilog' &&
+      (/^(this|super)\.\w+$/.test(ref.referenceName) || ref.referenceName.startsWith('__sv_'))
+    ) {
+      return null;
+    }
+
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
@@ -724,7 +736,320 @@ export class ReferenceResolver {
       );
     }
 
+    // Bind SystemVerilog this./super. calls now that extends + contains edges
+    // exist (these were intentionally skipped in resolveOne). Best-effort.
+    this.resolveSvHandleCalls();
+    // Bind SV factory-create + TLM-connect markers (composition + dataflow).
+    this.resolveSvHdlEdges();
+
     return result;
+  }
+
+  /**
+   * Bind SystemVerilog `this.<m>` / `super.<m>` method calls to the method they
+   * dispatch to, walking the `extends` chain so `super` reaches the parent's
+   * implementation (never the caller's own → no false self-edge).
+   *
+   * Runs as a post-pass because it needs the class `extends` and member
+   * `contains` edges already in the graph. These refs are left unresolved by
+   * resolveOne, so they're still in `unresolved_refs` when we get here.
+   *
+   * Returns the number of `calls` edges created.
+   */
+  resolveSvHandleCalls(): number {
+    const HANDLE_CALL = /^(this|super)\.(\w+)$/;
+    const candidates = this.queries
+      .getUnresolvedReferences()
+      .filter((ref) => ref.referenceKind === 'calls' && HANDLE_CALL.test(ref.referenceName));
+    if (candidates.length === 0) return 0;
+
+    const edges: Edge[] = [];
+    type RefKey = { fromNodeId: string; referenceName: string; referenceKind: string };
+    const bound: RefKey[] = [];
+    // SV handle-calls that have an SV caller but no resolvable target in the
+    // current graph. They are genuinely unresolvable now (the post-pass runs
+    // against the fully-built graph), so we drop them like any other dead ref.
+    // If we kept them, an unresolvable `super.x()` — the common case when the
+    // UVM base library isn't indexed — would linger in unresolved_refs forever,
+    // inflate the unresolved metric, and be re-walked on every incremental sync.
+    const unbindable: RefKey[] = [];
+    const key = (ref: UnresolvedReference): RefKey => ({
+      fromNodeId: ref.fromNodeId,
+      referenceName: ref.referenceName,
+      referenceKind: ref.referenceKind,
+    });
+
+    for (const ref of candidates) {
+      // The from-node is the calling method; confirm it's SV before touching it
+      // (the regex alone could collide with another language's ref name). A
+      // non-SV caller is left untouched — not our ref to delete.
+      const caller = this.queries.getNodeById(ref.fromNodeId);
+      if (!caller || caller.language !== 'systemverilog') continue;
+
+      const m = HANDLE_CALL.exec(ref.referenceName);
+      if (!m) continue;
+      const handle = m[1]!; // 'this' | 'super'
+      const method = m[2]!;
+
+      const enclosing = this.findEnclosingClass(ref.fromNodeId);
+      // `this.` searches the enclosing class and up its chain; `super.` starts
+      // at the parent so the caller's own same-named method is excluded.
+      const startClass = enclosing
+        ? (handle === 'super' ? this.superClassOf(enclosing.id) : enclosing)
+        : null;
+      const target = startClass ? this.findMethodInChain(startClass.id, method) : null;
+
+      if (!target) {
+        unbindable.push(key(ref));
+        continue;
+      }
+
+      edges.push({
+        source: ref.fromNodeId,
+        target: target.id,
+        kind: 'calls',
+        line: ref.line,
+        column: ref.column,
+        metadata: { confidence: 0.9, resolvedBy: 'qualified-name' },
+      });
+      bound.push(key(ref));
+    }
+
+    if (edges.length > 0) this.queries.insertEdges(edges);
+    // Both bound and unbindable refs are removed so subsequent syncs re-scan
+    // nothing — every SV handle-call is resolved exactly once.
+    const toDelete = bound.concat(unbindable);
+    if (toDelete.length > 0) this.queries.deleteSpecificResolvedReferences(toDelete);
+    return edges.length;
+  }
+
+  /**
+   * Resolve a SystemVerilog type name (bare `T` or scoped `pkg::T`) to its
+   * class node. Prefers an exact qualified-name hit so a scoped reference lands
+   * on the right package; falls back to a unique bare-name class.
+   */
+  private findClassByName(typeName: string): Node | null {
+    if (typeName.includes('::')) {
+      const exact = this.queries.getNodesByQualifiedNameExact(typeName).find((n) => n.kind === 'class');
+      if (exact) return exact;
+    }
+    const bare = typeName.includes('::') ? typeName.split('::').pop()! : typeName;
+    const classes = this.queries.getNodesByName(bare).filter((n) => n.kind === 'class');
+    return classes.length === 1 ? classes[0]! : (classes[0] ?? null);
+  }
+
+  /**
+   * Bind the SystemVerilog factory-create and TLM-connect markers emitted by
+   * the extractor (`__sv_create__<handle>__<Type>`, `__sv_connect__<from>__<to>`).
+   * Both express composition/dataflow that the generic resolver can't read, so
+   * they ride through as marker `calls` refs and are bound here, after the class
+   * graph exists. Returns the number of `references` edges created.
+   *
+   * Pass 1 (creates) runs first and builds a per-class handle->component-type
+   * map; pass 2 (connects) consumes that map to resolve dotted TLM chains.
+   */
+  resolveSvHdlEdges(): number {
+    const candidates = this.queries
+      .getUnresolvedReferences()
+      .filter((ref) => ref.referenceKind === 'calls' && ref.referenceName.startsWith('__sv_'));
+    if (candidates.length === 0) return 0;
+
+    type RefKey = { fromNodeId: string; referenceName: string; referenceKind: string };
+    const key = (ref: UnresolvedReference): RefKey => ({
+      fromNodeId: ref.fromNodeId,
+      referenceName: ref.referenceName,
+      referenceKind: ref.referenceKind,
+    });
+    const edges: Edge[] = [];
+    const bound: RefKey[] = [];
+    const unbindable: RefKey[] = [];
+
+    // map[classId][handle] = the component class that handle was created as.
+    // Built from creates so a chain walk stops at a component (a port handle is
+    // never factory-created, so it isn't a key → the walk halts there).
+    const createMap = new Map<string, Map<string, Node>>();
+
+    const creates = candidates.filter((r) => r.referenceName.startsWith('__sv_create__'));
+    const connects = candidates.filter((r) => r.referenceName.startsWith('__sv_connect__'));
+
+    // Create edges already emitted this pass, so two creates of the same type in
+    // one class don't add duplicate rows.
+    const emittedCreate = new Set<string>();
+
+    // Pass 1: factory creates -> class->Type composition edge + create-map.
+    for (const ref of creates) {
+      const caller = this.queries.getNodeById(ref.fromNodeId);
+      if (!caller || caller.language !== 'systemverilog') continue;
+
+      // `__sv_create__<handle>|<Type>`; handle may be empty (unassigned create).
+      // The handle/type split is `|` (not `__`) because `__` is a legal SV
+      // identifier substring and would mangle names like `cfg__db`.
+      const body = ref.referenceName.slice('__sv_create__'.length);
+      const sep = body.indexOf('|');
+      if (sep < 0) { unbindable.push(key(ref)); continue; }
+      const handle = body.slice(0, sep);
+      const typeName = body.slice(sep + 1);
+
+      const cls = this.findEnclosingClass(ref.fromNodeId);
+      const typeClass = typeName ? this.findClassByName(typeName) : null;
+      if (!cls || !typeClass) { unbindable.push(key(ref)); continue; }
+
+      // Composition edge — but only when it adds information the field view
+      // (#2) lacks. The dominant UVM pattern declares `T h;` AND creates it via
+      // the factory, which would otherwise yield two identical rows. The #2
+      // field edge is already persisted before this post-pass runs, so a create
+      // edge is emitted ONLY for a factory OVERRIDE (a created type with no
+      // matching field edge) — exactly the create's unique value. Self-creates
+      // are skipped as graph noise.
+      const pairKey = `${cls.id} ${typeClass.id}`;
+      const fieldEdgeExists = this.queries
+        .getOutgoingEdges(cls.id, ['references'])
+        .some((e) => e.target === typeClass.id);
+      if (typeClass.id !== cls.id && !fieldEdgeExists && !emittedCreate.has(pairKey)) {
+        emittedCreate.add(pairKey);
+        edges.push({
+          source: cls.id,
+          target: typeClass.id,
+          kind: 'references',
+          line: ref.line,
+          column: ref.column,
+          metadata: { confidence: 0.9, resolvedBy: 'qualified-name' },
+        });
+      }
+      // Always record the handle (even when the edge was suppressed or it's a
+      // self-create) so a later TLM chain can still walk through it.
+      if (handle) {
+        let perClass = createMap.get(cls.id);
+        if (!perClass) { perClass = new Map(); createMap.set(cls.id, perClass); }
+        perClass.set(handle, typeClass);
+      }
+      bound.push(key(ref));
+    }
+
+    // Pass 2: TLM connects -> dataflow edge between the resolved components.
+    for (const ref of connects) {
+      const caller = this.queries.getNodeById(ref.fromNodeId);
+      if (!caller || caller.language !== 'systemverilog') continue;
+
+      // `__sv_connect__<fromChain>|<toChain>`; chains are dotted (dots kept),
+      // split on `|` for the same reason the create marker does.
+      const body = ref.referenceName.slice('__sv_connect__'.length);
+      const sep = body.indexOf('|');
+      if (sep < 0) { unbindable.push(key(ref)); continue; }
+      const fromChain = body.slice(0, sep);
+      const toChain = body.slice(sep + 1);
+
+      const cls = this.findEnclosingClass(ref.fromNodeId);
+      const a = cls ? this.resolveSvChain(cls, fromChain, createMap) : null;
+      const b = cls ? this.resolveSvChain(cls, toChain, createMap) : null;
+      if (!a || !b || a.id === b.id) { unbindable.push(key(ref)); continue; }
+
+      edges.push({
+        source: a.id,
+        target: b.id,
+        kind: 'references',
+        line: ref.line,
+        column: ref.column,
+        metadata: { confidence: 0.9, resolvedBy: 'qualified-name' },
+      });
+      bound.push(key(ref));
+    }
+
+    if (edges.length > 0) this.queries.insertEdges(edges);
+    // Drop bound and genuinely-unbindable markers alike so no `__sv_*__` ref
+    // lingers to be re-walked on the next sync (same hygiene as the super pass).
+    const toDelete = bound.concat(unbindable);
+    if (toDelete.length > 0) this.queries.deleteSpecificResolvedReferences(toDelete);
+    return edges.length;
+  }
+
+  /**
+   * Walk a dotted TLM handle chain (`agt.mon.ap`) through the create-map,
+   * starting from `cls`. Each token is looked up as a created handle of the
+   * current class; while it resolves to a known class we descend, and we STOP
+   * at the first token with no mapping (a port/export like `ap`, which is never
+   * factory-created). Returns the last resolved component (the monitor for
+   * `agt.mon.ap`), or null if not even the first hop resolves. Visited-guard +
+   * the fixed token count bound the walk.
+   */
+  private resolveSvChain(cls: Node, chain: string, createMap: Map<string, Map<string, Node>>): Node | null {
+    const tokens = chain.split('.').filter((t) => t.length > 0);
+    let current: Node = cls;
+    let resolved: Node | null = null;
+    const visited = new Set<string>([cls.id]);
+    for (const token of tokens) {
+      const next = createMap.get(current.id)?.get(token);
+      if (!next || visited.has(next.id)) break; // port token or cycle -> stop here
+      visited.add(next.id);
+      resolved = next;
+      current = next;
+    }
+    return resolved;
+  }
+
+  /**
+   * Climb `contains` parents from a node until the first enclosing `class`.
+   * Works for both inline methods (parent class directly contains them) and
+   * out-of-class definitions (`task C::run();`), which the extractor wires
+   * under BOTH the file and the owning class. Because a node can have several
+   * contains-parents, each level prefers a `class` parent and otherwise climbs
+   * through a non-file parent — climbing into the file would dead-end at the
+   * root and miss the class sibling edge.
+   */
+  private findEnclosingClass(nodeId: string): Node | null {
+    let currentId = nodeId;
+    for (let depth = 0; depth < 32; depth++) {
+      const parents = this.queries
+        .getIncomingEdges(currentId, ['contains'])
+        .map((e) => this.queries.getNodeById(e.source))
+        .filter((n): n is Node => n !== null);
+      if (parents.length === 0) return null;
+
+      const klass = parents.find((p) => p.kind === 'class');
+      if (klass) return klass;
+
+      // No class at this level — keep climbing, but skip the file root so an
+      // out-of-class method still reaches its class via the class-side edge.
+      const next = parents.find((p) => p.kind !== 'file') ?? parents[0]!;
+      currentId = next.id;
+    }
+    return null;
+  }
+
+  /**
+   * The base class a class `extends` (one hop up the chain), or null.
+   * SystemVerilog has single class inheritance; an interface base is promoted
+   * to an `implements` edge (see createEdges), so filtering on `extends` yields
+   * only the true class parent — taking [0] is safe.
+   */
+  private superClassOf(classId: string): Node | null {
+    const extendsEdges = this.queries.getOutgoingEdges(classId, ['extends']);
+    const targetId = extendsEdges[0]?.target;
+    if (!targetId) return null;
+    return this.queries.getNodeById(targetId);
+  }
+
+  /**
+   * Find a `method` named `method` in `startClass`, else recurse up the
+   * `extends` chain. Visited-guard + depth cap keep a malformed/cyclic
+   * inheritance graph from looping forever.
+   */
+  private findMethodInChain(startClassId: string, method: string): Node | null {
+    const visited = new Set<string>();
+    let classId: string | null = startClassId;
+    for (let depth = 0; depth < 32 && classId; depth++) {
+      if (visited.has(classId)) return null;
+      visited.add(classId);
+
+      for (const edge of this.queries.getOutgoingEdges(classId, ['contains'])) {
+        const child = this.queries.getNodeById(edge.target);
+        if (child && child.kind === 'method' && child.name === method) return child;
+      }
+
+      const parent = this.superClassOf(classId);
+      classId = parent ? parent.id : null;
+    }
+    return null;
   }
 
   /**
@@ -772,10 +1097,18 @@ export class ReferenceResolver {
         );
       }
 
-      // Delete unresolvable refs from this batch to avoid re-processing them
-      if (result.unresolved.length > 0) {
+      // Delete unresolvable refs from this batch to avoid re-processing them.
+      // SystemVerilog this./super. calls and the __sv_create__/__sv_connect__
+      // markers are the exception: resolveOne leaves them unresolved on purpose
+      // so the SV post-passes (below) can bind them once the class graph +
+      // create-map exist. Keep those in the table.
+      const toDrop = result.unresolved.filter(
+        (r) => !(r.language === 'systemverilog' &&
+          (/^(this|super)\.\w+$/.test(r.referenceName) || r.referenceName.startsWith('__sv_')))
+      );
+      if (toDrop.length > 0) {
         this.queries.deleteSpecificResolvedReferences(
-          result.unresolved.map((r) => ({
+          toDrop.map((r) => ({
             fromNodeId: r.fromNodeId,
             referenceName: r.referenceName,
             referenceKind: r.referenceKind,
@@ -802,6 +1135,17 @@ export class ReferenceResolver {
       if (result.resolved.length === 0 && result.unresolved.length === batch.length) {
         break;
       }
+    }
+
+    // Bind SystemVerilog this./super. calls now that the extends + contains
+    // edges are all persisted (these refs were preserved above for this pass).
+    try {
+      const svBound = this.resolveSvHandleCalls();
+      if (svBound > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svBound;
+      const svHdl = this.resolveSvHdlEdges();
+      if (svHdl > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svHdl;
+    } catch {
+      // additive and optional; never fail the index on it
     }
 
     // Dynamic-edge synthesis: now that all base `calls` edges are persisted,

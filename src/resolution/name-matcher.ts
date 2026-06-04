@@ -608,7 +608,23 @@ function findBestMatch(
       if (
         candidate.kind === 'class' ||
         candidate.kind === 'struct' ||
-        candidate.kind === 'interface'
+        candidate.kind === 'interface' ||
+        candidate.kind === 'module'
+      ) {
+        score += 25;
+      }
+    }
+
+    // For inheritance references (`class D extends Base`, `implements I`), prefer
+    // type-like targets — a same-named function/method must not outscore the
+    // actual base type when both are in scope.
+    if (ref.referenceKind === 'extends' || ref.referenceKind === 'implements') {
+      if (
+        candidate.kind === 'class' ||
+        candidate.kind === 'struct' ||
+        candidate.kind === 'interface' ||
+        candidate.kind === 'trait' ||
+        candidate.kind === 'protocol'
       ) {
         score += 25;
       }
