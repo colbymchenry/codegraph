@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 export const phpExtractor: LanguageExtractor = {
@@ -19,6 +19,18 @@ export const phpExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'return_type',
+  getSignature: (node, source) => {
+    // Mirror Java's "<returnType> <params>" shape so resolvers that already
+    // parse signatures (e.g. inferJavaFieldReceiverType) have the same
+    // convention. The return-type prefix is what the chain resolver in
+    // name-matcher.ts reads to gate `Cls::for(...)->method(...)` chains on
+    // `: self` / `: static` (#608).
+    const params = getChildByField(node, 'parameters');
+    const returnType = getChildByField(node, 'return_type');
+    if (!params) return undefined;
+    const paramsText = getNodeText(params, source);
+    return returnType ? getNodeText(returnType, source) + ' ' + paramsText : paramsText;
+  },
   classifyClassNode: (node) => {
     return node.type === 'trait_declaration' ? 'trait' : 'class';
   },

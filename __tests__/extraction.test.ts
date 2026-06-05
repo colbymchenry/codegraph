@@ -1023,6 +1023,82 @@ class ChildController extends BaseController implements Serializable, JsonSerial
     expect(implementsRefs.map((r) => r.referenceName)).toContain('Serializable');
     expect(implementsRefs.map((r) => r.referenceName)).toContain('JsonSerializable');
   });
+
+  it('chained static-factory call emits a resolvable receiver (#608)', () => {
+    // `ApiClient::for($x)->createOrder(...)` parses as a member_call_expression
+    // whose `object` field is a scoped_call_expression. Pre-#608, getNodeText
+    // on the scoped_call_expression returned the full literal text (args
+    // included), so the emitted reference was the unmatchable
+    // `ApiClient::for('cred-123').createOrder`. The chain-receiver unwrap
+    // collapses it to `<ScopeClass>::<staticMethod>` so the chain resolver
+    // in name-matcher.ts can verify the static's return type and resolve
+    // the chained call against the correct class.
+    const code = `<?php
+class ApiClient {
+    public static function for(string $credential): self {
+        return new self;
+    }
+    public function createOrder(array $payload): array {
+        return [];
+    }
+}
+
+class DispatchOrder {
+    public function handle(): void {
+        $r = ApiClient::for('cred-123')->createOrder([]);
+    }
+}
+`;
+    const result = extractFromSource('repro.php', code);
+
+    const chainRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'calls' &&
+             r.referenceName === 'ApiClient::for.createOrder'
+    );
+    expect(chainRef).toBeDefined();
+
+    // No reference should still carry the args from the inner static call —
+    // that's the failure mode #608 documents.
+    const mangled = result.unresolvedReferences.find((r) =>
+      r.referenceName.includes("for('cred-123')")
+    );
+    expect(mangled).toBeUndefined();
+
+    // The inner static call edge is unchanged.
+    const innerStatic = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'calls' && r.referenceName === 'ApiClient.for'
+    );
+    expect(innerStatic).toBeDefined();
+  });
+
+  it('PHP method signatures include the declared return type', () => {
+    // Pre-#608 PHP had no getSignature, so methods got signature=undefined
+    // and the chain resolver had no return-type to gate on. The signature
+    // mirrors Java's "<returnType> <params>" convention so the same
+    // signature-parsing shape works across languages.
+    const code = `<?php
+class X {
+    public static function makeSelf(): self { return new self; }
+    public function noReturn() { return 0; }
+    public function nullableStr(): ?string { return null; }
+}
+`;
+    const result = extractFromSource('X.php', code);
+
+    const makeSelf = result.nodes.find((n) => n.name === 'makeSelf');
+    expect(makeSelf?.signature).toBeDefined();
+    // First whitespace-separated token is the return type.
+    expect(makeSelf!.signature!.trim().split(/\s+/)[0]).toBe('self');
+
+    const nullableStr = result.nodes.find((n) => n.name === 'nullableStr');
+    expect(nullableStr!.signature!.trim().split(/\s+/)[0]).toBe('?string');
+
+    // Methods without a declared return type still get a signature
+    // (just the params); the resolver handles the missing-return case.
+    const noReturn = result.nodes.find((n) => n.name === 'noReturn');
+    expect(noReturn?.signature).toBeDefined();
+    expect(noReturn!.signature!.trim()).toBe('()');
+  });
 });
 
 describe('Swift Extraction', () => {
