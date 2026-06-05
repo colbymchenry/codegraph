@@ -84,8 +84,16 @@ class FactoryDroidsTarget implements AgentTarget {
       if (Object.keys(config.mcpServers).length === 0) {
         delete config.mcpServers;
       }
-      writeJsonFile(file, config);
-      files.push({ path: file, action: 'removed' });
+
+      if (Object.keys(config).length === 0) {
+        if (fs.existsSync(file)) {
+          fs.unlinkSync(file);
+        }
+        files.push({ path: file, action: 'removed' });
+      } else {
+        writeJsonFile(file, config);
+        files.push({ path: file, action: 'updated' });
+      }
     } else {
       files.push({ path: file, action: 'not-found' });
     }

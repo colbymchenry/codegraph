@@ -539,12 +539,26 @@ describe('Installer targets — partial-state idempotency', () => {
     );
 
     factory.install('global', { autoAllow: true });
-    factory.uninstall('global');
+    const result = factory.uninstall('global');
 
     const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
     expect(cfg.mcpServers.sibling).toEqual({ command: 'uvx', args: ['other-server'] });
     expect(cfg.mcpServers.codegraph).toBeUndefined();
+    expect(result.files).toContainEqual({ path: mcp, action: 'updated' });
   });
+
+  it('factory: uninstall deletes the mcp.json file when no other content remains', () => {
+    const factory = getTarget('factory')!;
+    const mcp = path.join(tmpHome, '.factory', 'mcp.json');
+
+    factory.install('global', { autoAllow: true });
+    expect(fs.existsSync(mcp)).toBe(true);
+
+    const result = factory.uninstall('global');
+    expect(fs.existsSync(mcp)).toBe(false);
+    expect(result.files).toContainEqual({ path: mcp, action: 'removed' });
+  });
+
 
   it('factory: local install writes ./.factory/mcp.json', () => {
     const factory = getTarget('factory')!;
