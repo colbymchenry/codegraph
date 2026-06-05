@@ -2188,6 +2188,87 @@ end
     });
   });
 
+  describe('Ruby calls', () => {
+    it('should resolve a method call on a local var assigned from .new', () => {
+      const code = `
+module CachedCounting
+  def perform_increment!(key, count)
+    writer = CacheWriter.new
+    writer.write_cache!(key, count)
+  end
+end
+`;
+      const result = extractFromSource('concerns/cached_counting.rb', code);
+
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.some((c) => c.referenceName === 'CacheWriter::write_cache!')).toBe(true);
+    });
+
+    it('should resolve a method call on a local var assigned from namespaced .new', () => {
+      const code = `
+module Notifications
+  class Dispatcher
+    def dispatch(user)
+      mailer = Notifications::Mailer.new(user)
+      mailer.send_welcome!
+    end
+  end
+end
+`;
+      const result = extractFromSource('lib/notifications/dispatcher.rb', code);
+
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.some((c) => c.referenceName === 'Notifications::Mailer::send_welcome!')).toBe(true);
+    });
+
+    it('should extract .new as a calls reference to the class', () => {
+      const code = `
+module CachedCounting
+  def perform_increment!(key, count)
+    CacheWriter.new(key: key, count: count)
+  end
+end
+`;
+      const result = extractFromSource('concerns/cached_counting.rb', code);
+
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.some((c) => c.referenceName === 'CacheWriter')).toBe(true);
+    });
+
+    it('should extract .new on a fully-qualified namespaced class', () => {
+      const code = `
+module Discourse
+  class AuthProvider
+    def authenticate(params)
+      Discourse::Auth::TokenValidator.new(params)
+    end
+  end
+end
+`;
+      const result = extractFromSource('lib/auth.rb', code);
+
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.some((c) => c.referenceName === 'Discourse::Auth::TokenValidator')).toBe(true);
+    });
+
+    it('should extract a method call chained directly on a .new expression', () => {
+      const code = `
+module Discourse
+  class AuthProvider
+    def authenticate(params)
+      Discourse::Auth::TokenValidator.new(params).validate!
+    end
+  end
+end
+`;
+      const result = extractFromSource('lib/auth.rb', code);
+
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.some((c) => c.referenceName === 'Discourse::Auth::TokenValidator')).toBe(true);
+      expect(calls.some((c) => c.referenceName === 'validate!')).toBe(true);
+    });
+  });
+
   describe('C/C++ imports', () => {
     it('should extract system include', () => {
       const code = `#include <iostream>`;
