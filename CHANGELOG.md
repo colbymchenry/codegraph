@@ -11,6 +11,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- CodeGraph now indexes **Clojure and ClojureScript** (`.clj`, `.cljs`, `.cljc`, and Babashka `.bb` files) — namespaces, functions (`defn`, multi-arity, function-valued `def`s), protocols, records and their methods, multimethods, and `:require`/`:import` clauses. Calls through namespace aliases (`(str/upper-case ...)`) and `:refer`ed symbols resolve across files, so callers, callees, impact, and `codegraph_explore` flow tracing all work on Clojure codebases.
+- **EDN config files** (`deps.edn`, `bb.edn`, `shadow-cljs.edn`, integrant/system configs) are indexed as data: top-level keys become searchable config entries, and qualified symbols in their values (a shadow-cljs `:init-fn`, an integrant component's handler) link to the code they name. Large EDN datasets (translation dictionaries, fixtures) are deliberately kept out of the graph.
+- **re-frame apps get connected event flows**: every `reg-event-db`/`reg-event-fx`/`reg-sub` registration becomes a searchable symbol named by its keyword (`:profile/logout`), and `dispatch`/`subscribe` call sites link to it — so callers, impact, and flow tracing follow keyword-keyed dispatch across files. Project facades that wrap re-frame (custom `reg-*` helpers, `sub` aliases) are detected too.
+- **UIx and helix components are first-class**: `defui`/`defnc` definitions become component symbols, and `($ button ...)` element composition produces real call edges — so "what renders this component" works in ClojureScript React apps.
 - `codegraph status --json` now also reports the running CLI `version`, the index directory (`indexPath`), and a `lastIndexed` timestamp (ISO-8601, or null when nothing's indexed yet), so CI and scripts can pin the CLI version and check index freshness from a single command. A matching `CodeGraph.getLastIndexedAt()` library method exposes the same freshness check without shelling out. Thanks @12122J and @eddieran. (#329)
 
 ### Fixes

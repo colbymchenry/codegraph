@@ -94,5 +94,11 @@
     { "name": "react-native-segmented-control", "repo": "https://github.com/react-native-segmented-control/segmented-control", "size": "Small", "files": "~25", "question": "How does JSX `<SegmentedControl onChange={cb}/>` reach the native onChange handler on iOS/Android?" },
     { "name": "react-native-screens", "repo": "https://github.com/software-mansion/react-native-screens", "size": "Medium", "files": "~1200", "question": "How does JSX `<ScreenStack>` reach the native RNSScreenStackView component?" },
     { "name": "react-native-skia", "repo": "https://github.com/Shopify/react-native-skia", "size": "Large", "files": "~1000", "question": "How does a `<SkiaPictureView/>` JSX usage reach the iOS / Android native renderer?" }
+  ],
+  "Clojure": [
+    { "name": "ring", "repo": "https://github.com/ring-clojure/ring", "size": "Small", "files": "~80", "question": "How does a Ring request flow from the Jetty adapter through the handler to an HTTP response?" },
+    { "name": "logseq", "repo": "https://github.com/logseq/logseq", "size": "Medium", "files": "~960", "question": "How does editing a block in the editor get persisted to the database and reflected back in the UI?" },
+    { "name": "metabase", "repo": "https://github.com/metabase/metabase", "size": "Large", "files": "~3400", "question": "How does a query submitted to the API flow through the query processor middleware to the database driver?" },
+    { "name": "status-mobile", "repo": "https://github.com/status-im/status-mobile", "size": "Large", "files": "~2050", "question": "How does tapping the logout option in profile settings end the session and what happens to the app state?" }
   ]
 }

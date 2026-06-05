@@ -38,6 +38,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   lua: 'tree-sitter-lua.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  clojure: 'tree-sitter-clojure.wasm',
 };
 
 /**
@@ -99,6 +100,21 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.sc': 'scala',
   '.lua': 'lua',
   '.luau': 'luau',
+  // Clojure family: one language token for all dialects — .cljc files are
+  // shared between Clojure and ClojureScript, so splitting the dialects into
+  // separate Language values would break cross-dialect reference resolution
+  // (matchers gate on language equality). .bb is Babashka (plain Clojure).
+  '.clj': 'clojure',
+  '.cljs': 'clojure',
+  '.cljc': 'clojure',
+  // .bb is also BitBake (Yocto) — accepted collision: Clojure tooling treats
+  // .bb as Babashka, BitBake recipes parse as near-empty lexical trees
+  // (harmless), and Yocto + CodeGraph overlap is negligible.
+  '.bb': 'clojure',
+  // EDN config/data files (deps.edn, bb.edn, shadow-cljs.edn, system configs)
+  // parse with the same grammar but extract in data mode: top-level keys
+  // become property nodes and qualified symbols become references — no calls.
+  '.edn': 'clojure',
   '.m': 'objc',
   '.mm': 'objc',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
@@ -184,8 +200,10 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
       // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
       // 0.25 (drops nested calls/imports on every file after the first); we
-      // vendor the upstream ABI-15 wasm instead.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau')
+      // vendor the upstream ABI-15 wasm instead. Build provenance for the
+      // vendored binaries (source commit, toolchain, command) is recorded in
+      // wasm/README.md — keep it updated when bumping a grammar.
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'clojure')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -384,6 +402,7 @@ export function getLanguageDisplayName(language: Language): string {
     lua: 'Lua',
     luau: 'Luau',
     objc: 'Objective-C',
+    clojure: 'Clojure / ClojureScript',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',

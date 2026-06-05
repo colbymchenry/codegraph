@@ -4459,3 +4459,694 @@ func (s Stack[T]) Len() int { return len(s.items) }
     expect(js.nodes.find((n) => n.name === 'handleRequest' && n.kind === 'function')).toBeDefined();
   });
 });
+
+// =============================================================================
+// Clojure / ClojureScript (lexical grammar — extraction via visitNode hook)
+// =============================================================================
+
+describe('Clojure Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Clojure family files', () => {
+      expect(detectLanguage('src/my/app/core.clj')).toBe('clojure');
+      expect(detectLanguage('src/my/app/views.cljs')).toBe('clojure');
+      expect(detectLanguage('src/my/app/util.cljc')).toBe('clojure');
+      expect(detectLanguage('tasks.bb')).toBe('clojure');
+    });
+
+    it('should report Clojure as supported', () => {
+      expect(isLanguageSupported('clojure')).toBe(true);
+      expect(getSupportedLanguages()).toContain('clojure');
+    });
+  });
+
+  describe('Namespace and defs', () => {
+    it('should extract the ns as a module and scope defs under it', () => {
+      const code = `(ns my.app.core
+  (:require [clojure.string :as str]))
+
+(def max-retries 3)
+
+(defn- helper [x] (str/upper-case x))
+
+(defn process-user
+  "Process a user record."
+  [user]
+  (helper user))
+`;
+      const result = extractFromSource('src/my/app/core.clj', code);
+      const mod = result.nodes.find((n) => n.kind === 'module');
+      expect(mod?.name).toBe('my.app.core');
+
+      const fn = result.nodes.find((n) => n.name === 'process-user');
+      expect(fn?.kind).toBe('function');
+      expect(fn?.qualifiedName).toBe('my.app.core::process-user');
+      expect(fn?.docstring).toBe('Process a user record.');
+      expect(fn?.signature).toBe('[user]');
+      expect(fn?.language).toBe('clojure');
+
+      const helper = result.nodes.find((n) => n.name === 'helper');
+      expect(helper?.visibility).toBe('private');
+
+      const constant = result.nodes.find((n) => n.name === 'max-retries');
+      expect(constant?.kind).toBe('constant');
+    });
+
+    it('should extract multi-arity defns with a combined signature', () => {
+      const code = `(ns m.a)
+(defn greet
+  ([] (greet "world"))
+  ([who] (str "hi " who)))
+`;
+      const result = extractFromSource('src/m/a.clj', code);
+      const fn = result.nodes.find((n) => n.name === 'greet');
+      expect(fn?.signature).toBe('[] [who]');
+      // The zero-arity body calls the one-arity — a self call ref must exist
+      const selfCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'greet'
+      );
+      expect(selfCall).toBeDefined();
+    });
+
+    it('should treat function-valued defs as functions', () => {
+      const code = `(ns m.b)
+(def handler (fn [req] {:status 200}))
+(def shortcut #(inc %))
+`;
+      const result = extractFromSource('src/m/b.clj', code);
+      expect(result.nodes.find((n) => n.name === 'handler')?.kind).toBe('function');
+      expect(result.nodes.find((n) => n.name === 'shortcut')?.kind).toBe('function');
+    });
+
+    it('should extract library def-macros (defroutes, deftest) as named nodes', () => {
+      const code = `(ns m.routes)
+(defroutes app-routes
+  (GET "/" [] home-page))
+(deftest parses-input
+  (is (= 1 1)))
+`;
+      const result = extractFromSource('src/m/routes.clj', code);
+      expect(result.nodes.find((n) => n.name === 'app-routes')).toBeDefined();
+      expect(result.nodes.find((n) => n.name === 'parses-input')).toBeDefined();
+    });
+  });
+
+  describe('Requires and imports', () => {
+    it('should extract :require entries as import nodes with refs', () => {
+      const code = `(ns my.app.core
+  (:require [clojure.string :as str]
+            [my.app.db :refer [save!]]
+            my.app.flags)
+  (:import (java.time Instant)))
+`;
+      const result = extractFromSource('src/my/app/core.clj', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('clojure.string');
+      expect(imports).toContain('my.app.db');
+      expect(imports).toContain('my.app.flags');
+      expect(imports).toContain('java.time.Instant');
+
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'my.app.db'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    it('should resolve :as aliases in call references to qualified names', () => {
+      const code = `(ns my.app.core
+  (:require [my.app.db :as db]))
+
+(defn save-user [u] (db/insert! u))
+`;
+      const result = extractFromSource('src/my/app/core.clj', code);
+      const call = result.unresolvedReferences.find((r) => r.referenceKind === 'calls' && r.referenceName === 'my.app.db::insert!');
+      expect(call).toBeDefined();
+    });
+
+    it('should resolve :refer symbols in call references to qualified names', () => {
+      const code = `(ns my.app.core
+  (:require [my.app.db :refer [save!]]))
+
+(defn save-user [u] (save! u))
+`;
+      const result = extractFromSource('src/my/app/core.clj', code);
+      const call = result.unresolvedReferences.find((r) => r.referenceKind === 'calls' && r.referenceName === 'my.app.db::save!');
+      expect(call).toBeDefined();
+    });
+  });
+
+  describe('Protocols, records, multimethods', () => {
+    it('should extract defprotocol with method signatures', () => {
+      const code = `(ns m.proto)
+(defprotocol Storage
+  (put [this k v])
+  (fetch [this k]))
+`;
+      const result = extractFromSource('src/m/proto.clj', code);
+      const proto = result.nodes.find((n) => n.kind === 'protocol');
+      expect(proto?.name).toBe('Storage');
+      const put = result.nodes.find((n) => n.name === 'put');
+      expect(put?.kind).toBe('method');
+      expect(put?.qualifiedName).toBe('m.proto::Storage::put');
+    });
+
+    it('should extract defrecord with fields, methods, implements refs, and ctor fns', () => {
+      const code = `(ns m.rec)
+(defprotocol Storage
+  (put [this k v]))
+(defrecord MemStore [state]
+  Storage
+  (put [_ k v] (swap! state assoc k v)))
+`;
+      const result = extractFromSource('src/m/rec.clj', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls?.name).toBe('MemStore');
+      expect(result.nodes.find((n) => n.name === 'state' && n.kind === 'field')).toBeDefined();
+      expect(result.nodes.find((n) => n.name === '->MemStore' && n.kind === 'function')).toBeDefined();
+      expect(result.nodes.find((n) => n.name === 'map->MemStore')).toBeDefined();
+
+      const impl = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'implements' && r.referenceName === 'Storage'
+      );
+      expect(impl).toBeDefined();
+
+      const method = result.nodes.find((n) => n.name === 'put' && n.qualifiedName.includes('MemStore'));
+      expect(method?.kind).toBe('method');
+    });
+
+    it('should extract defmulti/defmethod as same-named functions (overloads)', () => {
+      const code = `(ns m.multi)
+(defmulti render :type)
+(defmethod render :button [w] (str w))
+(defmethod render :input [w] (str w))
+`;
+      const result = extractFromSource('src/m/multi.clj', code);
+      const renders = result.nodes.filter((n) => n.name === 'render' && n.kind === 'function');
+      expect(renders.length).toBe(3);
+    });
+  });
+
+  describe('Calls and references', () => {
+    it('should not emit call refs for special forms or core macros', () => {
+      const code = `(ns m.c)
+(defn f [x]
+  (let [y (inc x)]
+    (when (pos? y)
+      (->> y (map inc) (filter odd?)))))
+`;
+      const result = extractFromSource('src/m/c.clj', code);
+      const names = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(names).not.toContain('let');
+      expect(names).not.toContain('when');
+      expect(names).not.toContain('->>');
+      expect(names).not.toContain('map');
+    });
+
+    it('should emit a calls ref for a same-file fn passed to a HOF', () => {
+      const code = `(ns m.hof)
+(defn- transform [x] x)
+(defn run [xs] (map transform xs))
+`;
+      const result = extractFromSource('src/m/hof.clj', code);
+      const hof = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'transform'
+      );
+      expect(hof).toBeDefined();
+    });
+
+    it('should emit instantiates refs for ctor interop', () => {
+      const code = `(ns m.inst)
+(defn make [] (java.util.ArrayList.))
+(defn make2 [] (new StringBuilder))
+`;
+      const result = extractFromSource('src/m/inst.clj', code);
+      const kinds = result.unresolvedReferences.filter((r) => r.referenceKind === 'instantiates').map((r) => r.referenceName);
+      expect(kinds).toContain('java.util.ArrayList');
+      expect(kinds).toContain('StringBuilder');
+    });
+
+    it('should not emit calls from quoted, discarded, or rich-comment forms', () => {
+      const code = `(ns m.q)
+(def data '(fetch-thing 1))
+#_(dropped-call 2)
+(comment (scratch-call 3))
+`;
+      const result = extractFromSource('src/m/q.clj', code);
+      const names = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(names).not.toContain('fetch-thing');
+      expect(names).not.toContain('dropped-call');
+      expect(names).not.toContain('scratch-call');
+    });
+  });
+
+  describe('Reader conditionals (.cljc)', () => {
+    it('should extract defs from both branches of #?', () => {
+      const code = `(ns m.x)
+#?(:clj
+   (defn read-file [p] (slurp p))
+   :cljs
+   (defn write-log [m] (println m)))
+`;
+      const result = extractFromSource('src/m/x.cljc', code);
+      expect(result.nodes.find((n) => n.name === 'read-file')).toBeDefined();
+      expect(result.nodes.find((n) => n.name === 'write-log')).toBeDefined();
+    });
+
+    it('should extract requires inside reader conditionals', () => {
+      const code = `(ns m.y
+  (:require [m.shared :as shared]
+            #?(:cljs [m.dom :as dom])))
+`;
+      const result = extractFromSource('src/m/y.cljc', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('m.shared');
+      expect(imports).toContain('m.dom');
+    });
+  });
+});
+
+// =============================================================================
+// EDN data files (.edn — same grammar, data mode: properties + references)
+// =============================================================================
+
+describe('EDN Extraction', () => {
+  it('should detect .edn files as clojure', () => {
+    expect(detectLanguage('deps.edn')).toBe('clojure');
+    expect(detectLanguage('resources/system.edn')).toBe('clojure');
+  });
+
+  it('should extract top-level map keys as property nodes', () => {
+    const code = `{:paths ["src" "resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.11.1"}}
+ :aliases {:test {:extra-paths ["test"]}}}
+`;
+    const result = extractFromSource('deps.edn', code);
+    const props = result.nodes.filter((n) => n.kind === 'property').map((n) => n.name);
+    expect(props).toContain(':paths');
+    expect(props).toContain(':deps');
+    expect(props).toContain(':aliases');
+    // One level only — nested keys must NOT become nodes
+    expect(props).not.toContain(':test');
+    expect(props).not.toContain(':extra-paths');
+  });
+
+  it('should emit references for qualified symbols in values (shadow-cljs entry points)', () => {
+    const code = `{:builds
+ {:app {:target :browser
+        :modules {:main {:init-fn app.core/init}}}}}
+`;
+    const result = extractFromSource('shadow-cljs.edn', code);
+    const ref = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'references' && r.referenceName === 'app.core::init'
+    );
+    expect(ref).toBeDefined();
+  });
+
+  it('should never emit call references from EDN data', () => {
+    const code = `{:tasks {clean (shell "rm -rf target")}
+ :fixture [(make-thing 1) (make-thing 2)]}
+`;
+    const result = extractFromSource('bb.edn', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    expect(calls).toEqual([]);
+  });
+
+  it('should extract qualified keyword keys (integrant system maps) with refs', () => {
+    const code = `{:app/server {:port 8080 :handler app.http/router}
+ :app/db {:uri "datomic:mem://app"}}
+`;
+    const result = extractFromSource('resources/system.edn', code);
+    const props = result.nodes.filter((n) => n.kind === 'property').map((n) => n.name);
+    expect(props).toContain(':app/server');
+    expect(props).toContain(':app/db');
+    const ref = result.unresolvedReferences.find((r) => r.referenceName === 'app.http::router');
+    expect(ref).toBeDefined();
+    // the ref hangs off the :app/server property node
+    const prop = result.nodes.find((n) => n.name === ':app/server');
+    expect(ref?.fromNodeId).toBe(prop?.id);
+  });
+});
+
+// =============================================================================
+// Clojure review follow-ups: shadowing precision, interop forms, ns options
+// =============================================================================
+
+describe('Clojure Extraction (precision)', () => {
+  describe('Binding-position shadowing (no false calls)', () => {
+    it('should not emit a calls ref for a let binding name shadowing a same-file fn', () => {
+      const code = `(ns m.shadow)
+(defn- helper [x] x)
+(defn run [data]
+  (let [helper (compute data)]
+    (str helper)))
+`;
+      const result = extractFromSource('src/m/shadow.clj', code);
+      // `(compute data)` is walked (init expr), the binding NAME `helper` is not.
+      const helperRefs = result.unresolvedReferences.filter((r) => r.referenceName === 'helper');
+      expect(helperRefs).toEqual([]);
+      expect(
+        result.unresolvedReferences.find((r) => r.referenceName === 'compute' && r.referenceKind === 'calls')
+      ).toBeDefined();
+    });
+
+    it('should not emit refs for fn params shadowing a same-file fn', () => {
+      const code = `(ns m.shadow2)
+(defn- transform [x] x)
+(defn run [xs] (map (fn [transform] (inc transform)) xs))
+`;
+      const result = extractFromSource('src/m/shadow2.clj', code);
+      expect(result.unresolvedReferences.filter((r) => r.referenceName === 'transform')).toEqual([]);
+    });
+
+    it('should still walk for/doseq modifier expressions and :let vectors', () => {
+      const code = `(ns m.fors)
+(defn- check [x] x)
+(defn run [xs]
+  (for [x xs
+        :when (check x)
+        :let [y (deep-init x)]]
+    y))
+`;
+      const result = extractFromSource('src/m/fors.clj', code);
+      const names = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(names).toContain('check');
+      expect(names).toContain('deep-init');
+    });
+
+    it('should skip as-> and catch binding names', () => {
+      const code = `(ns m.asarrow)
+(defn- step [x] x)
+(defn run [v]
+  (try
+    (as-> v step (step step))
+    (catch Exception step (str step))))
+`;
+      const result = extractFromSource('src/m/asarrow.clj', code);
+      // the body call (step step) is head-position — allowed; the binding
+      // names themselves (as-> 3rd element, catch 3rd element) emit nothing.
+      const refs = result.unresolvedReferences.filter((r) => r.referenceName === 'step');
+      expect(refs.every((r) => r.referenceKind === 'calls')).toBe(true);
+    });
+  });
+
+  describe('Interop precision', () => {
+    it('should emit references (not calls) for .-property access', () => {
+      const code = `(ns m.dom)
+(defn read-value [el] (.-value el))
+(defn fire [el] (.focus el))
+`;
+      const result = extractFromSource('src/m/dom.cljs', code);
+      const valueRef = result.unresolvedReferences.find((r) => r.referenceName === 'value');
+      expect(valueRef?.referenceKind).toBe('references');
+      const focusRef = result.unresolvedReferences.find((r) => r.referenceName === 'focus');
+      expect(focusRef?.referenceKind).toBe('calls');
+    });
+
+    it('should extract definline as a function', () => {
+      const code = `(ns m.inline)
+(definline pow2 [x] \`(* ~x ~x))
+`;
+      const result = extractFromSource('src/m/inline.clj', code);
+      expect(result.nodes.find((n) => n.name === 'pow2')?.kind).toBe('function');
+    });
+  });
+
+  describe('Require/def option coverage', () => {
+    it('should mark ^:private defs as private', () => {
+      const code = `(ns m.priv)
+(def ^:private secret 42)
+(defn ^:private hidden [x] x)
+`;
+      const result = extractFromSource('src/m/priv.clj', code);
+      expect(result.nodes.find((n) => n.name === 'secret')?.visibility).toBe('private');
+      expect(result.nodes.find((n) => n.name === 'hidden')?.visibility).toBe('private');
+    });
+
+    it('should extract string requires (shadow-cljs npm deps)', () => {
+      const code = `(ns m.npm
+  (:require ["react" :as react]
+            ["@mui/material" :as mui]))
+(defn use-it [] (react/useState 0))
+`;
+      const result = extractFromSource('src/m/npm.cljs', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('react');
+      expect(imports).toContain('@mui/material');
+      expect(
+        result.unresolvedReferences.find((r) => r.referenceName === 'react::useState')
+      ).toBeDefined();
+    });
+
+    it('should expand prefix lists in :require', () => {
+      const code = `(ns m.prefix
+  (:require (my.app [db :as db] core)))
+(defn save [x] (db/insert! x))
+`;
+      const result = extractFromSource('src/m/prefix.clj', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('my.app.db');
+      expect(imports).toContain('my.app.core');
+      expect(
+        result.unresolvedReferences.find((r) => r.referenceName === 'my.app.db::insert!')
+      ).toBeDefined();
+    });
+
+    it('should extract calls from letfn bodies without false refs to the local names', () => {
+      const code = `(ns m.letfn)
+(defn- helper [x] x)
+(defn run [v]
+  (letfn [(local-a [x] (helper x))
+          (local-b [y] (local-a y))]
+    (local-b v)))
+`;
+      const result = extractFromSource('src/m/letfn.clj', code);
+      const names = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(names).toContain('helper');
+    });
+  });
+
+  describe('Babashka content', () => {
+    it('should extract symbols from .bb files', () => {
+      const code = `(ns tasks
+  (:require [babashka.process :refer [shell]]))
+(defn clean [] (shell "rm -rf target"))
+`;
+      const result = extractFromSource('tasks.bb', code);
+      expect(result.nodes.find((n) => n.name === 'clean')?.kind).toBe('function');
+      expect(
+        result.unresolvedReferences.find((r) => r.referenceName === 'babashka.process::shell')
+      ).toBeDefined();
+    });
+  });
+});
+
+describe('Clojure Extraction (head-position shadowing)', () => {
+  it('should not emit a calls edge when a let-bound local shadows a same-file fn and is called', () => {
+    const code = `(ns m.headshadow)
+(defn- helper [x] x)
+(defn run [data]
+  (let [helper (make-handler data)]
+    (helper 1)))
+`;
+    const result = extractFromSource('src/m/headshadow.clj', code);
+    expect(result.unresolvedReferences.filter((r) => r.referenceName === 'helper')).toEqual([]);
+    // the init expr is still a real call
+    expect(
+      result.unresolvedReferences.find((r) => r.referenceName === 'make-handler' && r.referenceKind === 'calls')
+    ).toBeDefined();
+  });
+
+  it('should still emit calls for the un-shadowed name outside the binding scope', () => {
+    const code = `(ns m.scopeend)
+(defn- helper [x] x)
+(defn a [v] (let [helper inc] (helper v)))
+(defn b [v] (helper v))
+`;
+    const result = extractFromSource('src/m/scopeend.clj', code);
+    const helperCalls = result.unresolvedReferences.filter(
+      (r) => r.referenceName === 'helper' && r.referenceKind === 'calls'
+    );
+    expect(helperCalls.length).toBe(1); // only the one in `b`
+  });
+});
+
+// =============================================================================
+// re-frame keyword-keyed dispatch (registrations ↔ dispatch/subscribe sites)
+// =============================================================================
+
+describe('Clojure Extraction (re-frame)', () => {
+  it('should create function nodes for registrations, named by the keyword', () => {
+    const code = `(ns my.app.events
+  (:require [re-frame.core :as rf]))
+(rf/reg-event-db :todo/add (fn [db [_ t]] (conj-todo db t)))
+(rf/reg-sub :todo/items (fn [db _] (:items db)))
+`;
+    const result = extractFromSource('src/my/app/events.cljs', code);
+    const add = result.nodes.find((n) => n.name === ':todo/add');
+    expect(add?.kind).toBe('function');
+    expect(add?.signature).toBe('(reg-event-db :todo/add)');
+    expect(result.nodes.find((n) => n.name === ':todo/items')).toBeDefined();
+    // handler body calls attribute to the registration node
+    const call = result.unresolvedReferences.find((r) => r.referenceName === 'conj-todo');
+    expect(call?.fromNodeId).toBe(add?.id);
+    // the registrar itself keeps its ordinary call ref (callers/impact on facades)
+    const registrar = result.unresolvedReferences.find(
+      (r) => r.referenceName === 're-frame.core::reg-event-db' && r.referenceKind === 'calls'
+    );
+    expect(registrar).toBeDefined();
+    expect(registrar?.fromNodeId).not.toBe(add?.id); // attributed to the enclosing scope
+  });
+
+  it('should expand :: and ::alias keywords in registrations', () => {
+    const code = `(ns my.app.events
+  (:require [re-frame.core :as rf]
+            [my.app.subs :as subs]))
+(rf/reg-event-db ::add (fn [db _] db))
+(rf/reg-sub ::subs/items (fn [db _] db))
+`;
+    const result = extractFromSource('src/my/app/events.cljs', code);
+    expect(result.nodes.find((n) => n.name === ':my.app.events/add')).toBeDefined();
+    expect(result.nodes.find((n) => n.name === ':my.app.subs/items')).toBeDefined();
+  });
+
+  it('should emit keyword calls refs at dispatch and subscribe sites', () => {
+    const code = `(ns my.app.views
+  (:require [re-frame.core :as rf]))
+(defn add-button [t]
+  [:button {:on-click #(rf/dispatch [:todo/add t])}])
+(defn todo-list []
+  (let [items @(rf/subscribe [:todo/items])]
+    items))
+`;
+    const result = extractFromSource('src/my/app/views.cljs', code);
+    const dispatchRef = result.unresolvedReferences.find(
+      (r) => r.referenceName === ':todo/add' && r.referenceKind === 'calls'
+    );
+    expect(dispatchRef).toBeDefined();
+    expect(
+      result.unresolvedReferences.find((r) => r.referenceName === ':todo/items')
+    ).toBeDefined();
+  });
+
+  it('should support :refer style and dispatch-sync', () => {
+    const code = `(ns my.app.core
+  (:require [re-frame.core :refer [reg-event-db dispatch-sync]]))
+(reg-event-db :app/init (fn [_ _] {}))
+(defn boot [] (dispatch-sync [:app/init]))
+`;
+    const result = extractFromSource('src/my/app/core.cljs', code);
+    expect(result.nodes.find((n) => n.name === ':app/init')).toBeDefined();
+    expect(
+      result.unresolvedReferences.filter((r) => r.referenceName === ':app/init').length
+    ).toBeGreaterThanOrEqual(1);
+    expect(
+      result.unresolvedReferences.find((r) => r.referenceName === 're-frame.core::reg-event-db')
+    ).toBeDefined();
+  });
+
+  it('should treat project facades (utils.re-frame style) as re-frame', () => {
+    // status-mobile fronts re-frame with its own ns: custom registrars
+    // (reg-root-key-sub) and `sub` for subscribe — shape-based detection
+    // covers them without knowing the facade.
+    const code = `(ns my.app.views
+  (:require [utils.re-frame :as rf]))
+(rf/reg-root-key-sub :profile/name :profile-name)
+(defn header [] (rf/sub [:profile/name]))
+(defn save [] (rf/dispatch [:profile/update]))
+`;
+    const result = extractFromSource('src/my/app/views.cljs', code);
+    expect(result.nodes.find((n) => n.name === ':profile/name')?.kind).toBe('function');
+    expect(
+      result.unresolvedReferences.find((r) => r.referenceName === ':profile/name' && r.referenceKind === 'calls')
+    ).toBeDefined();
+    expect(
+      result.unresolvedReferences.find((r) => r.referenceName === ':profile/update')
+    ).toBeDefined();
+  });
+
+  it('should not shape-match reg-* calls without a literal keyword key', () => {
+    const code = `(ns my.app.other)
+(reg-handler handler-map)
+(reg-watch "string-key" f)
+(reg-event-db dynamic-kw (fn [db _] db))
+`;
+    const result = extractFromSource('src/my/app/other.clj', code);
+    expect(result.nodes.filter((n) => n.name.startsWith(':'))).toEqual([]);
+  });
+
+  it('should skip variable event vectors (anonymous frontier)', () => {
+    const code = `(ns my.app.relay
+  (:require [re-frame.core :as rf]))
+(defn relay [evt] (rf/dispatch evt))
+`;
+    const result = extractFromSource('src/my/app/relay.cljs', code);
+    const kwRefs = result.unresolvedReferences.filter((r) => r.referenceName.startsWith(':'));
+    expect(kwRefs).toEqual([]);
+  });
+});
+
+// =============================================================================
+// UIx / helix (ClojureScript React wrappers — defui/defnc + $ composition)
+// =============================================================================
+
+describe('Clojure Extraction (UIx / helix)', () => {
+  it('should extract defui as component nodes', () => {
+    const code = `(ns my.app.ui
+  (:require [uix.core :refer [defui $]]))
+(defui button [{:keys [on-click]}]
+  ($ :button {:on-click on-click}))
+`;
+    const result = extractFromSource('src/my/app/ui.cljs', code);
+    const btn = result.nodes.find((n) => n.name === 'button');
+    expect(btn?.kind).toBe('component');
+    expect(btn?.signature).toBe('(defui ...)');
+  });
+
+  it('should emit calls edges for $ component composition (refer style)', () => {
+    const code = `(ns my.app.views
+  (:require [uix.core :refer [defui $]]
+            [my.app.ui :as ui]))
+(defui panel [_] ($ :aside))
+(defui toolbar [{:keys [doc]}]
+  ($ :div
+     ($ ui/button {:on-click identity})
+     ($ panel {})))
+`;
+    const result = extractFromSource('src/my/app/views.cljs', code);
+    expect(
+      result.unresolvedReferences.find((r) => r.referenceName === 'my.app.ui::button' && r.referenceKind === 'calls')
+    ).toBeDefined();
+    expect(
+      result.unresolvedReferences.find((r) => r.referenceName === 'panel' && r.referenceKind === 'calls')
+    ).toBeDefined();
+    // DOM tags produce nothing
+    expect(result.unresolvedReferences.find((r) => r.referenceName === 'div')).toBeUndefined();
+  });
+
+  it('should support aliased uix/$ and helix defnc', () => {
+    const code = `(ns my.app.hx
+  (:require [helix.core :as hx :refer [defnc]]
+            [my.app.widgets :as w]))
+(defnc row [props] (hx/$ w/cell {:v 1}))
+`;
+    const result = extractFromSource('src/my/app/hx.cljs', code);
+    expect(result.nodes.find((n) => n.name === 'row')?.kind).toBe('component');
+    expect(
+      result.unresolvedReferences.find((r) => r.referenceName === 'my.app.widgets::cell' && r.referenceKind === 'calls')
+    ).toBeDefined();
+  });
+
+  it('should not treat $ from non-uix namespaces as element creation', () => {
+    const code = `(ns my.app.money
+  (:require [my.currency :refer [$]]))
+(defn price [x] ($ amount x))
+`;
+    const result = extractFromSource('src/my/app/money.clj', code);
+    // plain refer'd call, no component edge to `amount`
+    expect(
+      result.unresolvedReferences.find((r) => r.referenceName === 'my.currency::$')
+    ).toBeDefined();
+    expect(
+      result.unresolvedReferences.find((r) => r.referenceName === 'amount' && r.referenceKind === 'calls')
+    ).toBeUndefined();
+  });
+});
