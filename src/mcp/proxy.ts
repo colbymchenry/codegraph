@@ -264,7 +264,13 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         sockBuf = sockBuf.slice(idx + 1);
         if (!line.trim()) continue;
         if (clientInitId !== undefined) {
-          try { const m = JSON.parse(line) as JsonRpc; if (m.id === clientInitId && ('result' in m || 'error' in m)) continue; } catch { /* relay */ }
+          try {
+            const m = JSON.parse(line) as JsonRpc;
+            if (m.id === clientInitId && ('result' in m || 'error' in m)) {
+              clientInitId = undefined;
+              continue;
+            }
+          } catch { /* relay */ }
         }
         writeClient(line);
       }

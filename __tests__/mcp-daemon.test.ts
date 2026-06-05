@@ -113,6 +113,21 @@ function findResponse(stdout: string[], id: number): any | null {
   return null;
 }
 
+/** Find every JSON-RPC response with the given id on stdout. */
+function findResponses(stdout: string[], id: number): any[] {
+  const responses: any[] = [];
+  for (const line of stdout) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && parsed.id === id && (parsed.result !== undefined || parsed.error !== undefined)) {
+        responses.push(parsed);
+      }
+    } catch { /* not JSON */ }
+  }
+  return responses;
+}
+
 function waitFor<T>(
   predicate: () => T | undefined | null | false,
   timeoutMs: number,
@@ -227,6 +242,24 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(countListeningLines(realRoot)).toBe(1);
     expect(readLockPid(realRoot)).toBe(daemonPid);
   }, 40000);
+
+  it('relays a later response when the client reuses the initialize request id', async () => {
+    const server = spawnServer(tempDir, { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '15000' });
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
+
+    // JSON-RPC request IDs may be reused after the previous request completes.
+    // The proxy must suppress only the daemon's duplicate initialize response,
+    // not a later response that happens to use the same ID.
+    sendMessage(server.child, { jsonrpc: '2.0', id: 1, method: 'ping' });
+    const responses = await waitFor(() => {
+      const found = findResponses(server.stdout, 1);
+      return found.length >= 2 ? found : null;
+    }, 3000);
+    expect(responses[1].result).toEqual({});
+  }, 20000);
 
   it('concurrent launchers converge on a single daemon (lockfile race — must-fix 1)', async () => {
     const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '15000' };
