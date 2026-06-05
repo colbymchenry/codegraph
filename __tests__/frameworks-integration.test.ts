@@ -105,6 +105,48 @@ describe('Flask end-to-end framework extraction', () => {
   });
 });
 
+describe('Hono end-to-end framework extraction', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('applies app.route mount prefixes to sub-router routes across files', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hono-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({ name: 'hono-app', dependencies: { hono: '^4.0.0' } }, null, 2)
+    );
+    fs.mkdirSync(path.join(tmpDir, 'routes'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'routes', 'users.ts'),
+      'import { Hono } from \"hono\"\\n' +
+        'export const userRoutes = new Hono()\\n' +
+        'userRoutes.get(\"/\", listUsers)\\n' +
+        'function listUsers() { return [] }\\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.ts'),
+      'import { Hono } from \"hono\"\\n' +
+        'import { userRoutes } from \"./routes/users\"\\n' +
+        'const app = new Hono()\\n' +
+        'app.get(\"/health\", health)\\n' +
+        'app.route(\"/users\", userRoutes)\\n' +
+        'function health() { return \"ok\" }\\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const routes = cg.getNodesByKind('route').map((r) => r.name);
+    expect(routes).toContain('GET /health');
+    expect(routes).toContain('GET /users');
+
+    cg.close();
+  });
+});
+
 describe('Flutter end-to-end — setState→build synthesis', () => {
   let tmpDir: string | undefined;
   afterEach(() => {

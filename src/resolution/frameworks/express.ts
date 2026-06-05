@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import * as path from 'path';
 
 function extractTailIdent(expr: string): string | null {
   const cleaned = expr.replace(/\s+/g, '').replace(/\(\)$/, '');
@@ -58,7 +59,7 @@ export const expressResolver: FrameworkResolver = {
       try {
         const pkg = JSON.parse(packageJson);
         const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-        if (deps.express || deps.fastify || deps.koa || deps.hapi) {
+        if (deps.express || deps.fastify || deps.koa || deps.hapi || deps.hono) {
           return true;
         }
       } catch {
@@ -75,7 +76,14 @@ export const expressResolver: FrameworkResolver = {
         file.includes('middleware')
       ) {
         const content = context.readFile(file);
-        if (content && (content.includes('express') || content.includes('app.get') || content.includes('router.get'))) {
+        if (content && (
+          content.includes('express') ||
+          content.includes('hono') ||
+          content.includes('new Hono(') ||
+          content.includes('app.get') ||
+          content.includes('router.get') ||
+          content.includes('.route(')
+        )) {
           return true;
         }
       }
@@ -141,12 +149,12 @@ export const expressResolver: FrameworkResolver = {
     // Match the route head up to the first arg: (app|router).METHOD('/path',
     // (NOT the whole call — handlers are often inline arrows whose `)`/`{}` the
     // old single-regex couldn't span, so inline-handler routes connected to nothing.)
-    const head = /\b(app|router)\.(get|post|put|patch|delete|all|use)\s*\(\s*['"]([^'"]+)['"]\s*,/g;
+    const head = /\b([A-Za-z_$][\w$]*)\.(get|post|put|patch|delete|all|use)\s*\(\s*['"]([^'"]+)['"]\s*,/g;
     let match: RegExpExecArray | null;
     while ((match = head.exec(safe)) !== null) {
       const method = match[2]!;
       const routePath = match[3]!;
-      if (method === 'use' && !routePath.startsWith('/')) continue;
+      if (routePath !== '*' && !routePath.startsWith('/')) continue;
       const line = safe.slice(0, match.index).split('\n').length;
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${method.toUpperCase()}:${routePath}`,
@@ -218,6 +226,141 @@ export const expressResolver: FrameworkResolver = {
       }
     }
     return { nodes, references };
+  },
+
+  /**
+   * Apply mounted prefixes from `parent.route('/prefix', childRouter)` across
+   * files (Hono-style composition). The per-file extract phase captures each
+   * router's own `get/post/...` routes, but a child route's final URL depends
+   * on where that router is mounted — information that can live in another file.
+   * We recompute route names from stable `qualifiedName` tails so this is
+   * idempotent across repeated sync/index runs.
+   */
+  postExtract(context: ResolutionContext): Node[] {
+    const jsFiles = context.getAllFiles().filter((f) => /\.(m?js|tsx?|cjs)$/.test(f));
+    if (jsFiles.length === 0) return [];
+
+    const ownerByRouteId = new Map<string, string>(); // route.id -> `${file}::${receiver}`
+    const ownersByFile = new Map<string, Set<string>>(); // file -> receiver names
+    const mountCandidates: Array<{
+      filePath: string;
+      parent: string;
+      childRef: string;
+      prefix: string;
+      language: 'typescript' | 'javascript';
+    }> = [];
+
+    const addOwner = (filePath: string, owner: string): void => {
+      const set = ownersByFile.get(filePath) ?? new Set<string>();
+      set.add(owner);
+      ownersByFile.set(filePath, set);
+    };
+
+    for (const filePath of jsFiles) {
+      const content = context.readFile(filePath);
+      if (!content) continue;
+      const language = detectLanguage(filePath);
+      const safe = stripCommentsForRegex(content, language);
+
+      const routeRe = /\b([A-Za-z_$][\w$]*)\.(get|post|put|patch|delete|all|use)\s*\(\s*['"]([^'"]+)['"]\s*,/g;
+      let rm: RegExpExecArray | null;
+      while ((rm = routeRe.exec(safe)) !== null) {
+        const receiver = rm[1]!;
+        const method = rm[2]!.toUpperCase();
+        const routePath = rm[3]!;
+        if (routePath !== '*' && !routePath.startsWith('/')) continue;
+        const line = safe.slice(0, rm.index).split('\n').length;
+        ownerByRouteId.set(`route:${filePath}:${line}:${method}:${routePath}`, `${filePath}::${receiver}`);
+        addOwner(filePath, receiver);
+      }
+
+      const mountRe = /\b([A-Za-z_$][\w$]*)\.route\s*\(\s*['"]([^'"]+)['"]\s*,\s*([A-Za-z_$][\w$]*)\s*\)/g;
+      let mm: RegExpExecArray | null;
+      while ((mm = mountRe.exec(safe)) !== null) {
+        const parent = mm[1]!;
+        const prefix = mm[2]!;
+        const childRef = mm[3]!;
+        if (!prefix.startsWith('/')) continue;
+        addOwner(filePath, parent);
+        mountCandidates.push({ filePath, parent, childRef, prefix, language });
+      }
+    }
+
+    if (mountCandidates.length === 0) return [];
+
+    const resolveChildOwnerKey = (
+      filePath: string,
+      childRef: string,
+      language: 'typescript' | 'javascript'
+    ): string | null => {
+      const localOwners = ownersByFile.get(filePath);
+      if (localOwners?.has(childRef)) return `${filePath}::${childRef}`;
+
+      const imports = context.getImportMappings(filePath, language);
+      const mapping = imports.find((m) => m.localName === childRef);
+      if (!mapping) return null;
+      const targetFile = resolveImportedFile(filePath, mapping.source, context);
+      if (!targetFile) return null;
+      const targetOwners = ownersByFile.get(targetFile);
+      if (!targetOwners || targetOwners.size === 0) return null;
+
+      if (mapping.exportedName && mapping.exportedName !== 'default' && targetOwners.has(mapping.exportedName)) {
+        return `${targetFile}::${mapping.exportedName}`;
+      }
+      if (targetOwners.has(childRef)) return `${targetFile}::${childRef}`;
+      if (targetOwners.size === 1) return `${targetFile}::${Array.from(targetOwners)[0]!}`;
+      return null;
+    };
+
+    const edgesByParent = new Map<string, Array<{ child: string; prefix: string }>>();
+    const incomingCount = new Map<string, number>();
+    const allRouterKeys = new Set<string>();
+    for (const [filePath, owners] of ownersByFile) {
+      for (const owner of owners) allRouterKeys.add(`${filePath}::${owner}`);
+    }
+
+    for (const mount of mountCandidates) {
+      const parentKey = `${mount.filePath}::${mount.parent}`;
+      const childKey = resolveChildOwnerKey(mount.filePath, mount.childRef, mount.language);
+      if (!childKey) continue;
+      allRouterKeys.add(parentKey);
+      allRouterKeys.add(childKey);
+      const arr = edgesByParent.get(parentKey) ?? [];
+      arr.push({ child: childKey, prefix: mount.prefix });
+      edgesByParent.set(parentKey, arr);
+      incomingCount.set(childKey, (incomingCount.get(childKey) ?? 0) + 1);
+    }
+
+    const roots = Array.from(allRouterKeys).filter((k) => !incomingCount.has(k));
+    const queue: Array<{ key: string; prefix: string }> = (roots.length > 0 ? roots : Array.from(allRouterKeys))
+      .map((key) => ({ key, prefix: '' }));
+    const prefixesByRouter = new Map<string, Set<string>>();
+    while (queue.length > 0) {
+      const item = queue.shift()!;
+      const seen = prefixesByRouter.get(item.key) ?? new Set<string>();
+      if (seen.has(item.prefix)) continue;
+      seen.add(item.prefix);
+      prefixesByRouter.set(item.key, seen);
+      for (const edge of edgesByParent.get(item.key) ?? []) {
+        queue.push({ key: edge.child, prefix: joinRoutePath(item.prefix, edge.prefix) });
+      }
+    }
+
+    const updates: Node[] = [];
+    for (const route of context.getNodesByKind('route')) {
+      const ownerKey = ownerByRouteId.get(route.id);
+      if (!ownerKey) continue;
+      const prefixSet = prefixesByRouter.get(ownerKey);
+      if (!prefixSet || prefixSet.size === 0) continue;
+      const nonEmpty = Array.from(prefixSet).filter((p) => p && p !== '/');
+      if (nonEmpty.length !== 1) continue;
+      const parsed = parseRouteFromQualifiedName(route);
+      if (!parsed) continue;
+      const newName = `${parsed.method} ${joinRoutePath(nonEmpty[0]!, parsed.originalPath)}`;
+      if (newName === route.name) continue;
+      updates.push({ ...route, name: newName, updatedAt: Date.now() });
+    }
+    return updates;
   },
 };
 
@@ -333,4 +476,52 @@ function detectLanguage(filePath: string): 'typescript' | 'javascript' {
     return 'typescript';
   }
   return 'javascript';
+}
+
+function parseRouteFromQualifiedName(route: Node): { method: string; originalPath: string } | null {
+  const sep = '::';
+  const idx = route.qualifiedName.indexOf(sep);
+  if (idx < 0) return null;
+  const tail = route.qualifiedName.slice(idx + sep.length);
+  const colon = tail.indexOf(':');
+  if (colon < 0) return null;
+  return { method: tail.slice(0, colon), originalPath: tail.slice(colon + 1) };
+}
+
+function joinRoutePath(prefix: string, subPath: string): string {
+  if (subPath === '*') return '*';
+  const parts = [prefix, subPath]
+    .map((p) => p.trim())
+    .map((p) => p.replace(/^\/+|\/+$/g, ''))
+    .filter((p) => p.length > 0);
+  return '/' + parts.join('/');
+}
+
+function resolveImportedFile(
+  fromFile: string,
+  importSource: string,
+  context: ResolutionContext
+): string | null {
+  if (!importSource.startsWith('.')) return null;
+  const fromDir = path.posix.dirname(fromFile);
+  const base = path.posix.normalize(path.posix.join(fromDir, importSource));
+  const candidates = [
+    base,
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.js`,
+    `${base}.jsx`,
+    `${base}.mjs`,
+    `${base}.cjs`,
+    `${base}/index.ts`,
+    `${base}/index.tsx`,
+    `${base}/index.js`,
+    `${base}/index.jsx`,
+    `${base}/index.mjs`,
+    `${base}/index.cjs`,
+  ];
+  for (const candidate of candidates) {
+    if (context.fileExists(candidate)) return candidate;
+  }
+  return null;
 }

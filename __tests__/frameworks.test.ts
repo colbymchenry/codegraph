@@ -245,6 +245,14 @@ describe('expressResolver.extract', () => {
     const { nodes, references } = expressResolver.extract!('routes.ts', src);
     expect(references[0].referenceName).toBe('list');
   });
+
+  it('extracts routes from non-app/router receivers (e.g. Hono sub-router vars)', () => {
+    const src = `userRoutes.get('/me', getMe);\n`;
+    const { nodes, references } = expressResolver.extract!('userRoutes.ts', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].name).toBe('GET /me');
+    expect(references[0].referenceName).toBe('getMe');
+  });
 });
 
 import { nestjsResolver } from '../src/resolution/frameworks/nestjs';
