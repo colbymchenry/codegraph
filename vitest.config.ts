@@ -19,6 +19,22 @@ export default defineConfig({
      * there, so the variable is a no-op.
      */
     env: { CODEGRAPH_ALLOW_UNSAFE_NODE: '1' },
+    /**
+     * Keep tree-sitter grammar compilation off V8's turboshaft optimizing
+     * tier inside test workers, exactly as every production launch path does
+     * (see src/extraction/wasm-runtime-flags.ts, issues #293/#298). Without
+     * it, suites that load many grammars (extraction.test.ts loads ALL of
+     * them in beforeAll) can abort the worker with the turboshaft Zone OOM —
+     * observed reliably on an arm64 Mac with Node 24: the worker dies mid-
+     * file and the remaining tests silently never run ("Worker exited
+     * unexpectedly", ~90 tests vanish from the count). The flag must be on
+     * the node command line, so it has to go through execArgv — NODE_OPTIONS
+     * disallows it and runtime v8.setFlagsFromString is too late.
+     */
+    poolOptions: {
+      forks: { execArgv: ['--liftoff-only'] },
+      threads: { execArgv: ['--liftoff-only'] },
+    },
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],

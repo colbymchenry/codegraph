@@ -1287,18 +1287,25 @@ export class ToolHandler {
       // names (Class.method / Class::method) — the agent's most precise input,
       // resolved exactly by findAllSymbols. (The old strip mangled Class.method
       // into Class, throwing the method away.)
-      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte)$/i;
+      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|clj|cljs|cljc|bb|edn)$/i;
       const tokens = [...new Set(
         query.split(/[\s,()[\]]+/)
           .map((t) => t.replace(FILE_EXT, '').trim())
-          .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
+          // Symbol charset covers Lisp-family names too: kebab-case
+          // (`on-route-change+`), predicates (`valid?`), and Clojure
+          // alias-qualified `set-state/dashboard` / keyword `:profile/logout`
+          // forms. Without these, NO Clojure symbol passes the filter and the
+          // flow builder silently never runs on Clojure repos. Tokens that
+          // don't resolve to nodes are dropped downstream, so the wider
+          // charset admits no noise by itself.
+          .filter((t) => t.length >= 3 && /^:?[A-Za-z_$][\w$+!?*<>='-]*(?:(?:::|[./]):?[\w$+!?*<>='-]+)*$/.test(t))
       )].slice(0, 16);
       if (tokens.length < 2) return EMPTY;
       // Pool of name SEGMENTS (Class + method from every token) used to
       // disambiguate an ambiguous SIMPLE name: keep a candidate only if its
       // CONTAINER class is itself named in the query.
       const segPool = new Set<string>();
-      for (const t of tokens) for (const s of t.toLowerCase().split(/::|\./)) if (s) segPool.add(s);
+      for (const t of tokens) for (const s of t.toLowerCase().split(/::|[./]/)) if (s) segPool.add(s);
       const named = new Map<string, Node>();
       // Nodes whose token is SPECIFIC — a (near-)unique callable name (<=3 defs in
       // the whole graph). These are safe to SPARE a file on: the agent named THIS
@@ -1635,14 +1642,21 @@ export class ToolHandler {
     // agent explicitly named is in the subgraph and its file is scored.
     const namedSeedIds = new Set<string>();
     {
-      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte)$/i;
+      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|clj|cljs|cljc|bb|edn)$/i;
       const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
       const isTestPath = (p: string) => /(^|\/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)\//i.test(p) || /\.(test|spec)\.[a-z]+$/i.test(p);
       const bodyLines = (n: Node) => Math.max(0, (n.endLine ?? n.startLine) - n.startLine);
       const tokens = [...new Set(
         query.split(/[\s,()[\]]+/)
           .map((t) => t.replace(FILE_EXT, '').trim())
-          .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
+          // Symbol charset covers Lisp-family names too: kebab-case
+          // (`on-route-change+`), predicates (`valid?`), and Clojure
+          // alias-qualified `set-state/dashboard` / keyword `:profile/logout`
+          // forms. Without these, NO Clojure symbol passes the filter and the
+          // flow builder silently never runs on Clojure repos. Tokens that
+          // don't resolve to nodes are dropped downstream, so the wider
+          // charset admits no noise by itself.
+          .filter((t) => t.length >= 3 && /^:?[A-Za-z_$][\w$+!?*<>='-]*(?:(?:::|[./]):?[\w$+!?*<>='-]+)*$/.test(t))
       )].slice(0, 16);
       // PascalCase tokens in the query are type/file disambiguators — when the
       // agent writes "DataRequest task validate", the `task`/`validate` it wants
@@ -1655,6 +1669,8 @@ export class ToolHandler {
           const lc = ct.toLowerCase();
           return n.filePath.toLowerCase().includes(lc) || n.qualifiedName.toLowerCase().includes(lc);
         });
+      // PASS 1 — resolve every token's candidate defs (no picking yet).
+      const perToken: { cands: Node[]; mods: Node[] }[] = [];
       for (const t of tokens) {
         // Enumerate ALL defs of a bare token via the direct index, not FTS — a
         // 50+-overload name (tokio `poll`) ranks the wanted def (`Harness::poll`)
@@ -1666,19 +1682,78 @@ export class ToolHandler {
         const cands = raw
           .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
           .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
-        // A specific name (<=3 defs) injects all its defs. An overloaded name
-        // (`validate` = 10, `request` = 44) would flood the subgraph, so inject
-        // only: the overloads whose file/class the query ALSO names (the agent
-        // told us which one it wants — DataRequest's, not Validation.swift's),
-        // capped; else fall back to the single most-substantive def. This is the
-        // explore-side mirror of codegraph_node's overload disambiguation.
+        // A token can also name a MODULE by its last segment — the Clojure norm
+        // ("the deactivate stage" = ns `app.page.lifecycle.deactivate`, whose
+        // fns are named per page type). Callable-only resolution makes those
+        // tokens contribute nothing, or worse, latch onto an unrelated same-name
+        // fn in another subsystem. A module match is a strong file pointer.
+        const last = t.toLowerCase();
+        const mods = cg
+          .searchNodes(t, { limit: 20, kinds: ['module', 'namespace'] })
+          .map((r) => r.node)
+          .filter(
+            (n) =>
+              !isTestPath(n.filePath) &&
+              lastQualifierPart(n.name).toLowerCase() === last
+          )
+          .slice(0, 3);
+        perToken.push({ cands, mods });
+      }
+      // Anchor directories: where the SPECIFIC tokens' defs live. The agent's
+      // bag of names describes ONE flow, so its tokens are spatially coherent —
+      // when `on-route-change+` (1 def) lives in app/page/, the `deactivate`
+      // the agent means is app/page/lifecycle's, not the SCIM backend's, even
+      // though the latter has the longer body. Without this, each ambiguous
+      // bare token resolved independently to its most-substantive def anywhere
+      // in the monorepo, dragging wrong-subsystem files into the render budget.
+      const anchorDirs: string[][] = [];
+      for (const { cands, mods } of perToken) {
+        if (cands.length >= 1 && cands.length <= 3) {
+          for (const n of cands) anchorDirs.push(n.filePath.toLowerCase().split('/').slice(0, -1));
+        }
+        for (const n of mods) anchorDirs.push(n.filePath.toLowerCase().split('/').slice(0, -1));
+      }
+      const sharedSegs = (a: string[], b: string[]) => {
+        let i = 0;
+        while (i < a.length && i < b.length && a[i] === b[i]) i++;
+        return i;
+      };
+      const anchorProximity = (n: Node) => {
+        const dir = n.filePath.toLowerCase().split('/').slice(0, -1);
+        let best = 0;
+        for (const a of anchorDirs) best = Math.max(best, sharedSegs(dir, a));
+        return best;
+      };
+
+      // PASS 2 — pick per token. A specific name (<=3 defs) injects all its
+      // defs. An overloaded name (`validate` = 10, `request` = 44) would flood
+      // the subgraph, so inject only: the overloads whose file/class the query
+      // ALSO names (the agent told us which one it wants — DataRequest's, not
+      // Validation.swift's); else the candidate co-located with the anchors
+      // (>=2 shared path segments so a bare repo-root match doesn't count);
+      // else the single most-substantive def. This is the explore-side mirror
+      // of codegraph_node's overload disambiguation.
+      for (const { cands, mods } of perToken) {
         let picks: Node[];
         if (cands.length <= 3) {
           picks = cands;
         } else {
           const ctx = cands.filter(inNamedContext);
-          picks = ctx.length > 0 ? ctx.slice(0, 4) : cands.slice(0, 1);
+          if (ctx.length > 0) {
+            picks = ctx.slice(0, 4);
+          } else if (anchorDirs.length > 0) {
+            // All max-proximity co-located candidates (≥2 shared segments so a
+            // bare repo-root match doesn't count), capped — when the per-stage
+            // overloads of one name all live beside the anchors, they are ALL
+            // the answer (Clojure lifecycle stages, C++ per-backend overrides).
+            const ranked = [...cands].sort((a, b) => anchorProximity(b) - anchorProximity(a));
+            const top = anchorProximity(ranked[0]!);
+            picks = top >= 2 ? ranked.filter((n) => anchorProximity(n) === top).slice(0, 3) : cands.slice(0, 1);
+          } else {
+            picks = cands.slice(0, 1);
+          }
         }
+        picks = picks.concat(mods);
         for (const n of picks) {
           if (!subgraph.nodes.has(n.id)) subgraph.nodes.set(n.id, n);
           // Mark as a named seed EVEN IF the FTS gather already had it — being
@@ -2995,6 +3070,12 @@ export class ToolHandler {
   private matchesSymbol(node: Node, symbol: string): boolean {
     // Simple name match
     if (node.name === symbol) return true;
+    // Clojure keyword nodes (re-frame registrations) are named WITH the
+    // leading colon (`:app/set-page-state`), but agents habitually write the
+    // keyword without it. Match the colon-prefixed form too — gated on the
+    // `/` (namespaced-keyword shape) so a bare name like `dashboard` is never
+    // hijacked by a same-named unqualified keyword (`:dashboard`).
+    if (symbol.includes('/') && node.name === ':' + symbol) return true;
     // File basename match (e.g., "product-card" matches "product-card.liquid")
     if (node.kind === 'file' && node.name.replace(/\.[^.]+$/, '') === symbol) return true;
 
@@ -3090,6 +3171,15 @@ export class ToolHandler {
    */
   private findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
     let results = cg.searchNodes(symbol, { limit: 50 });
+
+    // A colon-less namespaced keyword (`app/set-page-state` for the re-frame
+    // event `:app/set-page-state`) resolves to the registration node
+    // directly. Gated on the `/` so a bare name like `dashboard` can never be
+    // hijacked by a same-named unqualified keyword.
+    if (!symbol.startsWith(':') && symbol.includes('/')) {
+      const kw = cg.getNodesByName(':' + symbol);
+      if (kw.length > 0) return { nodes: kw, note: '' };
+    }
 
     // Mirror the fallback in `findSymbol` for qualified queries — FTS
     // strips colons, so a module-qualified lookup needs a second pass
