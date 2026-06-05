@@ -4459,3 +4459,93 @@ func (s Stack[T]) Len() int { return len(s.items) }
     expect(js.nodes.find((n) => n.name === 'handleRequest' && n.kind === 'function')).toBeDefined();
   });
 });
+
+describe('VB.NET Extraction', () => {
+  it('extracts classes, modules, structs, interfaces, enums, methods, properties, imports, and calls', () => {
+    const code = `
+Imports System
+Imports System.Collections.Generic
+
+Namespace MyApp
+
+Public Interface IAnimal
+    Function Speak() As String
+End Interface
+
+Public Class Animal
+    Implements IAnimal
+    Private _name As String
+    Public Property Name As String
+    Public Sub New(name As String)
+        _name = name
+    End Sub
+    Public Function Speak() As String
+        Return _name
+    End Function
+End Class
+
+Public Structure Point
+    Public X As Double
+    Public Y As Double
+    Public Function DistanceTo(other As Point) As Double
+        Return 0
+    End Function
+End Structure
+
+Public Enum Color
+    Red
+    Green
+    Blue
+End Enum
+
+Module MathHelper
+    Public Const PI As Double = 3.14159
+    Public Shared Function Add(a As Integer, b As Integer) As Integer
+        Return a + b
+    End Function
+    Public Sub Run()
+        Dim x = Add(1, 2)
+    End Sub
+End Module
+
+End Namespace
+`;
+    const result = extractFromSource('Sample.vb', code);
+    const byKind = (k: string) => result.nodes.filter((n) => n.kind === k).map((n) => n.name);
+
+    // Types
+    expect(byKind('class')).toContain('Animal');
+    expect(byKind('interface')).toContain('IAnimal');
+    expect(byKind('struct')).toContain('Point');
+    expect(byKind('enum')).toContain('Color');
+    expect(byKind('enum_member')).toEqual(expect.arrayContaining(['Red', 'Green', 'Blue']));
+    // Module is distinct from class (static sealed type)
+    const mod = result.nodes.find((n) => n.name === 'MathHelper' && n.kind === 'module');
+    expect(mod).toBeDefined();
+    expect(mod?.isStatic).toBe(true);
+
+    // Members
+    expect(byKind('method')).toEqual(expect.arrayContaining(['New', 'Speak', 'DistanceTo', 'Add']));
+    expect(byKind('property')).toContain('Name');
+    expect(byKind('field')).toContain('_name');
+    expect(byKind('constant')).toContain('PI');
+
+    // Shared method is static; constructor is not
+    expect(result.nodes.find((n) => n.name === 'Add')?.isStatic).toBe(true);
+    expect(result.nodes.find((n) => n.name === 'New')?.isStatic).toBeFalsy();
+
+    // Inherits/Implements lines must not appear as fields
+    expect(byKind('field')).not.toContain('Implements');
+    expect(byKind('field')).not.toContain('IAnimal');
+
+    // Namespace and imports
+    expect(byKind('namespace')).toContain('MyApp');
+    expect(byKind('import')).toEqual(expect.arrayContaining(['System', 'System.Collections.Generic']));
+
+    // Calls
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls')).toBe(true);
+
+    // Language tag
+    expect(result.nodes.find((n) => n.name === 'Animal')?.language).toBe('vbnet');
+  });
+});
