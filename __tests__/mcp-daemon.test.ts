@@ -143,6 +143,16 @@ function readLockPid(root: string): number | null {
   } catch { return null; }
 }
 
+/** The socket path the daemon actually bound, as it recorded in its lockfile —
+ *  robust on Windows where a recomputed pipe path can differ from the daemon's. */
+function readLockSocketPath(root: string): string | null {
+  try {
+    const raw = fs.readFileSync(path.join(root, '.codegraph', 'daemon.pid'), 'utf8');
+    const info = JSON.parse(raw);
+    return typeof info.socketPath === 'string' ? info.socketPath : null;
+  } catch { return null; }
+}
+
 function readDaemonLog(root: string): string {
   try { return fs.readFileSync(path.join(root, '.codegraph', 'daemon.log'), 'utf8'); }
   catch { return ''; }
@@ -357,6 +367,66 @@ describe('Shared MCP daemon (issue #411)', () => {
     } finally {
       await new Promise<void>((resolve) => miniServer.close(() => resolve()));
     }
+  }, 30000);
+
+  it('reaps a client whose process died without the socket closing (liveness sweep, #692)', async () => {
+    const net = await import('net');
+    // Bring a daemon up via a real proxy (a live client), sweep fast.
+    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000', CODEGRAPH_DAEMON_CLIENT_SWEEP_MS: '300' };
+    const server = spawnServer(tempDir, env);
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
+
+    // Connect a RAW client that announces a dead pid and then never closes its
+    // socket — the exact phantom-client shape the sweep exists to catch. Use the
+    // socket path the daemon recorded in its lockfile (robust on Windows, where
+    // a recomputed named-pipe path can differ from the one the daemon bound).
+    const sockPath = await waitFor(() => readLockSocketPath(realRoot), 8000);
+    const raw = net.createConnection(sockPath);
+    raw.on('error', () => { /* ignore — we destroy it ourselves */ });
+    try {
+      // Consume the daemon hello (one line), then send our client-hello.
+      // Generous timeouts: the unref'd sweep interval can stretch under a busy
+      // event loop (engine init / a loaded CI box), so don't race it tight.
+      await new Promise<void>((resolve, reject) => {
+        let buf = '';
+        const to = setTimeout(() => reject(new Error('no daemon hello within 15s')), 15000);
+        raw.on('data', (c: Buffer) => {
+          buf += c.toString('utf8');
+          if (buf.includes('\n')) { clearTimeout(to); resolve(); }
+        });
+      });
+      raw.write(JSON.stringify({ codegraph_client: 1, pid: 999_999, hostPid: null }) + '\n');
+
+      // The sweep should detect pid 999999 is dead and reap that client.
+      await waitFor(
+        () => readDaemonLog(realRoot).includes('Reaping client with dead peer (pid 999999'),
+        15000,
+      );
+    } finally {
+      raw.destroy();
+    }
+  }, 60000);
+
+  it('exits on the inactivity backstop even while a client stays connected (#692)', async () => {
+    // Backstop short, idle timeout long: with a client connected the idle timer
+    // never arms, so only the inactivity backstop can take the daemon down.
+    const env = { CODEGRAPH_DAEMON_MAX_IDLE_MS: '1500', CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '60000' };
+    const server = spawnServer(tempDir, env);
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
+    const daemonPid = readLockPid(realRoot)!;
+    expect(isAlive(daemonPid)).toBe(true);
+
+    // Send nothing further — the client stays connected but idle. The backstop
+    // should fire and the daemon should exit and clean up its lockfile.
+    expect(await waitProcessExit(daemonPid, 12000)).toBe(true);
+    expect(readDaemonLog(realRoot)).toContain('inactivity backstop');
+    expect(fs.existsSync(path.join(realRoot, '.codegraph', 'daemon.pid'))).toBe(false);
   }, 30000);
 
   it('daemon idle-times-out after the last client disconnects', async () => {

@@ -21,7 +21,7 @@
 import * as fs from 'fs';
 import * as net from 'net';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
-import { DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
+import { DaemonClientHello, DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
 import { supervisionLostReason } from './ppid-watchdog';
 import { CodeGraphPackageVersion } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION } from './session';
@@ -93,6 +93,7 @@ export async function runProxy(
     `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
   );
 
+  sendClientHello(socket);
   startPpidWatchdog(socket);
   await pipeUntilClose(socket);
   // Host disconnected (or the daemon went away). The proxy's only job is the
@@ -132,7 +133,26 @@ export async function connectWithHello(
   process.stderr.write(
     `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
   );
+  sendClientHello(socket);
   return socket;
+}
+
+/**
+ * Tell the daemon our pids right after we verify its hello, so its liveness
+ * sweep can reap this client if our process dies without the socket ever
+ * signalling close (the Windows named-pipe hazard behind #692). Best-effort:
+ * sent before any piped bytes so it's always the daemon's first line from us,
+ * and a write failure here is harmless (the daemon just falls back to the
+ * socket-close lifecycle). `hostPid` mirrors the PPID watchdog: the threaded
+ * host pid if set, else our own parent (the host, on a no-relaunch bundle).
+ */
+function sendClientHello(socket: net.Socket): void {
+  const clientHello: DaemonClientHello = {
+    codegraph_client: 1,
+    pid: process.pid,
+    hostPid: parseHostPpid(process.env[HOST_PPID_ENV]) ?? process.ppid,
+  };
+  try { socket.write(JSON.stringify(clientHello) + '\n'); } catch { /* best-effort */ }
 }
 
 type JsonRpc = Record<string, unknown>;
