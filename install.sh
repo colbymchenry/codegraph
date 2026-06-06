@@ -8,7 +8,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
 #
-# Upgrade:   re-run the same command.
+# Upgrade:   run `codegraph upgrade` (or just re-run the same command).
 # Uninstall: curl -fsSL .../install.sh | sh -s -- --uninstall
 #
 # Environment:

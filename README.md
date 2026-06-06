@@ -57,6 +57,8 @@ npm i -g @colbymchenry/codegraph
 
 <sub>CodeGraph bundles its own runtime — nothing to compile, no native build, works the same everywhere. The installer puts `codegraph` on your PATH but **doesn't change your current shell** — open a new terminal before the next step so the command resolves.</sub>
 
+<sub>**Upgrade any time** with `codegraph upgrade` — it detects how you installed (bundle, npm, or npx) and updates in place. Add `--check` to see if an update is available, or `codegraph upgrade <version>` to pin one.</sub>
+
 ### 2. Wire up your agent(s)
 
 In a **new terminal**, run the installer to connect CodeGraph to the agents you use:
@@ -465,6 +467,7 @@ codegraph callees <symbol>        # Find what a function/method calls (--limit, 
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
 codegraph affected [files...]     # Find test files affected by changes (see below)
 codegraph serve --mcp             # Start MCP server
+codegraph upgrade [version]       # Update to the latest release (--check, --force)
 ```
 
 ### `codegraph affected`

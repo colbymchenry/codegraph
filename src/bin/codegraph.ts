@@ -20,6 +20,7 @@
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph affected [files]   Find test files affected by changes
+ *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
 import { Command } from 'commander';
@@ -32,6 +33,7 @@ import { getGlyphs } from '../ui/glyphs';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
+import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -699,6 +701,9 @@ program
       const backend = cg.getBackend();
       const journalMode = cg.getJournalMode();
 
+      const buildInfo = cg.getIndexBuildInfo();
+      const reindexRecommended = cg.isIndexStale();
+
       // JSON output mode
       if (options.json) {
         const lastIndexedMs = cg.getLastIndexedAt();
@@ -724,6 +729,12 @@ program
           worktreeMismatch: worktreeMismatch
             ? { worktreeRoot: worktreeMismatch.worktreeRoot, indexRoot: worktreeMismatch.indexRoot }
             : null,
+          index: {
+            builtWithVersion: buildInfo.version,
+            builtWithExtractionVersion: buildInfo.extractionVersion,
+            currentExtractionVersion: EXTRACTION_VERSION,
+            reindexRecommended,
+          },
         }));
         cg.destroy();
         return;
@@ -796,6 +807,15 @@ program
         success('Index is up to date');
       }
       console.log();
+
+      // Re-index hint: the index was built by an older engine than the one now
+      // running, so a rebuild would add data a migration can't backfill.
+      if (reindexRecommended) {
+        const builtWith = buildInfo.version ? `v${buildInfo.version.replace(/^v/, '')}` : 'an earlier version';
+        warn(`Index was built by ${builtWith}; re-index to pick up this engine's improvements.`);
+        info('Run "codegraph index -f" (full rebuild) or "codegraph sync"');
+        console.log();
+      }
 
       cg.destroy();
     } catch (err) {
@@ -1662,6 +1682,43 @@ program
       error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
+  });
+
+/**
+ * codegraph upgrade [version]
+ *
+ * Self-update, however CodeGraph was installed (bundle via install.sh/.ps1,
+ * npm-global, npx, or a source checkout). See ../upgrade for the detection and
+ * per-method upgrade logic.
+ */
+program
+  .command('upgrade [version]')
+  .description('Update CodeGraph to the latest release (or a specific version)')
+  .option('--check', 'Check whether an update is available without installing')
+  .option('-f, --force', 'Reinstall even if already on the target version')
+  .action(async (versionArg: string | undefined, options: { check?: boolean; force?: boolean }) => {
+    const up = await import('../upgrade');
+    const method = up.detectInstallMethod({
+      filename: __filename,
+      platform: process.platform,
+      cwd: process.cwd(),
+    });
+    const pin = versionArg || process.env.CODEGRAPH_VERSION || undefined;
+    const code = await up.runUpgrade(
+      { version: pin, check: options.check, force: options.force },
+      {
+        currentVersion: packageJson.version,
+        method,
+        resolveLatest: () => up.resolveLatestVersion(),
+        run: up.defaultRun,
+        hasCommand: up.hasCommand,
+        log: (m: string) => console.log(m),
+        warn: (m: string) => warn(m),
+        error: (m: string) => error(m),
+        platform: process.platform,
+      }
+    );
+    process.exit(code);
   });
 
 // Parse and run
