@@ -92,6 +92,7 @@ export const LANGUAGES = [
   'twig',
   'xml',
   'properties',
+  'terraform',
   'unknown',
 ] as const;
 

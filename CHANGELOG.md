@@ -11,6 +11,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- Terraform and OpenTofu are now first-class indexed languages — `.tf`, `.tfvars`, and `.tofu` files are parsed into the graph, and `codegraph_search`, `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` return real results instead of nothing. Resources, data sources, modules, variables, outputs, providers, and every `locals` attribute become symbols (e.g. `aws_s3_bucket.my_bucket`, `var.region`, `module.vpc`, `local.prefix`), and uses like `var.region`, `module.vpc.id`, `data.aws_caller_identity.current`, or `aws_s3_bucket.my.arn` are wired up cross-file. The Terraform resolver disambiguates same-named variables across modules by preferring the variable defined in the same module directory as the reference site, so asking "what depends on `var.project_id`" in a multi-module repo no longer mixes in unrelated modules.
 - `codegraph status --json` now also reports the running CLI `version`, the index directory (`indexPath`), and a `lastIndexed` timestamp (ISO-8601, or null when nothing's indexed yet), so CI and scripts can pin the CLI version and check index freshness from a single command. A matching `CodeGraph.getLastIndexedAt()` library method exposes the same freshness check without shelling out. Thanks @12122J and @eddieran. (#329)
 
 ### Fixes

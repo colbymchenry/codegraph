@@ -38,6 +38,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   lua: 'tree-sitter-lua.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  terraform: 'tree-sitter-terraform.wasm',
 };
 
 /**
@@ -108,6 +109,10 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // shape as the `.yml` variants — the YAML/properties extractor emits one node
   // per leaf key, and the Spring resolver links `@Value("${k}")` references.
   '.properties': 'properties',
+  // Terraform / OpenTofu / HCL config — tree-sitter-terraform dialect of HCL.
+  '.tf': 'terraform',
+  '.tfvars': 'terraform',
+  '.tofu': 'terraform',
 };
 
 /**
@@ -184,8 +189,10 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
       // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
       // 0.25 (drops nested calls/imports on every file after the first); we
-      // vendor the upstream ABI-15 wasm instead.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau')
+      // vendor the upstream ABI-15 wasm instead. Terraform: tree-sitter-wasms
+      // does not ship HCL/Terraform at all, so we vendor the prebuilt wasm
+      // from @tree-sitter-grammars/tree-sitter-hcl (Apache-2.0).
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'terraform')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -388,6 +395,7 @@ export function getLanguageDisplayName(language: Language): string {
     twig: 'Twig',
     xml: 'XML',
     properties: 'Java properties',
+    terraform: 'Terraform',
     unknown: 'Unknown',
   };
   return names[language] || language;
