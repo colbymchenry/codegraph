@@ -117,6 +117,13 @@ export interface IndexOptions {
 
   /** Enable verbose logging (worker lifecycle, memory, timeouts) */
   verbose?: boolean;
+
+  /**
+   * Maximum file size in bytes; files larger than this are skipped with a
+   * `size_exceeded` warning. Defaults to 1 MiB (`DEFAULT_MAX_FILE_SIZE`) —
+   * see issue #369. Surface via `codegraph index --max-file-size <size>`.
+   */
+  maxFileSize?: number;
 }
 
 /**
@@ -331,7 +338,7 @@ export class CodeGraph {
       }
       try {
         const before = this.queries.getNodeAndEdgeCount();
-        const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
+        const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose, options.maxFileSize);
 
         // Re-detect frameworks now that the index is populated. The resolver
         // is constructed with createResolver() before any files exist, so
@@ -422,7 +429,7 @@ export class CodeGraph {
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
       }
       try {
-        const result = await this.orchestrator.sync(options.onProgress);
+        const result = await this.orchestrator.sync(options.onProgress, options.maxFileSize);
 
         // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
         // every sync that touched files so edits to `app.module.ts` propagate

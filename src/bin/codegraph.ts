@@ -32,6 +32,7 @@ import { getGlyphs } from '../ui/glyphs';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
+import { parseFileSize } from '../utils';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -407,6 +408,25 @@ function writeErrorLog(projectPath: string, errors: Array<{ message: string; fil
   fs.writeFileSync(logPath, lines.join('\n') + '\n');
 }
 
+/**
+ * Translate the `--max-file-size <size>` CLI option into a byte count for
+ * `IndexOptions.maxFileSize`. Empty / undefined returns `undefined` so the
+ * library default (1 MiB) applies. Invalid sizes exit the process with a
+ * clear error rather than silently coercing to the default.
+ */
+function resolveMaxFileSize(input: string | undefined): number | undefined {
+  if (input === undefined || input === '') return undefined;
+  const bytes = parseFileSize(input);
+  if (bytes === null) {
+    error(
+      `Invalid --max-file-size value: "${input}". ` +
+      `Use a non-negative number with an optional unit suffix (e.g. "500kb", "2mb", "1.5gb", "1048576").`,
+    );
+    process.exit(1);
+  }
+  return bytes;
+}
+
 // =============================================================================
 // Commands
 // =============================================================================
@@ -419,7 +439,8 @@ program
   .description('Initialize CodeGraph in a project directory and build the initial index')
   .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean }) => {
+  .option('--max-file-size <size>', 'Skip files larger than this (e.g. "500kb", "2mb", "1.5gb", or bytes). Default: 1mb')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean; maxFileSize?: string }) => {
     const projectPath = path.resolve(pathArg || process.cwd());
     const clack = await importESM('@clack/prompts');
 
@@ -445,16 +466,20 @@ program
       // accepted (so existing muscle memory and scripts don't break) but is a
       // no-op — initializing always builds the initial index.
       let result: IndexResult;
+      const maxFileSize = resolveMaxFileSize(options.maxFileSize);
+
       if (options.verbose) {
         result = await cg.indexAll({
           onProgress: createVerboseProgress(),
           verbose: true,
+          maxFileSize,
         });
       } else {
         process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
         const progress = createShimmerProgress();
         result = await cg.indexAll({
           onProgress: progress.onProgress,
+          maxFileSize,
         });
         await progress.stop();
       }
@@ -536,7 +561,8 @@ program
   .option('-f, --force', 'Force full re-index even if already indexed')
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
+  .option('--max-file-size <size>', 'Skip files larger than this (e.g. "500kb", "2mb", "1.5gb", or bytes). Default: 1mb')
+  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean; maxFileSize?: string }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -548,11 +574,12 @@ program
 
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
+      const maxFileSize = resolveMaxFileSize(options.maxFileSize);
 
       if (options.quiet) {
         // Quiet mode: no UI, just run
         if (options.force) cg.clear();
-        const result = await cg.indexAll();
+        const result = await cg.indexAll({ maxFileSize });
         if (!result.success) process.exit(1);
         cg.destroy();
         return;
@@ -572,12 +599,14 @@ program
         result = await cg.indexAll({
           onProgress: createVerboseProgress(),
           verbose: true,
+          maxFileSize,
         });
       } else {
         process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
         const progress = createShimmerProgress();
         result = await cg.indexAll({
           onProgress: progress.onProgress,
+          maxFileSize,
         });
         await progress.stop();
       }
@@ -603,7 +632,8 @@ program
   .command('sync [path]')
   .description('Sync changes since last index')
   .option('-q, --quiet', 'Suppress output (for git hooks)')
-  .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
+  .option('--max-file-size <size>', 'Skip files larger than this (e.g. "500kb", "2mb", "1.5gb", or bytes). Default: 1mb')
+  .action(async (pathArg: string | undefined, options: { quiet?: boolean; maxFileSize?: string }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -616,9 +646,10 @@ program
 
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
+      const maxFileSize = resolveMaxFileSize(options.maxFileSize);
 
       if (options.quiet) {
-        await cg.sync();
+        await cg.sync({ maxFileSize });
         cg.destroy();
         return;
       }
@@ -631,6 +662,7 @@ program
 
       const result = await cg.sync({
         onProgress: progress.onProgress,
+        maxFileSize,
       });
 
       await progress.stop();
