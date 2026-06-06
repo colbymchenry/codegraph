@@ -191,6 +191,19 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let engine: MCPEngine | null = null;
   let engineReady: Promise<void> | null = null;
   let shuttingDown = false;
+  // Requests forwarded to the daemon and not yet answered, keyed by JSON-RPC id.
+  // If the daemon dies mid-session (#662 — e.g. an MCP host SIGTERM's it when a
+  // new session starts), these would otherwise hang forever; we re-serve them
+  // in-process so the host always gets a reply.
+  const inflight = new Map<unknown, string>();
+  const trackInflight = (line: string): void => {
+    try {
+      const m = JSON.parse(line) as JsonRpc;
+      if (m && m.id !== undefined && typeof m.method === 'string' && m.method !== 'initialize') {
+        inflight.set(m.id, line);
+      }
+    } catch { /* unparseable — nothing we could re-serve anyway */ }
+  };
 
   const writeClient = (obj: JsonRpc | string): void => {
     try { process.stdout.write((typeof obj === 'string' ? obj : JSON.stringify(obj)) + '\n'); } catch { /* host gone */ }
@@ -221,11 +234,16 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       }
     } else if (msg.method === 'ping' && id !== undefined) {
       writeClient({ jsonrpc: '2.0', id, result: {} });
+    } else if (id !== undefined && msg.method !== 'initialize') {
+      // A request we can't serve in-process (and the daemon is gone) — answer
+      // with an error rather than let the host hang on a reply that won't come.
+      writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: 'CodeGraph daemon unavailable' } });
     }
     // initialize already answered locally; notifications (initialized) need no reply.
   };
   const routeToDaemon = (line: string): void => {
     if (daemonStatus === 'ready' && daemonSocket) {
+      trackInflight(line);
       try { daemonSocket.write(line.endsWith('\n') ? line : line + '\n'); } catch { /* close path */ }
     } else if (daemonStatus === 'failed') {
       void handleLocally(line);
@@ -284,15 +302,37 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         const line = sockBuf.slice(0, idx);
         sockBuf = sockBuf.slice(idx + 1);
         if (!line.trim()) continue;
-        if (clientInitId !== undefined) {
-          try { const m = JSON.parse(line) as JsonRpc; if (m.id === clientInitId && ('result' in m || 'error' in m)) continue; } catch { /* relay */ }
+        let resp: JsonRpc | null = null;
+        try { resp = JSON.parse(line) as JsonRpc; } catch { /* not JSON — relay verbatim */ }
+        if (resp && resp.id !== undefined && ('result' in resp || 'error' in resp)) {
+          inflight.delete(resp.id); // answered — no longer in flight
+          // Suppress the daemon's reply to the initialize we forwarded to prime it
+          // (the client already got the local handshake response).
+          if (clientInitId !== undefined && resp.id === clientInitId) continue;
         }
         writeClient(line);
       }
     });
-    socket.on('close', shutdown);
-    socket.on('error', shutdown);
-    for (const line of pending) { try { socket.write(line + '\n'); } catch { /* ignore */ } }
+    // The daemon going away does NOT end the session (#662). An MCP host can
+    // SIGTERM the shared daemon when another session starts; if we exited here,
+    // this host would silently lose CodeGraph and any in-flight request would
+    // hang. Instead, fall back to the in-process engine for the rest of the
+    // session and re-serve whatever the dead daemon never answered.
+    const onDaemonLost = (): void => {
+      if (shuttingDown || daemonStatus !== 'ready') return; // host teardown, or already handled
+      daemonStatus = 'failed';
+      try { daemonSocket?.destroy(); } catch { /* ignore */ }
+      daemonSocket = null;
+      process.stderr.write(
+        `[CodeGraph MCP] Shared daemon connection lost; serving this session in-process (degraded), re-serving ${inflight.size} in-flight request(s).\n`
+      );
+      const orphaned = [...inflight.values()];
+      inflight.clear();
+      for (const line of orphaned) void handleLocally(line);
+    };
+    socket.on('close', onDaemonLost);
+    socket.on('error', onDaemonLost);
+    for (const line of pending) { trackInflight(line); try { socket.write(line + '\n'); } catch { /* ignore */ } }
     pending.length = 0;
   } else if (!shuttingDown) {
     daemonStatus = 'failed';

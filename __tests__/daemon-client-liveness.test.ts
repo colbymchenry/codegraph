@@ -7,7 +7,7 @@
  * the full handshake + sweep is exercised end-to-end in `mcp-daemon.test.ts`.
  */
 import { describe, it, expect } from 'vitest';
-import { parseClientHelloLine, peerIsDead } from '../src/mcp/daemon';
+import { Daemon, parseClientHelloLine, peerIsDead } from '../src/mcp/daemon';
 
 describe('parseClientHelloLine', () => {
   it('parses a well-formed client-hello', () => {
@@ -65,5 +65,46 @@ describe('peerIsDead', () => {
 
   it('keeps a client when both proxy and host are alive', () => {
     expect(peerIsDead({ pid: 100, hostPid: 42 }, aliveAll)).toBe(false);
+  });
+});
+
+describe('Daemon.reapDeadClients', () => {
+  // Construct with idleTimeoutMs:0 so dropping the last client doesn't arm a real
+  // idle timer. The constructor opens no sockets/DB, so this stays a fast unit test.
+  const makeDaemon = () => new Daemon('/tmp/codegraph-reap-unit-test', { idleTimeoutMs: 0 }) as any;
+  const fakeSession = () => ({ stopped: false, stop() { this.stopped = true; } });
+
+  it('drops clients with a dead peer and leaves live ones attached', () => {
+    const d = makeDaemon();
+    const dead = fakeSession();
+    const live = fakeSession();
+    d.clients.add(dead); d.clientPeers.set(dead, { pid: 111, hostPid: null });
+    d.clients.add(live); d.clientPeers.set(live, { pid: 222, hostPid: null });
+
+    const reaped = d.reapDeadClients((pid: number) => pid !== 111); // 111 dead, 222 alive
+
+    expect(reaped).toBe(1);
+    expect(dead.stopped).toBe(true);
+    expect(d.clients.has(dead)).toBe(false);
+    expect(d.clientPeers.has(dead)).toBe(false); // peer record cleaned up too
+    expect(d.clients.has(live)).toBe(true);
+  });
+
+  it('never reaps a client with an unknown pid (no client-hello)', () => {
+    const d = makeDaemon();
+    const s = fakeSession();
+    d.clients.add(s); d.clientPeers.set(s, { pid: null, hostPid: null });
+
+    expect(d.reapDeadClients(() => false)).toBe(0); // everything "dead", but pid unknown
+    expect(d.clients.has(s)).toBe(true);
+  });
+
+  it('reaps a client whose host pid is gone even if its proxy pid is alive', () => {
+    const d = makeDaemon();
+    const s = fakeSession();
+    d.clients.add(s); d.clientPeers.set(s, { pid: 100, hostPid: 42 });
+
+    expect(d.reapDeadClients((pid: number) => pid !== 42)).toBe(1); // proxy 100 alive, host 42 dead
+    expect(d.clients.has(s)).toBe(false);
   });
 });

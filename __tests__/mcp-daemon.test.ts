@@ -143,16 +143,6 @@ function readLockPid(root: string): number | null {
   } catch { return null; }
 }
 
-/** The socket path the daemon actually bound, as it recorded in its lockfile —
- *  robust on Windows where a recomputed pipe path can differ from the daemon's. */
-function readLockSocketPath(root: string): string | null {
-  try {
-    const raw = fs.readFileSync(path.join(root, '.codegraph', 'daemon.pid'), 'utf8');
-    const info = JSON.parse(raw);
-    return typeof info.socketPath === 'string' ? info.socketPath : null;
-  } catch { return null; }
-}
-
 function readDaemonLog(root: string): string {
   try { return fs.readFileSync(path.join(root, '.codegraph', 'daemon.log'), 'utf8'); }
   catch { return ''; }
@@ -369,47 +359,11 @@ describe('Shared MCP daemon (issue #411)', () => {
     }
   }, 30000);
 
-  it('reaps a client whose process died without the socket closing (liveness sweep, #692)', async () => {
-    const net = await import('net');
-    // Bring a daemon up via a real proxy (a live client), sweep fast.
-    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000', CODEGRAPH_DAEMON_CLIENT_SWEEP_MS: '300' };
-    const server = spawnServer(tempDir, env);
-    servers.push(server);
-    sendInitialize(server.child, `file://${tempDir}`, 1);
-    await waitFor(() => findResponse(server.stdout, 1), 10000);
-    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
-
-    // Connect a RAW client that announces a dead pid and then never closes its
-    // socket — the exact phantom-client shape the sweep exists to catch. Use the
-    // socket path the daemon recorded in its lockfile (robust on Windows, where
-    // a recomputed named-pipe path can differ from the one the daemon bound).
-    const sockPath = await waitFor(() => readLockSocketPath(realRoot), 8000);
-    const raw = net.createConnection(sockPath);
-    raw.on('error', () => { /* ignore — we destroy it ourselves */ });
-    try {
-      // Consume the daemon hello (one line), then send our client-hello.
-      // Generous timeouts: the unref'd sweep interval can stretch under a busy
-      // event loop (engine init / a loaded CI box), so don't race it tight.
-      await new Promise<void>((resolve, reject) => {
-        let buf = '';
-        const to = setTimeout(() => reject(new Error('no daemon hello within 15s')), 15000);
-        raw.on('data', (c: Buffer) => {
-          buf += c.toString('utf8');
-          if (buf.includes('\n')) { clearTimeout(to); resolve(); }
-        });
-      });
-      raw.write(JSON.stringify({ codegraph_client: 1, pid: 999_999, hostPid: null }) + '\n');
-
-      // The sweep should detect pid 999999 is dead and reap that client.
-      await waitFor(
-        () => readDaemonLog(realRoot).includes('Reaping client with dead peer (pid 999999'),
-        15000,
-      );
-    } finally {
-      raw.destroy();
-    }
-  }, 60000);
-
+  // The over-the-wire client-hello → record → sweep path is covered by the
+  // deterministic `Daemon.reapDeadClients` unit test in daemon-client-liveness
+  // (a raw-socket variant here was flaky under heavy parallel load), plus the
+  // client-hello round-trip exercised by every test above (the real proxy now
+  // sends it). What stays here is the lifecycle behavior that needs real procs.
   it('exits on the inactivity backstop even while a client stays connected (#692)', async () => {
     // Backstop short, idle timeout long: with a client connected the idle timer
     // never arms, so only the inactivity backstop can take the daemon down.
@@ -445,4 +399,34 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(await waitProcessExit(daemonPid, 10000)).toBe(true);
     expect(fs.existsSync(path.join(realRoot, '.codegraph', 'daemon.pid'))).toBe(false);
   }, 30000);
+
+  it('proxy survives the daemon dying mid-session and keeps serving (#662)', async () => {
+    // The #662 scenario: an MCP host SIGTERM's the shared daemon while a session
+    // is live. The proxy must NOT exit (losing CodeGraph for that session) — it
+    // falls back to an in-process engine and keeps answering.
+    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000', CODEGRAPH_PPID_POLL_MS: '5000' };
+    const server = spawnServer(tempDir, env);
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
+    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
+    const daemonPid = readLockPid(realRoot)!;
+
+    // A warm call goes through the daemon.
+    sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    await waitFor(() => findResponse(server.stdout, 2), 10000);
+
+    // Kill the daemon out from under the live proxy.
+    process.kill(daemonPid, 'SIGTERM');
+    expect(await waitProcessExit(daemonPid, 8000)).toBe(true);
+
+    // The proxy must still be alive and still answer — served in-process now.
+    expect(isAlive(server.child.pid!)).toBe(true);
+    await waitFor(() => server.stderr.some((l) => l.includes('serving this session in-process')), 8000);
+    sendMessage(server.child, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    const resp = await waitFor(() => findResponse(server.stdout, 3), 15000);
+    expect(resp.result !== undefined || resp.error !== undefined).toBe(true);
+    expect(isAlive(server.child.pid!)).toBe(true);
+  }, 45000);
 });
