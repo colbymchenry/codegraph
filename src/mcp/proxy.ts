@@ -22,6 +22,7 @@ import * as fs from 'fs';
 import * as net from 'net';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 import { DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
+import { supervisionLostReason } from './ppid-watchdog';
 import { CodeGraphPackageVersion } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
@@ -292,8 +293,14 @@ function startPpidWatchdogNoSocket(onDeath: () => void): void {
   const originalPpid = process.ppid;
   const hostPpid = parseHostPpid(process.env[HOST_PPID_ENV]);
   const timer = setInterval(() => {
-    if (process.ppid !== originalPpid || (hostPpid !== null && !isProcessAliveLocal(hostPpid))) {
-      process.stderr.write('[CodeGraph MCP] Parent process exited; shutting down.\n');
+    const reason = supervisionLostReason({
+      originalPpid,
+      currentPpid: process.ppid,
+      hostPpid,
+      isAlive: isProcessAliveLocal,
+    });
+    if (reason) {
+      process.stderr.write(`[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`);
       onDeath();
     }
   }, pollMs);
@@ -408,13 +415,13 @@ function startPpidWatchdog(socket: net.Socket): void {
   const originalPpid = process.ppid;
   const hostPpid = parseHostPpid(process.env[HOST_PPID_ENV]);
   const timer = setInterval(() => {
-    const current = process.ppid;
-    const ppidChanged = current !== originalPpid;
-    const hostGone = hostPpid !== null && !isProcessAliveLocal(hostPpid);
-    if (ppidChanged || hostGone) {
-      const reason = ppidChanged
-        ? `ppid ${originalPpid} -> ${current}`
-        : `host pid ${hostPpid} exited`;
+    const reason = supervisionLostReason({
+      originalPpid,
+      currentPpid: process.ppid,
+      hostPpid,
+      isAlive: isProcessAliveLocal,
+    });
+    if (reason) {
       process.stderr.write(`[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`);
       try { socket.destroy(); } catch { /* ignore */ }
       process.exit(0);
