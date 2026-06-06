@@ -227,6 +227,7 @@ export class MCPSession {
 
     await this.retryInitIfNeeded();
 
+    process.stderr.write(`[CodeGraph MCP] ${new Date().toISOString()} tool_call pid=${process.pid} tool=${toolName}\n`);
     const result = await this.engine.getToolHandler().execute(toolName, toolArgs);
     this.transport.sendResult(request.id, result);
   }

@@ -9,6 +9,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Database paths with `..` traversal sequences are now rejected in `DatabaseConnection.initialize` and `DatabaseConnection.open`, and non-`.db` extensions are blocked, so a caller cannot be tricked into opening an arbitrary file as a SQLite database.
+- Every MCP tool call is now logged to stderr with a timestamp, process PID, and tool name, making unexpected tool invocations visible in daemon logs.
+- The daemon socket `chmod 0600` failure is now surfaced as a warning to stderr instead of being silently swallowed, so permission issues on shared filesystems don't go unnoticed.
+
 ### New Features
 
 - Cross-file impact and blast-radius coverage now spans **all 22 supported languages and 14 web frameworks**, each validated on a real-world repo — see the new coverage table in the README. This release ships the cross-file resolution behind it, including Lua and Luau `require`, Shopify OS 2.0 Liquid section templates, Delphi form code-behind, Rust cross-module calls and Rocket route macros, Swift Fluent relationships, and the SvelteKit / Nuxt / Vapor / Axum route conventions. The residual everywhere is genuine static-analysis frontiers (runtime dispatch, reflection / DI, framework-convention entry points), never hidden.

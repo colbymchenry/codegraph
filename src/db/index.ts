@@ -12,6 +12,15 @@ import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migr
 
 export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
 
+function validateDbPath(dbPath: string): void {
+  if (dbPath.includes('..')) {
+    throw new Error(`Invalid database path: path traversal not allowed`);
+  }
+  if (path.extname(path.resolve(dbPath)) !== '.db') {
+    throw new Error(`Invalid database path: must have .db extension`);
+  }
+}
+
 /**
  * Apply connection-level PRAGMAs. Shared by `initialize` and `open` so the two
  * paths can't drift.
@@ -54,6 +63,7 @@ export class DatabaseConnection {
    * Initialize a new database at the given path
    */
   static initialize(dbPath: string): DatabaseConnection {
+    validateDbPath(dbPath);
     // Ensure parent directory exists
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) {
@@ -85,6 +95,7 @@ export class DatabaseConnection {
    * Open an existing database
    */
   static open(dbPath: string): DatabaseConnection {
+    validateDbPath(dbPath);
     if (!fs.existsSync(dbPath)) {
       throw new Error(`Database not found: ${dbPath}`);
     }
