@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
-import { matchReference } from '../src/resolution/name-matcher';
+import { matchReference, inferCppTypeFromInitializer, parseCppReturnType } from '../src/resolution/name-matcher';
 import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache } from '../src/resolution/import-resolver';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
@@ -1773,6 +1773,78 @@ func main() {
       } finally {
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('C++ auto-local type inference (inferCppTypeFromInitializer)', () => {
+    // Tier 1 — type is syntactically present in the initializer.
+    it('infers from smart-pointer factories', () => {
+      expect(inferCppTypeFromInitializer('std::make_unique<Widget>()')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('make_shared<Widget>(a, b)')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('std::make_unique<ns::Widget>()')).toBe('Widget');
+    });
+    it('skips a leading cv-qualifier on the type argument', () => {
+      expect(inferCppTypeFromInitializer('std::make_unique<const Widget>()')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('make_shared<volatile Widget>()')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('static_cast<const Widget*>(p)')).toBe('Widget');
+    });
+    it('infers from new expressions', () => {
+      expect(inferCppTypeFromInitializer('new Widget()')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('new ns::Widget{}')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('new Widget<int>(3)')).toBe('Widget');
+    });
+    it('infers from cast expressions', () => {
+      expect(inferCppTypeFromInitializer('static_cast<Widget*>(p)')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('dynamic_cast<ns::Widget&>(r)')).toBe('Widget');
+    });
+    it('infers from direct construction', () => {
+      expect(inferCppTypeFromInitializer('Widget(1, 2)')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('Widget{}')).toBe('Widget');
+    });
+
+    // Tier 2 — self-returning singleton accessor: qualifier is the type.
+    it('infers from singleton accessors but not arbitrary scoped calls', () => {
+      expect(inferCppTypeFromInitializer('Widget::instance()')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('Widget::getInstance()')).toBe('Widget');
+      expect(inferCppTypeFromInitializer('ns::Widget::instance()')).toBe('Widget');
+      // A non-accessor scoped call may return some OTHER type — must NOT be
+      // mistaken for `Factory`. Returns null (Tier 3, uncovered).
+      expect(inferCppTypeFromInitializer('Factory::create()')).toBeNull();
+      expect(inferCppTypeFromInitializer('Config::parseFlags()')).toBeNull();
+    });
+
+    // Tier 3 — needs real return-type inference: deliberately uncovered.
+    it('returns null when the type is not syntactically evident', () => {
+      expect(inferCppTypeFromInitializer('helper()')).toBeNull(); // free function
+      expect(inferCppTypeFromInitializer('obj.getThing()')).toBeNull(); // member chain
+      expect(inferCppTypeFromInitializer('obj->getThing()')).toBeNull();
+      expect(inferCppTypeFromInitializer('')).toBeNull();
+      expect(inferCppTypeFromInitializer('   ')).toBeNull();
+    });
+  });
+
+  describe('C++ return-type parsing (parseCppReturnType)', () => {
+    it('reads the `-> ReturnType` suffix and normalizes it to a bare class', () => {
+      expect(parseCppReturnType('() -> Worker')).toBe('Worker');
+      expect(parseCppReturnType('(int a) -> Widget')).toBe('Widget');
+      expect(parseCppReturnType('() -> ns::Engine')).toBe('Engine');
+    });
+    it('unwraps smart-pointer return types to the pointee', () => {
+      expect(parseCppReturnType('() -> std::shared_ptr<Foo>')).toBe('Foo');
+      expect(parseCppReturnType('() -> unique_ptr<ns::Bar>')).toBe('Bar');
+      expect(parseCppReturnType('() -> std::weak_ptr<Baz>')).toBe('Baz');
+    });
+    it('unwraps a cv-qualified smart-pointer pointee to the type, not the qualifier', () => {
+      expect(parseCppReturnType('() -> std::shared_ptr<const Widget>')).toBe('Widget');
+      expect(parseCppReturnType('() -> unique_ptr<volatile Gadget>')).toBe('Gadget');
+    });
+    it('rejects primitives, void, and missing return types', () => {
+      expect(parseCppReturnType('() -> void')).toBeNull();
+      expect(parseCppReturnType('(int a) -> int')).toBeNull();
+      expect(parseCppReturnType('() -> bool')).toBeNull();
+      expect(parseCppReturnType('(int a)')).toBeNull(); // constructor: no `->`
+      expect(parseCppReturnType(undefined)).toBeNull();
+      expect(parseCppReturnType(null)).toBeNull();
     });
   });
 });

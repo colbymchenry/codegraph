@@ -6,6 +6,7 @@
 
 import { Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { CPP_SINGLETON_ACCESSORS } from '../extraction/tree-sitter-types';
 
 /**
  * Try to resolve a path-like reference (e.g., "snippets/drawer-menu.liquid")
@@ -242,10 +243,191 @@ function buildDeclaratorRegex(escapedReceiver: string): RegExp {
   );
 }
 
+/** Bare last `::`-segment of a possibly-qualified C++ name (`ns::Foo` → `Foo`). */
+function lastCppSegment(qualified: string): string | null {
+  const parts = qualified.split('::').filter(Boolean);
+  const last = parts[parts.length - 1];
+  return last || null;
+}
+
+/**
+ * Whether a qualified name matches `suffix` at a `::` boundary — exact, or a
+ * deeper namespace (`ns::Foo::bar` matches suffix `Foo::bar`). Crucially does
+ * NOT match `OtherFoo::bar`, which a plain `endsWith('Foo::bar')` would. Mirrors
+ * the boundary check in `resolveMethodOnType`.
+ */
+function cppQualifiedMatchesSuffix(qualifiedName: string, suffix: string): boolean {
+  return qualifiedName === suffix || qualifiedName.endsWith(`::${suffix}`);
+}
+
+/**
+ * Infer the type of an `auto` local from the text of its initializer, when the
+ * type is syntactically evident (Tier 1) or comes from a self-returning
+ * singleton accessor (Tier 2). Returns a bare type name, or null when the
+ * initializer needs real return-type inference (free function, member chain,
+ * generic factory — Tier 3, deliberately uncovered: silent beats wrong).
+ *
+ * `init` is the source text to the right of `=` in the declaration.
+ */
+export function inferCppTypeFromInitializer(init: string): string | null {
+  const s = init.trim();
+  if (!s) return null;
+
+  // make_unique<Foo>() / make_shared<Foo>() (with or without a std:: prefix).
+  // Skip a leading cv-qualifier on the type argument (`make_unique<const Foo>`).
+  let m = s.match(/\bmake_(?:unique|shared)\s*<\s*(?:(?:const|volatile)\s+)*([A-Za-z_][\w:]*)/);
+  if (m) return lastCppSegment(m[1]!);
+
+  // new Foo(...) / new Foo<...>(...) / new Foo{...} / new const Foo(...)
+  m = s.match(/\bnew\s+(?:(?:const|volatile)\s+)*([A-Za-z_][\w:]*)/);
+  if (m) return lastCppSegment(m[1]!);
+
+  // static_cast<Foo*>(...) / dynamic_cast / reinterpret_cast / const_cast
+  m = s.match(/\b(?:static|dynamic|reinterpret|const)_cast\s*<\s*(?:(?:const|volatile)\s+)*([A-Za-z_][\w:]*)/);
+  if (m) return lastCppSegment(m[1]!);
+
+  // Foo::instance() — self-returning singleton accessor (qualifier IS the type).
+  // Checked before bare construction so `Foo::instance()` doesn't fall into it.
+  m = s.match(/^([A-Za-z_][\w:]*)::([A-Za-z_]\w*)\s*\(/);
+  if (m && CPP_SINGLETON_ACCESSORS.has(m[2]!.toLowerCase())) return lastCppSegment(m[1]!);
+
+  // Direct construction: Foo(...) or Foo{...}. Require an upper-case initial
+  // (C++ type convention) so a lower-case free-function call — `helper()` —
+  // isn't mistaken for a constructor. No `::`, so a scoped accessor call that
+  // wasn't a known singleton above can't slip through here either. (Lower-case
+  // std types like `string(...)` are missed, but they're never user-defined
+  // nodes the resolver could match anyway, so nothing is lost.)
+  m = s.match(/^([A-Z]\w*)\s*[({]/);
+  if (m) return m[1]!;
+
+  return null;
+}
+
+/** Pseudo-receivers that name no inferable local/field type. */
+const CPP_SKIP_RECEIVERS: ReadonlySet<string> = new Set(['this', 'self', 'super']);
+
+/** C++ built-in / non-class return types that can't be a method receiver. */
+const CPP_PRIMITIVE_TYPES: ReadonlySet<string> = new Set([
+  'void', 'bool', 'char', 'short', 'int', 'long', 'float', 'double', 'unsigned',
+  'signed', 'wchar_t', 'char8_t', 'char16_t', 'char32_t', 'size_t', 'ssize_t',
+  'ptrdiff_t', 'intptr_t', 'uintptr_t', 'int8_t', 'int16_t', 'int32_t', 'int64_t',
+  'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t', 'auto',
+]);
+
+/**
+ * Normalize a C++ return-type string to the bare user-defined class name it
+ * yields a receiver of, or null. Unwraps the common smart-pointer wrappers
+ * (`std::shared_ptr<Foo>` → `Foo`) — a `ptr->method()` call on the result
+ * dispatches to the pointee — and rejects primitives/`void`.
+ */
+function normalizeCppReturnType(raw: string): string | null {
+  if (!raw) return null;
+  // Unwrap smart pointers, skipping a leading cv-qualifier on the pointee
+  // (`shared_ptr<const Widget>` → `Widget`, not `const`).
+  const smart = raw.match(/\b(?:shared_ptr|unique_ptr|weak_ptr|auto_ptr)\s*<\s*(?:(?:const|volatile)\s+)*([A-Za-z_][\w:]*)/);
+  if (smart) {
+    const inner = lastCppSegment(smart[1]!);
+    return inner && !CPP_PRIMITIVE_TYPES.has(inner) ? inner : null;
+  }
+  const base = normalizeCppTypeName(raw);
+  if (!base || CPP_PRIMITIVE_TYPES.has(base)) return null;
+  return base;
+}
+
+/**
+ * Pull the `-> ReturnType` suffix out of a C++ signature (built by
+ * `extractCppSignature` as `(params) -> ReturnType`) and normalize it.
+ */
+export function parseCppReturnType(signature: string | undefined | null): string | null {
+  if (!signature) return null;
+  const idx = signature.lastIndexOf('->');
+  if (idx < 0) return null;
+  return normalizeCppReturnType(signature.slice(idx + 2).trim());
+}
+
+/**
+ * The single return type shared by every cpp candidate that has a parseable
+ * one — or null when there are none, or they disagree. Disagreement means the
+ * lookup is ambiguous (e.g. the same class name in two namespaces returning
+ * different types), and guessing would misroute the call — so we stay silent.
+ */
+function uniqueCppReturnType(nodes: Node[]): string | null {
+  const types = new Set<string>();
+  for (const n of nodes) {
+    if (n.language !== 'cpp') continue;
+    const rt = parseCppReturnType(n.signature);
+    if (rt) types.add(rt);
+  }
+  return types.size === 1 ? [...types][0]! : null;
+}
+
+/**
+ * Return type (as a bare class name) of a C++ callable named by `callee` — a
+ * qualified `a::Foo::bar` / `Foo::bar`, or a bare free function `makeFoo` — read
+ * from the resolved node's signature. Null when the callable isn't indexed, has
+ * no captured return type, returns a primitive/void, or is ambiguous.
+ */
+function cppReturnTypeOf(callee: string, context: ResolutionContext): string | null {
+  if (!callee.includes('::')) {
+    // A bare (unqualified) callee like `makeWidget()` is a free function. Do NOT
+    // include same-named *methods* of unrelated classes — `Decoy::makeWidget`
+    // could otherwise supply the return type and misroute the chained call. (A
+    // method invoked via implicit `this` would need caller-class scoping we
+    // don't do; missing it is silent, which beats resolving to the wrong class.)
+    return uniqueCppReturnType(
+      context.getNodesByName(callee).filter((n) => n.kind === 'function'),
+    );
+  }
+  // Qualified callee like `a::Factory::create` — match most-specific first so a
+  // class name shared across namespaces is disambiguated by its return type.
+  const last = lastCppSegment(callee);
+  if (!last) return null;
+  const named = context.getNodesByName(last);
+  // 1. Exact qualified name — out-of-line definitions keep the namespace.
+  let rt = uniqueCppReturnType(context.getNodesByQualifiedName(callee));
+  if (rt) return rt;
+  // 2. The full qualifier at a `::` boundary (deeper-nested namespaces).
+  rt = uniqueCppReturnType(named.filter((n) => cppQualifiedMatchesSuffix(n.qualifiedName, callee)));
+  if (rt) return rt;
+  // 3. In-class definitions drop the namespace from the qualified name, so fall
+  //    back to `Class::accessor` — but only when every match agrees on the
+  //    return type. Distinct types means the class name is ambiguous across
+  //    namespaces and we must not guess.
+  const parts = callee.split('::').filter(Boolean);
+  if (parts.length > 2) {
+    const classAccessor = parts.slice(-2).join('::');
+    rt = uniqueCppReturnType(named.filter((n) => cppQualifiedMatchesSuffix(n.qualifiedName, classAccessor)));
+    if (rt) return rt;
+  }
+  return null;
+}
+
+/**
+ * Return type (bare class name) of method `methodName` declared on C++ class
+ * `typeName` — i.e. the type of `objOfTypeName.methodName()`. Strictly scoped to
+ * methods whose qualified name ends in `typeName::methodName`, so a same-named
+ * method on an unrelated class can't leak in. Returns null when the matches
+ * disagree (same class name across namespaces). Inherited methods (defined on a
+ * base class) are not followed — a deliberate single-level limit.
+ */
+function cppReturnTypeOfMethodOnType(
+  typeName: string,
+  methodName: string,
+  context: ResolutionContext,
+): string | null {
+  const suffix = `${typeName}::${methodName}`;
+  return uniqueCppReturnType(
+    context
+      .getNodesByName(methodName)
+      .filter((n) => n.kind === 'method' && cppQualifiedMatchesSuffix(n.qualifiedName, suffix)),
+  );
+}
+
 function inferCppReceiverType(
   receiverName: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
+  depth = 0,
 ): string | null {
   const source = context.readFile(ref.filePath);
   if (!source) return null;
@@ -263,7 +445,41 @@ function inferCppReceiverType(
     const declaratorMatch = line.match(declaratorRegex);
     if (declaratorMatch) {
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
-      if (normalized) return normalized;
+      if (normalized && normalized !== 'auto') return normalized;
+      if (normalized === 'auto') {
+        // `auto[&*] recv = <init>;` — the declared type is deduced, so recover
+        // it from the initializer.
+        const eqIdx = line.indexOf('=', (declaratorMatch.index ?? 0) + declaratorMatch[0].length);
+        if (eqIdx >= 0) {
+          const init = line.slice(eqIdx + 1);
+          // Tier 1/2: type is syntactically evident (new/make_*/cast) or a
+          // named self-returning accessor.
+          const syntactic = inferCppTypeFromInitializer(init);
+          if (syntactic) return syntactic;
+          // Tier 3: the initializer is a plain call — use the callee's captured
+          // return type (`auto w = makeWidget()`, `auto w = Factory::create()`).
+          const initText = init.trim();
+          const callMatch = initText.match(/^([A-Za-z_][\w:]*)\s*\(/);
+          if (callMatch) {
+            const rt = cppReturnTypeOf(callMatch[1]!, context);
+            if (rt) return rt;
+          }
+          // Tier 3, single-level member chain: `auto x = obj.getThing();`.
+          // Resolve obj's type (one recursion, depth-bounded), then read the
+          // return type of getThing on that type.
+          const memberMatch = initText.match(/^([A-Za-z_]\w*)\s*(?:\.|->)\s*([A-Za-z_]\w*)\s*\(/);
+          if (memberMatch && depth < 2 && !CPP_SKIP_RECEIVERS.has(memberMatch[1]!)) {
+            const objType = inferCppReceiverType(memberMatch[1]!, ref, context, depth + 1);
+            if (objType) {
+              const rt = cppReturnTypeOfMethodOnType(objType, memberMatch[2]!, context);
+              if (rt) return rt;
+            }
+          }
+        }
+        // Un-inferable auto initializer (deep chain / unindexed callee): keep
+        // scanning earlier lines in case the receiver was also declared with an
+        // explicit type elsewhere — rare, but cheap and strictly more precise.
+      }
     }
   }
 
@@ -348,6 +564,96 @@ function inferJavaFieldReceiverType(
   if (!lastPart) return null;
   if (!/^[A-Z]/.test(lastPart)) return null; // primitives / lowercase → skip
   return lastPart;
+}
+
+/**
+ * Resolve a C++ call chained off another call's result, which extraction
+ * encodes as `Recv().method` (see `cppChainedCallReceiverCallee`):
+ *
+ *   Foo::instance().bar()   → ref `Foo::instance().bar`
+ *   WidgetFactory::create().draw() → ref `WidgetFactory::create().draw`
+ *   makeWidget()->run()     → ref `makeWidget().run`
+ *
+ * Primary path is return-type driven: whatever `Recv()` actually returns is the
+ * receiver type, so a factory that returns a *different* class resolves to that
+ * class — something the name-only heuristic can't do. Fallback (when the
+ * callee's return type isn't indexed, e.g. an external accessor) treats a
+ * self-returning-accessor *name* as evidence the qualifier is the type.
+ */
+/**
+ * Resolve `method` on C++ `typeName`, but only when it lands on a single owner.
+ * `typeName` is an inferred return type whose namespace we may have lost (the
+ * source often writes a bare `Widget`, not `a::Widget`), so if its basename is
+ * shared across namespaces — multiple distinct owners define `method` — we bail
+ * rather than link to whichever was indexed first. Overloads on the *same*
+ * owner are fine (one owner). Used for the return-type-driven chained paths.
+ */
+function resolveUniqueMethodOnType(
+  typeName: string,
+  method: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number,
+): ResolvedRef | null {
+  const want = `${typeName}::${method}`;
+  const owners = new Set(
+    context
+      .getNodesByName(method)
+      .filter((n) => n.kind === 'method' && n.language === 'cpp' && cppQualifiedMatchesSuffix(n.qualifiedName, want))
+      .map((n) => n.qualifiedName.slice(0, -(method.length + 2))),
+  );
+  if (owners.size !== 1) return null; // 0 = not found, >1 = ambiguous across namespaces
+  return resolveMethodOnType(typeName, method, ref, context, confidence, 'instance-method');
+}
+
+export function matchCppChainedAccessor(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.language !== 'cpp') return null;
+
+  // Single-level member chain: `obj.getThing().method` — infer obj's type, then
+  // the return type of getThing on it, then resolve method on that. Matched
+  // before the simpler form because its two `()`-free segments are dot-joined.
+  const chain = ref.referenceName.match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)\(\)\.([A-Za-z_]\w*)$/);
+  if (chain) {
+    const [, objVar, midMethod, finalMethod] = chain;
+    if (CPP_SKIP_RECEIVERS.has(objVar!)) return null;
+    const objType = inferCppReceiverType(objVar!, ref, context);
+    if (!objType) return null;
+    const midType = cppReturnTypeOfMethodOnType(objType, midMethod!, context);
+    if (!midType) return null;
+    return resolveUniqueMethodOnType(midType, finalMethod!, ref, context, 0.85);
+  }
+
+  const m = ref.referenceName.match(/^([A-Za-z_][\w:]*)\(\)\.([A-Za-z_]\w*)$/);
+  if (!m) return null;
+  const callee = m[1]!;
+  const method = m[2]!;
+
+  // Return-type-driven: what does the receiver call actually return?
+  const returnType = cppReturnTypeOf(callee, context);
+  if (returnType) {
+    const hit = resolveUniqueMethodOnType(returnType, method, ref, context, 0.9);
+    if (hit) return hit;
+  }
+
+  // Fallback: a known self-returning accessor name (`Foo::instance()`) means the
+  // qualifier is the receiver type, even when we couldn't read its return type.
+  if (callee.includes('::')) {
+    const parts = callee.split('::').filter(Boolean);
+    const accessor = parts[parts.length - 1]!;
+    // The owning type is everything before the accessor — keep the namespace
+    // (`a::Factory`), not just the bare class, so resolveMethodOnType doesn't
+    // match a same-named class in another namespace.
+    const ownerType = parts.slice(0, -1).join('::');
+    if (ownerType && CPP_SINGLETON_ACCESSORS.has(accessor.toLowerCase())) {
+      const hit = resolveMethodOnType(ownerType, method, ref, context, 0.85, 'instance-method');
+      if (hit) return hit;
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -690,6 +996,12 @@ export function matchReference(
 
   // 0. File path match (e.g., "snippets/drawer-menu.liquid" → file node)
   result = matchByFilePath(ref, context);
+  if (result) return result;
+
+  // 0.5. C++ chained accessor/factory call (`Foo::instance().bar`) — resolved
+  // via the receiver call's return type. Runs before qualified-name match,
+  // whose partial matcher would otherwise mis-handle the `()` in the name.
+  result = matchCppChainedAccessor(ref, context);
   if (result) return result;
 
   // 1. Qualified name match (highest confidence)

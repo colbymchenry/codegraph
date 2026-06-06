@@ -14,6 +14,37 @@ import {
 } from '../types';
 
 /**
+ * C++ method names that, by convention, return an instance of their OWN
+ * enclosing class — singleton accessors (`Foo::instance()`) and similar
+ * self-returning statics. For these, the call's qualifier IS the receiver
+ * type, so `Foo::instance().bar()` can be resolved to `Foo::bar` without
+ * real return-type inference.
+ *
+ * Shared between extraction (tree-sitter.ts emits a qualified callee for
+ * inline `Foo::instance().bar()`) and resolution (name-matcher.ts infers
+ * the type of an `auto` local initialized from `Foo::instance()`), so the
+ * two sites can't drift apart. Compared case-insensitively (lower-cased).
+ *
+ * Intentionally curated, NOT permissive: a generic factory like
+ * `Widget::create()` may return some *other* type, so including loose names
+ * such as `get`/`create` here would mis-type those. Keep it to names that
+ * idiomatically return Self. Wrong matches are still bounded — both call
+ * sites validate that the inferred type actually has the method — but a
+ * tight set keeps that safety net from ever being exercised.
+ */
+export const CPP_SINGLETON_ACCESSORS: ReadonlySet<string> = new Set([
+  'instance',
+  'getinstance',
+  'get_instance',
+  'instanceptr',
+  'getinstanceptr',
+  'shared',
+  'sharedinstance',
+  'getsharedinstance',
+  'singleton',
+]);
+
+/**
  * Information returned by a language's extractImport hook.
  */
 export interface ImportInfo {
