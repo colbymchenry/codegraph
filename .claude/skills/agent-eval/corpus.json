@@ -378,6 +378,11 @@
       "question": "How does a JS `CameraView.takePictureAsync(options)` reach the native AVCaptureSession / CameraDevice call?"
     }
   ],
+  "ReScript": [
+    { "name": "rescript-core", "repo": "https://github.com/rescript-lang/rescript-core", "size": "Small", "files": "~100", "question": "How does rescript-core implement the Array module's map and reduce functions?" },
+    { "name": "rescript-relay", "repo": "https://github.com/zth/rescript-relay", "size": "Medium", "files": "~250", "question": "How does rescript-relay transform a GraphQL query into typed ReScript modules at build time?" },
+    { "name": "rescript", "repo": "https://github.com/rescript-lang/rescript", "size": "Large", "files": "~3500", "question": "How does the ReScript standard library implement the Belt.Array utility functions?" }
+  ],
   "React Native Fabric (view components)": [
     {
       "name": "react-native-segmented-control",

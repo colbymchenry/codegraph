@@ -1031,6 +1031,7 @@ export class TreeSitterExtractor {
       visitNode: (node) => self.visitNode(node),
       visitFunctionBody: (body, functionId) => self.visitFunctionBody(body, functionId),
       addUnresolvedReference: (ref) => self.unresolvedReferences.push(ref),
+      extractTypeAnnotations: (node, nodeId) => self.extractTypeAnnotations(node, nodeId),
       pushScope: (nodeId) => self.nodeStack.push(nodeId),
       popScope: () => self.nodeStack.pop(),
       get filePath() { return self.filePath; },
@@ -3938,7 +3939,7 @@ export class TreeSitterExtractor {
    * Languages that support type annotations (TypeScript, etc.)
    */
   private readonly TYPE_ANNOTATION_LANGUAGES = new Set([
-    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp', 'scala', 'php',
+    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp', 'scala', 'php', 'rescript',
   ]);
 
   /**
@@ -3967,6 +3968,8 @@ export class TreeSitterExtractor {
     // Scala (capitalized primitives + ubiquitous stdlib aliases)
     'Int', 'Long', 'Short', 'Byte', 'Float', 'Double', 'Boolean', 'Char', 'Unit',
     'String', 'Any', 'AnyRef', 'AnyVal', 'Nothing', 'Null',
+    // ReScript
+    'unit', 'option', 'list', 'result', 'promise', 'array', 'dict', 'map', 'set', 'date',
   ]);
 
   /**
