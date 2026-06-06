@@ -340,3 +340,30 @@ export function kindBonus(kind: Node['kind']): number {
   };
   return bonuses[kind] ?? 0;
 }
+
+/**
+ * Whether a query token looks like a code identifier the user deliberately typed
+ * (camelCase / PascalCase-with-internal-caps / snake_case / has a digit) rather
+ * than a plain dictionary word ("flat", "object", "screen").
+ *
+ * Used to decide whether an EXACT name match earns the "the user named this
+ * symbol" exemption from single-term dampening. A common English word that
+ * happens to exact-match an unrelated symbol — the query "flat object" matching
+ * a constant named `FLAT` — must NOT get that exemption, or the +exact-name
+ * bonus floats it to the top of a prose query on its own.
+ *
+ * Classifies the token AS THE USER TYPED IT, not the matched symbol's name:
+ * "flat" (lowercase, descriptive) is non-distinctive even though it matches
+ * `FLAT`. A leading-capital-only word ("Screen", "Zustand") is also treated as
+ * a plain word — sentence-start capitalization and proper nouns aren't reliable
+ * identifier signals.
+ */
+export function isDistinctiveIdentifier(token: string): boolean {
+  if (!token) return false;
+  // snake_case / SCREAMING_SNAKE, or an embedded digit → a deliberate identifier.
+  if (/[_0-9]/.test(token)) return true;
+  // An uppercase letter anywhere AFTER the first char → a camelCase/PascalCase
+  // boundary (setLastEmail, OrgUserStore) or an acronym (REST, HTTP).
+  if (/[A-Z]/.test(token.slice(1))) return true;
+  return false;
+}

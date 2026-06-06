@@ -235,4 +235,10 @@ export const kotlinExtractor: LanguageExtractor = {
     }
     return null;
   },
+  packageTypes: ['package_header'],
+  extractPackage: (node, source) => {
+    // package_header → identifier (dotted: `com.example.foo`)
+    const id = node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    return id ? source.substring(id.startIndex, id.endIndex).trim() : null;
+  },
 };

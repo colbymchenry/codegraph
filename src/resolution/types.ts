@@ -92,6 +92,21 @@ export interface ResolutionContext {
    */
   getProjectAliases?(): import('./path-aliases').AliasMap | null;
   /**
+   * Go module info from `go.mod` at the project root. Returns `null`
+   * when the project has no `go.mod` (non-Go projects, pre-modules
+   * Go code, or projects whose modules live in subdirectories). Used
+   * by the Go branch of import resolution to distinguish in-module
+   * cross-package imports from third-party packages.
+   */
+  getGoModule?(): import('./go-module').GoModule | null;
+  /**
+   * Monorepo workspace member packages, keyed by declared package name.
+   * Returns `null` for single-package repos (no `workspaces` field).
+   * Lets the resolver treat `@scope/ui/sub` as a local import into the
+   * member's directory instead of an external npm package (#629).
+   */
+  getWorkspacePackages?(): import('./workspace-packages').WorkspacePackages | null;
+  /**
    * Re-exports declared by a file (`export { x } from './other'`,
    * `export * from './other'`). Empty array when the file has none.
    * Optional so older callers compile; the import resolver follows
@@ -107,6 +122,13 @@ export interface ResolutionContext {
    * without modification.
    */
   listDirectories?(relativePath: string): string[];
+  /**
+   * C/C++ include search directories (relative to project root),
+   * extracted from compile_commands.json or discovered by heuristic.
+   * Used by resolveCppIncludePath to search -I directories when
+   * relative resolution fails. Optional so existing callers compile.
+   */
+  getCppIncludeDirs?(): string[];
 }
 
 /**
@@ -132,6 +154,14 @@ export interface FrameworkResolver {
   /** Resolve a reference using framework-specific patterns */
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null;
   /**
+   * Opt a reference NAME through the resolver's name-exists pre-filter, even when
+   * no node is named that. Needed for dynamic dispatch where the call target is
+   * an attribute/descriptor, not a declared symbol (e.g. Django's
+   * `self._iterable_class(...)`, React effect callbacks). Returning true lets the
+   * ref reach `resolve()` instead of being dropped for having no name match.
+   */
+  claimsReference?(name: string): boolean;
+  /**
    * Extract framework-specific nodes and references from a file.
    *
    * Returns route nodes, middleware nodes, etc., plus unresolved references
@@ -140,6 +170,20 @@ export interface FrameworkResolver {
    * pipeline; the framework's own `resolve()` is one of the strategies tried.
    */
   extract?(filePath: string, content: string): FrameworkExtractionResult;
+  /**
+   * Cross-file finalization pass, called once after all per-file extraction
+   * completes (and again on every incremental sync). Used by frameworks where
+   * a symbol's final representation depends on a sibling file the per-file
+   * `extract()` never saw — e.g. NestJS's `RouterModule.register([...])`
+   * sets route prefixes for controllers declared elsewhere.
+   *
+   * Implementations return route/etc. nodes with mutated fields (typically
+   * `name`); the orchestrator persists each via `updateNode`. The node `id`
+   * MUST be preserved so existing edges (route → handler, etc.) stay intact;
+   * `qualifiedName` SHOULD be preserved so the pass stays idempotent — a
+   * second run can recover the original in-file form from `qualifiedName`.
+   */
+  postExtract?(context: ResolutionContext): Node[];
 }
 
 /**

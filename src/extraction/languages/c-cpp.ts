@@ -2,6 +2,51 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
+  const declarator = getChildByField(node, 'declarator');
+  if (!declarator) return undefined;
+
+  const queue: SyntaxNode[] = [declarator];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (current.type === 'qualified_identifier') {
+      const text = getNodeText(current, source).trim();
+      const parts = text.split('::').filter(Boolean);
+      return parts[parts.length - 1];
+    }
+    for (let i = 0; i < current.namedChildCount; i++) {
+      const child = current.namedChild(i);
+      if (child) queue.push(child);
+    }
+  }
+
+  return undefined;
+}
+
+function extractCppReceiverType(node: SyntaxNode, source: string): string | undefined {
+  const declarator = getChildByField(node, 'declarator');
+  if (!declarator) return undefined;
+
+  const queue: SyntaxNode[] = [declarator];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (current.type === 'qualified_identifier') {
+      const text = getNodeText(current, source).trim();
+      const parts = text.split('::').filter(Boolean);
+      if (parts.length > 1) {
+        return parts.slice(0, -1).join('::');
+      }
+      return undefined;
+    }
+    for (let i = 0; i < current.namedChildCount; i++) {
+      const child = current.namedChild(i);
+      if (child) queue.push(child);
+    }
+  }
+
+  return undefined;
+}
+
 export const cExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
   classTypes: [],
@@ -62,6 +107,8 @@ export const cppExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
+  resolveName: extractCppQualifiedMethodName,
+  getReceiverType: extractCppReceiverType,
   getVisibility: (node) => {
     // Check for access specifier in parent
     const parent = node.parent;

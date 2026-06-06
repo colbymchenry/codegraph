@@ -54,7 +54,10 @@ describe('CodeGraph Foundation', () => {
       expect(fs.existsSync(gitignorePath)).toBe(true);
 
       const content = fs.readFileSync(gitignorePath, 'utf-8');
-      expect(content).toContain('*.db');
+      // Ignore everything in .codegraph/ except this file itself, so transient
+      // files (db, daemon.pid, sockets, logs) never show up in git. (#492, #484)
+      expect(content).toContain('*');
+      expect(content).toContain('!.gitignore');
 
       cg.close();
     });

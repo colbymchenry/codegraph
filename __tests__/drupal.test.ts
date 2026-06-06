@@ -87,6 +87,52 @@ describe('drupalResolver.detect', () => {
     const ctx = makeContext({ readFile: () => '{ bad json' });
     expect(drupalResolver.detect(ctx)).toBe(false);
   });
+
+  it('returns true for a contrib module with empty require (composer name/type)', () => {
+    const ctx = makeContext({
+      readFile: (f) =>
+        f === 'composer.json'
+          ? JSON.stringify({
+              name: 'drupal/admin_toolbar',
+              type: 'drupal-module',
+              require: {},
+            })
+          : null,
+    });
+    expect(drupalResolver.detect(ctx)).toBe(true);
+  });
+
+  it('returns true via the *.info.yml fallback when composer.json is absent', () => {
+    const ctx = makeContext({
+      readFile: () => null,
+      getAllFiles: () => [
+        'mymodule/mymodule.info.yml',
+        'mymodule/mymodule.routing.yml',
+      ],
+    });
+    expect(drupalResolver.detect(ctx)).toBe(true);
+  });
+
+  it('returns false for a stray *.info.yml with no Drupal PHP/route file', () => {
+    const ctx = makeContext({
+      readFile: () => null,
+      getAllFiles: () => ['some/unrelated.info.yml'],
+    });
+    expect(drupalResolver.detect(ctx)).toBe(false);
+  });
+});
+
+describe('drupalResolver.claimsReference', () => {
+  it('claims FQCN handler refs and hook names the pre-filter would drop', () => {
+    expect(drupalResolver.claimsReference!('\\Drupal\\m\\Form\\SettingsForm')).toBe(true);
+    expect(drupalResolver.claimsReference!('\\Drupal\\m\\Controller\\C:setNoJsCookie')).toBe(true);
+    expect(drupalResolver.claimsReference!('hook_form_alter')).toBe(true);
+  });
+
+  it('does not claim ordinary identifiers or entity-handler dotted refs', () => {
+    expect(drupalResolver.claimsReference!('someHelperFunction')).toBe(false);
+    expect(drupalResolver.claimsReference!('comment.default')).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -434,6 +480,51 @@ describe('drupalResolver.resolve', () => {
       language: 'yaml' as const,
     };
     expect(drupalResolver.resolve(ref, ctx)).toBeNull();
+  });
+
+  it('resolves a single-colon controller-service ref (Class:method)', () => {
+    const methodNode = {
+      id: 'method:nojs1',
+      kind: 'method' as const,
+      name: 'setNoJsCookie',
+      qualifiedName: 'BigPipeController::setNoJsCookie',
+      filePath: 'core/modules/big_pipe/src/Controller/BigPipeController.php',
+      language: 'php' as const,
+      startLine: 10,
+      endLine: 20,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: 0,
+    };
+    const classNode = {
+      id: 'class:nojs2',
+      kind: 'class' as const,
+      name: 'BigPipeController',
+      qualifiedName: 'BigPipeController',
+      filePath: 'core/modules/big_pipe/src/Controller/BigPipeController.php',
+      language: 'php' as const,
+      startLine: 5,
+      endLine: 30,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: 0,
+    };
+    const ctx = makeContext({
+      getNodesByName: (name) => (name === 'BigPipeController' ? [classNode] : []),
+      getNodesInFile: () => [classNode, methodNode],
+    });
+    const ref = {
+      fromNodeId: 'route:x',
+      referenceName: '\\Drupal\\big_pipe\\Controller\\BigPipeController:setNoJsCookie',
+      referenceKind: 'references' as const,
+      line: 1,
+      column: 0,
+      filePath: 'big_pipe.routing.yml',
+      language: 'yaml' as const,
+    };
+    const resolved = drupalResolver.resolve(ref, ctx);
+    expect(resolved).not.toBeNull();
+    expect(resolved!.targetNodeId).toBe('method:nojs1');
   });
 });
 

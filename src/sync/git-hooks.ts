@@ -44,6 +44,7 @@ export function isGitRepo(projectRoot: string): boolean {
       cwd: projectRoot,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
     }).trim();
     return out === 'true';
   } catch {
@@ -61,6 +62,7 @@ function gitHooksDir(projectRoot: string): string | null {
       cwd: projectRoot,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
     }).trim();
     if (!out) return null;
     return path.isAbsolute(out) ? out : path.resolve(projectRoot, out);

@@ -18,7 +18,8 @@ export const csharpExtractor: LanguageExtractor = {
   propertyTypes: ['property_declaration'],
   nameField: 'name',
   bodyField: 'body',
-  paramsField: 'parameter_list',
+  paramsField: 'parameters',
+  returnField: 'type',
   getVisibility: (node) => {
     for (let i = 0; i < node.childCount; i++) {
       const child = node.child(i);

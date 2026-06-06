@@ -241,4 +241,32 @@ describe('Integration: full pipeline', () => {
       cg.destroy();
     }
   }, 30_000);
+
+  it('reports edgesCreated including resolution + synthesizer phases', async () => {
+    // The synthetic project has cross-file imports, calls, and extends —
+    // all wired up in the resolution phase, AFTER the orchestrator's
+    // per-file extraction counter is done. The CLI summary used to read
+    // only the extraction-phase counter and undercount the graph; this
+    // test pins the counter to the true DB totals across all phases.
+    generateSyntheticProject(tempDir, 30);
+
+    const cg = await CodeGraph.init(tempDir, {
+      config: { include: ['**/*.ts'], exclude: [] },
+    });
+
+    try {
+      const result = await cg.indexAll();
+      const stats = cg.getStats();
+
+      expect(result.success).toBe(true);
+      expect(result.nodesCreated).toBe(stats.nodeCount);
+      expect(result.edgesCreated).toBe(stats.edgeCount);
+      // Sanity: cross-file resolution had something to do — calls/extends
+      // edges should exist beyond the bare extraction-time contains edges.
+      const containsOnly = stats.edgesByKind.contains ?? 0;
+      expect(stats.edgeCount).toBeGreaterThan(containsOnly);
+    } finally {
+      cg.destroy();
+    }
+  }, 30_000);
 });

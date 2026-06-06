@@ -56,4 +56,12 @@ export const javaExtractor: LanguageExtractor = {
     }
     return null;
   },
+  packageTypes: ['package_declaration'],
+  extractPackage: (node, source) => {
+    // package_declaration → scoped_identifier or identifier (single-segment)
+    const id = node.namedChildren.find(
+      (c: SyntaxNode) => c.type === 'scoped_identifier' || c.type === 'identifier'
+    );
+    return id ? source.substring(id.startIndex, id.endIndex).trim() : null;
+  },
 };

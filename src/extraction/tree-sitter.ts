@@ -15,7 +15,7 @@ import {
   ExtractionError,
   UnresolvedReference,
 } from '../types';
-import { getParser, detectLanguage, isLanguageSupported } from './grammars';
+import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
 import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
@@ -23,6 +23,7 @@ import { LiquidExtractor } from './liquid-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
+import { MyBatisExtractor } from './mybatis-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -35,6 +36,9 @@ export { generateNodeId } from './tree-sitter-helpers';
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
+  const hookName = extractor.resolveName?.(node, source);
+  if (hookName) return hookName;
+
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
   if (nameNode) {
@@ -211,7 +215,17 @@ export class TreeSitterExtractor {
 
       // Push file node onto stack so top-level declarations get contains edges
       this.nodeStack.push(fileNode.id);
+
+      // File-level package declaration (Kotlin/Java). Creates an implicit
+      // `namespace` node wrapping every top-level declaration so their
+      // qualifiedName carries the FQN — required for cross-file import
+      // resolution on JVM languages where filename ≠ class name.
+      const packageNodeId = this.extractFilePackage(this.tree.rootNode);
+      if (packageNodeId) this.nodeStack.push(packageNodeId);
+
       this.visitNode(this.tree.rootNode);
+
+      if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -374,6 +388,17 @@ export class TreeSitterExtractor {
     // their own `calls` refs.
     else if (INSTANTIATION_KINDS.has(nodeType)) {
       this.extractInstantiation(node);
+      // Java/C# `new T(...) { ... }` — anonymous class with body. Without
+      // extracting it as a class node + its methods, the interface→impl
+      // synthesizer (Phase 5.5) can't bridge T's abstract methods to the
+      // anonymous overrides, and an agent investigating a call through T
+      // (`strategy.iterator(...)` where strategy is a Strategy lambda body)
+      // has to Read the file to find the actual implementation.
+      const anonBody = this.findAnonymousClassBody(node);
+      if (anonBody) {
+        this.extractAnonymousClass(node, anonBody);
+        skipChildren = true;
+      }
     }
     // (Decorator handling lives inside the symbol-creating extractors
     // — extractClass / extractFunction / extractProperty — because the
@@ -382,6 +407,22 @@ export class TreeSitterExtractor {
     // Rust: `impl Trait for Type { ... }` — creates implements edge from Type to Trait
     else if (nodeType === 'impl_item') {
       this.extractRustImplItem(node);
+    }
+    // TypeScript interface members: property_signature (`foo: T`, `foo?: T`)
+    // and method_signature (`foo(arg: A): R`) both carry type annotations the
+    // interface walker would otherwise drop. Extract them as `references`
+    // edges from the interface so resolvers can wire callers/impact for
+    // types that only appear in interface members.
+    else if (
+      (nodeType === 'property_signature' || nodeType === 'method_signature') &&
+      this.isInsideClassLikeNode() &&
+      this.TYPE_ANNOTATION_LANGUAGES.has(this.language)
+    ) {
+      const parentId = this.nodeStack[this.nodeStack.length - 1];
+      if (parentId) {
+        this.extractTypeAnnotations(node, parentId);
+      }
+      // don't skipChildren — nested signatures still need traversal
     }
 
     // Visit children (unless the extract method already visited them)
@@ -412,6 +453,20 @@ export class TreeSitterExtractor {
 
     const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1);
 
+    // Some grammars (e.g. Dart) model a function/method body as a *sibling* of
+    // the signature node, so the declaration node's own range is just the
+    // signature line. Extend endLine to the resolved body when it sits beyond
+    // the node so the node spans its body — required for any body-level analysis
+    // (callees, the callback synthesizer's body scan, context slices). Guarded to
+    // only ever extend: for child-body grammars the body is within range (no-op).
+    let endLine = node.endPosition.row + 1;
+    if (kind === 'function' || kind === 'method') {
+      const body = this.extractor?.resolveBody?.(node, this.extractor.bodyField);
+      if (body && body.endPosition.row + 1 > endLine) {
+        endLine = body.endPosition.row + 1;
+      }
+    }
+
     const newNode: Node = {
       id,
       kind,
@@ -420,7 +475,7 @@ export class TreeSitterExtractor {
       filePath: this.filePath,
       language: this.language,
       startLine: node.startPosition.row + 1,
-      endLine: node.endPosition.row + 1,
+      endLine,
       startColumn: node.startPosition.column,
       endColumn: node.endPosition.column,
       updatedAt: Date.now(),
@@ -454,6 +509,33 @@ export class TreeSitterExtractor {
       if (child && types.includes(child.type)) return child;
     }
     return null;
+  }
+
+  /**
+   * Find a `packageTypes` child under the root, create a `namespace` node
+   * for it, and return its id so the caller can scope top-level
+   * declarations underneath. Returns null when no package header is
+   * present (script files, .kts without a package).
+   */
+  private extractFilePackage(rootNode: SyntaxNode): string | null {
+    const types = this.extractor?.packageTypes;
+    if (!types || types.length === 0 || !this.extractor?.extractPackage) return null;
+
+    let pkgNode: SyntaxNode | null = null;
+    for (let i = 0; i < rootNode.namedChildCount; i++) {
+      const child = rootNode.namedChild(i);
+      if (child && types.includes(child.type)) {
+        pkgNode = child;
+        break;
+      }
+    }
+    if (!pkgNode) return null;
+
+    const pkgName = this.extractor.extractPackage(pkgNode, this.source);
+    if (!pkgName) return null;
+
+    const ns = this.createNode('namespace', pkgName, pkgNode);
+    return ns?.id ?? null;
   }
 
   /**
@@ -516,7 +598,7 @@ export class TreeSitterExtractor {
   /**
    * Extract a function
    */
-  private extractFunction(node: SyntaxNode): void {
+  private extractFunction(node: SyntaxNode, nameOverride?: string): void {
     if (!this.extractor) return;
 
     // If the language provides getReceiverType and this function has a receiver
@@ -526,12 +608,17 @@ export class TreeSitterExtractor {
       return;
     }
 
-    let name = extractName(node, this.source, this.extractor);
+    // nameOverride is supplied only for explicitly-named anonymous functions the
+    // caller resolved itself (e.g. arrow values of exported-const object members
+    // — SvelteKit actions). Inline-object arrows reached by the general walker
+    // get no override, so they still fall through to the <anonymous> skip below.
+    let name = nameOverride ?? extractName(node, this.source, this.extractor);
     // For arrow functions and function expressions assigned to variables,
     // resolve the name from the parent variable_declarator.
     // e.g. `export const useAuth = () => { ... }` — the arrow_function node
     // has no `name` field; the name lives on the variable_declarator.
     if (
+      !nameOverride &&
       name === '<anonymous>' &&
       (node.type === 'arrow_function' || node.type === 'function_expression')
     ) {
@@ -543,7 +630,19 @@ export class TreeSitterExtractor {
         }
       }
     }
-    if (name === '<anonymous>') return; // Skip anonymous functions
+    if (name === '<anonymous>') {
+      // Don't emit a node for the anonymous wrapper itself, but still visit its
+      // body: AMD/RequireJS and CommonJS module wrappers (`define([], function(){…})`,
+      // `(function(){…})()`) hold named inner functions and calls that would
+      // otherwise be lost — the dispatcher set skipChildren, so nothing else
+      // descends into this subtree. (#528)
+      const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+        ?? getChildByField(node, this.extractor.bodyField);
+      if (body) {
+        this.visitFunctionBody(body, '');
+      }
+      return;
+    }
 
     // Check for misparse artifacts (e.g. C++ macros causing "namespace detail" functions)
     // Skip the node but still visit the body for calls and structural nodes
@@ -649,6 +748,11 @@ export class TreeSitterExtractor {
       // in inline objects). These are ephemeral and create noise (e.g., Svelte context
       // objects: `ctx.set({ get view() { ... } })`).
       if (node.parent?.type === 'object' || node.parent?.type === 'object_expression') {
+        const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+          ?? getChildByField(node, this.extractor.bodyField);
+        if (body) {
+          this.visitFunctionBody(body, '');
+        }
         return;
       }
       // Not inside a class-like node and no receiver type, treat as function
@@ -874,12 +978,12 @@ export class TreeSitterExtractor {
     const visibility = this.extractor.getVisibility?.(node);
     const isStatic = this.extractor.isStatic?.(node) ?? false;
 
-    // Property name is a direct identifier child
-    const nameNode = getChildByField(node, 'name')
-      || node.namedChildren.find(c => c.type === 'identifier');
-    if (!nameNode) return;
-
-    const name = getNodeText(nameNode, this.source);
+    const hookName = this.extractor.extractPropertyName?.(node, this.source);
+    const nameNode = hookName
+      ? null
+      : getChildByField(node, 'name') || node.namedChildren.find(c => c.type === 'identifier');
+    const name = hookName ?? (nameNode ? getNodeText(nameNode, this.source) : null);
+    if (!name) return;
 
     // Get property type from the type child (first named child that isn't modifier or identifier)
     const typeNode = node.namedChildren.find(
@@ -901,6 +1005,10 @@ export class TreeSitterExtractor {
     // decorator->target relationship for class properties too.
     if (propNode) {
       this.extractDecoratorsFor(node, propNode.id);
+      // Emit `references` edges from the property to types named in its
+      // type annotation (#381). The generic walker handles TS-style
+      // `type_annotation` children; the C# branch walks the `type` field.
+      this.extractTypeAnnotations(node, propNode.id);
     }
   }
 
@@ -983,7 +1091,15 @@ export class TreeSitterExtractor {
         });
         // Java/Kotlin annotations / TS field decorators sit on the
         // outer field_declaration, not on the individual declarator.
-        if (fieldNode) this.extractDecoratorsFor(node, fieldNode.id);
+        if (fieldNode) {
+          this.extractDecoratorsFor(node, fieldNode.id);
+          // Same as properties: emit `references` to the field's annotated
+          // type. The outer `field_declaration` is the right scope to
+          // search from — C# carries the `type` inside `variable_declaration`
+          // and the language-aware path in `extractTypeAnnotations` descends
+          // into that wrapper (#381).
+          this.extractTypeAnnotations(node, fieldNode.id);
+        }
       }
     } else {
       // Fallback: try to find an identifier child directly
@@ -998,6 +1114,102 @@ export class TreeSitterExtractor {
         });
       }
     }
+  }
+
+  /**
+   * Extract function-valued properties of an object literal as named function
+   * nodes (named by their property key). Shared by the two object-of-functions
+   * shapes in extractVariable: the object as a direct const value, and the
+   * object returned by a store-initializer call. Handles both `key: () => {}` /
+   * `key: function() {}` pairs and method shorthand `key() {}`.
+   */
+  private extractObjectLiteralFunctions(obj: SyntaxNode): void {
+    for (let i = 0; i < obj.namedChildCount; i++) {
+      const member = obj.namedChild(i);
+      if (!member) continue;
+      if (member.type === 'pair') {
+        const key = getChildByField(member, 'key');
+        const value = getChildByField(member, 'value');
+        if (key && value && (value.type === 'arrow_function' || value.type === 'function_expression')) {
+          this.extractFunction(value, this.objectKeyName(key));
+        }
+      } else if (member.type === 'method_definition') {
+        // Method shorthand: `{ fetchUser() {...} }`. extractMethod deliberately
+        // skips object-literal methods, so route through extractFunction with an
+        // explicit name (method_definition exposes a `body` field, so resolveBody
+        // falls through to it and the node spans the full method).
+        const key = getChildByField(member, 'name');
+        if (key) this.extractFunction(member, this.objectKeyName(key));
+      }
+    }
+  }
+
+  /** Property-key text with surrounding quotes stripped (`'foo'` → `foo`). */
+  private objectKeyName(key: SyntaxNode): string {
+    return getNodeText(key, this.source).replace(/^['"`]|['"`]$/g, '');
+  }
+
+  /**
+   * Given a `call_expression` initializer (`create((set, get) => ({...}))`),
+   * find the object literal RETURNED by a function argument — descending through
+   * nested call_expression arguments so middleware wrappers are unwrapped
+   * (`create(persist((set, get) => ({...}), {...}))`, devtools, immer,
+   * subscribeWithSelector). Returns null when no such object is found — the
+   * common case for ordinary call initializers — so this stays cheap and silent
+   * rather than guessing. Keyed purely on AST shape; no library names.
+   */
+  private findInitializerReturnedObject(callNode: SyntaxNode, depth = 0): SyntaxNode | null {
+    if (depth > 4) return null;
+    const args = getChildByField(callNode, 'arguments');
+    if (!args) return null;
+    for (let i = 0; i < args.namedChildCount; i++) {
+      const arg = args.namedChild(i);
+      if (!arg) continue;
+      if (arg.type === 'arrow_function' || arg.type === 'function_expression') {
+        const obj = this.functionReturnedObject(arg);
+        if (obj) return obj;
+      } else if (arg.type === 'call_expression') {
+        const obj = this.findInitializerReturnedObject(arg, depth + 1);
+        if (obj) return obj;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The object literal a function expression returns — either the `=> ({...})`
+   * arrow form (a parenthesized_expression wrapping an object) or a
+   * `=> { return {...} }` block. Returns null for any other body shape.
+   */
+  private functionReturnedObject(fnNode: SyntaxNode): SyntaxNode | null {
+    const body = getChildByField(fnNode, 'body');
+    if (!body) return null;
+    const asObject = (n: SyntaxNode | null): SyntaxNode | null => {
+      if (!n) return null;
+      if (n.type === 'object' || n.type === 'object_expression') return n;
+      if (n.type === 'parenthesized_expression') {
+        for (let i = 0; i < n.namedChildCount; i++) {
+          const inner = asObject(n.namedChild(i));
+          if (inner) return inner;
+        }
+      }
+      return null;
+    };
+    // `(set, get) => ({...})` — body is the (parenthesized) object directly.
+    const direct = asObject(body);
+    if (direct) return direct;
+    // `(set, get) => { return {...} }` — scan top-level return statements.
+    if (body.type === 'statement_block') {
+      for (let i = 0; i < body.namedChildCount; i++) {
+        const stmt = body.namedChild(i);
+        if (stmt?.type !== 'return_statement') continue;
+        for (let j = 0; j < stmt.namedChildCount; j++) {
+          const obj = asObject(stmt.namedChild(j));
+          if (obj) return obj;
+        }
+      }
+    }
+    return null;
   }
 
   /**
@@ -1056,6 +1268,46 @@ export class TreeSitterExtractor {
             // Extract type annotation references (e.g., const x: ITextModel = ...)
             if (varNode) {
               this.extractVariableTypeAnnotation(child, varNode.id);
+            }
+
+            // Exported const object-of-functions — extract each function-valued
+            // property as a function named by its key + walk its body so its
+            // calls are captured. Two shapes, both keyed on AST shape (not on any
+            // library name):
+            //   `export const actions = { default: async () => {} }` — object is
+            //     the DIRECT value (SvelteKit form actions / handler maps / route
+            //     tables).
+            //   `export const useStore = create((set, get) => ({ fetchUser:
+            //     async () => {} }))` — object is RETURNED by an initializer call,
+            //     possibly through middleware wrappers (persist/devtools/immer).
+            //     Covers Zustand/Redux/Pinia/MobX stores generically. Without
+            //     this, store actions exist only as object-literal properties —
+            //     never nodes — so `node`/`callers` on `fetchUser` return "not
+            //     found" and the agent Reads the store to reconstruct the flow.
+            // Scoped to EXPORTED consts to exclude inline-object noise
+            // (`ctx.set({...})`) the object-method skip deliberately avoids.
+            const objectOfFns =
+              valueNode && (valueNode.type === 'object' || valueNode.type === 'object_expression')
+                ? valueNode
+                : valueNode?.type === 'call_expression'
+                  ? this.findInitializerReturnedObject(valueNode)
+                  : null;
+            const extractObjectMethods = isExported && !!objectOfFns;
+
+            // Visit the initializer body for calls — EXCEPT object literals (their
+            // function-valued properties are extracted below) and the store-factory
+            // call whose returned object we extract method-by-method below (walking
+            // the whole call would re-visit those method arrows and mis-attribute
+            // their inner calls to the file/module scope).
+            if (valueNode &&
+                valueNode.type !== 'object' &&
+                valueNode.type !== 'object_expression' &&
+                !(extractObjectMethods && valueNode.type === 'call_expression')) {
+              this.visitFunctionBody(valueNode, '');
+            }
+
+            if (extractObjectMethods && objectOfFns) {
+              this.extractObjectLiteralFunctions(objectOfFns);
             }
           }
         }
@@ -1248,7 +1500,85 @@ export class TreeSitterExtractor {
       const value = getChildByField(node, 'value');
       if (value) {
         this.extractTypeRefsFromSubtree(value, typeAliasNode.id);
+        // `type X = { foo: T; bar(): T }` — make the members first-class
+        // property/method nodes under the type alias so `recorder.stop()`
+        // can attach the call edge to `RecorderHandle.stop` instead of
+        // an unrelated class method picked by path-proximity (#359).
+        if (this.language === 'typescript' || this.language === 'tsx') {
+          this.extractTsTypeAliasMembers(value, typeAliasNode);
+        }
       }
+    }
+    return false;
+  }
+
+  /**
+   * Surface the members of a TypeScript `type X = { ... }` (or intersection
+   * thereof) as `property` / `method` nodes under the type-alias node. Only
+   * walks the immediate object_type / intersection operands so anonymous
+   * nested object types inside generic arguments (`Promise<{ ok: true }>`)
+   * don't produce phantom members.
+   */
+  private extractTsTypeAliasMembers(value: SyntaxNode, typeAliasNode: Node): void {
+    const objectTypes: SyntaxNode[] = [];
+    if (value.type === 'object_type') {
+      objectTypes.push(value);
+    } else if (value.type === 'intersection_type') {
+      for (let i = 0; i < value.namedChildCount; i++) {
+        const op = value.namedChild(i);
+        if (op && op.type === 'object_type') objectTypes.push(op);
+      }
+    } else {
+      return;
+    }
+
+    this.nodeStack.push(typeAliasNode.id);
+    for (const objType of objectTypes) {
+      for (let i = 0; i < objType.namedChildCount; i++) {
+        const child = objType.namedChild(i);
+        if (!child) continue;
+        if (child.type !== 'property_signature' && child.type !== 'method_signature') continue;
+
+        const nameNode = getChildByField(child, 'name');
+        const memberName = nameNode ? getNodeText(nameNode, this.source) : '';
+        if (!memberName) continue;
+
+        // `foo: () => T` and `foo(): T` are functionally a method on the
+        // type contract. Treat the property_signature with a function-typed
+        // annotation as a method too so call sites can resolve to it.
+        const memberKind: NodeKind = child.type === 'method_signature'
+          ? 'method'
+          : this.isTsFunctionTypedProperty(child) ? 'method' : 'property';
+
+        const docstring = getPrecedingDocstring(child, this.source);
+        const signature = getNodeText(child, this.source);
+        this.createNode(memberKind, memberName, child, {
+          docstring,
+          signature,
+          qualifiedName: `${typeAliasNode.name}::${memberName}`,
+        });
+
+        // Emit `references` edges from the type alias to types named in the
+        // member's signature, matching the interface-member behavior added in
+        // #432. We attach refs to the type-alias parent (consistent with
+        // interface property_signature treatment).
+        this.extractTypeAnnotations(child, typeAliasNode.id);
+      }
+    }
+    this.nodeStack.pop();
+  }
+
+  /**
+   * `foo: () => T` → property_signature whose type_annotation contains a
+   * `function_type`. Treat that as a method-shaped contract member, since
+   * the call site `obj.foo()` has identical semantics to `bar(): T`.
+   */
+  private isTsFunctionTypedProperty(propertySignature: SyntaxNode): boolean {
+    const typeAnno = getChildByField(propertySignature, 'type');
+    if (!typeAnno) return false;
+    for (let i = 0; i < typeAnno.namedChildCount; i++) {
+      const inner = typeAnno.namedChild(i);
+      if (inner && inner.type === 'function_type') return true;
     }
     return false;
   }
@@ -1412,7 +1742,23 @@ export class TreeSitterExtractor {
     if (nameField && objectField && (node.type === 'method_invocation' || node.type === 'member_call_expression' || node.type === 'scoped_call_expression')) {
       // Method call with explicit receiver: receiver.method() / $receiver->method() / ClassName::method()
       const methodName = getNodeText(nameField, this.source);
-      let receiverName = getNodeText(objectField, this.source);
+      // Java `this.userbo.toLogin2()` parses as method_invocation(object=field_access(this, userbo)).
+      // Without unwrapping, receiverName is `this.userbo` and the name-matcher's
+      // single-dot receiver regex fails. Pull out the immediate field after `this.`
+      // so the receiver is the field name (`userbo`), which the resolver can then
+      // look up in the enclosing class's field declarations.
+      let receiverName: string;
+      if (objectField.type === 'field_access') {
+        const inner = getChildByField(objectField, 'object');
+        const fld = getChildByField(objectField, 'field');
+        if (inner && fld && (inner.type === 'this' || inner.type === 'this_expression')) {
+          receiverName = getNodeText(fld, this.source);
+        } else {
+          receiverName = getNodeText(objectField, this.source);
+        }
+      } else {
+        receiverName = getNodeText(objectField, this.source);
+      }
       // Strip PHP $ prefix from variable names
       receiverName = receiverName.replace(/^\$/, '');
 
@@ -1425,14 +1771,49 @@ export class TreeSitterExtractor {
           calleeName = `${receiverName}.${methodName}`;
         }
       }
+    } else if (node.type === 'message_expression') {
+      // ObjC message expressions emit one `method` field child per selector
+      // keyword: `[obj a:1 b:2 c:3]` has three `method=identifier` siblings.
+      // Joining them with `:` reconstructs the full selector and matches the
+      // multi-part selector names produced by the ObjC method_definition
+      // extractor (`extractObjcMethodName` in languages/objc.ts). Without this
+      // join, multi-keyword call sites only emitted the first keyword and never
+      // resolved to their target methods (e.g. `GET:parameters:headers:...` had
+      // zero callers despite obviously being called).
+      const methodKeywords: string[] = [];
+      for (let i = 0; i < node.namedChildCount; i++) {
+        if (node.fieldNameForNamedChild(i) === 'method') {
+          const kw = node.namedChild(i);
+          if (kw) methodKeywords.push(getNodeText(kw, this.source));
+        }
+      }
+      if (methodKeywords.length > 0) {
+        const methodName: string =
+          methodKeywords.length === 1
+            ? (methodKeywords[0] as string)
+            : methodKeywords.map((k) => `${k}:`).join('');
+        const receiverField = getChildByField(node, 'receiver');
+        const SKIP_RECEIVERS = new Set(['self', 'super']);
+        if (receiverField && receiverField.type !== 'message_expression') {
+          const receiverName = getNodeText(receiverField, this.source);
+          if (receiverName && !SKIP_RECEIVERS.has(receiverName)) {
+            calleeName = `${receiverName}.${methodName}`;
+          } else {
+            calleeName = methodName;
+          }
+        } else {
+          calleeName = methodName;
+        }
+      }
     } else {
       const func = getChildByField(node, 'function') || node.namedChild(0);
 
       if (func) {
-        if (func.type === 'member_expression' || func.type === 'attribute' || func.type === 'selector_expression' || func.type === 'navigation_expression') {
+        if (func.type === 'member_expression' || func.type === 'attribute' || func.type === 'selector_expression' || func.type === 'navigation_expression' || func.type === 'field_expression') {
           // Method call: obj.method() or obj.field.method()
           // Go uses selector_expression with 'field', JS/TS uses member_expression with 'property'
           // Kotlin uses navigation_expression with navigation_suffix > simple_identifier
+          // C/C++ use field_expression for both `obj.method()` and `ptr->method()`
           let property = getChildByField(func, 'property') || getChildByField(func, 'field');
           if (!property) {
             const child1 = func.namedChild(1);
@@ -1449,9 +1830,13 @@ export class TreeSitterExtractor {
             // This helps the resolver distinguish method calls from bare function calls
             // (e.g., Python's console.print() vs builtin print())
             // Skip self/this/cls as they don't aid resolution
-            const receiver = getChildByField(func, 'object') || getChildByField(func, 'operand') || func.namedChild(0);
+            const receiver =
+              getChildByField(func, 'object') ||
+              getChildByField(func, 'operand') ||
+              getChildByField(func, 'argument') ||
+              func.namedChild(0);
             const SKIP_RECEIVERS = new Set(['self', 'this', 'cls', 'super']);
-            if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier')) {
+            if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier' || receiver.type === 'field_identifier')) {
               const receiverName = getNodeText(receiver, this.source);
               if (!SKIP_RECEIVERS.has(receiverName)) {
                 calleeName = `${receiverName}.${methodName}`;
@@ -1531,6 +1916,78 @@ export class TreeSitterExtractor {
         column: node.startPosition.column,
       });
     }
+  }
+
+  /**
+   * Find a `class_body` child of an `object_creation_expression` — the
+   * marker for an anonymous class (`new T() { ... }`). Returns the body
+   * node so the caller can walk it as the anon class's members.
+   */
+  private findAnonymousClassBody(node: SyntaxNode): SyntaxNode | null {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      // Java: `class_body`. C# uses the same node kind.
+      if (child && (child.type === 'class_body' || child.type === 'declaration_list')) {
+        return child;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Extract a Java/C# anonymous class — `new T() { ...members }`. Emits a
+   * `class` node named `<T$anon@line>`, an `extends` reference to T (so
+   * Phase 5.5 interface-impl can bridge), and walks the body so its
+   * `method_declaration` members become method nodes under the anon class.
+   *
+   * Why this matters: without anon-class extraction, the overrides inside
+   * a lambda-returned `new T() { @Override int foo(){...} }` are not nodes,
+   * so a call through T.foo (the abstract parent method) has no static
+   * target — the agent has to Read the file to find the implementation.
+   */
+  private extractAnonymousClass(node: SyntaxNode, body: SyntaxNode): void {
+    if (!this.extractor) return;
+
+    // The instantiated type sits in the same field/position that
+    // extractInstantiation reads from. Use the same lookup so the anon
+    // class's `extends` target matches the `instantiates` edge.
+    const typeNode =
+      getChildByField(node, 'constructor') ||
+      getChildByField(node, 'type') ||
+      getChildByField(node, 'name') ||
+      node.namedChild(0);
+    let typeName = typeNode ? getNodeText(typeNode, this.source) : 'Object';
+    const ltIdx = typeName.indexOf('<');
+    if (ltIdx > 0) typeName = typeName.slice(0, ltIdx);
+    const lastDot = Math.max(typeName.lastIndexOf('.'), typeName.lastIndexOf('::'));
+    if (lastDot >= 0) typeName = typeName.slice(lastDot + 1).replace(/^[:.]/, '');
+    typeName = typeName.trim() || 'Object';
+
+    const anonName = `<${typeName}$anon@${node.startPosition.row + 1}>`;
+    const classNode = this.createNode('class', anonName, node, {});
+    if (!classNode) return;
+
+    // The anonymous class implicitly extends/implements the named type.
+    // We can't tell at extraction time whether T is a class or an interface,
+    // so emit `extends`. Resolution will still bind T to whatever it is, and
+    // Phase 5.5 (which already handles both `extends` and `implements`) will
+    // bridge T's methods to the override names found in the anon body.
+    this.unresolvedReferences.push({
+      fromNodeId: classNode.id,
+      referenceName: typeName,
+      referenceKind: 'extends',
+      line: typeNode?.startPosition.row ?? node.startPosition.row,
+      column: typeNode?.startPosition.column ?? node.startPosition.column,
+    });
+
+    // Walk the body's children so method_declaration nodes inside become
+    // method nodes scoped to the anon class.
+    this.nodeStack.push(classNode.id);
+    for (let i = 0; i < body.namedChildCount; i++) {
+      const child = body.namedChild(i);
+      if (child) this.visitNode(child);
+    }
+    this.nodeStack.pop();
   }
 
   /**
@@ -1662,6 +2119,14 @@ export class TreeSitterExtractor {
         // about `call_expression`, so constructor invocations
         // produced no graph edges at all.
         this.extractInstantiation(node);
+        // Anonymous class with body: `new T() { ... }` (Java/C#). Extract as
+        // a class so interface-impl synthesis (Phase 5.5) can bridge T's
+        // methods to the overrides — same rationale as in visitNode.
+        const anonBody = this.findAnonymousClassBody(node);
+        if (anonBody) {
+          this.extractAnonymousClass(node, anonBody);
+          return;
+        }
       } else if (this.extractor!.extractBareCall) {
         const calleeName = this.extractor!.extractBareCall(node, this.source);
         if (calleeName && this.nodeStack.length > 0) {
@@ -1675,6 +2140,21 @@ export class TreeSitterExtractor {
               column: node.startPosition.column,
             });
           }
+        }
+      }
+
+      // Nested NAMED functions inside a body — function declarations and named
+      // function expressions like `.on('mount', function onmount(){})` — become
+      // their own nodes so the graph can link to them (callback handlers, local
+      // helpers). Anonymous arrows/expressions fall through to the default
+      // recursion below, keeping their inner calls attributed to the enclosing
+      // function: this bounds the new nodes to NAMED functions only (no explosion,
+      // no lost edges). extractFunction walks the nested body itself, so we return.
+      if (this.extractor!.functionTypes.includes(nodeType)) {
+        const nestedName = extractName(node, this.source, this.extractor!);
+        if (nestedName && nestedName !== '<anonymous>') {
+          this.extractFunction(node);
+          return;
         }
       }
 
@@ -1717,6 +2197,42 @@ export class TreeSitterExtractor {
    * Extract inheritance relationships
    */
   private extractInheritance(node: SyntaxNode, classId: string): void {
+    // Objective-C @interface MyClass : NSObject <ProtoA, ProtoB>
+    if (node.type === 'class_interface') {
+      const superclass = getChildByField(node, 'superclass');
+      if (superclass) {
+        const name = getNodeText(superclass, this.source);
+        this.unresolvedReferences.push({
+          fromNodeId: classId,
+          referenceName: name,
+          referenceKind: 'extends',
+          line: superclass.startPosition.row + 1,
+          column: superclass.startPosition.column,
+        });
+      }
+      for (let j = 0; j < node.namedChildCount; j++) {
+        const argList = node.namedChild(j);
+        if (argList?.type !== 'parameterized_arguments') continue;
+        for (let k = 0; k < argList.namedChildCount; k++) {
+          const typeName = argList.namedChild(k);
+          if (!typeName) continue;
+          const typeId = typeName.namedChildren.find(
+            (c: SyntaxNode) => c.type === 'type_identifier' || c.type === 'identifier'
+          );
+          if (!typeId) continue;
+          const protocolName = getNodeText(typeId, this.source);
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: protocolName,
+            referenceKind: 'implements',
+            line: typeId.startPosition.row + 1,
+            column: typeId.startPosition.column,
+          });
+        }
+      }
+      return;
+    }
+
     // Look for extends/implements clauses
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
@@ -1741,6 +2257,27 @@ export class TreeSitterExtractor {
               referenceKind: 'extends',
               line: target.startPosition.row + 1,
               column: target.startPosition.column,
+            });
+          }
+        }
+      }
+
+      // C++ base classes: `class Derived : public Base, private Other` →
+      // base_class_clause holds access specifiers + base type(s). Emit an extends
+      // ref per base type (skip the public/private/protected keywords).
+      if (child.type === 'base_class_clause') {
+        for (const t of child.namedChildren) {
+          if (
+            t.type === 'type_identifier' ||
+            t.type === 'qualified_identifier' ||
+            t.type === 'template_type'
+          ) {
+            this.unresolvedReferences.push({
+              fromNodeId: classId,
+              referenceName: getNodeText(t, this.source),
+              referenceKind: 'extends',
+              line: t.startPosition.row + 1,
+              column: t.startPosition.column,
             });
           }
         }
@@ -2034,6 +2571,17 @@ export class TreeSitterExtractor {
     if (!this.extractor) return;
     if (!this.TYPE_ANNOTATION_LANGUAGES.has(this.language)) return;
 
+    // C# tree-sitter doesn't produce `type_identifier` leaves — it uses
+    // `identifier`, `predefined_type`, `qualified_name`, `generic_name`,
+    // etc. — so the generic walker below emits zero references for it.
+    // Dispatch to a C#-aware path that only walks type-position subtrees
+    // (the `type` field of a parameter/method/property/field), so
+    // parameter NAMES never accidentally surface as type refs (#381).
+    if (this.language === 'csharp') {
+      this.extractCsharpTypeRefs(node, nodeId);
+      return;
+    }
+
     // Extract parameter type annotations
     const params = getChildByField(node, this.extractor.paramsField || 'parameters');
     if (params) {
@@ -2052,6 +2600,113 @@ export class TreeSitterExtractor {
     );
     if (typeAnnotation) {
       this.extractTypeRefsFromSubtree(typeAnnotation, nodeId);
+    }
+  }
+
+  /**
+   * Extract C# type references from a node that owns a type position —
+   * a method/constructor declaration, a property declaration, or a
+   * field declaration (which wraps `variable_declaration → type`).
+   *
+   * Walks ONLY into known type fields, so parameter names like
+   * `request` in `Build(UserDto request)` are never mis-emitted as
+   * type references. Once inside a type subtree, `walkCsharpTypePosition`
+   * recognizes C#'s actual type-leaf node kinds (`identifier`,
+   * `qualified_name`, `generic_name`, `array_type`, `nullable_type`,
+   * `tuple_type`, …) — none of which are `type_identifier`. Closes #381.
+   */
+  private extractCsharpTypeRefs(node: SyntaxNode, nodeId: string): void {
+    // Return type / property type — the field is named `type`.
+    const directType = getChildByField(node, 'type');
+    if (directType) this.walkCsharpTypePosition(directType, nodeId);
+
+    // Field declarations wrap declarators in a `variable_declaration`
+    // whose `type` field carries the type. The outer `field_declaration`
+    // has no `type` field of its own, so the call above is a no-op here
+    // and we descend one level.
+    const varDecl = node.namedChildren.find((c: SyntaxNode) => c.type === 'variable_declaration');
+    if (varDecl) {
+      const vdType = getChildByField(varDecl, 'type');
+      if (vdType) this.walkCsharpTypePosition(vdType, nodeId);
+    }
+
+    // Method / constructor parameters. The field name on
+    // `method_declaration` is `parameters`; it points at a
+    // `parameter_list` whose `parameter` children each have their own
+    // `type` field. Walking ONLY the type field skips parameter NAMES,
+    // which would otherwise mis-emit as type references.
+    const params = getChildByField(node, 'parameters');
+    if (params) {
+      for (let i = 0; i < params.namedChildCount; i++) {
+        const child = params.namedChild(i);
+        if (!child || child.type !== 'parameter') continue;
+        const paramType = getChildByField(child, 'type');
+        if (paramType) this.walkCsharpTypePosition(paramType, nodeId);
+      }
+    }
+  }
+
+  /**
+   * Walk a C# subtree that is KNOWN to be in a type position
+   * (return type, parameter type, property type, field type, generic
+   * argument). Identifiers here are type names, not parameter names.
+   */
+  private walkCsharpTypePosition(node: SyntaxNode, fromNodeId: string): void {
+    // `predefined_type` is int/string/bool/etc. — never a project ref.
+    if (node.type === 'predefined_type') return;
+
+    // Bare type name: `Foo` in `Foo bar`, or the `Foo` inside `List<Foo>`.
+    if (node.type === 'identifier') {
+      const name = getNodeText(node, this.source);
+      if (name && !this.BUILTIN_TYPES.has(name)) {
+        this.unresolvedReferences.push({
+          fromNodeId,
+          referenceName: name,
+          referenceKind: 'references',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+
+    // `Namespace.Foo` → the rightmost identifier is the type. Emit the
+    // full qualified name as the reference; the resolver can still match
+    // on the trailing simple name when needed.
+    if (node.type === 'qualified_name') {
+      const text = getNodeText(node, this.source);
+      const last = text.split('.').pop() ?? text;
+      if (last && !this.BUILTIN_TYPES.has(last)) {
+        this.unresolvedReferences.push({
+          fromNodeId,
+          referenceName: last,
+          referenceKind: 'references',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+
+    // `(int Code, Foo Payload)` — tuple element has BOTH a `type` and a
+    // `name` field; descending into all named children would mis-emit
+    // the element name (`Code`, `Payload`) as a type ref. Walk only the
+    // type field.
+    if (node.type === 'tuple_element') {
+      const t = getChildByField(node, 'type');
+      if (t) this.walkCsharpTypePosition(t, fromNodeId);
+      return;
+    }
+
+    // Composite type nodes — recurse into named children. Covers
+    // `generic_name` (head identifier + `type_argument_list`),
+    // `nullable_type`, `array_type`, `pointer_type`, `tuple_type`,
+    // `ref_type`, and any newer wrapping shapes the grammar adds.
+    // Identifiers reached here are all type-positional (parameter/field
+    // names are gated out before we descend).
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child) this.walkCsharpTypePosition(child, fromNodeId);
     }
   }
 
@@ -2535,10 +3190,16 @@ export function extractFromSource(
     // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
     result = extractor.extract();
-  } else if (detectedLanguage === 'yaml' || detectedLanguage === 'twig') {
-    // No symbol extraction — file is tracked at the file-record level only.
-    // Framework extractors (e.g. Drupal routing resolver) run below and may
-    // add route nodes / references for yaml files such as *.routing.yml.
+  } else if (detectedLanguage === 'xml') {
+    // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
+    // file node so the watcher tracks it without emitting symbols.
+    const extractor = new MyBatisExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (isFileLevelOnlyLanguage(detectedLanguage)) {
+    // No symbol extraction at this stage — files are tracked at the file-record
+    // level only. Framework extractors (Drupal routing yml, Spring `@Value`
+    // resolution against application.yml/application.properties) run later and
+    // add per-file nodes/references when they apply.
     result = { nodes: [], edges: [], unresolvedReferences: [], errors: [], durationMs: 0 };
   } else if (
     detectedLanguage === 'pascal' &&

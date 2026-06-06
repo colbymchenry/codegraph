@@ -87,9 +87,12 @@ export const goResolver: FrameworkResolver = {
     const now = Date.now();
     const safe = stripCommentsForRegex(content, 'go');
 
-    // (router|r|mux|app).METHOD("/path", handler)
-    // Handles Gin (GET/POST/...), Chi (Get/Post/...), net/http (HandleFunc/Handle).
-    const routeRegex = /\b(?:router|r|mux|app|e)\.(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Get|Post|Put|Patch|Delete|Handle|HandleFunc)\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g;
+    // <anyVar>.METHOD("/path", handler) — Gin (GET/POST/...), Chi (Get/Post/...),
+    // net/http (HandleFunc/Handle). The receiver is ANY identifier, not just
+    // router|r|mux|app|e: real apps route on GROUP vars (`v1.GET`, `PublicGroup.GET`,
+    // `userRouter.POST`), which the fixed name list missed (gin-vue-admin: 4 routes
+    // for 625 files). The verb + string-path + handler-arg gates keep it route-specific.
+    const routeRegex = /\b\w+\.(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Get|Post|Put|Patch|Delete|Handle|HandleFunc)\s*\(\s*"([^"]+)"\s*,\s*([^)]+)\)/g;
     let match: RegExpExecArray | null;
     while ((match = routeRegex.exec(safe)) !== null) {
       const [, rawMethod, routePath, handlerExpr] = match;

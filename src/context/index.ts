@@ -25,7 +25,8 @@ import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
 import { validatePathWithinRoot } from '../utils';
-import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants } from '../search/query-utils';
+import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
+import { LOW_CONFIDENCE_MARKER } from './markers';
 
 /**
  * Extract likely symbol names from a natural language query
@@ -172,6 +173,11 @@ const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
   nodeKinds: HIGH_VALUE_NODE_KINDS, // Filter out imports/exports by default
 };
 
+// Re-export the low-confidence sentinel (defined in a dependency-free leaf so
+// the MCP layer can import it without pulling this module's deps onto the
+// cold-start path). Builder code below uses the imported binding directly.
+export { LOW_CONFIDENCE_MARKER } from './markers';
+
 /**
  * Context Builder
  *
@@ -259,12 +265,154 @@ export class ContextBuilder {
 
     // Return formatted output or raw context
     if (opts.format === 'markdown') {
-      return formatContextAsMarkdown(context);
+      return formatContextAsMarkdown(context)
+        + this.buildCallPathsSection(subgraph)
+        + (subgraph.confidence === 'low' ? this.buildLowConfidenceNote(entryPoints) : '');
     } else if (opts.format === 'json') {
       return formatContextAsJson(context);
     }
 
     return context;
+  }
+
+  /**
+   * Honest handoff appended when retrieval confidence is low (the query matched
+   * mostly common words). Instead of the usual "this covers the surface" framing
+   * — which, when wrong, sends the agent off to Read/Grep — it admits the
+   * uncertainty and routes the agent to the precise tools (explore with real
+   * symbol names, search, or files to browse the closest areas we *did* surface).
+   */
+  private buildLowConfidenceNote(entryPoints: Node[]): string {
+    const dirs: string[] = [];
+    const seen = new Set<string>();
+    for (const n of entryPoints) {
+      const slash = n.filePath.lastIndexOf('/');
+      const dir = slash > 0 ? n.filePath.slice(0, slash) : n.filePath;
+      if (!seen.has(dir)) { seen.add(dir); dirs.push(dir); }
+      if (dirs.length >= 4) break;
+    }
+    const dirLine = dirs.length
+      ? `\n- \`codegraph_files\` a likely area: ${dirs.map(d => `\`${d}\``).join(', ')}`
+      : '';
+    return `\n\n${LOW_CONFIDENCE_MARKER}\n\n`
+      + 'This query matched mostly on common words, so the entry points above may '
+      + 'be off-target — treat them as a starting point, not a complete answer. '
+      + 'For a reliable result:\n'
+      + '- `codegraph_explore` with the **exact symbol names** you are after '
+      + '(class / function / method names), or\n'
+      + '- `codegraph_search <name>` for one specific symbol'
+      + dirLine
+      + '\n\nDo not assume the list above is comprehensive.';
+  }
+
+  /**
+   * Surface short call-paths among the symbols this context already found,
+   * derived in-memory from the subgraph's `calls` edges (no extra queries).
+   *
+   * This bakes the value of path-finding INTO the always-loaded `context` tool.
+   * Agents reliably read context's output but do NOT discover/adopt a standalone
+   * trace tool (in deferred-MCP harnesses they only ToolSearch-select tools they
+   * already know). Delivering the flow here means "how does X reach Y" is
+   * answered without the agent needing to find, load, or choose a new tool.
+   * Chains stop where the static call graph ends (e.g. dynamic dispatch) — that
+   * truncation is honest, and the agent can codegraph_node the last hop to bridge.
+   */
+  private buildCallPathsSection(subgraph: Subgraph): string {
+    const adj = new Map<string, string[]>();
+    for (const e of subgraph.edges) {
+      if (e.kind !== 'calls') continue;
+      if (!subgraph.nodes.has(e.source) || !subgraph.nodes.has(e.target)) continue;
+      const list = adj.get(e.source);
+      if (list) list.push(e.target);
+      else adj.set(e.source, [e.target]);
+    }
+    if (adj.size === 0) return '';
+
+    const MAX_HOPS = 6;
+    const chains: string[][] = [];
+    let budget = 2000; // bound DFS work on dense subgraphs
+    const dfs = (id: string, path: string[], seen: Set<string>): void => {
+      if (budget-- <= 0) return;
+      const next = (adj.get(id) ?? []).filter((t) => !seen.has(t));
+      if (next.length === 0 || path.length >= MAX_HOPS) {
+        if (path.length >= 3) chains.push([...path]); // >=3 nodes = a real flow, not a single call
+        return;
+      }
+      for (const t of next) {
+        seen.add(t);
+        dfs(t, [...path, t], seen);
+        seen.delete(t);
+      }
+    };
+    const starts = (subgraph.roots.length > 0
+      ? subgraph.roots.filter((id) => adj.has(id))
+      : [...adj.keys()]
+    ).slice(0, 5);
+    for (const s of starts) dfs(s, [s], new Set([s]));
+    if (chains.length === 0) return '';
+
+    // Keep only chains that connect TWO OR MORE query-relevant symbols (roots).
+    // A chain from a root into an arbitrary callee (render → onMagicFrameGenerate)
+    // is structurally valid but tangential to the question; requiring ≥2 roots
+    // keeps the chain anchored to what the user actually asked about. Rank by
+    // #roots then length, and drop any that are a sub-path of a longer kept chain.
+    const rootSet = new Set(subgraph.roots);
+    const rootCount = (c: string[]): number => c.reduce((n, id) => n + (rootSet.has(id) ? 1 : 0), 0);
+    const relevant = chains.filter((c) => rootCount(c) >= 2);
+    relevant.sort((a, b) => rootCount(b) - rootCount(a) || b.length - a.length);
+    const kept: string[][] = [];
+    for (const c of relevant) {
+      const key = c.join('>');
+      if (kept.some((k) => k.join('>').includes(key))) continue;
+      kept.push(c);
+      if (kept.length >= 3) break;
+    }
+    if (kept.length === 0) return '';
+    const name = (id: string): string => subgraph.nodes.get(id)?.name ?? id;
+
+    // Synthesized (dynamic-dispatch) hops are real `calls` edges but invisible to
+    // static parsing — mark them inline so the agent sees WHERE the callback was
+    // wired up (`registered @file:line`) instead of grepping for it. Keyed by
+    // "source>target".
+    const synthByPair = new Map<string, string>();
+    for (const e of subgraph.edges) {
+      if (e.kind !== 'calls' || e.provenance !== 'heuristic') continue;
+      const m = e.metadata as Record<string, unknown> | undefined;
+      if (!m?.synthesizedBy) continue;
+      const at = typeof m.registeredAt === 'string' ? ` @${m.registeredAt}` : '';
+      const label = m.synthesizedBy === 'callback'
+        ? `callback via ${m.via ? `\`${String(m.via)}\`` : 'registrar'}${at}`
+        : m.synthesizedBy === 'react-render'
+        ? `React re-render via setState${at}`
+        : m.synthesizedBy === 'jsx-render'
+        ? `renders <${String(m.via || 'child')}>`
+        : m.synthesizedBy === 'vue-handler'
+        ? `Vue @${String(m.event || 'event')} handler`
+        : `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`;
+      synthByPair.set(`${e.source}>${e.target}`, label);
+    }
+    const renderChain = (c: string[]): string => {
+      let s = name(c[0]!);
+      for (let i = 1; i < c.length; i++) {
+        const synth = synthByPair.get(`${c[i - 1]}>${c[i]}`);
+        s += synth ? ` →[${synth}] ${name(c[i]!)}` : ` → ${name(c[i]!)}`;
+      }
+      return s;
+    };
+    const hasSynth = kept.some((c) => c.some((_, i) => i > 0 && synthByPair.has(`${c[i - 1]}>${c[i]}`)));
+    const lines = [
+      '',
+      '## Call paths',
+      '',
+      'Execution flow among the key symbols (traced through the call graph):',
+      '',
+      ...kept.map((c) => `- ${renderChain(c)}`),
+      '',
+      hasSynth
+        ? '_Hops marked `[callback/event …]` are dynamic dispatch bridged by codegraph (with the registration site); the rest are direct calls. codegraph_node any symbol for its body._'
+        : '_codegraph_node any symbol above for its source + its own callers/callees._',
+    ];
+    return '\n' + lines.join('\n') + '\n';
   }
 
   /**
@@ -477,6 +625,37 @@ export class ContextBuilder {
       }
     }
 
+    // Iter7 — Core-directory boost. On projects with one file that holds
+    // the dense majority of internal call edges (e.g. sinatra's
+    // `lib/sinatra/base.rb` at 85% of all in-file edges), the agent's
+    // task usually asks about the framework's core. Without this boost,
+    // ranking favors small focused extension files (e.g. text search
+    // picks `sinatra-contrib/lib/sinatra/multi_route.rb`'s 10-line
+    // `route` method over `base.rb`'s `route!` because the extension
+    // file's `route` matches the query verbatim AND the file is small,
+    // dwarfing the longer name `route!` in a 1500-line file). Boost
+    // results that share a directory prefix with the dominant file's
+    // directory so the core file's siblings outrank sibling-package
+    // extensions.
+    try {
+      const dominant = this.queries.getDominantFile?.();
+      if (dominant && dominant.edgeCount >= 3 * dominant.nextEdgeCount) {
+        // Take the directory of the dominant file (everything up to the
+        // last slash). For `lib/sinatra/base.rb` → `lib/sinatra/`.
+        const slash = dominant.filePath.lastIndexOf('/');
+        if (slash > 0) {
+          const coreDir = dominant.filePath.slice(0, slash + 1);
+          for (const result of searchResults) {
+            if (result.node.filePath.startsWith(coreDir)) {
+              result.score += 25;
+            }
+          }
+        }
+      }
+    } catch {
+      // SQL failure — fall through, scoring works without the boost
+    }
+
     // Step 5a: Multi-term co-occurrence re-ranking (applied BEFORE truncation).
     // For multi-word queries like "search execution from request to shard",
     // nodes matching 2+ query terms in their name or path are far more relevant
@@ -512,6 +691,21 @@ export class ContextBuilder {
       // term group is counter-productive.
       const exactMatchIds = new Set(exactMatches.map(r => r.node.id));
 
+      // ...but only exempt exact matches the user *named as an identifier*
+      // (camelCase/snake_case/acronym). A plain dictionary word that happens to
+      // exact-match an unrelated symbol — query "flat object" → a constant named
+      // FLAT — must NOT be exempt, or the +exact-name bonus floats it to the top
+      // of a prose query with zero corroboration from any other term. Classify by
+      // the QUERY token (what the user typed), not the matched symbol's name.
+      const distinctiveTokens = new Set(
+        symbolsFromQuery.filter(isDistinctiveIdentifier).map(s => s.toLowerCase())
+      );
+      const distinctiveExactMatchIds = new Set(
+        exactMatches
+          .filter(r => distinctiveTokens.has(r.node.name.toLowerCase()))
+          .map(r => r.node.id)
+      );
+
       for (const result of searchResults) {
         // Check term matches in name (substring) and path DIRECTORIES (exact).
         // Directory segments must match exactly — "search" matches directory
@@ -531,10 +725,17 @@ export class ContextBuilder {
         if (matchCount >= 2) {
           // Multiplicative boost — 2 terms → 2x, 3 terms → 2.5x
           result.score *= 1 + matchCount * 0.5;
-        } else if (!exactMatchIds.has(result.node.id)) {
-          // Mild dampen for single-term matches — they might be generic
+        } else if (distinctiveExactMatchIds.has(result.node.id)) {
+          // Exact match on a distinctive identifier the user explicitly named —
+          // keep full score (e.g. "LiveEditMode DevServerPreview").
+        } else if (exactMatchIds.has(result.node.id)) {
+          // Exact match on a COMMON word (e.g. "flat" → FLAT): high-scoring noise
+          // inflated by the +exact-name bonus, corroborated by no other query
+          // term. Demote hard so corroborated matches win.
+          result.score *= 0.3;
+        } else {
+          // Mild dampen for generic single-term matches — they might be generic
           // but could also be the right result (e.g., "Protocol" class for an IPC query).
-          // Exempt exact name matches: they are specific symbols the user queried for.
           result.score *= 0.6;
         }
       }
@@ -698,6 +899,35 @@ export class ContextBuilder {
     // Cap to searchLimit so each entry point gets a meaningful traversal budget.
     if (filteredResults.length > opts.searchLimit) {
       filteredResults = filteredResults.slice(0, opts.searchLimit);
+    }
+
+    // Confidence signal for the honest-handoff footer (consumed in buildContext).
+    // A multi-term prose query that resolves only to isolated common-word matches
+    // — no entry point corroborated by 2+ distinct query terms, and none a
+    // distinctive identifier the user explicitly named — is LOW confidence: the
+    // results are best-effort, not a located answer, so the agent should be told
+    // to drill in with explore/trace rather than trust the list as comprehensive.
+    // Single-keyword and symbol-name queries are exempt (their single match IS the
+    // answer), so the handoff never fires on them.
+    let confidence: 'high' | 'low' = 'high';
+    const confTerms = extractSearchTerms(query, { stems: false }).filter(t => t.length >= 3);
+    if (confTerms.length >= 2 && filteredResults.length > 0) {
+      const distinctive = new Set(
+        symbolsFromQuery.filter(isDistinctiveIdentifier).map(s => s.toLowerCase())
+      );
+      const anyStrong = filteredResults.some(r => {
+        if (distinctive.has(r.node.name.toLowerCase())) return true;
+        const nameLower = r.node.name.toLowerCase();
+        const dirSegs = path.dirname(r.node.filePath).toLowerCase().split('/');
+        let hits = 0;
+        for (const t of confTerms) {
+          if (nameLower.includes(t) || dirSegs.includes(t)) {
+            if (++hits >= 2) return true;
+          }
+        }
+        return false;
+      });
+      if (!anyStrong) confidence = 'low';
     }
 
     // Add entry points to subgraph
@@ -907,7 +1137,7 @@ export class ContextBuilder {
       }
     }
 
-    return { nodes: finalNodes, edges: finalEdges, roots };
+    return { nodes: finalNodes, edges: finalEdges, roots, confidence };
   }
 
   /**

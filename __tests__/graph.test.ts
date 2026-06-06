@@ -309,6 +309,19 @@ export { main };
       expect(impact.nodes.size).toBeGreaterThan(0);
       expect(impact.nodes.has(formatValue.id)).toBe(true);
     });
+
+    it('does not drag in sibling members via the structural contains edge (#536)', () => {
+      const getName = cg.getNodesByKind('method').find((n) => n.name === 'getName');
+      const derived = cg.getNodesByKind('class').find((n) => n.name === 'DerivedClass');
+      expect(getName).toBeDefined();
+      expect(derived).toBeDefined();
+
+      const impact = cg.getImpactRadius(getName!.id, 3);
+      // The containing class must NOT be pulled into impact just because it
+      // *contains* getName — climbing that contains edge would re-expand every
+      // sibling method and explode impact for a leaf symbol. (#536)
+      expect(impact.nodes.has(derived!.id)).toBe(false);
+    });
   });
 
   describe('findPath()', () => {

@@ -35,7 +35,23 @@ export const djangoResolver: FrameworkResolver = {
       const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, FORM_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
+    // ORM dynamic dispatch: QuerySet._fetch_all (and siblings) call
+    // `self._iterable_class(self)` — a runtime dispatch to the iterable class
+    // (default ModelIterable) whose __iter__ runs the SQL compiler. Static
+    // parsing can't resolve an attribute-as-callable, so it leaves an unresolved
+    // `_iterable_class` ref and a hole in the QuerySet→compiler chain. Bridge it
+    // to ModelIterable.__iter__ so the flow actually exists in the graph.
+    if (ref.referenceName === '_iterable_class') {
+      const target = resolveModelIterableIter(context);
+      if (target) return { original: ref, targetNodeId: target, confidence: 0.7, resolvedBy: 'framework' };
+    }
     return null;
+  },
+
+  // Let the ORM dynamic-dispatch ref reach resolve() despite no symbol being
+  // named `_iterable_class` (it's a QuerySet attribute, not a declared method).
+  claimsReference(name) {
+    return name === '_iterable_class';
   },
 
   extract(filePath, content) {
@@ -86,9 +102,53 @@ export const djangoResolver: FrameworkResolver = {
       }
     }
 
+    // DRF router registration: `router.register(r'articles', ArticleViewSet)` →
+    // route → the ViewSet class (the core CRUD endpoints, which path()/url() miss).
+    // The STRING first arg separates this from `admin.site.register(Model, Admin)`
+    // (whose first arg is a model class, not a string); the View/ViewSet suffix on
+    // the 2nd arg keeps it to DRF viewsets.
+    const routerRegex = /\.register\s*\(\s*r?['"]([^'"]+)['"]\s*,\s*([\w.]+)/g;
+    while ((match = routerRegex.exec(safe)) !== null) {
+      const prefix = match[1]!.replace(/^\^|\/?\$$/g, '');
+      const viewset = match[2]!.split('.').pop()!;
+      if (!/View(Set)?$/.test(viewset)) continue;
+      const line = safe.slice(0, match.index).split('\n').length;
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:VIEWSET:${prefix}`,
+        kind: 'route',
+        name: `VIEWSET /${prefix}`,
+        qualifiedName: `${filePath}::route:${prefix}`,
+        filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length,
+        language: 'python', updatedAt: now,
+      };
+      nodes.push(routeNode);
+      references.push({
+        fromNodeId: routeNode.id,
+        referenceName: viewset,
+        referenceKind: 'references',
+        line, column: 0, filePath, language: 'python',
+      });
+    }
+
     return { nodes, references };
   },
 };
+
+/**
+ * Find ModelIterable.__iter__ — the default iterable QuerySet invokes via
+ * `self._iterable_class(self)`. Its __iter__ statically calls the SQL compiler,
+ * so linking the dynamic dispatch here closes the QuerySet→SQL call chain.
+ * (Over-approximates to the default iterable; .values()/.values_list() swap in
+ * other BaseIterable subclasses, but ModelIterable is the canonical path.)
+ */
+function resolveModelIterableIter(context: ResolutionContext): string | null {
+  const cls = context.getNodesByName('ModelIterable').find((n) => n.kind === 'class');
+  if (!cls) return null;
+  const iter = context.getNodesByName('__iter__').find(
+    (n) => n.filePath === cls.filePath && n.startLine >= cls.startLine && n.startLine <= cls.endLine
+  );
+  return iter ? iter.id : null;
+}
 
 /**
  * Parse a Django URL handler expression and return the symbol/module to link.
@@ -117,13 +177,20 @@ export const flaskResolver: FrameworkResolver = {
   languages: ['python'],
 
   detect(context) {
-    const requirements = context.readFile('requirements.txt');
-    if (requirements && /\bflask\b/i.test(requirements)) return true;
-    const pyproject = context.readFile('pyproject.toml');
-    if (pyproject && /\bflask\b/i.test(pyproject)) return true;
-    for (const file of ['app.py', 'application.py', 'main.py', '__init__.py']) {
-      const content = context.readFile(file);
-      if (content && content.includes('Flask(__name__)')) return true;
+    for (const f of ['requirements.txt', 'pyproject.toml', 'Pipfile', 'setup.py']) {
+      const c = context.readFile(f);
+      if (c && /\bflask\b/i.test(c)) return true;
+    }
+    // Any app entrypoint (root OR subdir, e.g. conduit/app.py) that imports flask
+    // and instantiates Flask(...) — covers Flask(__name__), Flask(__name__.split…),
+    // and the app-factory pattern. Bounded to entrypoint-named files.
+    const entrypoints = context
+      .getAllFiles()
+      .filter((f) => /(?:^|\/)(app|application|main|wsgi|__init__)\.py$/.test(f))
+      .slice(0, 50);
+    for (const f of entrypoints) {
+      const c = context.readFile(f);
+      if (c && /\bFlask\s*\(/.test(c) && /\bimport\s+flask\b|\bfrom\s+flask\b/.test(c)) return true;
     }
     return false;
   },
@@ -138,15 +205,23 @@ export const flaskResolver: FrameworkResolver = {
 
   extract(filePath, content) {
     if (!filePath.endsWith('.py')) return { nodes: [], references: [] };
-    return extractDecoratorRoutes(filePath, stripCommentsForRegex(content, 'python'), {
-      // Flask: @x.route('/path', methods=[...])
-      decoratorRegex: /@(\w+)\.route\s*\(\s*['"]([^'"]+)['"](?:\s*,\s*methods\s*=\s*\[([^\]]+)\])?\s*\)\s*\n\s*(?:async\s+)?def\s+(\w+)/g,
+    const safe = stripCommentsForRegex(content, 'python');
+    const decorator = extractDecoratorRoutes(filePath, safe, {
+      // Flask: @x.route('/path', methods=[...] | (...)) — the handler is the next
+      // `def`, allowing intervening decorators (@login_required) and stacked
+      // @x.route() lines. methods may be a list OR a tuple (methods=('GET',)).
+      decoratorRegex: /@(\w+)\.route\s*\(\s*['"]([^'"]*)['"](?:\s*,\s*methods\s*=\s*[[(]([^\])]+)[\])])?\s*\)/g,
       defaultMethod: 'GET',
       methodFromGroup: 3,
       pathGroup: 2,
-      handlerGroup: 4,
+      findHandler: true,
       language: 'python',
     });
+    const restful = extractFlaskRestful(filePath, safe);
+    return {
+      nodes: [...decorator.nodes, ...restful.nodes],
+      references: [...decorator.references, ...restful.references],
+    };
   },
 };
 
@@ -181,8 +256,9 @@ export const fastapiResolver: FrameworkResolver = {
   extract(filePath, content) {
     if (!filePath.endsWith('.py')) return { nodes: [], references: [] };
     return extractDecoratorRoutes(filePath, stripCommentsForRegex(content, 'python'), {
-      // FastAPI: @x.METHOD('/path') -> handler on the next def line
-      decoratorRegex: /@(\w+)\.(get|post|put|patch|delete|options|head)\s*\(\s*['"]([^'"]+)['"]/g,
+      // FastAPI: @x.METHOD('/path') -> handler on the next def line. Path may be
+      // empty ("") for routes mounted at the router/prefix root.
+      decoratorRegex: /@(\w+)\.(get|post|put|patch|delete|options|head)\s*\(\s*['"]([^'"]*)['"]/g,
       defaultMethod: '',
       methodGroup: 2,
       pathGroup: 3,
@@ -218,7 +294,7 @@ function extractDecoratorRoutes(filePath: string, content: string, opts: Decorat
       if (m) method = m[1]!.toUpperCase();
     }
     const line = content.slice(0, match.index).split('\n').length;
-    const name = method ? `${method} ${routePath}` : routePath!;
+    const name = method ? `${method} ${routePath || '/'}` : (routePath || '/');
     const routeNode: Node = {
       id: `route:${filePath}:${line}:${method}:${routePath}`,
       kind: 'route',
@@ -246,6 +322,52 @@ function extractDecoratorRoutes(filePath: string, content: string, opts: Decorat
       references.push({
         fromNodeId: routeNode.id,
         referenceName: handlerName,
+        referenceKind: 'references',
+        line,
+        column: 0,
+        filePath,
+        language: 'python',
+      });
+    }
+  }
+  return { nodes, references };
+}
+
+/**
+ * Flask-RESTful: `api.add_resource(ResourceClass, '/path'[, '/path2'])`
+ * (and variants like redash's `add_org_resource`). The ResourceClass holds the
+ * HTTP-verb methods (get/post/…), so the route references the class — its verb
+ * methods resolve as the handlers via the class. Method is ANY (the class
+ * decides which verbs it serves).
+ */
+function extractFlaskRestful(filePath: string, safe: string): FrameworkExtractionResult {
+  const nodes: Node[] = [];
+  const references: UnresolvedRef[] = [];
+  const now = Date.now();
+  const re = /\.add\w*[Rr]esource\s*\(\s*(\w+)\s*,\s*((?:['"][^'"]+['"]\s*,?\s*)+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(safe)) !== null) {
+    const className = m[1]!;
+    const paths = (m[2]!.match(/['"]([^'"]+)['"]/g) || []).map((s) => s.slice(1, -1));
+    const line = safe.slice(0, m.index).split('\n').length;
+    for (const routePath of paths) {
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:ANY:${routePath}`,
+        kind: 'route',
+        name: `ANY ${routePath}`,
+        qualifiedName: `${filePath}::ANY:${routePath}`,
+        filePath,
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: 0,
+        language: 'python',
+        updatedAt: now,
+      };
+      nodes.push(routeNode);
+      references.push({
+        fromNodeId: routeNode.id,
+        referenceName: className,
         referenceKind: 'references',
         line,
         column: 0,

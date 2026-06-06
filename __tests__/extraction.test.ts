@@ -10,7 +10,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory } from '../src/extraction';
-import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars } from '../src/extraction/grammars';
+import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -91,6 +91,14 @@ describe('Language Detection', () => {
 
   it('should detect Dart files', () => {
     expect(detectLanguage('main.dart')).toBe('dart');
+  });
+
+  it('should detect Objective-C files', () => {
+    expect(detectLanguage('AppDelegate.m')).toBe('objc');
+    expect(detectLanguage('ViewController.mm')).toBe('objc');
+    const objcHeader = '@interface Foo : NSObject\n@end\n';
+    expect(detectLanguage('Foo.h', objcHeader)).toBe('objc');
+    expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
   });
 
   it('should return unknown for unsupported extensions', () => {
@@ -195,6 +203,38 @@ export interface User {
       name: 'User',
       isExported: true,
     });
+  });
+
+  it('should extract type references from interface property signatures', () => {
+    const code = `
+import type { IPage } from '../PromoterList';
+import type { IOrderField } from '../types';
+
+interface Hprops {
+  value?: Partial<IPage> & Partial<IOrderField>;
+}
+`;
+    const result = extractFromSource('HeaderFilter.ts', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(refs.some((r) => r.referenceName === 'IPage')).toBe(true);
+    expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
+  });
+
+  it('should extract type references from interface method signatures', () => {
+    const code = `
+import type { IPage } from '../PromoterList';
+import type { IOrderField } from '../types';
+
+interface MethodForm {
+  fetchPage(arg: IPage): IOrderField;
+}
+`;
+    const result = extractFromSource('MethodForm.ts', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(refs.some((r) => r.referenceName === 'IPage')).toBe(true);
+    expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
   });
 
   it('should track function calls', () => {
@@ -478,6 +518,20 @@ export const authMachine = createMachine({
     expect(varNode).toBeDefined();
     expect(varNode?.isExported).toBe(true);
   });
+
+  it('should extract calls from a top-level variable initializer (issue #425)', () => {
+    const code = `
+import { getTokenMp } from './api/upload';
+
+const token = getTokenMp();
+`;
+    const result = extractFromSource('app.ts', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(call).toBeDefined();
+  });
 });
 
 describe('File Node Extraction', () => {
@@ -759,6 +813,130 @@ public class Calculator {
     const methodNode = result.nodes.find((n) => n.kind === 'method' && n.name === 'add');
     expect(methodNode).toBeDefined();
     expect(methodNode?.isStatic).toBe(true);
+  });
+
+  it('wraps top-level declarations in a namespace from package_declaration', () => {
+    const code = `
+package com.example.foo;
+
+public class Bar {
+    public String greet() { return "hi"; }
+}
+`;
+    const result = extractFromSource('Bar.java', code);
+
+    const ns = result.nodes.find((n) => n.kind === 'namespace');
+    expect(ns?.name).toBe('com.example.foo');
+
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('com.example.foo::Bar');
+
+    const greet = result.nodes.find((n) => n.kind === 'method' && n.name === 'greet');
+    expect(greet?.qualifiedName).toBe('com.example.foo::Bar::greet');
+  });
+
+  it('does not wrap when no package is declared', () => {
+    const code = `
+public class Bar {
+    public String greet() { return "hi"; }
+}
+`;
+    const result = extractFromSource('Bar.java', code);
+    expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('Bar');
+  });
+
+  it('extracts anonymous-class overrides from `new T() { ... }`', () => {
+    // The pattern that breaks the trace through `strategy.foo()` in
+    // libraries like guava's Splitter: the lambda-returned anonymous
+    // class overrides abstract methods on the base, but without
+    // extracting those overrides the interface→impl synthesizer has
+    // nothing to bridge.
+    const code = `
+package com.example;
+
+abstract class Base {
+  abstract int compute(int x);
+}
+
+public class Factory {
+  public Base make() {
+    return new Base() {
+      @Override
+      int compute(int x) { return x + 1; }
+    };
+  }
+}
+`;
+    const result = extractFromSource('Factory.java', code);
+
+    const anon = result.nodes.find((n) => n.kind === 'class' && /Base\$anon@/.test(n.name));
+    expect(anon, 'anonymous Base subclass should be extracted as a class').toBeDefined();
+
+    const compute = result.nodes.find(
+      (n) => n.kind === 'method' && n.name === 'compute' && n.qualifiedName.includes('$anon@')
+    );
+    expect(compute, 'override method should be a method on the anon class').toBeDefined();
+    expect(compute!.qualifiedName).toContain('Factory::make::<Base$anon@');
+    expect(compute!.qualifiedName.endsWith('::compute')).toBe(true);
+
+    // Anon class must extend Base so Phase 5.5 (interface-impl) can bridge.
+    const extendsRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'extends' && r.referenceName === 'Base' && r.fromNodeId === anon!.id
+    );
+    expect(extendsRef, 'anon class should carry an `extends Base` reference').toBeDefined();
+
+    // The enclosing `make` method still emits an instantiates edge to Base —
+    // anon extraction must not swallow that signal.
+    const instantiatesRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'Base'
+    );
+    expect(instantiatesRef, 'enclosing method should still instantiate Base').toBeDefined();
+  });
+
+  it('extracts anonymous-class overrides inside a lambda body', () => {
+    // The exact guava pattern: a lambda is passed to a constructor, and the
+    // lambda body returns `new T() { @Override ... }`. The anon class must
+    // still surface even though it sits inside a lambda_expression node.
+    const code = `
+package com.example;
+
+interface Strategy {
+  java.util.Iterator<String> iterator(String s);
+}
+
+abstract class BaseIter implements java.util.Iterator<String> {
+  abstract int separatorStart(int start);
+}
+
+public class Splitter {
+  private final Strategy strategy;
+  public Splitter(Strategy s) { this.strategy = s; }
+
+  public static Splitter on(char c) {
+    return new Splitter((seq) ->
+        new BaseIter() {
+          @Override
+          int separatorStart(int start) { return start + 1; }
+          @Override public boolean hasNext() { return false; }
+          @Override public String next() { return null; }
+        });
+  }
+}
+`;
+    const result = extractFromSource('Splitter.java', code);
+
+    const anon = result.nodes.find((n) => n.kind === 'class' && /BaseIter\$anon@/.test(n.name));
+    expect(anon, 'anon BaseIter inside the lambda body should be extracted').toBeDefined();
+
+    const sepStart = result.nodes.find(
+      (n) =>
+        n.kind === 'method' &&
+        n.name === 'separatorStart' &&
+        n.qualifiedName.includes('$anon@')
+    );
+    expect(sepStart, 'override inside the lambda-returned anon class should be a method node').toBeDefined();
   });
 });
 
@@ -1119,6 +1297,54 @@ interface WebSocket {
     expect(methodNames).toContain('send');
     expect(methodNames).toContain('cancel');
   });
+
+  it('wraps top-level declarations in a namespace from package_header', () => {
+    const code = `
+package com.example.foo
+
+class Bar {
+  fun greet(): String = "hi"
+}
+
+fun util(): Int = 42
+`;
+    const result = extractFromSource('Bar.kt', code);
+
+    const ns = result.nodes.find((n) => n.kind === 'namespace');
+    expect(ns?.name).toBe('com.example.foo');
+
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('com.example.foo::Bar');
+
+    const greet = result.nodes.find((n) => n.kind === 'method' && n.name === 'greet');
+    expect(greet?.qualifiedName).toBe('com.example.foo::Bar::greet');
+
+    const util = result.nodes.find((n) => n.kind === 'function' && n.name === 'util');
+    expect(util?.qualifiedName).toBe('com.example.foo::util');
+  });
+
+  it('handles a single-segment package', () => {
+    const code = `
+package foo
+
+class Bar
+`;
+    const result = extractFromSource('Bar.kt', code);
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('foo::Bar');
+  });
+
+  it('does not wrap when no package is declared', () => {
+    const code = `
+class Bar {
+  fun greet() = "hi"
+}
+`;
+    const result = extractFromSource('Bar.kt', code);
+    expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
+    expect(cls?.qualifiedName).toBe('Bar');
+  });
 });
 
 describe('Dart Extraction', () => {
@@ -1151,6 +1377,11 @@ class UserService {
     const privateMethod = methodNodes.find((m) => m.name === '_privateMethod');
     expect(privateMethod).toBeDefined();
     expect(privateMethod?.visibility).toBe('private');
+
+    // Dart models a method body as a SIBLING of the signature, so the method
+    // node must be extended to span its body (not just the signature line) —
+    // required for body-level analysis (callees, the callback synthesizer).
+    expect(findById!.endLine).toBeGreaterThan(findById!.startLine);
   });
 
   it('should extract top-level function declarations', () => {
@@ -2010,6 +2241,27 @@ end
       expect(names).toContain('iostream');
       expect(names).toContain('vector');
       expect(names).toContain('config.h');
+    });
+
+    it('should create unresolved references for local includes', () => {
+      const code = `#include "myheader.h"`;
+      const result = extractFromSource('main.cpp', code);
+
+      const importRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'myheader.h'
+      );
+      expect(importRef).toBeDefined();
+      expect(importRef?.line).toBe(1);
+    });
+
+    it('should create unresolved references for system includes', () => {
+      const code = `#include <iostream>`;
+      const result = extractFromSource('main.cpp', code);
+
+      const importRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'iostream'
+      );
+      expect(importRef).toBeDefined();
     });
   });
 
@@ -2974,6 +3226,70 @@ export function multiply(a: number, b: number): number {
 
     cg.close();
   });
+
+  it('should count file-level tracked YAML files as indexed', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'routes.yml'), 'route: value\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll();
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+    expect(cg.getFiles().map((f) => f.path).sort()).toEqual(['app.yaml', 'routes.yml']);
+
+    cg.close();
+  });
+
+  it('should count file-level tracked YAML/Twig files as indexed in indexFiles()', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexFiles(['app.yaml', 'view.twig']);
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+
+    const tracked = cg.getFiles().map((f) => `${f.path}:${f.language}`).sort();
+    expect(tracked).toEqual(['app.yaml:yaml', 'view.twig:twig']);
+
+    cg.close();
+  });
+
+  it('should count file-level tracked .properties files as indexed', async () => {
+    fs.writeFileSync(path.join(tempDir, 'application.properties'), 'server.port=8080\n');
+    fs.writeFileSync(path.join(tempDir, 'log.properties'), 'log.level=INFO\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll();
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(2);
+    expect(result.filesSkipped).toBe(0);
+
+    cg.close();
+  });
+
+  it('should count the full file-level tracked class (yaml/twig/properties) in indexFiles()', async () => {
+    fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
+    fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');
+    fs.writeFileSync(path.join(tempDir, 'application.properties'), 'server.port=8080\n');
+
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexFiles(['app.yaml', 'view.twig', 'application.properties']);
+
+    expect(result.success).toBe(true);
+    expect(result.filesIndexed).toBe(3);
+    expect(result.filesSkipped).toBe(0);
+
+    const tracked = cg.getFiles().map((f) => `${f.path}:${f.language}`).sort();
+    expect(tracked).toEqual(['app.yaml:yaml', 'application.properties:properties', 'view.twig:twig']);
+
+    cg.close();
+  });
 });
 
 describe('Path Normalization', () => {
@@ -3555,6 +3871,79 @@ function increment(): void {
     }
   });
 
+  it('should extract calls from top-level <script setup> initializers', () => {
+    const code = `<template>
+  <div>{{ token }}</div>
+</template>
+
+<script setup lang="ts">
+import { getTokenMp } from './api/upload';
+
+const token = getTokenMp();
+</script>
+`;
+    const result = extractFromSource('Issue425Setup.vue', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('should extract calls from Vue Options API object methods', () => {
+    const code = `<template>
+  <button @click="save">Save</button>
+</template>
+
+<script>
+import { getTokenMp } from './api/upload';
+
+export default {
+  methods: {
+    save() {
+      return getTokenMp();
+    }
+  },
+  setup() {
+    return getTokenMp();
+  }
+}
+</script>
+`;
+    const result = extractFromSource('Issue425Options.vue', code);
+
+    const calls = result.unresolvedReferences.filter(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'getTokenMp'
+    );
+    expect(calls).toHaveLength(2);
+  });
+
+  it('should extract component usages from the Vue template (PascalCase + kebab, skipping built-ins) (#629)', () => {
+    const code = `<template>
+  <div class="wrap">
+    <UserCard :user="u" />
+    <my-button>Click</my-button>
+    <Transition><span>x</span></Transition>
+  </div>
+</template>
+
+<script setup lang="ts">
+import UserCard from './UserCard.vue';
+import MyButton from './MyButton.vue';
+</script>
+`;
+    const result = extractFromSource('Host.vue', code);
+    const refs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'references')
+      .map((r) => r.referenceName);
+
+    expect(refs).toContain('UserCard'); // PascalCase tag
+    expect(refs).toContain('MyButton'); // kebab <my-button> → MyButton
+    expect(refs).not.toContain('Transition'); // Vue built-in skipped
+    expect(refs).not.toContain('Div'); // native HTML element skipped
+    expect(refs).not.toContain('Span');
+  });
+
   it('should extract from both <script> and <script setup> blocks', () => {
     const code = `<template>
   <div>{{ msg }}</div>
@@ -3893,5 +4282,180 @@ local count = 0
       const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
       expect(vars).toContain('count');
     });
+  });
+});
+
+// =============================================================================
+// Objective-C
+// =============================================================================
+
+describe('Objective-C Extraction', () => {
+  const sample = `
+#import <Foundation/Foundation.h>
+#import "MyClass.h"
+
+@interface MyClass : NSObject <NSCopying>
+@property (nonatomic, copy) NSString *name;
+- (void)greet;
+- (void)doThing:(id)x with:(id)y;
++ (instancetype)shared;
+@end
+
+@implementation MyClass
+
+- (void)greet {
+    NSLog(@"Hello");
+    [self doWork];
+}
+
+- (void)doThing:(id)x with:(id)y {
+    [self notify:x];
+}
+
++ (instancetype)shared {
+    return [[MyClass alloc] init];
+}
+
+@end
+
+void helperFunction(int count) {
+    MyClass *obj = [MyClass shared];
+    [obj greet];
+}
+`;
+
+  it('should extract classes, methods, functions, and imports', () => {
+    const result = extractFromSource('App.m', sample);
+
+    const classes = result.nodes.filter((n) => n.kind === 'class');
+    expect(classes.filter((c) => c.name === 'MyClass')).toHaveLength(1);
+
+    const methods = result.nodes.filter((n) => n.kind === 'method');
+    expect(methods.map((m) => m.name).sort()).toEqual(['doThing:with:', 'greet', 'shared']);
+
+    const shared = methods.find((m) => m.name === 'shared');
+    expect(shared?.isStatic).toBe(true);
+
+    const properties = result.nodes.filter((n) => n.kind === 'property');
+    expect(properties.some((p) => p.name === 'name')).toBe(true);
+
+    const functions = result.nodes.filter((n) => n.kind === 'function');
+    expect(functions.some((f) => f.name === 'helperFunction')).toBe(true);
+
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toContain('Foundation/Foundation.h');
+    expect(imports).toContain('MyClass.h');
+  });
+
+  it('should record inheritance and protocol conformance', () => {
+    const result = extractFromSource('App.m', sample);
+    const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+    const implementsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+    expect(extendsRefs.map((r) => r.referenceName)).toContain('NSObject');
+    expect(implementsRefs.map((r) => r.referenceName)).toContain('NSCopying');
+  });
+
+  it('should record message sends and C calls', () => {
+    const result = extractFromSource('App.m', sample);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toEqual(expect.arrayContaining(['NSLog', 'doWork', 'MyClass.shared', 'obj.greet']));
+  });
+
+  it('should reconstruct multi-keyword selectors at the call site so they resolve to the method definition', () => {
+    // Regression for the gap discovered post-#165: message_expression's
+    // multi-keyword form `[obj a:1 b:2]` was only emitting the first keyword,
+    // so calls never resolved to multi-part method definitions like
+    // `GET:parameters:headers:progress:success:failure:`. The call-site name
+    // must match the method-definition name with full keywords + trailing colons.
+    const code = `
+@implementation Caller
+- (void)demo {
+    NSMutableDictionary *d = [NSMutableDictionary new];
+    [d setObject:@"v" forKey:@"k"];
+    [d setObject:@"v2" forKey:@"k2" withRetry:@YES];
+    [self touchesBegan:nil withEvent:nil];
+}
+@end
+`;
+    const result = extractFromSource('Caller.m', code);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toEqual(
+      expect.arrayContaining([
+        'd.setObject:forKey:',
+        'd.setObject:forKey:withRetry:',
+        'touchesBegan:withEvent:',
+      ])
+    );
+  });
+
+  it('should not classify pure C headers with @end in comments as objc', () => {
+    const cHeader = '/* @end of file */\n#ifndef STDIO_H\nvoid printf(const char *);\n#endif\n';
+    expect(detectLanguage('stdio.h', cHeader)).toBe('c');
+  });
+
+  it('should extract protocol declarations', () => {
+    const code = `
+@protocol DataSource <NSObject>
+- (NSInteger)numberOfItems;
+@end
+`;
+    const result = extractFromSource('DataSource.h', code);
+    const protocol = result.nodes.find((n) => n.kind === 'protocol' && n.name === 'DataSource');
+    expect(protocol).toBeDefined();
+  });
+
+  it('should report Objective-C as supported', () => {
+    expect(isLanguageSupported('objc')).toBe(true);
+    expect(getSupportedLanguages()).toContain('objc');
+  });
+});
+
+describe('Regression: issue-specific extraction fixes', () => {
+  it('indexes inner functions of an anonymous AMD/CommonJS module wrapper (#528)', () => {
+    const code = `
+define(['dep'], function (dep) {
+  function innerHelper(x) { return x + 1; }
+  function compute(y) { return innerHelper(y); }
+  return { compute: compute };
+});
+`;
+    const result = extractFromSource('amd-module.js', code);
+    const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(fns).toContain('innerHelper');
+    expect(fns).toContain('compute');
+  });
+
+  it('attaches Go methods on generic receivers to their type (#583)', () => {
+    const code = `
+package main
+
+type Stack[T any] struct { items []T }
+
+func (s *Stack[T]) Push(v T) { s.items = append(s.items, v) }
+func (s Stack[T]) Len() int { return len(s.items) }
+`;
+    const result = extractFromSource('stack.go', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method');
+    expect(methods.find((m) => m.name === 'Push')?.qualifiedName).toBe('Stack::Push');
+    expect(methods.find((m) => m.name === 'Len')?.qualifiedName).toBe('Stack::Len');
+  });
+
+  it('indexes new module extensions: .mts/.cts (TS) and .xsjs/.xsjslib (JS) (#366, #556)', () => {
+    expect(isSourceFile('mod.mts')).toBe(true);
+    expect(isSourceFile('mod.cts')).toBe(true);
+    expect(isSourceFile('service.xsjs')).toBe(true);
+    expect(isSourceFile('lib.xsjslib')).toBe(true);
+    expect(detectLanguage('mod.mts')).toBe('typescript');
+    expect(detectLanguage('service.xsjs')).toBe('javascript');
+
+    // End-to-end: a .mts file is parsed as TS, a .xsjs file as JS.
+    const ts = extractFromSource('mod.mts', 'export function hello(): number { return 1; }');
+    expect(ts.nodes.find((n) => n.name === 'hello' && n.kind === 'function')).toBeDefined();
+    const js = extractFromSource('service.xsjs', 'function handleRequest() { return 1; }');
+    expect(js.nodes.find((n) => n.name === 'handleRequest' && n.kind === 'function')).toBeDefined();
   });
 });

@@ -28,12 +28,10 @@ import {
   atomicWriteFileSync,
   getMcpServerConfig,
   removeMarkedSection,
-  replaceOrAppendMarkedSection,
 } from './shared';
 import {
   CODEGRAPH_SECTION_END,
   CODEGRAPH_SECTION_START,
-  INSTRUCTIONS_TEMPLATE,
 } from '../instructions-template';
 import { buildTomlTable, removeTomlTable, upsertTomlTable } from './toml';
 
@@ -84,7 +82,12 @@ class CodexTarget implements AgentTarget {
     const files: WriteResult['files'] = [];
 
     files.push(writeMcpEntry());
-    files.push(writeInstructionsEntry());
+
+    // AGENTS.md is no longer written — the codegraph usage guidance
+    // ships in the MCP server's `initialize` response (issue #529).
+    // Strip a block a previous install left so an upgrade self-heals.
+    const instrCleanup = removeInstructionsEntry();
+    if (instrCleanup.action === 'removed') files.push(instrCleanup);
 
     return { files };
   }
@@ -111,9 +114,7 @@ class CodexTarget implements AgentTarget {
       files.push({ path: tomlPath, action: 'not-found' });
     }
 
-    const instr = instructionsPath();
-    const instrAction = removeMarkedSection(instr, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
-    files.push({ path: instr, action: instrAction });
+    files.push(removeInstructionsEntry());
 
     return { files };
   }
@@ -160,22 +161,15 @@ function writeMcpEntry(): WriteResult['files'][number] {
   return { path: file, action: created ? 'created' : 'updated' };
 }
 
-function writeInstructionsEntry(): WriteResult['files'][number] {
+/**
+ * Strip the marker-delimited CodeGraph block from `~/.codex/AGENTS.md`
+ * if a prior install wrote one. Used by both install (self-heal on
+ * upgrade) and uninstall — see issue #529.
+ */
+function removeInstructionsEntry(): WriteResult['files'][number] {
   const file = instructionsPath();
-  const dir = path.dirname(file);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-  const action = replaceOrAppendMarkedSection(
-    file,
-    INSTRUCTIONS_TEMPLATE,
-    CODEGRAPH_SECTION_START,
-    CODEGRAPH_SECTION_END,
-  );
-  const mapped: 'created' | 'updated' | 'unchanged' =
-    action === 'created' ? 'created'
-      : action === 'unchanged' ? 'unchanged'
-        : 'updated';
-  return { path: file, action: mapped };
+  const action = removeMarkedSection(file, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
+  return { path: file, action };
 }
 
 export const codexTarget: AgentTarget = new CodexTarget();

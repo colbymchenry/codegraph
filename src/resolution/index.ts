@@ -17,9 +17,12 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference } from './name-matcher';
-import { resolveViaImport, extractImportMappings, extractReExports } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs } from './import-resolver';
 import { detectFrameworks } from './frameworks';
+import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
+import { loadGoModule, type GoModule } from './go-module';
+import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
@@ -129,6 +132,49 @@ const PASCAL_BUILT_INS = new Set([
   'IInterface', 'IUnknown',
 ]);
 
+const C_BUILT_INS = new Set([
+  // Standard C library functions
+  'printf', 'fprintf', 'sprintf', 'snprintf', 'scanf', 'fscanf', 'sscanf',
+  'malloc', 'calloc', 'realloc', 'free',
+  'memcpy', 'memmove', 'memset', 'memcmp', 'memchr',
+  'strlen', 'strcpy', 'strncpy', 'strcat', 'strncat', 'strcmp', 'strncmp',
+  'strstr', 'strchr', 'strrchr', 'strtok', 'strdup',
+  'fopen', 'fclose', 'fread', 'fwrite', 'fgets', 'fputs', 'fputc', 'fgetc',
+  'feof', 'ferror', 'fflush', 'fseek', 'ftell', 'rewind',
+  'exit', 'abort', 'atexit', 'atoi', 'atol', 'atof', 'strtol', 'strtoul', 'strtod',
+  'qsort', 'bsearch',
+  'abs', 'labs', 'rand', 'srand',
+  'sin', 'cos', 'tan', 'sqrt', 'pow', 'log', 'log10', 'exp', 'ceil', 'floor', 'fabs',
+  'time', 'clock', 'difftime', 'mktime', 'localtime', 'gmtime', 'strftime', 'asctime',
+  'assert', 'errno',
+  'perror', 'remove', 'rename', 'tmpfile', 'tmpnam',
+  'getenv', 'system',
+  'signal', 'raise',
+  'setjmp', 'longjmp',
+  'va_start', 'va_end', 'va_arg', 'va_copy',
+  'NULL', 'EOF', 'BUFSIZ', 'FILENAME_MAX', 'RAND_MAX', 'EXIT_SUCCESS', 'EXIT_FAILURE',
+  'size_t', 'ptrdiff_t', 'wchar_t', 'intptr_t', 'uintptr_t',
+  'int8_t', 'int16_t', 'int32_t', 'int64_t',
+  'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+  'FILE',
+  // POSIX additions commonly seen
+  'stat', 'lstat', 'fstat', 'open', 'close', 'read', 'write', 'pipe',
+  'fork', 'exec', 'waitpid', 'getpid', 'getppid', 'kill', 'sleep', 'usleep',
+  'pthread_create', 'pthread_join', 'pthread_mutex_lock', 'pthread_mutex_unlock',
+  'dlopen', 'dlsym', 'dlclose',
+]);
+
+const CPP_BUILT_INS = new Set([
+  // iostream objects (often used without std:: prefix via using)
+  'cout', 'cin', 'cerr', 'clog', 'endl', 'flush', 'ws',
+  'std', // the namespace itself when used as std::something
+  // Common C++ keywords that leak as references
+  'nullptr', 'true', 'false', 'this', 'sizeof', 'alignof', 'typeid',
+  'static_cast', 'dynamic_cast', 'reinterpret_cast', 'const_cast',
+  'make_unique', 'make_shared', 'make_pair',
+  'move', 'forward', 'swap',
+]);
+
 /**
  * Reference Resolver
  *
@@ -156,6 +202,10 @@ export class ReferenceResolver {
   // `null` = computed and absent. Treated as immutable for the
   // resolver's lifetime; callers re-create the resolver if config changes.
   private projectAliases: AliasMap | null | undefined = undefined;
+  // go.mod module path. Same lazy/immutable convention as projectAliases.
+  private goModule: GoModule | null | undefined = undefined;
+  // Monorepo workspace member packages. Same lazy/immutable convention.
+  private workspacePackages: WorkspacePackages | null | undefined = undefined;
 
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
@@ -182,6 +232,35 @@ export class ReferenceResolver {
   initialize(): void {
     this.frameworks = detectFrameworks(this.context);
     this.clearCaches();
+  }
+
+  /**
+   * Run each framework resolver's cross-file finalization pass and persist
+   * the returned node updates. Idempotent — safe to call after every indexAll
+   * and every incremental sync. Returns the number of nodes updated.
+   *
+   * Caches are cleared before/after so the post-extract pass sees fresh DB
+   * state and downstream queries see the updated names.
+   */
+  runPostExtract(): number {
+    let updated = 0;
+    this.clearCaches();
+    for (const fw of this.frameworks) {
+      if (!fw.postExtract) continue;
+      try {
+        const nodes = fw.postExtract(this.context);
+        for (const node of nodes) {
+          this.queries.updateNode(node);
+          updated++;
+        }
+      } catch (err) {
+        logDebug(`Framework '${fw.name}' postExtract failed`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (updated > 0) this.clearCaches();
+    return updated;
   }
 
   /**
@@ -340,6 +419,20 @@ export class ReferenceResolver {
         return this.projectAliases;
       },
 
+      getGoModule: () => {
+        if (this.goModule === undefined) {
+          this.goModule = loadGoModule(this.projectRoot);
+        }
+        return this.goModule;
+      },
+
+      getWorkspacePackages: () => {
+        if (this.workspacePackages === undefined) {
+          this.workspacePackages = loadWorkspacePackages(this.projectRoot);
+        }
+        return this.workspacePackages;
+      },
+
       getReExports: (filePath: string, language) => {
         const cached = this.reExportCache.get(filePath);
         if (cached) return cached;
@@ -348,9 +441,21 @@ export class ReferenceResolver {
           this.reExportCache.set(filePath, []);
           return [];
         }
-        const reExports = extractReExports(content, language);
+        // Re-exports are a JS/TS-only construct, and what matters is the
+        // BARREL file's own language — not the consuming reference's. A
+        // `.svelte`/`.vue` consumer threads its own language down the
+        // re-export chase, which would make extractReExports() bail on a
+        // `.ts` index barrel and silently break the chain (#629). Re-key
+        // the parse on the barrel's extension so the chase works no matter
+        // what kind of file imports through it.
+        const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?)$/i.test(filePath);
+        const reExports = extractReExports(content, isJsFamily ? 'typescript' : language);
         this.reExportCache.set(filePath, reExports);
         return reExports;
+      },
+
+      getCppIncludeDirs: () => {
+        return loadCppIncludeDirs(this.projectRoot);
       },
     };
   }
@@ -441,6 +546,14 @@ export class ReferenceResolver {
       // Also check capitalized receiver (instance-method resolution)
       const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
       if (this.knownNames.has(capitalized)) return true;
+      // JVM FQN: `com.example.foo.Bar` — the only useful segment is the
+      // last one (`Bar`); the earlier check finds `example.foo.Bar` which
+      // never matches a node name.
+      const lastDot = name.lastIndexOf('.');
+      if (lastDot > dotIdx) {
+        const tail = name.substring(lastDot + 1);
+        if (tail && this.knownNames.has(tail)) return true;
+      }
     }
     const colonIdx = name.indexOf('::');
     if (colonIdx > 0) {
@@ -493,9 +606,19 @@ export class ReferenceResolver {
     // from './barrel'` where the barrel has `export { signIn as login }
     // from './auth'`) intentionally call a name that has no
     // declaration anywhere — only the renamed upstream symbol does.
-    if (!this.hasAnyPossibleMatch(ref.referenceName) && !this.matchesAnyImport(ref)) {
+    if (
+      !this.hasAnyPossibleMatch(ref.referenceName) &&
+      !this.matchesAnyImport(ref) &&
+      !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
+    ) {
       return null;
     }
+
+    // JVM FQN imports skip framework/name-matcher: `import com.example.Bar`
+    // resolves directly through the qualifiedName index, which is unambiguous
+    // even when several `Bar` classes exist in different packages.
+    const jvmImport = resolveJvmImport(ref, this.context);
+    if (jvmImport) return jvmImport;
 
     const candidates: ResolvedRef[] = [];
 
@@ -681,6 +804,16 @@ export class ReferenceResolver {
       }
     }
 
+    // Dynamic-edge synthesis: now that all base `calls` edges are persisted,
+    // synthesize observer/callback dispatch edges (dispatcher → registered
+    // callbacks) that static parsing leaves out. Best-effort — never fail the
+    // index on it. See docs/design/callback-edge-synthesis.md.
+    try {
+      aggregateStats.byMethod['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
+    } catch {
+      // synthesis is additive and optional; ignore failures
+    }
+
     return {
       resolved: [],
       unresolved: [],
@@ -743,7 +876,13 @@ export class ReferenceResolver {
           }
         }
       }
-      if (PYTHON_BUILT_IN_METHODS.has(name)) {
+      // A bare name colliding with a builtin method (index, get, update, count…)
+      // is only a builtin when NOTHING in the codebase declares it. A declared
+      // symbol with that exact name — e.g. a Flask/FastAPI view `def index()` or
+      // `def get()` — is a real reference target. Mirrors the knownNames guard on
+      // the dotted branch above; without it, every handler named after a builtin
+      // method silently loses its route→handler edge.
+      if (PYTHON_BUILT_IN_METHODS.has(name) && !this.knownNames?.has(name)) {
         return true;
       }
     }
@@ -769,6 +908,24 @@ export class ReferenceResolver {
       }
       if (PASCAL_BUILT_INS.has(name)) {
         return true;
+      }
+    }
+
+    // C/C++ standard library symbols (printf, malloc, std::vector, etc.).
+    // Names that collide with user-defined symbols are NOT filtered —
+    // C and C++ projects routinely shadow stdlib names (custom allocators
+    // define `malloc`/`free`, stream wrappers define `read`/`write`/`open`,
+    // containers define `move`/`swap`, logging libs wrap `printf`). Killing
+    // those resolutions makes the graph wrong, not cleaner. We only filter
+    // when there's no user node with this name — then name-matching would
+    // produce zero edges anyway and the filter just short-circuits work.
+    if (ref.language === 'c' || ref.language === 'cpp') {
+      // C++ std:: namespace prefix — safe to filter unconditionally,
+      // since `std::foo` is never a user-defined qualified name in
+      // tree-sitter output.
+      if (name.startsWith('std::')) return true;
+      if (C_BUILT_INS.has(name) || CPP_BUILT_INS.has(name)) {
+        return !this.hasAnyPossibleMatch(name);
       }
     }
 
