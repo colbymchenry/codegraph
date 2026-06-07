@@ -903,6 +903,64 @@ def external_caller():
       expect(externalCalls).toHaveLength(0);
     });
 
+    it('attaches Go methods to their receiver type across files (#583, cross-file half)', async () => {
+      // In Go a type's methods are commonly declared in a different file from the
+      // `type` declaration (`type Box` in box.go, `func (b *Box) Get()` in
+      // box_methods.go). Extraction only attaches the struct→method `contains`
+      // edge when the type is in the SAME file (the owner lookup is file-scoped),
+      // so a cross-file method was orphaned from its struct — breaking member
+      // outlines and any callers/callees/impact traversal through `contains`. A
+      // resolution-phase pass now links them within the package (= directory).
+      fs.writeFileSync(
+        path.join(tempDir, 'box.go'),
+        'package main\n\ntype Box struct{ v int }\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'box_methods.go'),
+        'package main\n\nfunc (b *Box) Get() int { return b.v }\nfunc (b *Box) Set(x int) { b.v = x }\n'
+      );
+      // Generic receiver declared cross-file too — exercises #583 half A
+      // (generic `*Stack[T]` receiver parsing) and half B (cross-file) together.
+      fs.writeFileSync(
+        path.join(tempDir, 'stack.go'),
+        'package main\n\ntype Stack[T any] struct {\n\titems []T\n}\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'stack_push.go'),
+        'package main\n\nfunc (s *Stack[T]) Push(v T) { s.items = append(s.items, v) }\n'
+      );
+      // A same-named type in another package must NOT capture this package's
+      // methods — the link is scoped to the receiver type's own directory.
+      fs.mkdirSync(path.join(tempDir, 'other'));
+      fs.writeFileSync(
+        path.join(tempDir, 'other', 'box.go'),
+        'package other\n\ntype Box struct{ w int }\n'
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const methodsOf = (typeName: string, file: string): string[] => {
+        const node = cg
+          .getNodesByKind('struct')
+          .find((n) => n.name === typeName && n.filePath.replace(/\\/g, '/') === file);
+        expect(node, `${typeName} @ ${file}`).toBeDefined();
+        return cg
+          .getOutgoingEdges(node!.id)
+          .filter((e) => e.kind === 'contains')
+          .map((e) => cg.getNode(e.target))
+          .filter((n) => !!n && n.kind === 'method')
+          .map((n) => n!.name)
+          .sort();
+      };
+
+      // Cross-file (non-generic) methods now attach to their struct.
+      expect(methodsOf('Box', 'box.go')).toEqual(['Get', 'Set']);
+      // Generic + cross-file.
+      expect(methodsOf('Stack', 'stack.go')).toEqual(['Push']);
+      // Cross-package isolation: other/Box defines no methods of its own.
+      expect(methodsOf('Box', 'other/box.go')).toEqual([]);
+    });
+
     it('TS type_alias object-shape members resolve method calls (#359)', async () => {
       // Pre-#359, `recorder.stop()` (recorder: RecorderHandle) attached
       // to `StdioMcpClient.stop` in a sibling directory via path-proximity
