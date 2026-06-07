@@ -63,7 +63,3 @@ tmux-web/
 assets/__pycache__/
 
 assets/generate-waitlist.py
-
-# VS Code extension build output
-vscode-extension/out/
-vscode-extension/node_modules/

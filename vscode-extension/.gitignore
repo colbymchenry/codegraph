@@ -1,0 +1,9 @@
+# VS Code extension build output
+out/
+node_modules/
+
+# VSIX packages
+*.vsix
+
+# Editor settings
+.vscode/

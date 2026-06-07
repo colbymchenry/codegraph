@@ -2,7 +2,7 @@
   "name": "codegraph-vscode-plugin",
   "displayName": "CodeGraph for VSCode",
   "description": "VS Code extension for CodeGraph - semantic code intelligence",
-  "version": "0.9.13",
+  "version": "0.9.14",
   "publisher": "videostack",
   "license": "MIT",
   "icon": "logo.png",
