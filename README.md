@@ -707,3 +707,263 @@ MIT
 [Report Bug](https://github.com/colbymchenry/codegraph/issues) · [Request Feature](https://github.com/colbymchenry/codegraph/issues)
 
 </div>
+
+## 开发改动记录
+
+> 以下记录按时间倒序排列，方便后期快速定位相关修改。
+
+### 2026-06-08 03:45
+
+**改动内容：** 新增 VS Code 扩展 (`vscode-extension/`)
+
+**改动原因：**
+- 为 CodeGraph 增加 VS Code 插件功能，使用户可以在编辑器内直接进行符号搜索、调用图分析、影响分析等操作
+- 通过 MCP stdio 协议与 CodeGraph 子进程通信，避免在 Extension Host 中直接加载 CodeGraph 核心库（Node 版本不匹配问题）
+
+**改动范围：**
+- 新建目录 `vscode-extension/`，包含完整的 VS Code 扩展实现
+- `vscode-extension/package.json` - 扩展 manifest
+- `vscode-extension/tsconfig.json` - TypeScript 配置
+- `vscode-extension/src/extension.ts` - 扩展入口
+- `vscode-extension/src/mcpClient.ts` - 轻量 MCP 客户端
+- `vscode-extension/src/codegraphManager.ts` - 状态机和进程管理
+- `vscode-extension/src/treeProvider.ts` - TreeView 数据提供者
+- `vscode-extension/src/commands.ts` - 命令注册
+- 修改 `.gitignore` - 排除扩展构建产物
+
+**设计要点：**
+- 不破坏现有代码结构，所有新文件在独立目录中
+- 采用 4 状态 FSM（uninitialized → indexing → ready → error）
+- 三级自动降级策略：本地 node_modules → 全局 PATH → 提示安装
+- 指数退避重试机制（最多 3 次）
+- 自动检测 `.codegraph/` 目录，存在则自动启动，不存在则提示用户初始化
+
+**兼容性：**
+- 不影响现有 CLI、MCP 服务器或核心库
+- 对 fork 用户完全透明（可选功能）
+
+### 2026-06-08 04:05
+
+**改动内容：** 修复 VS Code 扩展代码缺陷和完善功能
+
+**修复问题：**
+1. `mcpClient.ts` - `stop()` 方法中 `setTimeout` 无取消机制，导致进程已退出后仍尝试 kill null
+2. `mcpClient.ts` - `sendRequest()` 写操作缺少 try-catch，进程崩溃时抛出未处理异常
+3. `codegraphManager.ts` - `showStatusMenu()` 使用纯字符串数组，VS Code 图标代码无法渲染
+4. `commands.ts` - `openNodeLocation()` 未处理相对路径，CodeGraph 返回相对路径时打开文件失败
+5. `commands.ts` - `openNodeLocation()` 调用未传递 `manager` 参数，导致路径解析缺失
+6. `extension.ts` - 缺少 `onDidSaveTextDocument` 监听，用户保存文件后 TreeView 无刷新反馈
+
+**新增功能：**
+- 文件保存后自动刷新 TreeView（配合 CodeGraph 内部文件 watcher 实现自动更新）
+- `openNodeLocation` 支持相对路径自动解析为绝对路径
+- `showStatusMenu` 使用 `QuickPickItem` 对象，图标正确渲染
+
+**验证：**
+- TypeScript 编译通过，无错误无警告
+
+### 2026-06-08 12:15
+
+**改动内容：** 修复 VS Code 扩展全部严重 bug 和逻辑缺陷（10+ 项修复）
+
+**修复问题：**
+
+🔴 致命 Bug：
+1. **Bug #1 - MCP 响应格式不匹配**：`commands.ts` 假设 `result.results` / `result.nodes` 是数组，但实际 MCP 返回 `{content: [{type: 'text', text: '...'}]}` 格式。添加 `extractMcpText()` 解析函数和 `parseSearchResults()`、`parseNodeList()`、`parseImpactResults()` 三类文本解析器，并增加 `showRawTextOutput()` 降级显示
+
+2. **Bug #2 - 缺少 `initialized` 通知**：MCP 协议要求客户端在 `initialize` 响应后发送 `initialized` 通知，否则可能被未来版本的服务端拒绝。新增 `sendNotification()` 方法和通知发送逻辑
+
+3. **Bug #3 - `stop()` 中 SIGKILL 定时器引用 null 进程**：`this.process = null` 在 `setTimeout` 回调前执行，5 秒后回调触发时 `this.process` 已为 null，SIGKILL 永远不执行。改为保存局部变量 `proc` 后再 null
+
+4. **Bug #4 - 进程崩溃无人监控**：`close` 事件只 reject pending 请求，未设置 `ready=false`，未通知 manager。添加 `onCrash` 回调，manager 注册后自动切换到 `error` 状态并提示用户
+
+🟠 严重 Bug：
+5. **Bug #5 - `codegraph:enabled` 上下文未设置**：TreeView 定义了 `when: "codegraph:enabled"` 但此上下文只在连接成功后设置，导致初始化/错误状态下 TreeView 不可见。改为在 `activate()` 中立即设置 `codegraph:enabled = true`
+
+6. **Bug #6 - `package.json` 图标语法错误**：命令图标使用 `$(add)` 等非标准语法，Activity Bar 需要 SVG 文件路径。移除命令中的 `icon` 字段（命令图标应通过 menus 配置），Activity Bar 改用 `resources/icon.svg`
+
+🟡 中等问题：
+7. **Bug #7 - TreeView 无数据加载**：`treeProvider.ts` 的 Files/Symbols 根节点展开时无子节点。新增 `fetchFilesRoot()` 和 `fetchSymbolsRoot()` 从 MCP 拉取数据
+
+8. **Bug #10 - reindex 断开重连**：reindex 停止再重启 MCP 进程导致短暂服务不可用。改为使用 `codegraph sync` 保持服务器运行，失败时才降级为重启
+
+9. **Bug #8（连带）**：`findCodeGraphCommand()` 声明为 `async` 但使用同步 `execSync`，改为同步函数消除误导
+
+🔵 小问题：
+10. **Bug #9 - `getSymbolAtCursor()` 只取单词**：改为使用 `getWordRangeAtPosition` 的正则版本尝试匹配限定名（`obj.method`），提高符号匹配精度
+
+**变更文件：**
+- `vscode-extension/src/mcpClient.ts` — Bug #2,#3,#4 修复
+- `vscode-extension/src/commands.ts` — Bug #1,#9 修复，新增 MCP 解析函数
+- `vscode-extension/src/codegraphManager.ts` — Bug #4,#5,#10,#12 修复
+- `vscode-extension/src/treeProvider.ts` — Bug #7 修复，新增懒加载
+- `vscode-extension/src/extension.ts` — Bug #5 上下文已移到 manager.activate()
+- `vscode-extension/package.json` — Bug #6 修复，图标和版本更新
+- `vscode-extension/resources/icon.svg` — 新增 Activity Bar 图标
+- `vscode-extension/.vscodeignore` — 新增打包排除规则
+
+**验证：**
+- TypeScript 编译通过，0 错误 0 警告
+
+### 2026-06-08 12:30
+
+**改动内容：** 第二轮审查修复 — 10 个 bug（A-J）
+
+**修复问题：**
+
+🔴 致命 Bug：
+- **Bug A** - `treeProvider.ts` `parseFilePaths()` 无法解析 `codegraph_files` 默认的 tree 格式输出（含 `├── │ └──` 字符）。改为传 `format: 'flat'` 参数获取简单列表格式
+- **Bug B** - `treeProvider.ts` `fetchSymbolsRoot()` 使用 `query: '*'` 搜索，但 FTS5 将裸 `*` 视为前缀操作符返回 0 结果。改为空字符串 `''` 触发 `searchAllByFilters` 返回全部符号
+
+🟠 严重 Bug：
+- **Bug C** - `commands.ts` `extractMcpText()` 不区分 `isError: true` 和成功响应，导致错误文本被当作搜索结果解析。改为返回 `{ text, isError }` 结构，调用方先检查 isError 再决定显示错误提示还是解析结果
+- **Bug D** - `mcpClient.ts` `close` 事件只检查退出码，不处理信号终止。当 OOM killer 发送 SIGKILL 时 code 为 null 而 signal 有值，被误判为正常退出。新增 signal 参数检查
+- **Bug E** - `mcpClient.ts` `start()` 无并发保护，快速点击重试可能 spawn 多个子进程。新增 `startPromise` guard，并发调用返回同一个 Promise
+
+🟡 中等问题：
+- **Bug F** - `treeProvider.ts` `resolvePath()` 在方法内部使用 `require('path')`，每次调用都执行模块加载。改为顶层 `import * as path from 'path'`
+- **Bug G** - `commands.ts` `showRawTextOutput()` 每次调用创建新 OutputChannel，导致 Output 面板下拉菜单中出现多个重复项。改为缓存单一 channel 实例
+
+🔵 小问题：
+- **Bug H** - `codegraphManager.ts` `stopAndRestart()` 先 stop 再 null 再调 startCodeGraph（内部又 stop），意图不清。改为显式 null 检查后 stop
+- **Bug I** - `treeProvider.ts` `parseFilePaths()` 跳过 `-` 开头的行，但 flat 格式正是 `- filePath`。重写为匹配 `- ` 前缀并提取路径
+- **Bug J** - `extension.ts` `activate()` 无 try-catch，极端异常导致扩展静默激活失败。添加全局 try-catch 并显示错误消息
+
+**变更文件：**
+- `vscode-extension/src/mcpClient.ts` — Bug D (signal), Bug E (startPromise guard)
+- `vscode-extension/src/commands.ts` — Bug C (McpTextResult), Bug G (cached channel)
+- `vscode-extension/src/treeProvider.ts` — Bug A (flat format), Bug B (empty query), Bug F (top import), Bug I (parseFilePaths rewrite)
+- `vscode-extension/src/codegraphManager.ts` — Bug H (stopAndRestart cleanup)
+- `vscode-extension/src/extension.ts` — Bug J (try-catch wrapper)
+
+**验证：**
+- TypeScript 编译通过，0 错误 0 警告
+
+### 2026-06-08 04:55
+
+**改动内容：** 插件功能增强 — displayName、索引按钮、双语支持、自动安装
+
+**新增功能：**
+1. **displayName** 改为 "CodeGraph for VS Code"，适配 VS Code Marketplace 发布
+2. **侧边栏按钮** — 顶部新增「建立索引」和「删除索引」按钮，始终显示，根据状态启用/禁用
+3. **双语支持 (zh/en)** — 新增 `i18n.ts` 模块，自动检测 `vscode.env.language`，中文用户使用中文提示，其他语言用户使用英文提示
+4. **自动安装 CodeGraph** — 检测到未安装时静默安装：
+   - 优先使用独立安装脚本（不需要 npm/Node.js）
+   - macOS/Linux: `curl ... | sh`
+   - Windows: `irm ... | iex` (PowerShell)
+   - 降级方案: `npm install -g @colbymchenry/codegraph`
+5. **删除索引** — 新增 `codegraph.deleteIndex` 命令，带确认对话框，删除 `.codegraph/` 目录
+6. **跨平台支持** — `findCodeGraphCommand()` 新增 Windows/macOS/Linux 常见安装路径检测
+
+**变更文件：**
+- `vscode-extension/src/i18n.ts` — 新增双语 i18n 模块（~480 行，覆盖所有 UI 文案）
+- `vscode-extension/src/codegraphManager.ts` — 新增 `buildIndex()`, `deleteIndex()`, `autoInstallCodeGraph()`, `runStandaloneInstaller()`, `runNpmInstaller()`, `isNpmAvailable()`；FSM 新增 `installing` 状态；所有提示改用 `t()` 函数
+- `vscode-extension/src/commands.ts` — 注册 `codegraph.buildIndex` 和 `codegraph.deleteIndex` 命令；所有提示改用 `t()` 函数
+- `vscode-extension/src/treeProvider.ts` — 新增 `installing` 状态节点；所有提示改用 `t()` 函数
+- `vscode-extension/src/extension.ts` — 错误提示改用 `t()` 函数
+- `vscode-extension/package.json` — displayName 改为 "CodeGraph for VS Code"；新增 `buildIndex`/`deleteIndex` 命令和 view/title 菜单项
+
+**验证：**
+- TypeScript 编译通过，0 错误 0 警告
+- 打包成功: `codegraph-vscode-0.9.10.vsix` (63 KB, 28 files)
+
+### 2026-06-08 05:40
+
+**改动内容：** UI 优化 — Activity Bar 悬停名称、图标、刷新按钮双语化
+
+**变更：**
+1. **Activity Bar 悬停名称** — `viewsContainers.activitybar.title` 从 "CodeGraph" 改为 "CodeGraph for VS Code"，鼠标悬停在左侧工具栏图标上时显示完整名称
+2. **Activity Bar 图标** — 使用用户自定义 `logo.svg`（黑底白字 CodeGraph 字样），直接复制到 `resources/icon.svg`。注意：亮色主题下可能显示为黑方块，暗色主题下正常显示
+3. **刷新按钮** — `codegraph.refresh` 命令使用 VS Code 内置 codicon `$(refresh)` 图标，view/title 栏仅显示刷新图标，不显示文字
+4. **双语 NLS 支持** — 新增 `package.nls.json`（英文）、`package.nls.zh-cn.json`（简体中文）、`package.nls.zh-tw.json`（繁体中文），所有命令标题使用 `%key%` 占位符，VS Code 根据显示语言自动切换
+   - 刷新按钮悬停提示：中文显示"刷新"，英文显示"Refresh"
+   - 所有命令面板标题也跟随语言切换
+
+**变更文件：**
+- `vscode-extension/resources/icon.svg` — 使用用户自定义 logo.svg（黑底白字）
+- `vscode-extension/package.json` — Activity Bar title 改为 "CodeGraph for VS Code"；所有命令 title 改用 `%key%` NLS 占位符；refresh 命令使用内置 `$(refresh)` codicon 图标
+- `vscode-extension/package.nls.json` — 新建英文 NLS 文件
+- `vscode-extension/package.nls.zh-cn.json` — 新建简体中文 NLS 文件
+- `vscode-extension/package.nls.zh-tw.json` — 新建繁体中文 NLS 文件
+
+**验证：**
+- TypeScript 编译通过，0 错误 0 警告
+- 打包成功: `codegraph-vscode-0.9.10.vsix` (76 KB, 33 files)
+
+### 2026-06-08 06:00
+
+**改动内容：** 修复 Marketplace 发布限制 — SVG 图标转 PNG
+
+**变更：**
+1. **Marketplace 图标** — VS Code Marketplace 出于安全考虑不允许 SVG 格式的扩展图标。使用 `sharp` 库将 `logo.svg` 转换为 `logo.png`（256x256），在 `package.json` 中添加 `"icon": "logo.png"` 字段
+2. **Activity Bar 图标** — `resources/icon.svg` 保持 SVG 格式不变（内部使用，不受 Marketplace 限制）
+3. **publisher** — 从 `colbymchenry` 改为 `videostack`（匹配 Marketplace 发布者 ID）
+4. **name** — 从 `codegraph-vscode` 改为 `codegraph-for-vscode`（避免与已存在扩展名冲突）
+
+**变更文件：**
+- `vscode-extension/logo.png` — 新建 PNG 图标（256x256，由 logo.svg 转换）
+- `vscode-extension/package.json` — 添加 `"icon": "logo.png"`；publisher 改为 `videostack`；name 改为 `codegraph-for-vscode`
+
+**验证：**
+- 打包成功: `codegraph-for-vscode-0.9.10.vsix` (76 KB, 33 files)
+
+### 2026-06-08 06:25
+
+**改动内容：** 应用市场显示名称更新
+
+**变更：**
+1. **displayName** — 从 "CodeGraph for VS Code" 改为 "CodeGraph for VSCode"（去掉 VS 和 Code 之间的空格）
+2. **Activity Bar title** — 同步更新为 "CodeGraph for VSCode"，悬停提示保持一致
+
+**变更文件：**
+- `vscode-extension/package.json` — displayName 和 viewsContainers.activitybar.title 改为 "CodeGraph for VSCode"
+
+**验证：**
+- 打包成功: `codegraph-vscode-plugin-0.9.10.vsix` (75 KB, 32 files)
+
+### 2026-06-08 06:32
+
+**改动内容：** 添加插件自述文件 + 版本号升级
+
+**变更：**
+1. **README.md** — 新建 `vscode-extension/README.md` 插件自述文件（英文），包含功能介绍、安装指南、使用说明、命令列表、故障排除等内容，Marketplace 页面将显示此文件
+2. **版本号** — 从 `0.9.10` 升级到 `0.9.11`，相同版本号不允许重复发布
+
+**变更文件：**
+- `vscode-extension/README.md` — 新建插件自述文件（~180 行）
+- `vscode-extension/package.json` — version 从 `0.9.10` 改为 `0.9.11`
+
+**验证：**
+- 打包成功: `codegraph-vscode-plugin-0.9.11.vsix` (77 KB, 33 files)
+
+### 2026-06-08 06:37
+
+**改动内容：** 添加 GitHub 仓库链接 + 版本号升级 + URL 统一
+
+**变更：**
+1. **GitHub 仓库** — `package.json` 新增 `repository`、`bugs`、`homepage` 字段，指向 `https://github.com/luowei729/codegraph`，Marketplace "Resources" 区域将显示 Repository、Issues 链接
+2. **版本号** — 从 `0.9.11` 升级到 `0.9.12`
+3. **URL 统一** — 代码和文档中所有 `colbymchenry/codegraph` 引用更新为 `luowei729/codegraph`（安装脚本 URL、npm 包名引用等）
+
+**变更文件：**
+- `vscode-extension/package.json` — 新增 repository/bugs/homepage；version 改为 `0.9.12`
+- `vscode-extension/README.md` — GitHub/Issues/CLI 链接更新为 luowei729/codegraph；安装脚本 URL 同步更新
+- `vscode-extension/src/codegraphManager.ts` — 安装脚本 URL 从 colbymchenry 更新为 luowei729（9 处）
+
+**验证：**
+- TypeScript 编译通过，0 错误 0 警告
+- 打包成功: `codegraph-vscode-plugin-0.9.12.vsix` (78 KB, 33 files)
+
+### 2026-06-08 06:43
+
+**改动内容：** 修复 Marketplace 详情页不显示 GitHub 仓库链接
+
+**变更：**
+1. **repository URL** — `package.json` 中 `repository.url` 必须以 `.git` 结尾，Marketplace 才能识别并显示在 Resources 区域。从 `https://github.com/luowei729/codegraph` 改为 `https://github.com/luowei729/codegraph.git`
+2. **版本号** — 从 `0.9.12` 升级到 `0.9.13`
+
+**变更文件：**
+- `vscode-extension/package.json` — repository.url 添加 `.git` 后缀；version 改为 `0.9.13`
+
+**验证：**
+- 打包成功: `codegraph-vscode-plugin-0.9.13.vsix` (78 KB, 33 files)

@@ -1,0 +1,16 @@
+# Files excluded from VS Code extension packaging
+# Only the compiled JS and necessary resources are included in the .vsix
+
+src/**
+.vscode/**
+tsconfig.json
+node_modules/@types/**
+node_modules/typescript/**
+
+# Include the compiled output
+!out/**
+
+# Include resources (Activity Bar icon)
+!resources/**
+
+# Include package.json and README (automatically included by vsce)

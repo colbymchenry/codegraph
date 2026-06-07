@@ -1,0 +1,11 @@
+{
+  "codegraph.initialize.title": "初始化專案",
+  "codegraph.buildIndex.title": "建立索引",
+  "codegraph.deleteIndex.title": "刪除索引",
+  "codegraph.searchSymbol.title": "搜尋符號",
+  "codegraph.showCallers.title": "顯示呼叫者",
+  "codegraph.showCallees.title": "顯示被呼叫者",
+  "codegraph.showImpact.title": "顯示影響範圍",
+  "codegraph.reindex.title": "重新索引",
+  "codegraph.refresh.title": "重新整理"
+}

@@ -1,0 +1,150 @@
+{
+  "name": "codegraph-vscode-plugin",
+  "displayName": "CodeGraph for VSCode",
+  "description": "VS Code extension for CodeGraph - semantic code intelligence",
+  "version": "0.9.13",
+  "publisher": "videostack",
+  "license": "MIT",
+  "icon": "logo.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/luowei729/codegraph.git"
+  },
+  "bugs": {
+    "url": "https://github.com/luowei729/codegraph/issues"
+  },
+  "homepage": "https://github.com/luowei729/codegraph#readme",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "codegraph",
+    "code-intelligence",
+    "knowledge-graph",
+    "static-analysis"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codegraph.initialize",
+        "title": "%codegraph.initialize.title%",
+        "category": "CodeGraph"
+      },
+      {
+        "command": "codegraph.buildIndex",
+        "title": "%codegraph.buildIndex.title%",
+        "category": "CodeGraph",
+        "icon": "$(add)"
+      },
+      {
+        "command": "codegraph.deleteIndex",
+        "title": "%codegraph.deleteIndex.title%",
+        "category": "CodeGraph",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "codegraph.searchSymbol",
+        "title": "%codegraph.searchSymbol.title%",
+        "category": "CodeGraph"
+      },
+      {
+        "command": "codegraph.showCallers",
+        "title": "%codegraph.showCallers.title%",
+        "category": "CodeGraph"
+      },
+      {
+        "command": "codegraph.showCallees",
+        "title": "%codegraph.showCallees.title%",
+        "category": "CodeGraph"
+      },
+      {
+        "command": "codegraph.showImpact",
+        "title": "%codegraph.showImpact.title%",
+        "category": "CodeGraph"
+      },
+      {
+        "command": "codegraph.reindex",
+        "title": "%codegraph.reindex.title%",
+        "category": "CodeGraph"
+      },
+      {
+        "command": "codegraph.refresh",
+        "title": "%codegraph.refresh.title%",
+        "category": "CodeGraph",
+        "icon": "$(refresh)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codegraph",
+          "title": "CodeGraph for VSCode",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "codegraph": [
+        {
+          "id": "codegraphExplorer",
+          "name": "Explorer"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "codegraph.buildIndex",
+          "when": "view == codegraphExplorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codegraph.deleteIndex",
+          "when": "view == codegraphExplorer && codegraph:ready",
+          "group": "navigation@2"
+        },
+        {
+          "command": "codegraph.refresh",
+          "when": "view == codegraphExplorer",
+          "group": "navigation@3"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "codegraph.showCallers",
+          "when": "codegraph:ready"
+        },
+        {
+          "command": "codegraph.showCallees",
+          "when": "codegraph:ready"
+        },
+        {
+          "command": "codegraph.showImpact",
+          "when": "codegraph:ready"
+        },
+        {
+          "command": "codegraph.searchSymbol",
+          "when": "codegraph:ready"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.0.0"
+  }
+}

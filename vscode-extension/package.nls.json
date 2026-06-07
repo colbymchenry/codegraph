@@ -1,0 +1,11 @@
+{
+  "codegraph.initialize.title": "Initialize Project",
+  "codegraph.buildIndex.title": "Build Index",
+  "codegraph.deleteIndex.title": "Delete Index",
+  "codegraph.searchSymbol.title": "Search Symbol",
+  "codegraph.showCallers.title": "Show Callers",
+  "codegraph.showCallees.title": "Show Callees",
+  "codegraph.showImpact.title": "Show Impact",
+  "codegraph.reindex.title": "Re-index",
+  "codegraph.refresh.title": "Refresh"
+}
