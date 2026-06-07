@@ -10,7 +10,7 @@ import * as path from 'path';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'razor' | 'visualforce' | 'lwc' | 'aura' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -33,6 +33,9 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   swift: 'tree-sitter-swift.wasm',
   kotlin: 'tree-sitter-kotlin.wasm',
   dart: 'tree-sitter-dart.wasm',
+  // Apex grammar isn't in tree-sitter-wasms — vendored from web-tree-sitter-sfapex
+  // (ABI 15, MIT). See the vendored-wasm branch in loadGrammarsForLanguages.
+  apex: 'tree-sitter-apex.wasm',
   pascal: 'tree-sitter-pascal.wasm',
   scala: 'tree-sitter-scala.wasm',
   lua: 'tree-sitter-lua.wasm',
@@ -90,6 +93,20 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.kt': 'kotlin',
   '.kts': 'kotlin',
   '.dart': 'dart',
+  // Salesforce Apex: classes (.cls), triggers (.trigger), anonymous Apex (.apex)
+  '.cls': 'apex',
+  '.trigger': 'apex',
+  '.apex': 'apex',
+  // Visualforce pages (.page) and components (.component) — custom markup
+  // extractor links controller/extensions/<c:comp> to Apex/components.
+  '.page': 'visualforce',
+  '.component': 'visualforce',
+  // Aura components (.cmp), apps (.app), events (.evt), interfaces (.intf) —
+  // custom markup extractor links <c:child>/{!c.handler} to components/methods.
+  '.cmp': 'aura',
+  '.app': 'aura',
+  '.evt': 'aura',
+  '.intf': 'aura',
   '.liquid': 'liquid',
   '.svelte': 'svelte',
   '.vue': 'vue',
@@ -122,6 +139,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
 export function isSourceFile(filePath: string): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
   if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
+  if (isLwcTemplate(filePath)) return true; // LWC bundle .html template (path-gated, not all .html)
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
   return filePath.slice(dot).toLowerCase() in EXTENSION_MAP;
@@ -136,6 +154,15 @@ export function isShopifyLiquidJson(filePath: string): boolean {
   // Allow nested template dirs (`templates/customers/login.json`), not just
   // top-level (`templates/product.json`).
   return /(^|\/)(templates|sections)\/.+\.json$/i.test(filePath);
+}
+
+/**
+ * Lightning Web Component HTML template: `.../lwc/<bundle>/<file>.html`.
+ * Path-gated so only LWC bundle templates are indexed — generic `.html` files
+ * elsewhere are not in EXTENSION_MAP and stay unindexed (no HTML hijack).
+ */
+export function isLwcTemplate(filePath: string): boolean {
+  return /(?:^|\/)lwc\/[^/]+\/[^/]+\.html$/i.test(filePath);
 }
 
 /**
@@ -201,7 +228,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
       // 0.25 (drops nested calls/imports on every file after the first); we
       // vendor the upstream ABI-15 wasm instead.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'apex')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -261,6 +288,9 @@ export function detectLanguage(filePath: string, source?: string): Language {
   // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
   // links each section `"type"` to its `sections/<type>.liquid`).
   if (isShopifyLiquidJson(filePath)) return 'liquid';
+  // LWC bundle .html templates → custom LWC template extractor (path-gated so
+  // generic .html stays unindexed).
+  if (isLwcTemplate(filePath)) return 'lwc';
   const lang = EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content
@@ -298,6 +328,9 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'vue') return true; // custom extractor (script block delegation)
   if (language === 'liquid') return true; // custom regex extractor
   if (language === 'razor') return true; // custom RazorExtractor (.cshtml/.razor markup)
+  if (language === 'visualforce') return true; // custom VisualforceExtractor (.page/.component markup)
+  if (language === 'lwc') return true; // custom LwcTemplateExtractor (lwc/*.html templates)
+  if (language === 'aura') return true; // custom AuraExtractor (.cmp/.app/.evt/.intf markup)
   if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver
   if (language === 'twig') return true; // file-level tracking only
   if (language === 'xml') return true; // MyBatis mapper extractor
@@ -310,7 +343,7 @@ export function isLanguageSupported(language: Language): boolean {
  * Check if a grammar has been loaded and is ready for parsing.
  */
 export function isGrammarLoaded(language: Language): boolean {
-  if (language === 'svelte' || language === 'vue' || language === 'liquid' || language === 'razor') return true;
+  if (language === 'svelte' || language === 'vue' || language === 'liquid' || language === 'razor' || language === 'visualforce' || language === 'lwc' || language === 'aura') return true;
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
   if (language === 'xml' || language === 'properties') return true; // no WASM grammar needed
   return languageCache.has(language);
@@ -333,7 +366,7 @@ export function isFileLevelOnlyLanguage(language: Language): boolean {
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid', 'visualforce', 'lwc', 'aura'];
 }
 
 /**
@@ -397,6 +430,10 @@ export function getLanguageDisplayName(language: Language): string {
     swift: 'Swift',
     kotlin: 'Kotlin',
     dart: 'Dart',
+    apex: 'Apex',
+    visualforce: 'Visualforce',
+    lwc: 'LWC',
+    aura: 'Aura',
     svelte: 'Svelte',
     vue: 'Vue',
     liquid: 'Liquid',

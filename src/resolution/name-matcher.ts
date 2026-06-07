@@ -135,6 +135,29 @@ export function isKnownLanguageFamily(lang: string): boolean {
   return LANGUAGE_FAMILY[lang] !== undefined;
 }
 /**
+ * Singleton-family languages that are nonetheless self-sufficient,
+ * general-purpose PROGRAMMING languages (their own runtime + builtins). Like
+ * the known-family ones, they never invoke another language by a bare
+ * coincidental name — a real FFI/cross-layer call goes through a framework or
+ * import resolver. They are NOT in {@link LANGUAGE_FAMILY} (no sibling shares
+ * their runtime), so this set carries the same "self-sufficient caller" signal
+ * for the cross-family `calls` gate. Markup/template/config languages
+ * (visualforce/lwc/aura/svelte/vue/liquid/twig/xml/yaml/…) are deliberately
+ * excluded — they legitimately dispatch to code in another language by name
+ * (config↔code bridges), so they stay ungated.
+ */
+const STANDALONE_CODE_LANGUAGES = new Set([
+  'python', 'go', 'rust', 'php', 'ruby', 'dart', 'lua', 'luau', 'pascal',
+]);
+/**
+ * True when a CALLER in `lang` is a self-sufficient programming language —
+ * either a known multi-language family member or a standalone language above.
+ * Such a caller's bare cross-family `calls` are name collisions, not calls.
+ */
+export function isSelfSufficientCaller(lang: string): boolean {
+  return isKnownLanguageFamily(lang) || STANDALONE_CODE_LANGUAGES.has(lang);
+}
+/**
  * True when `a` and `b` are two DIFFERENT *known* language families — the
  * signature of a coincidental cross-language name collision (a TS `import
  * React` matching a Swift `import React`, a C++ `#include "X.h"` matching a
@@ -148,7 +171,7 @@ export function crossesKnownFamily(a: string, b: string): boolean {
   return isKnownLanguageFamily(a) && isKnownLanguageFamily(b) && !sameLanguageFamily(a, b);
 }
 /**
- * Drop cross-language candidates from a name lookup. Two regimes:
+ * Drop cross-language candidates from a name lookup. Three regimes:
  *  - `references` (type-usage): a type named in language X resolves to a
  *    SAME-family type, never a coincidentally same-named symbol in another
  *    language (the Android `BatteryManager` system class vs a JS one). Strict
@@ -156,6 +179,17 @@ export function crossesKnownFamily(a: string, b: string): boolean {
  *  - `imports` (import binding): an `import`/`#include` never crosses two
  *    KNOWN families (TS `import React` ↮ Swift `import React`). Weaker
  *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
+ *  - `calls`: left ungated for callers in a MARKUP/TEMPLATE/CONFIG language
+ *    (`aura`/`visualforce`/`liquid`/`yaml` → code, and other config↔code
+ *    bridges) so genuine cross-layer calls with no same-language target survive.
+ *    But a caller in a self-sufficient PROGRAMMING language (js/ts, java/kotlin,
+ *    swift/objc, c/cpp, and standalone python/go/rust/php/ruby/dart/lua/pascal)
+ *    has its own runtime + builtins: a real cross-family call from it goes
+ *    through a framework or import resolver, never a bare coincidental name. So
+ *    for those callers we keep only same-family candidates — otherwise a JS
+ *    `String.replace()` (or a Python `str.replace()`) binds to an Apex
+ *    `CurrencyTokenReplacer::replace`, a JS `.resolve()` to an Apex `…::resolve`,
+ *    etc. (a name collision, not a call).
  */
 function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
   if (ref.referenceKind === 'references') {
@@ -163,6 +197,9 @@ function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
   }
   if (ref.referenceKind === 'imports') {
     return candidates.filter((c) => !crossesKnownFamily(c.language, ref.language));
+  }
+  if (ref.referenceKind === 'calls' && isSelfSufficientCaller(ref.language)) {
+    return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
   }
   return candidates;
 }

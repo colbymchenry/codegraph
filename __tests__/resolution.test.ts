@@ -1223,6 +1223,88 @@ func main() {
     });
   });
 
+  describe('Name Matcher: cross-family `calls` gate', () => {
+    const baseContext = (candidates: Node[]): ResolutionContext => ({
+      getNodesInFile: () => [],
+      getNodesByName: (name) => candidates.filter((c) => c.name === name),
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      fileExists: () => true,
+      readFile: () => null,
+      getProjectRoot: () => '/test',
+      getAllFiles: () => [],
+      getNodesByLowerName: () => [],
+      getImportMappings: () => [],
+    });
+
+    const apexReplace: Node = {
+      id: 'apex:CurrencyTokenReplacer.cls:replace:10', kind: 'method', name: 'replace',
+      qualifiedName: 'CurrencyTokenReplacer::replace', filePath: 'classes/CurrencyTokenReplacer.cls',
+      language: 'apex', startLine: 10, endLine: 20, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+    };
+
+    it('drops a JS bare call that only collides with a foreign-language method name', () => {
+      // A TS file calling `someString.replace(...)` emits a bare `replace`
+      // call ref. The graph has no JS `replace` node (it's a String builtin),
+      // only an Apex `CurrencyTokenReplacer::replace`. A known-family caller
+      // (web) must NOT bind to a different family by bare coincidental name.
+      const ref = {
+        fromNodeId: 'func:DataTransformer.ts:cleanText:1',
+        referenceName: 'replace',
+        referenceKind: 'calls' as const,
+        line: 5, column: 0, filePath: 'src/utils/DataTransformer.ts', language: 'typescript' as const,
+      };
+      const result = matchReference(ref, baseContext([apexReplace]));
+      expect(result).toBeNull();
+    });
+
+    it('still resolves a same-language call when a same-family candidate exists', () => {
+      // If a real TS `replace` method exists, the cross-family Apex one is
+      // dropped but the same-language one is kept.
+      const tsReplace: Node = {
+        id: 'ts:tokens.ts:replace:3', kind: 'method', name: 'replace',
+        qualifiedName: 'tokens.ts::TokenReplacer.replace', filePath: 'src/tokens.ts',
+        language: 'typescript', startLine: 3, endLine: 6, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const ref = {
+        fromNodeId: 'func:main.ts:run:1',
+        referenceName: 'replace',
+        referenceKind: 'calls' as const,
+        line: 5, column: 0, filePath: 'src/main.ts', language: 'typescript' as const,
+      };
+      const result = matchReference(ref, baseContext([apexReplace, tsReplace]));
+      expect(result?.targetNodeId).toBe('ts:tokens.ts:replace:3');
+    });
+
+    it('drops a Python bare call that only collides with a foreign-language method name', () => {
+      // Python is a singleton family but a self-sufficient programming language:
+      // a `str.replace(...)` builtin must NOT bind to the Apex `replace`.
+      const ref = {
+        fromNodeId: 'func:tokens.py:clean:1',
+        referenceName: 'replace',
+        referenceKind: 'calls' as const,
+        line: 5, column: 0, filePath: 'scripts/tokens.py', language: 'python' as const,
+      };
+      const result = matchReference(ref, baseContext([apexReplace]));
+      expect(result).toBeNull();
+    });
+
+    it('keeps a cross-layer call from a markup/template caller (Aura → Apex)', () => {
+      // Aura is not in LANGUAGE_FAMILY, so it stays ungated: a genuine
+      // cross-layer server call (`cmp.get("c.replace")`) with no same-language
+      // target survives — the gate only fences off self-sufficient known
+      // families (js/ts, java/kotlin, …), not config↔code bridges.
+      const ref = {
+        fromNodeId: 'aura:Foo.cmp:Foo:1',
+        referenceName: 'replace',
+        referenceKind: 'calls' as const,
+        line: 5, column: 0, filePath: 'aura/Foo/FooController.js', language: 'aura' as const,
+      };
+      const result = matchReference(ref, baseContext([apexReplace]));
+      expect(result?.targetNodeId).toBe('apex:CurrencyTokenReplacer.cls:replace:10');
+    });
+  });
+
   describe('tsconfig path aliases', () => {
     it('resolves an aliased import to the alias-mapped file (not a same-named file elsewhere)', async () => {
       // Two same-named exports in different directories. Without alias
