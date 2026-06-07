@@ -1168,7 +1168,20 @@ func main() {
       expect(result?.targetNodeId).toBe('ts:tokens.ts:replace:3');
     });
 
-    it('keeps a cross-layer call from a singleton-family caller (Aura → Apex)', () => {
+    it('drops a Python bare call that only collides with a foreign-language method name', () => {
+      // Python is a singleton family but a self-sufficient programming language:
+      // a `str.replace(...)` builtin must NOT bind to the Apex `replace`.
+      const ref = {
+        fromNodeId: 'func:tokens.py:clean:1',
+        referenceName: 'replace',
+        referenceKind: 'calls' as const,
+        line: 5, column: 0, filePath: 'scripts/tokens.py', language: 'python' as const,
+      };
+      const result = matchReference(ref, baseContext([apexReplace]));
+      expect(result).toBeNull();
+    });
+
+    it('keeps a cross-layer call from a markup/template caller (Aura → Apex)', () => {
       // Aura is not in LANGUAGE_FAMILY, so it stays ungated: a genuine
       // cross-layer server call (`cmp.get("c.replace")`) with no same-language
       // target survives — the gate only fences off self-sufficient known
