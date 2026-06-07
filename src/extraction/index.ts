@@ -174,6 +174,12 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
   } catch {
     // Unreadable root .gitignore — the built-in defaults still apply.
   }
+  try {
+    const rootCodegraphIgnore = path.join(rootDir, '.codegraphignore');
+    if (fs.existsSync(rootCodegraphIgnore)) ig.add(fs.readFileSync(rootCodegraphIgnore, 'utf-8'));
+  } catch {
+    // Unreadable root .codegraphignore
+  }
   return ig;
 }
 
@@ -265,7 +271,35 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     // committing a dependency/build dir doesn't make it project code. A
     // `.gitignore` negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
     const ig = buildDefaultIgnore(rootDir);
-    return new Set([...files].filter((f) => !ig.ignores(f)));
+    
+    // Find and parse all nested .codegraphignore files for a manual pass
+    // so we can apply them to both tracked and untracked files properly.
+    const codegraphIgnores: { dir: string; ig: Ignore }[] = [];
+    for (const f of files) {
+      if (f.endsWith('.codegraphignore')) {
+        const filePath = path.join(rootDir, f);
+        try {
+          const dir = path.dirname(f);
+          const relDir = dir === '.' ? '' : dir;
+          const matcher = ignore().add(fs.readFileSync(filePath, 'utf-8'));
+          codegraphIgnores.push({ dir: relDir, ig: matcher });
+        } catch {}
+      }
+    }
+
+    return new Set([...files].filter((f) => {
+      if (ig.ignores(f)) return false;
+      
+      for (const { dir, igMatcher } of codegraphIgnores.map(i => ({ dir: i.dir, igMatcher: i.ig }))) {
+        let rel = f;
+        if (dir !== '') {
+          if (!f.startsWith(dir + '/')) continue;
+          rel = f.slice(dir.length + 1);
+        }
+        if (igMatcher.ignores(rel)) return false;
+      }
+      return true;
+    }));
   } catch {
     return null;
   }
@@ -404,12 +438,23 @@ function scanDirectoryWalk(
 
   const loadIgnore = (dir: string): ScopedIgnore | null => {
     try {
+      const ig = ignore();
+      let found = false;
       const giPath = path.join(dir, '.gitignore');
       if (fs.existsSync(giPath)) {
-        return { dir, ig: ignore().add(fs.readFileSync(giPath, 'utf-8')) };
+        ig.add(fs.readFileSync(giPath, 'utf-8'));
+        found = true;
+      }
+      const cgiPath = path.join(dir, '.codegraphignore');
+      if (fs.existsSync(cgiPath)) {
+        ig.add(fs.readFileSync(cgiPath, 'utf-8'));
+        found = true;
+      }
+      if (found) {
+        return { dir, ig };
       }
     } catch {
-      // Unreadable .gitignore — treat as absent.
+      // Unreadable — treat as absent.
     }
     return null;
   };
