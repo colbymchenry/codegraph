@@ -148,7 +148,7 @@ export function crossesKnownFamily(a: string, b: string): boolean {
   return isKnownLanguageFamily(a) && isKnownLanguageFamily(b) && !sameLanguageFamily(a, b);
 }
 /**
- * Drop cross-language candidates from a name lookup. Two regimes:
+ * Drop cross-language candidates from a name lookup. Three regimes:
  *  - `references` (type-usage): a type named in language X resolves to a
  *    SAME-family type, never a coincidentally same-named symbol in another
  *    language (the Android `BatteryManager` system class vs a JS one). Strict
@@ -156,6 +156,15 @@ export function crossesKnownFamily(a: string, b: string): boolean {
  *  - `imports` (import binding): an `import`/`#include` never crosses two
  *    KNOWN families (TS `import React` ↮ Swift `import React`). Weaker
  *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
+ *  - `calls`: left ungated for callers in a SINGLETON/unknown family
+ *    (`aura`/`visualforce` → `apex`, and other config↔code bridges) so genuine
+ *    cross-layer calls with no same-language target survive. But a caller in a
+ *    KNOWN multi-language family (js/ts, java/kotlin, swift/objc, c/cpp, …) is
+ *    self-sufficient: a real cross-family call from it goes through a framework
+ *    or import resolver, never a bare coincidental name. So for those callers we
+ *    keep only same-family candidates — otherwise a JS `String.replace()` binds
+ *    to an Apex `CurrencyTokenReplacer::replace`, a JS `.resolve()` to an Apex
+ *    `…::resolve`, etc. (a name collision, not a call).
  */
 function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
   if (ref.referenceKind === 'references') {
@@ -163,6 +172,9 @@ function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
   }
   if (ref.referenceKind === 'imports') {
     return candidates.filter((c) => !crossesKnownFamily(c.language, ref.language));
+  }
+  if (ref.referenceKind === 'calls' && isKnownLanguageFamily(ref.language)) {
+    return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
   }
   return candidates;
 }

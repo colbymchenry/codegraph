@@ -83,6 +83,27 @@ function resolveLwcTemplateRef(ref: UnresolvedRef, context: ResolutionContext): 
   };
 }
 
+/**
+ * Resolve an Aura controller's server call to Apex. An Aura JS controller
+ * (`aura/<bundle>/<bundle>Controller|Helper|Renderer.js`) invokes a server
+ * method as `cmp.get("c.method")`; the extractor emits a bare `method` `calls`
+ * ref. The file is plain `javascript`, so the generic name-matcher's
+ * cross-family `calls` gate would (correctly, for coincidental collisions) drop
+ * it — but this IS a deliberate cross-layer dispatch, so the framework resolver
+ * binds it to the same-named Apex method here (Strategy 1, ungated). Scoped to
+ * the `aura/` bundle path so ordinary app JS never reaches it.
+ */
+function resolveAuraApexCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
+  if (ref.language !== 'javascript' && ref.language !== 'typescript') return null;
+  if (!/(^|\/)aura\/[^/]+\/[^/]+\.js$/i.test(ref.filePath)) return null;
+  const target = context
+    .getNodesByName(ref.referenceName)
+    .find((n) => n.kind === 'method' && n.language === 'apex');
+  if (!target) return null;
+  return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'framework' };
+}
+
 export const salesforceResolver: FrameworkResolver = {
   name: 'salesforce',
   languages: ['javascript', 'typescript', 'visualforce', 'lwc', 'aura'],
@@ -116,6 +137,10 @@ export const salesforceResolver: FrameworkResolver = {
       if (!target) return null;
       return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'framework' };
     }
+
+    // Aura controller JS `cmp.get("c.method")` → same-named Apex method.
+    const auraCall = resolveAuraApexCall(ref, context);
+    if (auraCall) return auraCall;
 
     // LWC/Aura JS: only the import binding and its call sites link to Apex.
     if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'imports') return null;
