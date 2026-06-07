@@ -1277,7 +1277,17 @@ function resolvePythonModuleMember(
         ? imp.source + imp.localName
         : imp.source + '.' + imp.localName;
 
-    const resolvedPath = resolveImportPath(modulePath, ref.filePath, ref.language, context);
+    // resolveImportPath only maps RELATIVE dotted paths (`.mod`, `..pkg.mod`); an
+    // ABSOLUTE package path (`pkg.module` from `from pkg import module`, or a bare
+    // `import pkg.mod`) resolves to null there, so fall back to the dotted-module
+    // file lookup — the same asymmetry resolveModuleImportToFile already handles
+    // for the file→file import edge. Without this, a `module.func()` call after
+    // `from pkg import module` dropped its `calls` edge even though the import
+    // edge resolved (#578).
+    let resolvedPath = resolveImportPath(modulePath, ref.filePath, ref.language, context);
+    if (!resolvedPath) {
+      resolvedPath = findPythonModuleFile(modulePath, context, ref.filePath)?.filePath ?? null;
+    }
     if (!resolvedPath || resolvedPath === ref.filePath) continue;
 
     // Find the member as a top-level definition in the module file. Exclude

@@ -853,6 +853,56 @@ func UseAliased() {
       expect(target?.filePath.replace(/\\/g, '/')).toBe('pkgb/lib.go');
     });
 
+    it('resolves Python module-attribute calls after `from pkg import module` (#578)', async () => {
+      // Pre-#578, a `module.func()` call where `module` was bound via
+      // `from pkg import module` dropped its `calls` edge. The file→file import
+      // edge resolved (resolveModuleImportToFile falls back to a dotted-module
+      // file lookup for absolute package paths), but resolvePythonModuleMember
+      // had no such fallback — resolveImportPath returns null for an absolute
+      // package path like `pkg.module`, so the member never resolved and
+      // callers/callees/impact on the target came back empty. Same root-cause
+      // class as the Go cross-package qualified call (#388).
+      fs.mkdirSync(path.join(tempDir, 'pkg'));
+      fs.writeFileSync(path.join(tempDir, 'pkg', '__init__.py'), '');
+      fs.writeFileSync(
+        path.join(tempDir, 'pkg', 'module.py'),
+        'def func():\n    return 1\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'main.py'),
+        `from pkg import module
+import os
+
+
+def caller():
+    return module.func()
+
+
+def external_caller():
+    return os.getcwd()
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const caller = cg.getNodesByKind('function').filter((n) => n.name === 'caller')[0];
+      expect(caller).toBeDefined();
+      const calls = cg.getOutgoingEdges(caller!.id).filter((e) => e.kind === 'calls');
+      // module.func() must resolve to the real function in the submodule file.
+      expect(calls).toHaveLength(1);
+      const target = cg.getNode(calls[0]!.target);
+      expect(target?.name).toBe('func');
+      expect(target?.filePath.replace(/\\/g, '/')).toBe('pkg/module.py');
+
+      // The flip side of the fix: an attribute call through a *stdlib* module
+      // (`os.getcwd()`) must still create no edge — the fallback only matches
+      // real in-repo module files.
+      const externalCaller = cg.getNodesByKind('function').filter((n) => n.name === 'external_caller')[0];
+      expect(externalCaller).toBeDefined();
+      const externalCalls = cg.getOutgoingEdges(externalCaller!.id).filter((e) => e.kind === 'calls');
+      expect(externalCalls).toHaveLength(0);
+    });
+
     it('TS type_alias object-shape members resolve method calls (#359)', async () => {
       // Pre-#359, `recorder.stop()` (recorder: RecorderHandle) attached
       // to `StdioMcpClient.stop` in a sibling directory via path-proximity
