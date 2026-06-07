@@ -1132,6 +1132,41 @@ public class DataExporter
       expect(userIncoming.length).toBeGreaterThanOrEqual(3);
     });
 
+    it('C# primary-constructor parameters record their type dependencies (#237)', async () => {
+      // C# 12 primary constructors declare a type's injected dependencies inline
+      // (`class Svc(IRepo repo, [FromKeyedServices("k")] ICache cache)`). Each
+      // ctor parameter's type is recorded as a `references` edge from the class,
+      // so a DI-registered contract reached only through a primary ctor is no
+      // longer reported as having no dependents.
+      fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'Contracts.cs'),
+        `namespace App;
+public interface IRepo { }
+public class ICache { }
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'OrderService.cs'),
+        `namespace App;
+public sealed class OrderService(IRepo repo, [FromKeyedServices("primary")] ICache cache)
+{
+  public void Run() { }
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const svc = cg.getNodesByKind('class').find((n) => n.name === 'OrderService');
+      expect(svc).toBeDefined();
+      // The class itself must index (it used to vanish under the old grammar).
+      const out = cg.getOutgoingEdges(svc!.id).filter((e) => e.kind === 'references');
+      const depNames = out.map((e) => cg.getNode(e.target)?.name);
+      expect(depNames).toContain('IRepo');
+      expect(depNames).toContain('ICache'); // the keyed-DI ([FromKeyedServices]) dependency
+    });
+
     it('Go: leaves stdlib calls (fmt.Println, etc.) external', async () => {
       fs.writeFileSync(
         path.join(tempDir, 'go.mod'),

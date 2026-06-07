@@ -272,6 +272,14 @@ export class TreeSitterExtractor {
     }
 
     try {
+      // Optional pre-parse source transform (offset-preserving) to work around
+      // grammar gaps — e.g. C# blanks conditional-compilation directive lines
+      // the grammar mis-parses inside enum bodies (#237). We reassign
+      // this.source so downstream getNodeText reads the same bytes the parser
+      // saw (identical outside the blanked directive lines).
+      if (this.extractor?.preParse) {
+        this.source = this.extractor.preParse(this.source);
+      }
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
         throw new Error('Parser returned null tree');
@@ -853,6 +861,9 @@ export class TreeSitterExtractor {
     // Extract extends/implements
     this.extractInheritance(node, classNode.id);
 
+    // C# primary-constructor parameter dependencies (`class Svc(IRepo r, …)`).
+    this.extractCsharpPrimaryCtorParamRefs(node, classNode.id);
+
     // Extract decorators applied to the class (`@Foo class X {}`).
     this.extractDecoratorsFor(node, classNode.id);
 
@@ -1026,6 +1037,10 @@ export class TreeSitterExtractor {
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
     this.extractInheritance(node, structNode.id);
+
+    // C# primary-constructor parameter dependencies (`struct P(int x)`, and
+    // `record struct M(decimal Amount)` which the grammar nests here).
+    this.extractCsharpPrimaryCtorParamRefs(node, structNode.id);
 
     // Push to stack for field extraction
     this.nodeStack.push(structNode.id);
@@ -3486,8 +3501,11 @@ export class TreeSitterExtractor {
    * `tuple_type`, …) — none of which are `type_identifier`. Closes #381.
    */
   private extractCsharpTypeRefs(node: SyntaxNode, nodeId: string): void {
-    // Return type / property type — the field is named `type`.
-    const directType = getChildByField(node, 'type');
+    // A property's type is under the `type` field; a method/constructor's RETURN
+    // type is under `returns` (tree-sitter-c-sharp 0.23.x — older builds used
+    // `type` for both). A node carries only one of the two, so checking both
+    // covers return types and property types without conflating them.
+    const directType = getChildByField(node, 'type') ?? getChildByField(node, 'returns');
     if (directType) this.walkCsharpTypePosition(directType, nodeId);
 
     // Field declarations wrap declarators in a `variable_declaration`
@@ -3513,6 +3531,29 @@ export class TreeSitterExtractor {
         const paramType = getChildByField(child, 'type');
         if (paramType) this.walkCsharpTypePosition(paramType, nodeId);
       }
+    }
+  }
+
+  /**
+   * Record the dependencies declared by a C# PRIMARY CONSTRUCTOR
+   * (`class Svc(IRepo repo, [FromKeyedServices("k")] ICache cache) { … }`,
+   * C# 12+). The parameter list hangs off the class/struct/record declaration
+   * as an unnamed-field `parameter_list` child (not the `parameters` field a
+   * method uses), so it's found by node type. Each parameter's declared type
+   * becomes a `references` edge from the owning type — these are exactly the
+   * services a DI-registered type depends on, so impact/blast-radius and
+   * "who depends on this contract" now see them. No-op when there's no primary
+   * constructor. (#237)
+   */
+  private extractCsharpPrimaryCtorParamRefs(node: SyntaxNode, ownerId: string): void {
+    if (this.language !== 'csharp') return;
+    const paramList = node.namedChildren.find((c: SyntaxNode) => c.type === 'parameter_list');
+    if (!paramList) return;
+    for (let i = 0; i < paramList.namedChildCount; i++) {
+      const param = paramList.namedChild(i);
+      if (!param || param.type !== 'parameter') continue;
+      const paramType = getChildByField(param, 'type');
+      if (paramType) this.walkCsharpTypePosition(paramType, ownerId);
     }
   }
 

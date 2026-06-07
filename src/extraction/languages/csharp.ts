@@ -2,7 +2,38 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/**
+ * Blank C# conditional-compilation directive lines (`#if` / `#elif` / `#else` /
+ * `#endif`) before parsing. The vendored tree-sitter-c-sharp grammar mis-parses
+ * a `#if` that appears *inside an enum member list* — the canonical
+ * multi-targeting shape:
+ *
+ *   enum ReadType {
+ *   #if HAVE_DATE_TIME_OFFSET
+ *       ReadAsDateTimeOffset,
+ *   #endif
+ *       ReadAsDouble,
+ *   }
+ *
+ * It emits an ERROR that, for a nested enum, detaches the *enclosing class's*
+ * member list, so most of the class's methods drop out of the index. Removing
+ * the directive lines (keeping the guarded code) sidesteps it. Both branches of
+ * an `#if/#else` are kept — the same behaviour the previous grammar produced,
+ * and the right default for a code graph (index every symbol regardless of
+ * build flags). Replacement preserves byte offsets (directive text → spaces,
+ * newlines kept) so every symbol's line/column stays exact. (#237)
+ */
+export function blankCsharpPreprocessorDirectives(source: string): string {
+  if (source.indexOf('#') === -1) return source;
+  // Conditional-compilation directives only. `#region`/`#pragma`/`#nullable`
+  // parse fine and are left alone. A directive must be the first non-space token
+  // on its line (C# requirement), so anchor to line start.
+  const re = /^([ \t]*)#[ \t]*(if|elif|else|endif)\b[^\n]*/gm;
+  return source.replace(re, (m, indent) => indent + ' '.repeat(m.length - indent.length));
+}
+
 export const csharpExtractor: LanguageExtractor = {
+  preParse: blankCsharpPreprocessorDirectives,
   functionTypes: [],
   // Records are first-class type declarations in modern C# (DTOs, value objects,
   // MediatR/CQRS messages). `record` / `record class` parse as record_declaration
