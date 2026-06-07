@@ -21,4 +21,9 @@
  * turns the re-index hint into noise — keep it honest (see CLAUDE.md, "Honesty
  * in the product is load-bearing").
  */
-export const EXTRACTION_VERSION = 1;
+// v2: added Salesforce Apex (.cls/.trigger/.apex) language extractor.
+// v3: added Salesforce resolver — LWC/Aura JS → Apex method (@salesforce/apex import).
+// v4: added Visualforce (.page/.component) extractor — page → controller/extensions/<c:comp>.
+// v5: added LWC HTML template (lwc/*.html) extractor — template → <c-child> component.
+// v6: added Aura (.cmp/.app/.evt/.intf) extractor + Aura JS handlers + cmp.get("c.x") → Apex.
+export const EXTRACTION_VERSION = 6;

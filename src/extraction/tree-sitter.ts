@@ -21,6 +21,9 @@ import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
+import { VisualforceExtractor } from './visualforce-extractor';
+import { LwcTemplateExtractor } from './lwc-template-extractor';
+import { AuraExtractor } from './aura-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
@@ -222,12 +225,17 @@ export class TreeSitterExtractor {
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
   private methodIndex: Map<string, string> | null = null; // lookup key → node ID for Pascal defProc lookup
+  // Aura controller/helper/renderer JS: a bare `({ handler: function(){} })`
+  // object literal whose members are handlers. Path-gated so only aura/ bundle
+  // files get the object-literal handler treatment (no effect on other JS).
+  private isAuraComponentJs: boolean;
 
   constructor(filePath: string, source: string, language?: Language) {
     this.filePath = filePath;
     this.source = source;
     this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
+    this.isAuraComponentJs = /(^|\/)aura\/[^/]+\/[^/]+(Controller|Helper|Renderer)\.js$/i.test(filePath);
   }
 
   /**
@@ -358,6 +366,21 @@ export class TreeSitterExtractor {
       const ctx = this.makeExtractorContext();
       const handled = this.extractor.visitNode(node, ctx);
       if (handled) return;
+    }
+
+    // Aura controller/helper/renderer: a top-level `({ handler: function(){} })`
+    // expression statement. The generic object-method gate only covers
+    // `export const x = {...}`; Aura uses a bare parenthesized object, so handle
+    // it here and extract each member as a handler node (path-gated to aura/
+    // bundle files — no effect on other JS). Returns to skip the default walk so
+    // handler-body calls attribute to the handler, not the file.
+    if (this.isAuraComponentJs && nodeType === 'expression_statement') {
+      const paren = node.namedChild(0);
+      const obj = paren?.type === 'parenthesized_expression' ? paren.namedChild(0) : null;
+      if (obj && (obj.type === 'object' || obj.type === 'object_expression')) {
+        this.extractObjectLiteralFunctions(obj);
+        return;
+      }
     }
 
     // Pascal-specific AST handling
@@ -2402,6 +2425,40 @@ export class TreeSitterExtractor {
         column: node.startPosition.column,
       });
     }
+
+    // Aura: `cmp.get("c.apexMethod")` invokes a server-side @AuraEnabled Apex
+    // method by string name. Emit an extra bare `calls` ref so the cross-language
+    // name-matcher links it to the Apex method (the `c.` namespace = Apex
+    // controller; `v.` = view attribute, skipped).
+    if (this.isAuraComponentJs) {
+      this.extractAuraApexCall(node, callerId);
+    }
+  }
+
+  /**
+   * Detect `cmp.get("c.method")` / `component.get("c.method")` /
+   * `cmp.getReference("c.method")` and emit a `calls` reference to the bare Apex
+   * method name. Only the `c.` (Apex controller) namespace is linked.
+   */
+  private extractAuraApexCall(node: SyntaxNode, callerId: string): void {
+    const func = getChildByField(node, 'function');
+    if (!func || func.type !== 'member_expression') return;
+    const prop = getChildByField(func, 'property');
+    const propName = prop ? getNodeText(prop, this.source) : '';
+    if (propName !== 'get' && propName !== 'getReference') return;
+    const args = getChildByField(node, 'arguments');
+    const firstArg = args?.namedChild(0);
+    if (!firstArg || firstArg.type !== 'string') return;
+    const literal = getNodeText(firstArg, this.source).replace(/^['"`]|['"`]$/g, '');
+    const m = literal.match(/^c\.([A-Za-z_]\w*)$/);
+    if (!m || !m[1]) return;
+    this.unresolvedReferences.push({
+      fromNodeId: callerId,
+      referenceName: m[1],
+      referenceKind: 'calls',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
   }
 
   /**
@@ -4120,6 +4177,18 @@ export function extractFromSource(
   } else if (detectedLanguage === 'razor') {
     // Use custom extractor for ASP.NET Razor (.cshtml) / Blazor (.razor) markup
     const extractor = new RazorExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'visualforce') {
+    // Custom extractor for Visualforce (.page) / VF component (.component) markup
+    const extractor = new VisualforceExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'lwc') {
+    // Custom extractor for LWC HTML templates (lwc/<bundle>/*.html)
+    const extractor = new LwcTemplateExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'aura') {
+    // Custom extractor for Aura component markup (.cmp/.app/.evt/.intf)
+    const extractor = new AuraExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'xml') {
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a

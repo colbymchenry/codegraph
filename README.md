@@ -225,7 +225,7 @@ CodeGraph cuts **tokens, tool calls, and wall-clock time on every repo** — acr
 | **Full-Text Search** | Find code by name instantly across your entire codebase, powered by FTS5 |
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
-| **20+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Objective-C, Swift, Kotlin, Dart, Lua, Luau, Svelte, Liquid, Pascal/Delphi |
+| **20+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Objective-C, Swift, Kotlin, Dart, Lua, Luau, Svelte, Liquid, Pascal/Delphi, Apex, Visualforce, Aura, LWC |
 | **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 14 frameworks |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
@@ -638,6 +638,10 @@ is written):
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX form files) |
 | Lua | `.lua` | Full support (functions, methods with receivers, local variables, `require` imports, call edges) |
 | Luau | `.luau` | Full support (everything in Lua, plus `type`/`export type` aliases, typed signatures, and Roblox instance-path `require`) |
+| Apex | `.cls`, `.trigger` | Full support (classes, interfaces, enums, methods, constructors, properties, triggers, inner classes; call/extends/implements edges; `@AuraEnabled`/`@RemoteAction` annotations) |
+| Visualforce | `.page`, `.component` | Markup support (page/component → `controller=`/`extensions=` Apex classes and `<c:child>` components; `standardController` left unlinked) |
+| Aura | `.cmp`, `.app`, `.evt`, `.intf` | Markup support (component → `<c:child>` components and `{!c.handler}` controller actions; controller/helper JS handlers → Apex via `cmp.get("c.x")`) |
+| Lightning Web Components | `.js` + `.html` | Full support (the `.js` via JavaScript; the template links `<c-child>` components and the `@salesforce/apex/...` import links to the Apex method) |
 
 ## Measured cross-file coverage
 
@@ -666,8 +670,11 @@ Impact and blast-radius queries are only as good as the dependency graph behind 
 | Luau | dphfox/Fusion | 92.2% |
 | Liquid | Shopify/dawn | 73.8% |
 | Pascal / Delphi | PascalCoin | 75.7% |
+| Apex (+ LWC / Aura / Visualforce → Apex) | trailheadapps/ebikes-lwc | 55.6% |
 
 Framework routing is validated the same way, on a canonical app per framework: Express 100%, FastAPI 98%, Flask 100%, NestJS 96.8%, Gin 96.5%, Axum 100%, Rocket 93.8%, Vapor 100%, Laravel 92%, Rails 89.6%, React Router 100% — and the convention/reflection-heavy ones at their honest static-analysis ceiling: ASP.NET 83.9%, Spring 83.3%, Drupal 78.9%, Django 74.1%.
+
+The **Salesforce** number reflects a quirk of the platform, not the extractor: every non-test Apex class in ebikes-lwc that something depends on is covered — the residual is the mandatory `*Test` classes (the platform requires a test class per class, and nothing in code depends on a test) plus one class referenced only from metadata XML. The novel coverage here is *cross-layer*: a Lightning Web Component's `@salesforce/apex/...` import resolves to the Apex method, a Visualforce page's `controller=`/`extensions=` resolve to their Apex classes, and an Aura controller's `cmp.get("c.x")` resolves to the Apex method — so editing Apex surfaces the LWC/Aura/Visualforce that depend on it.
 
 ## Troubleshooting
 

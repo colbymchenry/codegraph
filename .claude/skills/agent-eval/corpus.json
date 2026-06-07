@@ -94,5 +94,10 @@
     { "name": "react-native-segmented-control", "repo": "https://github.com/react-native-segmented-control/segmented-control", "size": "Small", "files": "~25", "question": "How does JSX `<SegmentedControl onChange={cb}/>` reach the native onChange handler on iOS/Android?" },
     { "name": "react-native-screens", "repo": "https://github.com/software-mansion/react-native-screens", "size": "Medium", "files": "~1200", "question": "How does JSX `<ScreenStack>` reach the native RNSScreenStackView component?" },
     { "name": "react-native-skia", "repo": "https://github.com/Shopify/react-native-skia", "size": "Large", "files": "~1000", "question": "How does a `<SkiaPictureView/>` JSX usage reach the iOS / Android native renderer?" }
+  ],
+  "Salesforce (Apex + LWC + Aura + Visualforce)": [
+    { "name": "dreamhouse-lwc", "repo": "https://github.com/trailheadapps/dreamhouse-lwc", "size": "Small", "files": "~176", "question": "How does the propertyTileList component reach the Apex that queries property records?" },
+    { "name": "ebikes-lwc", "repo": "https://github.com/trailheadapps/ebikes-lwc", "size": "Small", "files": "~182", "question": "How does the orderBuilder LWC reach the Apex OrderController that updates order items?" },
+    { "name": "apex-recipes", "repo": "https://github.com/trailheadapps/apex-recipes", "size": "Medium", "files": "~432", "question": "How does an LWC recipe invoke its Apex controller method, and what does that method call in turn?" }
   ]
 }

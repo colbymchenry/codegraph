@@ -6376,3 +6376,328 @@ describe('Swift property wrappers / attributes (blast-radius recall)', () => {
     } finally { cleanupTempDir(dir); }
   });
 });
+
+describe('Apex Extraction', () => {
+  it('extracts class/interface/enum/inner-class/static-method/trigger symbols', () => {
+    const code = `public class AccountService extends BaseService implements IService {
+    public static Integer COUNT = 0;
+    public String label { get; set; }
+
+    public AccountService() { COUNT = 1; }
+
+    @AuraEnabled
+    public static String greet(String who) {
+        Helper h = new Helper();
+        return h.format(who);
+    }
+
+    public enum Status { ACTIVE, CLOSED }
+
+    public class Inner {
+        public Integer bump(Integer n) { return n + 1; }
+    }
+}`;
+    const result = extractFromSource('AccountService.cls', code);
+
+    const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'AccountService');
+    expect(cls).toBeDefined();
+    expect(cls?.visibility).toBe('public');
+
+    const inner = result.nodes.find((n) => n.kind === 'class' && n.name === 'Inner');
+    expect(inner).toBeDefined();
+
+    const greet = result.nodes.find((n) => n.kind === 'method' && n.name === 'greet');
+    expect(greet).toBeDefined();
+    expect(greet?.isStatic).toBe(true);
+
+    const status = result.nodes.find((n) => n.kind === 'enum' && n.name === 'Status');
+    expect(status).toBeDefined();
+
+    // extends BaseService / implements IService
+    const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+    expect(extendsRefs.map((r) => r.referenceName)).toContain('BaseService');
+    const implRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+    expect(implRefs.map((r) => r.referenceName)).toContain('IService');
+
+    // @AuraEnabled annotation captured as a `decorates` reference
+    const decorRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'decorates');
+    expect(decorRefs.map((r) => r.referenceName)).toContain('AuraEnabled');
+
+    // cross-class call greet -> format (receiver kept until resolution)
+    const callRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    expect(callRefs.some((r) => r.referenceName.endsWith('format'))).toBe(true);
+  });
+
+  it('extracts a trigger and its handler call', () => {
+    const code = `trigger AccountTrigger on Account (before insert, after update) {
+    AccountService.greet('world');
+}`;
+    const result = extractFromSource('AccountTrigger.trigger', code);
+
+    const trigger = result.nodes.find((n) => n.name === 'AccountTrigger');
+    expect(trigger).toBeDefined();
+    expect(trigger?.signature).toContain('Account');
+
+    const callRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    expect(callRefs.some((r) => r.referenceName.endsWith('greet'))).toBe(true);
+  });
+
+  it('resolves cross-file caller→callee edges across .cls and .trigger', async () => {
+    const dir = createTempDir();
+    try {
+      const classes = path.join(dir, 'force-app/main/default/classes');
+      const triggers = path.join(dir, 'force-app/main/default/triggers');
+      fs.mkdirSync(classes, { recursive: true });
+      fs.mkdirSync(triggers, { recursive: true });
+
+      fs.writeFileSync(path.join(classes, 'Helper.cls'),
+        `public class Helper {\n    public String format(String who) { return 'Hi ' + who; }\n}\n`);
+      fs.writeFileSync(path.join(classes, 'AccountService.cls'),
+        `public class AccountService {\n    public static String greet(String who) {\n        Helper h = new Helper();\n        return h.format(who);\n    }\n}\n`);
+      fs.writeFileSync(path.join(triggers, 'AccountTrigger.trigger'),
+        `trigger AccountTrigger on Account (before insert) {\n    AccountService.greet('world');\n}\n`);
+
+      const cg = CodeGraph.initSync(dir, {
+        config: { include: ['**/*.cls', '**/*.trigger'], exclude: [] },
+      });
+      const indexResult = await cg.indexAll();
+      cg.resolveReferences();
+
+      expect(indexResult.filesIndexed).toBe(3);
+      // AccountService.greet() calls Helper.format() → Helper.cls has AccountService.cls as a dependent
+      expect(cg.getFileDependents('force-app/main/default/classes/Helper.cls'))
+        .toContain('force-app/main/default/classes/AccountService.cls');
+      // AccountTrigger calls AccountService.greet() → AccountService.cls has the trigger as a dependent
+      expect(cg.getFileDependents('force-app/main/default/classes/AccountService.cls'))
+        .toContain('force-app/main/default/triggers/AccountTrigger.trigger');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('Salesforce LWC → Apex resolver', () => {
+  it('links an LWC @salesforce/apex import to the Apex method node', async () => {
+    const dir = createTempDir();
+    try {
+      const classes = path.join(dir, 'force-app/main/default/classes');
+      const lwc = path.join(dir, 'force-app/main/default/lwc/acctList');
+      fs.mkdirSync(classes, { recursive: true });
+      fs.mkdirSync(lwc, { recursive: true });
+
+      fs.writeFileSync(path.join(classes, 'AccountController.cls'),
+        `public with sharing class AccountController {\n    @AuraEnabled(cacheable=true)\n    public static List<Account> getAccounts() { return [SELECT Id FROM Account]; }\n}\n`);
+      fs.writeFileSync(path.join(lwc, 'acctList.js'),
+        `import { LightningElement, wire } from 'lwc';\n` +
+        `import getAccounts from '@salesforce/apex/AccountController.getAccounts';\n` +
+        `export default class AcctList extends LightningElement {\n` +
+        `    @wire(getAccounts) accounts;\n` +
+        `    refresh() { getAccounts({ limit: 10 }).then(r => { this.data = r; }); }\n` +
+        `}\n`);
+
+      const cg = CodeGraph.initSync(dir, {
+        config: { include: ['**/*.cls', '**/*.js'], exclude: [] },
+      });
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      // The Apex method node exists with qualifiedName Class::method.
+      const apexMethod = cg.searchNodes('getAccounts', { limit: 20 })
+        .map((r) => r.node)
+        .find((n) => n.kind === 'method' && n.qualifiedName === 'AccountController::getAccounts');
+      expect(apexMethod).toBeDefined();
+
+      // Cross-layer edge is queryable: the LWC .js depends on the Apex .cls.
+      expect(cg.getFileDependents('force-app/main/default/classes/AccountController.cls'))
+        .toContain('force-app/main/default/lwc/acctList/acctList.js');
+
+      // getCallers on the Apex method surfaces the LWC call site.
+      const callers = cg.getCallers(apexMethod!.id).map((c: any) => (c.node ? c.node : c));
+      expect(callers.some((c: any) => (c.filePath || '').includes('/lwc/'))).toBe(true);
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('Visualforce extraction + resolver', () => {
+  it('emits a component node and Tier-1 references (single file)', () => {
+    const code = `<apex:page controller="AccountController" extensions="ExtA,ExtB">
+    <c:AccountCard acct="{!account}" />
+    <apex:pageBlock title="Accounts"/>
+</apex:page>`;
+    const result = extractFromSource('force-app/main/default/pages/AccountPage.page', code);
+
+    const comp = result.nodes.find((n) => n.kind === 'component' && n.language === 'visualforce');
+    expect(comp?.name).toBe('AccountPage');
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references').map((r) => r.referenceName);
+    expect(refs).toContain('AccountController'); // controller
+    expect(refs).toContain('ExtA');              // extensions, split
+    expect(refs).toContain('ExtB');
+    expect(refs).toContain('AccountCard');       // <c:AccountCard>
+    expect(refs).not.toContain('pageBlock');     // apex: standard tag skipped
+  });
+
+  it('skips standardController (SObject, not an Apex class)', () => {
+    const code = `<apex:page standardController="Account"><apex:detail/></apex:page>`;
+    const result = extractFromSource('force-app/main/default/pages/StdPage.page', code);
+    const refs = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(refs).not.toContain('Account');
+  });
+
+  it('resolves VF page → Apex controller/extension/component across files', async () => {
+    const dir = createTempDir();
+    try {
+      const classes = path.join(dir, 'force-app/main/default/classes');
+      const pages = path.join(dir, 'force-app/main/default/pages');
+      const components = path.join(dir, 'force-app/main/default/components');
+      fs.mkdirSync(classes, { recursive: true });
+      fs.mkdirSync(pages, { recursive: true });
+      fs.mkdirSync(components, { recursive: true });
+
+      fs.writeFileSync(path.join(classes, 'AccountController.cls'),
+        `public with sharing class AccountController {\n  public List<Account> getAccounts() { return null; }\n}\n`);
+      fs.writeFileSync(path.join(classes, 'AccountExt.cls'),
+        `public with sharing class AccountExt {\n  public AccountExt(ApexPages.StandardController c) {}\n}\n`);
+      fs.writeFileSync(path.join(components, 'AccountCard.component'),
+        `<apex:component><apex:attribute name="acct" type="Account" description="x"/></apex:component>\n`);
+      fs.writeFileSync(path.join(pages, 'AccountPage.page'),
+        `<apex:page controller="AccountController" extensions="AccountExt">\n  <c:AccountCard acct="{!account}"/>\n</apex:page>\n`);
+
+      const cg = CodeGraph.initSync(dir, {
+        config: { include: ['**/*.cls', '**/*.page', '**/*.component'], exclude: [] },
+      });
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      const page = 'force-app/main/default/pages/AccountPage.page';
+      expect(cg.getFileDependents('force-app/main/default/classes/AccountController.cls')).toContain(page);
+      expect(cg.getFileDependents('force-app/main/default/classes/AccountExt.cls')).toContain(page);
+      expect(cg.getFileDependents('force-app/main/default/components/AccountCard.component')).toContain(page);
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('LWC template extraction + resolver', () => {
+  it('emits a component node and <c-child> references, ignoring base components', () => {
+    const code = `<template>\n  <c-acct-tile data-x="1"></c-acct-tile>\n  <lightning-button label="x"></lightning-button>\n</template>`;
+    const result = extractFromSource('force-app/main/default/lwc/acctList/acctList.html', code);
+
+    const comp = result.nodes.find((n) => n.kind === 'component' && n.language === 'lwc');
+    expect(comp?.name).toBe('acctList');
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references').map((r) => r.referenceName);
+    expect(refs).toContain('AcctTile');     // <c-acct-tile> pascalized
+    expect(refs).not.toContain('Button');   // lightning-button base component skipped
+  });
+
+  it('does not index generic (non-LWC) .html files', () => {
+    expect(detectLanguage('force-app/main/default/lwc/acctList/acctList.html')).toBe('lwc');
+    expect(detectLanguage('public/index.html')).toBe('unknown');
+    expect(isSourceFile('public/index.html')).toBe(false);
+  });
+
+  it('resolves an LWC template <c-child> to the child component class', async () => {
+    const dir = createTempDir();
+    try {
+      const base = path.join(dir, 'force-app/main/default/lwc');
+      const parent = path.join(base, 'acctList');
+      const child = path.join(base, 'acctTile');
+      fs.mkdirSync(parent, { recursive: true });
+      fs.mkdirSync(child, { recursive: true });
+
+      fs.writeFileSync(path.join(parent, 'acctList.js'),
+        `import { LightningElement } from 'lwc';\nexport default class AcctList extends LightningElement {}\n`);
+      fs.writeFileSync(path.join(parent, 'acctList.html'),
+        `<template>\n  <c-acct-tile></c-acct-tile>\n</template>\n`);
+      fs.writeFileSync(path.join(child, 'acctTile.js'),
+        `import { LightningElement, api } from 'lwc';\nexport default class AcctTile extends LightningElement { @api record; }\n`);
+
+      const cg = CodeGraph.initSync(dir, {
+        config: { include: ['**/*.js', '**/*.html'], exclude: [] },
+      });
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      expect(cg.getFileDependents('force-app/main/default/lwc/acctTile/acctTile.js'))
+        .toContain('force-app/main/default/lwc/acctList/acctList.html');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('Aura extraction + resolver', () => {
+  it('emits a component node, <c:child> references, and {!c.handler} calls', () => {
+    const code = `<aura:component controller="AccountController">
+    <aura:attribute name="accounts" type="Account[]"/>
+    <lightning:button label="Load" onclick="{!c.doInit}"/>
+    <c:accountTile record="{!v.accounts}"/>
+</aura:component>`;
+    const result = extractFromSource('force-app/main/default/aura/AccountList/AccountList.cmp', code);
+
+    const comp = result.nodes.find((n) => n.kind === 'component' && n.language === 'aura');
+    expect(comp?.name).toBe('AccountList');
+
+    const refNames = result.unresolvedReferences.filter((r) => r.referenceKind === 'references').map((r) => r.referenceName);
+    expect(refNames).toContain('accountTile'); // <c:accountTile>
+    const callNames = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(callNames).toContain('doInit');     // {!c.doInit}
+  });
+
+  it('extracts Aura controller handlers and cmp.get("c.x") → Apex calls', () => {
+    const code = `({
+    doInit : function(cmp, event, helper) {
+        var action = cmp.get("c.getAccounts");
+        helper.process(cmp, action);
+    }
+})`;
+    const result = extractFromSource('force-app/main/default/aura/AccountList/AccountListController.js', code);
+
+    const handler = result.nodes.find((n) => n.name === 'doInit');
+    expect(handler).toBeDefined(); // object-literal handler is now a node
+
+    const callNames = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(callNames).toContain('getAccounts'); // cmp.get("c.getAccounts") bare name
+  });
+
+  it('does NOT extract object-literal handlers from non-Aura JS', () => {
+    const code = `({ doInit : function(cmp) { return cmp; } })`;
+    const result = extractFromSource('src/random.js', code);
+    expect(result.nodes.find((n) => n.name === 'doInit')).toBeUndefined();
+  });
+
+  it('resolves Aura JS cmp.get and markup <c:child> across files', async () => {
+    const dir = createTempDir();
+    try {
+      const classes = path.join(dir, 'force-app/main/default/classes');
+      const parent = path.join(dir, 'force-app/main/default/aura/AccountList');
+      const child = path.join(dir, 'force-app/main/default/aura/accountTile');
+      fs.mkdirSync(classes, { recursive: true });
+      fs.mkdirSync(parent, { recursive: true });
+      fs.mkdirSync(child, { recursive: true });
+
+      fs.writeFileSync(path.join(classes, 'AccountController.cls'),
+        `public with sharing class AccountController {\n  @AuraEnabled public static List<Account> getAccounts() { return null; }\n}\n`);
+      fs.writeFileSync(path.join(parent, 'AccountList.cmp'),
+        `<aura:component>\n  <c:accountTile/>\n</aura:component>\n`);
+      fs.writeFileSync(path.join(parent, 'AccountListController.js'),
+        `({\n  doInit : function(cmp) { var a = cmp.get("c.getAccounts"); }\n})\n`);
+      fs.writeFileSync(path.join(child, 'accountTile.cmp'),
+        `<aura:component><aura:attribute name="record" type="Account"/></aura:component>\n`);
+
+      const cg = CodeGraph.initSync(dir, {
+        config: { include: ['**/*.cls', '**/*.cmp', '**/*.js'], exclude: [] },
+      });
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      // Aura JS → Apex (cmp.get string ref)
+      expect(cg.getFileDependents('force-app/main/default/classes/AccountController.cls'))
+        .toContain('force-app/main/default/aura/AccountList/AccountListController.js');
+      // Aura markup → child component (<c:accountTile>)
+      expect(cg.getFileDependents('force-app/main/default/aura/accountTile/accountTile.cmp'))
+        .toContain('force-app/main/default/aura/AccountList/AccountList.cmp');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+});
