@@ -15,7 +15,13 @@ export function matchByFilePath(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  if (!ref.referenceName.includes('/')) return null;
+  // Path-like (`a/b.liquid`) OR a bare filename ending in a short extension
+  // (`Foo.h` — an Objective-C `#import "Foo.h"`, resolved to the header by
+  // basename). A bare ref WITHOUT an extension is a symbol name, not a file, so
+  // leave it to the symbol-matching strategies.
+  if (!ref.referenceName.includes('/') && !/\.[A-Za-z][A-Za-z0-9]{0,3}$/.test(ref.referenceName)) {
+    return null;
+  }
 
   // Extract the filename from the path
   const fileName = ref.referenceName.split('/').pop();
@@ -38,12 +44,20 @@ export function matchByFilePath(
     };
   }
 
-  // Fall back to suffix match (e.g., ref="snippets/foo.liquid" matches "src/snippets/foo.liquid")
-  const suffixMatch = fileNodes.find(n => n.qualifiedName.endsWith(ref.referenceName) || n.filePath.endsWith(ref.referenceName));
-  if (suffixMatch) {
+  // Fall back to suffix match (e.g., ref="snippets/foo.liquid" matches
+  // "src/snippets/foo.liquid"). When several files share the basename — a
+  // `#include "RNCAsyncStorage.h"` with a same-named header on another platform
+  // (windows/code/ vs apple/) — prefer the one in the includer's own directory,
+  // then by directory proximity / same language family. A C/C++ include (and any
+  // bare-filename import) resolves relative to the including file, not to an
+  // arbitrary same-named header elsewhere in the tree.
+  const suffixMatches = fileNodes.filter(
+    n => n.qualifiedName.endsWith(ref.referenceName) || n.filePath.endsWith(ref.referenceName)
+  );
+  if (suffixMatches.length > 0) {
     return {
       original: ref,
-      targetNodeId: suffixMatch.id,
+      targetNodeId: pickClosestFileNode(suffixMatches, ref).id,
       confidence: 0.85,
       resolvedBy: 'file-path',
     };
@@ -63,13 +77,104 @@ export function matchByFilePath(
 }
 
 /**
+ * Among several file nodes that all match a bare include/import by basename,
+ * pick the one closest to the referencing file: same directory first, then by
+ * directory-tree proximity, with the same language family as a tiebreak. A
+ * C/C++ `#include "X.h"` (and any bare-filename import) resolves relative to the
+ * including file — not to an arbitrary same-named header on another platform.
+ */
+function pickClosestFileNode(candidates: Node[], ref: UnresolvedRef): Node {
+  const dirOf = (p: string): string => {
+    const i = p.lastIndexOf('/');
+    return i >= 0 ? p.slice(0, i) : '';
+  };
+  const refDir = dirOf(ref.filePath);
+  const sameDir = candidates.filter((c) => dirOf(c.filePath) === refDir);
+  const pool = sameDir.length > 0 ? sameDir : candidates;
+  let best = pool[0]!;
+  let bestScore = -Infinity;
+  for (const c of pool) {
+    const score =
+      computePathProximity(ref.filePath, c.filePath) +
+      (sameLanguageFamily(c.language, ref.language) ? 5 : 0);
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return best;
+}
+
+/**
+ * Language families that share a type system / runtime, so a same-language-only
+ * reference may still resolve across them (a Kotlin `Foo.BAR` can name a Java
+ * `Foo`). Anything not listed forms its own singleton family.
+ */
+const LANGUAGE_FAMILY: Record<string, string> = {
+  java: 'jvm', kotlin: 'jvm', scala: 'jvm',
+  swift: 'apple', objc: 'apple',
+  typescript: 'web', tsx: 'web', javascript: 'web', jsx: 'web',
+  c: 'c', cpp: 'c',
+  // Razor/Blazor markup names C# types — same family so `@model Foo` /
+  // `<MyComponent/>` resolve to their `.cs` class through the cross-family gate.
+  csharp: 'dotnet', razor: 'dotnet',
+};
+export function sameLanguageFamily(a: string, b: string): boolean {
+  if (a === b) return true;
+  const fa = LANGUAGE_FAMILY[a];
+  return fa !== undefined && fa === LANGUAGE_FAMILY[b];
+}
+/**
+ * True when `lang` belongs to a known multi-language family (jvm/apple/web/c).
+ * Languages not listed (php, python, go, ruby, rust, dart, …) and config
+ * formats (yaml/xml/blade) form their own singleton families and return
+ * `false` — used to leave config↔code framework bridges (whose config side is
+ * never a known programming-language family) out of the cross-family gate.
+ */
+export function isKnownLanguageFamily(lang: string): boolean {
+  return LANGUAGE_FAMILY[lang] !== undefined;
+}
+/**
+ * True when `a` and `b` are two DIFFERENT *known* language families — the
+ * signature of a coincidental cross-language name collision (a TS `import
+ * React` matching a Swift `import React`, a C++ `#include "X.h"` matching a
+ * same-named ObjC header on another platform). The both-*known* test is
+ * deliberately weaker than {@link sameLanguageFamily}'s negation: a
+ * single-file-component language that carries its own tag (`vue`/`svelte`)
+ * importing a `.ts` module, or any singleton-family language (php/go/ruby/…),
+ * returns `false` here and is left alone.
+ */
+export function crossesKnownFamily(a: string, b: string): boolean {
+  return isKnownLanguageFamily(a) && isKnownLanguageFamily(b) && !sameLanguageFamily(a, b);
+}
+/**
+ * Drop cross-language candidates from a name lookup. Two regimes:
+ *  - `references` (type-usage): a type named in language X resolves to a
+ *    SAME-family type, never a coincidentally same-named symbol in another
+ *    language (the Android `BatteryManager` system class vs a JS one). Strict
+ *    same-family filter — cross-language communication is `calls`, not refs.
+ *  - `imports` (import binding): an `import`/`#include` never crosses two
+ *    KNOWN families (TS `import React` ↮ Swift `import React`). Weaker
+ *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
+ */
+function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
+  if (ref.referenceKind === 'references') {
+    return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
+  }
+  if (ref.referenceKind === 'imports') {
+    return candidates.filter((c) => !crossesKnownFamily(c.language, ref.language));
+  }
+  return candidates;
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  const candidates = context.getNodesByName(ref.referenceName);
+  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref);
 
   if (candidates.length === 0) {
     return null;
@@ -357,8 +462,16 @@ export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  // Parse method call patterns like "obj.method" or "Class::method"
-  const dotMatch = ref.referenceName.match(/^(\w+)\.(\w+)$/);
+  // Parse method call patterns like "obj.method" or "Class::method". The method
+  // part allows trailing `:` keywords so Objective-C selectors resolve
+  // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
+  // languages' method refs, so this is a no-op for them.
+  // The receiver allows dots (`builder.Services.AddCoreServices`) so a CHAINED
+  // call resolves by its last segment — Strategy 3 below name-matches the method
+  // (with its existing single-candidate / receiver-overlap guards). Without this
+  // a multi-dot extension-method call (C# DI `builder.Services.AddCoreServices()`,
+  // `Guard.Against.X()`) matched no pattern and never resolved.
+  const dotMatch = ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/);
   const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);
 
   const match = dotMatch || colonMatch;
@@ -659,7 +772,7 @@ export function matchFuzzy(
 
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind));
+  const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);

@@ -20,6 +20,7 @@ import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } f
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { LiquidExtractor } from './liquid-extractor';
+import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
@@ -116,6 +117,83 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
 }
 
 /**
+ * Resolve a Scala type node to its base type NAME for name-matching — unwrapping
+ * `generic_type` (`Monoid[Int]` → `Monoid`), taking the last segment of a
+ * qualified `stable_type_identifier` (`cats.Functor` → `Functor`), and falling
+ * back to a descendant `type_identifier`. Returns null for non-type nodes.
+ * Shared by Scala inheritance and type-reference extraction.
+ */
+function scalaBaseTypeName(node: SyntaxNode | null, source: string): string | null {
+  if (!node) return null;
+  switch (node.type) {
+    case 'type_identifier':
+    case 'identifier':
+      return getNodeText(node, source);
+    case 'generic_type':
+      // `<base> type_arguments` — the base type is the first named child.
+      return scalaBaseTypeName(node.namedChild(0), source);
+    case 'stable_type_identifier':
+    case 'stable_identifier': {
+      // Qualified `a.b.C` — match on the simple (last) segment.
+      const ids = node.namedChildren.filter(
+        (c: SyntaxNode) => c.type === 'type_identifier' || c.type === 'identifier'
+      );
+      const last = ids[ids.length - 1];
+      return last ? getNodeText(last, source) : null;
+    }
+    default: {
+      const id = node.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+      return id ? getNodeText(id, source) : null;
+    }
+  }
+}
+
+/**
+ * PHP type-position wrapper node kinds (a type-hint is `named_type`,
+ * `?Foo` is `optional_type`, `A|B` is `union_type`, `A&B` is
+ * `intersection_type`). Used to find the type subtree inside a parameter /
+ * property / return position before walking it for class references.
+ */
+const PHP_TYPE_NODES: ReadonlySet<string> = new Set([
+  'named_type', 'optional_type', 'nullable_type',
+  'union_type', 'intersection_type', 'disjunctive_normal_form_type',
+  'primitive_type',
+]);
+
+/**
+ * Member-access node kinds whose receiver, when it's a capitalized
+ * type/enum/class name, is a real dependency — `Enum.value`, `Type.CONST`,
+ * `Foo::BAR`. These VALUE reads (as opposed to `Type.method()` calls, already
+ * handled) produced no edge, so a type used only via a static member or enum
+ * value looked like nothing depended on it. See {@link extractStaticMemberRef}.
+ */
+const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
+  'field_access',                       // java (`Foo.BAR`)
+  'member_access_expression',           // c#  (`Foo.Bar`)
+  'navigation_expression',              // kotlin / swift (`Foo.bar`)
+  'field_expression',                   // scala (`Foo.bar`)
+  'class_constant_access_expression',   // php (`Foo::CONST`, `Foo::class`)
+  'scoped_property_access_expression',  // php (`Foo::$bar`)
+  'qualified_identifier',               // c++ (`Foo::bar`)
+]);
+
+/**
+ * Languages whose types are Capitalized by convention, so a capitalized
+ * member-access receiver is reliably a type (not a local/variable). The
+ * static-member/value-read pass is gated to these — the ones where it was the
+ * confirmed residual frontier (enum-value / static-field reads). TS/JS/Python
+ * are deliberately excluded, and a measured A/B confirms the call: extending the
+ * pass to them adds ZERO coverage — in import-based languages you must `import` a
+ * type before any `Type.MEMBER` read, so the import edge already covers it (the
+ * static read is pure duplication) — while adding real graph noise (+1813 edges /
+ * +2448 `references` on excalidraw, the retrieval-perf benchmark, all pointing at
+ * already-covered types). Don't re-add `member_expression`/`attribute` here.
+ */
+const STATIC_MEMBER_LANGS: ReadonlySet<string> = new Set([
+  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp',
+]);
+
+/**
  * Tree-sitter node kinds that represent constructor invocations
  * (`new Foo()` and friends). Used by extractInstantiation to emit
  * an `instantiates` reference targeting the class name.
@@ -124,6 +202,9 @@ const INSTANTIATION_KINDS: ReadonlySet<string> = new Set([
   'new_expression',                  // typescript / javascript / tsx / jsx
   'object_creation_expression',      // java / c#
   'instance_creation_expression',    // some grammars
+  'composite_literal',               // go — `Widget{...}` / `pkga.Widget{...}`
+  'struct_expression',               // rust — `Widget { n: 1 }` / `m::Widget { .. }`
+  'instance_expression',             // scala — `new Monoid[Int] { ... }`
 ]);
 
 /**
@@ -191,6 +272,14 @@ export class TreeSitterExtractor {
     }
 
     try {
+      // Optional pre-parse source transform (offset-preserving) to work around
+      // grammar gaps — e.g. C# blanks conditional-compilation directive lines
+      // the grammar mis-parses inside enum bodies (#237). We reassign
+      // this.source so downstream getNodeText reads the same bytes the parser
+      // saw (identical outside the blanked directive lines).
+      if (this.extractor?.preParse) {
+        this.source = this.extractor.preParse(this.source);
+      }
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
         throw new Error('Parser returned null tree');
@@ -361,6 +450,42 @@ export class TreeSitterExtractor {
       this.extractVariable(node);
       skipChildren = true; // extractVariable handles children
     }
+    // Swift stored properties inside a type. Swift instance properties aren't
+    // extracted as their own nodes, but a property's PROPERTY WRAPPER
+    // (`@Argument`/`@Published`/`@State`/custom) and declared type ARE
+    // dependencies — attribute them to the enclosing type so the wrapper/type
+    // files get dependents. Don't skipChildren: an initializer's calls still
+    // matter. (Other languages extract properties via property/field types.)
+    else if (
+      this.language === 'swift' &&
+      nodeType === 'property_declaration' &&
+      this.isInsideClassLikeNode()
+    ) {
+      const ownerId = this.nodeStack[this.nodeStack.length - 1];
+      if (ownerId) {
+        this.extractDecoratorsFor(node, ownerId);
+        this.extractVariableTypeAnnotation(node, ownerId);
+        // Fluent / SwiftUI property-wrapper attributes often reference a model or
+        // type by metatype in their ARGUMENTS — `@Siblings(through: Pivot.self,
+        // …)`, `@Group(…)`. extractDecoratorsFor captures the wrapper type
+        // (`Siblings`); this pulls the TYPE out of the argument expressions
+        // (`Pivot.self` → a dependency on Pivot), so a model reached ONLY through
+        // a relationship (a many-to-many pivot/join model) isn't left orphaned.
+        // extractStaticMemberRef self-filters to `Type.member` navigation, so the
+        // `\.$keypath` arguments and the wrapper `user_type` are skipped.
+        const modifiers = node.namedChildren.find((c: SyntaxNode) => c.type === 'modifiers');
+        if (modifiers) {
+          const walkAttrArgs = (n: SyntaxNode): void => {
+            this.extractStaticMemberRef(n);
+            for (let i = 0; i < n.namedChildCount; i++) {
+              const c = n.namedChild(i);
+              if (c) walkAttrArgs(c);
+            }
+          };
+          walkAttrArgs(modifiers);
+        }
+      }
+    }
     // `export_statement` itself is not extracted — the walker descends
     // into children, where the inner declaration (lexical_declaration,
     // function_declaration, class_declaration, etc.) is dispatched to
@@ -377,6 +502,22 @@ export class TreeSitterExtractor {
     // Check for imports
     else if (this.extractor.importTypes.includes(nodeType)) {
       this.extractImport(node);
+    }
+    // Re-export from another module — `export { X } from './y'` (TS/JS). A
+    // re-export is a dependency on the source module just like an import, but
+    // the export_statement is otherwise only descended into (no declaration to
+    // extract), so a barrel that ONLY re-exports produced zero edges and showed
+    // 0 dependents. Link each re-exported name to its definition. Children are
+    // still visited (a non-re-export `export const X = …` has no `source` and
+    // falls through to its normal declaration extraction).
+    else if (
+      nodeType === 'export_statement' &&
+      (this.language === 'typescript' || this.language === 'tsx' ||
+       this.language === 'javascript' || this.language === 'jsx') &&
+      getChildByField(node, 'source')
+    ) {
+      const parentId = this.nodeStack[this.nodeStack.length - 1];
+      if (parentId) this.emitReExportRefs(node, parentId);
     }
     // Check for function calls
     else if (this.extractor.callTypes.includes(nodeType)) {
@@ -481,6 +622,15 @@ export class TreeSitterExtractor {
       updatedAt: Date.now(),
       ...extra,
     };
+
+    // Persist extra symbol-level modifiers (e.g. Kotlin `expect`/`actual`) onto
+    // the node's decorators list so the resolver can pair multiplatform
+    // declarations with their implementations. Merged, not overwritten, so a
+    // language that also captures real annotations keeps both.
+    const mods = this.extractor?.extractModifiers?.(node);
+    if (mods && mods.length > 0) {
+      newNode.decorators = [...(newNode.decorators ?? []), ...mods];
+    }
 
     this.nodes.push(newNode);
 
@@ -711,6 +861,9 @@ export class TreeSitterExtractor {
     // Extract extends/implements
     this.extractInheritance(node, classNode.id);
 
+    // C# primary-constructor parameter dependencies (`class Svc(IRepo r, …)`).
+    this.extractCsharpPrimaryCtorParamRefs(node, classNode.id);
+
     // Extract decorators applied to the class (`@Foo class X {}`).
     this.extractDecoratorsFor(node, classNode.id);
 
@@ -884,6 +1037,10 @@ export class TreeSitterExtractor {
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
     this.extractInheritance(node, structNode.id);
+
+    // C# primary-constructor parameter dependencies (`struct P(int x)`, and
+    // `record struct M(decimal Amount)` which the grammar nests here).
+    this.extractCsharpPrimaryCtorParamRefs(node, structNode.id);
 
     // Push to stack for field extraction
     this.nodeStack.push(structNode.id);
@@ -1349,6 +1506,13 @@ export class TreeSitterExtractor {
             signature: initSignature,
           });
         }
+        // Walk the initializer so composite literals and calls in a
+        // package-level `var Query Binding = queryBinding{}` (a registry of
+        // implementations) or `var c = pkg.New()` are extracted as
+        // instantiates/calls dependencies — the body walker only covers
+        // initializers inside functions, not these top-level declarations.
+        const valueField = getChildByField(spec, 'value');
+        if (valueField) this.visitFunctionBody(valueField, '');
       }
 
       // Handle short_var_declaration (:=)
@@ -1485,6 +1649,13 @@ export class TreeSitterExtractor {
       // Extract interface inheritance from the inner type node
       const typeChild = getChildByField(node, 'type');
       if (typeChild) this.extractInheritance(typeChild, interfaceNode.id);
+      // Go: extract the interface's method specs as `method` nodes so implicit
+      // interface satisfaction (a struct's method set ⊇ the interface's) and
+      // impl-navigation can see the contract. Go has no `implements` keyword, so
+      // without the interface's method set there's nothing to match against.
+      if (this.language === 'go' && typeChild) {
+        this.extractGoInterfaceMethods(typeChild, interfaceNode.id);
+      }
       return true;
     }
 
@@ -1510,6 +1681,30 @@ export class TreeSitterExtractor {
       }
     }
     return false;
+  }
+
+  /**
+   * Extract the method specs of a Go `interface_type` body as `method` nodes
+   * contained by the interface (e.g. `Marshal`, `Unmarshal` of a `Core`
+   * interface). tree-sitter-go names these `method_elem` (newer) or
+   * `method_spec` (older). Embedded interfaces (`Reader` inside `ReadWriter`)
+   * are `type_identifier`s, not methods, and are left to inheritance extraction.
+   */
+  private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string): void {
+    this.nodeStack.push(ifaceId);
+    for (let i = 0; i < interfaceType.namedChildCount; i++) {
+      const m = interfaceType.namedChild(i);
+      if (!m || (m.type !== 'method_elem' && m.type !== 'method_spec')) continue;
+      const nameNode = getChildByField(m, 'name') ?? m.namedChild(0);
+      if (!nameNode) continue;
+      const mname = getNodeText(nameNode, this.source);
+      if (mname) {
+        this.createNode('method', mname, m, {
+          signature: this.extractor?.getSignature?.(m, this.source),
+        });
+      }
+    }
+    this.nodeStack.pop();
   }
 
   /**
@@ -1620,6 +1815,45 @@ export class TreeSitterExtractor {
             });
           }
         }
+        // Link each imported binding to its definition so imported-but-not-
+        // called/typed symbols still record a cross-file dependency (TS/JS only).
+        if (
+          this.language === 'typescript' || this.language === 'tsx' ||
+          this.language === 'javascript' || this.language === 'jsx'
+        ) {
+          const parentId = this.nodeStack[this.nodeStack.length - 1];
+          if (parentId) this.emitImportBindingRefs(node, parentId);
+        }
+        // Python `from module import X, Y` — link each imported name to its
+        // definition (covers `__init__.py` re-export barrels, which are just
+        // `from .sub import X`). Same recall gap as TS: a name imported and
+        // used in a non-call position created no dependency edge.
+        if (this.language === 'python' && node.type === 'import_from_statement') {
+          const parentId = this.nodeStack[this.nodeStack.length - 1];
+          if (parentId) this.emitPyFromImportRefs(node, parentId);
+        }
+        // Rust `use crate::m::Item;` / `pub use self::sub::Item;` — link each
+        // imported leaf to its definition. Covers `pub use` re-export hubs
+        // (a `mod.rs` re-exporting submodule items, e.g. tokio's `fs/mod.rs`)
+        // and items imported but used in non-call/non-type positions.
+        if (this.language === 'rust' && node.type === 'use_declaration') {
+          const parentId = this.nodeStack[this.nodeStack.length - 1];
+          if (parentId) this.emitRustUseBindingRefs(node, parentId);
+        }
+        // PHP `use Foo\Bar\Baz;` — link to the namespace-qualified definition so
+        // an imported-but-DI-injected contract (Laravel's pattern) records a
+        // cross-file dependency. Grouped imports are handled in their own branch.
+        if (this.language === 'php' && node.type === 'namespace_use_declaration') {
+          const parentId = this.nodeStack[this.nodeStack.length - 1];
+          if (parentId) this.emitPhpUseRefs(node, parentId);
+        }
+        // Ruby `require "lib/foo"` / `require_relative "../foo"` — resolve to the
+        // required FILE so a file pulled in only by `require` (config-loaded
+        // components, gems that don't autoload) records a cross-file dependency.
+        if (this.language === 'ruby' && node.type === 'call') {
+          const parentId = this.nodeStack[this.nodeStack.length - 1];
+          if (parentId) this.emitRubyRequireRefs(node, parentId);
+        }
         return;
       }
       // Hook returned null — fall through to multi-import inline handlers only
@@ -1631,18 +1865,37 @@ export class TreeSitterExtractor {
 
     // Python import_statement: import os, sys (creates one import per module)
     if (this.language === 'python' && node.type === 'import_statement') {
+      const importParentId = this.nodeStack[this.nodeStack.length - 1];
+      // A bare `import a.b.c` of an internal module (the standard Django
+      // `AppConfig.ready(): import myapp.signals` registration pattern, and any
+      // `import pkg.mod` used for its side effects) had no edge to the module
+      // file — only `from x import y` was linked. Push an `imports` ref (like
+      // Go) so the resolver maps the dotted path to its file. Stdlib/external
+      // modules naturally don't resolve (no `os.py` file node in the repo).
+      const pushModuleRef = (dotted: SyntaxNode): void => {
+        if (!importParentId) return;
+        this.unresolvedReferences.push({
+          fromNodeId: importParentId,
+          referenceName: getNodeText(dotted, this.source),
+          referenceKind: 'imports',
+          line: dotted.startPosition.row + 1,
+          column: dotted.startPosition.column,
+        });
+      };
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child?.type === 'dotted_name') {
           this.createNode('import', getNodeText(child, this.source), node, {
             signature: importText,
           });
+          pushModuleRef(child);
         } else if (child?.type === 'aliased_import') {
           const dottedName = child.namedChildren.find(c => c.type === 'dotted_name');
           if (dottedName) {
             this.createNode('import', getNodeText(dottedName, this.source), node, {
               signature: importText,
             });
+            pushModuleRef(dottedName);
           }
         }
       }
@@ -1707,6 +1960,8 @@ export class TreeSitterExtractor {
             this.createNode('import', fullPath, node, {
               signature: importText,
             });
+            const parentId = this.nodeStack[this.nodeStack.length - 1];
+            if (parentId) this.pushPhpUseRef(fullPath, parentId, node);
           }
         }
         return;
@@ -1720,6 +1975,268 @@ export class TreeSitterExtractor {
     this.createNode('import', importText, node, {
       signature: importText,
     });
+  }
+
+  /**
+   * Emit one `imports` reference per named/default import binding (TS/JS family),
+   * attributed to the file node — so the resolver links each imported symbol to
+   * the file that DEFINES it.
+   *
+   * Importing a symbol IS a dependency, but extraction only emits references for
+   * calls, instantiations, type annotations, and inheritance. A symbol that's
+   * imported and then only re-exported (`export { X } from './x'`), placed in a
+   * registry array (`[expressResolver, …]`), passed as an argument, or used in
+   * JSX produced NO cross-file edge at all — so the providing file showed a
+   * false "0 dependents" and was invisible to blast-radius / `affected`. The
+   * resolver maps the local name (alias-aware) to the provider's definition and
+   * creates a cross-file `imports` edge; `getFileDependents` picks it up, while
+   * `getImpactRadius` keeps it as a bounded leaf (the importing file node).
+   *
+   * Namespace imports (`import * as NS`) bind a whole module: `NS.member` calls
+   * resolve on their own, but a namespace used ONLY via a value-member read
+   * (`NS.SOME_CONST`) would leave no edge — so we also emit the namespace local
+   * name, which the resolver links to the module FILE as a dependency backstop.
+   */
+  private emitImportBindingRefs(node: SyntaxNode, fromNodeId: string): void {
+    const clause = node.namedChildren.find((c) => c.type === 'import_clause');
+    if (!clause) return; // side-effect import (`import './x'`) — no bindings
+
+    const pushRef = (nameNode: SyntaxNode | null | undefined): void => {
+      if (!nameNode) return;
+      const name = getNodeText(nameNode, this.source);
+      if (!name) return;
+      this.unresolvedReferences.push({
+        fromNodeId,
+        referenceName: name,
+        referenceKind: 'imports',
+        line: nameNode.startPosition.row + 1,
+        column: nameNode.startPosition.column,
+      });
+    };
+
+    for (const child of clause.namedChildren) {
+      if (child.type === 'identifier') {
+        // default import: `import Foo from './x'`
+        pushRef(child);
+      } else if (child.type === 'named_imports') {
+        // `import { A, B as C } from './x'` — link the LOCAL name (alias if any)
+        for (const spec of child.namedChildren) {
+          if (spec.type !== 'import_specifier') continue;
+          pushRef(getChildByField(spec, 'alias') ?? getChildByField(spec, 'name') ?? spec.namedChild(0));
+        }
+      } else if (child.type === 'namespace_import') {
+        // `import * as NS from './x'` — emit NS so the module-import backstop can
+        // record the file dependency even if NS is only used by value-member read.
+        pushRef(child.namedChildren.find((c) => c.type === 'identifier') ?? child.namedChild(0));
+      }
+    }
+  }
+
+  /**
+   * Emit one `imports` reference per re-exported binding of a
+   * `export { A, B as C } from './y'` statement, attributed to the file node —
+   * so a barrel that re-exports from another module records a dependency on it.
+   *
+   * Links the SOURCE-side name (`A`, the `name` field — not the local alias
+   * `C`), since that is what the source module defines. `export * from './y'`
+   * has no named bindings to attribute and `export { default as X }` can't be
+   * name-matched, so both are skipped.
+   */
+  private emitReExportRefs(node: SyntaxNode, fromNodeId: string): void {
+    const clause = node.namedChildren.find((c) => c.type === 'export_clause');
+    if (!clause) return; // `export * from './y'` — no named bindings
+    for (const spec of clause.namedChildren) {
+      if (spec.type !== 'export_specifier') continue;
+      const nameNode = getChildByField(spec, 'name') ?? spec.namedChild(0);
+      if (!nameNode) continue;
+      const name = getNodeText(nameNode, this.source);
+      if (!name || name === 'default') continue;
+      this.unresolvedReferences.push({
+        fromNodeId,
+        referenceName: name,
+        referenceKind: 'imports',
+        line: nameNode.startPosition.row + 1,
+        column: nameNode.startPosition.column,
+      });
+    }
+  }
+
+  /**
+   * Emit one `imports` reference per binding of a Rust `use` declaration —
+   * `use crate::m::Item`, `use crate::m::{A, B as C}`, `pub use self::sub::Item`.
+   * Emits the FULL path (e.g. `self::sub::Item`, not just `Item`) so the resolver
+   * can resolve the module prefix to a file and find the leaf symbol there —
+   * disambiguating common-name re-exports (`pub use self::read::read`, where the
+   * leaf `read` collides with many same-named symbols). Falls back to name-match
+   * on the leaf when the path can't be resolved. `use ...::*` has no leaf binding.
+   */
+  private emitRustUseBindingRefs(node: SyntaxNode, fromNodeId: string): void {
+    const paths: { text: string; node: SyntaxNode }[] = [];
+    const join = (prefix: string, seg: string): string => (prefix ? `${prefix}::${seg}` : seg);
+    const collect = (n: SyntaxNode, prefix: string): void => {
+      switch (n.type) {
+        case 'identifier':
+          paths.push({ text: join(prefix, getNodeText(n, this.source)), node: n });
+          break;
+        case 'scoped_identifier': {
+          // Full scoped path (`a::b::C`); combine with any outer group prefix.
+          const full = getNodeText(n, this.source).trim();
+          paths.push({ text: prefix ? `${prefix}::${full}` : full, node: n });
+          break;
+        }
+        case 'scoped_use_list': {
+          // `path::{ ... }` — the group's path becomes the prefix for each item.
+          const pathNode = getChildByField(n, 'path');
+          const seg = pathNode ? getNodeText(pathNode, this.source).trim() : '';
+          const newPrefix = seg ? join(prefix, seg) : prefix;
+          const list = getChildByField(n, 'list') ?? n.namedChildren.find((c) => c.type === 'use_list');
+          if (list) collect(list, newPrefix);
+          break;
+        }
+        case 'use_list':
+          for (let i = 0; i < n.namedChildCount; i++) {
+            const c = n.namedChild(i);
+            if (c) collect(c, prefix);
+          }
+          break;
+        case 'use_as_clause': {
+          // `Path as Alias` → link the source path (the definition), not the alias.
+          const p = getChildByField(n, 'path') ?? n.namedChild(0);
+          if (p) collect(p, prefix);
+          break;
+        }
+        // use_wildcard → no specific binding to link.
+      }
+    };
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const c = node.namedChild(i);
+      if (c) collect(c, '');
+    }
+    for (const p of paths) {
+      // The leaf must be a real name (skip a path that is only `self`/`super`/`crate`).
+      const leaf = p.text.split('::').pop();
+      if (!leaf || leaf === 'self' || leaf === 'super' || leaf === 'crate' || leaf === '*') continue;
+      this.unresolvedReferences.push({
+        fromNodeId,
+        referenceName: p.text,
+        referenceKind: 'imports',
+        line: p.node.startPosition.row + 1,
+        column: p.node.startPosition.column,
+      });
+    }
+  }
+
+  /**
+   * Emit an `imports` reference for a single PHP `use Foo\Bar\Baz;` (grouped
+   * imports `use Foo\{A, B}` are handled where their per-item nodes are created).
+   * The reference targets the namespace-qualified `Foo\Bar::Baz` form classes are
+   * stored under (see the PHP `namespace` capture), so it resolves to the RIGHT
+   * definition — Laravel has many same-named contracts (`Factory`, `Dispatcher`,
+   * `Guard`) across namespaces that a bare-name match can't disambiguate.
+   */
+  private emitPhpUseRefs(node: SyntaxNode, fromNodeId: string): void {
+    const clause = node.namedChildren.find((c: SyntaxNode) => c.type === 'namespace_use_clause');
+    if (!clause) return;
+    const qn = clause.namedChildren.find((c: SyntaxNode) => c.type === 'qualified_name')
+      ?? clause.namedChildren.find((c: SyntaxNode) => c.type === 'name');
+    if (qn) this.pushPhpUseRef(getNodeText(qn, this.source), fromNodeId, node);
+  }
+
+  /**
+   * Ruby `require`/`require_relative` → an `imports` ref to the required FILE.
+   * `require "sidekiq/fetch"` is load-path-relative (matched by file-path suffix
+   * via {@link matchByFilePath}); `require_relative "../foo"` is resolved against
+   * this file's directory. Bare gem/stdlib requires (`require "json"`, no slash)
+   * are skipped — they're external. The path form (a `/` + `.rb`) makes the ref
+   * resolve to the file node, so a file pulled in only by `require` — not by a
+   * resolved constant/call — still records a cross-file dependency.
+   */
+  private emitRubyRequireRefs(node: SyntaxNode, fromNodeId: string): void {
+    const method = node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    const mname = method ? getNodeText(method, this.source) : '';
+    if (mname !== 'require' && mname !== 'require_relative') return;
+    const argList = node.namedChildren.find((c: SyntaxNode) => c.type === 'argument_list');
+    const str = argList?.namedChildren.find((c: SyntaxNode) => c.type === 'string');
+    const content = str?.namedChildren.find((c: SyntaxNode) => c.type === 'string_content');
+    if (!content) return;
+    const req = getNodeText(content, this.source).trim();
+    if (!req) return;
+
+    let refPath: string;
+    if (mname === 'require_relative') {
+      const slash = this.filePath.lastIndexOf('/');
+      const dir = slash >= 0 ? this.filePath.slice(0, slash) : '';
+      refPath = path.posix.normalize(dir ? `${dir}/${req}` : req);
+    } else {
+      refPath = req; // load-path require — suffix-matched against the file path
+    }
+    if (!refPath.includes('/')) return; // bare gem/stdlib require — external
+    if (!refPath.endsWith('.rb')) refPath += '.rb';
+    this.unresolvedReferences.push({
+      fromNodeId,
+      referenceName: refPath,
+      referenceKind: 'imports',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
+  /** Convert a PHP FQN `Foo\Bar\Baz` to the stored `Foo\Bar::Baz` and emit an `imports` ref. */
+  private pushPhpUseRef(fqn: string, fromNodeId: string, node: SyntaxNode): void {
+    const clean = fqn.replace(/^\\/, '');
+    const lastSep = clean.lastIndexOf('\\');
+    if (lastSep < 0) return; // global-namespace class — already matches by simple name
+    this.unresolvedReferences.push({
+      fromNodeId,
+      referenceName: `${clean.slice(0, lastSep)}::${clean.slice(lastSep + 1)}`,
+      referenceKind: 'imports',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
+  /**
+   * Emit one `imports` reference per name imported in a Python
+   * `from module import A, B as C` statement, attributed to the file node — so
+   * the resolver links each imported name to the module that DEFINES it.
+   *
+   * Same recall gap as TS: extraction only emitted references for calls,
+   * instantiations, and inheritance, so a name imported and then used in a
+   * non-call position (a list/dict literal, a default argument, a decorator
+   * target, or simply re-exported through an `__init__.py` barrel) produced no
+   * cross-file edge — the providing module showed a false "0 dependents". Links
+   * the LOCAL name (alias when present, since that's what the resolver's import
+   * mapping keys on); `from module import *` has no names to attribute.
+   */
+  private emitPyFromImportRefs(node: SyntaxNode, fromNodeId: string): void {
+    const moduleNameNode = getChildByField(node, 'module_name');
+    for (const child of node.namedChildren) {
+      // Skip the `from <module>` part itself and `import *`.
+      if (moduleNameNode &&
+          child.startIndex === moduleNameNode.startIndex &&
+          child.endIndex === moduleNameNode.endIndex) continue;
+      if (child.type === 'wildcard_import') continue;
+
+      let nameNode: SyntaxNode | null | undefined = null;
+      if (child.type === 'aliased_import') {
+        nameNode = getChildByField(child, 'alias') ?? getChildByField(child, 'name') ?? child.namedChild(0);
+      } else if (child.type === 'dotted_name') {
+        nameNode = child;
+      }
+      if (!nameNode) continue;
+
+      const raw = getNodeText(nameNode, this.source);
+      // Imported names are simple identifiers; defensively take the last segment.
+      const local = raw.includes('.') ? raw.split('.').pop()! : raw;
+      if (!local) continue;
+      this.unresolvedReferences.push({
+        fromNodeId,
+        referenceName: local,
+        referenceKind: 'imports',
+        line: nameNode.startPosition.row + 1,
+        column: nameNode.startPosition.column,
+      });
+    }
   }
 
   /**
@@ -1788,16 +2305,41 @@ export class TreeSitterExtractor {
         }
       }
       if (methodKeywords.length > 0) {
-        const methodName: string =
-          methodKeywords.length === 1
-            ? (methodKeywords[0] as string)
-            : methodKeywords.map((k) => `${k}:`).join('');
+        // A selector keyword takes a `:` when it has an argument. A SINGLE
+        // keyword can be unary (`[c reset]` → `reset`) OR take one argument
+        // (`[c storeImage:k]` → `storeImage:`) — distinguished by whether the
+        // message has a `:` token. Without this, every single-argument message
+        // (the most common form: `addObject:`, `storeImage:`, …) was named
+        // without the colon and never matched its `storeImage:` method.
+        let hasColon = false;
+        for (let i = 0; i < node.childCount; i++) {
+          if (node.child(i)?.type === ':') { hasColon = true; break; }
+        }
+        const methodName: string = hasColon
+          ? methodKeywords.map((k) => `${k}:`).join('')
+          : (methodKeywords[0] as string);
         const receiverField = getChildByField(node, 'receiver');
         const SKIP_RECEIVERS = new Set(['self', 'super']);
         if (receiverField && receiverField.type !== 'message_expression') {
           const receiverName = getNodeText(receiverField, this.source);
           if (receiverName && !SKIP_RECEIVERS.has(receiverName)) {
             calleeName = `${receiverName}.${methodName}`;
+            // A CLASS-message receiver (`[SDImageCache alloc]`,
+            // `[SDImageCache sharedCache]`) is a capitalized class name. The
+            // call resolves the method (`alloc`/`sharedCache`), but the CLASS
+            // itself — whose @interface lives in the header — would otherwise
+            // never be referenced. Emit a `references` edge to it so a class
+            // used only via class messages (alloc/init, singletons, factories)
+            // and its header record a dependent.
+            if (/^[A-Z][A-Za-z0-9_]*$/.test(receiverName)) {
+              this.unresolvedReferences.push({
+                fromNodeId: callerId,
+                referenceName: receiverName,
+                referenceKind: 'references',
+                line: receiverField.startPosition.row + 1,
+                column: receiverField.startPosition.column,
+              });
+            }
           } else {
             calleeName = methodName;
           }
@@ -1856,6 +2398,16 @@ export class TreeSitterExtractor {
       }
     }
 
+    // Parenthesized type conversions — Go `(*T)(x)` / `(T)(x)` (and a
+    // parenthesized callee generally) parse as a call whose "function" is a
+    // parenthesized type/expression, so the callee text is the un-resolvable
+    // literal `(*T)`. Normalize to the inner name so it resolves to `T` (a real
+    // dependency on the converted-to type) instead of dropping on the floor.
+    if (calleeName) {
+      const conv = calleeName.match(/^\(\s*\*?\s*([A-Za-z_][\w.]*)\s*\)$/);
+      if (conv && conv[1]) calleeName = conv[1];
+    }
+
     if (calleeName) {
       this.unresolvedReferences.push({
         fromNodeId: callerId,
@@ -1890,6 +2442,46 @@ export class TreeSitterExtractor {
       node.namedChild(0);
     if (!ctor) return;
 
+    // Go composite literals: `Widget{...}` (same package) and `pkga.Widget{...}`
+    // (cross-package). Only a directly-named struct type is a meaningful
+    // instantiation target — skip slice/map/array literals (`[]T{}`,
+    // `map[K]V{}`) whose `type` field is a composite type, not a named type.
+    // Unlike `new ns.Foo()`, KEEP the package qualifier (`pkga.Widget`) so the
+    // Go cross-package resolver can disambiguate it to the right package's type.
+    if (node.type === 'composite_literal') {
+      if (ctor.type !== 'type_identifier' && ctor.type !== 'qualified_type') return;
+      let goType = getNodeText(ctor, this.source).trim();
+      const brIdx = goType.indexOf('['); // strip Go generic args: `Box[T]{}` -> `Box`
+      if (brIdx > 0) goType = goType.slice(0, brIdx).trim();
+      if (goType) {
+        this.unresolvedReferences.push({
+          fromNodeId: fromId,
+          referenceName: goType,
+          referenceKind: 'instantiates',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+
+    // Scala: `new Monoid[Int] { ... }` — the constructor is a `generic_type`
+    // (or qualified `stable_type_identifier`) using `[...]` type args, which the
+    // generic `<...>` strip below misses. Unwrap to the base type name.
+    if (node.type === 'instance_expression') {
+      const name = scalaBaseTypeName(ctor, this.source);
+      if (name) {
+        this.unresolvedReferences.push({
+          fromNodeId: fromId,
+          referenceName: name,
+          referenceKind: 'instantiates',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+
     let className = getNodeText(ctor, this.source);
     // Strip type-argument suffix first: `new Map<K, V>()` would
     // otherwise produce className 'Map<K, V>' (the constructor
@@ -1916,6 +2508,76 @@ export class TreeSitterExtractor {
         column: node.startPosition.column,
       });
     }
+  }
+
+  /**
+   * Static-member / value-read pass. A type/enum/class used only via a member
+   * VALUE — `Enum.value`, `Type.CONST`, `Colors.red`, `Foo::BAR` — recorded no
+   * edge, because the body walker only handled CALLS (`Type.method()`). So a
+   * type referenced only by an enum value or a static field looked like nothing
+   * depended on it (the residual frontier across Dart/Java/C#/Swift/Kotlin/PHP).
+   * Emit a `references` edge to the capitalized receiver. Gated to languages
+   * where types are Capitalized by convention, and skipped when the access is a
+   * call's callee (the call extractor already links the method).
+   */
+  private extractStaticMemberRef(node: SyntaxNode): void {
+    if (!STATIC_MEMBER_LANGS.has(this.language)) return;
+    if (this.nodeStack.length === 0) return;
+    const ownerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!ownerId) return;
+
+    // Dart structures member access as an `identifier` + a sibling `selector`,
+    // not a single node. A value-read selector (no `argument_part`) whose
+    // previous sibling is a capitalized identifier is `Enum.value`.
+    if (this.language === 'dart') {
+      if (node.type !== 'selector') return;
+      if (node.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) return;
+      const prev = node.previousNamedSibling;
+      if (prev?.type === 'identifier' && /^[A-Z][A-Za-z0-9_]*$/.test(prev.text)) {
+        this.pushStaticMemberRef(prev.text, ownerId, prev);
+      }
+      return;
+    }
+
+    if (!MEMBER_ACCESS_TYPES.has(node.type)) return;
+
+    // Skip `Type.method()` — the access is the callee of a call, already linked.
+    const parent = node.parent;
+    if (parent && this.extractor!.callTypes.includes(parent.type)) {
+      const callee =
+        getChildByField(parent, 'function') ??
+        getChildByField(parent, 'method') ??
+        parent.namedChild(0);
+      if (callee && callee.startIndex === node.startIndex) return;
+    }
+
+    // The receiver must be a SIMPLE capitalized identifier — `Type.X`, not the
+    // nested `a.B.c` (whose own head member-access is visited separately) nor a
+    // lowercase `obj.field` / `pkg.func`.
+    const recv =
+      getChildByField(node, 'object') ??
+      getChildByField(node, 'expression') ??
+      getChildByField(node, 'scope') ??
+      node.namedChild(0);
+    if (!recv) return;
+    const t = recv.type;
+    if (
+      t === 'identifier' || t === 'type_identifier' || t === 'simple_identifier' ||
+      t === 'name' || t === 'scoped_type_identifier'
+    ) {
+      const text = getNodeText(recv, this.source);
+      if (/^[A-Z][A-Za-z0-9_]*$/.test(text)) this.pushStaticMemberRef(text, ownerId, recv);
+    }
+  }
+
+  private pushStaticMemberRef(name: string, ownerId: string, node: SyntaxNode): void {
+    this.unresolvedReferences.push({
+      fromNodeId: ownerId,
+      referenceName: name,
+      referenceKind: 'references',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
   }
 
   /**
@@ -2009,12 +2671,14 @@ export class TreeSitterExtractor {
     const consider = (n: SyntaxNode | null): void => {
       if (!n) return;
       // `marker_annotation` is Java's grammar for arg-less annotations
-      // (`@Override`, `@Deprecated`); without including it, every
-      // such Java annotation would be silently skipped.
+      // (`@Override`, `@Deprecated`); `attribute` is Swift's grammar for
+      // attributes and PROPERTY WRAPPERS (`@objc`, `@Argument`, `@Published`,
+      // `@State`). Without these, those usages would be silently skipped.
       if (
         n.type !== 'decorator' &&
         n.type !== 'annotation' &&
-        n.type !== 'marker_annotation'
+        n.type !== 'marker_annotation' &&
+        n.type !== 'attribute'
       ) {
         return;
       }
@@ -2033,7 +2697,9 @@ export class TreeSitterExtractor {
           child.type === 'identifier' ||
           child.type === 'member_expression' ||
           child.type === 'scoped_identifier' ||
-          child.type === 'navigation_expression'
+          child.type === 'navigation_expression' ||
+          child.type === 'user_type' ||      // swift attribute → user_type (`@Argument`)
+          child.type === 'type_identifier'
         ) {
           target = child;
           break;
@@ -2041,8 +2707,11 @@ export class TreeSitterExtractor {
       }
       if (!target) return;
       let name = getNodeText(target, this.source);
+      const lt = name.indexOf('<'); // strip generic args: `@Argument<T>` → `Argument`
+      if (lt > 0) name = name.slice(0, lt);
       const lastDot = Math.max(name.lastIndexOf('.'), name.lastIndexOf('::'));
       if (lastDot >= 0) name = name.slice(lastDot + 1).replace(/^[:.]/, '');
+      name = name.trim();
       if (!name) return;
       this.unresolvedReferences.push({
         fromNodeId: decoratedId,
@@ -2056,7 +2725,17 @@ export class TreeSitterExtractor {
     // 1. Decorators that are direct children of the declaration
     //    (method/property style, also some grammars for class).
     for (let i = 0; i < declNode.namedChildCount; i++) {
-      consider(declNode.namedChild(i));
+      const child = declNode.namedChild(i);
+      consider(child);
+      // Java/Kotlin/C# put annotations INSIDE a `modifiers` node
+      // (`@MyAnno public class X` → class_declaration → modifiers → annotation),
+      // so descend into it — otherwise every annotation usage is silently
+      // dropped and annotation types show zero dependents.
+      if (child && child.type === 'modifiers') {
+        for (let j = 0; j < child.namedChildCount; j++) {
+          consider(child.namedChild(j));
+        }
+      }
     }
 
     // 2. Decorators that are PRECEDING siblings of the declaration
@@ -2105,11 +2784,72 @@ export class TreeSitterExtractor {
    *      tree-sitter to interpret the namespace block as a function_definition,
    *      hiding real class/struct/enum nodes inside the "function body".
    */
+  /**
+   * Rocket route-registration macros — `routes![a::b::handler, c::d::other]`
+   * and `catchers![not_found]`. Tree-sitter leaves a macro body as a flat
+   * `token_tree` of raw tokens (`identifier`, `::`, `,`), so the handler paths
+   * are never seen as references and each handler fn looks like it has no caller
+   * — it's mounted by Rocket at runtime, not called by in-repo code, so its file
+   * shows 0 dependents. Walk the token tree, reconstruct each comma-separated
+   * path, and emit a `references` edge; the Rust path resolver
+   * (`resolveRustPathReference`) then links it to the handler fn. The handler
+   * names are explicit in source, so this is precise static extraction, not a
+   * heuristic — no false edges (resolution still validates each path).
+   */
+  private extractRustRouteMacro(node: SyntaxNode): void {
+    if (this.language !== 'rust') return;
+    const macroName = node.namedChild(0);
+    if (!macroName) return;
+    const name = getNodeText(macroName, this.source);
+    if (name !== 'routes' && name !== 'catchers') return;
+    const tokenTree = node.namedChildren.find((c: SyntaxNode) => c.type === 'token_tree');
+    if (!tokenTree) return;
+    const fromId = this.nodeStack[this.nodeStack.length - 1];
+    if (!fromId) return;
+
+    // The token tree is a flat stream: `[ id :: id :: id , id … ]`. Group runs
+    // of `identifier` tokens (the `::` joiners are anonymous) into one path; a
+    // `,` (or the closing `]`) ends a path.
+    let parts: string[] = [];
+    let line = 0;
+    let column = 0;
+    const flush = (): void => {
+      if (parts.length > 0) {
+        this.unresolvedReferences.push({
+          fromNodeId: fromId,
+          referenceName: parts.join('::'),
+          referenceKind: 'references',
+          line,
+          column,
+        });
+        parts = [];
+      }
+    };
+    for (let i = 0; i < tokenTree.childCount; i++) {
+      const t = tokenTree.child(i);
+      if (!t) continue;
+      if (t.type === 'identifier') {
+        if (parts.length === 0) {
+          line = t.startPosition.row + 1;
+          column = t.startPosition.column;
+        }
+        parts.push(getNodeText(t, this.source));
+      } else if (t.type === ',') {
+        flush();
+      }
+    }
+    flush();
+  }
+
   private visitFunctionBody(body: SyntaxNode, _functionId: string): void {
     if (!this.extractor) return;
 
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
       const nodeType = node.type;
+
+      // Rocket route-registration macros (`routes![…]` / `catchers![…]`): the
+      // handler paths live in a raw token tree the call walker can't see.
+      if (nodeType === 'macro_invocation') this.extractRustRouteMacro(node);
 
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);
@@ -2141,6 +2881,27 @@ export class TreeSitterExtractor {
             });
           }
         }
+      }
+
+      // Static-member / value-read: `Enum.value`, `Type.CONST`, `Foo::BAR`.
+      this.extractStaticMemberRef(node);
+
+      // Local variable type annotations inside a body — `const items: Foo[] = []`,
+      // `const x: SomeType = svc.load()`. We deliberately do NOT create nodes for
+      // locals (that would explode the graph — the data-flow frontier we leave
+      // uncovered), but the TYPE a local is annotated with is a real dependency of
+      // the enclosing function, so attribute a `references` edge to it. Without
+      // this, a function that uses a type ONLY in its body (very common — e.g. a
+      // resolver building `const nodes: Node[] = []`) produced no edge to that
+      // type, so impact / `affected` missed the dependency entirely. We fall
+      // through to the default recursion below so the initializer's calls (and any
+      // nested declarators) are still walked.
+      if (
+        nodeType === 'variable_declarator' &&
+        this.TYPE_ANNOTATION_LANGUAGES.has(this.language)
+      ) {
+        const ownerId = this.nodeStack[this.nodeStack.length - 1];
+        if (ownerId) this.extractVariableTypeAnnotation(node, ownerId);
       }
 
       // Nested NAMED functions inside a body — function declarations and named
@@ -2244,6 +3005,61 @@ export class TreeSitterExtractor {
         child.type === 'base_clause' || // PHP class extends
         child.type === 'extends_interfaces' // Java interface extends
       ) {
+        // Scala: `extends A[X] with B with C` packs EVERY supertype into the
+        // one extends_clause (separated by `with`), each a `generic_type` /
+        // `type_identifier` / `stable_type_identifier`. The generic path below
+        // takes only namedChild(0) and keeps the full text (`A[X]`), so a
+        // parameterized supertype — every typeclass in cats/algebra — never
+        // matched and `with`-mixed traits past the first were dropped. Iterate
+        // all supertypes and unwrap each to its base type name.
+        if (this.language === 'scala') {
+          for (const target of child.namedChildren) {
+            const name = scalaBaseTypeName(target, this.source);
+            if (name) {
+              this.unresolvedReferences.push({
+                fromNodeId: classId,
+                referenceName: name,
+                referenceKind: 'extends',
+                line: target.startPosition.row + 1,
+                column: target.startPosition.column,
+              });
+            }
+          }
+          continue;
+        }
+        // Dart: `class C extends Base with M1, M2` — the `superclass` node holds
+        // the extends type as a direct `type_identifier` AND a `mixins` child
+        // listing the `with` mixins (and `class C with M` has ONLY mixins, no
+        // extends type). The generic `namedChild(0)` path would read the
+        // `mixins` node itself as the superclass and drop every mixin — yet
+        // mixins are Dart's core composition mechanism (Flutter is built on
+        // them). Emit `extends` for the base and `implements` for each mixin.
+        if (this.language === 'dart' && child.type === 'superclass') {
+          for (const t of child.namedChildren) {
+            if (t.type === 'mixins') {
+              for (const m of t.namedChildren) {
+                if (m.type === 'type_identifier') {
+                  this.unresolvedReferences.push({
+                    fromNodeId: classId,
+                    referenceName: getNodeText(m, this.source),
+                    referenceKind: 'implements',
+                    line: m.startPosition.row + 1,
+                    column: m.startPosition.column,
+                  });
+                }
+              }
+            } else if (t.type === 'type_identifier') {
+              this.unresolvedReferences.push({
+                fromNodeId: classId,
+                referenceName: getNodeText(t, this.source),
+                referenceKind: 'extends',
+                line: t.startPosition.row + 1,
+                column: t.startPosition.column,
+              });
+            }
+          }
+          continue;
+        }
         // Extract parent class/interface names
         // Java uses type_list wrapper: superclass -> type_identifier, extends_interfaces -> type_list -> type_identifier
         const typeList = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_list');
@@ -2544,7 +3360,16 @@ export class TreeSitterExtractor {
    * Languages that support type annotations (TypeScript, etc.)
    */
   private readonly TYPE_ANNOTATION_LANGUAGES = new Set([
-    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp',
+    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp', 'scala', 'php',
+  ]);
+
+  /**
+   * PHP pseudo-types and `self`/`static`/`parent` that aren't project symbols.
+   * (Scalar primitives parse as `primitive_type` and are skipped structurally.)
+   */
+  private readonly PHP_PSEUDO_TYPES = new Set([
+    'self', 'static', 'parent', 'mixed', 'object', 'iterable', 'callable', 'void',
+    'null', 'false', 'true', 'never', 'array', 'int', 'float', 'string', 'bool',
   ]);
 
   /**
@@ -2561,6 +3386,9 @@ export class TreeSitterExtractor {
     // Go
     'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64',
     'float32', 'float64', 'complex64', 'complex128', 'rune', 'error',
+    // Scala (capitalized primitives + ubiquitous stdlib aliases)
+    'Int', 'Long', 'Short', 'Byte', 'Float', 'Double', 'Boolean', 'Char', 'Unit',
+    'String', 'Any', 'AnyRef', 'AnyVal', 'Nothing', 'Null',
   ]);
 
   /**
@@ -2582,16 +3410,73 @@ export class TreeSitterExtractor {
       return;
     }
 
-    // Extract parameter type annotations
-    const params = getChildByField(node, this.extractor.paramsField || 'parameters');
-    if (params) {
-      this.extractTypeRefsFromSubtree(params, nodeId);
+    // PHP type-hints are `named_type`/`optional_type`/`union_type` wrapping a
+    // `name`/`qualified_name` — never `type_identifier` — so the generic walker
+    // below emits nothing for them. Dispatch to a PHP-aware path that walks only
+    // type positions (parameter / return / property types), so type-hinted
+    // dependencies (the constructor-injected contracts that dominate Laravel) are
+    // recorded and a `variable_name` like `$events` never mis-emits as a ref.
+    if (this.language === 'php') {
+      this.extractPhpTypeRefs(node, nodeId);
+      return;
+    }
+
+    // Dart: a `method_signature` wraps the real `function_signature` (where the
+    // params and return type live), and the return type is a bare
+    // `type_identifier` child, not a `type` field — so getChildByField below
+    // finds neither. Walk the inner signature: param names / the method name are
+    // `identifier` (not `type_identifier`), so only types surface.
+    if (this.language === 'dart') {
+      let sig: SyntaxNode | undefined = node;
+      if (node.type === 'method_signature') {
+        sig = node.namedChildren.find(
+          (c: SyntaxNode) =>
+            c.type === 'function_signature' ||
+            c.type === 'getter_signature' ||
+            c.type === 'setter_signature' ||
+            c.type === 'constructor_signature' ||
+            c.type === 'factory_constructor_signature'
+        ) ?? node;
+      }
+      this.extractTypeRefsFromSubtree(sig, nodeId);
+      return;
+    }
+
+    // Extract parameter type annotations. Scala curries — `def f(a)(implicit
+    // M: TC)` has MULTIPLE `parameters` siblings, and the typeclass is almost
+    // always in the trailing implicit list — so walk every parameter list, not
+    // just getChildByField's first match.
+    if (this.language === 'scala') {
+      for (const pc of node.namedChildren) {
+        if (pc.type === 'parameters') this.extractTypeRefsFromSubtree(pc, nodeId);
+      }
+    } else {
+      const params = getChildByField(node, this.extractor.paramsField || 'parameters');
+      if (params) {
+        this.extractTypeRefsFromSubtree(params, nodeId);
+      }
     }
 
     // Extract return type annotation
     const returnType = getChildByField(node, this.extractor.returnField || 'return_type');
     if (returnType) {
       this.extractTypeRefsFromSubtree(returnType, nodeId);
+    }
+
+    // Scala context bounds / type-parameter bounds: `def f[A: Monoid]`,
+    // `[F[_]: Monad]`, `[A <: Foo]` carry the bound type inside `type_parameters`.
+    // This is THE pervasive way a typeclass is required in Scala, yet the bound
+    // never appears in the value parameters. Param NAMES are `identifier` (not
+    // `type_identifier`), so only the bound types surface. Scala-only: in other
+    // languages a `type_parameters` child holds declaration names as
+    // `type_identifier` (TS `<T>`), which would wrongly surface as refs.
+    if (this.language === 'scala') {
+      const typeParams = node.namedChildren.find(
+        (c: SyntaxNode) => c.type === 'type_parameters'
+      );
+      if (typeParams) {
+        this.extractTypeRefsFromSubtree(typeParams, nodeId);
+      }
     }
 
     // Extract direct type annotation (for class fields like `model: ITextModel`)
@@ -2616,8 +3501,11 @@ export class TreeSitterExtractor {
    * `tuple_type`, …) — none of which are `type_identifier`. Closes #381.
    */
   private extractCsharpTypeRefs(node: SyntaxNode, nodeId: string): void {
-    // Return type / property type — the field is named `type`.
-    const directType = getChildByField(node, 'type');
+    // A property's type is under the `type` field; a method/constructor's RETURN
+    // type is under `returns` (tree-sitter-c-sharp 0.23.x — older builds used
+    // `type` for both). A node carries only one of the two, so checking both
+    // covers return types and property types without conflating them.
+    const directType = getChildByField(node, 'type') ?? getChildByField(node, 'returns');
     if (directType) this.walkCsharpTypePosition(directType, nodeId);
 
     // Field declarations wrap declarators in a `variable_declaration`
@@ -2643,6 +3531,29 @@ export class TreeSitterExtractor {
         const paramType = getChildByField(child, 'type');
         if (paramType) this.walkCsharpTypePosition(paramType, nodeId);
       }
+    }
+  }
+
+  /**
+   * Record the dependencies declared by a C# PRIMARY CONSTRUCTOR
+   * (`class Svc(IRepo repo, [FromKeyedServices("k")] ICache cache) { … }`,
+   * C# 12+). The parameter list hangs off the class/struct/record declaration
+   * as an unnamed-field `parameter_list` child (not the `parameters` field a
+   * method uses), so it's found by node type. Each parameter's declared type
+   * becomes a `references` edge from the owning type — these are exactly the
+   * services a DI-registered type depends on, so impact/blast-radius and
+   * "who depends on this contract" now see them. No-op when there's no primary
+   * constructor. (#237)
+   */
+  private extractCsharpPrimaryCtorParamRefs(node: SyntaxNode, ownerId: string): void {
+    if (this.language !== 'csharp') return;
+    const paramList = node.namedChildren.find((c: SyntaxNode) => c.type === 'parameter_list');
+    if (!paramList) return;
+    for (let i = 0; i < paramList.namedChildCount; i++) {
+      const param = paramList.namedChild(i);
+      if (!param || param.type !== 'parameter') continue;
+      const paramType = getChildByField(param, 'type');
+      if (paramType) this.walkCsharpTypePosition(paramType, ownerId);
     }
   }
 
@@ -2707,6 +3618,63 @@ export class TreeSitterExtractor {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (child) this.walkCsharpTypePosition(child, fromNodeId);
+    }
+  }
+
+  /**
+   * Extract PHP type references from a method/function/property declaration.
+   * Walks ONLY type positions: each parameter's type child (inside
+   * `formal_parameters`), the return type, and a property's type — all
+   * `named_type` / `optional_type` / `union_type` / … direct children. Parameter
+   * and property NAMES are `variable_name` (`$x`), never type nodes, so they
+   * can't be mis-emitted.
+   */
+  private extractPhpTypeRefs(node: SyntaxNode, nodeId: string): void {
+    const params = node.namedChildren.find((c: SyntaxNode) => c.type === 'formal_parameters');
+    if (params) {
+      for (const p of params.namedChildren) {
+        // simple_parameter / property_promotion_parameter / variadic_parameter
+        for (const c of p.namedChildren) {
+          if (PHP_TYPE_NODES.has(c.type)) this.walkPhpTypePosition(c, nodeId);
+        }
+      }
+    }
+    // Return type (method/function) and property type are TYPE nodes that are
+    // DIRECT children of the declaration.
+    for (const c of node.namedChildren) {
+      if (PHP_TYPE_NODES.has(c.type)) this.walkPhpTypePosition(c, nodeId);
+    }
+  }
+
+  /** Walk a PHP subtree KNOWN to be in a type position; emit class/interface refs. */
+  private walkPhpTypePosition(node: SyntaxNode, fromNodeId: string): void {
+    if (node.type === 'primitive_type') return; // int/string/void/…
+    if (node.type === 'name') {
+      const name = getNodeText(node, this.source);
+      if (name && !this.PHP_PSEUDO_TYPES.has(name)) {
+        this.unresolvedReferences.push({
+          fromNodeId, referenceName: name, referenceKind: 'references',
+          line: node.startPosition.row + 1, column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+    if (node.type === 'qualified_name') {
+      // `App\Contracts\Logger` → match on the trailing simple name (what the
+      // class node is stored as, and what a `use` import brings into scope).
+      const last = getNodeText(node, this.source).split('\\').pop() ?? '';
+      if (last && !this.PHP_PSEUDO_TYPES.has(last)) {
+        this.unresolvedReferences.push({
+          fromNodeId, referenceName: last, referenceKind: 'references',
+          line: node.startPosition.row + 1, column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+    // optional_type / nullable_type / union_type / intersection_type / named_type → recurse
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child) this.walkPhpTypePosition(child, fromNodeId);
     }
   }
 
@@ -3189,6 +4157,10 @@ export function extractFromSource(
   } else if (detectedLanguage === 'liquid') {
     // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'razor') {
+    // Use custom extractor for ASP.NET Razor (.cshtml) / Blazor (.razor) markup
+    const extractor = new RazorExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'xml') {
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a

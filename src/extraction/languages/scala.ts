@@ -10,6 +10,40 @@ function getValVarName(node: SyntaxNode, source: string): string | null {
   return identChild ? getNodeText(identChild, source) : null;
 }
 
+// Capitalized Scala primitives/ubiquitous aliases that shouldn't create refs.
+const SCALA_BUILTIN_TYPES = new Set([
+  'Int', 'Long', 'Short', 'Byte', 'Float', 'Double', 'Boolean', 'Char', 'Unit',
+  'String', 'Any', 'AnyRef', 'AnyVal', 'Nothing', 'Null',
+]);
+
+/**
+ * Emit `references` edges for every type identifier in a Scala type subtree
+ * (a `val`/`var` type annotation), unwrapping `generic_type` etc. Mirrors the
+ * generic type-annotation extraction the core extractor runs for method
+ * parameter/return types, but Scala `val`s are created here in visitNode so
+ * their type is walked here too. A trait used only as a field type (the common
+ * `implicit val x: Monoid[Int]` instance pattern) thus gains a dependent.
+ */
+function emitScalaTypeRefs(typeNode: SyntaxNode, fromId: string, ctx: { addUnresolvedReference: (r: { fromNodeId: string; referenceName: string; referenceKind: 'references'; line: number; column: number }) => void }, source: string): void {
+  if (typeNode.type === 'type_identifier') {
+    const name = source.substring(typeNode.startIndex, typeNode.endIndex);
+    if (name && !SCALA_BUILTIN_TYPES.has(name)) {
+      ctx.addUnresolvedReference({
+        fromNodeId: fromId,
+        referenceName: name,
+        referenceKind: 'references',
+        line: typeNode.startPosition.row + 1,
+        column: typeNode.startPosition.column,
+      });
+    }
+    return;
+  }
+  for (let i = 0; i < typeNode.namedChildCount; i++) {
+    const child = typeNode.namedChild(i);
+    if (child) emitScalaTypeRefs(child, fromId, ctx, source);
+  }
+}
+
 function extractVisibility(node: SyntaxNode): 'public' | 'private' | 'protected' {
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
@@ -96,7 +130,8 @@ export const scalaExtractor: LanguageExtractor = {
         ? `${t === 'val_definition' ? 'val' : 'var'} ${name}: ${getNodeText(typeNode, ctx.source)}`
         : undefined;
 
-      ctx.createNode(kind, name, node, { signature: sig, visibility: extractVisibility(node) });
+      const created = ctx.createNode(kind, name, node, { signature: sig, visibility: extractVisibility(node) });
+      if (created && typeNode) emitScalaTypeRefs(typeNode, created.id, ctx, ctx.source);
       return true;
     }
 

@@ -78,6 +78,18 @@ export const phpExtractor: LanguageExtractor = {
 
     return false;
   },
+  // PHP `namespace Foo\Bar;` is file-level (like a Java/Kotlin package). Capturing
+  // it scopes every class under an `Foo\Bar::` qualified name, which is what makes
+  // `use` imports and same-named types (Laravel has 7+ `Factory` interfaces across
+  // namespaces) resolvable to the RIGHT definition instead of an arbitrary match.
+  packageTypes: ['namespace_definition'],
+  extractPackage: (node, source) => {
+    const nsName = node.namedChildren.find((c: SyntaxNode) => c.type === 'namespace_name');
+    // Skip braced `namespace Foo { … }` (has a body) — file-level only.
+    const hasBody = node.namedChildren.some((c: SyntaxNode) => c.type === 'compound_statement' || c.type === 'declaration_list');
+    if (!nsName || hasBody) return null;
+    return getNodeText(nsName, source);
+  },
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();
 

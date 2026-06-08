@@ -3,9 +3,13 @@ import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 export const rustExtractor: LanguageExtractor = {
-  functionTypes: ['function_item'],
+  // `function_signature_item` is a trait method DECLARATION (`fn render(&self);`,
+  // no body). Extracting it makes a trait's method set first-class, which
+  // impl-navigation and trait-dispatch synthesis need (a struct's method set is
+  // matched against the trait's).
+  functionTypes: ['function_item', 'function_signature_item'],
   classTypes: [], // Rust has impl blocks
-  methodTypes: ['function_item'], // Methods are functions in impl blocks
+  methodTypes: ['function_item', 'function_signature_item'],
   interfaceTypes: ['trait_item'],
   structTypes: ['struct_item'],
   enumTypes: ['enum_item'],

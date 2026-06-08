@@ -49,6 +49,7 @@ import {
 } from './daemon';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import { getDaemonSocketPath } from './daemon-paths';
+import { supervisionLostReason } from './ppid-watchdog';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
 /**
@@ -423,13 +424,13 @@ export class MCPServer {
     const pollMs = parsePpidPollMs(process.env.CODEGRAPH_PPID_POLL_MS);
     if (pollMs <= 0) return;
     this.ppidWatchdog = setInterval(() => {
-      const current = process.ppid;
-      const ppidChanged = current !== this.originalPpid;
-      const hostGone = this.hostPpid !== null && !isProcessAlive(this.hostPpid);
-      if (ppidChanged || hostGone) {
-        const reason = ppidChanged
-          ? `ppid ${this.originalPpid} -> ${current}`
-          : `host pid ${this.hostPpid} exited`;
+      const reason = supervisionLostReason({
+        originalPpid: this.originalPpid,
+        currentPpid: process.ppid,
+        hostPpid: this.hostPpid,
+        isAlive: isProcessAlive,
+      });
+      if (reason) {
         process.stderr.write(
           `[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`
         );

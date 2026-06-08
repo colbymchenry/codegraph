@@ -6,7 +6,11 @@ export const javaExtractor: LanguageExtractor = {
   functionTypes: [],
   classTypes: ['class_declaration'],
   methodTypes: ['method_declaration', 'constructor_declaration'],
-  interfaceTypes: ['interface_declaration'],
+  // `annotation_type_declaration` is `@interface Foo { … }` — an annotation
+  // definition. Without it, annotation types (`@SerializedName`, `@GetMapping`,
+  // JPA/Spring annotations) aren't nodes, so the `@Foo` usages that DO get
+  // extracted can't resolve and the annotation file shows zero dependents.
+  interfaceTypes: ['interface_declaration', 'annotation_type_declaration'],
   structTypes: [],
   enumTypes: ['enum_declaration'],
   enumMemberTypes: ['enum_constant'],

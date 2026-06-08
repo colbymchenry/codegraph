@@ -47,7 +47,6 @@ Optionally auto-allow the read-only tools in `~/.claude/settings.json`:
   "permissions": {
     "allow": [
       "mcp__codegraph__codegraph_search",
-      "mcp__codegraph__codegraph_context",
       "mcp__codegraph__codegraph_callers",
       "mcp__codegraph__codegraph_callees",
       "mcp__codegraph__codegraph_impact",

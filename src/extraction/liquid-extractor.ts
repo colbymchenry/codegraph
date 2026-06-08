@@ -33,17 +33,25 @@ export class LiquidExtractor {
       // Create file node
       const fileNode = this.createFileNode();
 
-      // Extract render/include statements (snippet references)
-      this.extractSnippetReferences(fileNode.id);
+      // Shopify OS 2.0 JSON template / section group: link each section `type`
+      // to its `sections/<type>.liquid` file. (No symbol nodes are emitted — the
+      // JSON file just carries the references — so it stays out of any
+      // symbol-bearing-file metric while its sections still get their dependents.)
+      if (this.filePath.endsWith('.json')) {
+        this.extractShopifyJsonSections(fileNode.id);
+      } else {
+        // Extract render/include statements (snippet references)
+        this.extractSnippetReferences(fileNode.id);
 
-      // Extract section references
-      this.extractSectionReferences(fileNode.id);
+        // Extract section references
+        this.extractSectionReferences(fileNode.id);
 
-      // Extract schema block
-      this.extractSchema(fileNode.id);
+        // Extract schema block
+        this.extractSchema(fileNode.id);
 
-      // Extract assign statements as variables
-      this.extractAssignments(fileNode.id);
+        // Extract assign statements as variables
+        this.extractAssignments(fileNode.id);
+      }
     } catch (error) {
       this.errors.push({
         message: `Liquid extraction error: ${error instanceof Error ? error.message : String(error)}`,
@@ -84,6 +92,36 @@ export class LiquidExtractor {
 
     this.nodes.push(fileNode);
     return fileNode;
+  }
+
+  /**
+   * Shopify OS 2.0 JSON template / section group. Both have a `sections` object
+   * mapping an id → `{ "type": "<section-name>", ... }`; the `type` names a
+   * `sections/<type>.liquid` file. Emit a `references` edge to each, so a section
+   * used only from a JSON template (the OS 2.0 norm) is no longer orphaned.
+   */
+  private extractShopifyJsonSections(fromNodeId: string): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(this.source);
+    } catch {
+      return; // not valid JSON (or a partial) — nothing to link
+    }
+    const sections = (parsed as { sections?: Record<string, { type?: unknown }> })?.sections;
+    if (!sections || typeof sections !== 'object') return;
+    const seen = new Set<string>();
+    for (const key of Object.keys(sections)) {
+      const type = sections[key]?.type;
+      if (typeof type !== 'string' || seen.has(type)) continue;
+      seen.add(type);
+      this.unresolvedReferences.push({
+        fromNodeId,
+        referenceName: `sections/${type}.liquid`,
+        referenceKind: 'references',
+        line: 1,
+        column: 0,
+      });
+    }
   }
 
   /**

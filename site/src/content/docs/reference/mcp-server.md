@@ -16,8 +16,6 @@ Agents configured by the installer launch this automatically. When a `.codegraph
 | Tool | Purpose |
 |---|---|
 | `codegraph_search` | Find symbols by name across the codebase |
-| `codegraph_context` | Build relevant code context for a task — composes search + node + callers + callees in one call |
-| `codegraph_trace` | Trace the call path between two symbols ("how does X reach Y") in one call — each hop with its body inline, following dynamic-dispatch hops (callbacks, React re-render, interface→impl) that grep can't |
 | `codegraph_callers` | Find what calls a function |
 | `codegraph_callees` | Find what a function calls |
 | `codegraph_impact` | Analyze what code is affected by changing a symbol |

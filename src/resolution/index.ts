@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference } from './name-matcher';
+import { matchReference, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -185,6 +185,10 @@ export class ReferenceResolver {
   private queries: QueryBuilder;
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
+  // Per-`.razor`/`.cshtml`-file `@using` namespace set (own directives + folder
+  // `_Imports.razor`, cascading to the project root). Used to disambiguate a
+  // markup type ref to the right C# namespace.
+  private razorUsingsCache = new Map<string, string[]>();
   // All per-resolver caches are LRU-bounded. Previously these were
   // unbounded Maps that grew with every distinct lookup and OOM'd on
   // codebases with 20k+ files (see issue: unbounded cache growth).
@@ -560,6 +564,16 @@ export class ReferenceResolver {
       const receiver = name.substring(0, colonIdx);
       const member = name.substring(colonIdx + 2);
       if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      // Multi-segment path `a::b::c` (a Rust/C++ module call like
+      // `database::profiles::find`) — the only segment that names a symbol is
+      // the last (`c`); `member` above is `b::c`, which never matches a node
+      // name, so without this the pre-filter drops the ref before the Rust path
+      // resolver ever sees it. Mirror the dotted-name leaf check above.
+      const lastColon = name.lastIndexOf('::');
+      if (lastColon > colonIdx) {
+        const tail = name.substring(lastColon + 2);
+        if (tail && this.knownNames.has(tail)) return true;
+      }
     }
 
     // For path-like references (e.g., "snippets/drawer-menu.liquid"), check the filename
@@ -620,11 +634,25 @@ export class ReferenceResolver {
     const jvmImport = resolveJvmImport(ref, this.context);
     if (jvmImport) return jvmImport;
 
+    // Razor/Blazor: a markup or `@code` type ref resolves through the file's
+    // `@using` namespaces (incl. folder `_Imports.razor`). This precisely
+    // disambiguates a simple name that exists in several namespaces — e.g.
+    // `CatalogBrand` resolving to `BlazorShared.Models::CatalogBrand` (the DTO,
+    // which the `.razor` `@using`s) rather than the same-named domain entity.
+    if (ref.language === 'razor') {
+      const razorResult = this.resolveRazorUsing(ref);
+      if (razorResult) return razorResult;
+    }
+
     const candidates: ResolvedRef[] = [];
 
-    // Strategy 1: Try framework-specific resolution
+    // Strategy 1: Try framework-specific resolution. Cross-language bridges
+    // are deliberately preserved (Drupal `routing.yml` → PHP controller, RN
+    // JS → native `calls`) — `gateFrameworkLanguage` only drops a type/import
+    // edge between two KNOWN families (see its doc), never a `calls` bridge or
+    // a config↔code edge.
     for (const framework of this.frameworks) {
-      const result = framework.resolve(ref, this.context);
+      const result = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
       if (result) {
         if (result.confidence >= 0.9) return result; // High confidence, return immediately
         candidates.push(result);
@@ -632,14 +660,14 @@ export class ReferenceResolver {
     }
 
     // Strategy 2: Try import-based resolution
-    const importResult = resolveViaImport(ref, this.context);
+    const importResult = this.gateLanguage(resolveViaImport(ref, this.context), ref);
     if (importResult) {
       if (importResult.confidence >= 0.9) return importResult;
       candidates.push(importResult);
     }
 
     // Strategy 3: Try name matching
-    const nameResult = matchReference(ref, this.context);
+    const nameResult = this.gateLanguage(matchReference(ref, this.context), ref);
     if (nameResult) {
       candidates.push(nameResult);
     }
@@ -946,6 +974,97 @@ export class ReferenceResolver {
   private getLanguageFromNodeId(nodeId: string): UnresolvedRef['language'] {
     const node = this.queries.getNodeById(nodeId);
     return node?.language || 'unknown';
+  }
+
+  /**
+   * Drop an import/name-strategy resolution that crosses a language family.
+   * Two regimes (mirrors `applyLanguageGate`'s candidate filter):
+   *  - `references` (type usage): STRICT — a `Type.member` static read names a
+   *    same-family type, never a coincidentally same-named symbol in another
+   *    language. Drops any non-same-family target.
+   *  - `imports` (import binding / `#include`): both-known — a C++ `#include
+   *    "X.h"` must not resolve to a same-named ObjC header on another platform
+   *    (basename collision), but a singleton-family / SFC language (`vue` →
+   *    `.ts`) importing across is left alone.
+   * Applies to the import (strategy 2) + name-match (strategy 3) results.
+   */
+  /**
+   * Collect the `@using` namespaces in scope for a `.razor`/`.cshtml` file: its
+   * own `@using` directives plus every `_Imports.razor` from the file's folder up
+   * to the project root (Razor `_Imports` cascade). Cached per file.
+   */
+  private getRazorUsings(filePath: string): string[] {
+    const cached = this.razorUsingsCache.get(filePath);
+    if (cached) return cached;
+    const usings = new Set<string>();
+    const addFrom = (src: string | null): void => {
+      if (!src) return;
+      for (const m of src.matchAll(/^\s*@using\s+(?:static\s+)?([A-Za-z_][\w.]*)/gm)) usings.add(m[1]!);
+    };
+    addFrom(this.context.readFile(filePath));
+    let dir = filePath.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/')) : '';
+    // Walk up to the project root, reading each level's _Imports.razor.
+    for (;;) {
+      addFrom(this.context.readFile(dir ? `${dir}/_Imports.razor` : '_Imports.razor'));
+      if (!dir) break;
+      const slash = dir.lastIndexOf('/');
+      dir = slash >= 0 ? dir.slice(0, slash) : '';
+    }
+    const arr = [...usings];
+    this.razorUsingsCache.set(filePath, arr);
+    return arr;
+  }
+
+  /**
+   * Resolve a Razor/Blazor simple type ref through the file's `@using`
+   * namespaces: `CatalogBrand` + `@using BlazorShared.Models` → the node whose
+   * qualified name is `BlazorShared.Models::CatalogBrand`. Only resolves when the
+   * `@using` set yields exactly ONE type (otherwise it stays ambiguous and falls
+   * through to name-matching).
+   */
+  private resolveRazorUsing(ref: UnresolvedRef): ResolvedRef | null {
+    if (ref.referenceName.includes('.') || ref.referenceName.includes('::')) return null;
+    const usings = this.getRazorUsings(ref.filePath);
+    if (usings.length === 0) return null;
+    const found = new Map<string, Node>();
+    for (const ns of usings) {
+      for (const cand of this.context.getNodesByQualifiedName(`${ns}::${ref.referenceName}`)) {
+        found.set(cand.id, cand);
+      }
+    }
+    if (found.size !== 1) return null;
+    const target = found.values().next().value!;
+    return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
+  }
+
+  private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    if (!result) return result;
+    const tgt = this.getLanguageFromNodeId(result.targetNodeId);
+    if (!tgt || !ref.language) return result;
+    if (ref.referenceKind === 'references' && !sameLanguageFamily(tgt, ref.language)) return null;
+    if (ref.referenceKind === 'imports' && crossesKnownFamily(tgt, ref.language)) return null;
+    return result;
+  }
+
+  /**
+   * Drop a FRAMEWORK-strategy resolution that crosses two *known* language
+   * families for a type-usage (`references`) or import-binding (`imports`)
+   * edge. The framework strategy is intentionally ungated for cross-language
+   * bridges, but those legitimate bridges are either `calls` edges (RN/Expo
+   * JS → native) or config↔code edges whose config side (`yaml`/`blade`/…) is
+   * not a known programming-language family. A `references`/`imports` edge
+   * between two *known* families is always a coincidental name collision — the
+   * React/Svelte/Vue PascalCase component resolvers name-match `getNodesByName`
+   * without a language check, so a TS `<TestRunner>` ref happily matched a
+   * Kotlin `class TestRunner`. Gating only the both-known-cross-family case
+   * lets config bridges and `calls` bridges through untouched.
+   */
+  private gateFrameworkLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    if (!result) return result;
+    if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return result;
+    const tgt = this.getLanguageFromNodeId(result.targetNodeId);
+    if (tgt && ref.language && crossesKnownFamily(tgt, ref.language)) return null;
+    return result;
   }
 }
 

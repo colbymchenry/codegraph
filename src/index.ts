@@ -47,6 +47,8 @@ import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
+import { EXTRACTION_VERSION } from './extraction/extraction-version';
+import { CodeGraphPackageVersion } from './mcp/version';
 
 // Re-export types for consumers
 export * from './types';
@@ -382,6 +384,18 @@ export class CodeGraph {
           result.edgesCreated = after.edges - before.edges;
         }
 
+        // Stamp the index with the engine that built it, so `codegraph status`
+        // and `codegraph upgrade` can recommend a re-index when the running
+        // engine produces richer extraction than the one on disk. Only on a
+        // real full index — a sync touches a subset, so it must NOT advance the
+        // extraction stamp (the bulk would still be stale). See extraction-version.ts.
+        if (result.success && result.filesIndexed > 0) {
+          try {
+            this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
+            this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
+          } catch { /* metadata is advisory — never fail an index over it */ }
+        }
+
         return result;
       } finally {
         this.fileLock.release();
@@ -583,6 +597,32 @@ export class CodeGraph {
    */
   getLastIndexedAt(): number | null {
     return this.queries.getLastIndexedAt();
+  }
+
+  /**
+   * Which engine built the current index: the package version + extraction
+   * version stamped at the last full `indexAll`. Either field is null for an
+   * index built before stamping existed (treated as stale). See
+   * `extraction-version.ts` and `isIndexStale()`.
+   */
+  getIndexBuildInfo(): { version: string | null; extractionVersion: number | null } {
+    const version = this.queries.getMetadata('indexed_with_version');
+    const ev = this.queries.getMetadata('indexed_with_extraction_version');
+    const parsed = ev != null ? parseInt(ev, 10) : NaN;
+    return { version, extractionVersion: Number.isFinite(parsed) ? parsed : null };
+  }
+
+  /**
+   * True when the on-disk index was built by an engine whose extraction is
+   * older than the one now running — i.e. a re-index would add data a migration
+   * can't backfill. False when there's no index yet (nothing to refresh) or the
+   * stamp is current. This is the signal behind `codegraph status`'s re-index
+   * hint and `codegraph upgrade`'s reminder.
+   */
+  isIndexStale(): boolean {
+    if (this.queries.getLastIndexedAt() == null) return false;
+    const { extractionVersion } = this.getIndexBuildInfo();
+    return extractionVersion == null || extractionVersion < EXTRACTION_VERSION;
   }
 
   /**
