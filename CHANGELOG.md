@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Class inheritance edges are no longer silently dropped when the superclass or implemented interface carries generic type arguments — for example `class A extends Base<T>` or `class B implements Iface<T>` (including nested generics and qualified names). This affected Java, TypeScript, and C++ templates, and most often broke exactly the interface-to-implementation service classes that matter most for navigation, so `codegraph_callers`, `codegraph_impact`, and `codegraph_trace` now follow those inheritance links instead of dead-ending.
+
 
 ## [0.9.8] - 2026-06-01
 

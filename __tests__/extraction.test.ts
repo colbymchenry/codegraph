@@ -940,6 +940,47 @@ public class Splitter {
   });
 });
 
+describe('Generic supertype extraction', () => {
+  // Regression: a generic superclass/interface parses as a `generic_type`
+  // (C++ `template_type`) node whose text carries the angle-bracket suffix.
+  // Without stripping the type arguments the reference name (`Base<T>`) never
+  // matched the `Base` class node during resolution, so the extends/implements
+  // edge was silently dropped — it wasn't even kept in unresolved_refs.
+  it('strips generic type arguments from Java extends/implements supertypes', () => {
+    const code = `
+class Base<T> {}
+interface Iface<T> {}
+class A extends Base<String> {}
+class B implements Iface<String> {}
+class C extends Base<java.util.Map<String, Integer>> {}
+`;
+    const result = extractFromSource('Generics.java', code);
+
+    const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+    const implementsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+
+    // `extends Base<String>` and the nested `extends Base<Map<...>>` both → "Base"
+    expect(extendsRefs.some((r) => r.referenceName === 'Base')).toBe(true);
+    // `implements Iface<String>` → "Iface"
+    expect(implementsRefs.some((r) => r.referenceName === 'Iface')).toBe(true);
+    // The angle-bracket suffix is fully removed, including for nested generics.
+    expect(extendsRefs.every((r) => !r.referenceName.includes('<'))).toBe(true);
+    expect(implementsRefs.every((r) => !r.referenceName.includes('<'))).toBe(true);
+  });
+
+  it('strips template arguments from C++ base classes', () => {
+    const code = `
+template <typename T> class Base {};
+class Derived : public Base<int> {};
+`;
+    const result = extractFromSource('derived.cpp', code);
+
+    const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+    expect(extendsRefs.some((r) => r.referenceName === 'Base')).toBe(true);
+    expect(extendsRefs.every((r) => !r.referenceName.includes('<'))).toBe(true);
+  });
+});
+
 describe('C# Extraction', () => {
   it('should extract class declarations', () => {
     const code = `

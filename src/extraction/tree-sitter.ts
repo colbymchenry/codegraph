@@ -16,7 +16,7 @@ import {
   UnresolvedReference,
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
-import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
+import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring, stripTypeArguments } from './tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { LiquidExtractor } from './liquid-extractor';
@@ -2127,7 +2127,9 @@ export class TreeSitterExtractor {
         const targets = typeList ? typeList.namedChildren : [child.namedChild(0)];
         for (const target of targets) {
           if (target) {
-            const name = getNodeText(target, this.source);
+            // Generic supertypes parse as `generic_type` whose text is `Base<T>`;
+            // strip the type arguments so the ref resolves to the `Base` node.
+            const name = stripTypeArguments(getNodeText(target, this.source));
             this.unresolvedReferences.push({
               fromNodeId: classId,
               referenceName: name,
@@ -2149,9 +2151,11 @@ export class TreeSitterExtractor {
             t.type === 'qualified_identifier' ||
             t.type === 'template_type'
           ) {
+            // `template_type` text is `Base<T>` — strip the template arguments
+            // so the base resolves to the `Base` node.
             this.unresolvedReferences.push({
               fromNodeId: classId,
-              referenceName: getNodeText(t, this.source),
+              referenceName: stripTypeArguments(getNodeText(t, this.source)),
               referenceKind: 'extends',
               line: t.startPosition.row + 1,
               column: t.startPosition.column,
@@ -2172,7 +2176,9 @@ export class TreeSitterExtractor {
         const targets = typeList ? typeList.namedChildren : child.namedChildren;
         for (const iface of targets) {
           if (iface) {
-            const name = getNodeText(iface, this.source);
+            // Generic interfaces parse as `generic_type` whose text is `Iface<T>`;
+            // strip the type arguments so the ref resolves to the `Iface` node.
+            const name = stripTypeArguments(getNodeText(iface, this.source));
             this.unresolvedReferences.push({
               fromNodeId: classId,
               referenceName: name,

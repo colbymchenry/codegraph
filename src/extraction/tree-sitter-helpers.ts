@@ -44,6 +44,27 @@ export function getChildByField(node: SyntaxNode, fieldName: string): SyntaxNode
 }
 
 /**
+ * Strip generic/template type arguments from a type reference name.
+ *
+ * A supertype written as `Base<T>` (or nested `Base<Map<K, V>>`) is captured by
+ * tree-sitter as a `generic_type`/`template_type` node whose text includes the
+ * angle-bracket suffix. Class nodes are indexed under their argument-free name
+ * (`Base`), so without stripping, an `extends Base<T>` reference resolves to
+ * nothing and the inheritance edge is silently dropped.
+ *
+ * Only the first `<` matters: no Java/C#/Kotlin/Scala/C++ type identifier
+ * contains `<` except as the generic-argument delimiter, so slicing there is
+ * safe even for nested generics. Qualified prefixes (`com.foo.Base`, `ns::Base`)
+ * are intentionally preserved — resolution uses them to disambiguate same-named
+ * types across packages/namespaces. The `> 0` guard leaves synthetic names that
+ * legitimately start with `<` (e.g. anonymous-class markers) untouched.
+ */
+export function stripTypeArguments(name: string): string {
+  const lt = name.indexOf('<');
+  return (lt > 0 ? name.slice(0, lt) : name).trim();
+}
+
+/**
  * Get the docstring/comment preceding a node
  */
 export function getPrecedingDocstring(node: SyntaxNode, source: string): string | undefined {
