@@ -463,22 +463,22 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_node',
-    description: 'SECONDARY (after codegraph_explore): get ONE symbol in full — its location, signature, callers/callees trail, and verbatim body (includeCode=true). When the name is AMBIGUOUS (an overloaded method, or the same method name on different types), it returns EVERY matching definition\'s full body in a single call — so you never need to Read a file to find the specific overload you want. For a heavily-overloaded name, pass `file` (and/or `line`) to pin the exact definition — e.g. the `file:line` a trail or another tool already showed you. Reach for this when explore trimmed a body you need. Use codegraph_explore for several related symbols or the full flow.',
+    description: 'SECONDARY (after codegraph_explore): the Read upgrade for ONE symbol you can name. Returns its location, signature, the verbatim CURRENT on-disk source (includeCode=true — the same bytes Read would give you, safe to base an Edit on), AND its caller/callee trail in a single call — so before changing a symbol you already see what calls it and what your edit would break, for fewer tokens than reading the file. Prefer it over Read whenever you know the symbol name. Or pass `file` ALONE (no symbol) to get that whole source file\'s symbol map + what depends on it — a Read replacement for a file. When the name is AMBIGUOUS (an overloaded method, or the same name on different types) it returns EVERY matching definition\'s full body in one call — so you never Read a file to find the right overload; pass `file` (and/or `line`) to pin one. Use codegraph_explore for several related symbols or the full flow.',
     inputSchema: {
       type: 'object',
       properties: {
         symbol: {
           type: 'string',
-          description: 'Name of the symbol to get details for',
+          description: 'Name of the symbol to get details for. Omit it and pass `file` alone to get the whole file\'s symbols + dependents (a Read replacement).',
         },
         includeCode: {
           type: 'boolean',
-          description: 'Include full source code (default: false to minimize context)',
+          description: 'Include full source bodies (default: false to minimize context). In file mode, returns every symbol\'s body up to a size budget.',
           default: false,
         },
         file: {
           type: 'string',
-          description: 'Optional: disambiguate an overloaded name to the definition in this file (path or basename, e.g. "harness.rs").',
+          description: 'A file path or basename (e.g. "harness.rs", "src/auth/session.ts"). Pass it ALONE (no symbol) to get that whole file\'s symbol map + dependents — a Read replacement. Or pass it WITH a symbol to disambiguate an overloaded name to the definition in this file.',
         },
         line: {
           type: 'number',
@@ -486,12 +486,12 @@ export const tools: ToolDefinition[] = [
         },
         projectPath: projectPathProperty,
       },
-      required: ['symbol'],
+      required: [],
     },
   },
   {
     name: 'codegraph_explore',
-    description: 'PRIMARY TOOL — call FIRST for almost any question: how does X work, architecture, a bug, where/what is X, or surveying an area. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — do NOT re-open shown files). Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — answers without further search/node/Read/Grep.',
+    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2522,14 +2522,23 @@ export class ToolHandler {
    * Handle codegraph_node
    */
   private async handleNode(args: Record<string, unknown>): Promise<ToolResult> {
-    const symbol = this.validateString(args.symbol, 'symbol');
-    if (typeof symbol !== 'string') return symbol;
-
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     // Default to false to minimize context usage
     const includeCode = args.includeCode === true;
     const fileHint = typeof args.file === 'string' && args.file.trim() ? args.file.trim() : undefined;
     const lineHint = typeof args.line === 'number' && args.line > 0 ? args.line : undefined;
+    const symbolRaw = typeof args.symbol === 'string' ? args.symbol.trim() : '';
+
+    // FILE-VIEW MODE: a bare `file` with no `symbol` returns that file's symbol
+    // map + graph role (which files depend on it) — and, with includeCode, the
+    // bodies. A Read replacement for "show me file X" that also surfaces the
+    // blast radius, so an edit is made with impact in view.
+    if (!symbolRaw && fileHint) {
+      return this.handleFileView(cg, fileHint, includeCode);
+    }
+
+    const symbol = this.validateString(args.symbol, 'symbol');
+    if (typeof symbol !== 'string') return symbol;
 
     let matches = this.findSymbolMatches(cg, symbol);
     if (matches.length === 0) {
@@ -2620,6 +2629,103 @@ export class ToolHandler {
         '',
         `> Need one of these in full? Call codegraph_node again with \`file\` (e.g. \`"${listed[0]!.filePath.split('/').pop()}"\`) or \`line\` — do NOT Read it.`,
       );
+    }
+    return this.textResult(this.truncateOutput(out.join('\n')));
+  }
+
+  /**
+   * FILE-VIEW: resolve `fileArg` (path or basename) to an indexed file and
+   * return its symbol map + graph role (which files depend on it), plus bodies
+   * when `includeCode`. A Read replacement that also surfaces the blast radius.
+   */
+  private async handleFileView(cg: CodeGraph, fileArg: string, includeCode: boolean): Promise<ToolResult> {
+    const normalize = (p: string) => p.replace(/\\/g, '/').replace(/^(?:\.?\/+)+/, '').replace(/\/+$/, '');
+    const wantLower = normalize(fileArg).toLowerCase();
+    const allFiles = cg.getFiles();
+    if (allFiles.length === 0) return this.textResult('No files indexed. Run `codegraph index` first.');
+
+    let resolved = allFiles.find((f) => f.path.toLowerCase() === wantLower);
+    let candidates: typeof allFiles = [];
+    if (!resolved) {
+      candidates = allFiles.filter((f) => f.path.toLowerCase().endsWith('/' + wantLower));
+      if (candidates.length === 1) resolved = candidates[0];
+    }
+    if (!resolved && candidates.length === 0) {
+      candidates = allFiles.filter((f) => f.path.toLowerCase().includes(wantLower));
+      if (candidates.length === 1) resolved = candidates[0];
+    }
+    if (!resolved && candidates.length > 1) {
+      return this.textResult(
+        [`"${fileArg}" matches ${candidates.length} indexed files — pass a longer path:`, '',
+          ...candidates.slice(0, 25).map((f) => `- ${f.path}`)].join('\n'),
+      );
+    }
+    if (!resolved) {
+      return this.textResult(
+        `No indexed file matches "${fileArg}". Codegraph indexes source files; configs/docs it doesn't parse won't appear — Read those directly.`,
+      );
+    }
+
+    const filePath = resolved.path;
+    const nodes = cg.getNodesInFile(filePath)
+      .filter((n) => n.kind !== 'file' && n.kind !== 'import' && n.kind !== 'export')
+      .sort((a, b) => a.startLine - b.startLine);
+    const dependents = cg.getFileDependents(filePath);
+
+    const out: string[] = [`**${filePath}** — ${nodes.length} symbol${nodes.length === 1 ? '' : 's'}`];
+    if (dependents.length) {
+      out.push(
+        `Depended on by ${dependents.length} file${dependents.length === 1 ? '' : 's'}` +
+          `${dependents.length > 8 ? ' (first 8)' : ''}: ${dependents.slice(0, 8).join(', ')}${dependents.length > 8 ? ', …' : ''}`,
+        '> Editing a symbol here can affect those files — run codegraph_impact on the specific symbol for its exact blast radius.',
+      );
+    } else {
+      out.push('No other indexed file depends on this one.');
+    }
+    out.push('');
+
+    if (nodes.length === 0) {
+      out.push('_No indexed symbols in this file (codegraph may track it but not parse it for symbols)._');
+      return this.textResult(this.truncateOutput(out.join('\n')));
+    }
+
+    if (!includeCode) {
+      out.push('### Symbols');
+      for (const n of nodes) {
+        const sig = n.signature ? ` ${n.signature.replace(/\s+/g, ' ').trim()}` : '';
+        out.push(`- \`${n.name}\` (${n.kind})${sig} — :${n.startLine}`);
+      }
+      out.push('', '> Call again with `includeCode:true` for the bodies, or `codegraph_node <name>` for one symbol in full.');
+      return this.textResult(this.truncateOutput(out.join('\n')));
+    }
+
+    // Render each OUTERMOST symbol's verbatim body (a container's body already
+    // includes its members, so skip anything covered) — no duplication, and no
+    // "read the file" container outline. Budget-capped.
+    out.push('### Source (verbatim — treat as already Read)');
+    const BODY_BUDGET = 14000;
+    const outermost = [...nodes].sort((a, b) =>
+      a.startLine - b.startLine || (b.endLine ?? b.startLine) - (a.endLine ?? a.startLine));
+    const covered: Array<[number, number]> = [];
+    let used = out.join('\n').length;
+    const listed: Node[] = [];
+    for (const n of outermost) {
+      const end = n.endLine ?? n.startLine;
+      if (covered.some(([s, e]) => s <= n.startLine && e >= end)) continue;
+      const code = await cg.getCode(n.id);
+      if (!code) continue;
+      const section = `#### \`${n.name}\` (${n.kind}) — :${n.startLine}\n\`\`\`\n${code}\n\`\`\``;
+      if (used + section.length <= BODY_BUDGET || used < 1500) {
+        out.push('', section);
+        used += section.length;
+        covered.push([n.startLine, end]);
+      } else {
+        listed.push(n);
+      }
+    }
+    if (listed.length) {
+      out.push('', `### ${listed.length} more symbol${listed.length === 1 ? '' : 's'} (over the size budget — fetch with codegraph_node <name>)`,
+        ...listed.slice(0, 30).map((n) => `- \`${n.name}\` (${n.kind}) — :${n.startLine}`));
     }
     return this.textResult(this.truncateOutput(out.join('\n')));
   }

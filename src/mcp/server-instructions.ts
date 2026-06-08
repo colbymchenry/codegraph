@@ -17,15 +17,21 @@
  */
 export const SERVER_INSTRUCTIONS = `# Codegraph — code intelligence over an indexed knowledge graph
 
-Codegraph is a SQLite knowledge graph of every symbol, edge, and file
-in the workspace. Reads are sub-millisecond; the index lags writes by
-about a second through the file watcher. Consult it BEFORE writing or
-editing code, not during.
+Codegraph is a SQLite knowledge graph of every symbol, edge, and file in
+the workspace — pre-computed structure you would otherwise re-derive by
+reading files (cached intelligence: thousands of parse/trace decisions you
+don't pay to re-reason each run). Reads are sub-millisecond; the index lags
+writes by ~1s through the file watcher. Reach for it BEFORE *and* while
+writing or editing code — not just for questions: one call returns the
+verbatim source PLUS who calls it and what it affects, so you edit with the
+blast radius in view. More accurate context, in far fewer tokens and
+round-trips than reading files yourself.
 
-## Answer directly — don't delegate exploration
+## Use codegraph instead of reading files — for questions AND edits
 
-For "how does X work", architecture, trace, or where-is-X questions,
-answer DIRECTLY — usually with ONE \`codegraph_explore\` call.
+Whether you're answering "how does X work" or implementing a change (fixing
+a bug, adding a feature), reach for codegraph before you Read. For
+understanding, answer DIRECTLY — usually with ONE \`codegraph_explore\` call.
 \`codegraph_explore\` takes either a natural-language question or a bag of
 symbol/file names and returns the verbatim source of the relevant symbols
 grouped by file, so it is Read-equivalent and most often the ONLY
@@ -42,7 +48,7 @@ typically one to a few calls; a grep/read exploration is dozens.
 - **"How does X reach/become Y? / the flow / the path from X to Y"** → \`codegraph_explore\`, naming the symbols that span the flow (e.g. \`mutateElement renderScene\`) — it surfaces the call path among them, including dynamic-dispatch hops (callbacks, React re-render, JSX children) grep can't follow
 - **"What is the symbol named X?" (just its location)** → \`codegraph_search\`
 - **"What calls this?" / "What does this call?" / "What would changing this break?"** → \`codegraph_callers\` / \`codegraph_callees\` / \`codegraph_impact\`
-- **One specific symbol's full source (esp. a body \`codegraph_explore\` trimmed), or an OVERLOADED name** → \`codegraph_node\` (with \`includeCode\`): for an ambiguous name it returns EVERY matching definition's body in one call, so you never Read a file to find the right overload
+- **About to read or edit a symbol you can name** → \`codegraph_node\` (SECONDARY — the after-explore depth tool) instead of \`Read\`: it returns the **verbatim current on-disk source** (safe to base an \`Edit\` on) PLUS its caller/callee trail — the same bytes Read gives you, plus who calls it and what your change would break, for fewer tokens. For an OVERLOADED name it returns EVERY matching definition's body in one call, so you never Read a file to find the right overload. Or pass a FILE PATH alone (no symbol) to get that whole file's symbol map + what depends on it — a Read replacement for a source file
 - **"What's in directory X?"** → \`codegraph_files\`
 - **"Is the index ready / what's its size?"** → \`codegraph_status\`
 
@@ -59,6 +65,7 @@ typically one to a few calls; a grep/read exploration is dozens.
 - **Don't grep first** when looking up a symbol by name — \`codegraph_search\` is faster and returns kind + location + signature.
 - **Don't chain \`codegraph_search\` + \`codegraph_node\`** to understand an area — ONE \`codegraph_explore\` returns the relevant symbols' source together in a single round-trip.
 - **Don't loop \`codegraph_node\` over many symbols** — one \`codegraph_explore\` call returns them all grouped by file, while each separate call re-reads the whole context and costs far more. Use \`codegraph_node\` for a single symbol.
+- **Don't \`Read\` a file just to see or edit a symbol you can name** — \`codegraph_node\` returns the same current source plus its caller/callee trail in one call, for fewer tokens. Reach for raw \`Read\` only for what codegraph doesn't index (configs, docs) or when the staleness banner flags a file as pending re-index.
 - **After editing, check the staleness banner.** When a tool response starts with "⚠️ Some files referenced below were edited since the last index sync…", the listed files are pending re-index — Read those specific files for accurate content. Every file NOT in that banner is fresh, so still trust codegraph. \`codegraph_status\` also lists pending files under "Pending sync".
 
 ## Limitations
