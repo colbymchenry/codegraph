@@ -298,6 +298,53 @@ function main() {
     const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
     expect(calls.some((c) => c.referenceName === 'processData')).toBe(true);
   });
+
+  // Regression coverage for issue #634: string-literal type arguments
+  // inside generic tuple elements (the dynamic-dispatch contract pattern)
+  // are not currently indexed. The assertions below pin the failure mode
+  // so any future fix in src/extraction/languages/typescript.ts can be
+  // verified. The test is marked .skip to keep the suite green until the
+  // extractor change lands; remove the .skip and confirm it passes once
+  // the fix is in.
+  it.skip('should index string-literal type arguments in generic tuple elements (#634)', () => {
+    const code = `
+export interface Service<Name extends string, Req, Resp> {
+  name: Name;
+  request: Req;
+  response: Resp;
+}
+
+export type MyServiceList = [
+  Service<
+    'query_apply_record',
+    { pageNo: number; pageSize: number },
+    { success: boolean }
+  >,
+  Service<
+    'apply_confirm',
+    { code: string },
+    { success: boolean }
+  >
+];
+`;
+    const result = extractFromSource('api.ts', code);
+
+    // The two literal-arg names are the actual contract surface agents
+    // query for. Today they are not indexed, so these assertions fail.
+    const literalNames = result.nodes
+      .map((n) => n.name)
+      .filter((name): name is string => typeof name === 'string');
+
+    expect(literalNames).toContain('query_apply_record');
+    expect(literalNames).toContain('apply_confirm');
+
+    // The literal should also be reachable from the containing tuple type
+    // so a caller can navigate from the type to the literal contract.
+    const tupleNode = result.nodes.find(
+      (n) => n.kind === 'type_alias' && n.name === 'MyServiceList'
+    );
+    expect(tupleNode).toBeDefined();
+  });
 });
 
 describe('Arrow Function Export Extraction', () => {
