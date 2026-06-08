@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- CodeGraph now indexes Spring configuration files (`application.properties` / `application.yml`) by key only, and never includes their values in `codegraph_explore` or `codegraph_node` output. Previously a secret committed to one of these files — a database password, API key, or connection string with embedded credentials — could be surfaced to an AI agent that asked about nearby code, even though the agent never opened the file. The configuration keys are still indexed, so reference and impact analysis are unaffected; an agent that genuinely needs a value reads the file itself. Shopify Liquid `{% schema %}` blocks are likewise indexed by name only. (#383)
+
 ### New Features
 
 - New `codegraph upgrade` command updates CodeGraph to the latest release in place — it detects how you installed (the standalone `install.sh` / `install.ps1` bundle, npm, or npx) and does the right thing for each, on macOS, Linux, and Windows. Use `codegraph upgrade --check` to see whether an update is available without installing, or `codegraph upgrade <version>` to move to a specific version. After upgrading it reminds you to re-index your projects so they pick up the newer engine's improvements. (#679)

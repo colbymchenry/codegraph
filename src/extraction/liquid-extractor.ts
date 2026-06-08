@@ -313,7 +313,10 @@ export class LiquidExtractor {
         endLine,
         startColumn: match.index - this.getLineStart(startLine),
         endColumn: 0,
-        docstring: schemaContent?.trim().substring(0, 200), // Store first 200 chars as docstring
+        // SECURITY (#383): don't dump the raw {% schema %} JSON (section settings
+        // + default values) into the docstring — the schema name is already in
+        // `name`, so the data block adds nothing but a potential leak of any
+        // IDs/endpoints/keys a developer placed in setting defaults.
         updatedAt: Date.now(),
       };
 

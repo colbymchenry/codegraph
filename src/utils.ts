@@ -47,6 +47,25 @@ const SENSITIVE_PATHS = new Set([
 ]);
 
 /**
+ * Config "languages" whose nodes are pure key/value DATA lifted from a config
+ * file (e.g. Spring `application.{yml,properties}`), not source code.
+ */
+export const CONFIG_LEAF_LANGUAGES: ReadonlySet<string> = new Set(['yaml', 'properties']);
+
+/**
+ * A config-leaf node is a single key lifted out of a pure config/data file —
+ * `kind: 'constant'` in a {@link CONFIG_LEAF_LANGUAGES} language. Its on-disk
+ * line is `key = <value>`, and that value is routinely a secret (DB password,
+ * API key, JDBC URL with embedded creds). CodeGraph must surface the KEY only
+ * and never read/return the value, or it pushes secrets into agent context
+ * unbidden — the value isn't needed for resolution, and an agent that genuinely
+ * needs it can read the file directly. (#383)
+ */
+export function isConfigLeafNode(node: { kind: string; language?: string }): boolean {
+  return node.kind === 'constant' && !!node.language && CONFIG_LEAF_LANGUAGES.has(node.language);
+}
+
+/**
  * Validate that a resolved file path stays within the project root.
  * Prevents path traversal attacks (e.g. node.filePath = "../../etc/passwd").
  *
