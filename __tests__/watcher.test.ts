@@ -203,6 +203,24 @@ describe('FileWatcher', () => {
 
       watcher.stop();
     });
+
+    it('should sync a gitignored source file re-included by .ignore', async () => {
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'customer/\n');
+      fs.writeFileSync(path.join(testDir, '.ignore'), '!customer/\n');
+      fs.mkdirSync(path.join(testDir, 'customer'), { recursive: true });
+      fs.writeFileSync(path.join(testDir, 'customer', 'custom.ts'), 'export const custom = 1;');
+
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 200 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      __emitWatchEventForTests(testDir, 'customer/custom.ts');
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      expect(syncFn).toHaveBeenCalled();
+
+      watcher.stop();
+    });
   });
 
   describe('pending file tracking (#403)', () => {
