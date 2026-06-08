@@ -22,6 +22,7 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile } from '../search/query-utils';
+import { trimCodeBlockMiddle } from '../context/code-block-trim';
 import {
   existsSync,
   readFileSync,
@@ -32,6 +33,9 @@ import { resolve as resolvePath } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
+
+/** Maximum source block length inside codegraph_node before final response trimming. */
+const NODE_CODE_BLOCK_MAX_LENGTH = 11_000;
 
 /**
  * Maximum length for free-form string inputs (query, task, symbol).
@@ -57,16 +61,6 @@ const MAX_PATH_LENGTH = 4_096;
  * same as `configurator::stage_apply::run`.
  */
 const RUST_PATH_PREFIXES = new Set(['crate', 'super', 'self']);
-
-/**
- * Node kinds that contain other symbols. For these, `codegraph_node` with
- * `includeCode=true` returns a structural outline (member names + signatures
- * + line numbers) instead of the full body, which for a large class is a
- * multi-thousand-character wall of source that bloats the agent's context.
- */
-const CONTAINER_NODE_KINDS = new Set<NodeKind>([
-  'class', 'struct', 'interface', 'trait', 'protocol', 'enum', 'namespace', 'module',
-]);
 
 /** Last `::` / `.` / `/`-separated segment of a qualified symbol. */
 function lastQualifierPart(symbol: string): string {
@@ -2733,20 +2727,10 @@ export class ToolHandler {
   /** Render one symbol: details + (optional) body/outline + its caller/callee trail. */
   private async renderNodeSection(cg: CodeGraph, node: Node, includeCode: boolean): Promise<string> {
     let code: string | null = null;
-    let outline: string | null = null;
     if (includeCode) {
-      // For container symbols (class/interface/struct/…), the full body is the
-      // sum of every method body — a wall of source. Return a structural outline
-      // (members + signatures + line numbers) instead; leaf symbols return their
-      // full body.
-      if (CONTAINER_NODE_KINDS.has(node.kind)) {
-        outline = this.buildContainerOutline(cg, node);
-      }
-      if (!outline) {
-        code = await cg.getCode(node.id);
-      }
+      code = await cg.getCode(node.id);
     }
-    return this.formatNodeDetails(node, code, outline) + this.formatTrail(cg, node);
+    return this.formatNodeDetails(node, code) + this.formatTrail(cg, node);
   }
 
   /**
@@ -3308,29 +3292,7 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  /**
-   * Build a compact structural outline of a container symbol from its
-   * indexed children (methods, fields, properties, …) — name, kind,
-   * line number, and signature — so the agent gets the shape of a class
-   * without the full source of every method. Returns '' when the container
-   * has no indexed children, so the caller can fall back to full source.
-   */
-  private buildContainerOutline(cg: CodeGraph, node: Node): string {
-    const children = cg.getChildren(node.id)
-      .filter(c => c.kind !== 'import' && c.kind !== 'export')
-      .sort((a, b) => (a.startLine ?? 0) - (b.startLine ?? 0));
-    if (children.length === 0) return '';
-
-    const lines = [`**Members (${children.length}):**`, ''];
-    for (const c of children) {
-      const loc = c.startLine ? `:${c.startLine}` : '';
-      const sig = c.signature ? ` — \`${c.signature}\`` : '';
-      lines.push(`- ${c.name} (${c.kind})${loc}${sig}`);
-    }
-    return lines.join('\n');
-  }
-
-  private formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
+  private formatNodeDetails(node: Node, code: string | null): string {
     const location = node.startLine ? `:${node.startLine}` : '';
     const lines: string[] = [
       `## ${node.name} (${node.kind})`,
@@ -3347,14 +3309,12 @@ export class ToolHandler {
       lines.push('', node.docstring);
     }
 
-    if (outline) {
-      lines.push('', outline, '',
-        `> Structural outline only. Read \`${node.filePath}\` or call codegraph_node on a specific member for its body.`);
-    } else if (code) {
+    if (code) {
       // Line-numbered (cat -n style, like codegraph_explore and Read) so the
       // agent can cite/edit exact lines without re-Reading the file for them.
       const numbered = node.startLine ? numberSourceLines(code, node.startLine) : code;
-      lines.push('', '```' + node.language, numbered, '```');
+      const bounded = trimCodeBlockMiddle(numbered, NODE_CODE_BLOCK_MAX_LENGTH);
+      lines.push('', '```' + node.language, bounded, '```');
     }
 
     return lines.join('\n');

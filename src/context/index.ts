@@ -27,6 +27,7 @@ import { logDebug } from '../errors';
 import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
 import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
+import { trimCodeBlockMiddle } from './code-block-trim';
 
 /**
  * Extract likely symbol names from a natural language query
@@ -1244,15 +1245,8 @@ export class ContextBuilder {
 
       const code = await this.extractNodeCode(node);
       if (code) {
-        // Truncate if too long. Language-neutral marker (no `//` — not a
-        // comment in Python, Ruby, etc.); this renders inside a fenced
-        // source block whose language varies.
-        const truncated = code.length > maxBlockSize
-          ? code.slice(0, maxBlockSize) + '\n... (truncated) ...'
-          : code;
-
         blocks.push({
-          content: truncated,
+          content: trimCodeBlockMiddle(code, maxBlockSize),
           filePath: node.filePath,
           startLine: node.startLine,
           endLine: node.endLine,

@@ -181,7 +181,26 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     fs.mkdirSync(src, { recursive: true });
     fs.writeFileSync(
       path.join(src, 'session.ts'),
-      `export class Session {\n  request(): void { fetch('x'); }\n}\nexport function request(): void {}\n`
+      `export class Session {
+  request(): void {
+    const marker = 'SESSION_BODY_MARKER';
+    fetch(marker);
+  }
+}
+export function request(): void {}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'large-session.ts'),
+      `export class LargeSession {
+  run(): void {
+    const start = 'LARGE_BODY_START_MARKER';
+${Array.from({ length: 650 }, (_, i) => `    const filler${i} = '${'x'.repeat(30)}';`).join('\n')}
+    const tail = 'LARGE_BODY_TAIL_MARKER';
+    console.log(start, tail);
+  }
+}
+`
     );
 
     const CodeGraph = (await import('../src/index')).default;
@@ -218,5 +237,23 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     expect(text).toMatch(/\(method\)/);
     expect(text).toMatch(/\(function\)/);
     expect((text.match(/\*\*Location:\*\*/g) || []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('codegraph_node includeCode returns container bodies, not only member outlines', async () => {
+    const res = await handler.execute('codegraph_node', { symbol: 'Session', includeCode: true });
+    const text = res.content?.[0]?.text ?? '';
+    expect(text).toContain('SESSION_BODY_MARKER');
+    expect(text).not.toContain('Structural outline only');
+  });
+
+  it('codegraph_node trims large container bodies from the middle before final output truncation', async () => {
+    const res = await handler.execute('codegraph_node', { symbol: 'LargeSession', includeCode: true });
+    const text = res.content?.[0]?.text ?? '';
+
+    expect(text).toContain('LARGE_BODY_START_MARKER');
+    expect(text).toContain('LARGE_BODY_TAIL_MARKER');
+    expect(text).toContain('... (truncated middle) ...');
+    expect(text).not.toContain('... (output truncated)');
+    expect(text).toMatch(/LARGE_BODY_TAIL_MARKER[\s\S]*\n```/);
   });
 });
