@@ -7,16 +7,82 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+/** The default per-project data directory name. */
+const DEFAULT_CODEGRAPH_DIR = '.codegraph';
+
+let warnedBadDirName = false;
+
 /**
- * CodeGraph directory name
+ * Resolve the per-project data directory name, honoring the `CODEGRAPH_DIR`
+ * environment override (default `.codegraph`). The override is a single path
+ * segment that lives in the project root.
+ *
+ * Why this exists: two environments that share one working tree must NOT share
+ * one `.codegraph/` — most concretely Windows-native and WSL (issue #636). The
+ * daemon lockfile (`.codegraph/daemon.pid`) records a platform-specific pid and
+ * socket path (a Windows named pipe vs a WSL Unix socket), and SQLite file
+ * locking across the WSL2 ↔ Windows filesystem boundary is unreliable, so two
+ * daemons sharing one index risks corruption. Setting `CODEGRAPH_DIR=.codegraph-win`
+ * on one side gives each environment its own index in the same tree.
+ *
+ * Read live (not captured at load) so it is both process-accurate and testable.
+ * An override that isn't a plain directory name — empty, containing a path
+ * separator, `.`, `..`/traversal, or absolute — is ignored (we keep the
+ * default) rather than risk writing the index outside the project or into the
+ * project root itself; we warn once to stderr so the misconfiguration is seen.
  */
-export const CODEGRAPH_DIR = '.codegraph';
+export function codeGraphDirName(): string {
+  const raw = process.env.CODEGRAPH_DIR?.trim();
+  if (!raw) return DEFAULT_CODEGRAPH_DIR;
+  const invalid =
+    raw === '.' ||
+    raw.includes('..') ||
+    raw.includes('/') ||
+    raw.includes('\\') ||
+    path.isAbsolute(raw);
+  if (invalid) {
+    if (!warnedBadDirName) {
+      warnedBadDirName = true;
+      // stderr only — stdout is the MCP protocol channel.
+      console.warn(
+        `[codegraph] Ignoring invalid CODEGRAPH_DIR="${raw}" — it must be a plain ` +
+          `directory name (no path separators, no "..", not absolute). Using "${DEFAULT_CODEGRAPH_DIR}".`
+      );
+    }
+    return DEFAULT_CODEGRAPH_DIR;
+  }
+  return raw;
+}
+
+/**
+ * CodeGraph directory name — a load-time snapshot of {@link codeGraphDirName}.
+ * A running process's environment is fixed, so this equals the live value;
+ * it's kept as a stable string export for backward compatibility. Internal code
+ * resolves the name through {@link codeGraphDirName} / {@link getCodeGraphDir}
+ * so the `CODEGRAPH_DIR` override always applies.
+ */
+export const CODEGRAPH_DIR = codeGraphDirName();
+
+/**
+ * Is `name` (a single path segment) a CodeGraph data directory? Matches the
+ * default `.codegraph`, the active `CODEGRAPH_DIR` override, and any
+ * `.codegraph-*` sibling. File-watching and the indexer skip ALL of these, so
+ * when two environments share one working tree (Windows + WSL, issue #636)
+ * neither indexes or watches the other's index directory.
+ */
+export function isCodeGraphDataDir(name: string): boolean {
+  return (
+    name === DEFAULT_CODEGRAPH_DIR ||
+    name === codeGraphDirName() ||
+    name.startsWith(DEFAULT_CODEGRAPH_DIR + '-')
+  );
+}
 
 /**
  * Get the .codegraph directory path for a project
  */
 export function getCodeGraphDir(projectRoot: string): string {
-  return path.join(projectRoot, CODEGRAPH_DIR);
+  return path.join(projectRoot, codeGraphDirName());
 }
 
 /**
