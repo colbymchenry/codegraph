@@ -2,49 +2,47 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
-function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
-  const declarator = getChildByField(node, 'declarator');
-  if (!declarator) return undefined;
-
+/**
+ * Find the function NAME's `qualified_identifier` (`Foo::bar`) inside a
+ * declarator, skipping the `parameter_list` — a parameter with a qualified type
+ * (`const std::string& x`) must NOT be mistaken for the method name. Without the
+ * skip, a plain free function `std::string TableFileName(const std::string&...)`
+ * was named `string` (from the parameter type), so calls to it never resolved
+ * and its file looked like nothing depended on it.
+ */
+function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefined {
   const queue: SyntaxNode[] = [declarator];
   while (queue.length > 0) {
     const current = queue.shift()!;
-    if (current.type === 'qualified_identifier') {
-      const text = getNodeText(current, source).trim();
-      const parts = text.split('::').filter(Boolean);
-      return parts[parts.length - 1];
-    }
+    if (current.type === 'qualified_identifier') return current;
     for (let i = 0; i < current.namedChildCount; i++) {
       const child = current.namedChild(i);
-      if (child) queue.push(child);
+      // Don't descend into parameters or the trailing return type — their types
+      // (`const std::string&`, `-> std::string`) aren't the function name.
+      if (child && child.type !== 'parameter_list' && child.type !== 'trailing_return_type') {
+        queue.push(child);
+      }
     }
   }
-
   return undefined;
+}
+
+function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
+  const declarator = getChildByField(node, 'declarator');
+  if (!declarator) return undefined;
+  const qid = findDeclaratorQualifiedId(declarator);
+  if (!qid) return undefined;
+  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
+  return parts[parts.length - 1];
 }
 
 function extractCppReceiverType(node: SyntaxNode, source: string): string | undefined {
   const declarator = getChildByField(node, 'declarator');
   if (!declarator) return undefined;
-
-  const queue: SyntaxNode[] = [declarator];
-  while (queue.length > 0) {
-    const current = queue.shift()!;
-    if (current.type === 'qualified_identifier') {
-      const text = getNodeText(current, source).trim();
-      const parts = text.split('::').filter(Boolean);
-      if (parts.length > 1) {
-        return parts.slice(0, -1).join('::');
-      }
-      return undefined;
-    }
-    for (let i = 0; i < current.namedChildCount; i++) {
-      const child = current.namedChild(i);
-      if (child) queue.push(child);
-    }
-  }
-
-  return undefined;
+  const qid = findDeclaratorQualifiedId(declarator);
+  if (!qid) return undefined;
+  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
+  return parts.length > 1 ? parts.slice(0, -1).join('::') : undefined;
 }
 
 export const cExtractor: LanguageExtractor = {

@@ -388,16 +388,37 @@ export { main };
   });
 
   describe('File dependency analysis', () => {
-    it('should get file dependencies', () => {
+    // Regression: getFileDependents/getFileDependencies used to follow
+    // ONLY `imports` edges, which in this engine are same-file (a file → its
+    // own local import declarations). That made both return [] for EVERY file,
+    // so `codegraph affected` found no dependents on any language/framework.
+    // They must follow the cross-file symbol graph instead (calls / references
+    // / instantiates / extends / implements / ...).
+    it('reports cross-file dependencies via the symbol graph, not just imports', () => {
       const deps = cg.getFileDependencies('src/main.ts');
-
-      expect(Array.isArray(deps)).toBe(true);
+      // main() instantiates DerivedClass (derived.ts) and calls
+      // processValue/doubleValue (utils.ts) — both are real dependencies.
+      expect(deps).toContain('src/utils.ts');
+      expect(deps).toContain('src/derived.ts');
     });
 
-    it('should get file dependents', () => {
-      const dependents = cg.getFileDependents('src/utils.ts');
+    it('reports cross-file dependents via the symbol graph, not just imports', () => {
+      // utils.ts is used by main.ts (processValue/doubleValue calls); the old
+      // imports-only implementation returned [] here.
+      expect(cg.getFileDependents('src/utils.ts')).toContain('src/main.ts');
+    });
 
-      expect(Array.isArray(dependents)).toBe(true);
+    it('counts extends/implements as a dependency edge', () => {
+      // derived.ts extends BaseClass / implements Printable, both in base.ts.
+      expect(cg.getFileDependencies('src/derived.ts')).toContain('src/base.ts');
+      expect(cg.getFileDependents('src/base.ts')).toContain('src/derived.ts');
+    });
+
+    it('never lists a file as its own dependent or dependency', () => {
+      for (const f of ['src/main.ts', 'src/utils.ts', 'src/base.ts', 'src/derived.ts']) {
+        expect(cg.getFileDependents(f)).not.toContain(f);
+        expect(cg.getFileDependencies(f)).not.toContain(f);
+      }
     });
   });
 

@@ -227,6 +227,29 @@ export const kotlinExtractor: LanguageExtractor = {
     }
     return false;
   },
+  extractModifiers: (node) => {
+    // Kotlin Multiplatform `expect`/`actual` markers live in
+    //   modifiers > platform_modifier > (expect | actual)
+    // Capturing them lets the resolver link an `expect` declaration in a
+    // common source set to its `actual` implementations in platform source
+    // sets (those impls otherwise have zero dependents — the caller resolves
+    // to the `expect`). Match the AST node, not raw text, so an annotation
+    // argument or identifier named "actual" can't false-positive.
+    const mods: string[] = [];
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (child?.type !== 'modifiers') continue;
+      for (let j = 0; j < child.childCount; j++) {
+        const pm = child.child(j);
+        if (pm?.type !== 'platform_modifier') continue;
+        for (let k = 0; k < pm.childCount; k++) {
+          const kw = pm.child(k);
+          if (kw && (kw.type === 'expect' || kw.type === 'actual')) mods.push(kw.type);
+        }
+      }
+    }
+    return mods.length > 0 ? mods : undefined;
+  },
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();
     const identifier = node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');

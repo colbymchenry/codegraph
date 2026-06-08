@@ -24,7 +24,7 @@ import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
-import { validatePathWithinRoot } from '../utils';
+import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
 import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
 
@@ -1161,6 +1161,14 @@ export class ContextBuilder {
    * Extract code from a node's source file
    */
   private async extractNodeCode(node: Node): Promise<string | null> {
+    // SECURITY (#383): a config-leaf node's on-disk line is `key = <secret>`.
+    // Return the KEY only — never read the value off disk. This closes the
+    // includeCode / buildContext code-block path, mirroring the explore source
+    // renderer; an agent that genuinely needs a value can read the file itself.
+    if (isConfigLeafNode(node)) {
+      return node.signature || node.qualifiedName || node.name;
+    }
+
     const filePath = validatePathWithinRoot(this.projectRoot, node.filePath);
 
     if (!filePath || !fs.existsSync(filePath)) {

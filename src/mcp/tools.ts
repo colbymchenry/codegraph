@@ -26,7 +26,7 @@ import {
   existsSync,
   readFileSync,
 } from 'fs';
-import { clamp, validatePathWithinRoot, validateProjectPath } from '../utils';
+import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { resolve as resolvePath } from 'path';
 
@@ -1705,6 +1705,11 @@ export class ToolHandler {
     for (const node of subgraph.nodes.values()) {
       // Skip import/export nodes — they add noise without information
       if (node.kind === 'import' || node.kind === 'export') continue;
+      // SECURITY (#383): never render the on-disk source of a config-leaf
+      // (Spring application.{yml,properties} key) — its line is `key = <secret>`,
+      // so whole-file/cluster rendering here would push secrets into context
+      // unbidden. The key still appears in the flow/symbol listing above.
+      if (isConfigLeafNode(node)) continue;
 
       const group = fileGroups.get(node.filePath) || { nodes: [], score: 0 };
       group.nodes.push(node);

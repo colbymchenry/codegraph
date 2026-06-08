@@ -99,8 +99,8 @@ function defaultObjcModuleName(className: string): string {
 function parseObjcRNExports(
   source: string,
   className: string | null
-): Array<{ moduleName: string; jsName: string; nativeSelectorFirstKw: string }> {
-  const results: Array<{ moduleName: string; jsName: string; nativeSelectorFirstKw: string }> = [];
+): Array<{ moduleName: string; jsName: string; nativeSelectorFirstKw: string; line: number }> {
+  const results: Array<{ moduleName: string; jsName: string; nativeSelectorFirstKw: string; line: number }> = [];
 
   // RCT_EXPORT_MODULE — one per file by convention. Capture the optional arg.
   const moduleMatch = source.match(/RCT_EXPORT_MODULE\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)?\s*\)/);
@@ -111,6 +111,12 @@ function parseObjcRNExports(
     (className ? defaultObjcModuleName(className) : null);
   if (!moduleName) return results;
 
+  const lineOf = (idx: number): number => {
+    let line = 1;
+    for (let i = 0; i < idx && i < source.length; i++) if (source.charCodeAt(i) === 10) line++;
+    return line;
+  };
+
   // RCT_EXPORT_METHOD(selectorFirstKw:(args)…)
   // The first keyword (everything up to the first `:` or open paren) is the
   // JS-visible name. We don't try to parse full multi-keyword selectors —
@@ -119,7 +125,7 @@ function parseObjcRNExports(
   let m: RegExpExecArray | null;
   while ((m = exportRegex.exec(source)) !== null) {
     const kw = m[1];
-    if (kw) results.push({ moduleName, jsName: kw, nativeSelectorFirstKw: kw });
+    if (kw) results.push({ moduleName, jsName: kw, nativeSelectorFirstKw: kw, line: lineOf(m.index) });
   }
 
   // RCT_REMAP_METHOD(jsName, nativeSelectorFirstKw:(args)…)
@@ -129,7 +135,7 @@ function parseObjcRNExports(
     const jsName = m[1];
     const nativeKw = m[2];
     if (jsName && nativeKw) {
-      results.push({ moduleName, jsName, nativeSelectorFirstKw: nativeKw });
+      results.push({ moduleName, jsName, nativeSelectorFirstKw: nativeKw, line: lineOf(m.index) });
     }
   }
 
@@ -355,7 +361,48 @@ function buildRNMaps(context: ResolutionContext): { byJsName: Map<string, Native
 
 export const reactNativeBridgeResolver: FrameworkResolver = {
   name: 'react-native-bridge',
-  languages: ['javascript', 'typescript', 'tsx', 'jsx'],
+  // objc/mm included so `extract()` sees the native files — `resolve()` still
+  // only redirects JS callers (it returns null for native languages).
+  languages: ['javascript', 'typescript', 'tsx', 'jsx', 'objc'],
+
+  /**
+   * Extract `RCT_EXPORT_METHOD` / `RCT_REMAP_METHOD` declarations as method
+   * nodes. These macros parse as a macro-expression (an ERROR node), NOT a
+   * `method_definition`, so the ObjC extractor never made a node for them — the
+   * iOS half of a native module was invisible, so a JS call couldn't resolve to
+   * it and the cross-platform pairing had nothing to pair. The node is named by
+   * the JS-visible name (the selector's first keyword, or the explicit
+   * `RCT_REMAP_METHOD` JS name) so it matches the Android `@ReactMethod` method.
+   */
+  extract(filePath, source) {
+    if (!filePath.endsWith('.m') && !filePath.endsWith('.mm')) return { nodes: [], references: [] };
+    if (!/RCT_EXPORT_MODULE\b/.test(source)) return { nodes: [], references: [] };
+    const exports = parseObjcRNExports(source, findObjcClassName(source));
+    const now = Date.now();
+    const nodes: Node[] = [];
+    const seen = new Set<string>();
+    for (const e of exports) {
+      if (seen.has(e.jsName)) continue;
+      seen.add(e.jsName);
+      nodes.push({
+        id: `rn-export:${filePath}:${e.moduleName}.${e.jsName}`,
+        kind: 'method',
+        name: e.jsName,
+        qualifiedName: `${filePath}::${e.moduleName}.${e.jsName}`,
+        filePath,
+        language: 'objc',
+        startLine: e.line,
+        endLine: e.line,
+        startColumn: 0,
+        endColumn: 0,
+        isExported: true,
+        docstring: `RCT_EXPORT_METHOD ${e.nativeSelectorFirstKw} (module ${e.moduleName})`,
+        signature: `RCT_EXPORT_METHOD(${e.nativeSelectorFirstKw}:…)`,
+        updatedAt: now,
+      });
+    }
+    return { nodes, references: [] };
+  },
 
   /**
    * Detect: package.json depends on `react-native`, OR any source file

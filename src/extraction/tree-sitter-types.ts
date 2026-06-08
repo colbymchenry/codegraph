@@ -78,6 +78,16 @@ export interface ExtractorContext {
  * language-specific details like signatures, visibility, and imports.
  */
 export interface LanguageExtractor {
+  /**
+   * Optional source transform applied immediately before the grammar parses the
+   * file. Used to work around grammar gaps that would otherwise corrupt the
+   * parse tree (e.g. C# blanks conditional-compilation directive lines the
+   * grammar mis-parses inside enum bodies). MUST preserve byte offsets (replace
+   * removed text with spaces, keep newlines) so node positions and getNodeText
+   * stay correct; the returned string is used for both parsing and extraction.
+   */
+  preParse?: (source: string) => string;
+
   // --- Node type mappings ---
 
   /** Node types that represent functions */
@@ -138,6 +148,14 @@ export interface LanguageExtractor {
   isStatic?: (node: SyntaxNode) => boolean;
   /** Check if variable declaration is a constant (const vs let/var) */
   isConst?: (node: SyntaxNode) => boolean;
+  /**
+   * Extract extra symbol-level modifier keywords to persist on the node's
+   * `decorators` list (e.g. Kotlin `expect`/`actual` multiplatform markers).
+   * Called generically for every created node; return undefined/[] when none.
+   * Used by the resolver to link `expect` declarations to their `actual`
+   * implementations across source sets.
+   */
+  extractModifiers?: (node: SyntaxNode) => string[] | undefined;
 
   // --- New config properties ---
 

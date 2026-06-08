@@ -25,6 +25,14 @@
 [![Antigravity](https://img.shields.io/badge/Antigravity-supported-blueviolet.svg)](#supported-agents)
 [![Kiro](https://img.shields.io/badge/Kiro-supported-blueviolet.svg)](#supported-agents)
 
+<br>
+
+**The CodeGraph platform is coming** — for every PR, know exactly what to test, what could break, which flows are affected, and whether business logic is compromised.
+
+<a href="https://getcodegraph.com"><img alt="Join the waitlist for early beta access" src="https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/waitlist.svg?v=2" height="52"></a>
+
+<sub>Get <b>early beta access</b> to the hosted product · <a href="https://getcodegraph.com">getcodegraph.com</a></sub>
+
 </div>
 
 ## Get Started
@@ -48,6 +56,8 @@ npm i -g @colbymchenry/codegraph
 ```
 
 <sub>CodeGraph bundles its own runtime — nothing to compile, no native build, works the same everywhere. The installer puts `codegraph` on your PATH but **doesn't change your current shell** — open a new terminal before the next step so the command resolves.</sub>
+
+<sub>**Upgrade any time** with `codegraph upgrade` — it detects how you installed (bundle, npm, or npx) and updates in place. Add `--check` to see if an update is available, or `codegraph upgrade <version>` to pin one.</sub>
 
 ### 2. Wire up your agent(s)
 
@@ -457,6 +467,7 @@ codegraph callees <symbol>        # Find what a function/method calls (--limit, 
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
 codegraph affected [files...]     # Find test files affected by changes (see below)
 codegraph serve --mcp             # Start MCP server
+codegraph upgrade [version]       # Update to the latest release (--check, --force)
 ```
 
 ### `codegraph affected`
@@ -629,6 +640,36 @@ is written):
 | Luau | `.luau` | Full support (everything in Lua, plus `type`/`export type` aliases, typed signatures, and Roblox instance-path `require`) |
 
 Want to add another language? See [`docs/ADDING-A-LANGUAGE.md`](docs/ADDING-A-LANGUAGE.md) — it walks through sourcing a tree-sitter grammar, probing the AST, choosing between the OO and self-contained extractor patterns, and the worked examples in the existing extractors.
+
+## Measured cross-file coverage
+
+Impact and blast-radius queries are only as good as the dependency graph behind them, so coverage is measured rather than asserted. **Fair coverage** = the share of symbol-bearing source files that have at least one *resolved cross-file dependent* — something that imports, calls, references, or (through a framework convention) routes to them — on a real-world benchmark repo per language. The residual is always a genuine static-analysis frontier (runtime dynamic dispatch, reflection / DI containers, framework-convention entry points, vendored third-party code), never hidden by gaming the denominator.
+
+| Language | Benchmark repo | Coverage |
+|---|---|---|
+| TypeScript / JavaScript | this repo | 95.8% |
+| Python | psf/requests | 100% |
+| Go | gin-gonic/gin | 96.6% |
+| Rust | BurntSushi/ripgrep | 86.7% |
+| Java | google/gson | 93.3% |
+| C# | jbogard/MediatR | 85.2% |
+| PHP | guzzle/guzzle | 100% |
+| Ruby | sidekiq/sidekiq | 100% |
+| C | redis/redis | 92.2% |
+| C++ | google/leveldb | 94.8% |
+| Objective-C | SDWebImage | 91.6% |
+| Swift | Alamofire | 95.3% |
+| Kotlin | square/okhttp | 96.2% |
+| Scala | gatling/gatling | 91.2% |
+| Dart | flutter/packages | 92.4% |
+| Svelte / SvelteKit | sveltejs/realworld | 100% |
+| Vue / Nuxt | nuxt/movies | 93.5% |
+| Lua | nvim-telescope/telescope.nvim | 84.2% |
+| Luau | dphfox/Fusion | 92.2% |
+| Liquid | Shopify/dawn | 73.8% |
+| Pascal / Delphi | PascalCoin | 75.7% |
+
+Framework routing is validated the same way, on a canonical app per framework: Express 100%, FastAPI 98%, Flask 100%, NestJS 96.8%, Gin 96.5%, Axum 100%, Rocket 93.8%, Vapor 100%, Laravel 92%, Rails 89.6%, React Router 100% — and the convention/reflection-heavy ones at their honest static-analysis ceiling: ASP.NET 83.9%, Spring 83.3%, Drupal 78.9%, Django 74.1%.
 
 ## Troubleshooting
 
