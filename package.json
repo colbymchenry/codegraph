@@ -22,6 +22,7 @@
     "test:watch": "vitest",
     "test:eval": "vitest run __tests__/evaluation/",
     "eval": "npm run build && npx tsx __tests__/evaluation/runner.ts",
+    "test:neug": "npx tsx __tests__/neug-backend.test.ts",
     "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true})\""
   },
   "keywords": [
@@ -33,6 +34,7 @@
   "license": "MIT",
   "dependencies": {
     "@clack/prompts": "^1.3.0",
+    "@graphscope-neug/neug": "^0.1.2",
     "commander": "^14.0.2",
     "fast-string-width": "^3.0.2",
     "fast-wrap-ansi": "^0.2.0",

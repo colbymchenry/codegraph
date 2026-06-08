@@ -5,6 +5,7 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['__tests__/**/*.test.ts'],
+    exclude: ['__tests__/neug-backend.test.ts', '**/node_modules/**'],
     /**
      * Several MCP integration tests (mcp-daemon, mcp-initialize, mcp-ppid-watchdog,
      * mcp-roots) spawn `dist/bin/codegraph.js serve --mcp` with `process.execPath`

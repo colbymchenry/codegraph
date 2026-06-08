@@ -434,14 +434,17 @@ The exact text is `src/mcp/server-instructions.ts` — the single source of trut
 │       explore · search · callers · callees · impact · node        │
 │                                 │                                 │
 │                                 ▼                                 │
-│                       SQLite knowledge graph                      │
+│              SQLite knowledge graph (default)                     │
 │          symbols · edges · files · FTS5 full-text search          │
+│                           — or —                                  │
+│              NeuG graph database (optional)                       │
+│              property graph · Cypher-native                       │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
 1. **Extraction** — [tree-sitter](https://tree-sitter.github.io/) parses source code into ASTs. Language-specific queries extract nodes (functions, classes, methods) and edges (calls, imports, extends, implements).
 
-2. **Storage** — Everything goes into a local SQLite database (`.codegraph/codegraph.db`) with FTS5 full-text search.
+2. **Storage** — Everything goes into a local SQLite database (`.codegraph/codegraph.db`) with FTS5 full-text search (default). Optionally, use the [NeuG graph database backend](#graph-database-backend) (`codegraph init --backend neug`) for native Cypher queries and CSR-optimized graph traversal.
 
 3. **Resolution** — After extraction, references are resolved: function calls → definitions, imports → source files, class inheritance, and framework-specific patterns.
 
@@ -466,6 +469,7 @@ codegraph callers <symbol>        # Find what calls a function/method (--limit, 
 codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
 codegraph affected [files...]     # Find test files affected by changes (see below)
+codegraph cypher <query>          # Execute a Cypher query (NeuG backend only, --json)
 codegraph serve --mcp             # Start MCP server
 codegraph upgrade [version]       # Update to the latest release (--check, --force)
 ```
@@ -559,6 +563,49 @@ that drive the graph directly: `DatabaseConnection`, `QueryBuilder`,
   MCP server are unaffected — they run on the self-contained bundled runtime.
 - TypeScript types ship with the package. As with any Node-targeting library,
   keep `@types/node` available and `skipLibCheck: true` (the common default).
+
+---
+
+## Graph Database Backend
+
+By default CodeGraph stores the knowledge graph in SQLite — zero-config, portable, and battle-tested. For projects that benefit from native graph traversal and a declarative query language, CodeGraph also supports **NeuG** as an optional backend.
+
+### Why NeuG?
+
+| | SQLite (default) | NeuG (optional) |
+|---|---|---|
+| **Multi-hop traversal** | N rounds of SQL queries + application-level BFS | CSR-optimized adjacency — native multi-hop in one query |
+| **Graph queries** | Fixed tool set (callers, callees, impact) | Full Cypher: arbitrary pattern matching, path finding |
+| **Architecture** | Relational tables + B-tree indexes | Property graph with compressed sparse row storage |
+| **Extensibility** | SQL only | Native C++ extension framework (graph algorithms coming) |
+
+NeuG is built on [GraphScope Flex](https://github.com/alibaba/GraphScope), which set the world record on the [LDBC SNB Interactive benchmark](https://ldbcouncil.org/benchmarks/snb/interactive/2025-04-21-graphscope-flex-sf300/) — the industry's gold standard for graph database performance — achieving 80,000+ QPS using purely declarative Cypher queries. It is lightweight, embeddable, and supports incremental updates.
+
+### Quick start
+
+```bash
+# Initialize with NeuG backend
+codegraph init --backend neug
+
+# All existing commands work unchanged
+codegraph query myFunction
+codegraph callers myFunction
+codegraph callees myFunction
+codegraph impact myFunction
+# ... and all other CLI commands (index, sync, status, files, context, etc.)
+
+# NeuG-only: run arbitrary Cypher queries
+codegraph cypher "MATCH (a:CodeNode {name: 'handleRequest'})-[e:CodeEdge*1..3]->(b:CodeNode) RETURN a.name, b.name"
+codegraph cypher "MATCH (n:CodeNode)-[e:CodeEdge]->() RETURN n.kind, count(e) ORDER BY count(e) DESC" --json
+```
+
+### Platform support
+
+NeuG ships native binaries for **macOS ARM64**, **Linux x86_64**, and **Linux ARM64**. The `@graphscope-neug/neug` package is included as a dependency and installed automatically with CodeGraph.
+
+### Upcoming: graph algorithms
+
+NeuG's native C++ extension framework enables graph algorithms to be added without modifying CodeGraph itself. Planned algorithms include Connected Components, PageRank, ShortestPath, Louvain community detection etc. — enabling advanced code analysis like module clustering and influence ranking.
 
 ---
 

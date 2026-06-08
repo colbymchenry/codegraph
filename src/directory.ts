@@ -28,9 +28,10 @@ export function isInitialized(projectRoot: string): boolean {
   if (!fs.existsSync(codegraphDir) || !fs.statSync(codegraphDir).isDirectory()) {
     return false;
   }
-  // Must have codegraph.db, not just .codegraph folder
+  // Must have codegraph.db (SQLite) or codegraph.neug/ (NeuG)
   const dbPath = path.join(codegraphDir, 'codegraph.db');
-  return fs.existsSync(dbPath);
+  const neugPath = path.join(codegraphDir, 'codegraph.neug');
+  return fs.existsSync(dbPath) || fs.existsSync(neugPath);
 }
 
 /**

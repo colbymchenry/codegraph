@@ -1,7 +1,8 @@
 /**
  * Database Layer
  *
- * Handles SQLite database initialization and connection management.
+ * Handles database initialization and connection management.
+ * Supports SQLite (default) and NeuG (optional graph database) backends.
  */
 
 import { SqliteDatabase, SqliteBackend, createDatabase } from './sqlite-adapter';
@@ -11,6 +12,11 @@ import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
 
 export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
+
+/**
+ * Storage backend type: SQLite (default) or NeuG (graph DB).
+ */
+export type StorageBackendType = 'sqlite' | 'neug';
 
 /**
  * Apply connection-level PRAGMAs. Shared by `initialize` and `open` so the two
@@ -237,8 +243,151 @@ export class DatabaseConnection {
 export const DATABASE_FILENAME = 'codegraph.db';
 
 /**
+ * Default NeuG database directory name
+ */
+export const NEUG_DB_DIR = 'codegraph.neug';
+
+/**
  * Get the default database path for a project
  */
 export function getDatabasePath(projectRoot: string): string {
   return path.join(projectRoot, '.codegraph', DATABASE_FILENAME);
+}
+
+/**
+ * Get the NeuG database directory path for a project
+ */
+export function getNeuGDatabasePath(projectRoot: string): string {
+  return path.join(projectRoot, '.codegraph', NEUG_DB_DIR);
+}
+
+/**
+ * NeuG database connection wrapper with lifecycle management.
+ *
+ * Mirrors DatabaseConnection's public surface so CodeGraph can use either
+ * via duck typing. Methods that are SQLite-specific (journal mode, pragmas)
+ * return sensible defaults.
+ */
+export class NeuGDatabaseConnection {
+  private db: any; // neug.Database
+  private conn: any; // neug.Connection
+  private dbPath: string;
+
+  private constructor(db: any, conn: any, dbPath: string) {
+    this.db = db;
+    this.conn = conn;
+    this.dbPath = dbPath;
+  }
+
+  private static async loadNeuG(): Promise<any> {
+    try {
+      // @ts-expect-error no type declarations shipped yet
+      return await import('@graphscope-neug/neug');
+    } catch {
+      throw new Error(
+        'The "@graphscope-neug/neug" package is not installed. Install it to use the NeuG backend:\n' +
+        '  npm install @graphscope-neug/neug\n' +
+        'Note: the neug npm package requires a platform-specific native binary.'
+      );
+    }
+  }
+
+  /**
+   * Initialize a new NeuG database at the given path.
+   * Dynamically imports the `neug` package.
+   */
+  static async initialize(dbPath: string): Promise<NeuGDatabaseConnection> {
+    const dir = path.dirname(dbPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    const neug = await NeuGDatabaseConnection.loadNeuG();
+    const db = new neug.Database({ databasePath: dbPath, mode: 'w' });
+    const conn = db.connect();
+    return new NeuGDatabaseConnection(db, conn, dbPath);
+  }
+
+  /**
+   * Open an existing NeuG database.
+   */
+  static async open(dbPath: string): Promise<NeuGDatabaseConnection> {
+    if (!fs.existsSync(dbPath)) {
+      throw new Error(`NeuG database not found: ${dbPath}`);
+    }
+
+    const neug = await NeuGDatabaseConnection.loadNeuG();
+    const db = new neug.Database({ databasePath: dbPath, mode: 'rw' });
+    const conn = db.connect();
+    return new NeuGDatabaseConnection(db, conn, dbPath);
+  }
+
+  /**
+   * Get wrapped NeuG connection (used by NeuGQueryBuilder).
+   * Wraps the raw connection to adapt QueryResult to the expected interface.
+   */
+  getConnection(): any {
+    const { NeuGConnectionWrapper } = require('./neug-backend');
+    return new NeuGConnectionWrapper(this.conn);
+  }
+
+  getBackend(): 'neug' {
+    return 'neug';
+  }
+
+  getPath(): string {
+    return this.dbPath;
+  }
+
+  getJournalMode(): string {
+    return 'n/a';
+  }
+
+  getSchemaVersion(): SchemaVersion | null {
+    try {
+      const result = this.conn.execute(
+        `MATCH (v:SchemaVersion) RETURN v.version, v.applied_at, v.description ORDER BY v.version DESC LIMIT 1`,
+        { accessMode: 'read' }
+      );
+      if (result.length === 0) return null;
+      const row = result.toArray()[0];
+      return {
+        version: Number(row[0]),
+        appliedAt: Number(row[1]),
+        description: row[2] ?? undefined,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  transaction<T>(fn: () => T): T {
+    return fn();
+  }
+
+  getSize(): number {
+    try {
+      const stats = fs.statSync(this.dbPath);
+      return stats.size;
+    } catch {
+      return 0;
+    }
+  }
+
+  optimize(): void {
+    // NeuG has no equivalent of VACUUM/ANALYZE
+  }
+
+  runMaintenance(): void {
+    // No-op for NeuG
+  }
+
+  close(): void {
+    this.conn.close();
+    this.db.close();
+  }
+
+  isOpen(): boolean {
+    return true;
+  }
 }

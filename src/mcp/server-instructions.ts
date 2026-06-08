@@ -17,7 +17,7 @@
  */
 export const SERVER_INSTRUCTIONS = `# Codegraph — code intelligence over an indexed knowledge graph
 
-Codegraph is a SQLite knowledge graph of every symbol, edge, and file
+Codegraph is a knowledge graph of every symbol, edge, and file
 in the workspace. Reads are sub-millisecond; the index lags writes by
 about a second through the file watcher. Consult it BEFORE writing or
 editing code, not during.
@@ -45,6 +45,7 @@ typically one to a few calls; a grep/read exploration is dozens.
 - **One specific symbol's full source (esp. a body \`codegraph_explore\` trimmed), or an OVERLOADED name** → \`codegraph_node\` (with \`includeCode\`): for an ambiguous name it returns EVERY matching definition's body in one call, so you never Read a file to find the right overload
 - **"What's in directory X?"** → \`codegraph_files\`
 - **"Is the index ready / what's its size?"** → \`codegraph_status\`
+- **Arbitrary graph pattern matching / raw Cypher query (NeuG backend only)** → \`codegraph_cypher\`
 
 ## Common chains
 

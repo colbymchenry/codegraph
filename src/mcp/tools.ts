@@ -552,6 +552,21 @@ export const tools: ToolDefinition[] = [
       },
     },
   },
+  {
+    name: 'codegraph_cypher',
+    description: 'Execute a raw Cypher query against the knowledge graph (NeuG backend only). Returns tabular results.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Cypher query to execute (e.g. "MATCH (n:CodeNode)-[e:CodeEdge*1..3]->(m:CodeNode) RETURN n.name, m.name")',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['query'],
+    },
+  },
 ];
 
 /**
@@ -1038,6 +1053,8 @@ export class ToolHandler {
           return await this.handleStatus(args);
         case 'codegraph_files':
           result = await this.handleFiles(args); break;
+        case 'codegraph_cypher':
+          result = await this.handleCypher(args); break;
         default:
           return this.errorResult(`Unknown tool: ${toolName}`);
       }
@@ -2827,6 +2844,29 @@ export class ToolHandler {
     }
 
     return this.textResult(this.truncateOutput(output));
+  }
+
+  /**
+   * Handle codegraph_cypher — execute a raw Cypher query (NeuG backend only)
+   */
+  private async handleCypher(args: Record<string, unknown>): Promise<ToolResult> {
+    const query = this.validateString(args.query, 'query');
+    if (typeof query !== 'string') return query;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    if (cg.getBackendType() !== 'neug') {
+      return this.errorResult('codegraph_cypher is only available with the NeuG backend. Initialize with: codegraph init --backend neug');
+    }
+
+    const rows = cg.executeCypher(query);
+    if (rows.length === 0) {
+      return this.textResult('No results.');
+    }
+
+    const text = rows.map(row =>
+      row.map(v => typeof v === 'object' ? JSON.stringify(v) : String(v)).join('\t')
+    ).join('\n');
+    return this.textResult(text);
   }
 
   /**

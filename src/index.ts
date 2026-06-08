@@ -5,6 +5,7 @@
  * knowledge graph from any codebase.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import {
   Node,
@@ -22,7 +23,7 @@ import {
   BuildContextOptions,
   FindRelevantContextOptions,
 } from './types';
-import { DatabaseConnection, getDatabasePath } from './db';
+import { DatabaseConnection, NeuGDatabaseConnection, getDatabasePath, getNeuGDatabasePath, StorageBackendType } from './db';
 import { QueryBuilder } from './db/queries';
 import {
   isInitialized,
@@ -56,7 +57,7 @@ export * from './types';
 // directly (open a DB, run prepared queries) rather than through the CodeGraph
 // facade. Exposed from the package entry so they no longer require deep imports
 // into dist/ (issue #354).
-export { getDatabasePath, DatabaseConnection } from './db';
+export { getDatabasePath, getNeuGDatabasePath, DatabaseConnection, StorageBackendType } from './db';
 export { QueryBuilder } from './db/queries';
 export {
   getCodeGraphDir,
@@ -94,6 +95,9 @@ export interface InitOptions {
 
   /** Progress callback for indexing */
   onProgress?: (progress: IndexProgress) => void;
+
+  /** Storage backend: 'sqlite' (default) or 'neug' */
+  backend?: StorageBackendType;
 }
 
 /**
@@ -105,6 +109,9 @@ export interface OpenOptions {
 
   /** Whether to run in read-only mode */
   readOnly?: boolean;
+
+  /** Storage backend: 'sqlite' (default) or 'neug'. Auto-detected from existing DB if omitted. */
+  backend?: StorageBackendType;
 }
 
 /**
@@ -127,7 +134,7 @@ export interface IndexOptions {
  * Provides the primary interface for interacting with the code knowledge graph.
  */
 export class CodeGraph {
-  private db: DatabaseConnection;
+  private db: DatabaseConnection | NeuGDatabaseConnection;
   private queries: QueryBuilder;
   private projectRoot: string;
   private orchestrator: ExtractionOrchestrator;
@@ -135,6 +142,7 @@ export class CodeGraph {
   private graphManager: GraphQueryManager;
   private traverser: GraphTraverser;
   private contextBuilder: ContextBuilder;
+  private backendType: StorageBackendType;
 
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
@@ -146,13 +154,15 @@ export class CodeGraph {
   private watcher: FileWatcher | null = null;
 
   private constructor(
-    db: DatabaseConnection,
+    db: DatabaseConnection | NeuGDatabaseConnection,
     queries: QueryBuilder,
-    projectRoot: string
+    projectRoot: string,
+    backendType: StorageBackendType = 'sqlite'
   ) {
     this.db = db;
     this.queries = queries;
     this.projectRoot = projectRoot;
+    this.backendType = backendType;
     this.fileLock = new FileLock(
       path.join(projectRoot, '.codegraph', 'codegraph.lock')
     );
@@ -183,6 +193,7 @@ export class CodeGraph {
   static async init(projectRoot: string, options: InitOptions = {}): Promise<CodeGraph> {
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
+    const backend = options.backend ?? 'sqlite';
 
     // Check if already initialized
     if (isInitialized(resolvedRoot)) {
@@ -192,12 +203,22 @@ export class CodeGraph {
     // Create directory structure
     createDirectory(resolvedRoot);
 
-    // Initialize database
-    const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.initialize(dbPath);
-    const queries = new QueryBuilder(db.getDb());
+    let instance: CodeGraph;
 
-    const instance = new CodeGraph(db, queries, resolvedRoot);
+    if (backend === 'neug') {
+      const neugDbPath = getNeuGDatabasePath(resolvedRoot);
+      const db = await NeuGDatabaseConnection.initialize(neugDbPath);
+      const { NeuGQueryBuilder } = await import('./db/neug-backend');
+      const queries = new NeuGQueryBuilder(db.getConnection());
+      queries.initSchema();
+      queries.setMetadata('backend', 'neug');
+      instance = new CodeGraph(db, queries as unknown as QueryBuilder, resolvedRoot, 'neug');
+    } else {
+      const dbPath = getDatabasePath(resolvedRoot);
+      const db = DatabaseConnection.initialize(dbPath);
+      const queries = new QueryBuilder(db.getDb());
+      instance = new CodeGraph(db, queries, resolvedRoot, 'sqlite');
+    }
 
     // Run initial indexing if requested
     if (options.index) {
@@ -208,7 +229,7 @@ export class CodeGraph {
   }
 
   /**
-   * Initialize synchronously (without indexing)
+   * Initialize synchronously (without indexing). SQLite backend only.
    */
   static initSync(projectRoot: string): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
@@ -226,7 +247,7 @@ export class CodeGraph {
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, resolvedRoot);
+    return new CodeGraph(db, queries, resolvedRoot, 'sqlite');
   }
 
   /**
@@ -251,12 +272,23 @@ export class CodeGraph {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
-    // Open database
-    const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath);
-    const queries = new QueryBuilder(db.getDb());
+    // Auto-detect backend if not specified
+    const backend = options.backend ?? CodeGraph.detectBackend(resolvedRoot);
 
-    const instance = new CodeGraph(db, queries, resolvedRoot);
+    let instance: CodeGraph;
+
+    if (backend === 'neug') {
+      const neugDbPath = getNeuGDatabasePath(resolvedRoot);
+      const db = await NeuGDatabaseConnection.open(neugDbPath);
+      const { NeuGQueryBuilder } = await import('./db/neug-backend');
+      const queries = new NeuGQueryBuilder(db.getConnection());
+      instance = new CodeGraph(db, queries as unknown as QueryBuilder, resolvedRoot, 'neug');
+    } else {
+      const dbPath = getDatabasePath(resolvedRoot);
+      const db = DatabaseConnection.open(dbPath);
+      const queries = new QueryBuilder(db.getDb());
+      instance = new CodeGraph(db, queries, resolvedRoot, 'sqlite');
+    }
 
     // Sync if requested
     if (options.sync) {
@@ -267,7 +299,7 @@ export class CodeGraph {
   }
 
   /**
-   * Open synchronously (without sync)
+   * Open synchronously (without sync). SQLite backend only.
    */
   static openSync(projectRoot: string): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
@@ -288,7 +320,7 @@ export class CodeGraph {
     const db = DatabaseConnection.open(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, resolvedRoot);
+    return new CodeGraph(db, queries, resolvedRoot, 'sqlite');
   }
 
   /**
@@ -296,6 +328,17 @@ export class CodeGraph {
    */
   static isInitialized(projectRoot: string): boolean {
     return isInitialized(path.resolve(projectRoot));
+  }
+
+  /**
+   * Detect which backend an existing project uses by checking which DB files exist.
+   */
+  static detectBackend(projectRoot: string): StorageBackendType {
+    const neugPath = getNeuGDatabasePath(projectRoot);
+    if (fs.existsSync(neugPath)) {
+      return 'neug';
+    }
+    return 'sqlite';
   }
 
   /**
@@ -687,12 +730,30 @@ export class CodeGraph {
   }
 
   /**
-   * Active SQLite backend for this project's connection (`node-sqlite` — Node's
-   * built-in real-SQLite module). Surfaced via `codegraph status` and the
-   * `codegraph_status` MCP tool alongside the effective journal mode.
+   * Active storage backend for this project's connection.
+   * Returns 'neug' for graph DB backend, or an SqliteBackend string for SQLite.
+   * Surfaced via `codegraph status` and the `codegraph_status` MCP tool.
    */
-  getBackend(): import('./db').SqliteBackend {
+  getBackend(): import('./db').SqliteBackend | 'neug' {
     return this.db.getBackend();
+  }
+
+  /**
+   * The storage backend type: 'sqlite' or 'neug'.
+   */
+  getBackendType(): StorageBackendType {
+    return this.backendType;
+  }
+
+  /**
+   * Execute a raw Cypher query (NeuG backend only).
+   * Throws if called on a SQLite backend.
+   */
+  executeCypher(query: string, params?: Record<string, any>): any[][] {
+    if (this.backendType !== 'neug') {
+      throw new Error('executeCypher is only available with the NeuG backend');
+    }
+    return (this.queries as any).executeCypher(query, params);
   }
 
   /**
