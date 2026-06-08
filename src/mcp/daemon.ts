@@ -1,5 +1,6 @@
+/// <reference types="node" />
 /**
- * Shared MCP daemon — issue #411.
+* Shared MCP daemon — issue #411.
  *
  * One detached `codegraph serve --mcp` daemon process per project root,
  * accepting N concurrent MCP clients over a Unix-domain socket (or named pipe
@@ -163,12 +164,21 @@ export class Daemon {
     // (cross-project tool calls only) shouldn't pay any open cost.
     void this.engine.ensureInitialized(this.projectRoot);
 
-    // Stale socket file (left over from a SIGKILL'd previous daemon) will
-    // wedge `listen` with EADDRINUSE. We arrived here holding the lockfile,
-    // which means there's no live daemon, so it's safe to clear.
-    if (process.platform !== 'win32') {
+    // Stale socket / named-pipe left over from a SIGKILL'd previous daemon will
+    // wedge `listen` with EADDRINUSE (POSIX) or prevent binding (Windows).
+    // We arrived here holding the lockfile, so there is no live daemon — safe to
+    //  clear. On POSIX: just unlink. On Windows: named pipes cannot be unlinked,
+    // but we can probe the pipe with a short connect attempt; if it refuses the
+    // connection (ECONNREFUSED / ENOENT) the OS will let a new server bind the
+    //  same name once the old server object is garbage-collected. If it actually
+    //  accepts, a live daemon snuck in — skip cleanup and let listen() EADDRINUSE.
+    
+    if (process.platform === 'win32') {
+      await probeAndClearWindowsPipe(this.socketPath);
+    }else{
       try { fs.unlinkSync(this.socketPath); } catch { /* not-exists is fine */ }
     }
+      
 
     await new Promise<void>((resolve, reject) => {
       const server = net.createServer((socket) => this.handleConnection(socket));
@@ -616,3 +626,55 @@ function readClientHello(
 
 /** Exported for test stubs that need to bound the hello-line read. */
 export { MAX_HELLO_LINE_BYTES };
+
+/**
+ * Windows named-pipe stale-pipe cleanup (#723).
+ *
+ * Named pipes on Windows cannot be unlinked like Unix sockets. When a daemon
+ * exits without a graceful shutdown (SIGKILL, abrupt client disconnect like a
+ * Reasonix model-switch) the pipe name lingers in a half-disconnected state.
+ * The next daemon that tries to call server.listen() on the same name gets
+ * EADDRINUSE and fails to start — which is the exact failure in #723.
+ *
+ * Strategy: attempt a short probe connection.
+ *   - ECONNREFUSED / ENOENT / EPIPE → pipe is stale; Windows will release the
+ *     name once our probe closes, letting the new server bind it.
+ *   - Connection succeeds → a live daemon is actually there (race); we leave
+ *     it alone and let listen() surface EADDRINUSE normally.
+ *   - Any other error → treat as stale and proceed.
+ *
+ * Always resolves (never rejects) — fail-safe so a probe error never prevents
+ * the daemon from attempting to start.
+ */
+async function probeAndClearWindowsPipe(pipePath: string): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const probe = net.createConnection(pipePath);
+    const cleanup = () => {
+      probe.removeAllListeners();
+      try { probe.destroy(); } catch { /* best-effort */ }
+      resolve();
+    };
+
+    // Connection succeeded → a live daemon is running; leave it.
+    probe.once('connect', () => {
+      process.stderr.write(
+        `[CodeGraph daemon] Probe found live pipe on ${pipePath}; skipping cleanup.\n`,
+      );
+      cleanup();
+    });
+
+    // Expected for a stale or absent pipe — safe to proceed.
+    probe.once('error', (err: NodeJS.ErrnoException) => {
+      if (err.code !== 'ECONNREFUSED' && err.code !== 'ENOENT') {
+        process.stderr.write(
+          `[CodeGraph daemon] Pipe probe returned ${err.code}; treating as stale.\n`,
+        );
+      }
+      cleanup();
+    });
+
+    // Safety net: don't hang if the OS delivers neither connect nor error.
+    const timer = setTimeout(cleanup, 2000);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+}
