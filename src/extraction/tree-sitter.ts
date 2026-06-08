@@ -1677,6 +1677,9 @@ export class TreeSitterExtractor {
         // an unrelated class method picked by path-proximity (#359).
         if (this.language === 'typescript' || this.language === 'tsx') {
           this.extractTsTypeAliasMembers(value, typeAliasNode);
+          // `type List = [ Service<'name', Req, Resp>, … ]` — surface each
+          // entry's string-literal name as a searchable member (issue #634).
+          this.extractTsTupleContractNames(value, typeAliasNode);
         }
       }
     }
@@ -1758,6 +1761,75 @@ export class TreeSitterExtractor {
         // #432. We attach refs to the type-alias parent (consistent with
         // interface property_signature treatment).
         this.extractTypeAnnotations(child, typeAliasNode.id);
+      }
+    }
+    this.nodeStack.pop();
+  }
+
+  /**
+   * Surface the string-literal "names" of a TypeScript service/contract
+   * registry written as a tuple of generic instantiations:
+   *
+   *   type MyServiceList = [
+   *     Service<'query_apply_record', Req, Resp>,
+   *     Service<'apply_confirm', Req, Resp>,
+   *   ];
+   *
+   * Each `Service<'name', …>` tags an entry with a string-literal name that a
+   * dynamic factory (`createService<MyServiceList>()`) turns into a callable
+   * property (`api.query_apply_record(…)`). Static extraction otherwise never
+   * sees that name — it's a type argument, not a declaration — so
+   * `codegraph query query_apply_record` returned nothing (issue #634). We emit
+   * each name as a `method` node under the type alias (qualifiedName
+   * `MyServiceList::query_apply_record`) so it's searchable and resolvable as a
+   * symbol. (A call through the proxy, `api.query_apply_record(…)`, still
+   * resolves to the imported `api` binding — the receiver's type isn't known —
+   * so this fixes discoverability, not the per-method call edge.)
+   *
+   * Scope is deliberately narrow to avoid noise: only a string literal that is
+   * a DIRECT type argument of a `generic_type` that is itself a DIRECT element
+   * of a `tuple_type`. This excludes utility types (`Pick`/`Omit`/`Record` are
+   * never written as tuples) and string args nested deeper
+   * (`Service<'a', Pick<U, 'id'>>` yields only `a`, never `id`). Names must be
+   * valid identifiers, which also rules out route paths / arbitrary strings.
+   */
+  private extractTsTupleContractNames(value: SyntaxNode, typeAliasNode: Node): void {
+    const tuples: SyntaxNode[] = [];
+    const collectTuples = (n: SyntaxNode, depth: number): void => {
+      if (depth > 6) return; // a type expression is shallow; cap defensively
+      if (n.type === 'tuple_type') tuples.push(n);
+      for (let i = 0; i < n.namedChildCount; i++) {
+        const c = n.namedChild(i);
+        if (c) collectTuples(c, depth + 1);
+      }
+    };
+    collectTuples(value, 0);
+    if (tuples.length === 0) return;
+
+    this.nodeStack.push(typeAliasNode.id);
+    for (const tuple of tuples) {
+      for (let i = 0; i < tuple.namedChildCount; i++) {
+        const entry = tuple.namedChild(i);
+        if (!entry || entry.type !== 'generic_type') continue;
+        const typeArgs = getChildByField(entry, 'type_arguments');
+        if (!typeArgs) continue;
+        for (let j = 0; j < typeArgs.namedChildCount; j++) {
+          const arg = typeArgs.namedChild(j);
+          if (!arg || arg.type !== 'literal_type') continue;
+          // literal_type wraps the actual literal; only a string is a name.
+          const strNode = arg.namedChild(0);
+          if (!strNode || strNode.type !== 'string') continue;
+          const name = getNodeText(strNode, this.source)
+            .trim()
+            .replace(/^['"`]/, '')
+            .replace(/['"`]$/, '');
+          if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) continue;
+          const signature = getNodeText(entry, this.source).replace(/\s+/g, ' ').trim().slice(0, 120);
+          this.createNode('method', name, entry, {
+            signature,
+            qualifiedName: `${typeAliasNode.name}::${name}`,
+          });
+        }
       }
     }
     this.nodeStack.pop();
