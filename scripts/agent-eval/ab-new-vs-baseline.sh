@@ -2,18 +2,20 @@
 # A/B a codegraph retrieval/steering change: the NEW build (current HEAD) vs a
 # BASELINE build (a git ref) — BOTH with codegraph attached — on the same
 # implementation task, measuring how many Read vs codegraph calls the agent
-# makes. This ISOLATES the change (unlike run-all.sh, which is with-vs-without
-# codegraph). The agent works on a throwaway copy of the target, so its edits
-# never touch your repos.
+# makes. ISOLATES the change (unlike run-all.sh's with-vs-without). The agent
+# works on a throwaway copy of the target, so your repos are never touched.
 #
-# *** RUN THIS IN A REAL TERMINAL — NOT nested inside a Claude Code session. ***
-# A `claude -p` spawned from within another Claude session (e.g. from a Bash
-# tool call) cannot reliably attach the codegraph MCP server: the server is
-# healthy (full handshake ~165ms) but the nested client marks it
-# status:"pending" / 0 tools under CPU/timing contention, and degrades to
-# consistent failure over a long session. NO_DAEMON + `< /dev/null` do NOT fix
-# it — it's the nested client, not the server. See codegraph/CLAUDE.md
-# ("Running agent-evals — do NOT nest").
+# Reliable attach (works even when this is itself run nested inside a Claude
+# session): each arm PRE-WARMS a persistent codegraph daemon for its target so
+# claude connects to an already-bound, index-loaded daemon instantly — before
+# the agent's first turn — and SKIPS codegraph's startup re-exec via
+# CODEGRAPH_WASM_RELAUNCHED=1. Without this, on a multi-step task the agent
+# dives into Read/grep before codegraph finishes its ~2-3s startup (worse under
+# the CPU contention of a nested run) and runs with NO codegraph.
+#
+# Gotcha: claude's `system/init` snapshot can read status:"pending" / 0 tools
+# even when the server then connects fine — judge by ACTUAL codegraph usage in
+# parse-run.mjs's "by type", not the init line.
 #
 # Usage: ab-new-vs-baseline.sh <indexed-repo> "<task>" [baseline-ref]
 #   <indexed-repo>  a repo with a .codegraph index (copied per arm)
@@ -38,9 +40,13 @@ fi
 CHANGED=$(git -C "$ENGINE" diff --name-only "$BASE_REF" HEAD -- src 2>/dev/null)
 [ -n "$CHANGED" ] || { echo "no src/ changes between $BASE_REF and HEAD — nothing to A/B"; exit 1; }
 
-# Always restore the engine to HEAD on exit, even if interrupted mid-arm.
-restore() { git -C "$ENGINE" checkout HEAD -- $CHANGED 2>/dev/null; ( cd "$ENGINE" && npm run build >/dev/null 2>&1 ); }
-trap restore EXIT
+# On exit: kill any eval daemons + restore the engine to HEAD.
+cleanup() {
+  pkill -9 -f "serve --mcp --path $OUT/" 2>/dev/null
+  git -C "$ENGINE" checkout HEAD -- $CHANGED 2>/dev/null
+  ( cd "$ENGINE" && npm run build >/dev/null 2>&1 )
+}
+trap cleanup EXIT
 
 mkdir -p "$OUT"
 echo "###### engine=$ENGINE  baseline=$BASE_REF"
@@ -54,17 +60,25 @@ rm -rf "$OUT/t-new" "$OUT/t-base"
 rsync -a --exclude node_modules --exclude .git --exclude dist --exclude .codegraph "$TARGET/" "$OUT/t-new/"
 cp -R "$OUT/t-new" "$OUT/t-base"
 
-cfg() { printf '{"mcpServers":{"codegraph":{"command":"%s","args":["serve","--mcp","--path","%s"]}}}' "$BIN" "$1" > "$2"; }
+prewarm() { # target — spawn a persistent daemon (current $BIN) and wait for its socket
+  pkill -9 -f "serve --mcp --path $1" 2>/dev/null
+  CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS=1800000 node "$BIN" serve --mcp --path "$1" </dev/null >/dev/null 2>&1 &
+  node -e 'const fs=require("fs");let n=0;const t=setInterval(()=>{if(fs.existsSync(process.argv[1]+"/.codegraph/daemon.sock")){clearInterval(t);process.exit(0)}if(n++>150){clearInterval(t);process.exit(1)}},100)' "$1" \
+    && echo "  daemon warm: $1" || echo "  WARN: daemon never bound for $1 (arm may run without codegraph)"
+}
 
 run_arm() { # label, target-copy
   local label="$1" tgt="$2" c="$OUT/mcp-$1.json"
-  cfg "$tgt" "$c"
+  # Connect to the pre-warmed daemon; skip the startup re-exec for a fast attach.
+  printf '{"mcpServers":{"codegraph":{"command":"env","args":["CODEGRAPH_WASM_RELAUNCHED=1","node","%s","serve","--mcp","--path","%s"]}}}' "$BIN" "$tgt" > "$c"
+  prewarm "$tgt"
   echo "############## ARM [$label] ##############"
   ( cd "$tgt" && claude -p "$TASK" \
       --output-format stream-json --verbose --permission-mode bypassPermissions \
       --model opus --max-budget-usd 4 --strict-mcp-config --mcp-config "$c" \
-      < /dev/null > "$OUT/run-$label.jsonl" 2>"$OUT/run-$label.err" )
-  node "$PARSE" "$OUT/run-$label.jsonl" 2>&1 | grep -E "tools exposed|by type|Result" || echo "  (parse failed — see $OUT/run-$label.jsonl)"
+      </dev/null > "$OUT/run-$label.jsonl" 2>"$OUT/run-$label.err" )
+  node "$PARSE" "$OUT/run-$label.jsonl" 2>&1 | grep -E "by type|Result" || echo "  (parse failed — see $OUT/run-$label.jsonl)"
+  pkill -9 -f "serve --mcp --path $tgt" 2>/dev/null
   echo
 }
 
