@@ -52,7 +52,10 @@ function spawnServer(cwd: string, env: NodeJS.ProcessEnv = {}): SpawnedServer {
   const child = spawn(process.execPath, [BIN, 'serve', '--mcp'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, ...env },
+    // #618: the daemon-attach log line is now off by default; opt the test
+    // harness into it (CODEGRAPH_MCP_LOG_ATTACH=1) so the attach assertions
+    // below can still observe a successful attach. A per-test env still wins.
+    env: { CODEGRAPH_MCP_LOG_ATTACH: '1', ...process.env, ...env },
   }) as ChildProcessWithoutNullStreams;
   // Swallow spawn/EPIPE errors so killing a child mid-write can't surface as an
   // unhandled error that crashes the vitest worker.
