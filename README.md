@@ -575,7 +575,8 @@ What it skips out of the box:
   [supported stack](#supported-languages) — so the graph is your code, not
   third-party noise. This holds even with no `.gitignore`.
 - **Anything in your `.gitignore`** — honored in git repos via git, and in
-  non-git projects by reading `.gitignore` directly (root and nested).
+  non-git projects by reading `.gitignore` directly (root and nested). Add a
+  local `.ignore` next to `.gitignore` when you need CodeGraph-only overrides.
 - **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs.
 
 To keep something else out, add it to `.gitignore`. To pull a default-excluded
@@ -583,6 +584,11 @@ directory back **in** (say you really do want a vendored dependency indexed),
 add a negation — `!vendor/`. The defaults apply uniformly, so committing a
 dependency or build directory doesn't force it into the graph; the `.gitignore`
 negation is the explicit opt-in.
+
+If a path must stay gitignored but should still be indexed locally, put the
+negation in `.ignore` instead. For example, `.gitignore` can keep `customer/`
+out of git while `.ignore` contains `!customer/` so CodeGraph indexes that
+customer source without changing repository semantics.
 
 ## Supported Platforms
 

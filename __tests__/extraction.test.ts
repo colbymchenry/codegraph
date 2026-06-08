@@ -4955,6 +4955,26 @@ describe('Directory Exclusion', () => {
     expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
   });
 
+  it('should allow a root .ignore negation to re-include a gitignored directory', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'repo');
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'customer'), { recursive: true });
+    git(root, 'init', '-q');
+    fs.writeFileSync(path.join(root, 'src', 'index.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(root, 'customer', 'custom.ts'), 'export const custom = 1;');
+    fs.writeFileSync(path.join(root, '.gitignore'), 'customer/\n');
+    fs.writeFileSync(path.join(root, '.ignore'), '!customer/\n');
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('src/index.ts');
+    expect(files).toContain('customer/custom.ts');
+  });
+
   it('should apply a nested .gitignore only to its own subtree', () => {
     const appSrc = path.join(tempDir, 'app', 'src');
     fs.mkdirSync(appSrc, { recursive: true });

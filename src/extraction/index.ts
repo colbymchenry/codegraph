@@ -161,7 +161,8 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
 
 /**
  * An `ignore` matcher seeded with the built-in defaults, merged with the project's
- * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default. Shared
+ * root .gitignore and then root .ignore so a negation there (e.g. `!vendor/`)
+ * overrides an earlier exclusion. Shared
  * by both enumeration paths so behavior is identical with or without git — and so
  * the defaults apply to tracked files too (committing a dependency dir doesn't make
  * it project code; the explicit `.gitignore` negation is the only opt-in).
@@ -171,8 +172,10 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
   try {
     const rootGitignore = path.join(rootDir, '.gitignore');
     if (fs.existsSync(rootGitignore)) ig.add(fs.readFileSync(rootGitignore, 'utf-8'));
+    const rootIgnore = path.join(rootDir, '.ignore');
+    if (fs.existsSync(rootIgnore)) ig.add(fs.readFileSync(rootIgnore, 'utf-8'));
   } catch {
-    // Unreadable root .gitignore — the built-in defaults still apply.
+    // Unreadable root ignore files — the built-in defaults still apply.
   }
   return ig;
 }
@@ -235,6 +238,8 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): v
  */
 function getGitVisibleFiles(rootDir: string): Set<string> | null {
   try {
+    if (fs.existsSync(path.join(rootDir, '.ignore'))) return null;
+
     // Check if the project directory is gitignored by a parent repo.
     // When rootDir lives inside a parent git repo that ignores it,
     // `git ls-files` returns nothing — fall back to filesystem walk.
@@ -393,8 +398,8 @@ function scanDirectoryWalk(
   let count = 0;
   const visitedDirs = new Set<string>();
 
-  // A .gitignore matcher scoped to the directory that declared it. Patterns in
-  // a nested .gitignore are relative to that directory, so we keep the dir
+  // A matcher scoped to the directory that declared ignore files. Patterns in
+  // nested .gitignore/.ignore files are relative to that directory, so we keep the dir
   // alongside the matcher and test paths relative to it — mirroring how git
   // applies .gitignore files at every level.
   interface ScopedIgnore {
@@ -404,12 +409,20 @@ function scanDirectoryWalk(
 
   const loadIgnore = (dir: string): ScopedIgnore | null => {
     try {
+      const patterns: string[] = [];
       const giPath = path.join(dir, '.gitignore');
       if (fs.existsSync(giPath)) {
-        return { dir, ig: ignore().add(fs.readFileSync(giPath, 'utf-8')) };
+        patterns.push(fs.readFileSync(giPath, 'utf-8'));
+      }
+      const ignorePath = path.join(dir, '.ignore');
+      if (fs.existsSync(ignorePath)) {
+        patterns.push(fs.readFileSync(ignorePath, 'utf-8'));
+      }
+      if (patterns.length > 0) {
+        return { dir, ig: ignore().add(patterns) };
       }
     } catch {
-      // Unreadable .gitignore — treat as absent.
+      // Unreadable ignore files — treat as absent.
     }
     return null;
   };
@@ -439,9 +452,9 @@ function scanDirectoryWalk(
     }
     visitedDirs.add(realDir);
 
-    // This directory's own .gitignore (if present) applies to everything below it.
-    // The root's .gitignore is already merged into the seeded base matcher (so a
-    // negation there can override a built-in default), so skip it here.
+    // This directory's own ignore files (if present) apply to everything below it.
+    // The root ignore files are already merged into the seeded base matcher (so a
+    // negation there can override an earlier exclusion), so skip them here.
     const own = dir === rootDir ? null : loadIgnore(dir);
     const active = own ? [...matchers, own] : matchers;
 
@@ -495,8 +508,8 @@ function scanDirectoryWalk(
     }
   }
 
-  // Seed a base matcher with the built-in default ignores (merged with the root
-  // .gitignore so a negation can override). Nested .gitignores still layer per-dir.
+  // Seed a base matcher with the built-in default ignores merged with the root
+  // .gitignore/.ignore overlay. Nested ignore files still layer per-dir.
   walk(rootDir, [{ dir: rootDir, ig: buildDefaultIgnore(rootDir) }]);
   return files;
 }
