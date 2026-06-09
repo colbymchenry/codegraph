@@ -242,7 +242,7 @@ describe('Database Connection', () => {
 
     const version = db.getSchemaVersion();
     expect(version).not.toBeNull();
-    expect(version?.version).toBe(4);
+    expect(version?.version).toBe(5);
 
     db.close();
   });

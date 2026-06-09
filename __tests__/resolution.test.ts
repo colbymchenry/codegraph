@@ -1918,4 +1918,112 @@ func main() {
       }
     });
   });
+
+  describe('C++ chained-call receiver resolution (#645)', () => {
+    async function indexCpp(files: Record<string, string>): Promise<void> {
+      for (const [name, content] of Object.entries(files)) {
+        fs.writeFileSync(path.join(tempDir, name), content);
+      }
+      cg = await CodeGraph.init(tempDir, { index: true });
+    }
+
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves singleton chains and auto locals to the right class, never the first-sorted one', async () => {
+      // Two classes share writeLog; Logger sorts first so it wins any name-only
+      // tie. All three call forms target Metrics.
+      await indexCpp({
+        'logger.hpp': `#pragma once
+#include <string>
+class Logger  { public: static Logger&  instance(); void writeLog(const std::string&); };
+class Metrics { public: static Metrics& instance(); void writeLog(const std::string&); };
+`,
+        'impl.cpp': `#include "logger.hpp"
+Logger&  Logger::instance()  { static Logger l;  return l; }
+Metrics& Metrics::instance() { static Metrics m; return m; }
+void Logger::writeLog(const std::string&)  {}
+void Metrics::writeLog(const std::string&) {}
+`,
+        'app.cpp': `#include "logger.hpp"
+void a() { Metrics::instance().writeLog("x"); }              // chained singleton
+void b() { auto& m = Metrics::instance(); m.writeLog("x"); } // stored in auto
+void c() { Metrics& m = Metrics::instance(); m.writeLog("x"); } // explicit type
+`,
+      });
+
+      expect(callerNamesOf('Metrics::writeLog')).toEqual(['a', 'b', 'c']);
+      expect(callerNamesOf('Logger::writeLog')).toEqual([]);
+    });
+
+    it('resolves factories, free-function factories, and member chains via the inner call return type', async () => {
+      await indexCpp({
+        'types.hpp': `#pragma once
+#include <memory>
+struct Widget { void draw(); };
+struct Session { void run(); };
+struct View { void render(); };
+class WidgetFactory { public: static Widget create(); };
+class Manager { public: View view(); };
+Session* openSession();
+// Decoy that sorts first and has all three methods — must never win.
+struct Aaa { void draw(); void run(); void render(); };
+`,
+        'impl.cpp': `#include "types.hpp"
+void Widget::draw() {}
+void Session::run() {}
+void View::render() {}
+void Aaa::draw() {}
+void Aaa::run() {}
+void Aaa::render() {}
+Widget WidgetFactory::create() { return Widget(); }
+View Manager::view() { return View(); }
+Session* openSession() { return nullptr; }
+`,
+        'app.cpp': `#include "types.hpp"
+void factory()     { WidgetFactory::create().draw(); }   // -> Widget::draw
+void freefunc()    { openSession()->run(); }             // -> Session::run
+void member()      { Manager mgr; mgr.view().render(); }  // -> View::render
+void makeUnique()  { auto w = std::make_unique<Widget>(); w->draw(); } // -> Widget::draw
+`,
+      });
+
+      expect(callerNamesOf('Widget::draw')).toEqual(['factory', 'makeUnique']);
+      expect(callerNamesOf('Session::run')).toEqual(['freefunc']);
+      expect(callerNamesOf('View::render')).toEqual(['member']);
+      // The first-sorted decoy never captures any of them.
+      expect(callerNamesOf('Aaa::draw')).toEqual([]);
+      expect(callerNamesOf('Aaa::run')).toEqual([]);
+      expect(callerNamesOf('Aaa::render')).toEqual([]);
+    });
+
+    it('creates NO edge when the inferred type lacks the method (silent miss, not a wrong edge)', async () => {
+      await indexCpp({
+        'types.hpp': `#pragma once
+struct Widget { void draw(); };
+struct Other  { void onlyOther(); };
+class WidgetFactory { public: static Widget create(); };
+`,
+        'impl.cpp': `#include "types.hpp"
+void Widget::draw() {}
+void Other::onlyOther() {}
+Widget WidgetFactory::create() { return Widget(); }
+`,
+        'app.cpp': `#include "types.hpp"
+// Widget has no onlyOther() — must produce NO edge, never a wrong one to Other.
+void wrong() { WidgetFactory::create().onlyOther(); }
+`,
+      });
+
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
 });

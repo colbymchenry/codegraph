@@ -206,6 +206,15 @@ export interface LanguageExtractor {
   getReceiverType?: (node: SyntaxNode, source: string) => string | undefined;
 
   /**
+   * Extract a function/method's normalized return type name (bare class name,
+   * smart-pointer pointee unwrapped), stored on the node as `returnType`. Used
+   * by C/C++ so resolution can infer a chained receiver's type from what the
+   * inner call returns (`Foo::instance().bar()` → resolve `bar` on `Foo`,
+   * issue #645). Return undefined for primitives / void / constructors.
+   */
+  getReturnType?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
    * Resolve the actual node kind for a type alias declaration.
    * Used by Go where `type_spec` is the named declaration wrapper for structs/interfaces:
    *   `type Foo struct { ... }` → type_spec (name: "Foo") → struct_type

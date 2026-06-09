@@ -811,6 +811,7 @@ export class TreeSitterExtractor {
     const isExported = this.extractor.isExported?.(node, this.source);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
+    const returnType = this.extractor.getReturnType?.(node, this.source);
 
     const funcNode = this.createNode('function', name, node, {
       docstring,
@@ -819,6 +820,7 @@ export class TreeSitterExtractor {
       isExported,
       isAsync,
       isStatic,
+      returnType,
     });
     if (!funcNode) return;
 
@@ -930,12 +932,14 @@ export class TreeSitterExtractor {
     const visibility = this.extractor.getVisibility?.(node);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
+    const returnType = this.extractor.getReturnType?.(node, this.source);
     const extraProps: Partial<Node> = {
       docstring,
       signature,
       visibility,
       isAsync,
       isStatic,
+      returnType,
     };
     if (receiverType) {
       extraProps.qualifiedName = `${receiverType}::${name}`;
@@ -2457,6 +2461,23 @@ export class TreeSitterExtractor {
               } else {
                 calleeName = methodName;
               }
+            } else if (
+              (this.language === 'cpp' || this.language === 'c') &&
+              receiver &&
+              receiver.type === 'call_expression'
+            ) {
+              // C/C++ receiver that is itself a call — `Foo::instance().bar()`,
+              // `openSession()->run()`, `mgr.view().render()`. Keep the inner
+              // call so resolution can infer bar()'s class from what the inner
+              // call RETURNS (#645). Encode as `<innerCallee>().<method>`; the
+              // `().` marker never appears in an ordinary ref, so the C++
+              // resolver can detect and split it. Other languages keep the
+              // bare-name behavior (dropping the receiver) below.
+              const innerFn = getChildByField(receiver, 'function');
+              const innerCallee = innerFn
+                ? getNodeText(innerFn, this.source).replace(/->/g, '.').replace(/\s+/g, '')
+                : '';
+              calleeName = innerCallee ? `${innerCallee}().${methodName}` : methodName;
             } else {
               calleeName = methodName;
             }

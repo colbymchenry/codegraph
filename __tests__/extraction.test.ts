@@ -2369,6 +2369,41 @@ end
     });
   });
 
+  describe('C/C++ return type capture (#645)', () => {
+    it('captures the normalized return type of a C++ method/function', () => {
+      const code = `
+struct Widget { void draw(); };
+class Factory { public: static Widget create(); };
+Widget Factory::create() { return Widget(); }
+void doNothing() {}
+`;
+      const result = extractFromSource('f.cpp', code);
+
+      const create = result.nodes.find(
+        (n) => n.name === 'create' && (n.kind === 'method' || n.kind === 'function')
+      );
+      expect(create?.returnType).toBe('Widget');
+
+      // A `void` return records no type, so resolution never tries to resolve a
+      // method on it.
+      const doNothing = result.nodes.find((n) => n.name === 'doNothing');
+      expect(doNothing).toBeDefined();
+      expect(doNothing?.returnType).toBeUndefined();
+    });
+
+    it('unwraps a smart-pointer return type to its pointee', () => {
+      const code = `
+#include <memory>
+struct Widget {};
+std::unique_ptr<Widget> makeWidget() { return nullptr; }
+`;
+      const result = extractFromSource('f.cpp', code);
+
+      const make = result.nodes.find((n) => n.name === 'makeWidget');
+      expect(make?.returnType).toBe('Widget');
+    });
+  });
+
   describe('C/C++ imports', () => {
     it('should extract system include', () => {
       const code = `#include <iostream>`;
