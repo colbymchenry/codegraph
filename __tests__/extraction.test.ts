@@ -6438,6 +6438,34 @@ describe('Go cross-package composite literals (blast-radius recall)', () => {
     }
   });
 
+  it('attributes a call inside a top-level closure (cobra RunE) to the var, not the file (#693)', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      // Wire is called ONLY from the anonymous RunE closure inside a top-level
+      // `var rootCmd = &Cmd{...}` — previously the call leaked to the file node,
+      // so `callers(Wire)` surfaced a file (or read as "no caller"). It must now
+      // attribute to the enclosing var.
+      fs.writeFileSync(path.join(dir, 'factory.go'), `package main\n\nfunc Wire() error { return nil }\n`);
+      fs.writeFileSync(
+        path.join(dir, 'root.go'),
+        `package main\n\ntype Cmd struct{ RunE func() error }\n\nvar rootCmd = &Cmd{\n\tRunE: func() error { return Wire() },\n}\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      const wire = cg.getNodesByName('Wire').find((n) => n.kind === 'function');
+      expect(wire).toBeDefined();
+      const callers = cg.getCallers(wire!.id).map((c) => c.node);
+      expect(callers.some((n) => n.kind === 'variable' && n.name === 'rootCmd')).toBe(true);
+      expect(callers.some((n) => n.kind === 'file')).toBe(false);
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
   it('links a parenthesized pointer type conversion `(*T)(x)` to the type', async () => {
     const dir = createTempDir();
     try {
