@@ -2263,4 +2263,77 @@ class Caller {
       expect(callerNamesOf('Other::onlyOther')).toEqual([]);
     });
   });
+
+  describe('Kotlin chained companion-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo.getInstance().bar() via the companion return type, never a same-named decoy', async () => {
+      // Aaa sorts first and has a same-named bar() — without the chain fix Kotlin
+      // dropped the receiver to a bare `bar` and attached to Aaa (a wrong edge).
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.kt'),
+        `class Aaa { fun bar() {} }
+class Foo {
+    companion object {
+        fun getInstance(): Foo = Foo()
+    }
+    fun bar() {}
+}
+class Caller {
+    fun run() { Foo.getInstance().bar() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::bar')).toEqual(['run']);
+      expect(callerNamesOf('Aaa::bar')).toEqual([]);
+    });
+
+    it('resolves a companion factory chain that passes arguments — Foo.create(cfg).build()', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.kt'),
+        `class Config
+class Foo {
+    companion object {
+        fun create(c: Config): Foo = Foo()
+    }
+    fun build() {}
+}
+class Caller {
+    fun run() { Foo.create(Config()).build() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::build')).toEqual(['run']);
+    });
+
+    it('creates NO edge when the companion return type lacks the method (silent miss, not a wrong edge)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.kt'),
+        `class Foo {
+    companion object {
+        fun getInstance(): Foo = Foo()
+    }
+}
+class Other { fun onlyOther() {} }
+class Caller {
+    fun run() { Foo.getInstance().onlyOther() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
 });

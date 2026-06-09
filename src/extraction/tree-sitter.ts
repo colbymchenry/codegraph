@@ -2525,22 +2525,41 @@ export class TreeSitterExtractor {
                 calleeName = methodName;
               }
             } else if (
-              (this.language === 'cpp' || this.language === 'c') &&
+              (this.language === 'cpp' || this.language === 'c' || this.language === 'kotlin') &&
               receiver &&
               receiver.type === 'call_expression'
             ) {
-              // C/C++ receiver that is itself a call — `Foo::instance().bar()`,
-              // `openSession()->run()`, `mgr.view().render()`. Keep the inner
-              // call so resolution can infer bar()'s class from what the inner
-              // call RETURNS (#645). Encode as `<innerCallee>().<method>`; the
-              // `().` marker never appears in an ordinary ref, so the C++
-              // resolver can detect and split it. Other languages keep the
-              // bare-name behavior (dropping the receiver) below.
-              const innerFn = getChildByField(receiver, 'function');
-              const innerCallee = innerFn
-                ? getNodeText(innerFn, this.source).replace(/->/g, '.').replace(/\s+/g, '')
-                : '';
-              calleeName = innerCallee ? `${innerCallee}().${methodName}` : methodName;
+              // Receiver that is itself a call — `Foo::instance().bar()`,
+              // `openSession()->run()`, `mgr.view().render()` (C/C++), or
+              // `Foo.getInstance().bar()` (Kotlin). Keep the inner call so
+              // resolution can infer bar()'s class from what the inner call
+              // RETURNS (#645/#608). Encode as `<innerCallee>().<method>`; the
+              // `().` marker never appears in an ordinary ref, so the resolver
+              // can detect and split it. Other languages keep the bare-name
+              // behavior (dropping the receiver) below.
+              let innerCallee: string;
+              let reencode: boolean;
+              if (this.language === 'kotlin') {
+                // tree-sitter-kotlin has no field names — the inner callee is the
+                // call_expression's first named child (a navigation_expression
+                // `Foo.getInstance`, or a bare identifier for a free call).
+                const innerNav = receiver.namedChild(0);
+                innerCallee = innerNav ? getNodeText(innerNav, this.source).replace(/\s+/g, '') : '';
+                // Only re-encode a CLASS / companion-factory chain, whose receiver
+                // chain starts with a capitalized type (`Foo.getInstance().bar()`).
+                // An instance chain (`list.filter{}.map{}`) has a lowercase receiver
+                // whose type we can't recover here — re-encoding it would only drop
+                // the edge (no chain resolution, no bare-name fallback), regressing
+                // recall in fluent codebases. Leave those to the bare-name path.
+                reencode = /^[A-Z]/.test(innerCallee);
+              } else {
+                const innerFn = getChildByField(receiver, 'function');
+                innerCallee = innerFn
+                  ? getNodeText(innerFn, this.source).replace(/->/g, '.').replace(/\s+/g, '')
+                  : '';
+                reencode = !!innerCallee;
+              }
+              calleeName = reencode ? `${innerCallee}().${methodName}` : methodName;
             } else {
               calleeName = methodName;
             }

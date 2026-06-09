@@ -577,15 +577,16 @@ export function matchPhpCallChain(
 }
 
 /**
- * Resolve a Java chained call whose receiver is a static factory / fluent call —
+ * Resolve a dotted chained call whose receiver is a static factory / fluent call —
  * `Foo.getInstance().bar()`, encoded by the extractor as `Foo.getInstance().bar`
  * (#645/#608 mechanism). The receiver's type is what `Foo.getInstance` returns
  * (its declared return type); the outer method is then resolved and VALIDATED on
  * it (resolveMethodOnType requires `Type::method` to exist), so a wrong inference
  * yields no edge rather than a wrong one (e.g. a same-named `bar()` on an
- * unrelated class is never matched).
+ * unrelated class is never matched). Shared by the JVM dot-notation languages
+ * (Java, Kotlin) — same receiver shape, same `Class::method` qualified names.
  */
-export function matchJavaCallChain(
+export function matchDottedCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
@@ -593,20 +594,42 @@ export function matchJavaCallChain(
   if (!m || !m[1] || !m[2]) return null;
   const inner = m[1]; // `Foo.getInstance`
   const method = m[2]; // `bar`
-  // Require an explicit receiver (`Receiver.factory`) — a bare `factory().bar`
-  // chain (a method on `this`) isn't handled here.
   const lastDot = inner.lastIndexOf('.');
-  if (lastDot <= 0) return null;
+
+  // Constructor receiver `Foo(args).method()` (encoded `Foo().method`): a bare,
+  // capitalized inner is a class construction, so the receiver's type is the
+  // class itself — resolve the method on it. Kotlin only: there an unprefixed
+  // capitalized call constructs the class, whereas in Java a bare `Foo()` is a
+  // method call (constructors need `new`), so we must not assume construction.
+  // A lowercase bare inner is a top-level `factory().method()` whose type we
+  // can't recover — bail.
+  if (lastDot <= 0) {
+    if (ref.language !== 'kotlin' || !/^[A-Z]/.test(inner)) return null;
+    return resolveMethodOnType(inner, method, ref, context, 0.85, 'instance-method', importedFqnOf(inner, ref, context));
+  }
+
+  // Factory/fluent receiver `Receiver.factory(args).method()`: the receiver's
+  // type is what `Receiver.factory` returns (its declared return type).
   const factoryClass = inner.slice(0, lastDot).split('.').pop(); // simple class name
   const factoryMethod = inner.slice(lastDot + 1);
   if (!factoryClass || !factoryMethod) return null;
   const ret = lookupCalleeReturnType(`${factoryClass}::${factoryMethod}`, ref, context);
   if (!ret) return null;
-  // When several classes share the returned simple name, the caller file's
-  // import of that type is the only signal that names WHICH one (#314).
+  return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context));
+}
+
+/**
+ * When several classes share a simple type name, the caller file's import of
+ * that type is the only signal that names WHICH one (#314). Returns the imported
+ * FQN for `typeName` in the ref's file, or undefined.
+ */
+function importedFqnOf(
+  typeName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | undefined {
   const imports = context.getImportMappings(ref.filePath, ref.language);
-  const importedFqn = imports.find((i) => i.localName === ret)?.source;
-  return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqn);
+  return imports.find((i) => i.localName === typeName)?.source;
 }
 
 /**
@@ -1039,11 +1062,12 @@ export function matchReference(
     if (result) return result;
   }
 
-  // 1d. Java chained static-factory / fluent call — `Foo.getInstance().bar()`
-  // encoded as `Foo.getInstance().bar` (#645/#608 mechanism). Resolve bar's class
-  // from getInstance's declared return type, then validate the method on it.
-  if (ref.language === 'java') {
-    result = matchJavaCallChain(ref, context);
+  // 1d. JVM (Java / Kotlin) chained static-factory / fluent call —
+  // `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar` (#645/#608
+  // mechanism). Resolve bar's class from getInstance's declared return type, then
+  // validate the method on it.
+  if (ref.language === 'java' || ref.language === 'kotlin') {
+    result = matchDottedCallChain(ref, context);
     if (result) return result;
   }
 
