@@ -2349,6 +2349,33 @@ export class TreeSitterExtractor {
       // single-dot receiver regex fails. Pull out the immediate field after `this.`
       // so the receiver is the field name (`userbo`), which the resolver can then
       // look up in the enclosing class's field declarations.
+      // PHP static-factory fluent chain: `Cls::for($x)->method()` — the receiver
+      // is itself a static call, so resolution must infer the method's class
+      // from what `Cls::for` RETURNS (its `: self` / `: static` / `: Type`),
+      // #608 (mirrors the C++ chain fix in #645). Encode `<Cls::factory>().<method>`;
+      // the `().` marker lets the PHP resolver split it. The receiver text
+      // (`Cls::for('x')`) carries the args, so without this it degrades to an
+      // unresolvable string and the call edge is dropped.
+      if (methodName && this.language === 'php' && objectField.type === 'scoped_call_expression') {
+        const innerScope = getChildByField(objectField, 'scope');
+        const innerName = getChildByField(objectField, 'name');
+        if (innerScope && innerName) {
+          calleeName = `${getNodeText(innerScope, this.source)}::${getNodeText(innerName, this.source)}().${methodName}`;
+        } else {
+          calleeName = methodName;
+        }
+        if (calleeName) {
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: calleeName,
+            referenceKind: 'calls',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+        }
+        return;
+      }
+
       let receiverName: string;
       if (objectField.type === 'field_access') {
         const inner = getChildByField(objectField, 'object');

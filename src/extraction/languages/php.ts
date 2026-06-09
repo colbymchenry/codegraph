@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 // include / require (+ _once) expression node types. These carry the
@@ -33,6 +33,38 @@ function phpStaticIncludePath(node: SyntaxNode, source: string): string | null {
   return content ? getNodeText(content, source) : null;
 }
 
+/** PHP built-in return types that can't be a method receiver (so no class to chain on). */
+const PHP_NON_CLASS_RETURN = new Set([
+  'array', 'string', 'int', 'integer', 'float', 'double', 'bool', 'boolean',
+  'void', 'mixed', 'never', 'null', 'false', 'true', 'object', 'callable',
+  'iterable', 'resource',
+]);
+
+/**
+ * A method/function's declared return type, normalized to the class a chained
+ * `->method()` could be called on (issue #608). `self` / `static` / `$this` are
+ * kept as the marker `self` and resolved to the declaring class at resolution
+ * time; a concrete type returns its short name; primitives / unions / nullable
+ * non-class types return undefined.
+ */
+function extractPhpReturnType(node: SyntaxNode, source: string): string | undefined {
+  let rt = getChildByField(node, 'return_type');
+  if (!rt) return undefined;
+  // Unwrap `?Type`. Union / intersection types are ambiguous — skip them.
+  if (rt.type === 'optional_type') rt = rt.namedChild(0) ?? rt;
+  if (!rt || rt.type === 'primitive_type') return undefined;
+
+  const nameNode = rt.type === 'named_type' ? (rt.namedChild(0) ?? rt) : rt;
+  const text = getNodeText(nameNode, source).trim().replace(/^\\/, '');
+  if (!text) return undefined;
+  const last = text.split('\\').pop() ?? text;
+  const lc = last.toLowerCase();
+  if (lc === 'self' || lc === 'static' || lc === 'this' || lc === '$this') return 'self';
+  if (PHP_NON_CLASS_RETURN.has(lc)) return undefined;
+  if (!/^[A-Za-z_]\w*$/.test(last)) return undefined; // union/intersection/complex
+  return last;
+}
+
 export const phpExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
   classTypes: ['class_declaration', 'trait_declaration'],
@@ -50,6 +82,7 @@ export const phpExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'return_type',
+  getReturnType: extractPhpReturnType,
   classifyClassNode: (node) => {
     return node.type === 'trait_declaration' ? 'trait' : 'class';
   },

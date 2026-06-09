@@ -2158,4 +2158,41 @@ void wrong() { WidgetFactory::create().onlyOther(); }
       expect(callerNamesOf('Other::onlyOther')).toEqual([]);
     });
   });
+
+  describe('PHP chained static-factory call resolution (#608)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Cls::for($x)->method() via the factory\'s `: self` return (#608)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'ApiClient.php'),
+        `<?php\nclass ApiClient {\n    public static function for(string $c): self { return new self; }\n    public function createOrder(array $p): array { return []; }\n}\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'DispatchOrder.php'),
+        `<?php\nclass DispatchOrder {\n    public function handle(): void {\n        ApiClient::for('cred')->createOrder([]);\n    }\n}\n`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // The chained call's edge attaches to the factory result's method.
+      expect(callerNamesOf('ApiClient::createOrder')).toContain('handle');
+    });
+
+    it('creates NO edge when the factory result lacks the method (#608)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'lib.php'),
+        `<?php\nclass ApiClient { public static function for(string $c): self { return new self; } }\nclass Other { public function onlyOther(): void {} }\nclass Caller { public function go(): void { ApiClient::for('x')->onlyOther(); } }\n`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // ApiClient has no onlyOther — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
 });

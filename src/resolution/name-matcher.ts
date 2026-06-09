@@ -414,10 +414,11 @@ function cppLastSegment(name: string): string {
 
 /**
  * Return type captured at extraction for `Class::method` (or a free function),
- * read off the indexed node's `returnType` (#645). Null when not indexed or no
- * return type was recorded (e.g. a `void`/primitive return).
+ * read off the indexed node's `returnType` — used by the C++ (#645) and PHP
+ * (#608) chained-call resolvers. Language-filtered. Null when not indexed or no
+ * return type was recorded (a `void`/primitive return).
  */
-function lookupCppReturnType(
+function lookupCalleeReturnType(
   callee: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
@@ -492,10 +493,10 @@ function resolveCppCallResultType(
     if (recv.includes('.') || recv.includes('(') || recv.includes('::')) return null; // single level only
     const recvType = inferCppReceiverType(recv, ref, context, depth + 1);
     if (!recvType) return null;
-    return lookupCppReturnType(`${recvType}::${method}`, ref, context);
+    return lookupCalleeReturnType(`${recvType}::${method}`, ref, context);
   }
 
-  const ret = lookupCppReturnType(expr, ref, context);
+  const ret = lookupCalleeReturnType(expr, ref, context);
   if (ret) return ret;
 
   // Direct construction — the callee itself names a class/struct.
@@ -547,6 +548,32 @@ export function matchCppCallChain(
   const cls = resolveCppCallResultType(m[1], ref, context);
   if (!cls) return null;
   return resolveMethodOnType(cls, m[2], ref, context, 0.85, 'instance-method');
+}
+
+/**
+ * Resolve a PHP fluent static-factory chain whose receiver is a static call —
+ * `Cls::for($x)->method()`, encoded by the extractor as `Cls::for().method`
+ * (#608, the per-credential Laravel client idiom). The receiver's type is what
+ * `Cls::for` returns: a `: self` / `: static` resolves to `Cls` itself, a
+ * concrete `: Type` to that type. The outer method is then resolved and
+ * VALIDATED on it (resolveMethodOnType requires the method to exist), so a
+ * wrong inference yields no edge rather than a wrong one.
+ */
+export function matchPhpCallChain(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
+  if (!m || !m[1] || !m[2]) return null;
+  const inner = m[1];
+  const method = m[2];
+  if (!inner.includes('::')) return null; // only static-factory (`Cls::method`) chains
+  const factoryClass = inner.slice(0, inner.lastIndexOf('::'));
+  const ret = lookupCalleeReturnType(inner, ref, context);
+  if (!ret) return null;
+  // `self` (the extractor's marker for self/static/$this) → the factory's class.
+  const resolvedClass = ret === 'self' ? factoryClass : ret;
+  return resolveMethodOnType(resolvedClass, method, ref, context, 0.85, 'instance-method');
 }
 
 /**
@@ -968,6 +995,14 @@ export function matchReference(
   // receiver's type from what the inner call returns, then the method on it.
   if (ref.language === 'cpp' || ref.language === 'c') {
     result = matchCppCallChain(ref, context);
+    if (result) return result;
+  }
+
+  // 1c. PHP fluent static-factory chain — `Cls::for($x)->method()` encoded as
+  // `Cls::for().method` (#608). Same idea as 1b: the receiver's type is the
+  // factory's `: self` / `: Type` return.
+  if (ref.language === 'php') {
+    result = matchPhpCallChain(ref, context);
     if (result) return result;
   }
 
