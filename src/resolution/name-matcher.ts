@@ -624,14 +624,31 @@ export function matchDottedCallChain(
   const method = m[2]; // `bar`
   const lastDot = inner.lastIndexOf('.');
 
-  // Constructor receiver `Foo(args).method()` (encoded `Foo().method`): a bare,
-  // capitalized inner is a class construction, so the receiver's type is the
-  // class itself — resolve the method on it. Only in languages where an
-  // unprefixed capitalized call constructs the class (Kotlin, Swift); in Java/C#
-  // a bare `Foo()` is a method call (constructors need `new`), so we must not
-  // assume construction. A lowercase bare inner is a top-level `factory().method()`
-  // whose type we can't recover — bail.
   if (lastDot <= 0) {
+    // Go: bare package-level factory FUNCTION `New().method()` — the receiver's
+    // type is what `New` returns; resolve the method on that.
+    if (ref.language === 'go') {
+      const ret = lookupCalleeReturnType(inner, ref, context);
+      if (ret) {
+        return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context));
+      }
+      // `inner` isn't a function with a captured return type — typically a
+      // package-level VARIABLE holding a function value (e.g. gin's `engine()`),
+      // whose type we can't recover. Fall back to bare-name resolution of the
+      // method so we don't DROP an edge the un-re-encoded bare path would have
+      // found. (When `inner` IS a real factory function but the method doesn't
+      // exist on its return type, `ret` is truthy and we returned no edge above —
+      // the absent-method safety guarantee is preserved.)
+      const bareRef = { ...ref, referenceName: method };
+      return matchByExactName(bareRef, context) ?? matchFuzzy(bareRef, context);
+    }
+    // Constructor receiver `Foo(args).method()` (encoded `Foo().method`): a bare,
+    // capitalized inner is a class construction, so the receiver's type is the
+    // class itself — resolve the method on it. Only in languages where an
+    // unprefixed capitalized call constructs the class (Kotlin, Swift); in Java/C#
+    // a bare `Foo()` is a method call (constructors need `new`), so we must not
+    // assume construction. A lowercase bare inner is a top-level `factory().method()`
+    // whose type we can't recover — bail.
     if (!CONSTRUCTS_VIA_BARE_CALL.has(ref.language) || !/^[A-Z]/.test(inner)) return null;
     return resolveMethodOnType(inner, method, ref, context, 0.85, 'instance-method', importedFqnOf(inner, ref, context));
   }
@@ -1091,15 +1108,16 @@ export function matchReference(
     if (result) return result;
   }
 
-  // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C# / Swift) —
-  // `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar` (#645/#608
-  // mechanism). Resolve bar's class from getInstance's declared return type, then
-  // validate the method on it.
+  // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C# / Swift /
+  // Go) — `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar`, or Go's
+  // bare-factory `New().Method()` as `New().Method` (#645/#608 mechanism). Resolve
+  // the method's class from the inner call's declared return type, then validate it.
   if (
     ref.language === 'java' ||
     ref.language === 'kotlin' ||
     ref.language === 'csharp' ||
-    ref.language === 'swift'
+    ref.language === 'swift' ||
+    ref.language === 'go'
   ) {
     result = matchDottedCallChain(ref, context);
     if (result) return result;

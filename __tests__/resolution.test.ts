@@ -2617,4 +2617,83 @@ fn caller() { Foo::new().only_other(); }
       expect(callerNamesOf('Other::only_other')).toEqual([]);
     });
   });
+
+  describe('Go chained factory-function call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves New().Bar() via the factory return type (pointer), never a same-named decoy', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.go'),
+        `package main
+type Aaa struct{}
+func (a *Aaa) Bar() {}
+type Foo struct{}
+func New() *Foo { return &Foo{} }
+func (f *Foo) Bar() {}
+func caller() { New().Bar() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::Bar')).toEqual(['caller']);
+      expect(callerNamesOf('Aaa::Bar')).toEqual([]);
+    });
+
+    it('resolves an args chain and a multi-return factory — With(c).Build(), (*Foo, error)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.go'),
+        `package main
+type Config struct{}
+type Foo struct{}
+func With(c Config) (*Foo, error) { return &Foo{}, nil }
+func (f *Foo) Build() {}
+func caller() { With(Config{}).Build() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::Build')).toEqual(['caller']);
+    });
+
+    it('resolves a method provided by an embedded struct (via conformance)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.go'),
+        `package main
+type Base struct{}
+func (b *Base) Embedded() {}
+type Decoy struct{}
+func (d *Decoy) Embedded() {}
+type Widget struct{ Base }
+func NewWidget() *Widget { return &Widget{} }
+func caller() { NewWidget().Embedded() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Base::Embedded')).toEqual(['caller']);
+      expect(callerNamesOf('Decoy::Embedded')).toEqual([]);
+    });
+
+    it('creates NO edge when neither the type nor an embedded type has the method (silent miss)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.go'),
+        `package main
+type Foo struct{}
+func New() *Foo { return &Foo{} }
+type Other struct{}
+func (o *Other) OnlyOther() {}
+func caller() { New().OnlyOther() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no OnlyOther() — must not mis-attach to the same-named Other::OnlyOther.
+      expect(callerNamesOf('Other::OnlyOther')).toEqual([]);
+    });
+  });
 });
