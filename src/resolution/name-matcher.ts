@@ -605,7 +605,7 @@ export function matchScopedCallChain(
  * `Foo` — and resolveMethodOnType validates, so a non-conventional `apply` that
  * returns another type simply yields no edge rather than a wrong one.
  */
-const CONSTRUCTS_VIA_BARE_CALL = new Set(['kotlin', 'swift', 'scala']);
+const CONSTRUCTS_VIA_BARE_CALL = new Set(['kotlin', 'swift', 'scala', 'dart']);
 
 /**
  * Resolve a dotted chained call whose receiver is a static factory / fluent call —
@@ -1123,17 +1123,19 @@ export function matchReference(
   }
 
   // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C# / Swift /
-  // Go / Scala) — `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar`,
-  // Go's bare-factory `New().Method()` as `New().Method`, or Scala's companion
-  // factory `Foo.create().bar()` (#645/#608 mechanism). Resolve the method's class
-  // from the inner call's declared return type, then validate it.
+  // Go / Scala / Dart) — `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar`,
+  // Go's bare-factory `New().Method()` as `New().Method`, Scala's companion factory
+  // `Foo.create().bar()`, or Dart's static factory / factory-constructor
+  // `Foo.create().bar()` (#645/#608 mechanism). Resolve the method's class from the
+  // inner call's declared return type, then validate it.
   if (
     ref.language === 'java' ||
     ref.language === 'kotlin' ||
     ref.language === 'csharp' ||
     ref.language === 'swift' ||
     ref.language === 'go' ||
-    ref.language === 'scala'
+    ref.language === 'scala' ||
+    ref.language === 'dart'
   ) {
     result = matchDottedCallChain(ref, context);
     if (result) return result;
