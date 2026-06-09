@@ -160,6 +160,78 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
   'bazel-*/',        // Bazel output symlink trees
 ];
 
+/** True if `buf` decodes as strict UTF-8 (no invalid byte sequences). */
+function isValidUtf8(buf: Buffer): boolean {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(buf);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read a `.gitignore` and return patterns safe to hand to the `ignore` matcher —
+ * never throwing, even when the file isn't real gitignore text. Two failure
+ * modes, both seen in the wild (issue #682):
+ *
+ *  - The file isn't valid UTF-8 — e.g. transparently encrypted in place by
+ *    corporate DLP / endpoint-security software, leaving a UTF-16 header plus
+ *    ciphertext. None of it is meaningful patterns, so the whole file is skipped.
+ *  - The file is text but a single line can't be compiled to a regex by the
+ *    `ignore` library — `\\[` and friends throw "Unterminated character class".
+ *    Crucially the throw is LAZY (at match time, not `.add()`), so it would
+ *    otherwise escape mid-scan. That one pattern is dropped; the rest are kept.
+ *
+ * Either way a warning that NAMES the file is logged (the reporter couldn't tell
+ * which `.gitignore` was at fault) and indexing continues instead of aborting.
+ * Returns '' when there's nothing usable.
+ */
+function readGitignorePatterns(giPath: string): string {
+  let buf: Buffer;
+  try {
+    buf = fs.readFileSync(giPath);
+  } catch {
+    return ''; // unreadable (permissions / race) — treat as absent
+  }
+  // A NUL byte never appears in real gitignore text, and a fatal UTF-8 decode
+  // catches the rest. Such a file isn't ignore patterns at all.
+  if (buf.includes(0) || !isValidUtf8(buf)) {
+    logWarn(
+      'Ignoring a .gitignore that is not valid UTF-8 text — it may have been encrypted ' +
+        'in place by endpoint-security software. Indexing continues without it.',
+      { file: giPath },
+    );
+    return '';
+  }
+  const content = buf.toString('utf-8');
+  // Fast path: one `.ignores()` call forces the library to compile EVERY rule,
+  // so if it doesn't throw, the whole file is safe to use verbatim.
+  try {
+    ignore().add(content).ignores('.codegraph-probe');
+    return content;
+  } catch {
+    // Fall through: a line is uncompilable — keep the good ones, drop the bad.
+  }
+  const kept: string[] = [];
+  let dropped = 0;
+  for (const line of content.split(/\r?\n/)) {
+    try {
+      ignore().add(line).ignores('.codegraph-probe');
+      kept.push(line);
+    } catch {
+      dropped++;
+    }
+  }
+  if (dropped > 0) {
+    logWarn(
+      `Skipped ${dropped} unparseable pattern(s) in a .gitignore; the rest are applied.`,
+      { file: giPath },
+    );
+  }
+  return kept.join('\n');
+}
+
 /**
  * An `ignore` matcher seeded with the built-in defaults, merged with the project's
  * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default. Shared
@@ -169,12 +241,8 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
  */
 export function buildDefaultIgnore(rootDir: string): Ignore {
   const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
-  try {
-    const rootGitignore = path.join(rootDir, '.gitignore');
-    if (fs.existsSync(rootGitignore)) ig.add(fs.readFileSync(rootGitignore, 'utf-8'));
-  } catch {
-    // Unreadable root .gitignore — the built-in defaults still apply.
-  }
+  const rootGitignore = path.join(rootDir, '.gitignore');
+  if (fs.existsSync(rootGitignore)) ig.add(readGitignorePatterns(rootGitignore));
   return ig;
 }
 
@@ -404,15 +472,13 @@ function scanDirectoryWalk(
   }
 
   const loadIgnore = (dir: string): ScopedIgnore | null => {
-    try {
-      const giPath = path.join(dir, '.gitignore');
-      if (fs.existsSync(giPath)) {
-        return { dir, ig: ignore().add(fs.readFileSync(giPath, 'utf-8')) };
-      }
-    } catch {
-      // Unreadable .gitignore — treat as absent.
-    }
-    return null;
+    const giPath = path.join(dir, '.gitignore');
+    if (!fs.existsSync(giPath)) return null;
+    // readGitignorePatterns is defensive: a non-UTF-8 (DLP-encrypted) or
+    // uncompilable .gitignore is skipped/filtered with a warning, never thrown
+    // (issue #682) — so the per-file `.ignores()` calls below can't crash.
+    const patterns = readGitignorePatterns(giPath);
+    return patterns ? { dir, ig: ignore().add(patterns) } : null;
   };
 
   const isIgnored = (fullPath: string, isDir: boolean, matchers: ScopedIgnore[]): boolean => {

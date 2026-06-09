@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory } from '../src/extraction';
+import { extractFromSource, scanDirectory, buildDefaultIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { normalizePath } from '../src/utils';
 
@@ -5244,6 +5244,54 @@ describe('Nested non-submodule git repos', () => {
 
     expect(files).toContain('sub_repo/src/real.ts');
     expect(files).not.toContain('sub_repo/src/generated.ts');
+  });
+
+  // A .gitignore the `ignore` library can't compile to a regex must not abort
+  // the whole scan — the bad pattern is dropped, valid ones still apply (#682).
+  it('does not crash on a .gitignore with an uncompilable pattern (#682)', () => {
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'real.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'out.ts'), 'export const y = 2;');
+    // `\\[` makes the matcher build an unterminated character class — the throw
+    // is lazy (at match time), which is what escaped and killed sync.
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'build/\n\\\\[\n');
+
+    let files: string[] = [];
+    expect(() => {
+      files = scanDirectory(tempDir);
+    }).not.toThrow();
+    expect(files).toContain('src/real.ts');
+    // The still-valid `build/` rule is honored; only the bad line was dropped.
+    expect(files.some((f) => f.startsWith('build/'))).toBe(false);
+  });
+
+  // A .gitignore that isn't valid UTF-8 — e.g. encrypted in place by corporate
+  // DLP / endpoint software (UTF-16 header + ciphertext) — is skipped whole,
+  // not fed to the matcher as garbage patterns (#682).
+  it('does not crash on a non-UTF-8 (DLP-encrypted) .gitignore (#682)', () => {
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'real.ts'), 'export const x = 1;');
+    const header = Buffer.concat([
+      Buffer.from([0x00, 0x00]),
+      Buffer.from('[notice][user]', 'utf16le'),
+    ]);
+    const junk = Buffer.from([0x5b, 0x99, 0xc3, 0x28, 0x5c, 0x5b, 0xff, 0xfd]);
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), Buffer.concat([header, junk]));
+
+    let files: string[] = [];
+    expect(() => {
+      files = scanDirectory(tempDir);
+    }).not.toThrow();
+    expect(files).toContain('src/real.ts');
+  });
+
+  it('buildDefaultIgnore survives a bad .gitignore and still applies valid rules (#682)', () => {
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'dist/\n\\\\[\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(() => ig.ignores('src/app.ts')).not.toThrow();
+    expect(ig.ignores('dist/')).toBe(true); // valid rule survives
+    expect(ig.ignores('src/app.ts')).toBe(false);
   });
 });
 
