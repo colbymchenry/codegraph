@@ -2402,4 +2402,70 @@ class Caller {
       expect(callerNamesOf('Other::OnlyOther')).toEqual([]);
     });
   });
+
+  describe('Chained call resolves a method on a supertype (conformance, #750)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves a chained method defined only on a SUPERCLASS the return type extends', async () => {
+      // draw() lives on Base; Widget (the factory's return type) has no draw() of
+      // its own. Decoy.draw must never win. Needs the conformance second pass.
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Base { void draw() {} }
+class Widget extends Base {}
+class Decoy { void draw() {} }
+class Factory { static Widget create() { return new Widget(); } }
+class Caller {
+    void run() { Factory.create().draw(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Base::draw')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::draw')).toEqual([]);
+    });
+
+    it('resolves a chained method defined on an INTERFACE the return type implements (default method)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `interface Drawable { default void draw() {} }
+class Widget implements Drawable {}
+class Decoy { void draw() {} }
+class Factory { static Widget create() { return new Widget(); } }
+class Caller {
+    void run() { Factory.create().draw(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Drawable::draw')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::draw')).toEqual([]);
+    });
+
+    it('still creates NO edge when no supertype has the method (safety preserved)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Base {}
+class Widget extends Base {}
+class Other { void onlyOther() {} }
+class Factory { static Widget create() { return new Widget(); } }
+class Caller {
+    void run() { Factory.create().onlyOther(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Neither Widget nor Base has onlyOther() — must not attach to Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
 });

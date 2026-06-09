@@ -267,6 +267,8 @@ function resolveMethodOnType(
    * signal Java imports carry but the call site doesn't (#314).
    */
   preferredFqn?: string,
+  /** Recursion guard for the supertype/conformance walk. */
+  depth = 0,
 ): ResolvedRef | null {
   // Look up methods by name and match by qualifiedName ending in
   // `<typeName>::<methodName>`. This works whether the method is defined
@@ -284,7 +286,24 @@ function resolveMethodOnType(
       matches.push(m);
     }
   }
-  if (matches.length === 0) return null;
+  if (matches.length === 0) {
+    // Conformance fallback: the method may be defined on a supertype `typeName`
+    // extends, or on a protocol / trait it conforms to (e.g. a Swift protocol-
+    // extension method, a C# default-interface or extension method, a Kotlin
+    // extension on a supertype). Walk supertypes transitively (depth-capped) via
+    // the resolved implements/extends edges — empty in the first resolution pass,
+    // populated in the conformance pass. Still VALIDATED (the method must exist on
+    // a supertype), so a wrong inference produces no edge.
+    if (depth < 4 && context.getSupertypes) {
+      for (const supertype of context.getSupertypes(typeName, ref.language)) {
+        const via = resolveMethodOnType(
+          supertype, methodName, ref, context, confidence, resolvedBy, preferredFqn, depth + 1,
+        );
+        if (via) return via;
+      }
+    }
+    return null;
+  }
 
   if (matches.length > 1 && preferredFqn) {
     const ext = ref.language === 'kotlin' ? '.kt' : '.java';
