@@ -2728,4 +2728,102 @@ func caller() { engine().ServeHTTP() }
       expect(rawCalls.length).toBeLessThan(5);
     });
   });
+
+  describe('Scala chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves a companion-factory chain Foo.create().doIt() to the return type, never a same-named decoy', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.scala'),
+        `object Foo {
+  def create(): Bar = new Bar()
+}
+class Bar {
+  def doIt(): Unit = {}
+}
+class Decoy {
+  def doIt(): Unit = {}
+}
+object Main {
+  def run(): Unit = { Foo.create().doIt() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Bar::doIt')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::doIt')).toEqual([]);
+    });
+
+    it('resolves a case-class apply construction Point(x).dist() on the constructed class', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.scala'),
+        `class Point(x: Int) {
+  def dist(): Int = x
+}
+class Other {
+  def dist(): Int = 0
+}
+object Main {
+  def run(): Unit = { Point(3).dist() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Point::dist')).toEqual(['run']);
+      expect(callerNamesOf('Other::dist')).toEqual([]);
+    });
+
+    it('resolves a chained method provided by a trait the return type extends (via conformance)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.scala'),
+        `trait Base {
+  def shared(): Unit = {}
+}
+class Widget extends Base
+class Decoy {
+  def shared(): Unit = {}
+}
+object Factory {
+  def make(): Widget = new Widget()
+}
+object Main {
+  def run(): Unit = { Factory.make().shared() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Base::shared')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::shared')).toEqual([]);
+    });
+
+    it('creates NO edge when neither the factory return type nor a supertype has the method (silent miss)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.scala'),
+        `object Foo {
+  def create(): Bar = new Bar()
+}
+class Bar {
+}
+class Other {
+  def onlyOther(): Unit = {}
+}
+object Main {
+  def run(): Unit = { Foo.create().onlyOther() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Bar has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
 });

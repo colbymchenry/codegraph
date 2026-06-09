@@ -37,7 +37,7 @@ const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
  * second pass. Dotted-receiver languages resolve via matchDottedCallChain; the
  * `::`-receiver ones (Rust) via matchScopedCallChain.
  */
-const CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift', 'rust', 'go']);
+const CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift', 'rust', 'go', 'scala']);
 const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
 
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */

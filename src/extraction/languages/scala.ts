@@ -44,6 +44,28 @@ function emitScalaTypeRefs(typeNode: SyntaxNode, fromId: string, ctx: { addUnres
   }
 }
 
+/**
+ * Capture a Scala method's declared return type as a bare type name, for the
+ * chained static-factory / fluent call mechanism (#750). `def create(): Bar`
+ * yields `Bar`; a generic `List[Bar]` yields its base `List` (the method is on
+ * the container, not the element); a qualified `pkg.Bar` yields `Bar`. A
+ * singleton self-type (`this.type`, the fluent-builder idiom) is left undefined
+ * — its type can't be recovered here, so the chain falls through rather than
+ * inferring a wrong receiver.
+ */
+function extractScalaReturnType(node: SyntaxNode, source: string): string | undefined {
+  const rt = node.childForFieldName('return_type');
+  if (!rt) return undefined;
+  const raw = getNodeText(rt, source).trim();
+  if (raw.startsWith('this.')) return undefined; // `this.type` singleton — unhandled
+  const base = raw
+    .replace(/\[[^\]]*\]/g, '') // strip generic args: List[Bar] → List
+    .replace(/\s+/g, '');
+  const last = base.split('.').pop(); // qualified pkg.Bar → Bar
+  if (!last || !/^[A-Za-z_]\w*$/.test(last)) return undefined;
+  return last;
+}
+
 function extractVisibility(node: SyntaxNode): 'public' | 'private' | 'protected' {
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
@@ -77,6 +99,7 @@ export const scalaExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'return_type',
+  getReturnType: extractScalaReturnType,
   interfaceKind: 'trait',
 
   classifyClassNode: (node: SyntaxNode) => {

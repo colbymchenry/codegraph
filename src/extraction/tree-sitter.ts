@@ -2530,7 +2530,8 @@ export class TreeSitterExtractor {
                 this.language === 'kotlin' ||
                 this.language === 'swift' ||
                 this.language === 'rust' ||
-                this.language === 'go') &&
+                this.language === 'go' ||
+                this.language === 'scala') &&
               receiver &&
               receiver.type === 'call_expression'
             ) {
@@ -2572,6 +2573,11 @@ export class TreeSitterExtractor {
                 // only drop the edge. C/C++ re-encode any inner.
                 if (this.language === 'rust') reencode = innerFn?.type === 'scoped_identifier';
                 else if (this.language === 'go') reencode = innerFn?.type === 'identifier';
+                // Scala: only a companion-factory / case-class-apply chain whose
+                // receiver chain starts with a capitalized type (`Foo.create().bar()`,
+                // `Foo(args).bar()`). An instance chain (`list.map().filter()`) has a
+                // lowercase receiver whose type we can't recover — leave it bare.
+                else if (this.language === 'scala') reencode = /^[A-Z]/.test(innerCallee);
                 else reencode = !!innerCallee;
               }
               calleeName = reencode ? `${innerCallee}().${methodName}` : methodName;

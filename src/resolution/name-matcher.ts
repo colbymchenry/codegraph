@@ -600,9 +600,12 @@ export function matchScopedCallChain(
 /**
  * Languages where an unprefixed capitalized call `Foo(args)` constructs the
  * class (so a `Foo(args).method()` receiver's type is `Foo`). Java/C# need `new`,
- * so a bare `Foo()` there is a method call, not construction — excluded.
+ * so a bare `Foo()` there is a method call, not construction — excluded. Scala's
+ * `Foo(args)` is a case-class / companion `apply`, which conventionally returns
+ * `Foo` — and resolveMethodOnType validates, so a non-conventional `apply` that
+ * returns another type simply yields no edge rather than a wrong one.
  */
-const CONSTRUCTS_VIA_BARE_CALL = new Set(['kotlin', 'swift']);
+const CONSTRUCTS_VIA_BARE_CALL = new Set(['kotlin', 'swift', 'scala']);
 
 /**
  * Resolve a dotted chained call whose receiver is a static factory / fluent call —
@@ -1120,15 +1123,17 @@ export function matchReference(
   }
 
   // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C# / Swift /
-  // Go) — `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar`, or Go's
-  // bare-factory `New().Method()` as `New().Method` (#645/#608 mechanism). Resolve
-  // the method's class from the inner call's declared return type, then validate it.
+  // Go / Scala) — `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar`,
+  // Go's bare-factory `New().Method()` as `New().Method`, or Scala's companion
+  // factory `Foo.create().bar()` (#645/#608 mechanism). Resolve the method's class
+  // from the inner call's declared return type, then validate it.
   if (
     ref.language === 'java' ||
     ref.language === 'kotlin' ||
     ref.language === 'csharp' ||
     ref.language === 'swift' ||
-    ref.language === 'go'
+    ref.language === 'go' ||
+    ref.language === 'scala'
   ) {
     result = matchDottedCallChain(ref, context);
     if (result) return result;
