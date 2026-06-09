@@ -29,6 +29,16 @@ import {
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { resolve as resolvePath } from 'path';
+import { createHash } from 'crypto';
+import { tmpdir } from 'os';
+import {
+  constants as fsConstants,
+  closeSync,
+  lstatSync,
+  openSync,
+  writeSync,
+} from 'fs';
+import { join } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -283,6 +293,29 @@ function numberSourceLines(slice: string, firstLineNumber: number): string {
     out.push(`${firstLineNumber + i}\t${split[i]}`);
   }
   return out.join('\n');
+}
+
+/**
+ * Mark a Claude session as having consulted MCP tools.
+ * This enables Grep/Glob/Bash commands that would otherwise be blocked.
+ */
+function markSessionConsulted(sessionId: string): void {
+  try {
+    const hash = createHash('md5').update(sessionId).digest('hex').slice(0, 16);
+    const markerPath = join(tmpdir(), `codegraph-consulted-${hash}`);
+    try {
+      if (lstatSync(markerPath).isSymbolicLink()) return;
+    } catch {}
+    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
+    const fd = openSync(markerPath, flags, 0o600);
+    try {
+      writeSync(fd, new Date().toISOString());
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    // Silently fail
+  }
 }
 
 /**
@@ -565,6 +598,31 @@ export const tools: ToolDefinition[] = [
       },
     },
   },
+  {
+    name: 'codegraph_context',
+    description: 'PRIMARY TOOL — call FIRST for any "how does X work"/architecture/bug question. Returns entry points + related symbols + key code in one call; usually answers without further search/Read/Grep. Provides CODE context, not product requirements.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task: {
+          type: 'string',
+          description: 'Description of the task, bug, or feature to build context for',
+        },
+        maxNodes: {
+          type: 'number',
+          description: 'Maximum symbols to include (default: 20)',
+          default: 20,
+        },
+        includeCode: {
+          type: 'boolean',
+          description: 'Include code snippets for key symbols (default: true)',
+          default: true,
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['task'],
+    },
+  },
 ];
 
 /**
@@ -708,6 +766,7 @@ export class ToolHandler {
         'codegraph_explore',
         'codegraph_search',
         'codegraph_node',
+        'codegraph_context',
       ]);
       if (stats.fileCount < TINY_REPO_FILE_THRESHOLD) {
         visible = visible.filter(t => TINY_REPO_CORE_TOOLS.has(t.name));
@@ -829,15 +888,23 @@ export class ToolHandler {
     name: string,
     maxLength: number = MAX_INPUT_LENGTH
   ): string | ToolResult {
-    if (typeof value !== 'string' || value.length === 0) {
-      return this.errorResult(`${name} must be a non-empty string`);
-    }
-    if (value.length > maxLength) {
+    if (typeof value !== 'string') {
+      const got = value === undefined ? 'undefined' : typeof value;
       return this.errorResult(
-        `${name} exceeds maximum length of ${maxLength} characters (got ${value.length})`
+        `${name} must be a non-empty string (got ${got}). ` +
+        `Make sure to pass the \`${name}\` parameter directly — not wrapped in an object or nested.`
       );
     }
-    return value;
+    const trimmed = value.trim();
+    if (trimmed.length === 0) {
+      return this.errorResult(`${name} must be a non-empty string (received whitespace only)`);
+    }
+    if (trimmed.length > maxLength) {
+      return this.errorResult(
+        `${name} exceeds maximum length of ${maxLength} characters (got ${trimmed.length})`
+      );
+    }
+    return trimmed;
   }
 
   /**
@@ -1051,6 +1118,8 @@ export class ToolHandler {
           return await this.handleStatus(args);
         case 'codegraph_files':
           result = await this.handleFiles(args); break;
+        case 'codegraph_context':
+          result = await this.handleContext(args); break;
         default:
           return this.errorResult(`Unknown tool: ${toolName}`);
       }
@@ -3008,7 +3077,37 @@ export class ToolHandler {
 
     return this.textResult(this.truncateOutput(output));
   }
+  /**
+   * Handle codegraph_context — primary tool for task/architecture questions.
+   * Falls back from `task` to `query` for MCP clients that use different param names.
+   */
+  private async handleContext(args: Record<string, unknown>): Promise<ToolResult> {
+    const task = this.validateString(args.task ?? args.query, 'task');
+    if (typeof task !== 'string') return task;
 
+    // Mark session as consulted (enables Grep/Glob/Bash)
+    const sessionId = process.env.CLAUDE_SESSION_ID;
+    if (sessionId) {
+      markSessionConsulted(sessionId);
+    }
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    let defaultMaxNodes = 20;
+    try {
+      const stats = cg.getStats();
+      if (stats.fileCount < 150) { defaultMaxNodes = 8; }
+    } catch {}
+    const maxNodes = (args.maxNodes as number) || defaultMaxNodes;
+    const includeCode = args.includeCode !== false;
+
+    const context = await cg.buildContext(task, {
+      maxNodes,
+      includeCode,
+      format: 'markdown',
+    });
+    const output = typeof context === 'string' ? context : (context.summary || 'No context found');
+    return this.textResult(this.truncateOutput(output));
+  }
   /**
    * Convert glob pattern to regex
    */
