@@ -884,6 +884,7 @@ export class ReferenceResolver {
 
     // Process in batches. We always read from offset 0 because resolved refs
     // are deleted after each batch, shifting the remaining rows forward.
+    let prevRemaining = Number.POSITIVE_INFINITY;
     while (true) {
       const batch = this.queries.getUnresolvedReferencesBatch(0, batchSize);
       if (batch.length === 0) break;
@@ -937,6 +938,18 @@ export class ReferenceResolver {
       if (result.resolved.length === 0 && result.unresolved.length === batch.length) {
         break;
       }
+
+      // Non-progress guard (defense-in-depth). Because we re-read from offset 0
+      // each pass, the unresolved_refs table MUST shrink every iteration — both
+      // resolved and unresolved refs are deleted above. If it didn't shrink, a
+      // resolver returned a match whose `original.referenceName` differs from the
+      // stored row, so the keyed delete no-ops, and we'd re-read + re-resolve +
+      // re-insert the same rows forever (the runaway that grew a 99-file repo to
+      // 5M edges / 1.4 GB before the Go-fallback fix). Stop rather than grow the
+      // graph without bound.
+      const remaining = this.queries.getUnresolvedReferencesCount();
+      if (remaining >= prevRemaining) break;
+      prevRemaining = remaining;
     }
 
     // Dynamic-edge synthesis: now that all base `calls` edges are persisted,
