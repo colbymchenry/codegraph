@@ -406,6 +406,54 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).not.toContain('CODEGRAPH_START');
   });
 
+  it('qwen: install writes settings.json (mcpServers.codegraph) and no instructions file (#529)', () => {
+    const qwen = getTarget('qwen')!;
+    const result = qwen.install('global', { autoAllow: true });
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    expect(result.files.some((f) => f.path === settings)).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('qwen: install preserves pre-existing settings (modelProviders survives)', () => {
+    const qwen = getTarget('qwen')!;
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      modelProviders: { openai: [{ id: 'qwen3.6-plus', baseUrl: 'https://example.com' }] },
+    }, null, 2) + '\n');
+
+    qwen.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.modelProviders?.openai?.[0]?.id).toBe('qwen3.6-plus');
+    expect(after.mcpServers?.codegraph).toBeDefined();
+  });
+
+  it('qwen: uninstall strips codegraph but leaves pre-existing settings (modelProviders) intact', () => {
+    const qwen = getTarget('qwen')!;
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      modelProviders: { openai: [{ id: 'qwen3.6-plus', baseUrl: 'https://example.com' }] },
+    }, null, 2) + '\n');
+
+    qwen.install('global', { autoAllow: true });
+    qwen.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.modelProviders?.openai?.[0]?.id).toBe('qwen3.6-plus');
+    expect(after.mcpServers).toBeUndefined();
+  });
+
+  it('qwen: local install writes ./.qwen/settings.json', () => {
+    const qwen = getTarget('qwen')!;
+    const result = qwen.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.qwen/settings.json'))).toBe(true);
+  });
+
   it('kiro: install writes settings/mcp.json (mcpServers.codegraph) and no steering doc (#529)', () => {
     const kiro = getTarget('kiro')!;
     const result = kiro.install('global', { autoAllow: true });
