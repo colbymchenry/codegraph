@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchDottedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
+import { matchReference, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -32,8 +32,13 @@ const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
   'class', 'struct', 'interface', 'trait', 'protocol', 'enum',
 ]);
 
-/** Languages whose chained calls use the dotted `inner().method` encoding. */
-const DOT_CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift']);
+/**
+ * Languages whose chained static-factory/fluent calls defer to the conformance
+ * second pass. Dotted-receiver languages resolve via matchDottedCallChain; the
+ * `::`-receiver ones (Rust) via matchScopedCallChain.
+ */
+const CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift', 'rust']);
+const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
 
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */
 const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
@@ -726,7 +731,7 @@ export class ReferenceResolver {
       // resolvable once implements/extends edges exist (the conformance pass).
       if (
         ref.referenceKind === 'calls' &&
-        DOT_CHAIN_LANGUAGES.has(ref.language) &&
+        CHAIN_LANGUAGES.has(ref.language) &&
         CHAIN_SHAPE.test(ref.referenceName)
       ) {
         this.deferredChainRefs.push(ref);
@@ -839,7 +844,12 @@ export class ReferenceResolver {
     this.clearCaches();
     const resolved: ResolvedRef[] = [];
     for (const ref of deferred) {
-      const match = this.gateLanguage(matchDottedCallChain(ref, this.context), ref);
+      // `::`-receiver languages (Rust) split on `::` (matchScopedCallChain);
+      // dotted-receiver languages on `.` (matchDottedCallChain).
+      const chainMatch = SCOPED_CHAIN_LANGUAGES.has(ref.language)
+        ? matchScopedCallChain(ref, this.context)
+        : matchDottedCallChain(ref, this.context);
+      const match = this.gateLanguage(chainMatch, ref);
       if (match) resolved.push(match);
     }
     if (resolved.length === 0) return 0;

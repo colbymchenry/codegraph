@@ -2528,18 +2528,19 @@ export class TreeSitterExtractor {
               (this.language === 'cpp' ||
                 this.language === 'c' ||
                 this.language === 'kotlin' ||
-                this.language === 'swift') &&
+                this.language === 'swift' ||
+                this.language === 'rust') &&
               receiver &&
               receiver.type === 'call_expression'
             ) {
               // Receiver that is itself a call — `Foo::instance().bar()`,
-              // `openSession()->run()`, `mgr.view().render()` (C/C++), or
-              // `Foo.getInstance().bar()` (Kotlin) / `Foo.make().draw()` (Swift).
-              // Keep the inner call so resolution can infer bar()'s class from what
-              // the inner call RETURNS (#645/#608). Encode as `<innerCallee>().<method>`;
-              // the `().` marker never appears in an ordinary ref, so the resolver
-              // can detect and split it. Other languages keep the bare-name
-              // behavior (dropping the receiver) below.
+              // `openSession()->run()`, `mgr.view().render()` (C/C++),
+              // `Foo.getInstance().bar()` (Kotlin) / `Foo.make().draw()` (Swift), or
+              // `Foo::new().bar()` (Rust). Keep the inner call so resolution can
+              // infer bar()'s class from what the inner call RETURNS (#645/#608).
+              // Encode as `<innerCallee>().<method>`; the `().` marker never appears
+              // in an ordinary ref, so the resolver can detect and split it. Other
+              // languages keep the bare-name behavior (dropping the receiver) below.
               let innerCallee: string;
               let reencode: boolean;
               if (this.language === 'kotlin' || this.language === 'swift') {
@@ -2561,7 +2562,13 @@ export class TreeSitterExtractor {
                 innerCallee = innerFn
                   ? getNodeText(innerFn, this.source).replace(/->/g, '.').replace(/\s+/g, '')
                   : '';
-                reencode = !!innerCallee;
+                // Rust: only re-encode an associated-function chain
+                // (`Foo::new().bar()`), whose inner callee is a path/`scoped_identifier`.
+                // An instance chain (`x.foo().bar()`, inner callee a field_expression)
+                // keeps bare-name — the `::` resolver can't recover a variable's type,
+                // so re-encoding would only drop the edge. C/C++ re-encode any inner.
+                reencode =
+                  this.language === 'rust' ? innerFn?.type === 'scoped_identifier' : !!innerCallee;
               }
               calleeName = reencode ? `${innerCallee}().${methodName}` : methodName;
             } else {

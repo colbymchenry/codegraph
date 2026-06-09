@@ -2534,4 +2534,87 @@ class Caller {
       expect(callerNamesOf('Other::onlyOther')).toEqual([]);
     });
   });
+
+  describe('Rust chained associated-function call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo::new().bar() (and a Self return) via the associated fn, never a same-named decoy', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.rs'),
+        `struct Aaa { _x: i32 }
+impl Aaa { fn bar(&self) {} }
+struct Foo { _x: i32 }
+impl Foo {
+    fn new() -> Foo { Foo { _x: 0 } }
+    fn make() -> Self { Foo { _x: 0 } }
+    fn bar(&self) {}
+}
+fn caller() {
+    Foo::new().bar();
+    Foo::make().bar();
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::bar')).toEqual(['caller']);
+      expect(callerNamesOf('Aaa::bar')).toEqual([]);
+    });
+
+    it('resolves a chain that passes arguments — Foo::with(c).build()', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.rs'),
+        `struct Config;
+struct Foo { _x: i32 }
+impl Foo {
+    fn with(c: Config) -> Foo { Foo { _x: 0 } }
+    fn build(&self) {}
+}
+fn caller() { Foo::with(Config).build(); }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::build')).toEqual(['caller']);
+    });
+
+    it('resolves a chained method from a trait the type implements (default method, via conformance)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.rs'),
+        `struct Foo { _x: i32 }
+impl Foo { fn new() -> Foo { Foo { _x: 0 } } }
+struct Decoy { _x: i32 }
+impl Decoy { fn draw(&self) {} }
+trait Drawable { fn draw(&self) {} }
+impl Drawable for Foo {}
+fn caller() { Foo::new().draw(); }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Drawable::draw')).toEqual(['caller']);
+      expect(callerNamesOf('Decoy::draw')).toEqual([]);
+    });
+
+    it('creates NO edge when neither the type nor a supertype has the method (silent miss)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.rs'),
+        `struct Foo { _x: i32 }
+impl Foo { fn new() -> Foo { Foo { _x: 0 } } }
+struct Other { _x: i32 }
+impl Other { fn only_other(&self) {} }
+fn caller() { Foo::new().only_other(); }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no only_other() — must not mis-attach to the same-named Other::only_other.
+      expect(callerNamesOf('Other::only_other')).toEqual([]);
+    });
+  });
 });

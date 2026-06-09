@@ -570,15 +570,17 @@ export function matchCppCallChain(
 }
 
 /**
- * Resolve a PHP fluent static-factory chain whose receiver is a static call —
- * `Cls::for($x)->method()`, encoded by the extractor as `Cls::for().method`
- * (#608, the per-credential Laravel client idiom). The receiver's type is what
- * `Cls::for` returns: a `: self` / `: static` resolves to `Cls` itself, a
- * concrete `: Type` to that type. The outer method is then resolved and
- * VALIDATED on it (resolveMethodOnType requires the method to exist), so a
- * wrong inference yields no edge rather than a wrong one.
+ * Resolve a `::`-scoped factory chain whose receiver is a scoped/static call —
+ * PHP `Cls::for($x)->method()` (#608, the per-credential Laravel client idiom) or
+ * Rust `Foo::new().bar()` (an associated-function call) — both encoded by the
+ * extractor as `Cls::factory().method`. The receiver's type is what `Cls::factory`
+ * returns: a `self` marker (PHP `: self`/`: static`, Rust `-> Self`) resolves to
+ * the factory's own type, a concrete return type to that type. The outer method is
+ * then resolved and VALIDATED on it (resolveMethodOnType requires the method to
+ * exist on the type or a supertype it conforms to), so a wrong inference yields no
+ * edge rather than a wrong one. Shared by the `::`-receiver languages (PHP, Rust).
  */
-export function matchPhpCallChain(
+export function matchScopedCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
@@ -1080,11 +1082,12 @@ export function matchReference(
     if (result) return result;
   }
 
-  // 1c. PHP fluent static-factory chain — `Cls::for($x)->method()` encoded as
-  // `Cls::for().method` (#608). Same idea as 1b: the receiver's type is the
-  // factory's `: self` / `: Type` return.
-  if (ref.language === 'php') {
-    result = matchPhpCallChain(ref, context);
+  // 1c. `::`-scoped factory chain — PHP `Cls::for($x)->method()` (#608) or Rust
+  // `Foo::new().bar()`, both encoded as `Cls::factory().method`. The receiver's
+  // type is the factory's `self` (PHP `: self`/`: static`, Rust `-> Self`) or
+  // concrete return type.
+  if (ref.language === 'php' || ref.language === 'rust') {
+    result = matchScopedCallChain(ref, context);
     if (result) return result;
   }
 
