@@ -33,7 +33,7 @@ const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
 ]);
 
 /** Languages whose chained calls use the dotted `inner().method` encoding. */
-const DOT_CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp']);
+const DOT_CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift']);
 
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */
 const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;

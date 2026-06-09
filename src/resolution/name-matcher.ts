@@ -596,6 +596,13 @@ export function matchPhpCallChain(
 }
 
 /**
+ * Languages where an unprefixed capitalized call `Foo(args)` constructs the
+ * class (so a `Foo(args).method()` receiver's type is `Foo`). Java/C# need `new`,
+ * so a bare `Foo()` there is a method call, not construction — excluded.
+ */
+const CONSTRUCTS_VIA_BARE_CALL = new Set(['kotlin', 'swift']);
+
+/**
  * Resolve a dotted chained call whose receiver is a static factory / fluent call —
  * `Foo.getInstance().bar()`, encoded by the extractor as `Foo.getInstance().bar`
  * (#645/#608 mechanism). The receiver's type is what `Foo.getInstance` returns
@@ -603,7 +610,7 @@ export function matchPhpCallChain(
  * it (resolveMethodOnType requires `Type::method` to exist), so a wrong inference
  * yields no edge rather than a wrong one (e.g. a same-named `bar()` on an
  * unrelated class is never matched). Shared by the dot-notation languages
- * (Java, Kotlin, C#) — same receiver shape, same `Class::method` qualified names.
+ * (Java, Kotlin, C#, Swift) — same receiver shape, same `Class::method` qualified names.
  */
 export function matchDottedCallChain(
   ref: UnresolvedRef,
@@ -617,13 +624,13 @@ export function matchDottedCallChain(
 
   // Constructor receiver `Foo(args).method()` (encoded `Foo().method`): a bare,
   // capitalized inner is a class construction, so the receiver's type is the
-  // class itself — resolve the method on it. Kotlin only: there an unprefixed
-  // capitalized call constructs the class, whereas in Java a bare `Foo()` is a
-  // method call (constructors need `new`), so we must not assume construction.
-  // A lowercase bare inner is a top-level `factory().method()` whose type we
-  // can't recover — bail.
+  // class itself — resolve the method on it. Only in languages where an
+  // unprefixed capitalized call constructs the class (Kotlin, Swift); in Java/C#
+  // a bare `Foo()` is a method call (constructors need `new`), so we must not
+  // assume construction. A lowercase bare inner is a top-level `factory().method()`
+  // whose type we can't recover — bail.
   if (lastDot <= 0) {
-    if (ref.language !== 'kotlin' || !/^[A-Z]/.test(inner)) return null;
+    if (!CONSTRUCTS_VIA_BARE_CALL.has(ref.language) || !/^[A-Z]/.test(inner)) return null;
     return resolveMethodOnType(inner, method, ref, context, 0.85, 'instance-method', importedFqnOf(inner, ref, context));
   }
 
@@ -1081,11 +1088,16 @@ export function matchReference(
     if (result) return result;
   }
 
-  // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C#) —
+  // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C# / Swift) —
   // `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar` (#645/#608
   // mechanism). Resolve bar's class from getInstance's declared return type, then
   // validate the method on it.
-  if (ref.language === 'java' || ref.language === 'kotlin' || ref.language === 'csharp') {
+  if (
+    ref.language === 'java' ||
+    ref.language === 'kotlin' ||
+    ref.language === 'csharp' ||
+    ref.language === 'swift'
+  ) {
     result = matchDottedCallChain(ref, context);
     if (result) return result;
   }

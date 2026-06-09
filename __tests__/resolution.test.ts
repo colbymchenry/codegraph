@@ -2403,6 +2403,72 @@ class Caller {
     });
   });
 
+  describe('Swift chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo.make().draw() via the factory return type, never a same-named decoy', async () => {
+      // Aaa sorts first and has a same-named draw() — without the fix Swift dropped
+      // the receiver to a bare `draw` and attached to Aaa (a wrong edge).
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.swift'),
+        `class Aaa { func draw() {} }
+class Foo {
+    static func make() -> Foo { return Foo() }
+    func draw() {}
+}
+func runCaller() { Foo.make().draw() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::draw')).toEqual(['runCaller']);
+      expect(callerNamesOf('Aaa::draw')).toEqual([]);
+    });
+
+    it('resolves a constructor chain Foo().draw() and an args factory chain Foo.build(c).render()', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.swift'),
+        `class Config {}
+class Foo {
+    static func build(_ c: Config) -> Foo { return Foo() }
+    func draw() {}
+    func render() {}
+}
+func runCaller() {
+    Foo().draw()
+    Foo.build(Config()).render()
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::draw')).toEqual(['runCaller']);
+      expect(callerNamesOf('Foo::render')).toEqual(['runCaller']);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss, not a wrong edge)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.swift'),
+        `class Foo {
+    static func make() -> Foo { return Foo() }
+}
+class Other { func onlyOther() {} }
+func runCaller() { Foo.make().onlyOther() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
   describe('Chained call resolves a method on a supertype (conformance, #750)', () => {
     function callerNamesOf(qualifiedName: string): string[] {
       const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
