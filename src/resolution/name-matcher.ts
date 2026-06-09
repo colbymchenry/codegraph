@@ -577,6 +577,39 @@ export function matchPhpCallChain(
 }
 
 /**
+ * Resolve a Java chained call whose receiver is a static factory / fluent call —
+ * `Foo.getInstance().bar()`, encoded by the extractor as `Foo.getInstance().bar`
+ * (#645/#608 mechanism). The receiver's type is what `Foo.getInstance` returns
+ * (its declared return type); the outer method is then resolved and VALIDATED on
+ * it (resolveMethodOnType requires `Type::method` to exist), so a wrong inference
+ * yields no edge rather than a wrong one (e.g. a same-named `bar()` on an
+ * unrelated class is never matched).
+ */
+export function matchJavaCallChain(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
+  if (!m || !m[1] || !m[2]) return null;
+  const inner = m[1]; // `Foo.getInstance`
+  const method = m[2]; // `bar`
+  // Require an explicit receiver (`Receiver.factory`) — a bare `factory().bar`
+  // chain (a method on `this`) isn't handled here.
+  const lastDot = inner.lastIndexOf('.');
+  if (lastDot <= 0) return null;
+  const factoryClass = inner.slice(0, lastDot).split('.').pop(); // simple class name
+  const factoryMethod = inner.slice(lastDot + 1);
+  if (!factoryClass || !factoryMethod) return null;
+  const ret = lookupCalleeReturnType(`${factoryClass}::${factoryMethod}`, ref, context);
+  if (!ret) return null;
+  // When several classes share the returned simple name, the caller file's
+  // import of that type is the only signal that names WHICH one (#314).
+  const imports = context.getImportMappings(ref.filePath, ref.language);
+  const importedFqn = imports.find((i) => i.localName === ret)?.source;
+  return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqn);
+}
+
+/**
  * Java/Kotlin: infer a receiver's declared type by walking field declarations
  * in the class enclosing the call site. The field's `signature` is already in
  * the form "<TypeName> <fieldName>" (set by tree-sitter.ts extractField), so we
@@ -1003,6 +1036,14 @@ export function matchReference(
   // factory's `: self` / `: Type` return.
   if (ref.language === 'php') {
     result = matchPhpCallChain(ref, context);
+    if (result) return result;
+  }
+
+  // 1d. Java chained static-factory / fluent call — `Foo.getInstance().bar()`
+  // encoded as `Foo.getInstance().bar` (#645/#608 mechanism). Resolve bar's class
+  // from getInstance's declared return type, then validate the method on it.
+  if (ref.language === 'java') {
+    result = matchJavaCallChain(ref, context);
     if (result) return result;
   }
 

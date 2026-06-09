@@ -2376,6 +2376,33 @@ export class TreeSitterExtractor {
         return;
       }
 
+      // Java static-factory / fluent chain: `Foo.getInstance().bar()` — the
+      // receiver is itself a method call, so resolution must infer bar's class
+      // from what `Foo.getInstance` RETURNS (its declared return type), the
+      // #645/#608 mechanism. Encode `<inner-receiver>.<inner-method>().<method>`;
+      // the `().` marker lets the Java chain resolver split it, and normalizing to
+      // empty parens drops any factory args (`Foo.create(cfg).bar()`) that would
+      // otherwise leave a `(cfg)` in the receiver text and break the split.
+      if (
+        methodName &&
+        this.language === 'java' &&
+        objectField.type === 'method_invocation'
+      ) {
+        const innerObj = getChildByField(objectField, 'object');
+        const innerName = getChildByField(objectField, 'name');
+        if (innerObj && innerName) {
+          calleeName = `${getNodeText(innerObj, this.source)}.${getNodeText(innerName, this.source)}().${methodName}`;
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: calleeName,
+            referenceKind: 'calls',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+          return;
+        }
+      }
+
       let receiverName: string;
       if (objectField.type === 'field_access') {
         const inner = getChildByField(objectField, 'object');
