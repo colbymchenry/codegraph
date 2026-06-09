@@ -16,7 +16,7 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { LOW_CONFIDENCE_MARKER } from '../src/context';
-import { isDistinctiveIdentifier } from '../src/search/query-utils';
+import { isDistinctiveIdentifier, scorePathRelevance } from '../src/search/query-utils';
 
 describe('isDistinctiveIdentifier', () => {
   it('treats plain dictionary words as non-distinctive', () => {
@@ -36,6 +36,31 @@ describe('isDistinctiveIdentifier', () => {
     expect(isDistinctiveIdentifier('user_store')).toBe(true);
     expect(isDistinctiveIdentifier('REST')).toBe(true);
     expect(isDistinctiveIdentifier('v2')).toBe(true);
+  });
+});
+
+// A single PascalCase query word (notably a project name a user naturally
+// includes) splits into sub-tokens that all match the SAME path segment; summed
+// per sub-token it boosted that path 4×, burying the rest of the query's stack
+// (#720). Path relevance must count each original WORD once per level, while
+// still splitting it for cross-convention matching.
+describe('scorePathRelevance per-word scoring (#720)', () => {
+  it('counts a single PascalCase word once per path level, not once per sub-token', () => {
+    // "SuperBizAgent" → super/biz/agent/superbizagent all hit the dir, but it's
+    // one concept: +5 (dir) once, not +20.
+    expect(scorePathRelevance('SuperBizAgentFrontend/app.js', 'SuperBizAgent')).toBe(5);
+  });
+
+  it('still splits a word so it matches across naming conventions', () => {
+    // getUserName must still match a snake_case path via its sub-tokens.
+    expect(scorePathRelevance('get_user_name.go', 'getUserName')).toBeGreaterThanOrEqual(10);
+  });
+
+  it('still credits distinct query words matching different path segments', () => {
+    // auth (dir) and handler (filename) are separate concepts — each counts.
+    expect(scorePathRelevance('src/auth/login_handler.go', 'auth handler')).toBeGreaterThan(
+      scorePathRelevance('src/auth/login_handler.go', 'auth')
+    );
   });
 });
 

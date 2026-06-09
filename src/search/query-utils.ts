@@ -173,23 +173,34 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
  * Higher score = more relevant path
  */
 export function scorePathRelevance(filePath: string, query: string): number {
-  // Use base terms only — stem variants inflate path scores by generating
-  // many near-duplicate terms that all match the same path segments.
-  const terms = extractSearchTerms(query, { stems: false });
-  if (terms.length === 0) return 0;
-
   const pathLower = filePath.toLowerCase();
   const fileName = path.basename(filePath).toLowerCase();
   const dirName = path.dirname(filePath).toLowerCase();
   let score = 0;
 
-  for (const term of terms) {
+  // Score per original query WORD, not per sub-token. A single PascalCase word
+  // splits into many sub-tokens (a project name "SuperBizAgent" →
+  // superbizagent / super / biz / agent) that all match the SAME path segment,
+  // so summing per sub-token boosted that path 4× for one concept — enough to
+  // bury the rest of the query's stack (#720). A word matches a path level if
+  // ANY of its sub-tokens do, and counts ONCE; distinct words still each add.
+  // Split the ORIGINAL-case query into words; extractSearchTerms does the
+  // camelCase/snake split per word (so `getUserName` still matches a
+  // `get_user_name` path) — we just attribute each word's matches once.
+  const words = query.split(/\s+/).filter((w) => w.length > 0);
+  if (words.length === 0) return 0;
+
+  for (const word of words) {
+    // Use base terms only — stem variants inflate path scores by generating
+    // many near-duplicate terms that all match the same path segments.
+    const subtokens = extractSearchTerms(word, { stems: false });
+    if (subtokens.length === 0) continue;
     // Exact filename match (strongest)
-    if (fileName.includes(term)) score += 10;
+    if (subtokens.some((t) => fileName.includes(t))) score += 10;
     // Directory match
-    if (dirName.includes(term)) score += 5;
+    if (subtokens.some((t) => dirName.includes(t))) score += 5;
     // General path match
-    else if (pathLower.includes(term)) score += 3;
+    else if (subtokens.some((t) => pathLower.includes(t))) score += 3;
   }
 
   // Deprioritize test files unless the query is explicitly about tests
