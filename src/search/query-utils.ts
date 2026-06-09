@@ -4,8 +4,54 @@
  * Shared module for search term extraction and scoring.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import { Node } from '../types';
+
+/** Normalize a name to a comparable token: lowercase, alphanumerics only. */
+export function normalizeNameToken(raw: string): string {
+  return raw.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Tokens that name the PROJECT as a whole — its `go.mod` module, `package.json`
+ * name, or repo root directory — rather than any specific symbol. A user
+ * naturally puts the project name in a query as context ("MyApp backend
+ * routes"), but it carries no discriminative signal: when it's also a substring
+ * of a symbol or path on one stack (a `MyAppFrontend/` dir, a `MyAppApp` class)
+ * it lexically inflates that stack and buries the rest (#720).
+ *
+ * Returned normalized (lowercase, alphanumerics only) so a query word can be
+ * compared by its normalized form. Only names ≥5 chars are kept — short ones
+ * (`api`, `app`, `core`, `web`) collide with real query terms too often to
+ * safely down-weight.
+ */
+export function deriveProjectNameTokens(projectRoot: string): Set<string> {
+  const tokens = new Set<string>();
+  const add = (raw: string | undefined | null): void => {
+    if (!raw) return;
+    const norm = normalizeNameToken(raw);
+    if (norm.length >= 5) tokens.add(norm);
+  };
+
+  // go.mod module last segment (the most reliable signal for Go repos).
+  try {
+    const gomod = fs.readFileSync(path.join(projectRoot, 'go.mod'), 'utf-8');
+    const m = gomod.match(/^\s*module\s+(\S+)/m);
+    if (m && m[1]) add(m[1].split('/').pop());
+  } catch { /* no go.mod */ }
+
+  // package.json name (strip an `@scope/` prefix).
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf-8'));
+    if (typeof pkg.name === 'string') add(pkg.name.replace(/^@[^/]+\//, ''));
+  } catch { /* no / invalid package.json */ }
+
+  // Repo root directory name — a fallback when neither manifest names the project.
+  add(path.basename(path.resolve(projectRoot)));
+
+  return tokens;
+}
 
 /**
  * Common stop words to filter from search queries.
@@ -172,7 +218,11 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
  * Score path relevance to a query
  * Higher score = more relevant path
  */
-export function scorePathRelevance(filePath: string, query: string): number {
+export function scorePathRelevance(
+  filePath: string,
+  query: string,
+  projectNameTokens?: Set<string>,
+): number {
   const pathLower = filePath.toLowerCase();
   const fileName = path.basename(filePath).toLowerCase();
   const dirName = path.dirname(filePath).toLowerCase();
@@ -187,10 +237,21 @@ export function scorePathRelevance(filePath: string, query: string): number {
   // Split the ORIGINAL-case query into words; extractSearchTerms does the
   // camelCase/snake split per word (so `getUserName` still matches a
   // `get_user_name` path) — we just attribute each word's matches once.
-  const words = query.split(/\s+/).filter((w) => w.length > 0);
-  if (words.length === 0) return 0;
+  const allWords = query.split(/\s+/).filter((w) => w.length > 0);
+  if (allWords.length === 0) return 0;
 
-  for (const word of words) {
+  // A query word that just names the PROJECT (its go.mod / package.json / repo
+  // name) carries no discriminative path signal — drop it so the rest of the
+  // query decides the ranking, instead of every file under a `<ProjectName>…/`
+  // tree winning on the project name alone (#720). Only when OTHER words remain,
+  // so a bare project-name query still scores on its path.
+  const words =
+    projectNameTokens && projectNameTokens.size > 0
+      ? allWords.filter((w) => !projectNameTokens.has(normalizeNameToken(w)))
+      : allWords;
+  const scored = words.length > 0 ? words : allWords;
+
+  for (const word of scored) {
     // Use base terms only — stem variants inflate path scores by generating
     // many near-duplicate terms that all match the same path segments.
     const subtokens = extractSearchTerms(word, { stems: false });

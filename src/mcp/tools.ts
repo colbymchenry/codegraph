@@ -21,7 +21,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile } from '../search/query-utils';
+import { isTestFile, normalizeNameToken } from '../search/query-utils';
 import {
   existsSync,
   readFileSync,
@@ -1661,8 +1661,14 @@ export class ToolHandler {
       // agent writes "DataRequest task validate", the `task`/`validate` it wants
       // are DataRequest's, NOT the same-named overloads in Validation.swift /
       // Concurrency.swift / the abstract base. Used below to bias overloaded
-      // names toward the file/class the query also names.
-      const typeTokens = tokens.filter((o) => /^[A-Z][A-Za-z0-9]{3,}/.test(o));
+      // names toward the file/class the query also names. EXCLUDE the project
+      // name (a PascalCase token a user naturally includes) — it names the whole
+      // repo, so biasing toward it just pulls overloads to whichever stack
+      // embeds it, re-burying the rest (#720).
+      const projectNameTokens = cg.getProjectNameTokens();
+      const typeTokens = tokens.filter(
+        (o) => /^[A-Z][A-Za-z0-9]{3,}/.test(o) && !projectNameTokens.has(normalizeNameToken(o)),
+      );
       const inNamedContext = (n: Node) =>
         typeTokens.some((ct) => {
           const lc = ct.toLowerCase();

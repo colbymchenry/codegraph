@@ -176,6 +176,12 @@ function rowToFileRecord(row: FileRow): FileRecord {
 export class QueryBuilder {
   private db: SqliteDatabase;
 
+  // Project-name tokens (go.mod / package.json / repo dir), normalized. A query
+  // word matching one is dropped from path-relevance scoring — it names the
+  // whole project, not a symbol, so it carries no discriminative signal (#720).
+  // Set once by the CodeGraph instance; empty by default (no down-weighting).
+  private projectNameTokens: Set<string> = new Set();
+
   // Node cache for frequently accessed nodes (LRU-style, max 1000 entries)
   private nodeCache: Map<string, Node> = new Map();
   private readonly maxCacheSize = 1000;
@@ -217,6 +223,17 @@ export class QueryBuilder {
 
   constructor(db: SqliteDatabase) {
     this.db = db;
+  }
+
+  /** Set the normalized project-name tokens used to down-weight non-discriminative
+   * query words in path scoring (#720). Called once when the project opens. */
+  setProjectNameTokens(tokens: Set<string>): void {
+    this.projectNameTokens = tokens;
+  }
+
+  /** The normalized project-name tokens (#720); empty if none were derived. */
+  getProjectNameTokens(): Set<string> {
+    return this.projectNameTokens;
   }
 
   // ===========================================================================
@@ -842,7 +859,7 @@ export class QueryBuilder {
         ...r,
         score: r.score
           + kindBonus(r.node.kind)
-          + scorePathRelevance(r.node.filePath, scoringQuery)
+          + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens)
           + nameMatchBonus(r.node.name, scoringQuery),
       }));
       results.sort((a, b) => b.score - a.score);

@@ -49,6 +49,7 @@ import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
+import { deriveProjectNameTokens } from './search/query-utils';
 import { CodeGraphPackageVersion } from './mcp/version';
 
 // Re-export types for consumers
@@ -154,6 +155,13 @@ export class CodeGraph {
     this.db = db;
     this.queries = queries;
     this.projectRoot = projectRoot;
+    // Down-weight the project name as a query term in search ranking — it names
+    // the whole repo, not a symbol, so it has no discriminative value (#720).
+    try {
+      this.queries.setProjectNameTokens(deriveProjectNameTokens(projectRoot));
+    } catch {
+      // Best-effort: ranking still works without it.
+    }
     this.fileLock = new FileLock(
       path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
     );
@@ -745,6 +753,17 @@ export class CodeGraph {
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
     return this.queries.searchNodes(query, options);
+  }
+
+  /**
+   * Normalized project-name tokens (go.mod / package.json / repo dir) used to
+   * down-weight the non-discriminative project name in search ranking (#720).
+   * Exposed so explore can exclude it from the PascalCase type-disambiguation
+   * bias, which would otherwise pull overloaded tokens toward whichever stack
+   * embeds the project name.
+   */
+  getProjectNameTokens(): Set<string> {
+    return this.queries.getProjectNameTokens();
   }
 
   /**
