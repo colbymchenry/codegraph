@@ -583,8 +583,8 @@ export function matchPhpCallChain(
  * (its declared return type); the outer method is then resolved and VALIDATED on
  * it (resolveMethodOnType requires `Type::method` to exist), so a wrong inference
  * yields no edge rather than a wrong one (e.g. a same-named `bar()` on an
- * unrelated class is never matched). Shared by the JVM dot-notation languages
- * (Java, Kotlin) — same receiver shape, same `Class::method` qualified names.
+ * unrelated class is never matched). Shared by the dot-notation languages
+ * (Java, Kotlin, C#) — same receiver shape, same `Class::method` qualified names.
  */
 export function matchDottedCallChain(
   ref: UnresolvedRef,
@@ -1062,11 +1062,11 @@ export function matchReference(
     if (result) return result;
   }
 
-  // 1d. JVM (Java / Kotlin) chained static-factory / fluent call —
+  // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C#) —
   // `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar` (#645/#608
   // mechanism). Resolve bar's class from getInstance's declared return type, then
   // validate the method on it.
-  if (ref.language === 'java' || ref.language === 'kotlin') {
+  if (ref.language === 'java' || ref.language === 'kotlin' || ref.language === 'csharp') {
     result = matchDottedCallChain(ref, context);
     if (result) return result;
   }

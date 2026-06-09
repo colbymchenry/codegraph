@@ -32,6 +32,26 @@ export function blankCsharpPreprocessorDirectives(source: string): string {
   return source.replace(re, (m, indent) => indent + ' '.repeat(m.length - indent.length));
 }
 
+/**
+ * A C# method's declared return type, normalized to the bare class name a chained
+ * `Foo.Create().Bar()` could be called on (the #645/#608 mechanism). The return
+ * type lives in the `returns` field (`static Foo Create()` → `Foo`); built-in
+ * `predefined_type` (void/int/string/…) and arrays yield undefined, generics are
+ * unwrapped to the base type, nullable `Foo?` is stripped, and a dotted namespace
+ * is reduced to the simple name. Constructors have no `returns` field → undefined.
+ */
+function extractCsharpReturnType(node: SyntaxNode, source: string): string | undefined {
+  const typeNode = node.childForFieldName('returns');
+  if (!typeNode) return undefined;
+  if (typeNode.type === 'predefined_type' || typeNode.type === 'array_type') return undefined;
+  let t = getNodeText(typeNode, source).trim();
+  t = t.replace(/\?+$/, ''); // nullable `Foo?`
+  t = t.replace(/<[^>]*>/g, ''); // generics `List<Foo>` → `List`
+  const last = t.split('.').pop()?.trim(); // namespace `Ns.Foo` → `Foo`
+  if (!last || !/^[A-Za-z_]\w*$/.test(last)) return undefined;
+  return last;
+}
+
 export const csharpExtractor: LanguageExtractor = {
   preParse: blankCsharpPreprocessorDirectives,
   functionTypes: [],
@@ -67,6 +87,7 @@ export const csharpExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'type',
+  getReturnType: extractCsharpReturnType,
   getVisibility: (node) => {
     for (let i = 0; i < node.childCount; i++) {
       const child = node.child(i);

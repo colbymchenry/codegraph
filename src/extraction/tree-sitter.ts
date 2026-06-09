@@ -2567,6 +2567,22 @@ export class TreeSitterExtractor {
         } else if (func.type === 'scoped_identifier' || func.type === 'scoped_call_expression') {
           // Scoped call: Module::function()
           calleeName = getNodeText(func, this.source);
+        } else if (this.language === 'csharp' && func.type === 'member_access_expression') {
+          // C# member call `recv.Method(...)`. When the receiver is itself a call
+          // — a chained factory `Foo.Create(args).Bar()` — encode `inner().Bar`
+          // with normalized empty parens so resolution can infer Bar's class from
+          // what `Foo.Create` RETURNS (#645/#608). A non-call receiver keeps the
+          // full member-access text (the existing `recv.Method` behavior).
+          const recv = getChildByField(func, 'expression');
+          const nameNode = getChildByField(func, 'name');
+          const methodName = nameNode ? getNodeText(nameNode, this.source) : '';
+          if (recv && recv.type === 'invocation_expression' && methodName) {
+            const innerFunc = getChildByField(recv, 'function');
+            const innerCallee = innerFunc ? getNodeText(innerFunc, this.source).replace(/\s+/g, '') : '';
+            calleeName = innerCallee ? `${innerCallee}().${methodName}` : methodName;
+          } else {
+            calleeName = getNodeText(func, this.source);
+          }
         } else {
           calleeName = getNodeText(func, this.source);
         }

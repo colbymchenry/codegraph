@@ -2336,4 +2336,70 @@ class Caller {
       expect(callerNamesOf('Other::onlyOther')).toEqual([]);
     });
   });
+
+  describe('C# chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo.Create().Bar() via the factory return type, never a same-named decoy', async () => {
+      // Aaa sorts first and has a same-named Bar() — it must never win the chain.
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.cs'),
+        `class Aaa { void Bar() {} }
+class Foo {
+    static Foo Create() { return new Foo(); }
+    void Bar() {}
+}
+class Caller {
+    void Run() { Foo.Create().Bar(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::Bar')).toEqual(['Run']);
+      expect(callerNamesOf('Aaa::Bar')).toEqual([]);
+    });
+
+    it('resolves a factory chain that passes arguments — Foo.Make(cfg).Build()', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.cs'),
+        `class Config {}
+class Foo {
+    static Foo Make(Config c) { return new Foo(); }
+    void Build() {}
+}
+class Caller {
+    void Run() { Foo.Make(new Config()).Build(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::Build')).toEqual(['Run']);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss, not a wrong edge)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.cs'),
+        `class Foo {
+    static Foo Create() { return new Foo(); }
+}
+class Other { void OnlyOther() {} }
+class Caller {
+    void Run() { Foo.Create().OnlyOther(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no OnlyOther() — must not mis-attach to the same-named Other::OnlyOther.
+      expect(callerNamesOf('Other::OnlyOther')).toEqual([]);
+    });
+  });
 });
