@@ -32,6 +32,26 @@ import type { MCPEngine } from './engine';
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
 const DEFAULT_PPID_POLL_MS = 5000;
 
+/**
+ * Env var that opts INTO the "attached to shared daemon" log line. Off by
+ * default: the line is benign INFO, but MCP hosts render any server stderr at
+ * error level (and append an `undefined` data field), so on every session start
+ * a healthy attach showed up as `[error] … undefined`. Set to `1` to surface it
+ * when debugging daemon attach. (#618; approach from #640 by @mturac)
+ */
+const LOG_ATTACH_ENV = 'CODEGRAPH_MCP_LOG_ATTACH';
+
+/**
+ * Log a successful daemon attach — gated behind {@link LOG_ATTACH_ENV} so it is
+ * silent by default (see #618). Exported for tests.
+ */
+export function logAttachedDaemon(socketPath: string, hello: DaemonHello): void {
+  if (process.env[LOG_ATTACH_ENV] !== '1') return;
+  process.stderr.write(
+    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
+  );
+}
+
 export interface ProxyResult {
   /**
    * `proxied` — successfully attached to a same-version daemon and piped
@@ -89,9 +109,7 @@ export async function runProxy(
     return { outcome: 'fallback-needed', reason: 'version mismatch' };
   }
 
-  process.stderr.write(
-    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
-  );
+  logAttachedDaemon(socketPath, hello);
 
   sendClientHello(socket);
   startPpidWatchdog(socket);
@@ -130,9 +148,7 @@ export async function connectWithHello(
     socket.destroy();
     return 'version-mismatch';
   }
-  process.stderr.write(
-    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
-  );
+  logAttachedDaemon(socketPath, hello);
   sendClientHello(socket);
   return socket;
 }

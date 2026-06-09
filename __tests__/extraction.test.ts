@@ -451,6 +451,59 @@ type Internal = string;
     expect(exported).toHaveLength(2);
     expect(exported.map((n) => n.name).sort()).toEqual(['DateFormat', 'UnitSystem']);
   });
+
+  // A service/contract registry written as a tuple of generic instantiations —
+  // the names are string-literal type arguments, not declarations, so static
+  // extraction otherwise never indexes them (issue #634).
+  it('extracts string-literal contract names from a generic tuple type alias (#634)', () => {
+    const code = `
+interface Service<Name extends string, Req, Resp> { name: Name; }
+export type MyServiceList = [
+  Service<'query_apply_record', { pageNo: number }, { ok: boolean }>,
+  Service<'apply_confirm', { code: string }, { ok: boolean }>
+];
+`;
+    const result = extractFromSource('services/api.ts', code);
+
+    const names = result.nodes.filter(
+      (n) => n.kind === 'method' && n.qualifiedName.startsWith('MyServiceList::')
+    );
+    expect(names.map((n) => n.name).sort()).toEqual(['apply_confirm', 'query_apply_record']);
+
+    const queryNode = names.find((n) => n.name === 'query_apply_record');
+    expect(queryNode?.qualifiedName).toBe('MyServiceList::query_apply_record');
+    // Signature carries the full contract entry so search results show context.
+    expect(queryNode?.signature).toContain("Service<'query_apply_record'");
+
+    // The string-literal name is contained by the type alias.
+    const alias = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'MyServiceList');
+    const containsEdge = result.edges.find(
+      (e) => e.kind === 'contains' && e.source === alias?.id && e.target === queryNode?.id
+    );
+    expect(containsEdge).toBeDefined();
+  });
+
+  it('does not extract string literals from utility types or nested generics (#634)', () => {
+    const code = `
+interface User { id: string; name: string; }
+interface Service<Name extends string, Req, Resp> { name: Name; }
+export type Picked = Pick<User, 'id' | 'name'>;
+export type Rec = Record<'foo' | 'bar', number>;
+// Tuple entry, but the name is a non-identifier route path; the nested Pick's
+// 'id' must also stay out (only DIRECT literal args of a tuple's generic count).
+export type Routes = [Service<'/api/users', Pick<User, 'id'>, {}>];
+// Bare string-literal tuple — not generic type arguments.
+export type Names = ['alpha', 'beta'];
+`;
+    const result = extractFromSource('noise.ts', code);
+
+    const leaked = result.nodes.filter(
+      (n) =>
+        (n.kind === 'method' || n.kind === 'property') &&
+        ['id', 'name', 'foo', 'bar', 'alpha', 'beta'].includes(n.name)
+    );
+    expect(leaked).toEqual([]);
+  });
 });
 
 describe('Exported Variable Extraction', () => {
@@ -1012,6 +1065,86 @@ public class OrderService
     expect(classNode).toBeDefined();
     expect(classNode?.name).toBe('OrderService');
     expect(classNode?.visibility).toBe('public');
+  });
+
+  it('indexes primary-constructor classes, including keyed-DI attribute params (#237)', () => {
+    // C# 12 primary constructors (`class Foo(IDep dep) { … }`) are parsed
+    // natively by the vendored tree-sitter-c-sharp 0.23.x grammar. The worst
+    // shape under the previous (older) grammar — an attribute-with-args on a
+    // ctor param (`[FromKeyedServices("primary")] …`, the ASP.NET keyed-DI
+    // pattern) — used to parse as an ERROR that swallowed the whole class, so
+    // the class and all its methods vanished. They now index in every case.
+    const code = `
+public class DataService(IMemoryCache cache)
+{
+    public void Warm() { }
+}
+
+public class InstanceService(InstanceManager m, ProfileManager p)
+{
+    public void DeployAndLaunchAsync() { }
+    public void Deploy() { }
+}
+
+public partial class UpdateService(int x) : ILifetimeService
+{
+    public void Run() { }
+}
+
+public class K1KeyedDi([FromKeyedServices("primary")] IMemoryCache cache)
+{
+    public void Warm() { }
+}
+
+public record CatalogBrand(int Id, string Name);
+`;
+    const result = extractFromSource('Services.cs', code);
+    const classNames = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+    expect(classNames).toContain('DataService');
+    expect(classNames).toContain('InstanceService');
+    expect(classNames).toContain('UpdateService'); // partial + base list
+    expect(classNames).toContain('K1KeyedDi'); // attribute-arg ctor param — used to vanish entirely
+    expect(classNames).toContain('CatalogBrand'); // record
+
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toContain('DeployAndLaunchAsync');
+    expect(methods).toContain('Deploy');
+    expect(methods).toContain('Run');
+  });
+
+  it('keeps a class indexable when a nested enum has #if-guarded members (#237)', () => {
+    // A `#if` directive inside an enum member list (the multi-targeting pattern
+    // in libraries like Newtonsoft.Json) makes the grammar emit an ERROR that,
+    // for a nested enum, detaches the enclosing class's member list — dropping
+    // most of the class's methods. A pre-parse pass blanks the directive lines
+    // (keeping both branches), so the class and all its methods still index.
+    const code = `
+public class Reader
+{
+    private enum ReadType
+    {
+#if HAVE_DATE_TIME_OFFSET
+        ReadAsDateTimeOffset,
+#endif
+        ReadAsDouble,
+        ReadAsString,
+    }
+
+    public void Open() { }
+    public void Close() { }
+    public int ReadInt() { return 0; }
+}
+`;
+    const result = extractFromSource('Reader.cs', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    // All three methods after the #if-bearing enum must survive.
+    expect(methods).toContain('Open');
+    expect(methods).toContain('Close');
+    expect(methods).toContain('ReadInt');
+    // Both enum branches are kept.
+    const enumMembers = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+    expect(enumMembers).toContain('ReadAsDateTimeOffset');
+    expect(enumMembers).toContain('ReadAsDouble');
   });
 });
 
@@ -2270,6 +2403,41 @@ end
       const authMethod = result.nodes.find((n) => n.name === 'authenticate');
       expect(authMethod).toBeDefined();
       expect(authMethod?.qualifiedName).toBe('Discourse::Auth::AuthProvider::authenticate');
+    });
+  });
+
+  describe('C/C++ return type capture (#645)', () => {
+    it('captures the normalized return type of a C++ method/function', () => {
+      const code = `
+struct Widget { void draw(); };
+class Factory { public: static Widget create(); };
+Widget Factory::create() { return Widget(); }
+void doNothing() {}
+`;
+      const result = extractFromSource('f.cpp', code);
+
+      const create = result.nodes.find(
+        (n) => n.name === 'create' && (n.kind === 'method' || n.kind === 'function')
+      );
+      expect(create?.returnType).toBe('Widget');
+
+      // A `void` return records no type, so resolution never tries to resolve a
+      // method on it.
+      const doNothing = result.nodes.find((n) => n.name === 'doNothing');
+      expect(doNothing).toBeDefined();
+      expect(doNothing?.returnType).toBeUndefined();
+    });
+
+    it('unwraps a smart-pointer return type to its pointee', () => {
+      const code = `
+#include <memory>
+struct Widget {};
+std::unique_ptr<Widget> makeWidget() { return nullptr; }
+`;
+      const result = extractFromSource('f.cpp', code);
+
+      const make = result.nodes.find((n) => n.name === 'makeWidget');
+      expect(make?.returnType).toBe('Widget');
     });
   });
 

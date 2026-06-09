@@ -272,6 +272,14 @@ export class TreeSitterExtractor {
     }
 
     try {
+      // Optional pre-parse source transform (offset-preserving) to work around
+      // grammar gaps — e.g. C# blanks conditional-compilation directive lines
+      // the grammar mis-parses inside enum bodies (#237). We reassign
+      // this.source so downstream getNodeText reads the same bytes the parser
+      // saw (identical outside the blanked directive lines).
+      if (this.extractor?.preParse) {
+        this.source = this.extractor.preParse(this.source);
+      }
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
         throw new Error('Parser returned null tree');
@@ -803,6 +811,7 @@ export class TreeSitterExtractor {
     const isExported = this.extractor.isExported?.(node, this.source);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
+    const returnType = this.extractor.getReturnType?.(node, this.source);
 
     const funcNode = this.createNode('function', name, node, {
       docstring,
@@ -811,6 +820,7 @@ export class TreeSitterExtractor {
       isExported,
       isAsync,
       isStatic,
+      returnType,
     });
     if (!funcNode) return;
 
@@ -852,6 +862,9 @@ export class TreeSitterExtractor {
 
     // Extract extends/implements
     this.extractInheritance(node, classNode.id);
+
+    // C# primary-constructor parameter dependencies (`class Svc(IRepo r, …)`).
+    this.extractCsharpPrimaryCtorParamRefs(node, classNode.id);
 
     // Extract decorators applied to the class (`@Foo class X {}`).
     this.extractDecoratorsFor(node, classNode.id);
@@ -919,12 +932,14 @@ export class TreeSitterExtractor {
     const visibility = this.extractor.getVisibility?.(node);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
+    const returnType = this.extractor.getReturnType?.(node, this.source);
     const extraProps: Partial<Node> = {
       docstring,
       signature,
       visibility,
       isAsync,
       isStatic,
+      returnType,
     };
     if (receiverType) {
       extraProps.qualifiedName = `${receiverType}::${name}`;
@@ -1026,6 +1041,10 @@ export class TreeSitterExtractor {
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
     this.extractInheritance(node, structNode.id);
+
+    // C# primary-constructor parameter dependencies (`struct P(int x)`, and
+    // `record struct M(decimal Amount)` which the grammar nests here).
+    this.extractCsharpPrimaryCtorParamRefs(node, structNode.id);
 
     // Push to stack for field extraction
     this.nodeStack.push(structNode.id);
@@ -1662,6 +1681,9 @@ export class TreeSitterExtractor {
         // an unrelated class method picked by path-proximity (#359).
         if (this.language === 'typescript' || this.language === 'tsx') {
           this.extractTsTypeAliasMembers(value, typeAliasNode);
+          // `type List = [ Service<'name', Req, Resp>, … ]` — surface each
+          // entry's string-literal name as a searchable member (issue #634).
+          this.extractTsTupleContractNames(value, typeAliasNode);
         }
       }
     }
@@ -1743,6 +1765,75 @@ export class TreeSitterExtractor {
         // #432. We attach refs to the type-alias parent (consistent with
         // interface property_signature treatment).
         this.extractTypeAnnotations(child, typeAliasNode.id);
+      }
+    }
+    this.nodeStack.pop();
+  }
+
+  /**
+   * Surface the string-literal "names" of a TypeScript service/contract
+   * registry written as a tuple of generic instantiations:
+   *
+   *   type MyServiceList = [
+   *     Service<'query_apply_record', Req, Resp>,
+   *     Service<'apply_confirm', Req, Resp>,
+   *   ];
+   *
+   * Each `Service<'name', …>` tags an entry with a string-literal name that a
+   * dynamic factory (`createService<MyServiceList>()`) turns into a callable
+   * property (`api.query_apply_record(…)`). Static extraction otherwise never
+   * sees that name — it's a type argument, not a declaration — so
+   * `codegraph query query_apply_record` returned nothing (issue #634). We emit
+   * each name as a `method` node under the type alias (qualifiedName
+   * `MyServiceList::query_apply_record`) so it's searchable and resolvable as a
+   * symbol. (A call through the proxy, `api.query_apply_record(…)`, still
+   * resolves to the imported `api` binding — the receiver's type isn't known —
+   * so this fixes discoverability, not the per-method call edge.)
+   *
+   * Scope is deliberately narrow to avoid noise: only a string literal that is
+   * a DIRECT type argument of a `generic_type` that is itself a DIRECT element
+   * of a `tuple_type`. This excludes utility types (`Pick`/`Omit`/`Record` are
+   * never written as tuples) and string args nested deeper
+   * (`Service<'a', Pick<U, 'id'>>` yields only `a`, never `id`). Names must be
+   * valid identifiers, which also rules out route paths / arbitrary strings.
+   */
+  private extractTsTupleContractNames(value: SyntaxNode, typeAliasNode: Node): void {
+    const tuples: SyntaxNode[] = [];
+    const collectTuples = (n: SyntaxNode, depth: number): void => {
+      if (depth > 6) return; // a type expression is shallow; cap defensively
+      if (n.type === 'tuple_type') tuples.push(n);
+      for (let i = 0; i < n.namedChildCount; i++) {
+        const c = n.namedChild(i);
+        if (c) collectTuples(c, depth + 1);
+      }
+    };
+    collectTuples(value, 0);
+    if (tuples.length === 0) return;
+
+    this.nodeStack.push(typeAliasNode.id);
+    for (const tuple of tuples) {
+      for (let i = 0; i < tuple.namedChildCount; i++) {
+        const entry = tuple.namedChild(i);
+        if (!entry || entry.type !== 'generic_type') continue;
+        const typeArgs = getChildByField(entry, 'type_arguments');
+        if (!typeArgs) continue;
+        for (let j = 0; j < typeArgs.namedChildCount; j++) {
+          const arg = typeArgs.namedChild(j);
+          if (!arg || arg.type !== 'literal_type') continue;
+          // literal_type wraps the actual literal; only a string is a name.
+          const strNode = arg.namedChild(0);
+          if (!strNode || strNode.type !== 'string') continue;
+          const name = getNodeText(strNode, this.source)
+            .trim()
+            .replace(/^['"`]/, '')
+            .replace(/['"`]$/, '');
+          if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) continue;
+          const signature = getNodeText(entry, this.source).replace(/\s+/g, ' ').trim().slice(0, 120);
+          this.createNode('method', name, entry, {
+            signature,
+            qualifiedName: `${typeAliasNode.name}::${name}`,
+          });
+        }
       }
     }
     this.nodeStack.pop();
@@ -2370,6 +2461,23 @@ export class TreeSitterExtractor {
               } else {
                 calleeName = methodName;
               }
+            } else if (
+              (this.language === 'cpp' || this.language === 'c') &&
+              receiver &&
+              receiver.type === 'call_expression'
+            ) {
+              // C/C++ receiver that is itself a call — `Foo::instance().bar()`,
+              // `openSession()->run()`, `mgr.view().render()`. Keep the inner
+              // call so resolution can infer bar()'s class from what the inner
+              // call RETURNS (#645). Encode as `<innerCallee>().<method>`; the
+              // `().` marker never appears in an ordinary ref, so the C++
+              // resolver can detect and split it. Other languages keep the
+              // bare-name behavior (dropping the receiver) below.
+              const innerFn = getChildByField(receiver, 'function');
+              const innerCallee = innerFn
+                ? getNodeText(innerFn, this.source).replace(/->/g, '.').replace(/\s+/g, '')
+                : '';
+              calleeName = innerCallee ? `${innerCallee}().${methodName}` : methodName;
             } else {
               calleeName = methodName;
             }
@@ -3486,8 +3594,11 @@ export class TreeSitterExtractor {
    * `tuple_type`, …) — none of which are `type_identifier`. Closes #381.
    */
   private extractCsharpTypeRefs(node: SyntaxNode, nodeId: string): void {
-    // Return type / property type — the field is named `type`.
-    const directType = getChildByField(node, 'type');
+    // A property's type is under the `type` field; a method/constructor's RETURN
+    // type is under `returns` (tree-sitter-c-sharp 0.23.x — older builds used
+    // `type` for both). A node carries only one of the two, so checking both
+    // covers return types and property types without conflating them.
+    const directType = getChildByField(node, 'type') ?? getChildByField(node, 'returns');
     if (directType) this.walkCsharpTypePosition(directType, nodeId);
 
     // Field declarations wrap declarators in a `variable_declaration`
@@ -3513,6 +3624,29 @@ export class TreeSitterExtractor {
         const paramType = getChildByField(child, 'type');
         if (paramType) this.walkCsharpTypePosition(paramType, nodeId);
       }
+    }
+  }
+
+  /**
+   * Record the dependencies declared by a C# PRIMARY CONSTRUCTOR
+   * (`class Svc(IRepo repo, [FromKeyedServices("k")] ICache cache) { … }`,
+   * C# 12+). The parameter list hangs off the class/struct/record declaration
+   * as an unnamed-field `parameter_list` child (not the `parameters` field a
+   * method uses), so it's found by node type. Each parameter's declared type
+   * becomes a `references` edge from the owning type — these are exactly the
+   * services a DI-registered type depends on, so impact/blast-radius and
+   * "who depends on this contract" now see them. No-op when there's no primary
+   * constructor. (#237)
+   */
+  private extractCsharpPrimaryCtorParamRefs(node: SyntaxNode, ownerId: string): void {
+    if (this.language !== 'csharp') return;
+    const paramList = node.namedChildren.find((c: SyntaxNode) => c.type === 'parameter_list');
+    if (!paramList) return;
+    for (let i = 0; i < paramList.namedChildCount; i++) {
+      const param = paramList.namedChild(i);
+      if (!param || param.type !== 'parameter') continue;
+      const paramType = getChildByField(param, 'type');
+      if (paramType) this.walkCsharpTypePosition(paramType, ownerId);
     }
   }
 

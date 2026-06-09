@@ -853,6 +853,114 @@ func UseAliased() {
       expect(target?.filePath.replace(/\\/g, '/')).toBe('pkgb/lib.go');
     });
 
+    it('resolves Python module-attribute calls after `from pkg import module` (#578)', async () => {
+      // Pre-#578, a `module.func()` call where `module` was bound via
+      // `from pkg import module` dropped its `calls` edge. The file→file import
+      // edge resolved (resolveModuleImportToFile falls back to a dotted-module
+      // file lookup for absolute package paths), but resolvePythonModuleMember
+      // had no such fallback — resolveImportPath returns null for an absolute
+      // package path like `pkg.module`, so the member never resolved and
+      // callers/callees/impact on the target came back empty. Same root-cause
+      // class as the Go cross-package qualified call (#388).
+      fs.mkdirSync(path.join(tempDir, 'pkg'));
+      fs.writeFileSync(path.join(tempDir, 'pkg', '__init__.py'), '');
+      fs.writeFileSync(
+        path.join(tempDir, 'pkg', 'module.py'),
+        'def func():\n    return 1\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'main.py'),
+        `from pkg import module
+import os
+
+
+def caller():
+    return module.func()
+
+
+def external_caller():
+    return os.getcwd()
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const caller = cg.getNodesByKind('function').filter((n) => n.name === 'caller')[0];
+      expect(caller).toBeDefined();
+      const calls = cg.getOutgoingEdges(caller!.id).filter((e) => e.kind === 'calls');
+      // module.func() must resolve to the real function in the submodule file.
+      expect(calls).toHaveLength(1);
+      const target = cg.getNode(calls[0]!.target);
+      expect(target?.name).toBe('func');
+      expect(target?.filePath.replace(/\\/g, '/')).toBe('pkg/module.py');
+
+      // The flip side of the fix: an attribute call through a *stdlib* module
+      // (`os.getcwd()`) must still create no edge — the fallback only matches
+      // real in-repo module files.
+      const externalCaller = cg.getNodesByKind('function').filter((n) => n.name === 'external_caller')[0];
+      expect(externalCaller).toBeDefined();
+      const externalCalls = cg.getOutgoingEdges(externalCaller!.id).filter((e) => e.kind === 'calls');
+      expect(externalCalls).toHaveLength(0);
+    });
+
+    it('attaches Go methods to their receiver type across files (#583, cross-file half)', async () => {
+      // In Go a type's methods are commonly declared in a different file from the
+      // `type` declaration (`type Box` in box.go, `func (b *Box) Get()` in
+      // box_methods.go). Extraction only attaches the struct→method `contains`
+      // edge when the type is in the SAME file (the owner lookup is file-scoped),
+      // so a cross-file method was orphaned from its struct — breaking member
+      // outlines and any callers/callees/impact traversal through `contains`. A
+      // resolution-phase pass now links them within the package (= directory).
+      fs.writeFileSync(
+        path.join(tempDir, 'box.go'),
+        'package main\n\ntype Box struct{ v int }\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'box_methods.go'),
+        'package main\n\nfunc (b *Box) Get() int { return b.v }\nfunc (b *Box) Set(x int) { b.v = x }\n'
+      );
+      // Generic receiver declared cross-file too — exercises #583 half A
+      // (generic `*Stack[T]` receiver parsing) and half B (cross-file) together.
+      fs.writeFileSync(
+        path.join(tempDir, 'stack.go'),
+        'package main\n\ntype Stack[T any] struct {\n\titems []T\n}\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'stack_push.go'),
+        'package main\n\nfunc (s *Stack[T]) Push(v T) { s.items = append(s.items, v) }\n'
+      );
+      // A same-named type in another package must NOT capture this package's
+      // methods — the link is scoped to the receiver type's own directory.
+      fs.mkdirSync(path.join(tempDir, 'other'));
+      fs.writeFileSync(
+        path.join(tempDir, 'other', 'box.go'),
+        'package other\n\ntype Box struct{ w int }\n'
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const methodsOf = (typeName: string, file: string): string[] => {
+        const node = cg
+          .getNodesByKind('struct')
+          .find((n) => n.name === typeName && n.filePath.replace(/\\/g, '/') === file);
+        expect(node, `${typeName} @ ${file}`).toBeDefined();
+        return cg
+          .getOutgoingEdges(node!.id)
+          .filter((e) => e.kind === 'contains')
+          .map((e) => cg.getNode(e.target))
+          .filter((n) => !!n && n.kind === 'method')
+          .map((n) => n!.name)
+          .sort();
+      };
+
+      // Cross-file (non-generic) methods now attach to their struct.
+      expect(methodsOf('Box', 'box.go')).toEqual(['Get', 'Set']);
+      // Generic + cross-file.
+      expect(methodsOf('Stack', 'stack.go')).toEqual(['Push']);
+      // Cross-package isolation: other/Box defines no methods of its own.
+      expect(methodsOf('Box', 'other/box.go')).toEqual([]);
+    });
+
     it('TS type_alias object-shape members resolve method calls (#359)', async () => {
       // Pre-#359, `recorder.stop()` (recorder: RecorderHandle) attached
       // to `StdioMcpClient.stop` in a sibling directory via path-proximity
@@ -1022,6 +1130,41 @@ public class DataExporter
       // UserDto: Build param, BuildAsync param, _cached field.
       expect(sessionIncoming.length).toBeGreaterThanOrEqual(4);
       expect(userIncoming.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it('C# primary-constructor parameters record their type dependencies (#237)', async () => {
+      // C# 12 primary constructors declare a type's injected dependencies inline
+      // (`class Svc(IRepo repo, [FromKeyedServices("k")] ICache cache)`). Each
+      // ctor parameter's type is recorded as a `references` edge from the class,
+      // so a DI-registered contract reached only through a primary ctor is no
+      // longer reported as having no dependents.
+      fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'Contracts.cs'),
+        `namespace App;
+public interface IRepo { }
+public class ICache { }
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'OrderService.cs'),
+        `namespace App;
+public sealed class OrderService(IRepo repo, [FromKeyedServices("primary")] ICache cache)
+{
+  public void Run() { }
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const svc = cg.getNodesByKind('class').find((n) => n.name === 'OrderService');
+      expect(svc).toBeDefined();
+      // The class itself must index (it used to vanish under the old grammar).
+      const out = cg.getOutgoingEdges(svc!.id).filter((e) => e.kind === 'references');
+      const depNames = out.map((e) => cg.getNode(e.target)?.name);
+      expect(depNames).toContain('IRepo');
+      expect(depNames).toContain('ICache'); // the keyed-DI ([FromKeyedServices]) dependency
     });
 
     it('Go: leaves stdlib calls (fmt.Println, etc.) external', async () => {
@@ -1905,6 +2048,114 @@ func main() {
       } finally {
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('C++ chained-call receiver resolution (#645)', () => {
+    async function indexCpp(files: Record<string, string>): Promise<void> {
+      for (const [name, content] of Object.entries(files)) {
+        fs.writeFileSync(path.join(tempDir, name), content);
+      }
+      cg = await CodeGraph.init(tempDir, { index: true });
+    }
+
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves singleton chains and auto locals to the right class, never the first-sorted one', async () => {
+      // Two classes share writeLog; Logger sorts first so it wins any name-only
+      // tie. All three call forms target Metrics.
+      await indexCpp({
+        'logger.hpp': `#pragma once
+#include <string>
+class Logger  { public: static Logger&  instance(); void writeLog(const std::string&); };
+class Metrics { public: static Metrics& instance(); void writeLog(const std::string&); };
+`,
+        'impl.cpp': `#include "logger.hpp"
+Logger&  Logger::instance()  { static Logger l;  return l; }
+Metrics& Metrics::instance() { static Metrics m; return m; }
+void Logger::writeLog(const std::string&)  {}
+void Metrics::writeLog(const std::string&) {}
+`,
+        'app.cpp': `#include "logger.hpp"
+void a() { Metrics::instance().writeLog("x"); }              // chained singleton
+void b() { auto& m = Metrics::instance(); m.writeLog("x"); } // stored in auto
+void c() { Metrics& m = Metrics::instance(); m.writeLog("x"); } // explicit type
+`,
+      });
+
+      expect(callerNamesOf('Metrics::writeLog')).toEqual(['a', 'b', 'c']);
+      expect(callerNamesOf('Logger::writeLog')).toEqual([]);
+    });
+
+    it('resolves factories, free-function factories, and member chains via the inner call return type', async () => {
+      await indexCpp({
+        'types.hpp': `#pragma once
+#include <memory>
+struct Widget { void draw(); };
+struct Session { void run(); };
+struct View { void render(); };
+class WidgetFactory { public: static Widget create(); };
+class Manager { public: View view(); };
+Session* openSession();
+// Decoy that sorts first and has all three methods — must never win.
+struct Aaa { void draw(); void run(); void render(); };
+`,
+        'impl.cpp': `#include "types.hpp"
+void Widget::draw() {}
+void Session::run() {}
+void View::render() {}
+void Aaa::draw() {}
+void Aaa::run() {}
+void Aaa::render() {}
+Widget WidgetFactory::create() { return Widget(); }
+View Manager::view() { return View(); }
+Session* openSession() { return nullptr; }
+`,
+        'app.cpp': `#include "types.hpp"
+void factory()     { WidgetFactory::create().draw(); }   // -> Widget::draw
+void freefunc()    { openSession()->run(); }             // -> Session::run
+void member()      { Manager mgr; mgr.view().render(); }  // -> View::render
+void makeUnique()  { auto w = std::make_unique<Widget>(); w->draw(); } // -> Widget::draw
+`,
+      });
+
+      expect(callerNamesOf('Widget::draw')).toEqual(['factory', 'makeUnique']);
+      expect(callerNamesOf('Session::run')).toEqual(['freefunc']);
+      expect(callerNamesOf('View::render')).toEqual(['member']);
+      // The first-sorted decoy never captures any of them.
+      expect(callerNamesOf('Aaa::draw')).toEqual([]);
+      expect(callerNamesOf('Aaa::run')).toEqual([]);
+      expect(callerNamesOf('Aaa::render')).toEqual([]);
+    });
+
+    it('creates NO edge when the inferred type lacks the method (silent miss, not a wrong edge)', async () => {
+      await indexCpp({
+        'types.hpp': `#pragma once
+struct Widget { void draw(); };
+struct Other  { void onlyOther(); };
+class WidgetFactory { public: static Widget create(); };
+`,
+        'impl.cpp': `#include "types.hpp"
+void Widget::draw() {}
+void Other::onlyOther() {}
+Widget WidgetFactory::create() { return Widget(); }
+`,
+        'app.cpp': `#include "types.hpp"
+// Widget has no onlyOther() — must produce NO edge, never a wrong one to Other.
+void wrong() { WidgetFactory::create().onlyOther(); }
+`,
+      });
+
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
     });
   });
 });

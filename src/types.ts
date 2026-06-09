@@ -163,6 +163,15 @@ export interface Node {
   /** Generic type parameters */
   typeParameters?: string[];
 
+  /**
+   * Normalized return/result type name for a function/method (the bare class
+   * name, smart-pointer pointee unwrapped). Captured for C/C++ so resolution
+   * can infer a chained receiver's type from what the inner call returns —
+   * `Foo::instance().bar()` resolves `bar` on `Foo` (issue #645). Undefined for
+   * languages/symbols where it isn't captured.
+   */
+  returnType?: string;
+
   /** When the node was last updated */
   updatedAt: number;
 }

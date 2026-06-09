@@ -21,7 +21,7 @@
  * need receiver-type matching, deferred to Phase 3). All synthesized edges are
  * tagged `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
  */
-import type { Edge, Node } from '../types';
+import type { Edge, Node, NodeKind } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
@@ -530,6 +530,74 @@ function goImplementsEdges(queries: QueryBuilder): Edge[] {
       });
       added++;
     }
+  }
+  return edges;
+}
+
+/**
+ * Cross-file Go method → receiver-type `contains` edges. In Go a type's methods
+ * are commonly declared in a different file from the `type` declaration itself
+ * (`type User struct{…}` in `user.go`, `func (u *User) Save()` in
+ * `user_store.go`). Extraction attaches the struct→method `contains` edge only
+ * when the receiver type is in the SAME file — the owner lookup in
+ * `tree-sitter.ts` is scoped to the file being parsed — so a cross-file method
+ * is left orphaned from its type (it's still `contains`ed by its file, just not
+ * its struct). That breaks `codegraph_node` member outlines, any
+ * callers/callees/impact traversal that goes through the type's `contains`
+ * edges, and the {@link goImplementsEdges} method-set computation (which derives
+ * a struct's method set from those same edges, so it under-counts interfaces a
+ * cross-file struct satisfies).
+ *
+ * Go guarantees a method's receiver type is declared in the SAME PACKAGE as the
+ * method, and a Go package is a single directory — so this is a deterministic
+ * structural link, not a heuristic: find the same-named type in the method's own
+ * directory and add the missing `contains` edge (no `provenance: 'heuristic'`,
+ * matching the same-file edges extraction already emits). Skips methods that
+ * already have a type parent (the same-file case). (#583, cross-file half)
+ */
+function goCrossFileMethodContainsEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const TYPE_KINDS = new Set<NodeKind>(['struct', 'class', 'interface', 'enum', 'type_alias']);
+  const dirOf = (p: string): string => {
+    const i = p.replace(/\\/g, '/').lastIndexOf('/');
+    return i >= 0 ? p.slice(0, i) : '';
+  };
+
+  for (const method of queries.getNodesByKind('method')) {
+    if (method.language !== 'go') continue;
+    // The receiver type is encoded in the method's qualifiedName as `Recv::name`
+    // (extraction sets `${receiverType}::${name}` for receiver methods).
+    const qn = method.qualifiedName;
+    if (!qn) continue;
+    const sep = qn.lastIndexOf('::');
+    if (sep <= 0) continue;
+    const receiver = qn.slice(0, sep);
+    if (!receiver) continue;
+
+    // Already attached to its type (same-file case handled at extraction)?
+    const hasTypeParent = queries
+      .getIncomingEdges(method.id, ['contains'])
+      .some((e) => {
+        const src = queries.getNodeById(e.source);
+        return src != null && TYPE_KINDS.has(src.kind);
+      });
+    if (hasTypeParent) continue;
+
+    // Find the receiver type in the SAME directory (= same Go package). Go forbids
+    // duplicate type names within a package, so a same-name same-dir match is
+    // unambiguous; scoping to the directory avoids linking to a same-named type
+    // in another package.
+    const dir = dirOf(method.filePath);
+    const owner = queries
+      .getNodesByName(receiver)
+      .find((n) => n.language === 'go' && TYPE_KINDS.has(n.kind) && dirOf(n.filePath) === dir);
+    if (!owner) continue;
+
+    const key = `${owner.id}>${method.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edges.push({ source: owner.id, target: method.id, kind: 'contains', line: method.startLine });
   }
   return edges;
 }
@@ -1585,7 +1653,15 @@ function svelteKitLoadEdges(ctx: ResolutionContext): Edge[] {
  * Returns the count added. Never throws into indexing — callers wrap in try/catch.
  */
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
-  // Go implicit `implements` edges must be synthesized AND persisted first: the
+  // Cross-file Go method→type `contains` edges must be synthesized AND persisted
+  // FIRST: a method declared in a different file from its receiver type is
+  // otherwise orphaned from the struct, and goImplementsEdges (next) derives a
+  // struct's method set from its `contains` edges — so without this it would
+  // under-count the interfaces a cross-file struct satisfies. (#583)
+  const goMethodContains = goCrossFileMethodContainsEdges(queries);
+  if (goMethodContains.length > 0) queries.insertEdges(goMethodContains);
+
+  // Go implicit `implements` edges must be synthesized AND persisted next: the
   // interface-dispatch bridge below reads `implements` edges from the DB, and
   // Go has none statically. (Other languages already have static implements
   // edges from extraction, so they don't need this pre-pass.)
@@ -1641,5 +1717,5 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     merged.push(e);
   }
   if (merged.length > 0) queries.insertEdges(merged);
-  return merged.length + goImpl.length;
+  return merged.length + goImpl.length + goMethodContains.length;
 }
