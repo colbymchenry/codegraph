@@ -37,6 +37,7 @@ import type { Ignore } from 'ignore';
 import { isSourceFile, buildDefaultIgnore } from '../extraction';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
+import { isCodeGraphDataDir } from '../directory';
 import { watchDisabledReason } from './watch-policy';
 
 /**
@@ -425,8 +426,12 @@ export class FileWatcher {
 
   /** Our own dirs are always ignored, regardless of .gitignore. */
   private isAlwaysIgnored(rel: string): boolean {
+    // First path segment. Ignore any CodeGraph data dir — the active one AND a
+    // sibling like `.codegraph-win` a second environment (Windows/WSL) created
+    // in the same tree, so neither side watches the other's index (#636).
+    const top = rel.split('/')[0] ?? rel;
     return (
-      rel === '.codegraph' || rel.startsWith('.codegraph/') ||
+      isCodeGraphDataDir(top) ||
       rel === '.git' || rel.startsWith('.git/')
     );
   }

@@ -12,7 +12,7 @@ import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
 import { matchReference } from '../src/resolution/name-matcher';
-import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache } from '../src/resolution/import-resolver';
+import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
 import { QueryBuilder } from '../src/db/queries';
@@ -853,6 +853,114 @@ func UseAliased() {
       expect(target?.filePath.replace(/\\/g, '/')).toBe('pkgb/lib.go');
     });
 
+    it('resolves Python module-attribute calls after `from pkg import module` (#578)', async () => {
+      // Pre-#578, a `module.func()` call where `module` was bound via
+      // `from pkg import module` dropped its `calls` edge. The file→file import
+      // edge resolved (resolveModuleImportToFile falls back to a dotted-module
+      // file lookup for absolute package paths), but resolvePythonModuleMember
+      // had no such fallback — resolveImportPath returns null for an absolute
+      // package path like `pkg.module`, so the member never resolved and
+      // callers/callees/impact on the target came back empty. Same root-cause
+      // class as the Go cross-package qualified call (#388).
+      fs.mkdirSync(path.join(tempDir, 'pkg'));
+      fs.writeFileSync(path.join(tempDir, 'pkg', '__init__.py'), '');
+      fs.writeFileSync(
+        path.join(tempDir, 'pkg', 'module.py'),
+        'def func():\n    return 1\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'main.py'),
+        `from pkg import module
+import os
+
+
+def caller():
+    return module.func()
+
+
+def external_caller():
+    return os.getcwd()
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const caller = cg.getNodesByKind('function').filter((n) => n.name === 'caller')[0];
+      expect(caller).toBeDefined();
+      const calls = cg.getOutgoingEdges(caller!.id).filter((e) => e.kind === 'calls');
+      // module.func() must resolve to the real function in the submodule file.
+      expect(calls).toHaveLength(1);
+      const target = cg.getNode(calls[0]!.target);
+      expect(target?.name).toBe('func');
+      expect(target?.filePath.replace(/\\/g, '/')).toBe('pkg/module.py');
+
+      // The flip side of the fix: an attribute call through a *stdlib* module
+      // (`os.getcwd()`) must still create no edge — the fallback only matches
+      // real in-repo module files.
+      const externalCaller = cg.getNodesByKind('function').filter((n) => n.name === 'external_caller')[0];
+      expect(externalCaller).toBeDefined();
+      const externalCalls = cg.getOutgoingEdges(externalCaller!.id).filter((e) => e.kind === 'calls');
+      expect(externalCalls).toHaveLength(0);
+    });
+
+    it('attaches Go methods to their receiver type across files (#583, cross-file half)', async () => {
+      // In Go a type's methods are commonly declared in a different file from the
+      // `type` declaration (`type Box` in box.go, `func (b *Box) Get()` in
+      // box_methods.go). Extraction only attaches the struct→method `contains`
+      // edge when the type is in the SAME file (the owner lookup is file-scoped),
+      // so a cross-file method was orphaned from its struct — breaking member
+      // outlines and any callers/callees/impact traversal through `contains`. A
+      // resolution-phase pass now links them within the package (= directory).
+      fs.writeFileSync(
+        path.join(tempDir, 'box.go'),
+        'package main\n\ntype Box struct{ v int }\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'box_methods.go'),
+        'package main\n\nfunc (b *Box) Get() int { return b.v }\nfunc (b *Box) Set(x int) { b.v = x }\n'
+      );
+      // Generic receiver declared cross-file too — exercises #583 half A
+      // (generic `*Stack[T]` receiver parsing) and half B (cross-file) together.
+      fs.writeFileSync(
+        path.join(tempDir, 'stack.go'),
+        'package main\n\ntype Stack[T any] struct {\n\titems []T\n}\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'stack_push.go'),
+        'package main\n\nfunc (s *Stack[T]) Push(v T) { s.items = append(s.items, v) }\n'
+      );
+      // A same-named type in another package must NOT capture this package's
+      // methods — the link is scoped to the receiver type's own directory.
+      fs.mkdirSync(path.join(tempDir, 'other'));
+      fs.writeFileSync(
+        path.join(tempDir, 'other', 'box.go'),
+        'package other\n\ntype Box struct{ w int }\n'
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const methodsOf = (typeName: string, file: string): string[] => {
+        const node = cg
+          .getNodesByKind('struct')
+          .find((n) => n.name === typeName && n.filePath.replace(/\\/g, '/') === file);
+        expect(node, `${typeName} @ ${file}`).toBeDefined();
+        return cg
+          .getOutgoingEdges(node!.id)
+          .filter((e) => e.kind === 'contains')
+          .map((e) => cg.getNode(e.target))
+          .filter((n) => !!n && n.kind === 'method')
+          .map((n) => n!.name)
+          .sort();
+      };
+
+      // Cross-file (non-generic) methods now attach to their struct.
+      expect(methodsOf('Box', 'box.go')).toEqual(['Get', 'Set']);
+      // Generic + cross-file.
+      expect(methodsOf('Stack', 'stack.go')).toEqual(['Push']);
+      // Cross-package isolation: other/Box defines no methods of its own.
+      expect(methodsOf('Box', 'other/box.go')).toEqual([]);
+    });
+
     it('TS type_alias object-shape members resolve method calls (#359)', async () => {
       // Pre-#359, `recorder.stop()` (recorder: RecorderHandle) attached
       // to `StdioMcpClient.stop` in a sibling directory via path-proximity
@@ -1022,6 +1130,41 @@ public class DataExporter
       // UserDto: Build param, BuildAsync param, _cached field.
       expect(sessionIncoming.length).toBeGreaterThanOrEqual(4);
       expect(userIncoming.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it('C# primary-constructor parameters record their type dependencies (#237)', async () => {
+      // C# 12 primary constructors declare a type's injected dependencies inline
+      // (`class Svc(IRepo repo, [FromKeyedServices("k")] ICache cache)`). Each
+      // ctor parameter's type is recorded as a `references` edge from the class,
+      // so a DI-registered contract reached only through a primary ctor is no
+      // longer reported as having no dependents.
+      fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'Contracts.cs'),
+        `namespace App;
+public interface IRepo { }
+public class ICache { }
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'OrderService.cs'),
+        `namespace App;
+public sealed class OrderService(IRepo repo, [FromKeyedServices("primary")] ICache cache)
+{
+  public void Run() { }
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const svc = cg.getNodesByKind('class').find((n) => n.name === 'OrderService');
+      expect(svc).toBeDefined();
+      // The class itself must index (it used to vanish under the old grammar).
+      const out = cg.getOutgoingEdges(svc!.id).filter((e) => e.kind === 'references');
+      const depNames = out.map((e) => cg.getNode(e.target)?.name);
+      expect(depNames).toContain('IRepo');
+      expect(depNames).toContain('ICache'); // the keyed-DI ([FromKeyedServices]) dependency
     });
 
     it('Go: leaves stdlib calls (fmt.Println, etc.) external', async () => {
@@ -1773,6 +1916,1082 @@ func main() {
       } finally {
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('PHP Include Resolution', () => {
+    it('isPhpIncludePathRef distinguishes include paths from namespace use (#660)', () => {
+      const mk = (name: string, over: Partial<UnresolvedRef> = {}): UnresolvedRef => ({
+        fromNodeId: 'f', referenceName: name, referenceKind: 'imports',
+        line: 1, column: 0, filePath: 'x.php', language: 'php', ...over,
+      });
+      // include paths: contain a slash or a file extension
+      expect(isPhpIncludePathRef(mk('lib.php'))).toBe(true);
+      expect(isPhpIncludePathRef(mk('inc/db.php'))).toBe(true);
+      expect(isPhpIncludePathRef(mk('../config.php'))).toBe(true);
+      // namespace use symbols: a bare class (Closure) or FQN — never a path,
+      // so they must NOT be treated as includes (would mis-connect to a
+      // same-named Closure.php / Bar.php file).
+      expect(isPhpIncludePathRef(mk('Closure'))).toBe(false);
+      expect(isPhpIncludePathRef(mk('PDO'))).toBe(false);
+      expect(isPhpIncludePathRef(mk('App\\Foo\\Bar'))).toBe(false);
+      // scoped to PHP imports only
+      expect(isPhpIncludePathRef(mk('lib.php', { language: 'c' }))).toBe(false);
+      expect(isPhpIncludePathRef(mk('lib.php', { referenceKind: 'calls' }))).toBe(false);
+    });
+
+    it('resolves require_once to a file→file imports edge (#660)', async () => {
+      const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-php-e2e-'));
+      try {
+        fs.mkdirSync(path.join(tempProject, 'src'), { recursive: true });
+        fs.writeFileSync(
+          path.join(tempProject, 'src', 'lib.php'),
+          `<?php\nfunction greet() { return "hi"; }\n`
+        );
+        fs.writeFileSync(
+          path.join(tempProject, 'src', 'page.php'),
+          `<?php\nrequire_once("lib.php");\necho greet();\n`
+        );
+
+        cg = await CodeGraph.init(tempProject, { index: true });
+
+        // reporter's repro: page.php's `require_once("lib.php")` must resolve
+        // to the real src/lib.php file node — a file→file `imports` edge, so
+        // callers(lib.php) now includes page.php.
+        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        const rows = db.getDb().prepare(`
+          select dst.kind as dstKind, dst.file_path as dstPath
+          from edges e
+          join nodes src on e.source = src.id
+          join nodes dst on e.target = dst.id
+          where e.kind = 'imports'
+            and src.kind = 'file'
+            and src.file_path = 'src/page.php'
+        `).all() as Array<{ dstKind: string; dstPath: string }>;
+        const resolved = rows.find(
+          (r) => r.dstKind === 'file' && r.dstPath === 'src/lib.php'
+        );
+        expect(resolved, 'page.php → src/lib.php imports edge missing').toBeDefined();
+      } finally {
+        fs.rmSync(tempProject, { recursive: true, force: true });
+      }
+    });
+
+    it('resolves a subdirectory include path to the correct file (#660)', async () => {
+      const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-php-subdir-'));
+      try {
+        fs.mkdirSync(path.join(tempProject, 'inc'), { recursive: true });
+        fs.writeFileSync(
+          path.join(tempProject, 'inc', 'db.php'),
+          `<?php\nfunction query() { return 1; }\n`
+        );
+        fs.writeFileSync(
+          path.join(tempProject, 'index.php'),
+          `<?php\nrequire "inc/db.php";\nquery();\n`
+        );
+
+        cg = await CodeGraph.init(tempProject, { index: true });
+
+        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        const rows = db.getDb().prepare(`
+          select dst.kind as dstKind, dst.file_path as dstPath
+          from edges e
+          join nodes src on e.source = src.id
+          join nodes dst on e.target = dst.id
+          where e.kind = 'imports'
+            and src.kind = 'file'
+            and src.file_path = 'index.php'
+        `).all() as Array<{ dstKind: string; dstPath: string }>;
+        expect(
+          rows.find((r) => r.dstKind === 'file' && r.dstPath === 'inc/db.php'),
+          'index.php → inc/db.php imports edge missing'
+        ).toBeDefined();
+      } finally {
+        fs.rmSync(tempProject, { recursive: true, force: true });
+      }
+    });
+
+    it('does not mis-connect an unresolvable include to a same-named file elsewhere (#660)', async () => {
+      const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-php-misresolve-'));
+      try {
+        // app/page.php's `require "inc/db.php"` resolves relative to app/, where
+        // inc/db.php does NOT exist. A same-named lib/inc/db.php exists elsewhere
+        // but is unrelated — no edge should be created (a wrong edge is worse
+        // than a missing one).
+        fs.mkdirSync(path.join(tempProject, 'app'), { recursive: true });
+        fs.mkdirSync(path.join(tempProject, 'lib', 'inc'), { recursive: true });
+        fs.writeFileSync(
+          path.join(tempProject, 'lib', 'inc', 'db.php'),
+          `<?php\nfunction unrelated() {}\n`
+        );
+        fs.writeFileSync(
+          path.join(tempProject, 'app', 'page.php'),
+          `<?php\nrequire "inc/db.php";\n`
+        );
+
+        cg = await CodeGraph.init(tempProject, { index: true });
+
+        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        const rows = db.getDb().prepare(`
+          select dst.kind as dstKind, dst.file_path as dstPath
+          from edges e
+          join nodes src on e.source = src.id
+          join nodes dst on e.target = dst.id
+          where e.kind = 'imports'
+            and src.kind = 'file'
+            and src.file_path = 'app/page.php'
+        `).all() as Array<{ dstKind: string; dstPath: string }>;
+        expect(
+          rows.find((r) => r.dstKind === 'file' && r.dstPath === 'lib/inc/db.php'),
+          'app/page.php must NOT mis-connect to unrelated lib/inc/db.php'
+        ).toBeUndefined();
+      } finally {
+        fs.rmSync(tempProject, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('C++ chained-call receiver resolution (#645)', () => {
+    async function indexCpp(files: Record<string, string>): Promise<void> {
+      for (const [name, content] of Object.entries(files)) {
+        fs.writeFileSync(path.join(tempDir, name), content);
+      }
+      cg = await CodeGraph.init(tempDir, { index: true });
+    }
+
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves singleton chains and auto locals to the right class, never the first-sorted one', async () => {
+      // Two classes share writeLog; Logger sorts first so it wins any name-only
+      // tie. All three call forms target Metrics.
+      await indexCpp({
+        'logger.hpp': `#pragma once
+#include <string>
+class Logger  { public: static Logger&  instance(); void writeLog(const std::string&); };
+class Metrics { public: static Metrics& instance(); void writeLog(const std::string&); };
+`,
+        'impl.cpp': `#include "logger.hpp"
+Logger&  Logger::instance()  { static Logger l;  return l; }
+Metrics& Metrics::instance() { static Metrics m; return m; }
+void Logger::writeLog(const std::string&)  {}
+void Metrics::writeLog(const std::string&) {}
+`,
+        'app.cpp': `#include "logger.hpp"
+void a() { Metrics::instance().writeLog("x"); }              // chained singleton
+void b() { auto& m = Metrics::instance(); m.writeLog("x"); } // stored in auto
+void c() { Metrics& m = Metrics::instance(); m.writeLog("x"); } // explicit type
+`,
+      });
+
+      expect(callerNamesOf('Metrics::writeLog')).toEqual(['a', 'b', 'c']);
+      expect(callerNamesOf('Logger::writeLog')).toEqual([]);
+    });
+
+    it('resolves factories, free-function factories, and member chains via the inner call return type', async () => {
+      await indexCpp({
+        'types.hpp': `#pragma once
+#include <memory>
+struct Widget { void draw(); };
+struct Session { void run(); };
+struct View { void render(); };
+class WidgetFactory { public: static Widget create(); };
+class Manager { public: View view(); };
+Session* openSession();
+// Decoy that sorts first and has all three methods — must never win.
+struct Aaa { void draw(); void run(); void render(); };
+`,
+        'impl.cpp': `#include "types.hpp"
+void Widget::draw() {}
+void Session::run() {}
+void View::render() {}
+void Aaa::draw() {}
+void Aaa::run() {}
+void Aaa::render() {}
+Widget WidgetFactory::create() { return Widget(); }
+View Manager::view() { return View(); }
+Session* openSession() { return nullptr; }
+`,
+        'app.cpp': `#include "types.hpp"
+void factory()     { WidgetFactory::create().draw(); }   // -> Widget::draw
+void freefunc()    { openSession()->run(); }             // -> Session::run
+void member()      { Manager mgr; mgr.view().render(); }  // -> View::render
+void makeUnique()  { auto w = std::make_unique<Widget>(); w->draw(); } // -> Widget::draw
+`,
+      });
+
+      expect(callerNamesOf('Widget::draw')).toEqual(['factory', 'makeUnique']);
+      expect(callerNamesOf('Session::run')).toEqual(['freefunc']);
+      expect(callerNamesOf('View::render')).toEqual(['member']);
+      // The first-sorted decoy never captures any of them.
+      expect(callerNamesOf('Aaa::draw')).toEqual([]);
+      expect(callerNamesOf('Aaa::run')).toEqual([]);
+      expect(callerNamesOf('Aaa::render')).toEqual([]);
+    });
+
+    it('creates NO edge when the inferred type lacks the method (silent miss, not a wrong edge)', async () => {
+      await indexCpp({
+        'types.hpp': `#pragma once
+struct Widget { void draw(); };
+struct Other  { void onlyOther(); };
+class WidgetFactory { public: static Widget create(); };
+`,
+        'impl.cpp': `#include "types.hpp"
+void Widget::draw() {}
+void Other::onlyOther() {}
+Widget WidgetFactory::create() { return Widget(); }
+`,
+        'app.cpp': `#include "types.hpp"
+// Widget has no onlyOther() — must produce NO edge, never a wrong one to Other.
+void wrong() { WidgetFactory::create().onlyOther(); }
+`,
+      });
+
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
+  describe('PHP chained static-factory call resolution (#608)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Cls::for($x)->method() via the factory\'s `: self` return (#608)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'ApiClient.php'),
+        `<?php\nclass ApiClient {\n    public static function for(string $c): self { return new self; }\n    public function createOrder(array $p): array { return []; }\n}\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'DispatchOrder.php'),
+        `<?php\nclass DispatchOrder {\n    public function handle(): void {\n        ApiClient::for('cred')->createOrder([]);\n    }\n}\n`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // The chained call's edge attaches to the factory result's method.
+      expect(callerNamesOf('ApiClient::createOrder')).toContain('handle');
+    });
+
+    it('creates NO edge when the factory result lacks the method (#608)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'lib.php'),
+        `<?php\nclass ApiClient { public static function for(string $c): self { return new self; } }\nclass Other { public function onlyOther(): void {} }\nclass Caller { public function go(): void { ApiClient::for('x')->onlyOther(); } }\n`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // ApiClient has no onlyOther — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
+  describe('Java chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo.getInstance().bar() via the factory return type, never a same-named decoy', async () => {
+      // Aaa sorts first and has a same-named bar() — it must never win the chain.
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Aaa { void bar() {} }
+class Foo {
+    static Foo getInstance() { return new Foo(); }
+    void bar() {}
+}
+class Caller {
+    void run() { Foo.getInstance().bar(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::bar')).toEqual(['run']);
+      expect(callerNamesOf('Aaa::bar')).toEqual([]);
+    });
+
+    it('resolves a factory chain that passes arguments — Foo.create(cfg).build()', async () => {
+      // The factory call carries an argument; the extractor must normalize the
+      // receiver to empty parens (`Foo.create().build`) so the chain still splits.
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Config {}
+class Foo {
+    static Foo create(Config c) { return new Foo(); }
+    void build() {}
+}
+class Caller {
+    void run() { Foo.create(new Config()).build(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::build')).toEqual(['run']);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss, not a wrong edge)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Foo {
+    static Foo getInstance() { return new Foo(); }
+}
+class Other { void onlyOther() {} }
+class Caller {
+    void run() { Foo.getInstance().onlyOther(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
+  describe('Kotlin chained companion-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo.getInstance().bar() via the companion return type, never a same-named decoy', async () => {
+      // Aaa sorts first and has a same-named bar() — without the chain fix Kotlin
+      // dropped the receiver to a bare `bar` and attached to Aaa (a wrong edge).
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.kt'),
+        `class Aaa { fun bar() {} }
+class Foo {
+    companion object {
+        fun getInstance(): Foo = Foo()
+    }
+    fun bar() {}
+}
+class Caller {
+    fun run() { Foo.getInstance().bar() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::bar')).toEqual(['run']);
+      expect(callerNamesOf('Aaa::bar')).toEqual([]);
+    });
+
+    it('resolves a companion factory chain that passes arguments — Foo.create(cfg).build()', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.kt'),
+        `class Config
+class Foo {
+    companion object {
+        fun create(c: Config): Foo = Foo()
+    }
+    fun build() {}
+}
+class Caller {
+    fun run() { Foo.create(Config()).build() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::build')).toEqual(['run']);
+    });
+
+    it('creates NO edge when the companion return type lacks the method (silent miss, not a wrong edge)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.kt'),
+        `class Foo {
+    companion object {
+        fun getInstance(): Foo = Foo()
+    }
+}
+class Other { fun onlyOther() {} }
+class Caller {
+    fun run() { Foo.getInstance().onlyOther() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
+  describe('C# chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo.Create().Bar() via the factory return type, never a same-named decoy', async () => {
+      // Aaa sorts first and has a same-named Bar() — it must never win the chain.
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.cs'),
+        `class Aaa { void Bar() {} }
+class Foo {
+    static Foo Create() { return new Foo(); }
+    void Bar() {}
+}
+class Caller {
+    void Run() { Foo.Create().Bar(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::Bar')).toEqual(['Run']);
+      expect(callerNamesOf('Aaa::Bar')).toEqual([]);
+    });
+
+    it('resolves a factory chain that passes arguments — Foo.Make(cfg).Build()', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.cs'),
+        `class Config {}
+class Foo {
+    static Foo Make(Config c) { return new Foo(); }
+    void Build() {}
+}
+class Caller {
+    void Run() { Foo.Make(new Config()).Build(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::Build')).toEqual(['Run']);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss, not a wrong edge)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.cs'),
+        `class Foo {
+    static Foo Create() { return new Foo(); }
+}
+class Other { void OnlyOther() {} }
+class Caller {
+    void Run() { Foo.Create().OnlyOther(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no OnlyOther() — must not mis-attach to the same-named Other::OnlyOther.
+      expect(callerNamesOf('Other::OnlyOther')).toEqual([]);
+    });
+  });
+
+  describe('Swift chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo.make().draw() via the factory return type, never a same-named decoy', async () => {
+      // Aaa sorts first and has a same-named draw() — without the fix Swift dropped
+      // the receiver to a bare `draw` and attached to Aaa (a wrong edge).
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.swift'),
+        `class Aaa { func draw() {} }
+class Foo {
+    static func make() -> Foo { return Foo() }
+    func draw() {}
+}
+func runCaller() { Foo.make().draw() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::draw')).toEqual(['runCaller']);
+      expect(callerNamesOf('Aaa::draw')).toEqual([]);
+    });
+
+    it('resolves a constructor chain Foo().draw() and an args factory chain Foo.build(c).render()', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.swift'),
+        `class Config {}
+class Foo {
+    static func build(_ c: Config) -> Foo { return Foo() }
+    func draw() {}
+    func render() {}
+}
+func runCaller() {
+    Foo().draw()
+    Foo.build(Config()).render()
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::draw')).toEqual(['runCaller']);
+      expect(callerNamesOf('Foo::render')).toEqual(['runCaller']);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss, not a wrong edge)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.swift'),
+        `class Foo {
+    static func make() -> Foo { return Foo() }
+}
+class Other { func onlyOther() {} }
+func runCaller() { Foo.make().onlyOther() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
+  describe('Chained call resolves a method on a supertype (conformance, #750)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves a chained method defined only on a SUPERCLASS the return type extends', async () => {
+      // draw() lives on Base; Widget (the factory's return type) has no draw() of
+      // its own. Decoy.draw must never win. Needs the conformance second pass.
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Base { void draw() {} }
+class Widget extends Base {}
+class Decoy { void draw() {} }
+class Factory { static Widget create() { return new Widget(); } }
+class Caller {
+    void run() { Factory.create().draw(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Base::draw')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::draw')).toEqual([]);
+    });
+
+    it('resolves a chained method defined on an INTERFACE the return type implements (default method)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `interface Drawable { default void draw() {} }
+class Widget implements Drawable {}
+class Decoy { void draw() {} }
+class Factory { static Widget create() { return new Widget(); } }
+class Caller {
+    void run() { Factory.create().draw(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Drawable::draw')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::draw')).toEqual([]);
+    });
+
+    it('still creates NO edge when no supertype has the method (safety preserved)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Base {}
+class Widget extends Base {}
+class Other { void onlyOther() {} }
+class Factory { static Widget create() { return new Widget(); } }
+class Caller {
+    void run() { Factory.create().onlyOther(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Neither Widget nor Base has onlyOther() — must not attach to Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
+  describe('Rust chained associated-function call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo::new().bar() (and a Self return) via the associated fn, never a same-named decoy', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.rs'),
+        `struct Aaa { _x: i32 }
+impl Aaa { fn bar(&self) {} }
+struct Foo { _x: i32 }
+impl Foo {
+    fn new() -> Foo { Foo { _x: 0 } }
+    fn make() -> Self { Foo { _x: 0 } }
+    fn bar(&self) {}
+}
+fn caller() {
+    Foo::new().bar();
+    Foo::make().bar();
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::bar')).toEqual(['caller']);
+      expect(callerNamesOf('Aaa::bar')).toEqual([]);
+    });
+
+    it('resolves a chain that passes arguments — Foo::with(c).build()', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.rs'),
+        `struct Config;
+struct Foo { _x: i32 }
+impl Foo {
+    fn with(c: Config) -> Foo { Foo { _x: 0 } }
+    fn build(&self) {}
+}
+fn caller() { Foo::with(Config).build(); }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::build')).toEqual(['caller']);
+    });
+
+    it('resolves a chained method from a trait the type implements (default method, via conformance)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.rs'),
+        `struct Foo { _x: i32 }
+impl Foo { fn new() -> Foo { Foo { _x: 0 } } }
+struct Decoy { _x: i32 }
+impl Decoy { fn draw(&self) {} }
+trait Drawable { fn draw(&self) {} }
+impl Drawable for Foo {}
+fn caller() { Foo::new().draw(); }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Drawable::draw')).toEqual(['caller']);
+      expect(callerNamesOf('Decoy::draw')).toEqual([]);
+    });
+
+    it('creates NO edge when neither the type nor a supertype has the method (silent miss)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.rs'),
+        `struct Foo { _x: i32 }
+impl Foo { fn new() -> Foo { Foo { _x: 0 } } }
+struct Other { _x: i32 }
+impl Other { fn only_other(&self) {} }
+fn caller() { Foo::new().only_other(); }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no only_other() — must not mis-attach to the same-named Other::only_other.
+      expect(callerNamesOf('Other::only_other')).toEqual([]);
+    });
+  });
+
+  describe('Go chained factory-function call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves New().Bar() via the factory return type (pointer), never a same-named decoy', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.go'),
+        `package main
+type Aaa struct{}
+func (a *Aaa) Bar() {}
+type Foo struct{}
+func New() *Foo { return &Foo{} }
+func (f *Foo) Bar() {}
+func caller() { New().Bar() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::Bar')).toEqual(['caller']);
+      expect(callerNamesOf('Aaa::Bar')).toEqual([]);
+    });
+
+    it('resolves an args chain and a multi-return factory — With(c).Build(), (*Foo, error)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.go'),
+        `package main
+type Config struct{}
+type Foo struct{}
+func With(c Config) (*Foo, error) { return &Foo{}, nil }
+func (f *Foo) Build() {}
+func caller() { With(Config{}).Build() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::Build')).toEqual(['caller']);
+    });
+
+    it('resolves a method provided by an embedded struct (via conformance)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.go'),
+        `package main
+type Base struct{}
+func (b *Base) Embedded() {}
+type Decoy struct{}
+func (d *Decoy) Embedded() {}
+type Widget struct{ Base }
+func NewWidget() *Widget { return &Widget{} }
+func caller() { NewWidget().Embedded() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Base::Embedded')).toEqual(['caller']);
+      expect(callerNamesOf('Decoy::Embedded')).toEqual([]);
+    });
+
+    it('creates NO edge when neither the type nor an embedded type has the method (silent miss)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.go'),
+        `package main
+type Foo struct{}
+func New() *Foo { return &Foo{} }
+type Other struct{}
+func (o *Other) OnlyOther() {}
+func caller() { New().OnlyOther() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no OnlyOther() — must not mis-attach to the same-named Other::OnlyOther.
+      expect(callerNamesOf('Other::OnlyOther')).toEqual([]);
+    });
+
+    it('falls back to bare-name resolution for a VARIABLE-inner chain without exploding the graph', async () => {
+      // `engine` is a package-level VARIABLE holding a func value, not a factory
+      // FUNCTION — so its return type can't be recovered and the chain falls back
+      // to bare-name resolution of the method (restoring the pre-re-encoding edge).
+      // Regression for the runaway this fallback originally caused: it resolved
+      // with a mutated `original.referenceName` (the bare `ServeHTTP`, not the
+      // stored `engine().ServeHTTP`), so the batched resolver's keyed delete
+      // no-oped, the offset-0 batch never drained, and edges inserted forever
+      // (5M edges / 1.4 GB on a 99-file repo). The fallback now ties the match to
+      // the original ref, and a non-progress guard backstops the loop.
+      fs.writeFileSync(
+        path.join(tempDir, 'main.go'),
+        `package main
+type Server struct{}
+func (s *Server) ServeHTTP() {}
+var engine = func() *Server { return &Server{} }
+func caller() { engine().ServeHTTP() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Recall: the variable-inner chain still finds the method by bare name.
+      expect(callerNamesOf('Server::ServeHTTP')).toEqual(['caller']);
+      // No runaway: a single call site yields a single edge, not millions.
+      const target = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'Server::ServeHTTP')!;
+      const rawCalls = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls');
+      expect(rawCalls.length).toBeLessThan(5);
+    });
+  });
+
+  describe('Scala chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves a companion-factory chain Foo.create().doIt() to the return type, never a same-named decoy', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.scala'),
+        `object Foo {
+  def create(): Bar = new Bar()
+}
+class Bar {
+  def doIt(): Unit = {}
+}
+class Decoy {
+  def doIt(): Unit = {}
+}
+object Main {
+  def run(): Unit = { Foo.create().doIt() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Bar::doIt')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::doIt')).toEqual([]);
+    });
+
+    it('resolves a case-class apply construction Point(x).dist() on the constructed class', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.scala'),
+        `class Point(x: Int) {
+  def dist(): Int = x
+}
+class Other {
+  def dist(): Int = 0
+}
+object Main {
+  def run(): Unit = { Point(3).dist() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Point::dist')).toEqual(['run']);
+      expect(callerNamesOf('Other::dist')).toEqual([]);
+    });
+
+    it('resolves a chained method provided by a trait the return type extends (via conformance)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.scala'),
+        `trait Base {
+  def shared(): Unit = {}
+}
+class Widget extends Base
+class Decoy {
+  def shared(): Unit = {}
+}
+object Factory {
+  def make(): Widget = new Widget()
+}
+object Main {
+  def run(): Unit = { Factory.make().shared() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Base::shared')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::shared')).toEqual([]);
+    });
+
+    it('creates NO edge when neither the factory return type nor a supertype has the method (silent miss)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.scala'),
+        `object Foo {
+  def create(): Bar = new Bar()
+}
+class Bar {
+}
+class Other {
+  def onlyOther(): Unit = {}
+}
+object Main {
+  def run(): Unit = { Foo.create().onlyOther() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Bar has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
+  describe('Dart chained static-factory / factory-constructor call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves a static-factory chain Foo.makeBar().doIt() to the return type, never a same-named decoy', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.dart'),
+        `class Foo {
+  static Bar makeBar() => Bar();
+}
+class Bar {
+  void doIt() {}
+}
+class Decoy {
+  void doIt() {}
+}
+void run() {
+  Foo.makeBar().doIt();
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Bar::doIt')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::doIt')).toEqual([]);
+    });
+
+    it('resolves a named factory-constructor chain Foo.create().ship() on the constructed class', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.dart'),
+        `class Foo {
+  Foo._();
+  factory Foo.create() => Foo._();
+  void ship() {}
+}
+class Decoy {
+  void ship() {}
+}
+void run() {
+  Foo.create().ship();
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // The factory constructor `Foo.create` is now a node whose return type is Foo,
+      // so `ship` resolves on Foo, not the same-named Decoy.
+      expect(callerNamesOf('Foo::ship')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::ship')).toEqual([]);
+    });
+
+    it('resolves a constructor-receiver chain Bar().doIt() on the constructed class', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.dart'),
+        `class Bar {
+  void doIt() {}
+}
+class Decoy {
+  void doIt() {}
+}
+void run() {
+  Bar().doIt();
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Bar::doIt')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::doIt')).toEqual([]);
+    });
+
+    it('resolves a chained method inherited from a superclass the return type extends (via conformance)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.dart'),
+        `class Base {
+  void render() {}
+}
+class Widget extends Base {
+  static Widget make() => Widget();
+}
+class Decoy {
+  void render() {}
+}
+void run() {
+  Widget.make().render();
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Base::render')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::render')).toEqual([]);
+    });
+
+    it('creates NO edge when neither the factory return type nor a supertype has the method (silent miss)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.dart'),
+        `class Foo {
+  static Bar makeBar() => Bar();
+}
+class Bar {
+}
+class Other {
+  void onlyOther() {}
+}
+void run() {
+  Foo.makeBar().onlyOther();
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Bar has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+
+    it('still extracts a method tree-sitter misparses as a constructor (@override + record return)', async () => {
+      // tree-sitter-dart misparses `@override (A, B) reduce()` — the annotation
+      // swallows the record return type, so `reduce()` looks like a single-
+      // identifier constructor_signature. It must NOT be skipped as an unnamed
+      // ctor (its name doesn't match the class); its body call must attribute to
+      // `reduce`, not the class.
+      fs.writeFileSync(
+        path.join(tempDir, 'main.dart'),
+        `class Base {}
+class Action extends Base {
+  Action({required int x});
+  @override
+  (int, String) reduce() {
+    return (compute(), "y");
+  }
+  int compute() => 1;
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // reduce must be a node and its body call must resolve to Action::compute.
+      expect(callerNamesOf('Action::compute')).toEqual(['reduce']);
+    });
+
+    it('keeps plain construction Foo() as instantiation, not a Foo::Foo method call', async () => {
+      // The unnamed constructor is intentionally NOT extracted as a `Foo::Foo`
+      // method, so `Foo(...)` resolves to the class (an `instantiates` edge),
+      // never hijacked into a call to a phantom constructor method.
+      fs.writeFileSync(
+        path.join(tempDir, 'main.dart'),
+        `class Widget {
+  final int x;
+  Widget(this.x);
+}
+void run() {
+  Widget(3);
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // No Foo::Foo phantom method node.
+      expect(cg.getNodesByKind('method').some((n) => n.qualifiedName === 'Widget::Widget')).toBe(false);
+      // The construction resolves to the class as an `instantiates` edge.
+      const widget = cg.getNodesByKind('class').find((n) => n.name === 'Widget')!;
+      const incoming = cg.getIncomingEdges(widget.id);
+      expect(incoming.some((e) => e.kind === 'instantiates')).toBe(true);
     });
   });
 });

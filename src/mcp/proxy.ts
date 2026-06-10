@@ -21,7 +21,8 @@
 import * as fs from 'fs';
 import * as net from 'net';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
-import { DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
+import { DaemonClientHello, DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
+import { supervisionLostReason } from './ppid-watchdog';
 import { CodeGraphPackageVersion } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
@@ -30,6 +31,26 @@ import type { MCPEngine } from './engine';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
 const DEFAULT_PPID_POLL_MS = 5000;
+
+/**
+ * Env var that opts INTO the "attached to shared daemon" log line. Off by
+ * default: the line is benign INFO, but MCP hosts render any server stderr at
+ * error level (and append an `undefined` data field), so on every session start
+ * a healthy attach showed up as `[error] … undefined`. Set to `1` to surface it
+ * when debugging daemon attach. (#618; approach from #640 by @mturac)
+ */
+const LOG_ATTACH_ENV = 'CODEGRAPH_MCP_LOG_ATTACH';
+
+/**
+ * Log a successful daemon attach — gated behind {@link LOG_ATTACH_ENV} so it is
+ * silent by default (see #618). Exported for tests.
+ */
+export function logAttachedDaemon(socketPath: string, hello: DaemonHello): void {
+  if (process.env[LOG_ATTACH_ENV] !== '1') return;
+  process.stderr.write(
+    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
+  );
+}
 
 export interface ProxyResult {
   /**
@@ -88,10 +109,9 @@ export async function runProxy(
     return { outcome: 'fallback-needed', reason: 'version mismatch' };
   }
 
-  process.stderr.write(
-    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
-  );
+  logAttachedDaemon(socketPath, hello);
 
+  sendClientHello(socket);
   startPpidWatchdog(socket);
   await pipeUntilClose(socket);
   // Host disconnected (or the daemon went away). The proxy's only job is the
@@ -128,10 +148,27 @@ export async function connectWithHello(
     socket.destroy();
     return 'version-mismatch';
   }
-  process.stderr.write(
-    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
-  );
+  logAttachedDaemon(socketPath, hello);
+  sendClientHello(socket);
   return socket;
+}
+
+/**
+ * Tell the daemon our pids right after we verify its hello, so its liveness
+ * sweep can reap this client if our process dies without the socket ever
+ * signalling close (the Windows named-pipe hazard behind #692). Best-effort:
+ * sent before any piped bytes so it's always the daemon's first line from us,
+ * and a write failure here is harmless (the daemon just falls back to the
+ * socket-close lifecycle). `hostPid` mirrors the PPID watchdog: the threaded
+ * host pid if set, else our own parent (the host, on a no-relaunch bundle).
+ */
+function sendClientHello(socket: net.Socket): void {
+  const clientHello: DaemonClientHello = {
+    codegraph_client: 1,
+    pid: process.pid,
+    hostPid: parseHostPpid(process.env[HOST_PPID_ENV]) ?? process.ppid,
+  };
+  try { socket.write(JSON.stringify(clientHello) + '\n'); } catch { /* best-effort */ }
 }
 
 type JsonRpc = Record<string, unknown>;
@@ -170,6 +207,19 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let engine: MCPEngine | null = null;
   let engineReady: Promise<void> | null = null;
   let shuttingDown = false;
+  // Requests forwarded to the daemon and not yet answered, keyed by JSON-RPC id.
+  // If the daemon dies mid-session (#662 — e.g. an MCP host SIGTERM's it when a
+  // new session starts), these would otherwise hang forever; we re-serve them
+  // in-process so the host always gets a reply.
+  const inflight = new Map<unknown, string>();
+  const trackInflight = (line: string): void => {
+    try {
+      const m = JSON.parse(line) as JsonRpc;
+      if (m && m.id !== undefined && typeof m.method === 'string' && m.method !== 'initialize') {
+        inflight.set(m.id, line);
+      }
+    } catch { /* unparseable — nothing we could re-serve anyway */ }
+  };
 
   const writeClient = (obj: JsonRpc | string): void => {
     try { process.stdout.write((typeof obj === 'string' ? obj : JSON.stringify(obj)) + '\n'); } catch { /* host gone */ }
@@ -200,11 +250,16 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       }
     } else if (msg.method === 'ping' && id !== undefined) {
       writeClient({ jsonrpc: '2.0', id, result: {} });
+    } else if (id !== undefined && msg.method !== 'initialize') {
+      // A request we can't serve in-process (and the daemon is gone) — answer
+      // with an error rather than let the host hang on a reply that won't come.
+      writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: 'CodeGraph daemon unavailable' } });
     }
     // initialize already answered locally; notifications (initialized) need no reply.
   };
   const routeToDaemon = (line: string): void => {
     if (daemonStatus === 'ready' && daemonSocket) {
+      trackInflight(line);
       try { daemonSocket.write(line.endsWith('\n') ? line : line + '\n'); } catch { /* close path */ }
     } else if (daemonStatus === 'failed') {
       void handleLocally(line);
@@ -263,15 +318,37 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         const line = sockBuf.slice(0, idx);
         sockBuf = sockBuf.slice(idx + 1);
         if (!line.trim()) continue;
-        if (clientInitId !== undefined) {
-          try { const m = JSON.parse(line) as JsonRpc; if (m.id === clientInitId && ('result' in m || 'error' in m)) continue; } catch { /* relay */ }
+        let resp: JsonRpc | null = null;
+        try { resp = JSON.parse(line) as JsonRpc; } catch { /* not JSON — relay verbatim */ }
+        if (resp && resp.id !== undefined && ('result' in resp || 'error' in resp)) {
+          inflight.delete(resp.id); // answered — no longer in flight
+          // Suppress the daemon's reply to the initialize we forwarded to prime it
+          // (the client already got the local handshake response).
+          if (clientInitId !== undefined && resp.id === clientInitId) continue;
         }
         writeClient(line);
       }
     });
-    socket.on('close', shutdown);
-    socket.on('error', shutdown);
-    for (const line of pending) { try { socket.write(line + '\n'); } catch { /* ignore */ } }
+    // The daemon going away does NOT end the session (#662). An MCP host can
+    // SIGTERM the shared daemon when another session starts; if we exited here,
+    // this host would silently lose CodeGraph and any in-flight request would
+    // hang. Instead, fall back to the in-process engine for the rest of the
+    // session and re-serve whatever the dead daemon never answered.
+    const onDaemonLost = (): void => {
+      if (shuttingDown || daemonStatus !== 'ready') return; // host teardown, or already handled
+      daemonStatus = 'failed';
+      try { daemonSocket?.destroy(); } catch { /* ignore */ }
+      daemonSocket = null;
+      process.stderr.write(
+        `[CodeGraph MCP] Shared daemon connection lost; serving this session in-process (degraded), re-serving ${inflight.size} in-flight request(s).\n`
+      );
+      const orphaned = [...inflight.values()];
+      inflight.clear();
+      for (const line of orphaned) void handleLocally(line);
+    };
+    socket.on('close', onDaemonLost);
+    socket.on('error', onDaemonLost);
+    for (const line of pending) { trackInflight(line); try { socket.write(line + '\n'); } catch { /* ignore */ } }
     pending.length = 0;
   } else if (!shuttingDown) {
     daemonStatus = 'failed';
@@ -292,8 +369,14 @@ function startPpidWatchdogNoSocket(onDeath: () => void): void {
   const originalPpid = process.ppid;
   const hostPpid = parseHostPpid(process.env[HOST_PPID_ENV]);
   const timer = setInterval(() => {
-    if (process.ppid !== originalPpid || (hostPpid !== null && !isProcessAliveLocal(hostPpid))) {
-      process.stderr.write('[CodeGraph MCP] Parent process exited; shutting down.\n');
+    const reason = supervisionLostReason({
+      originalPpid,
+      currentPpid: process.ppid,
+      hostPpid,
+      isAlive: isProcessAliveLocal,
+    });
+    if (reason) {
+      process.stderr.write(`[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`);
       onDeath();
     }
   }, pollMs);
@@ -408,13 +491,13 @@ function startPpidWatchdog(socket: net.Socket): void {
   const originalPpid = process.ppid;
   const hostPpid = parseHostPpid(process.env[HOST_PPID_ENV]);
   const timer = setInterval(() => {
-    const current = process.ppid;
-    const ppidChanged = current !== originalPpid;
-    const hostGone = hostPpid !== null && !isProcessAliveLocal(hostPpid);
-    if (ppidChanged || hostGone) {
-      const reason = ppidChanged
-        ? `ppid ${originalPpid} -> ${current}`
-        : `host pid ${hostPpid} exited`;
+    const reason = supervisionLostReason({
+      originalPpid,
+      currentPpid: process.ppid,
+      hostPpid,
+      isAlive: isProcessAliveLocal,
+    });
+    if (reason) {
       process.stderr.write(`[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`);
       try { socket.destroy(); } catch { /* ignore */ }
       process.exit(0);

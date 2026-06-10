@@ -16,8 +16,8 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs } from './import-resolver';
+import { matchReference, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
@@ -26,6 +26,22 @@ import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packa
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
+
+/** Node kinds that can declare supertypes (extends/implements). */
+const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
+  'class', 'struct', 'interface', 'trait', 'protocol', 'enum',
+]);
+
+/**
+ * Languages whose chained static-factory/fluent calls defer to the conformance
+ * second pass. Dotted-receiver languages resolve via matchDottedCallChain; the
+ * `::`-receiver ones (Rust) via matchScopedCallChain.
+ */
+const CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift', 'rust', 'go', 'scala', 'dart']);
+const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
+
+/** The extractor's chained-receiver encoding: `<inner>().<method>`. */
+const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 
 /**
  * Cache size limits. Each per-resolver cache is bounded so memory
@@ -185,6 +201,12 @@ export class ReferenceResolver {
   private queries: QueryBuilder;
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
+  // Chained static-factory/fluent call refs the first pass couldn't resolve,
+  // collected in-memory (the batched resolver deletes unresolved refs from the
+  // DB, so they can't be re-read). Drained by resolveChainedCallsViaConformance
+  // once implements/extends edges exist, to resolve methods on a supertype the
+  // receiver conforms to (#750).
+  private deferredChainRefs: UnresolvedRef[] = [];
   // Per-`.razor`/`.cshtml`-file `@using` namespace set (own directives + folder
   // `_Imports.razor`, cascading to the project root). Used to disambiguate a
   // markup type ref to the right C# namespace.
@@ -398,6 +420,25 @@ export class ReferenceResolver {
         const result = this.queries.getNodesByLowerName(lowerName);
         this.lowerNameCache.set(lowerName, result);
         return result;
+      },
+
+      getSupertypes: (typeName: string, language) => {
+        // Union the `implements`/`extends` targets of every same-named type node.
+        // Matching by simple name (not id) reconciles a type declared in one node
+        // (`KF::Builder`) with conformance declared in a separate extension node
+        // (`KF.Builder: KFOptionSetter`) — both have name `Builder`.
+        const typeNodes = this.context
+          .getNodesByName(typeName)
+          .filter((n) => SUPERTYPE_BEARING_KINDS.has(n.kind) && n.language === language);
+        if (typeNodes.length === 0) return [];
+        const supertypes = new Set<string>();
+        for (const tn of typeNodes) {
+          for (const edge of this.queries.getOutgoingEdges(tn.id, ['implements', 'extends'])) {
+            const target = this.queries.getNodeById(edge.target);
+            if (target?.name && target.name !== typeName) supertypes.add(target.name);
+          }
+        }
+        return [...supertypes];
       },
 
       getImportMappings: (filePath: string, language) => {
@@ -666,13 +707,37 @@ export class ReferenceResolver {
       candidates.push(importResult);
     }
 
+    // PHP include/require paths resolve to files via import resolution only.
+    // If that didn't find the file, do NOT fall back to the symbol
+    // name-matcher — it would mis-connect e.g. "inc/db.php" to an unrelated
+    // db.php elsewhere in the tree (a wrong edge is worse than none, #660).
+    if (isPhpIncludePathRef(ref)) {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) =>
+            curr.confidence > best.confidence ? curr : best
+          )
+        : null;
+    }
+
     // Strategy 3: Try name matching
     const nameResult = this.gateLanguage(matchReference(ref, this.context), ref);
     if (nameResult) {
       candidates.push(nameResult);
     }
 
-    if (candidates.length === 0) return null;
+    if (candidates.length === 0) {
+      // Defer a chained static-factory/fluent call the first pass couldn't
+      // resolve — its method may live on a supertype the receiver conforms to,
+      // resolvable once implements/extends edges exist (the conformance pass).
+      if (
+        ref.referenceKind === 'calls' &&
+        CHAIN_LANGUAGES.has(ref.language) &&
+        CHAIN_SHAPE.test(ref.referenceName)
+      ) {
+        this.deferredChainRefs.push(ref);
+      }
+      return null;
+    }
 
     // Return highest confidence candidate
     return candidates.reduce((best, curr) =>
@@ -756,6 +821,48 @@ export class ReferenceResolver {
   }
 
   /**
+   * Second resolution pass for chained static-factory / fluent calls whose
+   * chained method is defined on a SUPERTYPE the receiver's type conforms to —
+   * a protocol-extension / inherited / default-interface method (#750). The
+   * first pass can't resolve these because `implements`/`extends` edges aren't
+   * built yet; this runs AFTER edges are persisted, so `context.getSupertypes`
+   * (and the conformance fallback in resolveMethodOnType) can walk them.
+   *
+   * Operates only on the leftover unresolved refs that have the `inner().method`
+   * chain shape, for the dotted-chain languages — a small set — and is idempotent
+   * (re-resolving an already-resolved ref is a no-op since it's been deleted).
+   * Returns the number of newly-created edges.
+   */
+  resolveChainedCallsViaConformance(): number {
+    const deferred = this.deferredChainRefs;
+    this.deferredChainRefs = [];
+    if (deferred.length === 0) return 0;
+
+    // Read fresh edges (the main pass built the implements/extends edges after
+    // these refs were deferred). matchDottedCallChain now resolves a method on a
+    // supertype via context.getSupertypes -> resolveMethodOnType's conformance walk.
+    this.clearCaches();
+    const resolved: ResolvedRef[] = [];
+    for (const ref of deferred) {
+      // `::`-receiver languages (Rust) split on `::` (matchScopedCallChain);
+      // dotted-receiver languages on `.` (matchDottedCallChain).
+      const chainMatch = SCOPED_CHAIN_LANGUAGES.has(ref.language)
+        ? matchScopedCallChain(ref, this.context)
+        : matchDottedCallChain(ref, this.context);
+      const match = this.gateLanguage(chainMatch, ref);
+      if (match) resolved.push(match);
+    }
+    if (resolved.length === 0) return 0;
+
+    const edges = this.createEdges(resolved);
+    if (edges.length > 0) {
+      this.queries.insertEdges(edges);
+      this.clearCaches();
+    }
+    return edges.length;
+  }
+
+  /**
    * Resolve and persist in batches to keep memory bounded.
    * Processes unresolved references in chunks, persisting edges and cleaning
    * up resolved refs after each batch to avoid accumulating large arrays.
@@ -777,6 +884,7 @@ export class ReferenceResolver {
 
     // Process in batches. We always read from offset 0 because resolved refs
     // are deleted after each batch, shifting the remaining rows forward.
+    let prevRemaining = Number.POSITIVE_INFINITY;
     while (true) {
       const batch = this.queries.getUnresolvedReferencesBatch(0, batchSize);
       if (batch.length === 0) break;
@@ -830,6 +938,18 @@ export class ReferenceResolver {
       if (result.resolved.length === 0 && result.unresolved.length === batch.length) {
         break;
       }
+
+      // Non-progress guard (defense-in-depth). Because we re-read from offset 0
+      // each pass, the unresolved_refs table MUST shrink every iteration — both
+      // resolved and unresolved refs are deleted above. If it didn't shrink, a
+      // resolver returned a match whose `original.referenceName` differs from the
+      // stored row, so the keyed delete no-ops, and we'd re-read + re-resolve +
+      // re-insert the same rows forever (the runaway that grew a 99-file repo to
+      // 5M edges / 1.4 GB before the Go-fallback fix). Stop rather than grow the
+      // graph without bound.
+      const remaining = this.queries.getUnresolvedReferencesCount();
+      if (remaining >= prevRemaining) break;
+      prevRemaining = remaining;
     }
 
     // Dynamic-edge synthesis: now that all base `calls` edges are persisted,

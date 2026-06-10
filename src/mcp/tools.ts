@@ -21,12 +21,12 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile } from '../search/query-utils';
+import { isTestFile, normalizeNameToken } from '../search/query-utils';
 import {
   existsSync,
   readFileSync,
 } from 'fs';
-import { clamp, validatePathWithinRoot, validateProjectPath } from '../utils';
+import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { resolve as resolvePath } from 'path';
 
@@ -463,35 +463,48 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_node',
-    description: 'SECONDARY (after codegraph_explore): get ONE symbol in full — its location, signature, callers/callees trail, and verbatim body (includeCode=true). When the name is AMBIGUOUS (an overloaded method, or the same method name on different types), it returns EVERY matching definition\'s full body in a single call — so you never need to Read a file to find the specific overload you want. For a heavily-overloaded name, pass `file` (and/or `line`) to pin the exact definition — e.g. the `file:line` a trail or another tool already showed you. Reach for this when explore trimmed a body you need. Use codegraph_explore for several related symbols or the full flow.',
+    description: 'Two modes. (1) READ A FILE — use INSTEAD of the Read tool: pass `file` (a path or basename) with no `symbol` and it returns that file\'s current on-disk source with line numbers, exactly the shape Read gives you (`<n>\\t<line>`, safe to Edit from), narrowable with `offset`/`limit` just like Read — PLUS a one-line note of which files depend on it. Same bytes as Read, faster (served from the index), with the blast radius attached. Use it whenever you would Read a source file. (2) ONE SYMBOL you can name — its location, signature, verbatim source (includeCode=true) and caller/callee trail in one call, so before changing it you see what calls it and what your edit would break. For an AMBIGUOUS name it returns EVERY matching definition\'s body in one call (so you never Read a file to find the right overload); pass `file`/`line` to pin one. Use codegraph_explore for several related symbols or the full flow.',
     inputSchema: {
       type: 'object',
       properties: {
         symbol: {
           type: 'string',
-          description: 'Name of the symbol to get details for',
+          description: 'Name of the symbol to read (symbol mode). Omit it and pass `file` alone to read a whole file like Read.',
         },
         includeCode: {
           type: 'boolean',
-          description: 'Include full source code (default: false to minimize context)',
+          description: 'Symbol mode: include the symbol\'s full body (default: false). Ignored in file mode, which always returns source unless `symbolsOnly` is set.',
           default: false,
         },
         file: {
           type: 'string',
-          description: 'Optional: disambiguate an overloaded name to the definition in this file (path or basename, e.g. "harness.rs").',
+          description: 'A file path or basename (e.g. "harness.rs", "src/auth/session.ts"). Pass it ALONE (no symbol) to READ the file like the Read tool — its full source with line numbers + which files depend on it. Or pass it WITH a symbol to disambiguate an overloaded name to the definition in this file.',
+        },
+        offset: {
+          type: 'number',
+          description: 'File mode: 1-based line to start reading from, exactly like Read\'s offset. Defaults to the start of the file.',
+        },
+        limit: {
+          type: 'number',
+          description: 'File mode: maximum number of lines to return, exactly like Read\'s limit. Defaults to the whole file (capped at 2000 lines, like Read).',
+        },
+        symbolsOnly: {
+          type: 'boolean',
+          description: 'File mode: return just the file\'s symbol map + dependents (a cheap structural overview) instead of its source.',
+          default: false,
         },
         line: {
           type: 'number',
-          description: 'Optional: disambiguate to the definition at/around this line (use with the file:line a trail showed you).',
+          description: 'Symbol mode only: disambiguate to the definition at/around this line (use with the file:line a trail showed you).',
         },
         projectPath: projectPathProperty,
       },
-      required: ['symbol'],
+      required: [],
     },
   },
   {
     name: 'codegraph_explore',
-    description: 'PRIMARY TOOL — call FIRST for almost any question: how does X work, architecture, a bug, where/what is X, or surveying an area. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — do NOT re-open shown files). Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — answers without further search/node/Read/Grep.',
+    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1648,8 +1661,14 @@ export class ToolHandler {
       // agent writes "DataRequest task validate", the `task`/`validate` it wants
       // are DataRequest's, NOT the same-named overloads in Validation.swift /
       // Concurrency.swift / the abstract base. Used below to bias overloaded
-      // names toward the file/class the query also names.
-      const typeTokens = tokens.filter((o) => /^[A-Z][A-Za-z0-9]{3,}/.test(o));
+      // names toward the file/class the query also names. EXCLUDE the project
+      // name (a PascalCase token a user naturally includes) — it names the whole
+      // repo, so biasing toward it just pulls overloads to whichever stack
+      // embeds it, re-burying the rest (#720).
+      const projectNameTokens = cg.getProjectNameTokens();
+      const typeTokens = tokens.filter(
+        (o) => /^[A-Z][A-Za-z0-9]{3,}/.test(o) && !projectNameTokens.has(normalizeNameToken(o)),
+      );
       const inNamedContext = (n: Node) =>
         typeTokens.some((ct) => {
           const lc = ct.toLowerCase();
@@ -1705,6 +1724,11 @@ export class ToolHandler {
     for (const node of subgraph.nodes.values()) {
       // Skip import/export nodes — they add noise without information
       if (node.kind === 'import' || node.kind === 'export') continue;
+      // SECURITY (#383): never render the on-disk source of a config-leaf
+      // (Spring application.{yml,properties} key) — its line is `key = <secret>`,
+      // so whole-file/cluster rendering here would push secrets into context
+      // unbidden. The key still appears in the flow/symbol listing above.
+      if (isConfigLeafNode(node)) continue;
 
       const group = fileGroups.get(node.filePath) || { nodes: [], score: 0 };
       group.nodes.push(node);
@@ -2517,14 +2541,27 @@ export class ToolHandler {
    * Handle codegraph_node
    */
   private async handleNode(args: Record<string, unknown>): Promise<ToolResult> {
-    const symbol = this.validateString(args.symbol, 'symbol');
-    if (typeof symbol !== 'string') return symbol;
-
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     // Default to false to minimize context usage
     const includeCode = args.includeCode === true;
     const fileHint = typeof args.file === 'string' && args.file.trim() ? args.file.trim() : undefined;
     const lineHint = typeof args.line === 'number' && args.line > 0 ? args.line : undefined;
+    const offset = typeof args.offset === 'number' && args.offset > 0 ? Math.floor(args.offset) : undefined;
+    const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.floor(args.limit) : undefined;
+    const symbolsOnly = args.symbolsOnly === true;
+    const symbolRaw = typeof args.symbol === 'string' ? args.symbol.trim() : '';
+
+    // FILE READ MODE: a `file` with no `symbol` reads that file like the Read
+    // tool — its current on-disk source with line numbers, narrowable with
+    // `offset`/`limit` exactly as Read does — PLUS a one-line blast-radius
+    // header (which files depend on it). `symbolsOnly` returns just the
+    // structural map instead. Backed by the index: same bytes Read gives you.
+    if (!symbolRaw && fileHint) {
+      return this.handleFileView(cg, fileHint, { offset, limit, symbolsOnly });
+    }
+
+    const symbol = this.validateString(args.symbol, 'symbol');
+    if (typeof symbol !== 'string') return symbol;
 
     let matches = this.findSymbolMatches(cg, symbol);
     if (matches.length === 0) {
@@ -2617,6 +2654,149 @@ export class ToolHandler {
       );
     }
     return this.textResult(this.truncateOutput(out.join('\n')));
+  }
+
+  /**
+   * FILE READ MODE: resolve `fileArg` (path or basename) to an indexed file and
+   * read it like the Read tool — its current on-disk source with line numbers,
+   * narrowable with `offset`/`limit` exactly as Read's are — preceded by a
+   * one-line blast-radius header (which files depend on it). `symbolsOnly`
+   * returns just the structural map (symbols + dependents) instead of source.
+   *
+   * Parity goal: the numbered source block is byte-for-byte the shape Read
+   * returns (`<n>\t<line>`, no padding), so the agent treats it as a Read — only
+   * faster (served from the index) and with the blast radius attached. Security:
+   * yaml/properties files are summarized by key, never dumped (#383); reads go
+   * through validatePathWithinRoot (#527).
+   */
+  private async handleFileView(
+    cg: CodeGraph,
+    fileArg: string,
+    opts: { offset?: number; limit?: number; symbolsOnly?: boolean } = {},
+  ): Promise<ToolResult> {
+    const normalize = (p: string) => p.replace(/\\/g, '/').replace(/^(?:\.?\/+)+/, '').replace(/\/+$/, '');
+    const wantLower = normalize(fileArg).toLowerCase();
+    const allFiles = cg.getFiles();
+    if (allFiles.length === 0) return this.textResult('No files indexed. Run `codegraph index` first.');
+
+    let resolved = allFiles.find((f) => f.path.toLowerCase() === wantLower);
+    let candidates: typeof allFiles = [];
+    if (!resolved) {
+      candidates = allFiles.filter((f) => f.path.toLowerCase().endsWith('/' + wantLower));
+      if (candidates.length === 1) resolved = candidates[0];
+    }
+    if (!resolved && candidates.length === 0) {
+      candidates = allFiles.filter((f) => f.path.toLowerCase().includes(wantLower));
+      if (candidates.length === 1) resolved = candidates[0];
+    }
+    if (!resolved && candidates.length > 1) {
+      return this.textResult(
+        [`"${fileArg}" matches ${candidates.length} indexed files — pass a longer path:`, '',
+          ...candidates.slice(0, 25).map((f) => `- ${f.path}`)].join('\n'),
+      );
+    }
+    if (!resolved) {
+      return this.textResult(
+        `No indexed file matches "${fileArg}". Codegraph indexes source files; configs/docs it doesn't parse won't appear — Read those directly.`,
+      );
+    }
+
+    const filePath = resolved.path;
+    const nodes = cg.getNodesInFile(filePath)
+      .filter((n) => n.kind !== 'file' && n.kind !== 'import' && n.kind !== 'export')
+      .sort((a, b) => a.startLine - b.startLine);
+    const dependents = cg.getFileDependents(filePath);
+
+    // Compact, one-line blast radius (codegraph's value-add over a plain Read).
+    const depSummary = dependents.length
+      ? `used by ${dependents.length} file${dependents.length === 1 ? '' : 's'}: ${dependents.slice(0, 8).join(', ')}${dependents.length > 8 ? `, +${dependents.length - 8} more` : ''}`
+      : 'no other indexed file depends on it';
+
+    // Symbol-map renderer — for symbolsOnly, the config fallback, and read errors.
+    const symbolMap = (heading: string, limit = 200): string[] => {
+      const lines: string[] = [heading];
+      for (const n of nodes.slice(0, limit)) {
+        const sig = n.signature ? ` ${n.signature.replace(/\s+/g, ' ').trim()}` : '';
+        lines.push(`- \`${n.name}\` (${n.kind})${sig} — :${n.startLine}`);
+      }
+      if (nodes.length > limit) lines.push(`- … +${nodes.length - limit} more`);
+      return lines;
+    };
+
+    // symbolsOnly → the cheap structural overview, no source.
+    if (opts.symbolsOnly) {
+      const out = [`**${filePath}** — ${nodes.length} symbol${nodes.length === 1 ? '' : 's'}, ${depSummary}`, ''];
+      if (nodes.length) out.push(...symbolMap('### Symbols'));
+      else out.push('_No indexed symbols in this file._');
+      out.push('', '> Drop `symbolsOnly` (or pass `offset`/`limit`) to read the source, like Read.');
+      return this.textResult(this.truncateOutput(out.join('\n')));
+    }
+
+    // SECURITY (#383): never dump a raw config/data file — a yaml/properties
+    // line is `key: <secret>`. Summarize by key and point to a real Read.
+    if (CONFIG_LEAF_LANGUAGES.has(resolved.language)) {
+      const out = [`**${filePath}** — configuration/data file, ${depSummary}`, ''];
+      if (nodes.length) out.push(...symbolMap('### Keys (values withheld for safety)'));
+      out.push('', '> Values may be secrets, so codegraph indexes keys only. Read the file directly if you need a value.');
+      return this.textResult(this.truncateOutput(out.join('\n')));
+    }
+
+    // Read the current bytes from disk through the security chokepoint
+    // (validatePathWithinRoot: blocks `../` traversal and symlink escapes, #527).
+    const abs = validatePathWithinRoot(cg.getProjectRoot(), filePath);
+    let content: string | null = null;
+    if (abs) {
+      try { content = readFileSync(abs, 'utf-8'); } catch { content = null; }
+    }
+    if (content === null) {
+      const out = [`**${filePath}** — could not read from disk (it may have moved since indexing). ${depSummary}`, ''];
+      if (nodes.length) out.push(...symbolMap('### Symbols'));
+      out.push('', `> Read \`${filePath}\` directly for its current content.`);
+      return this.textResult(this.truncateOutput(out.join('\n')));
+    }
+
+    // Split exactly as Read does — keep the trailing empty line a final newline
+    // produces (Read numbers it too), so line numbers line up byte-for-byte.
+    const fileLines = content.split('\n');
+    const total = fileLines.length;
+
+    // Read-parity windowing: `offset`/`limit` mean exactly what they do on Read
+    // (1-based start line; max line count). Default: the whole file, capped like
+    // Read at 2000 lines and bounded by a char budget that tracks explore's
+    // proven-safe ~38k response ceiling. Overflow is stated explicitly (Read
+    // paginates too) — never the silent 15k truncateOutput chop.
+    const CHAR_BUDGET = 38000;
+    const DEFAULT_LIMIT = 2000;
+    const offset = Math.max(1, opts.offset ?? 1);
+    if (offset > total) {
+      return this.textResult(`**${filePath}** has ${total} line${total === 1 ? '' : 's'} — offset ${offset} is past the end. ${depSummary}`);
+    }
+    const maxLines = Math.max(1, opts.limit ?? DEFAULT_LIMIT);
+    const start = offset - 1; // 0-based
+    const header = `**${filePath}** — ${total} lines, ${nodes.length} symbol${nodes.length === 1 ? '' : 's'} · ${depSummary}`;
+
+    // Numbered lines, byte-for-byte Read's shape: `<n>\t<line>`, no left-pad.
+    const numbered: string[] = [];
+    let used = header.length + 8;
+    let i = start;
+    for (; i < total && numbered.length < maxLines; i++) {
+      const ln = `${i + 1}\t${fileLines[i]}`;
+      if (used + ln.length + 1 > CHAR_BUDGET && numbered.length > 0) break;
+      numbered.push(ln);
+      used += ln.length + 1;
+    }
+    const shownEnd = start + numbered.length;
+    const complete = offset === 1 && shownEnd >= total;
+
+    const out: string[] = [header, '', ...numbered];
+    if (!complete) {
+      out.push(
+        '',
+        `(lines ${offset}–${shownEnd} of ${total} — pass \`offset\`/\`limit\` for another range, or \`codegraph_node <symbol>\` for one symbol in full)`,
+      );
+    }
+    // Self-bounded to CHAR_BUDGET — do NOT route through truncateOutput (15k).
+    return this.textResult(out.join('\n'));
   }
 
   /** Render one symbol: details + (optional) body/outline + its caller/callee trail. */

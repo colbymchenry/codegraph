@@ -2,10 +2,128 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/**
+ * The `function_signature` carrying a method's return type — unwrapped from a
+ * `method_signature` wrapper (Dart nests the signature one level for methods).
+ */
+function dartInnerSignature(node: SyntaxNode): SyntaxNode {
+  if (node.type === 'method_signature') {
+    const inner = node.namedChildren.find((c: SyntaxNode) =>
+      c.type === 'function_signature' || c.type === 'getter_signature' || c.type === 'setter_signature'
+    );
+    if (inner) return inner;
+  }
+  return node;
+}
+
+/**
+ * The factory/named-constructor signature inside a node, if any. A constructor
+ * parses as `method_signature > {factory_,}constructor_signature` (e.g.
+ * `factory Foo.create()` or `Foo._()`), whose children are the class identifier
+ * and — for a named ctor — the constructor-name identifier.
+ */
+function dartConstructorSignature(node: SyntaxNode): SyntaxNode | undefined {
+  if (node.type === 'factory_constructor_signature' || node.type === 'constructor_signature') {
+    return node;
+  }
+  if (node.type === 'method_signature') {
+    return node.namedChildren.find((c: SyntaxNode) =>
+      c.type === 'factory_constructor_signature' || c.type === 'constructor_signature'
+    );
+  }
+  return undefined;
+}
+
+/** The name of the class/mixin/extension/enum lexically enclosing `node`. */
+function dartEnclosingTypeName(node: SyntaxNode): string | undefined {
+  let p = node.parent;
+  while (p) {
+    if (
+      p.type === 'class_definition' || p.type === 'mixin_declaration' ||
+      p.type === 'extension_declaration' || p.type === 'enum_declaration'
+    ) {
+      return p.childForFieldName('name')?.text;
+    }
+    p = p.parent;
+  }
+  return undefined;
+}
+
+/**
+ * Validated constructor info for `node`, or undefined if it isn't genuinely a
+ * constructor. A constructor signature is structurally `<Class>` or
+ * `<Class>.<name>`, but tree-sitter-dart MISPARSES `@override (T) m()` — the
+ * annotation swallows the record return type `(T)`, leaving `m()` looking like a
+ * single-identifier constructor_signature. We disambiguate by the class name:
+ * a real ctor's class identifier matches the enclosing type; a misparsed method
+ * (`reduce` inside class `Action`) doesn't, and is treated as the method it is.
+ */
+function dartCtorInfo(node: SyntaxNode): { className: string; ctorName: string } | undefined {
+  const ctor = dartConstructorSignature(node);
+  if (!ctor) return undefined;
+  const ids = ctor.namedChildren.filter((c: SyntaxNode) => c.type === 'identifier');
+  const className = dartEnclosingTypeName(node);
+  if (!className || !ids[0]) return undefined;
+  if (ids[0].text !== className) return undefined; // misparsed method, not a ctor
+  // `<Class>.<name>` is a named ctor; bare `<Class>` is the unnamed ctor.
+  return { className, ctorName: ids[1]?.text ?? className };
+}
+
+/**
+ * Capture a Dart method/function's declared return type as a bare type name, for
+ * the chained static-factory / fluent call mechanism (#750). `Bar makeBar()`
+ * yields `Bar`; a generic `List<Foo>` yields its container `List` (the method is
+ * on the container, not the element); a prefixed `prefix.Bar` yields `Bar`. A
+ * factory / named constructor returns its enclosing class implicitly, so its
+ * "return type" is the class.
+ */
+function extractDartReturnType(node: SyntaxNode, source: string): string | undefined {
+  const ctor = dartCtorInfo(node);
+  if (ctor) return ctor.className;
+  const sig = dartInnerSignature(node);
+  // The return type precedes the method name; it's the first type_identifier
+  // (generic args sit in a sibling `type_arguments`, so this is the container).
+  const retType = sig.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+  if (!retType) return undefined;
+  const text = getNodeText(retType, source).replace(/<[^>]*>/g, '').trim();
+  const last = text.split('.').pop(); // prefixed `p.Bar` → `Bar`
+  if (!last || !/^[A-Za-z_]\w*$/.test(last)) return undefined;
+  return last;
+}
+
+/**
+ * The callee name of the Dart call whose `argument_part` selector is `argPart`
+ * — mirrors the main extractBareCall accessor logic so a chained receiver
+ * (`Foo.create()` in `Foo.create().bar()`) can be reconstructed. Returns
+ * `Foo.create`, a bare `create`, or `Foo` (constructor) — or undefined.
+ */
+function dartCalleeOfArgPart(argPart: SyntaxNode): string | undefined {
+  const prev = argPart.previousNamedSibling;
+  if (!prev) return undefined;
+  if (prev.type === 'identifier') return prev.text; // bare `Foo()` / `create()`
+  if (prev.type === 'selector') {
+    const accessor = prev.namedChildren.find((c: SyntaxNode) =>
+      c.type === 'unconditional_assignable_selector' || c.type === 'conditional_assignable_selector'
+    );
+    const methodId = accessor?.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    if (methodId) {
+      const accessorPrev = prev.previousNamedSibling;
+      if (accessorPrev?.type === 'identifier') return accessorPrev.text + '.' + methodId.text;
+      return methodId.text;
+    }
+  }
+  return undefined;
+}
+
 export const dartExtractor: LanguageExtractor = {
   functionTypes: ['function_signature'],
   classTypes: ['class_definition'],
-  methodTypes: ['method_signature'],
+  // `method_signature` covers regular methods AND factory constructors (which
+  // parse as method_signature > factory_constructor_signature). A plain named
+  // constructor `Foo._()` parses as a bare `constructor_signature`, so include
+  // it too — resolveName names it by the ctor name and getReturnType gives it
+  // the class as its return type, so `Foo._().bar()` chains resolve (#750).
+  methodTypes: ['method_signature', 'constructor_signature'],
   interfaceTypes: [],
   structTypes: [],
   enumTypes: ['enum_declaration'],
@@ -33,6 +151,19 @@ export const dartExtractor: LanguageExtractor = {
   bodyField: 'body', // class_definition uses 'body' field
   paramsField: 'formal_parameter_list',
   returnField: 'type',
+  getReturnType: extractDartReturnType,
+  isMisparsedFunction: (_name, node) => {
+    // Skip the UNNAMED constructor `Foo()` (its ctor name equals the class). It's
+    // ordinary construction — an `instantiates` edge to the class `Foo` — so
+    // extracting it as a `Foo::Foo` method node would hijack instantiation
+    // resolution (a `Foo(...)` call would resolve to the ctor method, not the
+    // class). NAMED ctors `Foo.create()` / `Foo._()` ARE kept so their chains
+    // resolve (#750). dartCtorInfo validates against the class name, so a method
+    // tree-sitter misparsed as a ctor (`@override (T) m()`) is NOT skipped here.
+    // (isMisparsedFunction skips node creation but still visits the body.)
+    const ctor = dartCtorInfo(node);
+    return ctor != null && ctor.ctorName === ctor.className;
+  },
   getSignature: (node, source) => {
     // For function_signature: extract params + return type
     // For method_signature: delegate to inner function_signature
@@ -87,6 +218,23 @@ export const dartExtractor: LanguageExtractor = {
       }
     }
     return false;
+  },
+  resolveName: (node) => {
+    // Name a factory / named constructor by its constructor name — the 2nd
+    // identifier (`create` in `factory Foo.create()`, `_` in `Foo._()`) — not
+    // the class, so a call `Foo.create()` resolves to `Foo::create` (#750). The
+    // default Dart naming returns the FIRST identifier (the class), which
+    // collides every named ctor onto `Foo::Foo` and leaves `Foo.create()`
+    // unresolvable. An unnamed ctor `Foo()` has a single identifier — fall
+    // through (undefined) to the default class name. Letting the core's
+    // extractMethod own the factory (rather than a custom visitNode) keeps the
+    // body attribution intact: calls inside `factory Foo.create() { … }` are
+    // attributed to `Foo::create`, and getReturnType gives it return type Foo.
+    const ctor = dartCtorInfo(node);
+    // A named ctor `Foo.create` → `create`; the unnamed ctor `Foo()` → undefined
+    // (default naming gives the class name `Foo`, which is correct).
+    if (ctor && ctor.ctorName !== ctor.className) return ctor.ctorName;
+    return undefined;
   },
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();
@@ -159,6 +307,21 @@ export const dartExtractor: LanguageExtractor = {
             const accessorPrev = prev.previousNamedSibling;
             if (accessorPrev?.type === 'identifier') {
               return accessorPrev.text + '.' + methodId.text;
+            }
+            // Chained static-factory / fluent call: the receiver is itself a call
+            // (`Foo.create().bar()`), so accessorPrev is that call's argument_part
+            // selector. Encode `<innerCallee>().<method>` so resolution can infer
+            // bar's class from what `Foo.create` RETURNS (#645/#608 mechanism) —
+            // but only when the chain starts with a capitalized type (a companion
+            // factory / static method / constructor); an instance chain
+            // (`obj.foo().bar()`) keeps the bare name (its receiver's type can't
+            // be recovered here).
+            if (accessorPrev?.type === 'selector' &&
+                accessorPrev.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) {
+              const innerCallee = dartCalleeOfArgPart(accessorPrev);
+              if (innerCallee && /^[A-Z]/.test(innerCallee)) {
+                return `${innerCallee}().${methodId.text}`;
+              }
             }
             return methodId.text;
           }

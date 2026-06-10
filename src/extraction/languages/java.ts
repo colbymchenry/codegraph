@@ -2,6 +2,40 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/**
+ * Tree-sitter-java node types for a method's `type` (return) field that can
+ * never be a method receiver — there's no class to chain a `.method()` on, so we
+ * store no `returnType` for them.
+ */
+const JAVA_NON_CLASS_RETURN_NODES = new Set([
+  'void_type',
+  'integral_type', // int, long, short, byte, char
+  'floating_point_type', // float, double
+  'boolean_type',
+]);
+
+/**
+ * A Java method's declared return type, normalized to the bare class name a
+ * chained `Foo.getInstance().bar()` could be called on (the #645/#608 mechanism).
+ * Reads the `type` field: primitives/void/arrays yield undefined (no class to
+ * chain on), `List<Foo>` is unwrapped to its base type `List`, and a dotted
+ * package/outer-class qualifier (`java.util.List`) is stripped to the simple
+ * name. Constructors have no `type` field → undefined.
+ */
+function extractJavaReturnType(node: SyntaxNode, source: string): string | undefined {
+  const typeNode = getChildByField(node, 'type');
+  if (!typeNode) return undefined;
+  if (JAVA_NON_CLASS_RETURN_NODES.has(typeNode.type)) return undefined;
+  // An array return (`Foo[]`) isn't a receiver you call instance methods on.
+  if (typeNode.type === 'array_type') return undefined;
+  // Strip type arguments (`List<Foo>` → `List`) — the chain resolves on the base.
+  const raw = getNodeText(typeNode, source).trim().replace(/<[^>]*>/g, '');
+  // Strip a dotted package / outer-class qualifier (`java.util.List` → `List`).
+  const last = raw.split('.').pop()?.trim();
+  if (!last || !/^[A-Za-z_]\w*$/.test(last)) return undefined;
+  return last;
+}
+
 export const javaExtractor: LanguageExtractor = {
   functionTypes: [],
   classTypes: ['class_declaration'],
@@ -23,6 +57,7 @@ export const javaExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'type',
+  getReturnType: extractJavaReturnType,
   getSignature: (node, source) => {
     const params = getChildByField(node, 'parameters');
     const returnType = getChildByField(node, 'type');

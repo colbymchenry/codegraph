@@ -200,8 +200,12 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
       // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
       // 0.25 (drops nested calls/imports on every file after the first); we
-      // vendor the upstream ABI-15 wasm instead.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau')
+      // vendor the upstream ABI-15 wasm instead. C#: the tree-sitter-wasms
+      // build (ABI 13) has no primary-constructor support and parses
+      // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
+      // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
+      // primary constructors natively.
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);

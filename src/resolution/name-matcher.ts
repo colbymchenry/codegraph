@@ -267,6 +267,8 @@ function resolveMethodOnType(
    * signal Java imports carry but the call site doesn't (#314).
    */
   preferredFqn?: string,
+  /** Recursion guard for the supertype/conformance walk. */
+  depth = 0,
 ): ResolvedRef | null {
   // Look up methods by name and match by qualifiedName ending in
   // `<typeName>::<methodName>`. This works whether the method is defined
@@ -284,7 +286,24 @@ function resolveMethodOnType(
       matches.push(m);
     }
   }
-  if (matches.length === 0) return null;
+  if (matches.length === 0) {
+    // Conformance fallback: the method may be defined on a supertype `typeName`
+    // extends, or on a protocol / trait it conforms to (e.g. a Swift protocol-
+    // extension method, a C# default-interface or extension method, a Kotlin
+    // extension on a supertype). Walk supertypes transitively (depth-capped) via
+    // the resolved implements/extends edges — empty in the first resolution pass,
+    // populated in the conformance pass. Still VALIDATED (the method must exist on
+    // a supertype), so a wrong inference produces no edge.
+    if (depth < 4 && context.getSupertypes) {
+      for (const supertype of context.getSupertypes(typeName, ref.language)) {
+        const via = resolveMethodOnType(
+          supertype, methodName, ref, context, confidence, resolvedBy, preferredFqn, depth + 1,
+        );
+        if (via) return via;
+      }
+    }
+    return null;
+  }
 
   if (matches.length > 1 && preferredFqn) {
     const ext = ref.language === 'kotlin' ? '.kt' : '.java';
@@ -351,6 +370,7 @@ function inferCppReceiverType(
   receiverName: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
+  depth = 0,
 ): string | null {
   const source = context.readFile(ref.filePath);
   if (!source) return null;
@@ -368,7 +388,15 @@ function inferCppReceiverType(
     const declaratorMatch = line.match(declaratorRegex);
     if (declaratorMatch) {
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
-      if (normalized) return normalized;
+      if (normalized === 'auto') {
+        // `auto x = Foo::instance();` — the declared type is deduced; recover it
+        // from the initializer (call return type / construction) (#645).
+        const initType = inferCppAutoInitializerType(line, receiverName, ref, context, depth);
+        if (initType) return initType;
+        // No usable initializer on this line — keep scanning earlier ones.
+      } else if (normalized) {
+        return normalized;
+      }
     }
   }
 
@@ -388,11 +416,279 @@ function inferCppReceiverType(
       const declaratorMatch = line.match(declaratorRegex);
       if (!declaratorMatch) continue;
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
-      if (normalized) return normalized;
+      if (normalized && normalized !== 'auto') return normalized;
     }
   }
 
   return null;
+}
+
+/**
+ * Last `::`-separated segment of a (possibly namespace-qualified) C++ name.
+ */
+function cppLastSegment(name: string): string {
+  const parts = name.split('::').filter(Boolean);
+  return parts[parts.length - 1] ?? name;
+}
+
+/**
+ * Return type captured at extraction for `Class::method` (or a free function),
+ * read off the indexed node's `returnType` — used by the C++ (#645) and PHP
+ * (#608) chained-call resolvers. Language-filtered. Null when not indexed or no
+ * return type was recorded (a `void`/primitive return).
+ */
+function lookupCalleeReturnType(
+  callee: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  let method = callee;
+  let cls: string | null = null;
+  if (callee.includes('::')) {
+    const parts = callee.split('::').filter(Boolean);
+    method = parts[parts.length - 1] ?? callee;
+    cls = parts.slice(0, -1).join('::');
+  }
+  const candidates = context.getNodesByName(method).filter(
+    (n) =>
+      (n.kind === 'method' || n.kind === 'function') &&
+      n.language === ref.language &&
+      !!n.returnType,
+  );
+  if (cls) {
+    const want = `${cls}::${method}`;
+    // The call site may name the class with MORE namespace qualification than
+    // the stored node (`details::registry::instance` at the call vs
+    // `registry::instance` on the node — the receiver type only carries the
+    // immediate class), or LESS. Accept an exact match or either being a
+    // namespace-suffix of the other; the shared `::<class>::<method>` tail keeps
+    // it specific.
+    const m = candidates.find(
+      (n) =>
+        n.qualifiedName === want ||
+        n.qualifiedName.endsWith(`::${want}`) ||
+        want.endsWith(`::${n.qualifiedName}`),
+    );
+    return m?.returnType ?? null;
+  }
+  return candidates.find((n) => n.kind === 'function')?.returnType ?? null;
+}
+
+/** Does the graph contain a class/struct named `name`'s last segment? */
+function cppClassExists(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const last = cppLastSegment(name);
+  return context
+    .getNodesByName(last)
+    .some((n) => (n.kind === 'class' || n.kind === 'struct') && n.language === ref.language);
+}
+
+/**
+ * Infer the class produced by a C++ call/construction expression, using return
+ * types captured at extraction (#645). Handles, in order:
+ *   - `make_unique<T>()` / `make_shared<T>()`        → T
+ *   - single-level member call `recv.method()`       → recv's type, then method's return
+ *   - `Class::method()` / free `func()`              → the callee's recorded return type
+ *   - direct construction `Type()` / `ns::Type()`    → Type
+ * Returns null when undeterminable. Callers MUST still validate the outer method
+ * exists on the result before creating an edge, so a wrong guess stays silent.
+ */
+function resolveCppCallResultType(
+  inner: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  depth = 0,
+): string | null {
+  if (depth > 3) return null; // guard against pathological mutual recursion
+  const expr = inner.trim();
+
+  const make = expr.match(/(?:^|::)(?:make_unique|make_shared)\s*<\s*([A-Za-z_]\w*)/);
+  if (make) return make[1] ?? null;
+
+  // Single-level member call `recv.method` (the `manager.view().render()` shape).
+  const dotIdx = expr.lastIndexOf('.');
+  if (dotIdx > 0) {
+    const recv = expr.slice(0, dotIdx);
+    const method = expr.slice(dotIdx + 1);
+    if (recv.includes('.') || recv.includes('(') || recv.includes('::')) return null; // single level only
+    const recvType = inferCppReceiverType(recv, ref, context, depth + 1);
+    if (!recvType) return null;
+    return lookupCalleeReturnType(`${recvType}::${method}`, ref, context);
+  }
+
+  const ret = lookupCalleeReturnType(expr, ref, context);
+  if (ret) return ret;
+
+  // Direct construction — the callee itself names a class/struct.
+  if (cppClassExists(expr, ref, context)) return cppLastSegment(expr);
+
+  return null;
+}
+
+/**
+ * Recover the type of an `auto`-declared local from its initializer on the
+ * declaration line — `auto x = Foo::instance();`, `auto w = make_unique<W>();`,
+ * `auto p = new W();`, `auto w = Widget();` (#645).
+ */
+function inferCppAutoInitializerType(
+  line: string,
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  depth: number,
+): string | null {
+  const escaped = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const m = line.match(new RegExp(`\\b${escaped}\\b\\s*=\\s*([^;]+)`));
+  if (!m || !m[1]) return null;
+  const init = m[1].trim();
+
+  const neu = init.match(/^new\s+([A-Za-z_][\w:]*)/);
+  if (neu && neu[1]) return cppLastSegment(neu[1]);
+
+  // A call or construction: `Foo(...)`, `A::b(...)`, `make_unique<T>(...)`.
+  const call = init.match(/^([A-Za-z_][\w:]*(?:\s*<[^>;]*>)?)\s*\(/);
+  if (call && call[1]) return resolveCppCallResultType(call[1].replace(/\s+/g, ''), ref, context, depth + 1);
+
+  return null;
+}
+
+/**
+ * Resolve a C++ chained call whose receiver is itself a call — encoded by the
+ * extractor as `<innerCallee>().<method>` (#645). The receiver's type is what
+ * the inner call returns; the outer method is then resolved and VALIDATED on it
+ * (resolveMethodOnType requires `cls::method` to exist), so a wrong inference
+ * produces no edge rather than a wrong one.
+ */
+export function matchCppCallChain(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
+  if (!m || !m[1] || !m[2]) return null;
+  const cls = resolveCppCallResultType(m[1], ref, context);
+  if (!cls) return null;
+  return resolveMethodOnType(cls, m[2], ref, context, 0.85, 'instance-method');
+}
+
+/**
+ * Resolve a `::`-scoped factory chain whose receiver is a scoped/static call —
+ * PHP `Cls::for($x)->method()` (#608, the per-credential Laravel client idiom) or
+ * Rust `Foo::new().bar()` (an associated-function call) — both encoded by the
+ * extractor as `Cls::factory().method`. The receiver's type is what `Cls::factory`
+ * returns: a `self` marker (PHP `: self`/`: static`, Rust `-> Self`) resolves to
+ * the factory's own type, a concrete return type to that type. The outer method is
+ * then resolved and VALIDATED on it (resolveMethodOnType requires the method to
+ * exist on the type or a supertype it conforms to), so a wrong inference yields no
+ * edge rather than a wrong one. Shared by the `::`-receiver languages (PHP, Rust).
+ */
+export function matchScopedCallChain(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
+  if (!m || !m[1] || !m[2]) return null;
+  const inner = m[1];
+  const method = m[2];
+  if (!inner.includes('::')) return null; // only static-factory (`Cls::method`) chains
+  const factoryClass = inner.slice(0, inner.lastIndexOf('::'));
+  const ret = lookupCalleeReturnType(inner, ref, context);
+  if (!ret) return null;
+  // `self` (the extractor's marker for self/static/$this) → the factory's class.
+  const resolvedClass = ret === 'self' ? factoryClass : ret;
+  return resolveMethodOnType(resolvedClass, method, ref, context, 0.85, 'instance-method');
+}
+
+/**
+ * Languages where an unprefixed capitalized call `Foo(args)` constructs the
+ * class (so a `Foo(args).method()` receiver's type is `Foo`). Java/C# need `new`,
+ * so a bare `Foo()` there is a method call, not construction — excluded. Scala's
+ * `Foo(args)` is a case-class / companion `apply`, which conventionally returns
+ * `Foo` — and resolveMethodOnType validates, so a non-conventional `apply` that
+ * returns another type simply yields no edge rather than a wrong one.
+ */
+const CONSTRUCTS_VIA_BARE_CALL = new Set(['kotlin', 'swift', 'scala', 'dart']);
+
+/**
+ * Resolve a dotted chained call whose receiver is a static factory / fluent call —
+ * `Foo.getInstance().bar()`, encoded by the extractor as `Foo.getInstance().bar`
+ * (#645/#608 mechanism). The receiver's type is what `Foo.getInstance` returns
+ * (its declared return type); the outer method is then resolved and VALIDATED on
+ * it (resolveMethodOnType requires `Type::method` to exist), so a wrong inference
+ * yields no edge rather than a wrong one (e.g. a same-named `bar()` on an
+ * unrelated class is never matched). Shared by the dot-notation languages
+ * (Java, Kotlin, C#, Swift) — same receiver shape, same `Class::method` qualified names.
+ */
+export function matchDottedCallChain(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
+  if (!m || !m[1] || !m[2]) return null;
+  const inner = m[1]; // `Foo.getInstance`
+  const method = m[2]; // `bar`
+  const lastDot = inner.lastIndexOf('.');
+
+  if (lastDot <= 0) {
+    // Go: bare package-level factory FUNCTION `New().method()` — the receiver's
+    // type is what `New` returns; resolve the method on that.
+    if (ref.language === 'go') {
+      const ret = lookupCalleeReturnType(inner, ref, context);
+      if (ret) {
+        return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context));
+      }
+      // `inner` isn't a function with a captured return type — typically a
+      // package-level VARIABLE holding a function value (e.g. gin's `engine()`),
+      // whose type we can't recover. Fall back to bare-name resolution of the
+      // method so we don't DROP an edge the un-re-encoded bare path would have
+      // found. (When `inner` IS a real factory function but the method doesn't
+      // exist on its return type, `ret` is truthy and we returned no edge above —
+      // the absent-method safety guarantee is preserved.)
+      //
+      // CRITICAL: resolve the TARGET via a synthetic bare-name ref, but return the
+      // match tied to the ORIGINAL `ref` (referenceName `inner().method`). The
+      // batched resolver (resolveAndPersistBatched) reads unresolved rows from
+      // offset 0 every pass and relies on deleteSpecificResolvedReferences —
+      // keyed on referenceName — to clear each resolved row so the batch empties.
+      // If we propagated the synthetic ref's bare `method` as `.original`, the
+      // delete would never match the stored `inner().method` row, the batch would
+      // never drain, and the loop would re-resolve + re-insert forever (a runaway
+      // that grew gin's graph to 5M edges / 1.4 GB before this fix).
+      const bareRef = { ...ref, referenceName: method };
+      const bareMatch = matchByExactName(bareRef, context) ?? matchFuzzy(bareRef, context);
+      return bareMatch ? { ...bareMatch, original: ref } : null;
+    }
+    // Constructor receiver `Foo(args).method()` (encoded `Foo().method`): a bare,
+    // capitalized inner is a class construction, so the receiver's type is the
+    // class itself — resolve the method on it. Only in languages where an
+    // unprefixed capitalized call constructs the class (Kotlin, Swift); in Java/C#
+    // a bare `Foo()` is a method call (constructors need `new`), so we must not
+    // assume construction. A lowercase bare inner is a top-level `factory().method()`
+    // whose type we can't recover — bail.
+    if (!CONSTRUCTS_VIA_BARE_CALL.has(ref.language) || !/^[A-Z]/.test(inner)) return null;
+    return resolveMethodOnType(inner, method, ref, context, 0.85, 'instance-method', importedFqnOf(inner, ref, context));
+  }
+
+  // Factory/fluent receiver `Receiver.factory(args).method()`: the receiver's
+  // type is what `Receiver.factory` returns (its declared return type).
+  const factoryClass = inner.slice(0, lastDot).split('.').pop(); // simple class name
+  const factoryMethod = inner.slice(lastDot + 1);
+  if (!factoryClass || !factoryMethod) return null;
+  const ret = lookupCalleeReturnType(`${factoryClass}::${factoryMethod}`, ref, context);
+  if (!ret) return null;
+  return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context));
+}
+
+/**
+ * When several classes share a simple type name, the caller file's import of
+ * that type is the only signal that names WHICH one (#314). Returns the imported
+ * FQN for `typeName` in the ref's file, or undefined.
+ */
+function importedFqnOf(
+  typeName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | undefined {
+  const imports = context.getImportMappings(ref.filePath, ref.language);
+  return imports.find((i) => i.localName === typeName)?.source;
 }
 
 /**
@@ -808,6 +1104,42 @@ export function matchReference(
   // 1. Qualified name match (highest confidence)
   result = matchByQualifiedName(ref, context);
   if (result) return result;
+
+  // 1b. C++ chained call whose receiver is another call — `Foo::instance().bar()`
+  // encoded as `Foo::instance().bar` by the extractor (#645). Resolve the
+  // receiver's type from what the inner call returns, then the method on it.
+  if (ref.language === 'cpp' || ref.language === 'c') {
+    result = matchCppCallChain(ref, context);
+    if (result) return result;
+  }
+
+  // 1c. `::`-scoped factory chain — PHP `Cls::for($x)->method()` (#608) or Rust
+  // `Foo::new().bar()`, both encoded as `Cls::factory().method`. The receiver's
+  // type is the factory's `self` (PHP `: self`/`: static`, Rust `-> Self`) or
+  // concrete return type.
+  if (ref.language === 'php' || ref.language === 'rust') {
+    result = matchScopedCallChain(ref, context);
+    if (result) return result;
+  }
+
+  // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C# / Swift /
+  // Go / Scala / Dart) — `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar`,
+  // Go's bare-factory `New().Method()` as `New().Method`, Scala's companion factory
+  // `Foo.create().bar()`, or Dart's static factory / factory-constructor
+  // `Foo.create().bar()` (#645/#608 mechanism). Resolve the method's class from the
+  // inner call's declared return type, then validate it.
+  if (
+    ref.language === 'java' ||
+    ref.language === 'kotlin' ||
+    ref.language === 'csharp' ||
+    ref.language === 'swift' ||
+    ref.language === 'go' ||
+    ref.language === 'scala' ||
+    ref.language === 'dart'
+  ) {
+    result = matchDottedCallChain(ref, context);
+    if (result) return result;
+  }
 
   // 2. Method call pattern
   result = matchMethodCall(ref, context);
