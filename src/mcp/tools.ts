@@ -463,7 +463,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_node',
-    description: 'Two modes. (1) READ A FILE — use INSTEAD of the Read tool: pass `file` (a path or basename) with no `symbol` and it returns that file\'s current on-disk source with line numbers, exactly the shape Read gives you (`<n>\\t<line>`, safe to Edit from), narrowable with `offset`/`limit` just like Read — PLUS a one-line note of which files depend on it. Same bytes as Read, faster (served from the index), with the blast radius attached. Use it whenever you would Read a source file. (2) ONE SYMBOL you can name — its location, signature, verbatim source (includeCode=true) and caller/callee trail in one call, so before changing it you see what calls it and what your edit would break. For an AMBIGUOUS name it returns EVERY matching definition\'s body in one call (so you never Read a file to find the right overload); pass `file`/`line` to pin one. Use codegraph_explore for several related symbols or the full flow.',
+    description: 'Read one file or one symbol, with its blast radius attached. FILE mode: pass `file` alone (no `symbol`) to get the file\'s source with line numbers — same shape as the Read tool (`offset`/`limit` supported, safe to Edit from) plus which files depend on it. Use instead of Read for indexed source files. SYMBOL mode: pass `symbol` to get its location, signature, source (includeCode=true) and caller/callee trail; an ambiguous name returns every matching definition\'s body. For several related symbols use codegraph_explore.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -478,7 +478,7 @@ export const tools: ToolDefinition[] = [
         },
         file: {
           type: 'string',
-          description: 'A file path or basename (e.g. "harness.rs", "src/auth/session.ts"). Pass it ALONE (no symbol) to READ the file like the Read tool — its full source with line numbers + which files depend on it. Or pass it WITH a symbol to disambiguate an overloaded name to the definition in this file.',
+          description: 'A file path or basename (e.g. "harness.rs", "src/auth/session.ts"). Alone (no symbol): file mode — read the file like Read. With a symbol: disambiguate an overloaded name to the definition in this file.',
         },
         offset: {
           type: 'number',
@@ -504,7 +504,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_explore',
-    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
+    description: 'PRIMARY TOOL — call FIRST for almost any question or before an edit. Query is a natural-language question or a bag of symbol/file names; returns the verbatim source of the relevant symbols grouped by file plus the call path among them, in ONE capped call. Treat the shown source as already Read — do not re-open those files. Usually the only call you need.',
     inputSchema: {
       type: 'object',
       properties: {
