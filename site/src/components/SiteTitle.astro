@@ -1,0 +1,24 @@
+---
+// Starlight 0.39 exposes route data on Astro.locals.starlightRoute (not props).
+// Link the wordmark to the landing page at the site root.
+const { siteTitle } = Astro.locals.starlightRoute;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<a href={`${base}/`} class="cg-site-title" translate="no">{siteTitle}</a>
+
+<style>
+	.cg-site-title {
+		font-family: var(--sl-font);
+		font-weight: 800;
+		font-size: 1.25rem;
+		letter-spacing: -0.025em;
+		line-height: 1;
+		color: var(--cg-ink);
+		text-decoration: none;
+		white-space: nowrap;
+	}
+	.cg-site-title:hover {
+		color: var(--cg-ink);
+	}
+</style>

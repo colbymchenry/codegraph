@@ -4,8 +4,54 @@
  * Shared module for search term extraction and scoring.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import { Node } from '../types';
+
+/** Normalize a name to a comparable token: lowercase, alphanumerics only. */
+export function normalizeNameToken(raw: string): string {
+  return raw.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Tokens that name the PROJECT as a whole — its `go.mod` module, `package.json`
+ * name, or repo root directory — rather than any specific symbol. A user
+ * naturally puts the project name in a query as context ("MyApp backend
+ * routes"), but it carries no discriminative signal: when it's also a substring
+ * of a symbol or path on one stack (a `MyAppFrontend/` dir, a `MyAppApp` class)
+ * it lexically inflates that stack and buries the rest (#720).
+ *
+ * Returned normalized (lowercase, alphanumerics only) so a query word can be
+ * compared by its normalized form. Only names ≥5 chars are kept — short ones
+ * (`api`, `app`, `core`, `web`) collide with real query terms too often to
+ * safely down-weight.
+ */
+export function deriveProjectNameTokens(projectRoot: string): Set<string> {
+  const tokens = new Set<string>();
+  const add = (raw: string | undefined | null): void => {
+    if (!raw) return;
+    const norm = normalizeNameToken(raw);
+    if (norm.length >= 5) tokens.add(norm);
+  };
+
+  // go.mod module last segment (the most reliable signal for Go repos).
+  try {
+    const gomod = fs.readFileSync(path.join(projectRoot, 'go.mod'), 'utf-8');
+    const m = gomod.match(/^\s*module\s+(\S+)/m);
+    if (m && m[1]) add(m[1].split('/').pop());
+  } catch { /* no go.mod */ }
+
+  // package.json name (strip an `@scope/` prefix).
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf-8'));
+    if (typeof pkg.name === 'string') add(pkg.name.replace(/^@[^/]+\//, ''));
+  } catch { /* no / invalid package.json */ }
+
+  // Repo root directory name — a fallback when neither manifest names the project.
+  add(path.basename(path.resolve(projectRoot)));
+
+  return tokens;
+}
 
 /**
  * Common stop words to filter from search queries.
@@ -172,24 +218,50 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
  * Score path relevance to a query
  * Higher score = more relevant path
  */
-export function scorePathRelevance(filePath: string, query: string): number {
-  // Use base terms only — stem variants inflate path scores by generating
-  // many near-duplicate terms that all match the same path segments.
-  const terms = extractSearchTerms(query, { stems: false });
-  if (terms.length === 0) return 0;
-
+export function scorePathRelevance(
+  filePath: string,
+  query: string,
+  projectNameTokens?: Set<string>,
+): number {
   const pathLower = filePath.toLowerCase();
   const fileName = path.basename(filePath).toLowerCase();
   const dirName = path.dirname(filePath).toLowerCase();
   let score = 0;
 
-  for (const term of terms) {
+  // Score per original query WORD, not per sub-token. A single PascalCase word
+  // splits into many sub-tokens (a project name "SuperBizAgent" →
+  // superbizagent / super / biz / agent) that all match the SAME path segment,
+  // so summing per sub-token boosted that path 4× for one concept — enough to
+  // bury the rest of the query's stack (#720). A word matches a path level if
+  // ANY of its sub-tokens do, and counts ONCE; distinct words still each add.
+  // Split the ORIGINAL-case query into words; extractSearchTerms does the
+  // camelCase/snake split per word (so `getUserName` still matches a
+  // `get_user_name` path) — we just attribute each word's matches once.
+  const allWords = query.split(/\s+/).filter((w) => w.length > 0);
+  if (allWords.length === 0) return 0;
+
+  // A query word that just names the PROJECT (its go.mod / package.json / repo
+  // name) carries no discriminative path signal — drop it so the rest of the
+  // query decides the ranking, instead of every file under a `<ProjectName>…/`
+  // tree winning on the project name alone (#720). Only when OTHER words remain,
+  // so a bare project-name query still scores on its path.
+  const words =
+    projectNameTokens && projectNameTokens.size > 0
+      ? allWords.filter((w) => !projectNameTokens.has(normalizeNameToken(w)))
+      : allWords;
+  const scored = words.length > 0 ? words : allWords;
+
+  for (const word of scored) {
+    // Use base terms only — stem variants inflate path scores by generating
+    // many near-duplicate terms that all match the same path segments.
+    const subtokens = extractSearchTerms(word, { stems: false });
+    if (subtokens.length === 0) continue;
     // Exact filename match (strongest)
-    if (fileName.includes(term)) score += 10;
+    if (subtokens.some((t) => fileName.includes(t))) score += 10;
     // Directory match
-    if (dirName.includes(term)) score += 5;
+    if (subtokens.some((t) => dirName.includes(t))) score += 5;
     // General path match
-    else if (pathLower.includes(term)) score += 3;
+    else if (subtokens.some((t) => pathLower.includes(t))) score += 3;
   }
 
   // Deprioritize test files unless the query is explicitly about tests
@@ -339,4 +411,31 @@ export function kindBonus(kind: Node['kind']): number {
     enum_member: 3,
   };
   return bonuses[kind] ?? 0;
+}
+
+/**
+ * Whether a query token looks like a code identifier the user deliberately typed
+ * (camelCase / PascalCase-with-internal-caps / snake_case / has a digit) rather
+ * than a plain dictionary word ("flat", "object", "screen").
+ *
+ * Used to decide whether an EXACT name match earns the "the user named this
+ * symbol" exemption from single-term dampening. A common English word that
+ * happens to exact-match an unrelated symbol — the query "flat object" matching
+ * a constant named `FLAT` — must NOT get that exemption, or the +exact-name
+ * bonus floats it to the top of a prose query on its own.
+ *
+ * Classifies the token AS THE USER TYPED IT, not the matched symbol's name:
+ * "flat" (lowercase, descriptive) is non-distinctive even though it matches
+ * `FLAT`. A leading-capital-only word ("Screen", "Zustand") is also treated as
+ * a plain word — sentence-start capitalization and proper nouns aren't reliable
+ * identifier signals.
+ */
+export function isDistinctiveIdentifier(token: string): boolean {
+  if (!token) return false;
+  // snake_case / SCREAMING_SNAKE, or an embedded digit → a deliberate identifier.
+  if (/[_0-9]/.test(token)) return true;
+  // An uppercase letter anywhere AFTER the first char → a camelCase/PascalCase
+  // boundary (setLastEmail, OrgUserStore) or an acronym (REST, HTTP).
+  if (/[A-Z]/.test(token.slice(1))) return true;
+  return false;
 }

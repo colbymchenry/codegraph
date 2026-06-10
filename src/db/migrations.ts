@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 /**
  * Migration definition
@@ -62,6 +62,16 @@ const migrations: Migration[] = [
       db.exec(`
         DROP INDEX IF EXISTS idx_edges_source;
         DROP INDEX IF EXISTS idx_edges_target;
+      `);
+    },
+  },
+  {
+    version: 5,
+    description:
+      'Add nodes.return_type — normalized return/result type for receiver-type inference (C++ singletons/factories, #645)',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE nodes ADD COLUMN return_type TEXT;
       `);
     },
   },

@@ -1,0 +1,86 @@
+---
+// Flat technical node-link diagram for the hero. Hand-placed so it reads as a
+// deliberate blueprint, not a physics blob: thin ink lines, hollow nodes, mono
+// labels. Hovering a node inks it in. No glow, no gradients, no motion.
+---
+
+<svg
+	class="cg-graph"
+	viewBox="0 0 780 600"
+	role="img"
+	aria-label="A code knowledge graph: index.ts links to auth.ts, router.ts and api/users.ts, which branch to middleware.ts, types/index.ts, createRouter and listUsers."
+>
+	<g class="edges">
+		<line x1="430" y1="64" x2="250" y2="210" />
+		<line x1="430" y1="64" x2="450" y2="250" />
+		<line x1="430" y1="64" x2="650" y2="200" />
+		<line x1="250" y1="210" x2="180" y2="380" />
+		<line x1="250" y1="210" x2="340" y2="380" />
+		<line x1="450" y1="250" x2="560" y2="380" />
+		<line x1="560" y1="380" x2="560" y2="500" />
+	</g>
+
+	<g class="nodes">
+		<g class="node">
+			<circle cx="430" cy="64" r="9" />
+			<text x="448" y="69" text-anchor="start">index.ts</text>
+		</g>
+		<g class="node">
+			<circle cx="250" cy="210" r="9" />
+			<text x="232" y="215" text-anchor="end">auth.ts</text>
+		</g>
+		<g class="node">
+			<circle cx="450" cy="250" r="9" />
+			<text x="468" y="255" text-anchor="start">router.ts</text>
+		</g>
+		<g class="node">
+			<circle cx="650" cy="200" r="9" />
+			<text x="668" y="205" text-anchor="start">api/users.ts</text>
+		</g>
+		<g class="node">
+			<circle cx="180" cy="380" r="9" />
+			<text x="180" y="410" text-anchor="middle">middleware.ts</text>
+		</g>
+		<g class="node">
+			<circle cx="340" cy="380" r="9" />
+			<text x="340" y="410" text-anchor="middle">types/index.ts</text>
+		</g>
+		<g class="node">
+			<circle cx="560" cy="380" r="9" />
+			<text x="578" y="385" text-anchor="start">createRouter</text>
+		</g>
+		<g class="node">
+			<circle cx="560" cy="500" r="9" />
+			<text x="560" y="530" text-anchor="middle">listUsers</text>
+		</g>
+	</g>
+</svg>
+
+<style>
+	.cg-graph {
+		width: 100%;
+		height: auto;
+		max-width: 560px;
+		min-width: 0; /* flex item: allow shrinking below intrinsic SVG width */
+		display: block;
+	}
+	.cg-graph .edges line {
+		stroke: var(--cg-ink);
+		stroke-width: 1.25;
+	}
+	.cg-graph .node circle {
+		fill: var(--cg-paper);
+		stroke: var(--cg-ink);
+		stroke-width: 1.5;
+		transition: fill 0.12s ease;
+	}
+	.cg-graph .node text {
+		font-family: var(--sl-font-mono);
+		font-size: 15px;
+		fill: var(--cg-ink);
+		dominant-baseline: middle;
+	}
+	.cg-graph .node:hover circle {
+		fill: var(--cg-ink);
+	}
+</style>

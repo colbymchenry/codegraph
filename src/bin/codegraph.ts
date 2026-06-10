@@ -20,17 +20,20 @@
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph affected [files]   Find test files affected by changes
+ *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized } from '../directory';
+import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
+import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -353,7 +356,7 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.info(`The index is fully usable ${getGlyphs().dash} only the failed files are missing.`);
     }
   } else if (projectPath) {
-    const logPath = path.join(projectPath, '.codegraph', 'errors.log');
+    const logPath = path.join(getCodeGraphDir(projectPath), 'errors.log');
     if (fs.existsSync(logPath)) {
       fs.unlinkSync(logPath);
     }
@@ -364,7 +367,7 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
  * Write detailed error log to .codegraph/errors.log
  */
 function writeErrorLog(projectPath: string, errors: Array<{ message: string; filePath?: string; severity: string; code?: string }>): void {
-  const cgDir = path.join(projectPath, '.codegraph');
+  const cgDir = getCodeGraphDir(projectPath);
   if (!fs.existsSync(cgDir)) return;
 
   const logPath = path.join(cgDir, 'errors.log');
@@ -415,8 +418,8 @@ function writeErrorLog(projectPath: string, errors: Array<{ message: string; fil
  */
 program
   .command('init [path]')
-  .description('Initialize CodeGraph in a project directory')
-  .option('-i, --index', 'Run initial indexing after initialization')
+  .description('Initialize CodeGraph in a project directory and build the initial index')
+  .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean }) => {
     const projectPath = path.resolve(pathArg || process.cwd());
@@ -428,15 +431,6 @@ program
       if (isInitialized(projectPath)) {
         clack.log.warn(`Already initialized in ${projectPath}`);
         clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
-        // Re-run agent surface wiring so re-running `init` is the
-        // documented way to recover a project that's missing its
-        // Cursor rules file (or future per-agent project surfaces).
-        try {
-          const { wireProjectSurfacesForGlobalAgents } = await import('../installer');
-          for (const { target, file } of wireProjectSurfacesForGlobalAgents()) {
-            clack.log.success(`${target.displayName}: ${file.action} ${file.path}`);
-          }
-        } catch { /* non-fatal */ }
         try {
           const { offerWatchFallback } = await import('../installer');
           await offerWatchFallback(clack, projectPath);
@@ -449,41 +443,24 @@ program
       const cg = await CodeGraph.init(projectPath, { index: false });
       clack.log.success(`Initialized in ${projectPath}`);
 
-      // Bootstrap project-local surfaces for any agent that's
-      // configured globally (Cursor needs ./.cursor/rules/codegraph.mdc
-      // to actually prefer codegraph over native grep). Silent when
-      // there's nothing to write.
-      try {
-        const { wireProjectSurfacesForGlobalAgents } = await import('../installer');
-        for (const { target, file } of wireProjectSurfacesForGlobalAgents()) {
-          clack.log.success(`${target.displayName}: ${file.action} ${file.path}`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        clack.log.warn(`Skipped wiring project-local agent surfaces: ${msg}`);
-      }
-
-      if (options.index) {
-        let result: IndexResult;
-
-        if (options.verbose) {
-          result = await cg.indexAll({
-            onProgress: createVerboseProgress(),
-            verbose: true,
-          });
-        } else {
-          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-          const progress = createShimmerProgress();
-          result = await cg.indexAll({
-            onProgress: progress.onProgress,
-          });
-          await progress.stop();
-        }
-
-        printIndexResult(clack, result, projectPath);
+      // Indexing runs by default now. The legacy -i/--index flag is still
+      // accepted (so existing muscle memory and scripts don't break) but is a
+      // no-op — initializing always builds the initial index.
+      let result: IndexResult;
+      if (options.verbose) {
+        result = await cg.indexAll({
+          onProgress: createVerboseProgress(),
+          verbose: true,
+        });
       } else {
-        clack.log.info('Run "codegraph index" to index the project');
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+        const progress = createShimmerProgress();
+        result = await cg.indexAll({
+          onProgress: progress.onProgress,
+        });
+        await progress.stop();
       }
+      printIndexResult(clack, result, projectPath);
 
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -692,11 +669,22 @@ program
   .option('-j, --json', 'Output as JSON')
   .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
+    // The directory the user actually ran from, before walking up to the index
+    // root. Used to detect when the resolved index lives in a different git
+    // working tree (e.g. a nested worktree borrowing the main checkout's index).
+    const startPath = path.resolve(pathArg || process.cwd());
+    const worktreeMismatch = detectWorktreeIndexMismatch(startPath, projectPath);
 
     try {
       if (!isInitialized(projectPath)) {
         if (options.json) {
-          console.log(JSON.stringify({ initialized: false, projectPath }));
+          console.log(JSON.stringify({
+            initialized: false,
+            version: packageJson.version,
+            projectPath,
+            indexPath: getCodeGraphDir(projectPath),
+            lastIndexed: null,
+          }));
           return;
         }
         console.log(chalk.bold('\nCodeGraph Status\n'));
@@ -713,11 +701,18 @@ program
       const backend = cg.getBackend();
       const journalMode = cg.getJournalMode();
 
+      const buildInfo = cg.getIndexBuildInfo();
+      const reindexRecommended = cg.isIndexStale();
+
       // JSON output mode
       if (options.json) {
+        const lastIndexedMs = cg.getLastIndexedAt();
         console.log(JSON.stringify({
           initialized: true,
+          version: packageJson.version,
           projectPath,
+          indexPath: getCodeGraphDir(projectPath),
+          lastIndexed: lastIndexedMs != null ? new Date(lastIndexedMs).toISOString() : null,
           fileCount: stats.fileCount,
           nodeCount: stats.nodeCount,
           edgeCount: stats.edgeCount,
@@ -731,6 +726,15 @@ program
             modified: changes.modified.length,
             removed: changes.removed.length,
           },
+          worktreeMismatch: worktreeMismatch
+            ? { worktreeRoot: worktreeMismatch.worktreeRoot, indexRoot: worktreeMismatch.indexRoot }
+            : null,
+          index: {
+            builtWithVersion: buildInfo.version,
+            builtWithExtractionVersion: buildInfo.extractionVersion,
+            currentExtractionVersion: EXTRACTION_VERSION,
+            reindexRecommended,
+          },
         }));
         cg.destroy();
         return;
@@ -740,6 +744,9 @@ program
 
       // Project info
       console.log(chalk.cyan('Project:'), projectPath);
+      if (worktreeMismatch) {
+        warn(worktreeMismatchWarning(worktreeMismatch));
+      }
       console.log();
 
       // Index stats
@@ -801,6 +808,15 @@ program
       }
       console.log();
 
+      // Re-index hint: the index was built by an older engine than the one now
+      // running, so a rebuild would add data a migration can't backfill.
+      if (reindexRecommended) {
+        const builtWith = buildInfo.version ? `v${buildInfo.version.replace(/^v/, '')}` : 'an earlier version';
+        warn(`Index was built by ${builtWith}; re-index to pick up this engine's improvements.`);
+        info('Run "codegraph index -f" (full rebuild) or "codegraph sync"');
+        console.log();
+      }
+
       cg.destroy();
     } catch (err) {
       error(`Failed to get status: ${err instanceof Error ? err.message : String(err)}`);
@@ -831,9 +847,19 @@ program
       const cg = await CodeGraph.open(projectPath);
 
       const limit = parseInt(options.limit || '10', 10);
-      const results = cg.searchNodes(search, {
+      const rawResults = cg.searchNodes(search, {
         limit,
         kinds: options.kind ? [options.kind as any] : undefined,
+      });
+
+      // Mirror the MCP search down-rank so the CLI also surfaces the
+      // hand-written implementation before protobuf/gRPC scaffolding
+      // when both share a name. See extraction/generated-detection.ts.
+      const { isGeneratedFile } = await import('../extraction/generated-detection');
+      const results = [...rawResults].sort((a, b) => {
+        const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
+        const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+        return aGen - bGen;
       });
 
       if (options.json) {
@@ -1078,52 +1104,6 @@ function printFileTree(
 }
 
 /**
- * codegraph context <task>
- */
-program
-  .command('context <task>')
-  .description('Build context for a task (outputs markdown)')
-  .option('-p, --path <path>', 'Project path')
-  .option('-n, --max-nodes <number>', 'Maximum nodes to include', '50')
-  .option('-c, --max-code <number>', 'Maximum code blocks', '10')
-  .option('--no-code', 'Exclude code blocks')
-  .option('-f, --format <format>', 'Output format (markdown, json)', 'markdown')
-  .action(async (task: string, options: {
-    path?: string;
-    maxNodes?: string;
-    maxCode?: string;
-    code?: boolean;
-    format?: string;
-  }) => {
-    const projectPath = resolveProjectPath(options.path);
-
-    try {
-      if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath}`);
-        process.exit(1);
-      }
-
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
-
-      const context = await cg.buildContext(task, {
-        maxNodes: parseInt(options.maxNodes || '50', 10),
-        maxCodeBlocks: parseInt(options.maxCode || '10', 10),
-        includeCode: options.code !== false,
-        format: options.format as 'markdown' | 'json',
-      });
-
-      // Output the context
-      console.log(context);
-
-      cg.destroy();
-    } catch (err) {
-      error(`Failed to build context: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-  });
-
-/**
  * codegraph serve
  */
 program
@@ -1165,8 +1145,8 @@ program
 }
 `));
         console.error('Available tools:');
+        console.error(chalk.cyan('  codegraph_explore') + '   - Primary: source of the relevant symbols for any question');
         console.error(chalk.cyan('  codegraph_search') + '    - Search for code symbols');
-        console.error(chalk.cyan('  codegraph_context') + '   - Build context for a task');
         console.error(chalk.cyan('  codegraph_callers') + '   - Find callers of a symbol');
         console.error(chalk.cyan('  codegraph_callees') + '   - Find what a symbol calls');
         console.error(chalk.cyan('  codegraph_impact') + '    - Analyze impact of changes');
@@ -1702,6 +1682,43 @@ program
       error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
+  });
+
+/**
+ * codegraph upgrade [version]
+ *
+ * Self-update, however CodeGraph was installed (bundle via install.sh/.ps1,
+ * npm-global, npx, or a source checkout). See ../upgrade for the detection and
+ * per-method upgrade logic.
+ */
+program
+  .command('upgrade [version]')
+  .description('Update CodeGraph to the latest release (or a specific version)')
+  .option('--check', 'Check whether an update is available without installing')
+  .option('-f, --force', 'Reinstall even if already on the target version')
+  .action(async (versionArg: string | undefined, options: { check?: boolean; force?: boolean }) => {
+    const up = await import('../upgrade');
+    const method = up.detectInstallMethod({
+      filename: __filename,
+      platform: process.platform,
+      cwd: process.cwd(),
+    });
+    const pin = versionArg || process.env.CODEGRAPH_VERSION || undefined;
+    const code = await up.runUpgrade(
+      { version: pin, check: options.check, force: options.force },
+      {
+        currentVersion: packageJson.version,
+        method,
+        resolveLatest: () => up.resolveLatestVersion(),
+        run: up.defaultRun,
+        hasCommand: up.hasCommand,
+        log: (m: string) => console.log(m),
+        warn: (m: string) => warn(m),
+        error: (m: string) => error(m),
+        platform: process.platform,
+      }
+    );
+    process.exit(code);
   });
 
 // Parse and run

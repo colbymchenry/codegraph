@@ -3,7 +3,7 @@
  *
  * Multi-target: writes MCP server config + instructions for the
  * agents the user picks (Claude Code, Cursor, Codex CLI, opencode,
- * Hermes Agent).
+ * Hermes Agent, Gemini CLI, Antigravity IDE).
  * Defaults to the Claude-only behavior for backwards compatibility
  * when no targets are explicitly chosen and nothing else is detected.
  *
@@ -21,13 +21,14 @@ import {
   getTarget,
   resolveTargetFlag,
 } from './targets/registry';
-import type { AgentTarget, Location, TargetId, WriteResult } from './targets/types';
+import type { AgentTarget, Location, TargetId } from './targets/types';
 import { getGlyphs } from '../ui/glyphs';
 // Import the lightweight submodules directly (not the ../sync barrel, which
 // re-exports FileWatcher and would transitively pull in ../extraction — the
 // installer must stay importable even when native modules can't load).
 import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
+import { getCodeGraphDir, codeGraphDirName } from '../directory';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -35,10 +36,8 @@ import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-
 export {
   writeMcpConfig,
   writePermissions,
-  writeClaudeMd,
   hasMcpConfig,
   hasPermissions,
-  hasClaudeMdSection,
 } from './config-writer';
 export type { InstallLocation } from './config-writer';
 
@@ -119,7 +118,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       const s = clack.spinner();
       s.start('Installing codegraph CLI...');
       try {
-        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe' });
+        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', windowsHide: true });
         s.stop('Installed codegraph CLI on PATH');
       } catch {
         s.stop('Could not install (permission denied)');
@@ -194,7 +193,9 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     for (const file of result.files) {
       const verb = file.action === 'unchanged'
         ? 'Unchanged'
-        : file.action === 'created' ? 'Created' : 'Updated';
+        : file.action === 'created' ? 'Created'
+          : file.action === 'removed' ? 'Removed'
+            : 'Updated';
       clack.log.success(`${target.displayName}: ${verb} ${tildify(file.path)}`);
     }
     for (const note of result.notes ?? []) {
@@ -317,8 +318,8 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes' },
-        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro' },
+        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc, ./.gemini, ./.kiro' },
       ],
       initialValue: 'global' as const,
     });
@@ -362,8 +363,8 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
 
   // Step 4: for local uninstall, the index dir is separate — point at
   // `uninit` so the user knows it's still there (and how to remove it).
-  if (location === 'local' && fs.existsSync(path.join(process.cwd(), '.codegraph'))) {
-    clack.log.info('The .codegraph/ index for this project is still here. Run `codegraph uninit` to delete it.');
+  if (location === 'local' && fs.existsSync(getCodeGraphDir(process.cwd()))) {
+    clack.log.info(`The ${codeGraphDirName()}/ index for this project is still here. Run \`codegraph uninit\` to delete it.`);
   }
 
   // Step 5: summary.
@@ -376,38 +377,6 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   } else {
     clack.outro(`CodeGraph was not configured in any ${location} agent — nothing to remove.`);
   }
-}
-
-/**
- * For every target that has a global config and exposes
- * `wireProjectSurfaces`, write its project-local surfaces (e.g.
- * Cursor's `.cursor/rules/codegraph.mdc`). Idempotent — runs
- * silently when there's nothing to write.
- *
- * Called by `codegraph init` so that a user who ran
- * `codegraph install` once globally doesn't have to re-run it per
- * project to get full agent support.
- *
- * Returns the list of `(target, file)` pairs that were created or
- * updated — caller decides how to surface them.
- */
-export function wireProjectSurfacesForGlobalAgents(): Array<{
-  target: AgentTarget;
-  file: WriteResult['files'][number];
-}> {
-  const written: Array<{ target: AgentTarget; file: WriteResult['files'][number] }> = [];
-  for (const target of ALL_TARGETS) {
-    if (typeof target.wireProjectSurfaces !== 'function') continue;
-    const detection = target.detect('global');
-    if (!detection.alreadyConfigured) continue;
-    const result = target.wireProjectSurfaces();
-    for (const file of result.files) {
-      if (file.action === 'created' || file.action === 'updated') {
-        written.push({ target, file });
-      }
-    }
-  }
-  return written;
 }
 
 /**

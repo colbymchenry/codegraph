@@ -2,6 +2,46 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/** Kotlin return types that can't be a chained-call receiver (no class to chain on). */
+const KOTLIN_NON_CLASS_RETURN = new Set(['Unit', 'Nothing']);
+
+/**
+ * A Kotlin function's declared return type, normalized to the bare class name a
+ * chained `Foo.getInstance().bar()` could be called on (the #645/#608 mechanism).
+ * tree-sitter-kotlin exposes no field names, so the return type is found
+ * positionally: the first `user_type` / `nullable_type` that FOLLOWS
+ * `function_value_parameters` (an extension receiver's type sits before the
+ * params, so it's never mistaken for the return). An inferred return (expression
+ * body with no `: Type`), a lambda return type, or `Unit` / `Nothing` → undefined.
+ */
+function extractKotlinReturnType(node: SyntaxNode, source: string): string | undefined {
+  let seenParams = false;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    if (child.type === 'function_value_parameters') {
+      seenParams = true;
+      continue;
+    }
+    if (!seenParams) continue;
+    // The return type is the type node right after the params. If we reach the
+    // body or a `where`-clause first, there's no declared return type.
+    if (child.type === 'function_body' || child.type === 'type_constraints') return undefined;
+    if (child.type === 'user_type' || child.type === 'nullable_type') {
+      const ut =
+        child.type === 'nullable_type'
+          ? (child.namedChildren.find((c: SyntaxNode) => c.type === 'user_type') ?? child)
+          : child;
+      const typeId = ut.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+      const name = getNodeText(typeId ?? ut, source).trim();
+      if (!name || !/^[A-Za-z_]\w*$/.test(name)) return undefined;
+      if (KOTLIN_NON_CLASS_RETURN.has(name)) return undefined;
+      return name;
+    }
+  }
+  return undefined;
+}
+
 /** Check if a node matches the `fun interface` misparse pattern */
 function isFunInterfaceNode(node: SyntaxNode): boolean {
   let hasFun = false;
@@ -130,6 +170,7 @@ export const kotlinExtractor: LanguageExtractor = {
   },
   paramsField: 'function_value_parameters',
   returnField: 'type',
+  getReturnType: extractKotlinReturnType,
   resolveBody: (node, _bodyField) => {
     // Kotlin's tree-sitter grammar doesn't use field names, so getChildByField fails.
     // Find body by type: function_body for functions/methods, class_body for classes,
@@ -227,6 +268,29 @@ export const kotlinExtractor: LanguageExtractor = {
     }
     return false;
   },
+  extractModifiers: (node) => {
+    // Kotlin Multiplatform `expect`/`actual` markers live in
+    //   modifiers > platform_modifier > (expect | actual)
+    // Capturing them lets the resolver link an `expect` declaration in a
+    // common source set to its `actual` implementations in platform source
+    // sets (those impls otherwise have zero dependents — the caller resolves
+    // to the `expect`). Match the AST node, not raw text, so an annotation
+    // argument or identifier named "actual" can't false-positive.
+    const mods: string[] = [];
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (child?.type !== 'modifiers') continue;
+      for (let j = 0; j < child.childCount; j++) {
+        const pm = child.child(j);
+        if (pm?.type !== 'platform_modifier') continue;
+        for (let k = 0; k < pm.childCount; k++) {
+          const kw = pm.child(k);
+          if (kw && (kw.type === 'expect' || kw.type === 'actual')) mods.push(kw.type);
+        }
+      }
+    }
+    return mods.length > 0 ? mods : undefined;
+  },
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();
     const identifier = node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
@@ -234,5 +298,11 @@ export const kotlinExtractor: LanguageExtractor = {
       return { moduleName: source.substring(identifier.startIndex, identifier.endIndex), signature: importText };
     }
     return null;
+  },
+  packageTypes: ['package_header'],
+  extractPackage: (node, source) => {
+    // package_header → identifier (dotted: `com.example.foo`)
+    const id = node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    return id ? source.substring(id.startIndex, id.endIndex).trim() : null;
   },
 };

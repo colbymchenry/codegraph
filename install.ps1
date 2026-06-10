@@ -5,8 +5,8 @@
 #
 #   irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
 #
-# Re-run to upgrade. To uninstall: remove $env:LOCALAPPDATA\codegraph and drop
-# its \current\bin entry from your user PATH.
+# Upgrade with `codegraph upgrade` (or just re-run this). To uninstall: remove
+# $env:LOCALAPPDATA\codegraph and drop its \current\bin entry from your user PATH.
 #
 # Environment:
 #   CODEGRAPH_VERSION      release tag to install (default: latest)

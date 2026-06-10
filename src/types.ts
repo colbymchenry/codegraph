@@ -75,6 +75,7 @@ export const LANGUAGES = [
   'c',
   'cpp',
   'csharp',
+  'razor',
   'php',
   'ruby',
   'swift',
@@ -88,8 +89,11 @@ export const LANGUAGES = [
   'lua',
   'luau',
   'terraform',
+  'objc',
   'yaml',
   'twig',
+  'xml',
+  'properties',
   'unknown',
 ] as const;
 
@@ -159,6 +163,15 @@ export interface Node {
 
   /** Generic type parameters */
   typeParameters?: string[];
+
+  /**
+   * Normalized return/result type name for a function/method (the bare class
+   * name, smart-pointer pointee unwrapped). Captured for C/C++ so resolution
+   * can infer a chained receiver's type from what the inner call returns —
+   * `Foo::instance().bar()` resolves `bar` on `Foo` (issue #645). Undefined for
+   * languages/symbols where it isn't captured.
+   */
+  returnType?: string;
 
   /** When the node was last updated */
   updatedAt: number;
@@ -309,6 +322,15 @@ export interface Subgraph {
 
   /** Root node IDs (entry points) */
   roots: string[];
+
+  /**
+   * Retrieval confidence for context-style queries. `'low'` means the query
+   * resolved only to isolated common-word matches (no entry point corroborated
+   * by 2+ distinct query terms) — callers should surface an honest handoff to
+   * explore/trace rather than present the results as comprehensive. Undefined
+   * for graph traversals that don't run the search-ranking path.
+   */
+  confidence?: 'high' | 'low';
 }
 
 /**
