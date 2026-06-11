@@ -93,10 +93,19 @@ function isWithinDir(child: string, parent: string): boolean {
  *
  * @param projectRoot - The project root directory
  * @param filePath - The (relative or absolute) file path to validate
+ * @param allowSymlinkedDirs - When true, skips the realpath check so that files
+ *   inside symlinked directories (whose real target may be outside the root) are
+ *   allowed. Use this for paths that come from the file watcher — the watcher
+ *   already validated that symlinks are within the monitored set, so re-checking
+ *   would incorrectly reject valid auto-sync events (#770).
  * @returns The resolved absolute path (realpath when it exists), or null if it
  *   escapes the root
  */
-export function validatePathWithinRoot(projectRoot: string, filePath: string): string | null {
+export function validatePathWithinRoot(
+  projectRoot: string,
+  filePath: string,
+  allowSymlinkedDirs = false
+): string | null {
   const resolved = path.resolve(projectRoot, filePath);
   const normalizedRoot = path.resolve(projectRoot);
 
@@ -107,6 +116,10 @@ export function validatePathWithinRoot(projectRoot: string, filePath: string): s
 
   // 2. Symlink-aware containment — resolve symlinks on both sides and re-check,
   //    so an in-repo symlink whose real target escapes the root is rejected.
+  //    Skip this check when allowSymlinkedDirs is true (watcher-validated paths).
+  if (allowSymlinkedDirs) {
+    return resolved;
+  }
   try {
     const realRoot = fs.realpathSync(normalizedRoot);
     const realResolved = fs.realpathSync(resolved);

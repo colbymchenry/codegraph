@@ -429,5 +429,90 @@ describe('FileWatcher', () => {
 
       cg.unwatch();
     });
+
+    it('should auto-sync changes inside a symlinked directory (symlink to project dir, #770)', async () => {
+      // Set up a separate "external" project directory
+      const externalDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-external-'));
+      const externalSrc = path.join(externalDir, 'src');
+      fs.mkdirSync(externalSrc);
+      fs.writeFileSync(path.join(externalSrc, 'external.ts'), 'export const external = 1;');
+
+      // Create a symlink inside testDir pointing to the external project
+      const symlinkPath = path.join(testDir, 'linked-project');
+      fs.symlinkSync(externalDir, symlinkPath);
+
+      cg = CodeGraph.initSync(testDir, {
+        config: { include: ['**/*.ts'], exclude: [] },
+      });
+      await cg.indexAll();
+
+      const initialStats = cg.getStats();
+      const initialNodes = initialStats.nodeCount;
+
+      cg.watch({ debounceMs: 300 });
+      // Let the watcher install (and discover the symlinked dir) before writing.
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Write to a file inside the symlinked directory — the watcher must pick it up.
+      const symlinkedFile = path.join(symlinkPath, 'src', 'new-in-symlink.ts');
+      fs.writeFileSync(symlinkedFile, 'export function newInSymlink() { return 99; }');
+
+      // Wait for auto-sync to pick it up (OS event delivery + debounce).
+      await waitFor(
+        () => {
+          const stats = cg.getStats();
+          return stats.nodeCount > initialNodes;
+        },
+        8000
+      );
+
+      // The new function inside the symlink should be in the graph.
+      const results = cg.searchNodes('newInSymlink');
+      expect(results.length).toBeGreaterThan(0);
+
+      cg.unwatch();
+
+      // Clean up external dir
+      fs.rmSync(externalDir, { recursive: true, force: true });
+    });
+
+    it('should not crash on symlink cycles (A→B, B→A or A→B→A)', async () => {
+      // Create two dirs with mutual symlinks: dirA/pointsToB → dirB, dirB/pointsToA → dirA
+      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cycle-a-'));
+      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cycle-b-'));
+      const srcA = path.join(dirA, 'src');
+      const srcB = path.join(dirB, 'src');
+      fs.mkdirSync(srcA);
+      fs.mkdirSync(srcB);
+      fs.symlinkSync(srcB, path.join(dirA, 'pointsToB'));
+      fs.symlinkSync(srcA, path.join(dirB, 'pointsToA'));
+      fs.writeFileSync(path.join(srcA, 'a.ts'), 'export const a = 1;');
+      fs.writeFileSync(path.join(srcB, 'b.ts'), 'export const b = 2;');
+
+      cg = CodeGraph.initSync(dirA, { config: { include: ['**/*.ts'], exclude: [] } });
+      await cg.indexAll();
+
+      const initialNodes = cg.getStats().nodeCount;
+
+      cg.watch({ debounceMs: 200 });
+      await new Promise((r) => setTimeout(r, 300));
+
+      // Write to both dirs
+      fs.writeFileSync(path.join(srcA, 'newA.ts'), 'export const newA = 3;');
+      fs.writeFileSync(path.join(srcB, 'newB.ts'), 'export const newB = 4;');
+
+      await new Promise((r) => setTimeout(r, 1000));
+
+      cg.unwatch();
+
+      // Should not have crashed, and new files should be indexed
+      const finalNodes = cg.getStats().nodeCount;
+      expect(finalNodes).toBeGreaterThan(initialNodes);
+      const searchResults = cg.searchNodes('newA');
+      expect(searchResults.length).toBeGreaterThan(0);
+
+      fs.rmSync(dirA, { recursive: true, force: true });
+      fs.rmSync(dirB, { recursive: true, force: true });
+    });
   });
 });
