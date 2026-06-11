@@ -3131,4 +3131,139 @@ void run() {
       expect(callerNamesOf('Decoy::clearAll')).toEqual([]);
     });
   });
+
+  describe('Pascal/Delphi chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+    function isCalled(qn: string): boolean {
+      const t = cg.getNodesByKind('method').find((n) => n.qualifiedName === qn);
+      return !!t && cg.getIncomingEdges(t.id).some((e) => e.kind === 'calls');
+    }
+
+    it('resolves a chained factory call TFoo.GetInstance().DoIt() via the return type, never a same-named decoy', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TBar = class
+    procedure DoIt;
+  end;
+  TDecoy = class
+    procedure DoIt;
+  end;
+  TFoo = class
+    class function GetInstance: TBar;
+  end;
+implementation
+procedure TBar.DoIt; begin end;
+procedure TDecoy.DoIt; begin end;
+class function TFoo.GetInstance: TBar; begin Result := nil; end;
+procedure Run;
+begin
+  TFoo.GetInstance().DoIt();
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(isCalled('TBar::DoIt')).toBe(true);
+      expect(isCalled('TDecoy::DoIt')).toBe(false);
+    });
+
+    it('resolves a constructor chain TFoo.Create().Configure() on the constructed class', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TFoo = class
+    constructor Create;
+    procedure Configure;
+  end;
+  TDecoy = class
+    procedure Configure;
+  end;
+implementation
+constructor TFoo.Create; begin end;
+procedure TFoo.Configure; begin end;
+procedure TDecoy.Configure; begin end;
+procedure Run;
+begin
+  TFoo.Create().Configure();
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // A constructor returns its own class (no `: TBar` annotation), so Configure
+      // resolves on TFoo, not the same-named decoy.
+      expect(isCalled('TFoo::Configure')).toBe(true);
+      expect(isCalled('TDecoy::Configure')).toBe(false);
+    });
+
+    it('resolves a typecast chain TFoo(x).DoIt() on the cast type', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TFoo = class
+    procedure DoIt;
+  end;
+  TDecoy = class
+    procedure DoIt;
+  end;
+implementation
+procedure TFoo.DoIt; begin end;
+procedure TDecoy.DoIt; begin end;
+procedure Run(obj: TObject);
+begin
+  TFoo(obj).DoIt();
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(isCalled('TFoo::DoIt')).toBe(true);
+      expect(isCalled('TDecoy::DoIt')).toBe(false);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TBar = class
+  end;
+  TOther = class
+    procedure OnlyOther;
+  end;
+  TFoo = class
+    class function GetInstance: TBar;
+  end;
+implementation
+procedure TOther.OnlyOther; begin end;
+class function TFoo.GetInstance: TBar; begin Result := nil; end;
+procedure Run;
+begin
+  TFoo.GetInstance().OnlyOther();
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // TBar has no OnlyOther — must not mis-attach to the same-named TOther::OnlyOther.
+      expect(isCalled('TOther::OnlyOther')).toBe(false);
+    });
+  });
 });

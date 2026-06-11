@@ -4312,12 +4312,41 @@ export class TreeSitterExtractor {
 
     let calleeName = '';
     if (firstChild.type === 'exprDot') {
-      // Qualified call: Obj.Method(...)
-      const identifiers = firstChild.namedChildren.filter(
-        (c: SyntaxNode) => c.type === 'identifier'
-      );
-      if (identifiers.length > 0) {
-        calleeName = identifiers.map((id: SyntaxNode) => getNodeText(id, this.source)).join('.');
+      // Chained static-factory call: `TFoo.GetInstance().DoIt()` — the exprDot's
+      // receiver is itself an `exprCall`, so the bare identifier list would
+      // collapse to just `DoIt` and mis-resolve to a same-named method on an
+      // unrelated class. Encode `TFoo.GetInstance().DoIt` so resolution infers
+      // DoIt's class from what `TFoo.GetInstance` RETURNS (#645/#608). Only a
+      // capitalized class-factory chain; a unary outer method.
+      const innerCall = firstChild.namedChildren.find((c: SyntaxNode) => c.type === 'exprCall');
+      const outerId = firstChild.namedChildren.filter((c: SyntaxNode) => c.type === 'identifier').pop();
+      const method = outerId ? getNodeText(outerId, this.source) : '';
+      if (innerCall && method && /^\w+$/.test(method)) {
+        const innerFirst = innerCall.namedChild(0);
+        let innerCallee = '';
+        if (innerFirst?.type === 'exprDot') {
+          innerCallee = innerFirst.namedChildren
+            .filter((c: SyntaxNode) => c.type === 'identifier')
+            .map((id: SyntaxNode) => getNodeText(id, this.source))
+            .join('.');
+        } else if (innerFirst?.type === 'identifier') {
+          innerCallee = getNodeText(innerFirst, this.source);
+        }
+        // Gate on the Delphi type-naming convention — `TFoo` classes / `IFoo`
+        // interfaces — so a class-factory chain re-encodes but a capitalized
+        // VARIABLE/parameter chain (Pascal capitalizes locals too: `Curve.X().Y()`,
+        // `Self.X().Y()`) stays bare and keeps its existing bare-name resolution.
+        calleeName = innerCallee && /^[TI][A-Z]/.test(innerCallee)
+          ? `${innerCallee}().${method}`
+          : method;
+      } else {
+        // Qualified call: Obj.Method(...)
+        const identifiers = firstChild.namedChildren.filter(
+          (c: SyntaxNode) => c.type === 'identifier'
+        );
+        if (identifiers.length > 0) {
+          calleeName = identifiers.map((id: SyntaxNode) => getNodeText(id, this.source)).join('.');
+        }
       }
     } else if (firstChild.type === 'identifier') {
       calleeName = getNodeText(firstChild, this.source);
