@@ -1113,11 +1113,14 @@ export class ToolHandler {
     // Aggregate callers across all matching symbols
     const seen = new Set<string>();
     const allCallers: Node[] = [];
+    const labels = new Map<string, string>();
     for (const node of allMatches.nodes) {
       for (const c of cg.getCallers(node.id)) {
         if (!seen.has(c.node.id)) {
           seen.add(c.node.id);
           allCallers.push(c.node);
+          const label = this.edgeLabel(c.edge);
+          if (label) labels.set(c.node.id, label);
         }
       }
     }
@@ -1126,7 +1129,7 @@ export class ToolHandler {
       return this.textResult(`No callers found for "${symbol}"${allMatches.note}`);
     }
 
-    const formatted = this.formatNodeList(allCallers.slice(0, limit), `Callers of ${symbol}`) + allMatches.note;
+    const formatted = this.formatNodeList(allCallers.slice(0, limit), `Callers of ${symbol}`, labels) + allMatches.note;
     return this.textResult(this.truncateOutput(formatted));
   }
 
@@ -1148,11 +1151,14 @@ export class ToolHandler {
     // Aggregate callees across all matching symbols
     const seen = new Set<string>();
     const allCallees: Node[] = [];
+    const labels = new Map<string, string>();
     for (const node of allMatches.nodes) {
       for (const c of cg.getCallees(node.id)) {
         if (!seen.has(c.node.id)) {
           seen.add(c.node.id);
           allCallees.push(c.node);
+          const label = this.edgeLabel(c.edge);
+          if (label) labels.set(c.node.id, label);
         }
       }
     }
@@ -1161,7 +1167,7 @@ export class ToolHandler {
       return this.textResult(`No callees found for "${symbol}"${allMatches.note}`);
     }
 
-    const formatted = this.formatNodeList(allCallees.slice(0, limit), `Callees of ${symbol}`) + allMatches.note;
+    const formatted = this.formatNodeList(allCallees.slice(0, limit), `Callees of ${symbol}`, labels) + allMatches.note;
     return this.textResult(this.truncateOutput(formatted));
   }
 
@@ -3337,16 +3343,35 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  private formatNodeList(nodes: Node[], title: string): string {
+  private formatNodeList(nodes: Node[], title: string, labels?: Map<string, string>): string {
     const lines: string[] = [`## ${title} (${nodes.length} found)`, ''];
 
     for (const node of nodes) {
       const location = node.startLine ? `:${node.startLine}` : '';
-      // Compact: just name, kind, location
-      lines.push(`- ${node.name} (${node.kind}) - ${node.filePath}${location}`);
+      // Compact: just name, kind, location — plus the relationship when it
+      // isn't a plain call (callback registration, instantiation, …).
+      const label = labels?.get(node.id);
+      lines.push(
+        `- ${node.name} (${node.kind}) - ${node.filePath}${location}${label ? ` — via ${label}` : ''}`
+      );
     }
 
     return lines.join('\n');
+  }
+
+  /**
+   * Relationship label for a non-`calls` edge in callers/callees lists. A
+   * function-as-value edge (#756) is the high-signal one: `callers(cb)`
+   * showing "via callback registration" tells the agent this is where the
+   * callback is WIRED, not where it's invoked.
+   */
+  private edgeLabel(edge: Edge): string | null {
+    if (edge.kind === 'calls') return null;
+    if (edge.metadata?.fnRef === true) return 'callback registration';
+    if (edge.kind === 'instantiates') return 'instantiation';
+    if (edge.kind === 'imports') return 'import';
+    if (edge.kind === 'references') return 'reference';
+    return edge.kind;
   }
 
   private formatImpact(symbol: string, impact: Subgraph): string {

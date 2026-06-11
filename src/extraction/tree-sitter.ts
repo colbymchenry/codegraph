@@ -17,6 +17,8 @@ import {
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
 import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
+import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandidate } from './function-ref';
+import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { LiquidExtractor } from './liquid-extractor';
@@ -222,12 +224,18 @@ export class TreeSitterExtractor {
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
   private methodIndex: Map<string, string> | null = null; // lookup key → node ID for Pascal defProc lookup
+  // Function-as-value capture (#756): per-language spec + candidates collected
+  // during the walk, gated & flushed into unresolvedReferences at end-of-file
+  // (see flushFnRefCandidates).
+  private fnRefSpec: FnRefSpec | undefined;
+  private fnRefCandidates: Array<FnRefCandidate & { fromNodeId: string }> = [];
 
   constructor(filePath: string, source: string, language?: Language) {
     this.filePath = filePath;
     this.source = source;
     this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
+    this.fnRefSpec = FN_REF_SPECS[this.language];
   }
 
   /**
@@ -314,6 +322,10 @@ export class TreeSitterExtractor {
 
       this.visitNode(this.tree.rootNode);
 
+      // Gate + flush function-as-value candidates (#756) while the file's
+      // nodes and import refs are complete and the file node is still pushed.
+      this.flushFnRefCandidates();
+
       if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
     } catch (error) {
@@ -353,6 +365,136 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Function-as-value capture (#756): if this node is one of the language's
+   * value-position containers (call arguments, assignment RHS, struct/object
+   * initializer, array/table literal), collect candidate function names from
+   * it. Candidates are gated & flushed at end-of-file (flushFnRefCandidates).
+   */
+  private maybeCaptureFnRefs(node: SyntaxNode, nodeType: string): void {
+    const spec = this.fnRefSpec;
+    if (!spec) return;
+    const rule = spec.dispatch.get(nodeType);
+    if (!rule || this.nodeStack.length === 0) return;
+    const fromNodeId = this.nodeStack[this.nodeStack.length - 1];
+    if (!fromNodeId) return;
+    for (const cand of captureFnRefCandidates(node, rule, spec, this.source)) {
+      this.fnRefCandidates.push({ ...cand, fromNodeId });
+    }
+  }
+
+  /**
+   * Candidates-only scan of a subtree the main walkers won't traverse
+   * (top-level variable initializers). No extraction side effects. Halts at
+   * nested function definitions: their bodies are walked — and their
+   * candidates attributed — by extractFunction's own body walk.
+   */
+  private scanFnRefSubtree(node: SyntaxNode, depth: number): void {
+    if (!this.fnRefSpec || depth > 12) return;
+    const nodeType = node.type;
+    if (depth > 0 && (
+      this.extractor?.functionTypes.includes(nodeType) ||
+      nodeType === 'arrow_function' ||
+      nodeType === 'function_expression' ||
+      nodeType === 'lambda_literal' ||
+      nodeType === 'lambda_expression'
+    )) {
+      return;
+    }
+    this.maybeCaptureFnRefs(node, nodeType);
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child) this.scanFnRefSubtree(child, depth + 1);
+    }
+  }
+
+  /**
+   * Gate captured function-as-value candidates and push survivors as
+   * `function_ref` unresolved references.
+   *
+   * The gate bounds volume and protects precision: a candidate survives only
+   * if its name matches a function/method DEFINED IN THIS FILE or a name this
+   * file imports/references. Everything else (locals, params, fields passed
+   * as arguments) is dropped before it ever reaches the database. Resolution
+   * then matches survivors against function/method nodes only
+   * (matchFunctionRef) and emits `references` edges — which callers/impact
+   * already traverse.
+   *
+   * Known v1 limit, deliberate: a C/C++ callback registered in a DIFFERENT
+   * translation unit than its definition (extern, no symbol imports to match)
+   * is not captured. Same-file registration — the dominant C pattern (static
+   * callback + same-file ops struct) — is.
+   */
+  private flushFnRefCandidates(): void {
+    if (this.fnRefCandidates.length === 0) return;
+    const candidates = this.fnRefCandidates;
+    this.fnRefCandidates = [];
+
+    // Generated/minified files (vendored jquery.min.js and friends): their
+    // function-as-value edges are noise — single-letter minified symbols
+    // resolve everywhere. Same policy as the callback synthesizer.
+    if (isGeneratedFile(this.filePath)) return;
+
+    const definedHere = new Set<string>();
+    for (const n of this.nodes) {
+      if (n.kind === 'function' || n.kind === 'method') definedHere.add(n.name);
+    }
+
+    // Import-binding names only (all binding emitters push kind 'imports').
+    // Deliberately NOT 'references': those carry type-annotation and
+    // interface-member names, which let local variables that share a type
+    // member's name slip through the gate (excalidraw A/B finding).
+    const SIMPLE_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+    const importedNames = new Set<string>();
+    for (const r of this.unresolvedReferences) {
+      if (r.referenceKind === 'imports' && SIMPLE_NAME.test(r.referenceName)) {
+        importedNames.add(r.referenceName);
+      }
+    }
+
+    const ungated = this.fnRefSpec?.ungatedModes;
+    const addressOfOnly = this.fnRefSpec?.addressOfOnly === true;
+    const seen = new Set<string>();
+    for (const c of candidates) {
+      const atFileScope = c.fromNodeId.startsWith('file:');
+      // C++ (addressOfOnly): a BARE identifier qualifies only inside a
+      // file-scope initializer table. Everywhere else — args, assignments,
+      // local braced-init lists like `{begin, size}` — only explicit `&`
+      // forms count (fmt A/B finding: generic names `begin`/`out`/`size`
+      // collide with locals and members).
+      if (
+        addressOfOnly &&
+        !c.explicitRef &&
+        !(atFileScope && (c.mode === 'value' || c.mode === 'list'))
+      ) {
+        continue;
+      }
+      // C-family file-scope initializers skip the gate (constant-expression
+      // context — a bare identifier there is a function address, never a
+      // variable; see FnRefSpec.ungatedModes). Local initializers and
+      // everything else require a same-file/import match.
+      const skipGate = ungated?.has(c.mode) === true && atFileScope;
+      // Qualified C++ member-pointers (`Widget::on_click`) gate on the member
+      // name; everything else on the full name.
+      const gateName = c.name.includes('::')
+        ? c.name.slice(c.name.lastIndexOf('::') + 2)
+        : c.name;
+      if (!skipGate && !definedHere.has(gateName) && !importedNames.has(gateName)) {
+        continue;
+      }
+      const key = `${c.fromNodeId}|${c.name}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      this.unresolvedReferences.push({
+        fromNodeId: c.fromNodeId,
+        referenceName: c.name,
+        referenceKind: 'function_ref',
+        line: c.line,
+        column: c.column,
+      });
+    }
+  }
+
+  /**
    * Visit a node and extract information
    */
   private visitNode(node: SyntaxNode): void {
@@ -365,7 +507,14 @@ export class TreeSitterExtractor {
     if (this.extractor.visitNode) {
       const ctx = this.makeExtractorContext();
       const handled = this.extractor.visitNode(node, ctx);
-      if (handled) return;
+      if (handled) {
+        // The hook consumed this subtree, so the walkers below never descend
+        // into it — scan it for function-as-value candidates (#756). Scala's
+        // hook handles val/var definitions (`val table = Seq(targetCb)`), for
+        // example. The scan is capture-only and halts at nested functions.
+        this.scanFnRefSubtree(node, 0);
+        return;
+      }
     }
 
     // Pascal-specific AST handling
@@ -373,6 +522,11 @@ export class TreeSitterExtractor {
       skipChildren = this.visitPascalNode(node);
       if (skipChildren) return;
     }
+
+    // Function-as-value capture (#756) — independent of the dispatch ladder
+    // below (the captured container types have no other handler there), so it
+    // can never shadow or be shadowed by an extraction branch.
+    this.maybeCaptureFnRefs(node, nodeType);
 
     // Check for function declarations
     // For Python/Ruby, function_definition inside a class should be treated as method
@@ -437,17 +591,33 @@ export class TreeSitterExtractor {
     // Check for class properties (e.g. C# property_declaration)
     else if (this.extractor.propertyTypes?.includes(nodeType) && this.isInsideClassLikeNode()) {
       this.extractProperty(node);
+      // Property initializers aren't walked — scan for function-as-value
+      // candidates (#756): Scala `val table = Seq(targetCb)` in an object,
+      // Kotlin `val cb = ::handler` class properties.
+      this.scanFnRefSubtree(node, 0);
       skipChildren = true;
     }
     // Check for class fields (e.g. Java field_declaration, C# field_declaration)
     else if (this.extractor.fieldTypes?.includes(nodeType) && this.isInsideClassLikeNode()) {
       this.extractField(node);
+      // Field initializers aren't walked — scan for function-as-value
+      // candidates (#756): Java `List<IntConsumer> table = List.of(Main::cb)`,
+      // C# `List<Action<int>> table = new() { TargetCb }`.
+      this.scanFnRefSubtree(node, 0);
       skipChildren = true;
     }
     // Check for variable declarations (const, let, var, etc.)
     // Only extract top-level variables (not inside functions/methods)
     else if (this.extractor.variableTypes.includes(nodeType) && !this.isInsideClassLikeNode()) {
       this.extractVariable(node);
+      // extractVariable doesn't walk every initializer shape (object literals
+      // are deliberately skipped; Python/Ruby don't walk at all), so scan the
+      // declaration subtree for function-as-value candidates — `const routes =
+      // { home: renderHome }`, `handlers = {"recv": target_cb}`. The scan halts
+      // at nested function definitions (their bodies are walked — and
+      // attributed — separately) and flush-time dedup absorbs any overlap with
+      // initializers extractVariable DOES walk.
+      this.scanFnRefSubtree(node, 0);
       skipChildren = true; // extractVariable handles children
     }
     // Swift stored properties inside a type. Swift instance properties aren't
@@ -3086,6 +3256,10 @@ export class TreeSitterExtractor {
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
       const nodeType = node.type;
 
+      // Function-as-value capture (#756) — function bodies are walked here,
+      // not in visitNode, so the capture hook must fire in both walkers.
+      this.maybeCaptureFnRefs(node, nodeType);
+
       // Rocket route-registration macros (`routes![…]` / `catchers![…]`): the
       // handler paths live in a raw token tree the call walker can't see.
       if (nodeType === 'macro_invocation') this.extractRustRouteMacro(node);
@@ -4461,8 +4635,16 @@ export class TreeSitterExtractor {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (!child) continue;
+      // Function-as-value capture (#756): Pascal bodies are walked here, not
+      // in visitNode/visitForCallsAndStructure, so the capture hook fires here
+      // — assignment RHS is the Delphi event-wiring idiom (`OnFire := Handler`).
+      this.maybeCaptureFnRefs(child, child.type);
       if (child.type === 'exprCall') {
         this.extractPascalCall(child);
+        // The walker doesn't descend into a call's arguments — dispatch the
+        // argument container directly (`RegisterHandler(TargetCb)` / `(@Cb)`).
+        const args = child.namedChildren.find((c: SyntaxNode) => c.type === 'exprArgs');
+        if (args) this.maybeCaptureFnRefs(args, 'exprArgs');
       } else if (child.type === 'exprDot') {
         // A STATEMENT-level bare exprDot is a paren-less call (`Obj.Free;`,
         // `TFoo.GetInstance.DoIt;`). Anywhere else (assignment side, condition,

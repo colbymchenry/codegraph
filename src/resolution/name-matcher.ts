@@ -158,13 +158,120 @@ export function crossesKnownFamily(a: string, b: string): boolean {
  *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
  */
 function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
-  if (ref.referenceKind === 'references') {
+  if (ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') {
     return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
   }
   if (ref.referenceKind === 'imports') {
     return candidates.filter((c) => !crossesKnownFamily(c.language, ref.language));
   }
   return candidates;
+}
+
+/**
+ * Resolve a function-as-value reference (#756) — a function name used as a
+ * callback/function-pointer value (`register(handler)`, `o->cb = handler`,
+ * `{ .cb = handler }`, `signal(SIGINT, handler)`). The ONLY strategy allowed
+ * for `function_ref` refs: exact name, function/method targets only, same
+ * language family, same-file first, and cross-file only when the match is
+ * UNIQUE. No fuzzy fallback, no qualified-name walking — a wrong callback
+ * edge is worse than none.
+ */
+export function matchFunctionRef(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  // In JS/TS/Python a bare identifier can never be a method value (methods
+  // are only reachable through a receiver — `this.m` / `self.m` /
+  // `Cls.m`), so bare fn-refs match FUNCTIONS only. This also sidesteps the
+  // pre-existing TS quirk of class fields extracting as method-kind nodes,
+  // which otherwise soaked up local names passed as arguments (excalidraw
+  // A/B finding; same pattern in vendored docopt.py). Python's `self.m`
+  // form keeps method targets via its own capture shape. C++ likewise: a
+  // bare identifier can only be a FREE function (member values need
+  // `&Cls::method`). Other languages keep method targets: C# method groups,
+  // Swift/Dart implicit-self, Java/Kotlin method references.
+  const bareFnOnly =
+    ref.language === 'typescript' || ref.language === 'tsx' ||
+    ref.language === 'javascript' || ref.language === 'jsx' ||
+    ref.language === 'cpp' || ref.language === 'python';
+
+  // Qualified member-pointer (`&Widget::on_click` → "Widget::on_click"):
+  // resolve the member ON THAT SCOPE — exempt from bareFnOnly (the `&Cls::m`
+  // shape is an explicit member reference). Unique-or-drop like everything else.
+  if (ref.referenceName.includes('::')) {
+    const memberName = ref.referenceName.slice(ref.referenceName.lastIndexOf('::') + 2);
+    const scoped = context
+      .getNodesByName(memberName)
+      .filter(
+        (n) =>
+          (n.kind === 'function' || n.kind === 'method') &&
+          sameLanguageFamily(n.language, ref.language) &&
+          n.id !== ref.fromNodeId &&
+          (n.qualifiedName === ref.referenceName ||
+            n.qualifiedName.endsWith(`::${ref.referenceName}`))
+      );
+    if (scoped.length === 0) return null;
+    const sameFileScoped = scoped.filter((n) => n.filePath === ref.filePath);
+    const pool = sameFileScoped.length > 0 ? sameFileScoped : scoped;
+    if (sameFileScoped.length === 0 && scoped.length > 1) return null;
+    const target = pool.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
+    return {
+      original: ref,
+      targetNodeId: target.id,
+      confidence: 0.9,
+      resolvedBy: 'function-ref',
+    };
+  }
+
+  const candidates = context
+    .getNodesByName(ref.referenceName)
+    .filter(
+      (n) =>
+        (n.kind === 'function' || (!bareFnOnly && n.kind === 'method')) &&
+        sameLanguageFamily(n.language, ref.language) &&
+        n.id !== ref.fromNodeId // a function registering itself is not a dependency edge
+    );
+  if (candidates.length === 0) return null;
+
+  // Same-file definition wins — the extraction gate guarantees most survivors
+  // have one, and it's the dominant C pattern (static callback registered in
+  // a same-file ops struct).
+  const sameFile = candidates.filter((n) => n.filePath === ref.filePath);
+  if (sameFile.length > 0) {
+    // Swift: several same-named METHODS in one file is an API overload family
+    // (`Session.request(...)` × N), and a bare identifier hitting it is almost
+    // always a same-named parameter, not a method value (Alamofire A/B
+    // finding) — refuse rather than guess. A single method (SwiftUI's
+    // `action: handleTap`) still resolves.
+    if (
+      ref.language === 'swift' &&
+      sameFile.length > 1 &&
+      sameFile.every((n) => n.kind === 'method')
+    ) {
+      return null;
+    }
+    // Same-name overloads in one file are the same conceptual symbol; pick
+    // the first by position for determinism.
+    const target = sameFile.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
+    return {
+      original: ref,
+      targetNodeId: target.id,
+      confidence: sameFile.length === 1 ? 0.95 : 0.9,
+      resolvedBy: 'function-ref',
+    };
+  }
+
+  // Cross-file (imported names the import resolver didn't already claim):
+  // only an unambiguous match resolves.
+  if (candidates.length === 1) {
+    return {
+      original: ref,
+      targetNodeId: candidates[0]!.id,
+      confidence: 0.8,
+      resolvedBy: 'function-ref',
+    };
+  }
+  return null;
 }
 
 /**
@@ -1124,6 +1231,13 @@ export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // Function-as-value refs (#756) resolve ONLY through the dedicated matcher —
+  // never the fuzzy/qualified fallthrough below (a wrong callback edge is
+  // worse than none).
+  if (ref.referenceKind === 'function_ref') {
+    return matchFunctionRef(ref, context);
+  }
+
   // Try strategies in order of confidence
   let result: ResolvedRef | null;
 

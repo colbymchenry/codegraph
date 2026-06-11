@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
+import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -669,6 +669,22 @@ export class ReferenceResolver {
       return null;
     }
 
+    // Function-as-value refs (#756) get a dedicated, strictly-gated path:
+    // import-based resolution first (an imported callback resolves through its
+    // import, the most precise cross-file signal), then matchFunctionRef
+    // (same-file first, unique-only cross-file, function/method targets only).
+    // They never reach the framework or fuzzy strategies below.
+    if (ref.referenceKind === 'function_ref') {
+      const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
+      if (viaImport) {
+        const target = this.queries.getNodeById(viaImport.targetNodeId);
+        if (target && (target.kind === 'function' || target.kind === 'method')) {
+          return viaImport;
+        }
+      }
+      return this.gateLanguage(matchFunctionRef(ref, this.context), ref);
+    }
+
     // JVM FQN imports skip framework/name-matcher: `import com.example.Bar`
     // resolves directly through the qualifiedName index, which is unambiguous
     // even when several `Bar` classes exist in different packages.
@@ -750,7 +766,13 @@ export class ReferenceResolver {
    */
   createEdges(resolved: ResolvedRef[]): Edge[] {
     return resolved.map((ref) => {
-      let kind = ref.original.referenceKind;
+      // `function_ref` (#756) is internal-only: it persists as a `references`
+      // edge (the registration site depends on the callback), distinguishable
+      // by metadata.resolvedBy === 'function-ref'. callers/impact already
+      // traverse `references`, so registration sites surface with no
+      // graph-layer changes.
+      let kind: Edge['kind'] =
+        ref.original.referenceKind === 'function_ref' ? 'references' : ref.original.referenceKind;
 
       // Promote "extends" to "implements" when a class/struct targets an interface
       if (kind === 'extends') {
@@ -784,6 +806,11 @@ export class ReferenceResolver {
         metadata: {
           confidence: ref.confidence,
           resolvedBy: ref.resolvedBy,
+          // Uniform marker for function-as-value edges (#756), regardless of
+          // which strategy resolved them (import vs matchFunctionRef) — lets
+          // tooling label "callback registration" and lets validation diff
+          // exactly the edges this feature added.
+          ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),
         },
       };
     });
@@ -1161,7 +1188,7 @@ export class ReferenceResolver {
     if (!result) return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (!tgt || !ref.language) return result;
-    if (ref.referenceKind === 'references' && !sameLanguageFamily(tgt, ref.language)) return null;
+    if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !sameLanguageFamily(tgt, ref.language)) return null;
     if (ref.referenceKind === 'imports' && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
   }

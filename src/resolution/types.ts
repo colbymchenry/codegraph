@@ -4,7 +4,7 @@
  * Types for the reference resolution system.
  */
 
-import { EdgeKind, Language, Node } from '../types';
+import { Language, Node, ReferenceKind } from '../types';
 
 /**
  * An unresolved reference from extraction
@@ -15,7 +15,7 @@ export interface UnresolvedRef {
   /** The name being referenced */
   referenceName: string;
   /** Type of reference */
-  referenceKind: EdgeKind;
+  referenceKind: ReferenceKind;
   /** Line where reference occurs */
   line: number;
   /** Column where reference occurs */
@@ -39,7 +39,7 @@ export interface ResolvedRef {
   /** Confidence score (0-1) */
   confidence: number;
   /** How it was resolved */
-  resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path';
+  resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path' | 'function-ref';
 }
 
 /**

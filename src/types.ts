@@ -279,6 +279,14 @@ export interface ExtractionError {
 }
 
 /**
+ * Kinds an unresolved reference can carry. `function_ref` is internal-only —
+ * a function name used as a VALUE (callback registration, #756). It never
+ * becomes an edge kind: resolution maps it to a `references` edge targeting
+ * function/method nodes only (see `matchFunctionRef`).
+ */
+export type ReferenceKind = EdgeKind | 'function_ref';
+
+/**
  * A reference that couldn't be resolved during extraction
  */
 export interface UnresolvedReference {
@@ -289,7 +297,7 @@ export interface UnresolvedReference {
   referenceName: string;
 
   /** Type of reference (call, type, import, etc.) */
-  referenceKind: EdgeKind;
+  referenceKind: ReferenceKind;
 
   /** Location of the reference */
   line: number;
