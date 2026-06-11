@@ -581,12 +581,23 @@ from ..services import auth_service
         line: 10,
         column: 5,
         filePath: 'src/App.tsx',
-        language: 'typescript' as const,
+        // Refs extracted from .tsx files carry language 'tsx' — component
+        // resolution is gated to JSX-capable refs (#764: PascalCase TYPE refs
+        // from plain .ts files were resolving to arbitrary same-named classes).
+        language: 'tsx' as const,
       };
 
       const result = reactResolver!.resolve(ref, context);
       expect(result).not.toBeNull();
       expect(result?.targetNodeId).toBe('component:src/Button.tsx:Button:5');
+
+      // The same PascalCase name referenced from a plain .ts file is a TYPE
+      // reference, not a component usage — component resolution must decline
+      // and leave it to proximity-aware name matching (#764: a .ts GraphQL
+      // types file's own `Account` alias was losing to an arbitrary same-named
+      // class in another monorepo package).
+      const tsRef = { ...ref, filePath: 'src/models.ts', language: 'typescript' as const };
+      expect(reactResolver!.resolve(tsRef, context)).toBeNull();
     });
 
     it('should resolve custom hook references', () => {
