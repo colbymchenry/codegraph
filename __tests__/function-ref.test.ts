@@ -544,6 +544,51 @@ describe('Function-as-value capture (#756)', () => {
     }
   });
 
+  it('KOTLIN: companion-object refs resolve cross-file without imports; decoy companion untouched', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-ktcomp-'));
+    // Same package, no imports — the Java/Kotlin reality the name gate can't
+    // see, which is why qualified `Type::member` candidates skip it.
+    fs.writeFileSync(
+      path.join(tmpDir, 'Handlers.kt'),
+      [
+        'class KtHandlers {',
+        '  companion object {',
+        '    fun handle(x: Int) {}',
+        '  }',
+        '}',
+        'class Decoy {',
+        '  companion object {',
+        '    fun handle(x: Int) {}',
+        '  }',
+        '}',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Wirer.kt'),
+      [
+        'fun register(cb: Any) {}',
+        'class Wirer {',
+        '  fun wire() { register(KtHandlers::handle) }',
+        '}',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      const handles = cg.getNodesByName('handle');
+      const target = handles.find((n) => n.qualifiedName.includes('KtHandlers'))!;
+      const decoy = handles.find((n) => n.qualifiedName.includes('Decoy'))!;
+      const into = cg.getIncomingEdges(target.id).filter((e) => e.metadata?.fnRef === true);
+      expect(into).toHaveLength(1);
+      expect(cg.getNode(into[0]!.source)?.name).toBe('wire');
+      expect(cg.getIncomingEdges(decoy.id).filter((e) => e.metadata?.fnRef === true)).toHaveLength(0);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
   it('SWIFT SCOPING: bare ids hit only the enclosing type’s methods; top-level bare hits functions only', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-swiftscope-'));
     fs.writeFileSync(

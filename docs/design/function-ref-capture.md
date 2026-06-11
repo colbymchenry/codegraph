@@ -192,10 +192,16 @@ Index cost on redis: +6% time, +5% db size.
   cross-file (scope gated on same-file types ∪ imported names, incl. the last
   segment of dotted JVM imports); `this::m` / `super::m` ride the
   class-scoped + supertype path.
-- **Kotlin companion-object members** extract UNQUALIFIED (node `handle`, not
-  `KtHandlers::Companion::handle` — pre-existing extraction shape), so
-  `KtHandlers::handle` refs to companion members stay silent rather than
-  guess. Fix belongs in kotlin companion extraction.
+- **Qualified `Type::member` candidates skip the name gate** (like `this.X`):
+  Java/Kotlin same-package references and Kotlin companions need NO import,
+  so the gate could never see their scope — and the explicit-ref syntax is
+  self-selecting while resolution stays scope-suffix-anchored +
+  unique-or-drop (a `Decoy::handle` can't match a `KtHandlers::handle` ref).
+  This is also what resolves companion-member refs: companions extract
+  TRANSPARENTLY (`KtHandlers::handle`, method of the class) in real
+  multi-line code. (A single-line `class X { companion object { … } }` is an
+  upstream tree-sitter-kotlin misparse — ERROR node — and only ever appeared
+  in our own probe fixture; don't chase it.)
 - **Swift cross-file bare references**: Swift sees module-wide symbols without
   imports, so cross-file bare callbacks only resolve when repo-unique
   (functions; methods are enclosing-type-only). Cross-TYPE `#selector`

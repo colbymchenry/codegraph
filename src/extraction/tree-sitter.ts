@@ -435,15 +435,8 @@ export class TreeSitterExtractor {
     if (isGeneratedFile(this.filePath)) return;
 
     const definedHere = new Set<string>();
-    const definedTypes = new Set<string>();
     for (const n of this.nodes) {
       if (n.kind === 'function' || n.kind === 'method') definedHere.add(n.name);
-      if (
-        n.kind === 'class' || n.kind === 'struct' || n.kind === 'interface' ||
-        n.kind === 'enum' || n.kind === 'trait' || n.kind === 'protocol'
-      ) {
-        definedTypes.add(n.name);
-      }
     }
 
     // Import-binding names only (all binding emitters push kind 'imports').
@@ -493,31 +486,20 @@ export class TreeSitterExtractor {
       //    strictly class-scoped (own members or the validated supertype
       //    pass), so nothing fuzzy can leak.
       //  - `Scope::member` (C++ member-pointers, Java/Kotlin type-qualified
-      //    method refs): the SCOPE name must be a type defined here or an
-      //    imported name (covers `OtherClass::method` cross-file), or the
-      //    member matches the plain gate (back-compat for C++ same-file).
+      //    method refs, PHP `'Cls::m'`): ALWAYS flush — the explicit-ref
+      //    syntax is self-selecting, the referenced type often needs NO
+      //    import (Java/Kotlin same-package, Kotlin companions), and
+      //    resolution is scope-suffix-anchored + unique-or-drop, so a
+      //    same-named member on another class can't match.
       //  - C-family file-scope initializers skip the gate entirely
       //    (constant-expression context — see FnRefSpec.ungatedModes).
       //  - everything else: name ∈ same-file functions/methods ∪ imports.
-      if (!c.name.startsWith('this.')) {
+      if (!c.name.startsWith('this.') && !c.name.includes('::')) {
         const skipGate =
           (ungated?.has(c.mode) === true && atFileScope) ||
           c.skipGate === true; // PHP HOF-position string callables (see FnRefCandidate.skipGate)
-        if (!skipGate) {
-          if (c.name.includes('::')) {
-            const scopeName = c.name.slice(0, c.name.indexOf('::'));
-            const memberName = c.name.slice(c.name.lastIndexOf('::') + 2);
-            if (
-              !definedTypes.has(scopeName) &&
-              !importedNames.has(scopeName) &&
-              !definedHere.has(memberName) &&
-              !importedNames.has(memberName)
-            ) {
-              continue;
-            }
-          } else if (!definedHere.has(c.name) && !importedNames.has(c.name)) {
-            continue;
-          }
+        if (!skipGate && !definedHere.has(c.name) && !importedNames.has(c.name)) {
+          continue;
         }
       }
       const key = `${c.fromNodeId}|${c.name}`;
