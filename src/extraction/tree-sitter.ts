@@ -2615,6 +2615,15 @@ export class TreeSitterExtractor {
         } else if (func.type === 'scoped_identifier' || func.type === 'scoped_call_expression') {
           // Scoped call: Module::function()
           calleeName = getNodeText(func, this.source);
+        } else if (func.type === 'qualified_identifier') {
+          // C++ qualified call `ns::a::Func(...)`. The callee is stored under its
+          // SIMPLE name (the C++ extractor records the last `::` segment as the
+          // node name), so reference that segment too. Storing the full
+          // `ns::a::Func` here drops through to the generic text below and the
+          // name-based resolver never links the `calls` edge ("No callers").
+          const qtext = getNodeText(func, this.source);
+          const qparts = qtext.split('::').filter(Boolean);
+          calleeName = qparts[qparts.length - 1] || qtext;
         } else if (this.language === 'csharp' && func.type === 'member_access_expression') {
           // C# member call `recv.Method(...)`. When the receiver is itself a call
           // — a chained factory `Foo.Create(args).Bar()` — encode `inner().Bar`

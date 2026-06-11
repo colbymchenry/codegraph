@@ -3841,6 +3841,45 @@ std::string use() {
       expect(reached.some((p) => p.endsWith('user.cc')), `${fn.name} should be called from user.cc`).toBe(true);
     }
   });
+
+  it('resolves a fully-qualified call `ns::a::Func(...)` to its definition', async () => {
+    const src = path.join(tempDir, 'src');
+    fs.mkdirSync(src, { recursive: true });
+
+    // The callee node is stored under its SIMPLE name (`GetInsured`), but the
+    // call site uses the fully-qualified `ns::insured::GetInsured(...)`. Storing
+    // the full qualified text as the callee left the name-based resolver unable
+    // to link the `calls` edge, so `GetInsured` reported no callers.
+    fs.writeFileSync(
+      path.join(src, 'insured.cc'),
+      `#include <string>
+namespace mmpayinspolicymgrao { namespace insured {
+std::string GetInsured(const std::string& id) { return id; }
+} }
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'caller.cc'),
+      `#include <string>
+std::string CallIt() {
+  return mmpayinspolicymgrao::insured::GetInsured("x");
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const getInsured = cg.getNodesByKind('function').find((n) => n.name === 'GetInsured');
+    expect(getInsured, 'GetInsured extracted').toBeDefined();
+
+    const reached = [...cg.getImpactRadius(getInsured!.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+    expect(
+      reached.some((p) => p.endsWith('caller.cc')),
+      'qualified call ns::insured::GetInsured should resolve to caller.cc',
+    ).toBe(true);
+  });
 });
 
 describe('Dart mixins and type references', () => {
