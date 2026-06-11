@@ -50,6 +50,7 @@ import {
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import { getDaemonSocketPath } from './daemon-paths';
 import { supervisionLostReason } from './ppid-watchdog';
+import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
 /**
@@ -330,8 +331,10 @@ export class MCPServer {
     // Detect parent-process death — same logic as pre-refactor. When stdin
     // closes we go through StdioTransport's `process.exit(0)` already, but
     // SIGKILL of the parent doesn't reliably close stdin on Linux (#277).
-    process.stdin.on('end', () => this.stop());
-    process.stdin.on('close', () => this.stop());
+    // Also treat a stdin `'error'` (a socket-backed stdin can fail with
+    // ECONNRESET/hangup instead of a clean close) as shutdown, and destroy the
+    // stream so a hung fd can't busy-spin the event loop (#799).
+    treatStdinFailureAsShutdown(() => this.stop());
 
     this.mode = 'direct';
     this.installSignalHandlers();

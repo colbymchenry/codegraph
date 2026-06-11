@@ -286,12 +286,24 @@ export class StdioTransport extends LineBasedJsonRpcTransport {
       await this.handleLine(line);
     });
 
-    this.rl.on('close', () => {
+    // readline 'close' fires on a clean stdin EOF. But a socket-backed stdin
+    // (the VS Code stdio shape) can fail with an 'error' (ECONNRESET/hangup)
+    // that readline doesn't surface as 'close' — unhandled, it escalated to
+    // the global uncaughtException handler (which keeps running), orphaning
+    // the server and, on Linux, busy-spinning a POLLHUP fd at 100% CPU. Treat
+    // 'error' as terminal too, and destroy stdin so the fd leaves epoll (#799).
+    let closed = false;
+    const onStreamEnd = (): void => {
+      if (closed) return;
+      closed = true;
+      try { process.stdin.destroy(); } catch { /* already gone */ }
       this.opts.onClose();
       if (this.opts.exitOnClose) {
         process.exit(0);
       }
-    });
+    };
+    this.rl.on('close', onStreamEnd);
+    process.stdin.on('error', onStreamEnd);
   }
 
   stop(): void {

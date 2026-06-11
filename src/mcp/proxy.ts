@@ -23,6 +23,7 @@ import * as net from 'net';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 import { DaemonClientHello, DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
 import { supervisionLostReason } from './ppid-watchdog';
+import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { CodeGraphPackageVersion } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
@@ -298,8 +299,11 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       }
     }
   });
-  process.stdin.on('end', shutdown);
-  process.stdin.on('close', shutdown);
+  // Shut down when stdin ends/closes — and also on a stdin `'error'`, which a
+  // socket-backed stdin (the VS Code stdio shape) can emit on client death
+  // instead of a clean close; destroying the stream stops a hung fd from
+  // busy-spinning the event loop (#799).
+  treatStdinFailureAsShutdown(shutdown);
   startPpidWatchdogNoSocket(shutdown);
 
   // ---- daemon connection (background) ----
@@ -459,10 +463,16 @@ function pipeUntilClose(socket: net.Socket): Promise<void> {
       try { socket.end(); } catch { /* ignore */ }
       done();
     });
-    process.stdin.on('close', () => {
+    // 'close' and 'error' both tear down: a socket-backed stdin can fail with
+    // an 'error' (ECONNRESET/hangup) rather than a clean close; destroying it
+    // stops a hung fd from busy-spinning the event loop (#799).
+    const teardown = () => {
+      try { process.stdin.destroy(); } catch { /* ignore */ }
       try { socket.destroy(); } catch { /* ignore */ }
       done();
-    });
+    };
+    process.stdin.on('close', teardown);
+    process.stdin.on('error', teardown);
 
     socket.on('data', (chunk) => {
       try { process.stdout.write(chunk); } catch { /* ignore */ }
