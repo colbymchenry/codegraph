@@ -6,6 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { execFileSync } from 'child_process';
 
 /** The default per-project data directory name. */
 const DEFAULT_CODEGRAPH_DIR = '.codegraph';
@@ -158,6 +159,89 @@ export function createDirectory(projectRoot: string): void {
 
     fs.writeFileSync(gitignorePath, gitignoreContent, 'utf-8');
   }
+
+  ignoreCodeGraphDirectory(projectRoot);
+}
+
+/**
+ * Add .codegraph/ to this repository's local excludes.
+ *
+ * We use .git/info/exclude instead of the project's .gitignore because the
+ * CodeGraph index is local machine state. This keeps it out of commits without
+ * changing a tracked file just because someone ran `codegraph init`.
+ */
+export function ignoreCodeGraphDirectory(projectRoot: string): void {
+  const exclude = gitExclude(projectRoot);
+  if (!exclude) return;
+
+  let content = '';
+  try {
+    content = fs.existsSync(exclude.path) ? fs.readFileSync(exclude.path, 'utf-8') : '';
+  } catch {
+    return;
+  }
+
+  if (hasIgnoreEntry(content, exclude.entry)) return;
+
+  const nextContent = appendIgnoreEntry(content, exclude.entry);
+  try {
+    fs.mkdirSync(path.dirname(exclude.path), { recursive: true });
+    fs.writeFileSync(exclude.path, nextContent, 'utf-8');
+  } catch {
+    // Local exclude is a convenience. Initialization should still succeed if
+    // git metadata is read-only or otherwise inaccessible.
+  }
+}
+
+function gitExclude(projectRoot: string): { path: string; entry: string } | null {
+  try {
+    const inside = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: projectRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    }).trim();
+    if (inside !== 'true') return null;
+
+    const worktreeRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: projectRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    }).trim();
+    if (!worktreeRoot) return null;
+
+    const gitPath = execFileSync('git', ['rev-parse', '--git-path', 'info/exclude'], {
+      cwd: projectRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    }).trim();
+    if (!gitPath) return null;
+
+    const excludePath = path.isAbsolute(gitPath) ? gitPath : path.resolve(projectRoot, gitPath);
+    const relativeProject = path.relative(worktreeRoot, projectRoot).split(path.sep).join('/');
+    const entry = relativeProject
+      ? `${relativeProject}/${CODEGRAPH_DIR}/`
+      : `${CODEGRAPH_DIR}/`;
+
+    return { path: excludePath, entry };
+  } catch {
+    return null;
+  }
+}
+
+function hasIgnoreEntry(content: string, entry: string): boolean {
+  return content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .some((line) => line === entry || line === entry.replace(/\/$/, ''));
+}
+
+function appendIgnoreEntry(content: string, entry: string): string {
+  const trimmed = content.replace(/\s*$/, '');
+  const block = `# CodeGraph local index\n${entry}\n`;
+  return trimmed.length > 0 ? `${trimmed}\n\n${block}` : block;
 }
 
 /**

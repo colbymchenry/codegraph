@@ -8,6 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
 import { Node, Edge } from '../src/types';
 import { isInitialized, getCodeGraphDir, validateDirectory, codeGraphDirName, isCodeGraphDataDir } from '../src/directory';
@@ -58,6 +59,63 @@ describe('CodeGraph Foundation', () => {
       // files (db, daemon.pid, sockets, logs) never show up in git. (#492, #484)
       expect(content).toContain('*');
       expect(content).toContain('!.gitignore');
+
+      cg.close();
+    });
+
+    it('should add .codegraph to the local git exclude file', () => {
+      execFileSync('git', ['init', '-q'], { cwd: tempDir, stdio: 'ignore' });
+
+      const cg = CodeGraph.initSync(tempDir);
+
+      const excludePath = path.join(tempDir, '.git', 'info', 'exclude');
+      const content = fs.readFileSync(excludePath, 'utf-8');
+      expect(content).toContain('# CodeGraph local index');
+      expect(content).toContain('.codegraph/');
+
+      const status = execFileSync('git', ['status', '--short'], {
+        cwd: tempDir,
+        encoding: 'utf8',
+      });
+      expect(status).not.toContain('.codegraph');
+
+      cg.close();
+    });
+
+    it('should not duplicate an existing .codegraph git exclude entry', () => {
+      execFileSync('git', ['init', '-q'], { cwd: tempDir, stdio: 'ignore' });
+      const excludePath = path.join(tempDir, '.git', 'info', 'exclude');
+      fs.appendFileSync(excludePath, '\n.codegraph/\n');
+
+      const cg = CodeGraph.initSync(tempDir);
+
+      const content = fs.readFileSync(excludePath, 'utf-8');
+      const occurrences = content.split('.codegraph/').length - 1;
+      expect(occurrences).toBe(1);
+
+      cg.close();
+    });
+
+    it('should add a relative local git exclude entry for a nested project', () => {
+      execFileSync('git', ['init', '-q'], { cwd: tempDir, stdio: 'ignore' });
+      const nestedDir = path.join(tempDir, 'packages', 'app');
+      fs.mkdirSync(nestedDir, { recursive: true });
+
+      const cg = CodeGraph.initSync(nestedDir);
+
+      const excludePath = path.join(tempDir, '.git', 'info', 'exclude');
+      const content = fs.readFileSync(excludePath, 'utf-8');
+      expect(content).toContain('packages/app/.codegraph/');
+      expect(content).not.toContain('\n.codegraph/\n');
+
+      cg.close();
+    });
+
+    it('should initialize outside git without a local exclude file', () => {
+      const cg = CodeGraph.initSync(tempDir);
+
+      expect(CodeGraph.isInitialized(tempDir)).toBe(true);
+      expect(fs.existsSync(path.join(tempDir, '.git', 'info', 'exclude'))).toBe(false);
 
       cg.close();
     });
