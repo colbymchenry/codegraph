@@ -665,7 +665,7 @@ Impact and blast-radius queries are only as good as the dependency graph behind 
 | Lua | nvim-telescope/telescope.nvim | 84.2% |
 | Luau | dphfox/Fusion | 92.2% |
 | Liquid | Shopify/dawn | 73.8% |
-| Pascal / Delphi | PascalCoin | 75.7% |
+| Pascal / Delphi | PascalCoin | 77.4% |
 
 Framework routing is validated the same way, on a canonical app per framework: Express 100%, FastAPI 98%, Flask 100%, NestJS 96.8%, Gin 96.5%, Axum 100%, Rocket 93.8%, Vapor 100%, Laravel 92%, Rails 89.6%, React Router 100% — and the convention/reflection-heavy ones at their honest static-analysis ceiling: ASP.NET 83.9%, Spring 83.3%, Drupal 78.9%, Django 74.1%.
 
