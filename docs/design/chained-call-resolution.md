@@ -1,12 +1,11 @@
 # Design + status: chained static-factory / fluent call resolution
 
-**Status:** SHIPPED for **11 languages** (C++, C, PHP, Java, Kotlin, C#, Swift, Rust,
-Go, Scala, Dart, Objective-C) + a conformance pass. **TypeScript and Luau were evaluated
-and intentionally skipped** (both gradually typed → the mechanism is +0 / regresses on
-real code). **Pascal/Delphi** is blocked on a larger prerequisite (its method-call
-extraction is broadly incomplete). See "Full README classification" below. Tracking
-issue: **#750** (which began as "the statically-typed README languages" but that
-enumeration was incomplete — it missed ObjC / Pascal / Luau).
+**Status:** SHIPPED for **13 languages** (C++, C, PHP, Java, Kotlin, C#, Swift, Rust,
+Go, Scala, Dart, Objective-C, Pascal/Delphi) + a conformance pass. **TypeScript and Luau
+were evaluated and intentionally skipped** (both gradually typed → the mechanism is +0 /
+regresses on real code). See "Full README classification" below. Tracking issue:
+**#750** (which began as "the statically-typed README languages" but that enumeration was
+incomplete — it missed ObjC / Pascal / Luau).
 
 **Motivation:** a call whose **receiver is itself a call** — a factory / singleton /
 builder that returns an object — should produce a `calls` edge to the chained method:
@@ -75,10 +74,11 @@ walking `context.getSupertypes(...)`.
 | **Scala** | #761 | `.` | gatling **+14 / −59** | Precision win (−59 = stdlib `Option`/`Iterator` `.map`/`.flatMap` the baseline mis-tied to gatling's `Validation::*`). Companion factories + case-class `apply`. |
 | **Dart** | #762 | `.` | localsend hand-written **+17 / −10** | Precision win **+ constructors made first-class** (factory/named ctors `Foo.create()`/`Foo._()` are now indexed; unnamed `Foo()` stays `instantiates`). `dartCtorInfo` validates a ctor against the enclosing class name — handles a tree-sitter misparse where `@override (A,B) m()` makes `m()` look like a ctor. |
 | **Objective-C** | #786 | message send | SDWebImage **+35 / −75** | Precision win. Chained message send `[[Foo create] doIt]` over `message_expression`. getReturnType skips nullability qualifiers (`nonnull instancetype`). A class-message factory returns the receiver class by convention, so `[[X alloc] init]` / singleton chains resolve on `X` (validated). The −75 are wrong `init` mis-matches retargeted to the right class. |
+| **Pascal/Delphi** | #791 | `.` (`exprDot`) | PascalCoin **+19 / −18** | Precision win. `TFoo.GetInstance().DoIt()` over Pascal's `exprCall`/`exprDot`. getReturnType from the `typeref` (incl. interface returns `IFoo`). Re-encoding gated on the Delphi `TFoo`/`IFoo` type convention so capitalized *variable* chains stay bare. A constructor (no `: TBar`) or typecast `TFoo(x)` resolves on the class. 15 of the −18 are correct class→interface retargets (`GetInstance(): IAsn1OctetString`). |
 | **TypeScript** | — | `.` | typeorm +0/−6 · nest **+0/−164** | **Evaluated, NOT shipped** — gradual typing; see below. |
 | **Luau** | — | `:` / `.` | Fusion +0/−0 · matter +0/−0 | **Evaluated, NOT shipped** — gradually typed; additive-safe (missing-edge gap, no regression) but real Luau rarely annotates factory returns, so +0 on both benchmarks. Works for `Foo.create(): Bar` then `:doIt()` (synthetic). |
 
-`EXTRACTION_VERSION` is now **15** (C++→…→Dart→Objective-C). Re-index with `codegraph index -f`
+`EXTRACTION_VERSION` is now **16** (C++→…→Objective-C→Pascal). Re-index with `codegraph index -f`
 to pick up the newer extractor on an existing graph.
 
 ## Why TypeScript was skipped
@@ -108,20 +108,21 @@ declarations). Against the README's full supported-language list:
 
 | Bucket | Languages |
 |---|---|
-| **Covered** (12) | C++, C, PHP, Java, Kotlin, C#, Swift, Rust, Go, Scala, Dart, Objective-C |
+| **Covered** (13) | C++, C, PHP, Java, Kotlin, C#, Swift, Rust, Go, Scala, Dart, Objective-C, Pascal/Delphi |
 | **Evaluated, skipped** (2) | **TypeScript** — gradual typing → inference-typed factories can't be recovered; net recall regression. **Luau** — gradually typed; additive-safe but +0 on Fusion AND matter (real Luau rarely annotates factory returns). Both: the mechanism needs reliably-declared return types, which gradually-typed code too often omits. |
-| **Blocked by a prerequisite** (1) | **Pascal/Delphi** — statically typed (so the mechanism *would* pay off), but its method-call extraction from procedure bodies is broadly incomplete: paren-less calls (`TFoo.GetInstance.DoIt`) parse as a bare `exprDot` (not in `callTypes`), and even paren'd calls (`f.Regular()`) produce no edge (no receiver-type tracking for Pascal locals). Building Pascal's call graph is a substantial standalone extractor effort; the chained-call port is a small part of it. Separate follow-up. |
+| **Known limitation (not blocking)** | **Pascal/Delphi** is shipped (#791), but only the **paren'd** chain `TFoo.GetInstance().DoIt()` is covered — the **paren-less** form `TFoo.GetInstance.DoIt` parses as a bare `exprDot` (not in `callTypes`) and isn't extracted as a call at all. Emitting paren-less method calls is a separate extractor follow-up (and a broader Pascal-coverage win independent of chains). |
 | **Out of scope — no declared return types** (6) | JavaScript, Ruby, Lua, Svelte, Vue, Liquid (Liquid has no methods/chains at all) |
 | **Partial / separate** (1) | Python — only optional `-> T` hints; tracked as #578, not part of this mechanism |
 
 So #750's original framing ("the 9 statically-typed README languages") was incomplete —
-it missed three more typed languages. Resolved: **Objective-C** shipped (#786, same
-wrong-edge gap, mechanism ports directly); **Luau** evaluated and skipped (gradual
-typing → +0 on real repos, additive-safe); **Pascal** is gated on unrelated extractor
-work (its call graph is broadly incomplete).
+it missed three more typed languages, all now resolved: **Objective-C** shipped (#786,
+same wrong-edge gap, mechanism ports directly); **Pascal/Delphi** shipped (#791, a clean
+port for the paren'd chain — an initial "blocked" read was wrong, caused by probing only
+the paren-less form); **Luau** evaluated and skipped (gradual typing → +0 on real repos,
+additive-safe).
 
 The through-line: this mechanism fits languages with **reliably-declared return types**
-(the 12 shipped). Gradually-typed languages (TypeScript, Luau) omit them too often for
+(the 13 shipped). Gradually-typed languages (TypeScript, Luau) omit them too often for
 it to pay off, and dynamically-typed languages have none.
 
 ---
