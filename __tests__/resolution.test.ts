@@ -2994,4 +2994,141 @@ void run() {
       expect(incoming.some((e) => e.kind === 'instantiates')).toBe(true);
     });
   });
+
+  describe('Objective-C chained message-send call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves a chained message send [[Foo create] doIt] via the return type, never a same-named decoy', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.m'),
+        `@interface Bar : NSObject
+- (void)doIt;
+@end
+@implementation Bar
+- (void)doIt {}
+@end
+@interface Decoy : NSObject
+- (void)doIt;
+@end
+@implementation Decoy
+- (void)doIt {}
+@end
+@interface Foo : NSObject
++ (Bar *)create;
+@end
+@implementation Foo
++ (Bar *)create { return nil; }
+- (void)run { [[Foo create] doIt]; }
+@end
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Bar::doIt')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::doIt')).toEqual([]);
+    });
+
+    it('resolves a chained message whose method is inherited from a superclass (via conformance)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.m'),
+        `@interface Base : NSObject
+- (void)render;
+@end
+@implementation Base
+- (void)render {}
+@end
+@interface Widget : Base
+@end
+@implementation Widget
+@end
+@interface Decoy : NSObject
+- (void)render;
+@end
+@implementation Decoy
+- (void)render {}
+@end
+@interface Factory : NSObject
++ (Widget *)make;
+@end
+@implementation Factory
++ (Widget *)make { return nil; }
+- (void)run { [[Factory make] render]; }
+@end
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Base::render')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::render')).toEqual([]);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.m'),
+        `@interface Bar : NSObject
+@end
+@implementation Bar
+@end
+@interface Other : NSObject
+- (void)onlyOther;
+@end
+@implementation Other
+- (void)onlyOther {}
+@end
+@interface Foo : NSObject
++ (Bar *)create;
+@end
+@implementation Foo
++ (Bar *)create { return nil; }
+- (void)run { [[Foo create] onlyOther]; }
+@end
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Bar has no onlyOther — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+
+    it('resolves a singleton chain [[Cache shared] clearAll] whose factory returns nonnull instancetype', async () => {
+      // The factory returns `nonnull instancetype` — the nullability qualifier must
+      // be skipped (not captured AS the type), and an instancetype class-message
+      // factory returns the receiver class, so clearAll resolves on Cache, never a
+      // same-named decoy. (Regression for both: the captured-`nonnull` bug and the
+      // ubiquitous `[[X alloc] init]` / singleton pattern.)
+      fs.writeFileSync(
+        path.join(tempDir, 'main.m'),
+        `@interface Cache : NSObject
++ (nonnull instancetype)shared;
+- (void)clearAll;
+@end
+@implementation Cache
++ (nonnull instancetype)shared { return nil; }
+- (void)clearAll {}
+@end
+@interface Decoy : NSObject
+- (void)clearAll;
+@end
+@implementation Decoy
+- (void)clearAll {}
+@end
+@interface Caller : NSObject
+- (void)run;
+@end
+@implementation Caller
+- (void)run { [[Cache shared] clearAll]; }
+@end
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Cache::clearAll')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::clearAll')).toEqual([]);
+    });
+  });
 });

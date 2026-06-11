@@ -2482,6 +2482,33 @@ export class TreeSitterExtractor {
           } else {
             calleeName = methodName;
           }
+        } else if (receiverField && receiverField.type === 'message_expression' && /^\w+$/.test(methodName)) {
+          // Chained message send `[[Foo create] doIt]` — the receiver is itself a
+          // class message. Recover the inner `Class.selector` and encode
+          // `Class.selector().doIt` so resolution infers doIt's class from what
+          // `Class.selector` RETURNS (#645/#608). Only a CLASS-factory chain
+          // (capitalized inner receiver); a unary outer selector is required
+          // because the chain resolver's method part is `\w+` (no `:`). An
+          // instance chain (`[[obj foo] bar]`, lowercase inner) stays bare.
+          const innerRecv = getChildByField(receiverField, 'receiver');
+          const innerRecvName = innerRecv ? getNodeText(innerRecv, this.source) : '';
+          if (innerRecv?.type === 'identifier' && /^[A-Z]/.test(innerRecvName)) {
+            const innerKw: string[] = [];
+            for (let i = 0; i < receiverField.namedChildCount; i++) {
+              if (receiverField.fieldNameForNamedChild(i) === 'method') {
+                const kw = receiverField.namedChild(i);
+                if (kw) innerKw.push(getNodeText(kw, this.source));
+              }
+            }
+            let innerColon = false;
+            for (let i = 0; i < receiverField.childCount; i++) {
+              if (receiverField.child(i)?.type === ':') { innerColon = true; break; }
+            }
+            const innerSelector = innerColon ? innerKw.map((k) => `${k}:`).join('') : innerKw[0];
+            calleeName = innerSelector ? `${innerRecvName}.${innerSelector}().${methodName}` : methodName;
+          } else {
+            calleeName = methodName;
+          }
         } else {
           calleeName = methodName;
         }

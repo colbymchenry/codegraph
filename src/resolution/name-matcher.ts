@@ -673,7 +673,23 @@ export function matchDottedCallChain(
   const factoryMethod = inner.slice(lastDot + 1);
   if (!factoryClass || !factoryMethod) return null;
   const ret = lookupCalleeReturnType(`${factoryClass}::${factoryMethod}`, ref, context);
-  if (!ret) return null;
+  if (!ret) {
+    // Objective-C: a class-message factory — `[X alloc]`, `[X new]`,
+    // `[X sharedFoo]` — returns an instance of the RECEIVER class `X` by
+    // convention (`instancetype`). So when the factory's own return type isn't
+    // recoverable (its selector returns `instancetype`, or `alloc`/`new` aren't
+    // user-defined nodes at all), the receiver's type is the class `X` itself.
+    // This resolves the ubiquitous `[[X alloc] init]` and singleton chains.
+    // resolveMethodOnType validates against X (and its supertypes), so a class
+    // whose method actually lives elsewhere yields NO edge, not a wrong one — and
+    // crucially this does NOT fire when a concrete return type WAS captured but
+    // simply lacks the method (that already returned null above: absent-method
+    // safety, so a same-named decoy is still never matched).
+    if (ref.language === 'objc' && /^[A-Z]/.test(factoryClass)) {
+      return resolveMethodOnType(factoryClass, method, ref, context, 0.8, 'instance-method', importedFqnOf(factoryClass, ref, context));
+    }
+    return null;
+  }
   return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context));
 }
 
@@ -1123,11 +1139,12 @@ export function matchReference(
   }
 
   // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C# / Swift /
-  // Go / Scala / Dart) — `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar`,
-  // Go's bare-factory `New().Method()` as `New().Method`, Scala's companion factory
-  // `Foo.create().bar()`, or Dart's static factory / factory-constructor
-  // `Foo.create().bar()` (#645/#608 mechanism). Resolve the method's class from the
-  // inner call's declared return type, then validate it.
+  // Go / Scala / Dart / Objective-C) — `Foo.getInstance().bar()` encoded as
+  // `Foo.getInstance().bar`, Go's bare-factory `New().Method()` as `New().Method`,
+  // Scala's companion factory, Dart's static factory / factory-constructor, or
+  // ObjC's chained message send `[[Foo create] doIt]` encoded as `Foo.create().doIt`
+  // (#645/#608 mechanism). Resolve the method's class from the inner call's
+  // declared return type, then validate it.
   if (
     ref.language === 'java' ||
     ref.language === 'kotlin' ||
@@ -1135,7 +1152,8 @@ export function matchReference(
     ref.language === 'swift' ||
     ref.language === 'go' ||
     ref.language === 'scala' ||
-    ref.language === 'dart'
+    ref.language === 'dart' ||
+    ref.language === 'objc'
   ) {
     result = matchDottedCallChain(ref, context);
     if (result) return result;
