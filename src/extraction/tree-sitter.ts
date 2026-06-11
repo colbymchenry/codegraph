@@ -4281,10 +4281,30 @@ export class TreeSitterExtractor {
       }
     }
 
-    const parentId =
+    let parentId =
       this.methodIndex.get(fullNameKey) ||
-      this.methodIndex.get(shortNameKey) ||
-      this.nodeStack[this.nodeStack.length - 1];
+      this.methodIndex.get(shortNameKey);
+
+    // No existing node? This is an implementation-only **free** procedure/function
+    // (`procedure Helper; begin … end;` with no interface declaration and not a
+    // class method). Create a function node so its body's calls attribute to it,
+    // not to the enclosing file/module. A method (`TClass.Method`, a dotted name)
+    // always has a node from its class declaration, so this only fires for free
+    // routines — and the methodIndex lookup above already covers interface-declared
+    // free routines, so there's no duplicate.
+    if (!parentId && !fullName.includes('.')) {
+      const fnNode = this.createNode('function', fullName, declProc, {
+        signature: this.extractor?.getSignature?.(declProc, this.source),
+        visibility: this.extractor?.getVisibility?.(declProc),
+      });
+      if (fnNode) {
+        parentId = fnNode.id;
+        this.methodIndex.set(fullNameKey, fnNode.id);
+        if (!this.methodIndex.has(shortNameKey)) this.methodIndex.set(shortNameKey, fnNode.id);
+      }
+    }
+
+    if (!parentId) parentId = this.nodeStack[this.nodeStack.length - 1];
     if (!parentId) return;
 
     // Visit the block for calls

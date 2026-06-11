@@ -3352,5 +3352,30 @@ end.
       expect(isCalled('TFoo::GetValue')).toBe(false);
       expect(isCalled('TFoo::SetValue')).toBe(false);
     });
+
+    it('attributes an implementation-only free procedure\'s calls to the procedure, not the file', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TTgt = class
+    procedure Hit;
+  end;
+  TFoo = class
+    procedure DoStuff;
+  end;
+implementation
+procedure TTgt.Hit; begin end;
+procedure TFoo.DoStuff; var t: TTgt; begin t.Hit; end;
+procedure Helper; var t: TTgt; begin t.Hit; end;
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // `Helper` is implementation-only (no interface decl, not a method), but its
+      // body's call must attribute to `Helper`, not the file/module — alongside the
+      // method `DoStuff`.
+      expect(callerNamesOf('TTgt::Hit')).toEqual(['DoStuff', 'Helper']);
+    });
   });
 });
