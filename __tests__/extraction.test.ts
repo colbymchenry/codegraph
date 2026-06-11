@@ -249,6 +249,24 @@ export class Box {
     expect(byName.get('PyModel')?.docstring).toBe('decorated class');
   });
 
+  it('cleans comment markers across language styles (#780)', () => {
+    const doc = (file: string, code: string, name: string) =>
+      new Map(extractFromSource(file, code).nodes.map((n) => [n.name, n])).get(name)?.docstring;
+
+    // Rust doc lines (`///`, `//!`) — the trailing slash used to leak through.
+    expect(doc('m.rs', '/// rust doc line\nfn rs_fn() {}', 'rs_fn')).toBe('rust doc line');
+    // Lua line + long-bracket comments.
+    expect(doc('m.lua', '-- lua line\nfunction lua_fn() end', 'lua_fn')).toBe('lua line');
+    expect(doc('b.lua', '--[[ lua block ]]\nfunction lua_b() end', 'lua_b')).toBe('lua block');
+    // Pascal brace and paren-star comments.
+    const pasUnit = (c: string) =>
+      `unit U;\ninterface\n${c}\nprocedure P;\nimplementation\nprocedure P;\nbegin\nend;\nend.\n`;
+    expect(doc('a.pas', pasUnit('{ pascal brace }'), 'P')).toBe('pascal brace');
+    expect(doc('c.pas', pasUnit('(* pascal paren *)'), 'P')).toBe('pascal paren');
+    // C block comment still clean (no regression).
+    expect(doc('m.c', '/* c block */\nvoid c_fn(void) {}', 'c_fn')).toBe('c block');
+  });
+
   it('should extract interfaces', () => {
     const code = `
 export interface User {

@@ -62,6 +62,33 @@ const DOCSTRING_WRAPPER_TYPES = new Set([
 ]);
 
 /**
+ * Strip comment-syntax markers from a raw comment so the stored docstring is
+ * just the prose. Covers the marker styles across every supported language:
+ * C-family line and block comments and their doc variants, Rust/Swift/Kotlin
+ * triple-slash and bang doc lines, hash lines (Python/Ruby/shell), Lua/Luau
+ * line and long-bracket comments, and Pascal brace and paren-star comments.
+ * (#780)
+ *
+ * Paired block delimiters are stripped only when the comment OPENS with one,
+ * so a line comment that merely happens to END with a closing delimiter is
+ * never truncated. The per-line markers are anchored at line start, so
+ * they're safe to apply to any comment.
+ */
+function cleanCommentMarkers(comment: string): string {
+  let c = comment.trim();
+  if (c.startsWith('/*')) c = c.replace(/^\/\*+!?/, '').replace(/\*+\/$/, '');
+  else if (c.startsWith('--[')) c = c.replace(/^--\[=*\[/, '').replace(/\]=*\]$/, '');
+  else if (c.startsWith('(*')) c = c.replace(/^\(\*/, '').replace(/\*\)$/, '');
+  else if (c.startsWith('{')) c = c.replace(/^\{/, '').replace(/\}$/, '');
+  return c
+    .replace(/^\/\/[/!]?\s?/gm, '') // // , and Rust/Swift doc lines /// //!
+    .replace(/^--\s?/gm, '') //        Lua/Luau line comments
+    .replace(/^#\s?/gm, '') //         Python/Ruby/shell line comments
+    .replace(/^\s*\*\s?/gm, '') //     block-comment continuation (* foo)
+    .trim();
+}
+
+/**
  * Get the docstring/comment preceding a node
  */
 export function getPrecedingDocstring(node: SyntaxNode, source: string): string | undefined {
@@ -94,16 +121,6 @@ export function getPrecedingDocstring(node: SyntaxNode, source: string): string 
 
   if (comments.length === 0) return undefined;
 
-  // Clean up comment markers
-  return comments
-    .map((c) =>
-      c
-        .replace(/^\/\*\*?|\*\/$/g, '')
-        .replace(/^\/\/\s?/gm, '')
-        .replace(/^#\s?/gm, '') // Python/Ruby/shell line comments (#780)
-        .replace(/^\s*\*\s?/gm, '')
-        .trim()
-    )
-    .join('\n')
-    .trim();
+  // Strip each comment's syntax markers (language-aware), then join.
+  return comments.map(cleanCommentMarkers).join('\n').trim();
 }
