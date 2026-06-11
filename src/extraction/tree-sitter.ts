@@ -4372,6 +4372,69 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Extract a PAREN-LESS Pascal method/procedure call (`Obj.Method;`,
+   * `TFoo.GetInstance.DoIt;`). Pascal lets a no-arg method drop its parens, so it
+   * parses as a bare `exprDot` (not an `exprCall`). A bare `exprDot` is
+   * syntactically identical to a field/property access, so this is only ever
+   * called for a STATEMENT-level exprDot (caller-gated): a bare `Obj.Field;`
+   * statement is a no-op, so a statement-level dot expression is a call. (An
+   * exprDot in assignment LHS/RHS or a condition is left alone — there it really
+   * can be a field/property read.)
+   */
+  private extractPascalParenlessCall(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!callerId) return;
+
+    const receiver = node.namedChild(0);
+    const outerId = node.namedChildren.filter((c: SyntaxNode) => c.type === 'identifier').pop();
+    const method = outerId ? getNodeText(outerId, this.source) : '';
+    if (!method) return;
+
+    let calleeName = '';
+    // Chained: the receiver is itself a call — a paren-less `TFoo.GetInstance` (an
+    // inner exprDot) or a paren'd `TFoo.GetInstance()` (an exprCall). Encode the
+    // chain `TFoo.GetInstance().DoIt` so resolution infers DoIt's class from what
+    // the factory RETURNS (#645/#608), gated on the Delphi `TFoo`/`IFoo` type
+    // convention; a capitalized VARIABLE chain stays a bare method name.
+    if ((receiver?.type === 'exprDot' || receiver?.type === 'exprCall') && /^\w+$/.test(method)) {
+      const innerCalleeNode = receiver.type === 'exprCall' ? receiver.namedChild(0) : receiver;
+      const innerCallee = !innerCalleeNode
+        ? ''
+        : innerCalleeNode.type === 'identifier'
+          ? getNodeText(innerCalleeNode, this.source)
+          : innerCalleeNode.namedChildren
+              .filter((c: SyntaxNode) => c.type === 'identifier')
+              .map((id: SyntaxNode) => getNodeText(id, this.source))
+              .join('.');
+      if (innerCallee && /^[TI][A-Z]/.test(innerCallee)) {
+        calleeName = `${innerCallee}().${method}`;
+        // The T/I-prefixed inner is itself a real call — record it too.
+        if (receiver.type === 'exprCall') this.extractPascalCall(receiver);
+        else this.extractPascalParenlessCall(receiver);
+      } else {
+        calleeName = method; // non-class receiver: a bare method ref (no field-access ref)
+      }
+    } else {
+      // Simple: `Obj.Method` → the dotted name (resolves via the receiver / bare name).
+      calleeName = node.namedChildren
+        .filter((c: SyntaxNode) => c.type === 'identifier')
+        .map((id: SyntaxNode) => getNodeText(id, this.source))
+        .join('.');
+    }
+
+    if (calleeName) {
+      this.unresolvedReferences.push({
+        fromNodeId: callerId,
+        referenceName: calleeName,
+        referenceKind: 'calls',
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column,
+      });
+    }
+  }
+
+  /**
    * Recursively visit a Pascal block/statement tree for call expressions
    */
   private visitPascalBlock(node: SyntaxNode): void {
@@ -4381,11 +4444,18 @@ export class TreeSitterExtractor {
       if (child.type === 'exprCall') {
         this.extractPascalCall(child);
       } else if (child.type === 'exprDot') {
-        // Check if exprDot contains an exprCall
-        for (let j = 0; j < child.namedChildCount; j++) {
-          const grandchild = child.namedChild(j);
-          if (grandchild?.type === 'exprCall') {
-            this.extractPascalCall(grandchild);
+        // A STATEMENT-level bare exprDot is a paren-less call (`Obj.Free;`,
+        // `TFoo.GetInstance.DoIt;`). Anywhere else (assignment side, condition,
+        // expression) a bare exprDot is ambiguous with a field/property access,
+        // so there we only descend for paren'd inner calls.
+        if (node.type === 'statement') {
+          this.extractPascalParenlessCall(child);
+        } else {
+          for (let j = 0; j < child.namedChildCount; j++) {
+            const grandchild = child.namedChild(j);
+            if (grandchild?.type === 'exprCall') {
+              this.extractPascalCall(grandchild);
+            }
           }
         }
       } else {

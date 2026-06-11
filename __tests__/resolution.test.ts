@@ -3265,5 +3265,92 @@ end.
       // TBar has no OnlyOther — must not mis-attach to the same-named TOther::OnlyOther.
       expect(isCalled('TOther::OnlyOther')).toBe(false);
     });
+
+    it('extracts paren-less method calls (Pascal lets a no-arg method drop its parens)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TFoo = class
+    procedure DoThing;
+    procedure Reset;
+  end;
+implementation
+procedure TFoo.DoThing; begin end;
+procedure TFoo.Reset; begin end;
+procedure Run(f: TFoo);
+begin
+  f.DoThing;
+  f.Reset;
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(isCalled('TFoo::DoThing')).toBe(true);
+      expect(isCalled('TFoo::Reset')).toBe(true);
+    });
+
+    it('resolves a PAREN-LESS chained factory call TFoo.GetInstance.DoIt via the return type', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TBar = class
+    procedure DoIt;
+  end;
+  TDecoy = class
+    procedure DoIt;
+  end;
+  TFoo = class
+    class function GetInstance: TBar;
+  end;
+implementation
+procedure TBar.DoIt; begin end;
+procedure TDecoy.DoIt; begin end;
+class function TFoo.GetInstance: TBar; begin Result := nil; end;
+procedure Run;
+begin
+  TFoo.GetInstance.DoIt;
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(isCalled('TBar::DoIt')).toBe(true);
+      expect(isCalled('TDecoy::DoIt')).toBe(false);
+    });
+
+    it('does NOT turn a property write/read into a call edge (only statement-level dots are calls)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TFoo = class
+    function GetValue: Integer;
+    procedure SetValue(v: Integer);
+    property Value: Integer read GetValue write SetValue;
+  end;
+implementation
+function TFoo.GetValue: Integer; begin Result := 0; end;
+procedure TFoo.SetValue(v: Integer); begin end;
+procedure Run(f: TFoo);
+var x: Integer;
+begin
+  f.Value := 5;
+  x := f.Value;
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // A property read/write is a bare dot in assignment position, not a statement,
+      // so it must not be mis-extracted as a call to the property's getter/setter.
+      expect(isCalled('TFoo::GetValue')).toBe(false);
+      expect(isCalled('TFoo::SetValue')).toBe(false);
+    });
   });
 });
