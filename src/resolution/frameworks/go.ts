@@ -131,6 +131,50 @@ export const goResolver: FrameworkResolver = {
       }
     }
 
+    // GoFrame binds routes reflectively: the path/method live in a `g.Meta`
+    // struct tag on the request type, so there is no literal route call to match
+    // above. Emit a route node from the tag and link it to the controller method,
+    // which GoFrame names after the request type with the `Req` suffix dropped
+    // (`ChatReq` -> `Chat`). Only the relative `path:` from the tag is captured;
+    // joining the `s.Group("/api", …)` prefix is left to a follow-up. (#747)
+    const goframeRegex = /\btype\s+(\w+)\s+struct\s*\{\s*g\.Meta\s+`([^`]*)`/g;
+    while ((match = goframeRegex.exec(safe)) !== null) {
+      const [, structName, tag] = match;
+      const routePath = /\bpath:"([^"]+)"/.exec(tag!)?.[1];
+      if (!routePath) continue; // a g.Meta without a path: tag is not a route
+      // Keep route node and its controller-method edge together: skip types that
+      // don't follow the `…Req` convention rather than emit an orphan route node.
+      if (!structName!.endsWith('Req')) continue;
+      const methodName = structName!.slice(0, -'Req'.length);
+      if (!methodName) continue;
+      const method = /\bmethod:"([^"]+)"/.exec(tag!)?.[1]?.toUpperCase() ?? 'ANY';
+      const line = safe.slice(0, match.index).split('\n').length;
+
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${method}:${routePath}`,
+        kind: 'route',
+        name: `${method} ${routePath}`,
+        qualifiedName: `${filePath}::route:${routePath}`,
+        filePath,
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: match[0].length,
+        language: 'go',
+        updatedAt: now,
+      };
+      nodes.push(routeNode);
+      references.push({
+        fromNodeId: routeNode.id,
+        referenceName: methodName,
+        referenceKind: 'references',
+        line,
+        column: 0,
+        filePath,
+        language: 'go',
+      });
+    }
+
     return { nodes, references };
   },
 };

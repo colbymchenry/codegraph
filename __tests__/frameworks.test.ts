@@ -942,6 +942,33 @@ describe('goResolver.extract', () => {
     const { references } = goResolver.extract!('routes.go', src);
     expect(references[0].referenceName).toBe('listUsers');
   });
+
+  it('extracts a GoFrame g.Meta route and links it to the controller method (#747)', () => {
+    // GoFrame binds reflectively: the route lives in a `g.Meta` struct tag on the
+    // request type, and the handler is the controller method named after that type
+    // (ChatReq -> Chat). No literal route string / call edge exists otherwise.
+    const src = `package v1
+type ChatReq struct {
+	g.Meta \`path:"/chat" method:"post"\`
+	Content string \`json:"content"\`
+}
+`;
+    const { nodes, references } = goResolver.extract!('api/chat/v1/chat.go', src);
+    expect(nodes[0].kind).toBe('route');
+    expect(nodes[0].name).toBe('POST /chat');
+    expect(references[0].referenceName).toBe('Chat');
+    expect(references[0].fromNodeId).toBe(nodes[0].id);
+  });
+
+  it('defaults a GoFrame g.Meta route with no method tag to ANY', () => {
+    const src = `type ListReq struct {
+	g.Meta \`path:"/list"\`
+}
+`;
+    const { nodes, references } = goResolver.extract!('api/v1/list.go', src);
+    expect(nodes[0].name).toBe('ANY /list');
+    expect(references[0].referenceName).toBe('List');
+  });
 });
 
 import { rustResolver } from '../src/resolution/frameworks/rust';
