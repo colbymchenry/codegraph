@@ -757,6 +757,47 @@ def bootstrap():
       expect(callsToUserService).toHaveLength(0);
     });
 
+    it('surfaces instantiation sites as callers/callees via the instantiates edge (#774)', async () => {
+      // Once a `Foo()` ref is promoted to `instantiates`, traversal must
+      // still surface it: `getCallers(Foo)` should list every instantiation
+      // site and `getCallees(site)` should list the class — otherwise
+      // `callers`/`impact` on a class miss where it is constructed (#774).
+      const srcDir = path.join(tempDir, 'src');
+      fs.mkdirSync(srcDir, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(srcDir, 'app.py'),
+        `class UserService:
+    def __init__(self):
+        self.db = None
+
+def bootstrap():
+    return UserService()
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const userService = cg
+        .getNodesByKind('class')
+        .find((n) => n.name === 'UserService');
+      expect(userService).toBeDefined();
+
+      const callers = cg.getCallers(userService!.id);
+      const fromBootstrap = callers.find((c) => c.node.name === 'bootstrap');
+      expect(fromBootstrap).toBeDefined();
+      expect(fromBootstrap!.edge.kind).toBe('instantiates');
+
+      const bootstrap = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'bootstrap');
+      const callees = cg.getCallees(bootstrap!.id);
+      const toUserService = callees.find((c) => c.node.name === 'UserService');
+      expect(toUserService).toBeDefined();
+      expect(toUserService!.edge.kind).toBe('instantiates');
+    });
+
     it('resolves Go cross-package qualified calls via go.mod module path (#388)', async () => {
       // Pre-#388, every `pkga.FuncX(...)` call in a Go monorepo was flagged
       // external (isExternalImport returned true for any non-`/internal/`
