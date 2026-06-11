@@ -44,27 +44,102 @@ export function getChildByField(node: SyntaxNode, fieldName: string): SyntaxNode
 }
 
 /**
- * Get the docstring/comment preceding a node
+ * Comment node utilities
  */
-export function getPrecedingDocstring(node: SyntaxNode, source: string): string | undefined {
+function isCommentNode(node: SyntaxNode): boolean {
+  return (
+    node.type === 'comment' ||
+    node.type === 'line_comment' ||
+    node.type === 'block_comment' ||
+    node.type === 'documentation_comment'
+  );
+}
+
+const DOCSTRING_WRAPPER_TYPES = new Set<string>([
+  // TS/JS
+  'export_statement',
+  'lexical_declaration',
+  'variable_declaration',
+  'variable_declarator',
+  // Python decorators
+  'decorated_definition',
+]);
+
+
+/**
+ * Collect the contiguous run of comment siblings immediately preceding `node`
+ */
+function collectPrecedingComments(node: SyntaxNode, source: string): string[] | null {
   let sibling = node.previousNamedSibling;
   const comments: string[] = [];
 
-  while (sibling) {
-    if (
-      sibling.type === 'comment' ||
-      sibling.type === 'line_comment' ||
-      sibling.type === 'block_comment' ||
-      sibling.type === 'documentation_comment'
-    ) {
-      comments.unshift(getNodeText(sibling, source));
-      sibling = sibling.previousNamedSibling;
-    } else {
+  while (sibling && isCommentNode(sibling)) {
+    comments.unshift(getNodeText(sibling, source));
+    sibling = sibling.previousNamedSibling;
+  }
+
+  return comments.length > 0 ? comments : null;
+}
+
+/**
+ * Climb from `node` toward the root through transparent wrapper/decorator parents, returning the outermost wrapper whose preceding comment should be  attributed to `node`.
+ */
+function climbToWrapperWithComment(node: SyntaxNode): SyntaxNode | null {
+  let current = node;
+
+  while (current.parent && DOCSTRING_WRAPPER_TYPES.has(current.parent.type)) {
+    const parent = current.parent;
+
+    let leading = true;
+    for (let i = 0; i < parent.namedChildCount; i++) {
+      const child = parent.namedChild(i);
+      if (!child) continue;
+      if (child.id === current.id) break;
+      if (
+        isCommentNode(child) ||
+        child.type === 'decorator' ||
+        child.type === 'identifier' ||
+        child.type === 'property_identifier' ||
+        child.type === 'type_annotation' ||
+        child.type === 'type_identifier'
+      ) {
+        continue;
+      }
+      leading = false;
       break;
+    }
+    if (!leading) break;
+
+    // If the wrapper itself has a preceding comment sibling, the climb has reached the node that owns the comment.
+    const prev = parent.previousNamedSibling;
+    if (prev && isCommentNode(prev)) {
+      return parent;
+    }
+
+    current = parent;
+  }
+
+  // No climbed wrapper had a preceding comment.
+  return null;
+}
+
+
+
+/**
+ * Get the docstring/comment preceding a node
+ */
+export function getPrecedingDocstring(node: SyntaxNode, source: string): string | undefined {
+  let comments = collectPrecedingComments(node, source);
+
+  if (comments === null) {
+    // No direct preceding comment — climb through wrapper/decorator parents.
+    const wrapper = climbToWrapperWithComment(node);
+    if (wrapper) {
+      comments = collectPrecedingComments(wrapper, source);
     }
   }
 
-  if (comments.length === 0) return undefined;
+  if (comments === null || comments.length === 0) return undefined;
 
   // Clean up comment markers
   return comments

@@ -6681,3 +6681,135 @@ describe('Swift property wrappers / attributes (blast-radius recall)', () => {
     } finally { cleanupTempDir(dir); }
   });
 });
+
+
+
+describe('Docstring attachment for wrapped/decorated symbols', () => {
+  it('attaches a preceding comment to an exported function', () => {
+    const code = `
+// Charges the card
+export function processPayment(amount) { return amount; }
+`;
+    const fn = extractFromSource('pay.ts', code).nodes.find((n) => n.name === 'processPayment');
+    expect(fn?.docstring).toBe('Charges the card');
+  });
+
+  it('attaches a preceding comment to an exported class', () => {
+    const code = `
+/** The payment service */
+export class PaymentService {}
+`;
+    const cls = extractFromSource('svc.ts', code).nodes.find((n) => n.name === 'PaymentService');
+    expect(cls?.docstring).toBe('The payment service');
+  });
+
+  it('attaches a preceding comment to an arrow export const', () => {
+    const code = `
+// adds two numbers
+export const add = (a, b) => a + b;
+`;
+    const fn = extractFromSource('add.ts', code).nodes.find((n) => n.name === 'add');
+    expect(fn?.docstring).toBe('adds two numbers');
+  });
+
+  it('attaches a preceding comment to an export default function', () => {
+    const code = `
+// default handler
+export default function handler() {}
+`;
+    const fn = extractFromSource('handler.ts', code).nodes.find((n) => n.name === 'handler');
+    expect(fn?.docstring).toBe('default handler');
+  });
+
+  it('attaches a preceding comment to a decorated Python function', () => {
+    const code = `
+# does the thing
+@app.route("/x")
+def view():
+    return 1
+`;
+    const fn = extractFromSource('views.py', code).nodes.find((n) => n.name === 'view');
+    expect(fn?.docstring).toContain('does the thing');
+  });
+
+  it('attaches a preceding comment to a decorated Python class', () => {
+    const code = `
+# a model
+@dataclass
+class Model:
+    pass
+`;
+    const cls = extractFromSource('model.py', code).nodes.find((n) => n.name === 'Model');
+    expect(cls?.docstring).toContain('a model');
+  });
+
+  it('captures a comment on an annotated Java method via the base walk (not affected by the bug)', () => {
+    // In tree-sitter-java the `@Override` annotation is inside the method
+    // declaration, so the method's own previousNamedSibling is already the
+    // comment — the base walk captures it without any wrapper climb. Pinned as
+    // a control so the wrapper-climb scope-narrowing doesn't regress it.
+    const code = `
+public class C {
+  // handles requests
+  @Override
+  public void handle() {}
+}
+`;
+    const m = extractFromSource('C.java', code).nodes.find((n) => n.name === 'handle');
+    expect(m?.docstring).toBe('handles requests');
+  });
+
+  it('captures a comment on a C# attributed method via the base walk (not affected by the bug)', () => {
+    // Same as Java: the `[HttpGet]` attribute is inside the method declaration,
+    // so the base sibling-walk already finds the comment — no climb needed.
+    const code = `
+public class C {
+  // the endpoint
+  [HttpGet]
+  public void Get() {}
+}
+`;
+    const m = extractFromSource('C.cs', code).nodes.find((n) => n.name === 'Get');
+    expect(m?.docstring).toBe('the endpoint');
+  });
+
+  it('does not change a non-wrapped symbol docstring (no regression)', () => {
+    const code = `
+// plain helper
+function helper() {}
+`;
+    const fn = extractFromSource('helper.ts', code).nodes.find((n) => n.name === 'helper');
+    expect(fn?.docstring).toBe('plain helper');
+  });
+
+  it('leaves a wrapped symbol with no preceding comment as undefined', () => {
+    const fn = extractFromSource('none.ts', `export const x = () => 1;`)
+      .nodes.find((n) => n.name === 'x');
+    expect(fn?.docstring).toBeUndefined();
+  });
+
+  it('does not mis-attach a comment across two sibling exports', () => {
+    // The comment precedes `second`, not `first` — it must attach only to
+    // `second`, and `first` must stay undefined.
+    const code = `
+export function first() {}
+// doc for second
+export function second() {}
+`;
+    const nodes = extractFromSource('multi.ts', code).nodes;
+    expect(nodes.find((n) => n.name === 'first')?.docstring).toBeUndefined();
+    expect(nodes.find((n) => n.name === 'second')?.docstring).toBe('doc for second');
+  });
+
+  it('does not attach a comment to the second declarator of one declaration', () => {
+    // A single comment above `const a = ..., b = ...` belongs to the leading
+    // declarator only — `b` must not inherit it.
+    const code = `
+// shared
+export const a = () => 1, b = () => 2;
+`;
+    const nodes = extractFromSource('decl.ts', code).nodes;
+    expect(nodes.find((n) => n.name === 'a')?.docstring).toBe('shared');
+    expect(nodes.find((n) => n.name === 'b')?.docstring).toBeUndefined();
+  });
+});
