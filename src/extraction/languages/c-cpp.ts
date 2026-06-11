@@ -3,46 +3,55 @@ import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /**
- * Find the function NAME's `qualified_identifier` (`Foo::bar`) inside a
- * declarator, skipping the `parameter_list` — a parameter with a qualified type
- * (`const std::string& x`) must NOT be mistaken for the method name. Without the
- * skip, a plain free function `std::string TableFileName(const std::string&...)`
- * was named `string` (from the parameter type), so calls to it never resolved
- * and its file looked like nothing depended on it.
+ * Walk the declarator chain to the function's NAME node only, unwrapping
+ * pointer / reference / parenthesized wrappers and never descending into the
+ * `parameter_list`. This keeps two failure modes out of the extracted name:
+ *   - a free function named after its first namespaced PARAMETER type
+ *     (`X GetThing(a::Ctx& c)` must be `GetThing`, not `Ctx`), and
+ *   - a reference-returning free function whose generic declarator-text
+ *     fallback kept the leading `&` and the whole signature
+ *     (`const std::string& GetRef(a::Ctx& c)` must be `GetRef`, not
+ *     `& GetRef(a::Ctx& c)`).
  */
-function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefined {
-  const queue: SyntaxNode[] = [declarator];
-  while (queue.length > 0) {
-    const current = queue.shift()!;
-    if (current.type === 'qualified_identifier') return current;
-    for (let i = 0; i < current.namedChildCount; i++) {
-      const child = current.namedChild(i);
-      // Don't descend into parameters or the trailing return type — their types
-      // (`const std::string&`, `-> std::string`) aren't the function name.
-      if (child && child.type !== 'parameter_list' && child.type !== 'trailing_return_type') {
-        queue.push(child);
-      }
-    }
+function getCppNameDeclarator(node: SyntaxNode): SyntaxNode | undefined {
+  let current: SyntaxNode | null | undefined = getChildByField(node, 'declarator');
+  while (
+    current &&
+    (current.type === 'function_declarator' ||
+      current.type === 'pointer_declarator' ||
+      current.type === 'reference_declarator' ||
+      current.type === 'parenthesized_declarator')
+  ) {
+    current = getChildByField(current, 'declarator') ?? current.namedChild(0);
+  }
+  return current ?? undefined;
+}
+
+function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
+  const nameNode = getCppNameDeclarator(node);
+  if (!nameNode) return undefined;
+  if (nameNode.type === 'qualified_identifier') {
+    const parts = getNodeText(nameNode, source).trim().split('::').filter(Boolean);
+    return parts[parts.length - 1];
+  }
+  // Return plain names directly so we don't fall through to the generic
+  // declarator-text fallback, which doesn't unwrap reference_declarator
+  // (`T& Foo(...)` -> "& Foo(...)"). operator_name / destructor_name /
+  // template_function are intentionally left to that fallback, which names
+  // them correctly.
+  if (nameNode.type === 'identifier' || nameNode.type === 'field_identifier') {
+    return getNodeText(nameNode, source).trim();
   }
   return undefined;
 }
 
-function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
-  const declarator = getChildByField(node, 'declarator');
-  if (!declarator) return undefined;
-  const qid = findDeclaratorQualifiedId(declarator);
-  if (!qid) return undefined;
-  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
-  return parts[parts.length - 1];
-}
-
 function extractCppReceiverType(node: SyntaxNode, source: string): string | undefined {
-  const declarator = getChildByField(node, 'declarator');
-  if (!declarator) return undefined;
-  const qid = findDeclaratorQualifiedId(declarator);
-  if (!qid) return undefined;
-  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
-  return parts.length > 1 ? parts.slice(0, -1).join('::') : undefined;
+  const nameNode = getCppNameDeclarator(node);
+  if (nameNode && nameNode.type === 'qualified_identifier') {
+    const parts = getNodeText(nameNode, source).trim().split('::').filter(Boolean);
+    if (parts.length > 1) return parts.slice(0, -1).join('::');
+  }
+  return undefined;
 }
 
 /**
