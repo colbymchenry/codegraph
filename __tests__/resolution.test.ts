@@ -1438,6 +1438,47 @@ func main() {
       expect(callers.some((c) => c.node.filePath === 'src/Bar.svelte')).toBe(true);
     });
 
+    it('links an .astro page to the component and TS util it uses (#768)', async () => {
+      // The canonical Astro shape: a page imports a layout/component in
+      // frontmatter and uses it as a template tag; the component's template
+      // calls an imported .ts util. Both hops must produce graph edges or
+      // an Astro project is invisible to callers/impact.
+      fs.mkdirSync(path.join(tempDir, 'src/components'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'src/utils'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'src/pages'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src/utils/format.ts'),
+        `export function formatDate(d: Date): string { return d.toISOString(); }\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/components/PostCard.astro'),
+        `---\nimport { formatDate } from '../utils/format';\nconst { date } = Astro.props;\n---\n<time>{formatDate(date)}</time>\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/pages/index.astro'),
+        `---\nimport PostCard from '../components/PostCard.astro';\n---\n<PostCard date={new Date()} />\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      // Hop 1: page → component (template tag through the frontmatter import)
+      const cardNode = cg
+        .getNodesByKind('component')
+        .find((n) => n.name === 'PostCard' && n.filePath === 'src/components/PostCard.astro');
+      expect(cardNode).toBeDefined();
+      const cardCallers = cg.getCallers(cardNode!.id);
+      expect(cardCallers.some((c) => c.node.filePath === 'src/pages/index.astro')).toBe(true);
+
+      // Hop 2: component template call → .ts util
+      const fmtNode = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'formatDate' && n.filePath === 'src/utils/format.ts');
+      expect(fmtNode).toBeDefined();
+      const fmtCallers = cg.getCallers(fmtNode!.id);
+      expect(fmtCallers.some((c) => c.node.filePath === 'src/components/PostCard.astro')).toBe(true);
+    });
+
     it('resolves a bare directory import (import { x } from "." / "./") to index.ts (#629)', async () => {
       // `import { helper } from '.'` (or './') must map to the
       // directory's index.ts before the re-export chase can run. The

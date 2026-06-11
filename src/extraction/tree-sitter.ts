@@ -24,6 +24,7 @@ import { EXTRACTORS } from './languages';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
+import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
@@ -4751,6 +4752,10 @@ export function extractFromSource(
   } else if (detectedLanguage === 'vue') {
     // Use custom extractor for Vue
     const extractor = new VueExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'astro') {
+    // Use custom extractor for Astro (frontmatter + template delegation)
+    const extractor = new AstroExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'liquid') {
     // Use custom extractor for Liquid

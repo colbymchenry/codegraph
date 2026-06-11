@@ -83,6 +83,7 @@ export const LANGUAGES = [
   'dart',
   'svelte',
   'vue',
+  'astro',
   'liquid',
   'pascal',
   'scala',

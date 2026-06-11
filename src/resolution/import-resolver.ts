@@ -24,6 +24,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   // `.svelte`/`.vue` file resolve to nothing, so barrel callers vanish (#629).
   svelte: ['.ts', '.js', '.svelte', '.tsx', '.jsx', '/index.ts', '/index.js', '/index.svelte'],
   vue: ['.ts', '.js', '.vue', '.tsx', '.jsx', '/index.ts', '/index.js', '/index.vue'],
+  astro: ['.ts', '.js', '.astro', '.tsx', '.jsx', '/index.ts', '/index.js', '/index.astro'],
   python: ['.py', '/__init__.py'],
   go: ['.go'],
   rust: ['.rs', '/mod.rs'],
@@ -582,9 +583,10 @@ export function extractImportMappings(
 
   if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx') {
     mappings.push(...extractJSImports(content));
-  } else if (language === 'svelte' || language === 'vue') {
+  } else if (language === 'svelte' || language === 'vue' || language === 'astro') {
     // Svelte/Vue single-file components import via plain ES6 inside their
-    // `<script>` block. Without this, a `.svelte`/`.vue` consumer produces
+    // `<script>` block (Astro: the `---` frontmatter). Without this, a
+    // `.svelte`/`.vue`/`.astro` consumer produces
     // zero import mappings, so `resolveViaImport` can't run and a barrel
     // import (`import { Foo } from './lib'`) falls back to name-matching —
     // which silently fails whenever the re-export alias differs from the

@@ -10,7 +10,7 @@ import * as path from 'path';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -93,6 +93,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.liquid': 'liquid',
   '.svelte': 'svelte',
   '.vue': 'vue',
+  '.astro': 'astro',
   '.pas': 'pascal',
   '.dpr': 'pascal',
   '.dpk': 'pascal',
@@ -181,6 +182,14 @@ export async function initGrammars(): Promise<void> {
 export async function loadGrammarsForLanguages(languages: Language[]): Promise<void> {
   if (!parserInitialized) {
     await initGrammars();
+  }
+
+  // SFC languages (svelte/vue/astro) have no grammar of their own — their
+  // extractors delegate <script>/frontmatter content to the TS/JS extractor,
+  // so those grammars must be loaded even when no plain .ts/.js file is in
+  // the index set (e.g. a pure-.astro content site).
+  if (languages.some((l) => l === 'svelte' || l === 'vue' || l === 'astro')) {
+    languages = [...languages, 'typescript', 'javascript'];
   }
 
   // Deduplicate and filter to languages that have WASM grammars and aren't already loaded
@@ -300,6 +309,7 @@ function looksLikeObjc(source: string): boolean {
 export function isLanguageSupported(language: Language): boolean {
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'vue') return true; // custom extractor (script block delegation)
+  if (language === 'astro') return true; // custom extractor (frontmatter/script block delegation)
   if (language === 'liquid') return true; // custom regex extractor
   if (language === 'razor') return true; // custom RazorExtractor (.cshtml/.razor markup)
   if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver
@@ -314,7 +324,7 @@ export function isLanguageSupported(language: Language): boolean {
  * Check if a grammar has been loaded and is ready for parsing.
  */
 export function isGrammarLoaded(language: Language): boolean {
-  if (language === 'svelte' || language === 'vue' || language === 'liquid' || language === 'razor') return true;
+  if (language === 'svelte' || language === 'vue' || language === 'astro' || language === 'liquid' || language === 'razor') return true;
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
   if (language === 'xml' || language === 'properties') return true; // no WASM grammar needed
   return languageCache.has(language);
@@ -337,7 +347,7 @@ export function isFileLevelOnlyLanguage(language: Language): boolean {
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'astro', 'liquid'];
 }
 
 /**
@@ -403,6 +413,7 @@ export function getLanguageDisplayName(language: Language): string {
     dart: 'Dart',
     svelte: 'Svelte',
     vue: 'Vue',
+    astro: 'Astro',
     liquid: 'Liquid',
     pascal: 'Pascal / Delphi',
     scala: 'Scala',

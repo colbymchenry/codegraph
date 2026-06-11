@@ -1373,6 +1373,7 @@ func boot(routes: RoutesBuilder) throws {
 
 import { reactResolver } from '../src/resolution/frameworks/react';
 import { svelteResolver } from '../src/resolution/frameworks/svelte';
+import { astroResolver } from '../src/resolution/frameworks/astro';
 
 describe('reactResolver.extract — React Router', () => {
   it('extracts a v6 <Route path element={<Comp/>}>', () => {
@@ -1425,6 +1426,77 @@ describe('svelteResolver.extract (smoke)', () => {
     const result = svelteResolver.extract!('+page.svelte', '');
     expect(result).toHaveProperty('nodes');
     expect(result).toHaveProperty('references');
+  });
+});
+
+describe('astroResolver.extract — src/pages file-based routing', () => {
+  const routeNames = (filePath: string): string[] =>
+    astroResolver.extract!(filePath, '').nodes.filter((n) => n.kind === 'route').map((n) => n.name);
+
+  it('maps index.astro to /', () => {
+    expect(routeNames('src/pages/index.astro')).toEqual(['/']);
+  });
+
+  it('maps nested index and plain pages', () => {
+    expect(routeNames('src/pages/blog/index.astro')).toEqual(['/blog']);
+    expect(routeNames('src/pages/about.astro')).toEqual(['/about']);
+  });
+
+  it('converts [param] and [...rest] syntax', () => {
+    expect(routeNames('src/pages/blog/[slug].astro')).toEqual(['/blog/:slug']);
+    expect(routeNames('src/pages/[...path].astro')).toEqual(['/*path']);
+  });
+
+  it('maps .ts endpoints under src/pages to routes', () => {
+    expect(routeNames('src/pages/api/posts.ts')).toEqual(['/api/posts']);
+    expect(routeNames('src/pages/rss.xml.js')).toEqual(['/rss.xml']);
+  });
+
+  it('excludes underscore-prefixed segments and config files', () => {
+    expect(routeNames('src/pages/_partial.astro')).toEqual([]);
+    expect(routeNames('src/pages/blog/_components/Card.astro')).toEqual([]);
+    expect(routeNames('src/pages/vite.config.ts')).toEqual([]);
+  });
+
+  it('ignores .astro files outside src/pages', () => {
+    expect(routeNames('src/components/Button.astro')).toEqual([]);
+    expect(routeNames('docs/pages/guide.astro')).toEqual([]);
+  });
+});
+
+describe('astroResolver.resolve — Astro global and virtual modules', () => {
+  const ctx = {} as never;
+  const baseRef = {
+    fromNodeId: 'component:a',
+    line: 1,
+    column: 0,
+    filePath: 'src/pages/index.astro',
+    language: 'astro',
+  };
+
+  it('claims Astro.* global references as framework-provided', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'Astro.props', referenceKind: 'references' } as never,
+      ctx
+    );
+    expect(res?.resolvedBy).toBe('framework');
+    expect(res?.confidence).toBe(1.0);
+  });
+
+  it('claims astro:content virtual module imports', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'astro:content', referenceKind: 'imports' } as never,
+      ctx
+    );
+    expect(res?.resolvedBy).toBe('framework');
+  });
+
+  it('leaves ordinary names alone', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'astrolabe', referenceKind: 'calls' } as never,
+      { getNodesByName: () => [] } as never
+    );
+    expect(res).toBeNull();
   });
 });
 
