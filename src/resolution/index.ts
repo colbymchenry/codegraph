@@ -1212,9 +1212,17 @@ export class ReferenceResolver {
     if (!member) return null;
     const fromNode = this.queries.getNodeById(ref.fromNodeId);
     if (!fromNode) return null;
-    const sep = fromNode.qualifiedName.lastIndexOf('::');
-    if (sep <= 0) return null; // not inside a class scope
-    const classPrefix = fromNode.qualifiedName.slice(0, sep);
+    // A hook declared at class-body level (Ruby `before_action :authenticate`)
+    // attributes to the CLASS node itself — its qualified name IS the scope.
+    // For members, strip the member segment.
+    let classPrefix: string;
+    if (SUPERTYPE_BEARING_KINDS.has(fromNode.kind) || fromNode.kind === 'module') {
+      classPrefix = fromNode.qualifiedName;
+    } else {
+      const sep = fromNode.qualifiedName.lastIndexOf('::');
+      if (sep <= 0) return null; // not inside a class scope
+      classPrefix = fromNode.qualifiedName.slice(0, sep);
+    }
     const candidates = this.context
       .getNodesByQualifiedName(`${classPrefix}::${member}`)
       .filter(
@@ -1260,38 +1268,72 @@ export class ReferenceResolver {
       const member = ref.referenceName.slice('this.'.length);
       const fromNode = this.queries.getNodeById(ref.fromNodeId);
       if (!fromNode || !member) continue;
-      const sep = fromNode.qualifiedName.lastIndexOf('::');
-      if (sep <= 0) continue;
-      const classPrefix = fromNode.qualifiedName.slice(0, sep);
-      const className = classPrefix.includes('::')
-        ? classPrefix.slice(classPrefix.lastIndexOf('::') + 2)
-        : classPrefix;
+      // Class-body-level hooks (Ruby) attribute to the CLASS node itself.
+      let className: string;
+      if (SUPERTYPE_BEARING_KINDS.has(fromNode.kind) || fromNode.kind === 'module') {
+        className = fromNode.name;
+      } else {
+        const sep = fromNode.qualifiedName.lastIndexOf('::');
+        if (sep <= 0) continue;
+        const classPrefix = fromNode.qualifiedName.slice(0, sep);
+        className = classPrefix.includes('::')
+          ? classPrefix.slice(classPrefix.lastIndexOf('::') + 2)
+          : classPrefix;
+      }
 
-      // BFS up the supertype graph by simple name.
-      const seen = new Set<string>([className]);
-      let frontier = this.context.getSupertypes?.(className, ref.language) ?? [];
+      // NODE-anchored BFS up the supertype graph: start from the class node
+      // in the ref's own file (never a same-named class elsewhere — rails has
+      // a dozen `Engine`s), follow implements/extends EDGES to supertype
+      // NODES, and look members up through `contains` edges. No name-based
+      // unions anywhere — a name-keyed getSupertypes('Engine') merged every
+      // Engine's parents and produced a cross-class wrong edge on rails.
+      let frontierNodes = this.context
+        .getNodesByName(className)
+        .filter(
+          (n) =>
+            SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+            n.filePath === ref.filePath
+        );
+      if (frontierNodes.length === 0) {
+        // The class itself may be declared in another file (partial/reopened
+        // classes); fall back to same-family nodes of that name.
+        frontierNodes = this.context
+          .getNodesByName(className)
+          .filter(
+            (n) =>
+              SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+              sameLanguageFamily(n.language, ref.language)
+          );
+      }
+      const seenNodes = new Set<string>(frontierNodes.map((n) => n.id));
       let target: Node | null = null;
-      for (let depth = 0; depth < 5 && frontier.length > 0 && !target; depth++) {
-        const next: string[] = [];
-        for (const superName of frontier) {
-          if (seen.has(superName)) continue;
-          seen.add(superName);
-          const members = this.context
-            .getNodesByName(member)
-            .filter(
-              (n) =>
-                (n.kind === 'function' || n.kind === 'method') &&
-                sameLanguageFamily(n.language, ref.language) &&
-                (n.qualifiedName === `${superName}::${member}` ||
-                  n.qualifiedName.endsWith(`::${superName}::${member}`))
-            );
-          if (members.length > 0) {
-            target = members.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
-            break;
+      for (let depth = 0; depth < 5 && frontierNodes.length > 0 && !target; depth++) {
+        const next: Node[] = [];
+        for (const typeNode of frontierNodes) {
+          for (const edge of this.queries.getOutgoingEdges(typeNode.id, ['implements', 'extends'])) {
+            const superNode = this.queries.getNodeById(edge.target);
+            if (!superNode || seenNodes.has(superNode.id)) continue;
+            seenNodes.add(superNode.id);
+            if (!SUPERTYPE_BEARING_KINDS.has(superNode.kind)) continue;
+            // Member lookup anchored on the supertype's contains edges.
+            for (const c of this.queries.getOutgoingEdges(superNode.id, ['contains'])) {
+              const m = this.queries.getNodeById(c.target);
+              if (
+                m &&
+                m.name === member &&
+                (m.kind === 'function' || m.kind === 'method') &&
+                sameLanguageFamily(m.language, ref.language)
+              ) {
+                target = m;
+                break;
+              }
+            }
+            if (target) break;
+            next.push(superNode);
           }
-          next.push(...(this.context.getSupertypes?.(superName, ref.language) ?? []));
+          if (target) break;
         }
-        frontier = next;
+        frontierNodes = next;
       }
 
       if (target) {

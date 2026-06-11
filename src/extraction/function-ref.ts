@@ -25,9 +25,9 @@
  *
  * Deliberately NOT covered (resolving the *dispatch* — `o->cb(x)` → the
  * registered function — needs data-flow through struct fields; a wrong edge
- * is worse than none): indirect-call resolution, PHP string callables,
- * Ruby bare symbols outside `method(:sym)`, and `obj.method` member values
- * where `obj` isn't `this`/`self`.
+ * is worse than none): indirect-call resolution and `obj.method` member
+ * values where `obj` isn't `this`/`self` (the receiver's type is statically
+ * unknowable without local data-flow).
  */
 
 import type { Node as SyntaxNode } from 'web-tree-sitter';
@@ -45,6 +45,15 @@ export interface FnRefCandidate {
    * C++'s flush policy keys on it.
    */
   explicitRef: boolean;
+  /**
+   * Skip the same-file/import name gate for this candidate. Set for PHP
+   * string callables in known HOF positions: PHP global functions are
+   * referenced cross-file WITHOUT imports (global namespace), so the gate
+   * can't see them — the strong positional prior (a string argument to
+   * `usort`/`array_map`/…) plus resolution's unique-or-drop rule carry the
+   * precision instead.
+   */
+  skipGate?: boolean;
 }
 
 /** How to pull candidate value nodes out of a dispatched container node. */
@@ -252,15 +261,29 @@ const CSHARP_SPEC: FnRefSpec = {
 
 const RUBY_SPEC: FnRefSpec = {
   // Bare identifiers in Ruby args are method CALLS or locals, never function
-  // values — only the `method(:name)` idiom (and `&method(:name)`) qualifies.
+  // values — only the `method(:name)` idiom (and `&method(:name)`) plus
+  // hook-DSL symbols (`before_action :authenticate`) qualify.
   idTypes: new Set<string>(),
   dispatch: new Map<string, CaptureRule>([
     ['argument_list', { mode: 'args' }],
     ['pair', { mode: 'value', field: 'value' }],
   ]),
   layers: new Map<string, string | null>([['block_argument', null]]),
-  special: new Set(['call']),
+  special: new Set(['call', 'simple_symbol']),
 };
+
+/**
+ * Rails/ActiveSupport-style hook DSLs whose symbol arguments name a method of
+ * the enclosing class: lifecycle callbacks (`before_action`, `after_save`,
+ * `around_create`, `skip_before_action`…), `validate :method`, `set_callback`,
+ * `helper_method`, and `rescue_from(..., with: :handler)`. NOT `validates`
+ * (plural) — its symbols name ATTRIBUTES, not methods.
+ */
+const RUBY_HOOK_RE = /^(skip_)?(before|after|around)_[a-z_]+$/;
+const RUBY_HOOK_NAMES = new Set(['validate', 'set_callback', 'helper_method', 'rescue_from']);
+function isRubyHookCall(name: string): boolean {
+  return RUBY_HOOK_RE.test(name) || RUBY_HOOK_NAMES.has(name);
+}
 
 const SWIFT_SPEC: FnRefSpec = {
   idTypes: new Set(['simple_identifier']),
@@ -316,9 +339,39 @@ const PASCAL_SPEC: FnRefSpec = {
 };
 
 /**
- * Capture specs by language. PHP is deliberately absent: its first-class
- * callable `fn(...)` already extracts as a `calls` edge, and string callables
- * (`'fn_name'`) are a precision risk left for a follow-up.
+ * PHP core functions whose string arguments are CALLABLES — the positional
+ * prior that makes a bare string trustworthy as a function reference.
+ * Deliberately core-PHP only; framework registries (WordPress `add_action`)
+ * belong in a frameworks/ resolver if ever added.
+ */
+const PHP_CALLABLE_HOFS = new Set([
+  'array_map', 'array_filter', 'array_walk', 'array_walk_recursive', 'array_reduce',
+  'usort', 'uasort', 'uksort',
+  'array_udiff', 'array_udiff_assoc', 'array_uintersect', 'array_uintersect_assoc',
+  'call_user_func', 'call_user_func_array',
+  'forward_static_call', 'forward_static_call_array',
+  'preg_replace_callback', 'preg_replace_callback_array',
+  'register_shutdown_function', 'register_tick_function',
+  'set_error_handler', 'set_exception_handler', 'spl_autoload_register',
+  'ob_start', 'iterator_apply', 'header_register_callback',
+  'is_callable',
+]);
+
+const PHP_SPEC: FnRefSpec = {
+  // PHP has no bare-identifier function values (the first-class callable
+  // `fn(...)` already extracts as a `calls` edge). What qualifies:
+  //  - a string argument to a known callable-taking core function
+  //    (`usort($a, 'cmp_items')`) — see PHP_CALLABLE_HOFS
+  //  - array callables: `[$this, 'method']` (class-scoped) and
+  //    `[Foo::class, 'method']` (qualified), in any call's arguments
+  idTypes: new Set<string>(),
+  dispatch: new Map<string, CaptureRule>([['arguments', { mode: 'args' }]]),
+  layers: new Map<string, string | null>([['argument', null]]),
+  special: new Set(['encapsed_string', 'string', 'array_creation_expression']),
+};
+
+/**
+ * Capture specs by language.
  */
 export const FN_REF_SPECS: Record<string, FnRefSpec | undefined> = {
   c: cFamilySpec(),
@@ -334,6 +387,7 @@ export const FN_REF_SPECS: Record<string, FnRefSpec | undefined> = {
   java: JAVA_SPEC,
   kotlin: KOTLIN_SPEC,
   csharp: CSHARP_SPEC,
+  php: PHP_SPEC,
   ruby: RUBY_SPEC,
   swift: SWIFT_SPEC,
   scala: SCALA_SPEC,
@@ -441,7 +495,7 @@ export function captureFnRefCandidates(
     // flush, where file scope is known) drops bare ids outside file-scope
     // initializer tables.
     const explicitRef = !spec.idTypes.has(v.type);
-    for (const { name, node } of normalizeValue(v, spec, source, 0)) {
+    for (const { name, node, skipGate } of normalizeValue(v, spec, source, 0)) {
       if (!name || NAME_STOPLIST.has(name)) continue;
       out.push({
         name,
@@ -449,10 +503,18 @@ export function captureFnRefCandidates(
         column: node.startPosition.column,
         mode: rule.mode,
         explicitRef,
+        skipGate,
       });
     }
   }
   return out;
+}
+
+/** One normalized function-value: its name, source node, and gate policy. */
+interface NormalizedRef {
+  name: string;
+  node: SyntaxNode;
+  skipGate?: boolean;
 }
 
 /**
@@ -465,7 +527,7 @@ function normalizeValue(
   spec: FnRefSpec,
   source: string,
   depth: number
-): Array<{ name: string; node: SyntaxNode }> {
+): NormalizedRef[] {
   if (depth > 4) return [];
   const type = node.type;
 
@@ -497,7 +559,7 @@ function normalizeValue(
       const inner = getChildByField(node, layerField);
       return inner ? normalizeValue(inner, spec, source, depth + 1) : [];
     }
-    const results: Array<{ name: string; node: SyntaxNode }> = [];
+    const results: NormalizedRef[] = [];
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (child) results.push(...normalizeValue(child, spec, source, depth + 1));
@@ -551,7 +613,7 @@ function normalizeSpecial(
   node: SyntaxNode,
   type: string,
   source: string
-): Array<{ name: string; node: SyntaxNode }> {
+): NormalizedRef[] {
   switch (type) {
     // Java method references. Receiver decides the resolution route (#808):
     //   `this::run0` / `super::close` → `this.<m>` (class-scoped resolver;
@@ -683,7 +745,99 @@ function normalizeSpecial(
       return isThisReceiver ? [{ name: getNodeText(name, source), node: name }] : [];
     }
 
+    // PHP string callable — trustworthy ONLY as an argument to a known
+    // callable-taking core function (`usort($a, 'cmp_items')`). PHP global
+    // functions are referenced cross-file without imports, so these skip the
+    // name gate and rely on resolution's unique-or-drop rule. A
+    // `'Cls::method'` string becomes a qualified candidate.
+    case 'encapsed_string':
+    case 'string': {
+      const callee = phpEnclosingCallName(node);
+      if (!callee || !PHP_CALLABLE_HOFS.has(callee)) return [];
+      const content = phpStringContent(node, source);
+      if (!content) return [];
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(content)) {
+        return [{ name: content, node, skipGate: true }];
+      }
+      if (/^[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/.test(content)) {
+        return [{ name: content, node, skipGate: true }];
+      }
+      return [];
+    }
+
+    // PHP array callables, valid in ANY call's arguments (the shape itself is
+    // unambiguous): `[$this, 'method']` → class-scoped `this.method`;
+    // `[Foo::class, 'method']` → qualified `Foo::method`.
+    case 'array_creation_expression': {
+      if (node.namedChildCount !== 2) return [];
+      const recv = node.namedChild(0)?.namedChild(0);
+      const strEl = node.namedChild(1)?.namedChild(0);
+      if (!recv || !strEl) return [];
+      if (strEl.type !== 'encapsed_string' && strEl.type !== 'string') return [];
+      const member = phpStringContent(strEl, source);
+      if (!member || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(member)) return [];
+      if (recv.type === 'variable_name' && getNodeText(recv, source) === '$this') {
+        return [{ name: `this.${member}`, node: strEl }];
+      }
+      if (recv.type === 'class_constant_access_expression') {
+        const cls = recv.namedChild(0);
+        const kw = recv.namedChild(1);
+        if (cls && kw && getNodeText(kw, source) === 'class') {
+          return [{ name: `${getNodeText(cls, source)}::${member}`, node: strEl }];
+        }
+      }
+      return [];
+    }
+
+    // Ruby hook-DSL symbols (`before_action :authenticate`,
+    // `rescue_from E, with: :render_404`): the symbol names a method of the
+    // ENCLOSING class — route through the class-scoped `this.` resolver
+    // (which also walks superclasses, covering ApplicationController-style
+    // inheritance). Symbols under any other call yield nothing.
+    case 'simple_symbol': {
+      const call = rubyEnclosingCall(node);
+      if (!call) return [];
+      const method = getChildByField(call, 'method');
+      if (!method || !isRubyHookCall(getNodeText(method, source))) return [];
+      const sym = getNodeText(node, source).replace(/^:/, '');
+      if (!/^[A-Za-z_][A-Za-z0-9_?!]*$/.test(sym)) return [];
+      return [{ name: `this.${sym}`, node }];
+    }
+
     default:
       return [];
   }
+}
+
+/** Content of a PHP string literal node (single- or double-quoted). */
+function phpStringContent(node: SyntaxNode, source: string): string | null {
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child?.type === 'string_content') return getNodeText(child, source).trim();
+  }
+  return null;
+}
+
+/** The function name of the PHP call whose arguments contain `node`, if any. */
+function phpEnclosingCallName(node: SyntaxNode): string | null {
+  let cur: SyntaxNode | null = node.parent;
+  for (let hops = 0; cur && hops < 4; hops++, cur = cur.parent) {
+    if (cur.type === 'function_call_expression') {
+      const fn = getChildByField(cur, 'function');
+      return fn ? fn.text : null;
+    }
+    if (cur.type === 'member_call_expression' || cur.type === 'scoped_call_expression') {
+      return null; // method calls aren't core HOFs
+    }
+  }
+  return null;
+}
+
+/** The Ruby `call` node whose argument_list (or keyword pair) contains `node`. */
+function rubyEnclosingCall(node: SyntaxNode): SyntaxNode | null {
+  let cur: SyntaxNode | null = node.parent;
+  for (let hops = 0; cur && hops < 4; hops++, cur = cur.parent) {
+    if (cur.type === 'call') return cur;
+  }
+  return null;
 }

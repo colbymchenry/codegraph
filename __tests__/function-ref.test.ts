@@ -617,6 +617,88 @@ describe('Function-as-value capture (#756)', () => {
     }
   });
 
+  it('PHP: HOF string callables, [$this,…] and [Cls::class,…] arrays; non-HOF strings ignored', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-php-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'handlers.php'),
+      "<?php\nfunction cmp_items($a, $b) { return $a <=> $b; }\n"
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.php'),
+      [
+        '<?php',
+        'class Saver {',
+        '    public function onSave($x) {}',
+        '    public function wire() {',
+        "        register_shutdown_function([$this, 'onSave']);",
+        '    }',
+        '}',
+        'class Loader {',
+        '    public static function load($cls) {}',
+        '}',
+        'function sorter($items) {',
+        "    usort($items, 'cmp_items');", // known HOF, cross-file string → edge
+        "    spl_autoload_register([Loader::class, 'load']);",
+        "    some_random_fn('cmp_items');", // NOT a known HOF → no edge
+        '    return $items;',
+        '}',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      // Exactly ONE source for cmp_items: the usort site, not some_random_fn.
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'cmp_items'))).toEqual(['sorter']);
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'onSave'))).toEqual(['wire']);
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'load'))).toEqual(['sorter']);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
+  it('RUBY HOOKS: before_action/rescue_from symbols resolve class-scoped incl. inherited; validates is excluded', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-rubyhooks-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'posts_controller.rb'),
+      [
+        'class ApplicationController',
+        '  def authenticate; end',
+        'end',
+        '',
+        'class PostsController < ApplicationController',
+        '  before_action :authenticate', // inherited → ApplicationController
+        '  after_save :reindex',
+        '  validates :title, presence: true', // attributes, NOT methods → no edge
+        '  rescue_from StandardError, with: :render_500',
+        '',
+        '  def reindex; end',
+        '  def render_500; end',
+        '  def title; end',
+        'end',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+
+      const auth = fnRefEdgesInto(cg, 'authenticate');
+      expect(auth).toHaveLength(1);
+      expect(cg.getNode(auth[0]!.target)?.qualifiedName).toContain('ApplicationController');
+
+      expect(fnRefEdgesInto(cg, 'reindex')).toHaveLength(1);
+      expect(fnRefEdgesInto(cg, 'render_500')).toHaveLength(1);
+      // `validates :title` names an attribute — the same-named METHOD must
+      // get no registration edge.
+      expect(fnRefEdgesInto(cg, 'title')).toHaveLength(0);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
   it('DRAIN: resolvable function_ref rows leave unresolved_refs; re-index is stable', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-drain-'));
     fs.writeFileSync(

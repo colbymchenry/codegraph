@@ -192,12 +192,15 @@ export function matchFunctionRef(
   // A/B finding; same pattern in vendored docopt.py). Python's `self.m`
   // form keeps method targets via its own capture shape. C++ likewise: a
   // bare identifier can only be a FREE function (member values need
-  // `&Cls::method`). Other languages keep method targets: C# method groups,
-  // Swift/Dart implicit-self, Java/Kotlin method references.
+  // `&Cls::method`). PHP string callables name global FUNCTIONS (methods
+  // need the `[$obj, 'm']` array form, which carries its own shape). Other
+  // languages keep method targets: C# method groups, Swift/Dart
+  // implicit-self, Java/Kotlin method references.
   const bareFnOnly =
     ref.language === 'typescript' || ref.language === 'tsx' ||
     ref.language === 'javascript' || ref.language === 'jsx' ||
-    ref.language === 'cpp' || ref.language === 'python';
+    ref.language === 'cpp' || ref.language === 'python' ||
+    ref.language === 'php';
 
   // Qualified member-pointer (`&Widget::on_click` → "Widget::on_click"):
   // resolve the member ON THAT SCOPE — exempt from bareFnOnly (the `&Cls::m`

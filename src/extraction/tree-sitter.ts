@@ -454,15 +454,18 @@ export class TreeSitterExtractor {
     // segment — the simple name Java/Kotlin code uses in `OtherClass::method`
     // references.
     const SIMPLE_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-    const DOTTED_NAME = /^[A-Za-z_$][A-Za-z0-9_$.]*\.([A-Za-z_$][A-Za-z0-9_$]*)$/;
+    // JVM imports are dotted (`com.example.OtherClass`); PHP `use` imports
+    // are backslashed (`App\Services\Mailer`). Both contribute their last
+    // segment — the simple name code uses to reference them.
+    const QUALIFIED_IMPORT = /^[A-Za-z_$][A-Za-z0-9_$.\\]*[.\\]([A-Za-z_$][A-Za-z0-9_$]*)$/;
     const importedNames = new Set<string>();
     for (const r of this.unresolvedReferences) {
       if (r.referenceKind !== 'imports') continue;
       if (SIMPLE_NAME.test(r.referenceName)) {
         importedNames.add(r.referenceName);
       } else {
-        const dotted = r.referenceName.match(DOTTED_NAME);
-        if (dotted) importedNames.add(dotted[1]!);
+        const qualified = r.referenceName.match(QUALIFIED_IMPORT);
+        if (qualified) importedNames.add(qualified[1]!);
       }
     }
 
@@ -497,7 +500,9 @@ export class TreeSitterExtractor {
       //    (constant-expression context — see FnRefSpec.ungatedModes).
       //  - everything else: name ∈ same-file functions/methods ∪ imports.
       if (!c.name.startsWith('this.')) {
-        const skipGate = ungated?.has(c.mode) === true && atFileScope;
+        const skipGate =
+          (ungated?.has(c.mode) === true && atFileScope) ||
+          c.skipGate === true; // PHP HOF-position string callables (see FnRefCandidate.skipGate)
         if (!skipGate) {
           if (c.name.includes('::')) {
             const scopeName = c.name.slice(0, c.name.indexOf('::'));

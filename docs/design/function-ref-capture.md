@@ -57,7 +57,8 @@ custom `visitNode` hooks like Scala's val/var handler) get a candidates-only
 | Dart | `arguments` (`argument`) | `assignment_expression.right` | `pair.value` | `list_literal`, `static_final_declaration` | — |
 | Lua / Luau | `arguments` | `assignment_statement` (`expression_list.value`) | `field.value` (keyed + positional) | (same) | — |
 | Pascal | `exprArgs` (via `visitPascalBlock`) | `assignment.rhs` (`OnFire := Handler`) | — | — | `@Handler` (`exprUnary.operand`) |
-| PHP | **skipped** | — | — | — | first-class callable `fn(...)` already extracts as a `calls` edge; string callables are a precision risk, deferred |
+| PHP | string callables ONLY as args of known core HOFs (`usort`, `array_map`, `call_user_func*`… — `PHP_CALLABLE_HOFS`), ungated + unique-or-drop (PHP globals aren't imported) | — | — | — | `[$this, 'm']` → class-scoped `this.m`; `[Foo::class, 'm']` → qualified; `'Cls::m'` → qualified; first-class callable `fn(...)` already extracts as `calls` |
+| Ruby hooks | `(skip_)?(before\|after\|around)_*` + `validate`/`set_callback`/`helper_method`/`rescue_from(with:)` symbols → class-scoped `this.<sym>` (rides the supertype pass: `before_action :authenticate` → ApplicationController). `validates` (plural) excluded — its symbols are ATTRIBUTES | — | — | — | symbols under any other call yield nothing |
 
 ## Precision rules (each one bought by a real-repo false positive)
 
@@ -199,8 +200,18 @@ Index cost on redis: +6% time, +5% db size.
   imports, so cross-file bare callbacks only resolve when repo-unique
   (functions; methods are enclosing-type-only). Cross-TYPE `#selector`
   targets (rare — target-action is normally self) are scoped away too.
-- **PHP string callables**, **Ruby bare symbols** outside `method(:sym)`,
-  **`obj.method` member values** where `obj` isn't `this`/`self`: deferred.
+- **`obj.method` member values** where `obj` isn't `this`/`self`: deferred —
+  the receiver's type is statically unknowable without local data-flow.
+- **PHP strings outside known-HOF positions** (a bare `'handler'` to an
+  arbitrary function; framework registries like WordPress `add_action`):
+  deliberately uncaptured — a string is only trustworthy as a callable in a
+  known callable position. Framework registries belong in a `frameworks/`
+  resolver if ever added. **Ruby symbols outside the hook DSLs** likewise.
+- **The supertype pass is NODE-anchored** (file-anchored class node →
+  implements/extends edge targets → `contains`-anchored member lookup): a
+  name-keyed `getSupertypes('Engine')` unioned every rails `Engine`'s parents
+  and produced a cross-class wrong edge; the node walk eliminated it
+  (rails +440 → +385, all sampled edges genuine).
 - **`this.X` inherited members resolve through the supertype pass**
   (`resolveDeferredThisMemberRefs`, depth-capped BFS over implements/extends,
   runs after edges persist — same lifecycle as the #750 conformance pass).
