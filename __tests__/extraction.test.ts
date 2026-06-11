@@ -6681,3 +6681,95 @@ describe('Swift property wrappers / attributes (blast-radius recall)', () => {
     } finally { cleanupTempDir(dir); }
   });
 });
+
+// #780 — preceding comments / docstrings are dropped for symbols whose emitted
+// node is wrapped by another syntax node (export_statement, decorated_definition,
+// lexical_declaration). The comment is a sibling of the wrapper, not of the
+// inner node, so getPrecedingDocstring returned undefined.
+describe('Docstring extraction for wrapped symbols (#780)', () => {
+  const docOf = (result: { nodes: Array<{ name: string; docstring?: string | null }> }, name: string) =>
+    result.nodes.find((n) => n.name === name)?.docstring ?? null;
+
+  it('captures docstrings for export- and lexical-wrapped TS/JS declarations', () => {
+    const code = `
+// plain class control captured
+class Ledger {}
+
+// exported class dropped
+export class Invoice {}
+
+// export default dropped
+export default function settle() { return true; }
+
+// exported arrow const dropped
+export const refund = (amount: number) => amount;
+
+// non-export arrow const also dropped
+const audit = (amount: number) => amount;
+`;
+    const result = extractFromSource('ledger.ts', code);
+
+    // Control: a plain (unwrapped) declaration already worked.
+    expect(docOf(result, 'Ledger')).toContain('plain class control captured');
+    // The regression cases (#780):
+    expect(docOf(result, 'Invoice')).toContain('exported class dropped');
+    expect(docOf(result, 'settle')).toContain('export default dropped');
+    expect(docOf(result, 'refund')).toContain('exported arrow const dropped');
+    expect(docOf(result, 'audit')).toContain('non-export arrow const also dropped');
+  });
+
+  it('captures docstrings for decorated Python declarations', () => {
+    const code = `
+# python decorator dropped
+@app.route("/x")
+def py_handler():
+    return 1
+
+
+# python plain control captured
+def py_plain():
+    return 1
+
+
+# python decorated class dropped
+@dataclass
+class PyModel:
+    pass
+`;
+    const result = extractFromSource('app.py', code);
+
+    // Control: a plain (undecorated) def already worked.
+    expect(docOf(result, 'py_plain')).toContain('python plain control captured');
+    // The regression cases (#780):
+    expect(docOf(result, 'py_handler')).toContain('python decorator dropped');
+    expect(docOf(result, 'PyModel')).toContain('python decorated class dropped');
+  });
+
+  it('does not borrow a non-adjacent / file-leading comment for a wrapped symbol', () => {
+    // The comment is adjacent to `first`, not to the exported class. The bounded
+    // walk must stop at the export_statement (whose previous sibling is the
+    // `const first` statement, not a comment) and not reach up to the comment.
+    const code = `
+// belongs to first, not to Bare
+const first = 1;
+export class Bare {}
+`;
+    const result = extractFromSource('bounded.ts', code);
+
+    expect(docOf(result, 'first')).toContain('belongs to first, not to Bare');
+    expect(docOf(result, 'Bare')).toBeNull();
+  });
+
+  it('attaches the shared comment to each declarator in a multi-declarator const', () => {
+    const code = `
+// shared across both
+export const a = () => 1, b = () => 2;
+`;
+    const result = extractFromSource('multi.ts', code);
+
+    // Both declarators resolve up to the same lexical/export wrapper, so both
+    // carry the one preceding comment (documented behavior, not a wrong edge).
+    expect(docOf(result, 'a')).toContain('shared across both');
+    expect(docOf(result, 'b')).toContain('shared across both');
+  });
+});
