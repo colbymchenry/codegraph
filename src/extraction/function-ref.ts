@@ -158,12 +158,13 @@ function cFamilySpec(extra?: { special?: string[]; addressOfOnly?: boolean }): F
   };
 }
 
-// NOTE: deliberately NO `member_expression` (`this.handleClick`) capture for
-// TS/JS. Class fields with type annotations are extracted as method-kind
-// nodes (pre-existing extractor behavior), so `this.X` value positions —
-// which in real code are mostly DATA reads (`setCursor(this.canvas)`) —
-// resolved to those field nodes and produced wrong "registration" edges
-// (excalidraw A/B finding). Revisit if/when TS field classification is fixed.
+// `this.handleClick` capture (member_expression) emits a `this.`-PREFIXED
+// candidate name: resolution scopes it to the enclosing symbol's class
+// (qualified-name prefix), so `this.fonts` (a property, post-#808) and
+// inherited/unknown members yield no edge, while same-class methods —
+// `btn.on('click', this.handleClick)`, the observer-registration idiom —
+// resolve precisely. Bare identifiers stay function-kind-only (a bare id can
+// never be a method value in JS).
 const TS_JS_SPEC: FnRefSpec = {
   idTypes: new Set(['identifier']),
   dispatch: new Map<string, CaptureRule>([
@@ -173,6 +174,7 @@ const TS_JS_SPEC: FnRefSpec = {
     ['pair', { mode: 'value', field: 'value' }],
     ['array', { mode: 'list' }],
   ]),
+  special: new Set(['member_expression']),
 };
 
 const PYTHON_SPEC: FnRefSpec = {
@@ -611,6 +613,18 @@ function normalizeSpecial(
       if (!sym || sym.type !== 'simple_symbol') return [];
       const name = getNodeText(sym, source).replace(/^:/, '');
       return name ? [{ name, node: sym }] : [];
+    }
+
+    // `this.handleClick` (TS/JS) — object must be EXACTLY `this`. The name
+    // keeps the `this.` prefix so resolution can scope it to the enclosing
+    // class (see resolveThisMemberFnRef) instead of bare name-matching.
+    case 'member_expression': {
+      const obj = getChildByField(node, 'object');
+      const prop = getChildByField(node, 'property');
+      if (obj && prop && obj.type === 'this' && prop.type === 'property_identifier') {
+        return [{ name: `this.${getNodeText(prop, source)}`, node: prop }];
+      }
+      return [];
     }
 
     // `self.handle_click` (Python) — object must be EXACTLY `self`.

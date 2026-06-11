@@ -473,11 +473,14 @@ export class TreeSitterExtractor {
       // variable; see FnRefSpec.ungatedModes). Local initializers and
       // everything else require a same-file/import match.
       const skipGate = ungated?.has(c.mode) === true && atFileScope;
-      // Qualified C++ member-pointers (`Widget::on_click`) gate on the member
-      // name; everything else on the full name.
-      const gateName = c.name.includes('::')
-        ? c.name.slice(c.name.lastIndexOf('::') + 2)
-        : c.name;
+      // Qualified C++ member-pointers (`Widget::on_click`) and TS/JS
+      // `this.<member>` candidates gate on the member name; everything else
+      // on the full name.
+      const gateName = c.name.startsWith('this.')
+        ? c.name.slice(5)
+        : c.name.includes('::')
+          ? c.name.slice(c.name.lastIndexOf('::') + 2)
+          : c.name;
       if (!skipGate && !definedHere.has(gateName) && !importedNames.has(gateName)) {
         continue;
       }
@@ -564,8 +567,30 @@ export class TreeSitterExtractor {
     }
     // Check for method declarations (only if not already handled by functionTypes)
     else if (this.extractor.methodTypes.includes(nodeType)) {
-      this.extractMethod(node);
-      skipChildren = true; // extractMethod visits children via visitFunctionBody
+      // TS/JS class fields parse as a methodTypes node; only function-valued
+      // fields are methods — a plain field (`public fonts: Fonts;`) is a
+      // property (#808). classifyMethodNode is absent for other languages.
+      if (this.extractor.classifyMethodNode?.(node) === 'property') {
+        const propNode = this.extractProperty(node);
+        // Walk the initializer so its calls/instantiations attribute to the
+        // property (`history = createHistory()` → history calls
+        // createHistory). The old field-as-method path never walked these
+        // (resolveBody only resolves function bodies), so this is additive.
+        const valueNode = getChildByField(node, 'value');
+        if (propNode && valueNode) {
+          this.nodeStack.push(propNode.id);
+          this.visitFunctionBody(valueNode, '');
+          this.nodeStack.pop();
+        }
+        // A field initializer can also register callbacks
+        // (`static handlers = { click: onClick }`) — scan it for
+        // function-as-value candidates (capture-only, halts at functions).
+        this.scanFnRefSubtree(node, 0);
+        skipChildren = true;
+      } else {
+        this.extractMethod(node);
+        skipChildren = true; // extractMethod visits children via visitFunctionBody
+      }
     }
     // Check for interface/protocol/trait declarations
     else if (this.extractor.interfaceTypes.includes(nodeType)) {
@@ -1302,27 +1327,41 @@ export class TreeSitterExtractor {
    * Extract a class property declaration (e.g. C# `public string Name { get; set; }`).
    * Extracts as 'property' kind node inside the owning class.
    */
-  private extractProperty(node: SyntaxNode): void {
-    if (!this.extractor) return;
+  private extractProperty(node: SyntaxNode): Node | null {
+    if (!this.extractor) return null;
 
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isStatic = this.extractor.isStatic?.(node) ?? false;
 
     const hookName = this.extractor.extractPropertyName?.(node, this.source);
+    // JS `field_definition` names its key the `property` field (TS uses
+    // `name`) — try both before the generic identifier scan (#808).
     const nameNode = hookName
       ? null
-      : getChildByField(node, 'name') || node.namedChildren.find(c => c.type === 'identifier');
+      : getChildByField(node, 'name') ||
+        getChildByField(node, 'property') ||
+        node.namedChildren.find(c => c.type === 'identifier');
     const name = hookName ?? (nameNode ? getNodeText(nameNode, this.source) : null);
-    if (!name) return;
+    if (!name) return null;
 
-    // Get property type from the type child (first named child that isn't modifier or identifier)
-    const typeNode = node.namedChildren.find(
-      c => c.type !== 'modifier' && c.type !== 'modifiers'
-        && c.type !== 'identifier' && c.type !== 'accessor_list'
-        && c.type !== 'accessors' && c.type !== 'equals_value_clause'
-    );
-    const typeText = typeNode ? getNodeText(typeNode, this.source) : undefined;
+    // Get property type. TS/JS field definitions carry an explicit `type`
+    // field (a `type_annotation`); their other named children are the name
+    // and the initializer VALUE, which the generic finder below would
+    // wrongly pick — so fields use the type field only (#808). Other
+    // languages (C# property_declaration) keep the generic scan.
+    const isTsJsField =
+      node.type === 'public_field_definition' || node.type === 'field_definition';
+    const typeNode = isTsJsField
+      ? getChildByField(node, 'type')
+      : node.namedChildren.find(
+          c => c.type !== 'modifier' && c.type !== 'modifiers'
+            && c.type !== 'identifier' && c.type !== 'accessor_list'
+            && c.type !== 'accessors' && c.type !== 'equals_value_clause'
+        );
+    const typeText = typeNode
+      ? getNodeText(typeNode, this.source).replace(/^:\s*/, '')
+      : undefined;
     const signature = typeText ? `${typeText} ${name}` : name;
 
     const propNode = this.createNode('property', name, node, {
@@ -1341,6 +1380,7 @@ export class TreeSitterExtractor {
       // `type_annotation` children; the C# branch walks the `type` field.
       this.extractTypeAnnotations(node, propNode.id);
     }
+    return propNode;
   }
 
   /**

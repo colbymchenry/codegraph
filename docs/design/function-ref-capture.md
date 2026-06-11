@@ -44,7 +44,7 @@ custom `visitNode` hooks like Scala's val/var handler) get a candidates-only
 |---|---|---|---|---|---|
 | C / ObjC | `argument_list` | `assignment_expression.right` | `initializer_pair.value` | `initializer_list`, `init_declarator.value` | `&fn` (`pointer_expression`), `@selector(...)` (ObjC) |
 | C++ | **`&` forms only** in args/rhs/varinit | (same — explicit `&` only) | bare ids at FILE scope only | bare ids at FILE scope only | `&fn`, `&Cls::method` (resolved scoped to the class) |
-| TS / JS (tsx/jsx) | `arguments` | `assignment_expression.right` | `pair.value` | `array`, `variable_declarator.value` | — (see TS notes) |
+| TS / JS (tsx/jsx) | `arguments` | `assignment_expression.right` | `pair.value` | `array`, `variable_declarator.value` | `this.method` (`member_expression`, class-scoped — see rule 3) |
 | Python | `argument_list`, `keyword_argument.value` | `assignment.right` | `pair.value` | `list` | `self.method` (`attribute`) |
 | Go | `argument_list` | `assignment_statement` / `short_var_declaration` (`expression_list`) | `keyed_element` | `literal_value`, `var_spec.value` | — |
 | Rust | `arguments` | `assignment_expression.right` | `field_initializer.value` | `array_expression`, `static_item` / `let_declaration.value` | — |
@@ -77,16 +77,19 @@ custom `visitNode` hooks like Scala's val/var handler) get a candidates-only
    were ungated.
 3. **TS/JS/Python: bare ids resolve to `function` kind only.** A bare
    identifier can never be a method value in these languages (methods need a
-   receiver — `this.m` / `self.m`), and TS class FIELDS are extracted as
-   method-kind nodes (pre-existing extractor quirk), so allowing method
-   targets soaked up locals passed as arguments
-   (`new Set(selectedPointsIndices)` → a same-named "method" field;
-   docopt.py's `name`/`match` params). For the same reason `this.X` capture
-   is disabled for TS/JS — in real code `this.X` value positions are mostly
-   data reads (`setCursor(this.canvas)`). Python's `self.m` form keeps method
-   targets through its own capture shape. C#/Swift/Dart/Java/Kotlin keep
-   method targets (method groups, implicit-self, method references are real
-   method values).
+   receiver — `this.m` / `self.m`), so allowing method targets soaked up
+   locals passed as arguments (`new Set(selectedPointsIndices)`;
+   docopt.py's `name`/`match` params — excalidraw/fmt A/B findings).
+   TS/JS `this.X` values are captured as `this.`-PREFIXED candidates and
+   resolved CLASS-SCOPED (`resolveThisMemberFnRef` in
+   `src/resolution/index.ts`): the target must be a function/method whose
+   qualified name shares the from-symbol's class prefix, same file, no
+   fallback of any kind — `addEventListener(…, this.onResize)` hits the
+   enclosing class's method; `this.fonts` (a property, post-#808 field
+   classification) and inherited/unknown members yield no edge. Python's
+   `self.m` form keeps method targets through its own capture shape.
+   C#/Swift/Dart/Java/Kotlin keep method targets (method groups,
+   implicit-self, method references are real method values).
 4. **C++ is `&`-explicit** (`addressOfOnly`): bare identifiers qualify only in
    FILE-scope initializer tables; everywhere else (args, assignments, local
    braced-init lists `{begin, size}`) only `&fn` / `&Cls::method` count.
@@ -184,5 +187,9 @@ Index cost on redis: +6% time, +5% db size.
   imports, so cross-file bare callbacks only resolve when repo-unique.
 - **PHP string callables**, **Ruby bare symbols** outside `method(:sym)`,
   **`obj.method` member values** where `obj` isn't `this`/`self`: deferred.
-- **TS `this.X`**: disabled until TS class-field kind classification is fixed
-  (fields currently extract as method-kind nodes).
+- **TS/JS `this.X` to inherited members**: the class-scoped resolver matches
+  the enclosing class's OWN members only — `this.handleClick` defined on a
+  superclass yields no edge (would need the supertype walk; deliberate v1).
+  Reading a getter into a local (`const s = this.snapshot`) produces a
+  references edge to the getter — a true dependency with an imperfect
+  "registration" flavor.

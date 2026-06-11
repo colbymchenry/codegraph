@@ -675,6 +675,11 @@ export class ReferenceResolver {
     // (same-file first, unique-only cross-file, function/method targets only).
     // They never reach the framework or fuzzy strategies below.
     if (ref.referenceKind === 'function_ref') {
+      // `this.<member>` values (TS/JS) resolve ONLY against the enclosing
+      // class's own members — never a same-named symbol elsewhere.
+      if (ref.referenceName.startsWith('this.')) {
+        return this.gateLanguage(this.resolveThisMemberFnRef(ref), ref);
+      }
       const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
       if (viaImport) {
         const target = this.queries.getNodeById(viaImport.targetNodeId);
@@ -1182,6 +1187,41 @@ export class ReferenceResolver {
     if (found.size !== 1) return null;
     const target = found.values().next().value!;
     return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
+  }
+
+  /**
+   * Resolve a `this.<member>` function-as-value reference (#756/#808) to the
+   * ENCLOSING CLASS's own member — never a same-named symbol elsewhere. The
+   * registration idiom (`btn.on('click', this.handleClick)`) names a member
+   * of the class being defined, so the only valid target shares the
+   * from-symbol's qualified-name scope. Function/method targets only — a
+   * property (a data field, post-#808 classification) yields no edge — same
+   * file required, no fallback of any kind.
+   */
+  private resolveThisMemberFnRef(ref: UnresolvedRef): ResolvedRef | null {
+    const member = ref.referenceName.slice('this.'.length);
+    if (!member) return null;
+    const fromNode = this.queries.getNodeById(ref.fromNodeId);
+    if (!fromNode) return null;
+    const sep = fromNode.qualifiedName.lastIndexOf('::');
+    if (sep <= 0) return null; // not inside a class scope
+    const classPrefix = fromNode.qualifiedName.slice(0, sep);
+    const candidates = this.context
+      .getNodesByQualifiedName(`${classPrefix}::${member}`)
+      .filter(
+        (n) =>
+          (n.kind === 'function' || n.kind === 'method') &&
+          n.filePath === ref.filePath &&
+          n.id !== ref.fromNodeId
+      );
+    if (candidates.length === 0) return null;
+    const target = candidates.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
+    return {
+      original: ref,
+      targetNodeId: target.id,
+      confidence: 0.95,
+      resolvedBy: 'function-ref',
+    };
   }
 
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {

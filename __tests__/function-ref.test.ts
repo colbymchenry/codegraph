@@ -144,10 +144,9 @@ describe('Function-as-value capture (#756)', () => {
         'objRegistrar',
         'timerRegistrar',
       ]);
-      // `this.handleClick` is deliberately NOT captured in TS/JS: class fields
-      // extract as method-kind nodes, so `this.X` value positions (mostly data
-      // reads in real code) produced wrong edges — see TS_JS_SPEC note.
-      expect(fnRefEdgesInto(cg, 'handleClick')).toHaveLength(0);
+      // `this.handleClick` resolves class-scoped (#808): the target must be a
+      // method of the ENCLOSING class, in the same file.
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'handleClick'))).toEqual(['wire']);
     } finally {
       cg.destroy();
       tmpDir = undefined;
@@ -402,6 +401,56 @@ describe('Function-as-value capture (#756)', () => {
         'ArgRegistrar',
         'Wire',
       ]);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
+  it('THIS-MEMBER SCOPING: this.X resolves only to the enclosing class, never elsewhere', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-thisx-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.ts'),
+      [
+        'declare const bus: { on(ev: string, cb: () => void): void };',
+        // Decoy: a same-named method on an UNRELATED class.
+        'export class Decoy { refresh(): void {} }',
+        'export class Panel {',
+        '  views: number[] = [];', // property (post-#808), shares no name
+        '  refresh(): void {}',
+        '  wire(): void {',
+        '    bus.on("update", this.refresh);', // → Panel::refresh, not Decoy::refresh
+        '    bus.on("data", this.views as never);', // property → NO edge
+        '    bus.on("gone", this.missing as never);', // unknown member → NO edge
+        '  }',
+        '}',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+
+      const refreshes = cg.getNodesByName('refresh');
+      const panelRefresh = refreshes.find((n) => n.qualifiedName.includes('Panel'))!;
+      const decoyRefresh = refreshes.find((n) => n.qualifiedName.includes('Decoy'))!;
+
+      const intoPanel = cg
+        .getIncomingEdges(panelRefresh.id)
+        .filter((e) => e.metadata?.fnRef === true);
+      expect(intoPanel).toHaveLength(1);
+      expect(cg.getNode(intoPanel[0]!.source)?.name).toBe('wire');
+      expect(
+        cg.getIncomingEdges(decoyRefresh.id).filter((e) => e.metadata?.fnRef === true)
+      ).toHaveLength(0);
+
+      // The property and the unknown member produce nothing.
+      const views = cg.getNodesByName('views').find((n) => n.kind === 'property');
+      if (views) {
+        expect(
+          cg.getIncomingEdges(views.id).filter((e) => e.metadata?.fnRef === true)
+        ).toHaveLength(0);
+      }
     } finally {
       cg.destroy();
       tmpDir = undefined;

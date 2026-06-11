@@ -180,6 +180,10 @@ export function matchFunctionRef(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // `this.<member>` refs are resolved ONLY by the class-scoped resolver in
+  // resolveOne (resolveThisMemberFnRef) — never by name matching here.
+  if (ref.referenceName.startsWith('this.')) return null;
+
   // In JS/TS/Python a bare identifier can never be a method value (methods
   // are only reachable through a receiver — `this.m` / `self.m` /
   // `Cls.m`), so bare fn-refs match FUNCTIONS only. This also sidesteps the
