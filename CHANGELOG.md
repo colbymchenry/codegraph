@@ -93,6 +93,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Indexing a very large repository no longer aborts during its first sync with a "too many SQL variables" error. (#540)
 - Files under directories with non-ASCII names (for example CJK characters) are no longer silently skipped during indexing. (#541)
 - The `.codegraph/` index folder no longer clutters `git status`: its generated ignore file now excludes everything in the folder except itself, so the database, `daemon.pid`, sockets, and logs stop showing up as untracked changes. (#492, #484)
+- Projects initialized by an older version now get that fix automatically: a `.codegraph/.gitignore` written before this change — which listed only the database, cache, and logs and so let the daemon's `daemon.pid` get committed — is upgraded in place the next time you run any CodeGraph command. A `.gitignore` you've customized yourself is left untouched. (#788)
 - SAP HANA `.xsjs` / `.xsjslib` files are now indexed as JavaScript. (#556)
 - TypeScript `.mts` and `.cts` module files are now indexed instead of being skipped. (#366)
 - JavaScript modules that wrap their code in an anonymous function — AMD/RequireJS, NetSuite SuiteScript, IIFE bundles — now have their inner functions and calls indexed, instead of the file coming up nearly empty. (#528)
