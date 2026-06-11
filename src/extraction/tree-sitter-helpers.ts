@@ -44,10 +44,38 @@ export function getChildByField(node: SyntaxNode, fieldName: string): SyntaxNode
 }
 
 /**
+ * Node types that *wrap* a declaration so a leading comment is a sibling of the
+ * wrapper, not of the emitted (inner) declaration node. CodeGraph emits the
+ * inner node, so before looking for its preceding comment we climb out through
+ * these. Examples: `export class X {}` (export_statement), `@dec\ndef f()`
+ * (decorated_definition), `const f = () => {}` (lexical_declaration →
+ * variable_declarator). Each wraps exactly one declaration, so climbing can't
+ * mis-attribute a comment to a sibling. (#780)
+ */
+const DOCSTRING_WRAPPER_TYPES = new Set([
+  'export_statement', // JS/TS: export class/function/const ...
+  'decorated_definition', // Python: @decorator over def/class
+  'lexical_declaration', // JS/TS: const/let x = () => {}
+  'variable_declaration', // JS/TS: var x = ...
+  'variable_declarator', // JS/TS: the `x = () => {}` inside the declaration
+  'ambient_declaration', // TS: declare ...
+]);
+
+/**
  * Get the docstring/comment preceding a node
  */
 export function getPrecedingDocstring(node: SyntaxNode, source: string): string | undefined {
-  let sibling = node.previousNamedSibling;
+  // Climb out of any wrapper(s) so a comment preceding the WHOLE construct
+  // (export-, decorator-, or const-arrow-wrapped) is reachable as a sibling.
+  // The emitted node's own `previousNamedSibling` is empty (export/const) or a
+  // decorator (Python) in those cases, so without this the docstring was
+  // dropped. (#780)
+  let anchor = node;
+  while (anchor.parent && DOCSTRING_WRAPPER_TYPES.has(anchor.parent.type)) {
+    anchor = anchor.parent;
+  }
+
+  let sibling = anchor.previousNamedSibling;
   const comments: string[] = [];
 
   while (sibling) {
@@ -72,6 +100,7 @@ export function getPrecedingDocstring(node: SyntaxNode, source: string): string 
       c
         .replace(/^\/\*\*?|\*\/$/g, '')
         .replace(/^\/\/\s?/gm, '')
+        .replace(/^#\s?/gm, '') // Python/Ruby/shell line comments (#780)
         .replace(/^\s*\*\s?/gm, '')
         .trim()
     )
