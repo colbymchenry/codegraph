@@ -158,13 +158,156 @@ export function crossesKnownFamily(a: string, b: string): boolean {
  *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
  */
 function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
-  if (ref.referenceKind === 'references') {
+  if (ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') {
     return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
   }
   if (ref.referenceKind === 'imports') {
     return candidates.filter((c) => !crossesKnownFamily(c.language, ref.language));
   }
   return candidates;
+}
+
+/**
+ * Resolve a function-as-value reference (#756) — a function name used as a
+ * callback/function-pointer value (`register(handler)`, `o->cb = handler`,
+ * `{ .cb = handler }`, `signal(SIGINT, handler)`). The ONLY strategy allowed
+ * for `function_ref` refs: exact name, function/method targets only, same
+ * language family, same-file first, and cross-file only when the match is
+ * UNIQUE. No fuzzy fallback, no qualified-name walking — a wrong callback
+ * edge is worse than none.
+ */
+export function matchFunctionRef(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  // `this.<member>` refs are resolved ONLY by the class-scoped resolver in
+  // resolveOne (resolveThisMemberFnRef) — never by name matching here.
+  if (ref.referenceName.startsWith('this.')) return null;
+
+  // In JS/TS/Python a bare identifier can never be a method value (methods
+  // are only reachable through a receiver — `this.m` / `self.m` /
+  // `Cls.m`), so bare fn-refs match FUNCTIONS only. This also sidesteps the
+  // pre-existing TS quirk of class fields extracting as method-kind nodes,
+  // which otherwise soaked up local names passed as arguments (excalidraw
+  // A/B finding; same pattern in vendored docopt.py). Python's `self.m`
+  // form keeps method targets via its own capture shape. C++ likewise: a
+  // bare identifier can only be a FREE function (member values need
+  // `&Cls::method`). PHP string callables name global FUNCTIONS (methods
+  // need the `[$obj, 'm']` array form, which carries its own shape). Other
+  // languages keep method targets: C# method groups, Swift/Dart
+  // implicit-self, Java/Kotlin method references.
+  const bareFnOnly =
+    ref.language === 'typescript' || ref.language === 'tsx' ||
+    ref.language === 'javascript' || ref.language === 'jsx' ||
+    ref.language === 'cpp' || ref.language === 'python' ||
+    ref.language === 'php';
+
+  // Qualified member-pointer (`&Widget::on_click` → "Widget::on_click"):
+  // resolve the member ON THAT SCOPE — exempt from bareFnOnly (the `&Cls::m`
+  // shape is an explicit member reference). Unique-or-drop like everything else.
+  if (ref.referenceName.includes('::')) {
+    const memberName = ref.referenceName.slice(ref.referenceName.lastIndexOf('::') + 2);
+    const scoped = context
+      .getNodesByName(memberName)
+      .filter(
+        (n) =>
+          (n.kind === 'function' || n.kind === 'method') &&
+          sameLanguageFamily(n.language, ref.language) &&
+          n.id !== ref.fromNodeId &&
+          (n.qualifiedName === ref.referenceName ||
+            n.qualifiedName.endsWith(`::${ref.referenceName}`))
+      );
+    if (scoped.length === 0) return null;
+    const sameFileScoped = scoped.filter((n) => n.filePath === ref.filePath);
+    const pool = sameFileScoped.length > 0 ? sameFileScoped : scoped;
+    if (sameFileScoped.length === 0 && scoped.length > 1) return null;
+    const target = pool.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
+    return {
+      original: ref,
+      targetNodeId: target.id,
+      confidence: 0.9,
+      resolvedBy: 'function-ref',
+    };
+  }
+
+  let candidates = context
+    .getNodesByName(ref.referenceName)
+    .filter(
+      (n) =>
+        (n.kind === 'function' || (!bareFnOnly && n.kind === 'method')) &&
+        sameLanguageFamily(n.language, ref.language) &&
+        n.id !== ref.fromNodeId // a function registering itself is not a dependency edge
+    );
+  if (candidates.length === 0) return null;
+
+  // Swift implicit-self: a bare identifier can name a METHOD only of the
+  // ENCLOSING type (`Button(action: handleTap)` written inside that type) —
+  // a same-named method on any OTHER class is a parameter collision
+  // (Alamofire: a `request` parameter resolving to EventMonitor::request).
+  // Scope method candidates to the from-symbol's type; top-level code has no
+  // implicit self, so method targets are excluded there entirely. Free
+  // functions are unaffected.
+  if (ref.language === 'swift' && candidates.some((n) => n.kind === 'method')) {
+    const fromNode = context.getNodeById?.(ref.fromNodeId);
+    const sep = fromNode ? fromNode.qualifiedName.lastIndexOf('::') : -1;
+    const classPrefix = fromNode && sep > 0 ? fromNode.qualifiedName.slice(0, sep) : null;
+    candidates = candidates.filter((n) => {
+      if (n.kind !== 'method') return true;
+      if (!classPrefix) return false;
+      const mSep = n.qualifiedName.lastIndexOf('::');
+      if (mSep <= 0) return false;
+      const methodPrefix = n.qualifiedName.slice(0, mSep);
+      // Accept exact-scope matches plus suffix relationships either way, so
+      // extension-declared members (`Holder::m`) still match a nested
+      // from-scope (`Module::Holder::wire`) and vice versa.
+      return (
+        methodPrefix === classPrefix ||
+        methodPrefix.endsWith(`::${classPrefix}`) ||
+        classPrefix.endsWith(`::${methodPrefix}`)
+      );
+    });
+    if (candidates.length === 0) return null;
+  }
+
+  // Same-file definition wins — the extraction gate guarantees most survivors
+  // have one, and it's the dominant C pattern (static callback registered in
+  // a same-file ops struct).
+  const sameFile = candidates.filter((n) => n.filePath === ref.filePath);
+  if (sameFile.length > 0) {
+    // Swift: several same-named METHODS in one file is an API overload family
+    // (`Session.request(...)` × N), and a bare identifier hitting it is almost
+    // always a same-named parameter, not a method value (Alamofire A/B
+    // finding) — refuse rather than guess. A single method (SwiftUI's
+    // `action: handleTap`) still resolves.
+    if (
+      ref.language === 'swift' &&
+      sameFile.length > 1 &&
+      sameFile.every((n) => n.kind === 'method')
+    ) {
+      return null;
+    }
+    // Same-name overloads in one file are the same conceptual symbol; pick
+    // the first by position for determinism.
+    const target = sameFile.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
+    return {
+      original: ref,
+      targetNodeId: target.id,
+      confidence: sameFile.length === 1 ? 0.95 : 0.9,
+      resolvedBy: 'function-ref',
+    };
+  }
+
+  // Cross-file (imported names the import resolver didn't already claim):
+  // only an unambiguous match resolves.
+  if (candidates.length === 1) {
+    return {
+      original: ref,
+      targetNodeId: candidates[0]!.id,
+      confidence: 0.8,
+      resolvedBy: 'function-ref',
+    };
+  }
+  return null;
 }
 
 /**
@@ -603,9 +746,11 @@ export function matchScopedCallChain(
  * so a bare `Foo()` there is a method call, not construction — excluded. Scala's
  * `Foo(args)` is a case-class / companion `apply`, which conventionally returns
  * `Foo` — and resolveMethodOnType validates, so a non-conventional `apply` that
- * returns another type simply yields no edge rather than a wrong one.
+ * returns another type simply yields no edge rather than a wrong one. Pascal/Delphi:
+ * a `TFoo(x)` is a TYPECAST whose result is a `TFoo`, so `TFoo(x).method()` resolves
+ * the method on `TFoo` — same shape, same validation.
  */
-const CONSTRUCTS_VIA_BARE_CALL = new Set(['kotlin', 'swift', 'scala', 'dart']);
+const CONSTRUCTS_VIA_BARE_CALL = new Set(['kotlin', 'swift', 'scala', 'dart', 'pascal']);
 
 /**
  * Resolve a dotted chained call whose receiver is a static factory / fluent call —
@@ -673,7 +818,35 @@ export function matchDottedCallChain(
   const factoryMethod = inner.slice(lastDot + 1);
   if (!factoryClass || !factoryMethod) return null;
   const ret = lookupCalleeReturnType(`${factoryClass}::${factoryMethod}`, ref, context);
-  if (!ret) return null;
+  if (!ret) {
+    // Objective-C: a class-message factory — `[X alloc]`, `[X new]`,
+    // `[X sharedFoo]` — returns an instance of the RECEIVER class `X` by
+    // convention (`instancetype`). So when the factory's own return type isn't
+    // recoverable (its selector returns `instancetype`, or `alloc`/`new` aren't
+    // user-defined nodes at all), the receiver's type is the class `X` itself.
+    // This resolves the ubiquitous `[[X alloc] init]` and singleton chains.
+    // resolveMethodOnType validates against X (and its supertypes), so a class
+    // whose method actually lives elsewhere yields NO edge, not a wrong one — and
+    // crucially this does NOT fire when a concrete return type WAS captured but
+    // simply lacks the method (that already returned null above: absent-method
+    // safety, so a same-named decoy is still never matched).
+    if (ref.language === 'objc' && /^[A-Z]/.test(factoryClass)) {
+      return resolveMethodOnType(factoryClass, method, ref, context, 0.8, 'instance-method', importedFqnOf(factoryClass, ref, context));
+    }
+    // Pascal/Delphi: the extractor only re-encodes a `TFoo`/`IFoo`-prefixed chain
+    // (the type-naming convention), so `factoryClass` is always a real class here.
+    // A factory whose return type wasn't captured is a CONSTRUCTOR
+    // (`TFileMem.Create().SetCachePerformance` — `constructor Create` has no `:
+    // TBar` annotation but returns its own class) or an unannotated function. In
+    // both cases the receiver's type is the class itself, so resolve the method on
+    // `factoryClass`. resolveMethodOnType validates against it (and its
+    // supertypes), so a wrong inference yields no edge — and this never fires when
+    // a return type WAS captured but lacks the method (absent-method safety above).
+    if (ref.language === 'pascal' && /^[TI]/.test(factoryClass)) {
+      return resolveMethodOnType(factoryClass, method, ref, context, 0.8, 'instance-method', importedFqnOf(factoryClass, ref, context));
+    }
+    return null;
+  }
   return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context));
 }
 
@@ -1094,6 +1267,13 @@ export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // Function-as-value refs (#756) resolve ONLY through the dedicated matcher —
+  // never the fuzzy/qualified fallthrough below (a wrong callback edge is
+  // worse than none).
+  if (ref.referenceKind === 'function_ref') {
+    return matchFunctionRef(ref, context);
+  }
+
   // Try strategies in order of confidence
   let result: ResolvedRef | null;
 
@@ -1123,11 +1303,12 @@ export function matchReference(
   }
 
   // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C# / Swift /
-  // Go / Scala / Dart) — `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar`,
-  // Go's bare-factory `New().Method()` as `New().Method`, Scala's companion factory
-  // `Foo.create().bar()`, or Dart's static factory / factory-constructor
-  // `Foo.create().bar()` (#645/#608 mechanism). Resolve the method's class from the
-  // inner call's declared return type, then validate it.
+  // Go / Scala / Dart / Objective-C) — `Foo.getInstance().bar()` encoded as
+  // `Foo.getInstance().bar`, Go's bare-factory `New().Method()` as `New().Method`,
+  // Scala's companion factory, Dart's static factory / factory-constructor, or
+  // ObjC's chained message send `[[Foo create] doIt]` encoded as `Foo.create().doIt`
+  // (#645/#608 mechanism). Resolve the method's class from the inner call's
+  // declared return type, then validate it.
   if (
     ref.language === 'java' ||
     ref.language === 'kotlin' ||
@@ -1135,7 +1316,9 @@ export function matchReference(
     ref.language === 'swift' ||
     ref.language === 'go' ||
     ref.language === 'scala' ||
-    ref.language === 'dart'
+    ref.language === 'dart' ||
+    ref.language === 'objc' ||
+    ref.language === 'pascal'
   ) {
     result = matchDottedCallChain(ref, context);
     if (result) return result;

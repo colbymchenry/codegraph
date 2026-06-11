@@ -159,6 +159,46 @@ describe('CodeGraph Foundation', () => {
       expect(validation.valid).toBe(false);
       expect(validation.errors.length).toBeGreaterThan(0);
     });
+
+    it('upgrades a stale pre-wildcard .gitignore in place (issue #788)', () => {
+      const cg = CodeGraph.initSync(tempDir);
+      cg.close();
+
+      const gitignorePath = path.join(getCodeGraphDir(tempDir), '.gitignore');
+      // A .gitignore written by an older version (<= 0.9.9): an explicit
+      // allowlist that never ignored daemon.pid, so the daemon's runtime
+      // pidfile got committed.
+      const staleV099 =
+        '# CodeGraph data files\n' +
+        '# These are local to each machine and should not be committed\n\n' +
+        '# Database\n*.db\n*.db-wal\n*.db-shm\n\n' +
+        '# Cache\ncache/\n\n# Logs\n*.log\n\n# Hook markers\n.dirty\n';
+      fs.writeFileSync(gitignorePath, staleV099, 'utf-8');
+
+      // Opening the project runs validateDirectory, which self-heals.
+      const cg2 = CodeGraph.openSync(tempDir);
+      cg2.close();
+
+      const upgraded = fs.readFileSync(gitignorePath, 'utf-8');
+      expect(upgraded).toContain('\n*\n'); // wildcard ignores everything…
+      expect(upgraded).toContain('!.gitignore'); // …except this file
+      expect(upgraded).not.toContain('.dirty'); // old explicit list is gone
+    });
+
+    it('leaves a user-customized .codegraph/.gitignore untouched', () => {
+      const cg = CodeGraph.initSync(tempDir);
+      cg.close();
+
+      const gitignorePath = path.join(getCodeGraphDir(tempDir), '.gitignore');
+      // No CodeGraph header → user-authored → must not be rewritten.
+      const custom = '# my own rules\n*.db\n!keep-this.json\n';
+      fs.writeFileSync(gitignorePath, custom, 'utf-8');
+
+      const cg2 = CodeGraph.openSync(tempDir);
+      cg2.close();
+
+      expect(fs.readFileSync(gitignorePath, 'utf-8')).toBe(custom);
+    });
   });
 
   describe('Uninitialize', () => {

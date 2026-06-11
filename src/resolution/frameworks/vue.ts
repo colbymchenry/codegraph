@@ -279,39 +279,32 @@ function resolveComponent(
   fromFile: string,
   context: ResolutionContext
 ): string | null {
-  const allFiles = context.getAllFiles();
-  const vueFiles = allFiles.filter((f) => f.endsWith('.vue'));
-
-  // Check for exact name match (Button -> Button.vue)
-  for (const file of vueFiles) {
+  // Collect ALL basename matches first. The previous version returned the
+  // FIRST `Button.vue` found anywhere in the tree (its same-directory pass
+  // below was unreachable), so a multi-app monorepo with one `Button.vue`
+  // per app resolved to an arbitrary one (#764).
+  const matches: string[] = [];
+  for (const file of context.getAllFiles()) {
+    if (!file.endsWith('.vue')) continue;
     const fileName = file.split(/[/\\]/).pop() || '';
-    const componentName = fileName.replace(/\.vue$/, '');
-    if (componentName === name) {
-      const nodes = context.getNodesInFile(file);
-      const component = nodes.find((n) => n.kind === 'component' && n.name === name);
-      if (component) {
-        return component.id;
-      }
-    }
+    if (fileName.replace(/\.vue$/, '') === name) matches.push(file);
   }
+  if (matches.length === 0) return null;
 
-  // Check same directory first for better specificity
+  const componentIn = (file: string): string | null => {
+    const nodes = context.getNodesInFile(file);
+    const component = nodes.find((n) => n.kind === 'component' && n.name === name);
+    return component ? component.id : null;
+  };
+
+  // Same directory first for specificity
   const fromDir = fromFile.substring(0, fromFile.lastIndexOf('/'));
-  for (const file of vueFiles) {
-    if (file.startsWith(fromDir)) {
-      const fileName = file.split(/[/\\]/).pop() || '';
-      const componentName = fileName.replace(/\.vue$/, '');
-      if (componentName === name) {
-        const nodes = context.getNodesInFile(file);
-        const component = nodes.find((n) => n.kind === 'component');
-        if (component) {
-          return component.id;
-        }
-      }
-    }
-  }
+  const sameDir = matches.filter((f) => f.startsWith(fromDir));
+  if (sameDir.length > 0) return componentIn(sameDir[0]!);
 
-  return null;
+  // No positional signal: only an UNAMBIGUOUS basename may resolve;
+  // ambiguity falls through to the name-matcher's proximity scoring.
+  return matches.length === 1 ? componentIn(matches[0]!) : null;
 }
 
 /**

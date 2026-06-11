@@ -581,12 +581,23 @@ from ..services import auth_service
         line: 10,
         column: 5,
         filePath: 'src/App.tsx',
-        language: 'typescript' as const,
+        // Refs extracted from .tsx files carry language 'tsx' — component
+        // resolution is gated to JSX-capable refs (#764: PascalCase TYPE refs
+        // from plain .ts files were resolving to arbitrary same-named classes).
+        language: 'tsx' as const,
       };
 
       const result = reactResolver!.resolve(ref, context);
       expect(result).not.toBeNull();
       expect(result?.targetNodeId).toBe('component:src/Button.tsx:Button:5');
+
+      // The same PascalCase name referenced from a plain .ts file is a TYPE
+      // reference, not a component usage — component resolution must decline
+      // and leave it to proximity-aware name matching (#764: a .ts GraphQL
+      // types file's own `Account` alias was losing to an arbitrary same-named
+      // class in another monorepo package).
+      const tsRef = { ...ref, filePath: 'src/models.ts', language: 'typescript' as const };
+      expect(reactResolver!.resolve(tsRef, context)).toBeNull();
     });
 
     it('should resolve custom hook references', () => {
@@ -2992,6 +3003,390 @@ void run() {
       const widget = cg.getNodesByKind('class').find((n) => n.name === 'Widget')!;
       const incoming = cg.getIncomingEdges(widget.id);
       expect(incoming.some((e) => e.kind === 'instantiates')).toBe(true);
+    });
+  });
+
+  describe('Objective-C chained message-send call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves a chained message send [[Foo create] doIt] via the return type, never a same-named decoy', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.m'),
+        `@interface Bar : NSObject
+- (void)doIt;
+@end
+@implementation Bar
+- (void)doIt {}
+@end
+@interface Decoy : NSObject
+- (void)doIt;
+@end
+@implementation Decoy
+- (void)doIt {}
+@end
+@interface Foo : NSObject
++ (Bar *)create;
+@end
+@implementation Foo
++ (Bar *)create { return nil; }
+- (void)run { [[Foo create] doIt]; }
+@end
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Bar::doIt')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::doIt')).toEqual([]);
+    });
+
+    it('resolves a chained message whose method is inherited from a superclass (via conformance)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.m'),
+        `@interface Base : NSObject
+- (void)render;
+@end
+@implementation Base
+- (void)render {}
+@end
+@interface Widget : Base
+@end
+@implementation Widget
+@end
+@interface Decoy : NSObject
+- (void)render;
+@end
+@implementation Decoy
+- (void)render {}
+@end
+@interface Factory : NSObject
++ (Widget *)make;
+@end
+@implementation Factory
++ (Widget *)make { return nil; }
+- (void)run { [[Factory make] render]; }
+@end
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Base::render')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::render')).toEqual([]);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.m'),
+        `@interface Bar : NSObject
+@end
+@implementation Bar
+@end
+@interface Other : NSObject
+- (void)onlyOther;
+@end
+@implementation Other
+- (void)onlyOther {}
+@end
+@interface Foo : NSObject
++ (Bar *)create;
+@end
+@implementation Foo
++ (Bar *)create { return nil; }
+- (void)run { [[Foo create] onlyOther]; }
+@end
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Bar has no onlyOther — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+
+    it('resolves a singleton chain [[Cache shared] clearAll] whose factory returns nonnull instancetype', async () => {
+      // The factory returns `nonnull instancetype` — the nullability qualifier must
+      // be skipped (not captured AS the type), and an instancetype class-message
+      // factory returns the receiver class, so clearAll resolves on Cache, never a
+      // same-named decoy. (Regression for both: the captured-`nonnull` bug and the
+      // ubiquitous `[[X alloc] init]` / singleton pattern.)
+      fs.writeFileSync(
+        path.join(tempDir, 'main.m'),
+        `@interface Cache : NSObject
++ (nonnull instancetype)shared;
+- (void)clearAll;
+@end
+@implementation Cache
++ (nonnull instancetype)shared { return nil; }
+- (void)clearAll {}
+@end
+@interface Decoy : NSObject
+- (void)clearAll;
+@end
+@implementation Decoy
+- (void)clearAll {}
+@end
+@interface Caller : NSObject
+- (void)run;
+@end
+@implementation Caller
+- (void)run { [[Cache shared] clearAll]; }
+@end
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Cache::clearAll')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::clearAll')).toEqual([]);
+    });
+  });
+
+  describe('Pascal/Delphi chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+    function isCalled(qn: string): boolean {
+      const t = cg.getNodesByKind('method').find((n) => n.qualifiedName === qn);
+      return !!t && cg.getIncomingEdges(t.id).some((e) => e.kind === 'calls');
+    }
+
+    it('resolves a chained factory call TFoo.GetInstance().DoIt() via the return type, never a same-named decoy', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TBar = class
+    procedure DoIt;
+  end;
+  TDecoy = class
+    procedure DoIt;
+  end;
+  TFoo = class
+    class function GetInstance: TBar;
+  end;
+implementation
+procedure TBar.DoIt; begin end;
+procedure TDecoy.DoIt; begin end;
+class function TFoo.GetInstance: TBar; begin Result := nil; end;
+procedure Run;
+begin
+  TFoo.GetInstance().DoIt();
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(isCalled('TBar::DoIt')).toBe(true);
+      expect(isCalled('TDecoy::DoIt')).toBe(false);
+    });
+
+    it('resolves a constructor chain TFoo.Create().Configure() on the constructed class', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TFoo = class
+    constructor Create;
+    procedure Configure;
+  end;
+  TDecoy = class
+    procedure Configure;
+  end;
+implementation
+constructor TFoo.Create; begin end;
+procedure TFoo.Configure; begin end;
+procedure TDecoy.Configure; begin end;
+procedure Run;
+begin
+  TFoo.Create().Configure();
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // A constructor returns its own class (no `: TBar` annotation), so Configure
+      // resolves on TFoo, not the same-named decoy.
+      expect(isCalled('TFoo::Configure')).toBe(true);
+      expect(isCalled('TDecoy::Configure')).toBe(false);
+    });
+
+    it('resolves a typecast chain TFoo(x).DoIt() on the cast type', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TFoo = class
+    procedure DoIt;
+  end;
+  TDecoy = class
+    procedure DoIt;
+  end;
+implementation
+procedure TFoo.DoIt; begin end;
+procedure TDecoy.DoIt; begin end;
+procedure Run(obj: TObject);
+begin
+  TFoo(obj).DoIt();
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(isCalled('TFoo::DoIt')).toBe(true);
+      expect(isCalled('TDecoy::DoIt')).toBe(false);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TBar = class
+  end;
+  TOther = class
+    procedure OnlyOther;
+  end;
+  TFoo = class
+    class function GetInstance: TBar;
+  end;
+implementation
+procedure TOther.OnlyOther; begin end;
+class function TFoo.GetInstance: TBar; begin Result := nil; end;
+procedure Run;
+begin
+  TFoo.GetInstance().OnlyOther();
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // TBar has no OnlyOther — must not mis-attach to the same-named TOther::OnlyOther.
+      expect(isCalled('TOther::OnlyOther')).toBe(false);
+    });
+
+    it('extracts paren-less method calls (Pascal lets a no-arg method drop its parens)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TFoo = class
+    procedure DoThing;
+    procedure Reset;
+  end;
+implementation
+procedure TFoo.DoThing; begin end;
+procedure TFoo.Reset; begin end;
+procedure Run(f: TFoo);
+begin
+  f.DoThing;
+  f.Reset;
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(isCalled('TFoo::DoThing')).toBe(true);
+      expect(isCalled('TFoo::Reset')).toBe(true);
+    });
+
+    it('resolves a PAREN-LESS chained factory call TFoo.GetInstance.DoIt via the return type', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TBar = class
+    procedure DoIt;
+  end;
+  TDecoy = class
+    procedure DoIt;
+  end;
+  TFoo = class
+    class function GetInstance: TBar;
+  end;
+implementation
+procedure TBar.DoIt; begin end;
+procedure TDecoy.DoIt; begin end;
+class function TFoo.GetInstance: TBar; begin Result := nil; end;
+procedure Run;
+begin
+  TFoo.GetInstance.DoIt;
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(isCalled('TBar::DoIt')).toBe(true);
+      expect(isCalled('TDecoy::DoIt')).toBe(false);
+    });
+
+    it('does NOT turn a property write/read into a call edge (only statement-level dots are calls)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TFoo = class
+    function GetValue: Integer;
+    procedure SetValue(v: Integer);
+    property Value: Integer read GetValue write SetValue;
+  end;
+implementation
+function TFoo.GetValue: Integer; begin Result := 0; end;
+procedure TFoo.SetValue(v: Integer); begin end;
+procedure Run(f: TFoo);
+var x: Integer;
+begin
+  f.Value := 5;
+  x := f.Value;
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // A property read/write is a bare dot in assignment position, not a statement,
+      // so it must not be mis-extracted as a call to the property's getter/setter.
+      expect(isCalled('TFoo::GetValue')).toBe(false);
+      expect(isCalled('TFoo::SetValue')).toBe(false);
+    });
+
+    it('attributes an implementation-only free procedure\'s calls to the procedure, not the file', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TTgt = class
+    procedure Hit;
+  end;
+  TFoo = class
+    procedure DoStuff;
+  end;
+implementation
+procedure TTgt.Hit; begin end;
+procedure TFoo.DoStuff; var t: TTgt; begin t.Hit; end;
+procedure Helper; var t: TTgt; begin t.Hit; end;
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // `Helper` is implementation-only (no interface decl, not a method), but its
+      // body's call must attribute to `Helper`, not the file/module — alongside the
+      // method `DoStuff`.
+      expect(callerNamesOf('TTgt::Hit')).toEqual(['DoStuff', 'Helper']);
     });
   });
 });

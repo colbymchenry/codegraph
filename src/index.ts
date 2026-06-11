@@ -382,6 +382,9 @@ export class CodeGraph {
           // interface). Needs the implements/extends edges the main pass just
           // built, so it runs after resolution (#750).
           this.resolver.resolveChainedCallsViaConformance();
+          // Same lifecycle for `this.<member>` callback registrations whose
+          // member is inherited from a supertype (#808).
+          this.resolver.resolveDeferredThisMemberRefs();
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -503,6 +506,9 @@ export class CodeGraph {
           // receiver conforms to (protocol-extension / inherited). Needs the
           // implements/extends edges built above (#750).
           this.resolver.resolveChainedCallsViaConformance();
+          // Same lifecycle for `this.<member>` callback registrations whose
+          // member is inherited from a supertype (#808).
+          this.resolver.resolveDeferredThisMemberRefs();
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.

@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
+import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -37,7 +37,7 @@ const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
  * second pass. Dotted-receiver languages resolve via matchDottedCallChain; the
  * `::`-receiver ones (Rust) via matchScopedCallChain.
  */
-const CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift', 'rust', 'go', 'scala', 'dart']);
+const CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift', 'rust', 'go', 'scala', 'dart', 'objc', 'pascal']);
 const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
 
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */
@@ -207,6 +207,11 @@ export class ReferenceResolver {
   // once implements/extends edges exist, to resolve methods on a supertype the
   // receiver conforms to (#750).
   private deferredChainRefs: UnresolvedRef[] = [];
+  // `this.<member>` function-as-value refs whose member is NOT on the
+  // enclosing class itself — possibly inherited. Collected in-memory for the
+  // same reason as deferredChainRefs and drained by
+  // resolveDeferredThisMemberRefs once implements/extends edges exist (#808).
+  private deferredThisMemberRefs: UnresolvedRef[] = [];
   // Per-`.razor`/`.cshtml`-file `@using` namespace set (own directives + folder
   // `_Imports.razor`, cascading to the project root). Used to disambiguate a
   // markup type ref to the right C# namespace.
@@ -420,6 +425,10 @@ export class ReferenceResolver {
         const result = this.queries.getNodesByLowerName(lowerName);
         this.lowerNameCache.set(lowerName, result);
         return result;
+      },
+
+      getNodeById: (id: string) => {
+        return this.queries.getNodeById(id);
       },
 
       getSupertypes: (typeName: string, language) => {
@@ -669,6 +678,27 @@ export class ReferenceResolver {
       return null;
     }
 
+    // Function-as-value refs (#756) get a dedicated, strictly-gated path:
+    // import-based resolution first (an imported callback resolves through its
+    // import, the most precise cross-file signal), then matchFunctionRef
+    // (same-file first, unique-only cross-file, function/method targets only).
+    // They never reach the framework or fuzzy strategies below.
+    if (ref.referenceKind === 'function_ref') {
+      // `this.<member>` values (TS/JS) resolve ONLY against the enclosing
+      // class's own members — never a same-named symbol elsewhere.
+      if (ref.referenceName.startsWith('this.')) {
+        return this.gateLanguage(this.resolveThisMemberFnRef(ref), ref);
+      }
+      const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
+      if (viaImport) {
+        const target = this.queries.getNodeById(viaImport.targetNodeId);
+        if (target && (target.kind === 'function' || target.kind === 'method')) {
+          return viaImport;
+        }
+      }
+      return this.gateLanguage(matchFunctionRef(ref, this.context), ref);
+    }
+
     // JVM FQN imports skip framework/name-matcher: `import com.example.Bar`
     // resolves directly through the qualifiedName index, which is unambiguous
     // even when several `Bar` classes exist in different packages.
@@ -750,7 +780,13 @@ export class ReferenceResolver {
    */
   createEdges(resolved: ResolvedRef[]): Edge[] {
     return resolved.map((ref) => {
-      let kind = ref.original.referenceKind;
+      // `function_ref` (#756) is internal-only: it persists as a `references`
+      // edge (the registration site depends on the callback), distinguishable
+      // by metadata.resolvedBy === 'function-ref'. callers/impact already
+      // traverse `references`, so registration sites surface with no
+      // graph-layer changes.
+      let kind: Edge['kind'] =
+        ref.original.referenceKind === 'function_ref' ? 'references' : ref.original.referenceKind;
 
       // Promote "extends" to "implements" when a class/struct targets an interface
       if (kind === 'extends') {
@@ -784,6 +820,11 @@ export class ReferenceResolver {
         metadata: {
           confidence: ref.confidence,
           resolvedBy: ref.resolvedBy,
+          // Uniform marker for function-as-value edges (#756), regardless of
+          // which strategy resolved them (import vs matchFunctionRef) — lets
+          // tooling label "callback registration" and lets validation diff
+          // exactly the edges this feature added.
+          ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),
         },
       };
     });
@@ -1157,11 +1198,168 @@ export class ReferenceResolver {
     return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
   }
 
+  /**
+   * Resolve a `this.<member>` function-as-value reference (#756/#808) to the
+   * ENCLOSING CLASS's own member — never a same-named symbol elsewhere. The
+   * registration idiom (`btn.on('click', this.handleClick)`) names a member
+   * of the class being defined, so the only valid target shares the
+   * from-symbol's qualified-name scope. Function/method targets only — a
+   * property (a data field, post-#808 classification) yields no edge — same
+   * file required, no fallback of any kind.
+   */
+  private resolveThisMemberFnRef(ref: UnresolvedRef): ResolvedRef | null {
+    const member = ref.referenceName.slice('this.'.length);
+    if (!member) return null;
+    const fromNode = this.queries.getNodeById(ref.fromNodeId);
+    if (!fromNode) return null;
+    // A hook declared at class-body level (Ruby `before_action :authenticate`)
+    // attributes to the CLASS node itself — its qualified name IS the scope.
+    // For members, strip the member segment.
+    let classPrefix: string;
+    if (SUPERTYPE_BEARING_KINDS.has(fromNode.kind) || fromNode.kind === 'module') {
+      classPrefix = fromNode.qualifiedName;
+    } else {
+      const sep = fromNode.qualifiedName.lastIndexOf('::');
+      if (sep <= 0) return null; // not inside a class scope
+      classPrefix = fromNode.qualifiedName.slice(0, sep);
+    }
+    const candidates = this.context
+      .getNodesByQualifiedName(`${classPrefix}::${member}`)
+      .filter(
+        (n) =>
+          (n.kind === 'function' || n.kind === 'method') &&
+          n.filePath === ref.filePath &&
+          n.id !== ref.fromNodeId
+      );
+    if (candidates.length === 0) {
+      // Not on the class itself — possibly INHERITED. implements/extends
+      // edges don't exist yet in this pass, so retry in the supertype pass
+      // (resolveDeferredThisMemberRefs) instead of giving up.
+      this.deferredThisMemberRefs.push(ref);
+      return null;
+    }
+    const target = candidates.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
+    return {
+      original: ref,
+      targetNodeId: target.id,
+      confidence: 0.95,
+      resolvedBy: 'function-ref',
+    };
+  }
+
+  /**
+   * Second pass for `this.<member>` refs whose member wasn't on the enclosing
+   * class itself (#808): once implements/extends edges exist, walk the
+   * class's supertypes (transitively, depth-capped) and resolve the member on
+   * the nearest one that declares it — `this.handleSubmit` registered in a
+   * subclass resolves to `FormBase::handleSubmit`. Validated targets only
+   * (function/method kind, same language family); no match → no edge.
+   * Mirrors resolveChainedCallsViaConformance's lifecycle. Returns the number
+   * of newly-created edges.
+   */
+  resolveDeferredThisMemberRefs(): number {
+    const deferred = this.deferredThisMemberRefs;
+    this.deferredThisMemberRefs = [];
+    if (deferred.length === 0) return 0;
+
+    this.clearCaches();
+    const resolved: ResolvedRef[] = [];
+    for (const ref of deferred) {
+      const member = ref.referenceName.slice('this.'.length);
+      const fromNode = this.queries.getNodeById(ref.fromNodeId);
+      if (!fromNode || !member) continue;
+      // Class-body-level hooks (Ruby) attribute to the CLASS node itself.
+      let className: string;
+      if (SUPERTYPE_BEARING_KINDS.has(fromNode.kind) || fromNode.kind === 'module') {
+        className = fromNode.name;
+      } else {
+        const sep = fromNode.qualifiedName.lastIndexOf('::');
+        if (sep <= 0) continue;
+        const classPrefix = fromNode.qualifiedName.slice(0, sep);
+        className = classPrefix.includes('::')
+          ? classPrefix.slice(classPrefix.lastIndexOf('::') + 2)
+          : classPrefix;
+      }
+
+      // NODE-anchored BFS up the supertype graph: start from the class node
+      // in the ref's own file (never a same-named class elsewhere — rails has
+      // a dozen `Engine`s), follow implements/extends EDGES to supertype
+      // NODES, and look members up through `contains` edges. No name-based
+      // unions anywhere — a name-keyed getSupertypes('Engine') merged every
+      // Engine's parents and produced a cross-class wrong edge on rails.
+      let frontierNodes = this.context
+        .getNodesByName(className)
+        .filter(
+          (n) =>
+            SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+            n.filePath === ref.filePath
+        );
+      if (frontierNodes.length === 0) {
+        // The class itself may be declared in another file (partial/reopened
+        // classes); fall back to same-family nodes of that name.
+        frontierNodes = this.context
+          .getNodesByName(className)
+          .filter(
+            (n) =>
+              SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+              sameLanguageFamily(n.language, ref.language)
+          );
+      }
+      const seenNodes = new Set<string>(frontierNodes.map((n) => n.id));
+      let target: Node | null = null;
+      for (let depth = 0; depth < 5 && frontierNodes.length > 0 && !target; depth++) {
+        const next: Node[] = [];
+        for (const typeNode of frontierNodes) {
+          for (const edge of this.queries.getOutgoingEdges(typeNode.id, ['implements', 'extends'])) {
+            const superNode = this.queries.getNodeById(edge.target);
+            if (!superNode || seenNodes.has(superNode.id)) continue;
+            seenNodes.add(superNode.id);
+            if (!SUPERTYPE_BEARING_KINDS.has(superNode.kind)) continue;
+            // Member lookup anchored on the supertype's contains edges.
+            for (const c of this.queries.getOutgoingEdges(superNode.id, ['contains'])) {
+              const m = this.queries.getNodeById(c.target);
+              if (
+                m &&
+                m.name === member &&
+                (m.kind === 'function' || m.kind === 'method') &&
+                sameLanguageFamily(m.language, ref.language)
+              ) {
+                target = m;
+                break;
+              }
+            }
+            if (target) break;
+            next.push(superNode);
+          }
+          if (target) break;
+        }
+        frontierNodes = next;
+      }
+
+      if (target) {
+        resolved.push({
+          original: ref,
+          targetNodeId: target.id,
+          confidence: 0.85,
+          resolvedBy: 'function-ref',
+        });
+      }
+    }
+    if (resolved.length === 0) return 0;
+
+    const edges = this.createEdges(resolved);
+    if (edges.length > 0) {
+      this.queries.insertEdges(edges);
+      this.clearCaches();
+    }
+    return edges.length;
+  }
+
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (!tgt || !ref.language) return result;
-    if (ref.referenceKind === 'references' && !sameLanguageFamily(tgt, ref.language)) return null;
+    if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !sameLanguageFamily(tgt, ref.language)) return null;
     if (ref.referenceKind === 'imports' && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
   }

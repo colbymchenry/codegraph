@@ -181,6 +181,15 @@ export interface LanguageExtractor {
   classifyClassNode?: (node: SyntaxNode) => 'class' | 'struct' | 'enum' | 'interface' | 'trait';
 
   /**
+   * Classify a methodTypes node when the grammar reuses one node type for
+   * both callable and data members (#808): TS/JS class FIELDS
+   * (`public_field_definition` / `field_definition`) are methods only when
+   * their value is callable (`onClick = () => {}`); a plain field
+   * (`public fonts: Fonts;`, `count = 0`) is a property. Default: 'method'.
+   */
+  classifyMethodNode?: (node: SyntaxNode) => 'method' | 'property';
+
+  /**
    * Resolve the body node for a function/method/class when it's not a child field.
    * (e.g. Dart puts function_body as a sibling, not a child.)
    */
