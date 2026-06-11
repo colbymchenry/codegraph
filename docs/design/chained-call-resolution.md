@@ -78,7 +78,7 @@ walking `context.getSupertypes(...)`.
 | **TypeScript** | — | `.` | typeorm +0/−6 · nest **+0/−164** | **Evaluated, NOT shipped** — gradual typing; see below. |
 | **Luau** | — | `:` / `.` | Fusion +0/−0 · matter +0/−0 | **Evaluated, NOT shipped** — gradually typed; additive-safe (missing-edge gap, no regression) but real Luau rarely annotates factory returns, so +0 on both benchmarks. Works for `Foo.create(): Bar` then `:doIt()` (synthetic). |
 
-`EXTRACTION_VERSION` is now **17** (C++→…→Pascal chains→Pascal paren-less calls). Re-index with `codegraph index -f`
+`EXTRACTION_VERSION` is now **18** (C++→…→Pascal chains→paren-less calls→free-routine attribution). Re-index with `codegraph index -f`
 to pick up the newer extractor on an existing graph.
 
 ## Why TypeScript was skipped
@@ -110,7 +110,7 @@ declarations). Against the README's full supported-language list:
 |---|---|
 | **Covered** (13) | C++, C, PHP, Java, Kotlin, C#, Swift, Rust, Go, Scala, Dart, Objective-C, Pascal/Delphi |
 | **Evaluated, skipped** (2) | **TypeScript** — gradual typing → inference-typed factories can't be recovered; net recall regression. **Luau** — gradually typed; additive-safe but +0 on Fusion AND matter (real Luau rarely annotates factory returns). Both: the mechanism needs reliably-declared return types, which gradually-typed code too often omits. |
-| **Pascal paren-less calls** | **Resolved (#793).** Pascal lets a no-arg method drop its parens (`Obj.Free;`, `TFoo.GetInstance.DoIt;`), which parse as a bare `exprDot` and weren't extracted as calls at all. Now extracted, scoped to STATEMENT position (a bare dot in assignment/condition position is left alone — there it's ambiguous with a field/property access). The paren-less chain reuses the same `TFoo`/`IFoo`-gated encoding. PascalCoin A/B **+1131 / −1**, all new edges resolve to methods (zero field/property false positives). |
+| **Pascal call-coverage follow-ups** | Two gaps from the chained-call work, both resolved. **Paren-less calls (#793):** Pascal lets a no-arg method drop its parens (`Obj.Free;`, `TFoo.GetInstance.DoIt;`), which parse as a bare `exprDot` and weren't extracted as calls at all. Now extracted, scoped to STATEMENT position (a bare dot in assignment/condition position is left alone — ambiguous with a field/property access). PascalCoin A/B **+1131 / −1**, all new edges resolve to methods. **Free-routine attribution (#795):** a procedure/function defined only in the `implementation` section (no interface decl, not a method) had no node, so its body's calls were lumped under the file; now it gets a function node and its calls attribute to it. PascalCoin A/B **+511 / −145** (file-level aggregates → per-routine edges). |
 | **Out of scope — no declared return types** (6) | JavaScript, Ruby, Lua, Svelte, Vue, Liquid (Liquid has no methods/chains at all) |
 | **Partial / separate** (1) | Python — only optional `-> T` hints; tracked as #578, not part of this mechanism |
 
