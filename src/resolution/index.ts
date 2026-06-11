@@ -207,6 +207,11 @@ export class ReferenceResolver {
   // once implements/extends edges exist, to resolve methods on a supertype the
   // receiver conforms to (#750).
   private deferredChainRefs: UnresolvedRef[] = [];
+  // `this.<member>` function-as-value refs whose member is NOT on the
+  // enclosing class itself — possibly inherited. Collected in-memory for the
+  // same reason as deferredChainRefs and drained by
+  // resolveDeferredThisMemberRefs once implements/extends edges exist (#808).
+  private deferredThisMemberRefs: UnresolvedRef[] = [];
   // Per-`.razor`/`.cshtml`-file `@using` namespace set (own directives + folder
   // `_Imports.razor`, cascading to the project root). Used to disambiguate a
   // markup type ref to the right C# namespace.
@@ -420,6 +425,10 @@ export class ReferenceResolver {
         const result = this.queries.getNodesByLowerName(lowerName);
         this.lowerNameCache.set(lowerName, result);
         return result;
+      },
+
+      getNodeById: (id: string) => {
+        return this.queries.getNodeById(id);
       },
 
       getSupertypes: (typeName: string, language) => {
@@ -1214,7 +1223,13 @@ export class ReferenceResolver {
           n.filePath === ref.filePath &&
           n.id !== ref.fromNodeId
       );
-    if (candidates.length === 0) return null;
+    if (candidates.length === 0) {
+      // Not on the class itself — possibly INHERITED. implements/extends
+      // edges don't exist yet in this pass, so retry in the supertype pass
+      // (resolveDeferredThisMemberRefs) instead of giving up.
+      this.deferredThisMemberRefs.push(ref);
+      return null;
+    }
     const target = candidates.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
     return {
       original: ref,
@@ -1222,6 +1237,80 @@ export class ReferenceResolver {
       confidence: 0.95,
       resolvedBy: 'function-ref',
     };
+  }
+
+  /**
+   * Second pass for `this.<member>` refs whose member wasn't on the enclosing
+   * class itself (#808): once implements/extends edges exist, walk the
+   * class's supertypes (transitively, depth-capped) and resolve the member on
+   * the nearest one that declares it — `this.handleSubmit` registered in a
+   * subclass resolves to `FormBase::handleSubmit`. Validated targets only
+   * (function/method kind, same language family); no match → no edge.
+   * Mirrors resolveChainedCallsViaConformance's lifecycle. Returns the number
+   * of newly-created edges.
+   */
+  resolveDeferredThisMemberRefs(): number {
+    const deferred = this.deferredThisMemberRefs;
+    this.deferredThisMemberRefs = [];
+    if (deferred.length === 0) return 0;
+
+    this.clearCaches();
+    const resolved: ResolvedRef[] = [];
+    for (const ref of deferred) {
+      const member = ref.referenceName.slice('this.'.length);
+      const fromNode = this.queries.getNodeById(ref.fromNodeId);
+      if (!fromNode || !member) continue;
+      const sep = fromNode.qualifiedName.lastIndexOf('::');
+      if (sep <= 0) continue;
+      const classPrefix = fromNode.qualifiedName.slice(0, sep);
+      const className = classPrefix.includes('::')
+        ? classPrefix.slice(classPrefix.lastIndexOf('::') + 2)
+        : classPrefix;
+
+      // BFS up the supertype graph by simple name.
+      const seen = new Set<string>([className]);
+      let frontier = this.context.getSupertypes?.(className, ref.language) ?? [];
+      let target: Node | null = null;
+      for (let depth = 0; depth < 5 && frontier.length > 0 && !target; depth++) {
+        const next: string[] = [];
+        for (const superName of frontier) {
+          if (seen.has(superName)) continue;
+          seen.add(superName);
+          const members = this.context
+            .getNodesByName(member)
+            .filter(
+              (n) =>
+                (n.kind === 'function' || n.kind === 'method') &&
+                sameLanguageFamily(n.language, ref.language) &&
+                (n.qualifiedName === `${superName}::${member}` ||
+                  n.qualifiedName.endsWith(`::${superName}::${member}`))
+            );
+          if (members.length > 0) {
+            target = members.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
+            break;
+          }
+          next.push(...(this.context.getSupertypes?.(superName, ref.language) ?? []));
+        }
+        frontier = next;
+      }
+
+      if (target) {
+        resolved.push({
+          original: ref,
+          targetNodeId: target.id,
+          confidence: 0.85,
+          resolvedBy: 'function-ref',
+        });
+      }
+    }
+    if (resolved.length === 0) return 0;
+
+    const edges = this.createEdges(resolved);
+    if (edges.length > 0) {
+      this.queries.insertEdges(edges);
+      this.clearCaches();
+    }
+    return edges.length;
   }
 
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {

@@ -91,6 +91,13 @@ export interface ResolutionContext {
    * method). Optional so external/test contexts compile without it.
    */
   getSupertypes?(typeName: string, language: Language): string[];
+  /**
+   * Look up a node by its id. Lets matchers derive the FROM-symbol's
+   * enclosing-class scope (Swift implicit-self method scoping, `this.X`
+   * member resolution). Optional so external/test contexts compile
+   * without it.
+   */
+  getNodeById?(id: string): Node | null;
   /** Get cached import mappings for a file */
   getImportMappings(filePath: string, language: Language): ImportMapping[];
   /**

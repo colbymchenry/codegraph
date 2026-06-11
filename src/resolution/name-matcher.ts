@@ -227,7 +227,7 @@ export function matchFunctionRef(
     };
   }
 
-  const candidates = context
+  let candidates = context
     .getNodesByName(ref.referenceName)
     .filter(
       (n) =>
@@ -236,6 +236,35 @@ export function matchFunctionRef(
         n.id !== ref.fromNodeId // a function registering itself is not a dependency edge
     );
   if (candidates.length === 0) return null;
+
+  // Swift implicit-self: a bare identifier can name a METHOD only of the
+  // ENCLOSING type (`Button(action: handleTap)` written inside that type) —
+  // a same-named method on any OTHER class is a parameter collision
+  // (Alamofire: a `request` parameter resolving to EventMonitor::request).
+  // Scope method candidates to the from-symbol's type; top-level code has no
+  // implicit self, so method targets are excluded there entirely. Free
+  // functions are unaffected.
+  if (ref.language === 'swift' && candidates.some((n) => n.kind === 'method')) {
+    const fromNode = context.getNodeById?.(ref.fromNodeId);
+    const sep = fromNode ? fromNode.qualifiedName.lastIndexOf('::') : -1;
+    const classPrefix = fromNode && sep > 0 ? fromNode.qualifiedName.slice(0, sep) : null;
+    candidates = candidates.filter((n) => {
+      if (n.kind !== 'method') return true;
+      if (!classPrefix) return false;
+      const mSep = n.qualifiedName.lastIndexOf('::');
+      if (mSep <= 0) return false;
+      const methodPrefix = n.qualifiedName.slice(0, mSep);
+      // Accept exact-scope matches plus suffix relationships either way, so
+      // extension-declared members (`Holder::m`) still match a nested
+      // from-scope (`Module::Holder::wire`) and vice versa.
+      return (
+        methodPrefix === classPrefix ||
+        methodPrefix.endsWith(`::${classPrefix}`) ||
+        classPrefix.endsWith(`::${methodPrefix}`)
+      );
+    });
+    if (candidates.length === 0) return null;
+  }
 
   // Same-file definition wins — the extraction gate guarantees most survivors
   // have one, and it's the dominant C pattern (static callback registered in

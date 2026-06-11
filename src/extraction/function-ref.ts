@@ -553,35 +553,66 @@ function normalizeSpecial(
   source: string
 ): Array<{ name: string; node: SyntaxNode }> {
   switch (type) {
-    // Java `Main::targetCb` / `this::run0` — last identifier child is the method.
+    // Java method references. Receiver decides the resolution route (#808):
+    //   `this::run0` / `super::close` → `this.<m>` (class-scoped resolver;
+    //     super rides the inherited-member supertype pass)
+    //   `Type::method` (capitalized) → qualified `Type::method` (suffix-
+    //     matched against that type's members, cross-file capable)
+    //   `variable::method` → nothing (receiver type unknown statically —
+    //     the deferred obj.method class)
     case 'method_reference': {
       let last: SyntaxNode | null = null;
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child && child.type === 'identifier') last = child;
       }
-      return last ? [{ name: getNodeText(last, source), node: last }] : [];
-    }
-
-    // Kotlin `::targetCb` — the simple_identifier child.
-    case 'callable_reference': {
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
-        if (child && child.type === 'simple_identifier') {
-          return [{ name: getNodeText(child, source), node: child }];
-        }
+      if (!last) return [];
+      const m = getNodeText(last, source);
+      const text = getNodeText(node, source);
+      if (text.startsWith('this::') || text.startsWith('super::')) {
+        return [{ name: `this.${m}`, node: last }];
+      }
+      const recv = text.match(/^([A-Z][A-Za-z0-9_]*)\s*::/);
+      if (recv) {
+        // `Type::method` — but `Type::new` (constructor ref) has no method
+        // node to land on; let the stoplist drop it via the bare name.
+        return m === 'new' ? [] : [{ name: `${recv[1]}::${m}`, node: last }];
       }
       return [];
     }
 
+    // Kotlin `::targetCb` (one part) / `OtherClass::handle` (two parts —
+    // receiver is a type_identifier; lowercase receivers are variables, the
+    // deferred obj.method class).
+    case 'callable_reference': {
+      let receiver: SyntaxNode | null = null;
+      let member: SyntaxNode | null = null;
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (!child) continue;
+        if (child.type === 'type_identifier') receiver = child;
+        if (child.type === 'simple_identifier') member = child;
+      }
+      if (!member) return [];
+      const m = getNodeText(member, source);
+      if (!receiver) return [{ name: m, node: member }]; // ::topLevelFn
+      const recvText = getNodeText(receiver, source);
+      return /^[A-Z]/.test(recvText)
+        ? [{ name: `${recvText}::${m}`, node: member }]
+        : []; // variable::method — unknown receiver type
+    }
+
     // Kotlin `this::fire` parses as navigation_expression with a `::fire`
-    // navigation_suffix. Ordinary `a.b` navigation MUST yield nothing.
+    // navigation_suffix — route through the class-scoped `this.` resolver.
+    // Ordinary `a.b` navigation (and any non-`this` receiver) MUST yield
+    // nothing.
     case 'navigation_expression': {
+      if (!getNodeText(node, source).startsWith('this::')) return [];
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child && child.type === 'navigation_suffix' && getNodeText(child, source).startsWith('::')) {
           const id = child.namedChild(child.namedChildCount - 1);
-          if (id) return [{ name: getNodeText(id, source), node: id }];
+          if (id) return [{ name: `this.${getNodeText(id, source)}`, node: id }];
         }
       }
       return [];

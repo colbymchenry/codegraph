@@ -457,6 +457,122 @@ describe('Function-as-value capture (#756)', () => {
     }
   });
 
+  it('INHERITED this.X: resolves on a supertype via the second pass, never on unrelated classes', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-inherit-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'base.ts'),
+      'export class FormBase { handleSubmit(): void {} }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'unrelated.ts'),
+      'export class Unrelated { handleSubmit(): void {} }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'login.ts'),
+      [
+        "import { FormBase } from './base';",
+        'declare const bus: { on(ev: string, cb: () => void): void };',
+        'export class LoginForm extends FormBase {',
+        '  wire(): void { bus.on("submit", this.handleSubmit); }',
+        '}',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      const handleSubmits = cg.getNodesByName('handleSubmit');
+      const baseM = handleSubmits.find((n) => n.qualifiedName.includes('FormBase'))!;
+      const unrelatedM = handleSubmits.find((n) => n.qualifiedName.includes('Unrelated'))!;
+
+      const intoBase = cg.getIncomingEdges(baseM.id).filter((e) => e.metadata?.fnRef === true);
+      expect(intoBase).toHaveLength(1);
+      expect(cg.getNode(intoBase[0]!.source)?.name).toBe('wire');
+      expect(
+        cg.getIncomingEdges(unrelatedM.id).filter((e) => e.metadata?.fnRef === true)
+      ).toHaveLength(0);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
+  it('JAVA: Type::method cross-file, this::/super:: scoped, variable:: yields nothing', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-java-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Handlers.java'),
+      [
+        'package com.example;',
+        'public class Handlers {',
+        '    public static void onMessage(int x) { System.out.println(x); }',
+        '}',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'BaseForm.java'),
+      ['package com.example;', 'public class BaseForm {', '    void baseHandler(int x) {}', '}'].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.java'),
+      [
+        'package com.example;',
+        'import com.example.Handlers;',
+        'import java.util.function.IntConsumer;',
+        'public class Main extends BaseForm {',
+        '    static void registerHandler(IntConsumer cb) { cb.accept(1); }',
+        '    void run0() {}',
+        '    void crossFile() { registerHandler(Handlers::onMessage); }',
+        '    void thisRef() { registerHandler(this::run0); }',
+        '    void superRef() { registerHandler(super::baseHandler); }',
+        '    void varRef(Main m) { registerHandler(m::run0); }',
+        '}',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'onMessage'))).toEqual(['crossFile']);
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'baseHandler'))).toEqual(['superRef']);
+      // this::run0 resolves class-scoped; m::run0 (variable receiver) must NOT
+      // add a second edge — exactly one source.
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'run0'))).toEqual(['thisRef']);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
+  it('SWIFT SCOPING: bare ids hit only the enclosing type’s methods; top-level bare hits functions only', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-swiftscope-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.swift'),
+      [
+        'func register(_ cb: (Int) -> Void) { cb(1) }',
+        'class Monitor {',
+        '  func report(_ x: Int) {}',
+        '  func wire() { register(report) }', // implicit self → Monitor::report
+        '}',
+        'class Other {',
+        // `report` here is a PARAMETER; Monitor::report must not win.
+        '  func use(report: (Int) -> Void) { register(report) }',
+        '}',
+        'func topLevel() { register(report) }', // no implicit self → no method target
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      const edges = fnRefEdgesInto(cg, 'report');
+      expect(sourceNames(cg, edges)).toEqual(['wire']);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
   it('C UNGATED TABLES: a command table names handlers defined in OTHER files (redis pattern)', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-ctable-'));
     // Handler defined in its own file…

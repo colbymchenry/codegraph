@@ -171,25 +171,39 @@ Index cost on redis: +6% time, +5% db size.
   without local-scope tracking — the data-flow frontier deliberately left
   uncovered. ~1-2 per 20 sampled edges on callback-heavy repos; the file-level
   dependency is real in every observed case.
-- **Swift single same-named method collisions** (`request(self, didFailTask:
-  task…)` where one `task` method exists): the overload-family rule only
-  refuses when ≥2 same-named methods share the file. Alamofire-style
-  API-mirrored param naming keeps a residual; needs same-type scoping (v2).
+- **Swift same-class param collisions** (`eventMonitor?.request(self,
+  didFailTask: task…)` where the enclosing type ALSO has a `task` method):
+  enclosing-type scoping (implicit self — methods match only the from-symbol's
+  own type, top-level bare ids never match methods) eliminated the CROSS-class
+  collision class on Alamofire (−44 wrong edges), but a parameter named after
+  a method of the SAME type is statically indistinguishable from an
+  implicit-self method value. Residual, documented.
 - **Pascal paren-less calls** (`Result := DoInitialize`): captured as
   references (Pascal can't distinguish a procedure VALUE from a paren-less
   CALL without types). The dependency direction is correct and these calls
   were previously invisible entirely (#791) — strictly more truth, imperfect
   label.
-- **Java/Kotlin cross-file method refs** (`OtherClass::method` without the
-  defining class imported as a simple name): gated away; same-file and
-  `this::m` forms work.
+- **Java/Kotlin method refs through a VARIABLE** (`subscriber::onNext`,
+  `m::run0`): receiver type unknown statically — deliberately no edge (the
+  obj.method class). RxJava's baseline bare capture was resolving these to
+  same-named same-file methods (a test method "registering" an anonymous
+  class's `onNext`); the qualified rework drops them. `Type::method` resolves
+  cross-file (scope gated on same-file types ∪ imported names, incl. the last
+  segment of dotted JVM imports); `this::m` / `super::m` ride the
+  class-scoped + supertype path.
+- **Kotlin companion-object members** extract UNQUALIFIED (node `handle`, not
+  `KtHandlers::Companion::handle` — pre-existing extraction shape), so
+  `KtHandlers::handle` refs to companion members stay silent rather than
+  guess. Fix belongs in kotlin companion extraction.
 - **Swift cross-file bare references**: Swift sees module-wide symbols without
-  imports, so cross-file bare callbacks only resolve when repo-unique.
+  imports, so cross-file bare callbacks only resolve when repo-unique
+  (functions; methods are enclosing-type-only). Cross-TYPE `#selector`
+  targets (rare — target-action is normally self) are scoped away too.
 - **PHP string callables**, **Ruby bare symbols** outside `method(:sym)`,
   **`obj.method` member values** where `obj` isn't `this`/`self`: deferred.
-- **TS/JS `this.X` to inherited members**: the class-scoped resolver matches
-  the enclosing class's OWN members only — `this.handleClick` defined on a
-  superclass yields no edge (would need the supertype walk; deliberate v1).
-  Reading a getter into a local (`const s = this.snapshot`) produces a
+- **`this.X` inherited members resolve through the supertype pass**
+  (`resolveDeferredThisMemberRefs`, depth-capped BFS over implements/extends,
+  runs after edges persist — same lifecycle as the #750 conformance pass).
+  Reading a getter into a local (`const s = this.snapshot`) still produces a
   references edge to the getter — a true dependency with an imperfect
   "registration" flavor.

@@ -435,19 +435,34 @@ export class TreeSitterExtractor {
     if (isGeneratedFile(this.filePath)) return;
 
     const definedHere = new Set<string>();
+    const definedTypes = new Set<string>();
     for (const n of this.nodes) {
       if (n.kind === 'function' || n.kind === 'method') definedHere.add(n.name);
+      if (
+        n.kind === 'class' || n.kind === 'struct' || n.kind === 'interface' ||
+        n.kind === 'enum' || n.kind === 'trait' || n.kind === 'protocol'
+      ) {
+        definedTypes.add(n.name);
+      }
     }
 
     // Import-binding names only (all binding emitters push kind 'imports').
     // Deliberately NOT 'references': those carry type-annotation and
     // interface-member names, which let local variables that share a type
-    // member's name slip through the gate (excalidraw A/B finding).
+    // member's name slip through the gate (excalidraw A/B finding). A dotted
+    // import (JVM `import com.example.OtherClass`) also contributes its LAST
+    // segment — the simple name Java/Kotlin code uses in `OtherClass::method`
+    // references.
     const SIMPLE_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+    const DOTTED_NAME = /^[A-Za-z_$][A-Za-z0-9_$.]*\.([A-Za-z_$][A-Za-z0-9_$]*)$/;
     const importedNames = new Set<string>();
     for (const r of this.unresolvedReferences) {
-      if (r.referenceKind === 'imports' && SIMPLE_NAME.test(r.referenceName)) {
+      if (r.referenceKind !== 'imports') continue;
+      if (SIMPLE_NAME.test(r.referenceName)) {
         importedNames.add(r.referenceName);
+      } else {
+        const dotted = r.referenceName.match(DOTTED_NAME);
+        if (dotted) importedNames.add(dotted[1]!);
       }
     }
 
@@ -468,21 +483,37 @@ export class TreeSitterExtractor {
       ) {
         continue;
       }
-      // C-family file-scope initializers skip the gate (constant-expression
-      // context — a bare identifier there is a function address, never a
-      // variable; see FnRefSpec.ungatedModes). Local initializers and
-      // everything else require a same-file/import match.
-      const skipGate = ungated?.has(c.mode) === true && atFileScope;
-      // Qualified C++ member-pointers (`Widget::on_click`) and TS/JS
-      // `this.<member>` candidates gate on the member name; everything else
-      // on the full name.
-      const gateName = c.name.startsWith('this.')
-        ? c.name.slice(5)
-        : c.name.includes('::')
-          ? c.name.slice(c.name.lastIndexOf('::') + 2)
-          : c.name;
-      if (!skipGate && !definedHere.has(gateName) && !importedNames.has(gateName)) {
-        continue;
+      // Gate policy by candidate shape:
+      //  - `this.<member>`: ALWAYS flush — the member may be inherited from a
+      //    class in another file (definedHere can't see it), volume is
+      //    naturally bounded by real `this.X` expressions, and resolution is
+      //    strictly class-scoped (own members or the validated supertype
+      //    pass), so nothing fuzzy can leak.
+      //  - `Scope::member` (C++ member-pointers, Java/Kotlin type-qualified
+      //    method refs): the SCOPE name must be a type defined here or an
+      //    imported name (covers `OtherClass::method` cross-file), or the
+      //    member matches the plain gate (back-compat for C++ same-file).
+      //  - C-family file-scope initializers skip the gate entirely
+      //    (constant-expression context — see FnRefSpec.ungatedModes).
+      //  - everything else: name ∈ same-file functions/methods ∪ imports.
+      if (!c.name.startsWith('this.')) {
+        const skipGate = ungated?.has(c.mode) === true && atFileScope;
+        if (!skipGate) {
+          if (c.name.includes('::')) {
+            const scopeName = c.name.slice(0, c.name.indexOf('::'));
+            const memberName = c.name.slice(c.name.lastIndexOf('::') + 2);
+            if (
+              !definedTypes.has(scopeName) &&
+              !importedNames.has(scopeName) &&
+              !definedHere.has(memberName) &&
+              !importedNames.has(memberName)
+            ) {
+              continue;
+            }
+          } else if (!definedHere.has(c.name) && !importedNames.has(c.name)) {
+            continue;
+          }
+        }
       }
       const key = `${c.fromNodeId}|${c.name}`;
       if (seen.has(key)) continue;
