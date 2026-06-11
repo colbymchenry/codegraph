@@ -302,5 +302,35 @@ describe('Sync Module', () => {
       expect(result.filesRemoved).toBe(0);
       expect(result.changedFilePaths).toBeUndefined();
     });
+
+    it('should not report changes to excluded tracked files (issue #766)', () => {
+      // A committed dependency dir (e.g. vendor/) is excluded from the index by
+      // the built-in default ignores, even though its files are tracked in git.
+      // git status still reports working-tree changes there, but the git
+      // fast-path of change detection must apply the same ignore matcher as
+      // enumeration — otherwise status flags a pending change that `index` will
+      // never produce (a perpetual phantom add that no sync can clear).
+      const vendorDir = path.join(testDir, 'vendor');
+      fs.mkdirSync(vendorDir);
+      fs.writeFileSync(path.join(vendorDir, 'lib.ts'), `export function vendored() { return 1; }`);
+      git('add', '-A');
+      git('commit', '-m', 'add vendored dep');
+
+      // Modify the tracked-but-excluded file → git status now flags it...
+      fs.writeFileSync(path.join(vendorDir, 'lib.ts'), `export function vendored() { return 2; }`);
+      // ...alongside a genuine change to real source code.
+      fs.writeFileSync(
+        path.join(testDir, 'src', 'index.ts'),
+        `export function hello() { return 'changed'; }`
+      );
+
+      const changes = cg.getChangedFiles();
+
+      // The excluded file must not leak into change detection...
+      expect(changes.added).not.toContain('vendor/lib.ts');
+      expect(changes.modified).not.toContain('vendor/lib.ts');
+      // ...while the genuine source change is still detected.
+      expect(changes.modified).toContain('src/index.ts');
+    });
   });
 });

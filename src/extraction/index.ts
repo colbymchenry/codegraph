@@ -1540,11 +1540,22 @@ export class ExtractionOrchestrator {
         }
       }
 
+      // Apply the same ignore matcher as enumeration (getGitVisibleFiles). git
+      // status reports working-tree changes to tracked files inside committed
+      // dependency/build dirs (vendor/, node_modules/, …) that the index
+      // deliberately excludes — without this filter those leak into `added`,
+      // disagreeing with what `index` produces (a phantom change no sync clears).
+      // Deletions stay unfiltered: they only act on paths already in the DB,
+      // where removal is always correct (and lets a now-excluded dir's stale
+      // entries clean up). (See issue #766.)
+      const ignoreMatcher = buildDefaultIgnore(this.rootDir);
+
       // Modified + added files — read + hash, compare with DB. Untracked (`??`)
       // files stay untracked in git even after indexing, so they must be
       // hash-compared like modified files instead of always counting as added —
       // otherwise status reports them as pending forever. (See issue #206.)
       for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
+        if (ignoreMatcher.ignores(filePath)) continue;
         const fullPath = path.join(this.rootDir, filePath);
         let content: string;
         try {
