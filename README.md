@@ -77,10 +77,13 @@ codegraph install
 
 ```bash
 cd your-project
-codegraph init -i
+codegraph init
 ```
 
-<sub>`codegraph init` just creates the local `.codegraph/` index directory; adding `-i` (`--index`) also builds the initial graph in the same step. Without `-i`, run `codegraph index` afterwards to populate it.</sub>
+<sub>`codegraph init` creates the local `.codegraph/` directory and builds the full graph in the same step — one command, done.</sub>
+
+**From that moment the index keeps itself up to date — it is never stale.** CodeGraph watches the project and auto-syncs on every file change: while your agent edits code, or you add, modify, or delete files, the graph updates automatically. There is nothing to re-run.
+
 
 <div align="center">
 
@@ -359,10 +362,10 @@ Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent /
 
 ```bash
 cd your-project
-codegraph init -i
+codegraph init
 ```
 
-Builds the per-project knowledge graph index. A single global `codegraph install` works in every project you open — no need to re-run the installer per project.
+Builds the per-project knowledge graph index, which then auto-syncs on every file change. A single global `codegraph install` works in every project you open — no need to re-run the installer per project.
 
 That's it — your agent will use CodeGraph tools automatically when a `.codegraph/` directory exists.
 
