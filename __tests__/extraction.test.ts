@@ -101,6 +101,16 @@ describe('Language Detection', () => {
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
   });
 
+  it('should detect Markdown files', () => {
+    expect(detectLanguage('README.md')).toBe('markdown');
+    expect(detectLanguage('docs/guide.markdown')).toBe('markdown');
+  });
+
+  it('should detect shell scripts by extension', () => {
+    expect(detectLanguage('scripts/build.sh')).toBe('shell');
+    expect(detectLanguage('scripts/bootstrap.bash')).toBe('shell');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -129,6 +139,8 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('markdown');
+    expect(languages).toContain('shell');
   });
 });
 
@@ -5126,6 +5138,57 @@ export function multiply(a: number, b: number): number {
     expect(tracked).toEqual(['app.yaml:yaml', 'application.properties:properties', 'view.twig:twig']);
 
     cg.close();
+  });
+
+  it('should index Markdown headings and local links', async () => {
+    const source = `# Project Overview
+
+See [Setup](docs/setup.md) and [API](#api).
+
+## API
+
+Details for callers.
+`;
+
+    const result = extractFromSource('README.md', source);
+
+    expect(result.errors).toEqual([]);
+    expect(result.nodes.find((n) => n.kind === 'file')).toMatchObject({
+      name: 'README.md',
+      language: 'markdown',
+    });
+
+    const headings = result.nodes.filter((n) => n.kind === 'module').map((n) => n.name);
+    expect(headings).toEqual(['Project Overview', 'API']);
+    expect(result.unresolvedReferences.map((r) => r.referenceName)).toEqual(['docs/setup.md', '#api']);
+  });
+
+  it('should index shell functions and command calls', () => {
+    const source = `#!/usr/bin/env bash
+
+main() {
+  echo "starting"
+  helper
+}
+
+helper() {
+  curl -fsSL https://example.invalid | jq .
+}
+
+main "$@"
+`;
+
+    const result = extractFromSource('scripts/build.sh', source);
+
+    expect(result.errors).toEqual([]);
+    const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(functions).toEqual(['helper', 'main']);
+
+    const calls = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(calls).toContain('helper');
+    expect(calls).toContain('main');
+    expect(calls).toContain('curl');
+    expect(calls).toContain('jq');
   });
 });
 
