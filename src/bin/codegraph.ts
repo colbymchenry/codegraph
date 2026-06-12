@@ -915,7 +915,7 @@ program
 
     try {
       if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath} — run 'codegraph init' first.`);
+        error(`CodeGraph isn't available here — no .codegraph/ index exists in ${projectPath}. If you are an AI agent: continue with your usual tools; indexing is the user's decision, do not run it yourself. (The project owner can enable CodeGraph with 'codegraph init'.)`);
         process.exit(1);
       }
 
@@ -957,7 +957,7 @@ program
 
     try {
       if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath} — run 'codegraph init' first.`);
+        error(`CodeGraph isn't available here — no .codegraph/ index exists in ${projectPath}. If you are an AI agent: continue with your usual tools; indexing is the user's decision, do not run it yourself. (The project owner can enable CodeGraph with 'codegraph init'.)`);
         process.exit(1);
       }
 
