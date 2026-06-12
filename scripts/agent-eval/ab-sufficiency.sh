@@ -66,7 +66,7 @@ run(){ # label, cfg, prewarm(0/1)
   for i in $(seq 1 "$RUNS"); do
     [ "$pw" = "1" ] && prewarm
     ( cd "$TGT" && claude -p "$Q" --output-format stream-json --verbose \
-        --permission-mode bypassPermissions --model opus --max-budget-usd 4 \
+        --permission-mode bypassPermissions --model "${MODEL:-sonnet}" --effort "${EFFORT:-high}" --max-budget-usd 4 \
         --strict-mcp-config --mcp-config "$cfg" </dev/null > "$OUT/$label-$i.jsonl" 2>"$OUT/$label-$i.err" )
     echo "[$label] run $i:"; analyze "$OUT/$label-$i.jsonl"
   done

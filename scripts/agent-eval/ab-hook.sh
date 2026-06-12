@@ -72,7 +72,7 @@ run_one() { # arm-label, run-index, use-hook(0|1)
   # array expansion otherwise, which would skip the no-hook arm's claude run.
   ( cd "$tgt" && claude -p "$TASK" \
       --output-format stream-json --verbose --permission-mode bypassPermissions \
-      --model opus --max-budget-usd 4 --strict-mcp-config --mcp-config "$c" ${extra[@]+"${extra[@]}"} \
+      --model "${MODEL:-sonnet}" --effort "${EFFORT:-high}" --max-budget-usd 4 --strict-mcp-config --mcp-config "$c" ${extra[@]+"${extra[@]}"} \
       </dev/null > "$OUT/run-$label-$idx.jsonl" 2>"$OUT/run-$label-$idx.err" )
   node "$PARSE" "$OUT/run-$label-$idx.jsonl" 2>&1 | grep -E "by type|Result" || echo "  (parse failed — see $OUT/run-$label-$idx.jsonl)"
   pkill -9 -f "serve --mcp --path $tgt" 2>/dev/null

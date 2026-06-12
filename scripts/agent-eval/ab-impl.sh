@@ -64,7 +64,7 @@ run(){ # label, withCodegraph(0/1)
       prewarm "$tgt"
     else cp "$OUT/mcp-empty.json" "$cfg"; fi
     ( cd "$tgt" && claude -p "$Q" --output-format stream-json --verbose \
-        --permission-mode bypassPermissions --model opus --max-budget-usd 4 \
+        --permission-mode bypassPermissions --model "${MODEL:-sonnet}" --effort "${EFFORT:-high}" --max-budget-usd 4 \
         --strict-mcp-config --mcp-config "$cfg" </dev/null > "$OUT/$label-$i.jsonl" 2>"$OUT/$label-$i.err" )
     echo "[$label] run $i:"; analyze "$OUT/$label-$i.jsonl"
     if [ -n "$BUILD_CMD" ]; then ( cd "$tgt" && eval "$BUILD_CMD" >/dev/null 2>&1 && echo "      build: PASS" || echo "      build: FAIL" ); fi

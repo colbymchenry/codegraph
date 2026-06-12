@@ -71,7 +71,7 @@ run_arm() { # label, N
     echo "----- [$label] run $i -----"
     ( cd "$tgt" && claude -p "$TASK" \
         --output-format stream-json --verbose --permission-mode bypassPermissions \
-        --model opus --max-budget-usd 4 --strict-mcp-config --mcp-config "$c" \
+        --model "${MODEL:-sonnet}" --effort "${EFFORT:-high}" --max-budget-usd 4 --strict-mcp-config --mcp-config "$c" \
         </dev/null > "$OUT/run-$label-$i.jsonl" 2>"$OUT/run-$label-$i.err" )
     count "$OUT/run-$label-$i.jsonl"
     pkill -9 -f "serve --mcp --path $tgt" 2>/dev/null

@@ -15,7 +15,7 @@ printf '{"mcpServers":{"codegraph":{"command":"%s","args":["serve","--mcp","--pa
 for i in $(seq 1 "$N"); do
   pkill -f "serve --mcp" 2>/dev/null; sleep 1; rm -f "$REPO/.codegraph/daemon.sock"
   ( cd "$REPO" && claude -p "$Q$WHY" --output-format stream-json --verbose \
-      --permission-mode bypassPermissions --model opus --effort "${EFFORT:-high}" --max-budget-usd 4 \
+      --permission-mode bypassPermissions --model "${MODEL:-sonnet}" --effort "${EFFORT:-high}" --max-budget-usd 4 \
       --strict-mcp-config --mcp-config "$OUT/cg.json" > "$OUT/with$i.jsonl" 2>"$OUT/with$i.err" )
   echo "WITH run $i: exit $? ($(wc -l < "$OUT/with$i.jsonl" | tr -d ' ') lines)"
 done
