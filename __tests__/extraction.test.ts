@@ -1150,6 +1150,40 @@ public class OrderService
     expect(classNode?.visibility).toBe('public');
   });
 
+  it('indexes every record form with the right kind (#831)', () => {
+    // The grammar parses ALL record forms as record_declaration — there is no
+    // record_struct_declaration node — so the value-type forms are told apart
+    // by their `struct` keyword child. Positional one-liners have no body
+    // block and must still index (the no-body gate is for C/C++ forward
+    // declarations, not records).
+    const code = `
+namespace Fixture;
+
+public record SimplePositional(int A);
+public record WithBody(int A) { public int DoubleIt() => A * 2; }
+public record class ExplicitClassRec(string Name);
+public record struct ValueRec(int X);
+public readonly record struct ReadonlyRec(int X, int Y);
+public record DerivedRec(int A, string B) : SimplePositional(A);
+public record GenericRec<T>(T Value);
+public partial record PartialRec(int A);
+`;
+    const result = extractFromSource('Records.cs', code);
+    const kindOf = (name: string) => result.nodes.find((n) => n.name === name)?.kind;
+
+    expect(kindOf('SimplePositional')).toBe('class');
+    expect(kindOf('WithBody')).toBe('class');
+    expect(kindOf('ExplicitClassRec')).toBe('class');
+    expect(kindOf('DerivedRec')).toBe('class');
+    expect(kindOf('GenericRec')).toBe('class');
+    expect(kindOf('PartialRec')).toBe('class');
+    // Value-type records are structs, not classes.
+    expect(kindOf('ValueRec')).toBe('struct');
+    expect(kindOf('ReadonlyRec')).toBe('struct');
+    // Members of a bodied record still extract.
+    expect(kindOf('DoubleIt')).toBe('method');
+  });
+
   it('indexes primary-constructor classes, including keyed-DI attribute params (#237)', () => {
     // C# 12 primary constructors (`class Foo(IDep dep) { … }`) are parsed
     // natively by the vendored tree-sitter-c-sharp 0.23.x grammar. The worst
