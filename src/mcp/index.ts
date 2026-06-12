@@ -49,6 +49,7 @@ import {
 } from './daemon';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import { getDaemonSocketPath } from './daemon-paths';
+import { getTelemetry } from '../telemetry';
 import { supervisionLostReason } from './ppid-watchdog';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
@@ -245,6 +246,11 @@ export class MCPServer {
    * mode — a misbehaving daemon must never block a session from starting.
    */
   async start(): Promise<void> {
+    // Long-lived process (direct / proxy / daemon alike): flush buffered
+    // telemetry opportunistically. Fire-and-forget + unref'd — adds nothing
+    // to the handshake path and never keeps the process alive.
+    getTelemetry().startInterval();
+
     // The detached daemon process itself. Checked before the opt-out so the
     // daemon honors the same env it was spawned with (it never sets NO_DAEMON).
     if (daemonInternalSet()) {

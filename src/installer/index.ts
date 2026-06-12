@@ -29,6 +29,7 @@ import { getGlyphs } from '../ui/glyphs';
 import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
 import { getCodeGraphDir, codeGraphDirName } from '../directory';
+import { getTelemetry, recordIndexEvent, TELEMETRY_DOCS } from '../telemetry';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -181,7 +182,33 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     autoAllow = false;
   }
 
+  // Step 4½: anonymous usage telemetry — a visible default-on toggle, asked
+  // exactly once. Skipped when an env var (DO_NOT_TRACK / CODEGRAPH_TELEMETRY)
+  // already decides, or when a previous run stored a choice — re-runs and
+  // upgrades never re-ask.
+  if (!useDefaults && getTelemetry().getStatus().decidedBy === 'default' && !getTelemetry().hasStoredChoice()) {
+    const share = await clack.confirm({
+      message: 'Share anonymous usage stats? (No code, paths, or names — see TELEMETRY.md)',
+      initialValue: true,
+    });
+    if (clack.isCancel(share)) {
+      // Don't kill the install over the telemetry question — leave it
+      // undecided (the documented default + first-run notice applies later).
+      clack.log.info('Skipped — manage anytime with `codegraph telemetry on|off`.');
+    } else {
+      getTelemetry().setEnabled(share, 'installer');
+      clack.log.info(
+        share
+          ? `Thanks! Exactly what is collected: ${TELEMETRY_DOCS}`
+          : 'Telemetry disabled — nothing will be collected or sent.',
+      );
+    }
+  }
+
   // Step 5: per-target install loop.
+  const installedIds: TargetId[] = [];
+  let sawCreated = false;
+  let sawUpdated = false;
   for (const target of targets) {
     if (!target.supportsLocation(location)) {
       clack.log.warn(
@@ -190,7 +217,10 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       continue;
     }
     const result = target.install(location, { autoAllow });
+    installedIds.push(target.id);
     for (const file of result.files) {
+      if (file.action === 'created') sawCreated = true;
+      if (file.action === 'updated') sawUpdated = true;
       const verb = file.action === 'unchanged'
         ? 'Unchanged'
         : file.action === 'created' ? 'Created'
@@ -203,6 +233,16 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
+  // Telemetry: which agents were configured, where, fresh-vs-upgrade (derived
+  // from the file actions above). Target IDs and the location enum only.
+  if (installedIds.length > 0) {
+    getTelemetry().recordLifecycle('install', {
+      targets: installedIds,
+      scope: location,
+      kind: sawCreated ? 'fresh' : sawUpdated ? 'upgrade' : 'reinstall',
+    });
+  }
+
   // Step 6: for local install, initialize the project.
   if (location === 'local') {
     await initializeLocalProject(clack, useDefaults);
@@ -211,6 +251,10 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   if (location === 'global') {
     clack.note('cd your-project\ncodegraph init -i', 'Quick start');
   }
+
+  // Deliver buffered telemetry while we're already in a long interactive
+  // command — bounded (~1.5s worst case), invisible after a multi-second install.
+  await getTelemetry().flushNow();
 
   const finalNote = targets.length > 0
     ? `Done! Restart your agent${targets.length > 1 ? 's' : ''} to use CodeGraph.`
@@ -367,6 +411,13 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     clack.log.info(`The ${codeGraphDirName()}/ index for this project is still here. Run \`codegraph uninit\` to delete it.`);
   }
 
+  // Telemetry churn signal (agent IDs only) — flush now, since after an
+  // uninstall there is usually no "next run" to deliver it.
+  if (removed.length > 0) {
+    getTelemetry().recordLifecycle('uninstall', { targets: removed.map((r) => r.id) });
+    await getTelemetry().flushNow();
+  }
+
   // Step 5: summary.
   if (removed.length > 0) {
     const names = removed.map((r) => r.displayName).join(', ');
@@ -487,6 +538,8 @@ async function initializeLocalProject(
   } else {
     clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files (${formatNumber(result.nodesCreated)} symbols)`);
   }
+
+  recordIndexEvent(cg, result); // buffered; the installer flushes at the end
 
   cg.close();
 

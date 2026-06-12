@@ -589,6 +589,23 @@ add a negation — `!vendor/`. The defaults apply uniformly, so committing a
 dependency or build directory doesn't force it into the graph; the `.gitignore`
 negation is the explicit opt-in.
 
+## Telemetry
+
+CodeGraph collects **anonymous usage statistics** — which tools and commands get
+used, which languages get indexed — to guide where language and agent support
+work goes. **Never** any code, paths, file or symbol names, queries, or IP
+addresses; usage is aggregated locally into daily totals before anything is
+sent, and the ingest endpoint is [public code in this repo](telemetry-worker/)
+that enforces the documented field list. The installer asks up front; turn it
+off any time:
+
+```bash
+codegraph telemetry off    # or: CODEGRAPH_TELEMETRY=0, or DO_NOT_TRACK=1
+```
+
+[`TELEMETRY.md`](TELEMETRY.md) lists every field, with the off-switches and the
+full data-handling story.
+
 ## Supported Platforms
 
 Every release ships a self-contained build (bundled Node runtime — nothing to

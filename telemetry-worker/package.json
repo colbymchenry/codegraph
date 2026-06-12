@@ -1,0 +1,15 @@
+{
+  "name": "codegraph-telemetry-worker",
+  "private": true,
+  "description": "First-party ingest endpoint for codegraph's anonymous usage telemetry (telemetry.getcodegraph.com)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "check": "wrangler types && tsc --noEmit && wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "wrangler": "^4.36.0"
+  }
+}

@@ -18,7 +18,16 @@ export default defineConfig({
      * have installed. CI on Node 22/23 is unaffected — the guard doesn't fire
      * there, so the variable is a no-op.
      */
-    env: { CODEGRAPH_ALLOW_UNSAFE_NODE: '1' },
+    env: {
+      CODEGRAPH_ALLOW_UNSAFE_NODE: '1',
+      /**
+       * The suite spawns real CLI/MCP processes; without this they would write
+       * telemetry state into the contributor's real ~/.codegraph and count test
+       * tool calls as real usage. The telemetry unit tests are unaffected —
+       * they inject their own `env` via the Telemetry constructor.
+       */
+      CODEGRAPH_TELEMETRY: '0',
+    },
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],

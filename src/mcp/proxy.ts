@@ -28,6 +28,7 @@ import { CodeGraphPackageVersion } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
+import { getTelemetry, ClientInfo } from '../telemetry';
 import type { MCPEngine } from './engine';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
@@ -204,6 +205,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let daemonStatus: 'connecting' | 'ready' | 'failed' = 'connecting';
   let daemonSocket: net.Socket | null = null;
   let clientInitId: unknown = undefined;   // suppress the daemon's reply to the forwarded initialize
+  // Telemetry attribution for the in-process fallback only — calls routed to
+  // the daemon are counted by the daemon's own session (which receives the
+  // forwarded initialize, clientInfo included), never double-counted here.
+  let telemetryClient: ClientInfo | undefined;
   const pending: string[] = [];            // client lines buffered until the daemon resolves
   let engine: MCPEngine | null = null;
   let engineReady: Promise<void> | null = null;
@@ -246,6 +251,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
         const result = await engine!.getToolHandler().execute(params.name, params.arguments || {});
         writeClient({ jsonrpc: '2.0', id, result });
+        getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
       } catch (err) {
         writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: err instanceof Error ? err.message : String(err) } });
       }
@@ -282,6 +288,13 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { routeToDaemon(line); continue; }
       if (msg.method === 'initialize') {
         clientInitId = msg.id;
+        const initParams = (msg.params ?? {}) as { clientInfo?: { name?: unknown; version?: unknown } };
+        if (initParams.clientInfo) {
+          telemetryClient = {
+            name: typeof initParams.clientInfo.name === 'string' ? initParams.clientInfo.name : undefined,
+            version: typeof initParams.clientInfo.version === 'string' ? initParams.clientInfo.version : undefined,
+          };
+        }
         writeClient({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: SERVER_INSTRUCTIONS } });
         routeToDaemon(line); // prime the daemon so it resolves the project (its reply is suppressed below)
       } else if (msg.method === 'tools/list') {
