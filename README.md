@@ -82,14 +82,15 @@ codegraph init
 
 <sub>`codegraph init` creates the local `.codegraph/` directory and builds the full graph in the same step — one command, done.</sub>
 
-**From that moment the index keeps itself up to date — it is never stale.** CodeGraph watches the project and auto-syncs on every file change: while your agent edits code, or you add, modify, or delete files, the graph updates automatically. There is nothing to re-run.
-
-
 <div align="center">
 
 ![1_C_VYnhpys0UHrOuOgpgoyw](https://github.com/user-attachments/assets/f168182f-4d9a-44e0-94d7-08d018cc8a3a)
 
 </div>
+
+### 4. No more syncing!
+
+Auto-sync is enabled by default. CodeGraph watches the project and updates the graph on every file change — while your agent edits code, or you add, modify, or delete files. **The index is never stale, and there is nothing to re-run.**
 
 ### Uninstall
 
