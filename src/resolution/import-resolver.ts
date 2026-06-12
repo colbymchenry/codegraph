@@ -1296,6 +1296,44 @@ export function resolveViaImport(
         );
 
         if (targetNode) {
+          // A `calls` ref shaped `ImportedClass.method` is a static method call
+          // (`Foo.bar()` after `import { Foo }`). The named-import branch above
+          // resolves `targetNode` to the class `Foo`; returning it as-is makes
+          // createEdges promote the `calls` edge to `instantiates` on the class
+          // and drops the method entirely (#825). When the imported receiver is
+          // a class and the trailing member names one of its methods, resolve to
+          // that method instead — preserving the exact-file precision the import
+          // gives over a name-match fallback.
+          if (
+            ref.referenceKind === 'calls' &&
+            !imp.isNamespace &&
+            ref.referenceName.startsWith(imp.localName + '.') &&
+            // Only the kinds createEdges promotes to `instantiates`
+            // (index.ts) — an interface target is never mis-promoted.
+            (targetNode.kind === 'class' || targetNode.kind === 'struct')
+          ) {
+            const memberLeaf = ref.referenceName
+              .slice(imp.localName.length + 1)
+              .split('.')[0];
+            // The method's OWNER segment must be exactly the imported class —
+            // a substring test would let class `Foo` soak up `FooBar::bar`
+            // when both live in the same file (a wrong edge is worse than none).
+            const method = context
+              .getNodesInFile(targetNode.filePath)
+              .find((n) => {
+                if (n.kind !== 'method' || n.name !== memberLeaf) return false;
+                const segs = n.qualifiedName.split('::');
+                return segs[segs.length - 2] === targetNode.name;
+              });
+            if (method) {
+              return {
+                original: ref,
+                targetNodeId: method.id,
+                confidence: 0.9,
+                resolvedBy: 'import',
+              };
+            }
+          }
           return {
             original: ref,
             targetNodeId: targetNode.id,

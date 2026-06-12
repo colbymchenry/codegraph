@@ -768,6 +768,68 @@ def bootstrap():
       expect(callsToUserService).toHaveLength(0);
     });
 
+    it('resolves cross-file static method calls ClassName.staticMethod() to the method, not the class (#825)', async () => {
+      // `Foo.bar()` after `import { Foo } from './helpers'` is a static method
+      // call. The named-import resolver matched the `Foo.` prefix and resolved
+      // the receiver to the class `Foo`; createEdges then promoted the `calls`
+      // edge to `instantiates` on the class and dropped the method — so
+      // callers/impact for the static method came back empty. The fix resolves
+      // the trailing member to the method on the imported class.
+      const srcDir = path.join(tempDir, 'src');
+      fs.mkdirSync(srcDir, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(srcDir, 'helpers.ts'),
+        `export class Foo {\n  static bar(x: number) { return x + 1; }\n}\n` +
+          // Sibling whose name CONTAINS the imported class name and has a
+          // same-named method — the resolver must not soak the call into it.
+          `export class FooBar {\n  bar() { return 0; }\n}\n`
+      );
+      fs.writeFileSync(
+        path.join(srcDir, 'caller.ts'),
+        `import { Foo } from './helpers';\n` +
+          `export function run() { return Foo.bar(41); }\n` +
+          `export function make() { return new Foo(); }\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const run = cg.getNodesByKind('function').find((n) => n.name === 'run')!;
+      const make = cg.getNodesByKind('function').find((n) => n.name === 'make')!;
+      const foo = cg.getNodesByKind('class').find((n) => n.name === 'Foo')!;
+      const bar = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'Foo::bar')!;
+      const fooBarBar = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'FooBar::bar')!;
+      expect(run).toBeDefined();
+      expect(bar).toBeDefined();
+      expect(fooBarBar).toBeDefined();
+
+      // run --calls--> Foo::bar (the method), exactly once...
+      const runOut = cg.getOutgoingEdges(run.id);
+      const callsBar = runOut.filter((e) => e.kind === 'calls' && e.target === bar.id);
+      expect(callsBar).toHaveLength(1);
+      // ...not soaked into the substring-named sibling FooBar::bar...
+      expect(runOut.find((e) => e.target === fooBarBar.id)).toBeUndefined();
+      // ...and NOT mis-promoted to `instantiates` on the class.
+      expect(
+        runOut.find((e) => e.kind === 'instantiates' && e.target === foo.id)
+      ).toBeUndefined();
+
+      // The whole point: callers(staticMethod) now surfaces the real caller.
+      const callers = cg.getCallers(bar.id).map((c) => c.node.name);
+      expect(callers).toContain('run');
+
+      // Boundary: real construction `new Foo()` must still instantiate the class.
+      const makeOut = cg.getOutgoingEdges(make.id);
+      expect(
+        makeOut.find((e) => e.kind === 'instantiates' && e.target === foo.id)
+      ).toBeDefined();
+    });
+
     it('resolves Go cross-package qualified calls via go.mod module path (#388)', async () => {
       // Pre-#388, every `pkga.FuncX(...)` call in a Go monorepo was flagged
       // external (isExternalImport returned true for any non-`/internal/`
