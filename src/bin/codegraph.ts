@@ -968,12 +968,15 @@ program
 
       // A name with a path separator is a file read; otherwise a symbol
       // (use --file for basename-only file reads or to pin an overload).
+      // Both separators: Windows users type src\auth\session.ts. Symbols
+      // never contain either ('/' isn't an identifier char anywhere we
+      // index; C++ scope is '::', JS members '.').
       const args: Record<string, unknown> = {};
       if (options.file) {
         args.file = options.file;
         if (name && name !== options.file) args.symbol = name;
-      } else if (name.includes('/')) {
-        args.file = name;
+      } else if (name.includes('/') || name.includes('\\')) {
+        args.file = name.replace(/\\/g, '/');
       } else {
         args.symbol = name;
         args.includeCode = true;
