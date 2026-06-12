@@ -27,7 +27,12 @@ function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
     // Direct (in-process) mode — the unindexed path never has a daemon
     // anyway (the daemon socket lives in .codegraph/), and this keeps the
     // suite from leaking a detached daemon in the indexed test.
-    env: { ...process.env, CODEGRAPH_NO_DAEMON: '1' },
+    // CODEGRAPH_WASM_RELAUNCHED skips the --liftoff-only re-exec: without
+    // it the server runs as a GRANDCHILD that survives child.kill() on
+    // Windows and holds the temp cwd/SQLite handles, failing teardown with
+    // EPERM no matter how long rmSync retries (the class documented for
+    // the mcp-initialize/mcp-roots suites).
+    env: { ...process.env, CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_WASM_RELAUNCHED: '1' },
   }) as ChildProcessWithoutNullStreams;
 }
 
@@ -85,12 +90,20 @@ describe('Unindexed-workspace session policy', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-unindexed-'));
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     if (child) {
+      // Wait for the child to actually exit before removing its cwd — on
+      // Windows a just-killed process briefly holds the directory/SQLite
+      // handles, and an immediate rmSync fails the teardown with EPERM
+      // (the documented file-locking class that fails the sibling
+      // mcp-initialize/mcp-roots suites). kill + await exit + retried
+      // removal keeps this suite green on Windows.
+      const exited = new Promise<void>((resolve) => child!.once('exit', () => resolve()));
       child.kill('SIGKILL');
+      await Promise.race([exited, new Promise((r) => setTimeout(r, 3000))]);
       child = null;
     }
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   it('initialize returns the short "inactive" instructions, not the playbook', async () => {
