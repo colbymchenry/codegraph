@@ -247,6 +247,176 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
 }
 
 /**
+ * Filename of the optional project-root override list. See {@link loadCodegraphOverride}.
+ */
+export const CODEGRAPHIGNORE_FILE = '.codegraphignore';
+
+/** A single parsed `.codegraphignore` directive line. */
+interface OverrideLine {
+  /** Single-pattern matcher (the line with any leading `!` stripped). */
+  matcher: Ignore;
+  /** True when the line began with `!` (force-include); false = force-exclude. */
+  negation: boolean;
+}
+
+/**
+ * Project-root `.codegraphignore` override — final authority over what the
+ * indexer includes, beating the built-in defaults AND every `.gitignore` (root,
+ * nested, and — by routing the scan to the filesystem walk — git's own view).
+ * Two directive forms, evaluated last-match-wins per path:
+ *
+ *   pattern    force-EXCLUDE — drop the path even if git/defaults would keep it
+ *   !pattern   force-INCLUDE — index the path even if git/.gitignore/defaults drop it
+ *
+ * Force-include is *code-aware*: it re-includes paths hidden by any `.gitignore`,
+ * but does NOT resurrect a built-in dependency/build dir (node_modules, dist,
+ * .yarn, …) caught under a broad include like `!environment/` — those stay
+ * excluded unless an include line's literal anchor reaches into the dep dir
+ * itself (e.g. `!environment/node_modules/mypkg/`). So `!environment/` means
+ * "index environment's code" without dragging in its dependencies.
+ *
+ * Because git cannot enumerate files it ignores (nor cross an embedded-repo
+ * boundary), the presence of any force-include routes `scanDirectory` to the
+ * git-agnostic filesystem walk — see {@link scanDirectory}.
+ */
+export interface CodegraphOverride {
+  /** True when at least one `!` (force-include) line is present. */
+  readonly hasForceInclude: boolean;
+  /**
+   * Final verdict for a file/dir path (POSIX, project-relative; a dir may carry
+   * a trailing `/`). 'include'/'exclude' are authoritative; null = no opinion,
+   * defer to the existing default/.gitignore logic. A code-aware drop of a dep
+   * dir under a broad include surfaces as 'exclude'.
+   */
+  verdict(rel: string): 'include' | 'exclude' | null;
+  /**
+   * Whether the walk should descend into a directory. 'include' = descend even
+   * if defaults/.gitignore exclude it (needed to reach a buried force-include);
+   * 'exclude' = prune; null = defer to the existing logic.
+   */
+  shouldDescend(relDir: string): 'include' | 'exclude' | null;
+}
+
+/** Strip a `.codegraphignore` pattern to its literal leading path (before any glob char). */
+function patternAnchor(pattern: string): string {
+  let p = pattern.replace(/^\//, '').replace(/\/+$/, '');
+  const glob = p.search(/[*?[]/);
+  if (glob >= 0) {
+    p = p.slice(0, glob);
+    const slash = p.lastIndexOf('/');
+    p = slash >= 0 ? p.slice(0, slash) : '';
+  }
+  return p;
+}
+
+/**
+ * Load and parse the project-root `.codegraphignore`. Returns null when the file
+ * is absent, unreadable, or has no effective directives — so every call site
+ * collapses to today's exact behavior when no override is present.
+ */
+export function loadCodegraphOverride(rootDir: string): CodegraphOverride | null {
+  let raw: string;
+  try {
+    const p = path.join(rootDir, CODEGRAPHIGNORE_FILE);
+    if (!fs.existsSync(p)) return null;
+    raw = fs.readFileSync(p, 'utf-8');
+  } catch {
+    return null;
+  }
+
+  const lines: OverrideLine[] = [];
+  const includeAnchors: string[] = [];
+  let hasGlobalInclude = false;
+
+  for (let line of raw.split('\n')) {
+    line = line.replace(/\r$/, '').replace(/\s+$/, '');
+    if (!line || line.startsWith('#')) continue;
+    // gitignore escape: a leading "\#" / "\!" is literal, not comment/negation.
+    if (line.startsWith('\\#') || line.startsWith('\\!')) line = line.slice(1);
+
+    let negation = false;
+    let pat = line;
+    if (pat.startsWith('!')) { negation = true; pat = pat.slice(1); }
+    if (!pat) continue;
+
+    lines.push({ matcher: ignore().add(pat), negation });
+    if (negation) {
+      const anchor = patternAnchor(pat);
+      if (anchor === '') hasGlobalInclude = true;
+      else includeAnchors.push(anchor);
+    }
+  }
+
+  if (lines.length === 0) return null;
+
+  const hasForceInclude = lines.some((l) => l.negation);
+
+  // last-match-wins: the last line that matches a path decides its directive.
+  // Test both the bare and trailing-slash forms so a dir-only pattern (`foo/`)
+  // matches whether the caller passed the path with a slash or not.
+  const directiveFor = (rel: string): 'include' | 'exclude' | null => {
+    const probe = rel.replace(/\/+$/, '');
+    if (!probe) return null;
+    let result: 'include' | 'exclude' | null = null;
+    for (const l of lines) {
+      if (l.matcher.ignores(probe) || l.matcher.ignores(probe + '/')) {
+        result = l.negation ? 'include' : 'exclude';
+      }
+    }
+    return result;
+  };
+
+  // Shallowest path segment that is a built-in default-ignore dir, returned as
+  // the dir path up to and including it. Drives the code-aware include rule.
+  const firstDefaultDir = (rel: string): string | null => {
+    const segs = rel.replace(/\/+$/, '').split('/');
+    for (let i = 0; i < segs.length; i++) {
+      if (DEFAULT_IGNORE_DIRS.has(segs[i]!)) return segs.slice(0, i + 1).join('/');
+    }
+    return null;
+  };
+
+  // True when `relDir` is at, or on the path to, a force-include anchor — i.e.
+  // the walk must descend into it (even through a default-ignored dir) to reach
+  // an explicitly-included subtree. hasGlobalInclude (a pure-glob `!*.x`) forces
+  // a full descent — the documented cost of an unanchored include.
+  const isStrictAncestorOfAnchor = (relDir: string): boolean => {
+    if (hasGlobalInclude) return true;
+    return includeAnchors.some((a) => a === relDir || a.startsWith(relDir + '/'));
+  };
+
+  const verdict = (rel: string): 'include' | 'exclude' | null => {
+    const d = directiveFor(rel);
+    if (d !== 'include') return d; // 'exclude' or null pass through unchanged
+    // code-aware: a force-include must not resurrect a built-in dep/build dir
+    // (node_modules, dist, .yarn, …) unless an include anchor *inside* that dep
+    // dir specifically covers this path. So `!environment/` indexes the code but
+    // not the deps, while `!environment/node_modules/mypkg/` reaches in surgically.
+    const probe = rel.replace(/\/+$/, '');
+    const depDir = firstDefaultDir(probe);
+    if (depDir) {
+      const covered = includeAnchors.some(
+        (a) =>
+          (a === depDir || a.startsWith(depDir + '/')) &&
+          (probe === a || probe.startsWith(a + '/'))
+      );
+      if (!covered) return 'exclude';
+    }
+    return 'include';
+  };
+
+  const shouldDescend = (relDir: string): 'include' | 'exclude' | null => {
+    const probe = relDir.replace(/\/+$/, '');
+    // Descend if an include anchor lives at or below this dir — even into a
+    // default-ignored dir; the per-file verdict still filters siblings out.
+    if (isStrictAncestorOfAnchor(probe)) return 'include';
+    return verdict(probe + '/');
+  };
+
+  return { hasForceInclude, verdict, shouldDescend };
+}
+
+/**
  * Collect git-visible files (tracked + untracked, .gitignore-respected) from the
  * git repository rooted at `repoDir`, adding each to `files` with `prefix`
  * prepended so paths stay relative to the original scan root.
@@ -302,7 +472,7 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): v
  * embedded (nested, non-submodule) git repos. Returns null on failure
  * (non-git project) so callers can fall back to a filesystem walk.
  */
-function getGitVisibleFiles(rootDir: string): Set<string> | null {
+function getGitVisibleFiles(rootDir: string, override?: CodegraphOverride | null): Set<string> | null {
   try {
     // Check if the project directory is gitignored by a parent repo.
     // When rootDir lives inside a parent git repo that ignores it,
@@ -334,7 +504,17 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     // committing a dependency/build dir doesn't make it project code. A
     // `.gitignore` negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
     const ig = buildDefaultIgnore(rootDir);
-    return new Set([...files].filter((f) => !ig.ignores(f)));
+    // A `.codegraphignore` force-exclude line drops the path; a force-include
+    // keeps it (force-include normally routes to the walk before reaching here,
+    // but applying it is harmless). Otherwise fall back to the default matcher.
+    return new Set([...files].filter((f) => {
+      if (override) {
+        const v = override.verdict(f);
+        if (v === 'exclude') return false;
+        if (v === 'include') return true;
+      }
+      return !ig.ignores(f);
+    }));
   } catch {
     return null;
   }
@@ -403,23 +583,29 @@ export function scanDirectory(
   rootDir: string,
   onProgress?: (current: number, file: string) => void
 ): string[] {
-  // Fast path: use git to get all visible files (respects .gitignore everywhere)
-  const gitFiles = getGitVisibleFiles(rootDir);
-  if (gitFiles) {
-    const files: string[] = [];
-    let count = 0;
-    for (const filePath of gitFiles) {
-      if (isSourceFile(filePath)) {
-        files.push(filePath);
-        count++;
-        onProgress?.(count, filePath);
+  const override = loadCodegraphOverride(rootDir);
+  // A `.codegraphignore` force-include can't be served by the git fast path —
+  // git cannot enumerate files it ignores, nor cross an embedded-repo boundary —
+  // so route straight to the git-agnostic filesystem walk when one is present.
+  if (!override?.hasForceInclude) {
+    // Fast path: use git to get all visible files (respects .gitignore everywhere)
+    const gitFiles = getGitVisibleFiles(rootDir, override);
+    if (gitFiles) {
+      const files: string[] = [];
+      let count = 0;
+      for (const filePath of gitFiles) {
+        if (isSourceFile(filePath)) {
+          files.push(filePath);
+          count++;
+          onProgress?.(count, filePath);
+        }
       }
+      return files;
     }
-    return files;
   }
 
-  // Fallback: walk filesystem for non-git projects
-  return scanDirectoryWalk(rootDir, onProgress);
+  // Fallback: walk filesystem for non-git projects (and force-include overrides)
+  return scanDirectoryWalk(rootDir, onProgress, override);
 }
 
 /**
@@ -430,25 +616,28 @@ export async function scanDirectoryAsync(
   rootDir: string,
   onProgress?: (current: number, file: string) => void
 ): Promise<string[]> {
-  const gitFiles = getGitVisibleFiles(rootDir);
-  if (gitFiles) {
-    const files: string[] = [];
-    let count = 0;
-    for (const filePath of gitFiles) {
-      if (isSourceFile(filePath)) {
-        files.push(filePath);
-        count++;
-        onProgress?.(count, filePath);
-        // Yield every 100 files so worker threads can render progress
-        if (count % 100 === 0) {
-          await new Promise<void>(r => setImmediate(r));
+  const override = loadCodegraphOverride(rootDir);
+  if (!override?.hasForceInclude) {
+    const gitFiles = getGitVisibleFiles(rootDir, override);
+    if (gitFiles) {
+      const files: string[] = [];
+      let count = 0;
+      for (const filePath of gitFiles) {
+        if (isSourceFile(filePath)) {
+          files.push(filePath);
+          count++;
+          onProgress?.(count, filePath);
+          // Yield every 100 files so worker threads can render progress
+          if (count % 100 === 0) {
+            await new Promise<void>(r => setImmediate(r));
+          }
         }
       }
+      return files;
     }
-    return files;
   }
 
-  return scanDirectoryWalk(rootDir, onProgress);
+  return scanDirectoryWalk(rootDir, onProgress, override);
 }
 
 /**
@@ -456,7 +645,8 @@ export async function scanDirectoryAsync(
  */
 function scanDirectoryWalk(
   rootDir: string,
-  onProgress?: (current: number, file: string) => void
+  onProgress?: (current: number, file: string) => void,
+  override?: CodegraphOverride | null
 ): string[] {
   const files: string[] = [];
   let count = 0;
@@ -482,6 +672,14 @@ function scanDirectoryWalk(
   };
 
   const isIgnored = (fullPath: string, isDir: boolean, matchers: ScopedIgnore[]): boolean => {
+    // `.codegraphignore` is the final authority — it overrides the built-in
+    // defaults and every (root or nested) .gitignore below.
+    if (override) {
+      const relRoot = normalizePath(path.relative(rootDir, fullPath)) + (isDir ? '/' : '');
+      const v = override.verdict(relRoot);
+      if (v === 'exclude') return true;
+      if (v === 'include') return false;
+    }
     for (const { dir, ig } of matchers) {
       let rel = normalizePath(path.relative(dir, fullPath));
       if (!rel || rel.startsWith('..')) continue; // not under this matcher's dir
@@ -489,6 +687,19 @@ function scanDirectoryWalk(
       if (ig.ignores(rel)) return true;
     }
     return false;
+  };
+
+  // Whether to descend into a directory. `.codegraphignore` may force descent
+  // into an otherwise-excluded dir to reach a buried force-include (e.g. walk
+  // into `environment/` — ignored by root .gitignore — to reach `!environment/src/`).
+  const decideDescend = (fullPath: string, matchers: ScopedIgnore[]): boolean => {
+    if (override) {
+      const relDir = normalizePath(path.relative(rootDir, fullPath));
+      const sd = override.shouldDescend(relDir);
+      if (sd === 'include') return true;
+      if (sd === 'exclude') return false;
+    }
+    return !isIgnored(fullPath, true, matchers);
   };
 
   function walk(dir: string, matchers: ScopedIgnore[]): void {
@@ -533,7 +744,7 @@ function scanDirectoryWalk(
           const realTarget = fs.realpathSync(fullPath);
           const stat = fs.statSync(realTarget);
           if (stat.isDirectory()) {
-            if (!isIgnored(fullPath, true, active)) {
+            if (decideDescend(fullPath, active)) {
               walk(fullPath, active);
             }
           } else if (stat.isFile()) {
@@ -550,7 +761,7 @@ function scanDirectoryWalk(
       }
 
       if (entry.isDirectory()) {
-        if (!isIgnored(fullPath, true, active)) {
+        if (decideDescend(fullPath, active)) {
           walk(fullPath, active);
         }
       } else if (entry.isFile()) {
@@ -1524,7 +1735,10 @@ export class ExtractionOrchestrator {
    * Uses git status as a fast path when available, falling back to full scan.
    */
   getChangedFiles(): { added: string[]; modified: string[]; removed: string[] } {
-    const gitChanges = getGitChangedFiles(this.rootDir);
+    // `git status` cannot see files a force-include resurrects from .gitignore,
+    // so skip the git fast path and use the full scan (which routes to the walk).
+    const override = loadCodegraphOverride(this.rootDir);
+    const gitChanges = override?.hasForceInclude ? null : getGitChangedFiles(this.rootDir);
 
     if (gitChanges) {
       // === Git fast path ===

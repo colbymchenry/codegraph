@@ -589,6 +589,37 @@ add a negation — `!vendor/`. The defaults apply uniformly, so committing a
 dependency or build directory doesn't force it into the graph; the `.gitignore`
 negation is the explicit opt-in.
 
+### `.codegraphignore` — overriding what gets indexed
+
+For cases a `.gitignore` negation can't reach — code hidden by the **root**
+`.gitignore`, by a **nested** `.gitignore`, by an **embedded git repo**, or
+otherwise invisible to git — drop a `.codegraphignore` at your project root. It
+is the final authority on indexing scope, overriding the built-in defaults
+**and** every `.gitignore`. Same syntax as `.gitignore`:
+
+- `path` — **force-exclude** (drop it even if it would otherwise be indexed).
+- `!path` — **force-include** (index it even if git/`.gitignore`/the defaults hide it).
+- **Last matching line wins**, so you can re-include a tree and then trim a few files back out.
+
+Force-include is **code-aware**: a broad `!app/` brings in that subtree's
+*source*, but still leaves built-in dependency/build dirs (`node_modules`,
+`dist`, `.yarn`, …) out — unless you name one explicitly (`!app/node_modules/mypkg/`).
+
+Example — a monorepo whose real code lives under `environment/`, which the root
+`.gitignore` excludes and whose own `.gitignore` further hides `src/app-*` and
+`src/common`:
+
+```gitignore
+# .codegraphignore
+!environment/                 # index environment's code (deps stay excluded)
+
+environment/.idea/            # trim tooling noise a broad include pulls in
+environment/.pnp.cjs
+```
+
+A `.codegraphignore` with a force-include automatically scans via the
+filesystem (rather than git), since git can't list the files it ignores.
+
 ## Supported Platforms
 
 Every release ships a self-contained build (bundled Node runtime — nothing to
