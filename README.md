@@ -53,7 +53,8 @@ curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install
 irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
 ```
 
-Already have Node? Use npm instead (works on any version):
+<details>
+<summary><b>Already have Node? Use npm instead (works on any version)</b></summary>
 
 ```bash
 npm i -g @colbymchenry/codegraph
@@ -62,6 +63,8 @@ npm i -g @colbymchenry/codegraph
 <sub>CodeGraph bundles its own runtime — nothing to compile, no native build, works the same everywhere. The installer puts `codegraph` on your PATH but **doesn't change your current shell** — open a new terminal before the next step so the command resolves.</sub>
 
 <sub>**Upgrade any time** with `codegraph upgrade` — it detects how you installed (bundle, npm, or npx) and updates in place. Add `--check` to see if an update is available, or `codegraph upgrade <version>` to pin one.</sub>
+
+</details>
 
 ### 2. Wire up your agent(s)
 
