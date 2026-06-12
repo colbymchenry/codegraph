@@ -88,7 +88,12 @@ node "$BIN" init "$OUT/t-new" >/dev/null 2>&1 && echo "  indexed t-new"
 run_arm new "$OUT/t-new"
 
 echo "== BASELINE build ($BASE_REF) =="
-git -C "$ENGINE" checkout "$BASE_REF" -- $CHANGED
+# Per-file: a file ADDED since baseline has no pathspec on the ref — and a
+# single multi-file checkout with one bad pathspec checks out NOTHING, which
+# silently ran the NEW build in the baseline arm. Absent-on-baseline → remove.
+for f in $CHANGED; do
+  git -C "$ENGINE" checkout "$BASE_REF" -- "$f" 2>/dev/null || rm -f "$ENGINE/$f"
+done
 ( cd "$ENGINE" && npm run build >/dev/null 2>&1 ) && echo "  built"
 node "$BIN" init "$OUT/t-base" >/dev/null 2>&1 && echo "  indexed t-base"
 run_arm baseline "$OUT/t-base"
