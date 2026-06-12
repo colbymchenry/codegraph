@@ -224,6 +224,43 @@ describe('codegraph_explore — dynamic boundaries', () => {
     expect(text).toContain('## Dynamic boundaries');
   });
 
+  it('renders a direct synthesized emit→handler hop as a dynamic-dispatch link (#687 criterion 1)', async () => {
+    // Custom EventBus with a LITERAL key: the event-emitter synthesizer
+    // bridges emit→handler, but the 2-node chain was invisible — too short
+    // for the Flow section and skipped by the links section as "in-chain".
+    await setup({
+      'bus.ts': [
+        'type Handler = (p: unknown) => void;',
+        'export class EventBus {',
+        '  private listeners: Record<string, Handler[]> = {};',
+        '  on(event: string, fn: Handler) { (this.listeners[event] ??= []).push(fn); }',
+        '  emit(event: string, payload: unknown) { for (const fn of this.listeners[event] ?? []) fn(payload); }',
+        '}',
+        'export const bus = new EventBus();',
+      ].join('\n'),
+      'billing.ts': [
+        "import { bus } from './bus';",
+        'export function settleInvoice(payload: unknown) { return payload; }',
+        "bus.on('invoice.settled', settleInvoice);",
+      ].join('\n'),
+      'checkout.ts': [
+        "import { bus } from './bus';",
+        'export function completeCheckout(order: unknown) {',
+        "  bus.emit('invoice.settled', order);",
+        '}',
+      ].join('\n'),
+    }, ['**/*.ts']);
+
+    const res = await handler.execute('codegraph_explore', { query: 'completeCheckout settleInvoice' });
+    const text = res.content[0].text as string;
+
+    expect(text).toContain('## Dynamic-dispatch links among your symbols');
+    expect(text).toMatch(/completeCheckout → settleInvoice/);
+    expect(text).toContain('invoice.settled');
+    // Connected via the synthesized edge — no boundary to announce.
+    expect(text).not.toContain('## Dynamic boundaries');
+  });
+
   it('never adds the section to a fully connected flow', async () => {
     await setup({
       'pipeline.ts': [

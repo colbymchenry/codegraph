@@ -1619,7 +1619,11 @@ export class ToolHandler {
       {
         const uncovered: Node[] = [];
         if (!hasMain) {
-          uncovered.push(...named.values());
+          // No rendered chain — but a 2-node chain still CONNECTS its two
+          // endpoints (e.g. via one synthesized hop, surfaced below as a
+          // dynamic-dispatch link). Only nodes off that short chain are
+          // unexplained breaks worth scanning.
+          for (const n of named.values()) if (!pathIds.has(n.id)) uncovered.push(n);
         } else {
           for (const ids of tokenNodes.values()) {
             if (ids.length === 0 || ids.some((id) => pathIds.has(id))) continue;
@@ -1650,7 +1654,12 @@ export class ToolHandler {
         for (const { node: other, edge } of [...cg.getCallers(n.id), ...cg.getCallees(n.id)]) {
           if (synthLines.length >= 6) break;
           if (edge.provenance !== 'heuristic' || other.id === n.id) continue;
-          if (pathIds.has(edge.source) && pathIds.has(edge.target)) continue; // already in the main chain
+          // "Already in the main chain" only applies when a chain RENDERS
+          // (hasMain). A 2-node chain populates pathIds but renders nothing,
+          // so a direct synthesized hop between two named symbols (custom
+          // EventBus emit→handler, #687) was invisible — too short for Flow,
+          // skipped here as in-chain. Surface it.
+          if (hasMain && pathIds.has(edge.source) && pathIds.has(edge.target)) continue;
           const src = edge.source === n.id ? n : other;
           const tgt = edge.source === n.id ? other : n;
           const key = `${src.name}>${tgt.name}`;
