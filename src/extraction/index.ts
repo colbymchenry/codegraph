@@ -247,6 +247,187 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
 }
 
 /**
+ * Defaults-only ignore matcher (no root `.gitignore` merged). Used wherever the
+ * parent repo's own ignore rules must NOT apply — inside embedded child repos,
+ * whose gitignore semantics their own `git ls-files` already enforced (#514).
+ */
+function defaultsOnlyIgnore(): Ignore {
+  return ignore().add(DEFAULT_IGNORE_PATTERNS);
+}
+
+/**
+ * List the gitignored DIRECTORIES of a repo (collapsed, trailing-slash form),
+ * relative to `repoDir`. These are invisible to every other `git ls-files` /
+ * `git status` mode — and in a multi-repo workspace they are exactly where the
+ * nested project repos live (a super-repo `.gitignore`s its child repos to keep
+ * `git status` quiet; that does not make them third-party code). (#514)
+ */
+function listIgnoredDirs(repoDir: string): string[] {
+  try {
+    const out = execFileSync(
+      'git',
+      ['ls-files', '-z', '-o', '-i', '--exclude-standard', '--directory'],
+      { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    );
+    return out.split('\0').filter((e) => e.endsWith('/'));
+  } catch {
+    return [];
+  }
+}
+
+/** Max directory depth searched below an ignored dir for nested `.git` roots. */
+const EMBEDDED_REPO_SEARCH_DEPTH = 4;
+/** Max directories examined per search — a huge ignored data dir must never stall a scan/sync. */
+const EMBEDDED_REPO_SEARCH_ENTRIES = 2000;
+
+/**
+ * Find git repositories nested under `absDir` (inclusive), shallow bounded BFS.
+ * Stops descending at each repo root found — contents belong to that repo's own
+ * enumeration. Skips default-ignored dirs (`node_modules` can contain `.git`
+ * from npm git-dependencies — that never makes it project code) and CodeGraph
+ * data dirs. Depth- and entry-capped so a huge ignored tree can't stall the scan.
+ */
+function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
+  const found: string[] = [];
+  const defaults = defaultsOnlyIgnore();
+  const queue: Array<{ abs: string; rel: string; depth: number }> = [
+    { abs: absDir, rel: relPrefix, depth: 0 },
+  ];
+  let examined = 0;
+  while (queue.length > 0) {
+    const { abs, rel, depth } = queue.shift()!;
+    if (++examined > EMBEDDED_REPO_SEARCH_ENTRIES) {
+      logDebug('Embedded-repo search entry cap hit — deeper repos (if any) not discovered', { under: relPrefix });
+      break;
+    }
+    if (fs.existsSync(path.join(abs, '.git'))) {
+      found.push(rel);
+      continue; // its own git handles everything below
+    }
+    if (depth >= EMBEDDED_REPO_SEARCH_DEPTH) continue;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(abs, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === '.git' || isCodeGraphDataDir(entry.name)) continue;
+      const childRel = rel + entry.name + '/';
+      if (defaults.ignores(childRel)) continue;
+      queue.push({ abs: path.join(abs, entry.name), rel: childRel, depth: depth + 1 });
+    }
+  }
+  return found;
+}
+
+/**
+ * Workspace-scope ignore matcher. Ordinary paths get the root's matcher
+ * (built-in defaults + root `.gitignore`); paths inside an EMBEDDED repo get
+ * that repo's own matcher (defaults + its root `.gitignore`) — the parent's
+ * `.gitignore` hides a child repo from git, not from the index (#514). A
+ * directory path (trailing slash) that is an ANCESTOR of an embedded root is
+ * never ignored, so directory-pruning callers (the Linux per-directory
+ * watcher) still descend to reach the embedded repos.
+ *
+ * Single source of truth for indexer and watcher scope — they must not diverge.
+ */
+export class ScopeIgnore {
+  private embedded: Array<{ root: string; matcher: Ignore }>;
+  private defaults: Ignore = defaultsOnlyIgnore();
+  constructor(private rootMatcher: Ignore, embedded: Array<{ root: string; matcher: Ignore }>) {
+    // Longest root first so paths in nested embedded repos hit the innermost matcher.
+    this.embedded = [...embedded].sort((a, b) => b.root.length - a.root.length);
+  }
+
+  ignores(rel: string): boolean {
+    for (const { root, matcher } of this.embedded) {
+      if (rel.startsWith(root)) {
+        const inner = rel.slice(root.length);
+        if (inner === '') return false;
+        // Built-in defaults apply to the FULL path uniformly (#407) — an
+        // embedded repo inside node_modules (an npm git-dependency) must stay
+        // excluded even though its own rules wouldn't ignore its files.
+        return this.defaults.ignores(rel) || matcher.ignores(inner);
+      }
+    }
+    // Never prune a directory that leads to an embedded repo.
+    if (rel.endsWith('/') && this.embedded.some(({ root }) => root.startsWith(rel))) {
+      return false;
+    }
+    return this.rootMatcher.ignores(rel);
+  }
+}
+
+/**
+ * Build the workspace-scope matcher. When the caller already knows the
+ * embedded roots (the scanner discovers them during collection), pass them to
+ * skip rediscovery; otherwise they're discovered here (the watcher path).
+ */
+export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<string>): ScopeIgnore {
+  const roots = embeddedRoots ? [...embeddedRoots] : discoverEmbeddedRepoRoots(rootDir);
+  return new ScopeIgnore(
+    buildDefaultIgnore(rootDir),
+    roots.map((root) => ({ root, matcher: buildDefaultIgnore(path.join(rootDir, root)) })),
+  );
+}
+
+/**
+ * Standalone discovery of every embedded repo root under `rootDir` (relative,
+ * trailing-slashed) — both the untracked kind (#193) and the gitignored kind
+ * (#514), recursively (an embedded repo can embed further repos). Returns []
+ * for non-git roots: the filesystem walk handles nested repos there already.
+ */
+export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
+  try {
+    execFileSync('git', ['rev-parse', '--git-dir'], { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  const defaults = defaultsOnlyIgnore();
+  const visit = (repoAbs: string, prefix: string): void => {
+    const candidates: string[] = [];
+    try {
+      const o = execFileSync(
+        'git',
+        ['ls-files', '-z', '-o', '--exclude-standard', '--directory'],
+        { cwd: repoAbs, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+      );
+      for (const e of o.split('\0')) {
+        if (e.endsWith('/') && !defaults.ignores(e)) {
+          candidates.push(...findNestedGitRepos(path.join(repoAbs, e), e));
+        }
+      }
+    } catch { /* untracked listing failed — ignored-side discovery still runs */ }
+    candidates.push(...findIgnoredEmbeddedRepos(repoAbs));
+    for (const rel of candidates) {
+      const full = normalizePath(prefix + rel);
+      out.push(full);
+      visit(path.join(repoAbs, rel), full);
+    }
+  };
+  visit(rootDir, '');
+  return out;
+}
+
+/**
+ * Discover embedded repos hidden by `repoDir`'s OWN ignore rules: for each
+ * gitignored directory (skipping built-in default excludes), search for nested
+ * `.git` roots. Returns repo paths relative to `repoDir`, trailing-slashed.
+ */
+function findIgnoredEmbeddedRepos(repoDir: string): string[] {
+  const defaults = defaultsOnlyIgnore();
+  const repos: string[] = [];
+  for (const dir of listIgnoredDirs(repoDir)) {
+    if (defaults.ignores(dir)) continue;
+    repos.push(...findNestedGitRepos(path.join(repoDir, dir), dir));
+  }
+  return repos;
+}
+
+/**
  * Collect git-visible files (tracked + untracked, .gitignore-respected) from the
  * git repository rooted at `repoDir`, adding each to `files` with `prefix`
  * prepended so paths stay relative to the original scan root.
@@ -257,9 +438,12 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
  * skips them entirely, and untracked output reports them only as an opaque
  * "subdir/" entry (trailing slash) rather than expanding their files. Each
  * embedded repo is its own git boundary, so we re-run `git ls-files` inside it.
- * (See issue #193.)
+ * (See issue #193.) GITIGNORED embedded repos are invisible even to that —
+ * they're discovered separately via `findIgnoredEmbeddedRepos` (#514); every
+ * embedded repo root (however found) is recorded in `embeddedRoots` so callers
+ * can exempt its files from the parent's own gitignore rules.
  */
-function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): void {
+function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, embeddedRoots?: Set<string>): void {
   const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true };
 
   // Tracked files. --recurse-submodules pulls in files from active submodules,
@@ -285,14 +469,25 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): v
     if (rel.endsWith('/')) {
       // git only emits a trailing-slash directory entry for an embedded repo.
       // Guard with a .git check anyway, and skip anything else exactly as git
-      // itself skips it (we never descend into a non-repo opaque dir).
+      // itself skips it (we never descend into a non-repo opaque dir). Never
+      // descend into default-ignored locations — an embedded repo inside
+      // node_modules is an npm git-dependency, not project code.
       const childDir = path.join(repoDir, rel);
-      if (fs.existsSync(path.join(childDir, '.git'))) {
-        collectGitFiles(childDir, prefix + rel, files);
+      if (fs.existsSync(path.join(childDir, '.git')) && !defaultsOnlyIgnore().ignores(rel)) {
+        embeddedRoots?.add(normalizePath(prefix + rel));
+        collectGitFiles(childDir, prefix + rel, files, embeddedRoots);
       }
       continue;
     }
     files.add(normalizePath(prefix + rel));
+  }
+
+  // Embedded repos hidden by THIS repo's ignore rules (`/packages/` in a
+  // super-repo .gitignore) never appear in any listing above — discover and
+  // recurse into them too. (#514)
+  for (const rel of findIgnoredEmbeddedRepos(repoDir)) {
+    embeddedRoots?.add(normalizePath(prefix + rel));
+    collectGitFiles(path.join(repoDir, rel), prefix + rel, files, embeddedRoots);
   }
 }
 
@@ -329,11 +524,15 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     }
 
     const files = new Set<string>();
-    collectGitFiles(rootDir, '', files);
+    const embeddedRoots = new Set<string>();
+    collectGitFiles(rootDir, '', files, embeddedRoots);
     // Apply built-in default ignores uniformly — to tracked files too, since
     // committing a dependency/build dir doesn't make it project code. A
     // `.gitignore` negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
-    const ig = buildDefaultIgnore(rootDir);
+    // Files inside an EMBEDDED repo are matched against that repo's own rules,
+    // not the parent's: the parent's .gitignore hides the child repo from git,
+    // not from the index. (#514)
+    const ig = buildScopeIgnore(rootDir, embeddedRoots);
     return new Set([...files].filter((f) => !ig.ignores(f)));
   } catch {
     return null;
@@ -354,41 +553,69 @@ interface GitChanges {
 /**
  * Use `git status` to detect changed files instead of scanning every file.
  * Returns null on failure so callers fall back to full scan.
+ *
+ * Recurses into embedded repos — both the untracked kind (#193: the parent's
+ * status collapses them to an opaque `?? subdir/` entry) and the gitignored
+ * kind (#514: they never appear in the parent's status at all) — running
+ * `git status` inside each, so changes in a multi-repo workspace sync without
+ * a full rescan. Deleting an ENTIRE embedded repo dir is the one case this
+ * cannot see (the child status that would report the deletions is gone with
+ * it); a full `codegraph index` reconciles that.
  */
 function getGitChangedFiles(rootDir: string): GitChanges | null {
   try {
-    const output = execFileSync(
-      'git',
-      ['status', '--porcelain', '--no-renames'],
-      { cwd: rootDir, encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
-    );
-
-    const modified: string[] = [];
-    const added: string[] = [];
-    const deleted: string[] = [];
-
-    for (const line of output.split('\n')) {
-      if (line.length < 4) continue; // Minimum: "XY file"
-
-      const statusCode = line.substring(0, 2);
-      const filePath = normalizePath(line.substring(3));
-
-      // Skip non-source files (git status already omits .gitignored paths).
-      if (!isSourceFile(filePath)) continue;
-
-      if (statusCode === '??') {
-        added.push(filePath);
-      } else if (statusCode.includes('D')) {
-        deleted.push(filePath);
-      } else {
-        // M, MM, AM, A (staged), etc. — treat as modified
-        modified.push(filePath);
-      }
-    }
-
-    return { modified, added, deleted };
+    const changes: GitChanges = { modified: [], added: [], deleted: [] };
+    collectGitStatus(rootDir, '', changes);
+    return changes;
   } catch {
     return null;
+  }
+}
+
+function collectGitStatus(repoDir: string, prefix: string, out: GitChanges): void {
+  const output = execFileSync(
+    'git',
+    ['status', '--porcelain', '--no-renames'],
+    { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+  );
+
+  const untrackedDirs: string[] = [];
+  for (const line of output.split('\n')) {
+    if (line.length < 4) continue; // Minimum: "XY file"
+
+    const statusCode = line.substring(0, 2);
+    const rel = normalizePath(line.substring(3));
+
+    // Untracked directory entries (trailing slash) may hide an embedded repo —
+    // collect for the recursion below instead of treating as a file.
+    if (statusCode === '??' && rel.endsWith('/')) {
+      untrackedDirs.push(rel);
+      continue;
+    }
+
+    const filePath = normalizePath(prefix + rel);
+    // Skip non-source files (git status already omits .gitignored paths).
+    if (!isSourceFile(filePath)) continue;
+
+    if (statusCode === '??') {
+      out.added.push(filePath);
+    } else if (statusCode.includes('D')) {
+      out.deleted.push(filePath);
+    } else {
+      // M, MM, AM, A (staged), etc. — treat as modified
+      out.modified.push(filePath);
+    }
+  }
+
+  // Recurse embedded repos found under untracked dirs (at the dir itself or
+  // nested deeper) and under this repo's gitignored dirs.
+  for (const rel of untrackedDirs) {
+    for (const repoRel of findNestedGitRepos(path.join(repoDir, rel), rel)) {
+      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out);
+    }
+  }
+  for (const rel of findIgnoredEmbeddedRepos(repoDir)) {
+    collectGitStatus(path.join(repoDir, rel), prefix + rel, out);
   }
 }
 
