@@ -28,6 +28,7 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { addCudaKernelLaunchReferences } from './cuda-kernel-launch-postprocess';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -4786,6 +4787,15 @@ export function extractFromSource(
   } else {
     const extractor = new TreeSitterExtractor(filePath, source, detectedLanguage);
     result = extractor.extract();
+
+    // CUDA kernel launches (`kernel<<<grid,block>>>(args)`) are not part of
+    // the C++ grammar tree-sitter-cpp parses, so the host→__global__-kernel
+    // call edge is missing from the base extraction. Post-process .cu/.cuh
+    // sources to emit those as unresolvedReferences; the cross-file resolver
+    // then turns them into proper 'calls' edges.
+    if (fileExtension === '.cu' || fileExtension === '.cuh') {
+      result = addCudaKernelLaunchReferences(result, filePath, source);
+    }
   }
 
   // Framework-specific extraction (routes, middleware, etc.)
