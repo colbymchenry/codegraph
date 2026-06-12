@@ -507,18 +507,18 @@ fi
 
 ## MCP Tools
 
-When running as an MCP server, CodeGraph exposes these tools to Claude Code:
+When running as an MCP server, CodeGraph exposes a focused set of four tools — measured agent behavior showed a leaner list steers agents to the right tool and saves context every session:
 
 | Tool | Purpose |
 |------|---------|
 | `codegraph_explore` | **Primary.** Answer almost any question in one call — "how does X work", a flow ("how does X reach Y"), or surveying an area — returning the relevant symbols' verbatim source grouped by file, plus a relationship map and blast radius. Surfaces dynamic-dispatch hops (callbacks, React re-render, interface→impl) grep can't follow. |
+| `codegraph_node` | One symbol's full source + caller/callee trail (every overload for an ambiguous name) — or pass a file path to **read a whole file like the Read tool** (same line-numbered output, `offset`/`limit`), with its dependents attached. |
 | `codegraph_search` | Find symbols by name across the codebase |
-| `codegraph_callers` | Find what calls a function |
-| `codegraph_callees` | Find what a function calls |
-| `codegraph_impact` | Analyze what code is affected by changing a symbol |
-| `codegraph_node` | Get one specific symbol's details + full source (returns every overload for an ambiguous name) |
-| `codegraph_files` | Get indexed file structure (faster than filesystem scanning) |
-| `codegraph_status` | Check index health and statistics |
+| `codegraph_callers` | Every call site of a function — including where it's registered as a callback — with one section per definition when several share a name |
+
+Four more tools (`codegraph_callees`, `codegraph_impact`, `codegraph_files`, `codegraph_status`) stay fully functional but unlisted by default — measured across eval runs, agents never or rarely picked them, and their information already arrives inline on the four above (explore's blast-radius section, node's dependents note, a symbol's body as its callee list). Re-enable any of them with the `CODEGRAPH_MCP_TOOLS` environment variable (e.g. `CODEGRAPH_MCP_TOOLS=explore,node,search,callers,impact`), or use their CLI equivalents (`codegraph callees` / `impact` / `files` / `status`).
+
+In a workspace with no `.codegraph/` index, the server announces itself inactive and lists **no** tools — agents work normally with their built-in tools, and indexing stays your decision.
 
 ---
 
