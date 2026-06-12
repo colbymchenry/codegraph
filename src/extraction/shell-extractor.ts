@@ -146,8 +146,10 @@ function firstCommandToken(segment: string): string | null {
   if (/^(then|do|done|else|elif|fi|esac|case|if|for|while|until)\b/.test(segment)) return null;
 
   let remaining = segment;
-  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(remaining)) {
-    remaining = remaining.replace(/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s*/, '');
+  while (true) {
+    const assignment = /^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s*/.exec(remaining);
+    if (!assignment) break;
+    remaining = remaining.slice(assignment[0].length);
   }
 
   const match = /^([A-Za-z_./][A-Za-z0-9_./:-]*)/.exec(remaining);
