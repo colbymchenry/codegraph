@@ -28,6 +28,8 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { MarkdownExtractor } from './markdown-extractor';
+import { ShellExtractor } from './shell-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -4769,6 +4771,14 @@ export function extractFromSource(
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
     // file node so the watcher tracks it without emitting symbols.
     const extractor = new MyBatisExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'markdown') {
+    // Lightweight docs extractor: file content, headings, and local links.
+    const extractor = new MarkdownExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'shell') {
+    // Lightweight shell extractor: file content, functions, and command calls.
+    const extractor = new ShellExtractor(filePath, source);
     result = extractor.extract();
   } else if (isFileLevelOnlyLanguage(detectedLanguage)) {
     // No symbol extraction at this stage — files are tracked at the file-record
