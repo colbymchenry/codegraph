@@ -1437,6 +1437,10 @@ describe('Installer targets — opencode XDG config path (#535)', () => {
 
   const xdgConfigFile = () => path.join(tmpHome, '.config', 'opencode', 'opencode.jsonc');
   const legacyDir = () => path.join(appDataDir, 'opencode');
+  // NOTE: never match on an 'AppData' substring — on Windows os.tmpdir()
+  // itself lives under AppData\Local\Temp, so EVERY harness path contains
+  // it. Match on the legacy dir prefix instead.
+  const inLegacyDir = (p: string) => path.resolve(p).startsWith(path.resolve(legacyDir()) + path.sep);
 
   it('global install writes to ~/.config/opencode, never %APPDATA% (#535)', () => {
     const opencode = getTarget('opencode')!;
@@ -1504,8 +1508,8 @@ describe('Installer targets — opencode XDG config path (#535)', () => {
     expect(fs.existsSync(path.join(legacyDir(), 'AGENTS.md'))).toBe(false);
     // Both cleanups are reported.
     const removed = result.files.filter((f) => f.action === 'removed').map((f) => f.path);
-    expect(removed.some((p) => p.includes('AppData') && p.endsWith('opencode.jsonc'))).toBe(true);
-    expect(removed.some((p) => p.includes('AppData') && p.endsWith('AGENTS.md'))).toBe(true);
+    expect(removed.some((p) => inLegacyDir(p) && p.endsWith('opencode.jsonc'))).toBe(true);
+    expect(removed.some((p) => inLegacyDir(p) && p.endsWith('AGENTS.md'))).toBe(true);
   });
 
   it('uninstall sweeps the legacy %APPDATA% entry too (no prior re-install needed)', () => {
@@ -1519,7 +1523,7 @@ describe('Installer targets — opencode XDG config path (#535)', () => {
     const result = opencode.uninstall('global');
 
     expect(fs.readFileSync(path.join(legacyDir(), 'opencode.json'), 'utf-8')).not.toContain('codegraph');
-    expect(result.files.some((f) => f.action === 'removed' && f.path.includes('AppData'))).toBe(true);
+    expect(result.files.some((f) => f.action === 'removed' && inLegacyDir(f.path))).toBe(true);
   });
 
   it('install after install sweeps only once — second run reports no legacy changes', () => {
@@ -1529,10 +1533,10 @@ describe('Installer targets — opencode XDG config path (#535)', () => {
 
     const opencode = getTarget('opencode')!;
     const first = opencode.install('global', { autoAllow: true });
-    expect(first.files.some((f) => f.action === 'removed' && f.path.includes('AppData'))).toBe(true);
+    expect(first.files.some((f) => f.action === 'removed' && inLegacyDir(f.path))).toBe(true);
 
     const second = opencode.install('global', { autoAllow: true });
-    expect(second.files.some((f) => f.path.includes('AppData'))).toBe(false);
+    expect(second.files.some((f) => inLegacyDir(f.path))).toBe(false);
     expect(second.files.find((f) => f.path.endsWith('opencode.jsonc'))!.action).toBe('unchanged');
   });
 
