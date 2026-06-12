@@ -28,6 +28,7 @@ import {
 } from 'fs';
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
+import { scanDynamicDispatch } from './dynamic-boundaries';
 
 /**
  * An expected, recoverable "codegraph can't serve this" condition — most
@@ -1539,6 +1540,10 @@ export class ToolHandler {
       // (`as_sql`, 110 defs across every Expression/Compiler subclass) is NOT here,
       // so naming it doesn't keep every backend variant full and flood the budget.
       const uniqueNamedNodeIds = new Set<string>();
+      // token → resolved node ids: drives the token-coverage check that gates
+      // the dynamic-boundary scan (a token is covered when ANY of its nodes
+      // lands on the main chain — overloads off the chain don't count against).
+      const tokenNodes = new Map<string, string[]>();
       for (const t of tokens) {
         const cands = this.findAllSymbols(cg, t).nodes.filter((n) => CALLABLE.has(n.kind));
         // A qualified or otherwise-specific name (<=3 hits) keeps all; an
@@ -1551,13 +1556,25 @@ export class ToolHandler {
               const container = segs.length >= 2 ? segs[segs.length - 2] : '';
               return !!container && segPool.has(container);
             });
-        for (const n of pick.slice(0, 6)) {
+        const kept = pick.slice(0, 6);
+        tokenNodes.set(t, kept.map((n) => n.id));
+        for (const n of kept) {
           named.set(n.id, n);
           if (specific) uniqueNamedNodeIds.add(n.id);
         }
         if (named.size > 40) break;
       }
-      if (named.size < 2) return EMPTY;
+      if (named.size < 2) {
+        // The agent named a flow but only one side resolved (the other end is
+        // anonymous / runtime-registered / not extracted). The resolved side's
+        // body may still hold the dynamic-dispatch site that EXPLAINS the gap —
+        // surface that instead of silently returning nothing.
+        if (named.size === 0) return EMPTY;
+        const boundaries = this.buildDynamicBoundaries(cg, [...named.values()], named);
+        if (!boundaries) return EMPTY;
+        const text = boundaries + '> Full source for these symbols is below.\n';
+        return { text, pathNodeIds: new Set(), namedNodeIds: new Set(named.keys()), uniqueNamedNodeIds };
+      }
       const MAX_HOPS = 7;
       let best: Array<{ node: Node; edge: Edge | null }> | null = null;
       // BFS the full call graph (incl. synth edges) from each named seed, but
@@ -1592,6 +1609,32 @@ export class ToolHandler {
       const hasMain = !!best && best.length >= 3;
       const pathIds = new Set((best ?? []).map((s) => s.node.id));
 
+      // Dynamic-boundary scan (#687) — fires ONLY when the flow the agent
+      // asked about did not fully connect: some token resolved to nodes but
+      // none of them sit on the main chain (or there is no chain at all). A
+      // healthy flow skips this entirely. Scan order: the chain's dead end
+      // first (where the partial flow stops), then the disconnected symbols,
+      // agent-specific (unique-named) ones first.
+      let boundaryText = '';
+      {
+        const uncovered: Node[] = [];
+        if (!hasMain) {
+          uncovered.push(...named.values());
+        } else {
+          for (const ids of tokenNodes.values()) {
+            if (ids.length === 0 || ids.some((id) => pathIds.has(id))) continue;
+            for (const id of ids) { const n = named.get(id); if (n) uncovered.push(n); }
+          }
+        }
+        if (uncovered.length > 0) {
+          const scanList: Node[] = [];
+          if (hasMain) scanList.push(best![best!.length - 1]!.node);
+          scanList.push(...uncovered.sort((a, b) =>
+            (uniqueNamedNodeIds.has(b.id) ? 1 : 0) - (uniqueNamedNodeIds.has(a.id) ? 1 : 0)));
+          boundaryText = this.buildDynamicBoundaries(cg, scanList, named);
+        }
+      }
+
       // Supplementary: dynamic-dispatch (synthesized) edges incident to a NAMED
       // symbol — the indirect hops an agent would otherwise grep/Read to
       // reconstruct ("where do the appended `validators` actually run?"). The
@@ -1618,7 +1661,7 @@ export class ToolHandler {
         }
       }
 
-      if (!hasMain && synthLines.length === 0) return EMPTY;
+      if (!hasMain && synthLines.length === 0 && !boundaryText) return EMPTY;
       const out: string[] = [];
       if (hasMain) {
         out.push('## Flow (call path among the symbols you queried)', '');
@@ -1638,6 +1681,7 @@ export class ToolHandler {
           ''
         );
       }
+      if (boundaryText) out.push(boundaryText);
       out.push('> Full source for these symbols is below — the call flow among them, followed by their bodies.', '');
       // namedNodeIds = every callable the agent explicitly named (a superset of
       // the spine). A file holding one is something the agent asked to SEE, so it
@@ -1648,6 +1692,129 @@ export class ToolHandler {
     } catch {
       return EMPTY;
     }
+  }
+
+  /**
+   * Dynamic-boundary surfacing (#687): when the flow among the agent's named
+   * symbols does not fully connect, scan the disconnected symbols' bodies for
+   * dynamic-dispatch sites (computed member calls, getattr, reflection, typed
+   * message buses, runtime-keyed emits) and ANNOUNCE the boundary — the exact
+   * site, the form, and (when a key is statically visible) candidate targets —
+   * instead of guessing edges. The answer to "how does A reach B" when no
+   * static path exists IS the dispatch site: that's where the flow continues
+   * at runtime. Query-time, deterministic, zero graph mutation; a fully
+   * connected flow never reaches this method.
+   */
+  private buildDynamicBoundaries(cg: CodeGraph, scanList: Node[], named: Map<string, Node>): string {
+    const MAX_NOTES = 4;       // boundary bullets per explore
+    const MAX_SCAN = 8;        // bodies scanned
+    const MAX_TOTAL_CHARS = 200_000;
+    let projectRoot: string;
+    try { projectRoot = cg.getProjectRoot(); } catch { return ''; }
+    const notes: string[] = [];
+    const seenNode = new Set<string>();
+    const seenSite = new Set<string>();
+    let scanned = 0, charsScanned = 0;
+    for (const node of scanList) {
+      if (notes.length >= MAX_NOTES || scanned >= MAX_SCAN || charsScanned > MAX_TOTAL_CHARS) break;
+      if (seenNode.has(node.id) || !node.startLine || !node.endLine) continue;
+      seenNode.add(node.id);
+      const absPath = validatePathWithinRoot(projectRoot, node.filePath);
+      if (!absPath || !existsSync(absPath)) continue;
+      let content: string;
+      try { content = readFileSync(absPath, 'utf-8'); } catch { continue; }
+      const body = content.split('\n').slice(node.startLine - 1, node.endLine).join('\n');
+      scanned++;
+      charsScanned += body.length;
+      for (const m of scanDynamicDispatch(body, node.language || '', node.startLine)) {
+        if (notes.length >= MAX_NOTES) break;
+        const siteKey = `${node.filePath}:${m.line}:${m.form}`;
+        if (seenSite.has(siteKey)) continue;
+        seenSite.add(siteKey);
+        const more = m.moreSites ? ` (+${m.moreSites} more such site${m.moreSites > 1 ? 's' : ''} in this body)` : '';
+        notes.push(`- \`${node.name}\` (${node.filePath}:${m.line}) — ${m.label}: \`${m.snippet}\`${more}`);
+        if (m.key) {
+          const cand = this.boundaryCandidates(cg, m.key, !!m.keyIsType, named, node.id);
+          if (cand) notes.push(`  ${cand}`);
+        }
+      }
+    }
+    if (notes.length === 0) return '';
+    return [
+      '## Dynamic boundaries (the static path ends at runtime dispatch)',
+      '',
+      ...notes,
+      '',
+      '> These sites choose their call target at runtime (registry / bus / reflection) — the site shown IS where the flow continues. To follow it, run codegraph_explore or codegraph_node on a candidate; source for the sites above is included below.',
+      '',
+    ].join('\n');
+  }
+
+  /**
+   * Shortlist candidate runtime targets for a dispatch key surfaced by
+   * {@link buildDynamicBoundaries}. Exact conventional names first (`save` →
+   * `onSave`/`handleSave`; `CreateCmd` → `CreateCmdHandler`), then FTS, with a
+   * normalized-containment post-filter (FTS camel-splitting is fuzzier than a
+   * candidate list should be). Symbols the agent already named sort first and
+   * are marked — that's the "you were right, here's the wiring" case.
+   */
+  private boundaryCandidates(cg: CodeGraph, key: string, keyIsType: boolean, named: Map<string, Node>, selfId: string): string {
+    const CALLABLE = new Set(['method', 'function', 'component', 'constructor', 'class']);
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const keyNorm = norm(key);
+    if (keyNorm.length < 3) return '';
+    const cands = new Map<string, Node>();
+    const consider = (n: Node | undefined | null) => {
+      if (!n || n.id === selfId || !CALLABLE.has(n.kind) || cands.has(n.id)) return;
+      const nameNorm = norm(n.name || '');
+      if (nameNorm.length < 3) return;
+      if (!nameNorm.includes(keyNorm) && !keyNorm.includes(nameNorm)) return;
+      cands.set(n.id, n);
+    };
+    const cap = key.charAt(0).toUpperCase() + key.slice(1);
+    const probes = keyIsType
+      ? [`${key}Handler`, key]
+      : [key, `on${cap}`, `handle${cap}`, `${key}Handler`, `handle_${key}`];
+    for (const p of probes) {
+      try { for (const n of cg.getNodesByName(p)) consider(n); } catch { /* exact probe miss is fine */ }
+    }
+    let raw = 0;
+    try {
+      const results = cg.searchNodes(key, { limit: 12 });
+      raw = results.length;
+      for (const r of results) consider(r.node);
+    } catch { /* FTS syntax edge — exact probes already ran */ }
+    if (cands.size === 0) {
+      return raw >= 12 && key.length < 5 ? `key \`${key}\` is too generic to shortlist (${raw}+ matches)` : '';
+    }
+    // A constructor candidate duplicates its class: extractors emit ctors as
+    // METHOD nodes named like the class (C#/Java `Foo::Foo`) — keep the class.
+    const all = [...cands.values()];
+    const classKey = new Set(all.filter((n) => n.kind === 'class').map((n) => `${n.name}|${n.filePath}`));
+    const namedNames = new Set([...named.values()].map((n) => n.name));
+    const isNamed = (n: Node) => named.has(n.id) || namedNames.has(n.name); // the flow's named set holds callables only — transfer the mark to the class
+    const list = all
+      .filter((n) => !(n.kind !== 'class' && classKey.has(`${n.name}|${n.filePath}`)))
+      .sort((a, b) => (isNamed(b) ? 1 : 0) - (isNamed(a) ? 1 : 0))
+      .slice(0, 4)
+      .map((n) => {
+        // Typed-bus convention: the runtime target is the candidate class's
+        // Handle/Execute/Consume method — name the exact node, not just the class.
+        let display = n.qualifiedName || n.name;
+        let at = `${n.filePath}:${n.startLine}`;
+        if (keyIsType && n.kind === 'class') {
+          try {
+            const HANDLER_METHODS = /^(handle|handleAsync|execute|executeAsync|consume|consumeAsync|run|__invoke)$/i;
+            const method = cg.getOutgoingEdges(n.id)
+              .filter((e) => e.kind === 'contains')
+              .map((e) => { try { return cg.getNode(e.target); } catch { return null; } })
+              .find((c): c is Node => !!c && c.kind === 'method' && HANDLER_METHODS.test(c.name));
+            if (method) { display = `${n.name}.${method.name}`; at = `${method.filePath}:${method.startLine}`; }
+          } catch { /* class without resolvable members — show the class itself */ }
+        }
+        return `\`${display}\` (${at})${isNamed(n) ? ' ← you named this' : ''}`;
+      });
+    return `candidates for key \`${key}\`: ${list.join(', ')}`;
   }
 
   /**
