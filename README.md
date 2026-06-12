@@ -2,6 +2,10 @@
 
 # CodeGraph
 
+## 🎉 1.0 Released!
+
+Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
+
 ### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, and Kiro with Semantic Code Intelligence
 
 **~16% cheaper · ~58% fewer tool calls · 100% local**
