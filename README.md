@@ -4,6 +4,8 @@
 
 ## 🎉 1.0 Released!
 
+Already installed? Run `codegraph upgrade` to update in place.
+
 Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
 ### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, and Kiro with Semantic Code Intelligence
