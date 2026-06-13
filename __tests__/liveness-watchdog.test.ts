@@ -3,47 +3,11 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  stepHeartbeat,
   parseWatchdogTimeoutMs,
   deriveCheckIntervalMs,
   installMainThreadWatchdog,
   DEFAULT_WATCHDOG_TIMEOUT_MS,
 } from '../src/mcp/liveness-watchdog';
-
-describe('stepHeartbeat (wedge-detection reducer)', () => {
-  it('resets the stale count when the counter advances', () => {
-    const r = stepHeartbeat({ lastCounter: 5, staleChecks: 3 }, 6, 4);
-    expect(r.wedged).toBe(false);
-    expect(r.next).toEqual({ lastCounter: 6, staleChecks: 0 });
-  });
-
-  it('accumulates stale checks while the counter is frozen', () => {
-    let s = { lastCounter: 9, staleChecks: 0 };
-    for (let i = 1; i < 4; i++) {
-      const r = stepHeartbeat(s, 9, 4);
-      expect(r.wedged).toBe(false);
-      expect(r.next.staleChecks).toBe(i);
-      s = r.next;
-    }
-  });
-
-  it('reports wedged once the stale count reaches the threshold', () => {
-    const r = stepHeartbeat({ lastCounter: 9, staleChecks: 3 }, 9, 4);
-    expect(r.wedged).toBe(true);
-  });
-
-  it('a single late heartbeat rescues the process (sleep/clock-jump safety)', () => {
-    // 3 stale checks, then progress (as if the main thread resumed after a
-    // system sleep) — must NOT be considered wedged.
-    let s = { lastCounter: 1, staleChecks: 0 };
-    s = stepHeartbeat(s, 1, 4).next; // stale 1
-    s = stepHeartbeat(s, 1, 4).next; // stale 2
-    s = stepHeartbeat(s, 1, 4).next; // stale 3
-    const resumed = stepHeartbeat(s, 2, 4); // counter advanced
-    expect(resumed.wedged).toBe(false);
-    expect(resumed.next.staleChecks).toBe(0);
-  });
-});
 
 describe('config parsing', () => {
   it('parseWatchdogTimeoutMs falls back for missing/invalid input', () => {
@@ -62,7 +26,7 @@ describe('config parsing', () => {
 });
 
 describe('installMainThreadWatchdog opt-out', () => {
-  it('returns null (no worker) when CODEGRAPH_NO_WATCHDOG is set', () => {
+  it('returns null (spawns nothing) when CODEGRAPH_NO_WATCHDOG is set', () => {
     const prev = process.env.CODEGRAPH_NO_WATCHDOG;
     process.env.CODEGRAPH_NO_WATCHDOG = '1';
     try {
@@ -75,11 +39,13 @@ describe('installMainThreadWatchdog opt-out', () => {
 });
 
 /**
- * End-to-end: spawn a real process, install the real worker, and prove it kills
- * a wedged main thread (and ONLY a wedged one). Drives the built module the same
- * way mcp-ppid-watchdog.test.ts drives the built CLI.
+ * End-to-end: spawn a real process, install the real watchdog (which spawns a
+ * separate watchdog child), and prove it kills a wedged main thread — including
+ * the case a worker thread could NOT (a non-allocating loop under heap pressure,
+ * which strands a same-process worker on V8's global safepoint, #850). Drives
+ * the built module the way mcp-ppid-watchdog.test.ts drives the built CLI.
  */
-describe('liveness watchdog (spawned, real worker)', () => {
+describe('liveness watchdog (spawned, real watchdog process)', () => {
   const MODULE = path.resolve(__dirname, '../dist/mcp/liveness-watchdog.js');
 
   beforeAll(() => {
@@ -117,7 +83,18 @@ describe('liveness watchdog (spawned, real worker)', () => {
   it('SIGKILLs a process whose main thread wedges in a sync loop', async () => {
     const { signal } = await runChild(
       { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '500' },
-      'setTimeout(() => { while (true) {} }, 150);', // wedge the event loop forever
+      'setTimeout(() => { while (true) {} }, 150);',
+      8000
+    );
+    expect(signal).toBe('SIGKILL');
+  }, 12000);
+
+  it('SIGKILLs a non-allocating wedge under heap pressure (the case worker threads stalled on)', async () => {
+    const { signal } = await runChild(
+      { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '500' },
+      // ~40MB retained so a GC is likely, then a tight NON-allocating loop — the
+      // exact shape that deadlocks a same-process worker on the global safepoint.
+      'const k=[]; for (let i=0;i<40;i++) k.push(Buffer.alloc(1024*1024,i)); global.__k=k; setTimeout(() => { while (true) {} }, 150);',
       8000
     );
     expect(signal).toBe('SIGKILL');
@@ -126,7 +103,6 @@ describe('liveness watchdog (spawned, real worker)', () => {
   it('does NOT kill a healthy process that keeps its event loop turning', async () => {
     const { code, signal } = await runChild(
       { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '500' },
-      // Stay responsive for 1.5s (3× the timeout), then exit cleanly with 7.
       'const iv = setInterval(() => {}, 50); setTimeout(() => { clearInterval(iv); process.exit(7); }, 1500);',
       8000
     );
@@ -137,12 +113,9 @@ describe('liveness watchdog (spawned, real worker)', () => {
   it('does NOT kill a wedged process when CODEGRAPH_NO_WATCHDOG=1', async () => {
     const { signal } = await runChild(
       { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '500', CODEGRAPH_NO_WATCHDOG: '1' },
-      // Wedge briefly, but the test's hard timeout reaps it (the watchdog must not).
       'setTimeout(() => { const end = Date.now() + 1500; while (Date.now() < end) {} process.exit(3); }, 150);',
       8000
     );
-    // Killed by neither the watchdog (disabled) nor the hard timeout — it ran
-    // its bounded busy-loop and exited 3 on its own.
-    expect(signal).toBeNull();
+    expect(signal).toBeNull(); // the watchdog is off, so nothing kills it
   }, 12000);
 });
