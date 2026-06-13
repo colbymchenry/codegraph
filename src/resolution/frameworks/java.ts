@@ -241,11 +241,11 @@ export const springResolver: FrameworkResolver = {
       // Method it decorates: first declared method after (skip stacked annotations;
       // Java puts the return type before the name). Bounded so we don't grab a far one.
       const tail = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
-      const methodMatch = tail.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
+      const methodMatch = tail.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(|\b(?:[A-Z]\w*(?:<[^>]*>)?|void)\s+(\w+)\s*\(/);
       if (methodMatch) {
         references.push({
           fromNodeId: routeNode.id,
-          referenceName: (methodMatch[1] ?? methodMatch[2])!,
+          referenceName: (methodMatch[1] ?? methodMatch[2] ?? methodMatch[3])!,
           referenceKind: 'references',
           line,
           column: 0,
@@ -263,7 +263,7 @@ export const springResolver: FrameworkResolver = {
       const args = (match[1] || '').replace(/^\(|\)$/g, '');
       const after = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
       if (/^\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+|open\s+|data\s+|sealed\s+)*class\b/.test(after)) continue; // class-level prefix
-      const methodMatch = after.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
+      const methodMatch = after.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(|\b(?:[A-Z]\w*(?:<[^>]*>)?|void)\s+(\w+)\s*\(/);
       if (!methodMatch) continue;
       const verbM = args.match(/method\s*=\s*(?:RequestMethod\.)?(\w+)/);
       const method = verbM ? verbM[1]!.toUpperCase() : 'ANY';
@@ -279,7 +279,7 @@ export const springResolver: FrameworkResolver = {
       nodes.push(routeNode);
       references.push({
         fromNodeId: routeNode.id,
-        referenceName: (methodMatch[1] ?? methodMatch[2])!,
+        referenceName: (methodMatch[1] ?? methodMatch[2] ?? methodMatch[3])!,
         referenceKind: 'references',
         line, column: 0, filePath, language: lang,
       });
