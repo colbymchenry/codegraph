@@ -1,6 +1,6 @@
 {
   "name": "@colbymchenry/codegraph",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Supercharge Claude Code with semantic code intelligence. 94% fewer tool calls • 77% faster exploration • 100% local.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
