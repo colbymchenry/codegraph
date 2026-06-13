@@ -281,6 +281,39 @@ const EMBEDDED_REPO_SEARCH_DEPTH = 4;
 const EMBEDDED_REPO_SEARCH_ENTRIES = 2000;
 
 /**
+ * Classify a directory's `.git` entry for embedded-repo discovery.
+ *
+ * - A `.git` **directory** is an embedded clone — distinct first-party code a
+ *   super-repo merely hides from git; index it (#193, #514).
+ * - A `.git` **file** is a pointer (`gitdir: …`). A git **worktree** points into
+ *   the host repo's own `.git/worktrees/<name>`, so it is a second working view
+ *   of a repo CodeGraph already indexes — indexing it just duplicates the whole
+ *   graph N times; skip it (#848). A **submodule** points into `.git/modules/`
+ *   and is distinct code, so index it as before.
+ *
+ * Returns `'none'` when there is no `.git` entry here.
+ */
+function classifyGitDir(absDir: string): 'embedded' | 'worktree' | 'none' {
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(path.join(absDir, '.git'));
+  } catch {
+    return 'none';
+  }
+  if (st.isDirectory()) return 'embedded';
+  if (!st.isFile()) return 'none';
+  try {
+    const gitdir = fs.readFileSync(path.join(absDir, '.git'), 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+    // A linked worktree's gitdir lives under some repo's `.git/worktrees/`.
+    // Match both separators so a Windows-style pointer is recognized too.
+    if (gitdir && /(^|[\\/])\.git[\\/]worktrees[\\/]/.test(gitdir)) return 'worktree';
+  } catch {
+    // Unreadable `.git` pointer — fall back to the prior "index it" behavior.
+  }
+  return 'embedded';
+}
+
+/**
  * Find git repositories nested under `absDir` (inclusive), shallow bounded BFS.
  * Stops descending at each repo root found — contents belong to that repo's own
  * enumeration. Skips default-ignored dirs (`node_modules` can contain `.git`
@@ -300,7 +333,11 @@ function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
       logDebug('Embedded-repo search entry cap hit — deeper repos (if any) not discovered', { under: relPrefix });
       break;
     }
-    if (fs.existsSync(path.join(abs, '.git'))) {
+    const cls = classifyGitDir(abs);
+    if (cls === 'worktree') {
+      continue; // a git worktree duplicates an already-indexed repo (#848) — skip
+    }
+    if (cls === 'embedded') {
       found.push(rel);
       continue; // its own git handles everything below
     }
@@ -473,7 +510,9 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
       // descend into default-ignored locations — an embedded repo inside
       // node_modules is an npm git-dependency, not project code.
       const childDir = path.join(repoDir, rel);
-      if (fs.existsSync(path.join(childDir, '.git')) && !defaultsOnlyIgnore().ignores(rel)) {
+      // A git worktree surfaces here as an opaque untracked dir too — skip it,
+      // it's a duplicate working view of an already-indexed repo (#848).
+      if (classifyGitDir(childDir) === 'embedded' && !defaultsOnlyIgnore().ignores(rel)) {
         embeddedRoots?.add(normalizePath(prefix + rel));
         collectGitFiles(childDir, prefix + rel, files, embeddedRoots);
       }
