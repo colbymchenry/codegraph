@@ -5,6 +5,7 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 /** The default per-project data directory name. */
@@ -108,6 +109,52 @@ export function isInitialized(projectRoot: string): boolean {
  * @param startPath - Directory to start searching from
  * @returns The project root containing .codegraph/, or null if not found
  */
+/**
+ * Reason a directory is unsafe to use as an index ROOT, or null when it's fine.
+ *
+ * Indexing your home directory or a filesystem root drags in caches, `Library`,
+ * every other project, etc. — a multi-GB index, constant file-watcher churn, and
+ * (pre-1.0 on macOS) a file-descriptor blowup that exhausted `kern.maxfiles` and
+ * took unrelated apps / the whole machine down (#845). The classic trigger:
+ * running the installer or `codegraph init` from `$HOME`, which auto-indexes the
+ * current directory. These are never intended project roots, so the installer
+ * and `init`/`index` refuse them (overridable with `--force`).
+ *
+ * Pure-ish (reads only `os.homedir()` + realpath) so it's easy to unit-test.
+ * The returned string is a human phrase that slots into "… looks like {reason}".
+ */
+export function unsafeIndexRootReason(projectRoot: string): string | null {
+  const resolve = (p: string): string => {
+    try {
+      return fs.realpathSync(path.resolve(p));
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  const resolved = resolve(projectRoot);
+
+  // Filesystem root: `/` on POSIX, a drive root like `C:\` on Windows.
+  if (path.parse(resolved).root === resolved) {
+    return 'the filesystem root';
+  }
+
+  const home = resolve(os.homedir());
+  // Case-insensitive on macOS/Windows (case-preserving but case-insensitive FS).
+  const norm = (p: string): string =>
+    process.platform === 'darwin' || process.platform === 'win32' ? p.toLowerCase() : p;
+  const r = norm(resolved);
+  const h = norm(home);
+
+  if (r === h) {
+    return 'your home directory';
+  }
+  // An ancestor of home (e.g. `/Users`, `/home`) — even broader than home.
+  if (h.startsWith(r + path.sep)) {
+    return 'a parent of your home directory';
+  }
+  return null;
+}
+
 export function findNearestCodeGraphRoot(startPath: string): string | null {
   let current = path.resolve(startPath);
   const root = path.parse(current).root;

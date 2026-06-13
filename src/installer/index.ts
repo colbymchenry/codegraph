@@ -28,7 +28,7 @@ import { getGlyphs } from '../ui/glyphs';
 // installer must stay importable even when native modules can't load).
 import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
-import { getCodeGraphDir, codeGraphDirName } from '../directory';
+import { getCodeGraphDir, codeGraphDirName, unsafeIndexRootReason } from '../directory';
 import { getTelemetry, recordIndexEvent, TELEMETRY_DOCS } from '../telemetry';
 
 // Backwards-compat: keep these named exports — downstream code may
@@ -500,6 +500,18 @@ async function initializeLocalProject(
   useDefaults = false,
 ): Promise<void> {
   const projectPath = process.cwd();
+
+  // Never auto-index the home directory or a filesystem root. Running the
+  // installer from `$HOME` would otherwise index the entire home tree — a
+  // multi-GB index, constant watcher churn, and (pre-1.0 on macOS) fd
+  // exhaustion that crashed the machine (#845). The install itself still
+  // completes; we just skip the auto-index and point them at a real project.
+  const unsafe = unsafeIndexRootReason(projectPath);
+  if (unsafe) {
+    clack.log.warn(`Skipping automatic indexing — ${projectPath} looks like ${unsafe}.`);
+    clack.log.info('Indexing it would pull in caches, other projects, and your whole tree. Run "codegraph init" inside a specific project instead.');
+    return;
+  }
 
   let CodeGraph: typeof import('../index').default;
   try {

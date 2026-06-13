@@ -16,6 +16,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - The CodeGraph MCP server no longer risks getting stuck at 100% CPU after an unexpected internal error. Previously such an error was logged but the process was left running in a broken state, where it could spin a CPU core indefinitely and had to be killed by hand. The server now logs the error and exits cleanly, so a fresh one starts on the next request. Thanks @songhlc. (#850)
+- CodeGraph no longer indexes your entire home directory by accident. Running the installer — or `codegraph init` / `codegraph index` — from your home folder or a filesystem root would index everything underneath it (caches, `Library`, every other project), producing a multi-gigabyte index and constant file-watching churn. CodeGraph now refuses these roots and points you at a specific project instead; pass `--force` if you genuinely mean to. (Combined with the macOS file-descriptor fix already in 1.0.0, this closes the report of a runaway watcher exhausting the system file limit.) Thanks @ligson. (#845)
 
 
 ## [1.0.0] - 2026-06-12

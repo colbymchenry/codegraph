@@ -26,7 +26,7 @@
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason } from '../directory';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -455,14 +455,27 @@ program
   .command('init [path]')
   .description('Initialize CodeGraph in a project directory and build the initial index')
   .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
+  .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean }) => {
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean }) => {
     const projectPath = path.resolve(pathArg || process.cwd());
     const clack = await importESM('@clack/prompts');
 
     clack.intro('Initializing CodeGraph');
 
     try {
+      // Refuse to index your home directory / a filesystem root — it pulls in
+      // caches, other projects, and your whole tree (a multi-GB index + watcher
+      // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
+      const unsafe = unsafeIndexRootReason(projectPath);
+      if (unsafe && !options.force) {
+        clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
+        clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
+        clack.outro('');
+        process.exitCode = 1;
+        return;
+      }
+
       if (isInitialized(projectPath)) {
         clack.log.warn(`Already initialized in ${projectPath}`);
         clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
@@ -585,6 +598,14 @@ program
     const projectPath = resolveProjectPath(pathArg);
 
     try {
+      // Don't (re)index your home directory / a filesystem root (#845). --force
+      // (already "force full re-index") doubles as the override.
+      const unsafe = unsafeIndexRootReason(projectPath);
+      if (unsafe && !options.force) {
+        error(`Refusing to index ${projectPath} — it looks like ${unsafe}. Pass --force to override.`);
+        process.exit(1);
+      }
+
       if (!isInitialized(projectPath)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         info('Run "codegraph init" first');
