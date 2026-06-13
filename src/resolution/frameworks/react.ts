@@ -32,8 +32,19 @@ export const reactResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
-    // Pattern 1: Component references (PascalCase)
-    if (isPascalCase(ref.referenceName) && !isBuiltInType(ref.referenceName)) {
+    // Pattern 1: Component references (PascalCase). Only from JSX-capable
+    // files — a component is USED in markup, which only parses in .tsx/.jsx.
+    // Without this gate, every PascalCase TYPE reference in plain .ts files
+    // went through component resolution: in a monorepo with same-named
+    // classes per package (#764, amplication), a `.ts` GraphQL-types file's
+    // own `Account` type alias lost to an arbitrary `Account` CLASS in
+    // another package (the framework's 0.8 outranked the name-matcher's
+    // proximity-correct 0.7).
+    if (
+      (ref.language === 'tsx' || ref.language === 'jsx') &&
+      isPascalCase(ref.referenceName) &&
+      !isBuiltInType(ref.referenceName)
+    ) {
       const result = resolveComponent(ref.referenceName, ref.filePath, context);
       if (result) {
         return {
@@ -305,7 +316,10 @@ function resolveComponent(
   );
   if (preferred.length > 0) return preferred[0]!.id;
 
-  return components[0]!.id;
+  // No positional signal: only an UNAMBIGUOUS name may resolve. Returning
+  // components[0] here picked an arbitrary same-named class anywhere in the
+  // repo (#764) — let the name-matcher's proximity scoring decide instead.
+  return components.length === 1 ? components[0]!.id : null;
 }
 
 /**

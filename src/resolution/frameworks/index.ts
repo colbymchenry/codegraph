@@ -13,6 +13,7 @@ import { nestjsResolver } from './nestjs';
 import { reactResolver } from './react';
 import { svelteResolver } from './svelte';
 import { vueResolver } from './vue';
+import { astroResolver } from './astro';
 import { djangoResolver, flaskResolver, fastapiResolver } from './python';
 import { railsResolver } from './ruby';
 import { springResolver } from './java';
@@ -39,6 +40,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   reactResolver,
   svelteResolver,
   vueResolver,
+  astroResolver,
   // Python
   djangoResolver,
   flaskResolver,
@@ -128,6 +130,7 @@ export { nestjsResolver } from './nestjs';
 export { reactResolver } from './react';
 export { svelteResolver } from './svelte';
 export { vueResolver } from './vue';
+export { astroResolver } from './astro';
 export { djangoResolver, flaskResolver, fastapiResolver } from './python';
 export { railsResolver } from './ruby';
 export { springResolver } from './java';

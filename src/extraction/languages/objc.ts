@@ -31,6 +31,46 @@ function extractObjcMethodName(node: SyntaxNode, source: string): string | undef
   return identifiers.map((id) => `${getNodeText(id, source)}:`).join('');
 }
 
+/** Nullability / ARC qualifiers that sit where a return type's first type
+ *  identifier does (`(nonnull instancetype)`, `(nullable Bar *)`) — never the type. */
+const OBJC_TYPE_QUALIFIERS = new Set([
+  'nonnull', 'nullable', 'null_unspecified', 'null_resettable',
+  '_Nonnull', '_Nullable', '_Null_unspecified', '__nonnull', '__nullable',
+  'const', 'volatile', 'strong', 'weak', 'copy', 'assign', 'retain', 'oneway',
+  '__strong', '__weak', '__unsafe_unretained', '__autoreleasing', '__kindof',
+]);
+
+/** Collect the type identifiers under a `method_type`, in document order. */
+function collectTypeIdentifiers(node: SyntaxNode, source: string, out: string[]): void {
+  if (node.type === 'type_identifier') out.push(getNodeText(node, source).trim());
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child) collectTypeIdentifiers(child, source, out);
+  }
+}
+
+/**
+ * Capture an ObjC method's declared return type as a bare class name, for the
+ * chained static-factory call mechanism (#750). `+ (Bar *)create` yields `Bar`;
+ * a nullability/ARC qualifier (`(nonnull instancetype)`, `(nullable Bar *)`) is
+ * skipped to reach the real type. `void` / `id` / `instancetype` / primitives
+ * yield undefined — for a class-message factory that means the receiver's type
+ * is the class itself (handled in resolution), so `[[X alloc] init]` and
+ * singleton chains still resolve.
+ */
+function extractObjcReturnType(node: SyntaxNode, source: string): string | undefined {
+  if (node.type !== 'method_definition' && node.type !== 'method_declaration') return undefined;
+  const methodType = node.namedChildren.find((c) => c.type === 'method_type');
+  if (!methodType) return undefined;
+  const ids: string[] = [];
+  collectTypeIdentifiers(methodType, source, ids);
+  const name = ids.find((n) => !OBJC_TYPE_QUALIFIERS.has(n));
+  if (!name || !/^[A-Za-z_]\w*$/.test(name) || name === 'void' || name === 'id' || name === 'instancetype') {
+    return undefined;
+  }
+  return name;
+}
+
 function extractObjcPropertyName(node: SyntaxNode, source: string): string | null {
   if (node.type !== 'property_declaration') return null;
 
@@ -73,6 +113,7 @@ export const objcExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
+  getReturnType: extractObjcReturnType,
   resolveName: extractObjcMethodName,
   extractPropertyName: extractObjcPropertyName,
   resolveBody: (node, bodyField) => {

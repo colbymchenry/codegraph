@@ -48,6 +48,8 @@ import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
+import { getCodeGraphDir } from './directory';
+import { deriveProjectNameTokens } from './search/query-utils';
 import { CodeGraphPackageVersion } from './mcp/version';
 
 // Re-export types for consumers
@@ -153,8 +155,15 @@ export class CodeGraph {
     this.db = db;
     this.queries = queries;
     this.projectRoot = projectRoot;
+    // Down-weight the project name as a query term in search ranking — it names
+    // the whole repo, not a symbol, so it has no discriminative value (#720).
+    try {
+      this.queries.setProjectNameTokens(deriveProjectNameTokens(projectRoot));
+    } catch {
+      // Best-effort: ranking still works without it.
+    }
     this.fileLock = new FileLock(
-      path.join(projectRoot, '.codegraph', 'codegraph.lock')
+      path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
     );
     this.orchestrator = new ExtractionOrchestrator(projectRoot, queries);
     this.resolver = createResolver(projectRoot, queries);
@@ -367,6 +376,15 @@ export class CodeGraph {
               total,
             });
           });
+
+          // Second pass: chained calls whose method lives on a supertype the
+          // receiver conforms to (protocol-extension / inherited / default-
+          // interface). Needs the implements/extends edges the main pass just
+          // built, so it runs after resolution (#750).
+          this.resolver.resolveChainedCallsViaConformance();
+          // Same lifecycle for `this.<member>` callback registrations whose
+          // member is inherited from a supertype (#808).
+          this.resolver.resolveDeferredThisMemberRefs();
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -483,6 +501,14 @@ export class CodeGraph {
               });
             });
           }
+
+          // Second pass: chained calls whose method lives on a supertype the
+          // receiver conforms to (protocol-extension / inherited). Needs the
+          // implements/extends edges built above (#750).
+          this.resolver.resolveChainedCallsViaConformance();
+          // Same lifecycle for `this.<member>` callback registrations whose
+          // member is inherited from a supertype (#808).
+          this.resolver.resolveDeferredThisMemberRefs();
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -744,6 +770,17 @@ export class CodeGraph {
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
     return this.queries.searchNodes(query, options);
+  }
+
+  /**
+   * Normalized project-name tokens (go.mod / package.json / repo dir) used to
+   * down-weight the non-discriminative project name in search ranking (#720).
+   * Exposed so explore can exclude it from the PascalCase type-disambiguation
+   * bias, which would otherwise pull overloaded tokens toward whichever stack
+   * embeds the project name.
+   */
+  getProjectNameTokens(): Set<string> {
+    return this.queries.getProjectNameTokens();
   }
 
   /**

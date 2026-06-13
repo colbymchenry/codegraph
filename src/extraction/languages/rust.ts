@@ -2,6 +2,36 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/**
+ * A Rust function's declared return type, normalized to the bare type a chained
+ * `Foo::new().bar()` could be called on (the #645/#608 mechanism). Reads the
+ * `return_type` field: `-> Self` yields the marker `self` (resolved to the impl's
+ * own type at resolution time, like PHP's `self`/`static`); a concrete `-> Foo` /
+ * `-> FooBuilder` its name; a reference (`&Foo`) is unwrapped; generics are reduced
+ * to the base type (`Vec<Foo>` → `Vec`); primitives / unit / tuple yield undefined.
+ * Stdlib types that aren't in the graph simply fail the later existence check.
+ */
+function extractRustReturnType(node: SyntaxNode, source: string): string | undefined {
+  let rt = getChildByField(node, 'return_type');
+  if (!rt) return undefined;
+  if (rt.type === 'reference_type') {
+    rt =
+      rt.namedChildren.find(
+        (c: SyntaxNode) =>
+          c.type === 'type_identifier' ||
+          c.type === 'scoped_type_identifier' ||
+          c.type === 'generic_type',
+      ) ?? rt;
+  }
+  if (!rt || rt.type === 'primitive_type' || rt.type === 'unit_type' || rt.type === 'tuple_type') {
+    return undefined;
+  }
+  const text = getNodeText(rt, source).trim().replace(/<[^>]*>/g, '');
+  const last = text.split('::').pop()?.trim();
+  if (!last || !/^[A-Za-z_]\w*$/.test(last)) return undefined;
+  return last === 'Self' ? 'self' : last;
+}
+
 export const rustExtractor: LanguageExtractor = {
   // `function_signature_item` is a trait method DECLARATION (`fn render(&self);`,
   // no body). Extracting it makes a trait's method set first-class, which
@@ -23,6 +53,7 @@ export const rustExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'return_type',
+  getReturnType: extractRustReturnType,
   getSignature: (node, source) => {
     const params = getChildByField(node, 'parameters');
     const returnType = getChildByField(node, 'return_type');

@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath } from '../src/utils';
+import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -173,6 +173,82 @@ describe('Path Traversal Prevention', () => {
   it('should return null for non-existent node', async () => {
     const code = await cg.getCode('does-not-exist');
     expect(code).toBeNull();
+  });
+});
+
+describe('Symlink escape prevention (#527)', () => {
+  // An in-repo symlink whose logical path is inside the project root but whose
+  // REAL target escapes the root must never be served. validatePathWithinRoot
+  // is the chokepoint both content-serving read sinks go through (codegraph_node
+  // includeCode + codegraph_explore source rendering), so it must resolve
+  // symlinks, not just compare strings. realpathSync the roots so the test's own
+  // expectations don't trip over /tmp -> /private/tmp on macOS.
+  let root: string;
+  let outside: string;
+
+  beforeEach(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-root-')));
+    outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-outside-')));
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.writeFileSync(path.join(root, 'src', 'in.ts'), 'export const x = 1;\n');
+    fs.mkdirSync(path.join(outside, 'pkg'));
+    fs.writeFileSync(path.join(outside, 'pkg', 'secret.txt'), 'TOP-SECRET\n');
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  });
+
+  // Symlink creation needs privileges on Windows; skip gracefully if it fails.
+  const link = (linkPath: string, target: string): boolean => {
+    try { fs.symlinkSync(target, linkPath); return true; } catch { return false; }
+  };
+
+  it('allows a real file inside the root (and realpaths consistently)', () => {
+    expect(validatePathWithinRoot(root, 'src/in.ts')).not.toBeNull();
+  });
+
+  it('allows a not-yet-existing path inside the root (ENOENT — files about to be written)', () => {
+    expect(validatePathWithinRoot(root, 'src/will-write.ts')).not.toBeNull();
+  });
+
+  it('rejects a lexical ../ traversal out of the root', () => {
+    expect(validatePathWithinRoot(root, `../${path.basename(outside)}/pkg/secret.txt`)).toBeNull();
+  });
+
+  it('rejects an in-repo symlink to an out-of-root FILE', () => {
+    if (!link(path.join(root, 'escape'), path.join(outside, 'pkg', 'secret.txt'))) return;
+    expect(validatePathWithinRoot(root, 'escape')).toBeNull();
+  });
+
+  it('rejects a path that escapes through an in-repo symlink to an out-of-root DIR', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+    expect(validatePathWithinRoot(root, 'escapedir/secret.txt')).toBeNull();
+  });
+
+  it('still allows an in-repo symlink that stays WITHIN the root (no over-blocking)', () => {
+    if (!link(path.join(root, 'src', 'inlink.ts'), path.join(root, 'src', 'in.ts'))) return;
+    expect(validatePathWithinRoot(root, 'src/inlink.ts')).not.toBeNull();
+  });
+
+  it('end-to-end: getCode never serves an out-of-root file reached via a dir symlink', async () => {
+    fs.writeFileSync(path.join(outside, 'pkg', 'leak.ts'),
+      'export function leaked() { return "LEAKED-ZZZ-9"; }\n');
+    if (!link(path.join(root, 'vendored'), path.join(outside, 'pkg'))) return;
+
+    const cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
+    try {
+      await cg.indexAll();
+      // Whether or not extraction followed the dir symlink, NO node may ever
+      // yield the out-of-root content through getCode.
+      for (const n of cg.getNodesByKind('function')) {
+        const code = await cg.getCode(n.id);
+        expect(code ?? '').not.toContain('LEAKED-ZZZ-9');
+      }
+    } finally {
+      cg.close();
+    }
   });
 });
 

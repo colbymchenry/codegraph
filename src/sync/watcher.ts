@@ -24,7 +24,7 @@
  *     per-file watches are never needed.
  *
  * Excluded trees (node_modules/, dist/, .git/, …) are filtered via the
- * indexer's `buildDefaultIgnore` (built-in default-ignore dirs + the project's
+ * indexer's `buildScopeIgnore` (built-in default-ignore dirs + the project's
  * .gitignore) — on Linux they're never descended into (so they cost no watch),
  * and on macOS/Windows the single recursive stream still covers them but their
  * events are dropped before any sync is scheduled. Either way the watcher's
@@ -33,10 +33,10 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import type { Ignore } from 'ignore';
-import { isSourceFile, buildDefaultIgnore } from '../extraction';
+import { isSourceFile, buildScopeIgnore, type ScopeIgnore } from '../extraction';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
+import { isCodeGraphDataDir } from '../directory';
 import { watchDisabledReason } from './watch-policy';
 
 /**
@@ -199,10 +199,12 @@ export class FileWatcher {
    * deterministically gate on watcher readiness.
    */
   private readyWaiters: Array<() => void> = [];
-  // The shared ignore matcher (built-in defaults + project .gitignore), built
-  // once at start(). Same source of truth the indexer uses, so watcher scope
-  // can never diverge from index scope.
-  private ignoreMatcher: Ignore | null = null;
+  // The shared scope matcher (built-in defaults + project .gitignore, with
+  // embedded child repos matched by their OWN rules — #514), built once at
+  // start(). Same source of truth the indexer uses, so watcher scope can
+  // never diverge from index scope. An embedded repo created after start()
+  // joins the scope on the next watcher restart / re-index.
+  private ignoreMatcher: ScopeIgnore | null = null;
 
   private readonly projectRoot: string;
   private readonly debounceMs: number;
@@ -243,7 +245,7 @@ export class FileWatcher {
     }
 
     // Reuse the indexer's ignore set so the watcher and indexer agree on scope.
-    this.ignoreMatcher = buildDefaultIgnore(this.projectRoot);
+    this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
 
     try {
       if (this.inertForTests) {
@@ -425,8 +427,12 @@ export class FileWatcher {
 
   /** Our own dirs are always ignored, regardless of .gitignore. */
   private isAlwaysIgnored(rel: string): boolean {
+    // First path segment. Ignore any CodeGraph data dir — the active one AND a
+    // sibling like `.codegraph-win` a second environment (Windows/WSL) created
+    // in the same tree, so neither side watches the other's index (#636).
+    const top = rel.split('/')[0] ?? rel;
     return (
-      rel === '.codegraph' || rel.startsWith('.codegraph/') ||
+      isCodeGraphDataDir(top) ||
       rel === '.git' || rel.startsWith('.git/')
     );
   }

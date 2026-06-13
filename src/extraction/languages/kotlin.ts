@@ -2,6 +2,46 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/** Kotlin return types that can't be a chained-call receiver (no class to chain on). */
+const KOTLIN_NON_CLASS_RETURN = new Set(['Unit', 'Nothing']);
+
+/**
+ * A Kotlin function's declared return type, normalized to the bare class name a
+ * chained `Foo.getInstance().bar()` could be called on (the #645/#608 mechanism).
+ * tree-sitter-kotlin exposes no field names, so the return type is found
+ * positionally: the first `user_type` / `nullable_type` that FOLLOWS
+ * `function_value_parameters` (an extension receiver's type sits before the
+ * params, so it's never mistaken for the return). An inferred return (expression
+ * body with no `: Type`), a lambda return type, or `Unit` / `Nothing` → undefined.
+ */
+function extractKotlinReturnType(node: SyntaxNode, source: string): string | undefined {
+  let seenParams = false;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    if (child.type === 'function_value_parameters') {
+      seenParams = true;
+      continue;
+    }
+    if (!seenParams) continue;
+    // The return type is the type node right after the params. If we reach the
+    // body or a `where`-clause first, there's no declared return type.
+    if (child.type === 'function_body' || child.type === 'type_constraints') return undefined;
+    if (child.type === 'user_type' || child.type === 'nullable_type') {
+      const ut =
+        child.type === 'nullable_type'
+          ? (child.namedChildren.find((c: SyntaxNode) => c.type === 'user_type') ?? child)
+          : child;
+      const typeId = ut.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+      const name = getNodeText(typeId ?? ut, source).trim();
+      if (!name || !/^[A-Za-z_]\w*$/.test(name)) return undefined;
+      if (KOTLIN_NON_CLASS_RETURN.has(name)) return undefined;
+      return name;
+    }
+  }
+  return undefined;
+}
+
 /** Check if a node matches the `fun interface` misparse pattern */
 function isFunInterfaceNode(node: SyntaxNode): boolean {
   let hasFun = false;
@@ -130,6 +170,7 @@ export const kotlinExtractor: LanguageExtractor = {
   },
   paramsField: 'function_value_parameters',
   returnField: 'type',
+  getReturnType: extractKotlinReturnType,
   resolveBody: (node, _bodyField) => {
     // Kotlin's tree-sitter grammar doesn't use field names, so getChildByField fails.
     // Find body by type: function_body for functions/methods, class_body for classes,

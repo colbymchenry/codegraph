@@ -34,6 +34,7 @@ import {
   readJsonFile,
   removeMarkedSection,
   writeJsonFile,
+  upsertInstructionsEntry,
 } from './shared';
 import {
   CODEGRAPH_SECTION_END,
@@ -120,15 +121,12 @@ class ClaudeCodeTarget implements AgentTarget {
     const hookCleanup = cleanupLegacyHooks(loc);
     if (hookCleanup.action === 'removed') files.push(hookCleanup);
 
-    // 3. CLAUDE.md instructions — no longer written. The codegraph
-    // usage guidance now ships solely in the MCP server's `initialize`
-    // response (see `mcp/server-instructions.ts`), which Claude Code
-    // surfaces in the system prompt automatically. Writing it into
-    // CLAUDE.md as well meant the agent read the same playbook twice
-    // every turn (issue #529). Strip any block a previous install left
-    // behind so an upgrade self-heals — same idiom as the hook cleanup.
-    const instrCleanup = removeInstructionsEntry(loc);
-    if (instrCleanup.action === 'removed') files.push(instrCleanup);
+    // 3. CLAUDE.md instructions — the short marker-fenced CodeGraph
+    // block (#704). The MCP initialize instructions reach only the main
+    // agent; CLAUDE.md is what Task-tool subagents (and non-MCP
+    // harnesses) actually see, so the block carries the codegraph
+    // pointers there. Upsert self-heals a stale pre-#529 long block.
+    files.push(upsertInstructionsEntry(instructionsPath(loc)));
 
     return { files };
   }

@@ -161,6 +161,18 @@ were found). Confirm it's dynamic by reading the break symbol's body.
 - `on('e',fn)` + `emit('e')` → **EventEmitter synthesizer** (§3b).
 - Inline handler not a node → **named:** extraction (already done generically in
   `tree-sitter.ts`); **anonymous:** synthesizer link-through-body (not yet built).
+- Dispatch that CAN'T be precision-gated as a class (runtime-keyed `table[key](...)`,
+  `getattr(self, expr)`, reflection, typed mediator buses, `new Proxy`) → **boundary
+  surfacing** (`src/mcp/dynamic-boundaries.ts`, #687): explore ANNOUNCES the dispatch
+  site where the static path ends — file:line, form, and candidate targets when the
+  key is statically visible — instead of synthesizing an edge. Query-time only, zero
+  graph mutation, fires only when the asked-about flow fails to connect. This is the
+  deliberate floor for the frontier: a wrong edge poisons the map (silent beats
+  wrong), but an honest "the flow continues at THIS site, likely into THESE
+  candidates" still saves the read-reconstruction spiral. When a boundary form later
+  proves precision-gateable on real repos (e.g. a same-repo literal-key command bus),
+  promote it to a synthesizer channel and the boundary note disappears on its own —
+  the flow then connects.
 
 ### Step 4 — Implement
 - **Resolver:** add to `src/resolution/frameworks/<lang>.ts` — a `resolve()` branch +

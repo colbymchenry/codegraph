@@ -16,8 +16,10 @@ import * as path from 'path';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
 import { tools } from './tools';
-import { SERVER_INSTRUCTIONS } from './server-instructions';
+import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_UNINDEXED } from './server-instructions';
 import { CodeGraphPackageVersion } from './version';
+import { findNearestCodeGraphRoot } from '../directory';
+import { getTelemetry, ClientInfo } from '../telemetry';
 
 /**
  * MCP Server Info — kept on the session because some clients log it. The
@@ -81,6 +83,8 @@ export interface MCPSessionOptions {
  */
 export class MCPSession {
   private clientSupportsRoots = false;
+  /** From the initialize handshake — attributes usage rollups to the agent host. */
+  private clientInfo: ClientInfo | undefined;
   private rootsAttempted = false;
   private resolvePromise: Promise<void> | null = null;
   private explicitProjectPath: string | null;
@@ -161,9 +165,16 @@ export class MCPSession {
       rootUri?: string;
       workspaceFolders?: Array<{ uri: string; name: string }>;
       capabilities?: { roots?: unknown };
+      clientInfo?: { name?: unknown; version?: unknown };
     } | undefined;
 
     this.clientSupportsRoots = !!params?.capabilities?.roots;
+    if (params?.clientInfo) {
+      this.clientInfo = {
+        name: typeof params.clientInfo.name === 'string' ? params.clientInfo.name : undefined,
+        version: typeof params.clientInfo.version === 'string' ? params.clientInfo.version : undefined,
+      };
+    }
 
     // Explicit project signal, strongest first: client-provided rootUri /
     // workspaceFolders (LSP-style), else the --path the server was launched
@@ -178,12 +189,24 @@ export class MCPSession {
       explicitPath = this.explicitProjectPath;
     }
 
+    // Pick the instructions variant by the workspace's index state — a cheap
+    // synchronous walk-up (existsSync loop only, no DB open, so the #172
+    // respond-fast contract holds). An unindexed workspace gets the short
+    // "inactive this session" note instead of the full playbook: the playbook
+    // tells the agent to lean on tools that would all fail, and early failures
+    // teach the agent to abandon codegraph entirely. `tools/list` is gated the
+    // same way (empty list when unindexed). When no explicit path is known yet
+    // (roots/list dance pending), cwd is the best predictor of where the
+    // default project will resolve — and on a mismatch the worst case is the
+    // optimistic full playbook backstopped by the empty tool list.
+    const indexed = findNearestCodeGraphRoot(explicitPath ?? process.cwd()) !== null;
+
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.
     this.transport.sendResult(request.id, {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
-      instructions: SERVER_INSTRUCTIONS,
+      instructions: indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_UNINDEXED,
     });
 
     if (explicitPath) {
@@ -196,8 +219,15 @@ export class MCPSession {
 
   private async handleToolsList(request: JsonRpcRequest): Promise<void> {
     await this.retryInitIfNeeded();
+    // An unindexed workspace serves an EMPTY tool list: absence is the one
+    // signal an agent can't misread. Listing 8 tools that all fail wastes the
+    // agent's calls and teaches it codegraph is broken (observed: one or two
+    // early isError responses and the agent stops calling codegraph for the
+    // whole session). A `codegraph init` run after the server started is
+    // picked up on the next tools/list — retryInitIfNeeded re-walks — though
+    // most hosts only request the list once per connection.
     this.transport.sendResult(request.id, {
-      tools: this.engine.getToolHandler().getTools(),
+      tools: this.engine.hasDefaultCodeGraph() ? this.engine.getToolHandler().getTools() : [],
     });
   }
 
@@ -229,6 +259,9 @@ export class MCPSession {
 
     const result = await this.engine.getToolHandler().execute(toolName, toolArgs);
     this.transport.sendResult(request.id, result);
+    // After the reply is on the wire — telemetry must never delay a tool
+    // response (in-memory increment only; see src/telemetry).
+    getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
   }
 
   /**

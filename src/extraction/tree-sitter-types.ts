@@ -181,6 +181,15 @@ export interface LanguageExtractor {
   classifyClassNode?: (node: SyntaxNode) => 'class' | 'struct' | 'enum' | 'interface' | 'trait';
 
   /**
+   * Classify a methodTypes node when the grammar reuses one node type for
+   * both callable and data members (#808): TS/JS class FIELDS
+   * (`public_field_definition` / `field_definition`) are methods only when
+   * their value is callable (`onClick = () => {}`); a plain field
+   * (`public fonts: Fonts;`, `count = 0`) is a property. Default: 'method'.
+   */
+  classifyMethodNode?: (node: SyntaxNode) => 'method' | 'property';
+
+  /**
    * Resolve the body node for a function/method/class when it's not a child field.
    * (e.g. Dart puts function_body as a sibling, not a child.)
    */
@@ -204,6 +213,15 @@ export interface LanguageExtractor {
    * When present, the receiver type is included in the qualified name for better searchability.
    */
   getReceiverType?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
+   * Extract a function/method's normalized return type name (bare class name,
+   * smart-pointer pointee unwrapped), stored on the node as `returnType`. Used
+   * by C/C++ so resolution can infer a chained receiver's type from what the
+   * inner call returns (`Foo::instance().bar()` → resolve `bar` on `Foo`,
+   * issue #645). Return undefined for primitives / void / constructors.
+   */
+  getReturnType?: (node: SyntaxNode, source: string) => string | undefined;
 
   /**
    * Resolve the actual node kind for a type alias declaration.

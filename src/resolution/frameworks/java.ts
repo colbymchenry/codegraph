@@ -335,7 +335,12 @@ function extractSpringConfig(
       endColumn: valueText.length,
       language: lang,
       signature: dottedKey,
-      docstring: valueText.slice(0, 200),
+      // SECURITY (#383): store the KEY only, never the value. Config files
+      // routinely hold secrets (DB passwords, API keys, JDBC URLs with embedded
+      // credentials), and surfacing the value here pushes it into agent context
+      // unbidden (it lands in codegraph_node/explore output via the docstring).
+      // The key is all `@Value`/`@ConfigurationProperties` resolution needs; an
+      // agent that genuinely needs a value can read the file directly.
       updatedAt: now,
     });
   };

@@ -10,6 +10,11 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import {
+  CODEGRAPH_INSTRUCTIONS_BLOCK,
+  CODEGRAPH_SECTION_START,
+  CODEGRAPH_SECTION_END,
+} from '../instructions-template';
 
 /**
  * The MCP-server config block codegraph injects. Same shape across
@@ -165,6 +170,26 @@ export function replaceOrAppendMarkedSection(
   const sep = trimmed.length > 0 ? '\n\n' : '';
   atomicWriteFileSync(filePath, trimmed + sep + body + '\n');
   return 'appended';
+}
+
+/**
+ * Upsert the CodeGraph instructions block into an agent instructions
+ * file (CLAUDE.md / AGENTS.md / GEMINI.md). The one write shared by
+ * every target: self-heals a stale pre-#529 long block (markers match →
+ * replaced by the current short one), appends after existing user
+ * content otherwise, and reports `unchanged` on byte-equal re-runs so
+ * install stays idempotent. See `instructions-template.ts` for why this
+ * block exists (#704: subagents + non-MCP harnesses never see the MCP
+ * initialize instructions).
+ */
+export function upsertInstructionsEntry(file: string): { path: string; action: 'created' | 'updated' | 'unchanged' } {
+  const action = replaceOrAppendMarkedSection(
+    file,
+    CODEGRAPH_INSTRUCTIONS_BLOCK,
+    CODEGRAPH_SECTION_START,
+    CODEGRAPH_SECTION_END,
+  );
+  return { path: file, action: action === 'appended' ? 'updated' : action };
 }
 
 /**
