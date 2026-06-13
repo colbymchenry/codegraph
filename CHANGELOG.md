@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Claude Code auto-allow setup now includes `codegraph_files`, matching the documented manual configuration so the indexed file-structure tool is ready after install. (#565)
 
 ## [1.0.0] - 2026-06-12
 

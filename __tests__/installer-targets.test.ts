@@ -921,6 +921,16 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(cfg.mcpServers.codegraph).toBeDefined();
   });
 
+  it('claude: auto-allow includes the indexed file structure tool (#565)', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true });
+
+    const settings = JSON.parse(
+      fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'),
+    );
+    expect(settings.permissions.allow).toContain('mcp__codegraph__codegraph_files');
+  });
+
   it('claude: local install migrates a legacy ./.claude.json codegraph entry into ./.mcp.json', () => {
     const claude = getTarget('claude')!;
     const legacy = path.join(tmpCwd, '.claude.json');

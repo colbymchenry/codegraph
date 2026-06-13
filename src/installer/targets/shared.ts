@@ -44,6 +44,7 @@ export function getCodeGraphPermissions(): string[] {
     'mcp__codegraph__codegraph_impact',
     'mcp__codegraph__codegraph_files',
     'mcp__codegraph__codegraph_status',
+    'mcp__codegraph__codegraph_files',
   ];
 }
 
