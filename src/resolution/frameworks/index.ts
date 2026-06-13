@@ -27,6 +27,7 @@ import { swiftObjcBridgeResolver } from './swift-objc';
 import { reactNativeBridgeResolver } from './react-native';
 import { expoModulesResolver } from './expo-modules';
 import { fabricViewResolver } from './fabric';
+import { tauriBridgeResolver } from './tauri';
 import { cicsResolver } from './cics';
 import { terraformResolver } from './terraform';
 
@@ -72,6 +73,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   expoModulesResolver,
   // React Native Fabric / Codegen view components — TS spec → component nodes
   fabricViewResolver,
+  // Tauri IPC — TS commands/events ↔ Rust #[tauri::command] / Event structs
+  tauriBridgeResolver,
   // CICS pseudo-conversational TRANSID hops (COBOL)
   cicsResolver,
   // Terraform / OpenTofu — disambiguate var/local/module/resource refs to same-dir module
@@ -152,3 +155,4 @@ export { swiftObjcBridgeResolver } from './swift-objc';
 export { reactNativeBridgeResolver } from './react-native';
 export { expoModulesResolver } from './expo-modules';
 export { fabricViewResolver } from './fabric';
+export { tauriBridgeResolver } from './tauri';
