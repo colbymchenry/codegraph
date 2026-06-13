@@ -7161,3 +7161,207 @@ GeomPoint <- ggproto("GeomPoint", Geom,
     });
   });
 });
+
+describe('Elixir Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect .ex and .exs files', () => {
+      expect(detectLanguage('lib/my_app/accounts.ex')).toBe('elixir');
+      expect(detectLanguage('test/accounts_test.exs')).toBe('elixir');
+    });
+  });
+
+  describe('Module extraction', () => {
+    it('should extract a defmodule as a module node', () => {
+      const code = `
+defmodule MyApp.Accounts do
+  @moduledoc "Accounts context"
+end
+`;
+      const result = extractFromSource('lib/accounts.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module');
+      expect(mod).toMatchObject({ kind: 'module', name: 'MyApp.Accounts', language: 'elixir' });
+    });
+
+    it('should extract nested modules', () => {
+      const code = `
+defmodule A do
+  defmodule B do
+  end
+end
+`;
+      const result = extractFromSource('lib/a.ex', code);
+      const names = result.nodes.filter((n) => n.kind === 'module').map((n) => n.name);
+      expect(names).toContain('A');
+      expect(names).toContain('B');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract def as a public function', () => {
+      const code = `
+defmodule M do
+  def get_user(id), do: id
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'get_user');
+      expect(fn).toBeDefined();
+      expect(fn?.visibility).toBe('public');
+    });
+
+    it('should extract defp as a private function', () => {
+      const code = `
+defmodule M do
+  defp helper(x), do: x
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'helper');
+      expect(fn).toBeDefined();
+      expect(fn?.visibility).toBe('private');
+    });
+
+    it('should extract defmacro', () => {
+      const code = `
+defmodule M do
+  defmacro mymacro(x) do
+    quote do: unquote(x)
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'mymacro');
+      expect(fn).toBeDefined();
+    });
+
+    it('should extract a function with a guard', () => {
+      const code = `
+defmodule M do
+  def bar(x) when is_integer(x), do: x
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'bar');
+      expect(fn).toBeDefined();
+    });
+
+    it('should dedupe multiple clauses of the same name/arity into one node', () => {
+      const code = `
+defmodule M do
+  def get(id) when is_integer(id), do: id
+  def get(_), do: nil
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const gets = result.nodes.filter((n) => n.kind === 'function' && n.name === 'get');
+      expect(gets.length).toBe(1);
+    });
+  });
+
+  describe('Imports / dependencies', () => {
+    it('should extract alias', () => {
+      const code = `
+defmodule M do
+  alias MyApp.Repo
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const imp = result.nodes.find((n) => n.kind === 'import');
+      expect(imp?.name).toBe('MyApp.Repo');
+    });
+
+    it('should expand multi-alias into one import each', () => {
+      const code = `
+defmodule M do
+  alias MyApp.Accounts.{User, Profile}
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('MyApp.Accounts.User');
+      expect(names).toContain('MyApp.Accounts.Profile');
+    });
+
+    it('should extract import, require, and use', () => {
+      const code = `
+defmodule M do
+  import Ecto.Query
+  require Logger
+  use GenServer
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('Ecto.Query');
+      expect(names).toContain('Logger');
+      expect(names).toContain('GenServer');
+    });
+  });
+
+  describe('Structural macros', () => {
+    it('should extract defprotocol as an interface and its callbacks', () => {
+      const code = `
+defprotocol Sizeable do
+  def size(data)
+end
+`;
+      const result = extractFromSource('lib/sizeable.ex', code);
+      const proto = result.nodes.find((n) => n.kind === 'interface' && n.name === 'Sizeable');
+      expect(proto).toBeDefined();
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'size');
+      expect(fn).toBeDefined();
+    });
+
+    it('should extract defstruct as a struct node', () => {
+      const code = `
+defmodule User do
+  defstruct [:id, :name]
+end
+`;
+      const result = extractFromSource('lib/user.ex', code);
+      const st = result.nodes.find((n) => n.kind === 'struct');
+      expect(st).toBeDefined();
+    });
+
+    it('should extract defimpl with an implements reference', () => {
+      const code = `
+defimpl Sizeable, for: List do
+  def size(list), do: length(list)
+end
+`;
+      const result = extractFromSource('lib/sizeable_list.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'size');
+      expect(fn).toBeDefined();
+      const impl = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'implements' && r.referenceName === 'Sizeable'
+      );
+      expect(impl).toBeDefined();
+    });
+
+    it('should extract defdelegate as a function', () => {
+      const code = `
+defmodule M do
+  defdelegate len(list), to: List, as: :length
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'len');
+      expect(fn).toBeDefined();
+    });
+  });
+
+  describe('Call edges', () => {
+    it('should record a qualified call inside a function body', () => {
+      const code = `
+defmodule M do
+  def clean(name), do: String.trim(name)
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'String.trim'
+      );
+      expect(call).toBeDefined();
+    });
+  });
+});
