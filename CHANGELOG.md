@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- **CodeGraph now indexes Elixir** (`.ex` / `.exs`) — modules (including nested), `def`/`defp`/`defmacro`/`defmacrop`/`defguard`/`defdelegate` with public/private visibility, multi-clause functions folded into one symbol, `alias`/`import`/`require`/`use` dependencies (including multi-alias `alias A.{B, C}` expansion), `defprotocol`/`defimpl` (with `implements` edges), `defstruct`/`defexception`, and call edges (qualified `Mod.fun` and local calls, including inside `if`/`case`/`with`/pipe bodies). Because tree-sitter-elixir parses every construct as a generic `call`, extraction dispatches on the macro identifier rather than node types; Phoenix/OTP codebases get the full explore / impact / callers surface.
+
 ### Fixes
 
 - `codegraph upgrade` now also refreshes what previous versions installed into your agents — the CodeGraph section in CLAUDE.md / AGENTS.md / GEMINI.md and the MCP entry — so upgrading no longer leaves agents following instructions written for tools that have since been renamed or removed. Refresh-only: agents you never configured are not touched, and your permission and hook choices are preserved. Also available manually as `codegraph install --refresh`, and skippable with `CODEGRAPH_NO_INSTALL_REFRESH=1`. (#1238)
