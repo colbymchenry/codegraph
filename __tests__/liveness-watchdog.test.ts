@@ -80,24 +80,33 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
     });
   }
 
+  // Assert the watchdog terminated the process. POSIX surfaces the external
+  // SIGKILL as signal 'SIGKILL'; Windows has no real signals, so the watchdog's
+  // `process.kill(pid, 'SIGKILL')` maps to TerminateProcess and an observer sees
+  // signal=null with a non-zero exit code. Either is a kill; the synthetic
+  // 'TIMEOUT' (the watchdog never fired) is the failure we're guarding against.
+  function expectKilled(r: { code: number | null; signal: NodeJS.Signals | 'TIMEOUT' | null }): void {
+    expect(r.signal === 'SIGKILL' || (r.signal === null && r.code !== 0 && r.code !== null)).toBe(true);
+  }
+
   it('SIGKILLs a process whose main thread wedges in a sync loop', async () => {
-    const { signal } = await runChild(
+    const r = await runChild(
       { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '500' },
       'setTimeout(() => { while (true) {} }, 150);',
       8000
     );
-    expect(signal).toBe('SIGKILL');
+    expectKilled(r);
   }, 12000);
 
   it('SIGKILLs a non-allocating wedge under heap pressure (the case worker threads stalled on)', async () => {
-    const { signal } = await runChild(
+    const r = await runChild(
       { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '500' },
       // ~40MB retained so a GC is likely, then a tight NON-allocating loop — the
       // exact shape that deadlocks a same-process worker on the global safepoint.
       'const k=[]; for (let i=0;i<40;i++) k.push(Buffer.alloc(1024*1024,i)); global.__k=k; setTimeout(() => { while (true) {} }, 150);',
       8000
     );
-    expect(signal).toBe('SIGKILL');
+    expectKilled(r);
   }, 12000);
 
   it('does NOT kill a healthy process that keeps its event loop turning', async () => {
@@ -111,11 +120,14 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   }, 12000);
 
   it('does NOT kill a wedged process when CODEGRAPH_NO_WATCHDOG=1', async () => {
-    const { signal } = await runChild(
+    const { code, signal } = await runChild(
       { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '500', CODEGRAPH_NO_WATCHDOG: '1' },
       'setTimeout(() => { const end = Date.now() + 1500; while (Date.now() < end) {} process.exit(3); }, 150);',
       8000
     );
-    expect(signal).toBeNull(); // the watchdog is off, so nothing kills it
+    // It exits with its OWN code 3 — proving nothing killed it. (Checking only
+    // signal=null is insufficient on Windows, where a kill also reports null.)
+    expect(signal).toBeNull();
+    expect(code).toBe(3);
   }, 12000);
 });
