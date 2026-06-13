@@ -9,7 +9,11 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 
 export const reactResolver: FrameworkResolver = {
   name: 'react',
-  languages: ['javascript', 'typescript'],
+  // `.tsx`/`.jsx` are detected as their own languages ('tsx'/'jsx'), so they
+  // must be listed explicitly — otherwise getApplicableFrameworks() drops this
+  // resolver from the extraction pass for the very files React components live
+  // in, and forwardRef/memo/arrow components never get a `component` node (#841).
+  languages: ['javascript', 'typescript', 'tsx', 'jsx'],
 
   detect(context: ResolutionContext): boolean {
     // Check for React in package.json

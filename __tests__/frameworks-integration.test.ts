@@ -908,3 +908,90 @@ describe('Go gRPC stub→impl synthesis', () => {
     }
   });
 });
+
+describe('React end-to-end — forwardRef component render edges (issue #841)', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('indexes a forwardRef component (.tsx) and links its JSX usage as a caller', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-react-fwref-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({ name: 'app', dependencies: { react: '^18.0.0' } })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'ui'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'ui/button.tsx'),
+      'import * as React from "react";\n' +
+        'export const Button = React.forwardRef<\n' +
+        '  HTMLButtonElement,\n' +
+        '  React.ButtonHTMLAttributes<HTMLButtonElement>\n' +
+        '>((props, ref) => <button ref={ref} {...props} />);\n' +
+        'Button.displayName = "Button";\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'page.tsx'),
+      'import { Button } from "./ui/button";\n' +
+        'export function Page() {\n' +
+        '  return <Button>Click</Button>;\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    // The forwardRef component is indexed as a `component` node, not only the
+    // tree-sitter `constant` node (which COMPONENT_KINDS would filter out).
+    const button = cg.getNodesByKind('component').find((n) => n.name === 'Button');
+    expect(button, 'forwardRef Button should be a component node').toBeDefined();
+
+    // Page renders <Button> → Page is reported as a caller of Button.
+    const callers = cg.getCallers(button!.id).map((c) => c.node.name);
+    expect(callers).toContain('Page');
+
+    cg.close();
+  });
+
+  it('keeps cross-dir callers for function-declared components in .tsx', async () => {
+    // Running the React resolver over .tsx now produces both a `function`
+    // (tree-sitter) and a `component` (resolver) node for `function X()`.
+    // Guard that this extra candidate does not drop a cross-directory render
+    // edge — function components already worked before this fix.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-react-fn-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({ name: 'app', dependencies: { react: '^18.0.0' } })
+    );
+    fs.mkdirSync(path.join(tmpDir, 'widgets'));
+    fs.mkdirSync(path.join(tmpDir, 'screens'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'widgets/card.tsx'),
+      'export function Card(props: { title: string }) {\n' +
+        '  return <div>{props.title}</div>;\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'screens/home.tsx'),
+      'import { Card } from "../widgets/card";\n' +
+        'export function Home() {\n' +
+        '  return <Card title="hi" />;\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const cards = cg
+      .getNodesByName('Card')
+      .filter((n) => n.kind === 'component' || n.kind === 'function');
+    const callers = new Set(
+      cards.flatMap((c) => cg.getCallers(c.id).map((x) => x.node.name))
+    );
+    expect(callers).toContain('Home');
+
+    cg.close();
+  });
+});
