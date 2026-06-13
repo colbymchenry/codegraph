@@ -120,6 +120,18 @@ const packageJson = JSON.parse(
   fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf-8')
 );
 
+// Make the version trivial to reach. commander's `.version()` (below) wires up
+// `--version` and `-V`; intercept the spellings it can't — lowercase `-v` and
+// single-dash `-version` — before any parsing. (commander's version short flag
+// is the capital `-V`, and its parser rejects a multi-character single-dash
+// flag.) The bare `codegraph version` subcommand is registered further down so
+// the affordance also shows up in `codegraph --help`.
+const firstArg = process.argv[2];
+if (firstArg === '-v' || firstArg === '-version') {
+  console.log(packageJson.version);
+  return;
+}
+
 // =============================================================================
 // ANSI Color Helpers (avoid chalk ESM issues)
 // =============================================================================
@@ -1976,6 +1988,21 @@ program
       }
     );
     process.exit(code);
+  });
+
+/**
+ * codegraph version
+ *
+ * The bare-noun form of `--version`. commander already provides `--version`
+ * and `-V`, and the `-v` / `-version` spellings are intercepted before parse
+ * (see top of main). This subcommand makes `codegraph version` work and lists
+ * the version affordance in `codegraph --help`.
+ */
+program
+  .command('version')
+  .description('Print the installed CodeGraph version (also: -v, --version)')
+  .action(() => {
+    console.log(packageJson.version);
   });
 
 // Parse and run
