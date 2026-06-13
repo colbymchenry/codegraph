@@ -1199,6 +1199,23 @@ program
   });
 
 /**
+ * Normalize a user-supplied file path to the project-relative, forward-slash
+ * form CodeGraph stores in the index. Accepts an absolute path, a `./`-prefixed
+ * path, or Windows back-slashes; an empty string when the input is blank. Used
+ * by `codegraph affected` so `./src/x.ts`, `/abs/repo/src/x.ts`, and
+ * `src/x.ts` all match the same indexed file. (#825)
+ */
+function normalizeIndexPath(filePath: string, projectPath: string): string {
+  let f = filePath.trim();
+  if (!f) return '';
+  if (path.isAbsolute(f)) f = path.relative(projectPath, f);
+  // Collapse `.`/`..` segments, then force forward slashes and drop a leading
+  // `./` (path.normalize already strips it on POSIX; explicit for Windows).
+  f = path.normalize(f).replace(/\\/g, '/').replace(/^\.\//, '');
+  return f;
+}
+
+/**
  * Convert glob pattern to regex
  */
 function globToRegex(pattern: string): RegExp {
@@ -1709,6 +1726,14 @@ program
         const stdinFiles = stdinData.split('\n').map(f => f.trim()).filter(Boolean);
         changedFiles.push(...stdinFiles);
       }
+
+      // Normalize inputs to the project-relative, forward-slash form the index
+      // stores. Without this, `affected ./src/x.ts`, an absolute path (what a
+      // wrapping script often passes), or a Windows back-slash path silently
+      // matches nothing and reports 0 affected tests. (#825)
+      changedFiles = changedFiles
+        .map((f) => normalizeIndexPath(f, projectPath))
+        .filter(Boolean);
 
       if (changedFiles.length === 0) {
         if (!options.quiet) info('No files provided. Use file arguments or --stdin.');
