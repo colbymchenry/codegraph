@@ -32,6 +32,7 @@ import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
+import { installFatalHandlers } from './fatal-handler';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
@@ -90,6 +91,13 @@ if (nodeMajor < MIN_NODE_MAJOR) {
 // inherits this process's flags) is compiled. See ../extraction/wasm-runtime-flags.
 relaunchWithWasmRuntimeFlagsIfNeeded(__filename);
 
+// Last-resort fatal handlers: log a bounded line and exit non-zero. A fault
+// that reaches here escaped every boundary, so the process is in an undefined
+// state — keeping it alive is what let the detached MCP daemon orphan and pin a
+// CPU core with no recovery (#799, #850). Installed before the command branch
+// so it also covers a synchronous throw during startup. See ./fatal-handler.
+installFatalHandlers();
+
 // Check if running with no arguments - run installer
 if (process.argv.length === 2) {
   import('../installer').then(({ runInstaller }) =>
@@ -102,14 +110,6 @@ if (process.argv.length === 2) {
   // Normal CLI flow
   main();
 }
-
-process.on('uncaughtException', (error) => {
-  console.error('[CodeGraph] Uncaught exception:', error);
-});
-
-process.on('unhandledRejection', (reason) => {
-  console.error('[CodeGraph] Unhandled rejection:', reason);
-});
 
 function main() {
 

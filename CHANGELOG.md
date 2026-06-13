@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- The CodeGraph MCP server no longer risks getting stuck at 100% CPU after an unexpected internal error. Previously such an error was logged but the process was left running in a broken state, where it could spin a CPU core indefinitely and had to be killed by hand. The server now logs the error and exits cleanly, so a fresh one starts on the next request. Thanks @songhlc. (#850)
+
 
 ## [1.0.0] - 2026-06-12
 
