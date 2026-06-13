@@ -1269,72 +1269,51 @@ function printFileTree(
 }
 
 /**
- * codegraph stop — stop the background daemon for a project (or --all).
+ * codegraph daemon — interactive manager for the background daemons. Arrow keys
+ * to pick one (the current project's daemon floats to the top, auto-selected),
+ * enter to stop it. Falls back to a plain list when output isn't a TTY.
  */
 program
-  .command('stop [path]')
-  .description('Stop the background CodeGraph daemon for a project (defaults to the current one)')
-  .option('-a, --all', 'Stop every running CodeGraph daemon on this machine')
-  .action(async (pathArg: string | undefined, options: { all?: boolean }) => {
-    const { stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
-    try {
-      if (options.all) {
-        const results = await stopAllDaemons();
-        const stopped = results.filter((r) => r.outcome === 'term' || r.outcome === 'kill');
-        if (stopped.length === 0) {
-          info('No running CodeGraph daemons.');
-          return;
-        }
-        for (const r of stopped) {
-          success(`Stopped daemon (pid ${r.pid}${r.outcome === 'kill' ? ', forced' : ''}) — ${r.root}`);
-        }
-        return;
-      }
+  .command('daemon')
+  .aliases(['daemons'])
+  .description('Manage running CodeGraph background daemons — pick one and press enter to stop it')
+  .action(async () => {
+    const { listDaemons, stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
+    const { runDaemonPicker } = await import('../mcp/daemon-manager');
 
-      const found = findNearestCodeGraphRoot(path.resolve(pathArg || process.cwd()));
-      if (!found) {
-        error('No CodeGraph project found here. Run inside a project, pass a path, or use --all.');
-        process.exit(1);
-      }
-      let root = found;
-      try { root = fs.realpathSync(found); } catch { /* fall back to the un-realpath'd root */ }
-
-      const result = await stopDaemonAt(root);
-      if (result.outcome === 'no-daemon' || result.outcome === 'not-running') {
-        info(`No daemon running for ${root}.`);
-      } else {
-        success(`Stopped daemon (pid ${result.pid}${result.outcome === 'kill' ? ', forced' : ''}) for ${root}.`);
-      }
-    } catch (err) {
-      error(`Failed to stop daemon: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-  });
-
-/**
- * codegraph list — show running background daemons.
- */
-program
-  .command('list')
-  .alias('ps')
-  .description('List running CodeGraph background daemons')
-  .option('--json', 'Output as JSON')
-  .action(async (options: { json?: boolean }) => {
-    const { listDaemons } = await import('../mcp/daemon-registry');
     const daemons = listDaemons();
-
-    if (options.json) {
-      process.stdout.write(JSON.stringify(daemons, null, 2) + '\n');
-      return;
-    }
     if (daemons.length === 0) {
       info('No CodeGraph daemons running.');
       return;
     }
-    for (const d of daemons) {
-      console.log(`pid ${d.pid}  v${d.version}  up ${formatDuration(Date.now() - d.startedAt)}  ${d.root}`);
+
+    // No TTY (piped / CI / non-interactive) — can't do arrow-key selection, so
+    // just print what's running instead of crashing on a prompt with no input.
+    if (!process.stdout.isTTY || !process.stdin.isTTY) {
+      for (const d of daemons) {
+        console.log(`pid ${d.pid}  v${d.version}  up ${formatDuration(Date.now() - d.startedAt)}  ${d.root}`);
+      }
+      return;
     }
-    info('Stop one with "codegraph stop <path>", or all with "codegraph stop --all".');
+
+    // The current project's daemon floats to the top and is pre-selected.
+    let cwdRoot: string | null = null;
+    const found = findNearestCodeGraphRoot(process.cwd());
+    if (found) { try { cwdRoot = fs.realpathSync(found); } catch { cwdRoot = found; } }
+
+    const clack = await importESM('@clack/prompts');
+    clack.intro('CodeGraph daemons');
+    await runDaemonPicker({
+      list: listDaemons,
+      stop: stopDaemonAt,
+      stopAll: stopAllDaemons,
+      cwdRoot,
+      now: () => Date.now(),
+      select: (opts) => clack.select(opts),
+      isCancel: (v) => clack.isCancel(v),
+      note: (m) => clack.log.success(m),
+      done: (m) => clack.outro(m),
+    });
   });
 
 /**

@@ -11,7 +11,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
-- New `codegraph list` and `codegraph stop` commands for managing the background daemon. `codegraph list` (alias `ps`) shows every running CodeGraph daemon — project, pid, version, uptime — with `--json` for scripting. `codegraph stop` stops the daemon for the current project (or `codegraph stop <path>`, or `codegraph stop --all` to stop every daemon on the machine). Previously the only way to shut a daemon down was to hunt for its pid and `kill` it by hand. (#845)
+- New `codegraph daemon` command (alias `daemons`) — an interactive manager for the background daemons. It shows what's running (your current project's daemon first, pre-selected), and you arrow-key to one and press enter to stop it, or pick "Stop all". Previously the only way to shut a daemon down was to hunt for its pid and `kill` it by hand. (#845)
 - The CodeGraph MCP server now self-heals if its main thread ever locks up. A lightweight watchdog notices when the process has stopped responding and stops it so a fresh one starts on your next request — it can no longer sit pinned at 100% CPU with no way to recover. Tune the detection window with `CODEGRAPH_WATCHDOG_TIMEOUT_MS`, or turn it off entirely with `CODEGRAPH_NO_WATCHDOG=1`. (#850)
 
 ### Fixes
