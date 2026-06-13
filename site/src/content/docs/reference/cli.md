@@ -14,6 +14,7 @@ codegraph sync [path]             # Incremental update
 codegraph status [path]           # Show statistics
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph files [path]            # Show file structure (--format, --filter, --max-depth, --json)
+codegraph visualize [symbol]      # Generate interactive HTML graph (--depth, --limit, --output)
 codegraph context <task>          # Build context for AI (--format, --max-nodes)
 codegraph callers <symbol>        # Find what calls a function/method (--limit, --json)
 codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)
@@ -30,6 +31,16 @@ codegraph serve --mcp             # Start MCP server
 codegraph query UserService --kind class --limit 10
 codegraph callers handleRequest --json
 codegraph impact AuthMiddleware --depth 3
+```
+
+## Visualization
+
+`visualize` writes a self-contained HTML file that can be opened locally. Without a symbol it creates a project overview; with a symbol it renders the selected symbol's graph neighborhood.
+
+```bash
+codegraph visualize
+codegraph visualize handleRequest --depth 3 --limit 500 --open
+codegraph visualize --kind class,function,method --edge-kind calls,extends,implements
 ```
 
 ## affected

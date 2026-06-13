@@ -43,21 +43,27 @@ export const NODE_KINDS = [
 export type NodeKind = (typeof NODE_KINDS)[number];
 
 /**
- * Types of edges (relationships) between nodes
+ * Types of edges (relationships) between nodes.
+ *
+ * Like NODE_KINDS, this is runtime-iterable so CLI filters and generated
+ * visualizations can validate user input from the same source of truth.
  */
-export type EdgeKind =
-  | 'contains'        // Parent contains child (file→class, class→method)
-  | 'calls'           // Function/method calls another
-  | 'imports'         // File imports from another
-  | 'exports'         // File exports a symbol
-  | 'extends'         // Class/interface extends another
-  | 'implements'      // Class implements interface
-  | 'references'      // Generic reference to another symbol
-  | 'type_of'         // Variable/parameter has type
-  | 'returns'         // Function returns type
-  | 'instantiates'    // Creates instance of class
-  | 'overrides'       // Method overrides parent method
-  | 'decorates';      // Decorator applied to symbol
+export const EDGE_KINDS = [
+  'contains',      // Parent contains child (file -> class, class -> method)
+  'calls',         // Function/method calls another
+  'imports',       // File imports from another
+  'exports',       // File exports a symbol
+  'extends',       // Class/interface extends another
+  'implements',    // Class implements interface
+  'references',    // Generic reference to another symbol
+  'type_of',       // Variable/parameter has type
+  'returns',       // Function returns type
+  'instantiates',  // Creates instance of class
+  'overrides',     // Method overrides parent method
+  'decorates',     // Decorator applied to symbol
+] as const;
+
+export type EdgeKind = (typeof EDGE_KINDS)[number];
 
 /**
  * Supported programming languages. See NODE_KINDS for why this is a
