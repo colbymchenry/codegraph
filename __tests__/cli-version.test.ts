@@ -48,6 +48,13 @@ describe('codegraph version affordances', () => {
     expect(out).toContain('Commands:');
   });
 
+  it('hides the internal `serve` command from --help', () => {
+    // `serve --mcp` is the stdio entry point an AI agent launches for itself,
+    // not a human command — it must not appear in the listing. (It stays fully
+    // invocable; the mcp-initialize suite covers that the agent path works.)
+    expect(run(['--help'])).not.toMatch(/^\s+serve\b/m);
+  });
+
   it('a trailing `-v` is still the subcommand\'s --verbose, not the version intercept', () => {
     // A fresh temp dir outside any indexed project: `index -v` parses `-v` as
     // the index command's --verbose, then short-circuits at "not initialized"

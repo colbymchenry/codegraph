@@ -1349,7 +1349,12 @@ program
  * codegraph serve
  */
 program
-  .command('serve')
+  // Hidden from `--help`: this is the stdio entry point an AI agent launches
+  // for itself (the installer wires `args: ['serve','--mcp']` into every
+  // agent's MCP config), not a command a human runs. It still works when
+  // invoked — hiding only removes it from the listing. See the interactive-TTY
+  // guard below, which explains this to anyone who runs it by hand.
+  .command('serve', { hidden: true })
   .description('Start CodeGraph as an MCP server for AI assistants')
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
@@ -1365,6 +1370,22 @@ program
 
     try {
       if (options.mcp) {
+        // `serve --mcp` is the stdio MCP server an AI agent launches for itself,
+        // not a command to run by hand. A human in a terminal would otherwise
+        // see it hang waiting for JSON-RPC on stdin, which reads as broken. If
+        // stdin is an interactive TTY, explain instead of hanging. The agent's
+        // pipe and the detached daemon both have a non-TTY stdin, so this only
+        // ever fires for a person who typed it.
+        if (process.stdin.isTTY && !process.env.CODEGRAPH_DAEMON_INTERNAL) {
+          console.error(chalk.bold('\nCodeGraph MCP server\n'));
+          console.error("This is the MCP server your AI agent (Claude Code, Cursor, Codex, opencode, …)");
+          console.error("starts automatically — you don't run it yourself.");
+          console.error(`\nIt's already wired up by ${chalk.cyan('codegraph install')}. To check on things:`);
+          console.error(`  ${chalk.cyan('codegraph status')}   ${chalk.dim('— is this project indexed and healthy?')}`);
+          console.error(`  ${chalk.cyan('codegraph daemon')}   ${chalk.dim('— list or stop background MCP servers')}`);
+          console.error(chalk.dim('\n(Running it directly only does something when an MCP client drives it over stdin.)'));
+          return;
+        }
         // Start MCP server - it handles initialization lazily based on rootUri from client
         const { MCPServer } = await import('../mcp/index');
         const server = new MCPServer(projectPath);
