@@ -26,7 +26,7 @@
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot } from '../directory';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -1267,6 +1267,75 @@ function printFileTree(
 
   renderNode(root, '', true, 0);
 }
+
+/**
+ * codegraph stop — stop the background daemon for a project (or --all).
+ */
+program
+  .command('stop [path]')
+  .description('Stop the background CodeGraph daemon for a project (defaults to the current one)')
+  .option('-a, --all', 'Stop every running CodeGraph daemon on this machine')
+  .action(async (pathArg: string | undefined, options: { all?: boolean }) => {
+    const { stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
+    try {
+      if (options.all) {
+        const results = await stopAllDaemons();
+        const stopped = results.filter((r) => r.outcome === 'term' || r.outcome === 'kill');
+        if (stopped.length === 0) {
+          info('No running CodeGraph daemons.');
+          return;
+        }
+        for (const r of stopped) {
+          success(`Stopped daemon (pid ${r.pid}${r.outcome === 'kill' ? ', forced' : ''}) — ${r.root}`);
+        }
+        return;
+      }
+
+      const found = findNearestCodeGraphRoot(path.resolve(pathArg || process.cwd()));
+      if (!found) {
+        error('No CodeGraph project found here. Run inside a project, pass a path, or use --all.');
+        process.exit(1);
+      }
+      let root = found;
+      try { root = fs.realpathSync(found); } catch { /* fall back to the un-realpath'd root */ }
+
+      const result = await stopDaemonAt(root);
+      if (result.outcome === 'no-daemon' || result.outcome === 'not-running') {
+        info(`No daemon running for ${root}.`);
+      } else {
+        success(`Stopped daemon (pid ${result.pid}${result.outcome === 'kill' ? ', forced' : ''}) for ${root}.`);
+      }
+    } catch (err) {
+      error(`Failed to stop daemon: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph list — show running background daemons.
+ */
+program
+  .command('list')
+  .alias('ps')
+  .description('List running CodeGraph background daemons')
+  .option('--json', 'Output as JSON')
+  .action(async (options: { json?: boolean }) => {
+    const { listDaemons } = await import('../mcp/daemon-registry');
+    const daemons = listDaemons();
+
+    if (options.json) {
+      process.stdout.write(JSON.stringify(daemons, null, 2) + '\n');
+      return;
+    }
+    if (daemons.length === 0) {
+      info('No CodeGraph daemons running.');
+      return;
+    }
+    for (const d of daemons) {
+      console.log(`pid ${d.pid}  v${d.version}  up ${formatDuration(Date.now() - d.startedAt)}  ${d.root}`);
+    }
+    info('Stop one with "codegraph stop <path>", or all with "codegraph stop --all".');
+  });
 
 /**
  * codegraph serve

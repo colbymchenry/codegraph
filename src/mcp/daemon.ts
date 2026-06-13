@@ -54,6 +54,7 @@ import {
   getDaemonSocketPath,
 } from './daemon-paths';
 import { CodeGraphPackageVersion } from './version';
+import { registerDaemon, deregisterDaemon } from './daemon-registry';
 
 /** Default idle linger after the last client disconnects. */
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
@@ -191,6 +192,10 @@ export class Daemon {
       startedAt: Date.now(),
     };
 
+    // Drop a discovery record so `codegraph list` / `stop --all` can find us.
+    // Best-effort; a missing record only means list's liveness prune covers it.
+    registerDaemon({ root: this.projectRoot, ...lock });
+
     process.stderr.write(
       `[CodeGraph daemon] Listening on ${this.socketPath} (pid ${process.pid}, v${CodeGraphPackageVersion}). Idle timeout ${this.idleTimeoutMs}ms.\n`
     );
@@ -244,6 +249,7 @@ export class Daemon {
     }
     this.engine.stop();
     this.cleanupLockfile();
+    deregisterDaemon(this.projectRoot);
     if (process.platform !== 'win32') {
       try { fs.unlinkSync(this.socketPath); } catch { /* may already be gone */ }
     }
