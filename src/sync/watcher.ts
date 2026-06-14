@@ -39,6 +39,16 @@ import { normalizePath } from '../utils';
 import { isCodeGraphDataDir } from '../directory';
 import { watchDisabledReason } from './watch-policy';
 
+const MAX_LOCK_RETRIES = 5;
+const MAX_LOCK_RETRY_DELAY_MS = 30000;
+
+function isWatchResourceExhaustion(err: unknown): boolean {
+  const e = err as NodeJS.ErrnoException | undefined;
+  if (e?.code === 'EMFILE' || e?.code === 'ENFILE') return true;
+  const msg = e?.message ?? String(err ?? '');
+  return /EMFILE|ENFILE|too many open files/i.test(msg);
+}
+
 /**
  * Native recursive `fs.watch` is only reliable on macOS and Windows; on Linux
  * (and AIX) it throws `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. We branch on this
@@ -46,6 +56,14 @@ import { watchDisabledReason } from './watch-policy';
  */
 function supportsRecursiveWatch(): boolean {
   return process.platform === 'darwin' || process.platform === 'win32';
+}
+
+type WatchFn = typeof fs.watch;
+let watchImpl: WatchFn = fs.watch;
+
+/** @internal Test-only seam to inject a fake fs.watch implementation. */
+export function __setFsWatchForTests(fn: WatchFn | null): void {
+  watchImpl = fn ?? fs.watch;
 }
 
 /**
@@ -164,6 +182,10 @@ export class FileWatcher {
   private dirWatchers = new Map<string, fs.FSWatcher>();
   /** Set once the per-directory watch cap is hit, so we log only once. */
   private dirCapWarned = false;
+  /** One-way marker that live watching has been disabled due to runtime degradation. */
+  private degradedReason: string | null = null;
+  /** Consecutive lock-contention retries for watcher-triggered syncs. */
+  private lockRetryCount = 0;
   /** Test-only inert mode: started, but with no OS watcher installed. */
   private inert = false;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -233,6 +255,8 @@ export class FileWatcher {
   start(): boolean {
     if (this.recursiveWatcher || this.dirWatchers.size > 0 || this.inert) return true; // Already watching
     this.stopped = false;
+    this.degradedReason = null;
+    this.lockRetryCount = 0;
 
     // Some environments make filesystem watching unusable — most notably
     // WSL2 /mnt/ drives, where the underlying fs.watch calls block long
@@ -275,8 +299,15 @@ export class FileWatcher {
       return true;
     } catch (err) {
       // Watcher setup failed (e.g., permission denied, missing directory).
-      logWarn('Could not start file watcher', { error: String(err) });
-      this.stop();
+      if (isWatchResourceExhaustion(err)) {
+        this.degrade(
+          'OS watch/file limit exhausted; auto-sync disabled. Run `codegraph sync` (or install git sync hooks) to refresh the graph after changes.',
+          { error: String(err) }
+        );
+      } else {
+        logWarn('Could not start file watcher', { error: String(err) });
+        this.stop();
+      }
       return false;
     }
   }
@@ -287,7 +318,7 @@ export class FileWatcher {
    * it maps straight to a project-relative path.
    */
   private startRecursive(): void {
-    this.recursiveWatcher = fs.watch(
+    this.recursiveWatcher = watchImpl(
       this.projectRoot,
       { recursive: true, persistent: true },
       (_event, filename) => {
@@ -296,6 +327,13 @@ export class FileWatcher {
       }
     );
     this.recursiveWatcher.on('error', (err: unknown) => {
+      if (isWatchResourceExhaustion(err)) {
+        this.degrade(
+          'OS watch/file limit exhausted; auto-sync disabled. Run `codegraph sync` (or install git sync hooks) to refresh the graph after changes.',
+          { error: String(err) }
+        );
+        return;
+      }
       logWarn('File watcher error', { error: String(err) });
     });
   }
@@ -319,6 +357,7 @@ export class FileWatcher {
    * sync owns the baseline).
    */
   private watchTree(dir: string, markExisting: boolean): void {
+    if (this.stopped || this.degradedReason) return;
     if (this.dirWatchers.has(dir)) return;
     if (this.dirWatchers.size >= maxDirWatches()) {
       if (!this.dirCapWarned) {
@@ -332,14 +371,29 @@ export class FileWatcher {
 
     let w: fs.FSWatcher;
     try {
-      w = fs.watch(dir, { persistent: true }, (_event, filename) =>
+      w = watchImpl(dir, { persistent: true }, (_event, filename) =>
         this.handleDirEvent(dir, filename)
       );
-    } catch {
-      // ENOENT / EACCES / too-many-open-files — skip this directory quietly.
+    } catch (err) {
+      if (isWatchResourceExhaustion(err)) {
+        this.degrade(
+          'OS watch/file limit exhausted; auto-sync disabled. Run `codegraph sync` (or install git sync hooks) to refresh the graph after changes.',
+          { error: String(err), dir }
+        );
+      }
+      // ENOENT / EACCES / too-many-open-files on one dir — skip non-fatal cases quietly.
       return;
     }
-    w.on('error', () => this.unwatchDir(dir));
+    w.on('error', (err: unknown) => {
+      if (isWatchResourceExhaustion(err)) {
+        this.degrade(
+          'OS watch/file limit exhausted; auto-sync disabled. Run `codegraph sync` (or install git sync hooks) to refresh the graph after changes.',
+          { error: String(err), dir }
+        );
+        return;
+      }
+      this.unwatchDir(dir);
+    });
     this.dirWatchers.set(dir, w);
 
     let entries: fs.Dirent[];
@@ -450,6 +504,14 @@ export class FileWatcher {
     return this.ignoreMatcher.ignores(rel + '/');
   }
 
+  /** Disable live watching after a terminal runtime failure. */
+  private degrade(reason: string, context: Record<string, unknown> = {}): void {
+    if (this.degradedReason) return;
+    this.degradedReason = reason;
+    logWarn('File watcher disabled', { projectRoot: this.projectRoot, reason, ...context });
+    this.stop();
+  }
+
   /**
    * Stop watching for file changes.
    */
@@ -478,6 +540,7 @@ export class FileWatcher {
     }
     this.dirWatchers.clear();
     this.dirCapWarned = false;
+    this.lockRetryCount = 0;
     this.inert = false;
 
     this.pendingFiles.clear();
@@ -530,14 +593,14 @@ export class FileWatcher {
   /**
    * Schedule a debounced sync.
    */
-  private scheduleSync(): void {
+  private scheduleSync(delayMs: number = this.debounceMs): void {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
       this.flush();
-    }, this.debounceMs);
+    }, delayMs);
   }
 
   /**
@@ -561,6 +624,7 @@ export class FileWatcher {
 
     try {
       const result = await this.syncFn();
+      this.lockRetryCount = 0;
       // Remove entries whose most recent event predates this sync — those
       // edits are now in the DB. Entries with lastSeenMs > syncStartedMs
       // arrived mid-sync; whether the in-flight sync captured them depends
@@ -576,13 +640,22 @@ export class FileWatcher {
       this.onSyncComplete?.(result);
     } catch (err) {
       if (err instanceof LockUnavailableError) {
+        this.lockRetryCount += 1;
         // Lock-failure no-op (another writer holds the lock). pendingFiles
-        // stays intact and the `finally` block reschedules. Debug-only —
-        // a long external index would otherwise spam stderr every cycle.
+        // stays intact. Keep short contention quiet, but stop retrying forever
+        // at the normal debounce cadence when another writer is long-lived.
         logDebug('Watch sync skipped: file lock unavailable', {
           pendingFiles: this.pendingFiles.size,
+          retryCount: this.lockRetryCount,
         });
+        if (this.lockRetryCount > MAX_LOCK_RETRIES) {
+          this.degrade(
+            'File lock unavailable for too long; auto-sync disabled. Run `codegraph sync` after the writer finishes (or install git sync hooks) to refresh the graph.',
+            { pendingFiles: this.pendingFiles.size, retryCount: this.lockRetryCount }
+          );
+        }
       } else {
+        this.lockRetryCount = 0;
         const error = err instanceof Error ? err : new Error(String(err));
         logWarn('Watch sync failed', { error: error.message });
         this.onSyncError?.(error);
@@ -595,7 +668,10 @@ export class FileWatcher {
       // If pending files remain (mid-sync events, or this sync failed),
       // schedule another pass.
       if (this.pendingFiles.size > 0 && !this.stopped) {
-        this.scheduleSync();
+        const delayMs = this.lockRetryCount > 0
+          ? Math.min(this.debounceMs * (2 ** Math.max(0, this.lockRetryCount - 1)), MAX_LOCK_RETRY_DELAY_MS)
+          : this.debounceMs;
+        this.scheduleSync(delayMs);
       }
     }
   }

@@ -18,6 +18,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -25,6 +26,7 @@ import {
   FileWatcher,
   LockUnavailableError,
   __emitWatchEventForTests,
+  __setFsWatchForTests,
   type WatchOptions,
 } from '../src/sync/watcher';
 import CodeGraph from '../src/index';
@@ -69,6 +71,8 @@ describe('FileWatcher', () => {
   });
 
   afterEach(() => {
+    __setFsWatchForTests(null);
+    vi.restoreAllMocks();
     if (fs.existsSync(testDir)) {
       fs.rmSync(testDir, { recursive: true, force: true });
     }
@@ -85,6 +89,58 @@ describe('FileWatcher', () => {
 
       watcher.stop();
       expect(watcher.isActive()).toBe(false);
+    });
+
+    it('should not start when fs.watch setup exhausts watch/file resources', () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 100 });
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      __setFsWatchForTests(() => {
+        const err = new Error('too many open files') as NodeJS.ErrnoException;
+        err.code = 'EMFILE';
+        throw err;
+      });
+
+      expect(watcher.start()).toBe(false);
+      expect(watcher.isActive()).toBe(false);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('File watcher disabled'),
+        expect.objectContaining({
+          reason: expect.stringContaining('auto-sync disabled'),
+        })
+      );
+    });
+
+    it('should degrade once when the recursive watcher emits EMFILE at runtime', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const handlers = new Map<string, Array<(arg?: unknown) => void>>();
+      const fakeWatcher = {
+        on: vi.fn((event: string, handler: (arg?: unknown) => void) => {
+          const list = handlers.get(event) ?? [];
+          list.push(handler);
+          handlers.set(event, list);
+          return fakeWatcher;
+        }),
+        close: vi.fn(),
+      } as unknown as fs.FSWatcher & EventEmitter;
+      __setFsWatchForTests(() => fakeWatcher);
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 100 });
+
+      expect(watcher.start()).toBe(true);
+      expect(watcher.isActive()).toBe(true);
+
+      const err = new Error('too many open files') as NodeJS.ErrnoException;
+      err.code = 'EMFILE';
+      for (const handler of handlers.get('error') ?? []) handler(err);
+      for (const handler of handlers.get('error') ?? []) handler(err);
+
+      expect(watcher.isActive()).toBe(false);
+      expect(fakeWatcher.close).toHaveBeenCalledTimes(1);
+      const disableCalls = warnSpy.mock.calls.filter(
+        (call) => typeof call[0] === 'string' && String(call[0]).includes('File watcher disabled')
+      );
+      expect(disableCalls).toHaveLength(1);
     });
 
     it('should be idempotent on double start', () => {
@@ -306,7 +362,7 @@ describe('FileWatcher', () => {
       expect(onSyncError).not.toHaveBeenCalled();
       expect(onSyncComplete).not.toHaveBeenCalled();
 
-      await waitFor(() => syncFn.mock.calls.length >= 2);
+      await waitFor(() => syncFn.mock.calls.length >= 2, 3000);
       await waitFor(
         () => !watcher.getPendingFiles().some((p) => p.path === 'src/locked.ts'),
       );
@@ -316,6 +372,35 @@ describe('FileWatcher', () => {
       expect(onSyncError).not.toHaveBeenCalled();
 
       watcher.stop();
+    });
+
+    it('should disable auto-sync after prolonged LockUnavailableError contention', async () => {
+      const syncFn = vi.fn().mockRejectedValue(new LockUnavailableError());
+      const onSyncComplete = vi.fn();
+      const onSyncError = vi.fn();
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const watcher = newWatcher(syncFn, {
+        debounceMs: 25,
+        onSyncComplete,
+        onSyncError,
+      });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      __emitWatchEventForTests(testDir, 'src/long-lock.ts');
+
+      await waitFor(() => !watcher.isActive(), 8000, 20);
+
+      expect(syncFn.mock.calls.length).toBeGreaterThanOrEqual(6);
+      expect(watcher.getPendingFiles()).toEqual([]);
+      expect(onSyncComplete).not.toHaveBeenCalled();
+      expect(onSyncError).not.toHaveBeenCalled();
+      const disableCalls = warnSpy.mock.calls.filter(
+        (call) => typeof call[0] === 'string' && String(call[0]).includes('File watcher disabled')
+      );
+      expect(disableCalls).toHaveLength(1);
+
+      warnSpy.mockRestore();
     });
   });
 
