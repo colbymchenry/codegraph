@@ -597,6 +597,17 @@ export const tools: ToolDefinition[] = [
       },
     },
   },
+  {
+    name: 'codegraph_check',
+    description:
+      'Detect circular file-import cycles in the indexed project. Returns the cycle count and each cycle as an ordered list of file paths. Use before a refactor or commit to catch import cycles that break builds; a clean result is a success, not an error.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectPath: projectPathProperty,
+      },
+    },
+  },
 ];
 
 /**
@@ -1120,6 +1131,8 @@ export class ToolHandler {
           return await this.handleStatus(args);
         case 'codegraph_files':
           result = await this.handleFiles(args); break;
+        case 'codegraph_check':
+          result = await this.handleCheck(args); break;
         default:
           return this.errorResult(`Unknown tool: ${toolName}`);
       }
@@ -3251,6 +3264,52 @@ export class ToolHandler {
       lines.push(`**Called by ←** ${callers.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callers.length > TRAIL_CAP ? `, +${callers.length - TRAIL_CAP} more` : ''}`);
     }
     return lines.join('\n');
+  }
+
+  /**
+   * Handle codegraph_check — surface file-level circular import cycles.
+   *
+   * Backed by CodeGraph.findCircularDependencies() (src/graph/queries.ts),
+   * which runs a DFS over file-level `imports` edges with white/gray/black
+   * coloring. The algorithm is unchanged here; this method only formats its
+   * string[][] result for the MCP surface.
+   *
+   * Output contract:
+   *  - No cycles  → SUCCESS textResult ("No circular imports found"), never
+   *    an error (per "Errors teach abandonment" — a clean graph is happy path).
+   *  - N > 0      → header with cycle count, then one numbered section per
+   *    cycle listing its file paths in DFS order. Cycles are sorted by first
+   *    path for deterministic output; the underlying result set is unchanged.
+   */
+  private async handleCheck(args: Record<string, unknown>): Promise<ToolResult> {
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const rawCycles = cg.findCircularDependencies();
+
+    if (rawCycles.length === 0) {
+      return this.textResult('No circular imports found.');
+    }
+
+    // Deterministic ordering for stable tests + readable output. Sort by the
+    // first path in each cycle; the DFS result set itself is unchanged.
+    const cycles = [...rawCycles].sort((x, y) => {
+      const a = x[0] ?? '';
+      const b = y[0] ?? '';
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+
+    const lines: string[] = [
+      `## Circular Imports — ${cycles.length} cycle${cycles.length === 1 ? '' : 's'} found`,
+      '',
+    ];
+    cycles.forEach((cycle, i) => {
+      lines.push(`### Cycle ${i + 1} (${cycle.length} files)`);
+      for (const p of cycle) lines.push(`- ${p}`);
+      // Close the loop visually: last file imports the first.
+      if (cycle.length > 1) lines.push(`- ↳ ${cycle[0]} (back to start)`);
+      lines.push('');
+    });
+
+    return this.textResult(this.truncateOutput(lines.join('\n').trim()));
   }
 
   /**
