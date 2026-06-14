@@ -199,8 +199,8 @@ export function matchFunctionRef(
   const bareFnOnly =
     ref.language === 'typescript' || ref.language === 'tsx' ||
     ref.language === 'javascript' || ref.language === 'jsx' ||
-    ref.language === 'cpp' || ref.language === 'python' ||
-    ref.language === 'php';
+    ref.language === 'cpp' || ref.language === 'cuda' ||
+    ref.language === 'python' || ref.language === 'php';
 
   // Qualified member-pointer (`&Widget::on_click` → "Widget::on_click"):
   // resolve the member ON THAT SCOPE — exempt from bareFnOnly (the `&Cls::m`
@@ -950,7 +950,7 @@ export function matchMethodCall(
 
   const [, objectOrClass, methodName] = match;
 
-  if (ref.language === 'cpp' && dotMatch) {
+  if ((ref.language === 'cpp' || ref.language === 'cuda') && dotMatch) {
     const inferredType = inferCppReceiverType(objectOrClass!, ref, context);
     if (inferredType) {
       const typedMatch = resolveMethodOnType(
@@ -1288,7 +1288,7 @@ export function matchReference(
   // 1b. C++ chained call whose receiver is another call — `Foo::instance().bar()`
   // encoded as `Foo::instance().bar` by the extractor (#645). Resolve the
   // receiver's type from what the inner call returns, then the method on it.
-  if (ref.language === 'cpp' || ref.language === 'c') {
+  if (ref.language === 'cpp' || ref.language === 'c' || ref.language === 'cuda') {
     result = matchCppCallChain(ref, context);
     if (result) return result;
   }

@@ -424,11 +424,11 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
   for (const cls of queries.getNodesByKind('class')) {
-    const subMethods = methodsOf(cls.id).filter((n) => n.language === 'cpp');
+    const subMethods = methodsOf(cls.id).filter((n) => n.language === 'cpp' || n.language === 'cuda');
     if (subMethods.length === 0) continue;
     for (const ext of queries.getOutgoingEdges(cls.id, ['extends'])) {
       const base = queries.getNodeById(ext.target);
-      if (!base || base.language !== 'cpp' || base.id === cls.id) continue;
+      if (!base || (base.language !== 'cpp' && base.language !== 'cuda') || base.id === cls.id) continue;
       const baseMethods = new Map(methodsOf(base.id).map((m) => [m.name, m]));
       let added = 0;
       for (const m of subMethods) {
