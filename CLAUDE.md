@@ -59,7 +59,7 @@ The public API surface is `src/index.ts` — the `CodeGraph` class wires all the
 - `src/sync/` — `FileWatcher` (native FSEvents/inotify/RDCW) with debounce + filter, and git-hook helpers.
 - `src/mcp/` — MCP server (`MCPServer`, `tools.ts`, `transport.ts`). `server-instructions.ts` is what the server returns in the MCP `initialize` response — keep it in sync with the user-facing tool guidance.
 - `src/installer/` — see below.
-- `src/bin/codegraph.ts` — CLI (commander). Subcommands: `install`, `init`, `uninit`, `index`, `sync`, `status`, `query`, `files`, `context`, `affected`, `serve --mcp`.
+- `src/bin/codegraph.ts` — CLI (commander). Subcommands: `install`, `uninstall`, `init`, `uninit`, `index`, `sync`, `status`, `unlock`, `query`, `explore`, `node`, `files`, `callers`, `callees`, `impact`, `affected`, `daemon`, `telemetry`, `upgrade`, `version`, `serve --mcp` (hidden).
 - `src/ui/` — terminal UI (shimmer progress, worker).
 
 ### NodeKind / EdgeKind
