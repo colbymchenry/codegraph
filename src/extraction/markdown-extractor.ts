@@ -49,6 +49,7 @@ export class MarkdownExtractor {
       this.extractHeadings(fileNode);
       this.extractStructuredBlocks(fileNode);
       this.extractLinksAndCommands(fileNode);
+      this.finalizeFileDigest(fileNode);
     } catch (error) {
       this.errors.push({
         message: `Markdown extraction error: ${error instanceof Error ? error.message : String(error)}`,
@@ -80,7 +81,9 @@ export class MarkdownExtractor {
       endLine: Math.max(1, this.lines.length),
       startColumn: 0,
       endColumn: this.lines[this.lines.length - 1]?.length || 0,
-      docstring: this.buildDocstring(1, Math.min(this.lines.length, 40)),
+      // docstring is filled in by finalizeFileDigest() once headings and
+      // references are known, so it becomes a triage-friendly digest.
+      docstring: undefined,
       updatedAt: Date.now(),
     };
 
@@ -90,18 +93,49 @@ export class MarkdownExtractor {
 
   private extractHeadings(fileNode: Node): void {
     const rawHeadings: Array<{ level: number; title: string; line: number; column: number }> = [];
+    const frontmatterEnd = this.frontmatterEndIndex();
+    let fenceMarker: string | null = null;
 
     for (let i = 0; i < this.lines.length; i++) {
+      if (i <= frontmatterEnd) continue;
       const line = this.lines[i]!;
-      const match = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
-      if (!match) continue;
 
-      rawHeadings.push({
-        level: match[1]!.length,
-        title: stripInlineMarkdown(match[2]!.trim()),
-        line: i + 1,
-        column: line.indexOf('#'),
-      });
+      // Track fenced code blocks so `# foo` comments and `===`/`---` lines
+      // inside a code sample are never mistaken for document headings.
+      const fence = /^(\s*)(`{3,}|~{3,})/.exec(line);
+      if (fence) {
+        const marker = fence[2]![0]!.repeat(fence[2]!.length);
+        if (fenceMarker === null) fenceMarker = marker;
+        else if (line.trimStart().startsWith(fenceMarker)) fenceMarker = null;
+        continue;
+      }
+      if (fenceMarker !== null) continue;
+
+      // ATX heading: `## Title`
+      const atx = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
+      if (atx) {
+        rawHeadings.push({
+          level: atx[1]!.length,
+          title: stripInlineMarkdown(atx[2]!.trim()),
+          line: i + 1,
+          column: line.indexOf('#'),
+        });
+        continue;
+      }
+
+      // Setext heading: a paragraph line underlined by `===` (level 1) or
+      // `---` (level 2). CommonMark treats a `---` directly under a paragraph
+      // as a heading, not a thematic break — and the frontmatter skip above
+      // keeps a closing `---` from turning its last key into a heading.
+      const underline = /^(=+|-+)\s*$/.exec(line.trim());
+      if (underline && i - 1 > frontmatterEnd && isSetextTextLine(this.lines[i - 1] ?? '')) {
+        rawHeadings.push({
+          level: underline[1]![0] === '=' ? 1 : 2,
+          title: stripInlineMarkdown((this.lines[i - 1] ?? '').trim()),
+          line: i, // the text line carries the heading
+          column: 0,
+        });
+      }
     }
 
     const slugCounts = new Map<string, number>();
@@ -583,10 +617,130 @@ export class MarkdownExtractor {
     if (!text) return undefined;
     return text.length > 600 ? `${text.slice(0, 600)}...` : text;
   }
+
+  /**
+   * Index of the closing `---` of a leading YAML frontmatter block, or -1 when
+   * the file has none. Lines at or before this index are metadata, not body —
+   * so they never produce headings and never seed the intro/digest.
+   */
+  private frontmatterEndIndex(): number {
+    if ((this.lines[0] ?? '').trim() !== '---') return -1;
+    for (let j = 1; j < this.lines.length; j++) {
+      if (this.lines[j]!.trim() === '---') return j;
+    }
+    return -1;
+  }
+
+  /**
+   * Replace the file node's docstring with a deterministic digest — a one-line
+   * "what is this doc about" intro plus the key files/symbols it references.
+   * It is derived purely from the already-extracted structure (no LLM), kept
+   * short enough to surface in node details, and — because docstrings are in
+   * the FTS index — makes a doc discoverable by the symbols it documents even
+   * when the query matches no heading or filename. See the reviewer thread on
+   * PR #361.
+   */
+  private finalizeFileDigest(fileNode: Node): void {
+    const intro = this.buildIntro();
+    const refs = this.collectKeyReferences();
+    const parts: string[] = [];
+    if (intro) parts.push(intro);
+    if (refs.length > 0) parts.push(`refs: ${refs.join(', ')}`);
+    const digest = parts.join('  ·  ').trim();
+    fileNode.docstring = digest || this.buildDocstring(1, Math.min(this.lines.length, 40));
+  }
+
+  /**
+   * First real prose line of the document — the closest deterministic stand-in
+   * for "what this file is about". Skips frontmatter, headings, fenced code,
+   * tables, badge/image-only lines, and raw HTML.
+   */
+  private buildIntro(): string | null {
+    let fenceMarker: string | null = null;
+    for (let i = this.frontmatterEndIndex() + 1; i < this.lines.length; i++) {
+      const trimmed = this.lines[i]!.trim();
+      const fence = /^(`{3,}|~{3,})/.exec(trimmed);
+      if (fence) {
+        const marker = fence[1]![0]!.repeat(fence[1]!.length);
+        fenceMarker = fenceMarker === null ? marker : (trimmed.startsWith(fenceMarker) ? null : fenceMarker);
+        continue;
+      }
+      if (fenceMarker !== null) continue;
+      if (!trimmed) continue;
+      if (/^#{1,6}\s/.test(trimmed)) continue;          // ATX heading
+      if (/^(=+|-+|\*{3,}|_{3,})\s*$/.test(trimmed)) continue; // setext underline / hr
+      if (trimmed.startsWith('|')) continue;             // table
+      if (/^!\[/.test(trimmed)) continue;                // image / badge line
+      if (/^<!--/.test(trimmed) || /^<[a-z]/i.test(trimmed)) continue; // html
+
+      const text = stripInlineMarkdown(trimmed.replace(/^[-*+]\s+/, '').replace(/^>\s?/, ''));
+      if (text) return truncateForSignature(text, 120);
+    }
+    return null;
+  }
+
+  /**
+   * The documents/symbols this file points at, de-duplicated and compacted
+   * (basename + `::symbol`/`#anchor`) in document order. Self-anchors and pure
+   * in-page links are dropped. Bounded so the whole digest stays short enough
+   * to display.
+   */
+  private collectKeyReferences(maxItems = 12, maxChars = 150): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    let budget = maxChars;
+    for (const ref of this.unresolvedReferences) {
+      const [pathSym] = splitAnchor(ref.referenceName);
+      const [pathPart] = splitFileSymbol(pathSym);
+      if (!pathPart || pathPart === this.filePath) continue; // pure/self anchor
+      const display = compactRefDisplay(ref.referenceName);
+      if (!display || seen.has(display)) continue;
+      if (out.length >= maxItems) break;
+      if (out.length > 0 && budget - display.length - 2 < 0) break;
+      seen.add(display);
+      out.push(display);
+      budget -= display.length + 2;
+    }
+    return out;
+  }
 }
 
 function normalizeRelativePath(filePath: string): string {
   return filePath.replace(/\\/g, '/');
+}
+
+/**
+ * Whether `line` can serve as the text of a Setext heading (the line sitting
+ * directly above a `===`/`---` underline). Excludes anything that is itself a
+ * block construct — blank lines, ATX headings, list items, blockquotes, table
+ * rows, fences, underlines/rules, and HTML comments.
+ */
+function isSetextTextLine(line: string): boolean {
+  const t = line.trim();
+  if (!t) return false;
+  if (/^#{1,6}\s/.test(t)) return false;          // ATX heading
+  if (/^[-*+]\s/.test(t)) return false;           // unordered list item
+  if (/^\d+[.)]\s/.test(t)) return false;         // ordered list item
+  if (t.startsWith('>') || t.startsWith('|')) return false; // blockquote / table
+  if (/^(`{3,}|~{3,})/.test(t)) return false;     // fence
+  if (/^(=+|-+|\*{3,}|_{3,})\s*$/.test(t)) return false; // underline / thematic break
+  if (/^<!--/.test(t)) return false;              // HTML comment
+  return true;
+}
+
+/**
+ * Compact a normalized reference target for the file digest: keep the basename
+ * of the path plus any `::symbol` or `#anchor` suffix (e.g.
+ * `phases/scripts/csv_search.py::run_p4` → `csv_search.py::run_p4`).
+ */
+function compactRefDisplay(referenceName: string): string | null {
+  const [pathSym, anchor] = splitAnchor(referenceName);
+  const [pathPart, symbol] = splitFileSymbol(pathSym);
+  if (!pathPart) return null;
+  const base = path.posix.basename(pathPart) || pathPart;
+  if (symbol) return `${base}::${symbol}`;
+  if (anchor) return `${base}#${anchor}`;
+  return base;
 }
 
 function stripInlineMarkdown(value: string): string {

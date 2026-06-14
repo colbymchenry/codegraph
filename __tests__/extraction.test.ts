@@ -228,6 +228,63 @@ node scripts/release.mjs
       ])
     );
   });
+
+  it('indexes Setext (underline) headings and skips frontmatter / code fences', () => {
+    const markdown = `---
+title: Config Doc
+---
+
+Architecture Overview
+=====================
+
+Intro paragraph for the overview.
+
+Routing Layer
+-------------
+
+\`\`\`md
+Not A Heading
+=============
+\`\`\`
+`;
+
+    const result = extractFromSource('docs/arch.md', markdown);
+    const headings = result.nodes.filter((n) => n.kind === 'module');
+    const byName = new Map(headings.map((h) => [h.name, h]));
+
+    // Setext H1 (===) and H2 (---) become module nodes.
+    expect(byName.get('Architecture Overview')?.signature).toBe('# Architecture Overview');
+    expect(byName.get('Routing Layer')?.signature).toBe('## Routing Layer');
+    // Frontmatter `title:` (above the closing `---`) is NOT a heading, and a
+    // setext-looking line inside a code fence is ignored.
+    expect(byName.has('title: Config Doc')).toBe(false);
+    expect(byName.has('Not A Heading')).toBe(false);
+  });
+
+  it('builds a deterministic, compact file digest (intro + key references)', () => {
+    const markdown = `# Release Runbook
+
+This runbook explains how to cut a release.
+
+See [setup](docs/setup.md#install) and run \`scripts/release.mjs\`.
+It dispatches \`scripts/csv_search.py::run_p4\`.
+`;
+
+    const result = extractFromSource('RUNBOOK.md', markdown);
+    const fileNode = result.nodes.find((n) => n.kind === 'file');
+
+    expect(fileNode?.docstring).toBeDefined();
+    const digest = fileNode!.docstring!;
+    // Intro is the first prose line, not the heading or a link blob.
+    expect(digest).toContain('This runbook explains how to cut a release.');
+    // Key referenced files/symbols are surfaced, compacted to basenames.
+    expect(digest).toContain('refs:');
+    expect(digest).toContain('setup.md#install');
+    expect(digest).toContain('release.mjs');
+    expect(digest).toContain('csv_search.py::run_p4');
+    // Short enough to show in node details (the < 200 char detail gate).
+    expect(digest.length).toBeLessThan(200);
+  });
 });
 
 describe('Code to Markdown Reference Extraction', () => {
