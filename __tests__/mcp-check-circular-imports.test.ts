@@ -58,4 +58,54 @@ describe('codegraph_check (circular import detection)', () => {
     expect(out).toContain('src/b.ts');
     expect(out).toMatch(/(1 cycle|cycles?:\s*1)/i);      // cycle count present
   });
+
+  /** Build an acyclic two-file graph: c.ts imports d.ts, d.ts imports nothing. */
+  async function withoutCycle(): Promise<void> {
+    fs.mkdirSync(path.join(dir, 'src'));
+    fs.writeFileSync(
+      path.join(dir, 'src', 'c.ts'),
+      "import { d } from './d';\nexport function c() { return d(); }\n",
+    );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'd.ts'),
+      "export function d() { return 42; }\n",
+    );
+    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+    h = new ToolHandler(cg);
+  }
+
+  it('reports a clean success message (not an error) when there are no cycles', async () => {
+    await withoutCycle();
+    const result = await h.execute('codegraph_check', {});
+    expect(result.isError).toBeFalsy();                 // happy path, never isError
+    const out = result.content.map((c) => (c as { text: string }).text).join('\n');
+    expect(out.toLowerCase()).toContain('no circular');
+  });
+
+  it('reports each cycle separately when more than one exists', async () => {
+    // Two independent cycles: x<->y in src/, and p<->q in other/.
+    fs.mkdirSync(path.join(dir, 'src'));
+    fs.mkdirSync(path.join(dir, 'other'));
+    fs.writeFileSync(path.join(dir, 'src', 'x.ts'),
+      "import { y } from './y';\nexport function x() { return y(); }\n");
+    fs.writeFileSync(path.join(dir, 'src', 'y.ts'),
+      "import { x } from './x';\nexport function y() { return x(); }\n");
+    fs.writeFileSync(path.join(dir, 'other', 'p.ts'),
+      "import { q } from './q';\nexport function p() { return q(); }\n");
+    fs.writeFileSync(path.join(dir, 'other', 'q.ts'),
+      "import { p } from './p';\nexport function q() { return p(); }\n");
+    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+    h = new ToolHandler(cg);
+
+    const out = await text({});
+    expect(out).toMatch(/2 cycles/i);
+    expect(out).toMatch(/Cycle 1/);
+    expect(out).toMatch(/Cycle 2/);
+    // All four files appear somewhere in the output.
+    for (const f of ['src/x.ts', 'src/y.ts', 'other/p.ts', 'other/q.ts']) {
+      expect(out).toContain(f);
+    }
+  });
 });
