@@ -102,6 +102,34 @@ function sendInitialize(child: ChildProcessWithoutNullStreams, rootUri: string, 
   });
 }
 
+function expectServerBranding(result: {
+  serverInfo: { name?: string; title?: string; icons?: Array<{ src?: string; mimeType?: string; sizes?: string[] }> };
+  _meta?: { icons?: unknown[] };
+}) {
+  expect(result.serverInfo.name).toBe('codegraph');
+  expect(result.serverInfo.title).toBe('CodeGraph');
+  expect(result.serverInfo.icons).toHaveLength(1);
+  const icon = result.serverInfo.icons![0]!;
+  expect(icon.mimeType).toBe('image/svg+xml');
+  expect(icon.sizes).toEqual(['32x32']);
+  expect(icon.src).toMatch(/^data:image\/svg\+xml;base64,/);
+  const encoded = icon.src!.replace(/^data:image\/svg\+xml;base64,/, '');
+  expect(Buffer.from(encoded, 'base64').toString('utf8')).toMatch(/^<svg\b/);
+  expect(result._meta?.icons).toEqual(result.serverInfo.icons);
+}
+
+function expectToolBranding(tool: {
+  icons?: Array<{ src?: string; mimeType?: string; sizes?: string[] }>;
+  _meta?: { icons?: unknown[] };
+}) {
+  expect(tool.icons).toHaveLength(1);
+  const icon = tool.icons![0]!;
+  expect(icon.mimeType).toBe('image/svg+xml');
+  expect(icon.sizes).toEqual(['32x32']);
+  expect(icon.src).toMatch(/^data:image\/svg\+xml;base64,/);
+  expect(tool._meta?.icons).toEqual(tool.icons);
+}
+
 /** Find a JSON-RPC response with the given id (result OR error) on stdout. */
 function findResponse(stdout: string[], id: number): any | null {
   for (const line of stdout) {
@@ -199,7 +227,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     servers.push(first);
     sendInitialize(first.child, `file://${tempDir}`, 1);
     const firstResp = await waitFor(() => findResponse(first.stdout, 1), 10000);
-    expect(firstResp.result.serverInfo.name).toBe('codegraph');
+    expectServerBranding(firstResp.result);
 
     // The launcher is a PROXY (not the daemon itself) — that's the detach fix.
     await waitFor(() => first.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
@@ -289,6 +317,9 @@ describe('Shared MCP daemon (issue #411)', () => {
     const toolsResp = await waitFor(() => findResponse(second.stdout, 2), 10000);
     expect(Array.isArray(toolsResp.result.tools)).toBe(true);
     expect(toolsResp.result.tools.length).toBeGreaterThan(0);
+    for (const tool of toolsResp.result.tools) {
+      expectToolBranding(tool);
+    }
   }, 45000);
 
   it('CODEGRAPH_NO_DAEMON=1 keeps each process independent (no socket/pidfile)', async () => {

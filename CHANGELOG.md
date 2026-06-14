@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph's MCP server now advertises a human-readable title and embedded icon metadata during `initialize` and `tools/list`, so MCP clients that render source or tool branding can show the CodeGraph name and icon instead of generic badges.
 
 ## [1.0.1] - 2026-06-13
 
