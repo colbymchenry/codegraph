@@ -1359,6 +1359,50 @@ func main() {
       expect(legacyCallers.some((c) => c.node.filePath === 'src/main.ts')).toBe(false);
     });
 
+    it('does not match a wildcard alias when the import has no segment for `*` (prefix/suffix overlap)', async () => {
+      // Pattern `@x/*/index` -> prefix `@x/`, suffix `/index`. An import of
+      // `@x/index` has nothing in the `*` slot, so it must NOT resolve via
+      // this alias. Previously startsWith(prefix) && endsWith(suffix) both
+      // passed for the single shared `/`, producing a bogus mapped target.
+      fs.mkdirSync(path.join(tempDir, 'src/widgets/button'), { recursive: true });
+      // The file the BOGUS rewrite would point at (`widgets/index`). If the
+      // alias wrongly matches `@x/index`, the call would attach here.
+      fs.writeFileSync(
+        path.join(tempDir, 'src/widgets/index.ts'),
+        `export function trap(): number { return 0; }\n`
+      );
+      // A real relative-resolvable target for the bare import.
+      fs.writeFileSync(
+        path.join(tempDir, 'src/index.ts'),
+        `export function trap(): number { return 1; }\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src/main.ts'),
+        `import { trap } from '@x/index';\nexport function go(): number { return trap(); }\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'tsconfig.json'),
+        JSON.stringify({
+          compilerOptions: {
+            baseUrl: './src',
+            paths: { '@x/*/index': ['widgets/*/index'] },
+          },
+        })
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      // The widgets/index.ts `trap` must NOT receive a caller from main.ts
+      // via the overlapping-alias false match.
+      const widgetsTrap = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'trap' && n.filePath === 'src/widgets/index.ts');
+      expect(widgetsTrap).toBeDefined();
+      const bogusCallers = cg.getCallers(widgetsTrap!.id);
+      expect(bogusCallers.some((c) => c.node.filePath === 'src/main.ts')).toBe(false);
+    });
+
     it('falls back gracefully when tsconfig is absent', async () => {
       fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
       fs.writeFileSync(

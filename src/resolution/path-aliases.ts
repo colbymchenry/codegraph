@@ -219,6 +219,14 @@ export function applyAliases(
 
     let captured = '';
     if (pat.hasWildcard) {
+      // The prefix and suffix must occupy DISJOINT regions of the import
+      // path. When they overlap (the import is shorter than prefix+suffix),
+      // `startsWith` and `endsWith` can both be satisfied by the same
+      // characters — e.g. pattern `src/*/index` (prefix `src/`, suffix
+      // `/index`) would otherwise falsely match `src/index`, whose single
+      // `/` is counted as both the prefix's and the suffix's slash. Such an
+      // import has no wildcard segment, so it must not match.
+      if (importPath.length < pat.prefix.length + pat.suffix.length) continue;
       captured = importPath.slice(pat.prefix.length, importPath.length - pat.suffix.length);
     } else if (importPath !== pat.prefix) {
       // Literal pattern must match exactly.
