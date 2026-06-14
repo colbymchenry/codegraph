@@ -108,4 +108,16 @@ describe('codegraph_check (circular import detection)', () => {
       expect(out).toContain(f);
     }
   });
+
+  it('is callable directly but NOT listed in the default tool surface', async () => {
+    await withoutCycle();
+    const result = await h.execute('codegraph_check', {});
+    expect(result.isError).toBeFalsy();                       // callable
+
+    // Default surface (no cg armed): the 4-tool trim. codegraph_check is
+    // intentionally absent here — agents won't see it in tools/list unless
+    // CODEGRAPH_MCP_TOOLS re-enables it.
+    const unlisted = new ToolHandler(null).getTools().map((t) => t.name);
+    expect(unlisted).not.toContain('codegraph_check');
+  });
 });
