@@ -29,6 +29,7 @@ import {
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { scanDynamicDispatch } from './dynamic-boundaries';
+import { SERVER_ICON } from './branding';
 
 /**
  * An expected, recoverable "codegraph can't serve this" condition — most
@@ -352,7 +353,12 @@ export function formatStaleFooter(stale: PendingFile[]): string {
  */
 export interface ToolDefinition {
   name: string;
+  title?: string;
   description: string;
+  icons?: readonly [typeof SERVER_ICON];
+  _meta?: {
+    icons?: readonly [typeof SERVER_ICON];
+  };
   inputSchema: {
     type: 'object';
     properties: Record<string, PropertySchema>;
@@ -386,6 +392,16 @@ const projectPathProperty: PropertySchema = {
   description: 'Path to a different project with .codegraph/ initialized. If omitted, uses current project. Use this to query other codebases.',
 };
 
+function withCodeGraphBranding(
+  toolList: Array<Omit<ToolDefinition, 'icons' | '_meta'>>
+): ToolDefinition[] {
+  return toolList.map(tool => ({
+    ...tool,
+    icons: [SERVER_ICON],
+    _meta: { icons: [SERVER_ICON] },
+  }));
+}
+
 /**
  * All CodeGraph MCP tools
  *
@@ -395,7 +411,7 @@ const projectPathProperty: PropertySchema = {
  *
  * All tools support cross-project queries via the optional `projectPath` parameter.
  */
-export const tools: ToolDefinition[] = [
+export const tools: ToolDefinition[] = withCodeGraphBranding([
   {
     name: 'codegraph_search',
     description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_explore instead to get the actual source / understand an area in one call.',
@@ -597,7 +613,7 @@ export const tools: ToolDefinition[] = [
       },
     },
   },
-];
+]);
 
 /**
  * Allowlist-filtered tool definitions WITHOUT an engine — the static surface the

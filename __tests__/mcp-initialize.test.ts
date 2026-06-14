@@ -49,6 +49,22 @@ function sendInitialize(child: ChildProcessWithoutNullStreams, projectPath: stri
   child.stdin.write(msg + '\n');
 }
 
+function expectServerBranding(result: {
+  serverInfo: { name?: string; title?: string; icons?: Array<{ src?: string; mimeType?: string; sizes?: string }> };
+  _meta?: { icons?: unknown[] };
+}) {
+  expect(result.serverInfo.name).toBe('codegraph');
+  expect(result.serverInfo.title).toBe('CodeGraph');
+  expect(result.serverInfo.icons).toHaveLength(1);
+  const icon = result.serverInfo.icons![0]!;
+  expect(icon.mimeType).toBe('image/svg+xml');
+  expect(icon.sizes).toBe('32x32');
+  expect(icon.src).toMatch(/^data:image\/svg\+xml;base64,/);
+  const encoded = icon.src!.replace(/^data:image\/svg\+xml;base64,/, '');
+  expect(Buffer.from(encoded, 'base64').toString('utf8')).toMatch(/^<svg\b/);
+  expect(result._meta?.icons).toEqual(result.serverInfo.icons);
+}
+
 /**
  * Collect stdout lines and stderr text from the child, tagging each piece
  * with a monotonic sequence number. Lets us assert ordering between the
@@ -125,6 +141,7 @@ describe('MCP initialize handshake (issue #172)', () => {
     expect(json.id).toBe(0);
     expect(json.result.protocolVersion).toBeDefined();
     expect(json.result.capabilities.tools).toBeDefined();
+    expectServerBranding(json.result);
   }, 10000);
 
   it('sends initialize response BEFORE tryInitializeDefault finishes', async () => {
@@ -152,7 +169,7 @@ describe('MCP initialize handshake (issue #172)', () => {
     expect(response.seq).toBeLessThan(watcherLog.seq);
     const json = JSON.parse(response.text);
     expect(json.id).toBe(0);
-    expect(json.result.serverInfo.name).toBe('codegraph');
+    expectServerBranding(json.result);
   }, 20000);
 
   it('answers resources/list and prompts/list with empty lists, not -32601 (issue #621)', async () => {

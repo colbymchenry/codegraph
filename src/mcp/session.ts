@@ -17,23 +17,22 @@ import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } fro
 import { MCPEngine } from './engine';
 import { tools } from './tools';
 import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_UNINDEXED } from './server-instructions';
-import { CodeGraphPackageVersion } from './version';
+import { SERVER_INFO, SERVER_META } from './branding';
 import { findNearestCodeGraphRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
 
-/**
- * MCP Server Info — kept on the session because some clients log it. The
- * version tracks the real package version (was a hard-coded '0.1.0').
- */
-// Exported so the proxy can answer `initialize` locally with the IDENTICAL
-// payload the daemon would send — no drift between the two handshake paths.
-export const SERVER_INFO = {
-  name: 'codegraph',
-  version: CodeGraphPackageVersion,
-};
-
 /** MCP Protocol Version (latest the server claims). */
 export const PROTOCOL_VERSION = '2024-11-05';
+
+export function buildInitializeResult(instructions: string) {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    capabilities: { tools: {} },
+    serverInfo: SERVER_INFO,
+    _meta: SERVER_META,
+    instructions,
+  };
+}
 
 /**
  * How long to wait for the client's `roots/list` response before giving up
@@ -202,12 +201,10 @@ export class MCPSession {
     const indexed = findNearestCodeGraphRoot(explicitPath ?? process.cwd()) !== null;
 
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.
-    this.transport.sendResult(request.id, {
-      protocolVersion: PROTOCOL_VERSION,
-      capabilities: { tools: {} },
-      serverInfo: SERVER_INFO,
-      instructions: indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_UNINDEXED,
-    });
+    this.transport.sendResult(
+      request.id,
+      buildInitializeResult(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_UNINDEXED),
+    );
 
     if (explicitPath) {
       // Kick off engine init in the background. If another session in the

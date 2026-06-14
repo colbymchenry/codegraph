@@ -82,6 +82,18 @@ function initializeParams(projectPath: string) {
   };
 }
 
+function expectToolBranding(tool: {
+  icons?: Array<{ src?: string; mimeType?: string; sizes?: string }>;
+  _meta?: { icons?: unknown[] };
+}) {
+  expect(tool.icons).toHaveLength(1);
+  const icon = tool.icons![0]!;
+  expect(icon.mimeType).toBe('image/svg+xml');
+  expect(icon.sizes).toBe('32x32');
+  expect(icon.src).toMatch(/^data:image\/svg\+xml;base64,/);
+  expect(tool._meta?.icons).toEqual(tool.icons);
+}
+
 describe('Unindexed-workspace session policy', () => {
   let tempDir: string;
   let child: ChildProcessWithoutNullStreams | null = null;
@@ -112,7 +124,10 @@ describe('Unindexed-workspace session policy', () => {
 
     const res = await request(child, { id: 0, method: 'initialize', params: initializeParams(tempDir) });
     const instructions = (res.result as { instructions: string }).instructions;
+    const result = res.result as { serverInfo: { title?: string; icons?: unknown[] }; _meta?: { icons?: unknown[] } };
 
+    expect(result.serverInfo.title).toBe('CodeGraph');
+    expect(result._meta?.icons).toEqual(result.serverInfo.icons);
     expect(instructions).toMatch(/inactive/i);
     expect(instructions).toMatch(/codegraph init/);
     // The full playbook must NOT be sent into a session where every call fails
@@ -140,12 +155,21 @@ describe('Unindexed-workspace session policy', () => {
     expect(instructions).not.toMatch(/inactive/i);
 
     const list = await request(child, { id: 1, method: 'tools/list' });
-    const tools = (list.result as { tools: Array<{ name: string }> }).tools;
+    const tools = (list.result as {
+      tools: Array<{
+        name: string;
+        icons?: Array<{ src?: string; mimeType?: string; sizes?: string }>;
+        _meta?: { icons?: unknown[] };
+      }>;
+    }).tools;
     // A 1-file project triggers the pre-existing tiny-repo tool gating (a
     // reduced core set) — the contract under test is "indexed → tools are
     // PRESENT", in contrast to the unindexed empty list above.
     expect(tools.length).toBeGreaterThanOrEqual(3);
     expect(tools.map((t) => t.name)).toContain('codegraph_explore');
+    for (const tool of tools) {
+      expectToolBranding(tool);
+    }
   });
 });
 
