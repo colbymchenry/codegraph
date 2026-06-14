@@ -64,6 +64,31 @@ describe('multi-repo workspaces (#514)', () => {
     expect(files).toContain('tools.ts'); // the parent's own tracked code still indexes
   });
 
+  it('excludes linked git worktrees nested under the repo, but keeps genuine embedded repos', () => {
+    // Main repo with a tracked file; .worktrees/ is gitignored (the common
+    // place tools put linked worktrees).
+    write(path.join(ws, 'src/app.ts'), 'export function app() { return 1; }\n');
+    write(path.join(ws, '.gitignore'), '/.worktrees/\n');
+    makeRepo(ws);
+
+    // A REAL linked worktree: its `.git` is a file pointing into
+    // ws/.git/worktrees/<id>, and it holds a full copy of the SAME repo's
+    // tracked files — re-indexing it duplicates every symbol N times.
+    git(ws, 'worktree', 'add', '-q', '-b', 'wt-branch', path.join(ws, '.worktrees/wt'));
+
+    // A genuine independent repo under the same ignored dir MUST still be
+    // discovered (#514 must not regress).
+    write(path.join(ws, '.worktrees/real-embed/src/lib.ts'), 'export function lib() {}\n');
+    makeRepo(path.join(ws, '.worktrees/real-embed'));
+
+    const files = scanDirectory(ws);
+    expect(files).toContain('src/app.ts'); // the main checkout indexes normally
+    // the linked worktree's copy is NOT re-indexed (no symbol duplication)
+    expect(files.some((f) => f.startsWith('.worktrees/wt/'))).toBe(false);
+    // a real embedded repo in the same ignored dir is still picked up
+    expect(files).toContain('.worktrees/real-embed/src/lib.ts');
+  });
+
   it('keeps respecting the parent .gitignore for the parent own (non-repo) dirs', () => {
     write(path.join(ws, 'scratch/junk.ts'), 'export function junk() { return 9; }\n');
     write(path.join(ws, 'src/app.ts'), 'export function app() { return 1; }\n');

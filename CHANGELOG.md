@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **Linked git worktrees parked inside a repo are no longer indexed as separate projects.** When you keep `git worktree add` checkouts in a gitignored subdir (`.worktrees/`, `.claude/worktrees/`, …), the embedded-repo discovery (#514) treated each worktree as its own repo and re-indexed it — duplicating every symbol once per worktree (an N-worktree repo ballooned the index ~Nx and made `query`/`callers`/`impact` return N copies of each result). CodeGraph now detects a linked worktree (its `.git` is a file resolving into another repo's `worktrees/<id>` admin dir) and skips it, since it's the same repo as the main checkout. Submodules and genuine embedded repos are unaffected.
+
 
 ## [1.0.0] - 2026-06-12
 

@@ -281,11 +281,36 @@ const EMBEDDED_REPO_SEARCH_DEPTH = 4;
 const EMBEDDED_REPO_SEARCH_ENTRIES = 2000;
 
 /**
+ * True if `dotGitPath` is a *linked git worktree* pointer — a `.git` FILE whose
+ * `gitdir:` resolves into another repo's `worktrees/<id>` admin dir. Such a
+ * worktree is a second checkout of an ALREADY-indexed repo (the main checkout),
+ * not an independent project, so the indexer must not re-walk it — doing so
+ * duplicates every symbol once per worktree. Workflows that park linked
+ * worktrees in a gitignored subdir (`.worktrees/`, `.claude/worktrees/`, …) are
+ * common, and the embedded-repo discovery (#514) would otherwise treat each as
+ * its own repo. A submodule pointer (`gitdir: …/modules/<id>`) and a genuine
+ * embedded repo (`.git` is a directory) both return false, so neither is
+ * affected.
+ */
+function isLinkedWorktree(dotGitPath: string): boolean {
+  try {
+    if (!fs.lstatSync(dotGitPath).isFile()) return false;
+    const m = /^gitdir:\s*(.+)$/m.exec(fs.readFileSync(dotGitPath, 'utf-8'));
+    if (!m) return false;
+    return /(^|[\\/])worktrees[\\/]/.test((m[1] ?? '').trim());
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Find git repositories nested under `absDir` (inclusive), shallow bounded BFS.
  * Stops descending at each repo root found — contents belong to that repo's own
  * enumeration. Skips default-ignored dirs (`node_modules` can contain `.git`
- * from npm git-dependencies — that never makes it project code) and CodeGraph
- * data dirs. Depth- and entry-capped so a huge ignored tree can't stall the scan.
+ * from npm git-dependencies — that never makes it project code), CodeGraph
+ * data dirs, and linked git worktrees (same repo as the main checkout — see
+ * isLinkedWorktree). Depth- and entry-capped so a huge ignored tree can't stall
+ * the scan.
  */
 function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
   const found: string[] = [];
@@ -300,8 +325,12 @@ function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
       logDebug('Embedded-repo search entry cap hit — deeper repos (if any) not discovered', { under: relPrefix });
       break;
     }
-    if (fs.existsSync(path.join(abs, '.git'))) {
-      found.push(rel);
+    const dotGit = path.join(abs, '.git');
+    if (fs.existsSync(dotGit)) {
+      // A linked worktree is the same repo as the main checkout (already
+      // indexed) — record nothing so it isn't re-walked, but still stop
+      // descending: its contents belong to that worktree, not the parent.
+      if (!isLinkedWorktree(dotGit)) found.push(rel);
       continue; // its own git handles everything below
     }
     if (depth >= EMBEDDED_REPO_SEARCH_DEPTH) continue;
