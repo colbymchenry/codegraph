@@ -39,6 +39,7 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   java: javaExtractor,
   c: cExtractor,
   cpp: cppExtractor,
+  cuda: cppExtractor,
   csharp: csharpExtractor,
   php: phpExtractor,
   ruby: rubyExtractor,

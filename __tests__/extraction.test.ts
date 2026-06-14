@@ -10,7 +10,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore } from '../src/extraction';
-import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
+import { detectLanguage, isLanguageSupported, getSupportedLanguages, isGrammarLoaded, isFileLevelOnlyLanguage, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -7158,6 +7158,153 @@ GeomPoint <- ggproto("GeomPoint", Geom,
       expect(ext?.fromNodeId).toBe(cls?.id);
       // No twin variable for the assignment.
       expect(result.nodes.find((n) => n.name === 'GeomPoint' && n.kind === 'variable')).toBeUndefined();
+    });
+  });
+});
+
+// =============================================================================
+// SCL (IEC 61131-3 Structured Text) — file-level-only
+// =============================================================================
+
+describe('SCL (IEC 61131-3 ST)', () => {
+  describe('Language detection', () => {
+    it('should detect SCL files by extension', () => {
+      expect(detectLanguage('main.scl')).toBe('scl');
+      expect(detectLanguage('control.st')).toBe('scl');
+      expect(detectLanguage('src/plc/axis.scl')).toBe('scl');
+    });
+
+    it('should report SCL as supported', () => {
+      expect(isLanguageSupported('scl')).toBe(true);
+      expect(getSupportedLanguages()).toContain('scl');
+    });
+
+    it('should report SCL grammar as loaded (file-level-only, no WASM needed)', () => {
+      expect(isGrammarLoaded('scl')).toBe(true);
+    });
+
+    it('should recognize SCL as file-level-only language', () => {
+      expect(isFileLevelOnlyLanguage('scl')).toBe(true);
+    });
+
+    it('should track SCL source files (no errors for file-level-only)', () => {
+      const code = `FUNCTION_BLOCK Motor\nVAR\n  speed : INT;\nEND_VAR\nspeed := 100;\nEND_FUNCTION_BLOCK`;
+      const result = extractFromSource('motor.scl', code);
+      expect(result.errors).toHaveLength(0);
+    });
+  });
+
+  describe('File-level tracking', () => {
+    it('should index SCL files as file records with zero symbol nodes', async () => {
+      const tempDir = createTempDir();
+      try {
+        fs.writeFileSync(path.join(tempDir, 'motor.scl'), 'FUNCTION_BLOCK Motor\nVAR speed : INT; END_VAR\nEND_FUNCTION_BLOCK\n');
+        fs.writeFileSync(path.join(tempDir, 'conveyor.st'), 'PROGRAM Conveyor\nVAR state : BOOL; END_VAR\nEND_PROGRAM\n');
+
+        const cg = CodeGraph.initSync(tempDir);
+        const result = await cg.indexAll();
+
+        expect(result.success).toBe(true);
+        expect(result.filesIndexed).toBe(2);
+
+        const files = cg.getFiles();
+        expect(files.length).toBe(2);
+        const pathsAndLangs = files.map((f: any) => `${f.path}:${f.language}`).sort();
+        // Normalize path separators for cross-platform
+        const normalized = pathsAndLangs.map((p: string) => p.replace(/\\/g, '/'));
+        expect(normalized).toEqual(['conveyor.st:scl', 'motor.scl:scl']);
+
+        // SCL files produce zero symbol nodes
+        const symbols = cg.getNodesInFile('motor.scl');
+        expect(symbols).toHaveLength(0);
+
+        cg.close();
+      } finally {
+        cleanupTempDir(tempDir);
+      }
+    });
+  });
+});
+
+// =============================================================================
+// CUDA (C++ dialect, reuses tree-sitter-cpp.wasm)
+// =============================================================================
+
+describe('CUDA', () => {
+  describe('Language detection', () => {
+    it('should detect CUDA files by extension', () => {
+      expect(detectLanguage('kernel.cu')).toBe('cuda');
+      expect(detectLanguage('common.cuh')).toBe('cuda');
+      expect(detectLanguage('cuda/kernel.cu')).toBe('cuda');
+    });
+
+    it('should report CUDA as supported', () => {
+      expect(isLanguageSupported('cuda')).toBe(true);
+      expect(getSupportedLanguages()).toContain('cuda');
+    });
+  });
+
+  describe('Extraction', () => {
+    it('should extract functions from a CUDA kernel file (fixture)', () => {
+      const fixturePath = path.join(__dirname, 'fixtures', 'cuda', 'selective_scan.cu');
+      const code = fs.readFileSync(fixturePath, 'utf-8');
+      const result = extractFromSource('selective_scan.cu', code);
+
+      // File node should be present with correct language
+      const fileNode = result.nodes.find((n) => n.kind === 'file');
+      expect(fileNode).toBeDefined();
+      expect(fileNode?.language).toBe('cuda');
+
+      // Should extract the __global__ kernel function
+      const kernelFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'selective_scan_kernel');
+      expect(kernelFn).toBeDefined();
+      expect(kernelFn?.language).toBe('cuda');
+
+      // Should extract the __host__ launch function
+      const hostFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'launch_selective_scan');
+      expect(hostFn).toBeDefined();
+      expect(hostFn?.language).toBe('cuda');
+    });
+
+    it('should extract #include as import nodes', () => {
+      const code = '#include <cuda_runtime.h>\n__global__ void kernel() {}\n';
+      const result = extractFromSource('kernel.cu', code);
+
+      const importNode = result.nodes.find((n) => n.kind === 'import');
+      expect(importNode).toBeDefined();
+      expect(importNode?.name).toBe('cuda_runtime.h');
+
+      const importRef = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'cuda_runtime.h'
+      );
+      expect(importRef).toBeDefined();
+    });
+
+    it('should extract function calls within CUDA code', () => {
+      const code = `
+__global__ void kernel(float* data, int n) {
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if (idx < n) data[idx] = idx;
+}
+
+void launch() {
+  // NOTE: tree-sitter-cpp misparses the triple-angle-bracket kernel launch
+  // syntax <<<grid,block>>> as nested shift operators, so a plain
+  // function call is used for testing instead of the launch expression.
+  cudaDeviceSynchronize();
+}
+`;
+      const result = extractFromSource('simple.cu', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.some((c) => c.referenceName === 'cudaDeviceSynchronize')).toBe(true);
+    });
+
+    it('should extract struct definitions from CUDA headers', () => {
+      const code = 'struct GPUKernelParams { int threads; int blocks; float shared_mem; };\n';
+      const result = extractFromSource('params.cuh', code);
+      const structNode = result.nodes.find((n) => n.kind === 'struct' && n.name === 'GPUKernelParams');
+      expect(structNode).toBeDefined();
+      expect(structNode?.language).toBe('cuda');
     });
   });
 });

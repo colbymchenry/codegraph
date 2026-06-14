@@ -74,6 +74,8 @@ export const LANGUAGES = [
   'java',
   'c',
   'cpp',
+  'cuda',
+  'scl',
   'csharp',
   'razor',
   'php',
