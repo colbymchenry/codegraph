@@ -400,6 +400,11 @@ export class CodeGraph {
           const after = this.queries.getNodeAndEdgeCount();
           result.nodesCreated = after.nodes - before.nodes;
           result.edgesCreated = after.edges - before.edges;
+          // Absolute totals so the CLI can report the real index size even
+          // when this run's net delta is 0 (re-index of unchanged files). See
+          // IndexResult.totalNodes / #874.
+          result.totalNodes = after.nodes;
+          result.totalEdges = after.edges;
         }
 
         // Stamp the index with the engine that built it, so `codegraph status`
