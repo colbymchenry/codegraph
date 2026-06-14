@@ -10,6 +10,23 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 
+## [1.0.1] - 2026-06-13
+
+### New Features
+
+- New `codegraph daemon` command (alias `daemons`) — an interactive manager for the background daemons. It shows what's running (your current project's daemon first, pre-selected), and you arrow-key to one and press enter to stop it, or pick "Stop all". Previously the only way to shut a daemon down was to hunt for its pid and `kill` it by hand. (#845)
+- Checking your installed version is now easy to reach however you guess at it: `codegraph version`, `codegraph -v`, and `codegraph -version` all print it, alongside the existing `codegraph --version`. (#864)
+- The CodeGraph MCP server now self-heals if its main thread ever locks up. A lightweight watchdog notices when the process has stopped responding and stops it so a fresh one starts on your next request — it can no longer sit pinned at 100% CPU with no way to recover. Tune the detection window with `CODEGRAPH_WATCHDOG_TIMEOUT_MS`, or turn it off entirely with `CODEGRAPH_NO_WATCHDOG=1`. (#850)
+
+### Fixes
+
+- Git worktrees nested inside your project — like the `.claude/worktrees/` that Claude Code creates — are no longer indexed as duplicate copies of your whole codebase. CodeGraph deliberately indexes genuine embedded repos (a real second project checked out inside yours), but a worktree is just another working view of a repo it already indexed, so each one was multiplying every symbol — one report went from ~1,850 files to over 24,000, with search and `explore` flooded by stale duplicates. CodeGraph now recognizes worktrees and skips them, while still indexing real embedded repos and submodules. Thanks @tphakala. (#848)
+- Running `codegraph serve --mcp` by hand no longer just hangs in silence. That command is the MCP server your AI agent starts for itself — not a step you run directly — and in a terminal it used to sit there waiting for input that never comes, looking broken. It now recognizes when a person runs it and explains what to do instead (`codegraph status`, `codegraph daemon`), and it's been dropped from the command listing so it stops looking like something you need to launch.
+- Cross-file static method calls like `ClassName.staticMethod()` now resolve correctly. CodeGraph was linking the call to the *class* instead of the method (and recording it as a construction), so `callers` and `impact` for a static method came back empty — a real blind spot in TypeScript and JavaScript codebases that lean on static utility classes (Python and other languages with the same call shape benefit too). The call now links to the method itself. Thanks @contextFlow-lab. (#825)
+- `codegraph affected` now accepts `./`-prefixed and absolute file paths, not just bare project-relative ones. Passing `./src/x.ts` or an absolute path — common when the file list comes from another tool — used to silently match nothing and report no affected tests. Thanks @contextFlow-lab. (#825)
+- The CodeGraph MCP server no longer risks getting stuck at 100% CPU after an unexpected internal error. Previously such an error was logged but the process was left running in a broken state, where it could spin a CPU core indefinitely and had to be killed by hand. The server now logs the error and exits cleanly, so a fresh one starts on the next request. Thanks @songhlc. (#850)
+- CodeGraph no longer indexes your entire home directory by accident. Running the installer — or `codegraph init` / `codegraph index` — from your home folder or a filesystem root would index everything underneath it (caches, `Library`, every other project), producing a multi-gigabyte index and constant file-watching churn. CodeGraph now refuses these roots and points you at a specific project instead; pass `--force` if you genuinely mean to. (Combined with the macOS file-descriptor fix already in 1.0.0, this closes the report of a runaway watcher exhausting the system file limit.) Thanks @ligson. (#845)
+
 ## [1.0.0] - 2026-06-12
 
 ### Security
@@ -393,3 +410,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [0.9.8]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.8
 [0.9.9]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.9
 [1.0.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.0.0
+[1.0.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.0.1

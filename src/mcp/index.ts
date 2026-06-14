@@ -51,6 +51,7 @@ import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import { getDaemonSocketPath } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
 import { supervisionLostReason } from './ppid-watchdog';
+import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
@@ -220,6 +221,9 @@ export class MCPServer {
   private engine: MCPEngine | null = null;
   private daemon: Daemon | null = null;
   private ppidWatchdog: ReturnType<typeof setInterval> | null = null;
+  // Worker-thread liveness watchdog (#850). Long-lived modes only; SIGKILLs the
+  // process if the main thread wedges in a non-yielding sync loop.
+  private livenessWatchdog: WatchdogHandle | null = null;
   // PPID watchdog baseline — captured at construction so we always have a
   // baseline, even if start() runs after a fork-style reparent.
   private originalPpid: number = process.ppid;
@@ -300,6 +304,10 @@ export class MCPServer {
       clearInterval(this.ppidWatchdog);
       this.ppidWatchdog = null;
     }
+    if (this.livenessWatchdog) {
+      this.livenessWatchdog.stop();
+      this.livenessWatchdog = null;
+    }
     if (this.daemon) {
       void this.daemon.stop('stop()');
       // Daemon.stop calls process.exit; nothing else to do.
@@ -345,6 +353,7 @@ export class MCPServer {
     this.mode = 'direct';
     this.installSignalHandlers();
     this.installPpidWatchdog();
+    this.livenessWatchdog = installMainThreadWatchdog();
   }
 
   /**
@@ -366,6 +375,10 @@ export class MCPServer {
         await daemon.start();
         this.daemon = daemon;
         this.mode = 'daemon';
+        // The detached daemon has no PPID watchdog or stdin lifeline, so a
+        // wedged main thread would pin a core forever (#850). The liveness
+        // watchdog is its only recovery path.
+        this.livenessWatchdog = installMainThreadWatchdog();
         return; // the net.Server keeps the process alive
       }
 

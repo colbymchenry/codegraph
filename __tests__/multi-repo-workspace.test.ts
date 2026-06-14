@@ -108,6 +108,29 @@ describe('multi-repo workspaces (#514)', () => {
     expect(files).toContain('main.ts');
   });
 
+  it('skips nested git worktrees instead of indexing them as duplicate embedded repos (#848)', () => {
+    // Claude Code (and others) create worktrees under a gitignored path like
+    // `.claude/worktrees/<name>/`. A worktree's `.git` is a FILE pointing into
+    // the host repo's own `.git/worktrees/`, so it is the SAME repo already
+    // indexed — sweeping it in as an embedded repo multiplies the whole graph.
+    // A genuine embedded clone (a `.git` *directory*) must still be indexed.
+    write(path.join(ws, 'src/app.ts'), 'export function app() { return 1; }\n');
+    write(path.join(ws, '.gitignore'), '.claude/\nvendored/\n');
+    makeRepo(ws);
+    // A real linked worktree under the gitignored .claude/worktrees/.
+    git(ws, 'worktree', 'add', '-q', '.claude/worktrees/feature', '-b', 'feature');
+    // A genuine embedded clone, also gitignored — must STAY indexed (#514).
+    write(path.join(ws, 'vendored/lib.ts'), 'export function vendoredFn() { return 9; }\n');
+    makeRepo(path.join(ws, 'vendored'));
+
+    const files = scanDirectory(ws);
+    expect(files).toContain('src/app.ts');
+    // The worktree is a duplicate working view — never indexed.
+    expect(files.some((f) => f.includes('.claude/worktrees'))).toBe(false);
+    // The genuine embedded clone is still indexed (#514/#622 preserved).
+    expect(files).toContain('vendored/lib.ts');
+  });
+
   it('non-git workspace: walks children and respects each child own .gitignore', () => {
     write(path.join(ws, 'proj-a/src/auth.ts'), 'export function login() {}\n');
     write(path.join(ws, 'proj-a/build/out.ts'), 'export function generated() {}\n');

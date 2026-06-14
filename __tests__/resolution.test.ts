@@ -768,6 +768,46 @@ def bootstrap():
       expect(callsToUserService).toHaveLength(0);
     });
 
+    it('resolves a cross-file static method call to the method, not the class (#825)', async () => {
+      // `Foo.bar()` where `Foo` is an imported class must link to the static
+      // method `Foo::bar`, NOT to the class `Foo`. Previously the import
+      // resolver dropped the `.bar` member and resolved to `Foo`, which the
+      // calls→instantiates promotion then turned into `run instantiates Foo`,
+      // leaving the static method with zero callers and a hollow impact radius.
+      fs.writeFileSync(
+        path.join(tempDir, 'helpers.ts'),
+        `export class Foo {\n  static bar(x: number) { return x + 1; }\n}\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'caller.ts'),
+        `import { Foo } from './helpers';\nexport function run() { return Foo.bar(41); }\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const bar = cg.getNodesByKind('method').find((n) => n.name === 'bar');
+      const foo = cg.getNodesByKind('class').find((n) => n.name === 'Foo');
+      const run = cg.getNodesByKind('function').find((n) => n.name === 'run');
+      expect(bar).toBeDefined();
+      expect(foo).toBeDefined();
+      expect(run).toBeDefined();
+
+      // `run` is reported as a caller of the static method `Foo.bar`.
+      const barCallers = cg.getCallers(bar!.id).map((c) => c.node.name);
+      expect(barCallers).toContain('run');
+
+      // And the call is NOT mis-promoted to `run instantiates Foo`.
+      const outgoing = cg.getOutgoingEdges(run!.id);
+      expect(
+        outgoing.filter((e) => e.kind === 'instantiates' && e.target === foo!.id)
+      ).toHaveLength(0);
+      // The real edge is a `calls` edge to the method.
+      expect(
+        outgoing.some((e) => e.kind === 'calls' && e.target === bar!.id)
+      ).toBe(true);
+    });
+
     it('resolves Go cross-package qualified calls via go.mod module path (#388)', async () => {
       // Pre-#388, every `pkga.FuncX(...)` call in a Go monorepo was flagged
       // external (isExternalImport returned true for any non-`/internal/`
