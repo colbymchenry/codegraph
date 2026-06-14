@@ -93,7 +93,8 @@ describe('FileWatcher', () => {
 
     it('should not start when fs.watch setup exhausts watch/file resources', () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 100 });
+      const onDegraded = vi.fn();
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 100, onDegraded });
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       __setFsWatchForTests(() => {
         const err = new Error('too many open files') as NodeJS.ErrnoException;
@@ -103,6 +104,8 @@ describe('FileWatcher', () => {
 
       expect(watcher.start()).toBe(false);
       expect(watcher.isActive()).toBe(false);
+      expect(onDegraded).toHaveBeenCalledTimes(1);
+      expect(onDegraded).toHaveBeenCalledWith(expect.stringContaining('auto-sync disabled'));
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining('File watcher disabled'),
         expect.objectContaining({
@@ -113,6 +116,7 @@ describe('FileWatcher', () => {
 
     it('should degrade once when the recursive watcher emits EMFILE at runtime', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const onDegraded = vi.fn();
       const handlers = new Map<string, Array<(arg?: unknown) => void>>();
       const fakeWatcher = {
         on: vi.fn((event: string, handler: (arg?: unknown) => void) => {
@@ -125,7 +129,7 @@ describe('FileWatcher', () => {
       } as unknown as fs.FSWatcher & EventEmitter;
       __setFsWatchForTests(() => fakeWatcher);
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 100 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 100, onDegraded });
 
       expect(watcher.start()).toBe(true);
       expect(watcher.isActive()).toBe(true);
@@ -136,6 +140,7 @@ describe('FileWatcher', () => {
       for (const handler of handlers.get('error') ?? []) handler(err);
 
       expect(watcher.isActive()).toBe(false);
+      expect(onDegraded).toHaveBeenCalledTimes(1);
       expect(fakeWatcher.close).toHaveBeenCalledTimes(1);
       const disableCalls = warnSpy.mock.calls.filter(
         (call) => typeof call[0] === 'string' && String(call[0]).includes('File watcher disabled')
@@ -378,11 +383,13 @@ describe('FileWatcher', () => {
       const syncFn = vi.fn().mockRejectedValue(new LockUnavailableError());
       const onSyncComplete = vi.fn();
       const onSyncError = vi.fn();
+      const onDegraded = vi.fn();
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const watcher = newWatcher(syncFn, {
         debounceMs: 25,
         onSyncComplete,
         onSyncError,
+        onDegraded,
       });
       watcher.start();
       await watcher.waitUntilReady();
@@ -395,6 +402,8 @@ describe('FileWatcher', () => {
       expect(watcher.getPendingFiles()).toEqual([]);
       expect(onSyncComplete).not.toHaveBeenCalled();
       expect(onSyncError).not.toHaveBeenCalled();
+      expect(onDegraded).toHaveBeenCalledTimes(1);
+      expect(onDegraded).toHaveBeenCalledWith(expect.stringContaining('auto-sync disabled'));
       const disableCalls = warnSpy.mock.calls.filter(
         (call) => typeof call[0] === 'string' && String(call[0]).includes('File watcher disabled')
       );

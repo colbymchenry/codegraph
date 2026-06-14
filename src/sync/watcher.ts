@@ -45,8 +45,10 @@ const MAX_LOCK_RETRY_DELAY_MS = 30000;
 function isWatchResourceExhaustion(err: unknown): boolean {
   const e = err as NodeJS.ErrnoException | undefined;
   if (e?.code === 'EMFILE' || e?.code === 'ENFILE') return true;
-  const msg = e?.message ?? String(err ?? '');
-  return /EMFILE|ENFILE|too many open files/i.test(msg);
+  if (!e?.code && e?.message) {
+    return /EMFILE|ENFILE|too many open files/i.test(e.message);
+  }
+  return false;
 }
 
 /**
@@ -115,6 +117,11 @@ export interface WatchOptions {
    * Callback when a sync errors (for logging/diagnostics).
    */
   onSyncError?: (error: Error) => void;
+
+  /**
+   * Callback when live watching degrades permanently and auto-sync is disabled.
+   */
+  onDegraded?: (reason: string) => void;
 
   /**
    * Test-only. When true, `start()` installs NO OS-level fs.watch — the
@@ -233,6 +240,7 @@ export class FileWatcher {
   private readonly syncFn: () => Promise<{ filesChanged: number; durationMs: number }>;
   private readonly onSyncComplete?: WatchOptions['onSyncComplete'];
   private readonly onSyncError?: WatchOptions['onSyncError'];
+  private readonly onDegraded?: WatchOptions['onDegraded'];
   private readonly inertForTests: boolean;
 
   constructor(
@@ -245,6 +253,7 @@ export class FileWatcher {
     this.debounceMs = options.debounceMs ?? 2000;
     this.onSyncComplete = options.onSyncComplete;
     this.onSyncError = options.onSyncError;
+    this.onDegraded = options.onDegraded;
     this.inertForTests = options.inertForTests ?? false;
   }
 
@@ -509,6 +518,7 @@ export class FileWatcher {
     if (this.degradedReason) return;
     this.degradedReason = reason;
     logWarn('File watcher disabled', { projectRoot: this.projectRoot, reason, ...context });
+    this.onDegraded?.(reason);
     this.stop();
   }
 
@@ -591,9 +601,22 @@ export class FileWatcher {
   }
 
   /**
-   * Schedule a debounced sync.
+   * Schedule a normal debounced sync after a source edit.
    */
-  private scheduleSync(delayMs: number = this.debounceMs): void {
+  private scheduleSync(): void {
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+    }
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
+      this.flush();
+    }, this.debounceMs);
+  }
+
+  /**
+   * Schedule a retry sync after a recoverable failure such as lock contention.
+   */
+  private scheduleRetrySync(delayMs: number): void {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
@@ -668,10 +691,15 @@ export class FileWatcher {
       // If pending files remain (mid-sync events, or this sync failed),
       // schedule another pass.
       if (this.pendingFiles.size > 0 && !this.stopped) {
-        const delayMs = this.lockRetryCount > 0
-          ? Math.min(this.debounceMs * (2 ** Math.max(0, this.lockRetryCount - 1)), MAX_LOCK_RETRY_DELAY_MS)
-          : this.debounceMs;
-        this.scheduleSync(delayMs);
+        if (this.lockRetryCount > 0) {
+          const retryDelayMs = Math.min(
+            this.debounceMs * (2 ** Math.max(0, this.lockRetryCount - 1)),
+            MAX_LOCK_RETRY_DELAY_MS,
+          );
+          this.scheduleRetrySync(retryDelayMs);
+        } else {
+          this.scheduleSync();
+        }
       }
     }
   }
