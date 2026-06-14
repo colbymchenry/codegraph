@@ -50,7 +50,7 @@ function sendInitialize(child: ChildProcessWithoutNullStreams, projectPath: stri
 }
 
 function expectServerBranding(result: {
-  serverInfo: { name?: string; title?: string; icons?: Array<{ src?: string; mimeType?: string; sizes?: string }> };
+  serverInfo: { name?: string; title?: string; icons?: Array<{ src?: string; mimeType?: string; sizes?: string[] }> };
   _meta?: { icons?: unknown[] };
 }) {
   expect(result.serverInfo.name).toBe('codegraph');
@@ -58,7 +58,7 @@ function expectServerBranding(result: {
   expect(result.serverInfo.icons).toHaveLength(1);
   const icon = result.serverInfo.icons![0]!;
   expect(icon.mimeType).toBe('image/svg+xml');
-  expect(icon.sizes).toBe('32x32');
+  expect(icon.sizes).toEqual(['32x32']);
   expect(icon.src).toMatch(/^data:image\/svg\+xml;base64,/);
   const encoded = icon.src!.replace(/^data:image\/svg\+xml;base64,/, '');
   expect(Buffer.from(encoded, 'base64').toString('utf8')).toMatch(/^<svg\b/);

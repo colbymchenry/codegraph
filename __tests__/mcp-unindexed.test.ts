@@ -83,13 +83,13 @@ function initializeParams(projectPath: string) {
 }
 
 function expectToolBranding(tool: {
-  icons?: Array<{ src?: string; mimeType?: string; sizes?: string }>;
+  icons?: Array<{ src?: string; mimeType?: string; sizes?: string[] }>;
   _meta?: { icons?: unknown[] };
 }) {
   expect(tool.icons).toHaveLength(1);
   const icon = tool.icons![0]!;
   expect(icon.mimeType).toBe('image/svg+xml');
-  expect(icon.sizes).toBe('32x32');
+  expect(icon.sizes).toEqual(['32x32']);
   expect(icon.src).toMatch(/^data:image\/svg\+xml;base64,/);
   expect(tool._meta?.icons).toEqual(tool.icons);
 }
@@ -158,7 +158,7 @@ describe('Unindexed-workspace session policy', () => {
     const tools = (list.result as {
       tools: Array<{
         name: string;
-        icons?: Array<{ src?: string; mimeType?: string; sizes?: string }>;
+        icons?: Array<{ src?: string; mimeType?: string; sizes?: string[] }>;
         _meta?: { icons?: unknown[] };
       }>;
     }).tools;

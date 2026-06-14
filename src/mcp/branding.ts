@@ -9,7 +9,7 @@ const SERVER_ICON_BASE64 =
 export const SERVER_ICON = {
   src: `data:image/svg+xml;base64,${SERVER_ICON_BASE64}`,
   mimeType: 'image/svg+xml',
-  sizes: '32x32',
+  sizes: ['32x32'],
 } as const;
 
 export const SERVER_INFO = {
