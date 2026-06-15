@@ -54,6 +54,19 @@ const EXHAUSTION_REASON =
   '(or install git sync hooks) to refresh the graph after changes.';
 
 /**
+ * Actionable, NON-fatal warning for Linux inotify watch-count exhaustion.
+ * Unlike {@link EXHAUSTION_REASON} this does not disable the watcher — the
+ * watches already installed keep working — so it names the exact kernel knob to
+ * raise instead.
+ */
+const INOTIFY_LIMIT_REASON =
+  'Linux inotify watch limit reached (fs.inotify.max_user_watches); live ' +
+  'watching now covers only part of the project, so edits in unwatched ' +
+  'directories will not auto-sync. Raise the limit (e.g. `sudo sysctl ' +
+  'fs.inotify.max_user_watches=1048576`, persisted in /etc/sysctl.d) and ' +
+  'restart, or run `codegraph sync` (or install git sync hooks) to refresh.';
+
+/**
  * True when an error is OS watch/file-descriptor exhaustion (EMFILE/ENFILE).
  * Prefers the structured `err.code`; falls back to message matching ONLY when
  * no code is present (some platforms surface a bare Error from `fs.watch`).
@@ -65,6 +78,17 @@ function isWatchResourceExhaustion(err: unknown): boolean {
     return /EMFILE|ENFILE|too many open files/i.test(e.message);
   }
   return false;
+}
+
+/**
+ * True when an error is Linux inotify *watch-count* exhaustion. `fs.watch`
+ * surfaces a hit `fs.inotify.max_user_watches` as ENOSPC ("no space" = no watch
+ * descriptors left, NOT disk space). This only arises on the Linux
+ * per-directory path; it is non-fatal (raise the limit and partial watching
+ * keeps working), so it warns rather than degrading.
+ */
+function isInotifyWatchExhaustion(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | undefined)?.code === 'ENOSPC';
 }
 
 /**
@@ -215,6 +239,14 @@ export class FileWatcher {
   private dirWatchers = new Map<string, fs.FSWatcher>();
   /** Set once the per-directory watch cap is hit, so we log only once. */
   private dirCapWarned = false;
+  /**
+   * Set once the Linux inotify watch limit (ENOSPC) is hit. Double duty: we
+   * warn only once, AND we stop attempting new directory watches for the rest
+   * of the session — once the kernel budget is exhausted every further
+   * `inotify_add_watch` fails too, so trying the rest of the tree is pure
+   * waste. NON-fatal (does not degrade): installed watches keep working.
+   */
+  private inotifyLimitWarned = false;
   /**
    * One-way latch: the reason live watching was permanently disabled at runtime
    * (watch-resource exhaustion, or lock contention past the retry budget), or
@@ -401,8 +433,10 @@ export class FileWatcher {
   private watchTree(dir: string, markExisting: boolean): void {
     // A degrade() mid-walk (exhaustion on an earlier directory) calls stop(),
     // which sets `stopped`; bail so the recursion unwinds without adding more
-    // watches to a watcher that is shutting down.
-    if (this.stopped || this.degradedReason) return;
+    // watches to a watcher that is shutting down. `inotifyLimitWarned` does the
+    // same after ENOSPC — the kernel budget is gone, so stop trying the rest of
+    // the tree (every add would fail) while keeping the watches already set.
+    if (this.stopped || this.degradedReason || this.inotifyLimitWarned) return;
     if (this.dirWatchers.has(dir)) return;
     if (this.dirWatchers.size >= maxDirWatches()) {
       if (!this.dirCapWarned) {
@@ -425,6 +459,10 @@ export class FileWatcher {
       // limping along with a partial watch set.
       if (isWatchResourceExhaustion(err)) {
         this.degrade(EXHAUSTION_REASON, { error: String(err), dir });
+      } else if (isInotifyWatchExhaustion(err)) {
+        // ENOSPC = inotify watch budget exhausted. NON-fatal: keep the watches
+        // we have and tell the user the knob to raise (warn once).
+        this.warnInotifyLimit({ error: String(err), dir });
       }
       // ENOENT / EACCES on a single directory stays non-fatal: skip it quietly.
       return;
@@ -433,6 +471,9 @@ export class FileWatcher {
       if (isWatchResourceExhaustion(err)) {
         this.degrade(EXHAUSTION_REASON, { error: String(err), dir });
         return;
+      }
+      if (isInotifyWatchExhaustion(err)) {
+        this.warnInotifyLimit({ error: String(err), dir });
       }
       this.unwatchDir(dir);
     });
@@ -561,6 +602,20 @@ export class FileWatcher {
   }
 
   /**
+   * Warn ONCE that the Linux inotify watch budget is exhausted (ENOSPC), and
+   * stop adding new watches for the rest of this session — every further
+   * `inotify_add_watch` would fail too, so walking the rest of the tree is
+   * waste. Unlike {@link degrade} this is NON-fatal: the watches already
+   * installed keep firing, and `codegraph sync` covers the unwatched remainder.
+   * The message names the kernel knob to raise (`fs.inotify.max_user_watches`).
+   */
+  private warnInotifyLimit(context: Record<string, unknown> = {}): void {
+    if (this.inotifyLimitWarned) return;
+    this.inotifyLimitWarned = true;
+    logWarn(INOTIFY_LIMIT_REASON, { watchedDirs: this.dirWatchers.size, ...context });
+  }
+
+  /**
    * Whether live watching has degraded permanently (until the next start()).
    * Distinct from {@link isActive}: a degraded watcher is inactive, but an
    * inactive watcher is not necessarily degraded (it may simply be stopped or
@@ -603,6 +658,7 @@ export class FileWatcher {
     }
     this.dirWatchers.clear();
     this.dirCapWarned = false;
+    this.inotifyLimitWarned = false;
     this.lockRetryCount = 0;
     // NB: degradedReason is intentionally NOT reset here — it must survive the
     // stop() that degrade() triggers so isDegraded() stays true. start() clears it.

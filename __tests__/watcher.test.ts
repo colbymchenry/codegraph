@@ -205,6 +205,63 @@ describe('FileWatcher', () => {
       expect(watcher.getDegradedReason()).toBeNull();
       watcher.stop();
     });
+
+    it('warns once (NOT degrade) when Linux inotify watches are exhausted (ENOSPC)', () => {
+      // ENOSPC only arises on the Linux per-directory path; force it so the test
+      // runs the per-directory branch on any host. Synchronous test, restored in
+      // finally — no await window for another test to observe the override.
+      const realPlatform = process.platform;
+      Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+      try {
+        // Empty-but-for-one-subdir temp dir: the root watch succeeds, then the
+        // child watch hits the (simulated) inotify budget — the realistic
+        // "partial watch installed, then exhausted" shape.
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-inotify-'));
+        fs.mkdirSync(path.join(dir, 'sub'));
+        const onDegraded = vi.fn();
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const emitter = new EventEmitter();
+        let calls = 0;
+        const okWatcher = {
+          on: (event: string, handler: (...a: unknown[]) => void) => {
+            emitter.on(event, handler);
+            return okWatcher;
+          },
+          close: () => {},
+        } as unknown as fs.FSWatcher;
+        __setFsWatchForTests(() => {
+          calls += 1;
+          if (calls === 1) return okWatcher; // root dir watch succeeds
+          const err = new Error('ENOSPC: System limit for number of file watchers reached') as NodeJS.ErrnoException;
+          err.code = 'ENOSPC';
+          throw err; // every subsequent dir exhausts the inotify budget
+        });
+        const watcher = new FileWatcher(
+          dir,
+          vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 }),
+          { debounceMs: 100, onDegraded }
+        );
+
+        try {
+          // NON-fatal: the watcher starts (partial watch on the root), does NOT
+          // degrade, and warns exactly once with the actionable sysctl remedy.
+          expect(watcher.start()).toBe(true);
+          expect(watcher.isActive()).toBe(true);
+          expect(watcher.isDegraded()).toBe(false);
+          expect(onDegraded).not.toHaveBeenCalled();
+          const inotifyWarnings = warnSpy.mock.calls.filter(
+            (c) => typeof c[0] === 'string' && c[0].includes('inotify watch limit')
+          );
+          expect(inotifyWarnings).toHaveLength(1);
+          expect(String(inotifyWarnings[0]![0])).toContain('fs.inotify.max_user_watches');
+        } finally {
+          watcher.stop();
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
+      } finally {
+        Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+      }
+    });
   });
 
   describe('lock contention degradation (#876)', () => {
