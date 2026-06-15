@@ -339,7 +339,7 @@ function eventEmitterEdges(ctx: ResolutionContext): Edge[] {
 function reactRenderEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  for (const cls of queries.getNodesByKind('class')) {
+  for (const cls of queries.iterateNodesByKind('class')) {
     const children = queries.getOutgoingEdges(cls.id, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
@@ -378,7 +378,7 @@ function reactRenderEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[]
 function flutterBuildEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  for (const cls of queries.getNodesByKind('class')) {
+  for (const cls of queries.iterateNodesByKind('class')) {
     const children = queries.getOutgoingEdges(cls.id, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
@@ -423,7 +423,7 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
       .getOutgoingEdges(classId, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
-  for (const cls of queries.getNodesByKind('class')) {
+  for (const cls of queries.iterateNodesByKind('class')) {
     const subMethods = methodsOf(cls.id).filter((n) => n.language === 'cpp');
     if (subMethods.length === 0) continue;
     for (const ext of queries.getOutgoingEdges(cls.id, ['extends'])) {
@@ -499,12 +499,14 @@ function goImplementsEdges(queries: QueryBuilder): Edge[] {
         .map((n) => n.name),
     );
 
-  const goStructs = queries.getNodesByKind('struct').filter((s) => s.language === 'go');
+  const goStructs: Node[] = [];
+  for (const s of queries.iterateNodesByKindAndLanguage('struct', 'go')) {
+    goStructs.push(s);
+  }
   const structMethods = new Map<string, Set<string>>();
   for (const s of goStructs) structMethods.set(s.id, methodNameSet(s.id));
 
-  for (const iface of queries.getNodesByKind('interface')) {
-    if (iface.language !== 'go') continue;
+  for (const iface of queries.iterateNodesByKindAndLanguage('interface', 'go')) {
     const want = methodNameSet(iface.id);
     if (want.size === 0) continue; // empty interface (`any`) — would match everything
     let added = 0;
@@ -564,8 +566,7 @@ function goCrossFileMethodContainsEdges(queries: QueryBuilder): Edge[] {
     return i >= 0 ? p.slice(0, i) : '';
   };
 
-  for (const method of queries.getNodesByKind('method')) {
-    if (method.language !== 'go') continue;
+  for (const method of queries.iterateNodesByKindAndLanguage('method', 'go')) {
     // The receiver type is encoded in the method's qualifiedName as `Recv::name`
     // (extraction sets `${receiverType}::${name}` for receiver methods).
     const qn = method.qualifiedName;
@@ -635,9 +636,19 @@ function kmpKindsCompatible(a: string, b: string): boolean {
 function kotlinExpectActualEdges(queries: QueryBuilder): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  const actuals = queries
-    .getAllNodes()
-    .filter((n) => n.language === 'kotlin' && !!n.decorators?.includes('actual'));
+  const actuals: Node[] = [];
+  for (const n of queries.iterateNodesByKindAndLanguage('function', 'kotlin')) {
+    if (n.decorators?.includes('actual')) actuals.push(n);
+  }
+  for (const n of queries.iterateNodesByKindAndLanguage('class', 'kotlin')) {
+    if (n.decorators?.includes('actual')) actuals.push(n);
+  }
+  for (const n of queries.iterateNodesByKindAndLanguage('interface', 'kotlin')) {
+    if (n.decorators?.includes('actual')) actuals.push(n);
+  }
+  for (const n of queries.iterateNodesByKindAndLanguage('type_alias', 'kotlin')) {
+    if (n.decorators?.includes('actual')) actuals.push(n);
+  }
   for (const act of actuals) {
     let added = 0;
     for (const cand of queries.getNodesByQualifiedNameExact(act.qualifiedName)) {
@@ -681,7 +692,7 @@ function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
   // types that conform to protocols. Iterate both.
   const concreteKinds = ['class', 'struct'] as const;
   for (const kind of concreteKinds) {
-  for (const cls of queries.getNodesByKind(kind)) {
+  for (const cls of queries.iterateNodesByKind(kind)) {
     const implMethods = methodsOf(cls.id).filter((n) => IFACE_OVERRIDE_LANGS.has(n.language));
     if (implMethods.length === 0) continue;
     for (const sup of queries.getOutgoingEdges(cls.id, ['implements', 'extends'])) {
@@ -761,8 +772,7 @@ function goGrpcStubImplEdges(queries: QueryBuilder): Edge[] {
   const methodNamesByStruct = new Map<string, Set<string>>();
   const methodNodesByStruct = new Map<string, Node[]>();
   const goStructs: Node[] = [];
-  for (const s of queries.getNodesByKind('struct')) {
-    if (s.language !== 'go') continue;
+  for (const s of queries.iterateNodesByKindAndLanguage('struct', 'go')) {
     goStructs.push(s);
     const ms = queries
       .getOutgoingEdges(s.id, ['contains'])
@@ -903,7 +913,7 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
   // misses it (flat components match by basename and don't need this). Map each
   // nested component's Nuxt name → node so those template usages resolve.
   const nuxtComponents = new Map<string, Node>();
-  for (const c of ctx.getNodesByKind('component')) {
+  for (const c of ctx.iterateNodesByKind('component')) {
     const nn = nuxtComponentName(c.filePath);
     if (nn && !nuxtComponents.has(nn)) nuxtComponents.set(nn, c);
   }
@@ -1226,8 +1236,7 @@ function expoCrossPlatformEdges(queries: QueryBuilder): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const byKey = new Map<string, Node[]>();
-  for (const m of queries.getNodesByKind('method')) {
-    if (!m.id.startsWith('expo-module:')) continue;
+  for (const m of queries.getNodesByKindAndIdPrefix('method', 'expo-module:')) {
     const key = m.qualifiedName.split('::').pop(); // `<module>.<method>`
     if (!key) continue;
     const arr = byKey.get(key);
@@ -1335,19 +1344,20 @@ function rnCrossPlatformEdges(queries: QueryBuilder): Edge[] {
   return edges;
 }
 
-function fabricNativeImplEdges(ctx: ResolutionContext): Edge[] {
+function fabricNativeImplEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
 
   // The Fabric extractor IDs are prefixed `fabric-component:` so we can
   // filter to just those without iterating all `component` nodes.
-  const components = ctx.getNodesByKind('component').filter((n) => n.id.startsWith('fabric-component:'));
+  const components = ctx.getNodesByKindAndIdPrefix('component', 'fabric-component:');
   if (components.length === 0) return edges;
 
   // Pre-index native classes by name for O(1) lookup.
   const nativeClassesByName = new Map<string, Node[]>();
-  for (const n of ctx.getNodesByKind('class')) {
-    if (n.language !== 'objc' && n.language !== 'kotlin' && n.language !== 'java' && n.language !== 'cpp') continue;
+  const NATIVE_LANGS = new Set(['objc', 'kotlin', 'java', 'cpp']);
+  for (const n of queries.iterateNodesByKind('class')) {
+    if (!NATIVE_LANGS.has(n.language)) continue;
     const arr = nativeClassesByName.get(n.name);
     if (arr) arr.push(n);
     else nativeClassesByName.set(n.name, [n]);
@@ -1668,54 +1678,38 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const goImpl = goImplementsEdges(queries);
   if (goImpl.length > 0) queries.insertEdges(goImpl);
 
-  const fieldEdges = fieldChannelEdges(queries, ctx);
-  const closureCollEdges = closureCollectionEdges(queries, ctx);
-  const emitterEdges = eventEmitterEdges(ctx);
-  const renderEdges = reactRenderEdges(queries, ctx);
-  const jsxEdges = reactJsxChildEdges(ctx);
-  const vueEdges = vueTemplateEdges(ctx);
-  const svelteKitEdges = svelteKitLoadEdges(ctx);
-  const pascalEdges = pascalFormEdges(ctx);
-  const flutterEdges = flutterBuildEdges(queries, ctx);
-  const cppEdges = cppOverrideEdges(queries);
-  const ifaceEdges = interfaceOverrideEdges(queries);
-  const kotlinExpectActual = kotlinExpectActualEdges(queries);
-  const goGrpcEdges = goGrpcStubImplEdges(queries);
-  const rnEventEdgesList = rnEventEdges(ctx);
-  const fabricNativeEdges = fabricNativeImplEdges(ctx);
-  const expoXPlatEdges = expoCrossPlatformEdges(queries);
-  const rnXPlatEdges = rnCrossPlatformEdges(queries);
-  const mybatisEdges = mybatisJavaXmlEdges(queries);
-  const ginEdges = ginMiddlewareChainEdges(queries, ctx);
-
   const merged: Edge[] = [];
   const seen = new Set<string>();
-  for (const e of [
-    ...fieldEdges,
-    ...closureCollEdges,
-    ...emitterEdges,
-    ...renderEdges,
-    ...jsxEdges,
-    ...vueEdges,
-    ...svelteKitEdges,
-    ...pascalEdges,
-    ...flutterEdges,
-    ...cppEdges,
-    ...ifaceEdges,
-    ...kotlinExpectActual,
-    ...goGrpcEdges,
-    ...rnEventEdgesList,
-    ...fabricNativeEdges,
-    ...expoXPlatEdges,
-    ...rnXPlatEdges,
-    ...mybatisEdges,
-    ...ginEdges,
-  ]) {
-    const key = `${e.source}>${e.target}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push(e);
-  }
+  const mergeUnique = (edges: Edge[]): void => {
+    if (edges.length === 0) return;
+    for (const e of edges) {
+      const key = `${e.source}>${e.target}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(e);
+    }
+  };
+
+  mergeUnique(fieldChannelEdges(queries, ctx));
+  mergeUnique(closureCollectionEdges(queries, ctx));
+  mergeUnique(eventEmitterEdges(ctx));
+  mergeUnique(reactRenderEdges(queries, ctx));
+  mergeUnique(reactJsxChildEdges(ctx));
+  mergeUnique(vueTemplateEdges(ctx));
+  mergeUnique(svelteKitLoadEdges(ctx));
+  mergeUnique(pascalFormEdges(ctx));
+  mergeUnique(flutterBuildEdges(queries, ctx));
+  mergeUnique(cppOverrideEdges(queries));
+  mergeUnique(interfaceOverrideEdges(queries));
+  mergeUnique(kotlinExpectActualEdges(queries));
+  mergeUnique(goGrpcStubImplEdges(queries));
+  mergeUnique(rnEventEdges(ctx));
+  mergeUnique(fabricNativeImplEdges(queries, ctx));
+  mergeUnique(expoCrossPlatformEdges(queries));
+  mergeUnique(rnCrossPlatformEdges(queries));
+  mergeUnique(mybatisJavaXmlEdges(queries));
+  mergeUnique(ginMiddlewareChainEdges(queries, ctx));
+
   if (merged.length > 0) queries.insertEdges(merged);
   return merged.length + goImpl.length + goMethodContains.length;
 }

@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Node, UnresolvedReference, Edge } from '../types';
+import { Node, NodeKind, UnresolvedReference, Edge } from '../types';
 import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
@@ -226,7 +226,7 @@ export class ReferenceResolver {
   private nameCache: LRUCache<string, Node[]>; // name → nodes cache
   private lowerNameCache: LRUCache<string, Node[]>; // lower(name) → nodes cache
   private qualifiedNameCache: LRUCache<string, Node[]>; // qualified_name → nodes cache
-  private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
+  private nameExistsCache: LRUCache<string, boolean>; // exact symbol-name existence pre-filter
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
   // tsconfig/jsconfig path-alias map. `undefined` = not yet computed,
@@ -253,6 +253,7 @@ export class ReferenceResolver {
     this.nameCache = new LRUCache(limit);
     this.lowerNameCache = new LRUCache(limit);
     this.qualifiedNameCache = new LRUCache(limit);
+    this.nameExistsCache = new LRUCache(Math.max(limit * 4, 20_000));
 
     this.context = this.createContext();
   }
@@ -296,18 +297,15 @@ export class ReferenceResolver {
 
   /**
    * Pre-build lightweight caches for resolution.
-   * Node lookups are now handled by indexed SQLite queries instead of
-   * loading all nodes into memory (which caused OOM on large codebases).
-   * We cache the set of known symbol names for fast pre-filtering.
+   * Node lookups are handled by indexed SQLite queries instead of loading all
+   * nodes/names into memory (which caused OOM on large codebases). File paths
+   * remain lightweight enough to cache as strings for import/path checks.
    */
   warmCaches(): void {
     if (this.cachesWarmed) return;
 
     // Only cache the set of known file paths (lightweight string set)
     this.knownFiles = new Set(this.queries.getAllFilePaths());
-
-    // Cache all distinct symbol names for fast pre-filtering (just strings, not full nodes)
-    this.knownNames = new Set(this.queries.getAllNodeNames());
 
     this.cachesWarmed = true;
   }
@@ -323,7 +321,7 @@ export class ReferenceResolver {
     this.nameCache.clear();
     this.lowerNameCache.clear();
     this.qualifiedNameCache.clear();
-    this.knownNames = null;
+    this.nameExistsCache.clear();
     this.knownFiles = null;
     this.cachesWarmed = false;
   }
@@ -358,6 +356,14 @@ export class ReferenceResolver {
 
       getNodesByKind: (kind: Node['kind']) => {
         return this.queries.getNodesByKind(kind);
+      },
+
+      iterateNodesByKind: (kind: Node['kind']) => {
+        return this.queries.iterateNodesByKind(kind);
+      },
+
+      getNodesByKindAndIdPrefix: (kind: Node['kind'], idPrefix: string) => {
+        return this.queries.getNodesByKindAndIdPrefix(kind as NodeKind, idPrefix);
       },
 
       fileExists: (filePath: string) => {
@@ -538,6 +544,7 @@ export class ReferenceResolver {
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
     }));
+    this.prefetchKnownNamesForRefs(refs);
 
     const total = refs.length;
     let lastReportedPercent = -1;
@@ -582,38 +589,36 @@ export class ReferenceResolver {
 
   /**
    * Check if a reference name has any possible match in the codebase.
-   * Uses the pre-built knownNames set to skip expensive resolution
-   * for names that definitely don't exist as symbols.
+   * Uses indexed point lookups so large repos don't materialize every
+   * distinct symbol name just to run the pre-filter.
    */
   private hasAnyPossibleMatch(name: string): boolean {
-    if (!this.knownNames) return true; // no pre-filter available
-
     // Direct name match
-    if (this.knownNames.has(name)) return true;
+    if (this.hasKnownName(name)) return true;
 
     // For qualified names like "obj.method" or "Class::method", check the parts
     const dotIdx = name.indexOf('.');
     if (dotIdx > 0) {
       const receiver = name.substring(0, dotIdx);
       const member = name.substring(dotIdx + 1);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (this.hasKnownName(receiver) || this.hasKnownName(member)) return true;
       // Also check capitalized receiver (instance-method resolution)
       const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-      if (this.knownNames.has(capitalized)) return true;
+      if (this.hasKnownName(capitalized)) return true;
       // JVM FQN: `com.example.foo.Bar` — the only useful segment is the
       // last one (`Bar`); the earlier check finds `example.foo.Bar` which
       // never matches a node name.
       const lastDot = name.lastIndexOf('.');
       if (lastDot > dotIdx) {
         const tail = name.substring(lastDot + 1);
-        if (tail && this.knownNames.has(tail)) return true;
+        if (tail && this.hasKnownName(tail)) return true;
       }
     }
     const colonIdx = name.indexOf('::');
     if (colonIdx > 0) {
       const receiver = name.substring(0, colonIdx);
       const member = name.substring(colonIdx + 2);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (this.hasKnownName(receiver) || this.hasKnownName(member)) return true;
       // Multi-segment path `a::b::c` (a Rust/C++ module call like
       // `database::profiles::find`) — the only segment that names a symbol is
       // the last (`c`); `member` above is `b::c`, which never matches a node
@@ -622,7 +627,7 @@ export class ReferenceResolver {
       const lastColon = name.lastIndexOf('::');
       if (lastColon > colonIdx) {
         const tail = name.substring(lastColon + 2);
-        if (tail && this.knownNames.has(tail)) return true;
+        if (tail && this.hasKnownName(tail)) return true;
       }
     }
 
@@ -630,10 +635,72 @@ export class ReferenceResolver {
     const slashIdx = name.lastIndexOf('/');
     if (slashIdx > 0) {
       const fileName = name.substring(slashIdx + 1);
-      if (this.knownNames.has(fileName)) return true;
+      if (this.hasKnownName(fileName)) return true;
     }
 
     return false;
+  }
+
+  private prefetchKnownNamesForRefs(refs: UnresolvedRef[]): void {
+    const names = new Set<string>();
+    for (const ref of refs) {
+      this.collectPossibleMatchNames(ref.referenceName, names);
+    }
+    if (names.size === 0) return;
+
+    const existing = this.queries.getExistingNodeNames(names);
+    for (const name of names) {
+      this.nameExistsCache.set(name, existing.has(name));
+    }
+  }
+
+  private collectPossibleMatchNames(name: string, names: Set<string>): void {
+    if (!name) return;
+    names.add(name);
+
+    // Keep this in sync with hasAnyPossibleMatch(). It collects the bounded
+    // set of indexed lookups that resolver pre-filtering may ask for.
+    const dotIdx = name.indexOf('.');
+    if (dotIdx > 0) {
+      const receiver = name.substring(0, dotIdx);
+      const member = name.substring(dotIdx + 1);
+      names.add(receiver);
+      names.add(member);
+      names.add(receiver.charAt(0).toUpperCase() + receiver.slice(1));
+      const lastDot = name.lastIndexOf('.');
+      if (lastDot > dotIdx) {
+        const tail = name.substring(lastDot + 1);
+        if (tail) names.add(tail);
+      }
+    }
+
+    const colonIdx = name.indexOf('::');
+    if (colonIdx > 0) {
+      const receiver = name.substring(0, colonIdx);
+      const member = name.substring(colonIdx + 2);
+      names.add(receiver);
+      names.add(member);
+      const lastColon = name.lastIndexOf('::');
+      if (lastColon > colonIdx) {
+        const tail = name.substring(lastColon + 2);
+        if (tail) names.add(tail);
+      }
+    }
+
+    const slashIdx = name.lastIndexOf('/');
+    if (slashIdx > 0) {
+      const fileName = name.substring(slashIdx + 1);
+      if (fileName) names.add(fileName);
+    }
+  }
+
+  private hasKnownName(name: string): boolean {
+    if (!name) return false;
+    const cached = this.nameExistsCache.get(name);
+    if (cached !== undefined) return cached;
+    const exists = this.queries.hasNodeName(name);
+    this.nameExistsCache.set(name, exists);
+    return exists;
   }
 
   /**
@@ -1060,7 +1127,7 @@ export class ReferenceResolver {
         // But allow if the capitalized receiver matches a known codebase class
         if (PYTHON_BUILT_IN_METHODS.has(method)) {
           const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-          if (!this.knownNames?.has(capitalized)) {
+          if (!this.hasKnownName(capitalized)) {
             return true;
           }
         }
@@ -1071,7 +1138,7 @@ export class ReferenceResolver {
       // `def get()` — is a real reference target. Mirrors the knownNames guard on
       // the dotted branch above; without it, every handler named after a builtin
       // method silently loses its route→handler edge.
-      if (PYTHON_BUILT_IN_METHODS.has(name) && !this.knownNames?.has(name)) {
+      if (PYTHON_BUILT_IN_METHODS.has(name) && !this.hasKnownName(name)) {
         return true;
       }
     }

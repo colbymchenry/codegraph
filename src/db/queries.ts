@@ -210,6 +210,7 @@ export class QueryBuilder {
     deleteUnresolvedByNode?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
     getNodesByName?: SqliteStatement;
+    hasNodeName?: SqliteStatement;
     getNodesByQualifiedNameExact?: SqliteStatement;
     getNodesByLowerName?: SqliteStatement;
     getUnresolvedCount?: SqliteStatement;
@@ -720,6 +721,30 @@ export class QueryBuilder {
   }
 
   /**
+   * Stream nodes of a specific kind AND language lazily. Like
+   * {@link iterateNodesByKind} but narrowed by language so callers that only
+   * care about one language (e.g. Go structs) don't materialize nodes from
+   * every other language.
+   */
+  *iterateNodesByKindAndLanguage(kind: NodeKind, language: string): IterableIterator<Node> {
+    const stmt = this.db.prepare('SELECT * FROM nodes WHERE kind = ? AND language = ?');
+    for (const row of stmt.iterate(kind, language)) {
+      yield rowToNode(row as NodeRow);
+    }
+  }
+
+  /**
+   * Get nodes filtered by kind + id prefix. Used by synthesizers
+   * that need a narrow subset (e.g. Expo methods with id starting
+   * 'expo-module:') without materializing all nodes of that kind.
+   */
+  getNodesByKindAndIdPrefix(kind: NodeKind, idPrefix: string): Node[] {
+    const stmt = this.db.prepare('SELECT * FROM nodes WHERE kind = ? AND id LIKE ?');
+    const rows = stmt.all(kind, `${idPrefix}%`) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
    * Get all nodes in the database
    */
   getAllNodes(): Node[] {
@@ -736,6 +761,37 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getNodesByName.all(name) as NodeRow[];
     return rows.map(rowToNode);
+  }
+
+  /**
+   * True when at least one node has this exact name. Uses idx_nodes_name and
+   * returns a single row instead of materializing the distinct symbol-name set.
+   */
+  hasNodeName(name: string): boolean {
+    if (!this.stmts.hasNodeName) {
+      this.stmts.hasNodeName = this.db.prepare('SELECT 1 FROM nodes WHERE name = ? LIMIT 1');
+    }
+    return this.stmts.hasNodeName.get(name) !== undefined;
+  }
+
+  /**
+   * Return the subset of names that exist as node names, using bounded IN-list
+   * chunks. This keeps resolver pre-filtering batch-oriented without ever
+   * materializing every distinct name from a large graph.
+   */
+  getExistingNodeNames(names: Iterable<string>): Set<string> {
+    const unique = [...new Set([...names].filter(Boolean))];
+    const existing = new Set<string>();
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT DISTINCT name FROM nodes WHERE name IN (${placeholders})`)
+        .all(...chunk) as Array<{ name: string }>;
+      for (const row of rows) existing.add(row.name);
+    }
+    return existing;
   }
 
   /**

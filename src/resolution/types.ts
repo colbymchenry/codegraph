@@ -71,6 +71,10 @@ export interface ResolutionContext {
   getNodesByQualifiedName(qualifiedName: string): Node[];
   /** Get all nodes of a kind */
   getNodesByKind(kind: Node['kind']): Node[];
+  /** Stream nodes of a kind lazily (O(1) memory) instead of materializing them all */
+  iterateNodesByKind(kind: Node['kind']): IterableIterator<Node>;
+  /** Get nodes filtered by kind + id prefix */
+  getNodesByKindAndIdPrefix(kind: Node['kind'], idPrefix: string): Node[];
   /** Check if a file exists */
   fileExists(filePath: string): boolean;
   /** Read file content */
