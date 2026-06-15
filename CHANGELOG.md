@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Impact and blast-radius analysis for TypeScript/JavaScript now understands the readers of a constant. When you change a file-scope `const`/`var` — a config object, a lookup table, a shared constant — the other symbols in that file that read it now show up as affected, where before they were invisible (impact only followed calls, imports, and inheritance, so a constant's consumers looked like "nothing depends on this"). This makes `codegraph impact`, and the impact trail in `codegraph_explore`/`codegraph_node`, catch the "change this table, break its readers" class of change. It's on by default for TS/JS and adds no nodes to your graph; bundled/minified files and ambiguously-shadowed names are skipped to keep results precise. Set `CODEGRAPH_VALUE_REFS=0` to turn it off.
+
 ### Fixes
 
 - `codegraph index` now rebuilds the full graph from scratch, so it produces the same result as a fresh `codegraph init` instead of reporting "0 nodes, 0 edges" and looking like it wiped your index. Previously, re-running `index` on an unchanged project skipped every file (their contents hadn't changed) and showed an empty-looking summary; it now clears and re-indexes for an honest, complete rebuild every time. Use `codegraph sync` for fast incremental updates between full rebuilds. Thanks @Arc-univer. (#874)

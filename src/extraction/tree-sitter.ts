@@ -221,11 +221,12 @@ export class TreeSitterExtractor {
   private nodes: Node[] = [];
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
-  // Value-reference edges (flag-gated, default off; see flushValueRefs). Same-file reads of
-  // file-scope const/var symbols → `references` edges so impact analysis catches const consumers.
+  // Value-reference edges (default ON; set CODEGRAPH_VALUE_REFS=0 to disable; see flushValueRefs).
+  // Same-file reads of file-scope const/var symbols → `references` edges so impact analysis catches
+  // value consumers ("change this constant/table, affect its readers").
   private static readonly VALUE_REF_LANGS = new Set<string>(['typescript', 'javascript', 'tsx']);
   private static readonly MAX_VALUE_REF_NODES = 20_000;
-  private readonly valueRefsEnabled = process.env.CODEGRAPH_VALUE_REFS === '1';
+  private readonly valueRefsEnabled = process.env.CODEGRAPH_VALUE_REFS !== '0';
   private fileScopeValues = new Map<string, string>();
   private valueRefScopes: Array<{ id: string; node: SyntaxNode }> = [];
   private errors: ExtractionError[] = [];
@@ -544,8 +545,8 @@ export class TreeSitterExtractor {
    * The engine doesn't edge const→consumer, so impact analysis misses "change this table, affect
    * its readers" (the ReScript-PR false positive). Same-file only (resolution is unambiguous),
    * distinctive target names only (dodges the local-shadowing precision trap documented on
-   * function_ref), deduped per (reader, target). Flag-gated (CODEGRAPH_VALUE_REFS) + additive —
-   * pending the agent A/B before it goes default-on.
+   * function_ref), deduped per (reader, target). Default on (CODEGRAPH_VALUE_REFS=0 disables) +
+   * additive. Shadowed targets are pruned — see below.
    */
   private flushValueRefs(): void {
     const scopes = this.valueRefScopes;
@@ -554,6 +555,38 @@ export class TreeSitterExtractor {
     this.fileScopeValues = new Map();
     if (!this.valueRefsEnabled || !TreeSitterExtractor.VALUE_REF_LANGS.has(this.language)) return;
     if (targets.size === 0 || scopes.length === 0 || isGeneratedFile(this.filePath)) return;
+
+    // Prune SHADOWED targets. A name bound more than once in the file (e.g. a
+    // bundled/Emscripten `const Module` re-declared as an inner `var Module` /
+    // function param) resolves to the INNER binding for nested readers, so a
+    // file-scope edge to it is a false positive. Those inner re-declarations
+    // aren't extracted as graph nodes, so detect them at the syntax level:
+    // count `variable_declarator` names across the tree and drop any target
+    // bound twice or more. Single-binding (unambiguous) names are kept. This
+    // complements the path-based isGeneratedFile() check for content-minified
+    // bundles it can't catch by suffix.
+    if (this.tree) {
+      const declCounts = new Map<string, number>();
+      const dstack: SyntaxNode[] = [this.tree.rootNode];
+      let dvisited = 0;
+      while (dstack.length > 0 && dvisited < TreeSitterExtractor.MAX_VALUE_REF_NODES) {
+        const n = dstack.pop()!;
+        dvisited++;
+        if (n.type === 'variable_declarator') {
+          const nameNode = n.namedChild(0);
+          if (nameNode && nameNode.type === 'identifier') {
+            const nm = getNodeText(nameNode, this.source);
+            if (targets.has(nm)) declCounts.set(nm, (declCounts.get(nm) ?? 0) + 1);
+          }
+        }
+        for (let i = 0; i < n.namedChildCount; i++) {
+          const c = n.namedChild(i);
+          if (c) dstack.push(c);
+        }
+      }
+      for (const [nm, c] of declCounts) if (c > 1) targets.delete(nm);
+      if (targets.size === 0) return;
+    }
 
     for (const scope of scopes) {
       const seen = new Set<string>();
