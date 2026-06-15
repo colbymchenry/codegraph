@@ -1364,6 +1364,17 @@ export class QueryBuilder {
   }
 
   /**
+   * Delete synthesized/dynamic edges before resuming an interrupted resolution
+   * pass. These edges are recomputed from the persisted base graph, and the
+   * edges table intentionally has no uniqueness constraint, so recomputing
+   * without clearing would duplicate them.
+   */
+  deleteEdgesByProvenance(provenance: Edge['provenance']): void {
+    if (!provenance) return;
+    this.db.prepare('DELETE FROM edges WHERE provenance = ?').run(provenance);
+  }
+
+  /**
    * Get outgoing edges from a node
    */
   getOutgoingEdges(sourceId: string, kinds?: EdgeKind[], provenance?: string): Edge[] {
@@ -1800,6 +1811,21 @@ export class QueryBuilder {
   }
 
   /**
+   * Lightweight count snapshot for interrupted-index recovery.
+   */
+  getIndexRecordCounts(): { files: number; nodes: number; edges: number; unresolvedRefs: number } {
+    return this.db
+      .prepare(`
+        SELECT
+          (SELECT COUNT(*) FROM files) AS files,
+          (SELECT COUNT(*) FROM nodes) AS nodes,
+          (SELECT COUNT(*) FROM edges) AS edges,
+          (SELECT COUNT(*) FROM unresolved_refs) AS unresolvedRefs
+      `)
+      .get() as { files: number; nodes: number; edges: number; unresolvedRefs: number };
+  }
+
+  /**
    * Get graph statistics
    */
   getStats(): GraphStats {
@@ -1866,6 +1892,13 @@ export class QueryBuilder {
     this.db.prepare(
       'INSERT INTO project_metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
     ).run(key, value, Date.now());
+  }
+
+  /**
+   * Delete a metadata key when a transient state marker no longer applies.
+   */
+  deleteMetadata(key: string): void {
+    this.db.prepare('DELETE FROM project_metadata WHERE key = ?').run(key);
   }
 
   /**

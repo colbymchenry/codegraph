@@ -628,10 +628,7 @@ program
       const cg = await CodeGraph.open(projectPath);
 
       if (options.quiet) {
-        // Quiet mode: no UI, just run. `index` is a full re-index, so clear the
-        // existing graph and rebuild from scratch (see the note below — #874).
-        cg.clear();
-        const result = await cg.indexAll();
+        const result = await cg.reindexAll();
         if (!result.success) process.exit(1);
         cg.destroy();
         return;
@@ -640,24 +637,21 @@ program
       const clack = await importESM('@clack/prompts');
       clack.intro('Indexing project');
 
-      // `index` is a FULL re-index: clear the existing graph and rebuild it from
-      // scratch so the result is identical to a fresh `init`. Without the clear,
-      // indexAll() skips every unchanged file by its content hash and reports
-      // "0 nodes, 0 edges" against the already-populated graph — which reads as
-      // "index wiped my index" (#874). For fast incremental updates use `sync`.
-      cg.clear();
+      // `index` is a FULL re-index: drop and recreate the DB from scratch so
+      // the result is identical to a fresh `init` (much faster than row-by-row
+      // DELETE on a large DB — see #874). For fast incremental updates use `sync`.
 
       let result: IndexResult;
 
       if (options.verbose) {
-        result = await cg.indexAll({
+        result = await cg.reindexAll({
           onProgress: createVerboseProgress(),
           verbose: true,
         });
       } else {
         process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
         const progress = createShimmerProgress();
-        result = await cg.indexAll({
+        result = await cg.reindexAll({
           onProgress: progress.onProgress,
         });
         await progress.stop();
