@@ -11,7 +11,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- The file watcher that auto-syncs the graph now fails cleanly when live watching can no longer be trusted, instead of looking healthy while the index quietly goes stale. If the operating system runs out of file-watch resources, or another process holds the write lock far longer than a normal save, CodeGraph now disables auto-sync once — with a single clear message telling you to run `codegraph sync` (or rely on the git sync hooks) to refresh — rather than retrying forever or repeating the same error on a loop. This mostly matters for long-running MCP/daemon sessions, which could otherwise keep serving stale results while appearing to work. Thanks @thismilktea. (#876)
+- The file watcher that auto-syncs the graph now fails cleanly when live watching can no longer be trusted, instead of looking healthy while the index quietly goes stale. If the operating system runs out of file-watch resources, or another process holds the write lock far longer than a normal save, CodeGraph now disables auto-sync once — with a single clear message telling you to run `codegraph sync` (or rely on the git sync hooks) to refresh — rather than retrying forever or repeating the same error on a loop. And while auto-sync is disabled, CodeGraph's tool responses (and `codegraph status`) now say so plainly, so your AI agent knows to read files directly instead of trusting a frozen index. This mostly matters for long-running MCP/daemon sessions, which could otherwise keep serving stale results while appearing to work. Thanks @thismilktea. (#876)
 
 
 ## [1.0.1] - 2026-06-13

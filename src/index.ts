@@ -585,6 +585,23 @@ export class CodeGraph {
   }
 
   /**
+   * True once live watching has permanently degraded (OS watch-resource
+   * exhaustion, or a write lock held past the retry budget) and auto-sync is
+   * disabled until the next {@link watch} call. Distinct from `!isWatching()`:
+   * a stopped/never-started watcher is inactive but NOT degraded. MCP tools use
+   * this to surface a whole-index "results may be stale" notice, since
+   * `getPendingFiles()` goes empty once watching stops (#876).
+   */
+  isWatcherDegraded(): boolean {
+    return this.watcher?.isDegraded() ?? false;
+  }
+
+  /** The reason live watching degraded, or null if it is healthy (#876). */
+  getWatcherDegradedReason(): string | null {
+    return this.watcher?.getDegradedReason() ?? null;
+  }
+
+  /**
    * Files seen by the file watcher since the last successful sync —
    * the per-file "stale" signal MCP tools attach to responses so an agent
    * can fall back to {@link Read} for just the affected file without
