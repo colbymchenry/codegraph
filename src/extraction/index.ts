@@ -872,7 +872,7 @@ export class ExtractionOrchestrator {
       getAllFiles: () => files,
       getProjectRoot: () => rootDir,
       fileExists: (relativePath: string) => {
-        const full = validatePathWithinRoot(rootDir, relativePath);
+        const full = validatePathWithinRoot(rootDir, relativePath, true);
         if (!full) return false;
         try {
           return fs.existsSync(full);
@@ -881,7 +881,7 @@ export class ExtractionOrchestrator {
         }
       },
       readFile: (relativePath: string) => {
-        const full = validatePathWithinRoot(rootDir, relativePath);
+        const full = validatePathWithinRoot(rootDir, relativePath, true);
         if (!full) return null;
         try {
           return fs.readFileSync(full, 'utf-8');
@@ -1169,7 +1169,7 @@ export class ExtractionOrchestrator {
       const fileContents = await Promise.all(
         batch.map(async (fp) => {
           try {
-            const fullPath = validatePathWithinRoot(this.rootDir, fp);
+            const fullPath = validatePathWithinRoot(this.rootDir, fp, true); // allowSymlinkedDirs: watched symlinks are pre-validated
             if (!fullPath) {
               logWarn('Path traversal blocked in batch reader', { filePath: fp });
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: new Error('Path traversal blocked') };
@@ -1323,7 +1323,7 @@ export class ExtractionOrchestrator {
 
         let content: string;
         try {
-          const fullPath = validatePathWithinRoot(this.rootDir, filePath);
+          const fullPath = validatePathWithinRoot(this.rootDir, filePath, true);
           if (!fullPath) continue;
           content = await fsp.readFile(fullPath, 'utf-8');
         } catch {
@@ -1368,7 +1368,7 @@ export class ExtractionOrchestrator {
 
           let fullContent: string;
           try {
-            const fullPath = validatePathWithinRoot(this.rootDir, filePath);
+            const fullPath = validatePathWithinRoot(this.rootDir, filePath, true);
             if (!fullPath) continue;
             fullContent = await fsp.readFile(fullPath, 'utf-8');
           } catch {
@@ -1475,7 +1475,7 @@ export class ExtractionOrchestrator {
    * Index a single file
    */
   async indexFile(relativePath: string): Promise<ExtractionResult> {
-    const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
+    const fullPath = validatePathWithinRoot(this.rootDir, relativePath, true);
 
     if (!fullPath) {
       return {
@@ -1523,7 +1523,7 @@ export class ExtractionOrchestrator {
     stats: fs.Stats
   ): Promise<ExtractionResult> {
     // Prevent path traversal
-    const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
+    const fullPath = validatePathWithinRoot(this.rootDir, relativePath, true);
     if (!fullPath) {
       logWarn('Path traversal blocked in indexFileWithContent', { relativePath });
       return {

@@ -166,6 +166,12 @@ export class FileWatcher {
   private dirCapWarned = false;
   /** Test-only inert mode: started, but with no OS watcher installed. */
   private inert = false;
+  /**
+   * Resolved realpath of directories already watched (or skipped). Prevents
+   * infinite recursion via symlink cycles — mirrors the same guard used in
+   * the indexer's `walk()` (extraction/index.ts).
+   */
+  private visitedRealDirs = new Set<string>();
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * Files seen by the watcher since the last successful sync — populated on
@@ -352,7 +358,33 @@ export class FileWatcher {
       const child = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         if (this.shouldIgnoreDir(child)) continue;
+        // Track regular dirs too so a symlink pointing to an already-visited
+        // real path is also skipped (A→B via isDirectory, then symlink→B).
+        try {
+          this.visitedRealDirs.add(fs.realpathSync(child));
+        } catch { /* ignore — will be caught by watch failure below */ }
         this.watchTree(child, markExisting);
+      } else if (entry.isSymbolicLink()) {
+        // Follow directory symlinks so symlinked project dirs are watched.
+        // Mirrors the indexer's walk() in extraction/index.ts.
+        try {
+          const realTarget = fs.realpathSync(child);
+          const stat = fs.statSync(realTarget);
+          if (stat.isDirectory()) {
+            if (this.visitedRealDirs.has(realTarget)) {
+              logDebug('Skipping already-visited directory (symlink cycle)', { dir: child, realTarget });
+              continue;
+            }
+            this.visitedRealDirs.add(realTarget);
+            if (!this.shouldIgnoreDir(child)) {
+              this.watchTree(child, markExisting);
+            }
+          } else if (markExisting && stat.isFile()) {
+            this.handleChange(normalizePath(path.relative(this.projectRoot, child)));
+          }
+        } catch {
+          logDebug('Skipping broken symlink in watcher', { path: child });
+        }
       } else if (markExisting && entry.isFile()) {
         this.handleChange(normalizePath(path.relative(this.projectRoot, child)));
       }
@@ -478,6 +510,7 @@ export class FileWatcher {
     }
     this.dirWatchers.clear();
     this.dirCapWarned = false;
+    this.visitedRealDirs.clear();
     this.inert = false;
 
     this.pendingFiles.clear();
