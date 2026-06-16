@@ -2,6 +2,26 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/** Extract annotation names from Java's `modifiers` → `annotation`/`marker_annotation` children. */
+function extractAnnotationNames(node: SyntaxNode): string[] | undefined {
+  const names: string[] = [];
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i);
+    if (child?.type !== 'modifiers') continue;
+    for (let j = 0; j < child.namedChildCount; j++) {
+      const anno = child.namedChild(j);
+      if (!anno || (anno.type !== 'annotation' && anno.type !== 'marker_annotation')) continue;
+      // annotation: `@Table(name="articles")` → text starts with `@`, extract
+      // the name before any `(`.  marker_annotation: `@Entity` (no args).
+      const text = anno.text;
+      if (!text.startsWith('@')) continue;
+      const name = text.slice(1).split('(')[0]!.trim();
+      if (name) names.push(name);
+    }
+  }
+  return names.length > 0 ? names : undefined;
+}
+
 /**
  * Tree-sitter-java node types for a method's `type` (return) field that can
  * never be a method receiver — there's no class to chain a `.method()` on, so we
@@ -86,6 +106,7 @@ export const javaExtractor: LanguageExtractor = {
     }
     return false;
   },
+  extractModifiers: (node) => extractAnnotationNames(node),
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();
     const scopedId = node.namedChildren.find((c: SyntaxNode) => c.type === 'scoped_identifier');
