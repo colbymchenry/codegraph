@@ -27,6 +27,9 @@ function makeContext(nodes: Node[], fileContents: Record<string, string> = {}): 
     getNodesByName: (name) => byName.get(name) ?? [],
     getNodesByQualifiedName: () => { throw new Error('not used'); },
     getNodesByKind: (kind) => nodes.filter((n) => n.kind === kind),
+    iterateNodesByKind: function* (kind) {
+      yield* nodes.filter((n) => n.kind === kind);
+    },
     getNodesByLowerName: () => { throw new Error('not used'); },
     fileExists: (fp) => allFiles.has(fp),
     readFile: (fp) => fileContents[fp] ?? null,
@@ -119,6 +122,27 @@ describe('React Native bridge resolver', () => {
       );
       expect(result?.targetNodeId).toBe(native.id);
       expect(result?.resolvedBy).toBe('framework');
+    });
+
+    it('streams method nodes when building the bridge map instead of materializing every method', () => {
+      const native = method('getCurrentPosition:', 'objc', 'RCTGeolocation.m');
+      const ctx = {
+        ...makeContext([native], {
+          'package.json': '{"dependencies":{"react-native":"^0.73"}}',
+          'RCTGeolocation.m':
+            '@implementation RCTGeolocation\n' +
+            'RCT_EXPORT_MODULE()\n' +
+            'RCT_EXPORT_METHOD(getCurrentPosition:(RCTResponseSenderBlock)cb) {}\n' +
+            '@end',
+        }),
+        getNodesByKind: () => { throw new Error('full method scan should not be used'); },
+      } satisfies ResolutionContext;
+
+      const result = reactNativeBridgeResolver.resolve(
+        ref('getCurrentPosition', 'javascript', 'App.js'),
+        ctx
+      );
+      expect(result?.targetNodeId).toBe(native.id);
     });
 
     it('resolves via explicit module name in RCT_EXPORT_MODULE(name)', () => {

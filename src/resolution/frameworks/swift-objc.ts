@@ -52,6 +52,12 @@ const objcByCandidateSwiftBase: WeakMap<
   Map<string, Node[]>
 > = new WeakMap();
 
+function methodNodes(context: ResolutionContext): Iterable<Node> {
+  return context.iterateNodesByKind
+    ? context.iterateNodesByKind('method')
+    : context.getNodesByKind('method');
+}
+
 /**
  * Build the reverse-bridge map: for every ObjC method node in the graph,
  * compute the Swift base names that would auto-bridge to its selector and
@@ -118,10 +124,8 @@ function buildObjcMap(context: ResolutionContext): Map<string, Node[]> {
   if (cached) return cached;
 
   const map = new Map<string, Node[]>();
-  const objcMethods = context
-    .getNodesByKind('method')
-    .filter((n) => n.language === 'objc');
-  for (const node of objcMethods) {
+  for (const node of methodNodes(context)) {
+    if (node.language !== 'objc') continue;
     const candidates = swiftBaseNamesForObjcSelector(node.name);
     for (const c of candidates) {
       // Skip the trivial case where the Swift base name equals the ObjC
@@ -227,9 +231,15 @@ function resolveObjcCallToSwift(
 
   const candidates = swiftBaseNamesForObjcSelector(rawSelector);
   for (const candidate of candidates) {
-    const matches = context
-      .getNodesByName(candidate)
-      .filter((n) => n.language === 'swift' && (n.kind === 'method' || n.kind === 'function'));
+    const matches = context.getNodesByNameFiltered
+      ? context.getNodesByNameFiltered(candidate, {
+          language: 'swift',
+          kinds: ['method', 'function'],
+          limit: 2000,
+        })
+      : context
+          .getNodesByName(candidate)
+          .filter((n) => n.language === 'swift' && (n.kind === 'method' || n.kind === 'function'));
     for (const match of matches) {
       const window = declarationSourceWindow(match, context);
       if (isObjcExposed(window)) {

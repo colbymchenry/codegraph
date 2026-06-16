@@ -21,6 +21,9 @@ function makeContext(nodes: Node[], fileContents: Record<string, string> = {}): 
     getNodesByName: (name) => byName.get(name) ?? [],
     getNodesByQualifiedName: () => { throw new Error('not used'); },
     getNodesByKind: (kind) => nodes.filter((n) => n.kind === kind),
+    iterateNodesByKind: function* (kind) {
+      yield* nodes.filter((n) => n.kind === kind);
+    },
     getNodesByLowerName: () => { throw new Error('not used'); },
     fileExists: (fp) => allFiles.has(fp),
     readFile: (fp) => fileContents[fp] ?? null,
@@ -111,6 +114,20 @@ describe('swiftObjcBridgeResolver integration', () => {
       expect(result?.targetNodeId).toBe(objcTarget.id);
       expect(result?.resolvedBy).toBe('framework');
       expect(result?.confidence).toBe(0.6);
+    });
+
+    it('streams ObjC method nodes when building the bridge map', () => {
+      const objcTarget = method('fetchEntryForKey:', 'objc', 'Cache.m');
+      const ctx = {
+        ...makeContext([objcTarget]),
+        getNodesByKind: () => { throw new Error('full method scan should not be used'); },
+      } satisfies ResolutionContext;
+
+      const result = swiftObjcBridgeResolver.resolve(
+        ref('fetchEntry', 'swift', 'Caller.swift'),
+        ctx
+      );
+      expect(result?.targetNodeId).toBe(objcTarget.id);
     });
 
     it('does NOT bridge generic Cocoa names like "init" or "description"', () => {
