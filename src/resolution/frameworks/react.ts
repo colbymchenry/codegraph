@@ -9,7 +9,7 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 
 export const reactResolver: FrameworkResolver = {
   name: 'react',
-  languages: ['javascript', 'typescript'],
+  languages: ['javascript', 'typescript', 'jsx', 'tsx'],
 
   detect(context: ResolutionContext): boolean {
     // Check for React in package.json

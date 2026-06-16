@@ -4,7 +4,7 @@
  * Types for the reference resolution system.
  */
 
-import { Language, Node, ReferenceKind } from '../types';
+import { Language, Node, NodeLookupFilters, ReferenceKind } from '../types';
 
 /**
  * An unresolved reference from extraction
@@ -67,6 +67,8 @@ export interface ResolutionContext {
   getNodesInFile(filePath: string): Node[];
   /** Get all nodes by name */
   getNodesByName(name: string): Node[];
+  /** Get nodes by name with SQL-side filters for memory-bounded resolution */
+  getNodesByNameFiltered?(name: string, filters?: NodeLookupFilters): Node[];
   /** Get all nodes by qualified name */
   getNodesByQualifiedName(qualifiedName: string): Node[];
   /** Get all nodes of a kind */
@@ -85,6 +87,8 @@ export interface ResolutionContext {
   getAllFiles(): string[];
   /** Get nodes by lowercase name (O(1) lookup for fuzzy matching) */
   getNodesByLowerName(lowerName: string): Node[];
+  /** Get lowercase-name matches with SQL-side filters for bounded fuzzy matching */
+  getNodesByLowerNameFiltered?(lowerName: string, filters?: NodeLookupFilters): Node[];
   /**
    * Direct supertypes of the type named `typeName` (same language): the classes
    * it extends and the interfaces / protocols / traits it implements/conforms to,

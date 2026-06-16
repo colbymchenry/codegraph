@@ -1307,6 +1307,79 @@ func main() {
       const result = matchReference(ref, baseContext([variable, decorator]));
       expect(result?.targetNodeId).toBe('func:di.ts:Inject:10');
     });
+
+    it('uses filtered name lookup for exact call refs instead of materializing all same-name nodes', () => {
+      const target: Node = {
+        id: 'func:src/app.ts:main:10', kind: 'function', name: 'main',
+        qualifiedName: 'src/app.ts::main', filePath: 'src/app.ts', language: 'typescript',
+        startLine: 10, endLine: 20, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const ref = {
+        fromNodeId: 'func:src/app.ts:bootstrap:1',
+        referenceName: 'main',
+        referenceKind: 'calls' as const,
+        line: 5, column: 0, filePath: 'src/app.ts', language: 'typescript' as const,
+      };
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => { throw new Error('full name lookup should not be used'); },
+        getNodesByNameFiltered: (name, filters = {}) => {
+          expect(name).toBe('main');
+          expect(filters.kinds).toContain('function');
+          return [target];
+        },
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+
+      const result = matchReference(ref, context);
+      expect(result?.targetNodeId).toBe(target.id);
+    });
+
+    it('uses filtered lookup for method-call fallback instead of loading every same-name method', () => {
+      const target: Node = {
+        id: 'method:src/service.ts:PermissionEngine::check:10', kind: 'method', name: 'check',
+        qualifiedName: 'src/service.ts::PermissionEngine::check', filePath: 'src/service.ts',
+        language: 'typescript', startLine: 10, endLine: 20, startColumn: 0, endColumn: 0,
+        updatedAt: Date.now(),
+      };
+      const ref = {
+        fromNodeId: 'func:src/app.ts:run:1',
+        referenceName: 'permissionEngine.check',
+        referenceKind: 'calls' as const,
+        line: 5, column: 0, filePath: 'src/app.ts', language: 'typescript' as const,
+      };
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => { throw new Error('full name lookup should not be used'); },
+        getNodesByNameFiltered: (name, filters = {}) => {
+          if (name === 'permissionEngine' || name === 'PermissionEngine') return [];
+          if (filters.qualifiedNameSuffix) return [];
+          expect(name).toBe('check');
+          expect(filters.kinds).toEqual(['method']);
+          expect(filters.language).toBe('typescript');
+          return [target];
+        },
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+
+      const result = matchReference(ref, context);
+      expect(result?.targetNodeId).toBe(target.id);
+      expect(result?.resolvedBy).toBe('instance-method');
+    });
   });
 
   describe('tsconfig path aliases', () => {

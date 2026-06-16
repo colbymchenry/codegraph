@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Node, NodeKind, UnresolvedReference, Edge } from '../types';
+import { LANGUAGES, Node, NodeKind, UnresolvedReference, Edge } from '../types';
 import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
@@ -17,8 +17,8 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
-import { detectFrameworks } from './frameworks';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCppStdlibHeader } from './import-resolver';
+import { detectFrameworks, getApplicableFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
@@ -43,6 +43,10 @@ const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */
 const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 
+function sameLanguageFamilyMembers(language: Node['language']): Node['language'][] {
+  return LANGUAGES.filter((candidate) => sameLanguageFamily(candidate, language));
+}
+
 /**
  * Cache size limits. Each per-resolver cache is bounded so memory
  * stays flat on large codebases (20k+ files). Sizes were chosen to
@@ -52,6 +56,8 @@ const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
  * caches) when tuning for very large or very small projects.
  */
 const DEFAULT_CACHE_LIMIT = 5_000;
+const MAX_UNFILTERED_NAME_LOOKUP_ROWS = 10_000;
+const MAX_CACHED_NAME_LOOKUP_ROWS = 1_000;
 function resolveCacheLimit(): number {
   const raw = process.env.CODEGRAPH_RESOLVER_CACHE_SIZE;
   if (!raw) return DEFAULT_CACHE_LIMIT;
@@ -341,9 +347,23 @@ export class ReferenceResolver {
       getNodesByName: (name: string) => {
         const cached = this.nameCache.get(name);
         if (cached !== undefined) return cached;
+        const count = this.queries.getNodeNameCount(name);
+        if (count > MAX_UNFILTERED_NAME_LOOKUP_ROWS) {
+          logDebug('Skipping high-fanout unfiltered node-name lookup during resolution', {
+            name,
+            count,
+          });
+          return [];
+        }
         const result = this.queries.getNodesByName(name);
-        this.nameCache.set(name, result);
+        if (count <= MAX_CACHED_NAME_LOOKUP_ROWS) {
+          this.nameCache.set(name, result);
+        }
         return result;
+      },
+
+      getNodesByNameFiltered: (name, filters = {}) => {
+        return this.queries.getNodesByNameFiltered(name, filters);
       },
 
       getNodesByQualifiedName: (qualifiedName: string) => {
@@ -428,9 +448,23 @@ export class ReferenceResolver {
       getNodesByLowerName: (lowerName: string) => {
         const cached = this.lowerNameCache.get(lowerName);
         if (cached !== undefined) return cached;
+        const count = this.queries.getLowerNodeNameCount(lowerName);
+        if (count > MAX_UNFILTERED_NAME_LOOKUP_ROWS) {
+          logDebug('Skipping high-fanout unfiltered lowercase node-name lookup during resolution', {
+            lowerName,
+            count,
+          });
+          return [];
+        }
         const result = this.queries.getNodesByLowerName(lowerName);
-        this.lowerNameCache.set(lowerName, result);
+        if (count <= MAX_CACHED_NAME_LOOKUP_ROWS) {
+          this.lowerNameCache.set(lowerName, result);
+        }
         return result;
+      },
+
+      getNodesByLowerNameFiltered: (lowerName, filters = {}) => {
+        return this.queries.getNodesByLowerNameFiltered(lowerName, filters);
       },
 
       getNodeById: (id: string) => {
@@ -442,9 +476,14 @@ export class ReferenceResolver {
         // Matching by simple name (not id) reconciles a type declared in one node
         // (`KF::Builder`) with conformance declared in a separate extension node
         // (`KF.Builder: KFOptionSetter`) — both have name `Builder`.
-        const typeNodes = this.context
-          .getNodesByName(typeName)
-          .filter((n) => SUPERTYPE_BEARING_KINDS.has(n.kind) && n.language === language);
+        const typeNodes = this.context.getNodesByNameFiltered
+          ? this.context.getNodesByNameFiltered(typeName, {
+              language,
+              kinds: [...SUPERTYPE_BEARING_KINDS],
+            })
+          : this.context
+              .getNodesByName(typeName)
+              .filter((n) => SUPERTYPE_BEARING_KINDS.has(n.kind) && n.language === language);
         if (typeNodes.length === 0) return [];
         const supertypes = new Set<string>();
         for (const tn of typeNodes) {
@@ -726,6 +765,8 @@ export class ReferenceResolver {
    * Resolve a single reference
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    const applicableFrameworks = getApplicableFrameworks(this.frameworks, ref.language);
+
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
@@ -740,7 +781,7 @@ export class ReferenceResolver {
     if (
       !this.hasAnyPossibleMatch(ref.referenceName) &&
       !this.matchesAnyImport(ref) &&
-      !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
+      !applicableFrameworks.some((f) => f.claimsReference?.(ref.referenceName))
     ) {
       return null;
     }
@@ -789,7 +830,7 @@ export class ReferenceResolver {
     // JS → native `calls`) — `gateFrameworkLanguage` only drops a type/import
     // edge between two KNOWN families (see its doc), never a `calls` bridge or
     // a config↔code edge.
-    for (const framework of this.frameworks) {
+    for (const framework of applicableFrameworks) {
       const result = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
       if (result) {
         if (result.confidence >= 0.9) return result; // High confidence, return immediately
@@ -809,6 +850,17 @@ export class ReferenceResolver {
     // name-matcher — it would mis-connect e.g. "inc/db.php" to an unrelated
     // db.php elsewhere in the tree (a wrong edge is worse than none, #660).
     if (isPhpIncludePathRef(ref)) {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) =>
+            curr.confidence > best.confidence ? curr : best
+          )
+        : null;
+    }
+
+    // C/C++ #include edges are file-path imports. If import resolution could not
+    // locate the header, falling through to global name matching only burns heap
+    // on common header names and risks a wrong basename collision.
+    if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports') {
       return candidates.length > 0
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
@@ -1176,6 +1228,7 @@ export class ReferenceResolver {
     // when there's no user node with this name — then name-matching would
     // produce zero edges anyway and the filter just short-circuits work.
     if (ref.language === 'c' || ref.language === 'cpp') {
+      if (ref.referenceKind === 'imports' && isCppStdlibHeader(name)) return true;
       // C++ std:: namespace prefix — safe to filter unconditionally,
       // since `std::foo` is never a user-defined qualified name in
       // tree-sitter output.
@@ -1354,23 +1407,34 @@ export class ReferenceResolver {
       // NODES, and look members up through `contains` edges. No name-based
       // unions anywhere — a name-keyed getSupertypes('Engine') merged every
       // Engine's parents and produced a cross-class wrong edge on rails.
-      let frontierNodes = this.context
-        .getNodesByName(className)
-        .filter(
-          (n) =>
-            SUPERTYPE_BEARING_KINDS.has(n.kind) &&
-            n.filePath === ref.filePath
-        );
+      let frontierNodes = this.context.getNodesByNameFiltered
+        ? this.context.getNodesByNameFiltered(className, {
+            kinds: [...SUPERTYPE_BEARING_KINDS],
+            filePath: ref.filePath,
+          })
+        : this.context
+            .getNodesByName(className)
+            .filter(
+              (n) =>
+                SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+                n.filePath === ref.filePath
+            );
       if (frontierNodes.length === 0) {
         // The class itself may be declared in another file (partial/reopened
         // classes); fall back to same-family nodes of that name.
-        frontierNodes = this.context
-          .getNodesByName(className)
-          .filter(
-            (n) =>
-              SUPERTYPE_BEARING_KINDS.has(n.kind) &&
-              sameLanguageFamily(n.language, ref.language)
-          );
+        frontierNodes = this.context.getNodesByNameFiltered
+          ? this.context.getNodesByNameFiltered(className, {
+              languages: sameLanguageFamilyMembers(ref.language),
+              kinds: [...SUPERTYPE_BEARING_KINDS],
+              limit: 2000,
+            })
+          : this.context
+              .getNodesByName(className)
+              .filter(
+                (n) =>
+                  SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+                  sameLanguageFamily(n.language, ref.language)
+              );
       }
       const seenNodes = new Set<string>(frontierNodes.map((n) => n.id));
       let target: Node | null = null;
