@@ -293,6 +293,25 @@ export { main };
 
       expect(Array.isArray(callees)).toBe(true);
     });
+
+    it('treats class instantiation as a caller/callee of the class (#774)', () => {
+      // main() does `new DerivedClass(10, 'test')`. Constructing a class is
+      // calling its constructor, so main is a caller of DerivedClass and
+      // DerivedClass is a callee of main. Before #774 the `instantiates` edge
+      // was excluded from the caller/callee traversal, so `callers <Class>`
+      // returned the importing file (or nothing) and missed every
+      // construction site.
+      const derived = cg.getNodesByKind('class').find((n) => n.name === 'DerivedClass');
+      const main = cg.getNodesByKind('function').find((n) => n.name === 'main');
+      expect(derived).toBeDefined();
+      expect(main).toBeDefined();
+
+      const callerNames = cg.getCallers(derived!.id).map((c) => c.node.name);
+      expect(callerNames).toContain('main');
+
+      const calleeNames = cg.getCallees(main!.id).map((c) => c.node.name);
+      expect(calleeNames).toContain('DerivedClass');
+    });
   });
 
   describe('getImpactRadius()', () => {
@@ -308,6 +327,19 @@ export { main };
 
       expect(impact.nodes.size).toBeGreaterThan(0);
       expect(impact.nodes.has(formatValue.id)).toBe(true);
+    });
+
+    it('does not drag in sibling members via the structural contains edge (#536)', () => {
+      const getName = cg.getNodesByKind('method').find((n) => n.name === 'getName');
+      const derived = cg.getNodesByKind('class').find((n) => n.name === 'DerivedClass');
+      expect(getName).toBeDefined();
+      expect(derived).toBeDefined();
+
+      const impact = cg.getImpactRadius(getName!.id, 3);
+      // The containing class must NOT be pulled into impact just because it
+      // *contains* getName — climbing that contains edge would re-expand every
+      // sibling method and explode impact for a leaf symbol. (#536)
+      expect(impact.nodes.has(derived!.id)).toBe(false);
     });
   });
 
@@ -375,16 +407,37 @@ export { main };
   });
 
   describe('File dependency analysis', () => {
-    it('should get file dependencies', () => {
+    // Regression: getFileDependents/getFileDependencies used to follow
+    // ONLY `imports` edges, which in this engine are same-file (a file → its
+    // own local import declarations). That made both return [] for EVERY file,
+    // so `codegraph affected` found no dependents on any language/framework.
+    // They must follow the cross-file symbol graph instead (calls / references
+    // / instantiates / extends / implements / ...).
+    it('reports cross-file dependencies via the symbol graph, not just imports', () => {
       const deps = cg.getFileDependencies('src/main.ts');
-
-      expect(Array.isArray(deps)).toBe(true);
+      // main() instantiates DerivedClass (derived.ts) and calls
+      // processValue/doubleValue (utils.ts) — both are real dependencies.
+      expect(deps).toContain('src/utils.ts');
+      expect(deps).toContain('src/derived.ts');
     });
 
-    it('should get file dependents', () => {
-      const dependents = cg.getFileDependents('src/utils.ts');
+    it('reports cross-file dependents via the symbol graph, not just imports', () => {
+      // utils.ts is used by main.ts (processValue/doubleValue calls); the old
+      // imports-only implementation returned [] here.
+      expect(cg.getFileDependents('src/utils.ts')).toContain('src/main.ts');
+    });
 
-      expect(Array.isArray(dependents)).toBe(true);
+    it('counts extends/implements as a dependency edge', () => {
+      // derived.ts extends BaseClass / implements Printable, both in base.ts.
+      expect(cg.getFileDependencies('src/derived.ts')).toContain('src/base.ts');
+      expect(cg.getFileDependents('src/base.ts')).toContain('src/derived.ts');
+    });
+
+    it('never lists a file as its own dependent or dependency', () => {
+      for (const f of ['src/main.ts', 'src/utils.ts', 'src/base.ts', 'src/derived.ts']) {
+        expect(cg.getFileDependents(f)).not.toContain(f);
+        expect(cg.getFileDependencies(f)).not.toContain(f);
+      }
     });
   });
 

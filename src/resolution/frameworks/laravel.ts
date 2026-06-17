@@ -44,6 +44,13 @@ export const laravelResolver: FrameworkResolver = {
     return context.fileExists('artisan') || context.fileExists('app/Http/Kernel.php');
   },
 
+  // `Controller@method` route refs name no declared symbol, so resolveOne's
+  // pre-filter would drop them before resolve() runs (Pattern 4). Claim them —
+  // same hook the django ORM / Rails routing work needed.
+  claimsReference(name: string): boolean {
+    return /^[A-Za-z_][A-Za-z0-9_]*Controller@\w+$/.test(name);
+  },
+
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Model::method() - Eloquent static calls
     const modelMatch = ref.referenceName.match(/^([A-Z][a-zA-Z]+)::(\w+)$/);
@@ -185,18 +192,21 @@ export const laravelResolver: FrameworkResolver = {
  */
 function extractLaravelHandler(expr: string): string | null {
   const trimmed = expr.trim();
+  const short = (s: string) => s.split('\\').pop()!; // strip namespace
 
-  // [Class::class, 'method'] — grab the string literal
-  const tupleMatch = trimmed.match(/^\[\s*[^,]+,\s*['"]([^'"]+)['"]\s*\]/);
-  if (tupleMatch) return tupleMatch[1]!;
+  // [Class::class, 'method'] → `Class@method` (PRECISE — keep the controller, so
+  // common action names like `index`/`show` resolve to the RIGHT controller, not
+  // whichever one name-matching happens to pick first).
+  const tupleMatch = trimmed.match(/^\[\s*([A-Za-z_\\][\w\\]*)::class\s*,\s*['"]([^'"]+)['"]\s*\]/);
+  if (tupleMatch) return `${short(tupleMatch[1]!)}@${tupleMatch[2]!}`;
 
-  // 'Controller@method'
+  // 'Controller@method' (possibly namespaced) → `Controller@method`
   const atMatch = trimmed.match(/^['"]([^'"@]+)@([^'"]+)['"]$/);
-  if (atMatch) return atMatch[2]!;
+  if (atMatch) return `${short(atMatch[1]!)}@${atMatch[2]!}`;
 
-  // Controller::class
-  const classMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)::class/);
-  if (classMatch) return classMatch[1]!;
+  // Class::class (Route::resource controller) → `Class`
+  const classMatch = trimmed.match(/^([A-Za-z_\\][\w\\]*)::class/);
+  if (classMatch) return short(classMatch[1]!);
 
   return null;
 }

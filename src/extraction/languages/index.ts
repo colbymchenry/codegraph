@@ -23,6 +23,10 @@ import { kotlinExtractor } from './kotlin';
 import { dartExtractor } from './dart';
 import { pascalExtractor } from './pascal';
 import { scalaExtractor } from './scala';
+import { luaExtractor } from './lua';
+import { rExtractor } from './r';
+import { luauExtractor } from './luau';
+import { objcExtractor } from './objc';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -43,4 +47,8 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   dart: dartExtractor,
   pascal: pascalExtractor,
   scala: scalaExtractor,
+  lua: luaExtractor,
+  r: rExtractor,
+  luau: luauExtractor,
+  objc: objcExtractor,
 };

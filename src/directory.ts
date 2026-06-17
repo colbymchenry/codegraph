@@ -5,18 +5,85 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
+/** The default per-project data directory name. */
+const DEFAULT_CODEGRAPH_DIR = '.codegraph';
+
+let warnedBadDirName = false;
+
 /**
- * CodeGraph directory name
+ * Resolve the per-project data directory name, honoring the `CODEGRAPH_DIR`
+ * environment override (default `.codegraph`). The override is a single path
+ * segment that lives in the project root.
+ *
+ * Why this exists: two environments that share one working tree must NOT share
+ * one `.codegraph/` — most concretely Windows-native and WSL (issue #636). The
+ * daemon lockfile (`.codegraph/daemon.pid`) records a platform-specific pid and
+ * socket path (a Windows named pipe vs a WSL Unix socket), and SQLite file
+ * locking across the WSL2 ↔ Windows filesystem boundary is unreliable, so two
+ * daemons sharing one index risks corruption. Setting `CODEGRAPH_DIR=.codegraph-win`
+ * on one side gives each environment its own index in the same tree.
+ *
+ * Read live (not captured at load) so it is both process-accurate and testable.
+ * An override that isn't a plain directory name — empty, containing a path
+ * separator, `.`, `..`/traversal, or absolute — is ignored (we keep the
+ * default) rather than risk writing the index outside the project or into the
+ * project root itself; we warn once to stderr so the misconfiguration is seen.
  */
-export const CODEGRAPH_DIR = '.codegraph';
+export function codeGraphDirName(): string {
+  const raw = process.env.CODEGRAPH_DIR?.trim();
+  if (!raw) return DEFAULT_CODEGRAPH_DIR;
+  const invalid =
+    raw === '.' ||
+    raw.includes('..') ||
+    raw.includes('/') ||
+    raw.includes('\\') ||
+    path.isAbsolute(raw);
+  if (invalid) {
+    if (!warnedBadDirName) {
+      warnedBadDirName = true;
+      // stderr only — stdout is the MCP protocol channel.
+      console.warn(
+        `[codegraph] Ignoring invalid CODEGRAPH_DIR="${raw}" — it must be a plain ` +
+          `directory name (no path separators, no "..", not absolute). Using "${DEFAULT_CODEGRAPH_DIR}".`
+      );
+    }
+    return DEFAULT_CODEGRAPH_DIR;
+  }
+  return raw;
+}
+
+/**
+ * CodeGraph directory name — a load-time snapshot of {@link codeGraphDirName}.
+ * A running process's environment is fixed, so this equals the live value;
+ * it's kept as a stable string export for backward compatibility. Internal code
+ * resolves the name through {@link codeGraphDirName} / {@link getCodeGraphDir}
+ * so the `CODEGRAPH_DIR` override always applies.
+ */
+export const CODEGRAPH_DIR = codeGraphDirName();
+
+/**
+ * Is `name` (a single path segment) a CodeGraph data directory? Matches the
+ * default `.codegraph`, the active `CODEGRAPH_DIR` override, and any
+ * `.codegraph-*` sibling. File-watching and the indexer skip ALL of these, so
+ * when two environments share one working tree (Windows + WSL, issue #636)
+ * neither indexes or watches the other's index directory.
+ */
+export function isCodeGraphDataDir(name: string): boolean {
+  return (
+    name === DEFAULT_CODEGRAPH_DIR ||
+    name === codeGraphDirName() ||
+    name.startsWith(DEFAULT_CODEGRAPH_DIR + '-')
+  );
+}
 
 /**
  * Get the .codegraph directory path for a project
  */
 export function getCodeGraphDir(projectRoot: string): string {
-  return path.join(projectRoot, CODEGRAPH_DIR);
+  return path.join(projectRoot, codeGraphDirName());
 }
 
 /**
@@ -42,6 +109,52 @@ export function isInitialized(projectRoot: string): boolean {
  * @param startPath - Directory to start searching from
  * @returns The project root containing .codegraph/, or null if not found
  */
+/**
+ * Reason a directory is unsafe to use as an index ROOT, or null when it's fine.
+ *
+ * Indexing your home directory or a filesystem root drags in caches, `Library`,
+ * every other project, etc. — a multi-GB index, constant file-watcher churn, and
+ * (pre-1.0 on macOS) a file-descriptor blowup that exhausted `kern.maxfiles` and
+ * took unrelated apps / the whole machine down (#845). The classic trigger:
+ * running the installer or `codegraph init` from `$HOME`, which auto-indexes the
+ * current directory. These are never intended project roots, so the installer
+ * and `init`/`index` refuse them (overridable with `--force`).
+ *
+ * Pure-ish (reads only `os.homedir()` + realpath) so it's easy to unit-test.
+ * The returned string is a human phrase that slots into "… looks like {reason}".
+ */
+export function unsafeIndexRootReason(projectRoot: string): string | null {
+  const resolve = (p: string): string => {
+    try {
+      return fs.realpathSync(path.resolve(p));
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  const resolved = resolve(projectRoot);
+
+  // Filesystem root: `/` on POSIX, a drive root like `C:\` on Windows.
+  if (path.parse(resolved).root === resolved) {
+    return 'the filesystem root';
+  }
+
+  const home = resolve(os.homedir());
+  // Case-insensitive on macOS/Windows (case-preserving but case-insensitive FS).
+  const norm = (p: string): string =>
+    process.platform === 'darwin' || process.platform === 'win32' ? p.toLowerCase() : p;
+  const r = norm(resolved);
+  const h = norm(home);
+
+  if (r === h) {
+    return 'your home directory';
+  }
+  // An ancestor of home (e.g. `/Users`, `/home`) — even broader than home.
+  if (h.startsWith(r + path.sep)) {
+    return 'a parent of your home directory';
+  }
+  return null;
+}
+
 export function findNearestCodeGraphRoot(startPath: string): string | null {
   let current = path.resolve(startPath);
   const root = path.parse(current).root;
@@ -64,6 +177,61 @@ export function findNearestCodeGraphRoot(startPath: string): string | null {
 }
 
 /**
+ * Contents of `.codegraph/.gitignore`. A single wildcard ignore keeps every
+ * transient file in the index dir — the database, `daemon.pid`, the socket,
+ * logs, cache, and anything future versions add — out of git, without having
+ * to enumerate each name (issues #788, #492, #484). Older versions wrote an
+ * explicit allowlist that never listed `daemon.pid` or the socket, so those
+ * runtime files were silently committed.
+ */
+const GITIGNORE_CONTENT = `# CodeGraph data files — local to each machine, not for committing.
+# Ignore everything in .codegraph/ except this file itself, so transient
+# files (the database, daemon.pid, sockets, logs) never show up in git.
+*
+!.gitignore
+`;
+
+/** Header line that prefixes every .gitignore CodeGraph has auto-generated. */
+const GITIGNORE_MARKER = '# CodeGraph data files';
+
+/**
+ * Is `content` a stale CodeGraph-generated `.gitignore` that should be
+ * regenerated in place? True when it carries our header but predates the
+ * wildcard ignore (it has no bare `*` line) — i.e. one of the old explicit
+ * allowlists (`*.db`, `cache/`, `.dirty`, …) that never ignored `daemon.pid`
+ * or the socket (issue #788). A file WITHOUT our header is user-authored and
+ * is left untouched; one that already has the wildcard is current. Matching
+ * on the header (not a byte-exact list of past defaults) heals every old
+ * variant — v0.7.x through 0.9.9 — and is idempotent once upgraded.
+ */
+function isStaleDefaultGitignore(content: string): boolean {
+  if (!content.trimStart().startsWith(GITIGNORE_MARKER)) return false;
+  return !content.split('\n').some((line) => line.trim() === '*');
+}
+
+/**
+ * Write `.codegraph/.gitignore` if it's absent, or upgrade a stale
+ * CodeGraph-generated default in place; a user-customized file is left alone.
+ * Best-effort — returns `false` only if a needed write failed.
+ */
+function ensureGitignore(gitignorePath: string): boolean {
+  let existing: string | null;
+  try {
+    existing = fs.readFileSync(gitignorePath, 'utf-8');
+  } catch {
+    existing = null; // absent (ENOENT) or unreadable — (re)create below
+  }
+  // Current default or a user-authored file: nothing to do.
+  if (existing !== null && !isStaleDefaultGitignore(existing)) return true;
+  try {
+    fs.writeFileSync(gitignorePath, GITIGNORE_CONTENT, 'utf-8');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Create the .codegraph directory structure
  * Note: Only throws if codegraph.db already exists, not just if .codegraph/ exists.
  */
@@ -80,29 +248,9 @@ export function createDirectory(projectRoot: string): void {
   // Create main directory (if it doesn't exist)
   fs.mkdirSync(codegraphDir, { recursive: true });
 
-  // Create .gitignore inside .codegraph (if it doesn't exist)
-  const gitignorePath = path.join(codegraphDir, '.gitignore');
-  if (!fs.existsSync(gitignorePath)) {
-    const gitignoreContent = `# CodeGraph data files
-# These are local to each machine and should not be committed
-
-# Database
-*.db
-*.db-wal
-*.db-shm
-
-# Cache
-cache/
-
-# Logs
-*.log
-
-# Hook markers
-.dirty
-`;
-
-    fs.writeFileSync(gitignorePath, gitignoreContent, 'utf-8');
-  }
+  // Write .gitignore inside .codegraph (create if absent, upgrade a stale
+  // pre-wildcard default left by an older version — issue #788).
+  ensureGitignore(path.join(codegraphDir, '.gitignore'));
 }
 
 /**
@@ -241,16 +389,15 @@ export function validateDirectory(projectRoot: string): {
     return { valid: false, errors };
   }
 
-  // Auto-repair missing .gitignore (non-critical file)
+  // Auto-repair / upgrade .gitignore (non-critical file). A missing one is
+  // recreated; a stale pre-wildcard default that never ignored daemon.pid is
+  // regenerated in place (issue #788); a user-authored file is left alone.
   const gitignorePath = path.join(codegraphDir, '.gitignore');
-  if (!fs.existsSync(gitignorePath)) {
-    try {
-      const gitignoreContent = `# CodeGraph data files\n# These are local to each machine and should not be committed\n\n# Database\n*.db\n*.db-wal\n*.db-shm\n\n# Cache\ncache/\n\n# Logs\n*.log\n\n# Hook markers\n.dirty\n`;
-      fs.writeFileSync(gitignorePath, gitignoreContent, 'utf-8');
-    } catch {
-      // Non-fatal: warn but don't block
-      errors.push('.gitignore missing in .codegraph directory and could not be created');
-    }
+  const existedBefore = fs.existsSync(gitignorePath);
+  if (!ensureGitignore(gitignorePath) && !existedBefore) {
+    // Only a missing-and-uncreatable file is surfaced; a failed in-place
+    // upgrade of an existing file is non-fatal — the index still works.
+    errors.push('.gitignore missing in .codegraph directory and could not be created');
   }
 
   return {

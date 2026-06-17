@@ -43,8 +43,22 @@ export const aspnetResolver: FrameworkResolver = {
       return true;
     }
 
-    // Check for Controllers directory
-    return allFiles.some((f) => f.includes('/Controllers/') && f.endsWith('Controller.cs'));
+    // ASP.NET signatures in controller/entrypoint SOURCE — covers feature-folder
+    // apps with no `/Controllers/` dir and a subdir `Program.cs` that the
+    // root-only checks above miss (e.g. realworld: Features/*/FooController.cs).
+    // `.csproj` often isn't in the indexed source set, so source-scan is the
+    // reliable signal.
+    for (const file of allFiles) {
+      if (!/(?:Controller|Program|Startup)\.cs$/.test(file)) continue;
+      const c = context.readFile(file);
+      if (c && (
+        /\[(?:ApiController|Route|Http(?:Get|Post|Put|Patch|Delete))\b/.test(c) ||
+        c.includes('ControllerBase') || c.includes(': Controller') ||
+        c.includes('MapControllers') || c.includes('WebApplication') ||
+        c.includes('Microsoft.AspNetCore')
+      )) return true;
+    }
+    return false;
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
@@ -123,12 +137,20 @@ export const aspnetResolver: FrameworkResolver = {
     const now = Date.now();
     const safe = stripCommentsForRegex(content, 'csharp');
 
-    // [HttpGet("path")], [HttpPost("path")], etc.
-    const attrRegex = /\[(HttpGet|HttpPost|HttpPut|HttpPatch|HttpDelete)\s*\(\s*"([^"]+)"\s*\)\]/g;
+    // Class-level [Route("api/[controller]")] prefix — joined onto each action.
+    let classPrefix = '';
+    const cls = /\[Route\s*\(\s*"([^"]+)"[^)]*\)\]\s*(?:\[[^\]]*\]\s*)*(?:public\s+|sealed\s+|abstract\s+|partial\s+)*class\b/.exec(safe);
+    if (cls) classPrefix = cls[1]!;
+
+    // [HttpGet], [HttpGet("path")], [HttpPost("path", Name="x")] — BARE or with a
+    // path. (The old regex required a string, so bare attributes — with the route
+    // on the class [Route] — were missed; eShopOnWeb was 24 bare / 2 string.)
+    const attrRegex = /\[(HttpGet|HttpPost|HttpPut|HttpPatch|HttpDelete)(?:\s*\(\s*"([^"]+)"[^)]*\))?\s*\]/g;
     let match: RegExpExecArray | null;
     while ((match = attrRegex.exec(safe)) !== null) {
-      const [, verb, routePath] = match;
-      const method = verb!.replace(/^Http/, '').toUpperCase();
+      const verb = match[1]!;
+      const method = verb.replace(/^Http/, '').toUpperCase();
+      const routePath = joinCsPath(classPrefix, match[2] || '');
       const line = safe.slice(0, match.index).split('\n').length;
 
       const routeNode: Node = {
@@ -146,9 +168,10 @@ export const aspnetResolver: FrameworkResolver = {
       };
       nodes.push(routeNode);
 
-      // Capture the next method declaration
-      const tail = safe.slice(match.index + match[0].length);
-      const methodMatch = tail.match(/(?:public|private|protected|internal)\s+[\w<>,\s\[\]]+?\s+(\w+)\s*\(/);
+      // Next method declaration (skip stacked attributes; C# puts the return type
+      // before the name). Bounded so we don't grab a far one.
+      const tail = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
+      const methodMatch = tail.match(/(?:public|private|protected|internal)\s+[\w<>,\s\[\]?.]+?\s+(\w+)\s*\(/);
       if (methodMatch) {
         references.push({
           fromNodeId: routeNode.id,
@@ -201,6 +224,12 @@ export const aspnetResolver: FrameworkResolver = {
     return { nodes, references };
   },
 };
+
+/** Join a class-level [Route] prefix and an action's path into one normalized `/path`. */
+function joinCsPath(prefix: string, sub: string): string {
+  const parts = [prefix, sub].map((p) => p.replace(/^\/+|\/+$/g, '')).filter(Boolean);
+  return '/' + parts.join('/');
+}
 
 /** Extract last identifier from an expression like `MyService.Handler` or `Handler`. */
 function extractCSharpTailIdent(expr: string): string | null {

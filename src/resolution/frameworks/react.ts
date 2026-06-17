@@ -32,8 +32,19 @@ export const reactResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
-    // Pattern 1: Component references (PascalCase)
-    if (isPascalCase(ref.referenceName) && !isBuiltInType(ref.referenceName)) {
+    // Pattern 1: Component references (PascalCase). Only from JSX-capable
+    // files — a component is USED in markup, which only parses in .tsx/.jsx.
+    // Without this gate, every PascalCase TYPE reference in plain .ts files
+    // went through component resolution: in a monorepo with same-named
+    // classes per package (#764, amplication), a `.ts` GraphQL-types file's
+    // own `Account` type alias lost to an arbitrary `Account` CLASS in
+    // another package (the framework's 0.8 outranked the name-matcher's
+    // proximity-correct 0.7).
+    if (
+      (ref.language === 'tsx' || ref.language === 'jsx') &&
+      isPascalCase(ref.referenceName) &&
+      !isBuiltInType(ref.referenceName)
+    ) {
       const result = resolveComponent(ref.referenceName, ref.filePath, context);
       if (result) {
         return {
@@ -76,6 +87,7 @@ export const reactResolver: FrameworkResolver = {
 
   extract(filePath, content) {
     const nodes: Node[] = [];
+    const references: UnresolvedRef[] = [];
     const now = Date.now();
 
     // Extract component definitions
@@ -143,6 +155,89 @@ export const reactResolver: FrameworkResolver = {
       });
     }
 
+    // React Router: <Route path="/x" component={Comp}/> (v5) or
+    // <Route path="/x" element={<Comp/>}/> (v6). Attributes appear in any order,
+    // and element={...} contains a nested `>`, so scan a window after each
+    // <Route rather than trying to match the whole (possibly multi-line) tag.
+    const routeTagRegex = /<Route\b/g;
+    let routeMatch: RegExpExecArray | null;
+    while ((routeMatch = routeTagRegex.exec(content)) !== null) {
+      const window = content.slice(routeMatch.index, routeMatch.index + 400);
+      const pathMatch = window.match(/\bpath\s*=\s*["']([^"']+)["']/);
+      if (!pathMatch) continue; // index/layout routes without a path
+      const routePath = pathMatch[1]!;
+      const compMatch =
+        window.match(/\bcomponent\s*=\s*\{\s*([A-Z][A-Za-z0-9_]*)/) ||
+        window.match(/\belement\s*=\s*\{\s*<\s*([A-Z][A-Za-z0-9_]*)/);
+      const line = content.slice(0, routeMatch.index).split('\n').length;
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${routePath}`,
+        kind: 'route',
+        name: routePath,
+        qualifiedName: `${filePath}::route:${routePath}`,
+        filePath,
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: 0,
+        language: filePath.endsWith('.tsx') ? 'tsx' : 'jsx',
+        updatedAt: now,
+      };
+      nodes.push(routeNode);
+      if (compMatch) {
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: compMatch[1]!,
+          referenceKind: 'references',
+          line,
+          column: 0,
+          filePath,
+          language: filePath.endsWith('.tsx') ? 'tsx' : 'jsx',
+        });
+      }
+    }
+
+    // React Router data-router (v6.4+): createBrowserRouter([{ path, element }]).
+    // Only scan files that use the data-router API, then pull each route object's
+    // `path` + `element={<Comp/>}` / `Component: Comp` (a forward window confirms
+    // it's a route object, not a stray `path:` field).
+    if (/\b(?:createBrowserRouter|createHashRouter|createMemoryRouter|createRoutesFromElements)\b/.test(content)) {
+      const objPathRe = /\bpath\s*:\s*['"]([^'"]*)['"]/g;
+      let om: RegExpExecArray | null;
+      while ((om = objPathRe.exec(content)) !== null) {
+        const win = content.slice(om.index, om.index + 300);
+        const compMatch =
+          win.match(/\belement\s*:\s*<\s*([A-Z][A-Za-z0-9_]*)/) ||
+          win.match(/\bComponent\s*:\s*([A-Z][A-Za-z0-9_]*)/);
+        if (!compMatch) continue; // require a component → it's a real route object
+        const routePath = om[1] || '/';
+        const line = content.slice(0, om.index).split('\n').length;
+        const routeNode: Node = {
+          id: `route:${filePath}:${line}:${routePath}`,
+          kind: 'route',
+          name: routePath,
+          qualifiedName: `${filePath}::route:${routePath}`,
+          filePath,
+          startLine: line,
+          endLine: line,
+          startColumn: 0,
+          endColumn: 0,
+          language: filePath.endsWith('.tsx') ? 'tsx' : 'jsx',
+          updatedAt: now,
+        };
+        nodes.push(routeNode);
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: compMatch[1]!,
+          referenceKind: 'references',
+          line,
+          column: 0,
+          filePath,
+          language: filePath.endsWith('.tsx') ? 'tsx' : 'jsx',
+        });
+      }
+    }
+
     // Extract Next.js pages/routes (pages directory convention)
     if (filePath.includes('pages/') || filePath.includes('app/')) {
       // Default export in pages becomes a route
@@ -169,7 +264,7 @@ export const reactResolver: FrameworkResolver = {
       }
     }
 
-    return { nodes, references: [] };
+    return { nodes, references };
   },
 };
 
@@ -221,7 +316,10 @@ function resolveComponent(
   );
   if (preferred.length > 0) return preferred[0]!.id;
 
-  return components[0]!.id;
+  // No positional signal: only an UNAMBIGUOUS name may resolve. Returning
+  // components[0] here picked an arbitrary same-named class anywhere in the
+  // repo (#764) — let the name-matcher's proximity scoring decide instead.
+  return components.length === 1 ? components[0]!.id : null;
 }
 
 /**
@@ -279,7 +377,17 @@ function filePathToRoute(filePath: string): string | null {
   // app/page.tsx -> /
   // app/about/page.tsx -> /about
 
-  if (filePath.includes('pages/')) {
+  // Only real page-component files are routes. Exclude non-page extensions
+  // (.mjs/.json/.cjs), config files (next.config.ts, vite.config.ts…), and
+  // Next.js special files (_app/_document). This also stops a `*.config.mjs`
+  // with `export default` in a dir like `nextjs-pages/` from being a "route".
+  const base = filePath.split('/').pop() ?? '';
+  if (!/\.(tsx?|jsx?)$/.test(base)) return null;
+  if (base.startsWith('_') || /\.config\.[a-z]+$/.test(base)) return null;
+
+  // Match pages/ and app/ as PATH SEGMENTS (not a substring — `nextjs-pages/`
+  // must not count as a `pages/` router dir).
+  if (/(?:^|\/)pages\//.test(filePath)) {
     let route = filePath
       .replace(/^.*pages\//, '/')
       .replace(/\/index\.(tsx?|jsx?)$/, '')
@@ -290,7 +398,7 @@ function filePathToRoute(filePath: string): string | null {
     return route;
   }
 
-  if (filePath.includes('app/')) {
+  if (/(?:^|\/)app\//.test(filePath)) {
     // App router - only page.tsx files are routes
     if (!filePath.includes('page.')) {
       return null;

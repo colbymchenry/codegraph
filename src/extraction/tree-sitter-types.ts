@@ -78,6 +78,16 @@ export interface ExtractorContext {
  * language-specific details like signatures, visibility, and imports.
  */
 export interface LanguageExtractor {
+  /**
+   * Optional source transform applied immediately before the grammar parses the
+   * file. Used to work around grammar gaps that would otherwise corrupt the
+   * parse tree (e.g. C# blanks conditional-compilation directive lines the
+   * grammar mis-parses inside enum bodies). MUST preserve byte offsets (replace
+   * removed text with spaces, keep newlines) so node positions and getNodeText
+   * stay correct; the returned string is used for both parsing and extraction.
+   */
+  preParse?: (source: string) => string;
+
   // --- Node type mappings ---
 
   /** Node types that represent functions */
@@ -120,6 +130,12 @@ export interface LanguageExtractor {
 
   // --- Existing hooks ---
 
+  /** Override symbol name extraction (e.g. ObjC multi-part selectors). */
+  resolveName?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /** Extract property name when the generic name walk fails (e.g. ObjC @property). */
+  extractPropertyName?: (node: SyntaxNode, source: string) => string | null;
+
   /** Extract signature from node */
   getSignature?: (node: SyntaxNode, source: string) => string | undefined;
   /** Extract visibility from node */
@@ -132,6 +148,14 @@ export interface LanguageExtractor {
   isStatic?: (node: SyntaxNode) => boolean;
   /** Check if variable declaration is a constant (const vs let/var) */
   isConst?: (node: SyntaxNode) => boolean;
+  /**
+   * Extract extra symbol-level modifier keywords to persist on the node's
+   * `decorators` list (e.g. Kotlin `expect`/`actual` multiplatform markers).
+   * Called generically for every created node; return undefined/[] when none.
+   * Used by the resolver to link `expect` declarations to their `actual`
+   * implementations across source sets.
+   */
+  extractModifiers?: (node: SyntaxNode) => string[] | undefined;
 
   // --- New config properties ---
 
@@ -155,6 +179,15 @@ export interface LanguageExtractor {
    * for multiple concepts (e.g. Swift uses class_declaration for classes, structs, and enums).
    */
   classifyClassNode?: (node: SyntaxNode) => 'class' | 'struct' | 'enum' | 'interface' | 'trait';
+
+  /**
+   * Classify a methodTypes node when the grammar reuses one node type for
+   * both callable and data members (#808): TS/JS class FIELDS
+   * (`public_field_definition` / `field_definition`) are methods only when
+   * their value is callable (`onClick = () => {}`); a plain field
+   * (`public fonts: Fonts;`, `count = 0`) is a property. Default: 'method'.
+   */
+  classifyMethodNode?: (node: SyntaxNode) => 'method' | 'property';
 
   /**
    * Resolve the body node for a function/method/class when it's not a child field.
@@ -182,6 +215,15 @@ export interface LanguageExtractor {
   getReceiverType?: (node: SyntaxNode, source: string) => string | undefined;
 
   /**
+   * Extract a function/method's normalized return type name (bare class name,
+   * smart-pointer pointee unwrapped), stored on the node as `returnType`. Used
+   * by C/C++ so resolution can infer a chained receiver's type from what the
+   * inner call returns (`Foo::instance().bar()` → resolve `bar` on `Foo`,
+   * issue #645). Return undefined for primitives / void / constructors.
+   */
+  getReturnType?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
    * Resolve the actual node kind for a type alias declaration.
    * Used by Go where `type_spec` is the named declaration wrapper for structs/interfaces:
    *   `type Foo struct { ... }` → type_spec (name: "Foo") → struct_type
@@ -206,4 +248,16 @@ export interface LanguageExtractor {
    * Returns the callee name if this node is a bare call, or undefined if not.
    */
   extractBareCall?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
+   * Node types representing a file-level package/namespace declaration
+   * (e.g. Kotlin `package_header`, Java `package_declaration`). When set,
+   * the core wraps every top-level declaration in an implicit `namespace`
+   * node carrying the FQN, so cross-file import resolution can match by
+   * qualifiedName instead of filename (Kotlin filename ≠ class name).
+   */
+  packageTypes?: string[];
+
+  /** Extract the dotted package name from a package declaration node. */
+  extractPackage?: (node: SyntaxNode, source: string) => string | null;
 }

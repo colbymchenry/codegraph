@@ -1,5 +1,42 @@
+import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
+
+/**
+ * A Go function's declared return type, normalized to the bare type a chained
+ * `New().Method()` could be called on (the #645/#608 mechanism). Reads the
+ * `result` field: a pointer `*Foo` is unwrapped to `Foo`, a multi-return
+ * `(*Foo, error)` takes the first result (the idiomatic value-or-error shape),
+ * a qualified `pkg.Foo` reduces to its last segment, and generics to the base.
+ * Built-ins / unnamed results simply fail the later existence check.
+ */
+function extractGoReturnType(node: SyntaxNode, source: string): string | undefined {
+  let result = getChildByField(node, 'result');
+  if (!result) return undefined;
+  // Multi-return `(T, error)` → the first result's type.
+  if (result.type === 'parameter_list') {
+    const first = result.namedChildren.find((c: SyntaxNode) => c.type === 'parameter_declaration');
+    if (!first) return undefined;
+    result = getChildByField(first, 'type') ?? first;
+  }
+  // Unwrap a pointer `*Foo` → `Foo`.
+  if (result?.type === 'pointer_type') {
+    result =
+      result.namedChildren.find(
+        (c: SyntaxNode) =>
+          c.type === 'type_identifier' || c.type === 'qualified_type' || c.type === 'generic_type',
+      ) ?? result;
+  }
+  if (!result) return undefined;
+  const text = getNodeText(result, source)
+    .trim()
+    .replace(/^\*/, '')
+    .replace(/<[^>]*>/g, '')
+    .replace(/\[[^\]]*\]/g, ''); // strip generic args `Foo[T]`
+  const last = text.split('.').pop()?.trim(); // qualified `pkg.Foo` → `Foo`
+  if (!last || !/^[A-Za-z_]\w*$/.test(last)) return undefined;
+  return last;
+}
 
 export const goExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration'],
@@ -17,6 +54,7 @@ export const goExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'result',
+  getReturnType: extractGoReturnType,
   getSignature: (node, source) => {
     const params = getChildByField(node, 'parameters');
     const result = getChildByField(node, 'result');
@@ -36,6 +74,18 @@ export const goExtractor: LanguageExtractor = {
     if (typeChild.type === 'interface_type') return 'interface';
     return undefined;
   },
+  isExported: (node, source) => {
+    // Go: a symbol is exported when its identifier starts with an uppercase letter.
+    // Look at the `name` field directly (works for function_declaration,
+    // method_declaration, type_spec, and var_spec / const_spec via extractor flow).
+    const nameNode = getChildByField(node, 'name');
+    if (nameNode) {
+      const text = getNodeText(nameNode, source);
+      const first = text.charCodeAt(0);
+      return first >= 65 && first <= 90; // A-Z
+    }
+    return false;
+  },
   getReceiverType: (node, source) => {
     // Go method_declaration has a "receiver" field: func (sl *scrapeLoop) run(...)
     // The receiver is a parameter_list containing a parameter_declaration
@@ -44,8 +94,12 @@ export const goExtractor: LanguageExtractor = {
     if (!receiver) return undefined;
     // Find the type identifier inside the receiver
     const text = getNodeText(receiver, source);
-    // Extract type name from patterns like "(sl *Type)", "(sl Type)", "(*Type)", "(Type)"
-    const match = text.match(/\*?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/);
+    // Extract type name from "(sl *Type)", "(sl Type)", "(*Type)", "(Type)" and
+    // generic receivers "(s *Stack[T])". Anchor on the opening "(" and skip an
+    // optional receiver var name; the old `name)`-anchored pattern never matched
+    // the `[T])` suffix, so generic-type methods were orphaned from their type
+    // (no struct→method `contains` edge). (#583)
+    const match = text.match(/\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*([A-Za-z_]\w*)/);
     return match?.[1];
   },
 };
