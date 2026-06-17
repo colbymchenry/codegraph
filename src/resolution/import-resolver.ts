@@ -35,6 +35,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   php: ['.php'],
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
+  powershell: ['.ps1', '.psm1', '.psd1'],
 };
 
 /**
@@ -60,6 +61,14 @@ export function resolveImportPath(
   // Handle relative imports
   if (importPath.startsWith('.')) {
     return resolveRelativeImport(importPath, fromDir, language, context);
+  }
+
+  // PowerShell module/script paths are often written as `Private/Foo.ps1` or
+  // `Helpers.psm1` without a leading `./`. Treat path-shaped values as relative
+  // to the importing script; bare module names (e.g. `Pester`) still fall through
+  // and remain external/unresolved.
+  if (language === 'powershell' && (importPath.includes('/') || /\.ps(?:m|d)?1$/i.test(importPath))) {
+    return resolveRelativeImport(`./${importPath}`, fromDir, language, context);
   }
 
   // Handle absolute/aliased imports (like @/ or src/)
@@ -1192,6 +1201,26 @@ export function resolveViaImport(
     // dead end. Return unresolved rather than falling through to the symbol
     // name-matcher, which would mis-connect e.g. "inc/db.php" to an unrelated
     // db.php elsewhere in the tree — a wrong edge is worse than a missing one.
+    return null;
+  }
+
+  // PowerShell module/script loading (`using module`, `Import-Module`, and
+  // dot-sourcing) resolves directly to the referenced script/module file.
+  if (ref.language === 'powershell' && ref.referenceKind === 'imports') {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
     return null;
   }
 

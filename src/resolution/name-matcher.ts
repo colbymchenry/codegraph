@@ -317,7 +317,18 @@ export function matchByExactName(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref);
+  let candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref);
+
+  // PowerShell command and symbol names are case-insensitive. Keep the exact
+  // lookup first so normal languages stay unchanged, then fall back to the
+  // lower-name index for PowerShell only.
+  if (candidates.length === 0 && ref.language === 'powershell') {
+    candidates = applyLanguageGate(
+      context.getNodesByLowerName(ref.referenceName.toLowerCase())
+        .filter((n) => n.language === 'powershell'),
+      ref
+    );
+  }
 
   if (candidates.length === 0) {
     return null;

@@ -101,6 +101,13 @@ describe('Language Detection', () => {
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
   });
 
+  it('should detect PowerShell files', () => {
+    expect(detectLanguage('install.ps1')).toBe('powershell');
+    expect(detectLanguage('Modules/Widgets.psm1')).toBe('powershell');
+    expect(detectLanguage('Widgets.psd1')).toBe('powershell');
+    expect(isSourceFile('install.ps1')).toBe(true);
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -129,6 +136,101 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('powershell');
+  });
+});
+
+describe('PowerShell Extraction', () => {
+  it('extracts functions, classes, members, enums, imports, and command calls', () => {
+    const code = `
+using module ./Private/Helpers.psm1
+
+$ModuleRoot = $PSScriptRoot
+
+function Get-Widget {
+  [CmdletBinding()]
+  param(
+    [string]$Name,
+    [int]$Limit = 10
+  )
+
+  Import-Module ./Private/Helpers.psm1
+  $items = Find-Widget -Name $Name | Where-Object { Test-Widget $_ }
+  foreach ($item in $items) {
+    Write-Output (Convert-Widget $item)
+  }
+}
+
+class WidgetRunner : BaseRunner {
+  [string]$Name
+
+  WidgetRunner([string]$name) {
+    $this.Name = $name
+  }
+
+  [void] Run() {
+    Get-Widget -Name $this.Name
+  }
+}
+
+enum WidgetState {
+  Ready = 1
+  Disabled = 2
+}
+`;
+
+    const result = extractFromSource('Widgets.psm1', code);
+    expect(result.errors).toHaveLength(0);
+
+    const symbol = (name: string, kind: string) => result.nodes.find((n) => n.name === name && n.kind === kind);
+    expect(symbol('Get-Widget', 'function')).toMatchObject({ kind: 'function', language: 'powershell' });
+    expect(symbol('WidgetRunner', 'class')).toMatchObject({ kind: 'class', language: 'powershell' });
+    expect(symbol('Run', 'method')).toMatchObject({ kind: 'method', language: 'powershell' });
+    expect(symbol('Name', 'property')).toMatchObject({ kind: 'property', language: 'powershell' });
+    expect(symbol('WidgetState', 'enum')).toMatchObject({ kind: 'enum', language: 'powershell' });
+    expect(symbol('Ready', 'enum_member')).toMatchObject({ kind: 'enum_member', language: 'powershell' });
+    expect(symbol('ModuleRoot', 'variable')).toMatchObject({ kind: 'variable', language: 'powershell' });
+
+    const refs = result.unresolvedReferences.map((r) => ({ name: r.referenceName, kind: r.referenceKind }));
+    expect(refs).toContainEqual({ name: './Private/Helpers.psm1', kind: 'imports' });
+    expect(refs).toContainEqual({ name: 'Find-Widget', kind: 'calls' });
+    expect(refs).toContainEqual({ name: 'Test-Widget', kind: 'calls' });
+    expect(refs).toContainEqual({ name: 'Convert-Widget', kind: 'calls' });
+    expect(refs).toContainEqual({ name: 'Get-Widget', kind: 'calls' });
+    expect(refs).toContainEqual({ name: 'BaseRunner', kind: 'extends' });
+  });
+
+  it('resolves PowerShell module imports and case-insensitive command calls', async () => {
+    const tempDir = createTempDir();
+    let cg: CodeGraph | null = null;
+    try {
+      fs.mkdirSync(path.join(tempDir, 'Private'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'Private', 'Helpers.psm1'),
+        `function Find-Widget { param([string]$Name) Write-Output $Name }\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'Widgets.psm1'),
+        `using module ./Private/Helpers.psm1\nfunction Get-Widget { find-widget -Name "demo" }\n`
+      );
+
+      cg = CodeGraph.initSync(tempDir);
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      const findWidget = cg.getNodesByKind('function').find((n) => n.name === 'Find-Widget');
+      expect(findWidget).toBeDefined();
+      const callers = cg.getCallers(findWidget!.id).map((entry) => entry.node.name);
+      expect(callers).toContain('Get-Widget');
+
+      const helperFile = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('Private/Helpers.psm1'));
+      expect(helperFile).toBeDefined();
+      const helperDependents = cg.getImpactRadius(helperFile!.id, 2).nodes;
+      expect([...helperDependents.values()].some((n) => n.filePath.endsWith('Widgets.psm1'))).toBe(true);
+    } finally {
+      cg?.close();
+      cleanupTempDir(tempDir);
+    }
   });
 });
 
