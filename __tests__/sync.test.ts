@@ -302,5 +302,37 @@ describe('Sync Module', () => {
       expect(result.filesRemoved).toBe(0);
       expect(result.changedFilePaths).toBeUndefined();
     });
+
+    it('should not index tracked files in default-ignored dirs (issue #766)', async () => {
+      // Create a committed file inside node_modules/ (a default-ignored dir).
+      // git status reports changes to tracked files even when they match
+      // DEFAULT_IGNORE_PATTERNS — the sync git fast path must filter them.
+      const nmDir = path.join(testDir, 'node_modules', 'pkg');
+      fs.mkdirSync(nmDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(nmDir, 'index.ts'),
+        `export function depFunc() { return 'original'; }`
+      );
+      git('add', '-A');
+      git('commit', '-m', 'add dependency');
+
+      // Full index excludes node_modules/ — depFunc is NOT in the graph.
+      await cg.indexAll();
+      expect(cg.searchNodes('depFunc').length).toBe(0);
+
+      // Modify the tracked file inside node_modules/.
+      fs.writeFileSync(
+        path.join(nmDir, 'index.ts'),
+        `export function depFunc() { return 'modified'; }`
+      );
+
+      // sync() must NOT pick up the change — the file is in an ignored dir.
+      const result = await cg.sync();
+      expect(result.filesAdded).toBe(0);
+      expect(result.filesModified).toBe(0);
+
+      // depFunc is still not in the graph.
+      expect(cg.searchNodes('depFunc').length).toBe(0);
+    });
   });
 });
