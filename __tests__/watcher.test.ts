@@ -401,6 +401,27 @@ describe('FileWatcher', () => {
       watcher.stop();
     });
 
+    it('should ignore nested .git and CodeGraph data dirs at any depth (#517)', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 200 });
+
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      // A nested `.git` (git subtree/submodule) and a sibling data dir like
+      // `.codegraph-win` (#636) below the root must be dropped by isAlwaysIgnored
+      // — even when the leaf looks like a source file. Otherwise the Linux walk
+      // descends into them and burns the inotify watch budget. The `.ts` leaves
+      // would pass isSourceFile, so only the segment check can drop them.
+      __emitWatchEventForTests(testDir, 'packages/sub/.git/hooks/x.ts');
+      __emitWatchEventForTests(testDir, 'packages/sub/.codegraph-win/cache.ts');
+
+      await new Promise((r) => setTimeout(r, 400));
+      expect(syncFn).not.toHaveBeenCalled();
+
+      watcher.stop();
+    });
+
     it('should drop ignored/non-source paths but sync real source edits', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
       const watcher = newWatcher(syncFn, { debounceMs: 200 });
