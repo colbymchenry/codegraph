@@ -10,7 +10,17 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore } from '../src/extraction';
-import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
+import {
+  detectLanguage,
+  isLanguageSupported,
+  getSupportedLanguages,
+  initGrammars,
+  loadAllGrammars,
+  loadGrammarsForLanguages,
+  isSourceFile,
+  isGrammarLoaded,
+  getParser,
+} from '../src/extraction/grammars';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -101,6 +111,12 @@ describe('Language Detection', () => {
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
   });
 
+  it('should detect QML files', () => {
+    expect(detectLanguage('Main.qml')).toBe('qml');
+    expect(detectLanguage('src/app/qml/LoginPage.qml')).toBe('qml');
+    expect(isSourceFile('Main.qml')).toBe(true);
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -112,6 +128,7 @@ describe('Language Support', () => {
     expect(isLanguageSupported('typescript')).toBe(true);
     expect(isLanguageSupported('python')).toBe(true);
     expect(isLanguageSupported('go')).toBe(true);
+    expect(isLanguageSupported('qml')).toBe(true);
     expect(isLanguageSupported('unknown')).toBe(false);
   });
 
@@ -129,6 +146,34 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('qml');
+  });
+});
+
+describe('QML Language Wiring', () => {
+  it('loads the QML grammar and keeps extraction minimal until QML extraction is implemented', async () => {
+    await initGrammars();
+    await loadGrammarsForLanguages(['qml']);
+
+    expect(isGrammarLoaded('qml')).toBe(true);
+    expect(getParser('qml')).toBeTruthy();
+
+    const result = extractFromSource(
+      'Main.qml',
+      `
+import QtQuick
+
+Item {
+  id: root
+}
+`
+    );
+
+    expect(result.nodes).toHaveLength(1);
+    expect(result.nodes[0]?.kind).toBe('file');
+    expect(result.nodes[0]?.language).toBe('qml');
+    expect(result.unresolvedReferences).toHaveLength(0);
+    expect(result.errors).toHaveLength(0);
   });
 });
 
