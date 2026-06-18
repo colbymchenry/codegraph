@@ -39,6 +39,8 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  mlir: 'tree-sitter-mlir.wasm',
+  tablegen: 'tree-sitter-tablegen.wasm',
 };
 
 /**
@@ -115,6 +117,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // shape as the `.yml` variants — the YAML/properties extractor emits one node
   // per leaf key, and the Spring resolver links `@Value("${k}")` references.
   '.properties': 'properties',
+  '.mlir': 'mlir',
+  '.td': 'tablegen',
 };
 
 /**
@@ -428,6 +432,8 @@ export function getLanguageDisplayName(language: Language): string {
     xml: 'XML',
     properties: 'Java properties',
     unknown: 'Unknown',
+    mlir: 'MLIR',
+    tablegen: 'TableGen',
   };
   return names[language] || language;
 }
