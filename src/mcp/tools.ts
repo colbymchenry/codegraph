@@ -415,13 +415,13 @@ const projectPathProperty: PropertySchema = {
 export const tools: ToolDefinition[] = [
   {
     name: 'codegraph_search',
-    description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_explore instead to get the actual source / understand an area in one call.',
+    description: 'Quick symbol or code-like source-string search. Returns locations only (no code). Use codegraph_explore instead to get the actual source / understand an area in one call.',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: 'Symbol name or partial name (e.g., "auth", "signIn", "UserService")',
+          description: 'Symbol name, partial name, or exact code-like source string (e.g., "auth", "signIn", "UserService", "/api/route", "game_matches")',
         },
         kind: {
           type: 'string',
@@ -3782,6 +3782,11 @@ export class ToolHandler {
       // Compact format: one line per result with key info
       lines.push(`### ${node.name} (${node.kind})`);
       lines.push(`${node.filePath}${location}`);
+      if (result.sourceString) {
+        lines.push(
+          `source string \`${result.sourceString.literal}\` at ${result.sourceString.filePath}:${result.sourceString.line}`
+        );
+      }
       if (node.signature) lines.push(`\`${node.signature}\``);
       lines.push('');
     }

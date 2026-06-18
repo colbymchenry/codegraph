@@ -16,6 +16,7 @@ import {
   GraphStats,
   SearchOptions,
   SearchResult,
+  SourceStringRef,
 } from '../types';
 import { safeJsonParse } from '../utils';
 import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
@@ -48,6 +49,34 @@ function isLowValueFile(filePath: string): boolean {
 }
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
+const SOURCE_STRING_SEARCH_SCORE = 1000;
+
+function sourceStringQueryVariants(query: string): string[] {
+  const trimmed = query.trim();
+  if (!trimmed) return [];
+
+  const variants = new Set<string>([trimmed]);
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+    (trimmed.startsWith('`') && trimmed.endsWith('`'))
+  ) {
+    variants.add(trimmed.slice(1, -1));
+  }
+  return [...variants].filter((v) => v.length >= 3 && (/[-_./:@]/.test(v) || /\s/.test(v)));
+}
+
+function sourceStringFtsQuery(query: string): string {
+  return query
+    .replace(/['"`*():^]/g, ' ')
+    .split(/[^A-Za-z0-9_./:@-]+/)
+    .flatMap((part) => part.split(/[-/.:@]+/))
+    .map((term) => term.trim())
+    .filter((term) => term.length >= 2)
+    .filter((term) => !/^(AND|OR|NOT|NEAR)$/i.test(term))
+    .map((term) => `"${term}"*`)
+    .join(' OR ');
+}
 
 /**
  * Database row types (snake_case from SQLite)
@@ -110,6 +139,18 @@ interface UnresolvedRefRow {
   language: string;
 }
 
+interface SourceStringRow {
+  id: string;
+  literal: string;
+  file_path: string;
+  line: number;
+  col: number;
+  language: string;
+  node_id: string | null;
+  node_name: string | null;
+  node_kind: string | null;
+}
+
 /**
  * Convert database row to Node object
  */
@@ -136,6 +177,20 @@ function rowToNode(row: NodeRow): Node {
     typeParameters: row.type_parameters ? safeJsonParse(row.type_parameters, undefined) : undefined,
     returnType: row.return_type ?? undefined,
     updatedAt: row.updated_at,
+  };
+}
+
+function rowToSourceString(row: SourceStringRow): SourceStringRef {
+  return {
+    id: row.id,
+    literal: row.literal,
+    filePath: row.file_path,
+    line: row.line,
+    column: row.col,
+    language: row.language as Language,
+    nodeId: row.node_id ?? undefined,
+    nodeName: row.node_name ?? undefined,
+    nodeKind: row.node_kind ? row.node_kind as NodeKind : undefined,
   };
 }
 
@@ -219,6 +274,8 @@ export class QueryBuilder {
     getDominantFile?: SqliteStatement;
     getTopRouteFile?: SqliteStatement;
     getRoutingManifest?: SqliteStatement;
+    insertSourceString?: SqliteStatement;
+    deleteSourceStringsByFile?: SqliteStatement;
   } = {};
 
   constructor(db: SqliteDatabase) {
@@ -820,6 +877,23 @@ export class QueryBuilder {
       results = this.searchNodesFuzzy(text, { kinds, languages, limit });
     }
 
+    const sourceStringResults = text && /[-_./:@]/.test(text)
+      ? this.searchSourceStringNodes(text, { kinds, languages, limit: Math.max(limit, 20) })
+      : [];
+    if (sourceStringResults.length > 0) {
+      const byId = new Map(results.map((r) => [r.node.id, r]));
+      for (const sourceResult of sourceStringResults) {
+        const existing = byId.get(sourceResult.node.id);
+        if (existing) {
+          existing.score = Math.max(existing.score, sourceResult.score);
+          existing.sourceString = existing.sourceString ?? sourceResult.sourceString;
+        } else {
+          results.push(sourceResult);
+          byId.set(sourceResult.node.id, sourceResult);
+        }
+      }
+    }
+
     // Supplement: ensure exact name matches are always candidates.
     // BM25 can bury short exact-match names (e.g. "getBean") under hundreds of
     // compound names (e.g. "getBeanDescriptor") in large codebases,
@@ -889,6 +963,90 @@ export class QueryBuilder {
     }
 
     return results;
+  }
+
+  searchSourceStrings(query: string, options: SearchOptions = {}): SourceStringRef[] {
+    const { limit = 50, languages, kinds } = options;
+    const variants = sourceStringQueryVariants(query);
+    if (variants.length === 0) return [];
+
+    const byId = new Map<string, SourceStringRef>();
+    for (const variant of variants) {
+      let sql = 'SELECT * FROM source_strings WHERE literal = ?';
+      const params: (string | number)[] = [variant];
+      if (languages && languages.length > 0) {
+        sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
+        params.push(...languages);
+      }
+      if (kinds && kinds.length > 0) {
+        sql += ` AND node_kind IN (${kinds.map(() => '?').join(',')})`;
+        params.push(...kinds);
+      }
+      sql += ' ORDER BY file_path, line, col LIMIT ?';
+      params.push(limit);
+
+      const rows = this.db.prepare(sql).all(...params) as SourceStringRow[];
+      for (const row of rows) byId.set(row.id, rowToSourceString(row));
+    }
+
+    if (byId.size === 0 && /\s/.test(query.trim())) {
+      const fts = sourceStringFtsQuery(variants[0]!);
+      if (fts) {
+        let sql = `
+          SELECT source_strings.*
+          FROM source_strings_fts
+          JOIN source_strings ON source_strings_fts.rowid = source_strings.rowid
+          WHERE source_strings_fts MATCH ?
+        `;
+        const params: (string | number)[] = [fts];
+        if (languages && languages.length > 0) {
+          sql += ` AND source_strings.language IN (${languages.map(() => '?').join(',')})`;
+          params.push(...languages);
+        }
+        if (kinds && kinds.length > 0) {
+          sql += ` AND source_strings.node_kind IN (${kinds.map(() => '?').join(',')})`;
+          params.push(...kinds);
+        }
+        sql += ' ORDER BY bm25(source_strings_fts) LIMIT ?';
+        params.push(limit);
+
+        try {
+          const rows = this.db.prepare(sql).all(...params) as SourceStringRow[];
+          for (const row of rows) byId.set(row.id, rowToSourceString(row));
+        } catch {
+          // Ignore FTS syntax/runtime failures; exact lookup already ran.
+        }
+      }
+    }
+
+    return [...byId.values()].slice(0, limit);
+  }
+
+  searchSourceStringNodes(query: string, options: SearchOptions = {}): SearchResult[] {
+    const refs = this.searchSourceStrings(query, options);
+    if (refs.length === 0) return [];
+
+    const nodeIds = refs.map((ref) => ref.nodeId).filter((id): id is string => !!id);
+    const nodes = this.getNodesByIds(nodeIds);
+    const results: SearchResult[] = [];
+    const seen = new Set<string>();
+
+    for (const ref of refs) {
+      if (!ref.nodeId || seen.has(ref.nodeId)) continue;
+      const node = nodes.get(ref.nodeId);
+      if (!node) continue;
+      seen.add(ref.nodeId);
+      results.push({
+        node,
+        sourceString: ref,
+        score:
+          SOURCE_STRING_SEARCH_SCORE +
+          kindBonus(node.kind) +
+          scorePathRelevance(node.filePath, query, this.projectNameTokens),
+      });
+    }
+
+    return results.sort((a, b) => b.score - a.score);
   }
 
   /**
@@ -1459,6 +1617,7 @@ export class QueryBuilder {
    */
   deleteFile(filePath: string): void {
     this.db.transaction(() => {
+      this.deleteSourceStringsByFile(filePath);
       this.deleteNodesByFile(filePath);
       if (!this.stmts.deleteFile) {
         this.stmts.deleteFile = this.db.prepare('DELETE FROM files WHERE path = ?');
@@ -1487,6 +1646,49 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getAllFiles.all() as FileRow[];
     return rows.map(rowToFileRecord);
+  }
+
+  replaceSourceStringsForFile(filePath: string, refs: SourceStringRef[]): void {
+    this.db.transaction(() => {
+      this.deleteSourceStringsByFile(filePath);
+      for (const ref of refs) {
+        this.insertSourceString(ref);
+      }
+    })();
+  }
+
+  deleteSourceStringsByFile(filePath: string): void {
+    if (!this.stmts.deleteSourceStringsByFile) {
+      this.stmts.deleteSourceStringsByFile = this.db.prepare(
+        'DELETE FROM source_strings WHERE file_path = ?'
+      );
+    }
+    this.stmts.deleteSourceStringsByFile.run(filePath);
+  }
+
+  private insertSourceString(ref: SourceStringRef): void {
+    if (!this.stmts.insertSourceString) {
+      this.stmts.insertSourceString = this.db.prepare(`
+        INSERT OR REPLACE INTO source_strings (
+          id, literal, file_path, line, col, language, node_id, node_name, node_kind
+        )
+        VALUES (
+          @id, @literal, @filePath, @line, @column, @language, @nodeId, @nodeName, @nodeKind
+        )
+      `);
+    }
+
+    this.stmts.insertSourceString.run({
+      id: ref.id,
+      literal: ref.literal,
+      filePath: ref.filePath,
+      line: ref.line,
+      column: ref.column,
+      language: ref.language,
+      nodeId: ref.nodeId ?? null,
+      nodeName: ref.nodeName ?? null,
+      nodeKind: ref.nodeKind ?? null,
+    });
   }
 
   /**
@@ -1830,6 +2032,7 @@ export class QueryBuilder {
   clear(): void {
     this.nodeCache.clear();
     this.db.transaction(() => {
+      this.db.exec('DELETE FROM source_strings');
       this.db.exec('DELETE FROM unresolved_refs');
       this.db.exec('DELETE FROM edges');
       this.db.exec('DELETE FROM nodes');

@@ -24,6 +24,7 @@ import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
+import { extractSourceStrings } from '../source-strings';
 
 /**
  * Number of files to read in parallel during indexing.
@@ -1611,6 +1612,9 @@ export class ExtractionOrchestrator {
     if (validNodes.length > 0) {
       this.queries.insertNodes(validNodes);
     }
+
+    const sourceStrings = extractSourceStrings(filePath, content, language, validNodes);
+    this.queries.replaceSourceStringsForFile(filePath, sourceStrings);
 
     // Filter edges to only reference nodes that were actually inserted
     if (result.edges.length > 0) {

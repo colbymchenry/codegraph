@@ -81,6 +81,22 @@ CREATE TABLE IF NOT EXISTS unresolved_refs (
     FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
+-- Source Strings: code-like string literals such as route keys, event names,
+-- collection names, and config keys. These are intentionally side-table data:
+-- the graph still contains symbols, while this table gives exact string
+-- occurrences a queryable file:line surface.
+CREATE TABLE IF NOT EXISTS source_strings (
+    id TEXT PRIMARY KEY,
+    literal TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    col INTEGER NOT NULL,
+    language TEXT NOT NULL,
+    node_id TEXT,
+    node_name TEXT,
+    node_kind TEXT
+);
+
 -- =============================================================================
 -- Indexes for Query Performance
 -- =============================================================================
@@ -143,6 +159,34 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_name ON unresolved_refs(reference_name
 CREATE INDEX IF NOT EXISTS idx_unresolved_file_path ON unresolved_refs(file_path);
 CREATE INDEX IF NOT EXISTS idx_unresolved_from_name ON unresolved_refs(from_node_id, reference_name);
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
+CREATE INDEX IF NOT EXISTS idx_source_strings_literal ON source_strings(literal);
+CREATE INDEX IF NOT EXISTS idx_source_strings_file_path ON source_strings(file_path);
+CREATE INDEX IF NOT EXISTS idx_source_strings_node_id ON source_strings(node_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS source_strings_fts USING fts5(
+    literal,
+    file_path UNINDEXED,
+    node_name UNINDEXED,
+    content='source_strings',
+    content_rowid='rowid'
+);
+
+CREATE TRIGGER IF NOT EXISTS source_strings_ai AFTER INSERT ON source_strings BEGIN
+    INSERT INTO source_strings_fts(rowid, literal, file_path, node_name)
+    VALUES (NEW.rowid, NEW.literal, NEW.file_path, NEW.node_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS source_strings_ad AFTER DELETE ON source_strings BEGIN
+    INSERT INTO source_strings_fts(source_strings_fts, rowid, literal, file_path, node_name)
+    VALUES ('delete', OLD.rowid, OLD.literal, OLD.file_path, OLD.node_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS source_strings_au AFTER UPDATE ON source_strings BEGIN
+    INSERT INTO source_strings_fts(source_strings_fts, rowid, literal, file_path, node_name)
+    VALUES ('delete', OLD.rowid, OLD.literal, OLD.file_path, OLD.node_name);
+    INSERT INTO source_strings_fts(rowid, literal, file_path, node_name)
+    VALUES (NEW.rowid, NEW.literal, NEW.file_path, NEW.node_name);
+END;
 
 -- Project metadata for version/provenance tracking
 CREATE TABLE IF NOT EXISTS project_metadata (
