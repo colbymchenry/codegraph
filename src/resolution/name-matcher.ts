@@ -448,7 +448,7 @@ function resolveMethodOnType(
     return null;
   }
 
-  if (matches.length > 1 && preferredFqn) {
+  if (matches.length > 1 && preferredFqn && (ref.language === 'java' || ref.language === 'kotlin')) {
     const ext = ref.language === 'kotlin' ? '.kt' : '.java';
     const fqnPath = preferredFqn.replace(/\./g, '/') + ext;
     const chosen = matches.find((m) => {
@@ -465,12 +465,51 @@ function resolveMethodOnType(
     }
   }
 
+  // TS/JS: a per-app `UserService` (and its `findAll`) repeats across a
+  // monorepo, so several methods share `UserService::findAll`. The caller's own
+  // location disambiguates: prefer the candidate whose file shares the longest
+  // directory prefix with the call site (the importer's app). This is the
+  // file-path proximity the bare-name path used before re-encoding, kept here so
+  // the typed path doesn't bind `apps/billing`'s call to `apps/admin`'s method.
+  if (matches.length > 1 && (ref.language === 'typescript' || ref.language === 'javascript')) {
+    return {
+      original: ref,
+      targetNodeId: pickClosestByDir(matches, ref.filePath).id,
+      confidence,
+      resolvedBy,
+    };
+  }
+
   return {
     original: ref,
     targetNodeId: matches[0]!.id,
     confidence,
     resolvedBy,
   };
+}
+
+/** Pick the candidate whose file shares the longest leading directory prefix with `fromPath`. */
+function pickClosestByDir(candidates: Node[], fromPath: string): Node {
+  const fromDirs = fromPath.replace(/\\/g, '/').split('/').slice(0, -1);
+  const sharedPrefix = (p: string): number => {
+    const d = p.replace(/\\/g, '/').split('/').slice(0, -1);
+    let shared = 0;
+    for (let i = 0; i < Math.min(fromDirs.length, d.length); i++) {
+      if (fromDirs[i] === d[i]) shared++;
+      else break;
+    }
+    return shared;
+  };
+  let best = candidates[0]!;
+  let bestProx = sharedPrefix(best.filePath);
+  for (let i = 1; i < candidates.length; i++) {
+    const prox = sharedPrefix(candidates[i]!.filePath);
+    if (prox > bestProx) {
+      best = candidates[i]!;
+      bestProx = prox;
+    }
+  }
+  return best;
 }
 
 // C++ keywords/control-flow tokens that can appear right before a receiver
@@ -924,6 +963,96 @@ function inferJavaFieldReceiverType(
   return lastPart;
 }
 
+/** Normalize a TS type expression to its bare class name, or null if it isn't a class. */
+function bareTsTypeName(typeExpr: string): string | null {
+  const noGenerics = typeExpr.replace(/<[^>]*>/g, '').trim();
+  const noArray = noGenerics.replace(/\[\s*\]/g, '').trim();
+  const lastPart = noArray.split('.').filter(Boolean).pop();
+  if (!lastPart) return null;
+  if (!/^[A-Z][\w$]*$/.test(lastPart)) return null; // primitives / lowercase / unions → skip
+  return lastPart;
+}
+
+/**
+ * TS/JS: infer a receiver's declared type for a `this.<field>.method()` call,
+ * re-encoded by the extractor as `<field>.method`. Two field-declaration sites
+ * are covered, both ubiquitous in NestJS / typed OOP TS:
+ *
+ *   1. Class-body property `private readonly userService: UserService;` is
+ *      extracted as a `property` node whose signature is the Java-style
+ *      "<Type> <name>" form, so the same parse as inferJavaFieldReceiverType
+ *      recovers the type.
+ *   2. Constructor parameter property `constructor(private readonly
+ *      userService: UserService) {}` is NOT a class member node; its type
+ *      lives in the constructor method's signature, so we read it from there.
+ *
+ * Returns the bare class name (generics stripped) or null when the field isn't
+ * declared in the enclosing class with a class-typed annotation. A null result
+ * leaves the ref to the regular strategies, forcing nothing.
+ */
+function inferTsFieldReceiverType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const inFile = context.getNodesInFile(ref.filePath);
+  if (inFile.length === 0) return null;
+
+  // Find the class enclosing the call line (tightest match by latest start).
+  let enclosing: Node | null = null;
+  for (const n of inFile) {
+    if (n.kind !== 'class' && n.kind !== 'interface') continue;
+    if (n.language !== ref.language) continue;
+    const end = n.endLine ?? n.startLine;
+    if (n.startLine <= ref.line && end >= ref.line) {
+      if (!enclosing || n.startLine >= enclosing.startLine) enclosing = n;
+    }
+  }
+  if (!enclosing) return null;
+  const enclosingEnd = enclosing.endLine ?? enclosing.startLine;
+  const inEnclosing = (n: Node): boolean =>
+    n.language === ref.language &&
+    n.startLine >= enclosing!.startLine &&
+    (n.endLine ?? n.startLine) <= enclosingEnd;
+
+  // 1. Class-body property declared with an explicit type.
+  const prop = inFile.find(
+    (n) =>
+      (n.kind === 'property' || n.kind === 'field') &&
+      n.name === receiverName &&
+      inEnclosing(n),
+  );
+  if (prop?.signature) {
+    const beforeName = prop.signature.slice(0, prop.signature.lastIndexOf(prop.name));
+    const fromProp = bareTsTypeName(beforeName.trim());
+    if (fromProp) return fromProp;
+  }
+
+  // 2. Constructor parameter property: the type is in the constructor's signature.
+  const ctor = inFile.find(
+    (n) => n.kind === 'method' && n.name === 'constructor' && inEnclosing(n),
+  );
+  if (ctor?.signature) {
+    const escaped = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Match the parameter named `receiverName`, skipping any leading modifiers
+    // (access/readonly) or decorators (`@Inject(TOKEN)`), then capture its type
+    // up to the next top-level `,` or `)`. Stops the type at `<`/`|`/`&` so
+    // generics and unions are handled by bareTsTypeName.
+    const re = new RegExp(
+      '(?:^|[,(])\\s*(?:(?:public|private|protected|readonly|override)\\s+|@[\\w$.]+(?:\\([^)]*\\))?\\s+)*' +
+        escaped +
+        '\\s*[?!]?\\s*:\\s*([A-Za-z_$][\\w$.]*)',
+    );
+    const m = ctor.signature.match(re);
+    if (m && m[1]) {
+      const fromCtor = bareTsTypeName(m[1]);
+      if (fromCtor) return fromCtor;
+    }
+  }
+
+  return null;
+}
+
 /**
  * Try to resolve by method name on a class/object
  */
@@ -978,6 +1107,34 @@ export function matchMethodCall(
       // When two classes share the same simple name, the caller file's
       // import is the only signal that names WHICH one — pass the
       // imported FQN so resolveMethodOnType can disambiguate (#314).
+      const imports = context.getImportMappings(ref.filePath, ref.language);
+      const importedFqn = imports.find((i) => i.localName === inferredType)?.source;
+      const typedMatch = resolveMethodOnType(
+        inferredType,
+        methodName!,
+        ref,
+        context,
+        0.9,
+        'instance-method',
+        importedFqn,
+      );
+      if (typedMatch) {
+        return typedMatch;
+      }
+    }
+  }
+
+  // TS/JS: `this.<field>.method()` re-encoded as `<field>.method` by the
+  // extractor. Recover the field's declared type from the enclosing class
+  // (constructor parameter property or class-body field) and resolve the method
+  // on that type. resolveMethodOnType validates the method exists on the type
+  // (and its supertypes), so a wrong inference yields no edge rather than a
+  // wrong one, which is also what fixes the misbinding to a same-named method
+  // on an unrelated class (the bare-name path's failure mode). Mirrors the
+  // Java/Kotlin field-injection block above.
+  if ((ref.language === 'typescript' || ref.language === 'javascript') && dotMatch) {
+    const inferredType = inferTsFieldReceiverType(objectOrClass!, ref, context);
+    if (inferredType) {
       const imports = context.getImportMappings(ref.filePath, ref.language);
       const importedFqn = imports.find((i) => i.localName === inferredType)?.source;
       const typedMatch = resolveMethodOnType(

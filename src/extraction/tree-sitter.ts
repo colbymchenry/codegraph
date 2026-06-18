@@ -3183,6 +3183,31 @@ export class TreeSitterExtractor {
                 calleeName = methodName;
               }
             } else if (
+              (this.language === 'typescript' || this.language === 'javascript') &&
+              receiver &&
+              receiver.type === 'member_expression'
+            ) {
+              // `this.<field>.method()`: the receiver is itself a member access,
+              // so it degrades to the bare `method` name below. A bare method
+              // name is unresolvable when several classes share it, and worse,
+              // tends to bind to the wrong class (a same-named method elsewhere).
+              // When the receiver is `this.<field>`, re-encode as `<field>.method`
+              // so the resolver can recover the field's declared type from the
+              // enclosing class (constructor parameter property or class-body
+              // field) and resolve the method on THAT type, mirroring the Java
+              // `this.userbo.toLogin2()` unwrap above. Deeper chains
+              // (`this.a.b.method()`) keep the bare name.
+              const innerObj = getChildByField(receiver, 'object');
+              const innerProp = getChildByField(receiver, 'property');
+              const innerObjIsThis =
+                innerObj?.type === 'this' ||
+                (innerObj ? getNodeText(innerObj, this.source) === 'this' : false);
+              if (innerObjIsThis && innerProp && innerProp.type === 'property_identifier') {
+                calleeName = `${getNodeText(innerProp, this.source)}.${methodName}`;
+              } else {
+                calleeName = methodName;
+              }
+            } else if (
               (this.language === 'cpp' ||
                 this.language === 'c' ||
                 this.language === 'kotlin' ||
