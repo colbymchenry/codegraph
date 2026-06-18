@@ -202,6 +202,23 @@ export function env_var_for(provider: string): string {
 `
     );
 
+    // Create a Directus-style client file with cross-repo contract strings
+    // that are not symbols in the caller repo.
+    fs.writeFileSync(
+      path.join(srcDir, 'directus-client.ts'),
+      `export async function sendPayload(payload: unknown): Promise<Response> {
+  return fetch('/live-scoring/append-event', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function saveRecord(createItem: (collection: string) => Promise<unknown>): Promise<unknown> {
+  return createItem('game_matches');
+}
+`
+    );
+
     // Initialize CodeGraph
     cg = CodeGraph.initSync(testDir, {
       config: {
@@ -332,6 +349,22 @@ export function env_var_for(provider: string): string {
       expect(entryNames[0]).toBe('env_var_for');
       expect(entryNames).toContain('activeProviderHasEnvApiKey');
       expect(entryNames).toContain('providerEnvVars');
+    });
+
+    it('should route exact cross-repo contract strings to their enclosing caller functions', async () => {
+      const routeResult = await cg.findRelevantContext('/live-scoring/append-event', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+      const routeEntryNames = routeResult.roots.map((id) => routeResult.nodes.get(id)?.name);
+      expect(routeEntryNames).toContain('sendPayload');
+
+      const collectionResult = await cg.findRelevantContext('game_matches', {
+        searchLimit: 3,
+        traversalDepth: 0,
+      });
+      const collectionEntryNames = collectionResult.roots.map((id) => collectionResult.nodes.get(id)?.name);
+      expect(collectionEntryNames).toContain('saveRecord');
     });
   });
 
