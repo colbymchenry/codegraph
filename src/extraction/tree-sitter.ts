@@ -153,6 +153,84 @@ function scalaBaseTypeName(node: SyntaxNode | null, source: string): string | nu
 }
 
 /**
+ * Resolve the declared identifier inside a C declarator. A `declaration`'s
+ * `declarator` field nests the name through `init_declarator` (with value),
+ * `pointer_declarator`/`array_declarator`/`parenthesized_declarator`
+ * wrappers (each via their own `declarator` field) down to an `identifier`.
+ * A `function_declarator` means the declaration is a function prototype (or a
+ * function-pointer var) — return null so it isn't extracted as a variable.
+ */
+function cDeclaratorIdentifier(node: SyntaxNode | null): SyntaxNode | null {
+  let cur: SyntaxNode | null = node;
+  let guard = 0;
+  while (cur && guard++ < 12) {
+    switch (cur.type) {
+      case 'identifier':
+        return cur;
+      case 'function_declarator':
+        return null;
+      case 'init_declarator':
+      case 'pointer_declarator':
+      case 'array_declarator':
+      case 'parenthesized_declarator':
+        cur = getChildByField(cur, 'declarator');
+        break;
+      default:
+        return null;
+    }
+  }
+  return null;
+}
+
+/** First `simple_identifier` in `node`'s subtree (breadth-ish, first-found).
+ * Swift's property name nests as `property_declaration → <name> pattern →
+ * bound_identifier → simple_identifier`; this resolves it (and the bound name of
+ * a Kotlin/Swift property declarator for the shadow prune). For a tuple pattern
+ * (`let (a, b)`) it returns the first — acceptable, those are rare for consts. */
+function firstSimpleIdentifier(node: SyntaxNode | null): SyntaxNode | null {
+  const stack: SyntaxNode[] = node ? [node] : [];
+  let guard = 0;
+  while (stack.length > 0 && guard++ < 40) {
+    const n = stack.shift()!;
+    if (n.type === 'simple_identifier') return n;
+    for (let i = 0; i < n.namedChildCount; i++) {
+      const c = n.namedChild(i);
+      if (c) stack.push(c);
+    }
+  }
+  return null;
+}
+
+/** Swift property facts: the bound name, whether it's a `let`, and whether it's
+ * a *computed* property (a getter block, no stored value — never a constant). */
+function swiftPropertyInfo(
+  node: SyntaxNode,
+  source: string,
+): { nameNode: SyntaxNode | null; isLet: boolean; isComputed: boolean } {
+  const pattern =
+    getChildByField(node, 'name') ??
+    node.namedChildren.find((c) => c.type === 'value_binding_pattern' || c.type === 'pattern') ??
+    null;
+  const binding = node.namedChildren.find((c) => c.type === 'value_binding_pattern');
+  const isLet = binding != null && getNodeText(binding, source).trimStart().startsWith('let');
+  const isComputed = node.namedChildren.some(
+    (c) => c.type === 'computed_property' || c.type === 'protocol_property_requirements',
+  );
+  return { nameNode: firstSimpleIdentifier(pattern), isLet, isComputed };
+}
+
+/** True when `node` is (transitively) inside a C function body — i.e. a local,
+ * not a file/namespace-scope declaration. Walks the parent chain to the root. */
+function hasFunctionAncestor(node: SyntaxNode): boolean {
+  let p = node.parent;
+  while (p) {
+    if (p.type === 'function_definition') return true;
+    p = p.parent;
+  }
+  return false;
+}
+
+/**
  * PHP type-position wrapper node kinds (a type-hint is `named_type`,
  * `?Foo` is `optional_type`, `A|B` is `union_type`, `A&B` is
  * `intersection_type`). Used to find the type subtree inside a parameter /
@@ -222,6 +300,15 @@ export class TreeSitterExtractor {
   private nodes: Node[] = [];
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
+  // Value-reference edges (default ON; set CODEGRAPH_VALUE_REFS=0 to disable; see flushValueRefs).
+  // Same-file reads of file-scope const/var symbols → `references` edges so impact analysis catches
+  // value consumers ("change this constant/table, affect its readers").
+  private static readonly VALUE_REF_LANGS = new Set<string>(['typescript', 'javascript', 'tsx', 'go', 'python', 'rust', 'ruby', 'c', 'java', 'csharp', 'php', 'scala', 'kotlin', 'swift', 'dart', 'pascal']);
+  private static readonly MAX_VALUE_REF_NODES = 20_000;
+  private readonly valueRefsEnabled = process.env.CODEGRAPH_VALUE_REFS !== '0';
+  private fileScopeValues = new Map<string, string>();
+  private fileScopeValueCounts = new Map<string, number>(); // file-scope nodes per name (conditional-def detection)
+  private valueRefScopes: Array<{ id: string; node: SyntaxNode; name: string }> = [];
   private errors: ExtractionError[] = [];
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
@@ -328,6 +415,7 @@ export class TreeSitterExtractor {
       // Gate + flush function-as-value candidates (#756) while the file's
       // nodes and import refs are complete and the file node is still pushed.
       this.flushFnRefCandidates();
+      this.flushValueRefs();
 
       if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
@@ -519,6 +607,209 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Record value-reference bookkeeping as nodes are created: file-scope const/var symbols with
+   * distinctive names become reference targets; function/method/const/var symbols become reader
+   * scopes whose bodies flushValueRefs scans.
+   */
+  private captureValueRefScope(kind: NodeKind, name: string, id: string, node: SyntaxNode): void {
+    // Pascal targets `constant` only: its extractor emits function PARAMETERS
+    // (`Dest: TBufferWriter`) and class fields (`declField`) as `variable` at the
+    // enclosing scope, which would otherwise become noisy targets (a param name
+    // shared across many procs collapses to one file-wide target). Genuine
+    // Pascal shared values are `const` (`constant`), so restrict to that. (Unit
+    // `var` globals are the rare cost; the parameter/field noise dominates.)
+    const targetKindOk =
+      this.language === 'pascal' ? kind === 'constant' : kind === 'constant' || kind === 'variable';
+    if (targetKindOk && name.length >= 3 && /[A-Z_]/.test(name)) {
+      const parentId = this.nodeStack[this.nodeStack.length - 1];
+      // file-scope OR class/module/struct/enum-scope constants are targets.
+      // Class/module scope matters for languages (Ruby) that keep nearly all
+      // constants inside a class or module; struct/enum scope matters for Swift,
+      // which namespaces shared constants in `struct`/`enum` (`enum Constants {
+      // static let X }`). Readers are same-file methods of that type.
+      if (
+        parentId &&
+        (parentId.startsWith('file:') || parentId.startsWith('class:') ||
+          parentId.startsWith('module:') || parentId.startsWith('struct:') ||
+          parentId.startsWith('enum:'))
+      ) {
+        this.fileScopeValues.set(name, id);
+        // How many target nodes carry this name. A conditional def
+        // (`try: X = a; except: X = b`) makes >1 — distinct from a local shadow,
+        // which adds a binding the prune must catch (see flushValueRefs).
+        this.fileScopeValueCounts.set(name, (this.fileScopeValueCounts.get(name) ?? 0) + 1);
+      }
+    }
+    if (kind === 'function' || kind === 'method' || kind === 'constant' || kind === 'variable') {
+      this.valueRefScopes.push({ id, node, name });
+    }
+  }
+
+  /**
+   * Emit same-file `references` edges from a symbol to the file-scope const/var it reads (TS/JS).
+   * The engine doesn't edge const→consumer, so impact analysis misses "change this table, affect
+   * its readers" (the ReScript-PR false positive). Same-file only (resolution is unambiguous),
+   * distinctive target names only (dodges the local-shadowing precision trap documented on
+   * function_ref), deduped per (reader, target). Default on (CODEGRAPH_VALUE_REFS=0 disables) +
+   * additive. Shadowed targets are pruned — see below.
+   */
+  private flushValueRefs(): void {
+    const scopes = this.valueRefScopes;
+    const targets = this.fileScopeValues;
+    const fileScopeCounts = this.fileScopeValueCounts;
+    this.valueRefScopes = [];
+    this.fileScopeValues = new Map();
+    this.fileScopeValueCounts = new Map();
+    if (!this.valueRefsEnabled || !TreeSitterExtractor.VALUE_REF_LANGS.has(this.language)) return;
+    if (targets.size === 0 || scopes.length === 0 || isGeneratedFile(this.filePath)) return;
+
+    // Prune SHADOWED targets. A target re-bound in an INNER scope (a
+    // bundled/Emscripten `const Module` re-declared as a nested `var Module`; a
+    // Go package `const Timeout` shadowed by a local `Timeout := …`; a Python
+    // module `CONFIG` shadowed by a local `CONFIG = …`) resolves to the inner
+    // binding for nested readers, so a file-scope edge is a false positive.
+    // Inner re-bindings aren't graph nodes, so detect them at the syntax level:
+    // count every declarator of the name across the tree and compare against how
+    // many FILE-SCOPE nodes carry it. A real shadow makes (declarators >
+    // file-scope nodes) — the excess is the local binding. A conditional
+    // module-level def (`try: X = a; except: X = b`) makes them EQUAL (both
+    // declarators are file-scope nodes), so it's correctly kept. Complements the
+    // path-based isGeneratedFile() check, which can't catch content-minified
+    // bundles.
+    //
+    // Declarator node types are per-grammar; a file only contains its own
+    // language's nodes, so matching all of them in one switch is safe.
+    if (this.tree) {
+      const declCounts = new Map<string, number>();
+      const bump = (nameNode: SyntaxNode | null) => {
+        // `simple_identifier` is Kotlin's name node (a property declarator's name).
+        if (nameNode && (nameNode.type === 'identifier' || nameNode.type === 'simple_identifier')) {
+          const nm = getNodeText(nameNode, this.source);
+          if (targets.has(nm)) declCounts.set(nm, (declCounts.get(nm) ?? 0) + 1);
+        }
+      };
+      const dstack: SyntaxNode[] = [this.tree.rootNode];
+      let dvisited = 0;
+      while (dstack.length > 0 && dvisited < TreeSitterExtractor.MAX_VALUE_REF_NODES) {
+        const n = dstack.pop()!;
+        dvisited++;
+        switch (n.type) {
+          case 'variable_declarator': // TS/JS/tsx
+          case 'const_spec':          // Go  `const X = …`
+          case 'var_spec':            // Go  `var X = …`
+            bump(n.namedChild(0));
+            break;
+          case 'const_item':          // Rust  `const X: T = …`
+          case 'static_item':         // Rust  `static X: T = …`
+            bump(getChildByField(n, 'name'));
+            break;
+          case 'let_declaration':       // Rust  `let x = …` (locals — the shadow source)
+          case 'short_var_declaration': // Go    `x, Y := …`
+          case 'assignment': {          // Python `X = …` / `X: T = …` / `A, B = …`
+            const left = getChildByField(n, 'left') ?? getChildByField(n, 'pattern') ?? n.namedChild(0);
+            if (left?.type === 'identifier') bump(left);
+            else if (left) for (const c of left.namedChildren) bump(c);
+            break;
+          }
+          case 'init_declarator':       // C  `T X = …` (file-scope const AND the local that shadows it)
+            bump(cDeclaratorIdentifier(n));
+            break;
+          case 'val_definition':        // Scala  `val X = …` (object/top-level const AND a method-local that shadows it)
+          case 'var_definition': {      // Scala  `var X = …`
+            const pat = getChildByField(n, 'pattern');
+            if (pat?.type === 'identifier') bump(pat);
+            break;
+          }
+          case 'static_final_declaration':         // Dart  top-level/`static` `const`/`final` (the target itself)
+          case 'initialized_identifier':           // Dart  instance field / `var`
+          case 'initialized_variable_definition': { // Dart  a method-local `const`/`final`/`var` that shadows a const
+            const id = n.namedChildren.find((c) => c.type === 'identifier');
+            if (id) bump(id);
+            break;
+          }
+          case 'declConst':  // Pascal  unit/class `const` (the target itself) AND a function-local `const` that shadows it
+          case 'declVar': {  // Pascal  a function-local `var` that shadows a const
+            bump(getChildByField(n, 'name'));
+            break;
+          }
+          case 'property_declaration': { // Kotlin / Swift  `val`/`let X = …` (object/static const AND a method-local that shadows it)
+            // Kotlin: variable_declaration → simple_identifier; Swift: a `pattern`
+            // (`<name>` field) → simple_identifier. Resolve either shape.
+            const vd = n.namedChildren.find((c) => c.type === 'variable_declaration');
+            const id = vd
+              ? vd.namedChildren.find((c) => c.type === 'simple_identifier')
+              : firstSimpleIdentifier(
+                  getChildByField(n, 'name') ??
+                    n.namedChildren.find((c) => c.type === 'value_binding_pattern' || c.type === 'pattern') ??
+                    null,
+                );
+            if (id) bump(id);
+            break;
+          }
+        }
+        for (let i = 0; i < n.namedChildCount; i++) {
+          const c = n.namedChild(i);
+          if (c) dstack.push(c);
+        }
+      }
+      for (const [nm, c] of declCounts) if (c > (fileScopeCounts.get(nm) ?? 1)) targets.delete(nm);
+      if (targets.size === 0) return;
+    }
+
+    for (const scope of scopes) {
+      const seen = new Set<string>();
+      const stack: SyntaxNode[] = [scope.node];
+      // Dart and Pascal attach a function/method BODY as a *next sibling* of the
+      // signature node that is stored as the reader scope (Dart `method_signature`
+      // ← `function_body`; Pascal `declProc` ← `block`, both under a `defProc`),
+      // not as a child — so the scope subtree is just the signature and the reads
+      // live in the sibling. Pull it in. (A body as a next sibling of the scope
+      // node is unique to Dart/Pascal among the value-ref languages — every other
+      // grammar nests the body inside the function node — so this is inert
+      // elsewhere.)
+      const sib = scope.node.nextNamedSibling;
+      if (sib && (sib.type === 'function_body' || sib.type === 'block')) stack.push(sib);
+      let visited = 0;
+      while (stack.length > 0 && visited < TreeSitterExtractor.MAX_VALUE_REF_NODES) {
+        const n = stack.pop()!;
+        visited++;
+        // `constant` covers Ruby, where both a constant's definition and its
+        // references are `constant`-typed nodes, not `identifier`. `name` covers
+        // PHP, where a constant reference — bare `MAX_ITEMS` or the const half of
+        // `self::MAX_ITEMS` / `Foo::MAX_ITEMS` — is a `name` node (a `$var` local
+        // is a `variable_name`, a different namespace, so it can never shadow a
+        // bare constant — no prune wiring needed). `simple_identifier` covers
+        // Kotlin, whose every name reference (a const read included) is that
+        // node type. Safe across languages: a file only holds its own grammar's
+        // nodes; `name` is PHP-only and `simple_identifier` is Kotlin-only here.
+        if (
+          n.type === 'identifier' || n.type === 'constant' ||
+          n.type === 'name' || n.type === 'simple_identifier'
+        ) {
+          const refName = getNodeText(n, this.source);
+          const targetId = targets.get(refName);
+          // Skip self and same-name targets: a symbol referencing a file-scope
+          // sibling of its own name (the two halves of a conditional `try: X=…;
+          // except: X=…`) is never a meaningful value read.
+          if (targetId && targetId !== scope.id && refName !== scope.name && !seen.has(targetId)) {
+            seen.add(targetId);
+            this.edges.push({
+              source: scope.id,
+              target: targetId,
+              kind: 'references',
+              metadata: { valueRef: true },
+            });
+          }
+        }
+        for (let i = 0; i < n.namedChildCount; i++) {
+          const c = n.namedChild(i);
+          if (c) stack.push(c);
+        }
+      }
+    }
+  }
+
+  /**
    * Visit a node and extract information
    */
   private visitNode(node: SyntaxNode): void {
@@ -655,8 +946,15 @@ export class TreeSitterExtractor {
       skipChildren = true;
     }
     // Check for variable declarations (const, let, var, etc.)
-    // Only extract top-level variables (not inside functions/methods)
-    else if (this.extractor.variableTypes.includes(nodeType) && !this.isInsideClassLikeNode()) {
+    // Only extract top-level variables (not inside functions/methods) — plus
+    // class/module-scope CONSTANTS, which Ruby (and other const-in-class
+    // languages) keep almost exclusively inside a class/module. A Ruby `CONST =
+    // …` has a `constant`-typed LHS; other languages don't put one here, so this
+    // is effectively Ruby-only and doesn't disturb their class-internal locals.
+    else if (
+      this.extractor.variableTypes.includes(nodeType) &&
+      (!this.isInsideClassLikeNode() || this.isClassScopeConstantAssignment(node))
+    ) {
       this.extractVariable(node);
       // extractVariable doesn't walk every initializer shape (object literals
       // are deliberately skipped; Python/Ruby don't walk at all), so scan the
@@ -680,6 +978,21 @@ export class TreeSitterExtractor {
       this.isInsideClassLikeNode()
     ) {
       const ownerId = this.nodeStack[this.nodeStack.length - 1];
+      // A `static let`/`static var` member is a SHARED constant of the type
+      // (Swift's `static`-namespacing idiom, esp. in `enum`/`struct`) — extract
+      // it as `constant`/`variable` so value-reference edges can target it. An
+      // instance stored property stays a `field` (per-instance; Swift instance
+      // properties otherwise aren't own nodes — that's unchanged). A *computed*
+      // property (getter, no stored value) is never a constant — skip the node.
+      const { nameNode, isLet, isComputed } = swiftPropertyInfo(node, this.source);
+      if (nameNode && !isComputed) {
+        const isStatic = this.extractor.isStatic?.(node) ?? false;
+        this.createNode(isStatic ? (isLet ? 'constant' : 'variable') : 'field',
+          getNodeText(nameNode, this.source), node, {
+            visibility: this.extractor.getVisibility?.(node),
+            isStatic,
+          });
+      }
       if (ownerId) {
         this.extractDecoratorsFor(node, ownerId);
         this.extractVariableTypeAnnotation(node, ownerId);
@@ -863,6 +1176,8 @@ export class TreeSitterExtractor {
         });
       }
     }
+
+    if (this.valueRefsEnabled) this.captureValueRefScope(kind, name, id, node);
 
     return newNode;
   }
@@ -1058,6 +1373,18 @@ export class TreeSitterExtractor {
       parentNode.kind === 'enum' ||
       parentNode.kind === 'module'
     );
+  }
+
+  /**
+   * Ruby `CONST = …` assignment whose LHS is a `constant` node — a class/module
+   * (or top-level) constant worth extracting as a symbol even inside a class.
+   * Other languages don't give an assignment a `constant`-typed LHS, so this
+   * gate is effectively Ruby-only.
+   */
+  private isClassScopeConstantAssignment(node: SyntaxNode): boolean {
+    if (node.type !== 'assignment') return false;
+    const left = getChildByField(node, 'left') ?? node.namedChild(0);
+    return left?.type === 'constant';
   }
 
   /**
@@ -1520,6 +1847,17 @@ export class TreeSitterExtractor {
     const visibility = this.extractor.getVisibility?.(node);
     const isStatic = this.extractor.isStatic?.(node) ?? false;
 
+    // A class field that is actually a CONSTANT (Java `static final`, C# `const`
+    // / `static readonly`) is extracted as `constant` kind, not `field`, so
+    // value-reference edges treat it as a target (the gate accepts
+    // constant/variable, not field). Scoped to languages whose `isConst`
+    // predicate is field-shaped — other languages' fields stay `field`.
+    const fieldKind: NodeKind =
+      (this.language === 'java' || this.language === 'csharp') &&
+      (this.extractor.isConst?.(node) ?? false)
+        ? 'constant'
+        : 'field';
+
     // Java field_declaration: "private final String name = value;" → variable_declarator(s) are direct children
     // C# field_declaration: wraps in variable_declaration → variable_declarator(s)
     let declarators = node.namedChildren.filter(
@@ -1583,7 +1921,7 @@ export class TreeSitterExtractor {
         if (!nameNode) continue;
         const name = getNodeText(nameNode, this.source);
         const signature = typeText ? `${typeText} ${name}` : name;
-        const fieldNode = this.createNode('field', name, decl, {
+        const fieldNode = this.createNode(fieldKind, name, decl, {
           docstring,
           signature,
           visibility,
@@ -1608,7 +1946,7 @@ export class TreeSitterExtractor {
         || node.namedChildren.find(c => c.type === 'identifier');
       if (nameNode) {
         const name = getNodeText(nameNode, this.source);
-        const fieldNode = this.createNode('field', name, node, {
+        const fieldNode = this.createNode(fieldKind, name, node, {
           docstring,
           visibility,
           isStatic,
@@ -1822,7 +2160,9 @@ export class TreeSitterExtractor {
       const left = getChildByField(node, 'left') || node.namedChild(0);
       const right = getChildByField(node, 'right') || node.namedChild(1);
 
-      if (left && left.type === 'identifier') {
+      // Ruby constant assignments (`MAX = 3`) have a `constant`-typed LHS, not
+      // `identifier`; without this they were never extracted as symbols at all.
+      if (left && (left.type === 'identifier' || left.type === 'constant')) {
         const name = getNodeText(left, this.source);
         // Skip if name starts with lowercase and looks like a function call result
         // Python constants are usually UPPER_CASE
@@ -1924,6 +2264,63 @@ export class TreeSitterExtractor {
           this.extractMarkdownPathReferencesFromSubtree(valueNode, varNode.id);
         }
       });
+    } else if (this.language === 'c') {
+      // C: a `declaration` node's name nests inside the `declarator` field —
+      // `init_declarator` (with value) or bare/pointer/array declarators (no
+      // value); a `function_declarator` is a prototype, not a variable. The
+      // generic fallback below only finds a *direct* identifier child, which C
+      // never has, so file-scope consts/globals went unextracted entirely (and
+      // so had no impact-radius edges). Only file-scope declarations are tracked
+      // — locals inside a function body are skipped (a `static const` table read
+      // by same-file functions is the value the impact graph wants, not every
+      // block-local). C allows several declarators per declaration
+      // (`int a = 1, b = 2;`), so iterate them.
+      if (!hasFunctionAncestor(node)) {
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (!child) continue;
+          // Accept only `init_declarator` (has a value) and pointer/array
+          // declarators. A *bare* `identifier` declarator is deliberately
+          // skipped: an unknown leading macro (`CURL_EXTERN`, `XXH_PUBLIC_API`)
+          // makes tree-sitter-c misparse a prototype `MACRO RetType fn(args);`
+          // as a declaration whose "variable" is the bare return-type
+          // identifier, splitting `fn(args)` off as a bogus expression — minting
+          // a spurious type-named global for every macro-prefixed prototype in a
+          // header. Those misparses are always bare identifiers; real
+          // consts/tables always carry an initializer. The only legit loss is
+          // uninitialized scalar globals (`static int g;`).
+          if (
+            child.type !== 'init_declarator' &&
+            child.type !== 'pointer_declarator' &&
+            child.type !== 'array_declarator'
+          ) {
+            continue;
+          }
+          const nameNode = cDeclaratorIdentifier(child);
+          if (!nameNode) continue;
+          const name = getNodeText(nameNode, this.source);
+          if (!name) continue;
+          const valueNode =
+            child.type === 'init_declarator' ? getChildByField(child, 'value') : null;
+          const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
+          const initSignature = initValue
+            ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}`
+            : undefined;
+          this.createNode(kind, name, child, { docstring, signature: initSignature, isExported });
+        }
+      }
+    } else if (this.language === 'swift') {
+      // Swift top-level property (`let X = …` / `var Y = …`). The name nests in
+      // a `pattern`, which the generic fallback can't read, so top-level Swift
+      // constants/globals went unextracted. A top-level `let`→`constant`,
+      // `var`→`variable`; a computed property (getter, no value) is skipped.
+      const { nameNode, isLet, isComputed } = swiftPropertyInfo(node, this.source);
+      if (nameNode && !isComputed) {
+        this.createNode(isLet ? 'constant' : 'variable', getNodeText(nameNode, this.source), node, {
+          docstring,
+          isExported,
+        });
+      }
     } else {
       // Generic fallback for other languages
       // Try to find identifier children

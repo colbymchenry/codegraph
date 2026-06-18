@@ -216,6 +216,14 @@ export class MCPEngine {
       onSyncError: (err) => {
         process.stderr.write(`[CodeGraph MCP] Auto-sync error: ${err.message}\n`);
       },
+      onDegraded: (reason) => {
+        // Live watching gave up permanently (watch-resource exhaustion or a
+        // write lock held past the retry budget). Say so loudly and ONCE — the
+        // graph will no longer auto-update, so a long-running MCP session must
+        // not keep assuming it's fresh. The reason already names the remedy
+        // (`codegraph sync` / git sync hooks).
+        process.stderr.write(`[CodeGraph MCP] File watcher degraded — ${reason}\n`);
+      },
     });
 
     this.watcherStarted = true;

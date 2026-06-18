@@ -86,6 +86,19 @@ export const javaExtractor: LanguageExtractor = {
     }
     return false;
   },
+  // A `static final` field is a Java constant (`MAX_ITEMS`, lookup tables,
+  // shared config). Drives `constant` kind so value-reference edges target it;
+  // instance / `final`-only / `static`-only fields stay mutable `field`s.
+  isConst: (node) => {
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (child?.type === 'modifiers') {
+        const text = child.text;
+        return /\bstatic\b/.test(text) && /\bfinal\b/.test(text);
+      }
+    }
+    return false;
+  },
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();
     const scopedId = node.namedChildren.find((c: SyntaxNode) => c.type === 'scoped_identifier');

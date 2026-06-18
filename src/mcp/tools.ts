@@ -348,6 +348,23 @@ export function formatStaleFooter(stale: PendingFile[]): string {
 }
 
 /**
+ * Whole-index degradation banner (issue #876). Emitted at the top of a read
+ * tool response when live watching has permanently stopped — at which point
+ * `getPendingFiles()` is empty, so the per-file banner above can't fire even
+ * though the index is now FROZEN and silently drifting stale. Leads with the
+ * agent-actionable instruction (Read directly) and carries the reason, which
+ * already names the operator remedy (`codegraph sync` / git hooks).
+ */
+export function formatDegradedBanner(reason: string | null): string {
+  return (
+    '⚠️ CodeGraph auto-sync is DISABLED — live file watching stopped, so the index is ' +
+    'frozen and any file edited since then is stale here. Read files directly to confirm ' +
+    'current content before relying on it.' +
+    (reason ? `\n  Reason: ${reason}` : '')
+  );
+}
+
+/**
  * MCP Tool definition
  */
 export interface ToolDefinition {
@@ -1014,6 +1031,32 @@ export class ToolHandler {
       } catch {
         /* getProjectRoot may throw on a closed instance — leave cg as is */
       }
+    }
+
+    // Whole-index degradation (#876): once live watching has permanently
+    // stopped, getPendingFiles() is empty so the per-file banner below can't
+    // fire — but the index is now FROZEN and silently drifting stale. Surface
+    // one global notice instead, so the agent Reads for current content rather
+    // than trusting a response off a no-longer-updating index. (Cross-project
+    // calls open a watcher-less CodeGraph, so this is false there — correct: we
+    // only know degraded state for the default session project.)
+    let degraded = false;
+    try {
+      degraded = cg.isWatcherDegraded?.() ?? false;
+    } catch {
+      degraded = false;
+    }
+    if (degraded) {
+      const [head, ...tail] = result.content;
+      if (!head || head.type !== 'text') return result;
+      let reason: string | null = null;
+      try {
+        reason = cg.getWatcherDegradedReason?.() ?? null;
+      } catch {
+        reason = null;
+      }
+      const composed = `${formatDegradedBanner(reason)}\n\n${head.text}`;
+      return { ...result, content: [{ type: 'text', text: composed }, ...tail] };
     }
 
     // Defensive: some test fakes inject a partial CodeGraph stub without the
@@ -3323,6 +3366,19 @@ export class ToolHandler {
       if ((count as number) > 0) {
         lines.push(`- ${lang}: ${count}`);
       }
+    }
+
+    // Whole-index degradation (#876): when live watching has permanently
+    // stopped, getPendingFiles() is empty (so no "Pending sync" section below)
+    // but the index is frozen — call that out explicitly here, the one place an
+    // agent asks "is the index caught up?".
+    if (cg.isWatcherDegraded()) {
+      lines.push(
+        '',
+        '### Auto-sync disabled:',
+        `- ${cg.getWatcherDegradedReason() ?? 'live file watching stopped'}`,
+        '- The index is frozen; Read files directly for current content.'
+      );
     }
 
     // Per-file freshness — the inverse of the auto-prepended staleness banner

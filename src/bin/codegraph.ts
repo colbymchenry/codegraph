@@ -602,8 +602,8 @@ program
  */
 program
   .command('index [path]')
-  .description('Index all files in the project')
-  .option('-f, --force', 'Force full re-index even if already indexed')
+  .description('Rebuild the full index from scratch (same result as a fresh init)')
+  .option('-f, --force', 'Index even if the path looks like your home directory or a filesystem root')
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
@@ -611,7 +611,7 @@ program
 
     try {
       // Don't (re)index your home directory / a filesystem root (#845). --force
-      // (already "force full re-index") doubles as the override.
+      // doubles as the override.
       const unsafe = unsafeIndexRootReason(projectPath);
       if (unsafe && !options.force) {
         error(`Refusing to index ${projectPath} — it looks like ${unsafe}. Pass --force to override.`);
@@ -628,8 +628,9 @@ program
       const cg = await CodeGraph.open(projectPath);
 
       if (options.quiet) {
-        // Quiet mode: no UI, just run
-        if (options.force) cg.clear();
+        // Quiet mode: no UI, just run. `index` is a full re-index, so clear the
+        // existing graph and rebuild from scratch (see the note below — #874).
+        cg.clear();
         const result = await cg.indexAll();
         if (!result.success) process.exit(1);
         cg.destroy();
@@ -639,10 +640,12 @@ program
       const clack = await importESM('@clack/prompts');
       clack.intro('Indexing project');
 
-      if (options.force) {
-        cg.clear();
-        clack.log.info('Cleared existing index');
-      }
+      // `index` is a FULL re-index: clear the existing graph and rebuild it from
+      // scratch so the result is identical to a fresh `init`. Without the clear,
+      // indexAll() skips every unchanged file by its content hash and reports
+      // "0 nodes, 0 edges" against the already-populated graph — which reads as
+      // "index wiped my index" (#874). For fast incremental updates use `sync`.
+      cg.clear();
 
       let result: IndexResult;
 
@@ -890,7 +893,7 @@ program
       if (reindexRecommended) {
         const builtWith = buildInfo.version ? `v${buildInfo.version.replace(/^v/, '')}` : 'an earlier version';
         warn(`Index was built by ${builtWith}; re-index to pick up this engine's improvements.`);
-        info('Run "codegraph index -f" (full rebuild) or "codegraph sync"');
+        info('Run "codegraph index" (full rebuild) or "codegraph sync"');
         console.log();
       }
 

@@ -26,7 +26,7 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
-import { __emitWatchEventForTests } from '../src/sync/watcher';
+import { __emitWatchEventForTests, __setFsWatchForTests } from '../src/sync/watcher';
 
 function waitFor(condition: () => boolean, timeoutMs = 2000, intervalMs = 25): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -71,10 +71,24 @@ describe('MCP staleness banner', () => {
   });
 
   afterEach(() => {
+    __setFsWatchForTests(null); // reset the injected fs.watch seam
     try { cg.unwatch(); } catch { /* ignore */ }
     try { cg.close(); } catch { /* ignore */ }
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
   });
+
+  // Force watch-resource exhaustion at startup so the real watcher degrades
+  // deterministically on any platform (recursive or per-directory strategy).
+  const degradeWatcher = () => {
+    __setFsWatchForTests(() => {
+      const err = new Error('too many open files') as NodeJS.ErrnoException;
+      err.code = 'EMFILE';
+      throw err;
+    });
+    const started = cg.watch({ debounceMs: 1000 }); // real (non-inert) watcher
+    expect(started).toBe(false);
+    expect(cg.isWatcherDegraded()).toBe(true);
+  };
 
   it('prepends a stale banner when the response references a pending file', async () => {
     // Long debounce so the edit lingers in pendingFiles while we query.
@@ -169,5 +183,30 @@ describe('MCP staleness banner', () => {
 
   it('returns zero pending files when no watcher is active', () => {
     expect(cg.getPendingFiles()).toEqual([]);
+  });
+
+  it('prepends a whole-index degraded banner once live watching has permanently stopped (#876)', async () => {
+    degradeWatcher();
+
+    const res = await handler.execute('codegraph_search', { query: 'alphaOnly' });
+    expect(res.isError).toBeFalsy();
+    const text = res.content[0].text;
+
+    expect(text.startsWith('⚠️')).toBe(true);
+    expect(text).toMatch(/auto-sync is DISABLED/i);
+    expect(text).toMatch(/Read files directly/i);
+    expect(text).toContain('OS watch/file limit exhausted'); // the degrade reason
+    expect(text).toMatch(/alphaOnly/); // the real result still follows the banner
+  });
+
+  it('surfaces the degraded state as its own section in codegraph_status (#876)', async () => {
+    degradeWatcher();
+
+    const res = await handler.execute('codegraph_status', {});
+    const text = res.content[0].text;
+    expect(text).toContain('### Auto-sync disabled:');
+    expect(text).toContain('OS watch/file limit exhausted');
+    // status renders the notice inline, so the auto-banner is not also prepended.
+    expect(text.startsWith('⚠️')).toBe(false);
   });
 });

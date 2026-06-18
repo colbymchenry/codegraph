@@ -110,6 +110,13 @@ export const cExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
+  // A `const`/`static const` file-scope declaration carries a `type_qualifier`
+  // child reading "const" — extract those as `constant`, plain globals as
+  // `variable`.
+  isConst: (node) =>
+    node.namedChildren.some(
+      (c: SyntaxNode) => c.type === 'type_qualifier' && c.text === 'const'
+    ),
   getReturnType: extractCppReturnType,
   resolveTypeAliasKind: (node, _source) => {
     // C typedef: `typedef enum { ... } name;` or `typedef struct { ... } name;`
