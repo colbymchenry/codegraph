@@ -4,6 +4,8 @@
 
 Add first-class `.qml` language support to CodeGraph so Qt Quick projects can be indexed with practical static coverage. The first version targets QML object trees plus embedded JavaScript behavior inside QML files. It does not attempt C++/QML bridging.
 
+**Implementation status:** implemented for QML-internal graph generation; C++/QML bridging remains deferred.
+
 The goal is to make `codegraph_explore`, `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` useful on real Qt Quick codebases by extracting:
 
 - QML component trees
