@@ -326,6 +326,27 @@ function conciseSignature(node: SyntaxNode, source: string): string {
   return getNodeText(node, source).trim().replace(/\s+/g, ' ');
 }
 
+function inlineComponentName(errorNode: SyntaxNode, source: string): string | null {
+  const text = getNodeText(errorNode, source).trimStart();
+  const match = /^component\s+([A-Za-z_][A-Za-z0-9_]*)\s*:/.exec(text);
+  return match?.[1] ?? null;
+}
+
+function inlineComponentSignature(errorNode: SyntaxNode, source: string): string {
+  const text = getNodeText(errorNode, source);
+  const openBrace = text.indexOf('{');
+  const signature = openBrace >= 0 ? text.slice(0, openBrace) : text;
+  return signature.trim().replace(/\s+/g, ' ');
+}
+
+function findNamedChildByType(node: SyntaxNode, type: string): SyntaxNode | null {
+  for (const child of node.namedChildren) {
+    if (child.type === type) return child;
+  }
+
+  return null;
+}
+
 function isQmlHandlerName(name: string): boolean {
   const handlerName = name.includes('.') ? name.split('.').pop() ?? '' : name;
   return /^on[A-Z]/.test(handlerName);
@@ -467,6 +488,27 @@ function visitQmlEnum(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true;
 }
 
+function visitInlineComponentError(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const name = inlineComponentName(node, ctx.source);
+  if (!name) return false;
+
+  const recoveredObject = findNamedChildByType(node, 'ui_object_definition');
+  const initializer = recoveredObject ? getChildByField(recoveredObject, 'initializer') : null;
+  if (!initializer) return false;
+
+  const component = ctx.createNode('component', name, node, {
+    signature: inlineComponentSignature(node, ctx.source),
+  });
+  if (!component) return true;
+
+  ctx.pushScope(component.id);
+  for (const child of initializer.namedChildren) {
+    ctx.visitNode(child);
+  }
+  ctx.popScope();
+  return true;
+}
+
 export const qmlExtractor: LanguageExtractor = {
   functionTypes: [],
   classTypes: [],
@@ -482,6 +524,10 @@ export const qmlExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   visitNode(node, ctx): boolean {
+    if (node.type === 'ERROR') {
+      return visitInlineComponentError(node, ctx);
+    }
+
     if (node.type === 'ui_import') {
       const sourceNode = getChildByField(node, 'source');
       if (!sourceNode) return true;

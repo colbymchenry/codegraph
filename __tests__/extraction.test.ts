@@ -473,6 +473,89 @@ Item {
     ).toBe(true);
   });
 
+  it('should cover additional base syntax: alias, attached properties, object arrays, JS imports, pragmas, and inline components', () => {
+    const code = `
+pragma Singleton
+import QtQuick
+import QtQuick.Layouts
+import "utils.js" as Utils
+
+component PrimaryButton : Rectangle {
+  id: primaryButton
+  property alias label: labelText.text
+  Layout.fillWidth: true
+  Text { id: labelText; text: Utils.format("OK") }
+}
+
+Item {
+  id: root
+  property list<Item> items
+  states: [ State { name: "busy" } ]
+  transitions: [ Transition {} ]
+}
+`;
+    const result = extractFromSource('BaseSyntax.qml', code);
+
+    const primaryButton = result.nodes.find(
+      (n) => n.kind === 'component' && n.name === 'PrimaryButton'
+    );
+    const label = result.nodes.find((n) => n.kind === 'property' && n.name === 'label');
+    const textComponent = result.nodes.find(
+      (n) => n.kind === 'component' && n.name.startsWith('Text@')
+    );
+    const labelText = result.nodes.find((n) => n.kind === 'variable' && n.name === 'labelText');
+
+    expect(result.nodes.some((n) => n.kind === 'import' && n.name === 'QtQuick.Layouts')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'import' && n.name === 'utils.js')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'PrimaryButton')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'property' && n.name === 'label')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'property' && n.name === 'items')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name.startsWith('State@'))).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name.startsWith('Transition@'))).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceName === 'labelText.text')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceName === 'Utils.format')).toBe(true);
+    expect(primaryButton).toBeDefined();
+    expect(label).toBeDefined();
+    expect(textComponent).toBeDefined();
+    expect(labelText).toBeDefined();
+    expect(
+      result.edges.some(
+        (edge) =>
+          edge.kind === 'contains' && edge.source === primaryButton!.id && edge.target === label!.id
+      )
+    ).toBe(true);
+    expect(
+      result.edges.some(
+        (edge) =>
+          edge.kind === 'contains' &&
+          edge.source === primaryButton!.id &&
+          edge.target === textComponent!.id
+      )
+    ).toBe(true);
+    expect(
+      result.edges.some(
+        (edge) =>
+          edge.kind === 'contains' &&
+          edge.source === textComponent!.id &&
+          edge.target === labelText!.id
+      )
+    ).toBe(true);
+    expect(
+      result.nodes.some((n) => n.kind === 'component' && n.name.startsWith('Rectangle@'))
+    ).toBe(false);
+  });
+
+  it('should not recover additional base syntax inline components without an object body', () => {
+    const result = extractFromSource(
+      'IncompleteInlineComponent.qml',
+      'component PrimaryButton : Rectangle'
+    );
+
+    expect(
+      result.nodes.some((n) => n.kind === 'component' && n.name === 'PrimaryButton')
+    ).toBe(false);
+  });
+
   it('should preserve object-valued properties and handlers under their owning symbols', () => {
     const result = extractFromSource(
       'ObjectValues.qml',
