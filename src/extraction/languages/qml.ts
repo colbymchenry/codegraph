@@ -40,6 +40,67 @@ const QML_STATIC_REFERENCE_SKIP_ROOTS = new Set([
   'Math',
 ]);
 
+const QML_BUILTIN_COMPONENT_TYPES = new Set([
+  'Action',
+  'ApplicationWindow',
+  'Behavior',
+  'BorderImage',
+  'BusyIndicator',
+  'Button',
+  'Canvas',
+  'CheckBox',
+  'Column',
+  'ColumnLayout',
+  'ComboBox',
+  'Component',
+  'Connections',
+  'Control',
+  'DelayButton',
+  'Dialog',
+  'Flickable',
+  'Flow',
+  'FocusScope',
+  'Grid',
+  'GridLayout',
+  'GroupBox',
+  'HoverHandler',
+  'Image',
+  'Item',
+  'Label',
+  'ListModel',
+  'ListView',
+  'Loader',
+  'Menu',
+  'MouseArea',
+  'NumberAnimation',
+  'OpacityAnimator',
+  'Popup',
+  'ProgressBar',
+  'PropertyAction',
+  'PropertyAnimation',
+  'RadioButton',
+  'Rectangle',
+  'Repeater',
+  'Row',
+  'RowLayout',
+  'ScrollBar',
+  'ScrollView',
+  'Slider',
+  'StackView',
+  'State',
+  'Switch',
+  'TabBar',
+  'Text',
+  'TextArea',
+  'TextEdit',
+  'TextField',
+  'Timer',
+  'ToolButton',
+  'ToolTip',
+  'Transition',
+  'Window',
+]);
+
 function isNameNode(node: SyntaxNode): boolean {
   return (
     node.type === 'identifier' ||
@@ -59,7 +120,11 @@ function shouldSkipStaticReference(referenceName: string): boolean {
 let inlineComponentNames = new Set<string>();
 
 function shouldReferenceComponentType(typeName: string): boolean {
-  return inlineComponentNames.has(typeName);
+  if (inlineComponentNames.has(typeName)) return true;
+  return (
+    /^[A-Z][A-Za-z0-9_]*$/.test(typeName) &&
+    !QML_BUILTIN_COMPONENT_TYPES.has(typeName)
+  );
 }
 
 function shouldSkipLocalReference(
@@ -153,6 +218,7 @@ function scanStaticReferences(
   localNames: ReadonlySet<string>
 ): void {
   if (node.type === 'ui_object_definition') return;
+  if (visitFunctionCallbackPair(node, ctx, localNames)) return;
   if (isStaticScopeBoundary(node)) return;
 
   if (node.type === 'assignment_expression') {
@@ -182,6 +248,7 @@ function scanStaticReferences(
     const argsNode = getChildByField(node, 'arguments');
     if (argsNode) {
       for (const child of argsNode.namedChildren) {
+        if (visitFunctionArgumentCallback(child, ctx, localNames, calleeName)) continue;
         scanStaticReferences(child, ctx, seen, localNames);
       }
     }
@@ -305,6 +372,103 @@ function collectFunctionLocalNames(node: SyntaxNode, body: SyntaxNode, source: s
   const names = collectFunctionParameterNames(node, source);
   collectLocalDeclarationNames(body, source, names);
   return names;
+}
+
+function unwrapExpressionStatement(node: SyntaxNode | null): SyntaxNode | null {
+  if (!node) return null;
+  if (node.type !== 'expression_statement') return node;
+  return node.namedChildren.length === 1 ? node.namedChildren[0] ?? node : node;
+}
+
+function isFunctionLikeExpression(node: SyntaxNode | null): node is SyntaxNode {
+  return !!node && (node.type === 'function_expression' || node.type === 'arrow_function');
+}
+
+function scanFunctionLikeExpression(
+  node: SyntaxNode,
+  ctx: ExtractorContext,
+  inheritedLocalNames: ReadonlySet<string> = new Set()
+): void {
+  const body = getChildByField(node, 'body');
+  if (!body) return;
+
+  const localNames = new Set(inheritedLocalNames);
+  for (const name of collectFunctionLocalNames(node, body, ctx.source)) {
+    localNames.add(name);
+  }
+
+  addStaticReferences(body, ctx, localNames);
+  visitOwnedQmlSubtree(body, ctx);
+}
+
+function callbackPairName(node: SyntaxNode, source: string): string | null {
+  const keyNode = getChildByField(node, 'key');
+  if (!keyNode) return null;
+
+  const fragment = keyNode.namedChildren.find((child: SyntaxNode) => child.type === 'string_fragment');
+  if (fragment) {
+    const text = getNodeText(fragment, source).trim();
+    return text.length > 0 ? text : null;
+  }
+
+  const keyText = qmlName(getNodeText(keyNode, source));
+  return keyText.length > 0 ? keyText : null;
+}
+
+function visitFunctionCallbackPair(
+  node: SyntaxNode,
+  ctx: ExtractorContext,
+  inheritedLocalNames: ReadonlySet<string>
+): boolean {
+  if (node.type !== 'pair') return false;
+
+  const valueNode = unwrapExpressionStatement(getChildByField(node, 'value'));
+  if (!isFunctionLikeExpression(valueNode)) return false;
+
+  const name = callbackPairName(node, ctx.source) ?? `callback@${valueNode.startPosition.row + 1}`;
+  const callback = ctx.createNode('method', name, valueNode, {
+    signature: conciseSignature(node, ctx.source),
+  });
+  if (!callback) return true;
+
+  ctx.pushScope(callback.id);
+  scanFunctionLikeExpression(valueNode, ctx, inheritedLocalNames);
+  ctx.popScope();
+  return true;
+}
+
+function functionArgumentCallbackName(
+  calleeName: string | null,
+  callbackNode: SyntaxNode
+): string {
+  const calleeLeaf = calleeName?.split('.').pop();
+  const prefix = calleeLeaf && calleeLeaf.length > 0 ? calleeLeaf : 'callback';
+  return `${prefix}.callback@${callbackNode.startPosition.row + 1}`;
+}
+
+function visitFunctionArgumentCallback(
+  node: SyntaxNode,
+  ctx: ExtractorContext,
+  inheritedLocalNames: ReadonlySet<string>,
+  calleeName: string | null
+): boolean {
+  const callbackNode = unwrapExpressionStatement(node);
+  if (!isFunctionLikeExpression(callbackNode)) return false;
+
+  const callback = ctx.createNode(
+    'method',
+    functionArgumentCallbackName(calleeName, callbackNode),
+    callbackNode,
+    {
+      signature: conciseSignature(callbackNode, ctx.source),
+    }
+  );
+  if (!callback) return true;
+
+  ctx.pushScope(callback.id);
+  scanFunctionLikeExpression(callbackNode, ctx, inheritedLocalNames);
+  ctx.popScope();
+  return true;
 }
 
 function findBindingValueText(
@@ -436,8 +600,26 @@ function visitQmlBinding(node: SyntaxNode, ctx: ExtractorContext): boolean {
     });
     if (method && valueNode) {
       ctx.pushScope(method.id);
-      addStaticReferences(valueNode, ctx, collectValueLocalNames(valueNode, ctx.source));
-      visitOwnedQmlSubtree(valueNode, ctx);
+      const unwrappedValue = unwrapExpressionStatement(valueNode);
+      if (isFunctionLikeExpression(unwrappedValue)) {
+        scanFunctionLikeExpression(unwrappedValue, ctx);
+      } else {
+        addStaticReferences(valueNode, ctx, collectValueLocalNames(valueNode, ctx.source));
+        visitOwnedQmlSubtree(valueNode, ctx);
+      }
+      ctx.popScope();
+    }
+    return true;
+  }
+
+  const unwrappedValue = unwrapExpressionStatement(valueNode);
+  if (isFunctionLikeExpression(unwrappedValue)) {
+    const method = ctx.createNode('method', name, node, {
+      signature: conciseSignature(node, ctx.source),
+    });
+    if (method) {
+      ctx.pushScope(method.id);
+      scanFunctionLikeExpression(unwrappedValue, ctx);
       ctx.popScope();
     }
     return true;

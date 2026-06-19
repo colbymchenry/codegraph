@@ -165,4 +165,285 @@ Item {
       Array.from(impacted.nodes.values()).some((n) => n.name === 'submit' && n.filePath === 'Main.qml')
     ).toBe(true);
   });
+
+  it('resolves directory-local QML component instances to QML component definitions', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import "Controls"
+
+Item {
+  id: root
+  Panel {
+    id: panel
+  }
+  ActionButton {
+    id: action
+  }
+  Text {
+    id: builtInText
+  }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Panel.qml'),
+      `import QtQuick
+
+Rectangle {
+  id: panelRoot
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'ActionButton.qml'),
+      `import QtQuick
+
+Item {
+  id: actionRoot
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Text.qml'),
+      `import QtQuick
+
+Item {
+  id: customText
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const panelDefinition = graph
+      .getNodesByName('Panel')
+      .find((n) => n.kind === 'component' && n.filePath === 'Panel.qml');
+    const panelInstance = graph
+      .getNodesByName('panel')
+      .find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const actionDefinition = graph
+      .getNodesByName('ActionButton')
+      .find((n) => n.kind === 'component' && n.filePath === 'Controls/ActionButton.qml');
+    const actionInstance = graph
+      .getNodesByName('action')
+      .find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const customText = graph
+      .getNodesByName('Text')
+      .find((n) => n.kind === 'component' && n.filePath === 'Text.qml');
+    const builtInText = graph
+      .getNodesByName('builtInText')
+      .find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+
+    expect(panelDefinition).toBeDefined();
+    expect(panelInstance).toBeDefined();
+    expect(actionDefinition).toBeDefined();
+    expect(actionInstance).toBeDefined();
+    expect(customText).toBeDefined();
+    expect(builtInText).toBeDefined();
+
+    expect(
+      graph
+        .getOutgoingEdges(panelInstance!.id)
+        .some((edge) => edge.kind === 'references' && edge.target === panelDefinition!.id)
+    ).toBe(true);
+    expect(
+      graph
+        .getOutgoingEdges(actionInstance!.id)
+        .some((edge) => edge.kind === 'references' && edge.target === actionDefinition!.id)
+    ).toBe(true);
+    expect(
+      graph
+        .getOutgoingEdges(builtInText!.id)
+        .some((edge) => edge.kind === 'references' && edge.target === customText!.id)
+    ).toBe(false);
+  });
+
+  it('extracts QML calls from function-valued handlers and object literal callbacks', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'Callbacks.qml'),
+      `import QtQuick
+
+Item {
+  id: root
+  signal accepted(var request)
+
+  function openInlineConfirm(request) {
+    request.accepted()
+  }
+
+  function closeInlineConfirm() {
+  }
+
+  function removeAll() {
+  }
+
+  function submit(page) {
+  }
+
+  Pager {
+    onPageRequested: function(page) {
+      root.submit(page)
+    }
+  }
+
+  ActionButton {
+    onClicked: root.openInlineConfirm({
+      "accepted": function () {
+        root.removeAll()
+      }
+    })
+  }
+
+  Confirm {
+    onAccepted: root.closeInlineConfirm()
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const submit = graph
+      .getNodesByName('submit')
+      .find((n) => n.kind === 'function' && n.filePath === 'Callbacks.qml');
+    const removeAll = graph
+      .getNodesByName('removeAll')
+      .find((n) => n.kind === 'function' && n.filePath === 'Callbacks.qml');
+    const closeInlineConfirm = graph
+      .getNodesByName('closeInlineConfirm')
+      .find((n) => n.kind === 'function' && n.filePath === 'Callbacks.qml');
+
+    expect(submit).toBeDefined();
+    expect(removeAll).toBeDefined();
+    expect(closeInlineConfirm).toBeDefined();
+
+    expect(
+      graph
+        .getCallers(submit!.id)
+        .some((caller) => caller.node.name === 'onPageRequested' && caller.edge.kind === 'calls')
+    ).toBe(true);
+    expect(
+      graph
+        .getCallers(removeAll!.id)
+        .some((caller) => caller.node.name.includes('accepted') && caller.edge.kind === 'calls')
+    ).toBe(true);
+    expect(
+      graph
+        .getCallers(closeInlineConfirm!.id)
+        .some((caller) => caller.node.name === 'onAccepted' && caller.edge.kind === 'calls')
+    ).toBe(true);
+  });
+
+  it('extracts QML calls from multi-level member expressions in nested handlers', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'NestedMemberCalls.qml'),
+      `import QtQuick
+
+Item {
+  id: root
+  property var viewModel: ({})
+
+  function goToPage(page) {
+  }
+
+  function onNodeClicked(id) {
+  }
+
+  Pager {
+    onPageRequested: function(page) {
+      if (root.viewModel) root.viewModel.goToPage(page)
+    }
+  }
+
+  ListView {
+    delegate: MouseArea {
+      onClicked: root.viewModel.onNodeClicked(model.id)
+    }
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const goToPage = graph
+      .getNodesByName('goToPage')
+      .find((n) => n.kind === 'function' && n.filePath === 'NestedMemberCalls.qml');
+    const onNodeClicked = graph
+      .getNodesByName('onNodeClicked')
+      .find((n) => n.filePath === 'NestedMemberCalls.qml');
+
+    expect(goToPage).toBeDefined();
+    expect(onNodeClicked).toBeDefined();
+
+    expect(
+      graph
+        .getCallers(goToPage!.id)
+        .some((caller) => caller.node.name === 'onPageRequested' && caller.edge.kind === 'calls')
+    ).toBe(true);
+    expect(
+      graph
+        .getCallers(onNodeClicked!.id)
+        .some((caller) => caller.node.name === 'onClicked' && caller.edge.kind === 'calls')
+    ).toBe(true);
+  });
+
+  it('extracts QML calls from function-valued bindings and callback arguments', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'FunctionCallbacks.qml'),
+      `import QtQuick
+
+Item {
+  id: root
+  property var sourceItems: []
+  readonly property var filteredItems: sourceItems.filter(function(item) {
+    return root.isVisibleItem(item)
+  })
+
+  function displayBookmarkGroupLabel(value) {
+    return value
+  }
+
+  function isVisibleItem(item) {
+    return !!item
+  }
+
+  FormatterControl {
+    labelFormatter: function(rawText) {
+      return root.displayBookmarkGroupLabel(rawText)
+    }
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const displayBookmarkGroupLabel = graph
+      .getNodesByName('displayBookmarkGroupLabel')
+      .find((n) => n.kind === 'function' && n.filePath === 'FunctionCallbacks.qml');
+    const isVisibleItem = graph
+      .getNodesByName('isVisibleItem')
+      .find((n) => n.kind === 'function' && n.filePath === 'FunctionCallbacks.qml');
+
+    expect(displayBookmarkGroupLabel).toBeDefined();
+    expect(isVisibleItem).toBeDefined();
+
+    expect(
+      graph
+        .getCallers(displayBookmarkGroupLabel!.id)
+        .some((caller) => caller.node.name === 'labelFormatter' && caller.edge.kind === 'calls')
+    ).toBe(true);
+    expect(
+      graph
+        .getCallers(isVisibleItem!.id)
+        .some((caller) => caller.node.name.includes('filter') && caller.edge.kind === 'calls')
+    ).toBe(true);
+  });
 });

@@ -715,6 +715,9 @@ export class ReferenceResolver {
       if (razorResult) return razorResult;
     }
 
+    const qmlResult = this.resolveQmlReference(ref);
+    if (qmlResult) return qmlResult;
+
     const candidates: ResolvedRef[] = [];
 
     // Strategy 1: Try framework-specific resolution. Cross-language bridges
@@ -1355,10 +1358,116 @@ export class ReferenceResolver {
     return edges.length;
   }
 
+  private normalizeProjectPath(filePath: string): string {
+    return filePath.replace(/\\/g, '/').replace(/^\.\//, '');
+  }
+
+  private dirname(filePath: string): string {
+    const normalized = this.normalizeProjectPath(filePath);
+    const slash = normalized.lastIndexOf('/');
+    return slash >= 0 ? normalized.slice(0, slash) : '';
+  }
+
+  private basename(filePath: string): string {
+    const normalized = this.normalizeProjectPath(filePath);
+    const slash = normalized.lastIndexOf('/');
+    return slash >= 0 ? normalized.slice(slash + 1) : normalized;
+  }
+
+  private isTopLevelQmlComponentDefinition(node: Node, name?: string): boolean {
+    if (node.language !== 'qml' || node.kind !== 'component') return false;
+    if (name && node.name !== name) return false;
+    if (node.qualifiedName !== node.name) return false;
+    return this.basename(node.filePath) === `${node.name}.qml`;
+  }
+
+  private getQmlLocalImportDirs(filePath: string): Set<string> {
+    const fromDir = this.dirname(filePath);
+    const dirs = new Set<string>([fromDir]);
+    const source = this.context.readFile(filePath);
+    if (!source) return dirs;
+
+    for (const match of source.matchAll(/^\s*import\s+(?:"([^"]+)"|'([^']+)')/gm)) {
+      const spec = match[1] ?? match[2];
+      if (!spec || spec.endsWith('.js')) continue;
+      const joined = path.posix.normalize(fromDir ? `${fromDir}/${spec}` : spec);
+      dirs.add(joined === '.' ? '' : joined);
+    }
+
+    return dirs;
+  }
+
+  private isQmlComponentInScope(ref: UnresolvedRef, target: Node): boolean {
+    if (target.filePath === ref.filePath) return true;
+    const scopeDirs = this.getQmlLocalImportDirs(ref.filePath);
+    return scopeDirs.has(this.dirname(target.filePath));
+  }
+
+  private resolveQmlReference(ref: UnresolvedRef): ResolvedRef | null {
+    if (ref.language !== 'qml') return null;
+
+    if (ref.referenceKind === 'calls' && ref.referenceName.includes('.')) {
+      const methodName = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
+      if (!methodName) return null;
+      const sameFileCallable = this.context
+        .getNodesByName(methodName)
+        .find(
+          (node) =>
+            node.language === 'qml' &&
+            node.filePath === ref.filePath &&
+            (node.kind === 'function' || node.kind === 'method')
+        );
+      if (sameFileCallable) {
+        return {
+          original: ref,
+          targetNodeId: sameFileCallable.id,
+          confidence: 0.9,
+          resolvedBy: 'qualified-name',
+        };
+      }
+    }
+
+    if (
+      ref.referenceKind !== 'references' ||
+      !/^[A-Z][A-Za-z0-9_]*$/.test(ref.referenceName)
+    ) {
+      return null;
+    }
+
+    const candidates = this.context
+      .getNodesByName(ref.referenceName)
+      .filter((node) => this.isTopLevelQmlComponentDefinition(node, ref.referenceName))
+      .filter((node) => this.isQmlComponentInScope(ref, node));
+    if (candidates.length === 0) return null;
+
+    const fromDir = this.dirname(ref.filePath);
+    const sameDir = candidates.find((node) => this.dirname(node.filePath) === fromDir);
+    const target = sameDir ?? candidates[0]!;
+    return {
+      original: ref,
+      targetNodeId: target.id,
+      confidence: 0.95,
+      resolvedBy: 'import',
+    };
+  }
+
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (!tgt || !ref.language) return result;
+    if (ref.language === 'qml' && ref.referenceKind === 'references' && tgt === 'qml') {
+      const targetNode = this.queries.getNodeById(result.targetNodeId);
+      if (
+        targetNode &&
+        targetNode.filePath !== ref.filePath &&
+        !(
+          this.isTopLevelQmlComponentDefinition(targetNode, ref.referenceName) &&
+          this.isQmlComponentInScope(ref, targetNode)
+        )
+      ) {
+        return null;
+      }
+    }
     if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !sameLanguageFamily(tgt, ref.language)) return null;
     if (ref.referenceKind === 'imports' && crossesKnownFamily(tgt, ref.language)) return null;
     return result;

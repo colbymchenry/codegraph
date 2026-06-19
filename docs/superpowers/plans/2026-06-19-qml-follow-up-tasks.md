@@ -10,6 +10,112 @@ resolution deferred.
 `test-qml-project/` may be used for validation, but files under that directory
 must not be staged or committed.
 
+## Current Scope Decision
+
+QML to C++ bridge work is explicitly deferred until after the QML-side graph is
+complete. Current implementation work must stay within QML extraction and
+QML-to-QML resolution:
+
+- QML component, property, id, function, signal, handler, and import extraction
+- QML directory-local component type references
+- QML nested handler bodies, including block handlers and function-valued
+  handlers
+- QML object-literal callback bodies
+- QML function-valued non-handler bindings, such as formatter callbacks
+- QML function callbacks passed as call arguments, such as
+  `items.filter(function (item) { ... })`
+- conservative suppression of broad cross-file QML property/name matches
+
+Deferred bridge scope:
+
+- `Q_PROPERTY`, `Q_INVOKABLE`, C++ signal exposure, `setContextProperty`,
+  `qmlRegisterType`, and `qmlRegisterSingletonType`
+- resolving `root.viewModel.someMethod(...)` to the C++ ViewModel by Qt bridge
+  metadata
+- treating existing heuristic QML-to-C++ name matches as final bridge behavior
+
+## Validation Update: QML-side Closure
+
+Validation was rerun against temporary copies of:
+
+```text
+test-qml-project/unifiedpromax/src/components/general/bookmark_tree_component
+test-qml-project/unifiedpromax/src/components/general/video_download_component
+```
+
+The source directories were not modified or staged.
+
+### `bookmark_tree_component` after QML-side fixes
+
+- Indexed files: 27
+- Languages: 26 C/C++ files, 1 QML file
+- Total graph facts: 709 nodes, 1,647 edges
+- QML nodes: 292
+- QML node breakdown:
+  - 63 `component`
+  - 139 `property`
+  - 27 `variable` / id
+  - 26 `function`
+  - 29 `method`
+  - 7 `import`
+- QML edge breakdown from QML-owned nodes:
+  - 291 `contains`
+  - 7 `imports`
+  - 53 `calls`
+  - 531 `references`
+- Newly confirmed QML-only chains:
+  - `labelFormatter -> displayBookmarkGroupLabel`
+  - `groupLabelFormatter -> displayBookmarkGroupLabel`
+  - `groups.filter(function (...) { ... })` callback extraction
+  - `onActivated -> applyCurrentFilters`
+  - `onSearchTriggered -> applyCurrentFilters`
+- No suspicious cross-file `text` property references were observed.
+
+The remaining absent links in this module are QML-to-C++ ViewModel links, for
+example:
+
+- `onPageRequested -> root.viewModel.goToPage(...)`
+- delegate `onClicked -> root.viewModel.onNodeClicked(...)`
+- delegate `onDoubleClicked -> root.viewModel.onNodeDoubleClicked(...)`
+
+These are intentionally left for the later C++/QML bridge phase. They should not
+be counted as QML-side extraction gaps after this update.
+
+### `video_download_component` after QML-side fixes
+
+- Indexed files: 39
+- Languages: 26 C/C++ files, 13 QML files
+- Total graph facts: 829 nodes, 2,023 edges
+- QML nodes: 455
+- QML node breakdown:
+  - 154 `component`
+  - 123 `property`
+  - 43 `variable` / id
+  - 16 `function`
+  - 47 `method`
+  - 59 `import`
+- QML edge breakdown from QML-owned nodes:
+  - 442 `contains`
+  - 59 `imports`
+  - 54 `calls`
+  - 740 `references`
+- Confirmed local QML component closure:
+  - `VideoDownloadOverviewBar`
+  - `VideoDownloadSegmentSection`
+  - `VideoDownloadTaskSection`
+  - `VideoDownloadSegmentItem`
+  - `VideoDownloadTaskItem`
+- Confirmed callback chains:
+  - object-literal `accepted -> removeAll`
+  - object-literal `accepted -> cancelAll`
+  - object-literal `accepted -> applySegmentEdit`
+- No suspicious cross-file `text` property references were observed.
+
+Historical validation notes below are kept as evidence of the gaps that led to
+these follow-up fixes. Where they say nested handlers, local component
+resolution, object-literal callbacks, or formatter callbacks were missing, those
+items are superseded by this validation update.
+
 ## Priority 1: Workspace and Documentation Hygiene
 
 - Review the remaining dirty or untracked workspace files and decide which
@@ -21,7 +127,9 @@ must not be staged or committed.
   - `Connections.target` supports member-expression references
   - same-file inline component type references are supported
   - local JavaScript helper imports are file-level dependencies
-  - cross-file QML component resolution remains deferred
+  - directory-local QML component resolution is supported for same-directory
+    files and explicit string imports
+  - `qmldir` module resolution remains deferred
 
 ## Priority 2: Real-project Validation
 
