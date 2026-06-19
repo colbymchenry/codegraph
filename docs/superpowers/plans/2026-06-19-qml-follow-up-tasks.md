@@ -169,6 +169,128 @@ Follow-up implication:
   proper bridge design is still needed for `Q_PROPERTY`, `Q_INVOKABLE`,
   `setContextProperty`, and registered QML types.
 
+### Validation Note: `video_download_component`
+
+Validation was run against a temporary copy of:
+
+```text
+test-qml-project/unifiedpromax/src/components/general/video_download_component
+```
+
+The source directory was not modified or staged. This module is a stronger
+mixed QML/C++ validation case than `bookmark_tree_component` because it has
+multiple local QML files that instantiate each other, plus a C++ component,
+service layer, domain models, and `VideoDownloadViewModel`.
+
+Observed result from the temporary copy:
+
+- Indexed files: 39
+- Languages: 26 C/C++ files, 13 QML files
+- Total graph facts: 819 nodes, 1,946 edges
+- QML parse/index result: all 13 QML files indexed with no file errors
+- QML node breakdown:
+  - 154 `component` nodes
+  - 123 `property` nodes
+  - 43 `variable` / `id` nodes
+  - 16 `function` nodes
+  - 37 `method` / handler nodes
+  - 59 `import` nodes
+- QML edge breakdown from QML-owned nodes:
+  - 432 `contains` edges
+  - 712 `references` edges
+  - 15 `calls` edges
+  - 59 `imports` edges
+- Top-level QML components found:
+  - `SegmentInlineEditor`
+  - `VideoDownloadComponent`
+  - `VideoDownloadIconActionButton`
+  - `VideoDownloadInlineActionButton`
+  - `VideoDownloadInlineConfirm`
+  - `VideoDownloadInlineField`
+  - `VideoDownloadOverviewBar`
+  - `VideoDownloadPanelHeader`
+  - `VideoDownloadSectionActionButton`
+  - `VideoDownloadSegmentItem`
+  - `VideoDownloadSegmentSection`
+  - `VideoDownloadTaskItem`
+  - `VideoDownloadTaskSection`
+- Sample local QML component instances found as component nodes:
+  - `VideoDownloadComponent::ColumnLayout@64::VideoDownloadOverviewBar@69`
+    with signature `VideoDownloadOverviewBar`
+  - `VideoDownloadComponent::ColumnLayout@64::VideoDownloadSegmentSection@76`
+    with signature `VideoDownloadSegmentSection`
+  - `VideoDownloadComponent::ColumnLayout@64::VideoDownloadTaskSection@95`
+    with signature `VideoDownloadTaskSection`
+  - `VideoDownloadSegmentItem::inlineEditor` with signature
+    `SegmentInlineEditor`
+  - `VideoDownloadSegmentSection::...::VideoDownloadSegmentItem@277`
+    with signature `VideoDownloadSegmentItem`
+  - `VideoDownloadTaskSection::...::VideoDownloadTaskItem@212`
+    with signature `VideoDownloadTaskItem`
+- Sample QML-to-C++ ViewModel call edges found:
+  - `VideoDownloadOverviewBar.onClicked ->
+    VideoDownloadViewModel::downloadAll`
+  - `VideoDownloadSegmentItem.applySegmentEdit ->
+    VideoDownloadViewModel::updateSegment`
+  - `VideoDownloadSegmentItem.onClicked ->
+    VideoDownloadViewModel::removeSegment`
+  - `VideoDownloadSegmentSection.onClicked ->
+    VideoDownloadViewModel::requestAddSegment`
+  - `VideoDownloadTaskItem.onClicked ->
+    VideoDownloadViewModel::pauseTask`
+  - `VideoDownloadTaskItem.onClicked ->
+    VideoDownloadViewModel::resumeTask`
+  - `VideoDownloadTaskItem.onClicked ->
+    VideoDownloadViewModel::cancelTask`
+  - `VideoDownloadTaskSection.onClicked ->
+    VideoDownloadViewModel::resumeAll`
+  - `VideoDownloadTaskSection.onClicked ->
+    VideoDownloadViewModel::pauseAll`
+
+Correctness assessment:
+
+- Graph generation succeeds for this module.
+- QML file discovery, import extraction, top-level component naming,
+  component nesting, id extraction, properties, handlers, and several direct
+  QML-to-C++ ViewModel calls are working.
+- Local QML component instantiations are detected as component nodes and their
+  type names are preserved in `signature`.
+- The generated graph is not complete for this module because directory-local
+  QML component type references are not resolved to the corresponding top-level
+  QML component definitions. For example:
+  - `VideoDownloadComponent.qml` instantiates `VideoDownloadOverviewBar`,
+    `VideoDownloadSegmentSection`, `VideoDownloadTaskSection`, and
+    `VideoDownloadInlineConfirm`, but there are no cross-file component
+    reference edges to those `.qml` definitions.
+  - `VideoDownloadSegmentSection.qml` instantiates
+    `VideoDownloadSegmentItem`, but there is no edge to
+    `VideoDownloadSegmentItem.qml`.
+  - `VideoDownloadTaskSection.qml` instantiates `VideoDownloadTaskItem`, but
+    there is no edge to `VideoDownloadTaskItem.qml`.
+- Object-literal callback bodies are still not fully represented as call
+  sources. Direct `root.viewModel.*` calls resolved for 9 observed ViewModel
+  methods, but calls inside `inlineConfirmRequested({ accepted: function () {
+  ... } })` did not produce edges for:
+  - `VideoDownloadTaskSection.qml -> VideoDownloadViewModel::cancelAll`
+  - `VideoDownloadSegmentSection.qml -> VideoDownloadViewModel::removeAll`
+- Cross-file QML references currently contain suspicious property-level matches
+  such as `SegmentInlineEditor.onTextChanged -> VideoDownloadInlineField::text`
+  across files. This reinforces the need to make QML module/import scope
+  explicit before enabling broad cross-file name matching.
+
+Follow-up implication:
+
+- Add QML directory-local component resolution before claiming multi-file QML
+  graph closure.
+- Resolve local component instance signatures to top-level QML component nodes
+  conservatively and only within valid QML import scope.
+- Add regression coverage for:
+  - top-level component basename extraction across multiple `.qml` files
+  - local component instance -> local component definition edges
+  - object-literal callback bodies that call `root.viewModel.*`
+  - suppression of accidental cross-file property matches such as generic
+    `text` properties
+
 ## Priority 3: QML Module and Import Scope Design
 
 - Design `qmldir` and QML import scope support before enabling cross-file QML
