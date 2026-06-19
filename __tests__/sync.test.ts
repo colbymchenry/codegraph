@@ -303,4 +303,138 @@ describe('Sync Module', () => {
       expect(result.changedFilePaths).toBeUndefined();
     });
   });
+
+  describe('Cross-file module-attribute caller edges survive callee re-index (#899)', () => {
+    let testDir: string;
+    let cg: CodeGraph;
+
+    beforeEach(async () => {
+      testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-899-'));
+
+      // pkg/mod.py — a module with two functions, both called from a separate
+      // test file via `mod.<fn>(...)` (module-attribute access). This is the
+      // exact shape from the RAGFlow production case in issue #899.
+      fs.mkdirSync(path.join(testDir, 'pkg'), { recursive: true });
+      fs.mkdirSync(path.join(testDir, 'test'), { recursive: true });
+      fs.writeFileSync(
+        path.join(testDir, 'pkg', '__init__.py'),
+        ``
+      );
+      fs.writeFileSync(
+        path.join(testDir, 'pkg', 'mod.py'),
+        [
+          `def callee_one(value):`,
+          `    """First callee — docstring above the second callee so edits here shift its line."""`,
+          `    return value + 1`,
+          ``,
+          ``,
+          `def callee_two(value):`,
+          `    """Second callee, called from the test file via mod.callee_two(...)."""`,
+          `    return value + 2`,
+          ``,
+        ].join('\n')
+      );
+      fs.writeFileSync(
+        path.join(testDir, 'test', 'test_callers.py'),
+        [
+          `from pkg import mod`,
+          ``,
+          ``,
+          `def test_calls_callee_one():`,
+          `    assert mod.callee_one(1) == 2`,
+          ``,
+          ``,
+          `def test_calls_callee_two():`,
+          `    assert mod.callee_two(1) == 3`,
+          ``,
+        ].join('\n')
+      );
+
+      cg = CodeGraph.initSync(testDir, {
+        config: { include: ['**/*.py'], exclude: [] },
+      });
+      await cg.indexAll();
+    });
+
+    afterEach(() => {
+      if (cg) cg.destroy();
+      if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+    });
+
+    function callerCount(fnName: string): number {
+      const results = cg.searchNodes(fnName);
+      const def = results.map(r => r.node).find(n => n.kind === 'function' && n.name === fnName);
+      if (!def) return -1;
+      return cg.getCallers(def.id).length;
+    }
+
+    it('preserves incoming cross-file calls edges when the callee file is re-indexed', async () => {
+      // Baseline: both callees have one cross-file caller each.
+      expect(callerCount('callee_one')).toBe(1);
+      expect(callerCount('callee_two')).toBe(1);
+
+      // Docstring-only edit to callee_one — adds 1 line, shifting callee_two's
+      // line number. A naive ID-based edge restore would drop callee_two's
+      // incoming edge (its node id changed); the (kind, name) re-resolve
+      // preserves it. A docstring-only edit also confirms zero-AST-change
+      // re-indexes don't sever edges.
+      fs.writeFileSync(
+        path.join(testDir, 'pkg', 'mod.py'),
+        [
+          `def callee_one(value):`,
+          `    """First callee — docstring above the second callee so edits here shift its line."""`,
+          `    """Probe: extra docstring line to shift callee_two's start line by 1."""`,
+          `    return value + 1`,
+          ``,
+          ``,
+          `def callee_two(value):`,
+          `    """Second callee, called from the test file via mod.callee_two(...)."""`,
+          `    return value + 2`,
+          ``,
+        ].join('\n')
+      );
+
+      const result = await cg.sync();
+      expect(result.filesModified).toBe(1);
+
+      // Both incoming cross-file calls edges must survive the callee re-index.
+      expect(callerCount('callee_one')).toBe(1);
+      expect(callerCount('callee_two')).toBe(1);
+    });
+
+    it('drops incoming edges for a callee that was renamed during re-index', async () => {
+      // Baseline.
+      expect(callerCount('callee_one')).toBe(1);
+
+      // Rename callee_one -> callee_one_renamed. The old edge's target
+      // (kind=function, name=callee_one) no longer matches any re-indexed
+      // node, so the edge is correctly dropped (not preserved against a
+      // non-existent symbol).
+      fs.writeFileSync(
+        path.join(testDir, 'pkg', 'mod.py'),
+        [
+          `def callee_one_renamed(value):`,
+          `    """Renamed callee — the old edge targeting callee_one must not be restored."""`,
+          `    return value + 1`,
+          ``,
+          ``,
+          `def callee_two(value):`,
+          `    """Second callee, called from the test file via mod.callee_two(...)."""`,
+          `    return value + 2`,
+          ``,
+        ].join('\n')
+      );
+
+      await cg.sync();
+
+      // The renamed callee has no callers (the test still calls mod.callee_one,
+      // which no longer exists). The old callee_one node is gone, so its
+      // callerCount is -1 (definition not found); callee_one_renamed exists
+      // but has no incoming edges (the test calls the old name).
+      expect(callerCount('callee_one')).toBe(-1);
+      expect(callerCount('callee_one_renamed')).toBe(0);
+      // callee_two is untouched by the rename and its edge survives.
+      expect(callerCount('callee_two')).toBe(1);
+    });
+  });
 });

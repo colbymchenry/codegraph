@@ -14,6 +14,7 @@ import {
   FileRecord,
   ExtractionResult,
   ExtractionError,
+  Edge,
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
@@ -1597,6 +1598,26 @@ export class ExtractionOrchestrator {
       return; // No changes
     }
 
+    // Snapshot incoming cross-file edges BEFORE deleting this file's nodes.
+    // `deleteFile` cascades to delete every edge whose source OR target is a
+    // node in this file (edges.FK ... ON DELETE CASCADE). Edges whose SOURCE is
+    // in this file are re-emitted by the extractor below, but edges whose SOURCE
+    // is in a *different* (unchanged) file are not — they would be silently
+    // dropped, which is issue #899: re-indexing a callee file severs `calls`/
+    // `references` edges from callers that import it via module-attribute
+    // access (`pkg.mod.fn(...)`).
+    //
+    // We snapshot the edge plus the target node's (name, kind) so we can
+    // re-resolve to the re-indexed target's NEW id. Node ids are
+    // `sha256(filePath:kind:name:line)`, so any line shift in the callee file
+    // (e.g. a docstring-only edit above the symbol) changes every target id and
+    // a naive re-insert by old id would silently drop every edge. Matching by
+    // (filePath, kind, name) is stable across line shifts; if the symbol was
+    // renamed/removed, no match is found and the edge stays dropped (correct).
+    const crossFileIncomingEdges = existingFile
+      ? this.queries.getCrossFileIncomingEdgesWithTarget(filePath)
+      : [];
+
     // Delete existing data for this file
     if (existingFile) {
       this.queries.deleteFile(filePath);
@@ -1620,6 +1641,32 @@ export class ExtractionOrchestrator {
       );
       if (validEdges.length > 0) {
         this.queries.insertEdges(validEdges);
+      }
+    }
+
+    // Re-insert cross-file incoming edges snapshotted before the delete,
+    // re-resolving each edge's target to the re-indexed node's new id by
+    // (filePath, kind, name). Node ids include the source line, so any line
+    // shift in the callee file (e.g. a docstring-only edit above the symbol)
+    // changes every target id and a naive re-insert by old id would drop them
+    // all. `insertEdges` still filters to endpoints that exist, so edges whose
+    // caller (source) was deleted, or whose callee (target) was renamed/removed
+    // during the re-index (no match in `newTargetIds`), are dropped. This
+    // closes the #899 edge-drop on `sync`.
+    if (crossFileIncomingEdges.length > 0) {
+      const newNodesByKindName = new Map<string, string>();
+      for (const n of validNodes) {
+        newNodesByKindName.set(`${n.kind}\0${n.name}`, n.id);
+      }
+      const reinserted: Edge[] = [];
+      for (const e of crossFileIncomingEdges) {
+        const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
+        if (newTargetId) {
+          reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
+        }
+      }
+      if (reinserted.length > 0) {
+        this.queries.insertEdges(reinserted);
       }
     }
 
