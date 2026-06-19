@@ -2126,6 +2126,7 @@ func main() {
     // feature can't silently regress to a no-op in the indexing flow.
     it('connects #include to the real header file via include-dir scan (end-to-end)', async () => {
       const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-e2e-'));
+      let includeCg: CodeGraph | undefined;
       try {
         fs.mkdirSync(path.join(tempProject, 'include'), { recursive: true });
         fs.mkdirSync(path.join(tempProject, 'src'), { recursive: true });
@@ -2139,25 +2140,30 @@ func main() {
         );
 
         clearCppIncludeDirCache();
-        cg = await CodeGraph.init(tempProject, { index: true });
+        includeCg = await CodeGraph.init(tempProject, { index: true });
 
         // Sanity: file nodes exist for the header and the cpp.
-        const allFiles = cg.getStats();
+        const allFiles = includeCg.getStats();
         expect(allFiles.fileCount).toBe(2);
 
         // The `#include "utils.h"` edge should target the real
         // `include/utils.h` file node — not a floating `import` node
         // living inside main.cpp.
         const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
-        const rows = db.getDb().prepare(`
-          select dst.kind as dstKind, dst.file_path as dstPath
-          from edges e
-          join nodes src on e.source = src.id
-          join nodes dst on e.target = dst.id
-          where e.kind = 'imports'
-            and src.kind = 'file'
-            and src.file_path = 'src/main.cpp'
-        `).all() as Array<{ dstKind: string; dstPath: string }>;
+        let rows: Array<{ dstKind: string; dstPath: string }>;
+        try {
+          rows = db.getDb().prepare(`
+            select dst.kind as dstKind, dst.file_path as dstPath
+            from edges e
+            join nodes src on e.source = src.id
+            join nodes dst on e.target = dst.id
+            where e.kind = 'imports'
+              and src.kind = 'file'
+              and src.file_path = 'src/main.cpp'
+          `).all() as Array<{ dstKind: string; dstPath: string }>;
+        } finally {
+          db.close();
+        }
         const resolvedToHeader = rows.find(
           (r) => r.dstKind === 'file' && r.dstPath === 'include/utils.h'
         );
@@ -2168,6 +2174,7 @@ func main() {
         );
         expect(stdlibFile).toBeUndefined();
       } finally {
+        includeCg?.destroy();
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
     });
