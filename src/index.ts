@@ -318,6 +318,17 @@ export class CodeGraph {
   }
 
   /**
+   * Whether the underlying DB file was replaced on disk since this instance
+   * opened it (same path, new inode — e.g. a `git worktree remove`+`add` or a
+   * fresh `codegraph init` at the same path). Callers that hold a long-lived
+   * instance use this to reopen instead of serving the stale, now-unlinked
+   * snapshot. See #925.
+   */
+  isDbReplaced(): boolean {
+    return this.db.isFileReplaced();
+  }
+
+  /**
    * Get the project root directory
    */
   getProjectRoot(): string {

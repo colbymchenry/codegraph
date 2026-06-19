@@ -38,17 +38,37 @@ function configureConnection(db: SqliteDatabase): void {
 }
 
 /**
+ * Identity of a DB file as `dev:ino`, or null if it does not exist. Lets a
+ * long-lived connection notice when the file at its fixed path was swapped for
+ * a different inode — e.g. the project dir was removed and recreated at the
+ * same path (`git worktree remove`+`add`, or a fresh `codegraph init`), which
+ * leaves the open handle pinned to the old, now-unlinked inode. See #925.
+ */
+function dbFileIdentity(dbPath: string): string | null {
+  try {
+    const st = fs.statSync(dbPath);
+    return `${st.dev}:${st.ino}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Database connection wrapper with lifecycle management
  */
 export class DatabaseConnection {
   private db: SqliteDatabase;
   private dbPath: string;
   private backend: SqliteBackend;
+  // Identity (`dev:ino`) of the DB file when this connection opened it, so a
+  // replaced file at the same path (#925) is detectable via isFileReplaced().
+  private dbFileId: string | null;
 
   private constructor(db: SqliteDatabase, dbPath: string, backend: SqliteBackend) {
     this.db = db;
     this.dbPath = dbPath;
     this.backend = backend;
+    this.dbFileId = dbFileIdentity(dbPath);
   }
 
   /**
@@ -126,6 +146,18 @@ export class DatabaseConnection {
    */
   getPath(): string {
     return this.dbPath;
+  }
+
+  /**
+   * Whether the DB file at this connection's path has been replaced by a
+   * different inode since we opened it — i.e. the open handle is now pinned to
+   * a deleted file while reads/writes at the path land on a new one. A missing
+   * file (mid-recreate) reports false, so a transient gap doesn't churn the
+   * connection; only a concrete swap to a new inode counts. See #925.
+   */
+  isFileReplaced(): boolean {
+    const current = dbFileIdentity(this.dbPath);
+    return current !== null && current !== this.dbFileId;
   }
 
   /**

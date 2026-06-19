@@ -681,6 +681,11 @@ export class ToolHandler {
   // populated by the watcher, not by catch-up. Cleared on first await so
   // subsequent calls don't pay any cost.
   private catchUpGate: Promise<void> | null = null;
+  // Hook the MCP engine registers so getCodeGraph can reopen the default
+  // project when its DB file was replaced on disk (#925). The engine owns the
+  // default instance's watcher/catch-up, so the reopen is delegated to it.
+  // Null when the handler has no engine (e.g. unit tests).
+  private onDefaultStale: (() => void) | null = null;
 
   constructor(private cg: CodeGraph | null) {}
 
@@ -700,6 +705,14 @@ export class ToolHandler {
    */
   setCatchUpGate(p: Promise<void> | null): void {
     this.catchUpGate = p;
+  }
+
+  /**
+   * Register the engine's hook to reopen the default project if its DB file was
+   * replaced on disk. Called from getCodeGraph on the default-serving path. See #925.
+   */
+  setDefaultReloadHook(fn: (() => void) | null): void {
+    this.onDefaultStale = fn;
   }
 
   /**
@@ -807,6 +820,38 @@ export class ToolHandler {
   }
 
   /**
+   * If the default project's DB file was replaced on disk (#925), ask the engine
+   * (via its registered hook) to reopen it before we serve `this.cg`; the engine
+   * owns the default instance's watcher/catch-up, so the reopen is delegated.
+   * After the hook runs, `this.cg` points at the fresh instance. No-op without a
+   * registered hook or an open default.
+   */
+  private refreshDefaultIfReplaced(): void {
+    if (this.onDefaultStale && this.cg?.isDbReplaced()) this.onDefaultStale();
+  }
+
+  /**
+   * Return the cached CodeGraph for `key` if its DB file is still the one it
+   * opened. If the file was replaced on disk (same path, new inode — a
+   * `git worktree remove`+`add`, or a fresh `codegraph init`), evict and close
+   * the stale instance and return null so the caller reopens against the new
+   * inode instead of serving the now-unlinked snapshot for the daemon's life.
+   * The default instance is never cached here, so closing a cached one is safe.
+   * See #925.
+   */
+  private liveCachedGraph(key: string): CodeGraph | null {
+    const cg = this.projectCache.get(key);
+    if (!cg) return null;
+    if (!cg.isDbReplaced()) return cg;
+    // Drop every key that points at this replaced instance, then close it once.
+    for (const [k, v] of this.projectCache) {
+      if (v === cg) this.projectCache.delete(k);
+    }
+    try { cg.close(); } catch { /* ignore */ }
+    return null;
+  }
+
+  /**
    * Get CodeGraph instance for a project
    *
    * If projectPath is provided, opens that project's CodeGraph (cached).
@@ -817,6 +862,7 @@ export class ToolHandler {
    */
   private getCodeGraph(projectPath?: string): CodeGraph {
     if (!projectPath) {
+      this.refreshDefaultIfReplaced();
       if (!this.cg) {
         const searched = this.defaultProjectHint ?? process.cwd();
         throw new NotIndexedError(
@@ -834,10 +880,10 @@ export class ToolHandler {
       return this.cg;
     }
 
-    // Check cache first (using original path as key)
-    if (this.projectCache.has(projectPath)) {
-      return this.projectCache.get(projectPath)!;
-    }
+    // Check cache first (using original path as key). Reopen instead of serving
+    // a cached instance whose DB file was replaced on disk under us (#925).
+    const cached = this.liveCachedGraph(projectPath);
+    if (cached) return cached;
 
     // Reject sensitive system directories before opening. Only validate a
     // path that actually exists — a nested or not-yet-created sub-path of a
@@ -871,15 +917,16 @@ export class ToolHandler {
     // not cached under projectPath — the server owns and closes the default
     // instance, so routing it through projectCache.closeAll() would double-close it.
     if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
+      this.refreshDefaultIfReplaced();
       return this.cg;
     }
 
     // Check if we already have this resolved root cached (different path, same project)
-    if (this.projectCache.has(resolvedRoot)) {
-      const cg = this.projectCache.get(resolvedRoot)!;
+    const hit = this.liveCachedGraph(resolvedRoot);
+    if (hit) {
       // Cache under original path too for faster future lookups
-      this.projectCache.set(projectPath, cg);
-      return cg;
+      this.projectCache.set(projectPath, hit);
+      return hit;
     }
 
     // Open and cache under both paths

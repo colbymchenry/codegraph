@@ -55,6 +55,11 @@ export class MCPEngine {
   constructor(opts: MCPEngineOptions = {}) {
     this.opts = { watch: opts.watch ?? true };
     this.toolHandler = new ToolHandler(null);
+    // Reopen the default project's stale handle from the per-tool-call chokepoint
+    // (ToolHandler.getCodeGraph), not just the cold init paths — a loaded daemon
+    // never re-enters those, so without this the default-project swap (#925) would
+    // never be detected at runtime.
+    this.toolHandler.setDefaultReloadHook(() => this.reloadDefaultIfDbReplaced());
   }
 
   /**
@@ -136,6 +141,44 @@ export class MCPEngine {
     } catch {
       // Still failing — caller will try again on the next tool call.
     }
+  }
+
+  /**
+   * Reopen the default project's CodeGraph if its on-disk DB file was replaced
+   * (same path, different inode) since we opened it — e.g. the project dir was
+   * removed and recreated at the same path (`git worktree remove` + `add`, or a
+   * fresh `codegraph init`). The long-lived SQLite handle would otherwise keep
+   * reading the old, now-unlinked inode while every `init`/`sync` writes to the
+   * new one, serving a stale snapshot for the life of the daemon. See #925.
+   *
+   * Invoked via the ToolHandler default-reload hook from `getCodeGraph`, i.e. on
+   * the per-tool-call path that serves the default project — not the cold init
+   * methods, which a loaded daemon never re-enters. Fully synchronous and run
+   * between requests, so the close+reopen never races an in-flight query. Opens
+   * the replacement before closing the stale handle, so a failed reopen leaves
+   * the (still-functional, if stale) current connection in place rather than
+   * tearing it down to nothing.
+   */
+  private reloadDefaultIfDbReplaced(): void {
+    if (this.closed || !this.cg || !this.projectPath || !this.cg.isDbReplaced()) return;
+
+    const root = this.projectPath;
+    let next: CodeGraph;
+    try {
+      next = loadCodeGraph().openSync(root);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[CodeGraph MCP] DB for ${root} was replaced but reopening failed: ${msg}\n`);
+      return;
+    }
+    process.stderr.write(`[CodeGraph MCP] Database file for ${root} was replaced (inode changed); reopened.\n`);
+    const old = this.cg;
+    this.cg = next;
+    this.watcherStarted = false;
+    this.toolHandler.setDefaultCodeGraph(next);
+    try { old?.close(); } catch { /* ignore */ }
+    this.startWatching();
+    this.catchUpSync();
   }
 
   /**
