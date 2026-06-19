@@ -74,6 +74,101 @@ submodule and produce searchable component, property, id, method/function,
 import, call, and reference graph facts without relying on C++/QML bridge
 support.
 
+### Validation Note: `bookmark_tree_component`
+
+Validation was run against a temporary copy of:
+
+```text
+test-qml-project/unifiedpromax/src/components/general/bookmark_tree_component
+```
+
+The source directory was not modified or staged. This module is intentionally
+useful as a mixed C++/QML validation case because it contains one large QML
+view plus the corresponding C++ component, service, runtime adapter, and
+`BookmarkTreeViewModel` implementation.
+
+Observed result from the temporary copy:
+
+- Indexed files: 27
+- Languages: 26 C/C++ files, 1 QML file
+- Total graph facts: 706 nodes, 1,599 edges
+- QML parse/index result: `presentation/qml/BookmarkTreeComponent.qml`
+  indexed with 289 QML nodes and no file errors
+- QML node breakdown:
+  - 63 `component` nodes
+  - 139 `property` nodes
+  - 27 `variable` / `id` nodes
+  - 26 `function` nodes
+  - 26 `method` / handler nodes
+  - 7 `import` nodes
+- QML edge breakdown from QML-owned nodes:
+  - 288 `contains` edges
+  - 519 `references` edges
+  - 20 `calls` edges
+  - 7 `imports` edges
+- Sample QML imports found:
+  - `QtQuick`
+  - `QtQuick.Controls`
+  - `QtQuick.Layouts`
+  - `Components`
+  - `Core.I18n`
+  - `Shared.Controls`
+  - `UnifiedProMax.Theme`
+- Sample QML structure found:
+  - top-level `BookmarkTreeComponent` component from the file basename
+  - `root` id node
+  - nested controls such as `panel`, `groupCombo`, `searchField`,
+    `bookmarkList`, `beginPicker`, `endPicker`, and `addBookmarkDialog`
+  - nested handlers such as `onActivated`, `onClicked`, `onDoubleClicked`,
+    `onAccepted`, `onPageRequested`, `onDateTimeConfirmed`, and
+    `onAddOperationInProgressChanged`
+- Sample correct call edges:
+  - `isAlertTag -> bookmarkTagText`
+  - `bookmarkTagFillColor -> isAlertTag`
+  - `formatDateTimeText -> padDateTimePart`
+  - `Component.onCompleted -> tryEagerLoad`
+  - `onViewModelChanged -> refreshFilterControls`
+  - `submitInlineBookmarkEdit -> BookmarkTreeViewModel::submitEditBookmark`
+  - `tryEagerLoad -> BookmarkTreeViewModel::loadSnapshot`
+  - `submitAddBookmarkDialog -> BookmarkTreeViewModel::submitAddBookmark`
+  - `handleSwitchPanelHeaderAction -> BookmarkTreeViewModel::refreshSnapshot`
+
+Correctness assessment:
+
+- Graph generation succeeds for this module.
+- QML file discovery, import extraction, component nesting, id extraction,
+  property extraction, root-level helper functions, top-level handlers, and
+  simple same-file helper calls are working.
+- A limited set of QML-to-C++ ViewModel calls can already resolve through the
+  existing graph pipeline when the target C++ method name is available.
+- The generated graph is not yet complete for this module. Nested control and
+  delegate handlers are extracted as method nodes, but their body calls are not
+  consistently emitted as `calls` edges. Missing examples include:
+  - `groupCombo.onActivated -> root.applyCurrentFilters()`
+  - `searchButton.onClicked -> root.applyCurrentFilters()`
+  - `currentDeviceOnlyCheck.onClicked -> root.applyCurrentFilters()`
+  - `bookmarkList` delegate `MouseArea.onClicked ->
+    root.viewModel.onNodeClicked(...)`
+  - `bookmarkList` delegate `MouseArea.onDoubleClicked ->
+    root.viewModel.onNodeDoubleClicked(...)`
+  - `ThemedPaginationBar.onPageRequested -> root.viewModel.goToPage(...)`
+  - `DateTimePickerPopup.onDateTimeConfirmed ->
+    root.formatDateTimeText(...) / root.applyCurrentFilters()`
+  - `addBookmarkDialog.onAccepted -> root.submitAddBookmarkDialog(...)`
+  - `Connections.onAddOperationInProgressChanged ->
+    root.closeAddBookmarkDialog()`
+
+Follow-up implication:
+
+- Before claiming full QML interaction-chain coverage, extend the QML extractor
+  or resolver so nested handler bodies participate in the same call/reference
+  extraction path as root-level functions and handlers.
+- Add a deterministic regression fixture based on the patterns above:
+  nested object handler -> root helper -> `root.viewModel.*` C++ method.
+- Treat the currently observed QML-to-C++ links as useful but heuristic. A
+  proper bridge design is still needed for `Q_PROPERTY`, `Q_INVOKABLE`,
+  `setContextProperty`, and registered QML types.
+
 ## Priority 3: QML Module and Import Scope Design
 
 - Design `qmldir` and QML import scope support before enabling cross-file QML
