@@ -285,6 +285,194 @@ describe('QML Extraction', () => {
     ).toBe(true);
   });
 
+  it('should extract static QML calls and references from bindings and handlers', () => {
+    const code = `
+import QtQuick
+import "utils.js" as Utils
+
+Item {
+  id: root
+  property int count: 1
+  property int nextCount: count
+  property string label: Utils.format(root.count)
+  property real size: Math.max(parent.width, Qt.dpiScale(2))
+
+  function submit() {
+    updateState(root.count)
+  }
+
+  function updateState(value) {
+    root.count = value
+  }
+
+  function inspect(value) {
+    const local = root.count
+    let other = local
+    return other
+  }
+
+  function runCallback(cb) {
+    cb()
+    const localFn = submit
+    localFn()
+  }
+
+  function outer() {
+    function inner() {
+      nestedCall(root.count)
+      const innerLocal = root.count
+      return innerLocal
+    }
+    inner()
+    return count
+  }
+
+  MouseArea {
+    onClicked: {
+      const handlerLocal = root.count
+      submit()
+      handlerLocal
+      mouse.accepted = true
+      event.accepted = false
+    }
+  }
+}
+`;
+    const result = extractFromSource('Interactions.qml', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    const callNames = calls.map((r) => r.referenceName);
+    const refNames = refs.map((r) => r.referenceName);
+
+    const label = result.nodes.find((node) => node.kind === 'property' && node.name === 'label');
+    const nextCount = result.nodes.find(
+      (node) => node.kind === 'property' && node.name === 'nextCount'
+    );
+    const submit = result.nodes.find((node) => node.kind === 'function' && node.name === 'submit');
+    const updateState = result.nodes.find(
+      (node) => node.kind === 'function' && node.name === 'updateState'
+    );
+    const inspect = result.nodes.find((node) => node.kind === 'function' && node.name === 'inspect');
+    const runCallback = result.nodes.find(
+      (node) => node.kind === 'function' && node.name === 'runCallback'
+    );
+    const outer = result.nodes.find((node) => node.kind === 'function' && node.name === 'outer');
+    const onClicked = result.nodes.find((node) => node.kind === 'method' && node.name === 'onClicked');
+
+    expect(label).toBeDefined();
+    expect(nextCount).toBeDefined();
+    expect(submit).toBeDefined();
+    expect(updateState).toBeDefined();
+    expect(inspect).toBeDefined();
+    expect(runCallback).toBeDefined();
+    expect(outer).toBeDefined();
+    expect(onClicked).toBeDefined();
+
+    expect(callNames).toContain('Utils.format');
+    expect(callNames).toContain('updateState');
+    expect(callNames).toContain('submit');
+    expect(refNames).toContain('Utils');
+    expect(refNames).toContain('root');
+    expect(refNames).toContain('root.count');
+    expect(refNames).toContain('count');
+    expect(refs).toContainEqual(expect.objectContaining({
+      fromNodeId: nextCount!.id,
+      referenceName: 'count',
+    }));
+    expect(calls).toContainEqual(expect.objectContaining({
+      fromNodeId: label!.id,
+      referenceName: 'Utils.format',
+    }));
+    expect(refs).toContainEqual(expect.objectContaining({
+      fromNodeId: label!.id,
+      referenceName: 'root.count',
+    }));
+    expect(calls).toContainEqual(expect.objectContaining({
+      fromNodeId: submit!.id,
+      referenceName: 'updateState',
+    }));
+    expect(refs).toContainEqual(expect.objectContaining({
+      fromNodeId: submit!.id,
+      referenceName: 'root.count',
+    }));
+    expect(refs).toContainEqual(expect.objectContaining({
+      fromNodeId: updateState!.id,
+      referenceName: 'root.count',
+    }));
+    expect(refs).toContainEqual(expect.objectContaining({
+      fromNodeId: inspect!.id,
+      referenceName: 'root.count',
+    }));
+    expect(refs).toContainEqual(expect.objectContaining({
+      fromNodeId: outer!.id,
+      referenceName: 'count',
+    }));
+    expect(calls).toContainEqual(expect.objectContaining({
+      fromNodeId: onClicked!.id,
+      referenceName: 'submit',
+    }));
+    expect(refs).toContainEqual(expect.objectContaining({
+      fromNodeId: onClicked!.id,
+      referenceName: 'root.count',
+    }));
+    expect(calls).not.toContainEqual(expect.objectContaining({
+      fromNodeId: outer!.id,
+      referenceName: 'nestedCall',
+    }));
+    expect(callNames).not.toContain('cb');
+    expect(callNames).not.toContain('localFn');
+    expect(callNames).not.toContain('inner');
+    expect(refNames).not.toContain('value');
+    expect(refNames).not.toContain('local');
+    expect(refNames).not.toContain('other');
+    expect(refNames).not.toContain('localFn');
+    expect(refNames).not.toContain('handlerLocal');
+    expect(refNames).not.toContain('innerLocal');
+
+    for (const skippedRoot of ['Qt', 'Math', 'parent', 'mouse', 'event']) {
+      expect(callNames.some((name) => name === skippedRoot || name.startsWith(`${skippedRoot}.`))).toBe(false);
+      expect(refNames.some((name) => name === skippedRoot || name.startsWith(`${skippedRoot}.`))).toBe(false);
+    }
+  });
+
+  it('should preserve object-valued generic binding traversal', () => {
+    const result = extractFromSource(
+      'States.qml',
+      [
+        'import QtQuick',
+        '',
+        'Item {',
+        '  id: root',
+        '  background: Rectangle { id: bg }',
+        '  states: [',
+        '    State { name: "busy" }',
+        '  ]',
+        '}',
+      ].join('\n')
+    );
+
+    expect(result.errors).toEqual([]);
+    const root = result.nodes.find((node) => node.kind === 'component' && node.name === 'root');
+    const bg = result.nodes.find((node) => node.kind === 'component' && node.name === 'bg');
+    const state = result.nodes.find(
+      (node) => node.kind === 'component' && node.name.startsWith('State@')
+    );
+    expect(root).toBeDefined();
+    expect(bg).toBeDefined();
+    expect(state).toBeDefined();
+    expect(
+      result.edges.some(
+        (edge) => edge.kind === 'contains' && edge.source === root!.id && edge.target === bg!.id
+      )
+    ).toBe(true);
+    expect(
+      result.edges.some(
+        (edge) =>
+          edge.kind === 'contains' && edge.source === root!.id && edge.target === state!.id
+      )
+    ).toBe(true);
+  });
+
   it('should preserve object-valued properties and handlers under their owning symbols', () => {
     const result = extractFromSource(
       'ObjectValues.qml',
