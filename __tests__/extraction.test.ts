@@ -208,6 +208,147 @@ describe('QML Extraction', () => {
       )
     ).toBe(true);
   });
+
+  it('should extract QML ids, properties, signals, functions, handlers, and enums', () => {
+    const result = extractFromSource(
+      'Dashboard.qml',
+      [
+        'import QtQuick',
+        '',
+        'Item {',
+        '  id: root',
+        '  required property var viewModel',
+        '  readonly property string title: "Dashboard"',
+        '  property alias label: titleText.text',
+        '  signal accepted(string name)',
+        '  enum Mode { Light, Dark }',
+        '',
+        '  Component.onCompleted: initialize()',
+        '  onAccepted: initialize()',
+        '',
+        '  function initialize() {',
+        '    viewModel.load(title)',
+        '  }',
+        '',
+        '  Text { id: titleText; text: root.title }',
+        '}',
+      ].join('\n')
+    );
+
+    expect(result.errors).toEqual([]);
+
+    const symbols = result.nodes.map((node) => `${node.kind}:${node.name}`);
+    expect(symbols).toContain('variable:root');
+    expect(symbols).toContain('property:viewModel');
+    expect(symbols).toContain('property:title');
+    expect(symbols).toContain('property:label');
+    expect(symbols).toContain('method:accepted');
+    expect(symbols).toContain('method:Component.onCompleted');
+    expect(symbols).toContain('method:onAccepted');
+    expect(symbols).toContain('function:initialize');
+    expect(symbols).toContain('enum:Mode');
+    expect(symbols).toContain('enum_member:Light');
+    expect(symbols).toContain('enum_member:Dark');
+  });
+
+  it('should extract Connections handlers as method nodes', () => {
+    const result = extractFromSource(
+      'ConnectionsExample.qml',
+      [
+        'import QtQuick',
+        '',
+        'Item {',
+        '  id: root',
+        '  property var viewModel',
+        '  Connections {',
+        '    target: viewModel',
+        '    function onLoaded(value) { root.count = value }',
+        '  }',
+        '}',
+      ].join('\n')
+    );
+
+    expect(result.errors).toEqual([]);
+    const connections = result.nodes.find(
+      (node) => node.kind === 'component' && node.name.startsWith('Connections')
+    );
+    expect(connections).toBeDefined();
+    const onLoaded = result.nodes.find((node) => node.kind === 'method' && node.name === 'onLoaded');
+    expect(onLoaded).toBeDefined();
+    expect(
+      result.unresolvedReferences.some(
+        (ref) =>
+          ref.fromNodeId === connections!.id &&
+          ref.referenceKind === 'references' &&
+          ref.referenceName === 'viewModel'
+      )
+    ).toBe(true);
+  });
+
+  it('should preserve object-valued properties and handlers under their owning symbols', () => {
+    const result = extractFromSource(
+      'ObjectValues.qml',
+      [
+        'import QtQuick',
+        '',
+        'Item {',
+        '  id: root',
+        '  property bool online: true',
+        '  property var child: QtObject { id: childObj }',
+        '  onAccepted: QtObject { id: temp }',
+        '  function onlineStatus() {}',
+        '}',
+      ].join('\n')
+    );
+
+    expect(result.errors).toEqual([]);
+
+    const propertyOnline = result.nodes.find(
+      (node) => node.kind === 'property' && node.name === 'online'
+    );
+    const propertyChild = result.nodes.find(
+      (node) => node.kind === 'property' && node.name === 'child'
+    );
+    const onlineMethod = result.nodes.find((node) => node.kind === 'method' && node.name === 'online');
+    const onlineStatusFunction = result.nodes.find(
+      (node) => node.kind === 'function' && node.name === 'onlineStatus'
+    );
+    const onlineStatusMethod = result.nodes.find(
+      (node) => node.kind === 'method' && node.name === 'onlineStatus'
+    );
+    const acceptedHandler = result.nodes.find(
+      (node) => node.kind === 'method' && node.name === 'onAccepted'
+    );
+    const childObj = result.nodes.find(
+      (node) => node.kind === 'component' && node.name === 'childObj'
+    );
+    const temp = result.nodes.find((node) => node.kind === 'component' && node.name === 'temp');
+
+    expect(propertyOnline).toBeDefined();
+    expect(propertyChild).toBeDefined();
+    expect(onlineMethod).toBeUndefined();
+    expect(onlineStatusFunction).toBeDefined();
+    expect(onlineStatusMethod).toBeUndefined();
+    expect(acceptedHandler).toBeDefined();
+    expect(childObj).toBeDefined();
+    expect(temp).toBeDefined();
+    expect(
+      result.edges.some(
+        (edge) =>
+          edge.kind === 'contains' &&
+          edge.source === propertyChild!.id &&
+          edge.target === childObj!.id
+      )
+    ).toBe(true);
+    expect(
+      result.edges.some(
+        (edge) =>
+          edge.kind === 'contains' &&
+          edge.source === acceptedHandler!.id &&
+          edge.target === temp!.id
+      )
+    ).toBe(true);
+  });
 });
 
 describe('TypeScript Extraction', () => {
