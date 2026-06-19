@@ -151,29 +151,62 @@ describe('Language Support', () => {
 });
 
 describe('QML Language Wiring', () => {
-  it('loads the QML grammar and keeps extraction minimal until QML extraction is implemented', async () => {
+  it('loads the QML grammar', async () => {
     await initGrammars();
     await loadGrammarsForLanguages(['qml']);
 
     expect(isGrammarLoaded('qml')).toBe(true);
     expect(getParser('qml')).toBeTruthy();
+  });
+});
 
+describe('QML Extraction', () => {
+  it('extracts imports and nested object components', () => {
     const result = extractFromSource(
       'Main.qml',
-      `
-import QtQuick
-
-Item {
-  id: root
-}
-`
+      [
+        'import QtQuick',
+        'import QtQuick.Controls 2.15',
+        '',
+        'ApplicationWindow {',
+        '  id: root',
+        '  Rectangle {',
+        '    id: panel',
+        '    Text { text: "Hello" }',
+        '  }',
+        '}',
+      ].join('\n')
     );
 
-    expect(result.nodes).toHaveLength(1);
-    expect(result.nodes[0]?.kind).toBe('file');
-    expect(result.nodes[0]?.language).toBe('qml');
-    expect(result.unresolvedReferences).toHaveLength(0);
-    expect(result.errors).toHaveLength(0);
+    expect(result.errors).toEqual([]);
+
+    const importNames = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(importNames).toContain('QtQuick');
+    expect(importNames).toContain('QtQuick.Controls');
+
+    const fileNode = result.nodes.find((n) => n.kind === 'file');
+    expect(fileNode).toBeDefined();
+    const importRefs = result.unresolvedReferences
+      .filter((ref) => ref.referenceKind === 'imports' && ref.fromNodeId === fileNode!.id)
+      .map((ref) => ref.referenceName);
+    expect(importRefs).toContain('QtQuick');
+    expect(importRefs).toContain('QtQuick.Controls');
+
+    const componentNodes = result.nodes.filter((n) => n.kind === 'component');
+    const componentNames = componentNodes.map((n) => n.name);
+    expect(componentNames).toContain('root');
+    expect(componentNames).toContain('panel');
+    expect(componentNames.some((name) => name.startsWith('Text@'))).toBe(true);
+
+    const root = componentNodes.find((n) => n.name === 'root');
+    const panel = componentNodes.find((n) => n.name === 'panel');
+    expect(root).toBeDefined();
+    expect(panel).toBeDefined();
+    expect(
+      result.edges.some(
+        (edge) => edge.kind === 'contains' && edge.source === root!.id && edge.target === panel!.id
+      )
+    ).toBe(true);
   });
 });
 
