@@ -6,6 +6,16 @@ Add first-class `.qml` language support to CodeGraph so Qt Quick projects can be
 
 **Implementation status:** implemented for QML-internal graph generation; C++/QML bridging remains deferred.
 
+Local JavaScript helper imports such as `import "utils.js" as Utils` are indexed
+as file-level imports. Cross-file resolution from QML member calls such as
+`Utils.format(...)` to JavaScript function symbols remains out of scope for the
+first version.
+
+QML object type references are emitted only for inline components declared in
+the same `.qml` file with `component Name : ...`. Common Qt Quick platform
+types and same-named project files are not linked by name alone; cross-file QML
+component resolution is deferred until import/qmldir scope rules are modeled.
+
 The goal is to make `codegraph_explore`, `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` useful on real Qt Quick codebases by extracting:
 
 - QML component trees

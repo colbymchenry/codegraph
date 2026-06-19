@@ -11,6 +11,11 @@ function qmlName(text: string): string {
   return text.trim().replace(/^['"]|['"]$/g, '');
 }
 
+function qmlFileComponentName(filePath: string): string {
+  const fileName = filePath.split(/[\\/]/).pop() ?? filePath;
+  return fileName.replace(/\.[^.]+$/, '');
+}
+
 function dottedText(node: SyntaxNode, source: string): string {
   if (node.type === 'nested_identifier') {
     return node.namedChildren
@@ -49,6 +54,12 @@ function rootReferenceName(referenceName: string): string {
 
 function shouldSkipStaticReference(referenceName: string): boolean {
   return QML_STATIC_REFERENCE_SKIP_ROOTS.has(rootReferenceName(referenceName));
+}
+
+let inlineComponentNames = new Set<string>();
+
+function shouldReferenceComponentType(typeName: string): boolean {
+  return inlineComponentNames.has(typeName);
 }
 
 function shouldSkipLocalReference(
@@ -209,6 +220,22 @@ function addStaticReferences(
   scanStaticReferences(node, ctx, new Set(), localNames);
 }
 
+function addReferenceFromNode(
+  ctx: ExtractorContext,
+  fromNodeId: string,
+  referenceName: string,
+  positionNode: SyntaxNode,
+  referenceKind: 'calls' | 'imports' | 'references' = 'references'
+): void {
+  ctx.addUnresolvedReference({
+    fromNodeId,
+    referenceName,
+    referenceKind,
+    line: positionNode.startPosition.row + 1,
+    column: positionNode.startPosition.column,
+  });
+}
+
 function collectPatternIdentifiers(node: SyntaxNode, source: string, names: Set<string>): void {
   if (node.type === 'identifier') {
     const name = getNodeText(node, source).trim();
@@ -347,6 +374,21 @@ function findNamedChildByType(node: SyntaxNode, type: string): SyntaxNode | null
   return null;
 }
 
+function collectInlineComponentNames(node: SyntaxNode, source: string, names: Set<string>): void {
+  if (node.type === 'ERROR') {
+    const name = inlineComponentName(node, source);
+    const recoveredObject = findNamedChildByType(node, 'ui_object_definition');
+    const initializer = recoveredObject ? getChildByField(recoveredObject, 'initializer') : null;
+    if (name && initializer) {
+      names.add(name);
+    }
+  }
+
+  for (const child of node.namedChildren) {
+    collectInlineComponentNames(child, source, names);
+  }
+}
+
 function isQmlHandlerName(name: string): boolean {
   const handlerName = name.includes('.') ? name.split('.').pop() ?? '' : name;
   return /^on[A-Z]/.test(handlerName);
@@ -383,18 +425,7 @@ function visitQmlBinding(node: SyntaxNode, ctx: ExtractorContext): boolean {
   }
 
   if (name === 'target') {
-    const target = directIdentifierText(valueNode, ctx.source);
-    const targetNode = directIdentifierNode(valueNode);
-    const fromNodeId = ctx.nodeStack[ctx.nodeStack.length - 1];
-    if (target && targetNode && fromNodeId) {
-      ctx.addUnresolvedReference({
-        fromNodeId,
-        referenceName: target,
-        referenceKind: 'references',
-        line: targetNode.startPosition.row + 1,
-        column: targetNode.startPosition.column,
-      });
-    }
+    addStaticReferences(valueNode, ctx);
     visitOwnedQmlSubtree(valueNode, ctx);
     return true;
   }
@@ -495,6 +526,7 @@ function visitInlineComponentError(node: SyntaxNode, ctx: ExtractorContext): boo
   const recoveredObject = findNamedChildByType(node, 'ui_object_definition');
   const initializer = recoveredObject ? getChildByField(recoveredObject, 'initializer') : null;
   if (!initializer) return false;
+  inlineComponentNames.add(name);
 
   const component = ctx.createNode('component', name, node, {
     signature: inlineComponentSignature(node, ctx.source),
@@ -524,6 +556,12 @@ export const qmlExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   visitNode(node, ctx): boolean {
+    if (node.type === 'program') {
+      inlineComponentNames = new Set();
+      collectInlineComponentNames(node, ctx.source, inlineComponentNames);
+      return false;
+    }
+
     if (node.type === 'ERROR') {
       return visitInlineComponentError(node, ctx);
     }
@@ -579,13 +617,23 @@ export const qmlExtractor: LanguageExtractor = {
 
       const initializer = getChildByField(node, 'initializer');
       const idValue = findBindingValueText(initializer, 'id', ctx.source);
-      const displayName = isIdentifierLike(idValue)
-        ? idValue
-        : `${typeName}@${node.startPosition.row + 1}`;
+      const parentId = ctx.nodeStack[ctx.nodeStack.length - 1];
+      const parentNode = parentId ? ctx.nodes.find((n) => n.id === parentId) : undefined;
+      const isTopLevelObject = parentNode?.kind === 'file';
+      let displayName = `${typeName}@${node.startPosition.row + 1}`;
+      if (isTopLevelObject) {
+        displayName = qmlFileComponentName(ctx.filePath);
+      } else if (isIdentifierLike(idValue)) {
+        displayName = idValue;
+      }
 
       const component = ctx.createNode('component', displayName, node, {
         signature: typeName,
       });
+
+      if (component && shouldReferenceComponentType(typeName)) {
+        addReferenceFromNode(ctx, component.id, typeName, typeNameNode);
+      }
 
       if (component && initializer) {
         ctx.pushScope(component.id);

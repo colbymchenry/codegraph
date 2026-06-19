@@ -194,11 +194,11 @@ describe('QML Extraction', () => {
 
     const componentNodes = result.nodes.filter((n) => n.kind === 'component');
     const componentNames = componentNodes.map((n) => n.name);
-    expect(componentNames).toContain('root');
+    expect(componentNames).toContain('Main');
     expect(componentNames).toContain('panel');
     expect(componentNames.some((name) => name.startsWith('Text@'))).toBe(true);
 
-    const root = componentNodes.find((n) => n.name === 'root');
+    const root = componentNodes.find((n) => n.name === 'Main');
     const panel = componentNodes.find((n) => n.name === 'panel');
     expect(root).toBeDefined();
     expect(panel).toBeDefined();
@@ -259,9 +259,9 @@ describe('QML Extraction', () => {
         '',
         'Item {',
         '  id: root',
-        '  property var viewModel',
+        '  property var backend',
         '  Connections {',
-        '    target: viewModel',
+        '    target: root.backend',
         '    function onLoaded(value) { root.count = value }',
         '  }',
         '}',
@@ -270,7 +270,7 @@ describe('QML Extraction', () => {
 
     expect(result.errors).toEqual([]);
     const connections = result.nodes.find(
-      (node) => node.kind === 'component' && node.name.startsWith('Connections')
+      (node) => node.kind === 'component' && node.name.startsWith('Connections@')
     );
     expect(connections).toBeDefined();
     const onLoaded = result.nodes.find((node) => node.kind === 'method' && node.name === 'onLoaded');
@@ -280,7 +280,15 @@ describe('QML Extraction', () => {
         (ref) =>
           ref.fromNodeId === connections!.id &&
           ref.referenceKind === 'references' &&
-          ref.referenceName === 'viewModel'
+          ref.referenceName === 'root.backend'
+      )
+    ).toBe(true);
+    expect(
+      result.unresolvedReferences.some(
+        (ref) =>
+          ref.fromNodeId === connections!.id &&
+          ref.referenceKind === 'references' &&
+          ref.referenceName === 'root'
       )
     ).toBe(true);
   });
@@ -452,7 +460,7 @@ Item {
     );
 
     expect(result.errors).toEqual([]);
-    const root = result.nodes.find((node) => node.kind === 'component' && node.name === 'root');
+    const root = result.nodes.find((node) => node.kind === 'component' && node.name === 'States');
     const bg = result.nodes.find((node) => node.kind === 'component' && node.name === 'bg');
     const state = result.nodes.find(
       (node) => node.kind === 'component' && node.name.startsWith('State@')
@@ -489,6 +497,7 @@ component PrimaryButton : Rectangle {
 
 Item {
   id: root
+  PrimaryButton { id: actionButton }
   property list<Item> items
   states: [ State { name: "busy" } ]
   transitions: [ Transition {} ]
@@ -510,8 +519,10 @@ Item {
     expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'PrimaryButton')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'property' && n.name === 'label')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'property' && n.name === 'items')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'actionButton')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'component' && n.name.startsWith('State@'))).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'component' && n.name.startsWith('Transition@'))).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceName === 'PrimaryButton')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceName === 'labelText.text')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceName === 'Utils.format')).toBe(true);
     expect(primaryButton).toBeDefined();

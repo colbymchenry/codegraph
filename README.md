@@ -714,7 +714,7 @@ is written):
 | Lua | `.lua` | Full support (functions, methods with receivers, local variables, `require` imports, call edges) |
 | R | `.R` `.r` | Full support (functions in every assignment form, S4/R5/R6 classes with methods, `library`/`require` imports, `source()` file references, call edges) |
 | Luau | `.luau` | Full support (everything in Lua, plus `type`/`export type` aliases, typed signatures, and Roblox instance-path `require`) |
-| QML / Qt Quick | `.qml` | Full support (component trees, ids, properties, signals, handlers, and QML-internal static calls/references) |
+| QML / Qt Quick | `.qml` | Full support (component trees, ids, properties, signals, handlers, QML-internal static calls/references, and local JS helper imports) |
 
 ## Measured cross-file coverage
 
