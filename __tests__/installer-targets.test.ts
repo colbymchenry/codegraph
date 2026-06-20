@@ -1097,6 +1097,58 @@ describe('Installer targets — partial-state idempotency', () => {
     // Both events emptied → the whole `hooks` object is removed.
     expect(after.hooks).toBeUndefined();
   });
+  it('bob: global install writes ~/.bob/settings/mcp_settings.json (mcpServers.codegraph)', () => {
+    const bob = getTarget('bob')!;
+    const result = bob.install('global', { autoAllow: true });
+    const settings = path.join(tmpHome, '.bob', 'settings', 'mcp_settings.json');
+    expect(result.files.some((f) => f.path === settings)).toBe(true);
+    expect(fs.existsSync(settings)).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('bob: local install writes ./.bob/mcp.json (mcpServers.codegraph)', () => {
+    const bob = getTarget('bob')!;
+    const result = bob.install('local', { autoAllow: true });
+    const mcpJson = path.join(tmpCwd, '.bob', 'mcp.json');
+    expect(result.files.some((f) => f.path === mcpJson)).toBe(true);
+    expect(fs.existsSync(mcpJson)).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(mcpJson, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('bob: install preserves pre-existing sibling MCP server', () => {
+    const bob = getTarget('bob')!;
+    const settings = path.join(tmpHome, '.bob', 'settings', 'mcp_settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      mcpServers: { other: { type: 'stdio', command: 'other-server', args: [] } },
+    }, null, 2) + '\n');
+
+    bob.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('bob: uninstall removes codegraph but preserves sibling MCP server', () => {
+    const bob = getTarget('bob')!;
+    const settings = path.join(tmpHome, '.bob', 'settings', 'mcp_settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      mcpServers: { other: { type: 'stdio', command: 'other-server', args: [] } },
+    }, null, 2) + '\n');
+
+    bob.install('global', { autoAllow: true });
+    bob.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+  });
 });
 
 describe('Installer targets — registry', () => {
@@ -1109,6 +1161,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('gemini')?.id).toBe('gemini');
     expect(getTarget('antigravity')?.id).toBe('antigravity');
     expect(getTarget('kiro')?.id).toBe('kiro');
+    expect(getTarget('bob')?.id).toBe('bob');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
