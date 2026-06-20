@@ -835,6 +835,7 @@ describe('railsResolver.extract', () => {
 });
 
 import { springResolver } from '../src/resolution/frameworks/java';
+import { extractJavaHttpClientCalls } from '../src/extraction/java-http-client';
 
 describe('springResolver.extract', () => {
   it('extracts route with @GetMapping and next method', () => {
@@ -877,6 +878,38 @@ class OwnerController {
     const { nodes, references } = springResolver.extract!('OwnerController.kt', src);
     expect(nodes[0].name).toBe('GET /owners/{ownerId}');
     expect(references[0].referenceName).toBe('showOwner');
+  });
+});
+
+describe('extractJavaHttpClientCalls', () => {
+  it('extracts company RestClient style POST calls', () => {
+    const calls = extractJavaHttpClientCalls(
+      'RestClient.post(core.getConsumeUrl()).params(fromUserJson).execute(Response.class)'
+    );
+    expect(calls).toEqual([{ method: 'POST', pathExpression: 'core.getConsumeUrl()' }]);
+  });
+
+  it('extracts common Java POST client variants', () => {
+    expect(extractJavaHttpClientCalls('restTemplate.postForObject("/api/users", body, Response.class)')[0]).toEqual({
+      method: 'POST',
+      pathExpression: '"/api/users"',
+    });
+    expect(extractJavaHttpClientCalls('restTemplate.exchange(url, HttpMethod.POST, entity, Response.class)')[0]).toEqual({
+      method: 'POST',
+      pathExpression: 'url',
+    });
+    expect(extractJavaHttpClientCalls('webClient.post().uri("/api/users").retrieve()')[0]).toEqual({
+      method: 'POST',
+      pathExpression: '"/api/users"',
+    });
+    expect(extractJavaHttpClientCalls('new Request.Builder().url("/api/users").post(body).build()')[0]).toEqual({
+      method: 'POST',
+      pathExpression: '"/api/users"',
+    });
+    expect(extractJavaHttpClientCalls('new HttpPost("http://user-service/api/users")')[0]).toEqual({
+      method: 'POST',
+      pathExpression: '"http://user-service/api/users"',
+    });
   });
 });
 
