@@ -5,7 +5,7 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 `vX.Y.Z`, which is where most people will look.
 
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
-and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).  
 
 ## [Unreleased]
 
@@ -45,6 +45,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- Database paths with `..` traversal sequences are now rejected in `DatabaseConnection.initialize` and `DatabaseConnection.open`, and non-`.db` extensions are blocked, so a caller cannot be tricked into opening an arbitrary file as a SQLite database.
+- Every MCP tool call is now logged to stderr with a timestamp, process PID, and tool name, making unexpected tool invocations visible in daemon logs.
+- The daemon socket `chmod 0600` failure is now surfaced as a warning to stderr instead of being silently swallowed, so permission issues on shared filesystems don't go unnoticed.
 - Closed a path-traversal hole where a symbolic link inside an indexed project that pointed *outside* the project root could make CodeGraph serve that out-of-root file's contents (for example a file under your home directory) to the AI agent. CodeGraph now resolves symlinks when validating file access and refuses to read anything whose real location is outside the project, while still allowing symlinks that stay within it. Thanks @sulthonzh. (#527)
 - CodeGraph now indexes Spring configuration files (`application.properties` / `application.yml`) by key only, and never includes their values in `codegraph_explore` or `codegraph_node` output. Previously a secret committed to one of these files — a database password, API key, or connection string with embedded credentials — could be surfaced to an AI agent that asked about nearby code, even though the agent never opened the file. The configuration keys are still indexed, so reference and impact analysis are unaffected; an agent that genuinely needs a value reads the file itself. Shopify Liquid `{% schema %}` blocks are likewise indexed by name only. (#383)
 

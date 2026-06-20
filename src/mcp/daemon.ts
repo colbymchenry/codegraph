@@ -178,7 +178,9 @@ export class Daemon {
         // POSIX: tighten permissions to user-only — the socket lives under
         // `.codegraph/`, which is git-ignored but may be on a shared FS.
         if (process.platform !== 'win32') {
-          try { fs.chmodSync(this.socketPath, 0o600); } catch { /* best-effort */ }
+          try { fs.chmodSync(this.socketPath, 0o600); } catch (err) {
+            process.stderr.write(`[CodeGraph daemon] warning: failed to restrict socket permissions: ${err instanceof Error ? err.message : String(err)}\n`);
+          }
         }
         this.server = server;
         resolve();
