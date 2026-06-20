@@ -834,9 +834,26 @@ export class ToolHandler {
       return this.cg;
     }
 
-    // Check cache first (using original path as key)
+    // Check cache first (using original path as key).
+    // Guard against stale entries: if the cached root is a *parent* of
+    // projectPath (a "walk-up" resolution), a worktree-local .codegraph/
+    // may have appeared since we cached it (issue #926). Re-run the walk
+    // in that case so a newly-initialised worktree index is picked up.
+    // When the cached root IS the projectPath itself, nothing closer can
+    // exist — skip the re-check to keep the hot path cheap.
     if (this.projectCache.has(projectPath)) {
-      return this.projectCache.get(projectPath)!;
+      const entry = this.projectCache.get(projectPath)!;
+      const entryRoot = entry.getProjectRoot();
+      if (entryRoot === resolvePath(projectPath)) {
+        return entry; // direct hit — can't be stale
+      }
+      // Parent resolution — check if a closer index has appeared.
+      const freshRoot = findNearestCodeGraphRoot(projectPath);
+      if (!freshRoot || freshRoot === entryRoot) {
+        return entry; // still the same resolution
+      }
+      // A new/closer index exists — evict the stale entry and fall through.
+      this.projectCache.delete(projectPath);
     }
 
     // Reject sensitive system directories before opening. Only validate a
@@ -958,17 +975,34 @@ export class ToolHandler {
    */
   private worktreeMismatchFor(projectPath?: string): WorktreeIndexMismatch | null {
     const startPath = projectPath ?? this.defaultProjectHint ?? process.cwd();
-    const cached = this.worktreeMismatchCache.get(startPath);
+
+    // Resolve the CodeGraph first so we can use its root as part of the cache
+    // key. Keying on startPath alone caused false positives (issue #926): a
+    // prior call without projectPath could cache a mismatch under the worktree
+    // path (startPath = defaultProjectHint = worktreePath, indexRoot =
+    // mainRepo), and a later call WITH projectPath=worktreePath would hit that
+    // stale entry even though getCodeGraph now correctly resolves the worktree's
+    // own index. Including indexRoot in the key ensures the two calls get
+    // independent cache entries.
+    let indexRoot: string;
+    try {
+      indexRoot = this.getCodeGraph(projectPath).getProjectRoot();
+    } catch {
+      // No resolvable project → nothing to warn about.
+      return null;
+    }
+
+    const cacheKey = `${startPath}\0${indexRoot}`;
+    const cached = this.worktreeMismatchCache.get(cacheKey);
     if (cached !== undefined) return cached;
 
     let mismatch: WorktreeIndexMismatch | null = null;
     try {
-      mismatch = detectWorktreeIndexMismatch(startPath, this.getCodeGraph(projectPath).getProjectRoot());
+      mismatch = detectWorktreeIndexMismatch(startPath, indexRoot);
     } catch {
-      // No resolvable project (or any other resolution error) → nothing to warn.
       mismatch = null;
     }
-    this.worktreeMismatchCache.set(startPath, mismatch);
+    this.worktreeMismatchCache.set(cacheKey, mismatch);
     return mismatch;
   }
 
