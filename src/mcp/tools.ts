@@ -134,7 +134,7 @@ export interface ExploreOutputBudget {
   maxCharsPerFile: number;
   /** Cluster gap threshold in lines — tighter clustering on small projects. */
   gapThreshold: number;
-  /** Max symbols listed in the per-file header (`#### path — sym(kind), ...`). */
+  /** Max symbols listed in the per-file header (`**path — sym(kind), ...`). */
   maxSymbolsInFileHeader: number;
   /** Max edges shown per relationship kind in the Relationships section. */
   maxEdgesPerRelationshipKind: number;
@@ -1716,7 +1716,7 @@ export class ToolHandler {
       if (!hasMain && synthLines.length === 0 && !boundaryText) return EMPTY;
       const out: string[] = [];
       if (hasMain) {
-        out.push('## Flow (call path among the symbols you queried)', '');
+        out.push('**Flow (call path among the symbols you queried)**', '');
         for (let i = 0; i < best!.length; i++) {
           const step = best![i]!;
           if (step.edge) { const sy = this.synthEdgeNote(step.edge); out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}`); }
@@ -1726,7 +1726,7 @@ export class ToolHandler {
       }
       if (synthLines.length) {
         out.push(
-          '## Dynamic-dispatch links among your symbols',
+          '**Dynamic-dispatch links among your symbols**',
           '(synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)',
           '',
           ...synthLines,
@@ -1922,7 +1922,7 @@ export class ToolHandler {
     if (entries.length === 0) return '';
 
     return [
-      '### Blast radius — what depends on these (update/verify before editing)',
+      '**Blast radius — what depends on these (update/verify before editing)**',
       '',
       ...entries,
       '',
@@ -2366,7 +2366,7 @@ export class ToolHandler {
 
     // Step 3: Build relationship map
     const lines: string[] = [
-      `## Exploration: ${query}`,
+      `**Exploration: ${query}`,
       '',
       `Found ${subgraph.nodes.size} symbols across ${fileGroups.size} files.`,
       '',
@@ -2384,7 +2384,7 @@ export class ToolHandler {
     );
 
     if (budget.includeRelationships && significantEdges.length > 0) {
-      lines.push('### Relationships');
+      lines.push('**Relationships**');
       lines.push('');
 
       // Group edges by kind for readability
@@ -2471,7 +2471,7 @@ export class ToolHandler {
       return false;
     };
 
-    lines.push('### Source Code');
+    lines.push('**Source Code**');
     lines.push('');
     lines.push('> The code below is the **verbatim, current on-disk source** of these files — re-read from disk on this call and line-numbered, byte-for-byte identical to what the Read tool returns. It is NOT a summary, outline, or stale cache. Treat each block as a Read you have already performed: do not Read a file shown here.');
     lines.push('');
@@ -2615,7 +2615,7 @@ export class ToolHandler {
           const tag = bodyIds.size > 0
             ? 'focused (the methods you named in full, the rest as signatures — codegraph_explore a signature by name for its body; do NOT Read)'
             : 'skeleton (signatures only — codegraph_explore a name for its full body; do NOT Read)';
-          lines.push(`#### ${filePath} — ${names} · ${tag}`, '', '```' + lang, skel.join('\n'), '```', '');
+          lines.push(`**${filePath} — ${names} · ${tag}`, '', '```' + lang, skel.join('\n'), '```', '');
           totalChars += skel.join('\n').length + 120;
           filesIncluded++;
           continue;
@@ -2656,7 +2656,7 @@ export class ToolHandler {
         )];
         const headerNames = uniqSymbols.slice(0, budget.maxSymbolsInFileHeader);
         const omitted = uniqSymbols.length - headerNames.length;
-        const wholeHeader = `#### ${filePath} — ${omitted > 0 ? `${headerNames.join(', ')}, +${omitted} more` : headerNames.join(', ')}`;
+        const wholeHeader = `**${filePath} — ${omitted > 0 ? `${headerNames.join(', ')}, +${omitted} more` : headerNames.join(', ')}**`;
 
         if (!fileNecessary && totalChars + wholeSection.length + 200 > budget.maxOutputChars) {
           // Don't slice a whole file mid-method: an incidental file that doesn't
@@ -2873,7 +2873,7 @@ export class ToolHandler {
       const headerSuffix = omittedCount > 0
         ? `${headerSymbols.join(', ')}, +${omittedCount} more`
         : headerSymbols.join(', ');
-      const fileHeader = `#### ${filePath} — ${headerSuffix}`;
+      const fileHeader = `**${filePath} — ${headerSuffix}**`;
 
       // The total cap bounds INCIDENTAL files only. A file that DEFINES a symbol
       // the agent named (or that's on the flow spine) renders even when the
@@ -2914,7 +2914,7 @@ export class ToolHandler {
         .sort((a, b) => b[1].score - a[1].score);
       const remainingFiles = [...remainingRelevant, ...peripheralFiles];
       if (remainingFiles.length > 0) {
-        lines.push('### Not shown above — explore these names for their source');
+        lines.push('**Not shown above — explore these names for their source');
         lines.push('');
         for (const [filePath, group] of remainingFiles.slice(0, 10)) {
           const symbols = group.nodes.map(n => `${n.name}:${n.startLine}`).join(', ');
@@ -2962,13 +2962,13 @@ export class ToolHandler {
     const output = flow.text + lines.join('\n');
     const hardCeiling = Math.min(Math.round(budget.maxOutputChars * 1.5), 25000);
     if (output.length > hardCeiling) {
-      // Cut at a FILE-SECTION boundary (the last `#### ` header before the
+      // Cut at a FILE-SECTION boundary (the last file-section header before the
       // ceiling) so we drop whole trailing file-sections rather than slicing
       // through a method body — a half-rendered method just forces the Read this
       // tool exists to prevent. Fall back to a line boundary only if no section
       // header sits in the back half (degenerate single-giant-section case).
       const cut = output.slice(0, hardCeiling);
-      const lastSection = cut.lastIndexOf('\n#### ');
+      const lastSection = cut.lastIndexOf('\n**');
       const boundary = lastSection > hardCeiling * 0.5 ? lastSection : cut.lastIndexOf('\n');
       const safe = boundary > 0 ? cut.slice(0, boundary) : cut;
       return this.textResult(safe + '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)');
@@ -3083,7 +3083,7 @@ export class ToolHandler {
       const shownList = listed.slice(0, LIST_CAP);
       out.push(
         '',
-        '### Other definitions',
+        '**Other definitions**',
         ...shownList.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`),
       );
       if (listed.length > LIST_CAP) out.push(`- … +${listed.length - LIST_CAP} more`);
@@ -3165,7 +3165,7 @@ export class ToolHandler {
     // symbolsOnly → the cheap structural overview, no source.
     if (opts.symbolsOnly) {
       const out = [`**${filePath}** — ${nodes.length} symbol${nodes.length === 1 ? '' : 's'}, ${depSummary}`, ''];
-      if (nodes.length) out.push(...symbolMap('### Symbols'));
+      if (nodes.length) out.push(...symbolMap('**Symbols**'));
       else out.push('_No indexed symbols in this file._');
       out.push('', '> Drop `symbolsOnly` (or pass `offset`/`limit`) to read the source, like Read.');
       return this.textResult(this.truncateOutput(out.join('\n')));
@@ -3175,7 +3175,7 @@ export class ToolHandler {
     // line is `key: <secret>`. Summarize by key and point to a real Read.
     if (CONFIG_LEAF_LANGUAGES.has(resolved.language)) {
       const out = [`**${filePath}** — configuration/data file, ${depSummary}`, ''];
-      if (nodes.length) out.push(...symbolMap('### Keys (values withheld for safety)'));
+      if (nodes.length) out.push(...symbolMap('**Keys (values withheld for safety)**'));
       out.push('', '> Values may be secrets, so codegraph indexes keys only. Read the file directly if you need a value.');
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
@@ -3189,7 +3189,7 @@ export class ToolHandler {
     }
     if (content === null) {
       const out = [`**${filePath}** — could not read from disk (it may have moved since indexing). ${depSummary}`, ''];
-      if (nodes.length) out.push(...symbolMap('### Symbols'));
+      if (nodes.length) out.push(...symbolMap('**Symbols**'));
       out.push('', `> Read \`${filePath}\` directly for its current content.`);
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
@@ -3286,7 +3286,7 @@ export class ToolHandler {
     const callees = collect(cg.getCallees(node.id));
     const callers = collect(cg.getCallers(node.id));
     if (callees.length === 0 && callers.length === 0) return '';
-    const lines: string[] = ['', '### Trail — codegraph_node any of these to follow it (no Read needed)'];
+    const lines: string[] = ['', '**Trail — codegraph_node any of these to follow it (no Read needed)**'];
     if (callees.length > 0) {
       lines.push(`**Calls →** ${callees.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callees.length > TRAIL_CAP ? `, +${callees.length - TRAIL_CAP} more` : ''}`);
     }
@@ -3322,7 +3322,7 @@ export class ToolHandler {
     const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined);
 
     const lines: string[] = [
-      '## CodeGraph Status',
+      '**CodeGraph Status**',
       '',
     ];
     if (mismatch) {
@@ -3353,7 +3353,7 @@ export class ToolHandler {
       );
     }
 
-    lines.push('', '### Nodes by Kind:');
+    lines.push('', '**Nodes by Kind:**');
 
     for (const [kind, count] of Object.entries(stats.nodesByKind)) {
       if ((count as number) > 0) {
@@ -3361,7 +3361,7 @@ export class ToolHandler {
       }
     }
 
-    lines.push('', '### Languages:');
+    lines.push('', '**Languages:**');
     for (const [lang, count] of Object.entries(stats.filesByLanguage)) {
       if ((count as number) > 0) {
         lines.push(`- ${lang}: ${count}`);
@@ -3387,7 +3387,7 @@ export class ToolHandler {
     // banners on other tool calls.
     const pending = cg.getPendingFiles();
     if (pending.length > 0) {
-      lines.push('', '### Pending sync:');
+      lines.push('', '**Pending sync:**');
       const now = Date.now();
       for (const p of pending) {
         const ageMs = Math.max(0, now - p.lastSeenMs);
@@ -3478,7 +3478,7 @@ export class ToolHandler {
    * Format files as a flat list
    */
   private formatFilesFlat(files: { path: string; language: string; nodeCount: number }[], includeMetadata: boolean): string {
-    const lines: string[] = [`## Files (${files.length})`, ''];
+    const lines: string[] = [`**Files (${files.length})`, ''];
 
     for (const file of files.sort((a, b) => a.path.localeCompare(b.path))) {
       if (includeMetadata) {
@@ -3503,13 +3503,13 @@ export class ToolHandler {
       byLang.set(file.language, existing);
     }
 
-    const lines: string[] = [`## Files by Language (${files.length} total)`, ''];
+    const lines: string[] = [`**Files by Language (${files.length} total)**`, ''];
 
     // Sort languages by file count (descending)
     const sortedLangs = [...byLang.entries()].sort((a, b) => b[1].length - a[1].length);
 
     for (const [lang, langFiles] of sortedLangs) {
-      lines.push(`### ${lang} (${langFiles.length})`);
+      lines.push(`**${lang} (${langFiles.length})`);
       for (const file of langFiles.sort((a, b) => a.path.localeCompare(b.path))) {
         if (includeMetadata) {
           lines.push(`- ${file.path} (${file.nodeCount} symbols)`);
@@ -3561,7 +3561,7 @@ export class ToolHandler {
     }
 
     // Render tree
-    const lines: string[] = [`## Project Structure (${files.length} files)`, ''];
+    const lines: string[] = [`**Project Structure (${files.length} files)**`, ''];
 
     const renderNode = (node: TreeNode, prefix: string, isLast: boolean, depth: number): void => {
       if (maxDepth !== undefined && depth > maxDepth) return;
@@ -3774,13 +3774,13 @@ export class ToolHandler {
   // =========================================================================
 
   private formatSearchResults(results: SearchResult[]): string {
-    const lines: string[] = [`## Search Results (${results.length} found)`, ''];
+    const lines: string[] = [`**Search Results (${results.length} found)**`, ''];
 
     for (const result of results) {
       const { node } = result;
       const location = node.startLine ? `:${node.startLine}` : '';
       // Compact format: one line per result with key info
-      lines.push(`### ${node.name} (${node.kind})`);
+      lines.push(`**${node.name} (${node.kind})`);
       lines.push(`${node.filePath}${location}`);
       if (node.signature) lines.push(`\`${node.signature}\``);
       lines.push('');
@@ -3790,7 +3790,7 @@ export class ToolHandler {
   }
 
   private formatNodeList(nodes: Node[], title: string, labels?: Map<string, string>): string {
-    const lines: string[] = [`## ${title} (${nodes.length} found)`, ''];
+    const lines: string[] = [`**${title} (${nodes.length} found)**`, ''];
 
     for (const node of nodes) {
       const location = node.startLine ? `:${node.startLine}` : '';
@@ -3825,7 +3825,7 @@ export class ToolHandler {
 
     // Compact format: just list affected symbols grouped by file
     const lines: string[] = [
-      `## Impact: "${symbol}" affects ${nodeCount} symbols`,
+      `**Impact: "${symbol}" affects ${nodeCount} symbols**`,
       '',
     ];
 
@@ -3873,7 +3873,7 @@ export class ToolHandler {
   private formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
     const location = node.startLine ? `:${node.startLine}` : '';
     const lines: string[] = [
-      `## ${node.name} (${node.kind})`,
+      `**${node.name} (${node.kind})**`,
       '',
       `**Location:** ${node.filePath}${location}`,
     ];
