@@ -136,6 +136,11 @@ describe('Installer targets — contract', () => {
               delete seed.mcpServers;
               seed.mcp = { other: { type: 'local', command: ['x'], enabled: true } };
             }
+            // openclaw uses `mcp.servers.<name>` (nested).
+            if (target.id === 'openclaw') {
+              delete seed.mcpServers;
+              seed.mcp = { servers: { other: { command: 'x' } } };
+            }
             fs.writeFileSync(jsonPath, JSON.stringify(seed, null, 2) + '\n');
 
             target.install(location, { autoAllow: true });
@@ -144,6 +149,9 @@ describe('Installer targets — contract', () => {
             if (target.id === 'opencode') {
               expect(after.mcp.other).toBeDefined();
               expect(after.mcp.codegraph).toBeDefined();
+            } else if (target.id === 'openclaw') {
+              expect(after.mcp.servers.other).toBeDefined();
+              expect(after.mcp.servers.codegraph).toBeDefined();
             } else {
               expect(after.mcpServers.other).toBeDefined();
               expect(after.mcpServers.codegraph).toBeDefined();
@@ -1546,5 +1554,134 @@ describe('Installer targets — opencode XDG config path (#535)', () => {
     expect(opencode.detect('global').installed).toBe(true);
     // But configuration state is read from the REAL path only.
     expect(opencode.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  // ── OpenClaw target tests ────────────────────────────────────────
+  // The OpenClaw target writes to $HOME/.openclaw/openclaw.json under
+  // mcp.servers.codegraph, and refuses local install (OpenClaw is a
+  // single gateway, no per-project config layer).
+
+  it('openclaw: install writes mcp.servers.codegraph to the resolved config file', () => {
+    const openclaw = getTarget('openclaw')!;
+    const result = openclaw.install('global', { autoAllow: true });
+    const cfg = openclaw.describePaths('global')[0];
+    expect(result.files.some((f) => f.path === cfg)).toBe(true);
+    expect(fs.existsSync(cfg)).toBe(true);
+
+    const parsed = JSON.parse(fs.readFileSync(cfg, 'utf-8'));
+    expect(parsed.mcp.servers.codegraph).toBeDefined();
+    expect(parsed.mcp.servers.codegraph.args).toContain('serve');
+    expect(parsed.mcp.servers.codegraph.args).toContain('--mcp');
+    expect(parsed.mcp.servers.codegraph.args).toContain('--path');
+    expect(parsed.mcp.servers.codegraph.env.CODEGRAPH_TELEMETRY).toBe('0');
+  });
+
+  it('openclaw: install preserves pre-existing sibling MCP servers (chrome-mcp, etc.)', () => {
+    const openclaw = getTarget('openclaw')!;
+    const cfg = openclaw.describePaths('global')[0];
+    fs.mkdirSync(path.dirname(cfg), { recursive: true });
+    fs.writeFileSync(
+      cfg,
+      JSON.stringify(
+        {
+          mcp: {
+            servers: {
+              'chrome-mcp': { type: 'streamableHttp', url: 'http://example/mcp' },
+            },
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+
+    openclaw.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(cfg, 'utf-8'));
+    expect(after.mcp.servers['chrome-mcp']).toBeDefined();
+    expect(after.mcp.servers.codegraph).toBeDefined();
+  });
+
+  it('openclaw: install preserves other top-level config keys (channels, agents, gateway)', () => {
+    const openclaw = getTarget('openclaw')!;
+    const cfg = openclaw.describePaths('global')[0];
+    fs.mkdirSync(path.dirname(cfg), { recursive: true });
+    fs.writeFileSync(
+      cfg,
+      JSON.stringify(
+        {
+          channels: { telegram: { botToken: 'redacted' } },
+          agents: { defaults: { model: 'deepseek-v4-pro' } },
+          gateway: { bind: 'loopback' },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+
+    openclaw.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(cfg, 'utf-8'));
+    expect(after.channels.telegram.botToken).toBe('redacted');
+    expect(after.agents.defaults.model).toBe('deepseek-v4-pro');
+    expect(after.gateway.bind).toBe('loopback');
+    expect(after.mcp.servers.codegraph).toBeDefined();
+  });
+
+  it('openclaw: install is idempotent (re-run produces action=unchanged)', () => {
+    const openclaw = getTarget('openclaw')!;
+    openclaw.install('global', { autoAllow: true });
+    const second = openclaw.install('global', { autoAllow: true });
+    expect(second.files.some((f) => f.action === 'unchanged')).toBe(true);
+    expect(second.files.some((f) => f.action === 'updated')).toBe(false);
+  });
+
+  it('openclaw: uninstall strips mcp.servers.codegraph but leaves siblings intact', () => {
+    const openclaw = getTarget('openclaw')!;
+    const cfg = openclaw.describePaths('global')[0];
+    fs.mkdirSync(path.dirname(cfg), { recursive: true });
+    fs.writeFileSync(
+      cfg,
+      JSON.stringify(
+        {
+          mcp: {
+            servers: {
+              'chrome-mcp': { type: 'streamableHttp', url: 'http://example/mcp' },
+            },
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+
+    openclaw.install('global', { autoAllow: true });
+    openclaw.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(cfg, 'utf-8'));
+    expect(after.mcp.servers['chrome-mcp']).toBeDefined();
+    expect(after.mcp.servers.codegraph).toBeUndefined();
+  });
+
+  it('openclaw: local install returns a note and writes nothing', () => {
+    const openclaw = getTarget('openclaw')!;
+    expect(openclaw.supportsLocation('local')).toBe(false);
+    const result = openclaw.install('local', { autoAllow: true });
+    expect(result.files).toEqual([]);
+    expect(result.notes && result.notes.length > 0).toBe(true);
+  });
+
+  it('openclaw: detect before install shows alreadyConfigured=false', () => {
+    const openclaw = getTarget('openclaw')!;
+    expect(openclaw.detect('global').installed).toBe(false);
+    expect(openclaw.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('openclaw: detect after install shows alreadyConfigured=true', () => {
+    const openclaw = getTarget('openclaw')!;
+    openclaw.install('global', { autoAllow: true });
+    const d = openclaw.detect('global');
+    expect(d.installed).toBe(true);
+    expect(d.alreadyConfigured).toBe(true);
   });
 });
