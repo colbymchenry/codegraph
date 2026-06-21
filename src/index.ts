@@ -132,11 +132,14 @@ export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
   private projectRoot: string;
-  private orchestrator: ExtractionOrchestrator;
-  private resolver: ReferenceResolver;
-  private graphManager: GraphQueryManager;
-  private traverser: GraphTraverser;
-  private contextBuilder: ContextBuilder;
+  // Assigned via wireLayers() from the constructor (and again on reopen) — the
+  // `!` tells TS these are definitely set even though the assignment is one
+  // method call away from the constructor body.
+  private orchestrator!: ExtractionOrchestrator;
+  private resolver!: ReferenceResolver;
+  private graphManager!: GraphQueryManager;
+  private traverser!: GraphTraverser;
+  private contextBuilder!: ContextBuilder;
 
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
@@ -155,25 +158,66 @@ export class CodeGraph {
     this.db = db;
     this.queries = queries;
     this.projectRoot = projectRoot;
-    // Down-weight the project name as a query term in search ranking — it names
-    // the whole repo, not a symbol, so it has no discriminative value (#720).
-    try {
-      this.queries.setProjectNameTokens(deriveProjectNameTokens(projectRoot));
-    } catch {
-      // Best-effort: ranking still works without it.
-    }
     this.fileLock = new FileLock(
       path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
     );
-    this.orchestrator = new ExtractionOrchestrator(projectRoot, queries);
-    this.resolver = createResolver(projectRoot, queries);
-    this.graphManager = new GraphQueryManager(queries);
-    this.traverser = new GraphTraverser(queries);
+    this.wireLayers();
+  }
+
+  /**
+   * (Re)build the query/extraction/graph layers over the current `this.queries`
+   * (which wraps `this.db`). Factored out of the constructor so `reopenIfReplaced`
+   * can rebuild them against a fresh connection without duplicating the wiring.
+   * The path-based `fileLock` is independent of the DB handle, so it stays put.
+   */
+  private wireLayers(): void {
+    // Down-weight the project name as a query term in search ranking — it names
+    // the whole repo, not a symbol, so it has no discriminative value (#720).
+    try {
+      this.queries.setProjectNameTokens(deriveProjectNameTokens(this.projectRoot));
+    } catch {
+      // Best-effort: ranking still works without it.
+    }
+    this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
+    this.resolver = createResolver(this.projectRoot, this.queries);
+    this.graphManager = new GraphQueryManager(this.queries);
+    this.traverser = new GraphTraverser(this.queries);
     this.contextBuilder = createContextBuilder(
-      projectRoot,
-      queries,
+      this.projectRoot,
+      this.queries,
       this.traverser
     );
+  }
+
+  /**
+   * Heal a stale database handle in place. If `.codegraph/` was removed and
+   * recreated at the SAME path while this instance held the DB open — a git
+   * worktree removed and re-added, or `rm -rf .codegraph` + `codegraph init` —
+   * our open fd points at the now-unlinked inode and can never see the new
+   * index, so every query returns the pre-removal snapshot until the process
+   * restarts (#925). When that's detected, open the live file at the same path,
+   * rebuild the query layers, and swap them IN PLACE, so every holder of this
+   * instance (the MCP daemon's default project, cached projectPath connections)
+   * heals without a restart. Returns true iff it reopened.
+   *
+   * POSIX-only in practice: `isReplacedOnDisk` never fires on Windows (an open
+   * file can't be unlinked there, and st_ino is unreliable).
+   */
+  reopenIfReplaced(): boolean {
+    if (!this.db.isReplacedOnDisk()) return false;
+    const dbPath = this.db.getPath();
+    // Open the live file FIRST — if that throws (e.g. mid-recreate), the old
+    // handle stays in place and the caller retries on the next query, rather
+    // than leaving this instance with no connection at all.
+    const fresh = DatabaseConnection.open(dbPath);
+    const stale = this.db;
+    this.db = fresh;
+    this.queries = new QueryBuilder(fresh.getDb());
+    this.wireLayers();
+    // Releasing the dead handle also frees the leaked db/-wal/-shm fds that were
+    // pinning the unlinked inode (#925).
+    try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
+    return true;
   }
 
   // ===========================================================================

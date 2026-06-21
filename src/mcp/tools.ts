@@ -820,7 +820,7 @@ export class ToolHandler {
           "and don't call codegraph again this session — the user can run 'codegraph init' to enable it."
         );
       }
-      return this.cg;
+      return this.freshen(this.cg);
     }
 
     // Reject sensitive system directories before opening. Only validate a
@@ -863,17 +863,42 @@ export class ToolHandler {
     // "database is locked" on concurrent tool calls. See issue #238. The
     // default instance is owned/closed by the server, so it's never cached.
     if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
-      return this.cg;
+      return this.freshen(this.cg);
     }
 
     // Cache the open DB connection by RESOLVED ROOT only — never by the input
     // path. One key per instance means closeAll() closes each exactly once, and
     // a changed resolution maps to a different entry instead of a stale hit.
     const cached = this.projectCache.get(resolvedRoot);
-    if (cached) return cached;
+    if (cached) return this.freshen(cached);
 
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
+    return cg;
+  }
+
+  /**
+   * Heal a long-lived connection whose `.codegraph/` was removed and recreated
+   * at the same path (a worktree recreated, or `rm -rf .codegraph` + re-init)
+   * before handing it to a tool. Otherwise the daemon keeps serving the
+   * pre-removal snapshot from its now-unlinked file handle until restart — and
+   * because the daemon registry is keyed by path, a same-path recreate routes
+   * new clients straight back to this same stale daemon (#925). The check is one
+   * stat() and a no-op unless the inode actually changed; it never throws into a
+   * tool call.
+   */
+  private freshen(cg: CodeGraph): CodeGraph {
+    try {
+      if (cg.reopenIfReplaced()) {
+        process.stderr.write(
+          '[CodeGraph MCP] The index was replaced on disk (e.g. a git worktree ' +
+          'recreated at the same path); reopened the live database in place.\n'
+        );
+      }
+    } catch {
+      // Best-effort self-heal — a failed reopen must never break the tool call;
+      // the (still stale) handle keeps serving and the next call retries.
+    }
     return cg;
   }
 
