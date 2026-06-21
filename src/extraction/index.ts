@@ -257,6 +257,21 @@ function defaultsOnlyIgnore(): Ignore {
 }
 
 /**
+ * `git ls-files --directory` collapses a wholly-untracked/ignored directory into
+ * one entry — and when the command's own cwd is such a directory (the indexed
+ * root is itself a git-ignored subdir of an enclosing repo), git emits the
+ * literal `./` meaning "this entire directory". That sentinel is not a real
+ * nested path: feeding it to the `ignore` matcher throws ("path should be a
+ * `path.relative()`d string, but got "./""), which used to abort `buildScopeIgnore`
+ * and so break the MCP daemon's watcher/auto-sync on connect; and joining it back
+ * onto `repoDir` would just re-point at the cwd. Drop it wherever we consume
+ * `--directory` output. (#936)
+ */
+function isWholeCwdEntry(entry: string): boolean {
+  return entry === './' || entry === '.' || entry === '';
+}
+
+/**
  * List the gitignored DIRECTORIES of a repo (collapsed, trailing-slash form),
  * relative to `repoDir`. These are invisible to every other `git ls-files` /
  * `git status` mode — and in a multi-repo workspace they are exactly where the
@@ -270,7 +285,7 @@ function listIgnoredDirs(repoDir: string): string[] {
       ['ls-files', '-z', '-o', '-i', '--exclude-standard', '--directory'],
       { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );
-    return out.split('\0').filter((e) => e.endsWith('/'));
+    return out.split('\0').filter((e) => e.endsWith('/') && !isWholeCwdEntry(e));
   } catch {
     return [];
   }
@@ -434,7 +449,7 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
         { cwd: repoAbs, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
       );
       for (const e of o.split('\0')) {
-        if (e.endsWith('/') && !defaults.ignores(e)) {
+        if (e.endsWith('/') && !isWholeCwdEntry(e) && !defaults.ignores(e)) {
           candidates.push(...findNestedGitRepos(path.join(repoAbs, e), e));
         }
       }

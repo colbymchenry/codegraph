@@ -203,6 +203,27 @@ describe('multi-repo workspaces (#514)', () => {
     expect(scope.ignores('src/app.ts')).toBe(false);
   });
 
+  it('buildScopeIgnore: indexed root is itself a gitignored subdir of an enclosing repo (#936)', () => {
+    // `child/` is NOT its own repo, so `git` resolves the ENCLOSING repo from
+    // inside it — and `git ls-files --directory`, whose cwd is then a wholly
+    // ignored directory, emits the literal `./` ("this entire directory").
+    // That sentinel used to reach the `ignore` matcher and throw
+    // ("path should be a `path.relative()`d string, but got "./""), aborting
+    // buildScopeIgnore → the MCP daemon's watcher never started and auto-sync
+    // silently stalled until a manual `codegraph sync`.
+    write(path.join(ws, 'child/src/a.ts'), 'export const x = 1;\n');
+    write(path.join(ws, '.gitignore'), '/child/\n');
+    makeRepo(ws);
+
+    const child = path.join(ws, 'child');
+    // The crux: building scope for the ignored subdir must not throw.
+    const scope = buildScopeIgnore(child);
+    // The subdir's own source is watchable/indexable, not ignored.
+    expect(scope.ignores('src/a.ts')).toBe(false);
+    // And the `./` self entry must not be mistaken for a nested embedded repo.
+    expect(discoverEmbeddedRepoRoots(child)).toEqual([]);
+  });
+
   it('sync picks up a change inside a gitignored embedded repo', async () => {
     write(path.join(ws, 'packages/proj-a/src/auth.ts'), 'export function login() { return 1; }\n');
     makeRepo(path.join(ws, 'packages/proj-a'));
