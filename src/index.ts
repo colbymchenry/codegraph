@@ -21,6 +21,7 @@ import {
   TaskContext,
   BuildContextOptions,
   FindRelevantContextOptions,
+  CodeGraphConfig,
 } from './types';
 import { DatabaseConnection, getDatabasePath } from './db';
 import { QueryBuilder } from './db/queries';
@@ -51,6 +52,12 @@ import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import { CodeGraphPackageVersion } from './mcp/version';
+import {
+  createDefaultConfig,
+  saveConfig,
+  loadConfig,
+  updateConfig as updateProjectConfig,
+} from './config';
 
 // Re-export types for consumers
 export * from './types';
@@ -96,6 +103,9 @@ export interface InitOptions {
 
   /** Progress callback for indexing */
   onProgress?: (progress: IndexProgress) => void;
+
+  /** Optional project configuration overrides */
+  config?: Partial<CodeGraphConfig>;
 }
 
 /**
@@ -201,6 +211,12 @@ export class CodeGraph {
     // Create directory structure
     createDirectory(resolvedRoot);
 
+    // Create default project configuration, then apply optional overrides
+    saveConfig(resolvedRoot, createDefaultConfig(resolvedRoot));
+    if (options.config) {
+      updateProjectConfig(resolvedRoot, options.config);
+    }
+
     // Initialize database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.initialize(dbPath);
@@ -219,7 +235,7 @@ export class CodeGraph {
   /**
    * Initialize synchronously (without indexing)
    */
-  static initSync(projectRoot: string): CodeGraph {
+  static initSync(projectRoot: string, options: InitOptions = {}): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if already initialized
@@ -229,6 +245,12 @@ export class CodeGraph {
 
     // Create directory structure
     createDirectory(resolvedRoot);
+
+    // Create default project configuration, then apply optional overrides
+    saveConfig(resolvedRoot, createDefaultConfig(resolvedRoot));
+    if (options.config) {
+      updateProjectConfig(resolvedRoot, options.config);
+    }
 
     // Initialize database
     const dbPath = getDatabasePath(resolvedRoot);
@@ -582,6 +604,24 @@ export class CodeGraph {
    */
   isWatching(): boolean {
     return this.watcher?.isActive() ?? false;
+  }
+
+  // ===========================================================================
+  // Configuration
+  // ===========================================================================
+
+  /**
+   * Get the effective configuration for this project.
+   */
+  getConfig(): CodeGraphConfig {
+    return loadConfig(this.projectRoot);
+  }
+
+  /**
+   * Update and persist configuration for this project.
+   */
+  updateConfig(updates: Partial<CodeGraphConfig>): CodeGraphConfig {
+    return updateProjectConfig(this.projectRoot, updates);
   }
 
   /**

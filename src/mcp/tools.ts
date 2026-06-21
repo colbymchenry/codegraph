@@ -22,6 +22,8 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import type { CodeGraphConfig } from '../types';
+import { loadConfig } from '../config';
 import {
   existsSync,
   readFileSync,
@@ -622,13 +624,23 @@ export const tools: ToolDefinition[] = [
  * `ToolHandler.getTools()` in the no-CodeGraph case (the dynamic per-repo budget
  * note in a description only adds once `cg` is loaded; the schemas are static).
  */
-export function getStaticTools(): ToolDefinition[] {
+export function getStaticTools(projectPath?: string): ToolDefinition[] {
+  let baseTools = tools;
+
+  if (projectPath) {
+    try {
+      baseTools = filterToolsByConfig(baseTools, loadConfig(projectPath));
+    } catch {
+      // Static tools must stay available even if config loading fails.
+    }
+  }
+
   const raw = process.env.CODEGRAPH_MCP_TOOLS;
   if (!raw || !raw.trim()) {
-    return tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
+    return baseTools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
   }
   const allow = new Set(raw.split(',').map(s => s.trim().replace(/^codegraph_/, '')).filter(Boolean));
-  return allow.size ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, ''))) : tools;
+  return allow.size ? baseTools.filter(t => allow.has(t.name.replace(/^codegraph_/, ''))) : baseTools;
 }
 
 /**
@@ -643,6 +655,19 @@ export function getStaticTools(): ToolDefinition[] {
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
 const DEFAULT_MCP_TOOLS = new Set(['explore']);
+
+/**
+ * Filter tool definitions by project MCP config.
+ * Unknown disabled tool names are ignored (lenient behavior).
+ */
+export function filterToolsByConfig(
+  allTools: ToolDefinition[],
+  config?: Pick<CodeGraphConfig, 'mcp'> | null
+): ToolDefinition[] {
+  const disabled = new Set(config?.mcp?.disabledTools ?? []);
+  if (disabled.size === 0) return allTools;
+  return allTools.filter(tool => !disabled.has(tool.name));
+}
 
 /**
  * Tool handler that executes tools against a CodeGraph instance
@@ -734,14 +759,23 @@ export class ToolHandler {
    * scaled to the number of indexed files. Honors the CODEGRAPH_MCP_TOOLS
    * allowlist so a trimmed surface is reflected in ListTools.
    */
-  getTools(): ToolDefinition[] {
+  getTools(projectPath?: string): ToolDefinition[] {
+    let baseTools = tools;
+
+    try {
+      const cg = projectPath ? this.getCodeGraph(projectPath) : this.cg;
+      if (cg) {
+        baseTools = filterToolsByConfig(baseTools, cg.getConfig());
+      }
+    } catch {
+      // If project resolution fails here, keep fallback behavior and expose all tools.
+    }
+
     const allow = this.toolAllowlist();
-    // No explicit allowlist → the default 4-tool surface (see
-    // DEFAULT_MCP_TOOLS for the evidence). An allowlist replaces the
-    // default entirely, so any defined tool can be re-enabled.
     let visible = allow
-      ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
-      : tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
+      ? baseTools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
+      : baseTools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
+
     if (!this.cg) return visible;
 
     try {
@@ -793,6 +827,13 @@ export class ToolHandler {
     } catch {
       return visible;
     }
+  }
+
+  /**
+   * Check whether a tool is enabled for the target project.
+   */
+  isToolEnabled(toolName: string, projectPath?: string): boolean {
+    return this.getTools(projectPath).some(tool => tool.name === toolName);
   }
 
   /**

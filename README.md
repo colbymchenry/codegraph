@@ -530,6 +530,8 @@ The other tools (`codegraph_node`, `codegraph_search`, `codegraph_callers`, `cod
 
 In a workspace with no `.codegraph/` index, the server announces itself inactive and lists **no** tools — agents work normally with their built-in tools, and indexing stays your decision.
 
+You can hide specific MCP tools per-project via `.codegraph/config.json` (see Configuration below). Hidden tools are removed from `tools/list` and are treated as unknown if called directly.
+
 ---
 
 ## Library Usage
@@ -579,25 +581,42 @@ that drive the graph directly: `DatabaseConnection`, `QueryBuilder`,
 
 ## Configuration
 
-There isn't any — CodeGraph is zero-config, with **no config file** to write or
-keep in sync. Language support is automatic from the file extension; there's
-nothing to wire up per language.
+CodeGraph works out-of-the-box with defaults, while allowing optional
+project-local overrides via `.codegraph/config.json`.
 
-What it skips out of the box:
+Defaults still skip dependency/build/cache directories, respect `.gitignore`,
+and ignore files larger than 1 MB.
 
-- **Dependency, build, and cache directories** — `node_modules`, `vendor`,
-  `dist`, `build`, `target`, `.venv`, `Pods`, `.next`, and the like across every
-  [supported stack](#supported-languages) — so the graph is your code, not
-  third-party noise. This holds even with no `.gitignore`.
-- **Anything in your `.gitignore`** — honored in git repos via git, and in
-  non-git projects by reading `.gitignore` directly (root and nested).
-- **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs.
+```json
+{
+  "version": 1,
+  "languages": ["typescript", "javascript"],
+  "exclude": ["node_modules/**", "dist/**", "build/**", "*.min.js"],
+  "frameworks": [],
+  "maxFileSize": 1048576,
+  "extractDocstrings": true,
+  "trackCallSites": true,
+  "mcp": {
+    "disabledTools": ["codegraph_explore"]
+  }
+}
+```
 
-To keep something else out, add it to `.gitignore`. To pull a default-excluded
-directory back **in** (say you really do want a vendored dependency indexed),
-add a negation — `!vendor/`. The defaults apply uniformly, so committing a
-dependency or build directory doesn't force it into the graph; the `.gitignore`
-negation is the explicit opt-in.
+| Option | Description | Default |
+|--------|-------------|---------|
+| `languages` | Languages to index (auto-detected if empty) | `[]` |
+| `exclude` | Glob patterns to ignore | `["node_modules/**", ...]` |
+| `frameworks` | Framework hints for better resolution | `[]` |
+| `maxFileSize` | Skip files larger than this (bytes) | `1048576` (1MB) |
+| `extractDocstrings` | Extract docstrings from code | `true` |
+| `trackCallSites` | Track call site locations | `true` |
+| `mcp.disabledTools` | MCP tool names to hide/disable for this project | `[]` |
+
+Example disabled tool names: `codegraph_explore`, `codegraph_context`, `codegraph_files`.
+
+Notes:
+- This setting is project-local only (no global override).
+- Unknown tool names are ignored (lenient behavior).
 
 ## Telemetry
 

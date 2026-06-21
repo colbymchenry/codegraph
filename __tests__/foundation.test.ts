@@ -11,7 +11,10 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { Node, Edge } from '../src/types';
 import { isInitialized, getCodeGraphDir, validateDirectory, codeGraphDirName, isCodeGraphDataDir } from '../src/directory';
+import { Node, Edge, DEFAULT_CONFIG } from '../src/types';
+import { isInitialized, getCodeGraphDir, validateDirectory } from '../src/directory';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
+import { loadConfig } from '../src/config';
 
 // Create a temporary directory for each test
 function createTempDir(): string {
@@ -141,6 +144,56 @@ describe('CodeGraph Foundation', () => {
       expect(stats.nodeCount).toBe(0);
 
       cg.close();
+    });
+  });
+
+  describe('Configuration', () => {
+    it('should load and merge config with defaults', () => {
+      const cg = CodeGraph.initSync(tempDir);
+      cg.close();
+
+      const config = loadConfig(tempDir);
+      expect(config.version).toBe(DEFAULT_CONFIG.version);
+      expect(config.rootDir).toBe(path.resolve(tempDir));
+    });
+
+    it('should update configuration', () => {
+      const cg = CodeGraph.initSync(tempDir);
+
+      cg.updateConfig({ maxFileSize: 999999 });
+
+      expect(cg.getConfig().maxFileSize).toBe(999999);
+
+      cg.close();
+
+      // Verify persistence
+      const config = loadConfig(tempDir);
+      expect(config.maxFileSize).toBe(999999);
+    });
+
+    it('should persist MCP disabled tools config', () => {
+      const cg = CodeGraph.initSync(tempDir);
+
+      cg.updateConfig({
+        mcp: { disabledTools: ['codegraph_explore'] },
+      });
+
+      cg.close();
+
+      const config = loadConfig(tempDir);
+      expect(config.mcp?.disabledTools).toEqual(['codegraph_explore']);
+    });
+
+    it('should reject invalid mcp.disabledTools format', () => {
+      const cg = CodeGraph.initSync(tempDir);
+      cg.close();
+
+      const configPath = path.join(getCodeGraphDir(tempDir), 'config.json');
+      const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+      raw.mcp = { disabledTools: [123] };
+      fs.writeFileSync(configPath, JSON.stringify(raw, null, 2));
+
+      expect(() => loadConfig(tempDir)).toThrow(/Invalid configuration format/i);
     });
   });
 

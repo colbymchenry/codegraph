@@ -14,7 +14,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
-import { ToolHandler, tools } from '../src/mcp/tools';
+import { ToolHandler, tools, filterToolsByConfig } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
@@ -423,6 +423,37 @@ describe('MCP Input Validation', () => {
       expect(result.content[0].text).toMatch(/sensitive system directory/i);
     }
   );
+
+  it('should hide disabled tools from tool list', async () => {
+    const projectWithDisabled = createTempDir();
+    const srcDir = path.join(projectWithDisabled, 'src');
+    fs.mkdirSync(srcDir);
+    fs.writeFileSync(path.join(srcDir, 'x.ts'), 'export const x = 1;\n');
+
+    const disabledCg = CodeGraph.initSync(projectWithDisabled, {
+      config: {
+        include: ['**/*.ts'],
+        exclude: [],
+        mcp: { disabledTools: ['codegraph_explore'] },
+      },
+    });
+
+    try {
+      const disabledHandler = new ToolHandler(disabledCg);
+      const toolNames = disabledHandler.getTools().map(t => t.name);
+      expect(toolNames).not.toContain('codegraph_explore');
+    } finally {
+      disabledCg.close();
+      cleanupTempDir(projectWithDisabled);
+    }
+  });
+
+  it('should ignore unknown disabled tool names (lenient)', () => {
+    const filtered = filterToolsByConfig(tools, {
+      mcp: { disabledTools: ['not_a_real_tool_name'] },
+    });
+    expect(filtered).toHaveLength(tools.length);
+  });
 });
 
 describe('Atomic Writes', () => {
