@@ -868,6 +868,8 @@ export class ExtractionOrchestrator {
       getNodesByName: () => [],
       getNodesByQualifiedName: () => [],
       getNodesByKind: () => [],
+      iterateNodesByKind: () => [][Symbol.iterator]() as IterableIterator<any>,
+      getNodesByKindAndIdPrefix: () => [],
       getNodesByLowerName: () => [],
       getImportMappings: () => [],
       getAllFiles: () => files,

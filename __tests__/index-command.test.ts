@@ -19,6 +19,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
+import { getCodeGraphDir } from '../src/directory';
+import { FileLock } from '../src/utils';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -103,5 +105,102 @@ describe('codegraph index — full re-index keeps the graph populated (#874)', (
 
     expect(afterIndex.nodes).toBe(afterInit.nodes);
     expect(afterIndex.edges).toBe(afterInit.edges);
+  });
+
+  it('does not reset the DB when the write lock is unavailable', async () => {
+    runCodegraph(['init'], tempDir);
+    const before = graphCounts(tempDir);
+
+    const lock = new FileLock(path.join(getCodeGraphDir(tempDir), 'codegraph.lock'));
+    lock.acquire();
+    try {
+      const cg = await CodeGraph.open(tempDir);
+      try {
+        const result = await cg.reindexAll();
+        expect(result.success).toBe(false);
+        expect(result.errors[0]?.message).toMatch(/Could not acquire file lock/);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      lock.release();
+    }
+
+    const after = graphCounts(tempDir);
+    expect(after.nodes).toBe(before.nodes);
+    expect(after.edges).toBe(before.edges);
+  });
+
+  it('resumes a parsed-but-unresolved full index instead of parsing everything again', async () => {
+    const cg = CodeGraph.initSync(tempDir);
+    const q = (cg as unknown as { queries: any }).queries;
+    const now = Date.now();
+
+    q.upsertFile({
+      path: 'a.ts',
+      contentHash: 'parsed-before-crash',
+      language: 'typescript',
+      size: 1,
+      modifiedAt: now,
+      indexedAt: now,
+      nodeCount: 2,
+    });
+    q.insertNodes([
+      {
+        id: 'a.ts::caller',
+        kind: 'function',
+        name: 'caller',
+        qualifiedName: 'caller',
+        filePath: 'a.ts',
+        language: 'typescript',
+        startLine: 1,
+        endLine: 1,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: now,
+      },
+      {
+        id: 'a.ts::target',
+        kind: 'function',
+        name: 'target',
+        qualifiedName: 'target',
+        filePath: 'a.ts',
+        language: 'typescript',
+        startLine: 2,
+        endLine: 2,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: now,
+      },
+    ]);
+    q.insertUnresolvedRefsBatch([
+      {
+        fromNodeId: 'a.ts::caller',
+        referenceName: 'target',
+        referenceKind: 'calls',
+        line: 1,
+        column: 0,
+        filePath: 'a.ts',
+        language: 'typescript',
+      },
+    ]);
+
+    const orchestrator = (cg as unknown as { orchestrator: { indexAll: () => Promise<never> } }).orchestrator;
+    orchestrator.indexAll = async () => {
+      throw new Error('resume path should not parse');
+    };
+
+    try {
+      const result = await cg.reindexAll();
+      expect(result.success).toBe(true);
+      expect(result.filesIndexed).toBe(1);
+      expect(result.nodesCreated).toBe(2);
+      expect(result.edgesCreated).toBeGreaterThan(0);
+      expect(q.getUnresolvedReferencesCount()).toBe(0);
+      expect(q.getMetadata('indexed_with_version')).not.toBeNull();
+      expect(q.getMetadata('index_phase')).toBeNull();
+    } finally {
+      cg.close();
+    }
   });
 });

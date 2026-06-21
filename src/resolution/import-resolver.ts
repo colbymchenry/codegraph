@@ -113,6 +113,12 @@ const C_CPP_STDLIB_HEADERS = new Set([
   'version',
 ]);
 
+export function isCppStdlibHeader(importPath: string): boolean {
+  if (C_CPP_STDLIB_HEADERS.has(importPath)) return true;
+  const withoutExt = importPath.replace(/\.h$/, '');
+  return C_CPP_STDLIB_HEADERS.has(withoutExt);
+}
+
 /**
  * Check if an import is external (npm package, etc.)
  *
@@ -193,10 +199,7 @@ function isExternalImport(
     // C/C++ standard library headers — both C-style (<stdio.h>) and
     // C++-style (<cstdio>, <vector>) forms. Checked against the import
     // path (which the extractor strips of <> or "" delimiters).
-    if (C_CPP_STDLIB_HEADERS.has(importPath)) return true;
-    // C++ headers without .h extension (e.g. "vector", "string")
-    const withoutExt = importPath.replace(/\.h$/, '');
-    if (C_CPP_STDLIB_HEADERS.has(withoutExt)) return true;
+    if (isCppStdlibHeader(importPath)) return true;
   }
 
   return false;
@@ -1132,6 +1135,7 @@ export function resolveViaImport(
   // edge — resolveViaImport's symbol lookup below would search the
   // resolved file for a symbol named like the file extension and fail.
   if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports') {
+    if (isCppStdlibHeader(ref.referenceName)) return null;
     // C/C++ quoted includes (`#include "X.h"`) resolve relative to the
     // INCLUDING file's own directory first (the C standard's quoted-include
     // search order). Prefer a same-directory header over an -I directory or a
@@ -1143,17 +1147,20 @@ export function resolveViaImport(
     const fromDir = slash >= 0 ? ref.filePath.slice(0, slash) : '';
     const siblingPath = path.posix.normalize(fromDir ? `${fromDir}/${ref.referenceName}` : ref.referenceName);
     const siblingBase = siblingPath.split('/').pop()!;
-    const sibling = context
-      .getNodesByName(siblingBase)
-      .find((n) => n.kind === 'file' && n.filePath === siblingPath);
+    const sibling = (context.getNodesByNameFiltered
+      ? context.getNodesByNameFiltered(siblingBase, { kinds: ['file'], filePath: siblingPath, limit: 1 })
+      : context.getNodesByName(siblingBase).filter((n) => n.kind === 'file' && n.filePath === siblingPath)
+    )[0];
     if (sibling) {
       return { original: ref, targetNodeId: sibling.id, confidence: 0.92, resolvedBy: 'import' };
     }
     const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
     if (!resolvedPath) return null;
     const basename = resolvedPath.split('/').pop()!;
-    const fileNodes = context.getNodesByName(basename).filter((n) => n.kind === 'file');
-    const fileNode = fileNodes.find((n) => n.filePath === resolvedPath);
+    const fileNode = (context.getNodesByNameFiltered
+      ? context.getNodesByNameFiltered(basename, { kinds: ['file'], filePath: resolvedPath, limit: 1 })
+      : context.getNodesByName(basename).filter((n) => n.kind === 'file' && n.filePath === resolvedPath)
+    )[0];
     if (fileNode) {
       return {
         original: ref,
@@ -1176,9 +1183,10 @@ export function resolveViaImport(
     const resolvedPath = resolvePhpIncludePath(ref.referenceName, ref.filePath, context);
     if (resolvedPath) {
       const basename = resolvedPath.split('/').pop()!;
-      const fileNode = context
-        .getNodesByName(basename)
-        .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+      const fileNode = (context.getNodesByNameFiltered
+        ? context.getNodesByNameFiltered(basename, { kinds: ['file'], filePath: resolvedPath, limit: 1 })
+        : context.getNodesByName(basename).filter((n) => n.kind === 'file' && n.filePath === resolvedPath)
+      )[0];
       if (fileNode) {
         return {
           original: ref,
@@ -1524,13 +1532,23 @@ function findPythonModuleFile(
   const rel = mod.replace(/\./g, '/');
   const lastSeg = mod.split('.').pop()!;
   const endsWith = (p: string, want: string): boolean => p === want || p.endsWith('/' + want);
-  const moduleFile = context
-    .getNodesByName(`${lastSeg}.py`)
-    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}.py`));
+  const moduleCandidates = context.getNodesByNameFiltered?.(`${lastSeg}.py`, {
+    kinds: ['file'],
+    filePathSuffix: `${rel}.py`,
+    limit: 100,
+  }) ?? context.getNodesByName(`${lastSeg}.py`);
+  const moduleFile = moduleCandidates.find(
+    (n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}.py`)
+  );
   if (moduleFile) return moduleFile;
-  const pkgFile = context
-    .getNodesByName('__init__.py')
-    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}/__init__.py`));
+  const pkgCandidates = context.getNodesByNameFiltered?.('__init__.py', {
+    kinds: ['file'],
+    filePathSuffix: `${rel}/__init__.py`,
+    limit: 100,
+  }) ?? context.getNodesByName('__init__.py');
+  const pkgFile = pkgCandidates.find(
+    (n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}/__init__.py`)
+  );
   return pkgFile ?? null;
 }
 
@@ -1714,7 +1732,11 @@ function resolveJavaImportedReference(
       ? imp.localName
       : ref.referenceName.substring(imp.localName.length + 1);
 
-    const candidates = context.getNodesByName(memberName);
+    const candidates = context.getNodesByNameFiltered?.(memberName, {
+      language: ref.language,
+      filePathSuffix: fqnPath,
+      limit: 100,
+    }) ?? context.getNodesByName(memberName);
     for (const node of candidates) {
       if (node.language !== ref.language) continue;
       const fp = node.filePath.replace(/\\/g, '/');
@@ -1737,7 +1759,12 @@ function resolveJavaImportedReference(
       if (dot > 0) {
         const ownerFqn = imp.source.substring(0, dot);
         const ownerPath = ownerFqn.replace(/\./g, '/') + ext;
-        for (const node of candidates) {
+        const staticCandidates = context.getNodesByNameFiltered?.(memberName, {
+          language: ref.language,
+          filePathSuffix: ownerPath,
+          limit: 100,
+        }) ?? candidates;
+        for (const node of staticCandidates) {
           if (node.language !== ref.language) continue;
           const fp = node.filePath.replace(/\\/g, '/');
           if (fp.endsWith(ownerPath) || fp.endsWith('/' + ownerPath)) {
@@ -1793,7 +1820,11 @@ function resolveGoCrossPackageReference(
     // directly in the package directory. Match the immediate parent dir
     // exactly so a call to `pkga.FuncX` doesn't accidentally land on a
     // `FuncX` declared in `pkga/subpkg/`.
-    const candidates = context.getNodesByName(memberName);
+    const candidates = context.getNodesByNameFiltered?.(memberName, {
+      language: 'go',
+      ...(pkgDir ? { filePathPrefix: `${pkgDir}/` } : {}),
+      limit: 2000,
+    }) ?? context.getNodesByName(memberName);
     for (const node of candidates) {
       if (node.language !== 'go') continue;
       if (!node.isExported) continue;

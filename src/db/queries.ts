@@ -13,6 +13,7 @@ import {
   NodeKind,
   EdgeKind,
   Language,
+  NodeLookupFilters,
   GraphStats,
   SearchOptions,
   SearchResult,
@@ -48,6 +49,10 @@ function isLowValueFile(filePath: string): boolean {
 }
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
 
 /**
  * Database row types (snake_case from SQLite)
@@ -210,8 +215,11 @@ export class QueryBuilder {
     deleteUnresolvedByNode?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
     getNodesByName?: SqliteStatement;
+    getNodeNameCount?: SqliteStatement;
+    hasNodeName?: SqliteStatement;
     getNodesByQualifiedNameExact?: SqliteStatement;
     getNodesByLowerName?: SqliteStatement;
+    getLowerNodeNameCount?: SqliteStatement;
     getUnresolvedCount?: SqliteStatement;
     getUnresolvedBatch?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
@@ -720,6 +728,30 @@ export class QueryBuilder {
   }
 
   /**
+   * Stream nodes of a specific kind AND language lazily. Like
+   * {@link iterateNodesByKind} but narrowed by language so callers that only
+   * care about one language (e.g. Go structs) don't materialize nodes from
+   * every other language.
+   */
+  *iterateNodesByKindAndLanguage(kind: NodeKind, language: string): IterableIterator<Node> {
+    const stmt = this.db.prepare('SELECT * FROM nodes WHERE kind = ? AND language = ?');
+    for (const row of stmt.iterate(kind, language)) {
+      yield rowToNode(row as NodeRow);
+    }
+  }
+
+  /**
+   * Get nodes filtered by kind + id prefix. Used by synthesizers
+   * that need a narrow subset (e.g. Expo methods with id starting
+   * 'expo-module:') without materializing all nodes of that kind.
+   */
+  getNodesByKindAndIdPrefix(kind: NodeKind, idPrefix: string): Node[] {
+    const stmt = this.db.prepare('SELECT * FROM nodes WHERE kind = ? AND id LIKE ?');
+    const rows = stmt.all(kind, `${idPrefix}%`) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
    * Get all nodes in the database
    */
   getAllNodes(): Node[] {
@@ -736,6 +768,140 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getNodesByName.all(name) as NodeRow[];
     return rows.map(rowToNode);
+  }
+
+  /**
+   * Count exact-name candidates without materializing them. Resolver-internal
+   * guardrails use this before legacy unfiltered name lookups.
+   */
+  getNodeNameCount(name: string): number {
+    if (!this.stmts.getNodeNameCount) {
+      this.stmts.getNodeNameCount = this.db.prepare('SELECT COUNT(*) AS count FROM nodes WHERE name = ?');
+    }
+    const row = this.stmts.getNodeNameCount.get(name) as { count: number };
+    return row.count;
+  }
+
+  /**
+   * Get nodes by exact name with resolver-side filters applied in SQL.
+   *
+   * This is intentionally separate from public `getNodesByName()`, which must
+   * keep returning the full set. Resolution often asks for common names like
+   * `main`, `default`, or `clone`; on large repos those names can have tens of
+   * thousands of rows, so filtering after `.all()` needlessly explodes the JS
+   * heap. Push the obvious language/kind/file/qualified-name predicates into
+   * SQLite and cap low-confidence global fallbacks.
+   */
+  getNodesByNameFiltered(name: string, filters: NodeLookupFilters = {}): Node[] {
+    const where: string[] = ['name = ?'];
+    const params: unknown[] = [name];
+
+    const languages = filters.languages?.length
+      ? [...new Set(filters.languages)]
+      : filters.language
+        ? [filters.language]
+        : [];
+    if (languages.length === 1) {
+      where.push('language = ?');
+      params.push(languages[0]);
+    } else if (languages.length > 1) {
+      where.push(`language IN (${languages.map(() => '?').join(',')})`);
+      params.push(...languages);
+    }
+
+    const kinds = filters.kinds?.length ? [...new Set(filters.kinds)] : [];
+    if (kinds.length === 1) {
+      where.push('kind = ?');
+      params.push(kinds[0]);
+    } else if (kinds.length > 1) {
+      where.push(`kind IN (${kinds.map(() => '?').join(',')})`);
+      params.push(...kinds);
+    }
+
+    if (filters.filePath) {
+      where.push('file_path = ?');
+      params.push(filters.filePath);
+    }
+    if (filters.filePathPrefix) {
+      where.push("file_path LIKE ? ESCAPE '\\'");
+      params.push(`${escapeLikePattern(filters.filePathPrefix)}%`);
+    }
+    if (filters.filePathSuffix) {
+      where.push("file_path LIKE ? ESCAPE '\\'");
+      params.push(`%${escapeLikePattern(filters.filePathSuffix)}`);
+    }
+    if (filters.qualifiedName) {
+      where.push('qualified_name = ?');
+      params.push(filters.qualifiedName);
+    }
+    if (filters.qualifiedNameSuffix) {
+      where.push("qualified_name LIKE ? ESCAPE '\\'");
+      params.push(`%${escapeLikePattern(filters.qualifiedNameSuffix)}`);
+    }
+    if (filters.hasReturnType) {
+      where.push("return_type IS NOT NULL AND return_type <> ''");
+    }
+    if (filters.excludeId) {
+      where.push('id <> ?');
+      params.push(filters.excludeId);
+    }
+
+    const orderBy: string[] = [];
+    if (filters.rankFilePath) {
+      orderBy.push('CASE WHEN file_path = ? THEN 0 ELSE 1 END');
+      params.push(filters.rankFilePath);
+    }
+    if (filters.rankFilePathPrefix) {
+      orderBy.push("CASE WHEN file_path LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END");
+      params.push(`${escapeLikePattern(filters.rankFilePathPrefix)}%`);
+    }
+    orderBy.push('file_path', 'start_line', 'id');
+
+    let sql = `
+      SELECT * FROM nodes
+      WHERE ${where.join(' AND ')}
+      ORDER BY ${orderBy.join(', ')}
+    `;
+
+    if (filters.limit !== undefined) {
+      const limit = Math.max(1, Math.floor(filters.limit));
+      sql += ' LIMIT ?';
+      params.push(limit);
+    }
+
+    const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
+   * True when at least one node has this exact name. Uses idx_nodes_name and
+   * returns a single row instead of materializing the distinct symbol-name set.
+   */
+  hasNodeName(name: string): boolean {
+    if (!this.stmts.hasNodeName) {
+      this.stmts.hasNodeName = this.db.prepare('SELECT 1 FROM nodes WHERE name = ? LIMIT 1');
+    }
+    return this.stmts.hasNodeName.get(name) !== undefined;
+  }
+
+  /**
+   * Return the subset of names that exist as node names, using bounded IN-list
+   * chunks. This keeps resolver pre-filtering batch-oriented without ever
+   * materializing every distinct name from a large graph.
+   */
+  getExistingNodeNames(names: Iterable<string>): Set<string> {
+    const unique = [...new Set([...names].filter(Boolean))];
+    const existing = new Set<string>();
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT DISTINCT name FROM nodes WHERE name IN (${placeholders})`)
+        .all(...chunk) as Array<{ name: string }>;
+      for (const row of rows) existing.add(row.name);
+    }
+    return existing;
   }
 
   /**
@@ -761,6 +927,95 @@ export class QueryBuilder {
       );
     }
     const rows = this.stmts.getNodesByLowerName.all(lowerName) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
+   * Count lowercase-name candidates without materializing them. Used as a
+   * safety check before legacy unfiltered fuzzy lookups.
+   */
+  getLowerNodeNameCount(lowerName: string): number {
+    if (!this.stmts.getLowerNodeNameCount) {
+      this.stmts.getLowerNodeNameCount = this.db.prepare(
+        'SELECT COUNT(*) AS count FROM nodes WHERE lower(name) = ?'
+      );
+    }
+    const row = this.stmts.getLowerNodeNameCount.get(lowerName) as { count: number };
+    return row.count;
+  }
+
+  /**
+   * Lowercase-name lookup with the same SQL-side filters as
+   * getNodesByNameFiltered(). Used by low-confidence fuzzy resolution, where a
+   * high-fanout lowercase match should never materialize the whole candidate
+   * set.
+   */
+  getNodesByLowerNameFiltered(lowerName: string, filters: NodeLookupFilters = {}): Node[] {
+    const where: string[] = ['lower(name) = ?'];
+    const params: unknown[] = [lowerName];
+
+    const languages = filters.languages?.length
+      ? [...new Set(filters.languages)]
+      : filters.language
+        ? [filters.language]
+        : [];
+    if (languages.length === 1) {
+      where.push('language = ?');
+      params.push(languages[0]);
+    } else if (languages.length > 1) {
+      where.push(`language IN (${languages.map(() => '?').join(',')})`);
+      params.push(...languages);
+    }
+
+    const kinds = filters.kinds?.length ? [...new Set(filters.kinds)] : [];
+    if (kinds.length === 1) {
+      where.push('kind = ?');
+      params.push(kinds[0]);
+    } else if (kinds.length > 1) {
+      where.push(`kind IN (${kinds.map(() => '?').join(',')})`);
+      params.push(...kinds);
+    }
+
+    if (filters.filePath) {
+      where.push('file_path = ?');
+      params.push(filters.filePath);
+    }
+    if (filters.filePathPrefix) {
+      where.push("file_path LIKE ? ESCAPE '\\'");
+      params.push(`${escapeLikePattern(filters.filePathPrefix)}%`);
+    }
+    if (filters.filePathSuffix) {
+      where.push("file_path LIKE ? ESCAPE '\\'");
+      params.push(`%${escapeLikePattern(filters.filePathSuffix)}`);
+    }
+    if (filters.excludeId) {
+      where.push('id <> ?');
+      params.push(filters.excludeId);
+    }
+
+    const orderBy: string[] = [];
+    if (filters.rankFilePath) {
+      orderBy.push('CASE WHEN file_path = ? THEN 0 ELSE 1 END');
+      params.push(filters.rankFilePath);
+    }
+    if (filters.rankFilePathPrefix) {
+      orderBy.push("CASE WHEN file_path LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END");
+      params.push(`${escapeLikePattern(filters.rankFilePathPrefix)}%`);
+    }
+    orderBy.push('file_path', 'start_line', 'id');
+
+    let sql = `
+      SELECT * FROM nodes
+      WHERE ${where.join(' AND ')}
+      ORDER BY ${orderBy.join(', ')}
+    `;
+    if (filters.limit !== undefined) {
+      const limit = Math.max(1, Math.floor(filters.limit));
+      sql += ' LIMIT ?';
+      params.push(limit);
+    }
+
+    const rows = this.db.prepare(sql).all(...params) as NodeRow[];
     return rows.map(rowToNode);
   }
 
@@ -1308,6 +1563,17 @@ export class QueryBuilder {
   }
 
   /**
+   * Delete synthesized/dynamic edges before resuming an interrupted resolution
+   * pass. These edges are recomputed from the persisted base graph, and the
+   * edges table intentionally has no uniqueness constraint, so recomputing
+   * without clearing would duplicate them.
+   */
+  deleteEdgesByProvenance(provenance: Edge['provenance']): void {
+    if (!provenance) return;
+    this.db.prepare('DELETE FROM edges WHERE provenance = ?').run(provenance);
+  }
+
+  /**
    * Get outgoing edges from a node
    */
   getOutgoingEdges(sourceId: string, kinds?: EdgeKind[], provenance?: string): Edge[] {
@@ -1770,6 +2036,21 @@ export class QueryBuilder {
   }
 
   /**
+   * Lightweight count snapshot for interrupted-index recovery.
+   */
+  getIndexRecordCounts(): { files: number; nodes: number; edges: number; unresolvedRefs: number } {
+    return this.db
+      .prepare(`
+        SELECT
+          (SELECT COUNT(*) FROM files) AS files,
+          (SELECT COUNT(*) FROM nodes) AS nodes,
+          (SELECT COUNT(*) FROM edges) AS edges,
+          (SELECT COUNT(*) FROM unresolved_refs) AS unresolvedRefs
+      `)
+      .get() as { files: number; nodes: number; edges: number; unresolvedRefs: number };
+  }
+
+  /**
    * Get graph statistics
    */
   getStats(): GraphStats {
@@ -1836,6 +2117,13 @@ export class QueryBuilder {
     this.db.prepare(
       'INSERT INTO project_metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
     ).run(key, value, Date.now());
+  }
+
+  /**
+   * Delete a metadata key when a transient state marker no longer applies.
+   */
+  deleteMetadata(key: string): void {
+    this.db.prepare('DELETE FROM project_metadata WHERE key = ?').run(key);
   }
 
   /**

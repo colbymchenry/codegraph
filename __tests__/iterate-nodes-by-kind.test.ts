@@ -59,4 +59,18 @@ describe('iterateNodesByKind (#610 streaming)', () => {
     }
     expect(seen).toBe(q.getNodesByKind('function').length);
   });
+
+  it('does not materialize every distinct node name before resolving', () => {
+    const q = (cg as unknown as { queries: any }).queries;
+    const original = q.getAllNodeNames.bind(q);
+    q.getAllNodeNames = () => {
+      throw new Error('resolver should use indexed name-exists lookups');
+    };
+
+    try {
+      expect(() => cg.resolveReferences()).not.toThrow();
+    } finally {
+      q.getAllNodeNames = original;
+    }
+  });
 });

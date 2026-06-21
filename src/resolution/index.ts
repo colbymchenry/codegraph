@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Node, UnresolvedReference, Edge } from '../types';
+import { LANGUAGES, Node, NodeKind, UnresolvedReference, Edge } from '../types';
 import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
@@ -17,8 +17,8 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
-import { detectFrameworks } from './frameworks';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCppStdlibHeader } from './import-resolver';
+import { detectFrameworks, getApplicableFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
@@ -43,6 +43,10 @@ const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */
 const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 
+function sameLanguageFamilyMembers(language: Node['language']): Node['language'][] {
+  return LANGUAGES.filter((candidate) => sameLanguageFamily(candidate, language));
+}
+
 /**
  * Cache size limits. Each per-resolver cache is bounded so memory
  * stays flat on large codebases (20k+ files). Sizes were chosen to
@@ -52,6 +56,8 @@ const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
  * caches) when tuning for very large or very small projects.
  */
 const DEFAULT_CACHE_LIMIT = 5_000;
+const MAX_UNFILTERED_NAME_LOOKUP_ROWS = 10_000;
+const MAX_CACHED_NAME_LOOKUP_ROWS = 1_000;
 function resolveCacheLimit(): number {
   const raw = process.env.CODEGRAPH_RESOLVER_CACHE_SIZE;
   if (!raw) return DEFAULT_CACHE_LIMIT;
@@ -226,7 +232,7 @@ export class ReferenceResolver {
   private nameCache: LRUCache<string, Node[]>; // name → nodes cache
   private lowerNameCache: LRUCache<string, Node[]>; // lower(name) → nodes cache
   private qualifiedNameCache: LRUCache<string, Node[]>; // qualified_name → nodes cache
-  private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
+  private nameExistsCache: LRUCache<string, boolean>; // exact symbol-name existence pre-filter
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
   // tsconfig/jsconfig path-alias map. `undefined` = not yet computed,
@@ -253,6 +259,7 @@ export class ReferenceResolver {
     this.nameCache = new LRUCache(limit);
     this.lowerNameCache = new LRUCache(limit);
     this.qualifiedNameCache = new LRUCache(limit);
+    this.nameExistsCache = new LRUCache(Math.max(limit * 4, 20_000));
 
     this.context = this.createContext();
   }
@@ -296,18 +303,15 @@ export class ReferenceResolver {
 
   /**
    * Pre-build lightweight caches for resolution.
-   * Node lookups are now handled by indexed SQLite queries instead of
-   * loading all nodes into memory (which caused OOM on large codebases).
-   * We cache the set of known symbol names for fast pre-filtering.
+   * Node lookups are handled by indexed SQLite queries instead of loading all
+   * nodes/names into memory (which caused OOM on large codebases). File paths
+   * remain lightweight enough to cache as strings for import/path checks.
    */
   warmCaches(): void {
     if (this.cachesWarmed) return;
 
     // Only cache the set of known file paths (lightweight string set)
     this.knownFiles = new Set(this.queries.getAllFilePaths());
-
-    // Cache all distinct symbol names for fast pre-filtering (just strings, not full nodes)
-    this.knownNames = new Set(this.queries.getAllNodeNames());
 
     this.cachesWarmed = true;
   }
@@ -323,7 +327,7 @@ export class ReferenceResolver {
     this.nameCache.clear();
     this.lowerNameCache.clear();
     this.qualifiedNameCache.clear();
-    this.knownNames = null;
+    this.nameExistsCache.clear();
     this.knownFiles = null;
     this.cachesWarmed = false;
   }
@@ -343,9 +347,23 @@ export class ReferenceResolver {
       getNodesByName: (name: string) => {
         const cached = this.nameCache.get(name);
         if (cached !== undefined) return cached;
+        const count = this.queries.getNodeNameCount(name);
+        if (count > MAX_UNFILTERED_NAME_LOOKUP_ROWS) {
+          logDebug('Skipping high-fanout unfiltered node-name lookup during resolution', {
+            name,
+            count,
+          });
+          return [];
+        }
         const result = this.queries.getNodesByName(name);
-        this.nameCache.set(name, result);
+        if (count <= MAX_CACHED_NAME_LOOKUP_ROWS) {
+          this.nameCache.set(name, result);
+        }
         return result;
+      },
+
+      getNodesByNameFiltered: (name, filters = {}) => {
+        return this.queries.getNodesByNameFiltered(name, filters);
       },
 
       getNodesByQualifiedName: (qualifiedName: string) => {
@@ -358,6 +376,14 @@ export class ReferenceResolver {
 
       getNodesByKind: (kind: Node['kind']) => {
         return this.queries.getNodesByKind(kind);
+      },
+
+      iterateNodesByKind: (kind: Node['kind']) => {
+        return this.queries.iterateNodesByKind(kind);
+      },
+
+      getNodesByKindAndIdPrefix: (kind: Node['kind'], idPrefix: string) => {
+        return this.queries.getNodesByKindAndIdPrefix(kind as NodeKind, idPrefix);
       },
 
       fileExists: (filePath: string) => {
@@ -422,9 +448,23 @@ export class ReferenceResolver {
       getNodesByLowerName: (lowerName: string) => {
         const cached = this.lowerNameCache.get(lowerName);
         if (cached !== undefined) return cached;
+        const count = this.queries.getLowerNodeNameCount(lowerName);
+        if (count > MAX_UNFILTERED_NAME_LOOKUP_ROWS) {
+          logDebug('Skipping high-fanout unfiltered lowercase node-name lookup during resolution', {
+            lowerName,
+            count,
+          });
+          return [];
+        }
         const result = this.queries.getNodesByLowerName(lowerName);
-        this.lowerNameCache.set(lowerName, result);
+        if (count <= MAX_CACHED_NAME_LOOKUP_ROWS) {
+          this.lowerNameCache.set(lowerName, result);
+        }
         return result;
+      },
+
+      getNodesByLowerNameFiltered: (lowerName, filters = {}) => {
+        return this.queries.getNodesByLowerNameFiltered(lowerName, filters);
       },
 
       getNodeById: (id: string) => {
@@ -436,9 +476,14 @@ export class ReferenceResolver {
         // Matching by simple name (not id) reconciles a type declared in one node
         // (`KF::Builder`) with conformance declared in a separate extension node
         // (`KF.Builder: KFOptionSetter`) — both have name `Builder`.
-        const typeNodes = this.context
-          .getNodesByName(typeName)
-          .filter((n) => SUPERTYPE_BEARING_KINDS.has(n.kind) && n.language === language);
+        const typeNodes = this.context.getNodesByNameFiltered
+          ? this.context.getNodesByNameFiltered(typeName, {
+              language,
+              kinds: [...SUPERTYPE_BEARING_KINDS],
+            })
+          : this.context
+              .getNodesByName(typeName)
+              .filter((n) => SUPERTYPE_BEARING_KINDS.has(n.kind) && n.language === language);
         if (typeNodes.length === 0) return [];
         const supertypes = new Set<string>();
         for (const tn of typeNodes) {
@@ -538,6 +583,7 @@ export class ReferenceResolver {
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
     }));
+    this.prefetchKnownNamesForRefs(refs);
 
     const total = refs.length;
     let lastReportedPercent = -1;
@@ -582,38 +628,36 @@ export class ReferenceResolver {
 
   /**
    * Check if a reference name has any possible match in the codebase.
-   * Uses the pre-built knownNames set to skip expensive resolution
-   * for names that definitely don't exist as symbols.
+   * Uses indexed point lookups so large repos don't materialize every
+   * distinct symbol name just to run the pre-filter.
    */
   private hasAnyPossibleMatch(name: string): boolean {
-    if (!this.knownNames) return true; // no pre-filter available
-
     // Direct name match
-    if (this.knownNames.has(name)) return true;
+    if (this.hasKnownName(name)) return true;
 
     // For qualified names like "obj.method" or "Class::method", check the parts
     const dotIdx = name.indexOf('.');
     if (dotIdx > 0) {
       const receiver = name.substring(0, dotIdx);
       const member = name.substring(dotIdx + 1);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (this.hasKnownName(receiver) || this.hasKnownName(member)) return true;
       // Also check capitalized receiver (instance-method resolution)
       const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-      if (this.knownNames.has(capitalized)) return true;
+      if (this.hasKnownName(capitalized)) return true;
       // JVM FQN: `com.example.foo.Bar` — the only useful segment is the
       // last one (`Bar`); the earlier check finds `example.foo.Bar` which
       // never matches a node name.
       const lastDot = name.lastIndexOf('.');
       if (lastDot > dotIdx) {
         const tail = name.substring(lastDot + 1);
-        if (tail && this.knownNames.has(tail)) return true;
+        if (tail && this.hasKnownName(tail)) return true;
       }
     }
     const colonIdx = name.indexOf('::');
     if (colonIdx > 0) {
       const receiver = name.substring(0, colonIdx);
       const member = name.substring(colonIdx + 2);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (this.hasKnownName(receiver) || this.hasKnownName(member)) return true;
       // Multi-segment path `a::b::c` (a Rust/C++ module call like
       // `database::profiles::find`) — the only segment that names a symbol is
       // the last (`c`); `member` above is `b::c`, which never matches a node
@@ -622,7 +666,7 @@ export class ReferenceResolver {
       const lastColon = name.lastIndexOf('::');
       if (lastColon > colonIdx) {
         const tail = name.substring(lastColon + 2);
-        if (tail && this.knownNames.has(tail)) return true;
+        if (tail && this.hasKnownName(tail)) return true;
       }
     }
 
@@ -630,10 +674,72 @@ export class ReferenceResolver {
     const slashIdx = name.lastIndexOf('/');
     if (slashIdx > 0) {
       const fileName = name.substring(slashIdx + 1);
-      if (this.knownNames.has(fileName)) return true;
+      if (this.hasKnownName(fileName)) return true;
     }
 
     return false;
+  }
+
+  private prefetchKnownNamesForRefs(refs: UnresolvedRef[]): void {
+    const names = new Set<string>();
+    for (const ref of refs) {
+      this.collectPossibleMatchNames(ref.referenceName, names);
+    }
+    if (names.size === 0) return;
+
+    const existing = this.queries.getExistingNodeNames(names);
+    for (const name of names) {
+      this.nameExistsCache.set(name, existing.has(name));
+    }
+  }
+
+  private collectPossibleMatchNames(name: string, names: Set<string>): void {
+    if (!name) return;
+    names.add(name);
+
+    // Keep this in sync with hasAnyPossibleMatch(). It collects the bounded
+    // set of indexed lookups that resolver pre-filtering may ask for.
+    const dotIdx = name.indexOf('.');
+    if (dotIdx > 0) {
+      const receiver = name.substring(0, dotIdx);
+      const member = name.substring(dotIdx + 1);
+      names.add(receiver);
+      names.add(member);
+      names.add(receiver.charAt(0).toUpperCase() + receiver.slice(1));
+      const lastDot = name.lastIndexOf('.');
+      if (lastDot > dotIdx) {
+        const tail = name.substring(lastDot + 1);
+        if (tail) names.add(tail);
+      }
+    }
+
+    const colonIdx = name.indexOf('::');
+    if (colonIdx > 0) {
+      const receiver = name.substring(0, colonIdx);
+      const member = name.substring(colonIdx + 2);
+      names.add(receiver);
+      names.add(member);
+      const lastColon = name.lastIndexOf('::');
+      if (lastColon > colonIdx) {
+        const tail = name.substring(lastColon + 2);
+        if (tail) names.add(tail);
+      }
+    }
+
+    const slashIdx = name.lastIndexOf('/');
+    if (slashIdx > 0) {
+      const fileName = name.substring(slashIdx + 1);
+      if (fileName) names.add(fileName);
+    }
+  }
+
+  private hasKnownName(name: string): boolean {
+    if (!name) return false;
+    const cached = this.nameExistsCache.get(name);
+    if (cached !== undefined) return cached;
+    const exists = this.queries.hasNodeName(name);
+    this.nameExistsCache.set(name, exists);
+    return exists;
   }
 
   /**
@@ -659,6 +765,8 @@ export class ReferenceResolver {
    * Resolve a single reference
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    const applicableFrameworks = getApplicableFrameworks(this.frameworks, ref.language);
+
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
@@ -673,7 +781,7 @@ export class ReferenceResolver {
     if (
       !this.hasAnyPossibleMatch(ref.referenceName) &&
       !this.matchesAnyImport(ref) &&
-      !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
+      !applicableFrameworks.some((f) => f.claimsReference?.(ref.referenceName))
     ) {
       return null;
     }
@@ -722,7 +830,7 @@ export class ReferenceResolver {
     // JS → native `calls`) — `gateFrameworkLanguage` only drops a type/import
     // edge between two KNOWN families (see its doc), never a `calls` bridge or
     // a config↔code edge.
-    for (const framework of this.frameworks) {
+    for (const framework of applicableFrameworks) {
       const result = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
       if (result) {
         if (result.confidence >= 0.9) return result; // High confidence, return immediately
@@ -742,6 +850,17 @@ export class ReferenceResolver {
     // name-matcher — it would mis-connect e.g. "inc/db.php" to an unrelated
     // db.php elsewhere in the tree (a wrong edge is worse than none, #660).
     if (isPhpIncludePathRef(ref)) {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) =>
+            curr.confidence > best.confidence ? curr : best
+          )
+        : null;
+    }
+
+    // C/C++ #include edges are file-path imports. If import resolution could not
+    // locate the header, falling through to global name matching only burns heap
+    // on common header names and risks a wrong basename collision.
+    if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports') {
       return candidates.length > 0
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
@@ -1060,7 +1179,7 @@ export class ReferenceResolver {
         // But allow if the capitalized receiver matches a known codebase class
         if (PYTHON_BUILT_IN_METHODS.has(method)) {
           const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-          if (!this.knownNames?.has(capitalized)) {
+          if (!this.hasKnownName(capitalized)) {
             return true;
           }
         }
@@ -1071,7 +1190,7 @@ export class ReferenceResolver {
       // `def get()` — is a real reference target. Mirrors the knownNames guard on
       // the dotted branch above; without it, every handler named after a builtin
       // method silently loses its route→handler edge.
-      if (PYTHON_BUILT_IN_METHODS.has(name) && !this.knownNames?.has(name)) {
+      if (PYTHON_BUILT_IN_METHODS.has(name) && !this.hasKnownName(name)) {
         return true;
       }
     }
@@ -1109,6 +1228,7 @@ export class ReferenceResolver {
     // when there's no user node with this name — then name-matching would
     // produce zero edges anyway and the filter just short-circuits work.
     if (ref.language === 'c' || ref.language === 'cpp') {
+      if (ref.referenceKind === 'imports' && isCppStdlibHeader(name)) return true;
       // C++ std:: namespace prefix — safe to filter unconditionally,
       // since `std::foo` is never a user-defined qualified name in
       // tree-sitter output.
@@ -1287,23 +1407,34 @@ export class ReferenceResolver {
       // NODES, and look members up through `contains` edges. No name-based
       // unions anywhere — a name-keyed getSupertypes('Engine') merged every
       // Engine's parents and produced a cross-class wrong edge on rails.
-      let frontierNodes = this.context
-        .getNodesByName(className)
-        .filter(
-          (n) =>
-            SUPERTYPE_BEARING_KINDS.has(n.kind) &&
-            n.filePath === ref.filePath
-        );
+      let frontierNodes = this.context.getNodesByNameFiltered
+        ? this.context.getNodesByNameFiltered(className, {
+            kinds: [...SUPERTYPE_BEARING_KINDS],
+            filePath: ref.filePath,
+          })
+        : this.context
+            .getNodesByName(className)
+            .filter(
+              (n) =>
+                SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+                n.filePath === ref.filePath
+            );
       if (frontierNodes.length === 0) {
         // The class itself may be declared in another file (partial/reopened
         // classes); fall back to same-family nodes of that name.
-        frontierNodes = this.context
-          .getNodesByName(className)
-          .filter(
-            (n) =>
-              SUPERTYPE_BEARING_KINDS.has(n.kind) &&
-              sameLanguageFamily(n.language, ref.language)
-          );
+        frontierNodes = this.context.getNodesByNameFiltered
+          ? this.context.getNodesByNameFiltered(className, {
+              languages: sameLanguageFamilyMembers(ref.language),
+              kinds: [...SUPERTYPE_BEARING_KINDS],
+              limit: 2000,
+            })
+          : this.context
+              .getNodesByName(className)
+              .filter(
+                (n) =>
+                  SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+                  sameLanguageFamily(n.language, ref.language)
+              );
       }
       const seenNodes = new Set<string>(frontierNodes.map((n) => n.id));
       let target: Node | null = null;

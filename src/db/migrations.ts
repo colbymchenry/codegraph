@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /**
  * Migration definition
@@ -72,6 +72,17 @@ const migrations: Migration[] = [
     up: (db) => {
       db.exec(`
         ALTER TABLE nodes ADD COLUMN return_type TEXT;
+      `);
+    },
+  },
+  {
+    version: 6,
+    description:
+      'Add composite node lookup indexes for memory-bounded reference resolution',
+    up: (db) => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_nodes_name_language_kind ON nodes(name, language, kind);
+        CREATE INDEX IF NOT EXISTS idx_nodes_name_language_file ON nodes(name, language, file_path);
       `);
     },
   },

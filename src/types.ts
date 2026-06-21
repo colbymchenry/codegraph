@@ -179,6 +179,26 @@ export interface Node {
 }
 
 /**
+ * Narrow node-name lookup filters used by the resolver to avoid materializing
+ * huge same-name candidate sets in JavaScript on symbol-dense projects.
+ */
+export interface NodeLookupFilters {
+  language?: Language;
+  languages?: readonly Language[];
+  kinds?: readonly NodeKind[];
+  filePath?: string;
+  filePathPrefix?: string;
+  filePathSuffix?: string;
+  rankFilePath?: string;
+  rankFilePathPrefix?: string;
+  qualifiedName?: string;
+  qualifiedNameSuffix?: string;
+  hasReturnType?: boolean;
+  excludeId?: string;
+  limit?: number;
+}
+
+/**
  * An edge representing a relationship between two nodes
  */
 export interface Edge {

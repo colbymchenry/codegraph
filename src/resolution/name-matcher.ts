@@ -4,8 +4,87 @@
  * Handles symbol name matching for reference resolution.
  */
 
-import { Node } from '../types';
+import { Language, Node, NodeKind, NodeLookupFilters } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+
+const CALLABLE_KINDS: NodeKind[] = ['function', 'method'];
+const TYPE_KINDS: NodeKind[] = ['class', 'struct', 'interface', 'trait', 'protocol', 'enum'];
+const FUZZY_KINDS: NodeKind[] = ['function', 'method', 'class'];
+const EXACT_LOCAL_CANDIDATE_LIMIT = 200;
+const EXACT_NEARBY_CANDIDATE_LIMIT = 500;
+const EXACT_GLOBAL_CANDIDATE_LIMIT = 200;
+const METHOD_MATCH_CANDIDATE_LIMIT = 2000;
+const FUZZY_CANDIDATE_LIMIT = 500;
+
+function sameLanguageFamilyMembers(language: Language): Language[] {
+  const family = LANGUAGE_FAMILY[language];
+  if (!family) return [language];
+  return Object.entries(LANGUAGE_FAMILY)
+    .filter(([, f]) => f === family)
+    .map(([lang]) => lang as Language);
+}
+
+function referenceLanguageFilters(ref: UnresolvedRef): Pick<NodeLookupFilters, 'language' | 'languages'> {
+  // Calls may deliberately cross language families through framework bridges
+  // that surface as normal method nodes (Expo Modules, React Native native
+  // modules). Keep them kind/proximity bounded, but do not pre-filter by
+  // language before those bridge candidates get a chance.
+  if (ref.referenceKind === 'calls') {
+    return {};
+  }
+  if (ref.referenceKind === 'imports' && !isKnownLanguageFamily(ref.language)) {
+    return {};
+  }
+  if (
+    ref.referenceKind === 'references' ||
+    ref.referenceKind === 'function_ref' ||
+    ref.referenceKind === 'imports' ||
+    ref.referenceKind === 'instantiates' ||
+    ref.referenceKind === 'decorates'
+  ) {
+    return { languages: sameLanguageFamilyMembers(ref.language) };
+  }
+  return { language: ref.language };
+}
+
+function filteredByName(
+  context: ResolutionContext,
+  name: string,
+  filters: NodeLookupFilters,
+): Node[] {
+  return context.getNodesByNameFiltered
+    ? context.getNodesByNameFiltered(name, filters)
+    : context.getNodesByName(name).filter((n) => nodeMatchesFilters(n, filters));
+}
+
+function filteredByLowerName(
+  context: ResolutionContext,
+  lowerName: string,
+  filters: NodeLookupFilters,
+): Node[] {
+  return context.getNodesByLowerNameFiltered
+    ? context.getNodesByLowerNameFiltered(lowerName, filters)
+    : context.getNodesByLowerName(lowerName).filter((n) => nodeMatchesFilters(n, filters));
+}
+
+function nodeMatchesFilters(node: Node, filters: NodeLookupFilters): boolean {
+  if (filters.language && node.language !== filters.language) return false;
+  if (filters.languages && !filters.languages.includes(node.language)) return false;
+  if (filters.kinds && !filters.kinds.includes(node.kind)) return false;
+  if (filters.filePath && node.filePath !== filters.filePath) return false;
+  if (filters.filePathPrefix && !node.filePath.startsWith(filters.filePathPrefix)) return false;
+  if (filters.filePathSuffix && !node.filePath.endsWith(filters.filePathSuffix)) return false;
+  if (filters.qualifiedName && node.qualifiedName !== filters.qualifiedName) return false;
+  if (filters.qualifiedNameSuffix && !node.qualifiedName.endsWith(filters.qualifiedNameSuffix)) return false;
+  if (filters.hasReturnType && !node.returnType) return false;
+  if (filters.excludeId && node.id === filters.excludeId) return false;
+  return true;
+}
+
+function directoryPrefix(filePath: string): string {
+  const slash = filePath.lastIndexOf('/');
+  return slash >= 0 ? filePath.slice(0, slash + 1) : '';
+}
 
 /**
  * Try to resolve a path-like reference (e.g., "snippets/drawer-menu.liquid")
@@ -28,8 +107,7 @@ export function matchByFilePath(
   if (!fileName) return null;
 
   // Search for file nodes with this name
-  const candidates = context.getNodesByName(fileName);
-  const fileNodes = candidates.filter(n => n.kind === 'file');
+  const fileNodes = filteredByName(context, fileName, { kinds: ['file'] });
 
   if (fileNodes.length === 0) return null;
 
@@ -207,16 +285,16 @@ export function matchFunctionRef(
   // shape is an explicit member reference). Unique-or-drop like everything else.
   if (ref.referenceName.includes('::')) {
     const memberName = ref.referenceName.slice(ref.referenceName.lastIndexOf('::') + 2);
-    const scoped = context
-      .getNodesByName(memberName)
-      .filter(
-        (n) =>
-          (n.kind === 'function' || n.kind === 'method') &&
-          sameLanguageFamily(n.language, ref.language) &&
-          n.id !== ref.fromNodeId &&
-          (n.qualifiedName === ref.referenceName ||
-            n.qualifiedName.endsWith(`::${ref.referenceName}`))
-      );
+    const scoped = filteredByName(context, memberName, {
+      ...referenceLanguageFilters(ref),
+      kinds: CALLABLE_KINDS,
+      excludeId: ref.fromNodeId,
+      limit: METHOD_MATCH_CANDIDATE_LIMIT,
+    }).filter(
+      (n) =>
+        n.qualifiedName === ref.referenceName ||
+        n.qualifiedName.endsWith(`::${ref.referenceName}`)
+    );
     if (scoped.length === 0) return null;
     const sameFileScoped = scoped.filter((n) => n.filePath === ref.filePath);
     const pool = sameFileScoped.length > 0 ? sameFileScoped : scoped;
@@ -230,14 +308,12 @@ export function matchFunctionRef(
     };
   }
 
-  let candidates = context
-    .getNodesByName(ref.referenceName)
-    .filter(
-      (n) =>
-        (n.kind === 'function' || (!bareFnOnly && n.kind === 'method')) &&
-        sameLanguageFamily(n.language, ref.language) &&
-        n.id !== ref.fromNodeId // a function registering itself is not a dependency edge
-    );
+  let candidates = filteredByName(context, ref.referenceName, {
+    ...referenceLanguageFilters(ref),
+    kinds: bareFnOnly ? ['function'] : CALLABLE_KINDS,
+    excludeId: ref.fromNodeId,
+    limit: METHOD_MATCH_CANDIDATE_LIMIT,
+  });
   if (candidates.length === 0) return null;
 
   // Swift implicit-self: a bare identifier can name a METHOD only of the
@@ -317,8 +393,59 @@ export function matchByExactName(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref);
+  const candidateKinds: NodeKind[] | undefined =
+    ref.referenceKind === 'calls'
+      ? [...CALLABLE_KINDS, 'class', 'struct']
+      : ref.referenceKind === 'instantiates'
+        ? TYPE_KINDS
+        : undefined;
+  const baseFilters = {
+    ...referenceLanguageFilters(ref),
+    ...(candidateKinds ? { kinds: candidateKinds } : {}),
+  };
 
+  // Same-file candidates are both the most precise and the cheapest. Try them
+  // before any repo-wide fallback so common names (`Output`, `Result`, `run`)
+  // don't repeatedly materialize hundreds or thousands of distant symbols.
+  const sameFile = applyLanguageGate(filteredByName(context, ref.referenceName, {
+    ...baseFilters,
+    filePath: ref.filePath,
+    limit: EXACT_LOCAL_CANDIDATE_LIMIT,
+  }), ref);
+  const sameFileResult = pickExactNameMatch(ref, sameFile, false);
+  if (sameFileResult) return sameFileResult;
+
+  const dir = directoryPrefix(ref.filePath);
+  if (dir) {
+    const rawNearby = filteredByName(context, ref.referenceName, {
+      ...baseFilters,
+      filePathPrefix: dir,
+      rankFilePath: ref.filePath,
+      limit: EXACT_NEARBY_CANDIDATE_LIMIT + 1,
+    });
+    const nearbyWasCapped = rawNearby.length > EXACT_NEARBY_CANDIDATE_LIMIT;
+    const nearby = applyLanguageGate(rawNearby.slice(0, EXACT_NEARBY_CANDIDATE_LIMIT), ref);
+    const nearbyResult = pickExactNameMatch(ref, nearby, nearbyWasCapped);
+    if (nearbyResult) return nearbyResult;
+  }
+
+  const rawCandidates = filteredByName(context, ref.referenceName, {
+    ...baseFilters,
+    rankFilePath: ref.filePath,
+    rankFilePathPrefix: directoryPrefix(ref.filePath),
+    limit: EXACT_GLOBAL_CANDIDATE_LIMIT + 1,
+  });
+  if (rawCandidates.length > EXACT_GLOBAL_CANDIDATE_LIMIT) return null;
+  const candidates = applyLanguageGate(rawCandidates, ref);
+
+  return pickExactNameMatch(ref, candidates, false);
+}
+
+function pickExactNameMatch(
+  ref: UnresolvedRef,
+  candidates: Node[],
+  candidateSetWasCapped: boolean
+): ResolvedRef | null {
   if (candidates.length === 0) {
     return null;
   }
@@ -335,10 +462,13 @@ export function matchByExactName(
   }
 
   // Multiple matches - try to narrow down
-  const bestMatch = findBestMatch(ref, candidates, context);
+  const bestMatch = findBestMatch(ref, candidates);
   if (bestMatch) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
+    if (candidateSetWasCapped && bestMatch.filePath !== ref.filePath && proximity < 30) {
+      return null;
+    }
     const confidence = proximity >= 30 ? 0.7 : 0.4;
     return {
       original: ref,
@@ -378,7 +508,12 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
-    const partialCandidates = context.getNodesByName(lastName);
+    const partialCandidates = filteredByName(context, lastName, {
+      ...referenceLanguageFilters(ref),
+      qualifiedNameSuffix: ref.referenceName,
+      rankFilePathPrefix: directoryPrefix(ref.filePath),
+      limit: 100,
+    });
     for (const candidate of partialCandidates) {
       if (candidate.qualifiedName.endsWith(ref.referenceName)) {
         return {
@@ -418,17 +553,17 @@ function resolveMethodOnType(
   // in-class (`class Foo { int bar() { ... } }`) or out-of-line in a separate
   // file (`int Foo::bar() { ... }` in foo.cpp while class Foo is in foo.hpp).
   // The previous same-file approach missed the latter — the typical C++ layout.
-  const methodCandidates = context.getNodesByName(methodName);
   const want = `${typeName}::${methodName}`;
-  const matches: Node[] = [];
-  for (const m of methodCandidates) {
-    if (m.kind !== 'method') continue;
-    if (m.language !== ref.language) continue;
+  const matches = filteredByName(context, methodName, {
+    language: ref.language,
+    kinds: ['method'],
+    qualifiedNameSuffix: want,
+    rankFilePathPrefix: directoryPrefix(ref.filePath),
+    limit: METHOD_MATCH_CANDIDATE_LIMIT,
+  }).filter((m) => {
     const qn = m.qualifiedName;
-    if (qn === want || qn.endsWith(`::${want}`)) {
-      matches.push(m);
-    }
-  }
+    return qn === want || qn.endsWith(`::${want}`);
+  });
   if (matches.length === 0) {
     // Conformance fallback: the method may be defined on a supertype `typeName`
     // extends, or on a protocol / trait it conforms to (e.g. a Swift protocol-
@@ -592,12 +727,13 @@ function lookupCalleeReturnType(
     method = parts[parts.length - 1] ?? callee;
     cls = parts.slice(0, -1).join('::');
   }
-  const candidates = context.getNodesByName(method).filter(
-    (n) =>
-      (n.kind === 'method' || n.kind === 'function') &&
-      n.language === ref.language &&
-      !!n.returnType,
-  );
+  const candidates = filteredByName(context, method, {
+    language: ref.language,
+    kinds: CALLABLE_KINDS,
+    hasReturnType: true,
+    rankFilePathPrefix: directoryPrefix(ref.filePath),
+    limit: METHOD_MATCH_CANDIDATE_LIMIT,
+  });
   if (cls) {
     const want = `${cls}::${method}`;
     // The call site may name the class with MORE namespace qualification than
@@ -620,9 +756,11 @@ function lookupCalleeReturnType(
 /** Does the graph contain a class/struct named `name`'s last segment? */
 function cppClassExists(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const last = cppLastSegment(name);
-  return context
-    .getNodesByName(last)
-    .some((n) => (n.kind === 'class' || n.kind === 'struct') && n.language === ref.language);
+  return filteredByName(context, last, {
+    language: ref.language,
+    kinds: ['class', 'struct'],
+    limit: 1,
+  }).length > 0;
 }
 
 /**
@@ -996,7 +1134,12 @@ export function matchMethodCall(
   }
 
   // Strategy 1: Direct class name match (existing logic)
-  const classCandidates = context.getNodesByName(objectOrClass!);
+  const classCandidates = filteredByName(context, objectOrClass!, {
+    language: ref.language,
+    kinds: ['class', 'struct', 'interface'],
+    rankFilePathPrefix: directoryPrefix(ref.filePath),
+    limit: METHOD_MATCH_CANDIDATE_LIMIT,
+  });
 
   for (const classNode of classCandidates) {
     if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
@@ -1026,7 +1169,12 @@ export function matchMethodCall(
   // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
   const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
   if (capitalizedReceiver !== objectOrClass) {
-    const fuzzyClassCandidates = context.getNodesByName(capitalizedReceiver);
+    const fuzzyClassCandidates = filteredByName(context, capitalizedReceiver, {
+      language: ref.language,
+      kinds: ['class', 'struct', 'interface'],
+      rankFilePathPrefix: directoryPrefix(ref.filePath),
+      limit: METHOD_MATCH_CANDIDATE_LIMIT,
+    });
     for (const classNode of fuzzyClassCandidates) {
       if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
         // Skip cross-language class matches
@@ -1056,32 +1204,42 @@ export function matchMethodCall(
   // name similarity with the containing class. Handles abbreviated variable
   // names like permissionEngine → PermissionRuleEngine.
   if (methodName) {
-    const methodCandidates = context.getNodesByName(methodName!);
-    const methods = methodCandidates.filter(
-      (n) => n.kind === 'method' && n.name === methodName
-    );
-
-    // Filter to same-language candidates first
-    const sameLanguageMethods = methods.filter(m => m.language === ref.language);
-    const targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
+    const sameLanguageMethods = filteredByName(context, methodName!, {
+      language: ref.language,
+      kinds: ['method'],
+      rankFilePath: ref.filePath,
+      rankFilePathPrefix: directoryPrefix(ref.filePath),
+      limit: METHOD_MATCH_CANDIDATE_LIMIT + 1,
+    });
+    const targetMethods = sameLanguageMethods.length > 0
+      ? sameLanguageMethods
+      : filteredByName(context, methodName!, {
+          kinds: ['method'],
+          rankFilePath: ref.filePath,
+          rankFilePathPrefix: directoryPrefix(ref.filePath),
+          limit: METHOD_MATCH_CANDIDATE_LIMIT + 1,
+        });
+    const candidatesWereCapped = targetMethods.length > METHOD_MATCH_CANDIDATE_LIMIT;
+    const methods = targetMethods.slice(0, METHOD_MATCH_CANDIDATE_LIMIT);
 
     // If only one same-language method with this name exists, use it
-    if (targetMethods.length === 1 && targetMethods[0]!.language === ref.language) {
+    if (!candidatesWereCapped && methods.length === 1) {
+      const confidence = methods[0]!.language === ref.language ? 0.7 : 0.65;
       return {
         original: ref,
-        targetNodeId: targetMethods[0]!.id,
-        confidence: 0.7,
+        targetNodeId: methods[0]!.id,
+        confidence,
         resolvedBy: 'instance-method',
       };
     }
 
     // Multiple methods: score by receiver name word overlap with class name
-    if (targetMethods.length > 1) {
+    if (methods.length > 1) {
       const receiverWords = splitCamelCase(objectOrClass!);
-      let bestMatch: typeof targetMethods[0] | undefined;
+      let bestMatch: typeof methods[0] | undefined;
       let bestScore = 0;
 
-      for (const method of targetMethods) {
+      for (const method of methods) {
         const classWords = splitCamelCase(method.qualifiedName);
         let score = receiverWords.filter(w =>
           classWords.some(cw => cw.toLowerCase() === w.toLowerCase())
@@ -1094,7 +1252,7 @@ export function matchMethodCall(
         }
       }
 
-      if (bestMatch && bestScore >= 2) {
+      if (bestMatch && bestScore >= 2 && (!candidatesWereCapped || bestMatch.filePath === ref.filePath || computePathProximity(ref.filePath, bestMatch.filePath) >= 30)) {
         return {
           original: ref,
           targetNodeId: bestMatch.id,
@@ -1145,8 +1303,7 @@ function computePathProximity(filePath1: string, filePath2: string): number {
  */
 function findBestMatch(
   ref: UnresolvedRef,
-  candidates: Node[],
-  _context: ResolutionContext
+  candidates: Node[]
 ): Node | null {
   // Prioritization rules:
   // 1. Same file > different file
@@ -1236,12 +1393,18 @@ export function matchFuzzy(
 ): ResolvedRef | null {
   const lowerName = ref.referenceName.toLowerCase();
 
-  // Use pre-built lowercase index for O(1) lookup instead of scanning all nodes
-  const candidates = context.getNodesByLowerName(lowerName);
-
-  // Filter to callable kinds only (function, method, class)
-  const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
+  // Use pre-built lowercase index, but keep fuzzy matching bounded. Fuzzy is a
+  // low-confidence fallback; on high-fanout names a silent miss is safer than
+  // materializing thousands of rows just to guess.
+  const candidates = filteredByLowerName(context, lowerName, {
+    ...referenceLanguageFilters(ref),
+    kinds: FUZZY_KINDS,
+    rankFilePath: ref.filePath,
+    rankFilePathPrefix: directoryPrefix(ref.filePath),
+    limit: FUZZY_CANDIDATE_LIMIT + 1,
+  });
+  if (candidates.length > FUZZY_CANDIDATE_LIMIT) return null;
+  const callableCandidates = applyLanguageGate(candidates, ref);
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);

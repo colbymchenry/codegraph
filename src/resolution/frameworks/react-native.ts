@@ -62,6 +62,12 @@ const nativeMethodMaps: WeakMap<
   { byJsName: Map<string, NativeMethod[]> }
 > = new WeakMap();
 
+function methodNodes(context: ResolutionContext): Iterable<Node> {
+  return context.iterateNodesByKind
+    ? context.iterateNodesByKind('method')
+    : context.getNodesByKind('method');
+}
+
 // ─── Native-side extraction ─────────────────────────────────────────────────
 
 /**
@@ -270,7 +276,7 @@ function buildRNMaps(context: ResolutionContext): { byJsName: Map<string, Native
   // their bridge exports.
   const objcMethodsByFirstKw = new Map<string, Node[]>();
   const jvmMethodsByName = new Map<string, Node[]>();
-  for (const node of context.getNodesByKind('method')) {
+  for (const node of methodNodes(context)) {
     if (node.language === 'objc') {
       const firstKw = node.name.includes(':') ? node.name.split(':')[0] : node.name;
       if (firstKw) {
