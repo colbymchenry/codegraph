@@ -823,11 +823,6 @@ export class ToolHandler {
       return this.cg;
     }
 
-    // Check cache first (using original path as key)
-    if (this.projectCache.has(projectPath)) {
-      return this.projectCache.get(projectPath)!;
-    }
-
     // Reject sensitive system directories before opening. Only validate a
     // path that actually exists — a nested or not-yet-created sub-path of a
     // real project must still be allowed to resolve UP to its .codegraph/
@@ -840,7 +835,16 @@ export class ToolHandler {
       }
     }
 
-    // Walk up parent directories to find nearest .codegraph/
+    // Always RE-RESOLVE the nearest .codegraph/ from the input path. The walk
+    // is cheap (a few existsSync up the tree) and is the only thing that
+    // notices a path whose index root CHANGED since it was first seen — most
+    // importantly a git worktree that gained its own .codegraph/ after the
+    // (long-lived) server first resolved it up to the parent checkout. We used
+    // to short-circuit on a `projectCache[projectPath]` entry before resolving,
+    // which pinned that first resolution for the server's whole lifetime, so a
+    // worktree kept being served the parent checkout's index until restart
+    // (#926). The DB connection itself is still cached (by resolved root,
+    // below), so re-resolving costs only the stat walk, never a reopen.
     const resolvedRoot = findNearestCodeGraphRoot(projectPath);
 
     if (!resolvedRoot) {
@@ -856,27 +860,20 @@ export class ToolHandler {
     // default instance rather than opening a SECOND connection to the same DB.
     // A duplicate connection serializes reads against the watcher's auto-sync
     // writes; on the wasm backend (no WAL) that surfaces as intermittent
-    // "database is locked" on concurrent tool calls. See issue #238. Deliberately
-    // not cached under projectPath — the server owns and closes the default
-    // instance, so routing it through projectCache.closeAll() would double-close it.
+    // "database is locked" on concurrent tool calls. See issue #238. The
+    // default instance is owned/closed by the server, so it's never cached.
     if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
       return this.cg;
     }
 
-    // Check if we already have this resolved root cached (different path, same project)
-    if (this.projectCache.has(resolvedRoot)) {
-      const cg = this.projectCache.get(resolvedRoot)!;
-      // Cache under original path too for faster future lookups
-      this.projectCache.set(projectPath, cg);
-      return cg;
-    }
+    // Cache the open DB connection by RESOLVED ROOT only — never by the input
+    // path. One key per instance means closeAll() closes each exactly once, and
+    // a changed resolution maps to a different entry instead of a stale hit.
+    const cached = this.projectCache.get(resolvedRoot);
+    if (cached) return cached;
 
-    // Open and cache under both paths
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
-    if (projectPath !== resolvedRoot) {
-      this.projectCache.set(projectPath, cg);
-    }
     return cg;
   }
 
@@ -947,17 +944,30 @@ export class ToolHandler {
    */
   private worktreeMismatchFor(projectPath?: string): WorktreeIndexMismatch | null {
     const startPath = projectPath ?? this.defaultProjectHint ?? process.cwd();
-    const cached = this.worktreeMismatchCache.get(startPath);
-    if (cached !== undefined) return cached;
 
-    let mismatch: WorktreeIndexMismatch | null = null;
+    // The verdict depends on BOTH the start path AND the index root it resolves
+    // to, so the cache must be keyed on the pair. Resolve the index root first
+    // (cheap — getCodeGraph re-walks to the nearest .codegraph/, no git), then
+    // key on `(startPath, indexRoot)`. The moment that root changes — most
+    // importantly when a git worktree gains its own index and the walk-up stops
+    // there instead of at the parent checkout — the key changes and the verdict
+    // is recomputed, instead of serving the stale "borrowed the parent's index"
+    // warning for the server's whole lifetime. Keying on startPath alone pinned
+    // that first verdict until restart (#926).
+    let indexRoot: string;
     try {
-      mismatch = detectWorktreeIndexMismatch(startPath, this.getCodeGraph(projectPath).getProjectRoot());
+      indexRoot = this.getCodeGraph(projectPath).getProjectRoot();
     } catch {
       // No resolvable project (or any other resolution error) → nothing to warn.
-      mismatch = null;
+      return null;
     }
-    this.worktreeMismatchCache.set(startPath, mismatch);
+
+    const cacheKey = `${startPath}\u0000${indexRoot}`;
+    const cached = this.worktreeMismatchCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+
+    const mismatch = detectWorktreeIndexMismatch(startPath, indexRoot);
+    this.worktreeMismatchCache.set(cacheKey, mismatch);
     return mismatch;
   }
 
