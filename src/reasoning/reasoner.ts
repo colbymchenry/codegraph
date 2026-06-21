@@ -29,7 +29,7 @@
  * session and an agent can abandon the tool entirely).
  */
 import * as fs from 'fs';
-import { resolveOffload } from './config';
+import { resolveOffload, type ResolvedOffloadProvider } from './config';
 
 interface SynthArgs {
   query: string;
@@ -195,35 +195,59 @@ export function stripAgentDirectives(context: string): string {
  */
 export async function synthesizeOffload({ query, context }: SynthArgs): Promise<string | null> {
   const cfg = resolveOffload();
-  if (!cfg.url) return null;
+  const providers = cfg.providers.length > 0 ? cfg.providers : (
+    cfg.url ? [{ managed: cfg.managed, url: cfg.url, model: cfg.model, apiKey: cfg.apiKey, keySource: cfg.keySource }] : []
+  );
+  if (providers.length === 0) return null;
 
-  const url = cfg.url.replace(/\/+$/, '') + '/chat/completions';
   const { system, footer } = promptFor(cfg.style);
   const ctx = cfg.strip ? stripAgentDirectives(context) : context;
   // Optional operator/eval flag forwarded verbatim to the managed Worker (see body below);
   // the Worker validates it and falls back to its default for anything it doesn't recognize.
   const workerStyle = (process.env.CODEGRAPH_OFFLOAD_STYLE || '').trim();
 
+  for (const provider of providers) {
+    const answer = await synthesizeWithProvider(provider, { query, context, ctx, system, footer, workerStyle, cfg });
+    if (answer) return answer;
+  }
+  return null;
+}
+
+async function synthesizeWithProvider(
+  provider: ResolvedOffloadProvider,
+  args: {
+    query: string;
+    context: string;
+    ctx: string;
+    system: string;
+    footer: string;
+    workerStyle: string;
+    cfg: ReturnType<typeof resolveOffload>;
+  }
+): Promise<string | null> {
+  const { query, context, ctx, system, footer, workerStyle, cfg } = args;
+  const url = provider.url.replace(/\/+$/, '') + '/chat/completions';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
   const started = Date.now();
+  const providerLabel = provider.name ?? provider.url;
   try {
     const headers: Record<string, string> = { 'content-type': 'application/json' };
-    if (cfg.apiKey) headers.authorization = `Bearer ${cfg.apiKey}`;
+    if (provider.apiKey) headers.authorization = `Bearer ${provider.apiKey}`;
 
     const res = await fetch(url, {
       method: 'POST',
       headers,
       signal: controller.signal,
       body: JSON.stringify({
-        model: cfg.model,
+        model: provider.model,
         max_tokens: cfg.maxTokens,
         temperature: 0.2,
         reasoning_effort: cfg.effort,
         // Optional managed-tier flag, forwarded ONLY to the managed gateway (which strips it
         // before the upstream model call) and ONLY when an operator/eval sets it — so BYO
         // endpoints, which may reject unknown fields, never see it.
-        ...(cfg.managed && workerStyle ? { offload_style: workerStyle } : {}),
+        ...(provider.managed && workerStyle ? { offload_style: workerStyle } : {}),
         messages: [
           { role: 'system', content: system },
           {
@@ -235,7 +259,7 @@ export async function synthesizeOffload({ query, context }: SynthArgs): Promise<
     });
 
     if (!res.ok) {
-      debug('upstream not ok', res.status, (await res.text().catch(() => '')).slice(0, 200));
+      debug('upstream not ok', providerLabel, res.status, (await res.text().catch(() => '')).slice(0, 200));
       return null;
     }
     const data = (await res.json()) as {
@@ -253,9 +277,11 @@ export async function synthesizeOffload({ query, context }: SynthArgs): Promise<
     recordUsage({
       ts: new Date().toISOString(),
       ms: Date.now() - started,
-      model: cfg.model,
+      provider: provider.name ?? null,
+      providerUrl: provider.url,
+      model: provider.model,
       style: cfg.style,
-      managed: cfg.managed,
+      managed: provider.managed,
       promptTokens: data.usage?.prompt_tokens ?? null,
       completionTokens: data.usage?.completion_tokens ?? null,
       totalTokens: data.usage?.total_tokens ?? null,
@@ -268,15 +294,15 @@ export async function synthesizeOffload({ query, context }: SynthArgs): Promise<
       finishReason: data.choices?.[0]?.finish_reason ?? null,
     });
     if (!answer) {
-      debug('empty answer', JSON.stringify(data).slice(0, 200));
+      debug('empty answer', providerLabel, JSON.stringify(data).slice(0, 200));
       return null;
     }
     debug(
-      `ok in ${Date.now() - started}ms [${cfg.style}] — answer ${answer.length} chars (ctx ${ctx.length} of ${context.length}, finish=${data.choices?.[0]?.finish_reason}), ${data.usage?.total_tokens ?? '?'} tok, ${Number.isFinite(creditsCharged) ? creditsCharged + ' cr' : 'no-charge-hdr'}`
+      `ok in ${Date.now() - started}ms [${cfg.style}] via ${providerLabel} — answer ${answer.length} chars (ctx ${ctx.length} of ${context.length}, finish=${data.choices?.[0]?.finish_reason}), ${data.usage?.total_tokens ?? '?'} tok, ${Number.isFinite(creditsCharged) ? creditsCharged + ' cr' : 'no-charge-hdr'}`
     );
     return answer + footer;
   } catch (err) {
-    debug('error', (err as Error)?.message);
+    debug('error', providerLabel, (err as Error)?.message);
     return null;
   } finally {
     clearTimeout(timer);
