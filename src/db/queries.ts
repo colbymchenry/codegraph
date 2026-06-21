@@ -47,8 +47,6 @@ function isLowValueFile(filePath: string): boolean {
   );
 }
 
-const SQLITE_PARAM_CHUNK_SIZE = 500;
-
 /**
  * Database row types (snake_case from SQLite)
  */
@@ -469,20 +467,18 @@ export class QueryBuilder {
     }
     if (misses.length === 0) return out;
 
-    // Chunk under SQLite's parameter limit (default 999, raised to 32766
-    // in better-sqlite3 builds — chunk at 500 for safety across both
-    // backends and to keep the query plan simple).
-    for (let i = 0; i < misses.length; i += SQLITE_PARAM_CHUNK_SIZE) {
-      const chunk = misses.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
-      const placeholders = chunk.map(() => '?').join(',');
-      const rows = this.db
-        .prepare(`SELECT * FROM nodes WHERE id IN (${placeholders})`)
-        .all(...chunk) as NodeRow[];
-      for (const row of rows) {
-        const node = rowToNode(row);
-        out.set(node.id, node);
-        this.cacheNode(node);
-      }
+    // Bind the id list as ONE JSON parameter and expand it server-side with
+    // json_each, so the bound-parameter count is fixed at 1 regardless of how
+    // many ids we look up. A placeholder-per-id `IN (?,?,…)` overflows
+    // SQLITE_MAX_VARIABLE_NUMBER (32766) once a project is large enough — the
+    // root cause of the "too many SQL variables" sync failure.
+    const rows = this.db
+      .prepare(`SELECT * FROM nodes WHERE id IN (SELECT value FROM json_each(?))`)
+      .all(JSON.stringify(misses)) as NodeRow[];
+    for (const row of rows) {
+      const node = rowToNode(row);
+      out.set(node.id, node);
+      this.cacheNode(node);
     }
     return out;
   }
@@ -491,16 +487,15 @@ export class QueryBuilder {
     const out = new Set<string>();
     if (ids.length === 0) return out;
 
+    // One JSON parameter expanded via json_each — fixed at a single bound
+    // variable no matter how many ids, so it can never overflow
+    // SQLITE_MAX_VARIABLE_NUMBER on a large project.
     const uniqueIds = [...new Set(ids)];
-    for (let i = 0; i < uniqueIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
-      const chunk = uniqueIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
-      const placeholders = chunk.map(() => '?').join(',');
-      const rows = this.db
-        .prepare(`SELECT id FROM nodes WHERE id IN (${placeholders})`)
-        .all(...chunk) as { id: string }[];
-      for (const row of rows) {
-        out.add(row.id);
-      }
+    const rows = this.db
+      .prepare(`SELECT id FROM nodes WHERE id IN (SELECT value FROM json_each(?))`)
+      .all(JSON.stringify(uniqueIds)) as { id: string }[];
+    for (const row of rows) {
+      out.add(row.id);
     }
 
     return out;
@@ -1693,19 +1688,15 @@ export class QueryBuilder {
   getUnresolvedReferencesByFiles(filePaths: string[]): UnresolvedReference[] {
     if (filePaths.length === 0) return [];
 
-    // Chunk under SQLite's parameter limit: the first sync of a very large repo
-    // passes every changed file here, which an unbounded `IN (...)` would bind
-    // as one parameter each — exceeding MAX_VARIABLE_NUMBER and aborting with
+    // The first sync of a very large repo passes every changed file here. Bind
+    // the whole list as ONE JSON parameter and expand it server-side with
+    // json_each, so the statement uses a single bound variable regardless of
+    // file count — an `IN (?,?,…)` placeholder-per-file would bind one variable
+    // each and exceed SQLITE_MAX_VARIABLE_NUMBER (32766), aborting with
     // "too many SQL variables". (#540)
-    const rows: UnresolvedRefRow[] = [];
-    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
-      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
-      const placeholders = chunk.map(() => '?').join(',');
-      const chunkRows = this.db
-        .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
-        .all(...chunk) as UnresolvedRefRow[];
-      rows.push(...chunkRows);
-    }
+    const rows = this.db
+      .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (SELECT value FROM json_each(?))`)
+      .all(JSON.stringify(filePaths)) as UnresolvedRefRow[];
 
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,
@@ -1731,8 +1722,12 @@ export class QueryBuilder {
    */
   deleteResolvedReferences(fromNodeIds: string[]): void {
     if (fromNodeIds.length === 0) return;
-    const placeholders = fromNodeIds.map(() => '?').join(',');
-    this.db.prepare(`DELETE FROM unresolved_refs WHERE from_node_id IN (${placeholders})`).run(...fromNodeIds);
+    // One JSON parameter expanded via json_each — a single bound variable
+    // regardless of how many ids resolve, so a large resolution batch can never
+    // overflow SQLITE_MAX_VARIABLE_NUMBER with "too many SQL variables".
+    this.db
+      .prepare(`DELETE FROM unresolved_refs WHERE from_node_id IN (SELECT value FROM json_each(?))`)
+      .run(JSON.stringify(fromNodeIds));
   }
 
   /**
