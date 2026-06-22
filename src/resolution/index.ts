@@ -1468,6 +1468,7 @@ export class ReferenceResolver {
         return null;
       }
     }
+    if (ref.language === 'qml' && ref.referenceKind === 'calls' && tgt === 'cpp') return null;
     if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !sameLanguageFamily(tgt, ref.language)) return null;
     if (ref.referenceKind === 'imports' && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
@@ -1490,6 +1491,10 @@ export class ReferenceResolver {
     if (!result) return result;
     if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
+    // QML/Qt bridge facts are explicit framework discoveries
+    // (qmlRegisterType/context properties/Q_PROPERTY), so QML references can
+    // legitimately point at C++ class or accessor nodes.
+    if (ref.language === 'qml' && tgt === 'cpp' && result.resolvedBy === 'framework') return result;
     if (tgt && ref.language && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
   }

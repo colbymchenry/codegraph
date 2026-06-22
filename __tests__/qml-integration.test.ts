@@ -1393,6 +1393,151 @@ BaseButton 1.0 BaseButtonAlt.qml
     expect(graph.getOutgoingEdges(baseFromDependencyAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === baseAltTarget!.id)).toBe(true);
   });
 
+  it('resolves C++/QML bridge registry facts through the QML Qt framework resolver', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QtQml>
+
+class ViewModel : public QObject {
+  Q_OBJECT
+  Q_PROPERTY(QString title READ title NOTIFY titleChanged)
+
+public:
+  QString title() const;
+  Q_INVOKABLE void refresh();
+  void hidden();
+
+public slots:
+  void save();
+
+signals:
+  void titleChanged();
+
+private:
+  QString m_title;
+};
+
+class OtherModel : public QObject {
+  Q_OBJECT
+
+public:
+  Q_INVOKABLE void refresh();
+  void hidden();
+};
+
+class ThemeApi : public QObject {
+  Q_OBJECT
+
+public:
+  Q_INVOKABLE QString color();
+};
+
+class MyButton : public QObject {
+  Q_OBJECT
+};
+
+QString ViewModel::title() const { return m_title; }
+void ViewModel::refresh() {}
+void ViewModel::save() {}
+void ViewModel::hidden() {}
+void OtherModel::refresh() {}
+void OtherModel::hidden() {}
+QString ThemeApi::color() { return "#123456"; }
+
+int main(int argc, char** argv) {
+  QQmlApplicationEngine engine;
+  ViewModel vm;
+  engine.rootContext()->setContextProperty("viewModel", &vm);
+  qmlRegisterType<MyButton>("App.Controls", 1, 0, "MyButton");
+  qmlRegisterUncreatableType<OtherModel>("App.Controls", 1, 0, "OtherModel", "Only context");
+  qmlRegisterSingletonType<ThemeApi>("App.Controls", 1, 0, "ThemeApi", [](QQmlEngine*, QJSEngine*) -> QObject* {
+    return new ThemeApi();
+  });
+  engine.load(QUrl(QStringLiteral("qrc:/Main.qml")));
+  return 0;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import App.Controls 1.0
+
+Item {
+  id: root
+  property string shownTitle: viewModel.title
+
+  Component.onCompleted: {
+    viewModel.refresh()
+    viewModel.save()
+    viewModel.hidden()
+    ThemeApi.color()
+  }
+
+  Connections {
+    target: viewModel
+    function onTitleChanged() {
+      viewModel.refresh()
+    }
+  }
+
+  MyButton {
+    id: registeredButton
+  }
+
+  OtherModel {
+    id: invalidOtherModelInstance
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const onTitleChanged = graph.getNodesByName('onTitleChanged').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const shownTitle = graph.getNodesByName('shownTitle').find((n) => n.kind === 'property' && n.filePath === 'Main.qml');
+    const registeredButton = graph.getNodesByName('registeredButton').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const invalidOtherModelInstance = graph.getNodesByName('invalidOtherModelInstance').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const viewModelRefresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::refresh'));
+    const viewModelSave = graph.getNodesByName('save').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::save'));
+    const viewModelTitle = graph.getNodesByName('title').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::title'));
+    const viewModelHidden = graph.getNodesByName('hidden').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::hidden'));
+    const otherModelRefresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('OtherModel::refresh'));
+    const themeColor = graph.getNodesByName('color').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ThemeApi::color'));
+    const myButton = graph.getNodesByName('MyButton').find((n) => n.kind === 'class' && n.filePath === 'main.cpp');
+    const otherModel = graph.getNodesByName('OtherModel').find((n) => n.kind === 'class' && n.filePath === 'main.cpp');
+
+    expect(onCompleted).toBeDefined();
+    expect(onTitleChanged).toBeDefined();
+    expect(shownTitle).toBeDefined();
+    expect(registeredButton).toBeDefined();
+    expect(invalidOtherModelInstance).toBeDefined();
+    expect(viewModelRefresh).toBeDefined();
+    expect(viewModelSave).toBeDefined();
+    expect(viewModelTitle).toBeDefined();
+    expect(viewModelHidden).toBeDefined();
+    expect(otherModelRefresh).toBeDefined();
+    expect(themeColor).toBeDefined();
+    expect(myButton).toBeDefined();
+    expect(otherModel).toBeDefined();
+
+    const onCompletedEdges = graph.getOutgoingEdges(onCompleted!.id);
+    expect(onCompletedEdges.some((edge) => edge.kind === 'calls' && edge.target === viewModelRefresh!.id)).toBe(true);
+    expect(onCompletedEdges.some((edge) => edge.kind === 'calls' && edge.target === viewModelSave!.id)).toBe(true);
+    expect(onCompletedEdges.some((edge) => edge.kind === 'calls' && edge.target === themeColor!.id)).toBe(true);
+    expect(onCompletedEdges.some((edge) => edge.kind === 'calls' && edge.target === otherModelRefresh!.id)).toBe(false);
+    expect(onCompletedEdges.some((edge) => edge.kind === 'calls' && edge.target === viewModelHidden!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(onTitleChanged!.id).some((edge) => edge.kind === 'calls' && edge.target === viewModelRefresh!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(shownTitle!.id).some((edge) => edge.kind === 'references' && edge.target === viewModelTitle!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(registeredButton!.id).some((edge) => edge.kind === 'references' && edge.target === myButton!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(invalidOtherModelInstance!.id).some((edge) => edge.kind === 'references' && edge.target === otherModel!.id)).toBe(false);
+  });
+
   it('uses the QML Qt framework resolver for QML-specific cross-file references', async () => {
     fs.writeFileSync(
       path.join(tmpDir, 'Main.qml'),
