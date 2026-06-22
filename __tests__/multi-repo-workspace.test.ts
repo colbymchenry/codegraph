@@ -131,6 +131,42 @@ describe('multi-repo workspaces (#514)', () => {
     expect(files).toContain('vendored/lib.ts');
   });
 
+  it('skips a submodule worktree instead of indexing it as a duplicate (#945)', () => {
+    // A worktree OF A SUBMODULE points its `.git` into
+    // `.git/modules/<module>/worktrees/<name>` — not the top-level repo's
+    // `.git/worktrees/`. The detector used to miss that extra `modules/<name>`
+    // segment, so the worktree fell through to "embedded" and every symbol it
+    // shared with the real submodule checkout got indexed twice. The submodule's
+    // own checkout (`.git/modules/<module>`, no `worktrees/`) is distinct code
+    // and must stay indexed (#514).
+    const upstream = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-945-up-'));
+    try {
+      // The repo that becomes the submodule's origin.
+      write(path.join(upstream, 'lib.ts'), 'export function libFn() { return 1; }\n');
+      makeRepo(upstream);
+
+      write(path.join(ws, 'src/app.ts'), 'export function app() { return 1; }\n');
+      write(path.join(ws, '.gitignore'), '.worktrees/\n');
+      git(ws, 'init', '-q');
+      // protocol.file.allow=always: modern git refuses a local-path submodule otherwise.
+      git(ws, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', upstream, 'common');
+      git(ws, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'add submodule');
+
+      // A worktree of the submodule, under the gitignored .worktrees/ — its `.git`
+      // points into `.git/modules/common/worktrees/<name>`.
+      git(path.join(ws, 'common'), 'worktree', 'add', '-q', '../.worktrees/common-feature', '-b', 'feature');
+
+      const files = scanDirectory(ws);
+      expect(files).toContain('src/app.ts');
+      // The real submodule checkout is distinct code — still indexed (#514).
+      expect(files).toContain('common/lib.ts');
+      // The submodule worktree is a duplicate working view — never indexed (#945).
+      expect(files.some((f) => f.includes('.worktrees'))).toBe(false);
+    } finally {
+      fs.rmSync(upstream, { recursive: true, force: true });
+    }
+  });
+
   it('non-git workspace: walks children and respects each child own .gitignore', () => {
     write(path.join(ws, 'proj-a/src/auth.ts'), 'export function login() {}\n');
     write(path.join(ws, 'proj-a/build/out.ts'), 'export function generated() {}\n');

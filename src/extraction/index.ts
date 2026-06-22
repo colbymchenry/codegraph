@@ -304,8 +304,10 @@ const EMBEDDED_REPO_SEARCH_ENTRIES = 2000;
  * - A `.git` **file** is a pointer (`gitdir: …`). A git **worktree** points into
  *   the host repo's own `.git/worktrees/<name>`, so it is a second working view
  *   of a repo CodeGraph already indexes — indexing it just duplicates the whole
- *   graph N times; skip it (#848). A **submodule** points into `.git/modules/`
- *   and is distinct code, so index it as before.
+ *   graph N times; skip it (#848). A **submodule worktree** points into
+ *   `.git/modules/<module>/worktrees/<name>` — same duplication, so skip it too
+ *   (#945). A **submodule** checkout points into `.git/modules/<module>` (no
+ *   `worktrees/` segment) and is distinct code, so index it as before.
  *
  * Returns `'none'` when there is no `.git` entry here.
  */
@@ -320,9 +322,12 @@ function classifyGitDir(absDir: string): 'embedded' | 'worktree' | 'none' {
   if (!st.isFile()) return 'none';
   try {
     const gitdir = fs.readFileSync(path.join(absDir, '.git'), 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
-    // A linked worktree's gitdir lives under some repo's `.git/worktrees/`.
+    // A worktree's gitdir lives under some repo's `.git/worktrees/<name>` —
+    // either the top-level repo's (`.git/worktrees/`) or, for a worktree of a
+    // submodule, that submodule's gitdir (`.git/modules/<module>/worktrees/`).
+    // The optional `modules/<module>` segment covers the submodule case (#945).
     // Match both separators so a Windows-style pointer is recognized too.
-    if (gitdir && /(^|[\\/])\.git[\\/]worktrees[\\/]/.test(gitdir)) return 'worktree';
+    if (gitdir && /(^|[\\/])\.git[\\/](modules[\\/][^\\/]+[\\/])?worktrees[\\/]/.test(gitdir)) return 'worktree';
   } catch {
     // Unreadable `.git` pointer — fall back to the prior "index it" behavior.
   }
