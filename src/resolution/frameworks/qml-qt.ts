@@ -818,6 +818,145 @@ function resolveQmlCppPropertyRead(
   return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'framework' };
 }
 
+function findRefSourceNode(ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  return context.getNodesInFile(ref.filePath).find((node) => node.id === ref.fromNodeId);
+}
+
+function resolveQmlCppContextPropertyRef(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.language !== 'qml' || ref.referenceKind !== 'references') return null;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ref.referenceName)) return null;
+
+  const registry = getQmlCppBridgeRegistry(context);
+  const contextProperty = registry.contextProperties.get(ref.referenceName);
+  if (!contextProperty?.classNodeId) return null;
+  return {
+    original: ref,
+    targetNodeId: contextProperty.classNodeId,
+    confidence: 0.95,
+    resolvedBy: 'framework',
+  };
+}
+
+function offsetFromLineColumn(source: string, line: number, column: number): number {
+  let offset = 0;
+  for (let currentLine = 1; currentLine < line; currentLine++) {
+    const next = source.indexOf('\n', offset);
+    if (next < 0) return source.length;
+    offset = next + 1;
+  }
+  return Math.min(source.length, offset + column);
+}
+
+function matchingBraceOffset(source: string, openBraceOffset: number): number {
+  let depth = 0;
+  for (let index = openBraceOffset; index < source.length; index++) {
+    const char = source[index];
+    if (char === '{') depth++;
+    if (char === '}') {
+      depth--;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function qmlConnectionsTargetForOffset(source: string, offset: number): string | null {
+  for (const match of source.matchAll(/\bConnections\s*\{/g)) {
+    const openBrace = source.indexOf('{', match.index);
+    if (openBrace < 0) continue;
+    const closeBrace = matchingBraceOffset(source, openBrace);
+    if (closeBrace < 0 || offset < openBrace || offset > closeBrace) continue;
+
+    const block = source.slice(openBrace + 1, closeBrace);
+    return /\btarget\s*:\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(block)?.[1] ?? null;
+  }
+  return null;
+}
+
+function qmlSignalNameFromHandler(handlerName: string): string | null {
+  const match = /^on([A-Z][A-Za-z0-9_]*)$/.exec(handlerName);
+  if (!match?.[1]) return null;
+  return `${match[1][0]!.toLowerCase()}${match[1].slice(1)}`;
+}
+
+function resolveQmlCppSignalHandler(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.language !== 'qml' || ref.referenceKind !== 'references') return null;
+
+  const signalName = qmlSignalNameFromHandler(ref.referenceName);
+  if (!signalName) return null;
+
+  const source = context.readFile(ref.filePath);
+  if (!source) return null;
+  const targetName = qmlConnectionsTargetForOffset(
+    source,
+    offsetFromLineColumn(source, ref.line, ref.column)
+  );
+  if (!targetName) return null;
+
+  const registry = getQmlCppBridgeRegistry(context);
+  const contextProperty = registry.contextProperties.get(targetName);
+  if (!contextProperty) return null;
+
+  const classFacts = registry.classes.get(simpleCppTypeName(contextProperty.cppType));
+  if (!classFacts?.signals.has(signalName)) return null;
+
+  const target = findCppMethodNode(context, contextProperty.cppType, signalName);
+  if (!target) return null;
+  return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'framework' };
+}
+
+function isExplicitQmlPropertyTypeRef(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  typeName: string
+): boolean {
+  const sourceNode = findRefSourceNode(ref, context);
+  return (
+    sourceNode?.language === 'qml' &&
+    sourceNode.kind === 'property' &&
+    new RegExp(`^property\\s+${typeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+`).test(
+      sourceNode.signature ?? ''
+    )
+  );
+}
+
+function resolveQmlCppRegisteredTypeReference(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.language !== 'qml' || ref.referenceKind !== 'references') return null;
+
+  const componentName = componentTypeName(ref.referenceName);
+  if (!componentName || !isExplicitQmlPropertyTypeRef(ref, context, ref.referenceName)) {
+    return null;
+  }
+
+  const parts = ref.referenceName.split('.');
+  const alias = parts.length > 1 ? parts[0] : undefined;
+  const registry = getQmlCppBridgeRegistry(context);
+  const registration = importedBridgeRegistration(
+    context,
+    registry,
+    ref.filePath,
+    componentName,
+    new Set<QmlCppRegistrationKind>(['type', 'uncreatable']),
+    alias
+  );
+  if (!registration?.classNodeId) return null;
+  return {
+    original: ref,
+    targetNodeId: registration.classNodeId,
+    confidence: 0.9,
+    resolvedBy: 'framework',
+  };
+}
+
 function resolveQmlCppRegisteredComponent(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -893,6 +1032,7 @@ export const qmlQtResolver: FrameworkResolver = {
       /\.qml$/i.test(name) ||
       /^[A-Za-z_][A-Za-z0-9_]*\.[A-Z][A-Za-z0-9_]*$/.test(name) ||
       /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/.test(name) ||
+      (ref?.referenceKind === 'references' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) ||
       /^[A-Z][A-Za-z0-9_]*$/.test(name)
     );
   },
@@ -900,7 +1040,10 @@ export const qmlQtResolver: FrameworkResolver = {
     return (
       resolveLiteralQmlUrl(ref, context) ??
       resolveQmlCppBridgeCall(ref, context) ??
+      resolveQmlCppSignalHandler(ref, context) ??
       resolveQmlCppPropertyRead(ref, context) ??
+      resolveQmlCppContextPropertyRef(ref, context) ??
+      resolveQmlCppRegisteredTypeReference(ref, context) ??
       resolveQmlCppRegisteredComponent(ref, context) ??
       resolveQmlModuleComponent(ref, context)
     );

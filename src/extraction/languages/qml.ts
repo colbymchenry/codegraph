@@ -101,6 +101,31 @@ const QML_BUILTIN_COMPONENT_TYPES = new Set([
   'Window',
 ]);
 
+const QML_BUILTIN_VALUE_TYPES = new Set([
+  'alias',
+  'bool',
+  'color',
+  'date',
+  'double',
+  'enumeration',
+  'font',
+  'int',
+  'list',
+  'matrix4x4',
+  'point',
+  'quaternion',
+  'real',
+  'rect',
+  'size',
+  'string',
+  'url',
+  'var',
+  'variant',
+  'vector2d',
+  'vector3d',
+  'vector4d',
+]);
+
 function isNameNode(node: SyntaxNode): boolean {
   return (
     node.type === 'identifier' ||
@@ -702,12 +727,17 @@ function visitQmlBinding(node: SyntaxNode, ctx: ExtractorContext): boolean {
 }
 
 function visitQmlProperty(node: SyntaxNode, ctx: ExtractorContext): boolean {
-  const name = childText(node, 'name', ctx.source);
+  const nameNode = getChildByField(node, 'name');
+  const name = nameNode ? qmlName(getNodeText(nameNode, ctx.source)) : null;
   if (!name) return false;
 
   const property = ctx.createNode('property', qmlName(name), node, {
     signature: conciseSignature(node, ctx.source),
   });
+  const typeMatch = property?.signature?.match(/^property\s+([A-Za-z_][A-Za-z0-9_.]*)\s+[A-Za-z_][A-Za-z0-9_]*/);
+  if (property && typeMatch?.[1] && !QML_BUILTIN_VALUE_TYPES.has(typeMatch[1])) {
+    addReferenceFromNode(ctx, property.id, typeMatch[1], node);
+  }
   const valueNode = getChildByField(node, 'value');
   if (property && valueNode) {
     ctx.pushScope(property.id);
@@ -729,7 +759,8 @@ function visitQmlSignal(node: SyntaxNode, ctx: ExtractorContext): boolean {
 }
 
 function visitQmlFunction(node: SyntaxNode, ctx: ExtractorContext): boolean {
-  const name = childText(node, 'name', ctx.source);
+  const nameNode = getChildByField(node, 'name');
+  const name = nameNode ? qmlName(getNodeText(nameNode, ctx.source)) : null;
   if (!name) return false;
 
   const symbolName = qmlName(name);
@@ -738,6 +769,9 @@ function visitQmlFunction(node: SyntaxNode, ctx: ExtractorContext): boolean {
     signature: conciseSignature(node, ctx.source),
   });
   if (!symbol) return true;
+  if (kind === 'method') {
+    addReferenceFromNode(ctx, symbol.id, symbolName, nameNode ?? node);
+  }
 
   const body = getChildByField(node, 'body');
   if (body) {

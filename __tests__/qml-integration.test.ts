@@ -1443,6 +1443,7 @@ QString ViewModel::title() const { return m_title; }
 void ViewModel::refresh() {}
 void ViewModel::save() {}
 void ViewModel::hidden() {}
+void ViewModel::titleChanged() {}
 void OtherModel::refresh() {}
 void OtherModel::hidden() {}
 QString ThemeApi::color() { return "#123456"; }
@@ -1469,6 +1470,7 @@ import App.Controls 1.0
 Item {
   id: root
   property string shownTitle: viewModel.title
+  property OtherModel selectedModel: null
 
   Component.onCompleted: {
     viewModel.refresh()
@@ -1501,28 +1503,36 @@ Item {
     const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
     const onTitleChanged = graph.getNodesByName('onTitleChanged').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
     const shownTitle = graph.getNodesByName('shownTitle').find((n) => n.kind === 'property' && n.filePath === 'Main.qml');
+    const selectedModel = graph.getNodesByName('selectedModel').find((n) => n.kind === 'property' && n.filePath === 'Main.qml');
+    const connections = graph.getNodesByKind('component').find((n) => n.signature === 'Connections' && n.filePath === 'Main.qml');
     const registeredButton = graph.getNodesByName('registeredButton').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
     const invalidOtherModelInstance = graph.getNodesByName('invalidOtherModelInstance').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
     const viewModelRefresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::refresh'));
     const viewModelSave = graph.getNodesByName('save').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::save'));
     const viewModelTitle = graph.getNodesByName('title').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::title'));
+    const viewModelTitleChanged = graph.getNodesByName('titleChanged').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::titleChanged'));
     const viewModelHidden = graph.getNodesByName('hidden').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::hidden'));
     const otherModelRefresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('OtherModel::refresh'));
     const themeColor = graph.getNodesByName('color').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ThemeApi::color'));
+    const viewModel = graph.getNodesByName('ViewModel').find((n) => n.kind === 'class' && n.filePath === 'main.cpp');
     const myButton = graph.getNodesByName('MyButton').find((n) => n.kind === 'class' && n.filePath === 'main.cpp');
     const otherModel = graph.getNodesByName('OtherModel').find((n) => n.kind === 'class' && n.filePath === 'main.cpp');
 
     expect(onCompleted).toBeDefined();
     expect(onTitleChanged).toBeDefined();
     expect(shownTitle).toBeDefined();
+    expect(selectedModel).toBeDefined();
+    expect(connections).toBeDefined();
     expect(registeredButton).toBeDefined();
     expect(invalidOtherModelInstance).toBeDefined();
     expect(viewModelRefresh).toBeDefined();
     expect(viewModelSave).toBeDefined();
     expect(viewModelTitle).toBeDefined();
+    expect(viewModelTitleChanged).toBeDefined();
     expect(viewModelHidden).toBeDefined();
     expect(otherModelRefresh).toBeDefined();
     expect(themeColor).toBeDefined();
+    expect(viewModel).toBeDefined();
     expect(myButton).toBeDefined();
     expect(otherModel).toBeDefined();
 
@@ -1533,7 +1543,10 @@ Item {
     expect(onCompletedEdges.some((edge) => edge.kind === 'calls' && edge.target === otherModelRefresh!.id)).toBe(false);
     expect(onCompletedEdges.some((edge) => edge.kind === 'calls' && edge.target === viewModelHidden!.id)).toBe(false);
     expect(graph.getOutgoingEdges(onTitleChanged!.id).some((edge) => edge.kind === 'calls' && edge.target === viewModelRefresh!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(onTitleChanged!.id).some((edge) => edge.kind === 'references' && edge.target === viewModelTitleChanged!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(connections!.id).some((edge) => edge.kind === 'references' && edge.target === viewModel!.id)).toBe(true);
     expect(graph.getOutgoingEdges(shownTitle!.id).some((edge) => edge.kind === 'references' && edge.target === viewModelTitle!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(selectedModel!.id).some((edge) => edge.kind === 'references' && edge.target === otherModel!.id)).toBe(true);
     expect(graph.getOutgoingEdges(registeredButton!.id).some((edge) => edge.kind === 'references' && edge.target === myButton!.id)).toBe(true);
     expect(graph.getOutgoingEdges(invalidOtherModelInstance!.id).some((edge) => edge.kind === 'references' && edge.target === otherModel!.id)).toBe(false);
   });
