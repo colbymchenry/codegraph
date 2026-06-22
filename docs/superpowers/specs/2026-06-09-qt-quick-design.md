@@ -4,17 +4,19 @@
 
 Add first-class `.qml` language support to CodeGraph so Qt Quick projects can be indexed with practical static coverage. The first version targets QML object trees plus embedded JavaScript behavior inside QML files. It does not attempt C++/QML bridging.
 
-**Implementation status:** implemented for QML-internal graph generation; C++/QML bridging remains deferred.
+**Implementation status:** QML-internal graph generation and QML-side closure are implemented. The extractor covers component trees, ids, properties, signals, functions, handlers, imports, embedded JavaScript static references, nested handler bodies, object-literal callbacks, function-valued callbacks, directory-local component references, and false-positive suppression for broad cross-file property/name matches. `qmldir` module registry resolution, statically safe dynamic QML loading, C++/QML bridge resolution, and release notes remain follow-up work.
 
 Local JavaScript helper imports such as `import "utils.js" as Utils` are indexed
 as file-level imports. Cross-file resolution from QML member calls such as
 `Utils.format(...)` to JavaScript function symbols remains out of scope for the
 first version.
 
-QML object type references are emitted only for inline components declared in
-the same `.qml` file with `component Name : ...`. Common Qt Quick platform
-types and same-named project files are not linked by name alone; cross-file QML
-component resolution is deferred until import/qmldir scope rules are modeled.
+QML object type references are emitted for inline components declared in the
+same `.qml` file with `component Name : ...` and for directory-local component
+references covered by the QML-side closure pass. Common Qt Quick platform types
+and same-named project files are not linked by broad name matching alone;
+`qmldir` module registry resolution, URI module scope, aliases, and versioned
+module resolution remain follow-up work.
 
 The goal is to make `codegraph_explore`, `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` useful on real Qt Quick codebases by extracting:
 
@@ -34,11 +36,17 @@ tree-sitter-backed languages:
 .qml files
   -> detectLanguage("qml")
   -> load QML tree-sitter WASM grammar
-  -> TreeSitterExtractor + qmlExtractor
+  -> TreeSitterExtractor + qmlExtractor (visitNode hook — see below)
   -> nodes / edges / unresolvedReferences
   -> ReferenceResolver
   -> GraphQuery / ContextBuilder / MCP tools
 ```
+
+**Critical implementation constraint:** QML's declarative object tree has no
+match in the standard `functionTypes`/`classTypes`/`methodTypes` field arrays.
+The QML extractor **must** implement the `visitNode(node, ctx): boolean` hook
+and return `true` for every handled QML node type. This is not optional — it
+is the only viable dispatch path for this language.
 
 Confirmed scope:
 
@@ -93,28 +101,145 @@ treating QML as JavaScript because:
 
 Add `qml` to:
 
-- `src/types.ts` language union
-- `src/extraction/grammars.ts` extension detection and grammar loading
-- `src/extraction/languages/index.ts` extractor registry
-- supported-language documentation and extraction-version metadata
+- `src/types.ts` — append `'qml'` to the `LANGUAGES` array **and** add
+  `qml: 'QML'` to the `Record<Language, string>` inside
+  `getLanguageDisplayName` (TypeScript enforces exhaustiveness — the compiler
+  will flag every missing entry after you add `'qml'` to `LANGUAGES`, use
+  those errors as a checklist)
+- `src/extraction/grammars.ts` — add `qml: 'tree-sitter-qmljs.wasm'` to
+  `WASM_GRAMMAR_FILES`, add `'.qml': 'qml'` to `EXTENSION_MAP`, and add
+  `'qml'` to the vendored-path condition in `loadGrammarsForLanguages`
+- `src/extraction/languages/qml.ts` — new extractor file (see
+  [Extractor implementation](#extractor-implementation) below)
+- `src/extraction/languages/index.ts` — add `qml: qmlExtractor` to the
+  `EXTRACTORS` map
+- `src/extraction/extraction-version.ts` — **bump `EXTRACTION_VERSION`** (a
+  new language extractor always warrants a bump; existing indexes will not
+  contain QML data and users need to re-index)
+- supported-language documentation
 
 `.qml` files should be treated as normal source files, not file-level-only files.
 
 ### Grammar integration
 
-Evaluate the QMLJS grammar shipped as a WASM artifact, with `@lumis-sh/wasm-qmljs` as the leading candidate and `tree-sitter-qmljs` as the grammar source reference.
+The grammar is **tree-sitter-qmljs**, vendored under
+`src/extraction/wasm/tree-sitter-qmljs.wasm`.
 
-The integration requirements are:
+**Why vendor:** every grammar CodeGraph has needed to vendor so far
+(lua, csharp, pascal, scala) was blocked by the same ABI-13 vs ABI-15
+incompatibility under `web-tree-sitter` 0.25. `@lumis-sh/wasm-qmljs` ships
+ABI-13 and is expected to exhibit the same issue. Treat vendoring as the
+default plan; Phase 0 confirms or refutes it.
 
-- compatible with `web-tree-sitter`
-- stable AST node names for QML object declarations, property declarations, handlers, and embedded JavaScript expressions or blocks
-- distributable through the existing bundle/copy-assets path
+To vendor:
+1. Build or download the ABI-15 WASM from the upstream
+   [`tree-sitter-qmljs`](https://github.com/nickel-lang/tree-sitter-qmljs)
+   repository.
+2. Place it at `src/extraction/wasm/tree-sitter-qmljs.wasm`.
+3. `copy-assets` (called by `npm run build`) automatically copies every
+   `*.wasm` under `src/extraction/wasm/` into `dist/` — no script change
+   needed as long as the file is in that directory.
+4. Add `'qml'` to the vendored-path condition in `loadGrammarsForLanguages`
+   inside `src/extraction/grammars.ts`.
 
-If the upstream package shape does not match the current grammar loader expectations, vendor the `.wasm` file under `src/extraction/wasm/` the same way this repo already does for languages that need custom packaging.
+If Phase 0 confirms that `@lumis-sh/wasm-qmljs` loads cleanly under
+`web-tree-sitter` 0.25, replace the vendored file with a
+`require.resolve('@lumis-sh/wasm-qmljs/...')` call and remove `'qml'` from
+the vendored-path condition.
+
+## Extractor implementation
+
+### visitNode hook — mandatory pattern
+
+QML extraction **must** use the `visitNode(node, ctx): boolean` hook. All
+field arrays (`functionTypes`, `classTypes`, etc.) are left empty. The hook
+returns `true` for every handled QML node type to skip the default dispatcher,
+and `false` for unknown nodes so the default dispatcher still walks their
+children.
+
+```typescript
+visitNode(node, ctx): boolean {
+  switch (node.type) {
+    // Verify these type strings against the real AST in Phase 0
+    case 'ui_object_definition':
+    case 'ui_object_binding':
+      extractQmlComponent(node, ctx);
+      return true;
+    case 'ui_property':
+      extractQmlProperty(node, ctx);
+      return true;
+    case 'ui_signal':
+      extractQmlSignal(node, ctx);
+      return true;
+    case 'ui_on_signal_handler':
+      extractQmlHandler(node, ctx);
+      return true;
+    case 'function_declaration':
+      extractQmlFunction(node, ctx);
+      return true;
+    case 'ui_import':
+      extractQmlImport(node, ctx);
+      return true;
+    default:
+      return false;
+  }
+}
+```
+
+### Scope management — pushScope / popScope
+
+`isInsideClassLikeNode()` checks the top of the `nodeStack` to decide whether
+a property or method node belongs to a class-like parent. `component` is now
+included in that check (alongside `class`, `struct`, etc.). For this to work,
+every `extractQmlComponent` call must bracket its child traversal with scope
+management:
+
+```typescript
+function extractQmlComponent(node, ctx) {
+  const id = ctx.createNode('component', name, ...);
+  ctx.pushScope(id);
+  // visit children — their property/method nodes now see 'component' as parent
+  for (let i = 0; i < node.namedChildCount; i++) {
+    ctx.visitNode(node.namedChild(i)!);
+  }
+  ctx.popScope();
+}
+```
+
+Without `pushScope`/`popScope`, nested properties and methods will not be
+associated with the component and will be silently dropped.
+
+### visitFunctionBody — ownerNodeId is required
+
+When traversing a handler or embedded function body for `calls` edges, the
+second argument to `ctx.visitFunctionBody` **must** be the owning node's ID:
+
+```typescript
+function extractQmlHandler(node, ctx) {
+  const handlerId = ctx.createNode('method', 'onClicked', ...);
+  const body = node.childForFieldName('body') ?? node;
+  ctx.visitFunctionBody(body, handlerId);  // ownerNodeId MUST be passed
+}
+```
+
+Omitting `ownerNodeId` (or passing `''`) attributes all discovered call edges
+to the file node rather than the handler, making `codegraph_callees(onClicked)`
+return empty.
+
+### Node naming
+
+- Top-level QML component: basename of the file without extension
+  (`LoginPage.qml` → `LoginPage`).
+- Objects with an explicit `id`: use the id value.
+- Anonymous objects: `${typeName}@${startLine}` (e.g. `Rectangle@42`).
+
+**Node ID stability note:** `generateNodeId` encodes `startLine` in every
+node ID for all languages. IDs for anonymous objects will drift whenever lines
+above them are inserted or removed. An explicit `id` declaration prevents this
+for that specific node but not for sibling anonymous objects. This is a
+known limitation of the current ID scheme, not a QML-specific bug.
 
 ## Graph Model
-
-First version stays within the existing graph schema.
 
 ### Nodes
 
@@ -449,6 +574,11 @@ handler to a QML function or property dependency.
 
 ## Delivery Phasing
 
+This phasing section is retained as historical first-version implementation
+guidance. Phases 0-3 are complete for QML-internal graph generation and
+QML-side closure; remaining follow-up work is tracked in the follow-up task
+plan and closure design.
+
 ### Phase 0: AST exploration and grammar decision
 
 Confirm the real QML grammar AST before implementing extraction rules.
@@ -460,21 +590,31 @@ Work:
   `Connections`, inline components, enums, and pragmas
 - verify that the selected QMLJS WASM grammar loads under `web-tree-sitter`
 - decide whether to load from `@lumis-sh/wasm-qmljs/tree-sitter-qmljs.wasm` or
-  vendor the WASM under `src/extraction/wasm/`
+  vendor the WASM under `src/extraction/wasm/` (default assumption: vendor,
+  due to ABI-13 incompatibility history — see Grammar integration)
 
 Acceptance:
 
-- AST node names and field shapes are known for the first-version syntax set
-- the grammar loading path is known and testable
-- grammar packaging risk is resolved before extraction logic is built
+- AST node type strings are recorded for **every** first-version syntax
+  construct (objects, properties, signals, handlers, imports, enums, pragmas,
+  inline components, `Connections`, `property alias`). These strings are the
+  switch-case keys in `visitNode` — do not start Phase 2 without them.
+- `npm run build` succeeds with the WASM in place and
+  `dist/extraction/wasm/tree-sitter-qmljs.wasm` is present in the build output
+- Grammar loading path is verified: `isLanguageSupported('qml')` returns `true`
+  and `loadGrammarsForLanguages(['qml'])` completes without error
+- Grammar packaging decision is documented and testable
 
 ### Phase 1: language wiring
 
-- add `qml` language wiring
-- integrate QMLJS grammar
-- add a `src/extraction/languages/qml.ts` extractor skeleton
+- add `qml` language wiring (see Language surface checklist above)
+- integrate QMLJS grammar (vendor under `src/extraction/wasm/` by default)
+- add a `src/extraction/languages/qml.ts` extractor skeleton with the
+  `visitNode` hook wired but returning `false` (Phase 1 — no extraction yet)
 - register the extractor in `src/extraction/languages/index.ts`
-- update supported-language display and extraction-version metadata
+- **bump `EXTRACTION_VERSION`** in `src/extraction/extraction-version.ts` —
+  adding a new language extractor requires a re-index of existing projects
+- add a `[Unreleased]` CHANGELOG entry describing QML support
 - add unit tests for language detection and grammar support
 
 Acceptance:

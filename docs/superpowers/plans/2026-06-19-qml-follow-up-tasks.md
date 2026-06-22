@@ -2,19 +2,15 @@
 
 ## Context
 
-The first QML graph generation version is implemented for QML-internal graph
-coverage. It uses the normal tree-sitter `LanguageExtractor` pipeline and keeps
-C++/QML bridge resolution, `qmldir` module resolution, and dynamic component URL
-resolution deferred.
+The first QML graph generation version and the QML-side closure pass are implemented. The current remaining follow-up scope is documentation hygiene, read-only real-project validation, `qmldir` module/import scope, statically safe dynamic QML loading, C++/QML bridge resolution, and release notes.
 
 `test-qml-project/` may be used for validation, but files under that directory
 must not be staged or committed.
 
 ## Current Scope Decision
 
-QML to C++ bridge work is explicitly deferred until after the QML-side graph is
-complete. Current implementation work must stay within QML extraction and
-QML-to-QML resolution:
+QML-side graph closure is the current baseline. Completed QML extraction and
+QML-to-QML resolution coverage includes:
 
 - QML component, property, id, function, signal, handler, and import extraction
 - QML directory-local component type references
@@ -25,6 +21,11 @@ QML-to-QML resolution:
 - QML function callbacks passed as call arguments, such as
   `items.filter(function (item) { ... })`
 - conservative suppression of broad cross-file QML property/name matches
+
+Remaining module/import scope work is limited to `qmldir` registries, module
+URI imports, import aliases, versioned imports, and built-in collision
+protection. QML to C++ bridge work remains deferred and must not be treated as
+complete Qt runtime or C++ meta-object closure.
 
 Deferred bridge scope:
 
@@ -118,9 +119,10 @@ items are superseded by this validation update.
 
 ## Priority 1: Workspace and Documentation Hygiene
 
-- Review the remaining dirty or untracked workspace files and decide which
-  should be kept, split, or discarded in separate commits.
-- Keep unrelated pre-existing changes out of QML implementation commits.
+- Keep QML follow-up commits scoped to QML docs, validation notes, tests,
+  extraction, and resolution changes.
+- Do not include unrelated pre-existing dirty or untracked workspace files in
+  QML follow-up commits.
 - Update QML design documentation so it matches current behavior:
   - top-level component names come from the `.qml` file basename
   - object `id` bindings are still indexed as `variable` nodes
@@ -355,7 +357,7 @@ Observed result from the temporary copy:
   - `VideoDownloadTaskSection.onClicked ->
     VideoDownloadViewModel::pauseAll`
 
-Correctness assessment:
+Historical correctness assessment, superseded by the QML-side closure update:
 
 - Graph generation succeeds for this module.
 - QML file discovery, import extraction, top-level component naming,
@@ -363,9 +365,10 @@ Correctness assessment:
   QML-to-C++ ViewModel calls are working.
 - Local QML component instantiations are detected as component nodes and their
   type names are preserved in `signature`.
-- The generated graph is not complete for this module because directory-local
-  QML component type references are not resolved to the corresponding top-level
-  QML component definitions. For example:
+- At the time of this historical validation, the generated graph was not
+  complete for this module because directory-local QML component type
+  references were not resolved to the corresponding top-level QML component
+  definitions. For example:
   - `VideoDownloadComponent.qml` instantiates `VideoDownloadOverviewBar`,
     `VideoDownloadSegmentSection`, `VideoDownloadTaskSection`, and
     `VideoDownloadInlineConfirm`, but there are no cross-file component
@@ -375,36 +378,38 @@ Correctness assessment:
     `VideoDownloadSegmentItem.qml`.
   - `VideoDownloadTaskSection.qml` instantiates `VideoDownloadTaskItem`, but
     there is no edge to `VideoDownloadTaskItem.qml`.
-- Object-literal callback bodies are still not fully represented as call
-  sources. Direct `root.viewModel.*` calls resolved for 9 observed ViewModel
-  methods, but calls inside `inlineConfirmRequested({ accepted: function () {
+- This historical directory-local gap is superseded by the QML-side closure
+  update above; directory-local component resolution is now completed baseline
+  behavior.
+- At the time of this historical validation, object-literal callback bodies
+  were not fully represented as call sources. Direct `root.viewModel.*` calls
+  resolved for 9 observed ViewModel methods, but calls inside
+  `inlineConfirmRequested({ accepted: function () {
   ... } })` did not produce edges for:
   - `VideoDownloadTaskSection.qml -> VideoDownloadViewModel::cancelAll`
   - `VideoDownloadSegmentSection.qml -> VideoDownloadViewModel::removeAll`
-- Cross-file QML references currently contain suspicious property-level matches
-  such as `SegmentInlineEditor.onTextChanged -> VideoDownloadInlineField::text`
-  across files. This reinforces the need to make QML module/import scope
-  explicit before enabling broad cross-file name matching.
+- At the time of this historical validation, cross-file QML references
+  contained suspicious property-level matches such as
+  `SegmentInlineEditor.onTextChanged -> VideoDownloadInlineField::text` across
+  files. This evidence still supports keeping remaining module/import scope
+  conservative.
 
-Follow-up implication:
+Historical follow-up implication, superseded by the QML-side closure update:
 
-- Add QML directory-local component resolution before claiming multi-file QML
-  graph closure.
-- Resolve local component instance signatures to top-level QML component nodes
-  conservatively and only within valid QML import scope.
-- Add regression coverage for:
-  - top-level component basename extraction across multiple `.qml` files
-  - local component instance -> local component definition edges
-  - object-literal callback bodies that call `root.viewModel.*`
-  - suppression of accidental cross-file property matches such as generic
-    `text` properties
+- The historical directory-local component-resolution gap is superseded by the
+  QML-side closure update above; directory-local component resolution is not
+  future work.
+- Remaining module/import scope work is `qmldir`, module URI imports, aliases,
+  versions, and built-in collision protection.
+- Remaining non-module follow-up work is statically safe dynamic QML loading,
+  C++/QML bridge resolution, and release notes.
 
 ## Priority 3: QML Module and Import Scope Design
 
-- Design `qmldir` and QML import scope support before enabling cross-file QML
-  component type resolution.
-- Model directory-local components, module URI imports, aliases, and versioned
-  imports conservatively.
+- Design `qmldir` and QML module import scope support for module URI imports,
+  aliases, and versioned imports.
+- Treat directory-local component resolution as completed baseline behavior,
+  not future module/import scope work.
 - Add regression tests that prevent same-name built-in/project-file collisions.
 
 ## Priority 4: C++ / QML Bridge Design
