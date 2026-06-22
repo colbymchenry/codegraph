@@ -446,4 +446,21 @@ Item {
         .some((caller) => caller.node.name.includes('filter') && caller.edge.kind === 'calls')
     ).toBe(true);
   });
+
+  it('uses the QML Qt framework resolver for QML-specific cross-file references', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  id: root
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    expect(graph.getDetectedFrameworks()).toContain('qml-qt');
+  });
 });
