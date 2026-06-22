@@ -1651,6 +1651,14 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'goframe-route') {
+      const route = m.route ? `\`${String(m.route)}\`` : 'a route';
+      return {
+        label: `GoFrame route ${route} — reflective Bind → controller method (dynamic dispatch)`,
+        compact: `dynamic: GoFrame route ${m.route ? String(m.route) : ''}${at}`,
+        registeredAt,
+      };
+    }
     // Generic fallback for any other synthesizer (redux-thunk, gin-middleware-chain,
     // flutter-build, …): a synthesized hop must never read as a bare static `calls`.
     // It's a dynamic-dispatch bridge — label it as one and keep its wiring site.
