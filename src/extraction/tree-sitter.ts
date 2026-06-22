@@ -1769,7 +1769,7 @@ export class TreeSitterExtractor {
     let found = false;
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
-      if (child && (child.type === 'simple_identifier' || child.type === 'identifier' || child.type === 'property_identifier')) {
+      if (child && (child.type === 'simple_identifier' || child.type === 'simple_name' || child.type === 'identifier' || child.type === 'property_identifier')) {
         this.createNode('enum_member', getNodeText(child, this.source), child);
         found = true;
       }
@@ -2604,6 +2604,31 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, name, nameNode, { docstring, signature: initSignature, isExported });
       });
+    } else if (this.language === 'powershell') {
+      // PowerShell assignment: left_assignment_expression wraps a variable node
+      // (`$Name = ...`). Track only top-level assignments (the dispatcher skips
+      // function/method locals) so module-scope state appears in search/impact.
+      const left = node.namedChildren.find((c) => c.type === 'left_assignment_expression');
+      let variable: SyntaxNode | null = null;
+      const stack: SyntaxNode[] = left ? [left] : [];
+      while (stack.length > 0 && !variable) {
+        const current = stack.pop()!;
+        if (current.type === 'variable') {
+          variable = current;
+          break;
+        }
+        for (let i = 0; i < current.namedChildCount; i++) {
+          const child = current.namedChild(i);
+          if (child) stack.push(child);
+        }
+      }
+      if (variable) {
+        const name = getNodeText(variable, this.source).replace(/^\$\{?/, '').replace(/\}$/, '');
+        const valueNode = getChildByField(node, 'value');
+        const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
+        const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
+        this.createNode('variable', name, variable, { docstring, signature: initSignature, isExported });
+      }
     } else if (this.language === 'c') {
       // C: a `declaration` node's name nests inside the `declarator` field —
       // `init_declarator` (with value) or bare/pointer/array declarators (no
@@ -4179,6 +4204,15 @@ export class TreeSitterExtractor {
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
       const nodeType = node.type;
 
+      // PowerShell commands are both the call syntax and the import syntax
+      // (`Import-Module`, dot-sourcing). Its extractor hook handles those nodes
+      // and walks any script-block arguments; the generic body walker normally
+      // bypasses language hooks, so opt PowerShell in here explicitly.
+      if (this.language === 'powershell' && this.extractor!.visitNode) {
+        const handled = this.extractor!.visitNode(node, this.makeExtractorContext());
+        if (handled) return;
+      }
+
       // Function-as-value capture (#756) — function bodies are walked here,
       // not in visitNode, so the capture hook must fire in both walkers.
       this.maybeCaptureFnRefs(node, nodeType);
@@ -4294,6 +4328,24 @@ export class TreeSitterExtractor {
    * Extract inheritance relationships
    */
   private extractInheritance(node: SyntaxNode, classId: string): void {
+    // PowerShell classes declare base types inline: `class Child : Parent, IFace`.
+    // The grammar exposes every name as a `simple_name`, with the first being the
+    // class itself. Treat remaining names as supertypes so changes to a base class
+    // surface dependents.
+    if (this.language === 'powershell' && node.type === 'class_statement') {
+      const supers = node.namedChildren.filter((c) => c.type === 'simple_name').slice(1);
+      for (const target of supers) {
+        this.unresolvedReferences.push({
+          fromNodeId: classId,
+          referenceName: getNodeText(target, this.source),
+          referenceKind: 'extends',
+          line: target.startPosition.row + 1,
+          column: target.startPosition.column,
+        });
+      }
+      return;
+    }
+
     // Objective-C @interface MyClass : NSObject <ProtoA, ProtoB>
     if (node.type === 'class_interface') {
       const superclass = getChildByField(node, 'superclass');
