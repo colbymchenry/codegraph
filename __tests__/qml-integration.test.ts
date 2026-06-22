@@ -1481,6 +1481,12 @@ Item {
   }
 
   Connections {
+    Binding {
+      target: localTarget
+      property: "value"
+      value: 1
+    }
+
     target: viewModel
     function onTitleChanged() {
       viewModel.refresh()
@@ -1496,6 +1502,11 @@ Item {
 
   function onTitleChanged() {
     viewModel.refresh()
+  }
+
+  Item {
+    id: nestedShadowOwner
+    property var viewModel: ({})
   }
 
   MyButton {

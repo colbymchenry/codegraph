@@ -835,7 +835,7 @@ function resolveQmlCppBridgeCall(
   const methodName = parts[parts.length - 1]!;
   if (parts.length === 2) {
     const receiver = parts[0]!;
-    if (isShadowedQmlContextProperty(context, ref.filePath, receiver)) return null;
+    if (isShadowedQmlContextProperty(context, ref, receiver)) return null;
 
     const bridgeNames = getQmlCppBridgeNameIndex(context);
     if (!bridgeNames.contextProperties.has(receiver) && !bridgeNames.singletonTypes.has(receiver)) {
@@ -892,7 +892,7 @@ function resolveQmlCppPropertyRead(
   if (ref.language !== 'qml' || ref.referenceKind !== 'references') return null;
   const parts = ref.referenceName.split('.');
   if (parts.length !== 2) return null;
-  if (isShadowedQmlContextProperty(context, ref.filePath, parts[0]!)) return null;
+  if (isShadowedQmlContextProperty(context, ref, parts[0]!)) return null;
   if (!getQmlCppBridgeNameIndex(context).contextProperties.has(parts[0]!)) return null;
 
   const registry = getQmlCppBridgeRegistry(context);
@@ -929,12 +929,57 @@ function isShadowingQmlNode(node: Node, name: string): boolean {
   );
 }
 
+interface QmlObjectRange {
+  openBrace: number;
+  closeBrace: number;
+}
+
+function qmlObjectRanges(source: string): QmlObjectRange[] {
+  const ranges: QmlObjectRange[] = [];
+  const objectPattern = /(^|[^A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_.]*)\s*\{/g;
+  for (const match of source.matchAll(objectPattern)) {
+    const openBrace = source.indexOf('{', match.index);
+    if (openBrace < 0) continue;
+    const closeBrace = matchingBraceOffset(source, openBrace);
+    if (closeBrace < 0) continue;
+    ranges.push({ openBrace, closeBrace });
+  }
+  return ranges;
+}
+
+function innermostQmlObjectRange(
+  source: string,
+  offset: number
+): QmlObjectRange | null {
+  return (
+    qmlObjectRanges(source)
+      .filter((range) => range.openBrace <= offset && offset <= range.closeBrace)
+      .sort(
+        (left, right) =>
+          left.closeBrace - left.openBrace - (right.closeBrace - right.openBrace)
+      )[0] ?? null
+  );
+}
+
 function isShadowedQmlContextProperty(
   context: ResolutionContext,
-  filePath: string,
+  ref: UnresolvedRef,
   name: string
 ): boolean {
-  return context.getNodesInFile(filePath).some((node) => isShadowingQmlNode(node, name));
+  const source = context.readFile(ref.filePath);
+  if (!source) return false;
+
+  const refOffset = offsetFromLineColumn(source, ref.line, ref.column);
+  return context.getNodesInFile(ref.filePath).some((node) => {
+    if (!isShadowingQmlNode(node, name)) return false;
+    const declarationOffset = offsetFromLineColumn(source, node.startLine, node.startColumn);
+    const declarationScope = innermostQmlObjectRange(source, declarationOffset);
+    return (
+      declarationScope != null &&
+      declarationScope.openBrace <= refOffset &&
+      refOffset <= declarationScope.closeBrace
+    );
+  });
 }
 
 function resolveQmlCppContextPropertyRef(
@@ -944,7 +989,7 @@ function resolveQmlCppContextPropertyRef(
   if (ref.language !== 'qml' || ref.referenceKind !== 'references') return null;
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ref.referenceName)) return null;
   if (!isConnectionsComponentNode(findRefSourceNode(ref, context))) return null;
-  if (isShadowedQmlContextProperty(context, ref.filePath, ref.referenceName)) return null;
+  if (isShadowedQmlContextProperty(context, ref, ref.referenceName)) return null;
   if (!getQmlCppBridgeNameIndex(context).contextProperties.has(ref.referenceName)) return null;
 
   const registry = getQmlCppBridgeRegistry(context);
@@ -981,6 +1026,31 @@ function matchingBraceOffset(source: string, openBraceOffset: number): number {
   return -1;
 }
 
+function topLevelQmlIdentifierBinding(
+  block: string,
+  bindingName: string
+): string | null {
+  let depth = 0;
+  let lineStart = 0;
+  for (let index = 0; index <= block.length; index++) {
+    const char = block[index];
+    if (char === '{') depth++;
+    if (char === '}') depth = Math.max(0, depth - 1);
+
+    if (char === '\n' || index === block.length) {
+      if (depth === 0) {
+        const line = block.slice(lineStart, index);
+        const match = new RegExp(
+          `^\\s*${bindingName}\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*$`
+        ).exec(line);
+        if (match?.[1]) return match[1];
+      }
+      lineStart = index + 1;
+    }
+  }
+  return null;
+}
+
 function qmlConnectionsTargetForOffset(source: string, offset: number): string | null {
   let nearest: { openBrace: number; closeBrace: number; targetName: string } | null = null;
   for (const match of source.matchAll(/\bConnections\s*\{/g)) {
@@ -990,10 +1060,10 @@ function qmlConnectionsTargetForOffset(source: string, offset: number): string |
     if (closeBrace < 0 || offset < openBrace || offset > closeBrace) continue;
 
     const block = source.slice(openBrace + 1, closeBrace);
-    const targetMatch = /(?:^|\n)\s*target\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\n|$)/.exec(block);
-    if (!targetMatch?.[1]) continue;
+    const targetName = topLevelQmlIdentifierBinding(block, 'target');
+    if (!targetName) continue;
     if (!nearest || openBrace > nearest.openBrace) {
-      nearest = { openBrace, closeBrace, targetName: targetMatch[1] };
+      nearest = { openBrace, closeBrace, targetName };
     }
   }
   return nearest?.targetName ?? null;
@@ -1021,7 +1091,7 @@ function resolveQmlCppSignalHandler(
     offsetFromLineColumn(source, ref.line, ref.column)
   );
   if (!targetName) return null;
-  if (isShadowedQmlContextProperty(context, ref.filePath, targetName)) return null;
+  if (isShadowedQmlContextProperty(context, ref, targetName)) return null;
   if (!getQmlCppBridgeNameIndex(context).contextProperties.has(targetName)) return null;
 
   const registry = getQmlCppBridgeRegistry(context);
