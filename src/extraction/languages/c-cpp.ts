@@ -148,6 +148,40 @@ export const cExtractor: LanguageExtractor = {
   },
 };
 
+/**
+ * Detect tree-sitter's misparse of a macro-annotated class/struct, e.g.
+ * `class MACRO Name { … }` or `class MACRO Name : public Base { … }` (#946).
+ * Not knowing `MACRO` is a macro, tree-sitter reads `class MACRO` as an
+ * *elaborated type specifier* (a bodyless `class_specifier`/`struct_specifier`
+ * whose "type name" is the macro) and the rest as a function: `Name` becomes the
+ * declarator and the `{ … }` a function body — so the whole declaration surfaces
+ * as a `function_definition` named after the class, with a line range spanning
+ * the entire class body. (A base clause, when present, additionally lands in an
+ * `ERROR` node, but it isn't required — the leading macro alone triggers this.)
+ *
+ * Two structural signals pin it down with no risk to genuine code:
+ *  - the `type` field is a *bodyless* class/struct specifier — an elaborated
+ *    type, not a real inline-defined return type like
+ *    `struct P { int x; } makeP() { … }` (which carries a field list); and
+ *  - the declarator is not a `function_declarator` — a real function definition
+ *    always has one, which also leaves the legal-but-rare `class Foo f() { … }`
+ *    (an elaborated return type on a genuine function) alone.
+ *
+ * The class body is mangled by the same misparse and is unrecoverable, so —
+ * matching how macro-prefixed C prototypes are handled — we drop the spurious
+ * node rather than mint a misleading whole-body `function` that pollutes
+ * callers/impact and skews kind statistics.
+ */
+function isMacroMisparsedTypeDecl(node: SyntaxNode): boolean {
+  const typeNode = getChildByField(node, 'type');
+  if (!typeNode) return false;
+  if (typeNode.type !== 'class_specifier' && typeNode.type !== 'struct_specifier') return false;
+  if (typeNode.namedChildren.some((c: SyntaxNode) => c.type === 'field_declaration_list')) return false;
+  const declarator = getChildByField(node, 'declarator');
+  if (declarator && declarator.type === 'function_declarator') return false;
+  return true;
+}
+
 export const cppExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
   classTypes: ['class_specifier'],
@@ -192,14 +226,17 @@ export const cppExtractor: LanguageExtractor = {
     }
     return undefined;
   },
-  isMisparsedFunction: (name) => {
+  isMisparsedFunction: (name, node) => {
     // C++ macros like NLOHMANN_JSON_NAMESPACE_BEGIN cause tree-sitter to misparse
     // namespace blocks as function_definitions (e.g. name = "namespace detail").
     // Also filter C++ keywords that tree-sitter occasionally misinterprets as
     // function/method names (e.g. switch statements inside macro-confused scopes).
     if (name.startsWith('namespace')) return true;
     const cppKeywords = ['switch', 'if', 'for', 'while', 'do', 'case', 'return'];
-    return cppKeywords.includes(name);
+    if (cppKeywords.includes(name)) return true;
+    // `class MACRO Name : public Base { … }` misparses to a function_definition
+    // named after the class — drop that phantom (#946).
+    return isMacroMisparsedTypeDecl(node);
   },
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();

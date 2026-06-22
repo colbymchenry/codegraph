@@ -2582,6 +2582,63 @@ std::unique_ptr<Widget> makeWidget() { return nullptr; }
     });
   });
 
+  describe('C++ macro-prefixed class/struct misparse (#946)', () => {
+    // An export/visibility macro before the class name plus a base clause
+    // (`class MACRO Name : public Base { … }`) makes tree-sitter read `class
+    // MACRO` as an elaborated type and the whole declaration as a
+    // function_definition named after the class, spanning the entire body — a
+    // phantom `function` that polluted callers/impact/blast-radius. It's dropped.
+    it('does not mint a phantom function for a macro-annotated class that inherits', () => {
+      const code = `#pragma once
+#define MAPCORE_EXPORT __attribute__((visibility("default")))
+
+class DataProvider {
+public:
+    virtual bool Request(void* param) = 0;
+};
+
+class MAPCORE_EXPORT LocalDataProvider : public DataProvider
+{
+public:
+    LocalDataProvider(int dataType);
+    virtual bool Request(void* param) override;
+};
+`;
+      // A header rich in C++ (class / public: / virtual) detects as C++ — the
+      // issue's exact scenario (a `.h` file). Guard it so a detection regression
+      // can't make this test pass for the wrong reason.
+      expect(detectLanguage('provider.h', code)).toBe('cpp');
+      const result = extractFromSource('provider.h', code);
+
+      // The misparse used to surface as `function | LocalDataProvider` spanning
+      // the whole class body — a false caller in the graph. It's gone now.
+      expect(
+        result.nodes.find((n) => n.name === 'LocalDataProvider' && n.kind === 'function')
+      ).toBeUndefined();
+
+      // The sibling class without the macro is unaffected — still a class.
+      expect(result.nodes.find((n) => n.name === 'DataProvider')?.kind).toBe('class');
+    });
+
+    it('drops the struct variant too, without dropping a genuine class', () => {
+      const code = `
+#define API __declspec(dllexport)
+struct API Widget : public Base { int x; };
+class Plain : public Base { public: int y; };
+`;
+      const result = extractFromSource('widget.cpp', code);
+
+      // `struct MACRO Name : Base { … }` misparses the same way — no phantom function.
+      expect(
+        result.nodes.find((n) => n.name === 'Widget' && n.kind === 'function')
+      ).toBeUndefined();
+
+      // A normal class with a base clause and no macro must still be a class — the
+      // drop is precise, not a blanket "class with inheritance" filter.
+      expect(result.nodes.find((n) => n.name === 'Plain')?.kind).toBe('class');
+    });
+  });
+
   describe('C/C++ imports', () => {
     it('should extract system include', () => {
       const code = `#include <iostream>`;
