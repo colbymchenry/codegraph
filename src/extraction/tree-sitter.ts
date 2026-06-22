@@ -1530,6 +1530,14 @@ export class TreeSitterExtractor {
         this.visitNode(child);
       }
     }
+
+    // Synthesize compile-time-generated members (Lombok accessors, #912). Runs
+    // after the body so the hook can dedup against hand-written members, and
+    // while the class is still on the stack so containment/QNs attach.
+    if (this.extractor.synthesizeMembers) {
+      this.extractor.synthesizeMembers(node, this.makeExtractorContext());
+    }
+
     this.nodeStack.pop();
   }
 
