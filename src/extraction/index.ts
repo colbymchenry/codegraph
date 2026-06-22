@@ -19,6 +19,7 @@ import {
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
+import { loadExtensionOverrides } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -637,14 +638,17 @@ interface GitChanges {
 function getGitChangedFiles(rootDir: string): GitChanges | null {
   try {
     const changes: GitChanges = { modified: [], added: [], deleted: [] };
-    collectGitStatus(rootDir, '', changes);
+    // Custom extension → language overrides from the project's codegraph.json,
+    // so change detection sees the same custom-extension files the full index does.
+    const overrides = loadExtensionOverrides(rootDir);
+    collectGitStatus(rootDir, '', changes, overrides);
     return changes;
   } catch {
     return null;
   }
 }
 
-function collectGitStatus(repoDir: string, prefix: string, out: GitChanges): void {
+function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>): void {
   const output = execFileSync(
     'git',
     ['status', '--porcelain', '--no-renames'],
@@ -678,7 +682,7 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges): voi
     }
 
     const filePath = normalizePath(prefix + rel);
-    if (!isSourceFile(filePath)) continue;
+    if (!isSourceFile(filePath, overrides)) continue;
 
     if (statusCode.includes('D')) {
       // Deletions stay unfiltered: getChangedFiles acts on one only when the
@@ -704,11 +708,11 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges): voi
   // nested deeper) and under this repo's gitignored dirs.
   for (const rel of untrackedDirs) {
     for (const repoRel of findNestedGitRepos(path.join(repoDir, rel), rel)) {
-      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out);
+      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out, overrides);
     }
   }
   for (const rel of findIgnoredEmbeddedRepos(repoDir)) {
-    collectGitStatus(path.join(repoDir, rel), prefix + rel, out);
+    collectGitStatus(path.join(repoDir, rel), prefix + rel, out, overrides);
   }
 }
 
@@ -723,13 +727,16 @@ export function scanDirectory(
   rootDir: string,
   onProgress?: (current: number, file: string) => void
 ): string[] {
+  // Custom extension → language overrides from the project's codegraph.json.
+  const overrides = loadExtensionOverrides(rootDir);
+
   // Fast path: use git to get all visible files (respects .gitignore everywhere)
   const gitFiles = getGitVisibleFiles(rootDir);
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath)) {
+      if (isSourceFile(filePath, overrides)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -750,12 +757,15 @@ export async function scanDirectoryAsync(
   rootDir: string,
   onProgress?: (current: number, file: string) => void
 ): Promise<string[]> {
+  // Custom extension → language overrides from the project's codegraph.json.
+  const overrides = loadExtensionOverrides(rootDir);
+
   const gitFiles = getGitVisibleFiles(rootDir);
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath)) {
+      if (isSourceFile(filePath, overrides)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -781,6 +791,8 @@ function scanDirectoryWalk(
   const files: string[] = [];
   let count = 0;
   const visitedDirs = new Set<string>();
+  // Custom extension → language overrides from the project's codegraph.json.
+  const overrides = loadExtensionOverrides(rootDir);
 
   // A .gitignore matcher scoped to the directory that declared it. Patterns in
   // a nested .gitignore are relative to that directory, so we keep the dir
@@ -857,7 +869,7 @@ function scanDirectoryWalk(
               walk(fullPath, active);
             }
           } else if (stat.isFile()) {
-            if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath)) {
+            if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath, overrides)) {
               files.push(relativePath);
               count++;
               onProgress?.(count, relativePath);
@@ -874,7 +886,7 @@ function scanDirectoryWalk(
           walk(fullPath, active);
         }
       } else if (entry.isFile()) {
-        if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath)) {
+        if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath, overrides)) {
           files.push(relativePath);
           count++;
           onProgress?.(count, relativePath);
@@ -994,6 +1006,11 @@ export class ExtractionOrchestrator {
     let totalNodes = 0;
     let totalEdges = 0;
 
+    // Custom extension → language overrides from the project's codegraph.json.
+    // Threaded into language detection so custom-extension files load the right
+    // grammar and store under the mapped language.
+    const overrides = loadExtensionOverrides(this.rootDir);
+
     const log = verbose
       ? (msg: string) => { console.log(`[worker] ${msg}`); }
       : (_msg: string) => {};
@@ -1050,7 +1067,7 @@ export class ExtractionOrchestrator {
     await new Promise(resolve => setImmediate(resolve));
 
     // Detect needed languages and load grammars in the parse worker
-    const neededLanguages = [...new Set(files.map((f) => detectLanguage(f)))];
+    const neededLanguages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides)))];
     // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded when c is needed
     if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
       neededLanguages.push('cpp');
@@ -1161,12 +1178,17 @@ export class ExtractionOrchestrator {
     }
 
     async function requestParse(filePath: string, content: string): Promise<ExtractionResult> {
+      // Resolve the language on the main thread (where the project's
+      // codegraph.json overrides are loaded) and hand it to the worker, so the
+      // worker never needs the override map itself.
+      const language = detectLanguage(filePath, content, overrides);
+
       if (!WorkerClass) {
         // In-process fallback
         return extractFromSource(
           filePath,
           content,
-          detectLanguage(filePath, content),
+          language,
           frameworkNames
         );
       }
@@ -1198,7 +1220,7 @@ export class ExtractionOrchestrator {
         }, timeoutMs);
 
         pendingParses.set(id, { resolve, reject, timer });
-        worker.postMessage({ type: 'parse', id, filePath, content, frameworkNames });
+        worker.postMessage({ type: 'parse', id, filePath, content, frameworkNames, language });
       });
     }
 
@@ -1312,7 +1334,7 @@ export class ExtractionOrchestrator {
 
         // Store in database on main thread (SQLite is not thread-safe)
         if (result.nodes.length > 0 || result.errors.length === 0) {
-          const language = detectLanguage(filePath, content);
+          const language = detectLanguage(filePath, content, overrides);
           this.storeExtractionResult(filePath, content, language, stats, result);
         }
 
@@ -1333,7 +1355,7 @@ export class ExtractionOrchestrator {
           // Files with no symbols but no errors (yaml, twig, properties) are
           // tracked at the file level — count them as indexed so the CLI
           // doesn't misleadingly report "No files found to index".
-          const lang = detectLanguage(filePath, content);
+          const lang = detectLanguage(filePath, content, overrides);
           if (isFileLevelOnlyLanguage(lang)) {
             filesIndexed++;
           } else {
@@ -1393,7 +1415,7 @@ export class ExtractionOrchestrator {
         }
 
         if (result.nodes.length > 0 || result.errors.length === 0) {
-          const language = detectLanguage(filePath, content);
+          const language = detectLanguage(filePath, content, overrides);
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
           this.storeExtractionResult(filePath, content, language, stats, result);
 
@@ -1444,7 +1466,7 @@ export class ExtractionOrchestrator {
           }
 
           if (result.nodes.length > 0 || result.errors.length === 0) {
-            const language = detectLanguage(filePath, fullContent);
+            const language = detectLanguage(filePath, fullContent, overrides);
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
             this.storeExtractionResult(filePath, fullContent, language, stats, result);
 
@@ -1607,8 +1629,8 @@ export class ExtractionOrchestrator {
       };
     }
 
-    // Detect language
-    const language = detectLanguage(relativePath, content);
+    // Detect language (honoring the project's codegraph.json extension overrides)
+    const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
     if (!isLanguageSupported(language)) {
       return {
         nodes: [],
@@ -1863,7 +1885,8 @@ export class ExtractionOrchestrator {
 
     // Load only grammars needed for changed files
     if (filesToIndex.length > 0) {
-      const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f)))];
+      const overrides = loadExtensionOverrides(this.rootDir);
+      const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f, undefined, overrides)))];
       // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded
       if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
         neededLanguages.push('cpp');

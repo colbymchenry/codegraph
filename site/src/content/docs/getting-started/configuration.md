@@ -1,9 +1,9 @@
 ---
 title: Configuration
-description: CodeGraph is zero-config — there are no config files.
+description: CodeGraph is zero-config by default, with one optional file for mapping custom extensions.
 ---
 
-There isn't any — CodeGraph is **zero-config**, with **no config file** to write or keep in sync. Language support is automatic from the file extension; there's nothing to wire up per language.
+Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file is for mapping [custom file extensions](#custom-file-extensions).
 
 ## What it skips out of the box
 
@@ -16,6 +16,23 @@ There isn't any — CodeGraph is **zero-config**, with **no config file** to wri
 To keep something else out, add it to `.gitignore`. To pull a default-excluded directory back **in** (e.g. you really want a vendored dependency indexed), add a negation — `!vendor/`.
 
 The defaults apply uniformly, so committing a dependency or build directory doesn't force it into the graph — the `.gitignore` negation is the explicit opt-in.
+
+## Custom file extensions
+
+If your project uses a non-standard extension for a [supported language](/codegraph/reference/languages/) — say `.dota_lua` for Lua, or `.tpl` for PHP — those files are skipped by default, because the extension isn't one CodeGraph recognizes. Map them with an optional `codegraph.json` at your project root:
+
+```json
+{
+  "extensions": {
+    ".dota_lua": "lua",
+    ".tpl": "php"
+  }
+}
+```
+
+Each value is a supported language id. The mappings merge on top of the built-in defaults and win on conflict, so you can also re-point a built-in (e.g. `".h": "cpp"`). Commit the file to share the mapping with your team.
+
+A typo'd language or a malformed file is warned about and skipped — it never breaks indexing — and a project with no `codegraph.json` behaves exactly as before. Re-index (`codegraph index`) after adding or changing mappings.
 
 ## Where data lives
 
