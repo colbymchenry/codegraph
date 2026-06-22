@@ -463,6 +463,18 @@ function isBuiltinLoaderComponentType(typeName: string | null, source: string): 
   return !!match?.[1] && qtQuickAliases(source).has(match[1]);
 }
 
+function nearestQmlObjectType(node: SyntaxNode, source: string): string | null {
+  let current: SyntaxNode | null = node.parent;
+  while (current) {
+    if (current.type === 'ui_object_definition') {
+      const typeNameNode = getChildByField(current, 'type_name');
+      return typeNameNode ? dottedText(typeNameNode, source) : null;
+    }
+    current = current.parent;
+  }
+  return null;
+}
+
 function isFunctionLikeExpression(node: SyntaxNode | null): node is SyntaxNode {
   return !!node && (node.type === 'function_expression' || node.type === 'arrow_function');
 }
@@ -769,7 +781,7 @@ function visitQmlFunction(node: SyntaxNode, ctx: ExtractorContext): boolean {
     signature: conciseSignature(node, ctx.source),
   });
   if (!symbol) return true;
-  if (kind === 'method') {
+  if (kind === 'method' && nearestQmlObjectType(node, ctx.source) === 'Connections') {
     addReferenceFromNode(ctx, symbol.id, symbolName, nameNode ?? node);
   }
 

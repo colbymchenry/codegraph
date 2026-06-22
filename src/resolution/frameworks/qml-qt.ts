@@ -87,8 +87,28 @@ interface QmlCppBridgeRegistryCacheEntry {
   registry: QmlCppBridgeRegistry;
 }
 
+interface QmlCppBridgeSourceCacheEntry {
+  versionKey: string;
+  key: string;
+  sources: Array<readonly [string, string | null]>;
+}
+
+interface QmlCppBridgeNameIndex {
+  contextProperties: Set<string>;
+  creatableTypes: Set<string>;
+  singletonTypes: Set<string>;
+  uncreatableTypes: Set<string>;
+}
+
+interface QmlCppBridgeNameIndexCacheEntry {
+  key: string;
+  index: QmlCppBridgeNameIndex;
+}
+
 const moduleCache = new WeakMap<ResolutionContext, QmlDirModuleCacheEntry>();
 const importCache = new WeakMap<ResolutionContext, Map<string, QmlModuleImportCacheEntry>>();
+const bridgeSourceCache = new WeakMap<ResolutionContext, QmlCppBridgeSourceCacheEntry>();
+const bridgeNameIndexCache = new WeakMap<ResolutionContext, QmlCppBridgeNameIndexCacheEntry>();
 const bridgeRegistryCache = new WeakMap<ResolutionContext, QmlCppBridgeRegistryCacheEntry>();
 
 function hasQmlFiles(context: ResolutionContext): boolean {
@@ -97,6 +117,33 @@ function hasQmlFiles(context: ResolutionContext): boolean {
 
 function isCppBridgeFile(filePath: string): boolean {
   return /\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx)$/i.test(filePath);
+}
+
+function cppBridgeFiles(context: ResolutionContext): string[] {
+  return context.getAllFiles().filter(isCppBridgeFile).sort();
+}
+
+function cppBridgeVersionKey(context: ResolutionContext): string {
+  return cppBridgeFiles(context)
+    .map((filePath) => {
+      const newestNodeUpdate = context
+        .getNodesInFile(filePath)
+        .reduce((max, node) => Math.max(max, node.updatedAt), 0);
+      return `${filePath}:${newestNodeUpdate}`;
+    })
+    .join('\0');
+}
+
+function getQmlCppBridgeSources(context: ResolutionContext): QmlCppBridgeSourceCacheEntry {
+  const versionKey = cppBridgeVersionKey(context);
+  const cached = bridgeSourceCache.get(context);
+  if (cached?.versionKey === versionKey) return cached;
+
+  const sources = cppBridgeFiles(context).map((filePath) => [filePath, context.readFile(filePath)] as const);
+  const key = sources.map(([filePath, source]) => `${filePath}\0${source ?? ''}`).join('\0');
+  const entry = { versionKey, key, sources };
+  bridgeSourceCache.set(context, entry);
+  return entry;
 }
 
 function dirname(filePath: string): string {
@@ -318,6 +365,41 @@ function parseQmlCppContextProperties(registry: QmlCppBridgeRegistry, source: st
   }
 }
 
+function getQmlCppBridgeNameIndex(context: ResolutionContext): QmlCppBridgeNameIndex {
+  const sourceEntry = getQmlCppBridgeSources(context);
+  const cached = bridgeNameIndexCache.get(context);
+  if (cached?.key === sourceEntry.key) return cached.index;
+
+  const index: QmlCppBridgeNameIndex = {
+    contextProperties: new Set(),
+    creatableTypes: new Set(),
+    singletonTypes: new Set(),
+    uncreatableTypes: new Set(),
+  };
+  const registrationPattern =
+    /\b(qmlRegisterType|qmlRegisterSingletonType|qmlRegisterUncreatableType)\s*<\s*[A-Za-z_][A-Za-z0-9_:]*\s*>\s*\(\s*(['"])([^'"]+)\2\s*,\s*\d+\s*,\s*\d+\s*,\s*(['"])([^'"]+)\4/g;
+  const contextPropertyPattern =
+    /setContextProperty\s*\(\s*(['"])([^'"]+)\1\s*,\s*&?\s*[A-Za-z_][A-Za-z0-9_]*/g;
+
+  for (const [, source] of sourceEntry.sources) {
+    if (!source) continue;
+    for (const match of source.matchAll(registrationPattern)) {
+      const api = match[1];
+      const qmlName = match[5];
+      if (!api || !qmlName) continue;
+      if (api === 'qmlRegisterSingletonType') index.singletonTypes.add(qmlName);
+      else if (api === 'qmlRegisterUncreatableType') index.uncreatableTypes.add(qmlName);
+      else index.creatableTypes.add(qmlName);
+    }
+    for (const match of source.matchAll(contextPropertyPattern)) {
+      if (match[2]) index.contextProperties.add(match[2]);
+    }
+  }
+
+  bridgeNameIndexCache.set(context, { key: sourceEntry.key, index });
+  return index;
+}
+
 function attachQmlCppNodes(context: ResolutionContext, registry: QmlCppBridgeRegistry): void {
   for (const node of context.getNodesByKind('class')) {
     if (node.language !== 'cpp') continue;
@@ -341,11 +423,7 @@ function attachQmlCppNodes(context: ResolutionContext, registry: QmlCppBridgeReg
 }
 
 function getQmlCppBridgeRegistry(context: ResolutionContext): QmlCppBridgeRegistry {
-  const sources = context
-    .getAllFiles()
-    .filter(isCppBridgeFile)
-    .map((filePath) => [filePath, context.readFile(filePath)] as const);
-  const key = sources.map(([filePath, source]) => `${filePath}\0${source ?? ''}`).join('\0');
+  const { key, sources } = getQmlCppBridgeSources(context);
   const cached = bridgeRegistryCache.get(context);
   if (cached?.key === key) return cached.registry;
 
@@ -754,10 +832,17 @@ function resolveQmlCppBridgeCall(
   const parts = ref.referenceName.split('.');
   if (parts.length < 2) return null;
 
-  const registry = getQmlCppBridgeRegistry(context);
   const methodName = parts[parts.length - 1]!;
   if (parts.length === 2) {
     const receiver = parts[0]!;
+    if (isShadowedQmlContextProperty(context, ref.filePath, receiver)) return null;
+
+    const bridgeNames = getQmlCppBridgeNameIndex(context);
+    if (!bridgeNames.contextProperties.has(receiver) && !bridgeNames.singletonTypes.has(receiver)) {
+      return null;
+    }
+
+    const registry = getQmlCppBridgeRegistry(context);
     const contextProperty = registry.contextProperties.get(receiver);
     if (contextProperty) {
       const classFacts = registry.classes.get(simpleCppTypeName(contextProperty.cppType));
@@ -781,6 +866,9 @@ function resolveQmlCppBridgeCall(
   if (parts.length === 3) {
     const alias = parts[0]!;
     const qmlName = parts[1]!;
+    if (!getQmlCppBridgeNameIndex(context).singletonTypes.has(qmlName)) return null;
+
+    const registry = getQmlCppBridgeRegistry(context);
     const registration = importedBridgeRegistration(
       context,
       registry,
@@ -804,6 +892,8 @@ function resolveQmlCppPropertyRead(
   if (ref.language !== 'qml' || ref.referenceKind !== 'references') return null;
   const parts = ref.referenceName.split('.');
   if (parts.length !== 2) return null;
+  if (isShadowedQmlContextProperty(context, ref.filePath, parts[0]!)) return null;
+  if (!getQmlCppBridgeNameIndex(context).contextProperties.has(parts[0]!)) return null;
 
   const registry = getQmlCppBridgeRegistry(context);
   const contextProperty = registry.contextProperties.get(parts[0]!);
@@ -822,12 +912,40 @@ function findRefSourceNode(ref: UnresolvedRef, context: ResolutionContext): Node
   return context.getNodesInFile(ref.filePath).find((node) => node.id === ref.fromNodeId);
 }
 
+function isConnectionsComponentNode(node: Node | undefined): boolean {
+  return node?.language === 'qml' && node.kind === 'component' && node.signature === 'Connections';
+}
+
+function isShadowingQmlNode(node: Node, name: string): boolean {
+  return (
+    node.language === 'qml' &&
+    node.name === name &&
+    (node.kind === 'variable' ||
+      node.kind === 'property' ||
+      node.kind === 'function' ||
+      node.kind === 'method' ||
+      node.kind === 'component' ||
+      node.kind === 'enum')
+  );
+}
+
+function isShadowedQmlContextProperty(
+  context: ResolutionContext,
+  filePath: string,
+  name: string
+): boolean {
+  return context.getNodesInFile(filePath).some((node) => isShadowingQmlNode(node, name));
+}
+
 function resolveQmlCppContextPropertyRef(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
   if (ref.language !== 'qml' || ref.referenceKind !== 'references') return null;
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ref.referenceName)) return null;
+  if (!isConnectionsComponentNode(findRefSourceNode(ref, context))) return null;
+  if (isShadowedQmlContextProperty(context, ref.filePath, ref.referenceName)) return null;
+  if (!getQmlCppBridgeNameIndex(context).contextProperties.has(ref.referenceName)) return null;
 
   const registry = getQmlCppBridgeRegistry(context);
   const contextProperty = registry.contextProperties.get(ref.referenceName);
@@ -864,6 +982,7 @@ function matchingBraceOffset(source: string, openBraceOffset: number): number {
 }
 
 function qmlConnectionsTargetForOffset(source: string, offset: number): string | null {
+  let nearest: { openBrace: number; closeBrace: number; targetName: string } | null = null;
   for (const match of source.matchAll(/\bConnections\s*\{/g)) {
     const openBrace = source.indexOf('{', match.index);
     if (openBrace < 0) continue;
@@ -871,9 +990,13 @@ function qmlConnectionsTargetForOffset(source: string, offset: number): string |
     if (closeBrace < 0 || offset < openBrace || offset > closeBrace) continue;
 
     const block = source.slice(openBrace + 1, closeBrace);
-    return /\btarget\s*:\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(block)?.[1] ?? null;
+    const targetMatch = /(?:^|\n)\s*target\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\n|$)/.exec(block);
+    if (!targetMatch?.[1]) continue;
+    if (!nearest || openBrace > nearest.openBrace) {
+      nearest = { openBrace, closeBrace, targetName: targetMatch[1] };
+    }
   }
-  return null;
+  return nearest?.targetName ?? null;
 }
 
 function qmlSignalNameFromHandler(handlerName: string): string | null {
@@ -898,6 +1021,8 @@ function resolveQmlCppSignalHandler(
     offsetFromLineColumn(source, ref.line, ref.column)
   );
   if (!targetName) return null;
+  if (isShadowedQmlContextProperty(context, ref.filePath, targetName)) return null;
+  if (!getQmlCppBridgeNameIndex(context).contextProperties.has(targetName)) return null;
 
   const registry = getQmlCppBridgeRegistry(context);
   const contextProperty = registry.contextProperties.get(targetName);
@@ -936,6 +1061,13 @@ function resolveQmlCppRegisteredTypeReference(
   if (!componentName || !isExplicitQmlPropertyTypeRef(ref, context, ref.referenceName)) {
     return null;
   }
+  const bridgeNames = getQmlCppBridgeNameIndex(context);
+  if (
+    !bridgeNames.creatableTypes.has(componentName) &&
+    !bridgeNames.uncreatableTypes.has(componentName)
+  ) {
+    return null;
+  }
 
   const parts = ref.referenceName.split('.');
   const alias = parts.length > 1 ? parts[0] : undefined;
@@ -965,6 +1097,7 @@ function resolveQmlCppRegisteredComponent(
 
   const componentName = componentTypeName(ref.referenceName);
   if (!componentName) return null;
+  if (!getQmlCppBridgeNameIndex(context).creatableTypes.has(componentName)) return null;
 
   const parts = ref.referenceName.split('.');
   const alias = parts.length > 1 ? parts[0] : undefined;

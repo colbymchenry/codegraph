@@ -1471,6 +1471,7 @@ Item {
   id: root
   property string shownTitle: viewModel.title
   property OtherModel selectedModel: null
+  property var localTarget: ({})
 
   Component.onCompleted: {
     viewModel.refresh()
@@ -1484,6 +1485,17 @@ Item {
     function onTitleChanged() {
       viewModel.refresh()
     }
+
+    Connections {
+      target: localTarget
+      function onTitleChanged() {
+        viewModel.refresh()
+      }
+    }
+  }
+
+  function onTitleChanged() {
+    viewModel.refresh()
   }
 
   MyButton {
@@ -1501,7 +1513,12 @@ Item {
     await graph.indexAll();
 
     const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
-    const onTitleChanged = graph.getNodesByName('onTitleChanged').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const onTitleChangedHandlers = graph.getNodesByName('onTitleChanged')
+      .filter((n) => n.kind === 'method' && n.filePath === 'Main.qml')
+      .sort((a, b) => a.startLine - b.startLine);
+    const connectionTitleChanged = onTitleChangedHandlers[0];
+    const nestedConnectionTitleChanged = onTitleChangedHandlers[1];
+    const ordinaryTitleChanged = onTitleChangedHandlers[2];
     const shownTitle = graph.getNodesByName('shownTitle').find((n) => n.kind === 'property' && n.filePath === 'Main.qml');
     const selectedModel = graph.getNodesByName('selectedModel').find((n) => n.kind === 'property' && n.filePath === 'Main.qml');
     const connections = graph.getNodesByKind('component').find((n) => n.signature === 'Connections' && n.filePath === 'Main.qml');
@@ -1519,7 +1536,9 @@ Item {
     const otherModel = graph.getNodesByName('OtherModel').find((n) => n.kind === 'class' && n.filePath === 'main.cpp');
 
     expect(onCompleted).toBeDefined();
-    expect(onTitleChanged).toBeDefined();
+    expect(connectionTitleChanged).toBeDefined();
+    expect(nestedConnectionTitleChanged).toBeDefined();
+    expect(ordinaryTitleChanged).toBeDefined();
     expect(shownTitle).toBeDefined();
     expect(selectedModel).toBeDefined();
     expect(connections).toBeDefined();
@@ -1542,13 +1561,81 @@ Item {
     expect(onCompletedEdges.some((edge) => edge.kind === 'calls' && edge.target === themeColor!.id)).toBe(true);
     expect(onCompletedEdges.some((edge) => edge.kind === 'calls' && edge.target === otherModelRefresh!.id)).toBe(false);
     expect(onCompletedEdges.some((edge) => edge.kind === 'calls' && edge.target === viewModelHidden!.id)).toBe(false);
-    expect(graph.getOutgoingEdges(onTitleChanged!.id).some((edge) => edge.kind === 'calls' && edge.target === viewModelRefresh!.id)).toBe(true);
-    expect(graph.getOutgoingEdges(onTitleChanged!.id).some((edge) => edge.kind === 'references' && edge.target === viewModelTitleChanged!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(connectionTitleChanged!.id).some((edge) => edge.kind === 'calls' && edge.target === viewModelRefresh!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(connectionTitleChanged!.id).some((edge) => edge.kind === 'references' && edge.target === viewModelTitleChanged!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(nestedConnectionTitleChanged!.id).some((edge) => edge.kind === 'references' && edge.target === viewModelTitleChanged!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(ordinaryTitleChanged!.id).some((edge) => edge.kind === 'references' && edge.target === viewModelTitleChanged!.id)).toBe(false);
     expect(graph.getOutgoingEdges(connections!.id).some((edge) => edge.kind === 'references' && edge.target === viewModel!.id)).toBe(true);
     expect(graph.getOutgoingEdges(shownTitle!.id).some((edge) => edge.kind === 'references' && edge.target === viewModelTitle!.id)).toBe(true);
     expect(graph.getOutgoingEdges(selectedModel!.id).some((edge) => edge.kind === 'references' && edge.target === otherModel!.id)).toBe(true);
     expect(graph.getOutgoingEdges(registeredButton!.id).some((edge) => edge.kind === 'references' && edge.target === myButton!.id)).toBe(true);
     expect(graph.getOutgoingEdges(invalidOtherModelInstance!.id).some((edge) => edge.kind === 'references' && edge.target === otherModel!.id)).toBe(false);
+  });
+
+  it('does not let C++ context properties steal shadowed QML names', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+
+class ViewModel : public QObject {
+  Q_OBJECT
+
+public:
+  Q_INVOKABLE void refresh();
+};
+
+void ViewModel::refresh() {}
+
+int main() {
+  QQmlApplicationEngine engine;
+  ViewModel vm;
+  engine.rootContext()->setContextProperty("viewModel", &vm);
+  return 0;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  id: root
+  property var viewModel: ({ refresh: function() {} })
+
+  Component.onCompleted: {
+    viewModel.refresh()
+  }
+
+  Connections {
+    target: viewModel
+    function onRefresh() {
+      viewModel.refresh()
+    }
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const onRefresh = graph.getNodesByName('onRefresh').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const connections = graph.getNodesByKind('component').find((n) => n.signature === 'Connections' && n.filePath === 'Main.qml');
+    const viewModelClass = graph.getNodesByName('ViewModel').find((n) => n.kind === 'class' && n.filePath === 'main.cpp');
+    const viewModelRefresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::refresh'));
+
+    expect(onCompleted).toBeDefined();
+    expect(onRefresh).toBeDefined();
+    expect(connections).toBeDefined();
+    expect(viewModelClass).toBeDefined();
+    expect(viewModelRefresh).toBeDefined();
+
+    expect(graph.getOutgoingEdges(onCompleted!.id).some((edge) => edge.kind === 'calls' && edge.target === viewModelRefresh!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(onRefresh!.id).some((edge) => edge.kind === 'calls' && edge.target === viewModelRefresh!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(connections!.id).some((edge) => edge.kind === 'references' && edge.target === viewModelClass!.id)).toBe(false);
   });
 
   it('uses the QML Qt framework resolver for QML-specific cross-file references', async () => {
