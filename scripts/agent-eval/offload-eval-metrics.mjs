@@ -48,7 +48,7 @@ for (const line of lines) {
       // "### Referenced source — verbatim" appendix). A refs call that cited nothing
       // valid falls back to RAW source, which is correctly counted as a raw explore below.
       if (/Synthesized by CodeGraph|### Referenced source — verbatim/.test(text)) { offloadAnswers.push(text); exploreResults++; }
-      else if (/Found \d+ symbols? across|## Exploration:/.test(text)) exploreResults++;
+      else if (/Found \d+ symbols? across|\*\*Exploration:/.test(text)) exploreResults++;
     }
   }
   if (ev.type === 'result') result = ev;

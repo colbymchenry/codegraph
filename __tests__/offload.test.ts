@@ -231,16 +231,16 @@ describe('reasoning offload', () => {
   describe('stripAgentDirectives', () => {
     it('drops the agent-directed header but keeps source sections', () => {
       const ctx = [
-        '## Exploration: how does X work',
+        '**Exploration: how does X work**',
         'Found 12 symbols across 3 files.',
         '',
-        '#### src/a.ts — foo(function)',
+        '**`src/a.ts`** — foo(function)',
         'code body',
       ].join('\n');
       const stripped = stripAgentDirectives(ctx);
-      expect(stripped).not.toContain('## Exploration:');
+      expect(stripped).not.toContain('**Exploration:');
       expect(stripped).not.toContain('Found 12 symbols');
-      expect(stripped).toContain('#### src/a.ts');
+      expect(stripped).toContain('**`src/a.ts`');
       expect(stripped).toContain('code body');
     });
   });

@@ -124,8 +124,8 @@ CORRECTNESS OVERRIDES EVERYTHING. Being incomplete is fine; being WRONG is not �
 const SYSTEM_PROMPT_REPORT = `${ROLE}
 
 Produce a single self-contained exploration report, formatted exactly like the summary a thorough senior engineer hands back after investigating. Clean Markdown, in this shape:
-- Open with the one-line coverage verdict (above). Then, ONLY if covered, a title: "## <Topic> — <Flow / Trace / Overview>". If coverage is not-found, the verdict + the names to explore next is the entire reply. NO preamble ("Here is", "Now I understand").
-- Body is numbered sections with bold headers: "### 1. **<step or aspect>**", "### 2. **<...>**", …
+- Open with the one-line coverage verdict (above). Then, ONLY if covered, a bold title: "**<Topic> — <Flow / Trace / Overview>**". If coverage is not-found, the verdict + the names to explore next is the entire reply. NO preamble ("Here is", "Now I understand"). Use bold labels for headers, never Markdown ATX headings (\`#\`/\`##\`) — they render oversized in some clients.
+- Body is numbered sections with bold headers: "**1. <step or aspect>**", "**2. <...>**", …
 - Cite every location inline and in bold as **\`path/to/file.ts:line\`** (or a line range), exactly as given in the source. Bold key classes, methods, and symbols.
 - For a flow/path question, include a call-chain diagram in a fenced code block using down-arrows:
   \`\`\`
@@ -135,7 +135,7 @@ Produce a single self-contained exploration report, formatted exactly like the s
   \`\`\`
 - Quote only the code lines that carry the logic, in fenced code blocks, keeping their line numbers. Keep snippets tight.
 - Separate major sections with a "---" rule.
-- End with "### Summary" — the end-to-end chain in one compact block.
+- End with "**Summary**" — the end-to-end chain in one compact block.
 
 Be precise and dense — an engineer should be able to act from this report without opening a file.`;
 
@@ -172,11 +172,13 @@ export function stripAgentDirectives(context: string): string {
   let i = 0;
   while (i < lines.length) {
     const ln = lines[i] ?? '';
-    if (/^##\s+Exploration:/.test(ln) || /^Found \d+ symbols? across \d+ files?/.test(ln)) { i++; continue; }
-    // "Not shown above" pointer section: drop header + its bullets/blanks until the next rule/heading/blockquote.
-    if (/^###\s+Not shown above/i.test(ln)) {
+    // Headers are bold labels, not ATX headings (tools.ts, issue #778): the
+    // explore header is `**Exploration: …**`, file sections start with ``**` ``.
+    if (/^\*\*Exploration:/.test(ln) || /^Found \d+ symbols? across \d+ files?/.test(ln)) { i++; continue; }
+    // "Not shown above" pointer section: drop header + its bullets/blanks until the next rule/header/blockquote.
+    if (/^\*\*Not shown above/i.test(ln)) {
       i++;
-      while (i < lines.length && !/^(---|#{2,4}\s|>\s)/.test(lines[i] ?? '')) i++;
+      while (i < lines.length && !/^(---|\*\*|>\s)/.test(lines[i] ?? '')) i++;
       continue;
     }
     // Agent-directed blockquote notes (completeness / budget / trimmed).

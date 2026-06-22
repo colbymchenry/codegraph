@@ -9,7 +9,7 @@
  * "### Relationships" section would have caught it, but that is disabled below 500 files.
  * Net: on a small RTK app the synthesized edge existed in the graph yet was invisible to
  * the agent. The fix feeds a `dynNamed` set (named non-callable endpoints that participate
- * in a heuristic edge) to the tier-independent "## Dynamic-dispatch links" scan. This test
+ * in a heuristic edge) to the tier-independent "**Dynamic-dispatch links**" scan. This test
  * pins it on a deliberately tiny (<150-file) fixture so the Relationships gate is OFF and
  * the dynamic-dispatch-links path is the ONLY thing that can surface the hop.
  */
@@ -77,7 +77,7 @@ export const outerThunk = createAsyncThunk('app/outer', async (n: number, { disp
 
     // The synthesized hop now surfaces (was invisible: both endpoints `constant` AND the
     // small-repo Relationships section is off).
-    expect(text).toContain('## Dynamic-dispatch links among your symbols');
+    expect(text).toContain('**Dynamic-dispatch links among your symbols');
     expect(text).toMatch(/outerThunk\s+→\s+innerThunk/);
     // It reads as a dynamic-dispatch bridge with its wiring site, not a bare `calls`.
     expect(text).toMatch(/dynamic: redux thunk @/);

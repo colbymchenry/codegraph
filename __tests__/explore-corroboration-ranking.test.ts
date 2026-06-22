@@ -28,11 +28,12 @@ import * as os from 'os';
 import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
 
-/** Paths that explore rendered as full-body `#### <path> —` source sections. */
+/** Paths that explore rendered as full-body ``**`<path>`** —`` source sections.
+ *  Headers are bold labels, not ATX headings (issue #778). */
 function sourcedFiles(text: string): string[] {
   const out: string[] = [];
   for (const line of text.split('\n')) {
-    const m = line.match(/^#### (.+?) —/);
+    const m = line.match(/^\*\*`(.+?)`\*\* —/);
     if (m) out.push(m[1].trim());
   }
   return out;

@@ -184,7 +184,7 @@ describe('codegraph_explore — dynamic boundaries', () => {
     const res = await handler.execute('codegraph_explore', { query: 'routeSave onSave' });
     const text = res.content[0].text as string;
 
-    expect(text).toContain('## Dynamic boundaries');
+    expect(text).toContain('**Dynamic boundaries');
     expect(text).toContain('computed member call');
     expect(text).toMatch(/router\.ts:6/); // the exact dispatch site
     expect(text).toContain('candidates for key `save`');
@@ -212,7 +212,7 @@ describe('codegraph_explore — dynamic boundaries', () => {
     const res = await handler.execute('codegraph_explore', { query: 'route onSave' });
     const text = res.content[0].text as string;
 
-    expect(text).toContain('## Dynamic boundaries');
+    expect(text).toContain('**Dynamic boundaries');
     expect(text).toContain('computed member call');
     expect(text).not.toContain('candidates for key'); // runtime key → no shortlist to claim
   });
@@ -234,7 +234,7 @@ describe('codegraph_explore — dynamic boundaries', () => {
     // `processPayment` does not exist anywhere — only `route` resolves.
     const res = await handler.execute('codegraph_explore', { query: 'route processPayment' });
     const text = res.content[0].text as string;
-    expect(text).toContain('## Dynamic boundaries');
+    expect(text).toContain('**Dynamic boundaries');
   });
 
   it('renders a direct synthesized emit→handler hop as a dynamic-dispatch link (#687 criterion 1)', async () => {
@@ -267,11 +267,11 @@ describe('codegraph_explore — dynamic boundaries', () => {
     const res = await handler.execute('codegraph_explore', { query: 'completeCheckout settleInvoice' });
     const text = res.content[0].text as string;
 
-    expect(text).toContain('## Dynamic-dispatch links among your symbols');
+    expect(text).toContain('**Dynamic-dispatch links among your symbols');
     expect(text).toMatch(/completeCheckout → settleInvoice/);
     expect(text).toContain('invoice.settled');
     // Connected via the synthesized edge — no boundary to announce.
-    expect(text).not.toContain('## Dynamic boundaries');
+    expect(text).not.toContain('**Dynamic boundaries');
   });
 
   it('never adds the section to a fully connected flow', async () => {
@@ -285,8 +285,8 @@ describe('codegraph_explore — dynamic boundaries', () => {
 
     const res = await handler.execute('codegraph_explore', { query: 'stepOne stepThree' });
     const text = res.content[0].text as string;
-    expect(text).toContain('## Flow');
-    expect(text).not.toContain('## Dynamic boundaries');
+    expect(text).toContain('**Flow');
+    expect(text).not.toContain('**Dynamic boundaries');
   });
 
   it('python getattr dispatch surfaces with a prefix-key candidate', async () => {
@@ -305,7 +305,7 @@ describe('codegraph_explore — dynamic boundaries', () => {
     const res = await handler.execute('codegraph_explore', { query: 'process handle_save' });
     const text = res.content[0].text as string;
 
-    expect(text).toContain('## Dynamic boundaries');
+    expect(text).toContain('**Dynamic boundaries');
     expect(text).toContain('getattr');
     expect(text).toContain('handle_save');
   });
@@ -373,7 +373,7 @@ describe('codegraph_explore — interface dispatch', () => {
     const res = await handler.execute('codegraph_explore', { query: 'processRunExecutionData executeNode execute' });
     const text = res.content[0].text as string;
 
-    expect(text).toContain('## Interface dispatch (a named method has many implementations)');
+    expect(text).toContain('**Interface dispatch (a named method has many implementations)');
     expect(text).toMatch(/`execute` → runtime dispatch to \*\*9\*\* types implementing `INodeType`/);
     // a couple of concrete targets, with file:line
     expect(text).toMatch(/\b\w+Node\.execute` \(/);
@@ -392,8 +392,8 @@ describe('codegraph_explore — interface dispatch', () => {
 
     const res = await handler.execute('codegraph_explore', { query: 'stepOne stepThree' });
     const text = res.content[0].text as string;
-    expect(text).toContain('## Flow');
-    expect(text).not.toContain('## Interface dispatch');
+    expect(text).toContain('**Flow');
+    expect(text).not.toContain('**Interface dispatch');
   });
 
   it('stays SILENT when the interface family is below the polymorphism threshold (3 impls)', async () => {
@@ -401,6 +401,6 @@ describe('codegraph_explore — interface dispatch', () => {
 
     const res = await handler.execute('codegraph_explore', { query: 'processRunExecutionData executeNode execute' });
     const text = res.content[0].text as string;
-    expect(text).not.toContain('## Interface dispatch');
+    expect(text).not.toContain('**Interface dispatch');
   });
 });
