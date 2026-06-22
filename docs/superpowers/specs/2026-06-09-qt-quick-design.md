@@ -2,9 +2,9 @@
 
 ## Summary
 
-Add first-class `.qml` language support to CodeGraph so Qt Quick projects can be indexed with practical static coverage. The first version targets QML object trees plus embedded JavaScript behavior inside QML files. It does not attempt C++/QML bridging.
+Add first-class `.qml` language support to CodeGraph so Qt Quick projects can be indexed with practical static coverage. The first version targeted QML object trees plus embedded JavaScript behavior inside QML files. Follow-up closure extends that baseline with conservative QML module, dynamic-loading, and explicit C++/QML bridge relationships.
 
-**Implementation status:** QML-internal graph generation and QML-side closure are implemented. The extractor covers component trees, ids, properties, signals, functions, handlers, imports, embedded JavaScript static references, nested handler bodies, object-literal callbacks, function-valued callbacks, directory-local component references, and false-positive suppression for broad cross-file property/name matches. `qmldir` module registry resolution, statically safe dynamic QML loading, C++/QML bridge resolution, and release notes remain follow-up work.
+**Implementation status:** QML-internal graph generation, QML-side closure, `qmldir` module import scope, literal local dynamic loading, and explicit Qt bridge fact resolution are implemented. The extractor covers component trees, ids, properties, signals, functions, handlers, imports, embedded JavaScript static references, nested handler bodies, object-literal callbacks, function-valued callbacks, directory-local component references, typed QML property references, and conservative false-positive suppression for broad cross-file property/name matches. Runtime-built URLs, runtime-computed Qt registration metadata, full C++ overload resolution, moc-generated code execution, and QML JavaScript helper alias function resolution remain unsupported.
 
 Local JavaScript helper imports such as `import "utils.js" as Utils` are indexed
 as file-level imports. Cross-file resolution from QML member calls such as
@@ -12,11 +12,10 @@ as file-level imports. Cross-file resolution from QML member calls such as
 first version.
 
 QML object type references are emitted for inline components declared in the
-same `.qml` file with `component Name : ...` and for directory-local component
-references covered by the QML-side closure pass. Common Qt Quick platform types
-and same-named project files are not linked by broad name matching alone;
-`qmldir` module registry resolution, URI module scope, aliases, and versioned
-module resolution remain follow-up work.
+same `.qml` file with `component Name : ...`, directory-local component
+references covered by the QML-side closure pass, and visible components from
+explicit `qmldir` module registries. Common Qt Quick platform types and
+same-named project files are not linked by broad name matching alone.
 
 The goal is to make `codegraph_explore`, `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` useful on real Qt Quick codebases by extracting:
 
@@ -57,7 +56,7 @@ Confirmed scope:
 - The first version focuses on QML-internal graph generation.
 - C++/QML bridging is explicitly deferred.
 
-Confirmed first-version non-goals:
+Confirmed first-version non-goals, before the follow-up closure:
 
 - No C++ `setContextProperty` to QML consumer resolution.
 - No `qmlRegisterType` / `qmlRegisterSingletonType` to QML type resolution.
@@ -65,6 +64,14 @@ Confirmed first-version non-goals:
 - No binding runtime evaluation.
 - No precise dynamic loading resolution for string-built `Loader.source`,
   `Qt.createComponent(url)`, or equivalent runtime URLs.
+
+Follow-up closure now implements conservative static bridge resolution for
+explicit Qt facts (`setContextProperty`, `qmlRegisterType`,
+`qmlRegisterSingletonType`, `qmlRegisterUncreatableType`, `Q_PROPERTY`,
+`Q_INVOKABLE`, public slots with Qt exposure evidence, and C++ signals) through
+the normal unresolved-reference and framework-resolver pipeline. Runtime Qt
+registration computation, moc execution, full overload resolution, and runtime
+URL evaluation remain non-goals.
 
 ## Goals
 
@@ -483,7 +490,7 @@ Supported in the first version:
   import nodes plus unresolved calls/references for static uses like
   `Utils.format()`
 
-Explicitly unsupported in the first version:
+Explicitly unsupported in the first version, before follow-up closure:
 
 - C++ `setContextProperty` to QML consumer resolution
 - `qmlRegisterType` / `qmlRegisterSingletonType` to QML type resolution
@@ -494,9 +501,12 @@ Explicitly unsupported in the first version:
 - cross-file QML module URI resolution unless a later QML module registry design
   introduces it explicitly
 
-The target behavior is: QML-internal static graph edges resolve when the target
-is visible and unambiguous; cross-module and cross-language relationships remain
-as unresolved references or conservative import/reference facts.
+Follow-up closure now resolves explicit `qmldir` module components, literal
+local `Loader.source` and `Qt.createComponent("...qml")` targets, and explicit
+Qt bridge facts. The target behavior remains conservative: static graph edges
+resolve when the target is visible and unambiguous; runtime-built URLs,
+runtime-computed bridge metadata, and JavaScript helper alias calls remain as
+unresolved references or conservative import/reference facts.
 
 ## Error Handling
 
@@ -685,12 +695,15 @@ QML base graph support is complete when:
   chain
 - `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` have practical
   value for QML-internal relationships
-- the implementation does not claim C++/QML cross-language closure
+- the base implementation does not claim complete Qt runtime or C++ meta-object
+  closure
 
 ## Open Risks
 
 - The chosen grammar may expose AST shapes that do not align cleanly with current extractor expectations.
 - QML bindings mix declarative object syntax with embedded JavaScript, so call extraction must be careful about scope and ownership.
 - Over-resolving common names such as `parent`, `model`, or framework-provided pseudo-properties could create noisy false edges. These should remain conservative unless the static target is explicit.
-- The first version may leave important Qt Quick project flows unresolved because
-  C++ context properties and registered QML types are intentionally out of scope.
+- Some Qt Quick project flows remain unresolved because runtime-computed
+  registration metadata, moc-generated code, runtime URLs, full overload
+  resolution, and JavaScript helper alias function resolution are intentionally
+  out of scope.

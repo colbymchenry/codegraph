@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- QML / Qt Quick indexing now connects explicit module, dynamic-loading, and Qt bridge relationships through the normal graph pipeline. `qmldir` module imports resolve visible QML components without broad built-in name matching; literal local `Loader.source` and `Qt.createComponent("...qml")` targets resolve to their QML component files; and explicit Qt bridge facts connect registered QML types, singletons, context properties, `Q_INVOKABLE` methods, Qt-exposed public slots, `Q_PROPERTY` reads, and signals to indexed C++ symbols. Runtime-built URLs, runtime-computed registration metadata, full C++ overload resolution, moc execution, and QML JavaScript helper alias function resolution remain intentionally unsupported. (QML, Qt Quick, C++)
+
 ### Fixes
 
 - CodeGraph now indexes nested repositories that git records as gitlinks, so a workspace built by stacking several repos inside one another indexes completely from a single `codegraph init` at the top. When a repo contains another git repo that was `git add`ed into it — so git tracks it as a `160000` "commit" pointer rather than a folder of files — or a submodule that isn't an active, initialized submodule in your checkout, that nested repo's source used to be skipped entirely: indexing the top level stopped at the nested repo's boundary and pulled in only the outer repo's own files, so a stacked-repo project came up nearly empty (one report saw ~10 files indexed at the root). CodeGraph now descends into each such nested repo that has a real working tree on disk and indexes it as its own embedded repository, recursively, so every layer of a stacked workspace is covered. Active submodules (already handled) and plain untracked nested clones are unchanged; a nested repo under a dependency directory such as `vendor/` or `node_modules/` stays excluded; and a submodule with nothing checked out on disk is correctly left alone rather than reported as empty. Thanks @ofergr and @kun-yx for the reports. (#1031, #1033)

@@ -2,7 +2,7 @@
 
 ## Context
 
-The first QML graph generation version and the QML-side closure pass are implemented. The current remaining follow-up scope is documentation hygiene, read-only real-project validation, `qmldir` module/import scope, statically safe dynamic QML loading, C++/QML bridge resolution, and release notes.
+The first QML graph generation version, QML-side closure pass, and follow-up closure are implemented. The follow-up closure covers documentation hygiene, read-only real-project validation, `qmldir` module/import scope, statically safe dynamic QML loading, explicit C++/QML bridge resolution, and release notes.
 
 `test-qml-project/` may be used for validation, but files under that directory
 must not be staged or committed.
@@ -22,18 +22,30 @@ QML-to-QML resolution coverage includes:
   `items.filter(function (item) { ... })`
 - conservative suppression of broad cross-file QML property/name matches
 
-Remaining module/import scope work is limited to `qmldir` registries, module
-URI imports, import aliases, versioned imports, and built-in collision
-protection. QML to C++ bridge work remains deferred and must not be treated as
-complete Qt runtime or C++ meta-object closure.
+Follow-up module/import scope now includes `qmldir` registries, module URI
+imports, import aliases, versioned imports, dependency imports, and built-in
+collision protection. QML to C++ bridge work now covers explicit Qt bridge facts
+only and must not be treated as complete Qt runtime or C++ meta-object closure.
 
-Deferred bridge scope:
+Implemented bridge scope:
 
 - `Q_PROPERTY`, `Q_INVOKABLE`, C++ signal exposure, `setContextProperty`,
-  `qmlRegisterType`, and `qmlRegisterSingletonType`
-- resolving `root.viewModel.someMethod(...)` to the C++ ViewModel by Qt bridge
-  metadata
-- treating existing heuristic QML-to-C++ name matches as final bridge behavior
+  `qmlRegisterType`, `qmlRegisterSingletonType`, and
+  `qmlRegisterUncreatableType`
+- resolving direct context-property calls such as `viewModel.refresh()` to
+  visible C++ methods by explicit Qt bridge metadata
+- resolving visible registered components, registered singletons, typed
+  uncreatable references, `Q_PROPERTY` reads, and `Connections` signal handlers
+  through normal resolver-produced graph edges
+
+Still unsupported:
+
+- runtime-built QML URLs
+- runtime-computed Qt registration metadata
+- full C++ overload resolution
+- moc-generated code execution
+- QML JavaScript helper alias function resolution such as `Utils.format(...)`
+- treating broad heuristic QML-to-C++ name matches as final bridge behavior
 
 ## Validation Update: QML-side Closure
 
@@ -450,9 +462,38 @@ The source directory was not modified or staged.
 - Indexed files: 39
 - QML files: 13
 - Status errors: none
-- Current expected remaining gaps:
+- Expected remaining gaps before this follow-up closure:
   - `qmldir` module imports are not yet resolved to concrete component
     definitions.
   - Literal dynamic QML loading is not yet connected.
   - C++/QML bridge facts are not yet modeled from Qt registration, context
     properties, `Q_PROPERTY`, `Q_INVOKABLE`, slots, or signals.
+
+## Follow-up Closure Update
+
+The follow-up closure implementation adds:
+
+- `qmldir` and module import scope for explicit QML component resolution,
+  including aliases, version-compatible selection, dependency imports,
+  extensionless `qmldir` tracking, uppercase `.QML` targets, renamed module URI
+  invalidation, and built-in collision protection.
+- literal local dynamic QML loading for `Loader.source` and
+  `Qt.createComponent("...qml")`, including incremental sync invalidation when
+  target files or `Loader.qml` shadowing files are added or removed.
+- explicit Qt bridge fact resolution for registered types, registered
+  singletons, uncreatable type references, context properties, `Q_INVOKABLE`
+  methods, Qt-exposed public slots, `Q_PROPERTY` reads, and C++ signals consumed
+  through `Connections` handlers.
+
+Still unsupported:
+
+- runtime-built QML URLs
+- runtime-computed Qt registration metadata
+- full C++ overload resolution
+- moc-generated code execution
+- QML JavaScript helper alias function resolution, such as `Utils.format(...)`
+- non-explicit or heuristic QML-to-C++ bridge guesses
+
+Validation after implementation used focused QML integration tests and the
+build. `test-qml-project/` remained validation-only and was not modified or
+staged.
