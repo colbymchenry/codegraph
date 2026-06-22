@@ -33,7 +33,9 @@ export type CommentLang =
   | 'csharp'
   | 'swift'
   | 'go'
-  | 'rust';
+  | 'rust'
+  | 'c'
+  | 'cpp';
 
 export function stripCommentsForRegex(content: string, lang: CommentLang): string {
   switch (lang) {
@@ -52,6 +54,8 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
     case 'java':
     case 'csharp':
     case 'swift':
+    case 'c':
+    case 'cpp':
       return stripCStyle(content, /* allowSingleQuoteStrings */ lang === 'javascript' || lang === 'typescript');
     default:
       return content;

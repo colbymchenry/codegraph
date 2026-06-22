@@ -1643,6 +1643,14 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'fn-pointer-dispatch') {
+      const via = m.via ? `\`${String(m.via)}\`` : 'a function pointer';
+      return {
+        label: `function-pointer dispatch via ${via} (dynamic dispatch)`,
+        compact: `dynamic: fn-pointer ${m.via ? String(m.via) : ''}${at}`,
+        registeredAt,
+      };
+    }
     // Generic fallback for any other synthesizer (redux-thunk, gin-middleware-chain,
     // flutter-build, …): a synthesized hop must never read as a bare static `calls`.
     // It's a dynamic-dispatch bridge — label it as one and keep its wiring site.
