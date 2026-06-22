@@ -436,3 +436,23 @@ Historical follow-up implication, superseded by the QML-side closure update:
 - Add a `[Unreleased]` changelog entry describing QML / Qt Quick indexing.
 - Mention the supported first-version scope and explicitly exclude C++/QML
   bridging, `qmldir`, and dynamic URL resolution until those phases land.
+
+## Validation Baseline: Follow-up Closure
+
+Validation was rerun against a temporary copy of:
+
+```text
+test-qml-project/unifiedpromax/src/components/general/video_download_component
+```
+
+The source directory was not modified or staged.
+
+- Indexed files: 39
+- QML files: 13
+- Status errors: none
+- Current expected remaining gaps:
+  - `qmldir` module imports are not yet resolved to concrete component
+    definitions.
+  - Literal dynamic QML loading is not yet connected.
+  - C++/QML bridge facts are not yet modeled from Qt registration, context
+    properties, `Q_PROPERTY`, `Q_INVOKABLE`, slots, or signals.
