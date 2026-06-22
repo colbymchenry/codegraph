@@ -9,20 +9,23 @@ CodeGraph runs as a [Model Context Protocol](https://modelcontextprotocol.io/) s
 codegraph serve --mcp
 ```
 
-Agents configured by the installer launch this automatically. When a `.codegraph/` index exists, the agent uses the tools below.
+Agents configured by the installer launch this automatically. When a `.codegraph/` index exists, the agent uses the focused default tool below.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `codegraph_search` | Find symbols by name across the codebase |
-| `codegraph_callers` | Find what calls a function |
-| `codegraph_callees` | Find what a function calls |
-| `codegraph_impact` | Analyze what code is affected by changing a symbol |
-| `codegraph_node` | Get details about a specific symbol (optionally with source code) |
 | `codegraph_explore` | Return source for several related symbols grouped by file, plus a relationship map, in one call |
-| `codegraph_files` | Get the indexed file structure (faster than filesystem scanning) |
-| `codegraph_status` | Check index health and statistics |
+
+`codegraph_node`, `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_files`, and `codegraph_status` remain implemented but are not listed by default. Set `CODEGRAPH_MCP_TOOLS` to change the exposed MCP surface:
+
+| Value | Exposed tools |
+|---|---|
+| unset or `default` | `explore` |
+| `compact` | `explore,node,search` |
+| `core` | `explore,node,search,callers` |
+| `full` | every defined MCP tool |
+| custom list | e.g. `explore,node,search,callers,impact` |
 
 ## How agents should use it
 

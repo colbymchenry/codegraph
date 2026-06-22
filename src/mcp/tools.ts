@@ -29,6 +29,11 @@ import {
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { scanDynamicDispatch } from './dynamic-boundaries';
+import {
+  DEFAULT_MCP_TOOL_NAMES,
+  normalizeMcpToolName,
+  parseMcpToolAllowlist,
+} from './tool-allowlist';
 
 /**
  * An expected, recoverable "codegraph can't serve this" condition — most
@@ -623,12 +628,8 @@ export const tools: ToolDefinition[] = [
  * note in a description only adds once `cg` is loaded; the schemas are static).
  */
 export function getStaticTools(): ToolDefinition[] {
-  const raw = process.env.CODEGRAPH_MCP_TOOLS;
-  if (!raw || !raw.trim()) {
-    return tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
-  }
-  const allow = new Set(raw.split(',').map(s => s.trim().replace(/^codegraph_/, '')).filter(Boolean));
-  return allow.size ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, ''))) : tools;
+  const allow = parseMcpToolAllowlist(process.env.CODEGRAPH_MCP_TOOLS, tools.map(t => t.name));
+  return tools.filter(t => (allow ?? DEFAULT_MCP_TOOLS).has(normalizeMcpToolName(t.name)));
 }
 
 /**
@@ -642,7 +643,7 @@ export function getStaticTools(): ToolDefinition[] {
  * status) remain fully functional — handlers stay, the library API and CLI are
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
-const DEFAULT_MCP_TOOLS = new Set(['explore']);
+const DEFAULT_MCP_TOOLS = new Set(DEFAULT_MCP_TOOL_NAMES);
 
 /**
  * Tool handler that executes tools against a CodeGraph instance
@@ -708,24 +709,21 @@ export class ToolHandler {
 
   /**
    * Optional allowlist of exposed tools, parsed from the CODEGRAPH_MCP_TOOLS
-   * env var (comma-separated short names, e.g. "trace,search,node,context").
-   * Unset/empty → every tool is exposed. Lets an operator (or an A/B harness)
-   * trim the tool surface without rebuilding the client config; the ablated
-   * tool is then truly absent from ListTools rather than merely denied on call.
+   * env var (comma-separated short names, e.g. "explore,search,node").
+   * Unset/empty → no execution guard; ListTools falls back to the default
+   * surface. Lets an operator (or an A/B harness) trim the tool surface without
+   * rebuilding the client config; the ablated tool is then truly absent from
+   * ListTools rather than merely denied on call.
    * Matching is on the short form, so "node" and "codegraph_node" both work.
    */
   private toolAllowlist(): Set<string> | null {
-    const raw = process.env.CODEGRAPH_MCP_TOOLS;
-    if (!raw || !raw.trim()) return null;
-    const short = (s: string) => s.trim().replace(/^codegraph_/, '');
-    const set = new Set(raw.split(',').map(short).filter(Boolean));
-    return set.size ? set : null;
+    return parseMcpToolAllowlist(process.env.CODEGRAPH_MCP_TOOLS, tools.map(t => t.name));
   }
 
   /** Whether a tool name passes the CODEGRAPH_MCP_TOOLS allowlist (if any). */
   private isToolAllowed(name: string): boolean {
     const allow = this.toolAllowlist();
-    return !allow || allow.has(name.replace(/^codegraph_/, ''));
+    return !allow || allow.has(normalizeMcpToolName(name));
   }
 
   /**
@@ -736,12 +734,11 @@ export class ToolHandler {
    */
   getTools(): ToolDefinition[] {
     const allow = this.toolAllowlist();
-    // No explicit allowlist → the default 4-tool surface (see
-    // DEFAULT_MCP_TOOLS for the evidence). An allowlist replaces the
-    // default entirely, so any defined tool can be re-enabled.
+    // No explicit allowlist → the single-tool default surface. An allowlist
+    // replaces the default entirely, so any defined tool can be re-enabled.
     let visible = allow
-      ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
-      : tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
+      ? tools.filter(t => allow.has(normalizeMcpToolName(t.name)))
+      : tools.filter(t => DEFAULT_MCP_TOOLS.has(normalizeMcpToolName(t.name)));
     if (!this.cg) return visible;
 
     try {

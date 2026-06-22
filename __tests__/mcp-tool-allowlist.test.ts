@@ -4,7 +4,7 @@
  * Filtering happens in ListTools (getTools) and is enforced again on execute().
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { ToolHandler } from '../src/mcp/tools';
+import { getStaticTools, ToolHandler } from '../src/mcp/tools';
 
 const ENV = 'CODEGRAPH_MCP_TOOLS';
 
@@ -16,6 +16,7 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
   });
 
   const listed = () => new ToolHandler(null).getTools().map(t => t.name).sort();
+  const staticListed = () => getStaticTools().map(t => t.name).sort();
 
   it('exposes ONLY codegraph_explore by default when unset', () => {
     delete process.env[ENV];
@@ -24,26 +25,90 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
     // node/search/callers/callees/impact/files/status stay defined and executable
     // but unlisted; CODEGRAPH_MCP_TOOLS re-enables them.
     expect(listed()).toEqual(['codegraph_explore']);
+    expect(staticListed()).toEqual(listed());
   });
 
   it('re-enables an unlisted tool via the allowlist (impact)', () => {
     process.env[ENV] = 'explore,impact';
     expect(listed()).toEqual(['codegraph_explore', 'codegraph_impact']);
+    expect(staticListed()).toEqual(listed());
   });
 
   it('filters ListTools to the allowlisted short names', () => {
     process.env[ENV] = 'explore,search,node';
     expect(listed()).toEqual(['codegraph_explore', 'codegraph_node', 'codegraph_search']);
+    expect(staticListed()).toEqual(listed());
   });
 
-  it('accepts fully-qualified codegraph_ names and ignores whitespace', () => {
-    process.env[ENV] = ' codegraph_explore , search ';
+  it('accepts fully-qualified codegraph_ names and ignores whitespace/case', () => {
+    process.env[ENV] = ' CODEGRAPH_EXPLORE , search ';
     expect(listed()).toEqual(['codegraph_explore', 'codegraph_search']);
+    expect(staticListed()).toEqual(listed());
   });
 
   it('treats an empty/whitespace value as unset (default surface)', () => {
     process.env[ENV] = '   ';
     expect(listed()).toEqual(['codegraph_explore']);
+    expect(staticListed()).toEqual(listed());
+  });
+
+  it('treats separator-only values as unset in both static and live listings', () => {
+    process.env[ENV] = ' , ,, ';
+    expect(listed()).toEqual(['codegraph_explore']);
+    expect(staticListed()).toEqual(listed());
+  });
+
+  it('supports the default preset as an explicit allowlist', async () => {
+    process.env[ENV] = 'default';
+    expect(listed()).toEqual(['codegraph_explore']);
+    expect(staticListed()).toEqual(listed());
+
+    const res = await new ToolHandler(null).execute('codegraph_impact', {});
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/disabled via CODEGRAPH_MCP_TOOLS/);
+  });
+
+  it('supports the compact preset', () => {
+    process.env[ENV] = 'compact';
+    expect(listed()).toEqual(['codegraph_explore', 'codegraph_node', 'codegraph_search']);
+    expect(staticListed()).toEqual(listed());
+  });
+
+  it('supports the core preset', () => {
+    process.env[ENV] = 'core';
+    expect(listed()).toEqual([
+      'codegraph_callers',
+      'codegraph_explore',
+      'codegraph_node',
+      'codegraph_search',
+    ]);
+    expect(staticListed()).toEqual(listed());
+  });
+
+  it('supports the full preset', () => {
+    process.env[ENV] = 'full';
+    expect(listed()).toEqual([
+      'codegraph_callees',
+      'codegraph_callers',
+      'codegraph_explore',
+      'codegraph_files',
+      'codegraph_impact',
+      'codegraph_node',
+      'codegraph_search',
+      'codegraph_status',
+    ]);
+    expect(staticListed()).toEqual(listed());
+  });
+
+  it('combines presets with explicit tool names', () => {
+    process.env[ENV] = 'compact,callers';
+    expect(listed()).toEqual([
+      'codegraph_callers',
+      'codegraph_explore',
+      'codegraph_node',
+      'codegraph_search',
+    ]);
+    expect(staticListed()).toEqual(listed());
   });
 
   it('rejects a disabled tool on execute (defense in depth)', async () => {
