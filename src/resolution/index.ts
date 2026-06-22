@@ -673,7 +673,7 @@ export class ReferenceResolver {
     if (
       !this.hasAnyPossibleMatch(ref.referenceName) &&
       !this.matchesAnyImport(ref) &&
-      !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
+      !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName, ref))
     ) {
       return null;
     }

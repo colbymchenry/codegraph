@@ -261,6 +261,333 @@ Item {
     ).toBe(false);
   });
 
+  it('resolves dynamic QML loading only for literal local component URLs', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import QtQuick as Quick
+
+Item {
+  id: root
+  property string panelName: "Panel"
+
+  Loader {
+    id: literalLoader
+    source: "LazyPanel.qml"
+  }
+
+  Loader {
+    id: dynamicLoader
+    source: "Lazy" + root.panelName + ".qml"
+  }
+
+  Image {
+    id: imageSource
+    source: "LazyPanel.qml"
+  }
+
+  Controls.Loader {
+    id: aliasedLoader
+    source: "LazyPanel.qml"
+  }
+
+  Quick.Loader {
+    id: qtQuickAliasedLoader
+    source: "LazyPanel.qml"
+  }
+
+  Loader {
+    id: qrcLoader
+    source: "qrc:/LazyPanel.qml"
+  }
+
+  Loader {
+    id: httpLoader
+    source: "http://example.com/LazyPanel.qml"
+  }
+
+  Loader {
+    id: absoluteLoader
+    source: "/absolute/LazyPanel.qml"
+  }
+
+  Loader {
+    id: windowsAbsoluteLoader
+    source: "C:\\\\tmp\\\\LazyPanel.qml"
+  }
+
+  Loader {
+    id: relativeLoader
+    source: "./LazyPanel.qml"
+  }
+
+  Loader {
+    id: windowsRelativeLoader
+    source: ".\\\\LazyPanel.qml"
+  }
+
+  Loader {
+    id: uppercaseLoader
+    source: "LazyUpper.QML"
+  }
+
+  Component.onCompleted: {
+    Qt.createComponent("LazyPanel.qml")
+  }
+}
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'LazyPanel.qml'), 'import QtQuick\nRectangle { id: lazyRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'LazyUpper.QML'), 'import QtQuick\nRectangle { id: upperRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const lazyPanel = graph.getNodesByName('LazyPanel').find((n) => n.kind === 'component' && n.filePath === 'LazyPanel.qml');
+    const lazyUpper = graph.getNodesByName('LazyUpper').find((n) => n.kind === 'component' && n.filePath === 'LazyUpper.QML');
+    const literalLoader = graph.getNodesByName('literalLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const dynamicLoader = graph.getNodesByName('dynamicLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const imageSource = graph.getNodesByName('imageSource').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const aliasedLoader = graph.getNodesByName('aliasedLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const qtQuickAliasedLoader = graph.getNodesByName('qtQuickAliasedLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const qrcLoader = graph.getNodesByName('qrcLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const httpLoader = graph.getNodesByName('httpLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const absoluteLoader = graph.getNodesByName('absoluteLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const windowsAbsoluteLoader = graph.getNodesByName('windowsAbsoluteLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const relativeLoader = graph.getNodesByName('relativeLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const windowsRelativeLoader = graph.getNodesByName('windowsRelativeLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const uppercaseLoader = graph.getNodesByName('uppercaseLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+
+    expect(lazyPanel).toBeDefined();
+    expect(lazyUpper).toBeDefined();
+    expect(literalLoader).toBeDefined();
+    expect(dynamicLoader).toBeDefined();
+    expect(imageSource).toBeDefined();
+    expect(aliasedLoader).toBeDefined();
+    expect(qtQuickAliasedLoader).toBeDefined();
+    expect(qrcLoader).toBeDefined();
+    expect(httpLoader).toBeDefined();
+    expect(absoluteLoader).toBeDefined();
+    expect(windowsAbsoluteLoader).toBeDefined();
+    expect(relativeLoader).toBeDefined();
+    expect(windowsRelativeLoader).toBeDefined();
+    expect(uppercaseLoader).toBeDefined();
+    expect(onCompleted).toBeDefined();
+
+    expect(graph.getOutgoingEdges(literalLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(qtQuickAliasedLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(relativeLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(windowsRelativeLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(uppercaseLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyUpper!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(onCompleted!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(dynamicLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(imageSource!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(aliasedLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(qrcLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(httpLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(absoluteLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(windowsAbsoluteLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+  });
+
+  it('does not resolve dynamic QML loading for project-defined Loader components', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  Loader {
+    id: customLoader
+    source: "LazyPanel.qml"
+  }
+}
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Loader.qml'), 'import QtQuick\nItem { property string source; id: loaderRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'LazyPanel.qml'), 'import QtQuick\nRectangle { id: lazyRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const lazyPanel = graph.getNodesByName('LazyPanel').find((n) => n.kind === 'component' && n.filePath === 'LazyPanel.qml');
+    const loaderDefinition = graph.getNodesByName('Loader').find((n) => n.kind === 'component' && n.filePath === 'Loader.qml');
+    const customLoader = graph.getNodesByName('customLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+
+    expect(lazyPanel).toBeDefined();
+    expect(loaderDefinition).toBeDefined();
+    expect(customLoader).toBeDefined();
+    expect(graph.getOutgoingEdges(customLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+  });
+
+  it('does not resolve dynamic QML loading for qmldir-exported Loader components', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import My.Controls 1.0
+
+Item {
+  Loader {
+    id: moduleLoader
+    source: "LazyPanel.qml"
+  }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+Loader 1.0 Loader.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'Loader.qml'), 'import QtQuick\nItem { property string source; id: loaderRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'LazyPanel.qml'), 'import QtQuick\nRectangle { id: lazyRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const lazyPanel = graph.getNodesByName('LazyPanel').find((n) => n.kind === 'component' && n.filePath === 'LazyPanel.qml');
+    const loaderDefinition = graph.getNodesByName('Loader').find((n) => n.kind === 'component' && n.filePath === 'Controls/Loader.qml');
+    const moduleLoader = graph.getNodesByName('moduleLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+
+    expect(lazyPanel).toBeDefined();
+    expect(loaderDefinition).toBeDefined();
+    expect(moduleLoader).toBeDefined();
+    expect(graph.getOutgoingEdges(moduleLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+  });
+
+  it('updates literal dynamic QML loading when target files appear during sync', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  Loader {
+    id: literalLoader
+    source: "LazyPanel.qml"
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const literalLoader = graph.getNodesByName('literalLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    expect(literalLoader).toBeDefined();
+    expect(graph.getOutgoingEdges(literalLoader!.id).some((edge) => edge.kind === 'references')).toBe(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.writeFileSync(path.join(tmpDir, 'LazyPanel.qml'), 'import QtQuick\nRectangle { id: lazyRoot }\n');
+    await graph.sync();
+
+    const lazyPanel = graph.getNodesByName('LazyPanel').find((n) => n.kind === 'component' && n.filePath === 'LazyPanel.qml');
+    const literalLoaderAfterSync = graph.getNodesByName('literalLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+
+    expect(lazyPanel).toBeDefined();
+    expect(literalLoaderAfterSync).toBeDefined();
+    expect(graph.getOutgoingEdges(literalLoaderAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(true);
+  });
+
+  it('removes literal dynamic QML loading when Loader shadow files appear during sync', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  Loader {
+    id: literalLoader
+    source: "LazyPanel.qml"
+  }
+}
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'LazyPanel.qml'), 'import QtQuick\nRectangle { id: lazyRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const lazyPanel = graph.getNodesByName('LazyPanel').find((n) => n.kind === 'component' && n.filePath === 'LazyPanel.qml');
+    const literalLoader = graph.getNodesByName('literalLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    expect(lazyPanel).toBeDefined();
+    expect(literalLoader).toBeDefined();
+    expect(graph.getOutgoingEdges(literalLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.writeFileSync(path.join(tmpDir, 'Loader.qml'), 'import QtQuick\nItem { property string source; id: loaderRoot }\n');
+    await graph.sync();
+
+    const literalLoaderAfterSync = graph.getNodesByName('literalLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    expect(literalLoaderAfterSync).toBeDefined();
+    expect(graph.getOutgoingEdges(literalLoaderAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+  });
+
+  it('restores literal dynamic QML loading when Loader shadow files are deleted during sync', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  Loader {
+    id: literalLoader
+    source: "LazyPanel.qml"
+  }
+}
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'LazyPanel.qml'), 'import QtQuick\nRectangle { id: lazyRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'Loader.qml'), 'import QtQuick\nItem { property string source; id: loaderRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const lazyPanel = graph.getNodesByName('LazyPanel').find((n) => n.kind === 'component' && n.filePath === 'LazyPanel.qml');
+    const literalLoader = graph.getNodesByName('literalLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    expect(lazyPanel).toBeDefined();
+    expect(literalLoader).toBeDefined();
+    expect(graph.getOutgoingEdges(literalLoader!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.rmSync(path.join(tmpDir, 'Loader.qml'));
+    await graph.sync();
+
+    const literalLoaderAfterSync = graph.getNodesByName('literalLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    expect(literalLoaderAfterSync).toBeDefined();
+    expect(graph.getOutgoingEdges(literalLoaderAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(true);
+  });
+
+  it('does not reindex unknown Loader aliases for literal dynamic QML target changes', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  Controls.Loader {
+    id: unknownAliasLoader
+    source: "LazyPanel.qml"
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const unknownAliasLoader = graph.getNodesByName('unknownAliasLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    expect(unknownAliasLoader).toBeDefined();
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.writeFileSync(path.join(tmpDir, 'LazyPanel.qml'), 'import QtQuick\nRectangle { id: lazyRoot }\n');
+    const result = await graph.sync();
+
+    const lazyPanel = graph.getNodesByName('LazyPanel').find((n) => n.kind === 'component' && n.filePath === 'LazyPanel.qml');
+    const unknownAliasLoaderAfterSync = graph.getNodesByName('unknownAliasLoader').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    expect(lazyPanel).toBeDefined();
+    expect(unknownAliasLoaderAfterSync).toBeDefined();
+    expect(result.changedFilePaths ?? []).not.toContain('Main.qml');
+    expect(graph.getOutgoingEdges(unknownAliasLoaderAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id)).toBe(false);
+  });
+
   it('extracts QML calls from function-valued handlers and object literal callbacks', async () => {
     fs.writeFileSync(
       path.join(tmpDir, 'Callbacks.qml'),

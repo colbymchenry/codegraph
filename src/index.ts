@@ -499,17 +499,18 @@ export class CodeGraph {
       }
       try {
         const result = await this.orchestrator.sync(options.onProgress);
+        const hasFilesToResolve = (result.changedFilePaths?.length ?? 0) > 0;
 
         // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
         // every sync that touched files so edits to `app.module.ts` propagate
         // to controllers in unchanged files. The pass is idempotent and cheap
         // (regex over *.module.ts only).
-        if (result.filesAdded > 0 || result.filesModified > 0) {
+        if (result.filesAdded > 0 || result.filesModified > 0 || hasFilesToResolve) {
           this.resolver.runPostExtract();
         }
 
         // Resolve references if files were updated
-        if (result.filesAdded > 0 || result.filesModified > 0) {
+        if (result.filesAdded > 0 || result.filesModified > 0 || hasFilesToResolve) {
           if (result.changedFilePaths) {
             // Scope resolution to changed files (git fast path — bounded set)
             const unresolvedRefs = this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths);

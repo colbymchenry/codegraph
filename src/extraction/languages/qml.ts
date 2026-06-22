@@ -240,6 +240,18 @@ function scanStaticReferences(
   if (node.type === 'call_expression') {
     const calleeNode = getChildByField(node, 'function');
     const calleeName = staticReferenceName(calleeNode, ctx.source);
+    const argsNode = getChildByField(node, 'arguments');
+    if (calleeName === 'Qt.createComponent') {
+      const firstArgument = argsNode?.namedChildren[0] ?? null;
+      addStaticReference(
+        literalQmlUrl(firstArgument, ctx.source),
+        'references',
+        firstArgument,
+        ctx,
+        seen,
+        localNames
+      );
+    }
     addStaticReference(calleeName, 'calls', calleeNode, ctx, seen, localNames);
 
     const rootNode = staticRootNode(calleeNode);
@@ -248,7 +260,6 @@ function scanStaticReferences(
       addStaticReference(rootName, 'references', rootNode, ctx, seen, localNames);
     }
 
-    const argsNode = getChildByField(node, 'arguments');
     if (argsNode) {
       for (const child of argsNode.namedChildren) {
         if (visitFunctionArgumentCallback(child, ctx, localNames, calleeName)) continue;
@@ -381,6 +392,50 @@ function unwrapExpressionStatement(node: SyntaxNode | null): SyntaxNode | null {
   if (!node) return null;
   if (node.type !== 'expression_statement') return node;
   return node.namedChildren.length === 1 ? node.namedChildren[0] ?? node : node;
+}
+
+function isLocalQmlUrl(url: string): boolean {
+  return (
+    /\.qml$/i.test(url) &&
+    !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(url) &&
+    !url.startsWith('/') &&
+    !url.startsWith('\\') &&
+    !/^[A-Za-z]:[\\/]/.test(url)
+  );
+}
+
+function literalQmlUrl(node: SyntaxNode | null, source: string): string | null {
+  const unwrapped = unwrapExpressionStatement(node);
+  if (!unwrapped) return null;
+  const text = getNodeText(unwrapped, source).trim();
+  const match = /^['"]([^'"]+\.qml)['"]$/i.exec(text);
+  const url = match?.[1] ?? null;
+  return url && isLocalQmlUrl(url) ? url : null;
+}
+
+function currentQmlComponentType(ctx: ExtractorContext): string | null {
+  const currentNodeId = ctx.nodeStack[ctx.nodeStack.length - 1];
+  if (!currentNodeId) return null;
+  const currentNode = ctx.nodes.find((node) => node.id === currentNodeId);
+  if (!currentNode || currentNode.kind !== 'component') return null;
+  const typeName = currentNode.signature?.trim().split(/\s+/)[0] ?? null;
+  return typeName;
+}
+
+function qtQuickAliases(source: string): Set<string> {
+  const aliases = new Set<string>();
+  const importPattern =
+    /^\s*import\s+QtQuick(?:\s+\d+(?:\.\d+)?)?\s+as\s+([A-Za-z_][A-Za-z0-9_]*)/gm;
+  for (const match of source.matchAll(importPattern)) {
+    if (match[1]) aliases.add(match[1]);
+  }
+  return aliases;
+}
+
+function isBuiltinLoaderComponentType(typeName: string | null, source: string): boolean {
+  if (typeName === 'Loader') return true;
+  const match = /^([A-Za-z_][A-Za-z0-9_]*)\.Loader$/.exec(typeName ?? '');
+  return !!match?.[1] && qtQuickAliases(source).has(match[1]);
 }
 
 function isFunctionLikeExpression(node: SyntaxNode | null): node is SyntaxNode {
@@ -595,6 +650,16 @@ function visitQmlBinding(node: SyntaxNode, ctx: ExtractorContext): boolean {
     addStaticReferences(valueNode, ctx);
     visitOwnedQmlSubtree(valueNode, ctx);
     return true;
+  }
+
+  if (name === 'source' && isBuiltinLoaderComponentType(currentQmlComponentType(ctx), ctx.source) && valueNode) {
+    const url = literalQmlUrl(valueNode, ctx.source);
+    if (url) {
+      const fromNodeId = ctx.nodeStack[ctx.nodeStack.length - 1];
+      if (fromNodeId) {
+        addReferenceFromNode(ctx, fromNodeId, url, valueNode);
+      }
+    }
   }
 
   if (isQmlHandlerName(name)) {

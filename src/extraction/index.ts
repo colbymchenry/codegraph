@@ -264,6 +264,182 @@ function findQmlImportersForQmlDirChange(
   return importers;
 }
 
+function qmlDirname(filePath: string): string {
+  const normalized = filePath.replace(/\\/g, '/');
+  const slash = normalized.lastIndexOf('/');
+  return slash >= 0 ? normalized.slice(0, slash) : '';
+}
+
+function normalizeQmlProjectPath(filePath: string): string {
+  const normalized = path.posix.normalize(filePath.replace(/\\/g, '/'));
+  return normalized === '.' ? '' : normalized.replace(/^\.\//, '');
+}
+
+function joinQmlProjectPath(dir: string, relativePath: string): string {
+  return normalizeQmlProjectPath(dir ? `${dir}/${relativePath}` : relativePath);
+}
+
+function isLocalQmlLiteralUrl(url: string): boolean {
+  return (
+    /\.qml$/i.test(url) &&
+    !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(url) &&
+    !url.startsWith('/') &&
+    !url.startsWith('\\') &&
+    !/^[A-Za-z]:[\\/]/.test(url)
+  );
+}
+
+function qmlLiteralUrlTarget(filePath: string, url: string | undefined): string | null {
+  if (!url || !isLocalQmlLiteralUrl(url)) return null;
+  return joinQmlProjectPath(qmlDirname(filePath), url);
+}
+
+function qtQuickAliases(source: string): Set<string> {
+  const aliases = new Set<string>();
+  const importPattern =
+    /^\s*import\s+QtQuick(?:\s+\d+(?:\.\d+)?)?\s+as\s+([A-Za-z_][A-Za-z0-9_]*)/gm;
+  for (const match of source.matchAll(importPattern)) {
+    if (match[1]) aliases.add(match[1]);
+  }
+  return aliases;
+}
+
+function isDynamicQmlLoaderAlias(alias: string | undefined, aliases: ReadonlySet<string>): boolean {
+  return !alias || aliases.has(alias);
+}
+
+function literalDynamicQmlTargets(filePath: string, source: string): Set<string> {
+  const targets = new Set<string>();
+  const aliases = qtQuickAliases(source);
+  const loaderPattern =
+    /\b(?:([A-Za-z_][A-Za-z0-9_]*)\.)?Loader\s*\{[\s\S]*?\bsource\s*:\s*(['"])([^'"]+\.qml)\2/gi;
+  for (const match of source.matchAll(loaderPattern)) {
+    if (!isDynamicQmlLoaderAlias(match[1], aliases)) continue;
+    const target = qmlLiteralUrlTarget(filePath, match[3]);
+    if (target) targets.add(target);
+  }
+
+  const createComponentPattern = /\bQt\.createComponent\s*\(\s*(['"])([^'"]+\.qml)\1/gi;
+  for (const match of source.matchAll(createComponentPattern)) {
+    const target = qmlLiteralUrlTarget(filePath, match[2]);
+    if (target) targets.add(target);
+  }
+
+  return targets;
+}
+
+function hasLiteralLoaderSource(source: string): boolean {
+  const aliases = qtQuickAliases(source);
+  const loaderPattern =
+    /\b(?:([A-Za-z_][A-Za-z0-9_]*)\.)?Loader\s*\{[\s\S]*?\bsource\s*:\s*['"][^'"]+\.qml['"]/gi;
+  for (const match of source.matchAll(loaderPattern)) {
+    if (isDynamicQmlLoaderAlias(match[1], aliases)) return true;
+  }
+  return false;
+}
+
+function parseQmlLocalImportDirs(filePath: string, source: string): Set<string> {
+  const fromDir = qmlDirname(filePath);
+  const dirs = new Set<string>([fromDir]);
+
+  for (const match of source.matchAll(/^\s*import\s+(?:"([^"]+)"|'([^']+)')/gm)) {
+    const spec = match[1] ?? match[2];
+    if (!spec || /\.js$/i.test(spec) || !isLocalQmlLiteralUrl(`${spec}/placeholder.qml`)) continue;
+    dirs.add(joinQmlProjectPath(fromDir, spec));
+  }
+
+  return dirs;
+}
+
+function qmlDirLoaderExportUrisForFiles(
+  rootDir: string,
+  sourceFiles: string[],
+  loaderFiles: ReadonlySet<string>
+): Set<string> {
+  const uris = new Set<string>();
+  if (loaderFiles.size === 0) return uris;
+
+  for (const filePath of sourceFiles) {
+    if (!isQmlDirFile(filePath)) continue;
+
+    try {
+      const source = fs.readFileSync(path.join(rootDir, filePath), 'utf-8');
+      const moduleUri = parseQmlDirModuleUri(source);
+      if (!moduleUri) continue;
+
+      const dir = qmlDirname(filePath);
+      for (const rawLine of source.split(/\r?\n/)) {
+        const line = rawLine.replace(/#.*/, '').trim();
+        if (!line) continue;
+
+        const tokens = line.split(/\s+/);
+        const nameIndex = tokens[0] === 'internal' || tokens[0] === 'singleton' ? 1 : 0;
+        if (tokens[nameIndex] !== 'Loader') continue;
+
+        const qmlFile = tokens.find((token) => /\.qml$/i.test(token));
+        if (qmlFile && loaderFiles.has(joinQmlProjectPath(dir, qmlFile))) {
+          uris.add(moduleUri);
+        }
+      }
+    } catch (error) {
+      logDebug('Skipping unreadable qmldir during dynamic QML invalidation', {
+        filePath,
+        error: String(error),
+      });
+    }
+  }
+
+  return uris;
+}
+
+function findQmlImportersForDynamicQmlChange(
+  rootDir: string,
+  sourceFiles: string[],
+  changedQmlFiles: ReadonlySet<string>
+): Set<string> {
+  const importers = new Set<string>();
+  if (changedQmlFiles.size === 0) return importers;
+
+  const changedLoaderFiles = new Set(
+    [...changedQmlFiles].filter((filePath) => filePath.split('/').pop()?.toLowerCase() === 'loader.qml')
+  );
+  const changedLoaderDirs = new Set([...changedLoaderFiles].map((filePath) => qmlDirname(filePath)));
+  const loaderExportUris = qmlDirLoaderExportUrisForFiles(rootDir, sourceFiles, changedLoaderFiles);
+
+  for (const filePath of sourceFiles) {
+    if (!isQmlFile(filePath) || changedQmlFiles.has(filePath)) continue;
+
+    try {
+      const source = fs.readFileSync(path.join(rootDir, filePath), 'utf-8');
+      const targets = literalDynamicQmlTargets(filePath, source);
+      if ([...targets].some((target) => changedQmlFiles.has(target))) {
+        importers.add(filePath);
+        continue;
+      }
+
+      if (changedLoaderFiles.size > 0 && hasLiteralLoaderSource(source)) {
+        const localDirs = parseQmlLocalImportDirs(filePath, source);
+        if ([...changedLoaderDirs].some((dir) => localDirs.has(dir))) {
+          importers.add(filePath);
+          continue;
+        }
+
+        const moduleImports = parseQmlModuleImports(source);
+        if (moduleImports.some((uri) => loaderExportUris.has(uri))) {
+          importers.add(filePath);
+        }
+      }
+    } catch (error) {
+      logDebug('Skipping unreadable QML importer during dynamic QML invalidation', {
+        filePath,
+        error: String(error),
+      });
+    }
+  }
+
+  return importers;
+}
+
 function hasChangedQmlDirMetadata(
   rootDir: string,
   sourceFiles: string[],
@@ -2117,6 +2293,7 @@ export class ExtractionOrchestrator {
     const filesToIndexSet = new Set<string>();
     const forceReindexFiles = new Set<string>();
     const qmlDirInvalidationScopes: QmlDirInvalidationScope[] = [];
+    const dynamicQmlChangedFiles = new Set<string>();
     // === Filesystem reconcile (git-independent) ===
     // The source of truth for "what changed" is the filesystem vs the indexed
     // state — never git. We enumerate the current source files and reconcile
@@ -2149,6 +2326,8 @@ export class ExtractionOrchestrator {
             qmlDirInvalidationScopes,
             this.queries.getNodesByFile(tracked.path)
           );
+        } else if (isQmlFile(tracked.path)) {
+          dynamicQmlChangedFiles.add(normalizeQmlProjectPath(tracked.path));
         }
         this.queries.deleteFile(tracked.path);
         filesRemoved++;
@@ -2203,6 +2382,8 @@ export class ExtractionOrchestrator {
         if (isQmlDirFile(filePath)) {
           const uri = parseQmlDirModuleUri(content);
           if (uri) qmlDirInvalidationScopes.push({ uri });
+        } else if (isQmlFile(filePath)) {
+          dynamicQmlChangedFiles.add(normalizeQmlProjectPath(filePath));
         }
         filesAdded++;
       } else if (tracked.contentHash !== contentHash) {
@@ -2216,6 +2397,8 @@ export class ExtractionOrchestrator {
           );
           const uri = parseQmlDirModuleUri(content);
           if (uri) qmlDirInvalidationScopes.push({ uri });
+        } else if (isQmlFile(filePath)) {
+          dynamicQmlChangedFiles.add(normalizeQmlProjectPath(filePath));
         }
         filesModified++;
       }
@@ -2232,6 +2415,21 @@ export class ExtractionOrchestrator {
         this.rootDir,
         currentFiles,
         expandedScopes
+      )) {
+        forceReindexFiles.add(filePath);
+        if (!filesToIndexSet.has(filePath)) {
+          filesToIndex.push(filePath);
+          filesToIndexSet.add(filePath);
+          changedFilePaths.push(filePath);
+        }
+      }
+    }
+
+    if (dynamicQmlChangedFiles.size > 0) {
+      for (const filePath of findQmlImportersForDynamicQmlChange(
+        this.rootDir,
+        currentFiles,
+        dynamicQmlChangedFiles
       )) {
         forceReindexFiles.add(filePath);
         if (!filesToIndexSet.has(filePath)) {

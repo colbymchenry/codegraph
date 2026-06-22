@@ -177,7 +177,7 @@ export interface FrameworkResolver {
    * `self._iterable_class(...)`, React effect callbacks). Returning true lets the
    * ref reach `resolve()` instead of being dropped for having no name match.
    */
-  claimsReference?(name: string): boolean;
+  claimsReference?(name: string, ref?: UnresolvedRef): boolean;
   /**
    * Extract framework-specific nodes and references from a file.
    *

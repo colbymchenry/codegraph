@@ -51,6 +51,15 @@ function dirname(filePath: string): string {
   return slash >= 0 ? normalized.slice(0, slash) : '';
 }
 
+function normalizeProjectPath(filePath: string): string {
+  const normalized = path.posix.normalize(filePath.replace(/\\/g, '/'));
+  return normalized === '.' ? '' : normalized.replace(/^\.\//, '');
+}
+
+function joinProjectPath(dir: string, relativePath: string): string {
+  return normalizeProjectPath(dir ? `${dir}/${relativePath}` : relativePath);
+}
+
 function parseQmlImports(context: ResolutionContext, filePath: string): QmlModuleImport[] {
   let perContext = importCache.get(context);
   if (!perContext) {
@@ -124,7 +133,7 @@ function parseQmlDir(filePath: string, source: string): QmlDirModule | null {
 
     const qmlFile = tokens[qmlFileIndex];
     if (!qmlFile) continue;
-    const targetPath = path.posix.normalize(dir ? `${dir}/${qmlFile}` : qmlFile);
+    const targetPath = joinProjectPath(dir, qmlFile);
     components.push({ name, version, filePath: targetPath, internal });
   }
 
@@ -166,17 +175,99 @@ function componentTypeName(referenceName: string): string | null {
 }
 
 function findQmlComponentNode(context: ResolutionContext, component: QmlDirComponent): Node | null {
+  return findQmlComponentNodeByPath(context, component.filePath);
+}
+
+function findQmlComponentNodeByPath(context: ResolutionContext, filePath: string): Node | null {
   return (
     context
-      .getNodesInFile(component.filePath)
+      .getNodesInFile(filePath)
       .find(
         (node) =>
           node.language === 'qml' &&
           node.kind === 'component' &&
-          node.filePath.replace(/\\/g, '/') === component.filePath &&
+          node.filePath.replace(/\\/g, '/') === filePath &&
           node.qualifiedName === node.name
       ) ?? null
   );
+}
+
+function isTopLevelQmlComponentDefinition(node: Node, name?: string): boolean {
+  return (
+    node.language === 'qml' &&
+    node.kind === 'component' &&
+    (!name || node.name === name) &&
+    node.qualifiedName === node.name
+  );
+}
+
+function isAbsoluteOrSchemedQmlUrl(url: string): boolean {
+  return (
+    /^[A-Za-z][A-Za-z0-9+.-]*:/.test(url) ||
+    url.startsWith('/') ||
+    url.startsWith('\\') ||
+    /^[A-Za-z]:[\\/]/.test(url)
+  );
+}
+
+function getLocalQmlImportDirs(context: ResolutionContext, filePath: string): Set<string> {
+  const fromDir = dirname(filePath);
+  const dirs = new Set<string>([fromDir]);
+  const source = context.readFile(filePath);
+  if (!source) return dirs;
+
+  for (const match of source.matchAll(/^\s*import\s+(?:"([^"]+)"|'([^']+)')/gm)) {
+    const spec = match[1] ?? match[2];
+    if (!spec || /\.js$/i.test(spec) || isAbsoluteOrSchemedQmlUrl(spec)) continue;
+    dirs.add(joinProjectPath(fromDir, spec));
+  }
+
+  return dirs;
+}
+
+function isShadowedLoaderSourceReference(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  const fromNode = context.getNodesInFile(ref.filePath).find((node) => node.id === ref.fromNodeId);
+  const sourceTypeName = fromNode?.signature?.trim().split(/\s+/)[0];
+  if (fromNode?.kind !== 'component' || sourceTypeName !== 'Loader') return false;
+
+  const localDirs = getLocalQmlImportDirs(context, ref.filePath);
+  if (context
+    .getNodesByName('Loader')
+    .some(
+      (node) =>
+        isTopLevelQmlComponentDefinition(node, 'Loader') && localDirs.has(dirname(node.filePath))
+    )) {
+    return true;
+  }
+
+  return parseQmlImports(context, ref.filePath).some((imported) =>
+    effectiveQmlImports(context, imported).some((effectiveImport) =>
+      importedComponentCandidates(context, effectiveImport, 'Loader').some((component) => {
+        const target = findQmlComponentNode(context, component);
+        return !!target;
+      })
+    )
+  );
+}
+
+function resolveLiteralQmlUrl(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.language !== 'qml' || ref.referenceKind !== 'references') return null;
+  if (!/\.qml$/i.test(ref.referenceName)) return null;
+  if (isAbsoluteOrSchemedQmlUrl(ref.referenceName)) return null;
+  if (isShadowedLoaderSourceReference(ref, context)) return null;
+
+  const refDir = dirname(ref.filePath);
+  const targetPath = joinProjectPath(refDir, ref.referenceName);
+  const target = findQmlComponentNodeByPath(context, targetPath);
+  if (!target) return null;
+
+  return { original: ref, targetNodeId: target.id, confidence: 0.95, resolvedBy: 'file-path' };
 }
 
 function parseVersion(version: string | undefined): { major: number; minor: number } | null {
@@ -317,14 +408,16 @@ export const qmlQtResolver: FrameworkResolver = {
   detect(context: ResolutionContext): boolean {
     return hasQmlFiles(context);
   },
-  claimsReference(name: string): boolean {
+  claimsReference(name: string, ref?: UnresolvedRef): boolean {
+    if (ref && ref.language !== 'qml') return false;
     return (
+      /\.qml$/i.test(name) ||
       /^[A-Za-z_][A-Za-z0-9_]*\.[A-Z][A-Za-z0-9_]*$/.test(name) ||
       /^[A-Z][A-Za-z0-9_]*$/.test(name)
     );
   },
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
-    return resolveQmlModuleComponent(ref, context);
+    return resolveLiteralQmlUrl(ref, context) ?? resolveQmlModuleComponent(ref, context);
   },
   extract(filePath: string, content: string): { nodes: Node[]; references: UnresolvedRef[] } {
     if (!isQmlDirFile(filePath)) return { nodes: [], references: [] };
