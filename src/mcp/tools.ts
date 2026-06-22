@@ -289,6 +289,27 @@ function adaptiveExploreEnabled(): boolean {
 }
 
 /**
+ * How long the FIRST tool call waits on the post-open catch-up reconcile before
+ * giving up and serving anyway (issue #905). On a normal repo the reconcile
+ * finishes in well under this, so the gate is fully honored and nothing changes.
+ * On a very large repo (~100k files) the reconcile takes minutes — blocking the
+ * first call on all of it presents as a multi-minute hang — so we wait briefly
+ * for a clean answer, then serve and let the reconcile finish in the background
+ * (it yields to the event loop, so a concurrent read still runs).
+ *
+ * `CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS` overrides the default; `0` restores the
+ * old unbounded-wait behavior (always block until the reconcile completes).
+ */
+const DEFAULT_CATCHUP_GATE_TIMEOUT_MS = 3000;
+function resolveCatchUpGateTimeoutMs(): number {
+  const raw = process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
+  if (raw === undefined || raw === '') return DEFAULT_CATCHUP_GATE_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_CATCHUP_GATE_TIMEOUT_MS;
+  return Math.floor(n);
+}
+
+/**
  * Prefix each line of a source slice with its 1-based line number, matching
  * the Read tool's `cat -n` convention (number + tab) so the agent treats it
  * the same way it treats Read output.
@@ -667,7 +688,9 @@ export class ToolHandler {
   // this, a tool call that races past `catchUpSync()` serves rows for files
   // that were deleted (or edited) while no MCP server was running — and the
   // per-file staleness banner can't help, because `getPendingFiles()` is
-  // populated by the watcher, not by catch-up. Cleared on first await so
+  // populated by the watcher, not by catch-up. The wait is time-boxed
+  // (see {@link resolveCatchUpGateTimeoutMs}) so a minutes-long reconcile on a
+  // huge repo can't hang the first call (#905); cleared on first await so
   // subsequent calls don't pay any cost.
   private catchUpGate: Promise<void> | null = null;
 
@@ -689,6 +712,43 @@ export class ToolHandler {
    */
   setCatchUpGate(p: Promise<void> | null): void {
     this.catchUpGate = p;
+  }
+
+  /**
+   * Await the catch-up gate, but no longer than the configured timeout (#905).
+   * If the reconcile settles first, we got the fully-reconciled answer. If the
+   * timeout wins, we serve the call now and let the reconcile finish in the
+   * background — it yields to the event loop (see SYNC_RECONCILE_YIELD_INTERVAL),
+   * so a concurrent read still runs against the same connection. Never throws:
+   * a failed reconcile is logged by the engine, and we serve best-effort over
+   * the same potentially-stale data the un-gated path would have.
+   */
+  private async awaitCatchUpGate(gate: Promise<void>): Promise<void> {
+    const timeoutMs = resolveCatchUpGateTimeoutMs();
+    if (timeoutMs <= 0) {
+      // 0 = opt back into the original unbounded wait.
+      try { await gate; } catch { /* engine already logged */ }
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs);
+      timer.unref?.();
+    });
+    try {
+      const outcome = await Promise.race([
+        gate.then(() => 'done' as const, () => 'done' as const),
+        timedOut,
+      ]);
+      if (outcome === 'timeout') {
+        process.stderr.write(
+          `[CodeGraph MCP] Catch-up reconcile still running after ${timeoutMs}ms; serving this tool call now and finishing the reconcile in the background (#905). ` +
+          `Set CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS=0 to always wait for it.\n`
+        );
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**
@@ -1128,13 +1188,16 @@ export class ToolHandler {
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
-      // running. The gate is cleared after first await — subsequent calls
-      // pay nothing. Catch-up failures are logged by the engine; we
-      // proceed regardless so a transient sync error never breaks tools.
+      // running. The wait is time-boxed (#905): a huge-repo reconcile takes
+      // minutes, and blocking the first call on all of it reads as a hang, so
+      // we wait briefly then serve and let it finish in the background. The
+      // gate is cleared after first await — subsequent calls pay nothing.
+      // Catch-up failures are logged by the engine; we proceed regardless so a
+      // transient sync error never breaks tools.
       if (this.catchUpGate) {
         const gate = this.catchUpGate;
         this.catchUpGate = null;
-        try { await gate; } catch { /* engine already logged */ }
+        await this.awaitCatchUpGate(gate);
       }
       // Honor the optional tool allowlist (CODEGRAPH_MCP_TOOLS): a trimmed
       // surface rejects ablated tools defensively even if a client cached them.

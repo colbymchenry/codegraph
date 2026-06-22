@@ -32,6 +32,18 @@ import type { ResolutionContext } from '../resolution/types';
  */
 const FILE_IO_BATCH_SIZE = 10;
 
+/**
+ * How many files the `sync()` reconcile processes between cooperative yields to
+ * the event loop. The reconcile runs two O(files) loops of synchronous `fs`
+ * calls (existsSync for removals, statSync for adds/mods); on a very large repo
+ * (~100k files) an un-yielded run wedges the main thread for minutes, which both
+ * trips the liveness watchdog (it SIGKILLs a process whose loop stops turning)
+ * and blocks the first MCP tool call behind the catch-up gate (issue #905).
+ * Yielding every N files keeps the socket, the watchdog heartbeat, and any
+ * concurrent read query responsive while the reconcile runs.
+ */
+const SYNC_RECONCILE_YIELD_INTERVAL = 1000;
+
 // PARSER_RESET_INTERVAL moved to parse-worker.ts (runs in worker thread)
 
 /**
@@ -1774,7 +1786,7 @@ export class ExtractionOrchestrator {
     // whether or not the project uses git, and crucially also catches committed
     // changes from `git pull`/`checkout`/`merge`/`rebase` — which `git status`
     // cannot see, because the working tree is clean afterward.
-    const currentFiles = scanDirectory(this.rootDir);
+    const currentFiles = await scanDirectoryAsync(this.rootDir);
     filesChecked = currentFiles.length;
     const currentSet = new Set(currentFiles);
 
@@ -1787,15 +1799,27 @@ export class ExtractionOrchestrator {
     // Removals: tracked in the DB but no longer a present source file. Check the
     // filesystem directly — `scanDirectory` (via `git ls-files`) still lists a
     // file deleted from disk but not yet staged, so set membership alone misses it.
+    // `reconcileChecks` drives the cooperative yield shared with the adds/mods loop
+    // below (see SYNC_RECONCILE_YIELD_INTERVAL / issue #905).
+    let reconcileChecks = 0;
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
         this.queries.deleteFile(tracked.path);
         filesRemoved++;
       }
+      if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
     }
 
     // Adds / modifications.
     for (const filePath of currentFiles) {
+      // Same cooperative yield as the removals loop — this is the other O(files)
+      // synchronous-stat loop that wedges the main thread on a large repo (#905).
+      // Yield at the top of the body so the `continue` fast-paths below still hit it.
+      if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
       const fullPath = path.join(this.rootDir, filePath);
       const tracked = trackedMap.get(filePath);
 
