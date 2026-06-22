@@ -1245,7 +1245,10 @@ export class ExtractionOrchestrator {
       const fileContents = await Promise.all(
         batch.map(async (fp) => {
           try {
-            const fullPath = validatePathWithinRoot(this.rootDir, fp);
+            // Indexing read: follow in-root symlinks the directory walk already
+            // descended into (the `../` guard still applies) so files reached
+            // via an in-root symlink-to-outside still index (#935).
+            const fullPath = validatePathWithinRoot(this.rootDir, fp, { allowSymlinkEscape: true });
             if (!fullPath) {
               logWarn('Path traversal blocked in batch reader', { filePath: fp });
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: new Error('Path traversal blocked') };
@@ -1551,7 +1554,8 @@ export class ExtractionOrchestrator {
    * Index a single file
    */
   async indexFile(relativePath: string): Promise<ExtractionResult> {
-    const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
+    // Indexing read: follow in-root symlinks (the `../` guard still applies), #935.
+    const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
 
     if (!fullPath) {
       return {
@@ -1598,8 +1602,8 @@ export class ExtractionOrchestrator {
     content: string,
     stats: fs.Stats
   ): Promise<ExtractionResult> {
-    // Prevent path traversal
-    const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
+    // Prevent `../` traversal; follow in-root symlinks like the directory walk (#935).
+    const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
     if (!fullPath) {
       logWarn('Path traversal blocked in indexFileWithContent', { relativePath });
       return {
