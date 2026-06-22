@@ -20,7 +20,7 @@ import {
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { ParseWorkerPool, resolveParsePoolSize } from './parse-pool';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, isQmlDirFile, isQmlFile, initGrammars, loadGrammarsForLanguages } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -107,6 +107,201 @@ export interface SyncResult {
  */
 export function hashContent(content: string): string {
   return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+interface QmlDirInvalidationScope {
+  uri: string;
+}
+
+interface QmlDirMetadata {
+  uri: string | null;
+  imports: string[];
+}
+
+function parseQmlDirMetadata(source: string): QmlDirMetadata {
+  let uri: string | null = null;
+  const imports: string[] = [];
+
+  for (const rawLine of source.split(/\r?\n/)) {
+    const line = rawLine.replace(/#.*/, '').trim();
+    const match = /^module\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)$/.exec(line);
+    if (match) {
+      uri = match[1]!;
+      continue;
+    }
+
+    const importMatch = /^import\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)(?:\s+\d+(?:\.\d+)?)?$/.exec(line);
+    if (importMatch?.[1]) imports.push(importMatch[1]);
+  }
+
+  return { uri, imports };
+}
+
+function parseQmlDirModuleUri(source: string): string | null {
+  return parseQmlDirMetadata(source).uri;
+}
+
+function parseQmlModuleImports(source: string): string[] {
+  const imports: string[] = [];
+  const importPattern =
+    /^\s*import\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:\d+(?:\.\d+)?)?\s*(?:as\s+[A-Za-z_][A-Za-z0-9_]*)?/gm;
+  for (const match of source.matchAll(importPattern)) {
+    if (match[1]) imports.push(match[1]);
+  }
+  return imports;
+}
+
+function qmlImportMatchesScope(importUri: string, scope: QmlDirInvalidationScope): boolean {
+  return importUri === scope.uri;
+}
+
+function addQmlDirScopesFromIndexedNodes(
+  scopes: QmlDirInvalidationScope[],
+  nodes: ReturnType<QueryBuilder['getNodesByFile']>
+): void {
+  for (const node of nodes) {
+    if (node.kind === 'module' && node.name) {
+      scopes.push({ uri: node.name });
+    }
+  }
+}
+
+function currentQmlDirDependencyMap(
+  rootDir: string,
+  sourceFiles: string[]
+): Map<string, Set<string>> {
+  const dependencies = new Map<string, Set<string>>();
+  for (const filePath of sourceFiles) {
+    if (!isQmlDirFile(filePath)) continue;
+
+    try {
+      const metadata = parseQmlDirMetadata(fs.readFileSync(path.join(rootDir, filePath), 'utf-8'));
+      if (!metadata.uri) continue;
+      dependencies.set(metadata.uri, new Set(metadata.imports));
+    } catch (error) {
+      logDebug('Skipping unreadable qmldir during dependency invalidation', {
+        filePath,
+        error: String(error),
+      });
+    }
+  }
+  return dependencies;
+}
+
+function indexedQmlDirDependencyMap(queries: QueryBuilder): Map<string, Set<string>> {
+  const dependencies = new Map<string, Set<string>>();
+  for (const moduleNode of queries.getNodesByKind('module')) {
+    if (!isQmlDirFile(moduleNode.filePath) || !moduleNode.name) continue;
+
+    const importNodes = queries
+      .getNodesByFile(moduleNode.filePath)
+      .filter((node) => node.kind === 'import' && node.name);
+    const importedUris = dependencies.get(moduleNode.name) ?? new Set<string>();
+    for (const importNode of importNodes) {
+      importedUris.add(importNode.name);
+    }
+    dependencies.set(moduleNode.name, importedUris);
+  }
+  return dependencies;
+}
+
+function expandQmlDirInvalidationScopes(
+  rootDir: string,
+  sourceFiles: string[],
+  scopes: QmlDirInvalidationScope[],
+  queries: QueryBuilder
+): QmlDirInvalidationScope[] {
+  const scopedUris = new Set(scopes.map((scope) => scope.uri));
+  const dependencyMaps = [
+    indexedQmlDirDependencyMap(queries),
+    currentQmlDirDependencyMap(rootDir, sourceFiles),
+  ];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const dependencyMap of dependencyMaps) {
+      for (const [moduleUri, importedUris] of dependencyMap) {
+        if (scopedUris.has(moduleUri)) continue;
+        for (const importedUri of importedUris) {
+          if (!scopedUris.has(importedUri)) continue;
+          scopedUris.add(moduleUri);
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+
+  return [...scopedUris].map((uri) => ({ uri }));
+}
+
+function findQmlImportersForQmlDirChange(
+  rootDir: string,
+  sourceFiles: string[],
+  scopes: QmlDirInvalidationScope[]
+): Set<string> {
+  const importers = new Set<string>();
+  if (scopes.length === 0) return importers;
+
+  for (const filePath of sourceFiles) {
+    if (!isQmlFile(filePath)) continue;
+
+    try {
+      const source = fs.readFileSync(path.join(rootDir, filePath), 'utf-8');
+      const imports = parseQmlModuleImports(source);
+      if (imports.some((importUri) => scopes.some((scope) => qmlImportMatchesScope(importUri, scope)))) {
+        importers.add(filePath);
+      }
+    } catch (error) {
+      logDebug('Skipping unreadable QML importer during qmldir invalidation', {
+        filePath,
+        error: String(error),
+      });
+    }
+  }
+
+  return importers;
+}
+
+function hasChangedQmlDirMetadata(
+  rootDir: string,
+  sourceFiles: string[],
+  trackedFiles: Iterable<FileRecord>,
+  queries: QueryBuilder
+): QmlDirInvalidationScope[] {
+  const scopes: QmlDirInvalidationScope[] = [];
+  const sourceSet = new Set(sourceFiles);
+  const trackedMap = new Map<string, FileRecord>();
+  for (const tracked of trackedFiles) {
+    trackedMap.set(tracked.path, tracked);
+    if (isQmlDirFile(tracked.path) && !sourceSet.has(tracked.path)) {
+      addQmlDirScopesFromIndexedNodes(scopes, queries.getNodesByFile(tracked.path));
+    }
+  }
+
+  for (const filePath of sourceFiles) {
+    if (!isQmlDirFile(filePath)) continue;
+
+    const tracked = trackedMap.get(filePath);
+    try {
+      const content = fs.readFileSync(path.join(rootDir, filePath), 'utf-8');
+      if (!tracked || tracked.contentHash !== hashContent(content)) {
+        if (tracked) {
+          addQmlDirScopesFromIndexedNodes(scopes, queries.getNodesByFile(filePath));
+        }
+        const uri = parseQmlDirModuleUri(content);
+        if (uri) scopes.push({ uri });
+      }
+    } catch (error) {
+      logDebug('Skipping unreadable qmldir during change detection', {
+        filePath,
+        error: String(error),
+      });
+    }
+  }
+
+  return scopes;
 }
 
 /**
@@ -1179,6 +1374,17 @@ export class ExtractionOrchestrator {
     // between runs is picked up without restarting the process.
     this.detectedFrameworkNames = null;
     const frameworkNames = this.ensureDetectedFrameworks(files);
+    const qmlDirInvalidationScopes = hasChangedQmlDirMetadata(
+      this.rootDir,
+      files,
+      this.queries.getAllFiles(),
+      this.queries
+    );
+    const forceReindexFiles = findQmlImportersForQmlDirChange(
+      this.rootDir,
+      files,
+      expandQmlDirInvalidationScopes(this.rootDir, files, qmlDirInvalidationScopes, this.queries)
+    );
 
     if (signal?.aborted) {
       return {
@@ -1276,7 +1482,14 @@ export class ExtractionOrchestrator {
       // Store in database on main thread (SQLite is not thread-safe)
       if (result.nodes.length > 0 || result.errors.length === 0) {
         const language = detectLanguage(filePath, content, overrides);
-        this.storeExtractionResult(filePath, content, language, stats, result);
+        this.storeExtractionResult(
+          filePath,
+          content,
+          language,
+          stats,
+          result,
+          forceReindexFiles.has(filePath)
+        );
       }
 
       if (result.errors.length > 0) {
@@ -1506,7 +1719,14 @@ export class ExtractionOrchestrator {
         if (result.nodes.length > 0 || result.errors.length === 0) {
           const language = detectLanguage(filePath, content, overrides);
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
-          this.storeExtractionResult(filePath, content, language, stats, result);
+          this.storeExtractionResult(
+            filePath,
+            content,
+            language,
+            stats,
+            result,
+            forceReindexFiles.has(filePath)
+          );
 
           const idx = errors.indexOf(errEntry);
           if (idx >= 0) errors.splice(idx, 1);
@@ -1556,7 +1776,14 @@ export class ExtractionOrchestrator {
           if (result.nodes.length > 0 || result.errors.length === 0) {
             const language = detectLanguage(filePath, fullContent, overrides);
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
-            this.storeExtractionResult(filePath, fullContent, language, stats, result);
+            this.storeExtractionResult(
+              filePath,
+              fullContent,
+              language,
+              stats,
+              result,
+              forceReindexFiles.has(filePath)
+            );
 
             const idx = errors.indexOf(errEntry);
             if (idx >= 0) errors.splice(idx, 1);
@@ -1635,7 +1862,7 @@ export class ExtractionOrchestrator {
   /**
    * Index a single file
    */
-  async indexFile(relativePath: string): Promise<ExtractionResult> {
+  async indexFile(relativePath: string, force = false): Promise<ExtractionResult> {
     // Indexing read: follow in-root symlinks (the `../` guard still applies), #935.
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
 
@@ -1672,7 +1899,7 @@ export class ExtractionOrchestrator {
       };
     }
 
-    return this.indexFileWithContent(relativePath, content, stats);
+    return this.indexFileWithContent(relativePath, content, stats, force);
   }
 
   /**
@@ -1682,7 +1909,8 @@ export class ExtractionOrchestrator {
   async indexFileWithContent(
     relativePath: string,
     content: string,
-    stats: fs.Stats
+    stats: fs.Stats,
+    force = false
   ): Promise<ExtractionResult> {
     // Prevent `../` traversal; follow in-root symlinks like the directory walk (#935).
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
@@ -1735,7 +1963,7 @@ export class ExtractionOrchestrator {
 
     // Store in database
     if (result.nodes.length > 0 || result.errors.length === 0) {
-      this.storeExtractionResult(relativePath, content, language, stats, result);
+      this.storeExtractionResult(relativePath, content, language, stats, result, force);
     }
 
     return result;
@@ -1749,13 +1977,14 @@ export class ExtractionOrchestrator {
     content: string,
     language: Language,
     stats: fs.Stats,
-    result: ExtractionResult
+    result: ExtractionResult,
+    force = false
   ): void {
     const contentHash = hashContent(content);
 
     // Check if file already exists and hasn't changed
     const existingFile = this.queries.getFileByPath(filePath);
-    if (existingFile && existingFile.contentHash === contentHash) {
+    if (existingFile && existingFile.contentHash === contentHash && !force) {
       return; // No changes
     }
 
@@ -1885,6 +2114,9 @@ export class ExtractionOrchestrator {
     });
 
     const filesToIndex: string[] = [];
+    const filesToIndexSet = new Set<string>();
+    const forceReindexFiles = new Set<string>();
+    const qmlDirInvalidationScopes: QmlDirInvalidationScope[] = [];
     // === Filesystem reconcile (git-independent) ===
     // The source of truth for "what changed" is the filesystem vs the indexed
     // state — never git. We enumerate the current source files and reconcile
@@ -1912,6 +2144,12 @@ export class ExtractionOrchestrator {
     let reconcileChecks = 0;
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
+        if (isQmlDirFile(tracked.path)) {
+          addQmlDirScopesFromIndexedNodes(
+            qmlDirInvalidationScopes,
+            this.queries.getNodesByFile(tracked.path)
+          );
+        }
         this.queries.deleteFile(tracked.path);
         filesRemoved++;
       }
@@ -1960,12 +2198,47 @@ export class ExtractionOrchestrator {
 
       if (!tracked) {
         filesToIndex.push(filePath);
+        filesToIndexSet.add(filePath);
         changedFilePaths.push(filePath);
+        if (isQmlDirFile(filePath)) {
+          const uri = parseQmlDirModuleUri(content);
+          if (uri) qmlDirInvalidationScopes.push({ uri });
+        }
         filesAdded++;
       } else if (tracked.contentHash !== contentHash) {
         filesToIndex.push(filePath);
+        filesToIndexSet.add(filePath);
         changedFilePaths.push(filePath);
+        if (isQmlDirFile(filePath)) {
+          addQmlDirScopesFromIndexedNodes(
+            qmlDirInvalidationScopes,
+            this.queries.getNodesByFile(filePath)
+          );
+          const uri = parseQmlDirModuleUri(content);
+          if (uri) qmlDirInvalidationScopes.push({ uri });
+        }
         filesModified++;
+      }
+    }
+
+    if (qmlDirInvalidationScopes.length > 0) {
+      const expandedScopes = expandQmlDirInvalidationScopes(
+        this.rootDir,
+        currentFiles,
+        qmlDirInvalidationScopes,
+        this.queries
+      );
+      for (const filePath of findQmlImportersForQmlDirChange(
+        this.rootDir,
+        currentFiles,
+        expandedScopes
+      )) {
+        forceReindexFiles.add(filePath);
+        if (!filesToIndexSet.has(filePath)) {
+          filesToIndex.push(filePath);
+          filesToIndexSet.add(filePath);
+          changedFilePaths.push(filePath);
+        }
       }
     }
 
@@ -1991,7 +2264,7 @@ export class ExtractionOrchestrator {
         currentFile: filePath,
       });
 
-      const result = await this.indexFile(filePath);
+      const result = await this.indexFile(filePath, forceReindexFiles.has(filePath));
       nodesUpdated += result.nodes.length;
     }
 

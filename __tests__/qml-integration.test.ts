@@ -447,6 +447,625 @@ Item {
     ).toBe(true);
   });
 
+  it('resolves qmldir module imports without broad built-in or internal matches', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import My.Controls 1.0
+import My.Controls 1.0 as Controls
+
+Item {
+  FancyButton { id: plainFancy }
+  Controls.FancyButton { id: aliasFancy }
+  HiddenButton { id: hiddenButton }
+  Text { id: builtInText }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 FancyButton.qml
+Text 1.0 Text.qml
+internal HiddenButton HiddenButton.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButton.qml'), 'import QtQuick\nRectangle { id: fancyRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'HiddenButton.qml'), 'import QtQuick\nItem { id: hiddenRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'Text.qml'), 'import QtQuick\nItem { id: customText }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const fancyDefinition = graph.getNodesByName('FancyButton').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButton.qml');
+    const plainFancy = graph.getNodesByName('plainFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const aliasFancy = graph.getNodesByName('aliasFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const hiddenDefinition = graph.getNodesByName('HiddenButton').find((n) => n.kind === 'component' && n.filePath === 'Controls/HiddenButton.qml');
+    const hiddenButton = graph.getNodesByName('hiddenButton').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const customText = graph.getNodesByName('Text').find((n) => n.kind === 'component' && n.filePath === 'Controls/Text.qml');
+    const builtInText = graph.getNodesByName('builtInText').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+
+    expect(fancyDefinition).toBeDefined();
+    expect(plainFancy).toBeDefined();
+    expect(aliasFancy).toBeDefined();
+    expect(hiddenDefinition).toBeDefined();
+    expect(hiddenButton).toBeDefined();
+    expect(customText).toBeDefined();
+    expect(builtInText).toBeDefined();
+
+    expect(graph.getOutgoingEdges(plainFancy!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(aliasFancy!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(hiddenButton!.id).some((edge) => edge.kind === 'references' && edge.target === hiddenDefinition!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(builtInText!.id).some((edge) => edge.kind === 'references' && edge.target === customText!.id)).toBe(false);
+  });
+
+  it('resolves and invalidates qmldir imports from uppercase QML files', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.QML'),
+      `import QtQuick
+import My.Controls 1.0
+
+Item {
+  FancyButton { id: upperFancy }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 FancyButton.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButton.qml'), 'import QtQuick\nItem { id: fancyRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'OtherButton.qml'), 'import QtQuick\nItem { id: otherRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const upperFancy = graph.getNodesByName('upperFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.QML');
+    const fancyDefinition = graph.getNodesByName('FancyButton').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButton.qml');
+    const otherDefinition = graph.getNodesByName('OtherButton').find((n) => n.kind === 'component' && n.filePath === 'Controls/OtherButton.qml');
+
+    expect(upperFancy).toBeDefined();
+    expect(fancyDefinition).toBeDefined();
+    expect(otherDefinition).toBeDefined();
+    expect(graph.getOutgoingEdges(upperFancy!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 OtherButton.qml
+`
+    );
+    await graph.sync();
+
+    const upperFancyAfterSync = graph.getNodesByName('upperFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.QML');
+
+    expect(upperFancyAfterSync).toBeDefined();
+    expect(graph.getOutgoingEdges(upperFancyAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(upperFancyAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === otherDefinition!.id)).toBe(true);
+  });
+
+  it('updates qmldir importer edges when only qmldir metadata changes', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import My.Controls 1.0
+
+Item {
+  FancyButton { id: plainFancy }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 FancyButton.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButton.qml'), 'import QtQuick\nItem { id: fancyRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'OtherButton.qml'), 'import QtQuick\nItem { id: otherRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const plainFancy = graph.getNodesByName('plainFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const fancyDefinition = graph.getNodesByName('FancyButton').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButton.qml');
+    const otherDefinition = graph.getNodesByName('OtherButton').find((n) => n.kind === 'component' && n.filePath === 'Controls/OtherButton.qml');
+
+    expect(plainFancy).toBeDefined();
+    expect(fancyDefinition).toBeDefined();
+    expect(otherDefinition).toBeDefined();
+    expect(graph.getOutgoingEdges(plainFancy!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(true);
+
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 OtherButton.qml
+# switched target
+`
+    );
+    await graph.sync();
+
+    const plainFancyAfterSync = graph.getNodesByName('plainFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    expect(plainFancyAfterSync).toBeDefined();
+    expect(graph.getOutgoingEdges(plainFancyAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(plainFancyAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === otherDefinition!.id)).toBe(true);
+
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 FancyButton.qml
+# switched back to original target
+`
+    );
+    await graph.indexAll();
+
+    const plainFancyAfterIndexAll = graph.getNodesByName('plainFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    expect(plainFancyAfterIndexAll).toBeDefined();
+    expect(graph.getOutgoingEdges(plainFancyAfterIndexAll!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(plainFancyAfterIndexAll!.id).some((edge) => edge.kind === 'references' && edge.target === otherDefinition!.id)).toBe(false);
+  });
+
+  it('does not force-reindex unrelated qmldir module importers during sync', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'OtherControls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import My.Controls 1.0
+
+Item {
+  FancyButton { id: fancy }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Other.qml'),
+      `import QtQuick
+import Other.Controls 1.0
+
+Item {
+  OtherButton { id: unrelatedOther }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 FancyButton.qml
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'OtherControls', 'qmldir'),
+      `module Other.Controls
+OtherButton 1.0 OtherButton.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButton.qml'), 'import QtQuick\nItem { id: fancyRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButtonAlt.qml'), 'import QtQuick\nItem { id: fancyAltRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'OtherControls', 'OtherButton.qml'), 'import QtQuick\nItem { id: otherRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const fancy = graph.getNodesByName('fancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const fancyDefinition = graph.getNodesByName('FancyButton').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButton.qml');
+    const fancyAltDefinition = graph.getNodesByName('FancyButtonAlt').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButtonAlt.qml');
+    const unrelatedOtherBefore = graph.getNodesByName('unrelatedOther').find((n) => n.kind === 'component' && n.filePath === 'Other.qml');
+
+    expect(fancy).toBeDefined();
+    expect(fancyDefinition).toBeDefined();
+    expect(fancyAltDefinition).toBeDefined();
+    expect(unrelatedOtherBefore).toBeDefined();
+    expect(graph.getOutgoingEdges(fancy!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 FancyButtonAlt.qml
+`
+    );
+    await graph.sync();
+
+    const fancyAfterSync = graph.getNodesByName('fancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const unrelatedOtherAfter = graph.getNodesByName('unrelatedOther').find((n) => n.kind === 'component' && n.filePath === 'Other.qml');
+
+    expect(fancyAfterSync).toBeDefined();
+    expect(unrelatedOtherAfter).toBeDefined();
+    expect(graph.getOutgoingEdges(fancyAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(fancyAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === fancyAltDefinition!.id)).toBe(true);
+    expect(unrelatedOtherAfter!.updatedAt).toBe(unrelatedOtherBefore!.updatedAt);
+  });
+
+  it('does not force-reindex unrelated qmldir module importers when qmldir is deleted', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'OtherControls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import My.Controls 1.0
+
+Item {
+  FancyButton { id: fancy }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Other.qml'),
+      `import QtQuick
+import Other.Controls 1.0
+
+Item {
+  OtherButton { id: unrelatedOther }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 FancyButton.qml
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'OtherControls', 'qmldir'),
+      `module Other.Controls
+OtherButton 1.0 OtherButton.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButton.qml'), 'import QtQuick\nItem { id: fancyRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'OtherControls', 'OtherButton.qml'), 'import QtQuick\nItem { id: otherRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const fancy = graph.getNodesByName('fancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const fancyDefinition = graph.getNodesByName('FancyButton').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButton.qml');
+    const unrelatedOtherBefore = graph.getNodesByName('unrelatedOther').find((n) => n.kind === 'component' && n.filePath === 'Other.qml');
+
+    expect(fancy).toBeDefined();
+    expect(fancyDefinition).toBeDefined();
+    expect(unrelatedOtherBefore).toBeDefined();
+    expect(graph.getOutgoingEdges(fancy!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.rmSync(path.join(tmpDir, 'Controls', 'qmldir'));
+    await graph.sync();
+
+    const fancyAfterSync = graph.getNodesByName('fancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const unrelatedOtherAfter = graph.getNodesByName('unrelatedOther').find((n) => n.kind === 'component' && n.filePath === 'Other.qml');
+
+    expect(fancyAfterSync).toBeDefined();
+    expect(unrelatedOtherAfter).toBeDefined();
+    expect(graph.getOutgoingEdges(fancyAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(false);
+    expect(unrelatedOtherAfter!.updatedAt).toBe(unrelatedOtherBefore!.updatedAt);
+  });
+
+  it('invalidates old and new importers when a qmldir module URI is renamed', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import My.Controls 1.0
+
+Item {
+  FancyButton { id: oldImporter }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'New.qml'),
+      `import QtQuick
+import New.Controls 1.0
+
+Item {
+  FancyButton { id: newImporter }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 FancyButton.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButton.qml'), 'import QtQuick\nItem { id: fancyRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const oldImporter = graph.getNodesByName('oldImporter').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const newImporter = graph.getNodesByName('newImporter').find((n) => n.kind === 'component' && n.filePath === 'New.qml');
+    const fancyDefinition = graph.getNodesByName('FancyButton').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButton.qml');
+
+    expect(oldImporter).toBeDefined();
+    expect(newImporter).toBeDefined();
+    expect(fancyDefinition).toBeDefined();
+    expect(graph.getOutgoingEdges(oldImporter!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(newImporter!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module New.Controls
+FancyButton 1.0 FancyButton.qml
+`
+    );
+    await graph.sync();
+
+    const oldImporterAfterSync = graph.getNodesByName('oldImporter').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const newImporterAfterSync = graph.getNodesByName('newImporter').find((n) => n.kind === 'component' && n.filePath === 'New.qml');
+
+    expect(oldImporterAfterSync).toBeDefined();
+    expect(newImporterAfterSync).toBeDefined();
+    expect(graph.getOutgoingEdges(oldImporterAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(newImporterAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === fancyDefinition!.id)).toBe(true);
+  });
+
+  it('resolves qmldir exported names that differ from target file basenames', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import My.Controls 1.0
+
+Item {
+  FancyButton { id: exportedFancy }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 FancyButtonImpl.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButtonImpl.qml'), 'import QtQuick\nItem { id: fancyImplRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const exportedFancy = graph.getNodesByName('exportedFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const target = graph.getNodesByName('FancyButtonImpl').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButtonImpl.qml');
+
+    expect(exportedFancy).toBeDefined();
+    expect(target).toBeDefined();
+    expect(graph.getOutgoingEdges(exportedFancy!.id).some((edge) => edge.kind === 'references' && edge.target === target!.id)).toBe(true);
+  });
+
+  it('discovers qmldir modules whose component targets live in subdirectories', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls', 'impl'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import My.Controls 1.0
+
+Item {
+  FancyButton { id: nestedFancy }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 impl/FancyButton.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'impl', 'FancyButton.qml'), 'import QtQuick\nItem { id: nestedFancyRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const nestedFancy = graph.getNodesByName('nestedFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const target = graph.getNodesByName('FancyButton').find((n) => n.kind === 'component' && n.filePath === 'Controls/impl/FancyButton.qml');
+
+    expect(nestedFancy).toBeDefined();
+    expect(target).toBeDefined();
+    expect(graph.getOutgoingEdges(nestedFancy!.id).some((edge) => edge.kind === 'references' && edge.target === target!.id)).toBe(true);
+  });
+
+  it('uses qmldir import versions as compatible disambiguation instead of exact matches', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import My.Controls 1.2
+
+Item {
+  FancyButton { id: compatibleFancy }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 FancyButton10.qml
+FancyButton 2.0 FancyButton20.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButton10.qml'), 'import QtQuick\nItem { id: fancy10Root }\n');
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButton20.qml'), 'import QtQuick\nItem { id: fancy20Root }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const compatibleFancy = graph.getNodesByName('compatibleFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const compatibleTarget = graph.getNodesByName('FancyButton10').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButton10.qml');
+    const incompatibleTarget = graph.getNodesByName('FancyButton20').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButton20.qml');
+
+    expect(compatibleFancy).toBeDefined();
+    expect(compatibleTarget).toBeDefined();
+    expect(incompatibleTarget).toBeDefined();
+    expect(graph.getOutgoingEdges(compatibleFancy!.id).some((edge) => edge.kind === 'references' && edge.target === compatibleTarget!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(compatibleFancy!.id).some((edge) => edge.kind === 'references' && edge.target === incompatibleTarget!.id)).toBe(false);
+  });
+
+  it('resolves versionless qmldir imports to the highest available version', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import My.Controls
+
+Item {
+  FancyButton { id: versionlessFancy }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 1.0 FancyButton10.qml
+FancyButton 2.0 FancyButton20.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButton10.qml'), 'import QtQuick\nItem { id: fancy10Root }\n');
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButton20.qml'), 'import QtQuick\nItem { id: fancy20Root }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const versionlessFancy = graph.getNodesByName('versionlessFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const olderTarget = graph.getNodesByName('FancyButton10').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButton10.qml');
+    const newerTarget = graph.getNodesByName('FancyButton20').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButton20.qml');
+
+    expect(versionlessFancy).toBeDefined();
+    expect(olderTarget).toBeDefined();
+    expect(newerTarget).toBeDefined();
+    expect(graph.getOutgoingEdges(versionlessFancy!.id).some((edge) => edge.kind === 'references' && edge.target === newerTarget!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(versionlessFancy!.id).some((edge) => edge.kind === 'references' && edge.target === olderTarget!.id)).toBe(false);
+  });
+
+  it('does not resolve a lone qmldir candidate with an incompatible version', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'Controls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import My.Controls 1.2
+
+Item {
+  FancyButton { id: incompatibleFancy }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Controls', 'qmldir'),
+      `module My.Controls
+FancyButton 2.0 FancyButton20.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'Controls', 'FancyButton20.qml'), 'import QtQuick\nItem { id: fancy20Root }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const incompatibleFancy = graph.getNodesByName('incompatibleFancy').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const incompatibleTarget = graph.getNodesByName('FancyButton20').find((n) => n.kind === 'component' && n.filePath === 'Controls/FancyButton20.qml');
+
+    expect(incompatibleFancy).toBeDefined();
+    expect(incompatibleTarget).toBeDefined();
+    expect(graph.getOutgoingEdges(incompatibleFancy!.id).some((edge) => edge.kind === 'references' && edge.target === incompatibleTarget!.id)).toBe(false);
+  });
+
+  it('resolves components from qmldir dependency imports', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'AppControls'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'BaseControls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import App.Controls 1.0
+
+Item {
+  BaseButton { id: baseFromDependency }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'AppControls', 'qmldir'),
+      `module App.Controls
+import Base.Controls 1.0
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'BaseControls', 'qmldir'),
+      `module Base.Controls
+BaseButton 1.0 BaseButton.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'BaseControls', 'BaseButton.qml'), 'import QtQuick\nItem { id: baseRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const baseFromDependency = graph.getNodesByName('baseFromDependency').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const baseTarget = graph.getNodesByName('BaseButton').find((n) => n.kind === 'component' && n.filePath === 'BaseControls/BaseButton.qml');
+
+    expect(baseFromDependency).toBeDefined();
+    expect(baseTarget).toBeDefined();
+    expect(graph.getOutgoingEdges(baseFromDependency!.id).some((edge) => edge.kind === 'references' && edge.target === baseTarget!.id)).toBe(true);
+  });
+
+  it('reindexes qmldir dependency importers when a dependency qmldir changes', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'AppControls'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'BaseControls'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import App.Controls 1.0
+
+Item {
+  BaseButton { id: baseFromDependency }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'AppControls', 'qmldir'),
+      `module App.Controls
+import Base.Controls 1.0
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'BaseControls', 'qmldir'),
+      `module Base.Controls
+BaseButton 1.0 BaseButton.qml
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'BaseControls', 'BaseButton.qml'), 'import QtQuick\nItem { id: baseRoot }\n');
+    fs.writeFileSync(path.join(tmpDir, 'BaseControls', 'BaseButtonAlt.qml'), 'import QtQuick\nItem { id: baseAltRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const baseFromDependency = graph.getNodesByName('baseFromDependency').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+    const baseTarget = graph.getNodesByName('BaseButton').find((n) => n.kind === 'component' && n.filePath === 'BaseControls/BaseButton.qml');
+    const baseAltTarget = graph.getNodesByName('BaseButtonAlt').find((n) => n.kind === 'component' && n.filePath === 'BaseControls/BaseButtonAlt.qml');
+
+    expect(baseFromDependency).toBeDefined();
+    expect(baseTarget).toBeDefined();
+    expect(baseAltTarget).toBeDefined();
+    expect(graph.getOutgoingEdges(baseFromDependency!.id).some((edge) => edge.kind === 'references' && edge.target === baseTarget!.id)).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.writeFileSync(
+      path.join(tmpDir, 'BaseControls', 'qmldir'),
+      `module Base.Controls
+BaseButton 1.0 BaseButtonAlt.qml
+`
+    );
+    await graph.sync();
+
+    const baseFromDependencyAfterSync = graph.getNodesByName('baseFromDependency').find((n) => n.kind === 'component' && n.filePath === 'Main.qml');
+
+    expect(baseFromDependencyAfterSync).toBeDefined();
+    expect(graph.getOutgoingEdges(baseFromDependencyAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === baseTarget!.id)).toBe(false);
+    expect(graph.getOutgoingEdges(baseFromDependencyAfterSync!.id).some((edge) => edge.kind === 'references' && edge.target === baseAltTarget!.id)).toBe(true);
+  });
+
   it('uses the QML Qt framework resolver for QML-specific cross-file references', async () => {
     fs.writeFileSync(
       path.join(tmpDir, 'Main.qml'),

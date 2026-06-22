@@ -121,9 +121,12 @@ let inlineComponentNames = new Set<string>();
 
 function shouldReferenceComponentType(typeName: string): boolean {
   if (inlineComponentNames.has(typeName)) return true;
+  const leafName = typeName.split('.').pop() ?? typeName;
+  if (inlineComponentNames.has(leafName)) return true;
   return (
-    /^[A-Z][A-Za-z0-9_]*$/.test(typeName) &&
-    !QML_BUILTIN_COMPONENT_TYPES.has(typeName)
+    /^[A-Za-z_][A-Za-z0-9_]*\.[A-Z][A-Za-z0-9_]*$/.test(typeName) ||
+    (/^[A-Z][A-Za-z0-9_]*$/.test(typeName) &&
+      !QML_BUILTIN_COMPONENT_TYPES.has(typeName))
   );
 }
 

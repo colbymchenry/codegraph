@@ -129,12 +129,22 @@ export const EXTENSION_MAP: Record<string, Language> = {
  * to the built-ins. Omitting it is byte-identical to the zero-config behavior.
  */
 export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
+  if (isQmlDirFile(filePath)) return true; // QML module metadata is extensionless
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
   if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
   const ext = filePath.slice(dot).toLowerCase();
   return ext in EXTENSION_MAP || (!!overrides && ext in overrides);
+}
+
+export function isQmlFile(filePath: string): boolean {
+  const dot = filePath.lastIndexOf('.');
+  return dot >= 0 && filePath.slice(dot).toLowerCase() === '.qml';
+}
+
+export function isQmlDirFile(filePath: string): boolean {
+  return filePath.replace(/\\/g, '/').split('/').pop() === 'qmldir';
 }
 
 /**
@@ -282,6 +292,7 @@ export function getParser(language: Language): Parser | null {
  * `EXTENSION_MAP`. Omitting it is byte-identical to the zero-config behavior.
  */
 export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>): Language {
+  if (isQmlDirFile(filePath)) return 'yaml';
   // Play `conf/routes` has no grammar — route through the no-symbol path; the
   // Play framework resolver extracts route nodes from it.
   if (isPlayRoutesFile(filePath)) return 'yaml';
