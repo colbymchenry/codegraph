@@ -304,6 +304,131 @@ describe('Sync Module', () => {
     });
   });
 
+  // Incremental sync's git fast path used to consume `git status` output without
+  // the ignore matcher the full index applies — so a committed dependency dir
+  // (built-in default exclude) or a tracked file under a .gitignored dir would
+  // leak into the index via `sync`, then vanish on the next `index --force`. The
+  // git fast path must exclude exactly what the full scan does. (#766)
+  describe('Incremental sync honors the ignore matcher (#766)', () => {
+    let testDir: string;
+    let cg: CodeGraph;
+
+    function git(...args: string[]) {
+      execFileSync('git', args, { cwd: testDir, stdio: 'pipe' });
+    }
+
+    beforeEach(async () => {
+      testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-766-'));
+
+      git('init');
+      git('config', 'user.email', 'test@test.com');
+      git('config', 'user.name', 'Test');
+
+      // Real project source — must keep flowing through sync untouched.
+      fs.mkdirSync(path.join(testDir, 'src'));
+      fs.writeFileSync(
+        path.join(testDir, 'src', 'index.ts'),
+        `export function hello() { return 'world'; }`
+      );
+
+      // A COMMITTED vendor/ dir: tracked in git, but a built-in default exclude
+      // git knows nothing about. git status happily reports edits to it.
+      fs.mkdirSync(path.join(testDir, 'vendor'));
+      fs.writeFileSync(
+        path.join(testDir, 'vendor', 'lib.ts'),
+        `export function vendoredHelper() { return 1; }`
+      );
+
+      // A tracked file inside a .gitignored dir: gitignore is a no-op for files
+      // already committed, so git status still reports modifications to it.
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'generated/\n');
+      fs.mkdirSync(path.join(testDir, 'generated'));
+      fs.writeFileSync(
+        path.join(testDir, 'generated', 'out.ts'),
+        `export function generatedThing() { return 2; }`
+      );
+
+      git('add', '-A'); // .gitignore + src/ + vendor/ (generated/ is now ignored)
+      git('add', '-f', 'generated/out.ts'); // force the ignored-but-tracked file in
+      git('commit', '-m', 'initial');
+
+      cg = CodeGraph.initSync(testDir, {
+        config: { include: ['**/*.ts'], exclude: [] },
+      });
+      await cg.indexAll();
+    });
+
+    afterEach(() => {
+      if (cg) cg.destroy();
+      if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+    });
+
+    it('the full index excludes both (baseline the sync path must match)', () => {
+      expect(cg.searchNodes('hello').length).toBeGreaterThan(0);
+      expect(cg.searchNodes('vendoredHelper')).toHaveLength(0);
+      expect(cg.searchNodes('generatedThing')).toHaveLength(0);
+    });
+
+    it('does not re-index a modified tracked file in a built-in excluded dir (vendor/)', () => {
+      fs.writeFileSync(
+        path.join(testDir, 'vendor', 'lib.ts'),
+        `export function vendoredHelper() { return 999; }`
+      );
+      const changes = cg.getChangedFiles();
+      expect(changes.modified).not.toContain('vendor/lib.ts');
+      expect(changes.added).not.toContain('vendor/lib.ts');
+    });
+
+    it('does not re-index a modified tracked file in a .gitignored dir', () => {
+      fs.writeFileSync(
+        path.join(testDir, 'generated', 'out.ts'),
+        `export function generatedThing() { return 999; }`
+      );
+      const changes = cg.getChangedFiles();
+      expect(changes.modified).not.toContain('generated/out.ts');
+      expect(changes.added).not.toContain('generated/out.ts');
+    });
+
+    it('does not index a new untracked file in an excluded dir', () => {
+      // vendor/ isn't in .gitignore, so an untracked file there surfaces as `??`
+      // in git status — it must still be filtered to match the full index.
+      fs.writeFileSync(
+        path.join(testDir, 'vendor', 'extra.ts'),
+        `export function vendoredExtra() { return 3; }`
+      );
+      const changes = cg.getChangedFiles();
+      expect(changes.added).not.toContain('vendor/extra.ts');
+    });
+
+    it('status (getChangedFiles) agrees with sync — no phantom pending changes', async () => {
+      // The user-visible symptom today: `codegraph status` reads getChangedFiles
+      // and reports a vendor edit as a pending change that `sync` (a filesystem
+      // reconcile) then never indexes — so the count never clears. Both must now
+      // agree that nothing happened.
+      fs.writeFileSync(
+        path.join(testDir, 'vendor', 'lib.ts'),
+        `export function vendoredHelper() { return 999; }`
+      );
+      const changes = cg.getChangedFiles();
+      expect(changes.added).toHaveLength(0);
+      expect(changes.modified).toHaveLength(0);
+
+      const result = await cg.sync();
+      expect(result.filesModified).toBe(0);
+      expect(result.changedFilePaths ?? []).not.toContain('vendor/lib.ts');
+      expect(cg.searchNodes('vendoredHelper')).toHaveLength(0);
+    });
+
+    it('still syncs a normal modified source file (no over-filtering)', () => {
+      fs.writeFileSync(
+        path.join(testDir, 'src', 'index.ts'),
+        `export function hello() { return 'changed'; }`
+      );
+      const changes = cg.getChangedFiles();
+      expect(changes.modified).toContain('src/index.ts');
+    });
+  });
+
   describe('Cross-file module-attribute caller edges survive callee re-index (#899)', () => {
     let testDir: string;
     let cg: CodeGraph;

@@ -639,6 +639,18 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges): voi
     { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
   );
 
+  // This repo's own ignore rules — built-in defaults (#407) plus its .gitignore.
+  // Change detection must exclude the SAME files the full index does, but git
+  // status hides neither: it ignores nothing for *tracked* paths, and the
+  // built-in defaults aren't gitignore at all. Without this filter a committed
+  // vendor/ dir, or a tracked file under a .gitignored dir, surfaces here as a
+  // change — so `codegraph status` (which reads getChangedFiles) reports a
+  // pending edit the full index never tracks and `sync` never clears. Matching
+  // repo-relative `rel` at each recursion level mirrors getGitVisibleFiles'
+  // ScopeIgnore: every embedded repo is judged by ITS OWN rules, never the
+  // parent's. (#766)
+  const ig = buildDefaultIgnore(repoDir);
+
   const untrackedDirs: string[] = [];
   for (const line of output.split('\n')) {
     if (line.length < 4) continue; // Minimum: "XY file"
@@ -654,13 +666,22 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges): voi
     }
 
     const filePath = normalizePath(prefix + rel);
-    // Skip non-source files (git status already omits .gitignored paths).
     if (!isSourceFile(filePath)) continue;
+
+    if (statusCode.includes('D')) {
+      // Deletions stay unfiltered: getChangedFiles acts on one only when the
+      // path is already tracked in the DB, where removal is always correct — and
+      // that lets a newly-excluded dir's stale rows clean themselves up. (#766)
+      out.deleted.push(filePath);
+      continue;
+    }
+
+    // Added (`??`) / modified files inside an excluded dir must not enter the
+    // index — match against the repo-relative path, same as the full scan. (#766)
+    if (ig.ignores(rel)) continue;
 
     if (statusCode === '??') {
       out.added.push(filePath);
-    } else if (statusCode.includes('D')) {
-      out.deleted.push(filePath);
     } else {
       // M, MM, AM, A (staged), etc. — treat as modified
       out.modified.push(filePath);
