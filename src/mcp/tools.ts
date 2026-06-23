@@ -3663,8 +3663,8 @@ export class ToolHandler {
     // `stage_applyrun` and finds nothing. Re-search by the bare last part and
     // let `matchesSymbol` filter by qualifier.
     if (isQualified && results.length === 0) {
-      const tail = lastQualifierPart(normalizedSymbol);
-      if (tail && tail !== normalizedSymbol) results = cg.searchNodes(tail, { limit });
+      const tail = lastQualifierPart(symbol);
+      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit });
     }
 
     if (results.length === 0) return [];

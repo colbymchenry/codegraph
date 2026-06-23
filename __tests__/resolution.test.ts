@@ -200,8 +200,8 @@ describe('Resolution Module', () => {
         projectPath: tempDir,
       });
 
-      expect(templateResult.content[0]?.text ?? '').toContain('_template');
-      expect(trackResult.content[0]?.text ?? '').toContain('_track');
+      expect(templateResult.content[0]?.text ?? '').toContain('StatusIconTemplate');
+      expect(trackResult.content[0]?.text ?? '').toContain('TrackPanel');
     });
 
     it('should include Godot scene instances when querying callers by instance node name', async () => {

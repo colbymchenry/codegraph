@@ -24,7 +24,7 @@ export function matchByFilePath(
   }
 
   // Extract the filename from the path
-  const fileName = referencePath.split('/').pop();
+  const fileName = ref.referenceName.split('/').pop();
   if (!fileName) return null;
 
   // Search for file nodes with this name
@@ -34,7 +34,7 @@ export function matchByFilePath(
   if (fileNodes.length === 0) return null;
 
   // Prefer exact path match on qualified_name
-  const exactMatch = fileNodes.find(n => n.qualifiedName === referencePath || n.filePath === referencePath);
+  const exactMatch = fileNodes.find(n => n.qualifiedName === ref.referenceName || n.filePath === ref.referenceName);
   if (exactMatch) {
     return {
       original: ref,
@@ -74,11 +74,6 @@ export function matchByFilePath(
   }
 
   return null;
-}
-
-function normalizePathReference(referenceName: string): string {
-  if (referenceName.startsWith('res://')) return referenceName.slice('res://'.length);
-  return referenceName;
 }
 
 /**
