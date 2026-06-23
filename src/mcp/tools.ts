@@ -936,7 +936,8 @@ export class ToolHandler {
     // If the path resolves to the default project, reuse the already-open
     // default instance rather than opening a SECOND connection to the same DB.
     // A duplicate connection serializes reads against the watcher's auto-sync
-    // writes; on the wasm backend (no WAL) that surfaces as intermittent
+    // writes; when WAL isn't in effect (e.g. a filesystem without shared-memory
+    // support) that surfaces as intermittent
     // "database is locked" on concurrent tool calls. See issue #238. The
     // default instance is owned/closed by the server, so it's never cached.
     if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
