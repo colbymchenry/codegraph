@@ -70,22 +70,34 @@ calls; a grep/read exploration is dozens.
 `;
 
 /**
- * Instructions variant sent when the workspace has NO codegraph index.
+ * Instructions variant sent when the server's own root has NO codegraph index.
  *
- * Sending the full playbook ("lean on codegraph for everything") into a
- * session where every call would fail wastes the agent's calls and — worse —
- * the failures teach it codegraph is broken. The unindexed variant is a
- * short, unambiguous "inactive this session" note; `tools/list` is gated to
- * empty in the same state, so the agent has nothing to mis-call. Indexing is
- * deliberately left to the user: the agent is told NOT to run init itself.
+ * The tools are still exposed (gating tool availability on whether `./` has an
+ * index is the bug behind #964: it breaks monorepos where only sub-projects are
+ * indexed, and a server that started before `codegraph init` never surfaces the
+ * tools afterward). Instead of an "inactive" note, this variant tells the agent
+ * codegraph works **per project**: there's no default project to query, so pass
+ * a `projectPath` to any project that HAS a `.codegraph/`. The full single-
+ * project playbook ({@link SERVER_INSTRUCTIONS}) is sent instead when the root
+ * IS indexed, so the common case stays tight.
  */
-export const SERVER_INSTRUCTIONS_UNINDEXED = `# Codegraph — inactive (workspace not indexed)
+export const SERVER_INSTRUCTIONS_NO_ROOT_INDEX = `# Codegraph — available (per-project; pass projectPath)
 
-This workspace has no codegraph index (no \`.codegraph/\` directory), so no
-codegraph tools are available this session. Work with your built-in tools as
-usual.
+Codegraph is a SQLite knowledge graph of a codebase's symbols, edges, and
+files: one \`codegraph_explore\` call returns the verbatim, line-numbered source
+of the relevant symbols PLUS the call paths between them and a blast-radius
+summary — replacing a grep + Read loop with one round-trip.
 
-Indexing is the user's decision — do not run it yourself. If the user asks
-about codegraph, they can enable it by running \`codegraph init\` in the
-project root and starting a new session.
+This server started somewhere with no \`.codegraph/\` of its own, so there is no
+default project — but the tools are available and work **per project**:
+
+- To query a project that HAS a \`.codegraph/\` index (e.g. a service inside a
+  monorepo, or a second repo), pass its path as \`projectPath\` to
+  \`codegraph_explore\` (and any other codegraph tool). Codegraph resolves the
+  nearest \`.codegraph/\` at or above that path and answers from it — for as many
+  projects as you like in one session.
+- For a project with no \`.codegraph/\`, use your built-in tools (Read/Grep/Glob)
+  for that project. Indexing is the user's decision — don't run it yourself, but
+  if it comes up they can run \`codegraph init\` in a project to enable codegraph
+  there (a new index is picked up live, no restart).
 `;

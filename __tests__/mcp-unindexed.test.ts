@@ -1,14 +1,18 @@
 /**
- * Unindexed-workspace session policy tests.
+ * No-root-index session policy tests (#964).
  *
- * An MCP session attached to a workspace with no .codegraph/ must go quiet
- * rather than fail loudly: `initialize` returns the short "inactive"
- * instructions variant (not the full playbook), `tools/list` returns an
- * EMPTY list, and a tool call that still arrives (cross-project
- * `projectPath`, or a host that skips tools/list) answers with a
- * SUCCESS-shaped guidance message — never `isError: true`. One or two early
- * isError responses teach an agent to abandon codegraph for the whole
- * session; that observed failure mode is what this suite guards.
+ * A server whose own root has no .codegraph/ still exposes its tools — gating
+ * tool AVAILABILITY on whether `./` is indexed broke monorepos (only
+ * sub-projects indexed) and hid the tools from a session that started before
+ * `codegraph init`. So `initialize` returns the per-project instructions
+ * variant (not the full single-project playbook, and NOT an "inactive" note),
+ * `tools/list` exposes the tool surface, and a query against an indexed project
+ * by `projectPath` works even with no default project. Safety is preserved by
+ * the response SHAPE, not by hiding tools: a call against an un-indexed path
+ * returns SUCCESS-shaped guidance ("pass projectPath / run codegraph init"),
+ * never `isError: true` — one or two early isError responses teach an agent to
+ * abandon codegraph for the whole session, and that failure mode is still
+ * guarded below.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
@@ -82,7 +86,7 @@ function initializeParams(projectPath: string) {
   };
 }
 
-describe('Unindexed-workspace session policy', () => {
+describe('No-root-index session policy', () => {
   let tempDir: string;
   let child: ChildProcessWithoutNullStreams | null = null;
 
@@ -106,26 +110,61 @@ describe('Unindexed-workspace session policy', () => {
     fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
-  it('initialize returns the short "inactive" instructions, not the playbook', async () => {
+  it('initialize returns the per-project instructions (not "inactive", not the full playbook)', async () => {
     fs.writeFileSync(path.join(tempDir, 'index.ts'), 'export const x = 1;\n');
     child = spawnServer(tempDir);
 
     const res = await request(child, { id: 0, method: 'initialize', params: initializeParams(tempDir) });
     const instructions = (res.result as { instructions: string }).instructions;
 
-    expect(instructions).toMatch(/inactive/i);
+    // No longer an "inactive, do nothing" note — the tools are available.
+    expect(instructions).not.toMatch(/inactive/i);
+    // It steers the agent to target a project explicitly via projectPath...
+    expect(instructions).toMatch(/projectPath/);
+    expect(instructions).toMatch(/codegraph_explore/);
     expect(instructions).toMatch(/codegraph init/);
-    // The full playbook must NOT be sent into a session where every call fails
-    expect(instructions).not.toMatch(/How to query/);
-    expect(instructions).not.toMatch(/codegraph_explore/);
+    // ...but it is NOT the full single-project playbook (that's sent only when
+    // the root itself is indexed — keeps the common case tight).
+    expect(instructions).not.toMatch(/## How to query/);
   });
 
-  it('tools/list returns an EMPTY list when the workspace has no index', async () => {
+  it('tools/list exposes the tools even when the server root has no index (#964)', async () => {
     child = spawnServer(tempDir);
     await request(child, { id: 0, method: 'initialize', params: initializeParams(tempDir) });
 
     const res = await request(child, { id: 1, method: 'tools/list' });
-    expect((res.result as { tools: unknown[] }).tools).toEqual([]);
+    const tools = (res.result as { tools: Array<{ name: string }> }).tools;
+    expect(tools.length).toBeGreaterThanOrEqual(1);
+    expect(tools.map((t) => t.name)).toContain('codegraph_explore');
+  });
+
+  it('a query by projectPath reaches an INDEXED sub-project of an unindexed root (monorepo) (#964)', async () => {
+    // The server root (tempDir) has no index; an indexed sub-project lives
+    // under it — exactly the monorepo shape. The query must resolve to the
+    // sub-project's .codegraph/ and return real results. Run through the real
+    // spawned server (a second-project open can't be exercised in-process under
+    // vitest — see mcp-toolhandler cache notes — but a child process can).
+    const svc = path.join(tempDir, 'service_a');
+    fs.mkdirSync(svc);
+    fs.writeFileSync(
+      path.join(svc, 'auth.ts'),
+      'export function validateToken(t: string): boolean { return !!t; }\n'
+    );
+    const cg = await CodeGraph.init(svc, { index: true });
+    cg.close();
+
+    child = spawnServer(tempDir);
+    await request(child, { id: 0, method: 'initialize', params: initializeParams(tempDir) });
+
+    const res = await request(child, {
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'codegraph_search', arguments: { query: 'validateToken', projectPath: svc } },
+    });
+    const result = res.result as { content: Array<{ text: string }>; isError?: boolean };
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toMatch(/validateToken/);
+    expect(result.content[0]!.text).not.toMatch(/isn't indexed/);
   });
 
   it('an INDEXED workspace still gets the full playbook and the explore tool', async () => {
@@ -179,6 +218,7 @@ describe('No-error policy on expected conditions', () => {
     expect(res.content[0]!.text).toMatch(/No CodeGraph project is loaded/);
     expect(res.content[0]!.text).toMatch(/projectPath/);
   });
+
 
   it.runIf(process.platform !== 'win32')(
     'sensitive-path refusal stays a hard error (no retry encouragement)',

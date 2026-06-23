@@ -176,6 +176,136 @@ export function findNearestCodeGraphRoot(startPath: string): string | null {
   return null;
 }
 
+/** Heavy/irrelevant directory names the sub-project scan never descends into. */
+const SUBPROJECT_SCAN_SKIP = new Set([
+  'node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', 'target',
+  'vendor', 'bin', 'obj', '.next', '.nuxt', '.svelte-kit', '.cache', 'coverage',
+  '.venv', 'venv', '__pycache__', '.turbo', '.idea', '.vscode', 'tmp', 'temp',
+]);
+
+/** Manifests that mark a directory as a project/workspace root. The down-scan
+ *  is gated on one of these so a non-project cwd (e.g. `$HOME`) is a cheap
+ *  no-op instead of a deep filesystem crawl. */
+const WORKSPACE_ROOT_MANIFESTS = [
+  'package.json', 'pnpm-workspace.yaml', 'lerna.json', 'nx.json', 'turbo.json',
+  'go.work', 'go.mod', 'Cargo.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts',
+  'settings.gradle', 'pyproject.toml', 'composer.json', 'Gemfile', 'rush.json',
+  'WORKSPACE', 'WORKSPACE.bazel',
+];
+
+function looksLikeProjectRoot(dir: string): boolean {
+  return WORKSPACE_ROOT_MANIFESTS.some((m) => fs.existsSync(path.join(dir, m)));
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Indexed sub-project roots beneath `root` (bounded breadth-first scan). For
+ * the monorepo case behind #964: the index lives in a CHILD
+ * (`packages/x/.codegraph/`), not at the workspace root the agent's cwd points
+ * at. Descent stops at the first indexed directory on a branch (a project's
+ * own sub-dirs aren't separate projects) and is bounded by depth + count so it
+ * never turns into a full-tree crawl on a large repo.
+ */
+export function findIndexedSubprojectRoots(
+  root: string,
+  opts: { maxDepth?: number; max?: number } = {},
+): string[] {
+  const maxDepth = opts.maxDepth ?? 4;
+  const max = opts.max ?? 64;
+  const out: string[] = [];
+  const walk = (dir: string, depth: number): void => {
+    if (out.length >= max || depth > maxDepth) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (out.length >= max) return;
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith('.') || SUBPROJECT_SCAN_SKIP.has(e.name)) continue;
+      const child = path.join(dir, e.name);
+      if (isInitialized(child)) { out.push(child); continue; } // don't descend into an indexed project
+      walk(child, depth + 1);
+    }
+  };
+  walk(root, 1);
+  return out;
+}
+
+/**
+ * What the front-load hook should do for a prompt issued from a directory.
+ */
+export interface FrontloadPlan {
+  /** Open + explore this project and inject its source as context. `null` when
+   *  there's no single project to front-load (none indexed, or several indexed
+   *  sub-projects with no clear match — see {@link nudgeProjects}). */
+  exploreRoot: string | null;
+  /** Indexed sub-projects to surface in a "pass `projectPath`" nudge: the rest
+   *  of a monorepo's indexed projects alongside `exploreRoot`, or — when no one
+   *  project clearly matches — the full list (with `exploreRoot` null). */
+  nudgeProjects: string[];
+  /** True when the plan came from scanning DOWN into sub-projects (cwd itself
+   *  is not under any index) — the monorepo case, where a follow-up
+   *  `codegraph_explore` needs an explicit `projectPath`. */
+  viaSubScan: boolean;
+}
+
+/**
+ * Decide what the front-load hook injects for a `prompt` issued from `cwd`,
+ * shaped by where the `.codegraph/` index(es) actually are:
+ *   1. **cwd (or an ancestor) is indexed** → front-load that project. The
+ *      normal single-project / nested-file case.
+ *   2. **cwd isn't indexed but looks like a workspace root** → the indexes live
+ *      in sub-projects (the monorepo case behind #964). One indexed
+ *      sub-project → front-load it; several → front-load the one the prompt
+ *      names (by relative path like `packages/api`, or package directory name)
+ *      and nudge about the rest; several with no match → nudge the full list so
+ *      the agent passes `projectPath`, rather than guessing wrong.
+ *   3. **nothing indexed reachable** → do nothing (the agent's own tools apply).
+ */
+export function planFrontload(cwd: string, prompt: string): FrontloadPlan {
+  const none: FrontloadPlan = { exploreRoot: null, nudgeProjects: [], viaSubScan: false };
+
+  // 1. up-walk — nearest indexed ancestor (incl. cwd). Cheap; covers the common
+  //    single-project case without a down-scan.
+  let dir = path.resolve(cwd);
+  for (let i = 0; i < 6; i++) {
+    if (isInitialized(dir)) return { exploreRoot: dir, nudgeProjects: [], viaSubScan: false };
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  // 2. down-scan — only from something that looks like a workspace root, so a
+  //    non-project cwd (e.g. $HOME) is a cheap no-op, not a deep crawl.
+  const base = path.resolve(cwd);
+  if (!looksLikeProjectRoot(base)) return none;
+  const subs = findIndexedSubprojectRoots(base);
+  if (subs.length === 0) return none;
+  if (subs.length === 1) return { exploreRoot: subs[0]!, nudgeProjects: [], viaSubScan: true };
+
+  // Several indexed sub-projects — pick the one the prompt points at, if any.
+  const p = prompt.toLowerCase();
+  let best: { root: string; score: number; relLen: number } | null = null;
+  for (const s of subs) {
+    const rel = path.relative(base, s);
+    const relLc = rel.split(path.sep).join('/').toLowerCase();
+    const name = path.basename(s).toLowerCase();
+    let score = 0;
+    if (relLc && p.includes(relLc)) score = 10;                         // "packages/api"
+    else if (name.length >= 3 && new RegExp(`\\b${escapeRegExp(name)}\\b`).test(p)) score = 5; // "api"
+    if (score > 0 && (!best || score > best.score || (score === best.score && rel.length < best.relLen))) {
+      best = { root: s, score, relLen: rel.length };
+    }
+  }
+  if (best) {
+    return { exploreRoot: best.root, nudgeProjects: subs.filter((s) => s !== best!.root), viaSubScan: true };
+  }
+  // No clear match — nudge the full list rather than front-load a guess.
+  return { exploreRoot: null, nudgeProjects: subs, viaSubScan: true };
+}
+
 /**
  * Contents of `.codegraph/.gitignore`. A single wildcard ignore keeps every
  * transient file in the index dir — the database, `daemon.pid`, the socket,

@@ -438,7 +438,7 @@ export interface ToolResult {
  */
 const projectPathProperty: PropertySchema = {
   type: 'string',
-  description: 'Path to a different project with .codegraph/ initialized. If omitted, uses current project. Use this to query other codebases.',
+  description: 'Absolute path to the project to query (or any directory inside it) — codegraph uses the nearest .codegraph/ index at or above that path. Omit to use this session\'s default project. Pass it to query a second codebase, or when the server root has no index of its own (e.g. a monorepo where only sub-projects are indexed, so there is no default project).',
 };
 
 /**
@@ -888,13 +888,16 @@ export class ToolHandler {
         throw new NotIndexedError(
           'No CodeGraph project is loaded for this session.\n' +
           `Searched for a .codegraph/ directory starting from: ${searched}\n` +
-          'If this project IS indexed, this is a working-directory detection issue: ' +
-          "the MCP client launched the server outside your project and didn't report the " +
-          'workspace root. Fix it either way:\n' +
-          '  • Pass projectPath to the tool call, e.g. projectPath: "/absolute/path/to/your/project"\n' +
+          'Either the server root has no index of its own (e.g. a monorepo where only ' +
+          "sub-projects are indexed), or the MCP client launched the server outside your " +
+          'project without reporting the workspace root. Either way, target the project ' +
+          'explicitly:\n' +
+          '  • Pass projectPath to the tool call, e.g. projectPath: "/absolute/path/to/your/project" ' +
+          '(any project that has a .codegraph/ — including a sub-project of a monorepo)\n' +
           '  • Or add --path to the server\'s MCP config args: ["serve", "--mcp", "--path", "/absolute/path/to/your/project"]\n' +
-          'If the project simply has no index, continue with your built-in tools (Read/Grep/Glob) ' +
-          "and don't call codegraph again this session — the user can run 'codegraph init' to enable it."
+          'If a project simply has no index, use your built-in tools (Read/Grep/Glob) for THAT ' +
+          "project (the user can run 'codegraph init' there to enable it) — you can still query " +
+          'other indexed projects by projectPath in the same session.'
         );
       }
       return this.freshen(this.cg);
