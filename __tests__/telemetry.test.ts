@@ -173,7 +173,7 @@ describe('Telemetry', () => {
       expect(calls).toHaveLength(1);
       const body = calls[0]!.body;
       expect(body.machine_id).toBe(t.getStatus().machineId);
-      expect(body.schema_version).toBe(1);
+      expect(body.schema_version).toBe(2);
       const events = body.events as Array<{ event: string; ts: string; props: Record<string, unknown> }>;
       expect(events).toHaveLength(2);
       const explore = events.find((e) => e.props.name === 'codegraph_explore')!;
@@ -265,7 +265,7 @@ describe('Telemetry', () => {
       const t = make();
       const stale = path.join(dir, 'telemetry-queue.sending.99999.jsonl');
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(stale, JSON.stringify({ v: 1, ev: 'uninstall', ts: '2026-06-11T00:00:00.000Z', props: {} }) + '\n');
+      fs.writeFileSync(stale, JSON.stringify({ v: 2, ev: 'uninstall', ts: '2026-06-11T00:00:00.000Z', props: {} }) + '\n');
       const old = new Date(nowValue.getTime() - 2 * 60 * 60_000);
       fs.utimesSync(stale, old, old);
       t.setEnabled(true, 'cli'); // config so send() has a machine id
