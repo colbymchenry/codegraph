@@ -2193,9 +2193,23 @@ export class ToolHandler {
       const testFiles = callerFiles.filter((f) => isTestFile(f));
       const nonTest = callerFiles.filter((f) => !isTestFile(f));
 
-      const shown = nonTest.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ');
-      const more = nonTest.length > FILE_CAP ? ` +${nonTest.length - FILE_CAP} more` : '';
-      const where = nonTest.length > 0 ? ` in ${shown}${more}` : '';
+      // Template views (.cshtml/.razor/.vue/.svelte/.astro) are cross-layer
+      // callers — a JS/TS change ripples into the view. Under a single flat cap
+      // they're easily drowned out by the far more numerous same-language code
+      // callers and vanish into "+N more" (a JS helper used by 4 .js files and
+      // 22 views would show 0 views). Surface them in their own slot so the
+      // "which views depend on this?" answer never gets hidden.
+      const isView = (f: string) => /\.(cshtml|razor|vue|svelte|astro)$/i.test(f);
+      const viewFiles = nonTest.filter(isView);
+      const codeFiles = nonTest.filter((f) => !isView(f));
+
+      const shownCode = codeFiles.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ');
+      const moreCode = codeFiles.length > FILE_CAP ? ` +${codeFiles.length - FILE_CAP} more` : '';
+      const codePart = codeFiles.length > 0 ? ` in ${shownCode}${moreCode}` : '';
+      const viewPart = viewFiles.length > 0
+        ? `; ${viewFiles.length} view${viewFiles.length === 1 ? '' : 's'}: ${viewFiles.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ')}${viewFiles.length > FILE_CAP ? ` +${viewFiles.length - FILE_CAP}` : ''}`
+        : '';
+      const where = codePart + viewPart;
       const tests = testFiles.length > 0
         ? `; tests: ${testFiles.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ')}${testFiles.length > FILE_CAP ? ` +${testFiles.length - FILE_CAP}` : ''}`
         : '; ⚠️ no covering tests found';
