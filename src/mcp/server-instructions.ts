@@ -58,6 +58,7 @@ typically one to a few calls; a grep/read exploration is dozens.
 - **Onboarding / understanding any area**: ONE \`codegraph_explore\` is usually the whole answer. Only follow up — \`codegraph_node\` for a specific symbol — if something is still unclear.
 - **Refactor planning**: \`codegraph_callers\` for the complete call-site list to update; the wider blast radius is already attached to \`codegraph_explore\` / \`codegraph_node\` output.
 - **Debugging a regression**: \`codegraph_callers\` of the suspected symbol; \`codegraph_node\` on anything unexpected that appears.
+- **Godot projects**: \`res://...\` resource paths and scene node names are valid symbols for callers/callees/impact queries.
 
 ## Anti-patterns
 

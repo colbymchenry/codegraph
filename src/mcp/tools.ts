@@ -88,8 +88,16 @@ const CONTAINER_NODE_KINDS = new Set<NodeKind>([
   'class', 'struct', 'interface', 'trait', 'protocol', 'enum', 'namespace', 'module',
 ]);
 
+/** Normalize engine/framework path aliases users commonly type into tools. */
+function normalizeSymbolQuery(symbol: string): string {
+  if (symbol.startsWith('res://')) return symbol.slice('res://'.length);
+  return symbol;
+}
+
 /** Last `::` / `.` / `/`-separated segment of a qualified symbol. */
 function lastQualifierPart(symbol: string): string {
+  const slashIndex = symbol.lastIndexOf('/');
+  if (slashIndex >= 0) return symbol.slice(slashIndex + 1);
   const parts = symbol.split(/::|[./]/).filter((p) => p.length > 0);
   return parts[parts.length - 1] ?? symbol;
 }
@@ -1249,6 +1257,10 @@ export class ToolHandler {
       const callers: Node[] = [];
       const labels = new Map<string, string>();
       for (const node of defNodes) {
+        if (this.isGodotSceneInstanceComponent(node) && !seen.has(node.id)) {
+          seen.add(node.id);
+          callers.push(node);
+        }
         for (const c of cg.getCallers(node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
@@ -1294,6 +1306,13 @@ export class ToolHandler {
       }
     }
     return this.textResult(this.truncateOutput(lines.join('\n') + filterNote));
+  }
+
+  private isGodotSceneInstanceComponent(node: Node): boolean {
+    return node.kind === 'component'
+      && node.language === 'godot_resource'
+      && node.filePath.endsWith('.tscn')
+      && (node.signature ?? '').includes('instance=ExtResource');
   }
 
   /**
@@ -3569,8 +3588,12 @@ export class ToolHandler {
    *      Python — `stage_apply::run` matches a `run` in `stage_apply.rs`)
    */
   private matchesSymbol(node: Node, symbol: string): boolean {
+    symbol = normalizeSymbolQuery(symbol);
+
     // Simple name match
     if (node.name === symbol) return true;
+    // File path match (e.g., Godot `res://runtime/run_state.gd`)
+    if (node.kind === 'file' && (node.filePath === symbol || node.qualifiedName === symbol)) return true;
     // File basename match (e.g., "product-card" matches "product-card.liquid")
     if (node.kind === 'file' && node.name.replace(/\.[^.]+$/, '') === symbol) return true;
 
@@ -3640,8 +3663,8 @@ export class ToolHandler {
     // `stage_applyrun` and finds nothing. Re-search by the bare last part and
     // let `matchesSymbol` filter by qualifier.
     if (isQualified && results.length === 0) {
-      const tail = lastQualifierPart(symbol);
-      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit });
+      const tail = lastQualifierPart(normalizedSymbol);
+      if (tail && tail !== normalizedSymbol) results = cg.searchNodes(tail, { limit });
     }
 
     if (results.length === 0) return [];
@@ -3665,21 +3688,22 @@ export class ToolHandler {
    * results across all matching symbols (e.g., multiple classes with an `execute` method).
    */
   private findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
-    let results = cg.searchNodes(symbol, { limit: 50 });
+    const normalizedSymbol = normalizeSymbolQuery(symbol);
+    let results = cg.searchNodes(normalizedSymbol, { limit: 50 });
 
     // Mirror the fallback in `findSymbol` for qualified queries — FTS
     // strips colons, so a module-qualified lookup needs a second pass
     // by the bare last part.
-    if (results.length === 0 && /[.\/]|::/.test(symbol)) {
-      const tail = lastQualifierPart(symbol);
-      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit: 50 });
+    if (results.length === 0 && /[.\/]|::/.test(normalizedSymbol)) {
+      const tail = lastQualifierPart(normalizedSymbol);
+      if (tail && tail !== normalizedSymbol) results = cg.searchNodes(tail, { limit: 50 });
     }
 
     if (results.length === 0) {
       return { nodes: [], note: '' };
     }
 
-    const exactMatches = results.filter(r => this.matchesSymbol(r.node, symbol));
+    const exactMatches = results.filter(r => this.matchesSymbol(r.node, normalizedSymbol));
 
     if (exactMatches.length <= 1) {
       const node = exactMatches[0]?.node ?? results[0]!.node;

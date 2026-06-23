@@ -101,6 +101,16 @@ describe('Language Detection', () => {
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
   });
 
+  it('should detect GDScript files', () => {
+    expect(detectLanguage('player.gd')).toBe('gdscript');
+  });
+
+  it('should detect Godot resource files', () => {
+    expect(detectLanguage('main.tscn')).toBe('godot_resource');
+    expect(detectLanguage('card.tres')).toBe('godot_resource');
+    expect(detectLanguage('project.godot')).toBe('godot_resource');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -129,6 +139,245 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('gdscript');
+    expect(languages).toContain('godot_resource');
+  });
+});
+
+describe('GDScript Extraction', () => {
+  it('should extract GDScript classes, methods, variables, and references', () => {
+    const code = `
+extends Node
+class_name PlayerController
+
+signal health_changed(value: int)
+const MAX_HP := 100
+const DYNAMIC_UI_SOUND_CONTROLLER_NAME := "MainDynamicUISoundController"
+const WRAPPED_LABEL_NAME := "CardRarity"
+const TEMPLATE_PATH := "MarginContainer/StatusFlow/StatusIconTemplate"
+const CARD_ROW_PATH := "RewardList/CardRewardTemplate"
+@onready var sprite := $Sprite2D
+@export_range(0.0, 1.0, 0.1) var move_ratio := 0.5
+static var shared_counter := 0
+
+func _ready() -> void:
+  var enemy = preload("res://enemy.gd")
+  var tint = Color(1, 0, 0)
+  $Sprite2D.play()
+  %StatusPanel.refresh()
+  var template = $MarginContainer/StatusFlow/StatusIconTemplate
+  var template_from_const = get_node_or_null(TEMPLATE_PATH)
+  var row_from_const = get_node_or_null(CARD_ROW_PATH)
+  var sound_controller = get_node_or_null(DYNAMIC_UI_SOUND_CONTROLLER_NAME)
+  var track = get_node("%TrackPanel")
+  var title_label = card_view.find_child("CardTitle", true, false)
+  var type_label = _find_label("CardType")
+  var rarity_label = _find_label(WRAPPED_LABEL_NAME)
+  var local_child_name := &"ChildBadge"
+  var child_badge = card_view.find_child(local_child_name, true, false)
+  var local_button_name := "DeckButton"
+  var deck_button = _find_node(root, local_button_name)
+  var controller_from_helper = _find_node(root, "MainDynamicUISoundController")
+  var row_name := "CardReward%d" % reward_index
+  var extra_row = get_node_or_null("CardReward%d" % reward_index)
+  var existing = get_node_or_null(row_name)
+  var reward_button = get_node_or_null("LootCardRewardButton")
+  reward_button = Button.new()
+  reward_button.name = "LootCardRewardButton"
+  $Sprite2D.pressed.connect(_on_sprite_pressed)
+  connect("health_changed", Callable(self, "_on_health_changed"))
+  setup_player()
+
+func setup_player() -> void:
+  health_changed.emit(MAX_HP)
+  emit_signal("health_changed", MAX_HP)
+
+func _on_sprite_pressed() -> void:
+  pass
+
+func _on_health_changed(value: int) -> void:
+  pass
+
+func _find_label(label_name: String) -> Label:
+  return root.find_child(label_name, true, false) as Label
+`;
+    const result = extractFromSource('player_controller.gd', code);
+
+    const classNode = result.nodes.find((n) => n.kind === 'class' && n.name === 'PlayerController');
+    expect(classNode).toBeDefined();
+    expect(classNode?.language).toBe('gdscript');
+
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === '_ready')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'setup_player')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'MAX_HP')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'DYNAMIC_UI_SOUND_CONTROLLER_NAME')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'WRAPPED_LABEL_NAME')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'TEMPLATE_PATH')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'CARD_ROW_PATH')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'sprite')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'move_ratio')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'shared_counter')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'health_changed')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'MainDynamicUISoundController')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'CardReward')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'LootCardRewardButton')).toBe(true);
+
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'Node')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://enemy.gd')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'Sprite2D.play')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'StatusPanel.refresh')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'health_changed.emit')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'health_changed')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'Sprite2D.pressed')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'pressed')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === '_on_sprite_pressed')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === '_on_health_changed')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'Sprite2D')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusPanel')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusIconTemplate')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'MarginContainer/StatusFlow/StatusIconTemplate')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/MarginContainer/StatusFlow/StatusIconTemplate')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardRewardTemplate')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'RewardList/CardRewardTemplate')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/RewardList/CardRewardTemplate')).toBe(true);
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'references' && r.referenceName === 'MainDynamicUISoundController')).toHaveLength(2);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardTitle')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardType')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardRarity')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'ChildBadge')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'DeckButton')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'TrackPanel')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/TrackPanel')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardReward')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController/CardReward')).toBe(true);
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'references' && r.referenceName === 'CardReward')).toHaveLength(3);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'LootCardRewardButton')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'Color')).toBe(false);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'setup_player')).toBe(true);
+  });
+
+  it('should extract annotated class_name and inline extends declarations', () => {
+    const code = `
+@tool class_name EditorPanel extends MarginContainer
+
+@rpc("any_peer") func sync_state() -> void:
+  emit_changed()
+
+class InnerPanel extends Control:
+  func render() -> void:
+    pass
+`;
+    const result = extractFromSource('editor_panel.gd', code);
+
+    expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'EditorPanel')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'sync_state')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'InnerPanel')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'render')).toBe(true);
+
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'MarginContainer')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'Control')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'emit_changed')).toBe(true);
+  });
+
+  it('should create an implicit script class for extends-only GDScript files', () => {
+    const code = `
+extends Control
+
+func _ready() -> void:
+  setup()
+
+func setup() -> void:
+  pass
+`;
+    const result = extractFromSource('battle_hud.gd', code);
+
+    expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'BattleHud')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === '_ready')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'setup')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'Control')).toBe(true);
+  });
+});
+
+describe('Godot Resource Extraction', () => {
+  it('should extract Godot scene nodes and external resource references', () => {
+    const code = `
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://player_controller.gd" id="1_script"]
+[ext_resource type="PackedScene" path="res://status_icon_template.tscn" id="2_status"]
+
+[node name="Player" type="Node2D"]
+script = ExtResource("1_script")
+
+[node name="Sprite2D" type="Sprite2D" parent="."]
+
+[node name="StatusIcon" parent="." instance=ExtResource("2_status")]
+
+[connection signal="pressed" from="Sprite2D" to="." method="_on_sprite_pressed"]
+`;
+    const result = extractFromSource('player.tscn', code);
+
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'Player')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'Sprite2D')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'StatusIcon')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'import' && n.name === 'res://player_controller.gd')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://player_controller.gd')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'PlayerController')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://status_icon_template.tscn')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusIconTemplate')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusIcon')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://status_icon_template.tscn' && result.nodes.some((n) => n.id === r.fromNodeId && n.name === 'StatusIcon'))).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusIconTemplate' && result.nodes.some((n) => n.id === r.fromNodeId && n.name === 'StatusIcon'))).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'StatusIcon' && result.nodes.some((n) => n.id === r.fromNodeId && n.name === 'StatusIcon'))).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === '_on_sprite_pressed')).toBe(true);
+    expect(result.edges.some((e) => e.kind === 'references' && e.metadata?.method === '_on_sprite_pressed')).toBe(true);
+  });
+
+  it('should preserve nested Godot scene node containment', () => {
+    const code = `
+[gd_scene format=3]
+
+[node name="StatusView" type="Control"]
+[node name="MarginContainer" type="MarginContainer" parent="."]
+[node name="StatusFlow" type="HFlowContainer" parent="MarginContainer"]
+[node name="StatusIconTemplate" type="Control" parent="MarginContainer/StatusFlow"]
+`;
+    const result = extractFromSource('status_view.tscn', code);
+    const nodeByName = new Map(result.nodes.map((node) => [node.name, node]));
+
+    const contains = (sourceName: string, targetName: string): boolean => {
+      const source = nodeByName.get(sourceName);
+      const target = nodeByName.get(targetName);
+      return Boolean(source && target && result.edges.some((edge) => (
+        edge.kind === 'contains' &&
+        edge.source === source.id &&
+        edge.target === target.id
+      )));
+    };
+
+    expect(contains('StatusView', 'MarginContainer')).toBe(true);
+    expect(contains('MarginContainer', 'StatusFlow')).toBe(true);
+    expect(contains('StatusFlow', 'StatusIconTemplate')).toBe(true);
+  });
+
+  it('should extract Godot resource scripts and content ids', () => {
+    const code = `
+[gd_resource type="Resource" script_class="CardResource" format=3]
+
+[ext_resource type="Script" path="res://core/cards/card_resource.gd" id="1_card"]
+
+[resource]
+script = ExtResource("1_card")
+id = &"ace"
+card_id = &"knife"
+`;
+    const result = extractFromSource('data/cards/ace.tres', code);
+
+    expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'resource')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'ace')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'knife')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardResource')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://core/cards/card_resource.gd')).toBe(true);
   });
 });
 
