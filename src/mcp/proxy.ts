@@ -135,6 +135,16 @@ export async function connectWithHello(
   if (process.platform !== 'win32' && !fs.existsSync(socketPath)) return null;
   const socket = net.createConnection(socketPath);
   socket.setEncoding('utf8');
+  // Keep an 'error' listener attached for the socket's ENTIRE life. readHelloLine
+  // attaches its own and then REMOVES it on success (its cleanup()), which left a
+  // window — from here until the caller attaches its onDaemonLost handler — where
+  // a socket 'error' had NO listener. In Node an unhandled socket 'error' is
+  // re-thrown as an uncaughtException, which the global fatal handler turns into
+  // process.exit(1); to an MCP client that surfaces as a bare "Transport closed"
+  // (#974). The window is rarely hit on a healthy FS but is common on flaky
+  // AF_UNIX-over-DrvFs (WSL2 /mnt drives). A no-op guard makes the error
+  // recoverable: the follow-up 'close' drives the caller's normal fallback.
+  socket.on('error', () => { /* absorbed — see #974; 'close' drives the fallback */ });
   const hello = await readHelloLine(socket).catch(() => null);
   if (!hello) {
     socket.destroy();
@@ -323,7 +333,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let socket: net.Socket | null = null;
   try { socket = await deps.getDaemonSocket(); } catch { socket = null; }
 
-  if (socket && !shuttingDown) {
+  // `!socket.destroyed`: the connect-window error guard above can absorb an
+  // 'error' that already destroyed the socket before we got here (#974) — treat
+  // a dead socket as "no daemon" so we cleanly fall back to the in-process engine.
+  if (socket && !socket.destroyed && !shuttingDown) {
     daemonSocket = socket;
     daemonStatus = 'ready';
     let sockBuf = '';
