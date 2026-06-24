@@ -37,4 +37,8 @@ test('extjs extract: Ext.define + alias + requires + Ext.create + Ext.applicatio
 
   const hasCreateRef = references.some((r) => r.referenceName === 'MyApp.view.Foo');
   expect(hasCreateRef).toBe(true);
+
+  // expect xtype extracted
+  const hasXtype = nodes.some((n) => n.kind === 'component' && n.name === 'grid');
+  expect(hasXtype).toBe(true);
 });
