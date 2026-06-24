@@ -585,6 +585,19 @@ export class ContextBuilder {
       logDebug('Text search failed', { query, error: String(error) });
     }
 
+    let sourceStringResults: SearchResult[] = [];
+    try {
+      sourceStringResults = /[-_./:@]/.test(query)
+        ? this.queries.searchSourceStringNodes(query, {
+            limit: opts.searchLimit * 2,
+            kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
+          })
+        : [];
+      logDebug('Source string search results', { count: sourceStringResults.length });
+    } catch (error) {
+      logDebug('Source string search failed', { query, error: String(error) });
+    }
+
     // Step 4: Merge results, taking the max score when duplicates appear
     // across search channels. Exact matches may have lower scores than FTS
     // results for the same node — use the best score from any channel.
@@ -607,6 +620,18 @@ export class ContextBuilder {
       const existing = resultById.get(result.node.id);
       if (existing) {
         existing.score = Math.max(existing.score, result.score);
+        existing.sourceString = existing.sourceString ?? result.sourceString;
+      } else {
+        resultById.set(result.node.id, result);
+        searchResults.push(result);
+      }
+    }
+
+    for (const result of sourceStringResults) {
+      const existing = resultById.get(result.node.id);
+      if (existing) {
+        existing.score = Math.max(existing.score, result.score);
+        existing.sourceString = existing.sourceString ?? result.sourceString;
       } else {
         resultById.set(result.node.id, result);
         searchResults.push(result);

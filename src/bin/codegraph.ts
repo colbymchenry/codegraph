@@ -909,7 +909,7 @@ program
  */
 program
   .command('query <search>')
-  .description('Search for symbols in the codebase')
+  .description('Search for symbols or code-like source strings in the codebase')
   .option('-p, --path <path>', 'Project path')
   .option('-l, --limit <number>', 'Maximum results', '10')
   .option('-k, --kind <kind>', 'Filter by node kind (function, class, etc.)')
@@ -952,7 +952,9 @@ program
 
           for (const result of results) {
             const node = result.node;
-            const location = `${node.filePath}:${node.startLine}`;
+            const location = result.sourceString
+              ? `${result.sourceString.filePath}:${result.sourceString.line}`
+              : `${node.filePath}:${node.startLine}`;
             const score = chalk.dim(`(${(result.score * 100).toFixed(0)}%)`);
 
             console.log(
@@ -961,6 +963,9 @@ program
               ' ' + score
             );
             console.log(chalk.dim(`  ${location}`));
+            if (result.sourceString) {
+              console.log(chalk.dim(`  source string: ${result.sourceString.literal}`));
+            }
             if (node.signature) {
               console.log(chalk.dim(`  ${node.signature}`));
             }

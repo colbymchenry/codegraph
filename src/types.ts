@@ -315,6 +315,39 @@ export interface UnresolvedReference {
   candidates?: string[];
 }
 
+/**
+ * A code-like string literal found inside source code and mapped back to the
+ * smallest indexed symbol that encloses the literal.
+ */
+export interface SourceStringRef {
+  /** Stable ID for this literal occurrence */
+  id: string;
+
+  /** The unquoted literal value */
+  literal: string;
+
+  /** File path relative to project root */
+  filePath: string;
+
+  /** 1-indexed line where the literal starts */
+  line: number;
+
+  /** 0-indexed column where the literal starts */
+  column: number;
+
+  /** Detected language of the containing file */
+  language: Language;
+
+  /** Enclosing node ID, when available */
+  nodeId?: string;
+
+  /** Enclosing node name, denormalized for query output */
+  nodeName?: string;
+
+  /** Enclosing node kind, denormalized for query output */
+  nodeKind?: NodeKind;
+}
+
 // =============================================================================
 // Query Types
 // =============================================================================
@@ -397,6 +430,9 @@ export interface SearchOptions {
 export interface SearchResult {
   /** Matching node */
   node: Node;
+
+  /** Source-string occurrence that led to this node, if any */
+  sourceString?: SourceStringRef;
 
   /** Relevance score (0-1) */
   score: number;

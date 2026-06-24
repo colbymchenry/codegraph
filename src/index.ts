@@ -15,6 +15,7 @@ import {
   TraversalOptions,
   SearchOptions,
   SearchResult,
+  SourceStringRef,
   Context,
   GraphStats,
   TaskInput,
@@ -831,6 +832,13 @@ export class CodeGraph {
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
     return this.queries.searchNodes(query, options);
+  }
+
+  /**
+   * Search exact code-like source string literals.
+   */
+  searchSourceStrings(query: string, options?: SearchOptions): SourceStringRef[] {
+    return this.queries.searchSourceStrings(query, options);
   }
 
   /**

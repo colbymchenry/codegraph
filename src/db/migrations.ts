@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /**
  * Migration definition
@@ -72,6 +72,53 @@ const migrations: Migration[] = [
     up: (db) => {
       db.exec(`
         ALTER TABLE nodes ADD COLUMN return_type TEXT;
+      `);
+    },
+  },
+  {
+    version: 6,
+    description: 'Add source_strings side-table and FTS index for code-like string literals',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS source_strings (
+          id TEXT PRIMARY KEY,
+          literal TEXT NOT NULL,
+          file_path TEXT NOT NULL,
+          line INTEGER NOT NULL,
+          col INTEGER NOT NULL,
+          language TEXT NOT NULL,
+          node_id TEXT,
+          node_name TEXT,
+          node_kind TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_source_strings_literal ON source_strings(literal);
+        CREATE INDEX IF NOT EXISTS idx_source_strings_file_path ON source_strings(file_path);
+        CREATE INDEX IF NOT EXISTS idx_source_strings_node_id ON source_strings(node_id);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS source_strings_fts USING fts5(
+          literal,
+          file_path UNINDEXED,
+          node_name UNINDEXED,
+          content='source_strings',
+          content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS source_strings_ai AFTER INSERT ON source_strings BEGIN
+          INSERT INTO source_strings_fts(rowid, literal, file_path, node_name)
+          VALUES (NEW.rowid, NEW.literal, NEW.file_path, NEW.node_name);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS source_strings_ad AFTER DELETE ON source_strings BEGIN
+          INSERT INTO source_strings_fts(source_strings_fts, rowid, literal, file_path, node_name)
+          VALUES ('delete', OLD.rowid, OLD.literal, OLD.file_path, OLD.node_name);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS source_strings_au AFTER UPDATE ON source_strings BEGIN
+          INSERT INTO source_strings_fts(source_strings_fts, rowid, literal, file_path, node_name)
+          VALUES ('delete', OLD.rowid, OLD.literal, OLD.file_path, OLD.node_name);
+          INSERT INTO source_strings_fts(rowid, literal, file_path, node_name)
+          VALUES (NEW.rowid, NEW.literal, NEW.file_path, NEW.node_name);
+        END;
       `);
     },
   },
