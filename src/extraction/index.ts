@@ -19,7 +19,7 @@ import {
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
-import { loadExtensionOverrides } from '../project-config';
+import { loadExtensionOverrides, loadIgnorePatterns } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -257,6 +257,8 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
   const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
   const rootGitignore = path.join(rootDir, '.gitignore');
   if (fs.existsSync(rootGitignore)) ig.add(readGitignorePatterns(rootGitignore));
+  const extra = loadIgnorePatterns(rootDir);
+  if (extra.length > 0) ig.add(extra);
   return ig;
 }
 
@@ -458,6 +460,8 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
   }
   const out: string[] = [];
   const defaults = defaultsOnlyIgnore();
+  const userPatterns = loadIgnorePatterns(rootDir);
+  const userIgnore = userPatterns.length > 0 ? ignore().add(userPatterns) : null;
   const visit = (repoAbs: string, prefix: string): void => {
     const candidates: string[] = [];
     try {
@@ -467,12 +471,12 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
         { cwd: repoAbs, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
       );
       for (const e of o.split('\0')) {
-        if (e.endsWith('/') && !isWholeCwdEntry(e) && !defaults.ignores(e)) {
+        if (e.endsWith('/') && !isWholeCwdEntry(e) && !defaults.ignores(e) && !userIgnore?.ignores(e)) {
           candidates.push(...findNestedGitRepos(path.join(repoAbs, e), e));
         }
       }
     } catch { /* untracked listing failed — ignored-side discovery still runs */ }
-    candidates.push(...findIgnoredEmbeddedRepos(repoAbs));
+    candidates.push(...findIgnoredEmbeddedRepos(repoAbs, userIgnore));
     for (const rel of candidates) {
       const full = normalizePath(prefix + rel);
       out.push(full);
@@ -488,11 +492,12 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
  * gitignored directory (skipping built-in default excludes), search for nested
  * `.git` roots. Returns repo paths relative to `repoDir`, trailing-slashed.
  */
-function findIgnoredEmbeddedRepos(repoDir: string): string[] {
+function findIgnoredEmbeddedRepos(repoDir: string, userIgnore?: Ignore | null): string[] {
   const defaults = defaultsOnlyIgnore();
   const repos: string[] = [];
   for (const dir of listIgnoredDirs(repoDir)) {
     if (defaults.ignores(dir)) continue;
+    if (userIgnore?.ignores(dir)) continue;
     repos.push(...findNestedGitRepos(path.join(repoDir, dir), dir));
   }
   return repos;
@@ -514,7 +519,7 @@ function findIgnoredEmbeddedRepos(repoDir: string): string[] {
  * embedded repo root (however found) is recorded in `embeddedRoots` so callers
  * can exempt its files from the parent's own gitignore rules.
  */
-function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, embeddedRoots?: Set<string>): void {
+function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, embeddedRoots?: Set<string>, userIgnore?: Ignore | null): void {
   const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true };
 
   // Tracked files. --recurse-submodules pulls in files from active submodules,
@@ -546,9 +551,9 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
       const childDir = path.join(repoDir, rel);
       // A git worktree surfaces here as an opaque untracked dir too — skip it,
       // it's a duplicate working view of an already-indexed repo (#848).
-      if (classifyGitDir(childDir) === 'embedded' && !defaultsOnlyIgnore().ignores(rel)) {
+      if (classifyGitDir(childDir) === 'embedded' && !defaultsOnlyIgnore().ignores(rel) && !userIgnore?.ignores(rel)) {
         embeddedRoots?.add(normalizePath(prefix + rel));
-        collectGitFiles(childDir, prefix + rel, files, embeddedRoots);
+        collectGitFiles(childDir, prefix + rel, files, embeddedRoots, userIgnore);
       }
       continue;
     }
@@ -558,9 +563,9 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
   // Embedded repos hidden by THIS repo's ignore rules (`/packages/` in a
   // super-repo .gitignore) never appear in any listing above — discover and
   // recurse into them too. (#514)
-  for (const rel of findIgnoredEmbeddedRepos(repoDir)) {
+  for (const rel of findIgnoredEmbeddedRepos(repoDir, userIgnore)) {
     embeddedRoots?.add(normalizePath(prefix + rel));
-    collectGitFiles(path.join(repoDir, rel), prefix + rel, files, embeddedRoots);
+    collectGitFiles(path.join(repoDir, rel), prefix + rel, files, embeddedRoots, userIgnore);
   }
 }
 
@@ -598,7 +603,9 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
 
     const files = new Set<string>();
     const embeddedRoots = new Set<string>();
-    collectGitFiles(rootDir, '', files, embeddedRoots);
+    const userPatterns = loadIgnorePatterns(rootDir);
+    const userIgnore = userPatterns.length > 0 ? ignore().add(userPatterns) : null;
+    collectGitFiles(rootDir, '', files, embeddedRoots, userIgnore);
     // Apply built-in default ignores uniformly — to tracked files too, since
     // committing a dependency/build dir doesn't make it project code. A
     // `.gitignore` negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
@@ -641,14 +648,16 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
     // Custom extension → language overrides from the project's codegraph.json,
     // so change detection sees the same custom-extension files the full index does.
     const overrides = loadExtensionOverrides(rootDir);
-    collectGitStatus(rootDir, '', changes, overrides);
+    const userPatterns = loadIgnorePatterns(rootDir);
+    const userIgnore = userPatterns.length > 0 ? ignore().add(userPatterns) : null;
+    collectGitStatus(rootDir, '', changes, overrides, userIgnore);
     return changes;
   } catch {
     return null;
   }
 }
 
-function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>): void {
+function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, userIgnore?: Ignore | null): void {
   const output = execFileSync(
     'git',
     ['status', '--porcelain', '--no-renames'],
@@ -708,11 +717,11 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
   // nested deeper) and under this repo's gitignored dirs.
   for (const rel of untrackedDirs) {
     for (const repoRel of findNestedGitRepos(path.join(repoDir, rel), rel)) {
-      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out, overrides);
+      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out, overrides, userIgnore);
     }
   }
-  for (const rel of findIgnoredEmbeddedRepos(repoDir)) {
-    collectGitStatus(path.join(repoDir, rel), prefix + rel, out, overrides);
+  for (const rel of findIgnoredEmbeddedRepos(repoDir, userIgnore)) {
+    collectGitStatus(path.join(repoDir, rel), prefix + rel, out, overrides, userIgnore);
   }
 }
 

@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph.json` now supports an `ignore` field — an array of gitignore-style patterns that exclude matching paths from indexing and embedded-repo discovery. Useful for large gitignored directories containing cloned reference repos or data files that should never be indexed (e.g. `{"ignore": ["resource/"]}`).
+
 
 ## [1.1.0] - 2026-06-23
 

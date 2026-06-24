@@ -34,6 +34,8 @@ export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
 export interface ProjectConfig {
   /** Map of custom file extension (`.foo`) to a supported language id. */
   extensions?: Record<string, string>;
+  /** Gitignore-style patterns to exclude from indexing and embedded-repo discovery. */
+  ignore?: string[];
 }
 
 interface CacheEntry {
@@ -148,8 +150,83 @@ export function loadExtensionOverrides(rootDir: string): Record<string, Language
   return overrides;
 }
 
+// ---------------------------------------------------------------------------
+// Ignore patterns
+// ---------------------------------------------------------------------------
+
+interface IgnoreCacheEntry {
+  mtimeMs: number;
+  patterns: string[];
+}
+
+const ignoreCache = new Map<string, string[]>();
+const ignoreCacheMeta = new Map<string, IgnoreCacheEntry>();
+
+const EMPTY_PATTERNS: string[] = Object.freeze([]) as unknown as string[];
+
+function parseIgnorePatterns(file: string): string[] {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf-8');
+  } catch {
+    return EMPTY_PATTERNS;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return EMPTY_PATTERNS;
+  }
+
+  if (!parsed || typeof parsed !== 'object') return EMPTY_PATTERNS;
+  const patterns = (parsed as ProjectConfig).ignore;
+  if (!Array.isArray(patterns)) return EMPTY_PATTERNS;
+
+  const out: string[] = [];
+  for (const entry of patterns) {
+    if (typeof entry === 'string' && entry.trim().length > 0) {
+      out.push(entry.trim());
+    } else {
+      logWarn(`Ignoring non-string entry in ${PROJECT_CONFIG_FILENAME} "ignore" array`, { file });
+    }
+  }
+
+  return out.length > 0 ? out : EMPTY_PATTERNS;
+}
+
+/**
+ * Load user-configured ignore patterns from `codegraph.json`, mtime-cached.
+ *
+ * Returns an array of gitignore-style pattern strings that should be excluded
+ * from indexing and embedded-repo discovery. Returns an empty array when there
+ * is no `codegraph.json` or no `ignore` field (the zero-config default).
+ */
+export function loadIgnorePatterns(rootDir: string): string[] {
+  const file = path.join(rootDir, PROJECT_CONFIG_FILENAME);
+
+  let mtimeMs: number;
+  try {
+    mtimeMs = fs.statSync(file).mtimeMs;
+  } catch {
+    ignoreCacheMeta.delete(rootDir);
+    ignoreCache.delete(rootDir);
+    return EMPTY_PATTERNS;
+  }
+
+  const meta = ignoreCacheMeta.get(rootDir);
+  if (meta && meta.mtimeMs === mtimeMs) return meta.patterns;
+
+  const patterns = parseIgnorePatterns(file);
+  ignoreCacheMeta.set(rootDir, { mtimeMs, patterns });
+  ignoreCache.set(rootDir, patterns);
+  return patterns;
+}
+
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */
 export function clearProjectConfigCache(): void {
   cacheMeta.clear();
   overridesCache.clear();
+  ignoreCacheMeta.clear();
+  ignoreCache.clear();
 }
