@@ -14,6 +14,7 @@ import { codexTarget } from './codex';
 import { opencodeTarget } from './opencode';
 import { hermesTarget } from './hermes';
 import { geminiTarget } from './gemini';
+import { qwenTarget } from './qwen';
 import { antigravityTarget } from './antigravity';
 import { kiroTarget } from './kiro';
 
@@ -24,6 +25,7 @@ export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   opencodeTarget,
   hermesTarget,
   geminiTarget,
+  qwenTarget,
   antigravityTarget,
   kiroTarget,
 ]);
