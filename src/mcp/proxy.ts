@@ -29,6 +29,7 @@ import { SERVER_INFO, PROTOCOL_VERSION } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
 import { getTelemetry, ClientInfo } from '../telemetry';
+import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
 import type { MCPEngine } from './engine';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
@@ -202,6 +203,10 @@ export interface LocalHandshakeDeps {
  * never costs the old fall-back-to-direct robustness.
  */
 export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<void> {
+  // The proxy is long-lived and can serve fallback tool calls in-process. Match
+  // direct/daemon mode by killing this launcher if its main thread wedges, so an
+  // MCP host retry cannot accumulate abandoned `serve --mcp` wrapper processes.
+  const livenessWatchdog: WatchdogHandle | null = installMainThreadWatchdog();
   let daemonStatus: 'connecting' | 'ready' | 'failed' = 'connecting';
   let daemonSocket: net.Socket | null = null;
   let clientInitId: unknown = undefined;   // suppress the daemon's reply to the forwarded initialize
@@ -232,6 +237,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   };
   const shutdown = (): void => {
     if (shuttingDown) return; shuttingDown = true;
+    try { livenessWatchdog?.stop(); } catch { /* ignore */ }
     try { daemonSocket?.destroy(); } catch { /* ignore */ }
     try { engine?.stop(); } catch { /* ignore */ }
     process.exit(0);

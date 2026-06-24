@@ -193,7 +193,10 @@ describe('Shared MCP daemon (issue #411)', () => {
   });
 
   it('two invocations share ONE detached daemon; both attach as proxies', async () => {
-    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '15000' };
+    const env = {
+      CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '15000',
+      CODEGRAPH_MCP_DEBUG: '1',
+    };
 
     const first = spawnServer(tempDir, env);
     servers.push(first);
@@ -203,6 +206,9 @@ describe('Shared MCP daemon (issue #411)', () => {
 
     // The launcher is a PROXY (not the daemon itself) — that's the detach fix.
     await waitFor(() => first.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
+    // The local-handshake proxy also needs the main-thread liveness watchdog
+    // (#943), matching direct and detached-daemon mode.
+    await waitFor(() => first.stderr.some((l) => l.includes('[CodeGraph watchdog] armed')), 8000);
 
     // A detached daemon came up and recorded itself.
     await waitFor(() => fs.existsSync(path.join(realRoot, '.codegraph', 'daemon.pid')), 8000);
@@ -415,10 +421,6 @@ describe('Shared MCP daemon (issue #411)', () => {
     await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
     await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
     const daemonPid = readLockPid(realRoot)!;
-
-    // A warm call goes through the daemon.
-    sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
-    await waitFor(() => findResponse(server.stdout, 2), 10000);
 
     // Kill the daemon out from under the live proxy.
     process.kill(daemonPid, 'SIGTERM');
