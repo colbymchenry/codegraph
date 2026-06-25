@@ -10,6 +10,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 
+## [1.1.1] - 2026-06-24
+
+### Fixes
+
+- CodeGraph respects your `.gitignore` again when looking for nested git repositories. A directory you've gitignored — a `resource/` or `.repos/` folder of cloned reference projects, a large vendored data dir — is no longer walked into and indexed: version 1.0.0 started searching inside *every* gitignored directory for embedded git repos and pulling them all in, which could multiply a graph many times over and slow indexing to a crawl on a multi-gigabyte folder of clones, even though you'd explicitly excluded it. Indexing the repos inside a gitignored directory is now opt-in — add an `includeIgnored` list to a `codegraph.json` at your repo root, e.g. `{ "includeIgnored": ["packages/", "services/"] }`, to index the embedded repos under the directories you name. The "super-repo of independent clones" layout from 1.0.0 still works, just declared explicitly. Nested repos you *haven't* gitignored (untracked clones) are indexed as before, and a project without this layout is unaffected. (#970, #976, #622)
+- The MCP server no longer drops out with `Transport closed` when its connection to the shared background server hits a transient socket error. To serve all your editor/agent sessions from a single index, CodeGraph runs one shared background server they reach over a local socket; a stray error on that socket while a session was connecting used to take the whole server process down, so your agent saw a bare `Transport closed` even though `codegraph status` and `codegraph sync` were perfectly healthy. Now such an error is handled gracefully — the session falls back to serving itself in-process instead of crashing. This is most common on WSL2 when your project lives on a Windows drive (a `/mnt/c` or `/mnt/d` path), where that socket is flaky; if you still hit problems there, set `CODEGRAPH_NO_DAEMON=1` to skip the shared server entirely and run each session in its own process. Affects Codex and any other MCP client. (#974)
+- A shared background server that can't bind its socket now cleans up its own lock file before exiting, instead of leaving a stale lock that the next launch trips over — which previously could let duplicate `serve --mcp` processes pile up for the same project. (#974)
+
 ## [1.1.0] - 2026-06-23
 
 ### New Features
@@ -460,3 +468,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.0.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.0.0
 [1.0.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.0.1
 [1.1.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.0
+[1.1.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.1

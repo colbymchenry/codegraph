@@ -1,9 +1,9 @@
 ---
 title: Configuration
-description: CodeGraph is zero-config by default, with one optional file for mapping custom extensions.
+description: CodeGraph is zero-config by default, with one optional codegraph.json for custom extensions and indexing nested git repositories.
 ---
 
-Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file is for mapping [custom file extensions](#custom-file-extensions).
+Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions) and [indexing nested git repositories](#indexing-nested-git-repositories).
 
 ## What it skips out of the box
 
@@ -33,6 +33,28 @@ If your project uses a non-standard extension for a [supported language](/codegr
 Each value is a supported language id. The mappings merge on top of the built-in defaults and win on conflict, so you can also re-point a built-in (e.g. `".h": "cpp"`). Commit the file to share the mapping with your team.
 
 A typo'd language or a malformed file is warned about and skipped — it never breaks indexing — and a project with no `codegraph.json` behaves exactly as before. Re-index (`codegraph index`) after adding or changing mappings.
+
+## Indexing nested git repositories
+
+CodeGraph respects your `.gitignore`, so a directory you've gitignored stays out of the graph — **including any git repositories nested inside it.** If you keep cloned reference projects, vendored copies, or a folder of unrelated repos in a gitignored directory (a `resource/`, `.repos/`, or `examples/` dir), CodeGraph leaves it untouched: it won't walk in, discover the embedded repos, or index them.
+
+If instead you run a **"super-repo" of independent clones** — a workspace whose own `.gitignore` lists its child repos to keep `git status` quiet, where you genuinely want every child indexed into one graph — opt those directories back in with `includeIgnored`:
+
+```json
+{
+  "includeIgnored": ["packages/", "services/"]
+}
+```
+
+Each entry is a gitignore-style pattern naming a gitignored directory whose nested git repositories should be indexed anyway. CodeGraph descends into the directories you list and indexes each embedded repo by its own `git ls-files`, so every child repo's own `.gitignore` is still honored. Directories you don't list stay excluded.
+
+A few things to know:
+
+- **Untracked** nested repositories (ones you haven't gitignored) are indexed automatically — `includeIgnored` is only for the ones your `.gitignore` excludes.
+- Built-in skips like `node_modules` are never re-included, even inside an opted-in directory.
+- A project without this layout needs no `codegraph.json` at all.
+
+Re-index (`codegraph index`) after adding or changing `includeIgnored`.
 
 ## Where data lives
 

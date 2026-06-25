@@ -183,6 +183,19 @@ export class Daemon {
         this.server = server;
         resolve();
       });
+    }).catch((err) => {
+      // Bind failed — e.g. AF_UNIX is unsupported/unreliable on this filesystem
+      // (the WSL2 DrvFs hazard behind #974), or a stale socket we couldn't clear.
+      // We already hold the lockfile that `tryAcquireDaemonLock` wrote; release it
+      // and any partial socket so the NEXT launcher doesn't spin respawning us on
+      // a stale lock that points at our now-dying pid. Then re-throw so the caller
+      // (the bin's try/catch) exits this detached daemon cleanly and every
+      // launcher falls back to direct mode.
+      this.cleanupLockfile();
+      if (process.platform !== 'win32') {
+        try { fs.unlinkSync(this.socketPath); } catch { /* may not exist */ }
+      }
+      throw err;
     });
 
     const lock: DaemonLockInfo = {
