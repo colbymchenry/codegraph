@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- New `codegraph check` command detects circular file-import cycles in an indexed project and prints each cycle's file paths, exiting non-zero when any are found — so it drops straight into a git pre-commit hook and catches import cycles before they break a build instead of after. The same detection is also available to an AI agent as `codegraph_check`, or enable it in an agent's tool list with `CODEGRAPH_MCP_TOOLS=check`.
+
 
 ## [1.1.1] - 2026-06-24
 

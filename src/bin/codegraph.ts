@@ -1959,6 +1959,74 @@ program
   });
 
 /**
+ * codegraph check [path]
+ *
+ * Detect circular file-import cycles in an indexed project. Prints each cycle
+ * as an ordered list of file paths. Exits non-zero if any cycle is found, so
+ * the command drops into a git pre-commit hook directly:
+ *
+ *   # .git/hooks/pre-commit
+ *   codegraph check || exit 1
+ *
+ * Backed by CodeGraph.findCircularDependencies() (the same DFS detector the
+ * codegraph_check MCP tool surfaces).
+ */
+program
+  .command('check [path]')
+  .description('Detect circular file-import cycles (exits non-zero if any found)')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
+    const projectPath = resolveProjectPath(pathArg);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        warn('Not initialized');
+        info('Run "codegraph init" first');
+        process.exitCode = 1;
+        return;
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      try {
+        // Deterministic ordering (sort by first path) — same contract as the
+        // MCP handler, so CLI and MCP output stay consistent.
+        const cycles = [...cg.findCircularDependencies()].sort((x, y) => {
+          const a = x[0] ?? '';
+          const b = y[0] ?? '';
+          return a < b ? -1 : a > b ? 1 : 0;
+        });
+
+        if (options.json) {
+          console.log(JSON.stringify({
+            projectPath,
+            cycleCount: cycles.length,
+            cycles,
+          }));
+        } else if (cycles.length === 0) {
+          console.log(chalk.green('No circular imports found.'));
+        } else {
+          console.log(chalk.bold(`\nCircular Imports — ${cycles.length} cycle${cycles.length === 1 ? '' : 's'} found\n`));
+          cycles.forEach((cycle, i) => {
+            console.log(chalk.cyan(`Cycle ${i + 1} (${cycle.length} files):`));
+            for (const p of cycle) console.log(`  ${p}`);
+            if (cycle.length > 1) console.log(`  ↳ ${cycle[0]} (back to start)`);
+            console.log();
+          });
+        }
+
+        // Non-zero exit on cycles so this works as a git pre-commit gate.
+        if (cycles.length > 0) process.exitCode = 1;
+      } finally {
+        cg.destroy();
+      }
+    } catch (err) {
+      error(`Check failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
+  });
+
+/**
  * codegraph install
  */
 program
