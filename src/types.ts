@@ -75,6 +75,7 @@ export const LANGUAGES = [
   'c',
   'cpp',
   'csharp',
+  'razor',
   'php',
   'ruby',
   'swift',
@@ -82,12 +83,14 @@ export const LANGUAGES = [
   'dart',
   'svelte',
   'vue',
+  'astro',
   'liquid',
   'pascal',
   'scala',
   'lua',
   'luau',
   'objc',
+  'r',
   'yaml',
   'twig',
   'xml',
@@ -161,6 +164,15 @@ export interface Node {
 
   /** Generic type parameters */
   typeParameters?: string[];
+
+  /**
+   * Normalized return/result type name for a function/method (the bare class
+   * name, smart-pointer pointee unwrapped). Captured for C/C++ so resolution
+   * can infer a chained receiver's type from what the inner call returns —
+   * `Foo::instance().bar()` resolves `bar` on `Foo` (issue #645). Undefined for
+   * languages/symbols where it isn't captured.
+   */
+  returnType?: string;
 
   /** When the node was last updated */
   updatedAt: number;
@@ -269,6 +281,14 @@ export interface ExtractionError {
 }
 
 /**
+ * Kinds an unresolved reference can carry. `function_ref` is internal-only —
+ * a function name used as a VALUE (callback registration, #756). It never
+ * becomes an edge kind: resolution maps it to a `references` edge targeting
+ * function/method nodes only (see `matchFunctionRef`).
+ */
+export type ReferenceKind = EdgeKind | 'function_ref';
+
+/**
  * A reference that couldn't be resolved during extraction
  */
 export interface UnresolvedReference {
@@ -279,7 +299,7 @@ export interface UnresolvedReference {
   referenceName: string;
 
   /** Type of reference (call, type, import, etc.) */
-  referenceKind: EdgeKind;
+  referenceKind: ReferenceKind;
 
   /** Location of the reference */
   line: number;

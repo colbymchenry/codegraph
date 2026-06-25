@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
+import { getCodeGraphDir } from '../directory';
 
 export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
 
@@ -43,11 +44,21 @@ export class DatabaseConnection {
   private db: SqliteDatabase;
   private dbPath: string;
   private backend: SqliteBackend;
+  /**
+   * `dev:ino` of the DB file at the moment we opened it (or null when the
+   * platform/filesystem reports no usable inode). Lets us notice when the file
+   * we hold open has been unlinked and REPLACED by a new file at the same path
+   * — a git worktree removed and re-added, or `.codegraph/` deleted and
+   * re-`init`ed under a long-lived server — at which point our fd reads a now
+   * dead inode forever (#925). See `isReplacedOnDisk`.
+   */
+  private openedInode: string | null;
 
   private constructor(db: SqliteDatabase, dbPath: string, backend: SqliteBackend) {
     this.db = db;
     this.dbPath = dbPath;
     this.backend = backend;
+    this.openedInode = statInode(dbPath);
   }
 
   /**
@@ -132,7 +143,7 @@ export class DatabaseConnection {
    *
    * SQLite silently keeps the prior mode if WAL can't be enabled — e.g. on
    * filesystems without shared-memory support (some network/virtualized mounts,
-   * WSL2 /mnt), and always on the wasm backend. So the effective mode can differ
+   * WSL2 /mnt). So the effective mode can differ
    * from what `configureConnection` requested. Surfaced in `codegraph status` so
    * a "database is locked" report is triageable: 'wal' ⇒ readers never block on a
    * writer; anything else ⇒ they can. See issue #238.
@@ -229,6 +240,40 @@ export class DatabaseConnection {
   isOpen(): boolean {
     return this.db.open;
   }
+
+  /**
+   * True when the DB file at our path has been REPLACED on disk since we opened
+   * it — a different inode now lives at the same path, so the fd we still hold
+   * points at a now-unlinked inode that can never receive new writes (#925).
+   * The trigger is removing and recreating `.codegraph/` at the same path under
+   * a long-lived process (`git worktree remove` + re-add, or `rm -rf
+   * .codegraph` + `codegraph init`). Returns false when the inode is unchanged,
+   * when the file is momentarily absent (mid-recreate — nothing to reopen onto
+   * yet), or when the platform doesn't report a usable inode (Windows can't
+   * unlink an open file and its st_ino is unreliable, so this never fires there).
+   */
+  isReplacedOnDisk(): boolean {
+    if (this.openedInode === null) return false;
+    const current = statInode(this.dbPath);
+    return current !== null && current !== this.openedInode;
+  }
+}
+
+/**
+ * `dev:ino` for a path, or null if it can't be stat'd or the platform doesn't
+ * report a usable inode. Windows st_ino is unreliable across handle reopens, so
+ * we deliberately return null there — the deleted-but-open-inode hazard this
+ * guards (#925) is a POSIX file-semantics issue that doesn't arise on Windows
+ * (an open file can't be unlinked).
+ */
+function statInode(p: string): string | null {
+  if (process.platform === 'win32') return null;
+  try {
+    const s = fs.statSync(p);
+    return `${s.dev}:${s.ino}`;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -240,5 +285,5 @@ export const DATABASE_FILENAME = 'codegraph.db';
  * Get the default database path for a project
  */
 export function getDatabasePath(projectRoot: string): string {
-  return path.join(projectRoot, '.codegraph', DATABASE_FILENAME);
+  return path.join(getCodeGraphDir(projectRoot), DATABASE_FILENAME);
 }

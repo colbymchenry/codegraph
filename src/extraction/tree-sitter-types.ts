@@ -78,6 +78,16 @@ export interface ExtractorContext {
  * language-specific details like signatures, visibility, and imports.
  */
 export interface LanguageExtractor {
+  /**
+   * Optional source transform applied immediately before the grammar parses the
+   * file. Used to work around grammar gaps that would otherwise corrupt the
+   * parse tree (e.g. C# blanks conditional-compilation directive lines the
+   * grammar mis-parses inside enum bodies). MUST preserve byte offsets (replace
+   * removed text with spaces, keep newlines) so node positions and getNodeText
+   * stay correct; the returned string is used for both parsing and extraction.
+   */
+  preParse?: (source: string) => string;
+
   // --- Node type mappings ---
 
   /** Node types that represent functions */
@@ -138,6 +148,14 @@ export interface LanguageExtractor {
   isStatic?: (node: SyntaxNode) => boolean;
   /** Check if variable declaration is a constant (const vs let/var) */
   isConst?: (node: SyntaxNode) => boolean;
+  /**
+   * Extract extra symbol-level modifier keywords to persist on the node's
+   * `decorators` list (e.g. Kotlin `expect`/`actual` multiplatform markers).
+   * Called generically for every created node; return undefined/[] when none.
+   * Used by the resolver to link `expect` declarations to their `actual`
+   * implementations across source sets.
+   */
+  extractModifiers?: (node: SyntaxNode) => string[] | undefined;
 
   // --- New config properties ---
 
@@ -157,10 +175,33 @@ export interface LanguageExtractor {
   visitNode?: (node: SyntaxNode, ctx: ExtractorContext) => boolean;
 
   /**
+   * Synthesize members that exist at compile time but not in the source AST,
+   * called at the end of class extraction with the class still on the scope
+   * stack (so `ctx.createNode` attaches containment + qualified names) and the
+   * class's real members already extracted (so the hook can skip a member the
+   * source explicitly declares). Used by Java for Lombok-generated accessors
+   * (`@Getter`/`@Setter`/`@Data`/`@Value`/`@Builder` → `getX`/`setX`/`builder`/
+   * `equals`/`hashCode`/`toString` + the `log` field), which are otherwise
+   * invisible and break call-chain analysis (#912). The created nodes carry a
+   * `lombok` decorator + a docstring naming the generating annotation, so an
+   * agent can tell them apart from hand-written code.
+   */
+  synthesizeMembers?: (classNode: SyntaxNode, ctx: ExtractorContext) => void;
+
+  /**
    * Classify a class_declaration node when the grammar reuses one node type
    * for multiple concepts (e.g. Swift uses class_declaration for classes, structs, and enums).
    */
   classifyClassNode?: (node: SyntaxNode) => 'class' | 'struct' | 'enum' | 'interface' | 'trait';
+
+  /**
+   * Classify a methodTypes node when the grammar reuses one node type for
+   * both callable and data members (#808): TS/JS class FIELDS
+   * (`public_field_definition` / `field_definition`) are methods only when
+   * their value is callable (`onClick = () => {}`); a plain field
+   * (`public fonts: Fonts;`, `count = 0`) is a property. Default: 'method'.
+   */
+  classifyMethodNode?: (node: SyntaxNode) => 'method' | 'property';
 
   /**
    * Resolve the body node for a function/method/class when it's not a child field.
@@ -186,6 +227,15 @@ export interface LanguageExtractor {
    * When present, the receiver type is included in the qualified name for better searchability.
    */
   getReceiverType?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
+   * Extract a function/method's normalized return type name (bare class name,
+   * smart-pointer pointee unwrapped), stored on the node as `returnType`. Used
+   * by C/C++ so resolution can infer a chained receiver's type from what the
+   * inner call returns (`Foo::instance().bar()` → resolve `bar` on `Foo`,
+   * issue #645). Return undefined for primitives / void / constructors.
+   */
+  getReturnType?: (node: SyntaxNode, source: string) => string | undefined;
 
   /**
    * Resolve the actual node kind for a type alias declaration.

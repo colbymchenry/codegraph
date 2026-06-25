@@ -40,9 +40,14 @@ npm-debug.log*
 # Local Claude settings
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+.claude/handoffs/
 
 # Parallels Windows VM SSH/connection config (local machine, see CLAUDE.md)
 .parallels
+
+# Confidential business / product / strategy docs — must NOT land in the
+# public engine repo (see the IP boundary in CLAUDE.md)
+docs/business/
 
 # CodeGraph data directories (in test projects)
 .codegraph/
@@ -59,3 +64,7 @@ release/
 
 # Local-only: browser-based tmux session launcher (see tmux-web/README.md)
 tmux-web/
+
+assets/__pycache__/
+
+assets/generate-waitlist.py

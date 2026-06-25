@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory } from '../src/extraction';
+import { extractFromSource, scanDirectory, buildDefaultIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { normalizePath } from '../src/utils';
 
@@ -184,6 +184,89 @@ export class PaymentService {
     expect(chargeMethod).toBeDefined();
   });
 
+  it('captures docstrings for export- and const-wrapped declarations (#780)', () => {
+    const code = `
+// plain class control
+class Ledger {}
+
+// exported class
+export class Invoice {}
+
+// export default
+export default function settle() { return true; }
+
+// exported arrow const
+export const refund = (amount: number) => amount;
+
+// non-export arrow const
+const audit = (amount: number) => amount;
+`;
+    const byName = new Map(extractFromSource('doc.ts', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('Ledger')?.docstring).toBe('plain class control'); // control still works
+    expect(byName.get('Invoice')?.docstring).toBe('exported class');
+    expect(byName.get('settle')?.docstring).toBe('export default');
+    expect(byName.get('refund')?.docstring).toBe('exported arrow const');
+    expect(byName.get('audit')?.docstring).toBe('non-export arrow const');
+  });
+
+  it('does not mis-attribute a class comment to an uncommented member (#780)', () => {
+    const code = `
+// Comment for Box
+export class Box {
+  noComment() {}
+  // own comment
+  withComment() {}
+}
+`;
+    const byName = new Map(extractFromSource('box.ts', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('Box')?.docstring).toBe('Comment for Box');
+    expect(byName.get('noComment')?.docstring ?? null).toBeNull(); // no over-walk
+    expect(byName.get('withComment')?.docstring).toBe('own comment');
+  });
+
+  it('captures docstrings for decorated Python declarations, stripping `#` (#780)', () => {
+    const code = [
+      '# decorated function',
+      '@app.route("/x")',
+      'def py_handler():',
+      '    return 1',
+      '',
+      '',
+      '# plain function control',
+      'def py_plain():',
+      '    return 1',
+      '',
+      '',
+      '# decorated class',
+      '@dataclass',
+      'class PyModel:',
+      '    pass',
+      '',
+    ].join('\n');
+    const byName = new Map(extractFromSource('mod.py', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('py_handler')?.docstring).toBe('decorated function');
+    expect(byName.get('py_plain')?.docstring).toBe('plain function control'); // `#` stripped
+    expect(byName.get('PyModel')?.docstring).toBe('decorated class');
+  });
+
+  it('cleans comment markers across language styles (#780)', () => {
+    const doc = (file: string, code: string, name: string) =>
+      new Map(extractFromSource(file, code).nodes.map((n) => [n.name, n])).get(name)?.docstring;
+
+    // Rust doc lines (`///`, `//!`) — the trailing slash used to leak through.
+    expect(doc('m.rs', '/// rust doc line\nfn rs_fn() {}', 'rs_fn')).toBe('rust doc line');
+    // Lua line + long-bracket comments.
+    expect(doc('m.lua', '-- lua line\nfunction lua_fn() end', 'lua_fn')).toBe('lua line');
+    expect(doc('b.lua', '--[[ lua block ]]\nfunction lua_b() end', 'lua_b')).toBe('lua block');
+    // Pascal brace and paren-star comments.
+    const pasUnit = (c: string) =>
+      `unit U;\ninterface\n${c}\nprocedure P;\nimplementation\nprocedure P;\nbegin\nend;\nend.\n`;
+    expect(doc('a.pas', pasUnit('{ pascal brace }'), 'P')).toBe('pascal brace');
+    expect(doc('c.pas', pasUnit('(* pascal paren *)'), 'P')).toBe('pascal paren');
+    // C block comment still clean (no regression).
+    expect(doc('m.c', '/* c block */\nvoid c_fn(void) {}', 'c_fn')).toBe('c block');
+  });
+
   it('should extract interfaces', () => {
     const code = `
 export interface User {
@@ -235,6 +318,54 @@ interface MethodForm {
     const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
     expect(refs.some((r) => r.referenceName === 'IPage')).toBe(true);
     expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
+  });
+
+  it('extracts type references from in-body local variable annotations', () => {
+    // A function that uses a type ONLY in its body — `const items: Foo[] = []` —
+    // still depends on Foo. The body walker used to capture calls but never type
+    // annotations, so impact / `affected` missed the dependency. Must cover
+    // function, class-method, and object-literal-method bodies — and must NOT
+    // turn the locals themselves into graph nodes (that would explode the graph).
+    const code = `
+import { Foo } from './types';
+
+export function build(): void {
+  const items: Foo[] = [];
+  void items;
+}
+
+export class K {
+  run(): void {
+    const a: Foo = { x: 1 };
+    void a;
+  }
+}
+
+export const handler = {
+  handle(): void {
+    const b: Foo = { x: 1 };
+    void b;
+  },
+};
+`;
+    const result = extractFromSource('inbody.ts', code);
+
+    const fooRefs = result.unresolvedReferences.filter(
+      (r) => r.referenceKind === 'references' && r.referenceName === 'Foo'
+    );
+    // One per body scope: build(), K.run(), handler.handle().
+    expect(fooRefs.length).toBeGreaterThanOrEqual(3);
+
+    // Each reference is attributed to its enclosing function/method node — never
+    // to a local-variable node, because locals are intentionally not extracted.
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    for (const ref of fooRefs) {
+      const owner = byId.get(ref.fromNodeId);
+      expect(owner).toBeDefined();
+      expect(['function', 'method']).toContain(owner!.kind);
+    }
+    // The locals (items/a/b) must not leak in as symbols.
+    expect(result.nodes.some((n) => ['items', 'a', 'b'].includes(n.name))).toBe(false);
   });
 
   it('should track function calls', () => {
@@ -402,6 +533,59 @@ type Internal = string;
     const exported = typeAliases.filter((n) => n.isExported);
     expect(exported).toHaveLength(2);
     expect(exported.map((n) => n.name).sort()).toEqual(['DateFormat', 'UnitSystem']);
+  });
+
+  // A service/contract registry written as a tuple of generic instantiations —
+  // the names are string-literal type arguments, not declarations, so static
+  // extraction otherwise never indexes them (issue #634).
+  it('extracts string-literal contract names from a generic tuple type alias (#634)', () => {
+    const code = `
+interface Service<Name extends string, Req, Resp> { name: Name; }
+export type MyServiceList = [
+  Service<'query_apply_record', { pageNo: number }, { ok: boolean }>,
+  Service<'apply_confirm', { code: string }, { ok: boolean }>
+];
+`;
+    const result = extractFromSource('services/api.ts', code);
+
+    const names = result.nodes.filter(
+      (n) => n.kind === 'method' && n.qualifiedName.startsWith('MyServiceList::')
+    );
+    expect(names.map((n) => n.name).sort()).toEqual(['apply_confirm', 'query_apply_record']);
+
+    const queryNode = names.find((n) => n.name === 'query_apply_record');
+    expect(queryNode?.qualifiedName).toBe('MyServiceList::query_apply_record');
+    // Signature carries the full contract entry so search results show context.
+    expect(queryNode?.signature).toContain("Service<'query_apply_record'");
+
+    // The string-literal name is contained by the type alias.
+    const alias = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'MyServiceList');
+    const containsEdge = result.edges.find(
+      (e) => e.kind === 'contains' && e.source === alias?.id && e.target === queryNode?.id
+    );
+    expect(containsEdge).toBeDefined();
+  });
+
+  it('does not extract string literals from utility types or nested generics (#634)', () => {
+    const code = `
+interface User { id: string; name: string; }
+interface Service<Name extends string, Req, Resp> { name: Name; }
+export type Picked = Pick<User, 'id' | 'name'>;
+export type Rec = Record<'foo' | 'bar', number>;
+// Tuple entry, but the name is a non-identifier route path; the nested Pick's
+// 'id' must also stay out (only DIRECT literal args of a tuple's generic count).
+export type Routes = [Service<'/api/users', Pick<User, 'id'>, {}>];
+// Bare string-literal tuple — not generic type arguments.
+export type Names = ['alpha', 'beta'];
+`;
+    const result = extractFromSource('noise.ts', code);
+
+    const leaked = result.nodes.filter(
+      (n) =>
+        (n.kind === 'method' || n.kind === 'property') &&
+        ['id', 'name', 'foo', 'bar', 'alpha', 'beta'].includes(n.name)
+    );
+    expect(leaked).toEqual([]);
   });
 });
 
@@ -964,6 +1148,120 @@ public class OrderService
     expect(classNode).toBeDefined();
     expect(classNode?.name).toBe('OrderService');
     expect(classNode?.visibility).toBe('public');
+  });
+
+  it('indexes every record form with the right kind (#831)', () => {
+    // The grammar parses ALL record forms as record_declaration — there is no
+    // record_struct_declaration node — so the value-type forms are told apart
+    // by their `struct` keyword child. Positional one-liners have no body
+    // block and must still index (the no-body gate is for C/C++ forward
+    // declarations, not records).
+    const code = `
+namespace Fixture;
+
+public record SimplePositional(int A);
+public record WithBody(int A) { public int DoubleIt() => A * 2; }
+public record class ExplicitClassRec(string Name);
+public record struct ValueRec(int X);
+public readonly record struct ReadonlyRec(int X, int Y);
+public record DerivedRec(int A, string B) : SimplePositional(A);
+public record GenericRec<T>(T Value);
+public partial record PartialRec(int A);
+`;
+    const result = extractFromSource('Records.cs', code);
+    const kindOf = (name: string) => result.nodes.find((n) => n.name === name)?.kind;
+
+    expect(kindOf('SimplePositional')).toBe('class');
+    expect(kindOf('WithBody')).toBe('class');
+    expect(kindOf('ExplicitClassRec')).toBe('class');
+    expect(kindOf('DerivedRec')).toBe('class');
+    expect(kindOf('GenericRec')).toBe('class');
+    expect(kindOf('PartialRec')).toBe('class');
+    // Value-type records are structs, not classes.
+    expect(kindOf('ValueRec')).toBe('struct');
+    expect(kindOf('ReadonlyRec')).toBe('struct');
+    // Members of a bodied record still extract.
+    expect(kindOf('DoubleIt')).toBe('method');
+  });
+
+  it('indexes primary-constructor classes, including keyed-DI attribute params (#237)', () => {
+    // C# 12 primary constructors (`class Foo(IDep dep) { … }`) are parsed
+    // natively by the vendored tree-sitter-c-sharp 0.23.x grammar. The worst
+    // shape under the previous (older) grammar — an attribute-with-args on a
+    // ctor param (`[FromKeyedServices("primary")] …`, the ASP.NET keyed-DI
+    // pattern) — used to parse as an ERROR that swallowed the whole class, so
+    // the class and all its methods vanished. They now index in every case.
+    const code = `
+public class DataService(IMemoryCache cache)
+{
+    public void Warm() { }
+}
+
+public class InstanceService(InstanceManager m, ProfileManager p)
+{
+    public void DeployAndLaunchAsync() { }
+    public void Deploy() { }
+}
+
+public partial class UpdateService(int x) : ILifetimeService
+{
+    public void Run() { }
+}
+
+public class K1KeyedDi([FromKeyedServices("primary")] IMemoryCache cache)
+{
+    public void Warm() { }
+}
+
+public record CatalogBrand(int Id, string Name);
+`;
+    const result = extractFromSource('Services.cs', code);
+    const classNames = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+    expect(classNames).toContain('DataService');
+    expect(classNames).toContain('InstanceService');
+    expect(classNames).toContain('UpdateService'); // partial + base list
+    expect(classNames).toContain('K1KeyedDi'); // attribute-arg ctor param — used to vanish entirely
+    expect(classNames).toContain('CatalogBrand'); // record
+
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toContain('DeployAndLaunchAsync');
+    expect(methods).toContain('Deploy');
+    expect(methods).toContain('Run');
+  });
+
+  it('keeps a class indexable when a nested enum has #if-guarded members (#237)', () => {
+    // A `#if` directive inside an enum member list (the multi-targeting pattern
+    // in libraries like Newtonsoft.Json) makes the grammar emit an ERROR that,
+    // for a nested enum, detaches the enclosing class's member list — dropping
+    // most of the class's methods. A pre-parse pass blanks the directive lines
+    // (keeping both branches), so the class and all its methods still index.
+    const code = `
+public class Reader
+{
+    private enum ReadType
+    {
+#if HAVE_DATE_TIME_OFFSET
+        ReadAsDateTimeOffset,
+#endif
+        ReadAsDouble,
+        ReadAsString,
+    }
+
+    public void Open() { }
+    public void Close() { }
+    public int ReadInt() { return 0; }
+}
+`;
+    const result = extractFromSource('Reader.cs', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    // All three methods after the #if-bearing enum must survive.
+    expect(methods).toContain('Open');
+    expect(methods).toContain('Close');
+    expect(methods).toContain('ReadInt');
+    // Both enum branches are kept.
+    const enumMembers = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+    expect(enumMembers).toContain('ReadAsDateTimeOffset');
+    expect(enumMembers).toContain('ReadAsDouble');
   });
 });
 
@@ -2066,6 +2364,43 @@ use Closure;
       expect(names).toContain('Illuminate\\Support\\Str');
       expect(names).toContain('Closure');
     });
+
+    it('should extract include/require (+_once) static paths as imports (#660)', () => {
+      const code = `<?php
+require_once("lib.php");
+include 'other.php';
+require 'r.php';
+include_once("io.php");
+`;
+      const result = extractFromSource('page.php', code);
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('lib.php');
+      expect(names).toContain('other.php');
+      expect(names).toContain('r.php');
+      expect(names).toContain('io.php');
+    });
+
+    it('should skip dynamic include/require with no static path (#660)', () => {
+      const code = `<?php
+require_once(__DIR__ . '/dyn.php');
+include $file;
+include "tpl/{$name}.php";
+`;
+      const result = extractFromSource('page.php', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import');
+      expect(imports).toHaveLength(0);
+    });
+
+    it('should extract include alongside namespace use without interference (#660)', () => {
+      const code = `<?php
+use App\\Service\\Mailer;
+require_once("bootstrap.php");
+`;
+      const result = extractFromSource('page.php', code);
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('App\\Service\\Mailer');
+      expect(names).toContain('bootstrap.php');
+    });
   });
 
   describe('Ruby imports', () => {
@@ -2185,6 +2520,122 @@ end
       const authMethod = result.nodes.find((n) => n.name === 'authenticate');
       expect(authMethod).toBeDefined();
       expect(authMethod?.qualifiedName).toBe('Discourse::Auth::AuthProvider::authenticate');
+    });
+  });
+
+  describe('PHP return type capture (#608)', () => {
+    it('captures self/static factory returns as the `self` marker; primitives as undefined', () => {
+      const code = `<?php
+class ApiClient {
+    public static function for(string $c): self { return new self; }
+    public static function make(): static { return new static; }
+    public function send(array $p): array { return []; }
+}`;
+      const result = extractFromSource('ApiClient.php', code);
+      expect(result.nodes.find((n) => n.name === 'for' && n.kind === 'method')?.returnType).toBe('self');
+      expect(result.nodes.find((n) => n.name === 'make' && n.kind === 'method')?.returnType).toBe('self');
+      // `array` is not a class to chain on → no return type recorded.
+      expect(result.nodes.find((n) => n.name === 'send' && n.kind === 'method')?.returnType).toBeUndefined();
+    });
+
+    it('captures a concrete return type as its short class name', () => {
+      const code = `<?php
+namespace App;
+class WidgetFactory { public static function make(): Widget { return new Widget(); } }`;
+      const result = extractFromSource('WidgetFactory.php', code);
+      expect(result.nodes.find((n) => n.name === 'make' && n.kind === 'method')?.returnType).toBe('Widget');
+    });
+  });
+
+  describe('C/C++ return type capture (#645)', () => {
+    it('captures the normalized return type of a C++ method/function', () => {
+      const code = `
+struct Widget { void draw(); };
+class Factory { public: static Widget create(); };
+Widget Factory::create() { return Widget(); }
+void doNothing() {}
+`;
+      const result = extractFromSource('f.cpp', code);
+
+      const create = result.nodes.find(
+        (n) => n.name === 'create' && (n.kind === 'method' || n.kind === 'function')
+      );
+      expect(create?.returnType).toBe('Widget');
+
+      // A `void` return records no type, so resolution never tries to resolve a
+      // method on it.
+      const doNothing = result.nodes.find((n) => n.name === 'doNothing');
+      expect(doNothing).toBeDefined();
+      expect(doNothing?.returnType).toBeUndefined();
+    });
+
+    it('unwraps a smart-pointer return type to its pointee', () => {
+      const code = `
+#include <memory>
+struct Widget {};
+std::unique_ptr<Widget> makeWidget() { return nullptr; }
+`;
+      const result = extractFromSource('f.cpp', code);
+
+      const make = result.nodes.find((n) => n.name === 'makeWidget');
+      expect(make?.returnType).toBe('Widget');
+    });
+  });
+
+  describe('C++ macro-prefixed class/struct misparse (#946)', () => {
+    // An export/visibility macro before the class name plus a base clause
+    // (`class MACRO Name : public Base { … }`) makes tree-sitter read `class
+    // MACRO` as an elaborated type and the whole declaration as a
+    // function_definition named after the class, spanning the entire body — a
+    // phantom `function` that polluted callers/impact/blast-radius. It's dropped.
+    it('does not mint a phantom function for a macro-annotated class that inherits', () => {
+      const code = `#pragma once
+#define MAPCORE_EXPORT __attribute__((visibility("default")))
+
+class DataProvider {
+public:
+    virtual bool Request(void* param) = 0;
+};
+
+class MAPCORE_EXPORT LocalDataProvider : public DataProvider
+{
+public:
+    LocalDataProvider(int dataType);
+    virtual bool Request(void* param) override;
+};
+`;
+      // A header rich in C++ (class / public: / virtual) detects as C++ — the
+      // issue's exact scenario (a `.h` file). Guard it so a detection regression
+      // can't make this test pass for the wrong reason.
+      expect(detectLanguage('provider.h', code)).toBe('cpp');
+      const result = extractFromSource('provider.h', code);
+
+      // The misparse used to surface as `function | LocalDataProvider` spanning
+      // the whole class body — a false caller in the graph. It's gone now.
+      expect(
+        result.nodes.find((n) => n.name === 'LocalDataProvider' && n.kind === 'function')
+      ).toBeUndefined();
+
+      // The sibling class without the macro is unaffected — still a class.
+      expect(result.nodes.find((n) => n.name === 'DataProvider')?.kind).toBe('class');
+    });
+
+    it('drops the struct variant too, without dropping a genuine class', () => {
+      const code = `
+#define API __declspec(dllexport)
+struct API Widget : public Base { int x; };
+class Plain : public Base { public: int y; };
+`;
+      const result = extractFromSource('widget.cpp', code);
+
+      // `struct MACRO Name : Base { … }` misparses the same way — no phantom function.
+      expect(
+        result.nodes.find((n) => n.name === 'Widget' && n.kind === 'function')
+      ).toBeUndefined();
+
+      // A normal class with a base clause and no macro must still be a class — the
+      // drop is precise, not a blanket "class with inheritance" filter.
+      expect(result.nodes.find((n) => n.name === 'Plain')?.kind).toBe('class');
     });
   });
 
@@ -3093,6 +3544,1483 @@ end`;
   });
 });
 
+describe('Kotlin Multiplatform expect/actual', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links expect declarations to platform actual implementations and surfaces them in impact', async () => {
+    const common = path.join(tempDir, 'src', 'commonMain');
+    const jvm = path.join(tempDir, 'src', 'jvmMain');
+    fs.mkdirSync(common, { recursive: true });
+    fs.mkdirSync(jvm, { recursive: true });
+
+    // common source set: expect declarations + a caller that uses them
+    fs.writeFileSync(
+      path.join(common, 'SystemProps.kt'),
+      `package demo.internal
+
+expect fun systemProp(name: String): String?
+
+expect class Platform {
+    fun describe(): String
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(common, 'Caller.kt'),
+      `package demo
+
+import demo.internal.systemProp
+import demo.internal.Platform
+
+fun useIt(): String {
+    val v = systemProp("os.name")
+    return Platform().describe() + v
+}
+`
+    );
+    // jvm source set: actual implementations
+    fs.writeFileSync(
+      path.join(jvm, 'SystemProps.kt'),
+      `package demo.internal
+
+actual fun systemProp(name: String): String? = System.getProperty(name)
+
+actual class Platform {
+    actual fun describe(): String = "JVM"
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // The expect/actual markers are captured onto the node's decorators.
+    const fns = cg.getNodesByKind('function');
+    const actualFn = fns.find(
+      (n) => n.name === 'systemProp' && n.decorators?.includes('actual')
+    );
+    const expectFn = fns.find(
+      (n) => n.name === 'systemProp' && n.decorators?.includes('expect')
+    );
+    expect(actualFn).toBeDefined();
+    expect(expectFn).toBeDefined();
+    expect(actualFn!.filePath).not.toBe(expectFn!.filePath);
+
+    // Editing the JVM actual must surface the common expect AND its caller —
+    // before the expect/actual bridge the actual had zero dependents.
+    const impact = cg.getImpactRadius(actualFn!.id, 3);
+    const impacted = [...impact.nodes.values()].map((n) => n.name);
+    expect(impacted).toContain('systemProp'); // the common expect
+    expect(impacted).toContain('useIt'); // the caller, reached transitively
+
+    // The bridging edge is a heuristic `calls` edge tagged by the synthesizer.
+    const bridge = impact.edges.find(
+      (e) =>
+        e.target === actualFn!.id &&
+        e.provenance === 'heuristic' &&
+        (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy ===
+          'kotlin-expect-actual'
+    );
+    expect(bridge).toBeDefined();
+    expect(bridge!.source).toBe(expectFn!.id);
+  });
+
+  it('links an expect class to an actual typealias (different node kinds)', async () => {
+    const common = path.join(tempDir, 'src', 'commonMain');
+    const jvm = path.join(tempDir, 'src', 'jvmMain');
+    fs.mkdirSync(common, { recursive: true });
+    fs.mkdirSync(jvm, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(common, 'Lock.kt'),
+      `package demo
+
+expect class Lock {
+    fun acquire()
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(jvm, 'Lock.kt'),
+      `package demo
+
+actual typealias Lock = java.util.concurrent.locks.ReentrantLock
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const aliasNode = cg
+      .getNodesByKind('type_alias')
+      .find((n) => n.name === 'Lock' && n.decorators?.includes('actual'));
+    expect(aliasNode).toBeDefined();
+
+    // The actual typealias is now a cross-file dependency target (linked from
+    // the expect class), so it participates in impact rather than being orphaned.
+    const impact = cg.getImpactRadius(aliasNode!.id, 3);
+    const bridge = impact.edges.find(
+      (e) =>
+        e.target === aliasNode!.id &&
+        (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy ===
+          'kotlin-expect-actual'
+    );
+    expect(bridge).toBeDefined();
+  });
+});
+
+describe('Scala cross-file dependencies', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links parameterized supertypes, type annotations, and implicit params across files', async () => {
+    const src = path.join(tempDir, 'src', 'main', 'scala', 'demo');
+    fs.mkdirSync(src, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(src, 'Semigroup.scala'),
+      `package demo
+
+trait Semigroup[A] {
+  def combine(x: A, y: A): A
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'Monoid.scala'),
+      `package demo
+
+trait Monoid[A] extends Semigroup[A] {
+  def empty: A
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'Instances.scala'),
+      `package demo
+
+object Instances {
+  implicit val intMonoid: Monoid[Int] = new Monoid[Int] {
+    def empty: Int = 0
+    def combine(x: Int, y: Int): Int = x + y
+  }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'Folding.scala'),
+      `package demo
+
+object Folding {
+  def fold[A](xs: List[A])(implicit M: Monoid[A]): A =
+    xs.foldLeft(M.empty)(M.combine)
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const monoid = cg.getNodesByKind('trait').find((n) => n.name === 'Monoid');
+    const semigroup = cg.getNodesByKind('trait').find((n) => n.name === 'Semigroup');
+    expect(monoid).toBeDefined();
+    expect(semigroup).toBeDefined();
+    expect(monoid!.filePath).not.toBe(semigroup!.filePath);
+
+    // Parameterized supertype `extends Semigroup[A]` must create an extends edge —
+    // the whole point of the fix (the `[A]` used to defeat name matching).
+    const semaImpact = cg.getImpactRadius(semigroup!.id, 3);
+    expect([...semaImpact.nodes.values()].map((n) => n.name)).toContain('Monoid');
+
+    // Editing Monoid surfaces the cross-file users: the instance val typed
+    // `Monoid[Int]` and the method taking it as an implicit (curried) param.
+    const impacted = [...cg.getImpactRadius(monoid!.id, 3).nodes.values()].map((n) => n.name);
+    expect(impacted).toContain('intMonoid'); // field type annotation
+    expect(impacted).toContain('fold'); // trailing implicit parameter list
+  });
+});
+
+describe('PHP namespace + import resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('resolves `use` imports to the namespace-qualified definition and type-hints across files', async () => {
+    const src = path.join(tempDir, 'src');
+    // Two interfaces with the SAME simple name in different namespaces — the
+    // exact ambiguity (Laravel has 7+ `Factory`) that bare-name matching can't
+    // resolve. The namespace qualifies them; the `use` import disambiguates.
+    fs.mkdirSync(path.join(src, 'Cache'), { recursive: true });
+    fs.mkdirSync(path.join(src, 'Mail'), { recursive: true });
+    fs.mkdirSync(path.join(src, 'App'), { recursive: true });
+    fs.writeFileSync(
+      path.join(src, 'Cache', 'Factory.php'),
+      `<?php
+namespace Contracts\\Cache;
+
+interface Factory {
+    public function store(): object;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'Mail', 'Factory.php'),
+      `<?php
+namespace Contracts\\Mail;
+
+interface Factory {
+    public function mailer(): object;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'App', 'Service.php'),
+      `<?php
+namespace App;
+
+use Contracts\\Cache\\Factory;
+
+class Service {
+    public function make(): Factory {
+        return resolve(Factory::class);
+    }
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // The PHP namespace is captured into the qualified name, so the two
+    // same-named interfaces are distinguishable.
+    const cacheFactory = cg
+      .getNodesByKind('interface')
+      .find((n) => n.qualifiedName === 'Contracts\\Cache::Factory');
+    const mailFactory = cg
+      .getNodesByKind('interface')
+      .find((n) => n.qualifiedName === 'Contracts\\Mail::Factory');
+    expect(cacheFactory).toBeDefined();
+    expect(mailFactory).toBeDefined();
+
+    // Service `use`s Contracts\Cache\Factory, so editing THAT interface reaches
+    // Service.php — and editing the same-named Contracts\Mail\Factory must NOT
+    // (the import resolved to the right namespace, not an arbitrary `Factory`).
+    const serviceFile = 'src/App/Service.php';
+    const cacheReaches = [...cg.getImpactRadius(cacheFactory!.id, 3).nodes.values()].some(
+      (n) => (n.filePath ?? '').endsWith(serviceFile)
+    );
+    const mailReaches = [...cg.getImpactRadius(mailFactory!.id, 3).nodes.values()].some(
+      (n) => (n.filePath ?? '').endsWith(serviceFile)
+    );
+    expect(cacheReaches).toBe(true);
+    expect(mailReaches).toBe(false);
+  });
+});
+
+describe('Ruby mixins (include/extend/prepend)', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links include/extend/prepend to the mixed-in module across files', async () => {
+    const lib = path.join(tempDir, 'lib');
+    fs.mkdirSync(lib, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(lib, 'concerns.rb'),
+      `module Trackable
+  def track; end
+end
+
+module Cacheable
+  def cache; end
+end
+
+module Loggable
+  def log; end
+end
+`
+    );
+    fs.writeFileSync(
+      path.join(lib, 'model.rb'),
+      `class Model
+  include Trackable
+  prepend Cacheable
+  extend Loggable
+end
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const model = cg.getNodesByKind('class').find((n) => n.name === 'Model');
+    expect(model).toBeDefined();
+
+    // All three mixin forms create an `implements` edge Model → module, so
+    // editing a concern surfaces every class that mixes it in (across files).
+    for (const moduleName of ['Trackable', 'Cacheable', 'Loggable']) {
+      const mod = cg.getNodesByKind('module').find((n) => n.name === moduleName);
+      expect(mod, moduleName).toBeDefined();
+      const impacted = [...cg.getImpactRadius(mod!.id, 3).nodes.values()].map((n) => n.name);
+      expect(impacted, `${moduleName} should be depended on by Model`).toContain('Model');
+    }
+  });
+
+  it('resolves require / require_relative to the required file', async () => {
+    const lib = path.join(tempDir, 'lib');
+    fs.mkdirSync(path.join(lib, 'app'), { recursive: true });
+
+    // A leaf file whose class is referenced only dynamically — so without
+    // require resolution it would look like nothing depends on it.
+    fs.writeFileSync(
+      path.join(lib, 'app', 'fetcher.rb'),
+      `module App
+  class Fetcher
+    def fetch; end
+  end
+end
+`
+    );
+    // Pulled in by a load-path `require` …
+    fs.writeFileSync(
+      path.join(lib, 'app', 'worker.rb'),
+      `require "app/fetcher"
+
+module App
+  class Worker; end
+end
+`
+    );
+    // … and a sibling pulled in by `require_relative`.
+    fs.writeFileSync(
+      path.join(lib, 'app', 'boot.rb'),
+      `require_relative "fetcher"
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // The require edges target fetcher.rb's FILE node. Editing it should reach
+    // BOTH the load-path requirer (worker.rb) and the require_relative one
+    // (boot.rb) — without require resolution its file would have no dependents.
+    const fetcher = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('app/fetcher.rb'));
+    expect(fetcher, 'fetcher.rb indexed').toBeDefined();
+    const reached = [...cg.getImpactRadius(fetcher!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(reached.some((p) => p.endsWith('app/worker.rb'))).toBe(true);
+    expect(reached.some((p) => p.endsWith('app/boot.rb'))).toBe(true);
+  });
+});
+
+describe('C++ free-function name extraction', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('names a free function correctly when it has qualified-type params or a trailing return type', async () => {
+    const src = path.join(tempDir, 'src');
+    fs.mkdirSync(src, { recursive: true });
+
+    // TableFileName has a `const std::string&` parameter; BuildName uses an
+    // `auto … -> std::string` trailing return type. Both used to be named
+    // `string` (picked up from the parameter / return type), so callers never
+    // resolved and the defining file looked like nothing depended on it.
+    fs.writeFileSync(
+      path.join(src, 'names.cc'),
+      `#include <string>
+
+std::string TableFileName(const std::string& dbname, int number) {
+  return dbname;
+}
+
+auto BuildName(const std::string& a) -> std::string {
+  return a;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'user.cc'),
+      `#include <string>
+
+std::string use() {
+  return TableFileName("db", 1) + BuildName("x");
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // The functions are extracted under their real names, not `string`.
+    const fns = cg.getNodesByKind('function');
+    const tableFn = fns.find((n) => n.name === 'TableFileName');
+    const buildFn = fns.find((n) => n.name === 'BuildName');
+    expect(tableFn, 'TableFileName extracted (not "string")').toBeDefined();
+    expect(buildFn, 'BuildName extracted (not "string")').toBeDefined();
+
+    // And the cross-file calls resolve to them, so editing names.cc surfaces user.cc.
+    for (const fn of [tableFn!, buildFn!]) {
+      const reached = [...cg.getImpactRadius(fn.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+      expect(reached.some((p) => p.endsWith('user.cc')), `${fn.name} should be called from user.cc`).toBe(true);
+    }
+  });
+});
+
+describe('Dart mixins and type references', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links `with` mixins and method parameter/return types across files', async () => {
+    const lib = path.join(tempDir, 'lib');
+    fs.mkdirSync(lib, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(lib, 'models.dart'),
+      `class User {
+  final String name;
+  User(this.name);
+}
+
+mixin Loggable {
+  void log() {}
+}
+
+abstract class Repository {
+  User find(int id);
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(lib, 'service.dart'),
+      `import 'models.dart';
+
+class UserService extends Repository with Loggable {
+  @override
+  User find(int id) => User('x');
+
+  List<User> all() => [];
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const inModels = (name: string) =>
+      cg.getNodesByKind('class').concat(cg.getNodesByKind('module'))
+        .find((n) => n.name === name && n.filePath.endsWith('models.dart'));
+
+    // The `with Loggable` mixin records a dependency — editing the mixin surfaces
+    // the class that mixes it in (across files). Loggable is a `mixin`, indexed
+    // as a class-like node.
+    const loggable = cg.getNodesByKind('class').find((n) => n.name === 'Loggable')
+      ?? cg.getNodesByKind('module').find((n) => n.name === 'Loggable');
+    expect(loggable, 'Loggable mixin indexed').toBeDefined();
+    const mixinUsers = [...cg.getImpactRadius(loggable!.id, 3).nodes.values()].map((n) => n.name);
+    expect(mixinUsers).toContain('UserService');
+
+    // `User` is used only as a method parameter/return type in service.dart —
+    // editing it must still surface service.dart via the type references.
+    const user = inModels('User') ?? cg.getNodesByKind('class').find((n) => n.name === 'User');
+    expect(user, 'User indexed').toBeDefined();
+    const userDeps = [...cg.getImpactRadius(user!.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+    expect(userDeps.some((p) => p.endsWith('service.dart'))).toBe(true);
+  });
+});
+
+describe('Static-member / value-read references', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a type referenced only via a static field / enum value (and ignores lowercase receivers)', async () => {
+    fs.writeFileSync(
+      path.join(tempDir, 'JsonScope.java'),
+      `class JsonScope {
+  static final int EMPTY_DOCUMENT = 1;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Reader.java'),
+      `class Reader {
+  private int helper;
+  int peek() {
+    return JsonScope.EMPTY_DOCUMENT;
+  }
+  int noop() {
+    return this.helper;
+  }
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // JsonScope is used ONLY as `JsonScope.EMPTY_DOCUMENT` (a static-field value
+    // read — never constructed or called), so before the static-member pass it
+    // had no dependents. Editing it now surfaces Reader.java.
+    const scope = cg.getNodesByKind('class').find((n) => n.name === 'JsonScope');
+    expect(scope, 'JsonScope indexed').toBeDefined();
+    const reached = [...cg.getImpactRadius(scope!.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+    expect(reached.some((p) => p.endsWith('Reader.java'))).toBe(true);
+
+    // A lowercase receiver (`this.helper`) must NOT be emitted as a type ref —
+    // only Capitalized receivers (types) are. No node named `this`/`helper`
+    // should appear as a reference target from peek/noop beyond JsonScope.
+    const refTargets = cg
+      .getNodesByKind('class')
+      .filter((n) => n.name === 'this' || n.name === 'helper');
+    expect(refTargets.length).toBe(0);
+  });
+
+  it('does not link a static-member read across language families (coincidental name)', async () => {
+    // A native (Kotlin) `Build.VERSION` reads the Android system class — it must
+    // NOT link to a coincidentally same-named TS class (the cross-language false
+    // positive that name-matching produces; `references` edges are language-local).
+    fs.writeFileSync(
+      path.join(tempDir, 'Build.ts'),
+      `export class Build {\n  static version = 1;\n}\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Device.kt'),
+      `package app\nclass Device {\n  fun sdk(): Int = Build.VERSION\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const tsBuild = cg.getNodesByKind('class').find((n) => n.name === 'Build' && n.filePath.endsWith('Build.ts'));
+    expect(tsBuild).toBeDefined();
+    // The Kotlin file is `app/Device.kt`; the TS Build must have NO dependent there.
+    const deps = [...cg.getImpactRadius(tsBuild!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('Device.kt'))).toBe(false);
+  });
+});
+
+describe('Cross-language type/import gate (RN name collisions)', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a TS PascalCase type ref lands on the TS type, never a same-named native class', async () => {
+    // react-native-async-storage's example app has a TS `type TestRunner` AND a
+    // Kotlin `class TestRunner`. The React PascalCase resolver name-matched the
+    // Kotlin `class` (its COMPONENT_KINDS includes `class`) with no language
+    // check at confidence 0.8, outranking the (cross-language-penalized 0.5)
+    // TS name-match — so a TS ref to `TestRunner` crossed web→jvm. The ref here
+    // is intentionally NOT imported: a clean relative import would mask the bug
+    // by resolving via the import map before the framework strategy can win.
+    fs.writeFileSync(
+      path.join(tempDir, 'package.json'),
+      JSON.stringify({ dependencies: { 'react-native': '*' } })
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'useTests.ts'),
+      `export type TestRunner = { run: () => void };\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'basic.tsx'),
+      `export function useBasicTest(r: TestRunner): TestRunner {\n  return r;\n}\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'TestUtils.kt'),
+      `package app\nclass TestRunner {\n  fun run() {}\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const ktRunner = cg
+      .getNodesByKind('class')
+      .find((n) => n.name === 'TestRunner' && n.filePath.endsWith('TestUtils.kt'));
+    expect(ktRunner, 'Kotlin TestRunner class').toBeDefined();
+    const ktDeps = [...cg.getImpactRadius(ktRunner!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(ktDeps.some((p) => p.endsWith('basic.tsx')), 'Kotlin class has NO TS dependent').toBe(false);
+
+    const tsRunner = cg.getNodesByKind('type_alias').find((n) => n.name === 'TestRunner');
+    expect(tsRunner, 'TS TestRunner type_alias').toBeDefined();
+    const tsDeps = [...cg.getImpactRadius(tsRunner!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(tsDeps.some((p) => p.endsWith('basic.tsx')), 'TS type captured the ref (re-pointed)').toBe(true);
+  });
+
+  it('gates a cross-family import name collision but keeps same-family imports', async () => {
+    // A TS `import { Widget }` that only matches a Swift `class Widget` must not
+    // create a web→apple dependency — but a sibling TS module imported by
+    // another TS file (same family) must still resolve (no over-gating).
+    fs.writeFileSync(path.join(tempDir, 'Widget.swift'), `class Widget {\n  func render() {}\n}\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'widget.ts'),
+      `import { Widget } from './native';\nexport function mount(w: Widget) {}\n`
+    );
+    fs.writeFileSync(path.join(tempDir, 'util.ts'), `export class Helper {}\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'app.ts'),
+      `import { Helper } from './util';\nexport const h = new Helper();\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const swiftWidget = cg
+      .getNodesByKind('class')
+      .find((n) => n.name === 'Widget' && n.filePath.endsWith('.swift'));
+    expect(swiftWidget, 'Swift Widget class').toBeDefined();
+    const wDeps = [...cg.getImpactRadius(swiftWidget!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(wDeps.some((p) => p.endsWith('widget.ts')), 'Swift class has NO TS dependent').toBe(false);
+
+    // Same-family control — the TS Helper must still see its TS dependent.
+    const helper = cg.getNodesByKind('class').find((n) => n.name === 'Helper');
+    expect(helper, 'TS Helper class').toBeDefined();
+    const hDeps = [...cg.getImpactRadius(helper!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(hDeps.some((p) => p.endsWith('app.ts')), 'same-family TS import preserved').toBe(true);
+  });
+});
+
+describe('Python absolute module import resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a bare `import pkg.module` of an internal module to its file', async () => {
+    // `import conduit.apps.signals` (a Django-style side-effect import, and any
+    // dotted absolute module import) had no edge to the module file — only
+    // `from x import y` was linked — so a module imported by its dotted path
+    // looked like nothing depended on it.
+    fs.mkdirSync(path.join(tempDir, 'conduit/apps'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'conduit/__init__.py'), '');
+    fs.writeFileSync(path.join(tempDir, 'conduit/apps/__init__.py'), '');
+    fs.writeFileSync(path.join(tempDir, 'conduit/apps/signals.py'), `def handler():\n    pass\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'conduit/apps/app.py'),
+      `import conduit.apps.signals\nimport os\n\nVALUE = 1\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const signals = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('conduit/apps/signals.py'));
+    expect(signals, 'signals.py indexed').toBeDefined();
+    const deps = [...cg.getImpactRadius(signals!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('app.py')), 'importer depends on the module').toBe(true);
+    // `import os` (stdlib) must NOT fabricate an edge — no os.py file in the repo.
+    const osNode = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('/os.py'));
+    expect(osNode, 'no stdlib os.py node').toBeUndefined();
+  });
+
+  it('Django include() links the root URLconf to the included app urls module', async () => {
+    // `url(r'^api/', include('app.urls'))` should record a dependency from the
+    // root urlconf onto the included app's `urls.py` — so editing an app's routes
+    // surfaces the project urlconf that mounts them.
+    fs.mkdirSync(path.join(tempDir, 'app'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'requirements.txt'), `django==4.0\n`);
+    fs.writeFileSync(path.join(tempDir, 'app/__init__.py'), '');
+    fs.writeFileSync(path.join(tempDir, 'app/views.py'), `def home(request):\n    return None\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'app/urls.py'),
+      `from django.conf.urls import url\nfrom . import views\nurlpatterns = [url(r'^$', views.home)]\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'urls.py'),
+      `from django.conf.urls import include, url\nurlpatterns = [url(r'^app/', include('app.urls'))]\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const appUrls = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('app/urls.py'));
+    expect(appUrls, 'app/urls.py indexed').toBeDefined();
+    const deps = [...cg.getImpactRadius(appUrls!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('urls.py') && !p.endsWith('app/urls.py')), 'root urlconf depends on the included app urls').toBe(true);
+  });
+
+  it('resolves `from pkg import submodule` to the submodule under that package, not a same-named one', async () => {
+    // FastAPI router-aggregator pattern: `from app.api.routes import authentication`
+    // with same-named modules in sibling packages must resolve via the import's
+    // SOURCE (the package), not a coincidental same-basename file elsewhere.
+    fs.mkdirSync(path.join(tempDir, 'app/api/routes'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'app/api/dependencies'), { recursive: true });
+    for (const p of ['app/__init__.py', 'app/api/__init__.py', 'app/api/routes/__init__.py', 'app/api/dependencies/__init__.py']) {
+      fs.writeFileSync(path.join(tempDir, p), '');
+    }
+    fs.writeFileSync(path.join(tempDir, 'app/api/routes/authentication.py'), `def login():\n    pass\n`);
+    fs.writeFileSync(path.join(tempDir, 'app/api/dependencies/authentication.py'), `def get_user():\n    pass\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'app/api/routes/api.py'),
+      `from app.api.routes import authentication\n\nROUTER = authentication\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const routesAuth = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('routes/authentication.py'));
+    const depsAuth = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('dependencies/authentication.py'));
+    expect(routesAuth && depsAuth).toBeTruthy();
+    const routesDeps = [...cg.getImpactRadius(routesAuth!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    const depsDeps = [...cg.getImpactRadius(depsAuth!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(routesDeps.some((p) => p.endsWith('routes/api.py')), 'submodule under the imported package is the dependent').toBe(true);
+    expect(depsDeps.some((p) => p.endsWith('routes/api.py')), 'same-named module in a sibling package is NOT').toBe(false);
+  });
+});
+
+describe('Razor / Blazor markup extraction', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links @model and Blazor component tags to their C# types; ignores HTML elements', async () => {
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'LoginViewModel.cs'),
+      `namespace App { public class LoginViewModel { public string Email { get; set; } } }`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'ToastComponent.cs'),
+      `namespace App { public class ToastComponent { } }`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Views/Login.cshtml'),
+      `@model LoginViewModel\n<div class="form">\n  <input asp-for="Email" />\n</div>\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Index.razor'),
+      `<div>\n  <ToastComponent />\n</div>\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // `@model LoginViewModel` → the view-model class.
+    const vm = cg.getNodesByKind('class').find((n) => n.name === 'LoginViewModel');
+    expect(vm, 'LoginViewModel class').toBeDefined();
+    const vmDeps = [...cg.getImpactRadius(vm!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(vmDeps.some((p) => p.endsWith('Login.cshtml')), '@model links the view').toBe(true);
+
+    // `<ToastComponent />` → the component class.
+    const toast = cg.getNodesByKind('class').find((n) => n.name === 'ToastComponent');
+    expect(toast, 'ToastComponent class').toBeDefined();
+    const toastDeps = [...cg.getImpactRadius(toast!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(toastDeps.some((p) => p.endsWith('Index.razor')), 'Blazor tag links the component').toBe(true);
+
+    // HTML elements (`<div>`, `<input>`) must NOT become component references.
+    const htmlNodes = cg.getNodesByKind('class').filter((n) => n.name === 'div' || n.name === 'input');
+    expect(htmlNodes.length, 'no node for HTML elements').toBe(0);
+  });
+
+  it('C# namespaces qualify type names so same-named types are distinct', async () => {
+    fs.writeFileSync(path.join(tempDir, 'entity.cs'), `namespace App.Entities { public class CatalogBrand { } }`);
+    fs.writeFileSync(path.join(tempDir, 'dto.cs'), `namespace App.Models { public class CatalogBrand { } }`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+
+    const brands = cg.getNodesByKind('class').filter((n) => n.name === 'CatalogBrand');
+    expect(brands.length, 'both CatalogBrand classes indexed').toBe(2);
+    const qns = brands.map((b) => b.qualifiedName).sort();
+    expect(qns[0]).not.toBe(qns[1]); // distinct qualified names (namespace-scoped)
+    expect(qns.some((q) => q.includes('Entities') && q.endsWith('CatalogBrand'))).toBe(true);
+    expect(qns.some((q) => q.includes('Models') && q.endsWith('CatalogBrand'))).toBe(true);
+  });
+
+  it('disambiguates a Razor type ref via @using (incl. folder _Imports.razor)', async () => {
+    // `CatalogBrand` exists as both a domain entity and a DTO; the component
+    // `@using`s the DTO's namespace (here via the folder _Imports.razor), so the
+    // ref must resolve to the DTO, not the same-named entity.
+    fs.mkdirSync(path.join(tempDir, 'Models'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'Entities'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'Pages'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'Models/CatalogBrand.cs'), `namespace App.Models { public class CatalogBrand { public int Id { get; set; } } }`);
+    fs.writeFileSync(path.join(tempDir, 'Entities/CatalogBrand.cs'), `namespace App.Entities { public class CatalogBrand { public int Id { get; set; } } }`);
+    fs.writeFileSync(path.join(tempDir, 'Pages/_Imports.razor'), `@using App.Models\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'Pages/List.razor'),
+      `<h1>List</h1>\n@code {\n  private CatalogBrand _b = new CatalogBrand();\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const dto = cg.getNodesByKind('class').find((n) => n.qualifiedName === 'App.Models::CatalogBrand');
+    const entity = cg.getNodesByKind('class').find((n) => n.qualifiedName === 'App.Entities::CatalogBrand');
+    expect(dto && entity, 'both CatalogBrand classes').toBeTruthy();
+    const dtoDeps = [...cg.getImpactRadius(dto!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    const entityDeps = [...cg.getImpactRadius(entity!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(dtoDeps.some((p) => p.endsWith('List.razor')), 'resolves to the @using\'d DTO').toBe(true);
+    expect(entityDeps.some((p) => p.endsWith('List.razor')), 'NOT the same-named entity').toBe(false);
+  });
+
+  it('delegates Blazor @code block C# to cover types used in component logic', async () => {
+    fs.writeFileSync(
+      path.join(tempDir, 'CatalogService.cs'),
+      `namespace App { public class CatalogService { public void Load() { } } }`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'List.razor'),
+      `<h1>Catalog</h1>\n\n@code {\n  private CatalogService _svc = new CatalogService();\n  void Refresh() { _svc.Load(); }\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const svc = cg.getNodesByKind('class').find((n) => n.name === 'CatalogService');
+    expect(svc, 'CatalogService class').toBeDefined();
+    const deps = [...cg.getImpactRadius(svc!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('List.razor')), '@code usage links the component to the service').toBe(true);
+  });
+});
+
+describe('Default import resolution (renamed default export)', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a renamed default import to the module file', async () => {
+    // Express route aggregator: `import articlesController from './controller'`
+    // where the module does `export default router`. The renamed local can't be
+    // found as a symbol, so the controller file had no dependent — the dependency
+    // is on the module file regardless of the default export's name.
+    fs.mkdirSync(path.join(tempDir, 'app'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'app/controller.ts'), `const router = { get() {} };\nexport default router;\n`);
+    fs.writeFileSync(path.join(tempDir, 'app/routes.ts'), `import myController from './controller';\nexport const api = myController;\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const controller = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('app/controller.ts'));
+    expect(controller, 'controller.ts indexed').toBeDefined();
+    const deps = [...cg.getImpactRadius(controller!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('routes.ts')), 'importer depends on the default-exporting module').toBe(true);
+  });
+});
+
+describe('Chained method-call resolution (C# extension methods)', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('resolves a chained extension-method call (a.b.Method()) to its definition', async () => {
+    // ASP.NET DI registration: `builder.Services.AddCoreServices(...)` calls a
+    // static extension method elsewhere. A multi-dot receiver chain matched no
+    // method-call pattern before, so the extension method had no caller.
+    fs.mkdirSync(path.join(tempDir, 'cfg'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'cfg/Ext.cs'),
+      `namespace App {\n  public static class Ext {\n    public static object AddCoreServices(this object services, int x) { return services; }\n  }\n}\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Program.cs'),
+      `namespace App {\n  public class Program {\n    public void Run(object builder) {\n      builder.Services.AddCoreServices(1);\n    }\n  }\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const ext = cg
+      .getNodesByKind('method')
+      .find((n) => n.name === 'AddCoreServices')
+      ?? cg.getNodesByKind('function').find((n) => n.name === 'AddCoreServices');
+    expect(ext, 'AddCoreServices defined').toBeDefined();
+    const callers = [...cg.getImpactRadius(ext!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(callers.some((p) => p.endsWith('Program.cs')), 'chained extension call resolves to its definition').toBe(true);
+  });
+});
+
+describe('Same-directory include + KMP import resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a C/C++ #include resolves to the same-directory header, not a same-named one elsewhere', async () => {
+    // A multi-platform native module has a header of the same basename per
+    // platform. `windows/Provider.cpp`'s `#include "Storage.h"` means its OWN
+    // sibling header — not `apple/Storage.h` (which sorts first and so was
+    // picked arbitrarily before, leaving the real local header with 0 deps).
+    fs.mkdirSync(path.join(tempDir, 'apple'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'windows'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'apple', 'Storage.h'), `#pragma once\nstruct Storage { int n; };\n`);
+    fs.writeFileSync(path.join(tempDir, 'windows', 'Storage.h'), `#pragma once\nstruct Storage { int n; };\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'windows', 'Provider.cpp'),
+      `#include "Storage.h"\nint use() { Storage s; return s.n; }\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const winHeader = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('windows/Storage.h'));
+    const appleHeader = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('apple/Storage.h'));
+    expect(winHeader, 'windows/Storage.h indexed').toBeDefined();
+    expect(appleHeader, 'apple/Storage.h indexed').toBeDefined();
+    const winDeps = [...cg.getImpactRadius(winHeader!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    const appleDeps = [...cg.getImpactRadius(appleHeader!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(winDeps.some((p) => p.endsWith('Provider.cpp')), 'same-dir header gets the includer').toBe(true);
+    expect(appleDeps.some((p) => p.endsWith('Provider.cpp')), 'other-platform header does NOT').toBe(false);
+  });
+
+  it('a Kotlin Multiplatform commonMain import resolves to the expect, not a platform actual', async () => {
+    const common = path.join(tempDir, 'src/commonMain/kotlin/app');
+    const android = path.join(tempDir, 'src/androidMain/kotlin/app');
+    fs.mkdirSync(common, { recursive: true });
+    fs.mkdirSync(android, { recursive: true });
+    fs.writeFileSync(path.join(common, 'Platform.kt'), `package app\nexpect class PlatformContext\n`);
+    fs.writeFileSync(path.join(android, 'Platform.android.kt'), `package app\nactual class PlatformContext\n`);
+    fs.writeFileSync(
+      path.join(common, 'Db.kt'),
+      `package app\nimport app.PlatformContext\nclass Db {\n  fun open(ctx: PlatformContext) {}\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const expectCtx = cg
+      .getNodesByKind('class')
+      .find((n) => n.name === 'PlatformContext' && n.filePath.endsWith('commonMain/kotlin/app/Platform.kt'));
+    expect(expectCtx, 'commonMain expect PlatformContext').toBeDefined();
+    const deps = [...cg.getImpactRadius(expectCtx!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('Db.kt')), 'commonMain import lands on the expect, not the actual').toBe(true);
+  });
+});
+
+describe('Delphi form code-behind pairing', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a `.dfm` form to its sibling `.pas` code-behind unit', async () => {
+    // A Delphi form unit owns its visual form definition via `{$R *.dfm}`, not a
+    // `uses` clause — so a `.dfm` used only as a form definition looked orphaned.
+    fs.writeFileSync(path.join(tempDir, 'UFRMAbout.dfm'),
+      `object FRMAbout: TFRMAbout\n  Caption = 'About'\nend\n`);
+    fs.writeFileSync(path.join(tempDir, 'UFRMAbout.pas'),
+      `unit UFRMAbout;\ninterface\nuses Forms;\ntype\n  TFRMAbout = class(TForm)\n  end;\nimplementation\n{$R *.dfm}\nend.\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const dfm = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('UFRMAbout.dfm'));
+    expect(dfm, 'UFRMAbout.dfm file node').toBeDefined();
+    const deps = cg.getFileDependents(dfm!.filePath);
+    expect(deps.some((p) => p.endsWith('UFRMAbout.pas')), 'the .pas unit links its .dfm form').toBe(true);
+  });
+});
+
+describe('Liquid Shopify JSON template section resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a Shopify JSON template section `type` to its sections/<type>.liquid', async () => {
+    // Shopify OS 2.0 templates are JSON, referencing sections by `type` — not
+    // a `{% section %}` Liquid tag — so a section used only from a JSON template
+    // looked unused. The JSON is now indexed and its `type`s linked.
+    fs.mkdirSync(path.join(tempDir, 'sections'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'templates/customers'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
+    fs.writeFileSync(path.join(tempDir, 'sections/main-login.liquid'), `<form>{{ 'customer.login' | t }}</form>\n`);
+    fs.writeFileSync(path.join(tempDir, 'templates/product.json'), JSON.stringify({ sections: { main: { type: 'main-product' } }, order: ['main'] }));
+    // Nested template dir (templates/customers/login.json) must resolve too.
+    fs.writeFileSync(path.join(tempDir, 'templates/customers/login.json'), JSON.stringify({ sections: { main: { type: 'main-login' } }, order: ['main'] }));
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const product = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('sections/main-product.liquid'));
+    const login = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('sections/main-login.liquid'));
+    expect(product, 'main-product section').toBeDefined();
+    expect(login, 'main-login section').toBeDefined();
+    expect(cg.getFileDependents(product!.filePath).some((p) => p.endsWith('templates/product.json')), 'top-level JSON template links its section').toBe(true);
+    expect(cg.getFileDependents(login!.filePath).some((p) => p.endsWith('customers/login.json')), 'nested JSON template links its section').toBe(true);
+  });
+});
+
+describe('Lua/Luau require resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('resolves a dotted Lua require and an instance-path Luau require to their module files', async () => {
+    // The require is the ONLY link (no method call), so coverage here proves the
+    // require resolver specifically, not method-call name-matching.
+    // Lua dotted module path: require("myapp.config") → lua/myapp/config.lua.
+    fs.mkdirSync(path.join(tempDir, 'lua/myapp'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'lua/myapp/config.lua'), `local M = {}\nfunction M.setup() end\nreturn M\n`);
+    fs.writeFileSync(path.join(tempDir, 'lua/myapp/init.lua'), `local config = require("myapp.config")\nreturn config\n`);
+    // Luau Roblox instance-path require (only the leaf survives extraction):
+    // require(script.Util.helper) → src/Util/helper.luau.
+    fs.mkdirSync(path.join(tempDir, 'src/Util'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/Util/helper.luau'), `local H = {}\nfunction H.go() end\nreturn H\n`);
+    fs.writeFileSync(path.join(tempDir, 'src/init.luau'), `local helper = require(script.Util.helper)\nreturn helper\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const config = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('myapp/config.lua'));
+    const helper = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('Util/helper.luau'));
+    expect(config, 'config.lua file node').toBeDefined();
+    expect(helper, 'helper.luau file node').toBeDefined();
+    const cfgDeps = cg.getFileDependents(config!.filePath);
+    const helpDeps = cg.getFileDependents(helper!.filePath);
+    expect(cfgDeps.some((p) => p.endsWith('myapp/init.lua')), 'dotted Lua require resolves to the module').toBe(true);
+    expect(helpDeps.some((p) => p.endsWith('src/init.luau')), 'instance-path Luau require resolves to the module').toBe(true);
+  });
+});
+
+describe('Rust module-path call resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a bare submodule call (`users::router()`) resolves self-relative to the submodule fn', async () => {
+    // The canonical Axum router-assembly pattern: a parent module calls each
+    // submodule's `router()`. `users::` / `profiles::` are SELF-relative
+    // submodule prefixes (2018 edition) — `mod users;` makes `users` a child of
+    // the CURRENT module, NOT `crate::users`. Before the fix the bare prefix was
+    // resolved crate-relative only (looking for `src/users.rs`), so it found
+    // nothing and the handler modules looked dependent-less.
+    const http = path.join(tempDir, 'src/http');
+    fs.mkdirSync(http, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/lib.rs'), `pub mod http;\n`);
+    fs.writeFileSync(
+      path.join(http, 'mod.rs'),
+      `mod users;\nmod profiles;\npub fn api_router() {\n    users::router();\n    profiles::router();\n}\n`
+    );
+    fs.writeFileSync(path.join(http, 'users.rs'), `pub fn router() -> i32 { 1 }\n`);
+    fs.writeFileSync(path.join(http, 'profiles.rs'), `pub fn router() -> i32 { 2 }\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // Each submodule's same-named `router` fn must get mod.rs as a dependent —
+    // proving the bare prefix resolved self-relative AND disambiguated the
+    // colliding `router` name to the correct file (not an arbitrary one).
+    const routers = cg.getNodesByKind('function').filter((n) => n.name === 'router');
+    const usersRouter = routers.find((n) => n.filePath.endsWith('http/users.rs'));
+    const profilesRouter = routers.find((n) => n.filePath.endsWith('http/profiles.rs'));
+    expect(usersRouter, 'users.rs router fn').toBeDefined();
+    expect(profilesRouter, 'profiles.rs router fn').toBeDefined();
+    const usersDeps = [...cg.getImpactRadius(usersRouter!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    const profilesDeps = [...cg.getImpactRadius(profilesRouter!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(usersDeps.some((p) => p.endsWith('http/mod.rs')), 'users::router() lands on users.rs').toBe(true);
+    expect(profilesDeps.some((p) => p.endsWith('http/mod.rs')), 'profiles::router() lands on profiles.rs').toBe(true);
+  });
+
+  it('a 3-segment module-path call (`database::profiles::find()`) resolves to the leaf fn', async () => {
+    // A 2-level module path — the common `db.run(move |c| database::profiles::find(c))`
+    // / `crate::a::b::func()` shape. The reference-resolver pre-filter used to drop any
+    // `a::b::c` whose leaf it never checked (it tested only the first segment and the
+    // `b::c` remainder, neither of which names a symbol), so the call never reached the
+    // Rust path resolver and the leaf module looked dependent-less.
+    const routes = path.join(tempDir, 'src/routes');
+    const database = path.join(tempDir, 'src/database');
+    fs.mkdirSync(routes, { recursive: true });
+    fs.mkdirSync(database, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/lib.rs'), `pub mod routes;\npub mod database;\n`);
+    fs.writeFileSync(path.join(database, 'mod.rs'), `pub mod profiles;\n`);
+    fs.writeFileSync(path.join(database, 'profiles.rs'), `pub fn find(id: i32) -> i32 { id }\n`);
+    fs.writeFileSync(
+      path.join(routes, 'mod.rs'),
+      `use crate::database;\npub fn get_profile(id: i32) -> i32 {\n    database::profiles::find(id)\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const find = cg
+      .getNodesByKind('function')
+      .find((n) => n.name === 'find' && n.filePath.endsWith('database/profiles.rs'));
+    expect(find, 'database/profiles.rs find fn').toBeDefined();
+    const deps = [...cg.getImpactRadius(find!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('routes/mod.rs')), 'database::profiles::find() resolves to the leaf fn').toBe(true);
+  });
+
+  it('Rocket `routes![…]` / `catchers![…]` macros link the mount to the handler fns', async () => {
+    // Tree-sitter leaves the macro body as a raw token tree, so the handler
+    // paths inside `routes![a::b::handler, …]` are invisible to the call walker
+    // and the handlers — mounted by Rocket at runtime, not called in-repo — look
+    // like they have no caller. The route-macro extractor reconstructs each path
+    // and emits a reference, which the Rust path resolver links to the handler.
+    const routes = path.join(tempDir, 'src/routes');
+    fs.mkdirSync(routes, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/lib.rs'),
+      `mod routes;\nfn not_found() {}\npub fn rocket() {\n` +
+      `    rocket::build()\n` +
+      `        .mount("/api", routes![routes::users::post_users, routes::users::get_user])\n` +
+      `        .register("/", catchers![not_found]);\n}\n`);
+    fs.writeFileSync(path.join(routes, 'mod.rs'), `pub mod users;\n`);
+    fs.writeFileSync(path.join(routes, 'users.rs'), `pub fn post_users() {}\npub fn get_user() {}\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const handlers = cg.getNodesByKind('function').filter((n) => n.filePath.endsWith('routes/users.rs'));
+    expect(handlers.length, 'both handler fns indexed').toBe(2);
+    for (const h of handlers) {
+      const deps = [...cg.getImpactRadius(h.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+      expect(deps.some((p) => p.endsWith('lib.rs')), `routes![] links ${h.name} to its mount in lib.rs`).toBe(true);
+    }
+  });
+});
+
+describe('SvelteKit load → page synthesizer', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a +page.svelte to its OWN directory\'s +page.server.js load, not another route\'s', async () => {
+    // SvelteKit wires +page.server.js's `load` to +page.svelte's `data` BY FILE
+    // PATH — there is no static import — so editing a loader showed no impact on
+    // the page it feeds. The synthesizer links each page component to the `load`
+    // in its OWN directory (path-deterministic, so it never crosses routes).
+    const login = path.join(tempDir, 'src/routes/login');
+    const register = path.join(tempDir, 'src/routes/register');
+    fs.mkdirSync(login, { recursive: true });
+    fs.mkdirSync(register, { recursive: true });
+    fs.writeFileSync(path.join(login, '+page.svelte'), `<script>export let data;</script>\n<h1>Login {data.x}</h1>\n`);
+    fs.writeFileSync(path.join(login, '+page.server.js'), `export function load() { return { x: 1 }; }\n`);
+    fs.writeFileSync(path.join(register, '+page.svelte'), `<script>export let data;</script>\n<h1>Register</h1>\n`);
+    fs.writeFileSync(path.join(register, '+page.server.js'), `export function load() { return { y: 2 }; }\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const loginLoad = cg
+      .getNodesByKind('function')
+      .find((n) => n.name === 'load' && n.filePath.endsWith('login/+page.server.js'));
+    expect(loginLoad, 'login load fn').toBeDefined();
+    const impacted = [...cg.getImpactRadius(loginLoad!.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+    // editing login's load surfaces login's page (the framework-wired data flow)…
+    expect(impacted.some((p) => p.endsWith('login/+page.svelte')), 'load links to its own page').toBe(true);
+    // …but never register's page (same-directory only).
+    expect(impacted.some((p) => p.endsWith('register/+page.svelte')), 'does not cross routes').toBe(false);
+  });
+});
+
+describe('Nuxt nested auto-imported component resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a `<MediaCard/>` usage to components/media/Card.vue (Nuxt dir-prefixed auto-import)', async () => {
+    // Nuxt auto-imports a nested component by a DIRECTORY-PREFIXED name —
+    // components/media/Card.vue is used as <MediaCard/>, not <Card/> — but the
+    // component node is named by basename (`Card`), so the PascalCase usage
+    // didn't resolve and the nested component looked unused.
+    const media = path.join(tempDir, 'components/media');
+    fs.mkdirSync(media, { recursive: true });
+    fs.writeFileSync(path.join(media, 'Card.vue'), `<template><div>card</div></template>\n<script setup>defineProps(['item'])</script>\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'components/Grid.vue'),
+      `<template>\n  <div><MediaCard :item="i" /></div>\n</template>\n<script setup>const i = {}</script>\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const card = cg.getNodesByKind('component').find((n) => n.filePath.endsWith('media/Card.vue'));
+    expect(card, 'media/Card.vue component').toBeDefined();
+    const deps = [...cg.getImpactRadius(card!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('components/Grid.vue')), '<MediaCard> links Grid to media/Card.vue').toBe(true);
+  });
+});
+
+describe('Swift property-wrapper attribute type references', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a Fluent `@Siblings(through: Pivot.self)` links the model to the pivot type', async () => {
+    // A many-to-many pivot/join model is referenced ONLY through the relationship
+    // property wrapper's metatype argument (`Pivot.self`), never by a controller
+    // query. The wrapper type was captured but the argument expression wasn't
+    // walked, so the pivot model looked like nothing depended on it.
+    fs.writeFileSync(path.join(tempDir, 'Pivot.swift'),
+      `import Fluent\nfinal class AcronymCategoryPivot: Model {\n  static let schema = "acronym-category"\n}\n`);
+    fs.writeFileSync(path.join(tempDir, 'Acronym.swift'),
+      `import Fluent\nfinal class Acronym: Model {\n` +
+      `  @Siblings(through: AcronymCategoryPivot.self, from: \\.$acronym, to: \\.$category)\n` +
+      `  var categories: [Category]\n}\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const pivot = cg.getNodesByKind('class').find((n) => n.name === 'AcronymCategoryPivot');
+    expect(pivot, 'pivot model class').toBeDefined();
+    const deps = [...cg.getImpactRadius(pivot!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('Acronym.swift')), '@Siblings metatype arg links Acronym to the pivot').toBe(true);
+  });
+});
+
+describe('Objective-C messages, class receivers, and #import', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('resolves single-arg selectors, class-message receivers, and #import headers', async () => {
+    fs.writeFileSync(
+      path.join(tempDir, 'SDImageCache.h'),
+      `#import <Foundation/Foundation.h>
+@interface SDImageCache : NSObject
++ (instancetype)sharedCache;
++ (void)storeImage:(NSString *)key;
+@end
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'SDImageCache.m'),
+      `#import "SDImageCache.h"
+@implementation SDImageCache
++ (instancetype)sharedCache { return nil; }
++ (void)storeImage:(NSString *)key { }
+@end
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'SDManager.m'),
+      `#import "SDImageCache.h"
+@interface SDManager : NSObject
+@end
+@implementation SDManager
+- (void)run {
+  [SDImageCache sharedCache];
+  [SDImageCache storeImage:@"k"];
+}
+@end
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // 1. The single-argument selector `[SDImageCache storeImage:@"k"]` resolves
+    //    to the `storeImage:` method — named WITH its colon both at the call site
+    //    and the definition (before the fix the call site dropped the colon).
+    const storeImage = cg.getNodesByKind('method').find((n) => n.name === 'storeImage:');
+    expect(storeImage, 'storeImage: method').toBeDefined();
+    const storeCallers = [...cg.getImpactRadius(storeImage!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(storeCallers.some((p) => p.endsWith('SDManager.m'))).toBe(true);
+
+    // 2. The class-message receiver `[SDImageCache sharedCache]` references the
+    //    SDImageCache class (whose @interface lives in the header).
+    const cache = cg.getNodesByKind('class').find((n) => n.name === 'SDImageCache');
+    expect(cache, 'SDImageCache class').toBeDefined();
+    const classDeps = [...cg.getImpactRadius(cache!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(classDeps.some((p) => p.endsWith('SDManager.m'))).toBe(true);
+
+    // 3. `#import "SDImageCache.h"` resolves to the header FILE — editing it
+    //    surfaces both importers.
+    const header = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('SDImageCache.h'));
+    expect(header, 'SDImageCache.h indexed').toBeDefined();
+    const importers = [...cg.getImpactRadius(header!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(importers.some((p) => p.endsWith('SDManager.m'))).toBe(true);
+  });
+});
+
 describe('Full Indexing', () => {
   let tempDir: string;
 
@@ -3514,6 +5442,54 @@ describe('Nested non-submodule git repos', () => {
 
     expect(files).toContain('sub_repo/src/real.ts');
     expect(files).not.toContain('sub_repo/src/generated.ts');
+  });
+
+  // A .gitignore the `ignore` library can't compile to a regex must not abort
+  // the whole scan — the bad pattern is dropped, valid ones still apply (#682).
+  it('does not crash on a .gitignore with an uncompilable pattern (#682)', () => {
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'real.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'out.ts'), 'export const y = 2;');
+    // `\\[` makes the matcher build an unterminated character class — the throw
+    // is lazy (at match time), which is what escaped and killed sync.
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'build/\n\\\\[\n');
+
+    let files: string[] = [];
+    expect(() => {
+      files = scanDirectory(tempDir);
+    }).not.toThrow();
+    expect(files).toContain('src/real.ts');
+    // The still-valid `build/` rule is honored; only the bad line was dropped.
+    expect(files.some((f) => f.startsWith('build/'))).toBe(false);
+  });
+
+  // A .gitignore that isn't valid UTF-8 — e.g. encrypted in place by corporate
+  // DLP / endpoint software (UTF-16 header + ciphertext) — is skipped whole,
+  // not fed to the matcher as garbage patterns (#682).
+  it('does not crash on a non-UTF-8 (DLP-encrypted) .gitignore (#682)', () => {
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'real.ts'), 'export const x = 1;');
+    const header = Buffer.concat([
+      Buffer.from([0x00, 0x00]),
+      Buffer.from('[notice][user]', 'utf16le'),
+    ]);
+    const junk = Buffer.from([0x5b, 0x99, 0xc3, 0x28, 0x5c, 0x5b, 0xff, 0xfd]);
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), Buffer.concat([header, junk]));
+
+    let files: string[] = [];
+    expect(() => {
+      files = scanDirectory(tempDir);
+    }).not.toThrow();
+    expect(files).toContain('src/real.ts');
+  });
+
+  it('buildDefaultIgnore survives a bad .gitignore and still applies valid rules (#682)', () => {
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'dist/\n\\\\[\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(() => ig.ignores('src/app.ts')).not.toThrow();
+    expect(ig.ignores('dist/')).toBe(true); // valid rule survives
+    expect(ig.ignores('src/app.ts')).toBe(false);
   });
 });
 
@@ -4010,6 +5986,218 @@ const value = 42;
   });
 });
 
+describe('Astro Extraction', () => {
+  it('should detect Astro files', () => {
+    expect(detectLanguage('src/pages/index.astro')).toBe('astro');
+    expect(detectLanguage('Layout.astro')).toBe('astro');
+    expect(isLanguageSupported('astro')).toBe(true);
+  });
+
+  it('should extract component node from an .astro file', () => {
+    const code = `---
+const title = 'Hello';
+---
+<h1>{title}</h1>
+`;
+    const result = extractFromSource('Card.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Card');
+    expect(componentNode?.language).toBe('astro');
+    expect(componentNode?.isExported).toBe(true);
+  });
+
+  it('should extract frontmatter symbols with correct line numbers (#768)', () => {
+    const code = `---
+import { formatDate } from '../utils/format';
+
+function getIconNode(name: string): string {
+  return name;
+}
+
+const { title } = Astro.props;
+---
+<span>{title}</span>
+`;
+    const result = extractFromSource('navs.astro', code);
+
+    // The #768 repro: a function defined in frontmatter must be found
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'getIconNode');
+    expect(fn).toBeDefined();
+    expect(fn?.language).toBe('astro');
+    expect(fn?.startLine).toBe(4);
+
+    const imp = result.nodes.find((n) => n.kind === 'import');
+    expect(imp).toBeDefined();
+    expect(imp?.startLine).toBe(2);
+  });
+
+  it('should extract exported getStaticPaths from frontmatter', () => {
+    const code = `---
+export async function getStaticPaths() {
+  return [];
+}
+const { slug } = Astro.params;
+---
+<p>{slug}</p>
+`;
+    const result = extractFromSource('[slug].astro', code);
+
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'getStaticPaths');
+    expect(fn).toBeDefined();
+    expect(fn?.isExported).toBe(true);
+  });
+
+  it('should extract calls from template expressions', () => {
+    const code = `---
+import { formatDate } from '../utils/format';
+const date = new Date();
+---
+<time>{formatDate(date)}</time>
+`;
+    const result = extractFromSource('Stamp.astro', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'formatDate' && ref.line === 5
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('should extract calls from a multiline expression opening line', () => {
+    const code = `---
+const posts = [];
+---
+<ul>
+  {posts.map((post) => (
+    <li>{render(post)}</li>
+  ))}
+</ul>
+`;
+    const result = extractFromSource('List.astro', code);
+
+    const mapCall = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'posts.map'
+    );
+    expect(mapCall).toBeDefined();
+    const innerCall = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'render'
+    );
+    expect(innerCall).toBeDefined();
+  });
+
+  it('should extract PascalCase component usages from the template', () => {
+    const code = `---
+import Layout from '../layouts/Layout.astro';
+import PostCard from '../components/PostCard.astro';
+---
+<Layout title="Home">
+  <PostCard />
+  <Fragment slot="head" />
+  <div class="plain-html" />
+</Layout>
+`;
+    const result = extractFromSource('index.astro', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    const names = refs.map((r) => r.referenceName);
+    expect(names).toContain('Layout');
+    expect(names).toContain('PostCard');
+    // Astro built-ins and lowercase HTML are not component references
+    expect(names).not.toContain('Fragment');
+    expect(names).not.toContain('div');
+  });
+
+  it('should not extract template patterns from frontmatter, script, or style content', () => {
+    const code = `---
+// <FakeComponent /> inside frontmatter comment
+const x = { y: maybeCall(1) };
+---
+<div>real</div>
+<script>
+  const z = { w: scriptCall(2) };
+</script>
+<style>
+  .a { color: red; }
+</style>
+`;
+    const result = extractFromSource('Guard.astro', code);
+
+    const templateRefs = result.unresolvedReferences.filter(
+      (r) => r.referenceKind === 'references' && r.referenceName === 'FakeComponent'
+    );
+    expect(templateRefs).toHaveLength(0);
+
+    // maybeCall/scriptCall come from the delegated TS extraction (once),
+    // not double-counted by the template scanner
+    const maybeCalls = result.unresolvedReferences.filter(
+      (r) => r.referenceName === 'maybeCall' && r.referenceKind === 'calls'
+    );
+    expect(maybeCalls.length).toBeLessThanOrEqual(1);
+  });
+
+  it('should extract <script> block symbols with correct line numbers', () => {
+    const code = `---
+const a = 1;
+---
+<div>hi</div>
+<script>
+function trackView(page: string) {
+  console.log(page);
+}
+</script>
+`;
+    const result = extractFromSource('Tracker.astro', code);
+
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'trackView');
+    expect(fn).toBeDefined();
+    expect(fn?.startLine).toBe(6);
+    expect(fn?.language).toBe('astro');
+  });
+
+  it('should create component node for a frontmatter-less template-only file', () => {
+    const code = `<div>Static content</div>
+`;
+    const result = extractFromSource('Static.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Static');
+    expect(componentNode?.language).toBe('astro');
+  });
+
+  it('should treat an unclosed frontmatter fence as no frontmatter', () => {
+    const code = `---
+const broken = true;
+<div>never closed</div>
+`;
+    const result = extractFromSource('Broken.astro', code);
+
+    // No TS delegation happened (the fence never closes), but the component
+    // node still exists and nothing throws.
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(result.nodes.find((n) => n.name === 'broken')).toBeUndefined();
+  });
+
+  it('should create containment edges from component to frontmatter nodes', () => {
+    const code = `---
+const value = 42;
+---
+<div>{value}</div>
+`;
+    const result = extractFromSource('Contained.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+
+    const containEdges = result.edges.filter(
+      (e) => e.source === componentNode!.id && e.kind === 'contains'
+    );
+    expect(containEdges.length).toBeGreaterThan(0);
+  });
+});
+
 describe('Instantiates + Decorates edge extraction', () => {
   it('emits an instantiates ref for `new Foo()`', () => {
     const code = `
@@ -4457,5 +6645,576 @@ func (s Stack[T]) Len() int { return len(s.items) }
     expect(ts.nodes.find((n) => n.name === 'hello' && n.kind === 'function')).toBeDefined();
     const js = extractFromSource('service.xsjs', 'function handleRequest() { return 1; }');
     expect(js.nodes.find((n) => n.name === 'handleRequest' && n.kind === 'function')).toBeDefined();
+  });
+});
+
+describe('Import / re-export dependency linking (blast-radius recall)', () => {
+  // An import IS a dependency, but extraction only emits references for calls,
+  // instantiations, type annotations, and inheritance — so a symbol imported and
+  // then merely re-exported, placed in a registry array, passed as an argument,
+  // or used in JSX produced no cross-file edge, leaving the providing file with a
+  // false "0 dependents". These tests pin the import/re-export binding linking.
+  it('emits an imports reference per named, aliased, and default import binding', () => {
+    const code = `
+import { widget, helper as h } from './foo';
+import Thing from './thing';
+import * as NS from './ns';
+export const registry = [widget];
+`;
+    const result = extractFromSource('bar.ts', code);
+    const names = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    expect(names).toContain('widget');   // named import → local name
+    expect(names).toContain('h');        // aliased import → local alias
+    expect(names).toContain('Thing');    // default import
+    expect(names).toContain('NS');       // namespace import → linked to the module file as a dependency
+  });
+
+  it('emits an imports reference per re-exported binding', () => {
+    const result = extractFromSource('barrel.ts', `export { alpha, beta as b } from './source';`);
+    const names = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    // Re-export links the SOURCE-side name, not the local alias.
+    expect(names).toContain('alpha');
+    expect(names).toContain('beta');
+  });
+
+  it('a value imported/re-exported but never called still makes the importer a dependent', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'src', 'foo.ts'),
+        `export const widget = { n: 1 };\nexport function helper(): void {}\n`
+      );
+      // bar uses widget ONLY in an array and re-exports helper — neither is
+      // called/typed, so before import-linking bar had no edge to foo at all.
+      fs.writeFileSync(
+        path.join(dir, 'src', 'bar.ts'),
+        `import { widget } from './foo';\nexport { helper } from './foo';\nexport const registry = [widget];\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.ts'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/foo.ts')).toContain('src/bar.ts');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('a namespace import touched only via a value-member read still links the module file', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'foo.ts'), `export const SOME_CONST = 42;\n`);
+      // `foo` is imported as a namespace and used ONLY via a value-member read
+      // (no call, no type) — `foo.helper()` would link on its own, but a bare
+      // `foo.SOME_CONST` would not, so the module-import backstop must link it.
+      fs.writeFileSync(path.join(dir, 'src', 'bar.ts'), `import * as foo from './foo';\nexport const x = foo.SOME_CONST;\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.ts'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/foo.ts')).toContain('src/bar.ts');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('Python import dependency linking (blast-radius recall)', () => {
+  // Same recall gap as TS: Python only linked called/instantiated imports, so a
+  // name brought in with `from module import X` and then merely stored, used as
+  // a decorator/argument, or re-exported through an `__init__.py` produced no
+  // cross-file edge — the providing module showed a false "0 dependents".
+  it('emits an imports reference per name in a `from module import ...` (incl. value/aliased)', () => {
+    const code = [
+      'from foo import helper, widget',
+      'from foo import Thing as T',
+      'from . import sibling',
+      'from bar import *',
+    ].join('\n');
+    const names = extractFromSource('mod.py', code)
+      .unresolvedReferences.filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    expect(names).toContain('helper');
+    expect(names).toContain('widget');   // value import
+    expect(names).toContain('T');        // aliased import → local name
+    expect(names).toContain('sibling');  // `from . import <name>`
+    expect(names).not.toContain('*');    // wildcard import has no names
+  });
+
+  it('a Python value imported but never called still makes the importer a dependent', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'pkg', 'foo.py'), `widget = {"n": 1}\ndef helper():\n    return 1\n`);
+      // bar imports widget+helper but only stores widget in a list — nothing is
+      // called, so before import-linking bar had no edge to foo.
+      fs.writeFileSync(path.join(dir, 'pkg', 'bar.py'), `from foo import widget, helper\nregistry = [widget]\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('pkg/foo.py')).toContain('pkg/bar.py');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('resolves `from . import submodule` + `submodule.func()` to the submodule', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'pkg', '__init__.py'), '');
+      fs.writeFileSync(path.join(dir, 'pkg', 'certs.py'), `def where():\n    return "/ca.pem"\n`);
+      // certs is an imported MODULE (a file), and certs.where() is a qualified
+      // call through it — the receiver isn't a symbol, so plain name-matching
+      // can't link it. Also exercises the Python relative-dot path fix (`.certs`).
+      fs.writeFileSync(path.join(dir, 'pkg', 'utils.py'), `from . import certs\ndef go():\n    return certs.where()\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('pkg/certs.py')).toContain('pkg/utils.py');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('a module import is a dependency even when the used member is re-exported elsewhere', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'pkg', '__init__.py'), '');
+      // `where` is NOT defined in certs.py (re-exported from a 3rd-party pkg), so
+      // member resolution can't find it — the module-import backstop must still
+      // record utils -> certs. (Mirrors requests' real `certs.where`.)
+      fs.writeFileSync(path.join(dir, 'pkg', 'certs.py'), `from external_ca import where\n`);
+      fs.writeFileSync(path.join(dir, 'pkg', 'utils.py'), `from . import certs\nCA = certs.where()\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('pkg/certs.py')).toContain('pkg/utils.py');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('Go cross-package composite literals (blast-radius recall)', () => {
+  // Go function calls and type references across packages already resolved, but
+  // struct composite literals — `render.XML{...}` / `pkga.Widget{...}` — were not
+  // extracted at all, so a package whose types are only INSTANTIATED elsewhere
+  // (gin's render/binding implementations) showed 0 dependents.
+  it('links a cross-package struct composite literal to the defining package', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.mkdirSync(path.join(dir, 'render'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'render', 'xml.go'), `package render\n\ntype XML struct { Data any }\n`);
+      fs.writeFileSync(path.join(dir, 'app.go'), `package main\n\nimport "example.com/proj/render"\n\nfunc handle() any { return render.XML{} }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('render/xml.go')).toContain('app.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('links a composite literal in a package-level var registry', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.mkdirSync(path.join(dir, 'render'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'render', 'xml.go'), `package render\n\ntype XML struct {}\nfunc (XML) Render() {}\n`);
+      // The implementation is registered only in a top-level `var registry = {...}`
+      // map literal — the body walker doesn't cover top-level declarations, so this
+      // exercises the var-initializer walking added for Go.
+      fs.writeFileSync(path.join(dir, 'reg.go'), `package main\n\nimport "example.com/proj/render"\n\ntype R interface { Render() }\n\nvar registry = map[string]R{ "xml": render.XML{} }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('render/xml.go')).toContain('reg.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('attributes a call inside a top-level closure (cobra RunE) to the var, not the file (#693)', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      // Wire is called ONLY from the anonymous RunE closure inside a top-level
+      // `var rootCmd = &Cmd{...}` — previously the call leaked to the file node,
+      // so `callers(Wire)` surfaced a file (or read as "no caller"). It must now
+      // attribute to the enclosing var.
+      fs.writeFileSync(path.join(dir, 'factory.go'), `package main\n\nfunc Wire() error { return nil }\n`);
+      fs.writeFileSync(
+        path.join(dir, 'root.go'),
+        `package main\n\ntype Cmd struct{ RunE func() error }\n\nvar rootCmd = &Cmd{\n\tRunE: func() error { return Wire() },\n}\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      const wire = cg.getNodesByName('Wire').find((n) => n.kind === 'function');
+      expect(wire).toBeDefined();
+      const callers = cg.getCallers(wire!.id).map((c) => c.node);
+      expect(callers.some((n) => n.kind === 'variable' && n.name === 'rootCmd')).toBe(true);
+      expect(callers.some((n) => n.kind === 'file')).toBe(false);
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('links a parenthesized pointer type conversion `(*T)(x)` to the type', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.writeFileSync(path.join(dir, 'types.go'), `package main\n\ntype Wrapped struct { N int }\n`);
+      // `(*Wrapped)(x)` parses as a call whose callee is the parenthesized type
+      // `(*Wrapped)` — without normalization it dropped on the floor.
+      fs.writeFileSync(path.join(dir, 'use.go'), `package main\n\nfunc run(x *int) { _ = (*Wrapped)(x) }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('types.go')).toContain('use.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('links an implementation reached only through a Go interface (implicit satisfaction, #584)', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.mkdirSync(path.join(dir, 'codec'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'codec', 'api.go'), `package codec\n\ntype Core interface {\n\tMarshal(v any) ([]byte, error)\n}\n\nvar API Core\n`);
+      // jsonApi satisfies Core structurally (no `implements` keyword) and is
+      // reached ONLY through the interface (API.Marshal). Without implicit
+      // interface satisfaction + dispatch, json.go shows 0 dependents.
+      fs.writeFileSync(path.join(dir, 'codec', 'json.go'), `package codec\n\ntype jsonApi struct{}\n\nfunc (j jsonApi) Marshal(v any) ([]byte, error) { return nil, nil }\n\nfunc init() { API = jsonApi{} }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('codec/json.go')).toContain('codec/api.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('C# records (blast-radius recall)', () => {
+  // Records are ubiquitous in modern C# (DTOs, value objects, CQRS messages),
+  // but `record` / `record struct` declarations weren't extracted as types — so
+  // every reference, generic-type-argument, and `new` of a record dropped on the
+  // floor and the defining file showed 0 dependents. (#237)
+  it('extracts a record as a graph node (record class + record struct)', () => {
+    const r = extractFromSource('r.cs', `namespace P;\npublic record Box(int N);\npublic record struct Pt(int X);\n`);
+    expect(r.nodes.find((n) => n.name === 'Box' && (n.kind === 'class' || n.kind === 'struct'))).toBeDefined();
+    expect(r.nodes.find((n) => n.name === 'Pt' && (n.kind === 'class' || n.kind === 'struct'))).toBeDefined();
+  });
+
+  it('resolves references / instantiations of a record across files', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'types.cs'), `namespace P;\npublic record Box(int N);\n`);
+      // Box is used as a generic type argument and instantiated — both require
+      // Box to be a node to resolve.
+      fs.writeFileSync(
+        path.join(dir, 'use.cs'),
+        `using System.Collections.Generic;\nnamespace P;\npublic class User {\n    public IEnumerable<Box> Boxes { get; }\n    public Box Make() => new Box(1);\n}\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.cs'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('types.cs')).toContain('use.cs');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('Rust cross-module recall', () => {
+  function rustProject(files: Record<string, string>): string {
+    const dir = createTempDir();
+    fs.writeFileSync(path.join(dir, 'Cargo.toml'), '[package]\nname = "proj"\nversion = "0.1.0"\nedition = "2021"\n');
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    for (const [rel, content] of Object.entries(files)) {
+      const full = path.join(dir, 'src', rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, content);
+    }
+    return dir;
+  }
+
+  it('extracts a struct literal `Foo { .. }` as an instantiation across modules', async () => {
+    const dir = rustProject({
+      'lib.rs': 'pub mod types;\npub mod consumer;\n',
+      'types.rs': 'pub struct Widget { pub n: i32 }\n',
+      'consumer.rs': 'use crate::types::Widget;\npub fn build() -> Widget { Widget { n: 1 } }\n',
+    });
+    try {
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/types.rs')).toContain('src/consumer.rs');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+
+  it('extracts trait method declarations and bridges trait dispatch to the impl', async () => {
+    const dir = rustProject({
+      'lib.rs': 'pub mod types;\npub mod consumer;\n',
+      'types.rs': 'pub trait Render { fn render(&self) -> i32; }\n',
+      // Mine implements Render structurally; reached via &dyn Render dispatch.
+      'consumer.rs': 'use crate::types::Render;\npub struct Mine { pub x: i32 }\nimpl Render for Mine { fn render(&self) -> i32 { self.x } }\n',
+    });
+    try {
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      // implements edge (Mine -> Render) makes types.rs a dependent of consumer.rs's struct.
+      expect(cg.getFileDependents('src/types.rs')).toContain('src/consumer.rs');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+
+  it('links `pub use` re-export hubs to the modules they re-export', async () => {
+    const dir = rustProject({
+      'lib.rs': 'pub mod api;\n',
+      'api/mod.rs': 'mod widget;\npub use self::widget::Widget;\n',
+      'api/widget.rs': 'pub struct Widget { pub n: i32 }\n',
+    });
+    try {
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      // The re-export hub depends on the module it re-exports from.
+      expect(cg.getFileDependents('src/api/widget.rs')).toContain('src/api/mod.rs');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+
+  it('resolves a qualified path to the correct module when the leaf name collides', async () => {
+    const dir = rustProject({
+      'lib.rs': 'pub mod fast;\npub mod slow;\npub mod hub;\n',
+      'fast.rs': 'pub fn read() -> i32 { 1 }\n',
+      'slow.rs': 'pub fn read() -> i32 { 2 }\n',
+      // `read` exists in BOTH fast.rs and slow.rs — module-path resolution must
+      // send this re-export to fast.rs specifically, not name-match either.
+      'hub.rs': 'pub use crate::fast::read;\n',
+    });
+    try {
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/fast.rs')).toContain('src/hub.rs');
+      expect(cg.getFileDependents('src/slow.rs')).not.toContain('src/hub.rs');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('Java annotations (blast-radius recall)', () => {
+  it('indexes @interface definitions and links @Annotation usages to them', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'p'), { recursive: true });
+      // The annotation DEFINITION must be a node, and the @MyAnno usages (which
+      // live inside a `modifiers` node on the class/field/method) must extract.
+      fs.writeFileSync(path.join(dir, 'p', 'MyAnno.java'), `package p;\npublic @interface MyAnno { String value() default ""; }\n`);
+      fs.writeFileSync(
+        path.join(dir, 'p', 'User.java'),
+        `package p;\n@MyAnno("c")\npublic class User {\n  @MyAnno("f") int field;\n  @MyAnno("m") void go() {}\n}\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.java'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('p/MyAnno.java')).toContain('p/User.java');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('Swift property wrappers / attributes (blast-radius recall)', () => {
+  it('links a @propertyWrapper usage to the wrapper type', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'Sources', 'M'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'Sources', 'M', 'Wrap.swift'), `@propertyWrapper\npublic struct Argument<T> { public var wrappedValue: T }\n`);
+      // `@Argument` is a Swift attribute on a stored property — it lives in the
+      // property's `modifiers` and Swift doesn't extract instance properties as
+      // their own nodes, so without the fix the wrapper type has no users.
+      fs.writeFileSync(path.join(dir, 'Sources', 'M', 'Cmd.swift'), `public struct MyCommand {\n  @Argument var name: String\n  @Argument var count: Int\n}\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['Sources/**/*.swift'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('Sources/M/Wrap.swift')).toContain('Sources/M/Cmd.swift');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('R Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect R files (both extension cases)', () => {
+      expect(detectLanguage('analysis.R')).toBe('r');
+      expect(detectLanguage('scripts/clean.r')).toBe('r');
+    });
+
+    it('should report R as supported', () => {
+      expect(isLanguageSupported('r')).toBe(true);
+      expect(getSupportedLanguages()).toContain('r');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('extracts every assignment form, lambdas, and nested functions', () => {
+      const code = `
+clean_data <- function(df, threshold = 0.5) {
+  helper <- function(d) scale(d)
+  helper(df)
+}
+normalize = function(v) (v - mean(v)) / sd(v)
+double_it <- \\(x) x * 2
+`;
+      const result = extractFromSource('analysis.R', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('clean_data');
+      expect(funcs).toContain('normalize');
+      expect(funcs).toContain('double_it');
+      expect(funcs).toContain('helper'); // nested, inside clean_data's scope
+      const cleanData = result.nodes.find((n) => n.name === 'clean_data');
+      expect(cleanData?.language).toBe('r');
+      expect(cleanData?.signature).toBe('(df, threshold = 0.5)');
+    });
+
+    it('attributes body calls to the enclosing function', () => {
+      const code = `
+prep <- function(d) scale(d)
+fit_model <- function(data) {
+  lm(y ~ x, data = prep(data))
+}
+`;
+      const result = extractFromSource('models.R', code);
+      const prepCall = result.unresolvedReferences.find(
+        (r) => r.referenceName === 'prep' && r.referenceKind === 'calls'
+      );
+      expect(prepCall).toBeDefined();
+      const fitModel = result.nodes.find((n) => n.name === 'fit_model');
+      expect(prepCall?.fromNodeId).toBe(fitModel?.id);
+    });
+  });
+
+  describe('Imports', () => {
+    it('extracts library/require/source as imports, not calls', () => {
+      const code = `
+library(dplyr)
+require(stats)
+requireNamespace("jsonlite")
+source("helpers.R")
+`;
+      const result = extractFromSource('main.R', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('dplyr');
+      expect(imports).toContain('stats');
+      expect(imports).toContain('jsonlite');
+      expect(imports).toContain('helpers.R');
+      // Claimed by the hook — no call references to the import machinery.
+      const libCalls = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && (r.referenceName === 'library' || r.referenceName === 'source')
+      );
+      expect(libCalls).toHaveLength(0);
+    });
+  });
+
+  describe('Variables and constants', () => {
+    it('extracts top-level assignments; ALL_CAPS as constants; right-assign too', () => {
+      const code = `
+ALPHA <- 0.05
+max_iter = 100
+compute_stats(df) -> stats_result
+inner <- function() {
+  local_var <- 1
+}
+`;
+      const result = extractFromSource('config.R', code);
+      const constant = result.nodes.find((n) => n.name === 'ALPHA');
+      expect(constant?.kind).toBe('constant');
+      const variable = result.nodes.find((n) => n.name === 'max_iter');
+      expect(variable?.kind).toBe('variable');
+      const rightAssigned = result.nodes.find((n) => n.name === 'stats_result');
+      expect(rightAssigned?.kind).toBe('variable');
+      // Locals inside functions are deliberately NOT extracted.
+      expect(result.nodes.find((n) => n.name === 'local_var')).toBeUndefined();
+    });
+  });
+
+  describe('Classes', () => {
+    it('extracts S4/R5/R6 class calls as classes with their list methods', () => {
+      const code = `
+setClass("Patient", representation(id = "character"))
+Account <- setRefClass("Account",
+  fields = list(balance = "numeric"),
+  methods = list(deposit = function(x) { balance <<- balance + x })
+)
+Stack <- R6Class("Stack",
+  public = list(push = function(v) invisible(v))
+)
+setGeneric("describe", function(obj) standardGeneric("describe"))
+setMethod("describe", "Patient", function(obj) paste(obj@id))
+`;
+      const result = extractFromSource('classes.R', code);
+      const classes = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(classes).toContain('Patient');
+      expect(classes).toContain('Account');
+      expect(classes).toContain('Stack');
+      const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+      expect(methods).toContain('deposit');
+      expect(methods).toContain('push');
+      // setGeneric/setMethod produce functions named by their string argument.
+      const describes = result.nodes.filter((n) => n.name === 'describe' && n.kind === 'function');
+      expect(describes.length).toBeGreaterThanOrEqual(2);
+      // The class-assignment idiom must not ALSO produce a variable node.
+      expect(result.nodes.find((n) => n.name === 'Account' && n.kind === 'variable')).toBeUndefined();
+    });
+
+    it('extracts ggproto classes with direct-arg methods and the parent as extends', () => {
+      // ggplot2's OO system — every Geom/Stat/Scale in the ecosystem uses it.
+      const code = `
+GeomPoint <- ggproto("GeomPoint", Geom,
+  required_aes = c("x", "y"),
+  draw_panel = function(data, panel_params, coord) {
+    coords <- coord$transform(data, panel_params)
+    grid::pointsGrob(coords$x, coords$y)
+  },
+  draw_key = draw_key_point
+)
+`;
+      const result = extractFromSource('geom-point.R', code);
+      const cls = result.nodes.find((n) => n.name === 'GeomPoint' && n.kind === 'class');
+      expect(cls).toBeDefined();
+      const method = result.nodes.find((n) => n.name === 'draw_panel' && n.kind === 'method');
+      expect(method).toBeDefined();
+      const ext = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'extends' && r.referenceName === 'Geom'
+      );
+      expect(ext?.fromNodeId).toBe(cls?.id);
+      // No twin variable for the assignment.
+      expect(result.nodes.find((n) => n.name === 'GeomPoint' && n.kind === 'variable')).toBeUndefined();
+    });
   });
 });

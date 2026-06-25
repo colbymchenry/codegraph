@@ -48,7 +48,7 @@ fi
 
 LOG="$OUT/$ARM-r$RID.jsonl"; ERR="$OUT/$ARM-r$RID.err"
 ARGS=( -p "$Q" --output-format stream-json --verbose
-       --permission-mode bypassPermissions --model opus --max-budget-usd 4
+       --permission-mode bypassPermissions --model "${MODEL:-sonnet}" --effort "${EFFORT:-high}" --max-budget-usd 4
        --strict-mcp-config --mcp-config "$CFG" )
 [ -n "$STEERING" ] && ARGS+=( --append-system-prompt "$STEERING" )
 

@@ -24,6 +24,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   // `.svelte`/`.vue` file resolve to nothing, so barrel callers vanish (#629).
   svelte: ['.ts', '.js', '.svelte', '.tsx', '.jsx', '/index.ts', '/index.js', '/index.svelte'],
   vue: ['.ts', '.js', '.vue', '.tsx', '.jsx', '/index.ts', '/index.js', '/index.vue'],
+  astro: ['.ts', '.js', '.astro', '.tsx', '.jsx', '/index.ts', '/index.js', '/index.astro'],
   python: ['.py', '/__init__.py'],
   go: ['.go'],
   rust: ['.rs', '/mod.rs'],
@@ -212,6 +213,24 @@ function resolveRelativeImport(
 ): string | null {
   const projectRoot = context.getProjectRoot();
   const extensions = EXTENSION_RESOLUTION[language] || [];
+
+  // Python dotted-relative imports (`from .certs import x`, `from ..pkg.mod
+  // import y`): leading dots are PACKAGE levels (1 = current package), and the
+  // remainder is a dotted submodule path. `path.resolve(dir, '.certs')` would
+  // treat `.certs` as a literal hidden filename, so translate the Python form
+  // to a real filesystem-relative path before resolving.
+  if (language === 'python' && importPath.startsWith('.')) {
+    const dots = importPath.length - importPath.replace(/^\.+/, '').length;
+    const up = '../'.repeat(Math.max(0, dots - 1));    // 1 dot = current dir
+    const rest = importPath.slice(dots).replace(/\./g, '/'); // 'sub.mod' -> 'sub/mod'
+    const pyBase = path.resolve(fromDir, up + rest);
+    const pyRel = path.relative(projectRoot, pyBase).replace(/\\/g, '/');
+    for (const ext of extensions) {
+      if (context.fileExists(pyRel + ext)) return pyRel + ext;
+    }
+    if (pyRel && context.fileExists(pyRel)) return pyRel;
+    return null;
+  }
 
   // Try the path as-is first
   const basePath = path.resolve(fromDir, importPath);
@@ -512,6 +531,47 @@ function resolveCppIncludePath(
 }
 
 /**
+ * Is this reference a PHP include/require PATH (vs a namespace `use` symbol)?
+ *
+ * include/require emit a file path ("lib.php", "inc/db.php", "../x.php"),
+ * whereas namespace use is an FQN (App\Foo\Bar) or a bare class symbol
+ * (Closure). PHP identifiers contain neither '/' nor '.', so a slash or dot
+ * marks a path-shaped include. Such references resolve to files only — never
+ * to a same-named symbol — so callers must not fall back to the name-matcher.
+ */
+export function isPhpIncludePathRef(ref: UnresolvedRef): boolean {
+  return (
+    ref.language === 'php' &&
+    ref.referenceKind === 'imports' &&
+    (ref.referenceName.includes('/') || ref.referenceName.includes('.'))
+  );
+}
+
+/**
+ * Resolve a PHP include/require path to a project-relative file path.
+ *
+ * PHP resolves includes relative to the including file's directory (the
+ * common case for procedural codebases); php.ini `include_path` is not
+ * modeled. Callers pass an already-extracted static literal path.
+ */
+function resolvePhpIncludePath(
+  includePath: string,
+  fromFile: string,
+  context: ResolutionContext
+): string | null {
+  const projectRoot = context.getProjectRoot();
+  const fromDir = path.dirname(path.join(projectRoot, fromFile));
+  const basePath = path.resolve(fromDir, includePath);
+  const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');
+  if (context.fileExists(relativePath)) return relativePath;
+  // The literal may omit the .php extension (e.g. include "config").
+  for (const ext of EXTENSION_RESOLUTION.php ?? []) {
+    if (context.fileExists(relativePath + ext)) return relativePath + ext;
+  }
+  return null;
+}
+
+/**
  * Extract import mappings from a file
  */
 export function extractImportMappings(
@@ -523,9 +583,10 @@ export function extractImportMappings(
 
   if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx') {
     mappings.push(...extractJSImports(content));
-  } else if (language === 'svelte' || language === 'vue') {
+  } else if (language === 'svelte' || language === 'vue' || language === 'astro') {
     // Svelte/Vue single-file components import via plain ES6 inside their
-    // `<script>` block. Without this, a `.svelte`/`.vue` consumer produces
+    // `<script>` block (Astro: the `---` frontmatter). Without this, a
+    // `.svelte`/`.vue`/`.astro` consumer produces
     // zero import mappings, so `resolveViaImport` can't run and a barrel
     // import (`import { Foo } from './lib'`) falls back to name-matching —
     // which silently fails whenever the re-export alias differs from the
@@ -1012,12 +1073,51 @@ export function resolveJvmImport(
   const candidates = context.getNodesByQualifiedName(`${pkg}::${sym}`);
   if (candidates.length === 0) return null;
 
+  // Kotlin Multiplatform: an `expect` declaration and its `actual`s share one
+  // FQN across source sets (commonMain / androidMain / appleMain). Taking the
+  // first candidate let a single platform `actual` absorb every common-side
+  // import, so the `expect` (the canonical API a commonMain file imports)
+  // looked unused. Prefer the candidate CLOSEST to the importing file by
+  // directory proximity — a commonMain import resolves to the commonMain
+  // declaration — with the `expect` side as a tiebreak.
+  const best = candidates.length === 1 ? candidates[0]! : pickClosestJvmCandidate(candidates, ref.filePath);
   return {
     original: ref,
-    targetNodeId: candidates[0]!.id,
+    targetNodeId: best.id,
     confidence: 0.95,
     resolvedBy: 'import',
   };
+}
+
+/**
+ * Pick the same-FQN candidate closest to `fromPath` by shared directory
+ * prefix, preferring an `expect` declaration on a tie. Used to keep a Kotlin
+ * Multiplatform `expect`/`actual` import resolving within the importer's own
+ * source set instead of an arbitrary platform `actual`.
+ */
+function pickClosestJvmCandidate(candidates: Node[], fromPath: string): Node {
+  const fromDirs = fromPath.split('/').slice(0, -1);
+  const sharedPrefix = (p: string): number => {
+    const d = p.split('/').slice(0, -1);
+    let shared = 0;
+    for (let i = 0; i < Math.min(fromDirs.length, d.length); i++) {
+      if (fromDirs[i] === d[i]) shared++;
+      else break;
+    }
+    return shared;
+  };
+  const isExpect = (n: Node): boolean => Array.isArray(n.decorators) && n.decorators.includes('expect');
+  let best = candidates[0]!;
+  let bestProx = sharedPrefix(best.filePath);
+  for (let i = 1; i < candidates.length; i++) {
+    const c = candidates[i]!;
+    const prox = sharedPrefix(c.filePath);
+    if (prox > bestProx || (prox === bestProx && isExpect(c) && !isExpect(best))) {
+      best = c;
+      bestProx = prox;
+    }
+  }
+  return best;
 }
 
 export function resolveViaImport(
@@ -1032,6 +1132,23 @@ export function resolveViaImport(
   // edge — resolveViaImport's symbol lookup below would search the
   // resolved file for a symbol named like the file extension and fail.
   if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports') {
+    // C/C++ quoted includes (`#include "X.h"`) resolve relative to the
+    // INCLUDING file's own directory first (the C standard's quoted-include
+    // search order). Prefer a same-directory header over an -I directory or a
+    // same-named header on another platform (windows/code/RNCAsyncStorage.h vs
+    // apple/.../RNCAsyncStorage.h) — the include-dir heuristic below would
+    // otherwise pick an arbitrary same-named header, leaving the real local one
+    // with no dependents.
+    const slash = ref.filePath.lastIndexOf('/');
+    const fromDir = slash >= 0 ? ref.filePath.slice(0, slash) : '';
+    const siblingPath = path.posix.normalize(fromDir ? `${fromDir}/${ref.referenceName}` : ref.referenceName);
+    const siblingBase = siblingPath.split('/').pop()!;
+    const sibling = context
+      .getNodesByName(siblingBase)
+      .find((n) => n.kind === 'file' && n.filePath === siblingPath);
+    if (sibling) {
+      return { original: ref, targetNodeId: sibling.id, confidence: 0.92, resolvedBy: 'import' };
+    }
     const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
     if (!resolvedPath) return null;
     const basename = resolvedPath.split('/').pop()!;
@@ -1045,6 +1162,36 @@ export function resolveViaImport(
         resolvedBy: 'import',
       };
     }
+    return null;
+  }
+
+  // PHP include/require — resolve the static string path to a file→file
+  // edge, mirroring the C/C++ branch above. Distinguish include PATHS from
+  // namespace `use` symbols by shape: an include path contains a slash or a
+  // file extension ("lib.php", "inc/db.php", "../x.php"), whereas a namespace
+  // use is an FQN (App\Foo\Bar) or a bare class symbol (Closure) — PHP
+  // identifiers contain neither '/' nor '.'. Only path-shaped references are
+  // includes; symbol references fall through to the namespace resolution.
+  if (isPhpIncludePathRef(ref)) {
+    const resolvedPath = resolvePhpIncludePath(ref.referenceName, ref.filePath, context);
+    if (resolvedPath) {
+      const basename = resolvedPath.split('/').pop()!;
+      const fileNode = context
+        .getNodesByName(basename)
+        .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+      if (fileNode) {
+        return {
+          original: ref,
+          targetNodeId: fileNode.id,
+          confidence: 0.9,
+          resolvedBy: 'import',
+        };
+      }
+    }
+    // A path-shaped include that doesn't resolve to a known project file is a
+    // dead end. Return unresolved rather than falling through to the symbol
+    // name-matcher, which would mis-connect e.g. "inc/db.php" to an unrelated
+    // db.php elsewhere in the tree — a wrong edge is worse than a missing one.
     return null;
   }
 
@@ -1074,6 +1221,55 @@ export function resolveViaImport(
     if (javaResult) return javaResult;
   }
 
+  // Python qualified access through an imported MODULE: `certs.where()` after
+  // `from . import certs`, `mod.func()` after `import mod`. The receiver names a
+  // submodule (a file), not a symbol, so the generic symbol lookup below would
+  // search the *package* for `certs` instead of looking inside the module.
+  if (ref.language === 'python') {
+    const pyResult = resolvePythonModuleMember(ref, imports, context);
+    if (pyResult) return pyResult;
+    // Absolute dotted module import: `import conduit.apps.articles.signals`
+    // (the standard Django AppConfig.ready() signal-registration pattern, and
+    // any side-effect `import pkg.mod`). Map the dotted path to its file.
+    const pyModResult = resolvePythonAbsoluteModule(ref, context);
+    if (pyModResult) return pyModResult;
+  }
+
+  // Rust qualified path: resolve the module prefix of `crate::m::Item` /
+  // `self::sub::Item` / `super::m::func` to a file, then find the leaf symbol in
+  // it. Disambiguates common-name `pub use self::read::read` re-exports that
+  // name-matching would land on the wrong same-named symbol.
+  if (ref.language === 'rust' && ref.referenceName.includes('::')) {
+    const rustResult = resolveRustPathReference(ref, context);
+    if (rustResult) return rustResult;
+  }
+
+  // Lua / Luau `require(...)`: a dotted module path (`a.b.c` from
+  // `require("a.b.c")`) or an instance-path leaf (`Signal` from
+  // `require(script.Parent.Signal)`) — map it to a module file. There's no static
+  // import statement, so the generic path-matcher can't bridge the dot↔slash /
+  // leaf↔basename gap; resolve it explicitly to the module file.
+  if ((ref.language === 'lua' || ref.language === 'luau') && ref.referenceKind === 'imports') {
+    const luaResult = resolveLuaRequire(ref, context);
+    if (luaResult) return luaResult;
+  }
+
+  // Whole-module / namespace imports → link the importing file to the module
+  // file. Python `from . import certs` / `import mod`, and TS/JS `import * as ns
+  // from './x'` (so a namespace touched only via a value-member read still
+  // records the dependency). A named TS/JS import returns null here and falls
+  // through to symbol resolution below.
+  if (
+    ref.language === 'python' ||
+    ref.language === 'typescript' ||
+    ref.language === 'tsx' ||
+    ref.language === 'javascript' ||
+    ref.language === 'jsx'
+  ) {
+    const moduleFile = resolveModuleImportToFile(ref, imports, context);
+    if (moduleFile) return moduleFile;
+  }
+
   // Check if the reference name matches any import
   for (const imp of imports) {
     if (imp.localName === ref.referenceName || ref.referenceName.startsWith(imp.localName + '.')) {
@@ -1100,6 +1296,25 @@ export function resolveViaImport(
         );
 
         if (targetNode) {
+          // `Foo.bar()` / `Foo.CONST` — a NAMED (non-namespace) class import
+          // accessed through a member. `findExportedSymbol` resolved `Foo` to
+          // the class itself; descend into it so the reference links to the
+          // member `bar`, not the class. Without this the edge points at the
+          // class and `createEdges` then mis-promotes the call to an
+          // `instantiates` edge, so the static method shows zero callers and a
+          // hollow impact radius. (#825)
+          if (!imp.isNamespace && ref.referenceName.startsWith(imp.localName + '.')) {
+            const memberNode = resolveStaticMember(targetNode, ref, imp.localName, context);
+            if (memberNode) {
+              return {
+                original: ref,
+                targetNodeId: memberNode.id,
+                confidence: 0.9,
+                resolvedBy: 'import',
+              };
+            }
+          }
+
           return {
             original: ref,
             targetNodeId: targetNode.id,
@@ -1112,6 +1327,355 @@ export function resolveViaImport(
   }
 
   return null;
+}
+
+/**
+ * Resolve a Python qualified reference whose receiver is an imported MODULE:
+ * `certs.where()` after `from . import certs`, `mod.func()` after `import mod`
+ * or `from pkg import mod`. The receiver names a submodule (a file), not a
+ * symbol, so the generic symbol lookup in `resolveViaImport` can't follow it —
+ * it would search the *package* for `certs`/`mod` instead of looking inside the
+ * module. This is the Python half of the cross-package qualified-call problem
+ * (cf. `resolveGoCrossPackageReference` for Go's `pkg.Func`, issue #388).
+ *
+ * Builds the module's dotted import path from the binding — `from . import
+ * certs` → `.certs`; `from pkg import mod` → `pkg.mod`; `import mod` → `mod` —
+ * resolves it to the module file, and finds the member defined there. Returns
+ * null when no module file exists at that path, so attribute access on an
+ * imported *value* (`helper.attr` where `helper` is a function) falls through
+ * to the other strategies untouched.
+ */
+function resolvePythonModuleMember(
+  ref: UnresolvedRef,
+  imports: ImportMapping[],
+  context: ResolutionContext
+): ResolvedRef | null {
+  const dotIdx = ref.referenceName.indexOf('.');
+  if (dotIdx <= 0) return null;
+  const receiver = ref.referenceName.substring(0, dotIdx);
+  // The immediate member of the module (first segment after the receiver).
+  const member = ref.referenceName.substring(dotIdx + 1).split('.')[0];
+  if (!member) return null;
+
+  for (const imp of imports) {
+    if (imp.localName !== receiver) continue;
+
+    // `import mod` / `import numpy as np` bind the module at `source` itself;
+    // `from . import certs` / `from pkg import mod` bind a SUBMODULE whose
+    // dotted path is the source joined with the imported name.
+    const modulePath = imp.isNamespace
+      ? imp.source
+      : imp.source.endsWith('.')
+        ? imp.source + imp.localName
+        : imp.source + '.' + imp.localName;
+
+    // resolveImportPath only maps RELATIVE dotted paths (`.mod`, `..pkg.mod`); an
+    // ABSOLUTE package path (`pkg.module` from `from pkg import module`, or a bare
+    // `import pkg.mod`) resolves to null there, so fall back to the dotted-module
+    // file lookup — the same asymmetry resolveModuleImportToFile already handles
+    // for the file→file import edge. Without this, a `module.func()` call after
+    // `from pkg import module` dropped its `calls` edge even though the import
+    // edge resolved (#578).
+    let resolvedPath = resolveImportPath(modulePath, ref.filePath, ref.language, context);
+    if (!resolvedPath) {
+      resolvedPath = findPythonModuleFile(modulePath, context, ref.filePath)?.filePath ?? null;
+    }
+    if (!resolvedPath || resolvedPath === ref.filePath) continue;
+
+    // Find the member as a top-level definition in the module file. Exclude
+    // `method` so `mod.foo` never lands on a same-named class method.
+    const target = context.getNodesInFile(resolvedPath).find(
+      (n) =>
+        n.name === member &&
+        (n.kind === 'function' ||
+          n.kind === 'class' ||
+          n.kind === 'variable' ||
+          n.kind === 'constant')
+    );
+    if (target) {
+      return { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'import' };
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve a whole-MODULE import to that module's file (a file→file dependency).
+ * The imported name is a module, not a symbol, so there's nothing to resolve to
+ * — but importing a module IS a dependency on it. Covers:
+ *   - Python submodule imports — `from . import certs`, `from pkg import sub`;
+ *   - namespace imports — Python `import mod` / `import numpy as np`, and
+ *     TS/JS `import * as ns from './x'`.
+ *
+ * It is also the robust backstop for {@link resolvePythonModuleMember} and for
+ * TS namespace usage: it records the dependency even when the used member is
+ * re-exported elsewhere (requests' `certs.where`, re-exported from `certifi`),
+ * the usage is module-level code that isn't extracted as a call, or a TS
+ * namespace is touched only via a value-member read (`ns.SOME_CONST`).
+ *
+ * Only fires for dot-free `imports`-kind refs whose module path resolves to a
+ * real file. A NAMED TS/JS import (`import { widget }`) is not a module, so it
+ * returns null and normal symbol resolution handles it.
+ */
+/**
+ * Resolve a Lua/Luau `require(...)` to its module file. The reference name is
+ * either a dotted module path (`telescope.config` → `telescope/config.lua`) or a
+ * Roblox instance-path leaf (`Signal` from `require(script.Parent.Signal)` →
+ * `Signal.luau`). We try `<path>.lua|.luau` and `<path>/init.lua|.luau`, matched
+ * by path suffix (the module root — `lua/`, `src/`, … — is project-specific).
+ * Among suffix matches, the one sharing the longest directory prefix with the
+ * requiring file wins (instance-path requires resolve within the same package).
+ */
+function resolveLuaRequire(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const name = ref.referenceName;
+  if (!name) return null;
+  const base = name.includes('.') ? name.replace(/\./g, '/') : name;
+  const suffixes = [`${base}.lua`, `${base}.luau`, `${base}/init.lua`, `${base}/init.luau`];
+  const files = context.getAllFiles();
+  const shared = (a: string, b: string): number => {
+    let i = 0;
+    while (i < a.length && i < b.length && a[i] === b[i]) i++;
+    return i;
+  };
+  for (const suffix of suffixes) {
+    const matches = files.filter((f) => f === suffix || f.endsWith('/' + suffix));
+    if (matches.length === 0) continue;
+    matches.sort((x, y) => shared(y, ref.filePath) - shared(x, ref.filePath));
+    const best = matches[0]!;
+    if (best === ref.filePath) continue;
+    const fileNode = context.getNodesInFile(best).find((n) => n.kind === 'file');
+    if (fileNode) {
+      // Confidence ≥ 0.9 so this deterministic path/suffix match wins over
+      // name-matching, which otherwise resolves the require to the import node
+      // itself (a same-name self-match).
+      return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+    }
+  }
+  return null;
+}
+
+function resolveModuleImportToFile(
+  ref: UnresolvedRef,
+  imports: ImportMapping[],
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.referenceKind !== 'imports') return null;
+  if (ref.referenceName.includes('.')) return null;
+
+  for (const imp of imports) {
+    if (imp.localName !== ref.referenceName) continue;
+
+    let modulePath: string;
+    if (imp.isNamespace || imp.isDefault) {
+      // `import * as ns from './x'` (namespace) or `import x from './x'`
+      // (default) — the dependency is on the MODULE FILE. A default import binds
+      // a (possibly renamed) local to whatever the module's default export is
+      // (`import articlesController from './article.controller'` ← `export
+      // default router`), so the binding name can't be found as a symbol — link
+      // the file the import resolves to instead. External modules don't resolve
+      // (no file), so `import React from 'react'` creates no edge.
+      modulePath = imp.source;
+    } else if (ref.language === 'python') {
+      // `from . import certs` — the imported NAME is a submodule of the source.
+      modulePath = imp.source.endsWith('.')
+        ? imp.source + imp.localName
+        : imp.source + '.' + imp.localName;
+    } else {
+      // A named TS/JS import binds a symbol, not a module — leave it alone.
+      continue;
+    }
+
+    const resolvedPath = resolveImportPath(modulePath, ref.filePath, ref.language, context);
+    if (resolvedPath && resolvedPath !== ref.filePath) {
+      const fileNode = context.getNodesInFile(resolvedPath).find((n) => n.kind === 'file');
+      if (fileNode) {
+        return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+      }
+    }
+
+    // Python absolute `from a.b import submodule` (a FastAPI router aggregator's
+    // `from app.api.routes import authentication`): resolveImportPath only maps
+    // RELATIVE dotted paths to a file, so resolve the absolute dotted module
+    // directly to its file node.
+    if (ref.language === 'python') {
+      const modFile = findPythonModuleFile(modulePath, context, ref.filePath);
+      if (modFile) {
+        return { original: ref, targetNodeId: modFile.id, confidence: 0.9, resolvedBy: 'import' };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Find the file node for a Python dotted module path `a.b.c` — a module file
+ * ending in `a/b/c.py`, or a package `a/b/c/__init__.py` (suffix-matched, so a
+ * package rooted under `src/` etc. still resolves). Returns null for
+ * stdlib/external modules (no matching repo file node), so `import os` creates
+ * no edge. Shared by absolute `import a.b.c` and absolute `from a.b import c`
+ * (where `c` is a submodule) resolution.
+ */
+function findPythonModuleFile(
+  mod: string,
+  context: ResolutionContext,
+  excludeFilePath: string
+): Node | null {
+  if (!mod || mod.startsWith('.')) return null; // relative imports handled elsewhere
+  const rel = mod.replace(/\./g, '/');
+  const lastSeg = mod.split('.').pop()!;
+  const endsWith = (p: string, want: string): boolean => p === want || p.endsWith('/' + want);
+  const moduleFile = context
+    .getNodesByName(`${lastSeg}.py`)
+    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}.py`));
+  if (moduleFile) return moduleFile;
+  const pkgFile = context
+    .getNodesByName('__init__.py')
+    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}/__init__.py`));
+  return pkgFile ?? null;
+}
+
+/**
+ * Resolve a Python ABSOLUTE dotted module import (`import a.b.c`) to its file —
+ * the Django `AppConfig.ready(): import myapp.signals` pattern and any
+ * side-effect module import.
+ */
+function resolvePythonAbsoluteModule(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.referenceKind !== 'imports') return null;
+  // Only a DOTTED `import a.b.c` ref carries its full module path. A bare leaf
+  // (`from app.api.routes import authentication`) is ambiguous on its own — three
+  // `authentication.py` files may exist — so leave it to resolveModuleImportToFile,
+  // which uses the import's source (`app.api.routes`) to build the full path.
+  if (!ref.referenceName.includes('.')) return null;
+  const hit = findPythonModuleFile(ref.referenceName, context, ref.filePath);
+  return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;
+}
+
+/**
+ * Resolve a Rust qualified reference `A::B::C` by mapping the MODULE prefix
+ * (`A::B`) to a file and finding the leaf symbol (`C`) in it. This is the Rust
+ * analog of {@link resolvePythonModuleMember} / {@link resolveGoCrossPackageReference}
+ * and the precise answer to common-name re-exports (`pub use self::read::read`)
+ * that name-matching can't disambiguate. Returns null when the prefix isn't a
+ * real module path (e.g. `Widget::new` — `Widget` is a struct, not a module),
+ * so associated-function calls and enum-variant paths fall through untouched.
+ */
+function resolveRustPathReference(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const segments = ref.referenceName.split('::').filter((s) => s.length > 0);
+  if (segments.length < 2) return null;
+  const leaf = segments[segments.length - 1]!;
+  const modSegs = segments.slice(0, -1);
+
+  const file = resolveRustModuleFile(modSegs, ref.filePath, context);
+  if (!file || file === ref.filePath) return null;
+
+  const target = context.getNodesInFile(file).find(
+    (n) =>
+      n.name === leaf &&
+      (n.kind === 'function' ||
+        n.kind === 'struct' ||
+        n.kind === 'enum' ||
+        n.kind === 'trait' ||
+        n.kind === 'type_alias' ||
+        n.kind === 'constant' ||
+        n.kind === 'method' ||
+        n.kind === 'class' ||
+        n.kind === 'interface')
+  );
+  if (target) {
+    return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
+  }
+  return null;
+}
+
+/** The crate-root directory (holds `lib.rs`/`main.rs`), walking up from a file. */
+function rustCrateRootDir(fromFileAbs: string, context: ResolutionContext): string | null {
+  const projectRoot = context.getProjectRoot();
+  const toRel = (p: string) => path.relative(projectRoot, p).replace(/\\/g, '/');
+  let dir = path.dirname(fromFileAbs);
+  for (let i = 0; i < 64; i++) {
+    if (context.fileExists(toRel(path.join(dir, 'lib.rs'))) ||
+        context.fileExists(toRel(path.join(dir, 'main.rs')))) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  return null;
+}
+
+/** Directory under which the current file's module declares its SUBMODULES. */
+function rustSelfModuleDir(fromFileAbs: string): string {
+  const base = path.basename(fromFileAbs);
+  const dir = path.dirname(fromFileAbs);
+  // mod.rs / lib.rs / main.rs own their directory; `foo.rs`'s submodules live in `foo/`.
+  if (base === 'mod.rs' || base === 'lib.rs' || base === 'main.rs') return dir;
+  return path.join(dir, base.replace(/\.rs$/, ''));
+}
+
+/**
+ * Resolve a Rust module path (segments WITHOUT the leaf symbol) to the file of
+ * the last module segment — `crate::a::b` → `<crate>/a/b.rs` (or `.../b/mod.rs`).
+ * Anchors on `crate` / `self` / `super`; a bare path is tried crate-relative.
+ */
+function resolveRustModuleFile(
+  segments: string[],
+  fromFile: string,
+  context: ResolutionContext
+): string | null {
+  if (segments.length === 0) return null;
+  const projectRoot = context.getProjectRoot();
+  const fromAbs = path.join(projectRoot, fromFile);
+  const toRel = (p: string) => path.relative(projectRoot, p).replace(/\\/g, '/');
+
+  // Walk a sequence of module segments down from `startDir`, mapping each to a
+  // `<seg>.rs` or `<seg>/mod.rs` file. Returns the leaf module's file, or null
+  // if `startDir` is null or any segment has no file on disk.
+  const resolveUnder = (startDir: string | null, rest: string[]): string | null => {
+    if (!startDir) return null;
+    let dir = startDir;
+    let targetFile: string | null = null;
+    for (const seg of rest) {
+      if (seg === 'self' || seg === 'crate' || seg === 'super') continue;
+      const asFile = toRel(path.join(dir, seg + '.rs'));
+      const asMod = toRel(path.join(dir, seg, 'mod.rs'));
+      if (context.fileExists(asFile)) targetFile = asFile;
+      else if (context.fileExists(asMod)) targetFile = asMod;
+      else return null;
+      dir = path.join(dir, seg);
+    }
+    return targetFile;
+  };
+
+  const first = segments[0]!;
+  if (first === 'crate') {
+    return resolveUnder(rustCrateRootDir(fromAbs, context), segments.slice(1));
+  }
+  if (first === 'self') {
+    return resolveUnder(rustSelfModuleDir(fromAbs), segments.slice(1));
+  }
+  if (first === 'super') {
+    let supers = 0;
+    while (segments[supers] === 'super') supers++;
+    let dir: string | null = rustSelfModuleDir(fromAbs);
+    for (let s = 0; s < supers && dir; s++) dir = path.dirname(dir);
+    return resolveUnder(dir, segments.slice(supers));
+  }
+  // Bare path. In expression position (`submodule::item()` — the router-assembly
+  // and general cross-module-call pattern) the prefix is a SUBMODULE of the
+  // current module, i.e. 2018 `self::`-relative — so try self-relative FIRST.
+  // Fall back to crate-relative for 2015-edition / crate-root items. External
+  // crate paths (`serde::de::Error`) miss both and fall through to name-matching.
+  return (
+    resolveUnder(rustSelfModuleDir(fromAbs), segments) ??
+    resolveUnder(rustCrateRootDir(fromAbs, context), segments)
+  );
 }
 
 /**
@@ -1350,4 +1914,47 @@ function findExportedSymbol(
   }
 
   return undefined;
+}
+
+/** Node kinds that own static members reachable as `Container.member`. */
+const STATIC_MEMBER_CONTAINERS = new Set<Node['kind']>([
+  'class', 'struct', 'interface', 'enum', 'trait', 'protocol',
+]);
+
+/**
+ * Resolve `Container.member` — a static method/property access on a NAMED class
+ * import (`import { Foo } …; Foo.bar()`) — to the member node, given the
+ * already-resolved container class.
+ *
+ * Members carry a `Container::member` qualifiedName, so we look up
+ * `${container.qualifiedName}::${member}` within the container's own file (the
+ * file filter disambiguates same-named classes in other modules). Returns
+ * undefined when the container isn't a member-owning kind or the member isn't
+ * found, so the caller falls back to the container itself (prior behavior) —
+ * languages whose members aren't `::`-qualified, and genuine class references,
+ * are unaffected. See #825.
+ */
+function resolveStaticMember(
+  container: Node,
+  ref: UnresolvedRef,
+  localName: string,
+  context: ResolutionContext
+): Node | undefined {
+  if (!STATIC_MEMBER_CONTAINERS.has(container.kind)) return undefined;
+  // First segment after the receiver: `Foo.bar.baz` → `bar`.
+  const member = ref.referenceName.slice(localName.length + 1).split('.')[0];
+  if (!member) return undefined;
+
+  const candidates = context
+    .getNodesByQualifiedName(`${container.qualifiedName}::${member}`)
+    .filter((n) => n.filePath === container.filePath);
+  if (candidates.length === 0) return undefined;
+
+  // When the reference is a call, prefer a callable member if several nodes
+  // share the qualifiedName (e.g. a static property and a method).
+  if (ref.referenceKind === 'calls') {
+    const callable = candidates.find((n) => n.kind === 'method' || n.kind === 'function');
+    if (callable) return callable;
+  }
+  return candidates[0];
 }

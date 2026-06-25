@@ -220,7 +220,11 @@ function resolveComponent(
   const sameDir = components.filter((n) => n.filePath.startsWith(fromDir));
   if (sameDir.length > 0) return sameDir[0]!.id;
 
-  return components[0]!.id;
+  // No positional signal: only an UNAMBIGUOUS name may resolve — picking
+  // components[0] chose an arbitrary same-named component in a multi-app
+  // monorepo (#764). Ambiguity falls through to the name-matcher, whose
+  // proximity scoring decides.
+  return components.length === 1 ? components[0]!.id : null;
 }
 
 /**

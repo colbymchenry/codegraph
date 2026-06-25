@@ -68,6 +68,13 @@ export interface InstallOptions {
    * target has no permissions concept this option is a no-op.
    */
   autoAllow: boolean;
+  /**
+   * Front-load prompt hook (Claude `UserPromptSubmit`) that injects
+   * codegraph_explore context for structural prompts. `true` installs it,
+   * `false` removes any prior install (so opt-out round-trips), `undefined`
+   * leaves it untouched. Targets without a prompt-hook concept ignore it.
+   */
+  promptHook?: boolean;
 }
 
 export interface AgentTarget {

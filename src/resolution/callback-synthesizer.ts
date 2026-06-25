@@ -21,11 +21,13 @@
  * need receiver-type matching, deferred to Phase 3). All synthesized edges are
  * tagged `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
  */
-import type { Edge, Node } from '../types';
+import type { Edge, Node, NodeKind } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
+import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
+import { goframeRouteEdges } from './goframe-synthesizer';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -42,6 +44,10 @@ const MAX_JSX_CHILDREN = 30;
 // event bindings (@click="fn" / v-on:click="fn"). PascalCase children (<VPNav/>)
 // are already caught by JSX_TAG_RE via the SFC component node.
 const VUE_KEBAB_RE = /<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)[\s/>]/g;
+// PascalCase component tags — `<MediaCard ...>`, `<NavBar/>`. HTML elements are
+// lowercase, so an uppercase-initial tag is a component usage; built-ins
+// (`<NuxtLink>`, `<Transition>`) simply resolve to nothing and emit no edge.
+const VUE_PASCAL_RE = /<([A-Z][A-Za-z0-9]*)[\s/>]/g;
 const VUE_HANDLER_RE = /(?:@|v-on:)([a-zA-Z][\w-]*)(?:\.[\w]+)*\s*=\s*"([^"]+)"/g;
 // Composable/hook destructure: `const { close: closeSidebar } = useSidebarControl()`.
 // Captures the destructure body + the called composable; only `use*` calls qualify.
@@ -62,6 +68,30 @@ const CC_FANOUT_CAP = 8; // skip a field name with more dispatchers/registrars t
 
 function kebabToPascal(s: string): string {
   return s.split('-').map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join('');
+}
+
+/**
+ * Nuxt auto-import name for a component, derived from its path UNDER `components/`:
+ * `components/media/Card.vue` → `MediaCard`, `components/base/foo/Bar.vue` →
+ * `BaseFooBar`. Each directory segment and the filename is PascalCased and
+ * concatenated; a directory whose PascalCase name prefixes the next segment is
+ * collapsed (Nuxt's de-dup: `base/BaseButton.vue` → `BaseButton`, not
+ * `BaseBaseButton`). Returns null for a flat component (`components/NavBar.vue`)
+ * — its node is already named by basename, so a direct tag match finds it.
+ */
+function nuxtComponentName(filePath: string): string | null {
+  const marker = filePath.lastIndexOf('components/');
+  if (marker === -1) return null;
+  const rel = filePath.slice(marker + 'components/'.length).replace(/\.(vue|ts|tsx|js|jsx)$/i, '');
+  const segs = rel.split('/').filter(Boolean).map(kebabToPascal);
+  if (segs.length < 2) return null;
+  const out: string[] = [];
+  for (const s of segs) {
+    const prev = out[out.length - 1];
+    if (prev && s.startsWith(prev)) out[out.length - 1] = s;
+    else out.push(s);
+  }
+  return out.join('');
 }
 
 function sliceLines(content: string, startLine?: number, endLine?: number): string | null {
@@ -444,8 +474,202 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
 // and are added below; their concrete-side nodes can be a `struct` (Swift)
 // or an `object` (Scala) so the loop also iterates those kinds.
 const IFACE_OVERRIDE_LANGS = new Set([
-  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala',
+  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go', 'rust',
 ]);
+/**
+ * Go implicit interface satisfaction (#584). Go has no `implements` keyword — a
+ * struct satisfies an interface structurally when its method set covers the
+ * interface's. Synthesize the missing `implements` edge (struct → interface) by
+ * matching method-NAME sets, so impl-navigation works and the interface-dispatch
+ * bridge ({@link interfaceOverrideEdges}, now 'go'-enabled) can link an interface
+ * method call to the concrete overrides.
+ *
+ * Name-only matching (signatures ignored) — over-approximation accepted, in line
+ * with the other dispatch synthesizers; capped per interface. Empty interfaces
+ * (`any`) are skipped so they don't match every struct.
+ */
+function goImplementsEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  const methodNameSet = (id: string): Set<string> =>
+    new Set(
+      queries
+        .getOutgoingEdges(id, ['contains'])
+        .map((e) => queries.getNodeById(e.target))
+        .filter((n): n is Node => !!n && n.kind === 'method')
+        .map((n) => n.name),
+    );
+
+  const goStructs = queries.getNodesByKind('struct').filter((s) => s.language === 'go');
+  const structMethods = new Map<string, Set<string>>();
+  for (const s of goStructs) structMethods.set(s.id, methodNameSet(s.id));
+
+  for (const iface of queries.getNodesByKind('interface')) {
+    if (iface.language !== 'go') continue;
+    const want = methodNameSet(iface.id);
+    if (want.size === 0) continue; // empty interface (`any`) — would match everything
+    let added = 0;
+    for (const s of goStructs) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      const have = structMethods.get(s.id);
+      if (!have || have.size < want.size) continue;
+      let all = true;
+      for (const m of want) {
+        if (!have.has(m)) { all = false; break; }
+      }
+      if (!all) continue;
+      const key = `${s.id}>${iface.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: s.id,
+        target: iface.id,
+        kind: 'implements',
+        line: s.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'go-implements', via: iface.name, registeredAt: `${s.filePath}:${s.startLine}` },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
+/**
+ * Cross-file Go method → receiver-type `contains` edges. In Go a type's methods
+ * are commonly declared in a different file from the `type` declaration itself
+ * (`type User struct{…}` in `user.go`, `func (u *User) Save()` in
+ * `user_store.go`). Extraction attaches the struct→method `contains` edge only
+ * when the receiver type is in the SAME file — the owner lookup in
+ * `tree-sitter.ts` is scoped to the file being parsed — so a cross-file method
+ * is left orphaned from its type (it's still `contains`ed by its file, just not
+ * its struct). That breaks `codegraph_node` member outlines, any
+ * callers/callees/impact traversal that goes through the type's `contains`
+ * edges, and the {@link goImplementsEdges} method-set computation (which derives
+ * a struct's method set from those same edges, so it under-counts interfaces a
+ * cross-file struct satisfies).
+ *
+ * Go guarantees a method's receiver type is declared in the SAME PACKAGE as the
+ * method, and a Go package is a single directory — so this is a deterministic
+ * structural link, not a heuristic: find the same-named type in the method's own
+ * directory and add the missing `contains` edge (no `provenance: 'heuristic'`,
+ * matching the same-file edges extraction already emits). Skips methods that
+ * already have a type parent (the same-file case). (#583, cross-file half)
+ */
+function goCrossFileMethodContainsEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const TYPE_KINDS = new Set<NodeKind>(['struct', 'class', 'interface', 'enum', 'type_alias']);
+  const dirOf = (p: string): string => {
+    const i = p.replace(/\\/g, '/').lastIndexOf('/');
+    return i >= 0 ? p.slice(0, i) : '';
+  };
+
+  for (const method of queries.getNodesByKind('method')) {
+    if (method.language !== 'go') continue;
+    // The receiver type is encoded in the method's qualifiedName as `Recv::name`
+    // (extraction sets `${receiverType}::${name}` for receiver methods).
+    const qn = method.qualifiedName;
+    if (!qn) continue;
+    const sep = qn.lastIndexOf('::');
+    if (sep <= 0) continue;
+    const receiver = qn.slice(0, sep);
+    if (!receiver) continue;
+
+    // Already attached to its type (same-file case handled at extraction)?
+    const hasTypeParent = queries
+      .getIncomingEdges(method.id, ['contains'])
+      .some((e) => {
+        const src = queries.getNodeById(e.source);
+        return src != null && TYPE_KINDS.has(src.kind);
+      });
+    if (hasTypeParent) continue;
+
+    // Find the receiver type in the SAME directory (= same Go package). Go forbids
+    // duplicate type names within a package, so a same-name same-dir match is
+    // unambiguous; scoping to the directory avoids linking to a same-named type
+    // in another package.
+    const dir = dirOf(method.filePath);
+    const owner = queries
+      .getNodesByName(receiver)
+      .find((n) => n.language === 'go' && TYPE_KINDS.has(n.kind) && dirOf(n.filePath) === dir);
+    if (!owner) continue;
+
+    const key = `${owner.id}>${method.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edges.push({ source: owner.id, target: method.id, kind: 'contains', line: method.startLine });
+  }
+  return edges;
+}
+
+/**
+ * Kotlin Multiplatform `expect`/`actual` linking. A `common` source set declares
+ * `expect fun foo()` / `expect class Bar`; each platform source set (jvm, native,
+ * js, …) provides an `actual` implementation with the IDENTICAL fully-qualified
+ * name in a different file. Callers in common code resolve to the `expect`
+ * declaration, so every `actual` impl ends up with zero dependents — invisible to
+ * impact/affected even though editing it can break every caller of the API.
+ *
+ * Synthesize a `calls` edge from the common declaration to each platform `actual`
+ * (mirroring the interface-impl bridge: abstract → concrete), so editing a
+ * platform impl surfaces the common `expect` and its callers, and the impl file
+ * participates in the graph.
+ *
+ * `expect`/`actual` are captured onto the node's `decorators` list at extraction
+ * (kotlin.ts `extractModifiers`). Members of an `expect class` are NOT themselves
+ * keyword-marked, so the declaration side is matched as the same-FQN, same-kind
+ * node that is NOT marked `actual`. Requiring an `actual`-marked counterpart also
+ * gates out plain cross-file overloads (neither side is marked).
+ */
+// Kinds that an `expect`/`actual` pair may legitimately straddle. `expect class`
+// is routinely fulfilled by an `actual typealias` (e.g. `actual typealias
+// CancellationException = …`, `actual typealias SchedulerTask = Task`), so a
+// strict kind match would miss those one-line alias files. Same-FQN + the
+// `actual` marker already gates out unrelated symbols, so widening to the
+// type-like kinds is safe.
+const KMP_TYPE_KINDS = new Set(['class', 'interface', 'struct', 'enum', 'type_alias']);
+function kmpKindsCompatible(a: string, b: string): boolean {
+  return a === b || (KMP_TYPE_KINDS.has(a) && KMP_TYPE_KINDS.has(b));
+}
+
+function kotlinExpectActualEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const actuals = queries
+    .getAllNodes()
+    .filter((n) => n.language === 'kotlin' && !!n.decorators?.includes('actual'));
+  for (const act of actuals) {
+    let added = 0;
+    for (const cand of queries.getNodesByQualifiedNameExact(act.qualifiedName)) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      // The declaration side: same FQN + compatible kind, a different file, NOT
+      // itself an `actual` (that would be a sibling platform impl, not the decl).
+      if (cand.language !== 'kotlin' || cand.id === act.id) continue;
+      if (!kmpKindsCompatible(cand.kind, act.kind) || cand.filePath === act.filePath) continue;
+      if (cand.decorators?.includes('actual')) continue;
+      const key = `${cand.id}>${act.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: cand.id,
+        target: act.id,
+        kind: 'calls',
+        line: cand.startLine,
+        provenance: 'heuristic',
+        metadata: {
+          synthesizedBy: 'kotlin-expect-actual',
+          via: act.name,
+          registeredAt: `${act.filePath}:${act.startLine}`,
+        },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
 function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -675,6 +899,16 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
   // A composable's returned member may be a fn (`function close(){}`) or an
   // arrow assigned to a const (`const close = () => {}`).
   const RETURN_KINDS = new Set(['method', 'function', 'variable', 'constant']);
+  // Nuxt auto-imports nested components by a DIRECTORY-PREFIXED name —
+  // `components/media/Card.vue` is used as `<MediaCard/>`, not `<Card/>` — but
+  // the component node is named by basename (`Card`), so a direct tag match
+  // misses it (flat components match by basename and don't need this). Map each
+  // nested component's Nuxt name → node so those template usages resolve.
+  const nuxtComponents = new Map<string, Node>();
+  for (const c of ctx.getNodesByKind('component')) {
+    const nn = nuxtComponentName(c.filePath);
+    if (nn && !nuxtComponents.has(nn)) nuxtComponents.set(nn, c);
+  }
   for (const file of ctx.getAllFiles()) {
     if (!file.endsWith('.vue')) continue;
     const content = ctx.readFile(file);
@@ -716,7 +950,18 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
 
     let m: RegExpExecArray | null;
     VUE_KEBAB_RE.lastIndex = 0;
-    while ((m = VUE_KEBAB_RE.exec(tpl))) addEdge(resolve(kebabToPascal(m[1]!), COMPONENT_KINDS), { synthesizedBy: 'jsx-render', via: m[1] });
+    while ((m = VUE_KEBAB_RE.exec(tpl))) {
+      const tag = kebabToPascal(m[1]!);
+      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: m[1] });
+    }
+    // PascalCase component tags. Try a direct name match first (flat components
+    // and explicit registrations), then the Nuxt dir-prefixed auto-import name
+    // (`<MediaCard>` → components/media/Card.vue). Built-ins match neither → no edge.
+    VUE_PASCAL_RE.lastIndex = 0;
+    while ((m = VUE_PASCAL_RE.exec(tpl))) {
+      const tag = m[1]!;
+      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: tag });
+    }
     VUE_HANDLER_RE.lastIndex = 0;
     while ((m = VUE_HANDLER_RE.exec(tpl))) {
       const event = m[1]!;
@@ -780,6 +1025,14 @@ const RN_SWIFT_SEND_RE = /\bsendEvent\s*\(\s*withName\s*:\s*"([^"]+)"/g;
 // JVM source files in the consumer so we don't re-process JS emits
 // (which `eventEmitterEdges` already handles).
 const RN_JVM_EMIT_RE = /\.emit\s*\(\s*"([^"]+)"\s*,/g;
+// Custom `sendEvent(reactContext, "X", body)` wrapper — extremely common
+// (react-native-device-info and many libs wrap `DeviceEventManagerModule…emit`
+// behind a helper whose `.emit(eventName, …)` uses a VARIABLE, so RN_JVM_EMIT_RE
+// misses it; the literal lives in the wrapper CALL instead). Captures the first
+// string literal inside a `sendEvent(...)` call. `[^;{}]*?` keeps it on one
+// statement and stops at a block boundary, so the wrapper DEFINITION (whose `(`
+// is followed by `… ) {`) never matches. Multi-line tolerant. (java/kotlin/swift)
+const RN_NATIVE_SENDEVENT_RE = /\bsendEvent\s*\([^;{}]*?"([^"]+)"/g;
 
 function rnEventEdges(ctx: ResolutionContext): Edge[] {
   // Native dispatchers (source = the native method whose body sends the
@@ -819,15 +1072,24 @@ function rnEventEdges(ctx: ResolutionContext): Edge[] {
       while ((m = RN_SWIFT_SEND_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
       }
+      RN_NATIVE_SENDEVENT_RE.lastIndex = 0;
+      while ((m = RN_NATIVE_SENDEVENT_RE.exec(content))) {
+        if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
     }
 
-    // JVM side: `.emit("X", …)` in Java/Kotlin. (We pattern-match
-    // anywhere in the file; the JS in-language path uses a separate
-    // emitter object pattern and is already handled by eventEmitterEdges.)
+    // JVM side: `.emit("X", …)` in Java/Kotlin, plus the common
+    // `sendEvent(ctx, "X", body)` wrapper. (We pattern-match anywhere in the
+    // file; the JS in-language path uses a separate emitter object pattern and
+    // is already handled by eventEmitterEdges.)
     if (file.endsWith('.java') || file.endsWith('.kt')) {
-      RN_JVM_EMIT_RE.lastIndex = 0;
       let m: RegExpExecArray | null;
+      RN_JVM_EMIT_RE.lastIndex = 0;
       while ((m = RN_JVM_EMIT_RE.exec(content))) {
+        if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
+      RN_NATIVE_SENDEVENT_RE.lastIndex = 0;
+      while ((m = RN_NATIVE_SENDEVENT_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
       }
     }
@@ -950,6 +1212,130 @@ function rnEventEdges(ctx: ResolutionContext): Edge[] {
  * conflict otherwise).
  */
 const FABRIC_NATIVE_SUFFIXES = ['', 'View', 'ViewManager', 'ComponentView', 'Manager'];
+
+/**
+ * Expo Modules cross-platform pairing. An Expo Module exposes the SAME
+ * JS-visible method (`AsyncFunction("getBatteryLevelAsync")`) from BOTH an iOS
+ * (Swift) and an Android (Kotlin) implementation. A JS callsite name-resolves to
+ * only ONE of them, so the other platform's impl looked like nothing called it
+ * (and editing it showed no blast radius). Link the iOS and Android impls of the
+ * same `<module>.<method>` to each other (both directions), so a JS call that
+ * reaches one platform reaches the other, and editing either surfaces the JS
+ * caller. The Expo method nodes are id-prefixed `expo-module:` and qualified
+ * `<file>::<module>.<method>` by the framework extractor.
+ */
+function expoCrossPlatformEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const byKey = new Map<string, Node[]>();
+  for (const m of queries.getNodesByKind('method')) {
+    if (!m.id.startsWith('expo-module:')) continue;
+    const key = m.qualifiedName.split('::').pop(); // `<module>.<method>`
+    if (!key) continue;
+    const arr = byKey.get(key);
+    if (arr) arr.push(m);
+    else byKey.set(key, [m]);
+  }
+  for (const group of byKey.values()) {
+    if (group.length < 2) continue;
+    for (const a of group) {
+      for (const b of group) {
+        if (a.id === b.id || a.language === b.language) continue; // cross-platform only
+        const key = `${a.id}>${b.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: a.id,
+          target: b.id,
+          kind: 'calls',
+          line: a.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'expo-cross-platform', via: a.name },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
+/**
+ * Classic React Native NativeModules cross-platform pairing. A native module
+ * method (`@ReactMethod` on Android, `RCT_EXPORT_METHOD` on iOS) is implemented
+ * on BOTH platforms, but a JS callsite name-resolves to only ONE — so the other
+ * platform's impl looked like nothing called it. A native method that HAS a JS
+ * caller is a confirmed bridge method; link it to the same-named native method
+ * in another language (the other platform's impl) so a JS call reaching one
+ * platform reaches the other, and editing either surfaces the JS caller.
+ *
+ * Names are normalized to the first selector keyword (`getFreeDiskStorage:` →
+ * `getFreeDiskStorage`) — that's the JS-visible name, and how the iOS selector
+ * lines up with the bare Android method name.
+ */
+function rnCrossPlatformEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const NATIVE = new Set(['java', 'kotlin', 'objc', 'cpp']);
+  const JS = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
+  // RN module INFRASTRUCTURE methods exist on every native module (called by the
+  // RN runtime, not user JS), so pairing them by name would cross-link unrelated
+  // modules in a multi-module repo. Skip them — they aren't user-facing methods.
+  const RN_INFRA = new Set([
+    'addListener', 'removeListeners', 'getConstants', 'constantsToExport', 'getName',
+    'invalidate', 'initialize', 'getDefaultEventTypes', 'supportedEvents',
+    'requiresMainQueueSetup', 'methodQueue',
+  ]);
+  const norm = (name: string): string => {
+    const i = name.indexOf(':');
+    return i >= 0 ? name.slice(0, i) : name;
+  };
+
+  // Index native methods by their JS-visible (normalized) name. Only names with
+  // impls in ≥2 native languages can pair, so the per-method JS-caller check
+  // below only runs for genuine cross-platform candidates.
+  const byName = new Map<string, Node[]>();
+  for (const m of queries.iterateNodesByKind('method')) {
+    if (!NATIVE.has(m.language)) continue;
+    const key = norm(m.name);
+    const arr = byName.get(key);
+    if (arr) arr.push(m);
+    else byName.set(key, [m]);
+  }
+
+  for (const [groupName, group] of byName) {
+    if (RN_INFRA.has(groupName)) continue;
+    const langs = new Set(group.map((m) => m.language));
+    if (langs.size < 2) continue; // single-platform — nothing to pair
+    for (const m of group) {
+      // Is m a bridge method? (a JS-language `calls` edge points at it)
+      const incoming = queries.getIncomingEdges(m.id, ['calls']);
+      if (incoming.length === 0) continue;
+      const sources = queries.getNodesByIds(incoming.map((e) => e.source));
+      const isBridge = incoming.some((e) => {
+        const s = sources.get(e.source);
+        return !!s && JS.has(s.language);
+      });
+      if (!isBridge) continue;
+      // Link to the other-platform impls (both directions).
+      for (const sib of group) {
+        if (sib.id === m.id || sib.language === m.language) continue;
+        for (const [a, b] of [[m, sib], [sib, m]] as const) {
+          const key = `${a.id}>${b.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: a.id,
+            target: b.id,
+            kind: 'calls',
+            line: a.startLine,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'rn-cross-platform', via: norm(m.name) },
+          });
+        }
+      }
+    }
+  }
+  return edges;
+}
 
 function fabricNativeImplEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
@@ -1184,26 +1570,1141 @@ function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext):
 }
 
 /**
+ * Delphi form code-behind: a form unit `UFRMAbout.pas` owns its visual form
+ * definition `UFRMAbout.dfm` (VCL) / `.fmx` (FireMonkey) — paired by basename in
+ * the same directory, wired by the `{$R *.dfm}` directive rather than a `uses`
+ * clause. Link the unit → its form so a `.dfm`/`.fmx` used only as a form
+ * definition isn't orphaned, and editing the form surfaces its code-behind unit.
+ */
+function pascalFormEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const allFiles = new Set(ctx.getAllFiles());
+  for (const file of allFiles) {
+    if (!/\.(dfm|fmx)$/i.test(file)) continue;
+    const pasFile = file.replace(/\.(dfm|fmx)$/i, '.pas');
+    if (!allFiles.has(pasFile)) continue;
+    const formNode = ctx.getNodesInFile(file).find((n) => n.kind === 'file');
+    const unitNode = ctx.getNodesInFile(pasFile).find((n) => n.kind === 'file');
+    if (!formNode || !unitNode) continue;
+    edges.push({
+      source: unitNode.id,
+      target: formNode.id,
+      kind: 'references',
+      line: unitNode.startLine,
+      provenance: 'heuristic',
+      metadata: { synthesizedBy: 'pascal-form', registeredAt: pasFile },
+    });
+  }
+  return edges;
+}
+
+/**
+ * SvelteKit file-convention data flow. A route directory's `+page.svelte` (a
+ * `component` node) receives its `data` from the sibling `+page.server.{ts,js}`
+ * / `+page.{ts,js}` `load` function and posts forms to its `actions` — wired by
+ * the framework BY FILE PATH, with no static import between them. So editing a
+ * `load` shows no impact on the page it feeds, and the page looks like it has no
+ * server-side dependency. Link the page component to its sibling loader's
+ * `load` / `actions` (same for `+layout`). The pairing is path-deterministic
+ * (same directory, matching `+page`/`+layout` prefix), so it's precise — but
+ * it's a framework-convention edge, so provenance stays `heuristic`.
+ *
+ * Direction: page → load, so `getImpactRadius(load)` surfaces the page (editing
+ * a loader's data shows the page it feeds) and the page's dependencies include
+ * its loader.
+ */
+function svelteKitLoadEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const allFiles = new Set(ctx.getAllFiles());
+  const HOOKS = new Set(['load', 'actions']);
+  const HOOK_KINDS = new Set(['function', 'method', 'constant', 'variable']);
+  for (const file of allFiles) {
+    const m = file.match(/(.*\/)(\+(?:page|layout))\.svelte$/);
+    if (!m) continue;
+    const dir = m[1]!;
+    const prefix = m[2]!;
+    const page = ctx.getNodesInFile(file).find((n) => n.kind === 'component');
+    if (!page) continue;
+    for (const ext of ['.server.ts', '.server.js', '.ts', '.js']) {
+      const loaderFile = `${dir}${prefix}${ext}`;
+      if (!allFiles.has(loaderFile)) continue;
+      for (const hook of ctx.getNodesInFile(loaderFile)) {
+        if (!HOOK_KINDS.has(hook.kind) || !HOOKS.has(hook.name)) continue;
+        edges.push({
+          source: page.id,
+          target: hook.id,
+          kind: 'references',
+          line: page.startLine,
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'sveltekit-load',
+            via: hook.name,
+            registeredAt: `${loaderFile}:${hook.startLine ?? 0}`,
+          },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
+/**
+ * Redux-thunk dispatch chain. `export const X = createAsyncThunk(prefix, async (a, api) => {...})`
+ * (or a wrapper like trezor's `createThunk(...)`) passes the async body as an ARGUMENT, so
+ * tree-sitter never extracts it as a function node: `X` is a `constant` whose body's calls are
+ * ORPHANED. The `dispatch(nextThunk(...))` calls that drive a thunk chain forward therefore produce
+ * no edges, so `callees(X)` is empty and a flow `dispatch(X(...)) → X → nextThunk` dead-ends at the
+ * constant (validated on trezor-suite: the signXxxThunk constants had ZERO outgoing edges). Bridge
+ * it: body-scan each thunk constant for `dispatch(Y(...))` and link `X → Y`, so the dispatch chain
+ * connects. High-precision — the `dispatch(` keyword plus `Y` must resolve to a function/constant/
+ * method node; capped; gated on thunk constants existing so it never runs on non-RTK repos.
+ * Cross-file by design (a suite thunk dispatches a wallet-core thunk). Provenance `heuristic`,
+ * `synthesizedBy:'redux-thunk'`; `registeredAt` is the dispatch site.
+ */
+const THUNK_DECL_RE = /create(?:Async)?Thunk/;
+const THUNK_DISPATCH_RE = /\bdispatch\s*\(\s*([A-Za-z_]\w*)\s*[(),]/g;
+const THUNK_FANOUT_CAP = 24;
+
+function reduxThunkEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const node of queries.iterateNodesByKind('constant')) {
+    // Cheap gate: the initializer (captured in `signature`) must be a create(Async)Thunk call —
+    // avoids reading every constant's body on a large repo.
+    if (!node.signature || !THUNK_DECL_RE.test(node.signature)) continue;
+    const content = ctx.readFile(node.filePath);
+    const src = content && sliceLines(content, node.startLine, node.endLine);
+    if (!src) continue;
+    // Thunks are TS/JS-family (same // and /* */ comment syntax); map to a CommentLang.
+    const safe = stripCommentsForRegex(src, node.language === 'javascript' || node.language === 'jsx' ? 'javascript' : 'typescript');
+    THUNK_DISPATCH_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    let added = 0;
+    while ((m = THUNK_DISPATCH_RE.exec(safe)) && added < THUNK_FANOUT_CAP) {
+      const name = m[1]!;
+      if (name === node.name) continue; // self-dispatch (recursive thunk) — skip
+      // Resolve the dispatched name, PREFERRING the thunk/action-creator over a same-named
+      // service function. `dispatch(X(...))` dispatches a thunk or an action-creator (both
+      // `constant`s) — never an unrelated helper that merely shares the name. On octo-call,
+      // `leaveCall` is BOTH a `createAsyncThunk` const AND a service function, and the bare
+      // `.find()` picked the function (wrong). Order: thunk const > other const > same-file
+      // callable > first match. A single candidate (no collision) is unaffected.
+      const cands = ctx
+        .getNodesByName(name)
+        .filter((n) => n.kind === 'constant' || n.kind === 'function' || n.kind === 'method');
+      const target =
+        cands.find((n) => !!n.signature && THUNK_DECL_RE.test(n.signature)) ??
+        cands.find((n) => n.kind === 'constant') ??
+        cands.find((n) => n.filePath === node.filePath) ??
+        cands[0];
+      if (!target || target.id === node.id) continue;
+      const key = `${node.id}>${target.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const line = node.startLine + safe.slice(0, m.index).split('\n').length - 1;
+      edges.push({
+        source: node.id,
+        target: target.id,
+        kind: 'calls',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'redux-thunk', via: name, registeredAt: `${node.filePath}:${line}` },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
+// ── Object-literal registry dispatch ─────────────────────────────────────────
+// A command/handler registry maps string keys → handler class/function symbols in an
+// object literal, then dispatches by a RUNTIME key static parsing can't follow:
+//   this.commands = { [Cmd.ADD]: AddObjectCommand, ... }    // registration
+//   new this.commands[command](args).execute()              // dynamic dispatch
+// Bridge it like gin-middleware-chain: link each dispatching function → each registered
+// handler's callable entry (a class's execute/run/handle/… method — preferring the method
+// chained at the dispatch site — or the function value). Scoped to a registry + dispatch in
+// the SAME file (the cross-file barrel-namespace variant, e.g. trezor's getMethod, is
+// deferred). Gated on a real object literal with ≥2 entries that RESOLVE to callables (a
+// `{ width: 5 }` literal resolves to nothing → no edges); fan-out capped.
+const REGISTRY_ASSIGN_RE = /(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)|((?:this\.)?[A-Za-z_$][\w$]*))\s*=\s*\{/g;
+const REGISTRY_DISPATCH_RE = /(?:\bnew\s+)?((?:this\.)?[A-Za-z_$][\w$]*)\s*\[\s*([A-Za-z_$][\w$.]*)\s*\]\s*(?:\(|\.[A-Za-z_$])/g;
+const REGISTRY_MIN_ENTRIES = 2;
+const REGISTRY_FANOUT_CAP = 40;
+const REGISTRY_CLASS_ENTRY = new Set(['execute', 'run', 'handle', 'perform', 'process', 'call', 'apply', 'dispatch']);
+const REGISTRY_JS_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs)$/;
+
+/** From the index of an opening `{`, return the brace-balanced body up to its matching `}`. */
+function braceBody(src: string, openIdx: number): string | null {
+  let depth = 0;
+  for (let i = openIdx; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}' && --depth === 0) return src.slice(openIdx + 1, i);
+  }
+  return null;
+}
+
+/** Top-level `key: Identifier` entries of an object-literal body. DEPTH-AWARE: only depth-0
+ *  segments are considered, so method-shorthand bodies (`number(a,b){…}`), arrow values
+ *  (`x: () => …`), and nested objects (`x: { … }`) don't leak their inner `k: v` pairs as
+ *  bogus handlers. The per-segment anchor (`^… key: Ident …$`) keeps only pure identifier
+ *  values — a data value (`x: 5`), call, or arrow fails to match. */
+function registryEntryNames(body: string): string[] {
+  const segs: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === '{' || c === '(' || c === '[') depth++;
+    else if (c === '}' || c === ')' || c === ']') depth--;
+    else if (c === ',' && depth === 0) { segs.push(body.slice(start, i)); start = i + 1; }
+  }
+  segs.push(body.slice(start));
+  const names: string[] = [];
+  for (const seg of segs) {
+    const m = /^\s*(?:\[[^\]]+\]|['"]?[\w$]+['"]?)\s*:\s*([A-Za-z_$][\w$]*)\s*$/.exec(seg);
+    if (m && m[1]!.length >= 3 && !names.includes(m[1]!)) names.push(m[1]!);
+  }
+  return names;
+}
+
+/** Resolve a registered handler name to its callable entry: a function value, or a class's
+ *  `execute`-like method (preferring the method chained at the dispatch site), else the class. */
+function resolveRegistryHandler(ctx: ResolutionContext, name: string, chained: string | null): Node | null {
+  const cands = ctx.getNodesByName(name);
+  const fn = cands.find((n) => n.kind === 'function');
+  if (fn) return fn;
+  const cls = cands.find((n) => n.kind === 'class' || n.kind === 'struct');
+  if (cls) {
+    const methods = ctx
+      .getNodesInFile(cls.filePath)
+      .filter((n) => n.kind === 'method' && n.startLine >= cls.startLine && n.startLine <= (cls.endLine ?? cls.startLine));
+    const want = chained && REGISTRY_CLASS_ENTRY.has(chained) ? chained : null;
+    const entry =
+      (want && methods.find((m) => m.name === want)) ||
+      methods.find((m) => REGISTRY_CLASS_ENTRY.has(m.name)) ||
+      methods.find((m) => m.name === 'constructor');
+    return entry ?? cls;
+  }
+  // Require a CALLABLE target — a registry dispatched as `reg[k](…)` invokes a function/
+  // method, never a data `constant` (dropping it removes false positives like a `{ x: URL }`
+  // entry resolving to the global URL constant).
+  return cands.find((n) => n.kind === 'method') ?? null;
+}
+
+function objectRegistryEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!REGISTRY_JS_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    // Cheap pre-filter: a computed member access BY NAME (`ident[ident`) — the dispatch shape.
+    if (!content || !/[\w$]\s*\[\s*[A-Za-z_$]/.test(content)) continue;
+    // Skip minified/generated bundles (draco, three.min, base64…): their pervasive `h[x](...)`
+    // calls + single-letter `{a:b}` literals are a false-positive minefield. Average line
+    // length is the reliable tell — real source ~30–80, minified in the hundreds/thousands.
+    const newlines = (content.match(/\n/g)?.length ?? 0) + 1;
+    if (content.length / newlines > 200) continue;
+    const safe = stripCommentsForRegex(content, /\.(?:jsx?|mjs|cjs)$/.test(file) ? 'javascript' : 'typescript');
+
+    // 1. Dispatch sites: `(new )?<ref>[<ident-key>]` followed by a call or a chained method.
+    //    A quoted-string key (`['save']`) does NOT match — that's a static access, not dispatch.
+    REGISTRY_DISPATCH_RE.lastIndex = 0;
+    const dispatches: Array<{ ref: string; line: number; chained: string | null }> = [];
+    let dm: RegExpExecArray | null;
+    while ((dm = REGISTRY_DISPATCH_RE.exec(safe))) {
+      const win = safe.slice(dm.index, dm.index + 160);
+      const cm = /\]\s*\([^)]*\)\s*\.\s*([A-Za-z_$][\w$]*)/.exec(win) || /\]\s*\.\s*([A-Za-z_$][\w$]*)/.exec(win);
+      dispatches.push({ ref: dm[1]!, line: safe.slice(0, dm.index).split('\n').length, chained: cm ? cm[1]! : null });
+    }
+    if (!dispatches.length) continue;
+    // Normalize a leading `this.` so a class FIELD-INITIALIZER registry (`commands = {…}`)
+    // matches a `this.commands[k]` dispatch, not just the constructor form `this.commands = {…}`.
+    const norm = (r: string) => r.replace(/^this\./, '');
+    const refs = new Set(dispatches.map((d) => norm(d.ref)));
+
+    // 2. Registries: an object literal assigned to a dispatched ref, ≥2 entries resolving to callables.
+    REGISTRY_ASSIGN_RE.lastIndex = 0;
+    const registries = new Map<string, { names: string[]; line: number }>();
+    let am: RegExpExecArray | null;
+    while ((am = REGISTRY_ASSIGN_RE.exec(safe))) {
+      const lhs = norm(am[1] ?? am[2]!);
+      if (!refs.has(lhs) || registries.has(lhs)) continue;
+      const body = braceBody(safe, am.index + am[0].length - 1);
+      if (!body) continue;
+      const names = registryEntryNames(body); // depth-0 `key: Identifier` entries only
+      if (names.length >= REGISTRY_MIN_ENTRIES) {
+        registries.set(lhs, { names, line: safe.slice(0, am.index).split('\n').length });
+      }
+    }
+    if (!registries.size) continue;
+
+    // 3. Link each dispatcher → each registered handler's callable entry.
+    const nodesInFile = ctx.getNodesInFile(file);
+    for (const d of dispatches) {
+      const reg = registries.get(norm(d.ref));
+      if (!reg) continue;
+      const disp = enclosingFn(nodesInFile, d.line);
+      if (!disp) continue;
+      let added = 0;
+      for (const name of reg.names) {
+        if (added >= REGISTRY_FANOUT_CAP) break;
+        const target = resolveRegistryHandler(ctx, name, d.chained);
+        if (!target || target.id === disp.id) continue;
+        const key = `${disp.id}>${target.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: disp.id,
+          target: target.id,
+          kind: 'calls',
+          line: d.line,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'object-registry', via: name, registeredAt: `${file}:${reg.line}` },
+        });
+        added++;
+      }
+    }
+  }
+  return edges;
+}
+
+// ── RTK Query generated-hook → endpoint ──────────────────────────────────────
+// RTK Query generates one `useGetXQuery`/`useUpdateYMutation` hook per endpoint
+// (`createApi({ endpoints: b => ({ getX: b.query(...) }) })`). Components call the
+// hook; the fetch logic lives in the endpoint's queryFn. The hook↔endpoint link is
+// pure NAMING CONVENTION (no static edge): strip `use` + the optional `Lazy`
+// variant + the `Query|Mutation` suffix, lowercase the head → the endpoint key.
+// Both are extracted as function nodes (the hook from its `export const {…}=api`
+// binding, carrying a sentinel signature; the endpoint from the createApi object),
+// so bridging hook→endpoint connects `component → useGetXQuery → getX → queryFn`.
+// Gated on the extraction sentinel so it only ever fires on genuinely-generated
+// hooks (never a hand-written `useFooQuery`), and on a SAME-FILE endpoint (RTK
+// colocates the hooks and their api in one module) — 0 on any non-RTK repo.
+const RTK_HOOK_DERIVE_RE = /^use([A-Z][A-Za-z0-9]*?)(?:Query|Mutation)$/;
+// MUST match the signature set in tree-sitter.ts `extractRtkHookBindings`.
+const RTK_GENERATED_HOOK_SIGNATURE = '= RTK Query generated hook';
+
+/** Derive the endpoint key from a generated-hook name (`useLazyGetRecordsQuery`
+ *  → `getRecords`), or null if it doesn't fit the convention. */
+function rtkEndpointNameFromHook(hook: string): string | null {
+  const m = RTK_HOOK_DERIVE_RE.exec(hook);
+  if (!m) return null;
+  let mid = m[1]!;
+  if (mid.startsWith('Lazy')) mid = mid.slice(4); // useLazyGetX → getX (same endpoint)
+  if (!mid) return null;
+  return mid.charAt(0).toLowerCase() + mid.slice(1);
+}
+
+function rtkQueryEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const hook of queries.iterateNodesByKind('function')) {
+    // Only our extracted generated-hook bindings (sentinel) — not a real hook fn.
+    if (hook.signature !== RTK_GENERATED_HOOK_SIGNATURE) continue;
+    const endpointName = rtkEndpointNameFromHook(hook.name);
+    if (!endpointName) continue;
+    // The endpoint is a same-file function by the derived name (RTK colocates the
+    // api definition and its generated-hook exports in one module).
+    const target = ctx
+      .getNodesByName(endpointName)
+      .find((n) => n.kind === 'function' && n.filePath === hook.filePath);
+    if (!target || target.id === hook.id) continue;
+    const key = `${hook.id}>${target.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edges.push({
+      source: hook.id,
+      target: target.id,
+      kind: 'calls',
+      line: hook.startLine,
+      provenance: 'heuristic',
+      metadata: { synthesizedBy: 'rtk-query', via: endpointName, registeredAt: `${hook.filePath}:${hook.startLine}` },
+    });
+  }
+  return edges;
+}
+
+// ── Pinia useStore().action() dispatch bridge ────────────────────────────────
+// A Pinia store factory `export const useXStore = defineStore(...)` exposes its
+// actions as methods on the store instance; a consumer does `const s = useXStore()`
+// then `s.action()`. The call is a method-on-instance with no static edge to the
+// action (which lives in the store's module). Bridge it: map each factory → its
+// file, bind `const <var> = useXStore()` per consumer file, and link the enclosing
+// function → the `<var>.method()` action node IN THE STORE'S FILE. The same-store-
+// file gate keeps it precise (a Pinia built-in like `$patch` or an unrelated
+// same-named method resolves to nothing). Covers both the options and setup store
+// forms uniformly (the action is a function node in the store file either way).
+const PINIA_CONSUMER_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|vue)$/;
+const PINIA_FACTORY_RE = /\b(?:export\s+)?const\s+(\w+)\s*=\s*defineStore\s*\(/g;
+const PINIA_BIND_RE = /\bconst\s+(\w+)\s*=\s*(?:await\s+)?(\w+)\s*\(/g;
+const PINIA_CALL_RE = /(\w+)\s*\.\s*(\w+)\s*\(/g;
+const PINIA_FANOUT_CAP = 80;
+
+function piniaStoreEdges(ctx: ResolutionContext): Edge[] {
+  // 1. Map each `const useXStore = defineStore(...)` factory → its store file.
+  const factoryFile = new Map<string, string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!PINIA_CONSUMER_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || !content.includes('defineStore')) continue;
+    PINIA_FACTORY_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = PINIA_FACTORY_RE.exec(content))) factoryFile.set(m[1]!, file);
+  }
+  if (!factoryFile.size) return [];
+
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!PINIA_CONSUMER_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || !content.includes('Store')) continue;
+    const safe = stripCommentsForRegex(content, /\.(?:jsx?|mjs|cjs)$/.test(file) ? 'javascript' : 'typescript');
+
+    // 2. Bind store vars in this file: `const <var> = <known-factory>(...)`.
+    const varStore = new Map<string, string>();
+    PINIA_BIND_RE.lastIndex = 0;
+    let bm: RegExpExecArray | null;
+    while ((bm = PINIA_BIND_RE.exec(safe))) {
+      const sf = factoryFile.get(bm[2]!);
+      if (sf) varStore.set(bm[1]!, sf);
+    }
+    if (!varStore.size) continue;
+
+    // 3. Link `<var>.<method>(` → the action function node in the store's file.
+    const nodesInFile = ctx.getNodesInFile(file);
+    const fallbackDispatcher = nodesInFile.find((n) => n.kind === 'component'); // .vue top-level setup
+    PINIA_CALL_RE.lastIndex = 0;
+    let cm: RegExpExecArray | null;
+    let added = 0;
+    while ((cm = PINIA_CALL_RE.exec(safe)) && added < PINIA_FANOUT_CAP) {
+      const storeFile = varStore.get(cm[1]!);
+      if (!storeFile) continue;
+      const method = cm[2]!;
+      const line = safe.slice(0, cm.index).split('\n').length;
+      const disp = enclosingFn(nodesInFile, line) ?? fallbackDispatcher;
+      if (!disp) continue;
+      const target = ctx
+        .getNodesByName(method)
+        .find((n) => n.kind === 'function' && n.filePath === storeFile);
+      if (!target || target.id === disp.id) continue;
+      const key = `${disp.id}>${target.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: disp.id,
+        target: target.id,
+        kind: 'calls',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'pinia-store', via: method, registeredAt: `${file}:${line}` },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
+// ── Vuex string-keyed dispatch / commit bridge ───────────────────────────────
+// Vuex dispatches actions/mutations by a runtime STRING key: `dispatch('user/login')`
+// / `commit('SET_TOKEN')` / `this.$store.dispatch('app/toggleDevice')`. The action
+// & mutation definitions are object-literal methods in store module files (now
+// extracted as function nodes). Bridge the string key to its node: the LAST `/`
+// segment is the action/mutation name; the preceding segment is the namespace
+// (≈ the store module's file). Resolve the name to a function node IN A STORE FILE
+// (the store-file gate excludes a same-named `api/` helper — `getInfo`/`login`
+// commonly collide), disambiguated by the namespace appearing in the path (or, for
+// a root key, the same file — Vuex's local-module `commit('M')` inside an action).
+const VUEX_DISPATCH_RE = /\b(?:dispatch|commit)\s*\(\s*['"]([A-Za-z][\w/]*)['"]/g;
+const VUEX_STORE_SIGNAL = /\bdefineStore\b|\bcreateStore\b|\bVuex\b|\bmutations\b|\bactions\b|\bgetters\b|\bnamespaced\b/g;
+const VUEX_FANOUT_CAP = 120;
+
+/** A path segment (dir or filename stem) equals `seg` — `…/modules/user.js` has
+ *  the segment `user` for namespace `user`. */
+function pathHasSegment(filePath: string, seg: string): boolean {
+  return new RegExp('[\\\\/]' + seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[\\\\/.]').test(filePath);
+}
+
+function vuexDispatchEdges(ctx: ResolutionContext): Edge[] {
+  const storeFileCache = new Map<string, boolean>();
+  const isStoreFile = (file: string): boolean => {
+    let v = storeFileCache.get(file);
+    if (v === undefined) {
+      const c = ctx.readFile(file);
+      const seen = new Set<string>();
+      if (c) {
+        VUEX_STORE_SIGNAL.lastIndex = 0;
+        let sm: RegExpExecArray | null;
+        while ((sm = VUEX_STORE_SIGNAL.exec(c))) { seen.add(sm[0]); if (seen.size >= 2) break; }
+      }
+      v = seen.size >= 2;
+      storeFileCache.set(file, v);
+    }
+    return v;
+  };
+
+  const resolve = (key: string, dispatchFile: string): Node | null => {
+    const segs = key.split('/');
+    const action = segs[segs.length - 1]!;
+    const cands = ctx.getNodesByName(action).filter((n) => n.kind === 'function' && isStoreFile(n.filePath));
+    if (!cands.length) return null;
+    if (segs.length > 1) {
+      const mod = segs[segs.length - 2]!; // immediate namespace ≈ the module file
+      return cands.find((c) => pathHasSegment(c.filePath, mod)) ?? (cands.length === 1 ? cands[0]! : null);
+    }
+    // Root key: a local `commit('M')` inside an action targets the same module file;
+    // otherwise accept only an unambiguous single store-wide match.
+    return cands.find((c) => c.filePath === dispatchFile) ?? (cands.length === 1 ? cands[0]! : null);
+  };
+
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!PINIA_CONSUMER_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || (!content.includes('dispatch(') && !content.includes('commit('))) continue;
+    const safe = stripCommentsForRegex(content, /\.(?:jsx?|mjs|cjs)$/.test(file) ? 'javascript' : 'typescript');
+    const nodesInFile = ctx.getNodesInFile(file);
+    const fallback = nodesInFile.find((n) => n.kind === 'component'); // .vue top-level
+    VUEX_DISPATCH_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    let added = 0;
+    while ((m = VUEX_DISPATCH_RE.exec(safe)) && added < VUEX_FANOUT_CAP) {
+      const key = m[1]!;
+      const line = safe.slice(0, m.index).split('\n').length;
+      const disp = enclosingFn(nodesInFile, line) ?? fallback;
+      if (!disp) continue;
+      const target = resolve(key, file);
+      if (!target || target.id === disp.id) continue;
+      const edgeKey = `${disp.id}>${target.id}`;
+      if (seen.has(edgeKey)) continue;
+      seen.add(edgeKey);
+      edges.push({
+        source: disp.id,
+        target: target.id,
+        kind: 'calls',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'vuex-dispatch', via: key, registeredAt: `${file}:${line}` },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
+// ── Celery task dispatch (Python) ─────────────────────────────────────────────
+// Celery decouples a task's call site from its body through async dispatch:
+//   # tasks.py
+//   @shared_task                       # also @app.task / @celery_app.task / @<app>.task / @task
+//   def process(account_ids): ...
+//   # views.py — a DIFFERENT module
+//   process.apply_async(kwargs={...})  # or process.delay(...) — dynamic, no static edge
+// Bridge it: link the enclosing function/method at each `.delay(`/`.apply_async(` site → the
+// task function body. Precision rests on the DECORATOR gate — the dispatched name must resolve
+// to a Python function carrying a celery task decorator (read from the source lines above its
+// `def`, since the def's own startLine excludes the decorator). A `.delay()` on a non-task
+// object resolves to no task node → no edge, so a Celery-free repo yields 0. Same-file /
+// unique-candidate disambiguation like vuex. (Canvas forms — `group(t).delay()`, `t.s()`/`.si()`
+// — have no single identifier before `.delay`/`.apply_async`, so they're skipped, not mis-bridged.)
+const CELERY_DISPATCH_RE = /\b([A-Za-z_]\w*)\s*\.\s*(?:delay|apply_async)\s*\(/g;
+// A task decorator: bare `@shared_task`/`@task` or attribute `@app.task`/`@celery_app.task`,
+// each optionally called with args. `\b`-bounded and `@`-anchored so `@mytask`, or a symbol
+// merely named `task`, can't match. No `/g`, so `.test()` is stateless across reuse.
+const CELERY_TASK_DECORATOR_RE = /@\s*(?:[A-Za-z_][\w.]*\.)?(?:shared_task|task)\b/;
+const CELERY_PY_EXT = /\.py$/;
+const CELERY_FANOUT_CAP = 80;
+const CELERY_DECORATOR_LOOKBACK = 12; // max lines above a `def` to scan for its decorators
+
+function celeryDispatchEdges(ctx: ResolutionContext): Edge[] {
+  // Memoize the decorator check per task-candidate node: it reads the file and scans a few
+  // lines above the def. Only called on names that are actually `.delay`/`.apply_async`
+  // receivers, so the candidate set stays small.
+  const taskCache = new Map<string, boolean>();
+  const isCeleryTask = (node: Node): boolean => {
+    let v = taskCache.get(node.id);
+    if (v !== undefined) return v;
+    v = false;
+    if (node.kind === 'function' && CELERY_PY_EXT.test(node.filePath)) {
+      const content = ctx.readFile(node.filePath);
+      if (content) {
+        const lines = content.split('\n');
+        // startLine is the `def` line (decorators sit ABOVE it). Walk upward, stopping at the
+        // previous declaration so a non-task def can never inherit the prior def's decorator.
+        const stop = Math.max(0, node.startLine - 1 - CELERY_DECORATOR_LOOKBACK);
+        for (let i = node.startLine - 2; i >= stop; i--) {
+          const t = (lines[i] ?? '').trim();
+          if (/^(?:async\s+def|def|class)\b/.test(t)) break; // previous decl → stop
+          if (CELERY_TASK_DECORATOR_RE.test(t)) { v = true; break; }
+        }
+      }
+    }
+    taskCache.set(node.id, v);
+    return v;
+  };
+
+  const resolve = (name: string, dispatchFile: string): Node | null => {
+    const cands = ctx.getNodesByName(name).filter((n) => n.kind === 'function' && isCeleryTask(n));
+    if (!cands.length) return null;
+    if (cands.length === 1) return cands[0]!;
+    // Cross-module name collision: prefer a task defined in the dispatching file, else bail
+    // (ambiguous — precision over recall, like vuex's root-key resolution).
+    return cands.find((c) => c.filePath === dispatchFile) ?? null;
+  };
+
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!CELERY_PY_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || (!content.includes('.delay(') && !content.includes('.apply_async('))) continue;
+    const safe = stripCommentsForRegex(content, 'python');
+    const nodesInFile = ctx.getNodesInFile(file);
+    CELERY_DISPATCH_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    let added = 0;
+    while ((m = CELERY_DISPATCH_RE.exec(safe)) && added < CELERY_FANOUT_CAP) {
+      const name = m[1]!;
+      const line = safe.slice(0, m.index).split('\n').length;
+      const disp = enclosingFn(nodesInFile, line);
+      if (!disp) continue; // module-level dispatch — no source symbol to attribute
+      const target = resolve(name, file);
+      if (!target || target.id === disp.id) continue;
+      const key = `${disp.id}>${target.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: disp.id,
+        target: target.id,
+        kind: 'calls',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'celery-dispatch', via: name, registeredAt: `${file}:${line}` },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
+// ── Spring application events (Java) ──────────────────────────────────────────
+// Spring decouples an event PUBLISHER from its LISTENER(s) through the application
+// event bus, linked by the EVENT TYPE (not a name):
+//   // SomeService.java
+//   eventPublisher.publishEvent(new PasswordChangedEvent(this, username));   // publish
+//   // RememberMeTokenRevoker.java — a DIFFERENT file
+//   @EventListener(PasswordChangedEvent.class)                              // listen
+//   public void onPasswordChanged(PasswordChangedEvent event) { ... }
+// Bridge it: link the enclosing method at each `publishEvent(new XEvent(...))` site →
+// every listener method of XEvent. Listeners are `@EventListener` / `@TransactionalEventListener`
+// methods (event type = the first param type, or the `@EventListener(X.class)` value form) and
+// the older `class … implements ApplicationListener<X> { void onApplicationEvent(X e) }`. Keyed
+// by exact type name, usually cross-file. A repo with no `@EventListener`/`publishEvent` yields 0.
+// (Java method nodes INCLUDE their leading annotations in the range — startLine is the first
+// `@…` line — so the annotation block is scanned DOWNWARD from startLine, bounded to consecutive
+// `@`-lines so it can't bleed into an adjacent method.)
+const SPRING_PUBLISH_RE = /\.publishEvent\s*\(\s*new\s+([A-Z][A-Za-z0-9_]*)/g;
+const SPRING_LISTENER_ANNO_RE = /@(?:EventListener|TransactionalEventListener)\b/;
+const SPRING_ANNO_TYPE_RE = /@(?:EventListener|TransactionalEventListener)\s*\(\s*([A-Z][A-Za-z0-9_]*)\.class/;
+const SPRING_APP_LISTENER_RE = /\bApplicationListener\s*</;
+const SPRING_JAVA_EXT = /\.java$/;
+const SPRING_FANOUT_CAP = 80;
+
+/** The first parameter's type from a Java method `signature` (`"void (XEvent e)"` → `XEvent`).
+ *  Skips a leading `final`/`@Anno`, strips generics, and requires a PascalCase class name (event
+ *  types are classes) — so a no-arg or primitive-param method yields null. */
+function springFirstParamType(sig: string | undefined): string | null {
+  if (!sig) return null;
+  const open = sig.indexOf('(');
+  if (open < 0) return null;
+  const close = sig.indexOf(')', open);
+  const inner = sig.slice(open + 1, close < 0 ? sig.length : close).trim();
+  if (!inner) return null;
+  const first = inner.split(',')[0]!.trim();
+  const toks = first.split(/\s+/).filter((t) => t && t !== 'final' && !t.startsWith('@'));
+  if (toks.length < 2) return null; // need `Type name`
+  const type = toks[toks.length - 2]!.replace(/<.*$/, ''); // drop generic args
+  return /^[A-Z][A-Za-z0-9_]*$/.test(type) ? type : null;
+}
+
+function springEventEdges(ctx: ResolutionContext): Edge[] {
+  // Pass 1 — event-type → listener methods, scanning only event-relevant files.
+  const listeners = new Map<string, Node[]>();
+  for (const file of ctx.getAllFiles()) {
+    if (!SPRING_JAVA_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content) continue;
+    const hasAnno = content.includes('@EventListener') || content.includes('@TransactionalEventListener');
+    const hasAppListener = SPRING_APP_LISTENER_RE.test(content);
+    if (!hasAnno && !hasAppListener) continue;
+    const lines = content.split('\n');
+    for (const node of ctx.getNodesInFile(file)) {
+      if (node.kind !== 'method') continue;
+      // Collect this method's own leading annotation block (consecutive `@`-lines from startLine).
+      const annoLines: string[] = [];
+      for (let i = node.startLine - 1; i < lines.length && i < node.startLine + 7; i++) {
+        const t = (lines[i] ?? '').trim();
+        if (!t.startsWith('@')) break; // reached the declaration → stop (no bleed into next method)
+        annoLines.push(t);
+      }
+      const head = annoLines.join('\n');
+      const annotated = hasAnno && SPRING_LISTENER_ANNO_RE.test(head);
+      const isAppListener = hasAppListener && node.name === 'onApplicationEvent';
+      if (!annotated && !isAppListener) continue;
+      let type = springFirstParamType(node.signature);
+      if (!type && annotated) {
+        const m = SPRING_ANNO_TYPE_RE.exec(head);
+        if (m) type = m[1]!;
+      }
+      if (!type) continue;
+      let arr = listeners.get(type);
+      if (!arr) { arr = []; listeners.set(type, arr); }
+      arr.push(node);
+    }
+  }
+  if (!listeners.size) return [];
+
+  // Pass 2 — link each publishEvent(new XEvent(...)) site → every listener of XEvent.
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!SPRING_JAVA_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || !content.includes('.publishEvent(')) continue;
+    const safe = stripCommentsForRegex(content, 'java');
+    const nodesInFile = ctx.getNodesInFile(file);
+    SPRING_PUBLISH_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    let added = 0;
+    while ((m = SPRING_PUBLISH_RE.exec(safe)) && added < SPRING_FANOUT_CAP) {
+      const targets = listeners.get(m[1]!);
+      if (!targets || !targets.length) continue;
+      const line = safe.slice(0, m.index).split('\n').length;
+      const disp = enclosingFn(nodesInFile, line);
+      if (!disp) continue;
+      for (const target of targets) {
+        if (target.id === disp.id) continue;
+        const key = `${disp.id}>${target.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: disp.id,
+          target: target.id,
+          kind: 'calls',
+          line,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'spring-event', via: m[1]!, registeredAt: `${file}:${line}` },
+        });
+        added++;
+      }
+    }
+  }
+  return edges;
+}
+
+// ── MediatR request/notification dispatch (C#/.NET) ───────────────────────────
+// MediatR decouples a Send/Publish call site from its Handle method through a mediator,
+// linked by the request/notification TYPE (the IRequestHandler<T,…> generic):
+//   // CancelOrderCommandHandler.cs — the handler
+//   public class CancelOrderCommandHandler : IRequestHandler<CancelOrderCommand, bool> {
+//       public async Task<bool> Handle(CancelOrderCommand request, CancellationToken ct) { … }
+//   // some controller — the dispatch (usually a DIFFERENT file)
+//   var command = new CancelOrderCommand(orderId);   await _mediator.Send(command);
+// Bridge it: link the enclosing method at each mediator `.Send(x)`/`.Publish(x)` site → the
+// `Handle` method of the handler for x's type. The sent type is resolved from the argument —
+// inline `new X(…)`, a local `var v = new X(…)`, or a parameter/local declared `X v` — bounded
+// to the enclosing method. Precision rests on TWO gates: the receiver must be mediator-ish
+// (`mediator`/`sender`/`publisher`, so MAUI `MessagingCenter.Send` is ignored) AND the resolved
+// type must be a known handler request type (so a same-named non-request DTO is never bridged).
+// C# has no `signature` on method nodes, so the handler's request type is read from the class
+// base-list source (`: IRequestHandler<X,…>`), not a param signature.
+const MEDIATR_HANDLER_BASE_RE = /(?:IRequestHandler|INotificationHandler)\s*<\s*([A-Za-z_]\w*)/;
+const MEDIATR_DISPATCH_RE = /([A-Za-z_][\w.]*)\s*\.\s*(?:Send|Publish)\s*\(\s*(new\s+[A-Z]\w*|[A-Za-z_]\w*)/g;
+const MEDIATR_RECEIVER_RE = /(?:mediator|sender|publisher)/i;
+const MEDIATR_CS_EXT = /\.cs$/;
+const MEDIATR_FANOUT_CAP = 80;
+const MEDIATR_HANDLER_DECL_LOOKAHEAD = 4; // lines from a class startLine to find a wrapped base list
+
+/** The type sent at a MediatR `.Send(arg)`/`.Publish(arg)` site: an inline `new X(…)`, else
+ *  `arg` as an identifier resolved within the enclosing method — a `… arg = new X(…)` assignment
+ *  (wins), or a parameter/local declared `X arg`. Returns null when the type can't be seen. */
+function resolveMediatrArgType(arg: string, lines: string[], methodStart: number, dispatchLine: number): string | null {
+  const inl = /^new\s+([A-Z]\w*)/.exec(arg);
+  if (inl) return inl[1]!;
+  if (!/^[A-Za-z_]\w*$/.test(arg)) return null;
+  const assignRe = new RegExp(`\\b${arg}\\b\\s*=\\s*new\\s+([A-Z]\\w*)`);
+  const declRe = new RegExp(`\\b([A-Z]\\w*)\\b\\s+${arg}\\b`);
+  let declType: string | null = null;
+  for (let i = Math.max(0, methodStart - 1); i < dispatchLine && i < lines.length; i++) {
+    const ln = lines[i] ?? '';
+    const a = assignRe.exec(ln);
+    if (a) return a[1]!; // an explicit `arg = new X` is the most specific — take it
+    if (!declType) {
+      const d = declRe.exec(ln);
+      if (d) declType = d[1]!; // a `X arg` declaration — remember, but keep scanning for an assignment
+    }
+  }
+  return declType;
+}
+
+function mediatrDispatchEdges(ctx: ResolutionContext): Edge[] {
+  // Pass 1 — request/notification type → the Handle method of each handler class.
+  const handlers = new Map<string, Node[]>();
+  for (const file of ctx.getAllFiles()) {
+    if (!MEDIATR_CS_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || (!content.includes('IRequestHandler<') && !content.includes('INotificationHandler<'))) continue;
+    const lines = content.split('\n');
+    const nodesInFile = ctx.getNodesInFile(file);
+    for (const cls of nodesInFile) {
+      if (cls.kind !== 'class') continue;
+      const decl = lines.slice(cls.startLine - 1, cls.startLine - 1 + MEDIATR_HANDLER_DECL_LOOKAHEAD).join('\n');
+      const m = MEDIATR_HANDLER_BASE_RE.exec(decl);
+      if (!m) continue;
+      const type = m[1]!;
+      const end = cls.endLine ?? cls.startLine;
+      const handle = nodesInFile.find(
+        (n) => n.kind === 'method' && n.name === 'Handle' && n.startLine >= cls.startLine && n.startLine <= end
+      );
+      if (!handle) continue;
+      let arr = handlers.get(type);
+      if (!arr) { arr = []; handlers.set(type, arr); }
+      arr.push(handle);
+    }
+  }
+  if (!handlers.size) return [];
+
+  // Pass 2 — link each mediator-ish .Send(x)/.Publish(x) → the handler of x's type.
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!MEDIATR_CS_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || (!content.includes('.Send(') && !content.includes('.Publish('))) continue;
+    const safe = stripCommentsForRegex(content, 'csharp');
+    const safeLines = safe.split('\n');
+    const nodesInFile = ctx.getNodesInFile(file);
+    MEDIATR_DISPATCH_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    let added = 0;
+    while ((m = MEDIATR_DISPATCH_RE.exec(safe)) && added < MEDIATR_FANOUT_CAP) {
+      if (!MEDIATR_RECEIVER_RE.test(m[1]!)) continue; // not a mediator (MessagingCenter, HttpClient, …)
+      const line = safe.slice(0, m.index).split('\n').length;
+      const disp = enclosingFn(nodesInFile, line);
+      if (!disp) continue;
+      const type = resolveMediatrArgType(m[2]!, safeLines, disp.startLine, line);
+      if (!type) continue;
+      const targets = handlers.get(type);
+      if (!targets) continue;
+      for (const target of targets) {
+        if (target.id === disp.id) continue;
+        const key = `${disp.id}>${target.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: disp.id,
+          target: target.id,
+          kind: 'calls',
+          line,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'mediatr-dispatch', via: type, registeredAt: `${file}:${line}` },
+        });
+        added++;
+      }
+    }
+  }
+  return edges;
+}
+
+// ── Sidekiq job dispatch (Ruby) ───────────────────────────────────────────────
+// Sidekiq decouples a job's enqueue site from the worker's `perform`, linked by the WORKER
+// CLASS NAME:
+//   # app/workers/destroy_user_worker.rb
+//   class DestroyUserWorker
+//     include Sidekiq::Worker          # or Sidekiq::Job (the modern alias)
+//     def perform(user_id) … end
+//   # app/services/… — a DIFFERENT file
+//   DestroyUserWorker.perform_async(user.id)   # also .perform_in(t, …) / .perform_at(t, …)
+// Bridge it: link the enclosing method at each `Worker.perform_async/_in/_at(…)` site → that
+// worker's instance `perform`. Name-keyed (like Celery): the receiver class must be a Sidekiq
+// worker — gated by reading `include Sidekiq::Job|Worker` from the class body, since that mixin
+// is an external gem module that forms no resolvable edge. ActiveJob's `perform_later`/`_now` is
+// a different shape and deliberately not matched, so an ActiveJob-only app yields 0.
+const SIDEKIQ_DISPATCH_RE = /([A-Z][A-Za-z0-9_]*(?:::[A-Z][A-Za-z0-9_]*)*)\s*\.\s*perform_(?:async|in|at)\b/g;
+const SIDEKIQ_WORKER_RE = /\binclude\s+Sidekiq::(?:Job|Worker)\b/;
+const SIDEKIQ_RB_EXT = /\.rb$/;
+const SIDEKIQ_FANOUT_CAP = 80;
+
+function sidekiqDispatchEdges(ctx: ResolutionContext): Edge[] {
+  // class node id → its instance `perform` method (null if the class isn't a Sidekiq worker),
+  // memoized. Reads the class body for the mixin; only consulted for actual dispatch receivers.
+  const performCache = new Map<string, Node | null>();
+  const performOf = (cls: Node): Node | null => {
+    let v = performCache.get(cls.id);
+    if (v !== undefined) return v;
+    v = null;
+    const content = ctx.readFile(cls.filePath);
+    if (content) {
+      const end = cls.endLine ?? cls.startLine;
+      const body = content.split('\n').slice(cls.startLine - 1, end).join('\n');
+      if (SIDEKIQ_WORKER_RE.test(body)) {
+        v = ctx.getNodesInFile(cls.filePath).find(
+          (n) => n.kind === 'method' && n.name === 'perform' && n.startLine >= cls.startLine && n.startLine <= end
+        ) ?? null;
+      }
+    }
+    performCache.set(cls.id, v);
+    return v;
+  };
+
+  // Resolve a (possibly namespaced) worker reference to its `perform`. A namespaced ref is
+  // matched by EXACT qualified name first, so same-named workers in different namespaces
+  // (forem has four `SendEmailNotificationWorker`s) resolve to the right one; an unqualified
+  // ref falls back to the simple name and links only when a single worker bears it — an
+  // ambiguous collision bails (precision over recall).
+  const resolve = (ref: string): Node | null => {
+    if (ref.includes('::')) {
+      const q = ctx.getNodesByQualifiedName(ref).find((n) => n.kind === 'class' && performOf(n));
+      if (q) return performOf(q);
+    }
+    const workers = ctx.getNodesByName(ref.split('::').pop()!).filter((n) => n.kind === 'class' && performOf(n));
+    return workers.length === 1 ? performOf(workers[0]!) : null;
+  };
+
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!SIDEKIQ_RB_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || !/\.perform_(?:async|in|at)\b/.test(content)) continue;
+    const safe = stripCommentsForRegex(content, 'ruby');
+    const nodesInFile = ctx.getNodesInFile(file);
+    SIDEKIQ_DISPATCH_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    let added = 0;
+    while ((m = SIDEKIQ_DISPATCH_RE.exec(safe)) && added < SIDEKIQ_FANOUT_CAP) {
+      const line = safe.slice(0, m.index).split('\n').length;
+      const disp = enclosingFn(nodesInFile, line);
+      if (!disp) continue;
+      const target = resolve(m[1]!);
+      if (!target || target.id === disp.id) continue;
+      const key = `${disp.id}>${target.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: disp.id,
+        target: target.id,
+        kind: 'calls',
+        line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'sidekiq-dispatch', via: m[1]!, registeredAt: `${file}:${line}` },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
+// ── Laravel events (PHP) ──────────────────────────────────────────────────────
+// Laravel decouples an event dispatch from its listener(s), linked by the EVENT CLASS:
+//   // app/Events/PlaybackStarted.php  +  app/Listeners/UpdateLastfmNowPlaying.php
+//   class UpdateLastfmNowPlaying { public function handle(PlaybackStarted $event) { … } }
+//   // a controller / service — a DIFFERENT file
+//   event(new PlaybackStarted($song, $user));
+// Bridge it: link the enclosing method at each `event(new XEvent(...))` site → every listener's
+// `handle` for XEvent. Listeners come from TWO registration mechanisms (both real, both needed):
+//   (A) auto-discovery — a `handle(EventType $e)` typed first param (also splits a union A|B);
+//   (B) the `protected $listen = [ XEvent::class => [Listener::class, …] ]` map in an
+//       EventServiceProvider, which also covers a listener whose `handle()` is UNTYPED.
+// Only `event(new X)` is matched — queued JOBS dispatch via `::dispatch()` and their `handle()`
+// takes an injected service, never an event type, so jobs are excluded by construction.
+const LARAVEL_DISPATCH_RE = /\bevent\s*\(\s*new\s+\\?([A-Za-z_][\w\\]*)/g;
+const LARAVEL_PHP_EXT = /\.php$/;
+const LARAVEL_FANOUT_CAP = 200;
+// A `$listen` entry: `Event::class => [Listener::class, …]`, key/values as `::class` or strings.
+const LISTEN_ENTRY_RE = /(?:([A-Za-z_\\][\w\\]*)::class|'([^']+)'|"([^"]+)")\s*=>\s*\[([^\]]*)\]/g;
+const LISTEN_CLASS_RE = /(?:([A-Za-z_\\][\w\\]*)::class|'([^']+)'|"([^"]+)")/g;
+
+/** Short class name from a PHP reference: `\App\Events\Foo` / `App\Events::Foo` → `Foo`. */
+function phpSimpleName(s: string): string {
+  return s.replace(/^\\/, '').split('\\').pop()!.split('::').pop()!.trim();
+}
+
+/** The first-parameter class type(s) of a `handle(...)` declaration — union-split, short-named,
+ *  primitives dropped. `handle(A|B $e)` → [A, B]; `handle(string $x)` / `handle()` → []. */
+function laravelHandleEventTypes(decl: string): string[] {
+  const m = /function\s+handle\s*\(\s*(?:\.\.\.\s*)?(\??[A-Za-z_\\][\w\\|]*)\s+&?\s*(?:\.\.\.\s*)?\$/.exec(decl);
+  if (!m) return [];
+  return m[1]!
+    .replace(/^\?/, '')
+    .split('|')
+    .map((t) => phpSimpleName(t))
+    .filter((t) => /^[A-Z]\w*$/.test(t));
+}
+
+/** From an opening `[`, the bracket-balanced body up to its matching `]`. */
+function phpArrayBody(src: string, openIdx: number): string | null {
+  let depth = 0;
+  for (let i = openIdx; i < src.length; i++) {
+    if (src[i] === '[') depth++;
+    else if (src[i] === ']' && --depth === 0) return src.slice(openIdx + 1, i);
+  }
+  return null;
+}
+
+function laravelEventEdges(ctx: ResolutionContext): Edge[] {
+  // event short name → its listener `handle` methods (deduped by node id).
+  const listeners = new Map<string, Map<string, Node>>();
+  const add = (event: string, handle: Node) => {
+    let m = listeners.get(event);
+    if (!m) { m = new Map(); listeners.set(event, m); }
+    m.set(handle.id, handle);
+  };
+  const handleOf = (cls: Node): Node | null =>
+    ctx
+      .getNodesInFile(cls.filePath)
+      .find(
+        (n) => n.kind === 'method' && n.name === 'handle'
+          && n.startLine >= cls.startLine && n.startLine <= (cls.endLine ?? cls.startLine)
+      ) ?? null;
+
+  // Pass 1 — build the event→handle map from both registration mechanisms.
+  for (const file of ctx.getAllFiles()) {
+    if (!LARAVEL_PHP_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content) continue;
+
+    // (A) typed listener handles — node-driven, so a commented-out method can't leak in.
+    if (content.includes('function handle')) {
+      const lines = content.split('\n');
+      for (const node of ctx.getNodesInFile(file)) {
+        if (node.kind !== 'method' || node.name !== 'handle') continue;
+        const decl = lines.slice(node.startLine - 1, node.startLine + 2).join('\n');
+        for (const ev of laravelHandleEventTypes(decl)) add(ev, node);
+      }
+    }
+
+    // (B) the EventServiceProvider `$listen` map — parsed from comment-stripped source so a
+    // fully-commented map (firefly's, on auto-discovery) contributes nothing.
+    if (content.includes('$listen')) {
+      const safe = stripCommentsForRegex(content, 'php');
+      const decl = safe.search(/\$listen\s*=\s*\[/);
+      const body = decl >= 0 ? phpArrayBody(safe, safe.indexOf('[', decl)) : null;
+      if (body) {
+        LISTEN_ENTRY_RE.lastIndex = 0;
+        let em: RegExpExecArray | null;
+        while ((em = LISTEN_ENTRY_RE.exec(body))) {
+          const event = phpSimpleName(em[1] ?? em[2] ?? em[3] ?? '');
+          LISTEN_CLASS_RE.lastIndex = 0;
+          let lm: RegExpExecArray | null;
+          while ((lm = LISTEN_CLASS_RE.exec(em[4]!))) {
+            const ln = phpSimpleName(lm[1] ?? lm[2] ?? lm[3] ?? '');
+            const cls = ctx.getNodesByName(ln).find((n) => n.kind === 'class' && handleOf(n));
+            if (cls) add(event, handleOf(cls)!);
+          }
+        }
+      }
+    }
+  }
+  if (!listeners.size) return [];
+
+  // Pass 2 — link each event(new X(...)) site → every listener of X.
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!LARAVEL_PHP_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || !content.includes('event(')) continue;
+    const safe = stripCommentsForRegex(content, 'php');
+    const nodesInFile = ctx.getNodesInFile(file);
+    LARAVEL_DISPATCH_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    let added = 0;
+    while ((m = LARAVEL_DISPATCH_RE.exec(safe)) && added < LARAVEL_FANOUT_CAP) {
+      const targets = listeners.get(phpSimpleName(m[1]!));
+      if (!targets) continue;
+      const line = safe.slice(0, m.index).split('\n').length;
+      const disp = enclosingFn(nodesInFile, line);
+      if (!disp) continue;
+      for (const target of targets.values()) {
+        if (target.id === disp.id) continue;
+        const key = `${disp.id}>${target.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: disp.id,
+          target: target.id,
+          kind: 'calls',
+          line,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'laravel-event', via: phpSimpleName(m[1]!), registeredAt: `${file}:${line}` },
+        });
+        added++;
+      }
+    }
+  }
+  return edges;
+}
+
+/**
  * Synthesize dispatcher→callback edges (field observers + EventEmitters +
- * React re-render + JSX children + Vue templates + RN event channel +
- * Fabric native-impl + MyBatis Java↔XML + Gin middleware chain). Returns the
- * count added. Never throws into indexing — callers wrap in try/catch.
+ * React re-render + JSX children + Vue templates + SvelteKit load + RN event
+ * channel + Fabric native-impl + MyBatis Java↔XML + Gin middleware chain +
+ * Redux-thunk dispatch chain + object-literal registry dispatch + RTK Query
+ * generated-hook → endpoint + Pinia useStore().action() + Vuex string dispatch +
+ * Celery task .delay()/.apply_async() → task body + Spring publishEvent → @EventListener +
+ * MediatR Send/Publish → IRequestHandler/INotificationHandler +
+ * Sidekiq Worker.perform_async → #perform + Laravel event(new X) → listener handle).
+ * Returns the count added. Never throws into indexing — callers wrap in try/catch.
  */
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
+  // Cross-file Go method→type `contains` edges must be synthesized AND persisted
+  // FIRST: a method declared in a different file from its receiver type is
+  // otherwise orphaned from the struct, and goImplementsEdges (next) derives a
+  // struct's method set from its `contains` edges — so without this it would
+  // under-count the interfaces a cross-file struct satisfies. (#583)
+  const goMethodContains = goCrossFileMethodContainsEdges(queries);
+  if (goMethodContains.length > 0) queries.insertEdges(goMethodContains);
+
+  // Go implicit `implements` edges must be synthesized AND persisted next: the
+  // interface-dispatch bridge below reads `implements` edges from the DB, and
+  // Go has none statically. (Other languages already have static implements
+  // edges from extraction, so they don't need this pre-pass.)
+  const goImpl = goImplementsEdges(queries);
+  if (goImpl.length > 0) queries.insertEdges(goImpl);
+
   const fieldEdges = fieldChannelEdges(queries, ctx);
   const closureCollEdges = closureCollectionEdges(queries, ctx);
   const emitterEdges = eventEmitterEdges(ctx);
   const renderEdges = reactRenderEdges(queries, ctx);
   const jsxEdges = reactJsxChildEdges(ctx);
   const vueEdges = vueTemplateEdges(ctx);
+  const svelteKitEdges = svelteKitLoadEdges(ctx);
+  const pascalEdges = pascalFormEdges(ctx);
   const flutterEdges = flutterBuildEdges(queries, ctx);
   const cppEdges = cppOverrideEdges(queries);
   const ifaceEdges = interfaceOverrideEdges(queries);
+  const kotlinExpectActual = kotlinExpectActualEdges(queries);
   const goGrpcEdges = goGrpcStubImplEdges(queries);
   const rnEventEdgesList = rnEventEdges(ctx);
   const fabricNativeEdges = fabricNativeImplEdges(ctx);
+  const expoXPlatEdges = expoCrossPlatformEdges(queries);
+  const rnXPlatEdges = rnCrossPlatformEdges(queries);
   const mybatisEdges = mybatisJavaXmlEdges(queries);
   const ginEdges = ginMiddlewareChainEdges(queries, ctx);
+  const thunkEdges = reduxThunkEdges(queries, ctx);
+  const registryEdges = objectRegistryEdges(ctx);
+  const rtkEdges = rtkQueryEdges(queries, ctx);
+  const piniaEdges = piniaStoreEdges(ctx);
+  const vuexEdges = vuexDispatchEdges(ctx);
+  const celeryEdges = celeryDispatchEdges(ctx);
+  const springEdges = springEventEdges(ctx);
+  const mediatrEdges = mediatrDispatchEdges(ctx);
+  const sidekiqEdges = sidekiqDispatchEdges(ctx);
+  const laravelEdges = laravelEventEdges(ctx);
+  const cFnPtrEdges = cFnPointerDispatchEdges(queries, ctx);
+  const goframeEdges = goframeRouteEdges(ctx);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -1214,14 +2715,31 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...renderEdges,
     ...jsxEdges,
     ...vueEdges,
+    ...svelteKitEdges,
+    ...pascalEdges,
     ...flutterEdges,
     ...cppEdges,
     ...ifaceEdges,
+    ...kotlinExpectActual,
     ...goGrpcEdges,
     ...rnEventEdgesList,
     ...fabricNativeEdges,
+    ...expoXPlatEdges,
+    ...rnXPlatEdges,
     ...mybatisEdges,
     ...ginEdges,
+    ...thunkEdges,
+    ...registryEdges,
+    ...rtkEdges,
+    ...piniaEdges,
+    ...vuexEdges,
+    ...celeryEdges,
+    ...springEdges,
+    ...mediatrEdges,
+    ...sidekiqEdges,
+    ...laravelEdges,
+    ...cFnPtrEdges,
+    ...goframeEdges,
   ]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
@@ -1229,5 +2747,5 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     merged.push(e);
   }
   if (merged.length > 0) queries.insertEdges(merged);
-  return merged.length;
+  return merged.length + goImpl.length + goMethodContains.length;
 }

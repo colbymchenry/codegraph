@@ -72,6 +72,7 @@ interface NodeRow {
   is_abstract: number;
   decorators: string | null;
   type_parameters: string | null;
+  return_type: string | null;
   updated_at: number;
 }
 
@@ -133,6 +134,7 @@ function rowToNode(row: NodeRow): Node {
     isAbstract: row.is_abstract === 1,
     decorators: row.decorators ? safeJsonParse(row.decorators, undefined) : undefined,
     typeParameters: row.type_parameters ? safeJsonParse(row.type_parameters, undefined) : undefined,
+    returnType: row.return_type ?? undefined,
     updatedAt: row.updated_at,
   };
 }
@@ -173,6 +175,12 @@ function rowToFileRecord(row: FileRow): FileRecord {
  */
 export class QueryBuilder {
   private db: SqliteDatabase;
+
+  // Project-name tokens (go.mod / package.json / repo dir), normalized. A query
+  // word matching one is dropped from path-relevance scoring — it names the
+  // whole project, not a symbol, so it carries no discriminative signal (#720).
+  // Set once by the CodeGraph instance; empty by default (no down-weighting).
+  private projectNameTokens: Set<string> = new Set();
 
   // Node cache for frequently accessed nodes (LRU-style, max 1000 entries)
   private nodeCache: Map<string, Node> = new Map();
@@ -217,6 +225,17 @@ export class QueryBuilder {
     this.db = db;
   }
 
+  /** Set the normalized project-name tokens used to down-weight non-discriminative
+   * query words in path scoring (#720). Called once when the project opens. */
+  setProjectNameTokens(tokens: Set<string>): void {
+    this.projectNameTokens = tokens;
+  }
+
+  /** The normalized project-name tokens (#720); empty if none were derived. */
+  getProjectNameTokens(): Set<string> {
+    return this.projectNameTokens;
+  }
+
   // ===========================================================================
   // Node Operations
   // ===========================================================================
@@ -232,13 +251,13 @@ export class QueryBuilder {
           start_line, end_line, start_column, end_column,
           docstring, signature, visibility,
           is_exported, is_async, is_static, is_abstract,
-          decorators, type_parameters, updated_at
+          decorators, type_parameters, return_type, updated_at
         ) VALUES (
           @id, @kind, @name, @qualifiedName, @filePath, @language,
           @startLine, @endLine, @startColumn, @endColumn,
           @docstring, @signature, @visibility,
           @isExported, @isAsync, @isStatic, @isAbstract,
-          @decorators, @typeParameters, @updatedAt
+          @decorators, @typeParameters, @returnType, @updatedAt
         )
       `);
     }
@@ -281,6 +300,7 @@ export class QueryBuilder {
       isAbstract: node.isAbstract ? 1 : 0,
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
+      returnType: node.returnType ?? null,
       updatedAt: node.updatedAt ?? Date.now(),
     });
   }
@@ -321,6 +341,7 @@ export class QueryBuilder {
           is_abstract = @isAbstract,
           decorators = @decorators,
           type_parameters = @typeParameters,
+          return_type = @returnType,
           updated_at = @updatedAt
         WHERE id = @id
       `);
@@ -355,6 +376,7 @@ export class QueryBuilder {
       isAbstract: node.isAbstract ? 1 : 0,
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
+      returnType: node.returnType ?? null,
       updatedAt: node.updatedAt ?? Date.now(),
     });
   }
@@ -837,7 +859,7 @@ export class QueryBuilder {
         ...r,
         score: r.score
           + kindBonus(r.node.kind)
-          + scorePathRelevance(r.node.filePath, scoringQuery)
+          + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens)
           + nameMatchBonus(r.node.name, scoringQuery),
       }));
       results.sort((a, b) => b.score - a.score);
@@ -1349,6 +1371,78 @@ export class QueryBuilder {
 
     const rows = this.db.prepare(sql).all(...params) as EdgeRow[];
     return rows.map(rowToEdge);
+  }
+
+  /**
+   * Distinct file paths that DEPEND ON `filePath`: every file containing a
+   * symbol with a cross-file edge (any kind except `contains`) into a symbol
+   * of this file. This is the file-level projection of the symbol dependency
+   * graph and the basis for blast-radius / `affected` test selection.
+   *
+   * It deliberately does NOT restrict to `imports` edges. In this graph an
+   * `imports` edge connects a file to its own local import declarations
+   * (it is always same-file), so an imports-only lookup returns zero
+   * cross-file dependents for every file. The real cross-file dependency
+   * signal is the resolved call/reference graph — calls, references,
+   * instantiates, extends, implements, overrides, type_of, returns,
+   * decorates — exactly what {@link GraphTraverser.getImpactRadius} traverses.
+   * `contains` is excluded: a parent containing a symbol does not *depend* on
+   * it. One indexed query (idx_nodes_file_path + idx_edges_target_kind).
+   */
+  getDependentFilePaths(filePath: string): string[] {
+    const sql = `SELECT DISTINCT src.file_path AS fp
+      FROM edges e
+      JOIN nodes tgt ON tgt.id = e.target
+      JOIN nodes src ON src.id = e.source
+      WHERE tgt.file_path = ?
+        AND e.kind != 'contains'
+        AND src.file_path != ?`;
+    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<{ fp: string }>;
+    return rows.map((r) => r.fp);
+  }
+
+  /**
+   * Distinct file paths that `filePath` DEPENDS ON — the inverse of
+   * {@link getDependentFilePaths}: every file containing a symbol that a
+   * symbol of this file has a cross-file edge into. Same edge-kind rules
+   * (all kinds except `contains`); same reason imports-only is insufficient.
+   */
+  getDependencyFilePaths(filePath: string): string[] {
+    const sql = `SELECT DISTINCT tgt.file_path AS fp
+      FROM edges e
+      JOIN nodes src ON src.id = e.source
+      JOIN nodes tgt ON tgt.id = e.target
+      WHERE src.file_path = ?
+        AND e.kind != 'contains'
+        AND tgt.file_path != ?`;
+    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<{ fp: string }>;
+    return rows.map((r) => r.fp);
+  }
+
+  /**
+   * Cross-file edges whose TARGET is a node in `filePath` and whose SOURCE is a
+   * node in a *different* file, paired with the target node's (name, kind) so a
+   * caller can re-resolve the edge to the re-indexed target's new ID (node IDs
+   * are `sha256(filePath:kind:name:line)`, so any line shift in the callee file
+   * changes target IDs and a naive re-insert by old ID silently drops them).
+   * Used by `storeExtractionResult` to preserve incoming edges across a file
+   * re-index (issue #899). Same edge-kind rules as
+   * {@link getDependentFilePaths}: all kinds except `contains`.
+   */
+  getCrossFileIncomingEdgesWithTarget(filePath: string): Array<Edge & { targetName: string; targetKind: NodeKind }> {
+    const sql = `SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind
+      FROM edges e
+      JOIN nodes tgt ON tgt.id = e.target
+      JOIN nodes src ON src.id = e.source
+      WHERE tgt.file_path = ?
+        AND e.kind != 'contains'
+        AND src.file_path != ?`;
+    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<EdgeRow & { target_name: string; target_kind: NodeKind }>;
+    return rows.map(row => ({
+      ...rowToEdge(row),
+      targetName: row.target_name,
+      targetKind: row.target_kind,
+    }));
   }
 
   // ===========================================================================

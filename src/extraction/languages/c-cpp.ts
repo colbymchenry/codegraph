@@ -2,49 +2,97 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
-function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
-  const declarator = getChildByField(node, 'declarator');
-  if (!declarator) return undefined;
-
+/**
+ * Find the function NAME's `qualified_identifier` (`Foo::bar`) inside a
+ * declarator, skipping the `parameter_list` — a parameter with a qualified type
+ * (`const std::string& x`) must NOT be mistaken for the method name. Without the
+ * skip, a plain free function `std::string TableFileName(const std::string&...)`
+ * was named `string` (from the parameter type), so calls to it never resolved
+ * and its file looked like nothing depended on it.
+ */
+function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefined {
   const queue: SyntaxNode[] = [declarator];
   while (queue.length > 0) {
     const current = queue.shift()!;
-    if (current.type === 'qualified_identifier') {
-      const text = getNodeText(current, source).trim();
-      const parts = text.split('::').filter(Boolean);
-      return parts[parts.length - 1];
-    }
+    if (current.type === 'qualified_identifier') return current;
     for (let i = 0; i < current.namedChildCount; i++) {
       const child = current.namedChild(i);
-      if (child) queue.push(child);
+      // Don't descend into parameters or the trailing return type — their types
+      // (`const std::string&`, `-> std::string`) aren't the function name.
+      if (child && child.type !== 'parameter_list' && child.type !== 'trailing_return_type') {
+        queue.push(child);
+      }
     }
   }
-
   return undefined;
+}
+
+function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
+  const declarator = getChildByField(node, 'declarator');
+  if (!declarator) return undefined;
+  const qid = findDeclaratorQualifiedId(declarator);
+  if (!qid) return undefined;
+  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
+  return parts[parts.length - 1];
 }
 
 function extractCppReceiverType(node: SyntaxNode, source: string): string | undefined {
   const declarator = getChildByField(node, 'declarator');
   if (!declarator) return undefined;
+  const qid = findDeclaratorQualifiedId(declarator);
+  if (!qid) return undefined;
+  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
+  return parts.length > 1 ? parts.slice(0, -1).join('::') : undefined;
+}
 
-  const queue: SyntaxNode[] = [declarator];
-  while (queue.length > 0) {
-    const current = queue.shift()!;
-    if (current.type === 'qualified_identifier') {
-      const text = getNodeText(current, source).trim();
-      const parts = text.split('::').filter(Boolean);
-      if (parts.length > 1) {
-        return parts.slice(0, -1).join('::');
-      }
-      return undefined;
-    }
-    for (let i = 0; i < current.namedChildCount; i++) {
-      const child = current.namedChild(i);
-      if (child) queue.push(child);
-    }
-  }
+/**
+ * Built-in / non-class return types that can never be a method receiver. We
+ * store no `returnType` for these so resolution never tries to resolve a method
+ * on `void` / `int` / etc.
+ */
+const CPP_NON_CLASS_RETURN = new Set([
+  'void', 'bool', 'char', 'short', 'int', 'long', 'float', 'double', 'unsigned',
+  'signed', 'size_t', 'ssize_t', 'auto', 'wchar_t', 'char8_t', 'char16_t',
+  'char32_t', 'int8_t', 'int16_t', 'int32_t', 'int64_t', 'uint8_t', 'uint16_t',
+  'uint32_t', 'uint64_t', 'intptr_t', 'uintptr_t', 'nullptr_t',
+]);
 
-  return undefined;
+/**
+ * Normalize a C++ return type to the bare class name a method could be called
+ * on. Unwraps smart-pointer / optional wrappers to their element type
+ * (`std::unique_ptr<Widget>` → `Widget`) so a factory's `->method()` resolves on
+ * the pointee. Strips cv-qualifiers, `&`/`*`, namespace qualifiers, and other
+ * template args. Returns undefined for primitives / void / `auto` / empty.
+ */
+export function normalizeCppReturnType(raw: string): string | undefined {
+  let t = raw.trim();
+  if (!t) return undefined;
+  // Unwrap smart pointers / optional to their pointee (the thing you call `->` on).
+  const wrapper = t.match(/\b(?:std\s*::\s*)?(?:unique_ptr|shared_ptr|weak_ptr|optional)\s*<\s*([^,>]+?)\s*>/);
+  if (wrapper && wrapper[1]) t = wrapper[1];
+  t = t
+    .replace(/\b(?:const|volatile|typename|struct|class|enum)\b/g, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/[*&]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t) return undefined;
+  const last = t.split('::').filter(Boolean).pop();
+  if (!last) return undefined;
+  if (CPP_NON_CLASS_RETURN.has(last)) return undefined;
+  if (!/^[A-Za-z_]\w*$/.test(last)) return undefined;
+  return last;
+}
+
+/**
+ * A function/method's return type lives in the `function_definition`'s `type`
+ * field (`Metrics& Metrics::instance()` → `Metrics`). Constructors, destructors,
+ * and conversion operators have no `type` field → undefined.
+ */
+function extractCppReturnType(node: SyntaxNode, source: string): string | undefined {
+  const typeNode = getChildByField(node, 'type');
+  if (!typeNode) return undefined;
+  return normalizeCppReturnType(getNodeText(typeNode, source));
 }
 
 export const cExtractor: LanguageExtractor = {
@@ -62,6 +110,14 @@ export const cExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
+  // A `const`/`static const` file-scope declaration carries a `type_qualifier`
+  // child reading "const" — extract those as `constant`, plain globals as
+  // `variable`.
+  isConst: (node) =>
+    node.namedChildren.some(
+      (c: SyntaxNode) => c.type === 'type_qualifier' && c.text === 'const'
+    ),
+  getReturnType: extractCppReturnType,
   resolveTypeAliasKind: (node, _source) => {
     // C typedef: `typedef enum { ... } name;` or `typedef struct { ... } name;`
     // The inner enum_specifier/struct_specifier is anonymous, but we want the typedef name
@@ -92,6 +148,40 @@ export const cExtractor: LanguageExtractor = {
   },
 };
 
+/**
+ * Detect tree-sitter's misparse of a macro-annotated class/struct, e.g.
+ * `class MACRO Name { … }` or `class MACRO Name : public Base { … }` (#946).
+ * Not knowing `MACRO` is a macro, tree-sitter reads `class MACRO` as an
+ * *elaborated type specifier* (a bodyless `class_specifier`/`struct_specifier`
+ * whose "type name" is the macro) and the rest as a function: `Name` becomes the
+ * declarator and the `{ … }` a function body — so the whole declaration surfaces
+ * as a `function_definition` named after the class, with a line range spanning
+ * the entire class body. (A base clause, when present, additionally lands in an
+ * `ERROR` node, but it isn't required — the leading macro alone triggers this.)
+ *
+ * Two structural signals pin it down with no risk to genuine code:
+ *  - the `type` field is a *bodyless* class/struct specifier — an elaborated
+ *    type, not a real inline-defined return type like
+ *    `struct P { int x; } makeP() { … }` (which carries a field list); and
+ *  - the declarator is not a `function_declarator` — a real function definition
+ *    always has one, which also leaves the legal-but-rare `class Foo f() { … }`
+ *    (an elaborated return type on a genuine function) alone.
+ *
+ * The class body is mangled by the same misparse and is unrecoverable, so —
+ * matching how macro-prefixed C prototypes are handled — we drop the spurious
+ * node rather than mint a misleading whole-body `function` that pollutes
+ * callers/impact and skews kind statistics.
+ */
+function isMacroMisparsedTypeDecl(node: SyntaxNode): boolean {
+  const typeNode = getChildByField(node, 'type');
+  if (!typeNode) return false;
+  if (typeNode.type !== 'class_specifier' && typeNode.type !== 'struct_specifier') return false;
+  if (typeNode.namedChildren.some((c: SyntaxNode) => c.type === 'field_declaration_list')) return false;
+  const declarator = getChildByField(node, 'declarator');
+  if (declarator && declarator.type === 'function_declarator') return false;
+  return true;
+}
+
 export const cppExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
   classTypes: ['class_specifier'],
@@ -109,6 +199,7 @@ export const cppExtractor: LanguageExtractor = {
   paramsField: 'parameters',
   resolveName: extractCppQualifiedMethodName,
   getReceiverType: extractCppReceiverType,
+  getReturnType: extractCppReturnType,
   getVisibility: (node) => {
     // Check for access specifier in parent
     const parent = node.parent;
@@ -135,14 +226,17 @@ export const cppExtractor: LanguageExtractor = {
     }
     return undefined;
   },
-  isMisparsedFunction: (name) => {
+  isMisparsedFunction: (name, node) => {
     // C++ macros like NLOHMANN_JSON_NAMESPACE_BEGIN cause tree-sitter to misparse
     // namespace blocks as function_definitions (e.g. name = "namespace detail").
     // Also filter C++ keywords that tree-sitter occasionally misinterprets as
     // function/method names (e.g. switch statements inside macro-confused scopes).
     if (name.startsWith('namespace')) return true;
     const cppKeywords = ['switch', 'if', 'for', 'while', 'do', 'case', 'return'];
-    return cppKeywords.includes(name);
+    if (cppKeywords.includes(name)) return true;
+    // `class MACRO Name : public Base { … }` misparses to a function_definition
+    // named after the class — drop that phantom (#946).
+    return isMacroMisparsedTypeDecl(node);
   },
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();

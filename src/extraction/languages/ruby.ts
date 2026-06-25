@@ -17,6 +17,42 @@ export const rubyExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   visitNode: (node, ctx) => {
+    // Ruby mixins: `include Mod`, `extend Mod`, `prepend Mod[, Other]` — the
+    // primary composition mechanism (ActiveSupport concerns, Comparable, …).
+    // These parse as a bare `call` to `include`/`extend`/`prepend` with the
+    // module(s) as constant arguments, so without special handling they'd be
+    // mis-extracted as a call to a method named "include" and the module would
+    // record no dependent — even though it's mixed into a class. Emit an
+    // `implements` edge (enclosing class/module → mixed-in module), so editing a
+    // concern surfaces every class that includes it.
+    if (node.type === 'call' && !node.childForFieldName('receiver')) {
+      const method = node.childForFieldName('method');
+      const mname = method?.text;
+      if (mname === 'include' || mname === 'extend' || mname === 'prepend') {
+        const parentId = ctx.nodeStack.length > 0 ? ctx.nodeStack[ctx.nodeStack.length - 1] : undefined;
+        const args = node.childForFieldName('arguments')
+          ?? node.namedChildren.find((c: SyntaxNode) => c.type === 'argument_list');
+        if (parentId && args) {
+          for (let i = 0; i < args.namedChildCount; i++) {
+            const arg = args.namedChild(i);
+            // `Mod` is `constant`, `Foo::Bar` is `scope_resolution`. Skip
+            // `extend self` / dynamic args (`include foo()`).
+            if (arg && (arg.type === 'constant' || arg.type === 'scope_resolution')) {
+              ctx.addUnresolvedReference({
+                fromNodeId: parentId,
+                referenceName: getNodeText(arg, ctx.source),
+                referenceKind: 'implements',
+                filePath: ctx.filePath,
+                line: node.startPosition.row + 1,
+                column: node.startPosition.column,
+              });
+            }
+          }
+          return true; // handled — don't also extract as a call to "include"
+        }
+      }
+    }
+
     if (node.type !== 'module') return false;
 
     const nameNode = node.childForFieldName('name');

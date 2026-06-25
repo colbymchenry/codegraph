@@ -52,7 +52,10 @@ function spawnServer(cwd: string, env: NodeJS.ProcessEnv = {}): SpawnedServer {
   const child = spawn(process.execPath, [BIN, 'serve', '--mcp'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, ...env },
+    // #618: the daemon-attach log line is now off by default; opt the test
+    // harness into it (CODEGRAPH_MCP_LOG_ATTACH=1) so the attach assertions
+    // below can still observe a successful attach. A per-test env still wins.
+    env: { CODEGRAPH_MCP_LOG_ATTACH: '1', ...process.env, ...env },
   }) as ChildProcessWithoutNullStreams;
   // Swallow spawn/EPIPE errors so killing a child mid-write can't surface as an
   // unhandled error that crashes the vitest worker.
@@ -359,6 +362,30 @@ describe('Shared MCP daemon (issue #411)', () => {
     }
   }, 30000);
 
+  // The over-the-wire client-hello → record → sweep path is covered by the
+  // deterministic `Daemon.reapDeadClients` unit test in daemon-client-liveness
+  // (a raw-socket variant here was flaky under heavy parallel load), plus the
+  // client-hello round-trip exercised by every test above (the real proxy now
+  // sends it). What stays here is the lifecycle behavior that needs real procs.
+  it('exits on the inactivity backstop even while a client stays connected (#692)', async () => {
+    // Backstop short, idle timeout long: with a client connected the idle timer
+    // never arms, so only the inactivity backstop can take the daemon down.
+    const env = { CODEGRAPH_DAEMON_MAX_IDLE_MS: '1500', CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '60000' };
+    const server = spawnServer(tempDir, env);
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
+    const daemonPid = readLockPid(realRoot)!;
+    expect(isAlive(daemonPid)).toBe(true);
+
+    // Send nothing further — the client stays connected but idle. The backstop
+    // should fire and the daemon should exit and clean up its lockfile.
+    expect(await waitProcessExit(daemonPid, 12000)).toBe(true);
+    expect(readDaemonLog(realRoot)).toContain('inactivity backstop');
+    expect(fs.existsSync(path.join(realRoot, '.codegraph', 'daemon.pid'))).toBe(false);
+  }, 30000);
+
   it('daemon idle-times-out after the last client disconnects', async () => {
     const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '800', CODEGRAPH_PPID_POLL_MS: '200' };
     const server = spawnServer(tempDir, env);
@@ -375,4 +402,34 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(await waitProcessExit(daemonPid, 10000)).toBe(true);
     expect(fs.existsSync(path.join(realRoot, '.codegraph', 'daemon.pid'))).toBe(false);
   }, 30000);
+
+  it('proxy survives the daemon dying mid-session and keeps serving (#662)', async () => {
+    // The #662 scenario: an MCP host SIGTERM's the shared daemon while a session
+    // is live. The proxy must NOT exit (losing CodeGraph for that session) — it
+    // falls back to an in-process engine and keeps answering.
+    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000', CODEGRAPH_PPID_POLL_MS: '5000' };
+    const server = spawnServer(tempDir, env);
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
+    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
+    const daemonPid = readLockPid(realRoot)!;
+
+    // A warm call goes through the daemon.
+    sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    await waitFor(() => findResponse(server.stdout, 2), 10000);
+
+    // Kill the daemon out from under the live proxy.
+    process.kill(daemonPid, 'SIGTERM');
+    expect(await waitProcessExit(daemonPid, 8000)).toBe(true);
+
+    // The proxy must still be alive and still answer — served in-process now.
+    expect(isAlive(server.child.pid!)).toBe(true);
+    await waitFor(() => server.stderr.some((l) => l.includes('serving this session in-process')), 8000);
+    sendMessage(server.child, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    const resp = await waitFor(() => findResponse(server.stdout, 3), 15000);
+    expect(resp.result !== undefined || resp.error !== undefined).toBe(true);
+    expect(isAlive(server.child.pid!)).toBe(true);
+  }, 45000);
 });

@@ -1,0 +1,174 @@
+# Dispatch-Synthesizer Backlog — the "dispatch-through-indirection" family
+
+**Audience:** a Claude agent continuing the coverage mission.
+**Relationship to the playbook:** this is a *cross-cutting* companion to
+[`dynamic-dispatch-coverage-playbook.md`](./dynamic-dispatch-coverage-playbook.md).
+The playbook's §6 matrix is organized by **language × framework**. This doc is
+organized by **dispatch *shape*** — because a single framework can contain several
+distinct indirection shapes (Redux alone is ≥2: hand-written thunks vs RTK Query),
+and several shapes recur identically across many frameworks/languages (a name→class
+registry is the same problem in trezor `connect`, n8n nodes, and a VS Code command
+palette). Redux-thunk (`synthesizedBy:'redux-thunk'`) was the first member shipped;
+this is the queue behind it.
+
+Status legend (matches the playbook): ✅ done+validated · 🟡 shipped but under-validated
+· 🔬 hole identified · ⬜ not started · ⛔ deliberately not built (silent beats wrong).
+
+---
+
+## The discipline (lessons already paid for — read before building any of these)
+
+1. **Build against ≥2 real repos that *contain the pattern*, from the start.**
+   redux-thunk was tuned on **trezor-suite alone (n=1)**. The obvious second repo,
+   **shapeshift/web**, fires **0** redux-thunk edges — and that 0 is *correct*:
+   shapeshift has **zero** `createAsyncThunk`/`createThunk` (it's an **RTK Query**
+   codebase, 14 `createApi` files). So shapeshift could neither confirm nor refute
+   generalization — it doesn't contain the shape. **A synthesizer validated on one
+   repo is unvalidated.** Pick the validation repos *by grepping for the pattern
+   first*, not by reputation.
+
+2. **"One framework" ≠ "one shape."** The trezor→shapeshift split is the proof:
+   - `createAsyncThunk` + thunk→thunk `dispatch(Y())` chains → **redux-thunk** ✅ (trezor)
+   - `createApi` + `builder.query/mutation` endpoints → hooks/components → **RTK Query** 🔬 (shapeshift) — a *different, unbuilt* synthesizer
+   - plain `dispatch(action)` → matching `reducer`/slice `case` → **slice-dispatch** ⬜
+   Don't let "we did Redux" hide two-thirds of Redux.
+
+3. **Precision is free recall's price.** redux-thunk's 0-on-shapeshift is the *good*
+   kind of zero (no false edges on a non-thunk repo — same bar as the playbook's
+   "0 on every non-pattern control"). Every synthesizer below must show **0 on a
+   control that lacks the shape** *and* **non-zero + precise on ≥2 that have it**.
+
+4. **Two-part master lever still governs.** An edge only helps if a *realistic
+   symbol-named explore seeds a path it lies on*. A synthesizer whose far endpoint
+   no normal query names buys nothing (the trezor "11 explores" tail). Prefer shapes
+   where both endpoints are names an agent would actually type.
+
+5. **Partial coverage is worse than none** (playbook §7). Close each flow
+   *end-to-end* and re-measure; never ship a half-bridged flow.
+
+---
+
+## The backlog (prioritized by frequency × static-resolvability × query-seedability)
+
+### Tier A — high traffic, cleanly static, build next
+
+| Shape | Ecosystem | The static anchor that bridges it | Mechanism | Status |
+|---|---|---|---|---|
+| **Name→class registry / command bus** | any (TS/JS first) | object-literal registry `{key: Handler}` + computed-key dispatch `(new) reg[var](…)` | S (fan-out, `object-registry`) | ✅ **SHIPPED v1 (2026-06-20)** — `objectRegistryEdges`. Links each dispatcher fn → each registered handler's callable entry (a class's `execute`/run/handle method — preferring the method chained at the dispatch — or the function value). Precise on **xrengine** (CommandManager, 64 edges, class registry → `.execute`), **Prebid.js** (7: builder/consent/message dispatch, fn registry), **warp-drive** (1). **0 false positives** after: minified-file skip (avg line >200), **depth-aware** entry parse (top-level `key: Ident` only — method-shorthand/nested-object bodies don't leak), callable-only targets (no data `constant`), dynamic-dispatch gate. Handles constructor + field-initializer (`this.` normalized) forms. **Deferred (recall, documented):** assign-then-call (`const h=reg[k]; h()` — warp-drive's main `COMMANDS`), augmentation (`reg[k]=H` — Prebid single-entry), method-shorthand entry recall, and the **cross-file barrel-namespace** variant (trezor `getMethod`: `import * as M; M[method]→new` + computed dynamic import + camel↔Pascal — the hard tier, still 🔬). |
+| **RTK Query** | TS / Redux Toolkit | `createApi({ endpoints: b => ({ getX: b.query(...) }) })` → generated `useGetXQuery` hook → component; endpoint name ↔ hook name (`getX`↔`useGetXQuery`) is convention | X (extract endpoints) + S (endpoint→hook) | ✅ **SHIPPED (2026-06-20)** — `synthesizedBy:'rtk-query'`. **X:** extraction mints a function node per endpoint (named by its key, spanning the `queryFn`/`query` handler so its calls attribute; both `endpoints: b => ({…})` arrow and `endpoints(b){ return {…} }` method forms; a factory-handler endpoint `queryFn: makeFn(url)` falls back to a bare node spanning the builder call) **and** per generated-hook binding from `export const {…} = api` (carrying the sentinel signature `= RTK Query generated hook`). **S:** `rtkQueryEdges` bridges hook→same-file endpoint by the naming convention (strip `use` + optional `Lazy` + `Query`/`Mutation`, lc head). Component→hook is normal import/call resolution; hook→endpoint surfaces in explore as `dynamic: rtk query`. Validated **100% precision** (hooks == synth edges, **0 cross-file**) on **basetool** (small, 54 edges, both forms + factory fallback), **minusx-metabase** (small, 11), **shapeshift** (large, 13); **0** on the uwave-web control (no `createApi` → a complete no-op, 0 nodes/edges added). Sentinel gate correctly ignores hand-written look-alikes (shapeshift's `useFoxyQuery` is a real custom hook, never bridged). **Deferred:** cross-module `injectEndpoints` where the hook destructuring's RHS isn't the same bare api const (synth requires same-file endpoint). |
+| **Vuex / Pinia** | Vue | `store.dispatch('ns/action')` / `commit('mutation')` → action/mutation by string key (namespaced); Pinia `useStore().action()` instance call | **X (extract collections) ✅ + S (dispatch bridge) ⬜** | 🟡 **EXTRACTION FOUNDATION SHIPPED (2026-06-20)** — store actions/mutations/getters are now nodes (`codegraph_node login`/`getSessionList` works). Corpus probe found this is **NOT one clean string-keyed shape** — it's ~5: **(1)** Vuex MODULE non-exported `const actions/mutations = {…}` (element-admin), **(2)** Vuex split-file `export default {…}` + computed-key `commit(CONST)` + `mapActions` (vue2-elm), **(3)** Pinia OPTIONS `defineStore({actions:{…}})` (Geeker), **(4)** Pinia SETUP `defineStore('id',()=>{const f=…;return{f}})` body-locals (MallChat), **(5)** Pinia `useStore().action()` instance dispatch. Extraction covers **1, 3, 4** (`extractObjectLiteralFunctions` on `actions`/`mutations`/`getters` collections + a `findPiniaSetupFn`/`extractPiniaSetupBody` for setup locals; `looksLikeVueStoreFile` ≥2-signal gate + the shape gate make it a **0-node no-op on a Redux control** despite the word "actions"). Validated findable on element-admin (50 fns), Geeker (21), MallChat (68); vue2-elm form-2 + computed-key **deferred** (n=1, needs export-default dispatch + const-string resolution). **The dispatch BRIDGE synth, 2 members — BOTH ✅ SHIPPED (2026-06-20):** **(a)** Vuex string-key `dispatch('ns/action')`/`commit('M')` → action/mutation node — `synthesizedBy:'vuex-dispatch'` (`vuexDispatchEdges`): last `/` segment = action name, preceding = namespace; resolve to a function node IN A STORE FILE (the ≥2-signal `isStoreFile` gate excludes a same-named `api/` helper — `getInfo`/`login` collide), disambiguated by the immediate namespace segment in the path (handles DEEP nesting `d2admin/user/set`) or same-file for a root local `commit('M')`. Also added `export default { namespaced, actions:{…}, mutations:{…} }` extraction (the canonical Vuex module form — `extractStoreCollectionMethods` off the export_statement, store-file gated) since d2-admin needs it. **100% precision: element-admin 55 edges, vue-admin-template 12, d2-admin 63; 0 non-store targets, 0 namespace mismatches (54/54 namespaced edges route to the correct module); 0 on Redux controls (basetool/uwave — non-string `dispatch()` ignored).** `+ vuex-dispatch-synthesizer.test.ts`. **(b)** Pinia `useStore().action()` → action — ✅ **SHIPPED (2026-06-20)** `synthesizedBy:'pinia-store'` (`piniaStoreEdges`): maps each `const useXStore=defineStore(…)` factory → its file, binds `const s=useXStore()` per consumer file, links the enclosing fn (or the `.vue` component, via fallback) → the `s.method()` action node IN THE STORE'S FILE (same-store-file gate ⇒ `$patch`/built-ins/unrelated same-named methods resolve to nothing). Covers options + setup forms uniformly. **100% precision** (Geeker 41 edges, MallChat 64; 0 targets outside a store file), 0 on the Vuex-only element-admin control; surfaces as `dynamic: pinia store`; suite 1612 + `pinia-store-synthesizer.test.ts`. Corpus: `/tmp/cg-vuex-eval/{vue-element-admin,vue2-elm,Geeker-Admin,MallChatWeb}`. |
+| **NgRx effects** | Angular | `createEffect(() => actions.pipe(ofType(LoginAction), …))` → effect handler; `Store.dispatch(new LoginAction())` → effect by action type/class | S (type/class-keyed) | ⬜ |
+
+### Tier B — backend command/event/message buses (each needs its own canonical flow + ≥2 repos)
+
+| Shape | Ecosystem | Anchor | Mechanism | Status |
+|---|---|---|---|---|
+| **MediatR / CQRS** | .NET | `_mediator.Send(x)`/`.Publish(x)` → the `Handle` of `IRequestHandler<X,…>`/`INotificationHandler<X>` by request type | S (type-keyed, 2-pass + arg resolution) | ✅ **SHIPPED (2026-06-20)** — `synthesizedBy:'mediatr-dispatch'` (`mediatrDispatchEdges`). Same 2-pass type-keyed shape as Spring, with a twist: **C# method nodes have NO `signature`** (csharp.ts defines no `getSignature`), so Pass 1 reads the request type from the handler **class base-list source** (`: IRequestHandler<X,…>` — first generic arg), not a param signature, and binds the class's `Handle` method. **The dominant .NET idiom is VARIABLE-passed, not inline** — eShop had **0** genuine inline `Send(new X)` (every send is `mediator.Send(command)`), so Pass 2 RESOLVES the sent type from the argument three ways within the enclosing method: inline `new X(…)`, a local `var v = new X(…)` (backward scan, wins), or a parameter/local declared `X v`. **Two precision gates:** (1) receiver must be mediator-ish (`/mediator|sender|publisher/i` — excludes MAUI `MessagingCenter.Send`, `HttpClient.Send`), (2) resolved type must be in the handler map (so eShop's same-named `CancelOrderCommand` DTO in ClientApp, which has no handler, is never bridged). Handles the `IdentifiedCommand<T,R>` wrapper (sent + handled at that layer) and void single-arg `IRequestHandler<T>`. **100% precision: jasontaylordev/CleanArchitecture (small, 9 edges, inline + param forms) + dotnet/eShop (medium, 9 edges, 0 FP, variable-passed + IdentifiedCommand + DTO-collision avoided); 0 on the Newtonsoft.Json control.** Node-stable (pure edge synth). Surfaces `dynamic: mediatr dispatch`. `+ mediatr-dispatch-synthesizer.test.ts`. **Deferred (recall):** generic `_mediator.Publish(domainEvent)` over a collection (concrete type erased at the publish site — eShop's DDD AddDomainEvent fan-out), `record`-positional or factory-built args whose type isn't a `new X`/param, the `ICommandHandler<T>` facade indirection (modular-monolith). |
+| **Celery** | Python | `@shared_task`/`@app.task`/`@<app>.task`/`@task` def + `.delay()`/`.apply_async()` call → task body | S (decorator-gated name) | ✅ **SHIPPED (2026-06-20)** — `synthesizedBy:'celery-dispatch'` (`celeryDispatchEdges`). Link the enclosing fn at each `.delay(`/`.apply_async(` site → the task fn. Precision rests on the DECORATOR gate: the dispatched name must resolve to a Python `function` carrying a task decorator, read from the source lines ABOVE its `def` (the def's own startLine excludes the decorator; no `decorates` edge exists — `@shared_task` is an unresolved external import). `kind==='function'` filter drops the same-named test-method collision (`consume_file`). Canvas forms (`group(t).delay()`, `t.s()`/`.si()`) have no single identifier before `.delay` → skipped, not mis-bridged. Cross-module name collision → same-file preference else bail. **100% precision: paperless-ngx (small, `@shared_task`, 31 edges, 31/31 real), pretix (medium, `@app.task`, 63 edges across 21 tasks, 0/21 FP); 0 on the httpie control (no Celery).** Node-stable (pure edge synth, no extraction change). Surfaces as `dynamic: celery dispatch @site` via the generic fallback. `+ celery-dispatch-synthesizer.test.ts`. **Deferred (recall):** canvas dispatch, class-based `Task` subclasses, `app.send_task('dotted.name')` string dispatch, aliased imports (`import send_email as s; s.delay()`). |
+| **Sidekiq** | Ruby | `W.perform_async(...)`/`.perform_in`/`.perform_at` → `W#perform`, gated on `include Sidekiq::Job`/`Worker` | S (name-keyed class→perform) | ✅ **SHIPPED (2026-06-20)** — `synthesizedBy:'sidekiq-dispatch'` (`sidekiqDispatchEdges`). Name-keyed (like Celery): link the enclosing method at each `Worker.perform_async/_in/_at(…)` site → the worker's instance `perform`. The receiver class must be a Sidekiq worker — gated by reading `include Sidekiq::Job|Worker` from the class BODY source (the mixin is an external gem module → no resolvable edge, like Celery's decorator / Spring's annotation). **Namespace disambiguation (the n>1 fix):** loomio's flat workers hid a collision bug forem exposed — 4 `SendEmailNotificationWorker`s across modules; simple-name resolution mis-targeted 7/143 edges to the wrong namespace. Fixed by resolving a namespaced ref (`Comments::SendEmailNotificationWorker`) via EXACT `getNodesByQualifiedName` first, falling back to simple-name only for a unique worker (ambiguous unqualified collision bails). ActiveJob's `perform_later`/`_now` deliberately NOT matched (different shape → ActiveJob-only app yields 0). **100% precision: loomio (medium, `Sidekiq::Worker`, 47 edges) + forem (large, both aliases — 131 `Sidekiq::Job` + 11 `Sidekiq::Worker`, 142 edges, 0 worker-FP, 0 source-FP, 0 namespace-mismatch); 0 on the jekyll control.** Node-stable. Surfaces `dynamic: sidekiq dispatch`. `+ sidekiq-dispatch-synthesizer.test.ts`. **Deferred (recall):** the superclass-chain variant (diaspora: `class Foo < Base` where only `Base` has the include — worker detection must follow `< Base`), the `Jobs.enqueue(:sym)` facade (Discourse), dispatch from non-method contexts (admin DSL blocks → no enclosing method). |
+| **Spring events** | Java | `publishEvent(new XEvent(…))` → `@EventListener`/`@TransactionalEventListener`/`ApplicationListener<X>` by event type | S (type-keyed, 2-pass) | ✅ **SHIPPED (2026-06-20)** — `synthesizedBy:'spring-event'` (`springEventEdges`). Pass 1 builds `Map<eventType, listenerMethod[]>` — listeners are `@EventListener`/`@TransactionalEventListener` methods (event type = the first param type off the node `signature`, or the `@EventListener(X.class)` value form) + `class … implements ApplicationListener<X>` `onApplicationEvent` methods (name + file `ApplicationListener<` gate). Pass 2 links each `publishEvent(new XEvent(…))` site's enclosing method → every listener of XEvent. **KEY Java fact:** a method node's range INCLUDES its leading annotations (`startLine` = first `@…` line, NOT the `public void` decl), so the annotation gate scans DOWNWARD from startLine, bounded to consecutive `@`-lines (no bleed into an adjacent method). Keyed by EXACT type name, no name resolution — precision is structural (param type ↔ `new X` type). Multi-line `publishEvent(\n new X(…))` handled (`\s*` spans newlines). **100% precision: halo (medium, 1254 java, 33 edges across 24 events, 0 publisher/listener FP, all 3 listener forms + fan-out) + thombergs/code-examples (4 edges incl. the `@TransactionalEventListener` form halo lacks); 0 on the gson control (no Spring).** Node-stable (pure edge synth). Surfaces `dynamic: spring event @site`. `+ spring-event-synthesizer.test.ts`. **Deferred (recall):** `publishEvent(bareVar)` (needs the var's declared type), Spring's listener-return-value re-publish, `@DomainEvents`/`AbstractAggregateRoot.registerEvent`, generic `PayloadApplicationEvent<X>` params. |
+| **Laravel events** | PHP | `event(new XEvent(...))` → each listener's `handle`, via a typed `handle(XEvent $e)` AND the `$listen` map | X+S (two registration sources) | ✅ **SHIPPED (2026-06-21)** — `synthesizedBy:'laravel-event'` (`laravelEventEdges`). Pass 1 builds `Map<eventName, handle[]>` from BOTH mechanisms (both real, both needed): **(A)** a typed listener `handle(EventType $e)` first param (read from the method decl source — PHP has no `signature`, like C#; splits a `handle(A|B $e)` UNION into two events); **(B)** the `protected $listen = [ XEvent::class => [Listener::class, …] ]` map in an EventServiceProvider — parsed from comment-stripped source (so firefly's fully-commented map on auto-discovery contributes nothing), keys/values as `::class` or string literals — which is the ONLY way to link a listener whose `handle()` is UNTYPED (koel's `PruneLibrary`). Pass 2 links each `event(new XEvent(...))` site → every handle of XEvent. **Job exclusion is free:** queued jobs dispatch via `::dispatch()`/`dispatch()` (not matched) and their `handle()` takes an injected service (never an event type) — so matching ONLY `event(new X)` excludes them by construction; no job-vs-event ambiguity. `use Dispatchable` is NOT keyed on (unreliable — koel 1/9, firefly 5/50 events use it). **100% precision: koel (small, populated `$listen` map, 9 edges incl. the untyped-handle case + a fan-out) + firefly-iii (large, pure auto-discovery / empty `$listen`, 141 edges, 0 source/target FP, 0 namespace-mismatch via use-import check, union split verified); 0 on the guzzle control.** Namespace-agnostic (`FireflyIII\` not hardcoded). Node-stable. Surfaces `dynamic: laravel event`. `+ laravel-event-synthesizer.test.ts`. **Deferred (recall):** `XEvent::dispatch()` static-trait dispatch (neither repo uses it for events — would reintroduce job ambiguity), `Event::listen(closure)`, string-literal `$listen` keys for framework events (parsed but never `event(new)`-dispatched), event simple-name collisions across namespaces (none in the corpus — add qualified disambiguation like Sidekiq if a repo needs it). |
+
+### Tier C — frontier, ⛔ do **not** build (no static anchor; would add noise)
+
+| Shape | Why not | 
+|---|---|
+| **RxJS subscribe** | observable→observer is predominantly *anonymous* closures; no name to seed (playbook ⬜, deferred) |
+| **MobX / Vue-reactivity / Solid signals** | Proxy reactive runtime — the edge doesn't exist statically at all; silent beats wrong (matches vue-core deferral) |
+| **Redux-Saga** | generator `yield put()` / `takeEvery(ACTION, saga*)` — generator-body dispatch, materially harder; revisit only if a real repo demands it |
+
+### Already shipped (for context)
+
+| Shape | `synthesizedBy` | Validated on |
+|---|---|---|
+| Redux thunk | `redux-thunk` | ✅ **generalizes (2026-06-20)** — precise on uwave-web (small, 5 edges), session-desktop (medium, 2), trezor (large, 211); control shapeshift (RTK Query, no thunks) = 0. Receiver-agnostic (`api.dispatch`/`thunkApi.dispatch`/`window.…dispatch` all matched). **⚠️ 2 follow-ups below.** |
+| Object-literal registry | `object-registry` | ✅ **shipped (2026-06-20)** — xrengine `CommandManager` (64), Prebid.js (7), warp-drive (1); 0 false positives after 4 precision gates. |
+| RTK Query | `rtk-query` | ✅ **shipped (2026-06-20)** — 100% precision (hooks == synth edges, 0 cross-file) on basetool (54), minusx-metabase (11), shapeshift (13); 0 on uwave-web control. Extraction mints endpoint + generated-hook nodes; synth bridges hook→endpoint by convention. |
+| Pinia store | `pinia-store` | ✅ **shipped (2026-06-20)** — `useStore().action()` instance dispatch → action; 100% precision Geeker (41) / MallChat (64), 0 on element-admin (Vuex) control. |
+| Vuex dispatch | `vuex-dispatch` | ✅ **shipped (2026-06-20)** — string `dispatch('ns/action')`/`commit('M')` → handler; 100% precision element-admin (55) / vue-admin-template (12) / d2-admin (63), 0 on Redux controls. |
+| Celery | `celery-dispatch` | ✅ **shipped (2026-06-20)** — `.delay()`/`.apply_async()` → `@shared_task`/`@app.task` body; 100% precision paperless-ngx (31) / pretix (63 across 21 tasks), 0 on httpie control. Decorator-gated via source above the `def`. |
+| Spring events | `spring-event` | ✅ **shipped (2026-06-20)** — `publishEvent(new XEvent)` → `@EventListener`/`@TransactionalEventListener`/`ApplicationListener<X>` by event type; 100% precision halo (33 across 24 events) / code-examples (4), 0 on gson control. Type-keyed 2-pass, no name resolution. |
+| MediatR | `mediatr-dispatch` | ✅ **shipped (2026-06-20)** — `_mediator.Send(x)`/`.Publish(x)` → the `Handle` of `IRequestHandler<X>`/`INotificationHandler<X>` by request type; 100% precision jasontaylor (9) / eShop (9, variable-passed), 0 on Newtonsoft control. Type from class base-list (C# has no signature) + arg resolved inline/local/param; receiver + handler-map gates. |
+| Sidekiq | `sidekiq-dispatch` | ✅ **shipped (2026-06-20)** — `W.perform_async/_in/_at(…)` → `W#perform`, gated on `include Sidekiq::Job`/`Worker`; 100% precision loomio (47) / forem (142, both aliases), 0 on jekyll control. Name-keyed; namespaced collisions disambiguated by qualified name; ActiveJob `perform_later` excluded. |
+| Laravel events | `laravel-event` | ✅ **shipped (2026-06-21)** — `event(new XEvent)` → each listener's `handle`, via typed `handle(XEvent $e)` (auto-discovery, union-split) AND the `$listen` map (covers untyped handles); 100% precision koel (9, `$listen`) / firefly (141, auto-discovery), 0 on guzzle control. Jobs excluded (they use `::dispatch`). |
+| C/C++ fn-pointer dispatch | `fn-pointer-dispatch` | ✅ **shipped (2026-06-22)** — FIRST C / systems-language member (#932). Keyed by **(struct type, fn-pointer field)**: a fn registered to `S.field` (positional init matched by field index, designated `.field=fn`, or `x->field=fn`) ← linked → an indirect dispatch `recv->field(…)` whose receiver resolves to `S` (param/local type, else unique-field fallback). Source-read synth (`c-fnptr-synthesizer.ts`, regex over `ctx.readFile`), NOT extraction — handles the typedef'd field (`hook_func func`) + the **field←field double-hop** (`h->func = found->fn`, the issue's `hook_demo.c` shape). Covers BOTH the command-table idiom (Shape 1) and the ops-struct/vtable idiom (Shape 2) with the same key. Validated: **git 502** (`run_builtin→cmd_*` + 7 real vtables), **redis 357** (`dictType.hashFunction`, conn vtable), **curl 478** (`Curl_cwtype.do_init→{deflate,gzip,brotli,zstd}_do_init`); **0 non-function targets** everywhere, node-stable (pure edge synth), **0 on lua** (its `{name,fn}` tables register into the VM — no C indirect call → correctly nothing to bridge). **Deferred:** direct fn-pointer *variables* (`fp=f; fp()` — not field-keyed), array-of-fn-pointers without a struct, C++ *class* fn-pointer fields (virtual dispatch already covered by `interface-impl`/`cpp-override`), and macro-built tables (redis `MAKE_CMD(…)` proc arg lives inside a macro call, not a struct initializer, so `redisCommand.proc` registrations are unbridged). |
+| (see playbook §6 / `callback-synthesizer.ts` for the other ~20 channels) | | |
+
+### redux-thunk follow-ups (found by the n>1 validation — this is exactly what it's for)
+
+1. **Precision: name-collision target resolution — ✅ FIXED (2026-06-20).** `reduxThunkEdges`
+   resolved the dispatched name via `getNodesByName(name).find(kind ∈ {constant,function,
+   method})` — first match wins, no preference for the thunk. On **octo-call**, `leaveCall`
+   collides (a `createAsyncThunk` const at `state/call.ts:201` *and* a service `function`
+   at `services/firestore-signaling.ts:253`); **both** edges mis-resolved to the *service
+   function*. trezor's long unique thunk names hid this. **Fix:** resolution now prefers a
+   thunk-signature const > other const > same-file callable > first match (single-candidate
+   unaffected). Verified: octo-call's 2 edges now target the thunk (`call.ts:201`); uwave's 5
+   unchanged; regression test in `__tests__/redux-thunk-synthesizer.test.ts`.
+2. **Surfacing: synth edges between non-callable nodes were invisible — ✅ ROOT-CAUSED + FIXED
+   (2026-06-20).** redux-thunk connects `constant` nodes (thunks are `const X=createAsyncThunk`),
+   but explore's flow machinery assumed callables, so the hop fell through both surfacing
+   paths: **(a)** `buildFlowFromNamedSymbols` filtered its named set to
+   `CALLABLE={method,function,component,constructor}` (tools.ts:1554) → constants never entered
+   the Flow scan / #687 Dynamic-dispatch-links loop, at any tier; **(b)** the kind-agnostic
+   `### Relationships` section (which *does* render constant→constant) is
+   `includeRelationships:false` below 500 files. Net: redux-thunk edges surfaced ONLY via
+   Relationships, ONLY on repos ≥500 files (uwave/octo-call showed nothing). **Fix (surgical,
+   tier-independent):** a `dynNamed` set of named CONSTANT/VARIABLE/FIELD nodes that participate
+   in a heuristic edge feeds the `## Dynamic-dispatch links` scan (main call-chain stays
+   callable-only); plus a generic `synthEdgeNote` fallback so any synth hop reads
+   `dynamic: <kind> @wiring-site`, not a bare `[calls]`. Verified: uwave `shufflePlaylist→
+   loadPlaylist` and `register→login→initState` now surface; trezor unchanged; full suite +
+   new `__tests__/explore-synth-constant-endpoints.test.ts` pass. **No-op for callable flows**
+   (dynNamed stays empty) — so it generalizes: any future constant/variable/field-connecting
+   synth (RTK Query, Vuex) surfaces for free.
+
+---
+
+## Per-synthesizer validation protocol (condensed from the playbook)
+
+For each shape, before marking ✅:
+1. **Grep ≥3 real repos for the pattern**; keep the **2+ that contain it** (small/medium)
+   + **1 control that lacks it**. (Graph-level precision/recall validation does **not**
+   need not-trained-on repos — that constraint is only for *agent A/B baselines*.)
+2. **Measure the hole**: `select count(*) from edges where synthesizedBy='X'` →
+   non-zero + node count stable (no explosion) on the pattern repos; **0 on the control**.
+3. **Precision spot-check**: sample ~12 edges; source & target must both be real and the
+   indirection must actually exist in the source body.
+4. **Seed a flow**: `scripts/agent-eval/probe-explore.mjs` with the shape's endpoint
+   symbol names → the Flow section shows the path through the synthesized hop.
+5. **Agent A/B** (only for the headline repo, not every control): `--model sonnet
+   --effort high`, n≥2/arm, record Read/Grep/duration.
+
+---
+
+## Immediate next actions
+
+- [ ] **Validate redux-thunk for real (workstream 1):** clone a small + medium
+      `createAsyncThunk`-using app (grep-confirmed), re-index, repeat the protocol.
+      Promote `redux-thunk` 🟡→✅ or fix the overfit. *(None of the 4 already-cloned
+      eval repos contain `createAsyncThunk`.)*
+- [x] **Decide trezor end (workstream 3):** ✅ **RESOLVED (2026-06-21) — SHELVED as single-lineage / likely-overfit.**
+      The same-file object-literal half shipped as `object-registry` (xrengine/Prebid/warp-drive). The
+      remaining **cross-file barrel-namespace** half (`import * as M from './api'` → `M[runtimeKey]` →
+      `new` → `.run()`) was the open Tier-A item. A grep-confirmed discovery across **15 independent diverse
+      repos + GitHub-wide code search** found the STRICT shape in exactly **2 repos — trezor-suite AND
+      OneKey hardware-js-sdk — but OneKey is a `@trezor/connect` FORK** (same `findMethod`/`MethodConstructor`/
+      `ApiMethods[method]`/`new`+`BaseMethod.run()` skeleton, 130 vs 61 methods). So it's **2 indexable repos
+      but ONE design lineage = effectively n=1**. The hypothesis that it "*also* closes n8n/VS-Code registries"
+      is **DISPROVEN**: every independent "registry by runtime key" is a DIFFERENT shape the trezor-tuned synth
+      won't catch — n8n = dynamic `import()`-of-computed-PATH + DI (`Container.get`), polkadot = array-of-
+      constructors + numeric index, ccxt = object-literal/external-pkg (already covered by `object-registry`),
+      typeorm/bcoin/xrpl = `switch`. The barrel synth is the HARD tier (cross-file barrel re-export enumeration +
+      computed index + camel↔Pascal + entry-method fan-out) — **meaningful complexity for a single-lineage win**,
+      which the overfit discipline (see #1 above — the redux-thunk-on-trezor-alone lesson) says **don't build**.
+      Corpus `/tmp/cg-barrel-eval/` (trezor-suite, onekey-hardware + 15 non-matches). Reopen ONLY if an
+      independent (non-trezor-lineage) repo with the strict shape turns up. The **facade**
+      (`connect-common/factory.ts`) remains **low-value** (single `call` fan-in, no per-method disambiguation) — skip.
+- [x] **RTK Query (workstream 2 spillover):** ✅ **shipped (2026-06-20)** —
+      `synthesizedBy:'rtk-query'`, validated on basetool / minusx-metabase /
+      shapeshift (+ uwave control). See the Tier-A row for the mechanism.
+      **Next RTK spillover:** the cross-module `injectEndpoints` case (hooks
+      destructured off an enhanced api in a different file than the base) — the
+      synth's same-file gate skips it today; would need a same-`reducerPath` or
+      import-following relaxation, validated on a repo that splits endpoints.

@@ -13,11 +13,13 @@ import { nestjsResolver } from './nestjs';
 import { reactResolver } from './react';
 import { svelteResolver } from './svelte';
 import { vueResolver } from './vue';
+import { astroResolver } from './astro';
 import { djangoResolver, flaskResolver, fastapiResolver } from './python';
 import { railsResolver } from './ruby';
 import { springResolver } from './java';
 import { playResolver } from './play';
 import { goResolver } from './go';
+import { goframeResolver } from './goframe';
 import { rustResolver } from './rust';
 import { aspnetResolver } from './csharp';
 import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
@@ -39,6 +41,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   reactResolver,
   svelteResolver,
   vueResolver,
+  astroResolver,
   // Python
   djangoResolver,
   flaskResolver,
@@ -50,6 +53,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   playResolver,
   // Go
   goResolver,
+  goframeResolver,
   // Rust
   rustResolver,
   // C#
@@ -128,11 +132,13 @@ export { nestjsResolver } from './nestjs';
 export { reactResolver } from './react';
 export { svelteResolver } from './svelte';
 export { vueResolver } from './vue';
+export { astroResolver } from './astro';
 export { djangoResolver, flaskResolver, fastapiResolver } from './python';
 export { railsResolver } from './ruby';
 export { springResolver } from './java';
 export { playResolver } from './play';
 export { goResolver } from './go';
+export { goframeResolver } from './goframe';
 export { rustResolver } from './rust';
 export { aspnetResolver } from './csharp';
 export { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
