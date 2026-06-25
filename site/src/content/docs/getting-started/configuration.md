@@ -3,7 +3,7 @@ title: Configuration
 description: CodeGraph is zero-config by default, with one optional codegraph.json for custom extensions and indexing nested git repositories.
 ---
 
-Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions) and [indexing nested git repositories](#indexing-nested-git-repositories).
+Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions), [indexing nested git repositories](#indexing-nested-git-repositories), and [C# MediatR handler interfaces](#c-mediatr-handler-interfaces).
 
 ## What it skips out of the box
 
@@ -55,6 +55,20 @@ A few things to know:
 - A project without this layout needs no `codegraph.json` at all.
 
 Re-index (`codegraph index`) after adding or changing `includeIgnored`.
+
+## C# MediatR handler interfaces
+
+`codegraph_explore` follows MediatR `_mediator.Send(...)` and `_mediator.Publish(...)` into the matching handler's `Handle` method. By default it recognizes `IRequestHandler<>` and `INotificationHandler<>`. If your project uses derived CQRS interfaces — `ICommandHandler<>`, `IQueryHandler<>`, or similar — register them in `codegraph.json`:
+
+```json
+{
+  "csharp": {
+    "mediatrHandlerInterfaces": ["ICommandHandler", "IQueryHandler"]
+  }
+}
+```
+
+Each entry is a C# interface name (no generic arguments). Built-in MediatR interfaces are always recognized; this list adds any extras. Invalid entries are warned about and skipped — they never break indexing — and a project without this block behaves exactly as before. Re-index (`codegraph index`) after adding or changing the list.
 
 ## Where data lives
 

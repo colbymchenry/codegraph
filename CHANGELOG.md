@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- C# projects that use derived MediatR handler interfaces — such as `ICommandHandler<>` or `IQueryHandler<>` instead of `IRequestHandler<>` directly — can now register those interface names in `codegraph.json` under `csharp.mediatrHandlerInterfaces`. `codegraph_explore` then follows `_mediator.Send(...)` into the matching `Handle` method the same way it already does for `IRequestHandler<>` and `INotificationHandler<>`. Built-in MediatR interfaces are always recognized; the config adds any extras your CQRS layout uses. Re-index after changing the list.
+
 
 ## [1.1.1] - 2026-06-24
 

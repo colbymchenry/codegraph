@@ -15,7 +15,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { CodeGraph } from '../src';
 import { detectLanguage, isSourceFile } from '../src/extraction/grammars';
-import { loadExtensionOverrides, clearProjectConfigCache } from '../src/project-config';
+import { loadExtensionOverrides, loadMediatrHandlerInterfaces, clearProjectConfigCache } from '../src/project-config';
 
 describe('custom extension → language mapping (#906)', () => {
   describe('detectLanguage / isSourceFile overrides argument', () => {
@@ -100,6 +100,78 @@ describe('custom extension → language mapping (#906)', () => {
       fs.utimesSync(path.join(dir, 'codegraph.json'), future, future);
 
       expect(loadExtensionOverrides(dir)).toEqual({ '.foo': 'go' });
+    });
+  });
+
+  describe('loadMediatrHandlerInterfaces (codegraph.json)', () => {
+    let dir: string;
+    beforeEach(() => {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mediatr-cfg-'));
+      clearProjectConfigCache();
+    });
+    afterEach(() => {
+      clearProjectConfigCache();
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+    const writeConfig = (obj: unknown) =>
+      fs.writeFileSync(
+        path.join(dir, 'codegraph.json'),
+        typeof obj === 'string' ? obj : JSON.stringify(obj)
+      );
+
+    it('returns an empty array when there is no codegraph.json', () => {
+      expect(loadMediatrHandlerInterfaces(dir)).toEqual([]);
+    });
+
+    it('loads additional handler interface names from csharp.mediatrHandlerInterfaces', () => {
+      writeConfig({
+        csharp: { mediatrHandlerInterfaces: ['ICommandHandler', 'IQueryHandler'] },
+      });
+      expect(loadMediatrHandlerInterfaces(dir)).toEqual(['ICommandHandler', 'IQueryHandler']);
+    });
+
+    it('filters out built-in IRequestHandler and INotificationHandler duplicates', () => {
+      writeConfig({
+        csharp: {
+          mediatrHandlerInterfaces: ['IRequestHandler', 'ICommandHandler', 'INotificationHandler'],
+        },
+      });
+      expect(loadMediatrHandlerInterfaces(dir)).toEqual(['ICommandHandler']);
+    });
+
+    it('dedupes repeated entries', () => {
+      writeConfig({
+        csharp: { mediatrHandlerInterfaces: ['ICommandHandler', 'ICommandHandler'] },
+      });
+      expect(loadMediatrHandlerInterfaces(dir)).toEqual(['ICommandHandler']);
+    });
+
+    it('ignores a non-object csharp field', () => {
+      writeConfig({ csharp: 'nope' });
+      expect(loadMediatrHandlerInterfaces(dir)).toEqual([]);
+    });
+
+    it('ignores a non-array mediatrHandlerInterfaces field', () => {
+      writeConfig({ csharp: { mediatrHandlerInterfaces: 'nope' } });
+      expect(loadMediatrHandlerInterfaces(dir)).toEqual([]);
+    });
+
+    it('skips invalid identifier entries', () => {
+      writeConfig({
+        csharp: { mediatrHandlerInterfaces: ['ICommandHandler', 'not-valid!', ''] },
+      });
+      expect(loadMediatrHandlerInterfaces(dir)).toEqual(['ICommandHandler']);
+    });
+
+    it('picks up a changed config (mtime-invalidated cache)', () => {
+      writeConfig({ csharp: { mediatrHandlerInterfaces: ['ICommandHandler'] } });
+      expect(loadMediatrHandlerInterfaces(dir)).toEqual(['ICommandHandler']);
+
+      writeConfig({ csharp: { mediatrHandlerInterfaces: ['IQueryHandler'] } });
+      const future = new Date(Date.now() + 2000);
+      fs.utimesSync(path.join(dir, 'codegraph.json'), future, future);
+
+      expect(loadMediatrHandlerInterfaces(dir)).toEqual(['IQueryHandler']);
     });
   });
 

@@ -629,6 +629,22 @@ language or a malformed file is warned about and skipped — it never breaks
 indexing — and a project with no `codegraph.json` behaves exactly as before.
 Re-index (`codegraph index`) after adding or changing mappings.
 
+C# projects that implement handlers through derived CQRS interfaces (e.g.
+`ICommandHandler<>` / `IQueryHandler<>` instead of `IRequestHandler<>` directly)
+can register those names under `csharp.mediatrHandlerInterfaces` so MediatR
+dispatch tracing picks them up:
+
+```json
+{
+  "csharp": {
+    "mediatrHandlerInterfaces": ["ICommandHandler", "IQueryHandler"]
+  }
+}
+```
+
+`IRequestHandler<>` and `INotificationHandler<>` are always recognized; this
+list adds any extras. Re-index after changing it.
+
 ## Telemetry
 
 CodeGraph collects **anonymous usage statistics** — which tools and commands get
