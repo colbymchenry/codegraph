@@ -37,6 +37,13 @@
  * then reads the positional/designated bindings. Dispatch additionally resolves
  * an array subscript through a file-scope table (`(cmdnames[i].cmd_func)(…)`).
  *
+ * Also bridges **bare arrays of function pointers** (no struct, no field) —
+ * `opcode_t *opcodes[256] = {nop,…}` dispatched `opcodes[op](…)` (SameBoy's CPU),
+ * `zend_rc_dtor_func_t t[] = {[IS_STRING]=(cast)fn,…}` dispatched `t[GC_TYPE(p)](…)`
+ * (php's Zend) — keyed by the array VARIABLE name. The element type must be a
+ * function typedef (the precision gate), entries are literal function names, and
+ * the same-file table wins on a name collision (two file-local `opcodes[256]`).
+ *
  * Whole-graph pass after base resolution; all edges are `provenance:'heuristic'`
  * (`synthesizedBy:'fn-pointer-dispatch'`). High precision via the (type, field)
  * key + a real-function gate; a project with no fn-pointer dispatch is a no-op.
@@ -279,10 +286,13 @@ function expandMacroCalls(text: string, env: Map<string, MacroDef>): string {
   return out;
 }
 
-/** A fn-pointer field looks like `… (*name)(…)` — capture `name`. */
-const FNPTR_DECL_RE = /\(\s*\*\s*(\w+)\s*\)\s*\(/;
-/** `typedef RET (*NAME)(…)` — a function-pointer typedef. */
-const FNPTR_TYPEDEF_RE = /\btypedef\b[^;{}]*?\(\s*\*\s*(\w+)\s*\)\s*\(/g;
+/** A fn-pointer field looks like `… (*name)(…)` — capture `name`. A
+ *  calling-convention / attribute macro may precede the `*`
+ *  (`(ZEND_FASTCALL *name)`), so allow leading word tokens. */
+const FNPTR_DECL_RE = /\(\s*(?:\w+\s+)*\*\s*(\w+)\s*\)\s*\(/;
+/** `typedef RET (*NAME)(…)` — a function-pointer typedef (CC/attr macro before
+ *  the `*` allowed, as in php's `typedef void (ZEND_FASTCALL *fn_t)(…)`). */
+const FNPTR_TYPEDEF_RE = /\btypedef\b[^;{}]*?\(\s*(?:\w+\s+)*\*\s*(\w+)\s*\)\s*\(/g;
 /** A whole brace-free `typedef … ;` statement — capture the guts to spot the
  *  function-TYPE form `typedef RET NAME(params)` (no `(*name)` pointer form). */
 const FNTYPE_TYPEDEF_STMT_RE = /\btypedef\b([^;{}]*);/g;
@@ -462,6 +472,20 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
     idToNode.set(fn.id, fn);
   };
 
+  // Bare arrays-of-fn-pointers (no struct): array VARIABLE name → per-file sets
+  // of registered function ids. Multi-entry because a file-scope `static` table
+  // name can recur across files (SameBoy declares `static opcode_t *opcodes[256]`
+  // in BOTH sm83_cpu.c and sm83_disassembler.c), so dispatch resolves same-file.
+  const arrayReg = new Map<string, { file: string; ids: Set<string> }[]>();
+  const addArrayReg = (name: string, file: string, fn: Node): void => {
+    let entries = arrayReg.get(name);
+    if (!entries) { entries = []; arrayReg.set(name, entries); }
+    let e = entries.find((x) => x.file === file);
+    if (!e) { e = { file, ids: new Set() }; entries.push(e); }
+    e.ids.add(fn.id);
+    idToNode.set(fn.id, fn);
+  };
+
   // A struct value `{ … }` (one element) — register its function entries to the
   // struct's fields, by `.field = fn` designators or by positional slot.
   const registerStructValue = (
@@ -505,6 +529,33 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
         }
       }
       pos++;
+    }
+  };
+
+  // Collect the literal function entries of an array-of-fn-pointers initializer
+  // and register them under the array's variable name. Entries may be positional
+  // (`fn`, `&fn`), designated by index (`[OP] = fn`), or cast-wrapped
+  // (`(handler_t)fn`, as in php's Zend dtor table). Non-identifier entries
+  // (`NULL`, `0`, a nested expression) are skipped — a miss, never a wrong edge.
+  // No index tracking: a runtime subscript fans the dispatch out to the whole
+  // set, exactly like a command table reaches every command.
+  const registerArrayValue = (
+    name: string,
+    body: string,
+    file: string,
+    env?: Map<string, MacroDef>,
+  ): void => {
+    if (env && env.size) body = expandMacroCalls(body, env);
+    for (const rawItem of splitTopLevel(body, ',')) {
+      let item = rawItem.trim();
+      if (!item) continue;
+      const des = item.match(/^\[[^\]]*\]\s*=\s*([\s\S]*)$/); // `[IDX] = …` designator
+      if (des) item = des[1]!.trim();
+      item = item.replace(/^\((?:[\w\s*]+)\)\s*/, '').replace(/^&\s*/, '').trim(); // (cast) / &
+      const id = item.match(/^(\w+)$/);
+      if (!id) continue;
+      const fn = resolveFn(id[1]!, file);
+      if (fn) addArrayReg(name, file, fn);
     }
   };
 
@@ -658,6 +709,13 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
   // by a `#define …` line ending in a digit, as in vim), and the trailing
   // `var … = {` check below is what distinguishes a TABLE from a plain type.
   const INLINE_STRUCT_RE = /\bstruct\s+(\w+)\s*\{/g;
+  // `(?:static …)* ELEMTYPE [*] name[…] = { … }` — a bare array of function
+  // pointers (no struct wrapper). The optional `*` covers a function-TYPE
+  // typedef element (`opcode_t *opcodes[]`); a function-pointer typedef element
+  // (`zend_rc_dtor_func_t t[]`) needs none. The typedef-set membership gate
+  // (below) is what separates this from a plain data/struct array.
+  const ARRAY_TABLE_RE =
+    /(?:^|[;{}])\s*(?:(?:static|const|extern|register|volatile)\s+)*(\w+)\s+(\*\s*)?(\w+)\s*\[[^\]]*\]\s*=\s*\{/g;
   for (const unit of units) {
     const s = unit.text;
     if (!s || !s.includes('{')) continue;
@@ -701,6 +759,23 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
       globalVarType.set(m[2]!, struct);
       processInit(struct, s.slice(open + 1, close), isArray, unit.file, unit.env);
       INIT_RE.lastIndex = close;
+    }
+
+    // Bare arrays-of-function-pointers (no struct, no field). Gated on the
+    // element type being a function typedef — a fn-TYPE typedef needs the `*`
+    // (array of pointers to it), a fn-pointer typedef does not. A data or
+    // struct array's element type is never in these sets, so it never fires.
+    ARRAY_TABLE_RE.lastIndex = 0;
+    let am: RegExpExecArray | null;
+    while ((am = ARRAY_TABLE_RE.exec(s))) {
+      const elemType = am[1]!;
+      const hasStar = !!am[2];
+      if (!((fnTypeTypedefs.has(elemType) && hasStar) || fnPtrTypedefs.has(elemType))) continue;
+      const open = am.index + am[0].length - 1; // the `{`
+      const close = matchBrace(s, open);
+      if (close < 0) continue;
+      registerArrayValue(am[3]!, s.slice(open + 1, close), unit.file, unit.env);
+      ARRAY_TABLE_RE.lastIndex = close;
     }
   }
 
@@ -785,7 +860,7 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
     }
     if (!changed) break;
   }
-  if (reg.size === 0) return [];
+  if (reg.size === 0 && arrayReg.size === 0) return [];
 
   // ---- Pass E: dispatch sites → edges ----
   // `base->…->field(` or `base.…field(` where `field` is a known fn-pointer field.
@@ -793,6 +868,11 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
   // (`cmdnames[i].cmd_func`). An optional `)` before the call covers the
   // parenthesized form `(cmdnames[i].cmd_func)(&ea)` vim uses.
   const DISPATCH_RE = /((?:\w+(?:\s*\[[^\][]*\])?\s*(?:->|\.)\s*)+)(\w+)\s*\)?\s*\(/g;
+  // Bare-array dispatch: `tbl[i](…)` or the explicit-deref `(*tbl[i])(…)`. The
+  // subscript may itself contain a call (`tbl[GC_TYPE(p)](…)`), so the index
+  // class excludes only brackets. Precision comes from the `arrayReg` gate below
+  // — this fires only when `tbl` is a known fn-pointer array.
+  const ARRAY_DISPATCH_RE = /(?:\(\s*\*\s*)?\b(\w+)\s*\[[^\][]*\]\s*\)?\s*\(/g;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const fn of cFns) {
@@ -839,6 +919,41 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
           },
         });
         if (++added >= FANOUT_CAP) break;
+      }
+    }
+
+    // ---- bare array-of-fn-pointers dispatch (`tbl[i](…)`) ----
+    if (arrayReg.size && added < FANOUT_CAP) {
+      ARRAY_DISPATCH_RE.lastIndex = 0;
+      while ((m = ARRAY_DISPATCH_RE.exec(body)) && added < FANOUT_CAP) {
+        const entries = arrayReg.get(m[1]!);
+        if (!entries) continue;
+        // Same-file table wins on a name collision (two file-local `opcodes`);
+        // a unique name resolves cross-file; otherwise ambiguous — bail.
+        const ids = entries.length === 1
+          ? entries[0]!.ids
+          : (entries.find((e) => e.file === fn.filePath)?.ids ?? null);
+        if (!ids) continue;
+        const line = fn.startLine + body.slice(0, m.index).split('\n').length - 1;
+        for (const tid of ids) {
+          if (tid === fn.id) continue;
+          const key = `${fn.id}>${tid}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: fn.id,
+            target: tid,
+            kind: 'calls',
+            line,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'fn-pointer-dispatch',
+              via: `${m[1]}[]`,
+              registeredAt: `${fn.filePath}:${line}`,
+            },
+          });
+          if (++added >= FANOUT_CAP) break;
+        }
       }
     }
   }
