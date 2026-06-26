@@ -5,6 +5,7 @@
  */
 
 import type CodeGraph from '../index';
+import type { QueryPool } from './query-pool';
 import { findNearestCodeGraphRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
@@ -710,8 +711,23 @@ export class ToolHandler {
   // huge repo can't hang the first call (#905); cleared on first await so
   // subsequent calls don't pay any cost.
   private catchUpGate: Promise<void> | null = null;
+  // Optional worker-thread pool for off-loop read-tool dispatch (daemon mode).
+  // When set + healthy, the heavy read tools run on a worker so the daemon's
+  // main loop stays free for the MCP transport under concurrent load. Null in
+  // direct/in-process mode (one client, no concurrency to parallelize).
+  private queryPool: QueryPool | null = null;
 
   constructor(private cg: CodeGraph | null) {}
+
+  /**
+   * Engine-only: attach (or detach with null) the worker-thread query pool. The
+   * shared daemon sets this once its default project is open; the workers each
+   * hold their own WAL read connection and run {@link executeReadTool}. A
+   * worker's own ToolHandler never has a pool, so there is no nested off-loading.
+   */
+  setQueryPool(pool: QueryPool | null): void {
+    this.queryPool = pool;
+  }
 
   /**
    * Update the default CodeGraph instance (e.g. after lazy initialization)
@@ -1244,36 +1260,27 @@ export class ToolHandler {
         if (typeof check === 'object' && check !== undefined) return check;
       }
 
-      // Read tools resolve through a single result variable so cross-cutting
-      // notices — worktree-index mismatch (issue #155) and per-file
-      // staleness (issue #403) — can be applied in one place. status embeds
-      // its own verbose worktree warning but still flows through the
-      // staleness wrapper so its pending-files section stays consistent
-      // with what the read tools surface.
-      let result: ToolResult;
-      switch (toolName) {
-        case 'codegraph_search':
-          result = await this.handleSearch(args); break;
-        case 'codegraph_callers':
-          result = await this.handleCallers(args); break;
-        case 'codegraph_callees':
-          result = await this.handleCallees(args); break;
-        case 'codegraph_impact':
-          result = await this.handleImpact(args); break;
-        case 'codegraph_explore':
-          result = await this.handleExplore(args); break;
-        case 'codegraph_node':
-          result = await this.handleNode(args); break;
-        case 'codegraph_status':
-          // status embeds the pending-files list as a first-class section
-          // (see handleStatus), so we skip the auto-banner wrapper here to
-          // avoid duplicating the same info at the top of the response.
-          return await this.handleStatus(args);
-        case 'codegraph_files':
-          result = await this.handleFiles(args); break;
-        default:
-          return this.errorResult(`Unknown tool: ${toolName}`);
+      // codegraph_status reports watcher state (pending files, degraded mode,
+      // worktree warning) and embeds its own sections — it must run on the MAIN
+      // thread against the watched default instance, so it is NEVER off-loaded to
+      // a worker (whose read connection has no watcher). It also skips the
+      // auto-banner wrapper to avoid duplicating its own pending-files section.
+      if (toolName === 'codegraph_status') {
+        return await this.handleStatus(args);
       }
+
+      // Read tools: off-load the CPU-heavy dispatch to the worker pool when one
+      // is attached and healthy (daemon mode), so the daemon's single event loop
+      // stays free for the MCP transport under concurrent load — otherwise N
+      // concurrent explores serialize AND starve the transport until the whole
+      // batch drains (clients then time out). With no pool (direct mode) or a
+      // degraded one, dispatch runs in-process exactly as before. Either way the
+      // result flows through the cross-cutting notices — worktree-index mismatch
+      // (#155) and per-file staleness (#403) — which need the watched MAIN
+      // instance and so are always applied here, never in the worker.
+      const result = (this.queryPool && this.queryPool.healthy)
+        ? await this.queryPool.run(toolName, args)
+        : await this.executeReadTool(toolName, args);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
@@ -1292,6 +1299,56 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    }
+  }
+
+  /**
+   * Run a single read tool to completion and return its raw {@link ToolResult},
+   * classifying expected failures the same way {@link execute}'s catch does so
+   * the SHAPE is identical whether dispatch runs in-process or on a worker:
+   * NotIndexed → success-shaped guidance, PathRefusal → clean error, anything
+   * else → internal-error-with-retry. Never throws.
+   *
+   * This is the worker thread's entry point (see {@link ./query-worker}) and the
+   * in-process fallback for {@link execute}. It deliberately does NOT run the
+   * catch-up gate or the staleness/worktree notices — those need the daemon's
+   * watched main instance and stay on the main thread. Cross-cutting allowlist +
+   * path validation already ran in {@link execute} before routing here.
+   */
+  async executeReadTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    try {
+      return await this.dispatchTool(toolName, args);
+    } catch (err) {
+      if (err instanceof NotIndexedError) {
+        return this.textResult(err.message);
+      }
+      if (err instanceof PathRefusalError) {
+        return this.errorResult(err.message);
+      }
+      return this.errorResult(
+        `Tool execution failed: ${err instanceof Error ? err.message : String(err)}. ` +
+        'This is an internal codegraph error — retry the call once; if it persists, ' +
+        'continue without codegraph for this task.'
+      );
+    }
+  }
+
+  /**
+   * Pure dispatch over the read tools — the switch, with no gate, no notices, no
+   * allowlist/validation (the caller owns those). `codegraph_status` is handled
+   * on the main thread in {@link execute} and never reaches here. May throw
+   * NotIndexed/PathRefusal, which {@link executeReadTool} classifies.
+   */
+  private async dispatchTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    switch (toolName) {
+      case 'codegraph_search': return await this.handleSearch(args);
+      case 'codegraph_callers': return await this.handleCallers(args);
+      case 'codegraph_callees': return await this.handleCallees(args);
+      case 'codegraph_impact': return await this.handleImpact(args);
+      case 'codegraph_explore': return await this.handleExplore(args);
+      case 'codegraph_node': return await this.handleNode(args);
+      case 'codegraph_files': return await this.handleFiles(args);
+      default: return this.errorResult(`Unknown tool: ${toolName}`);
     }
   }
 

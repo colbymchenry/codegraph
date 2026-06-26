@@ -148,7 +148,12 @@ export class Daemon {
     this.pidPath = getDaemonPidPath(projectRoot);
     this.idleTimeoutMs = opts.idleTimeoutMs ?? resolveIdleTimeoutMs();
     this.maxIdleMs = opts.maxIdleMs ?? resolveMaxIdleMs();
-    this.engine = new MCPEngine();
+    // Daemon mode serves many concurrent clients on one event loop, so off-load
+    // read-tool dispatch to a worker pool — otherwise concurrent explores
+    // serialize and starve the MCP transport (clients time out). Direct mode
+    // (one stdio client) leaves the pool off; `CODEGRAPH_QUERY_POOL_SIZE=0`
+    // disables it here too.
+    this.engine = new MCPEngine({ queryPool: true });
     this.engine.setProjectPathHint(projectRoot);
   }
 
