@@ -234,6 +234,86 @@ export function findIndexedSubprojectRoots(
 }
 
 /**
+ * English structural keywords, matched with `\b` word boundaries so a keyword
+ * inside a longer word doesn't false-positive ("flow" in "flower").
+ */
+const STRUCTURAL_EN = /\b(how|where|trace|flow|path|reach(?:es|ed)?|call(?:s|ed|er|ers|ee)?|depend|impact|affect|wired?|connect|implement|architect|structure|breaks?|what calls|why does)\b/i;
+
+/**
+ * Non-English (CJK) structural keywords, matched WITHOUT `\b`. JS's `\b` is
+ * ASCII-only — it only fires at `[A-Za-z0-9_]` boundaries, never between Han
+ * characters — so a Chinese keyword wrapped in `\b…\b` could never match. That
+ * was issue #994: the English-only gate silently no-op'd every Chinese prompt,
+ * so non-English users got no front-load nudge and no error to explain why. The
+ * set mirrors the English intent (如何=how, 在哪/哪里=where, 流程/流向=flow,
+ * 路径=path, 调用=call, 依赖=depend, 影响=impact/affect, 实现=implement,
+ * 架构=architect, 结构=structure, 追踪/跟踪=trace) plus structural-overview words
+ * with no single clean English equivalent (介绍/解析/分析/原理/机制).
+ */
+const STRUCTURAL_CJK = /如何|怎么|在哪|哪里|追踪|跟踪|流程|流向|路径|调用|依赖|影响|实现|架构|结构|介绍|解析|分析|原理|机制/;
+
+/** Doc/data/asset file extensions — a `name.ext` of this kind is a file
+ *  reference, not a code symbol, so it must not trip the member-access signal. */
+const DOC_DATA_EXT = /\.(md|markdown|txt|rst|json|ya?ml|toml|lock|csv|tsv|log|ini|cfg|conf|env|xml|html?|png|jpe?g|gif|svg|pdf)$/i;
+
+/**
+ * Does `prompt` contain an explicit structural keyword (English or CJK)? A
+ * keyword is a strong, self-contained signal, so the front-load hook fires on it
+ * directly — no graph check needed. (A *code-token* match, by contrast, is only
+ * a candidate the hook verifies against the graph first; see {@link extractCodeTokens}.)
+ */
+export function hasStructuralKeyword(prompt: string): boolean {
+  return !!prompt && (STRUCTURAL_EN.test(prompt) || STRUCTURAL_CJK.test(prompt));
+}
+
+/**
+ * Identifier-shaped tokens in `prompt` — camelCase / PascalCase-with-inner-cap,
+ * snake_case, a `name(` call, or the two sides of an `a.b` member access. Naming
+ * a symbol is a code question whatever the surrounding human language, and these
+ * shapes almost never occur in ordinary prose, so they catch the common
+ * "<symbol> 的调用链?" / "where is <symbol> 定義" prompts no keyword list would.
+ *
+ * These are *candidates*, not a verdict: a tech brand like `JavaScript` or
+ * `GitHub` is identifier-shaped too, so the front-load hook checks each token
+ * against the actual index ({@link getNodesByName}) and only fires when one is a
+ * real symbol here — otherwise a brand-name prompt would inject ~16KB of
+ * low-relevance context (issue #994 follow-up). A doc/data filename ("README.md")
+ * is excluded from the member-access form since it's a file reference, not a symbol.
+ */
+export function extractCodeTokens(prompt: string): string[] {
+  if (!prompt) return [];
+  const out = new Set<string>();
+  // camelCase / PascalCase-with-inner-cap (getUserId, parseToken, UserService) or
+  // snake_case (article_publish, get_user) — a whole identifier run that has an
+  // inner lower→upper transition or an underscore flanked by alphanumerics.
+  for (const m of prompt.matchAll(/[A-Za-z_$][\w$]*/g)) {
+    const w = m[0];
+    if (/[a-z][A-Z]/.test(w) || /[A-Za-z0-9]_[A-Za-z0-9]/.test(w)) out.add(w);
+  }
+  // call form: an identifier directly before '(' — parseToken(, render(). No
+  // whitespace before '(' so prose like "the function (entry point)" doesn't trip it.
+  for (const m of prompt.matchAll(/([A-Za-z_$][\w$]*)\(/g)) out.add(m[1]!);
+  // member access on identifiers (user.login) — but not a doc/data filename.
+  for (const m of prompt.matchAll(/([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)/g)) {
+    if (!DOC_DATA_EXT.test(m[0])) { out.add(m[1]!); out.add(m[2]!); }
+  }
+  return [...out];
+}
+
+/**
+ * Cheap, graph-free candidate gate for the front-load hook: could `prompt` be a
+ * structural / flow / impact / "where-how" question worth front-loading context
+ * for? True on an explicit keyword (English or CJK, issue #994) OR an
+ * identifier-shaped token. A keyword is sufficient to fire on its own; a
+ * token-only match is only a candidate the hook then verifies against the graph
+ * (a brand name like `JavaScript` is token-shaped but isn't a symbol). Every
+ * non-candidate prompt ("fix this typo", in any language) stays a zero-cost no-op.
+ */
+export function isStructuralPrompt(prompt: string): boolean {
+  return hasStructuralKeyword(prompt) || extractCodeTokens(prompt).length > 0;
+}
+
+/**
  * What the front-load hook should do for a prompt issued from a directory.
  */
 export interface FrontloadPlan {
