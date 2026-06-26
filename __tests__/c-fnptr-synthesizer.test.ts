@@ -144,4 +144,91 @@ function run(name, x) { return handlers[name](x); }
     const edges = await load();
     expect(edges.length).toBe(0);
   });
+
+  // The redis command-table shape, minimized: the handler is wrapped in a
+  // function-like macro, the table's struct type is an object-like macro alias,
+  // the fn-pointer field uses a function-TYPE typedef, and the dispatch receiver
+  // is a chained field access through a multi-declarator field.
+  it('bridges a macro-built table with a typedef field, type-alias macro, and chained dispatch', async () => {
+    write('reg.h', `
+typedef void cmdProc(int x);                 /* function-TYPE typedef, not (*name) */
+struct command { const char *name; cmdProc *proc; };
+struct context { int id; struct command *cmd, *last; };  /* multi-declarator field */
+`);
+    write('reg.c', `
+#include "reg.h"
+#define ENTRY(nm, handler) nm, handler       /* function-like macro wrapping the handler */
+#define CMD_T command                        /* object-like macro: the struct-type alias */
+static void getCmd(int x) {}
+static void setCmd(int x) {}
+static void unusedCmd(int x) {}              /* defined, NOT in the table */
+static struct CMD_T table[] = {
+    { ENTRY("get", getCmd) },
+    { ENTRY("set", setCmd) },
+};
+void run(struct context *ctx, int x) { ctx->cmd->proc(x); }  /* context.cmd → command → proc */
+`);
+    const edges = await load();
+    expect(has(edges, 'run', 'getCmd')).toBe(true);
+    expect(has(edges, 'run', 'setCmd')).toBe(true);
+    expect(edges.every((e) => e.via === 'command.proc')).toBe(true);
+    // PRECISION: a function not registered in the table is never a target.
+    expect(has(edges, 'run', 'unusedCmd')).toBe(false);
+  });
+
+  // redis generates its command table into a `.def` that is #included (and never
+  // indexed on its own). The synthesizer reads the included file with the
+  // includer's macros in scope so the table still resolves.
+  it('reads a macro-built table from a non-indexed #included file', async () => {
+    write('inc.h', `
+typedef int opRun(void);
+struct op { const char *name; opRun *run; };
+`);
+    write('inc.c', `
+#include "inc.h"
+#define MK(nm, fn) nm, fn
+#define CMD_T op
+static int a_impl(void){return 0;}
+static int b_impl(void){return 0;}
+#include "ops.def"
+int go(struct op *o) { return o->run(); }
+`);
+    // `.def` is not a C source extension, so this file is never indexed — it is
+    // only visible to the synthesizer through inc.c's #include.
+    write('ops.def', `
+static struct CMD_T optable[] = {
+  { MK("a", a_impl) },
+  { MK("b", b_impl) },
+};
+`);
+    const edges = await load();
+    expect(has(edges, 'go', 'a_impl')).toBe(true);
+    expect(has(edges, 'go', 'b_impl')).toBe(true);
+    expect(edges.every((e) => e.via === 'op.run')).toBe(true);
+  });
+
+  // The sqlite builtin-function-table shape: the table-building macro lives in a
+  // header (`sqliteInt.h`), separate from the file with the table (`func.c`), and
+  // expands to a whole brace-wrapped struct element `{ …, xFunc, … }`.
+  it('expands a header-defined macro that produces a brace-wrapped element', async () => {
+    write('fn.h', `
+typedef void sqlFn(int *ctx);
+struct FuncDef { int nArg; sqlFn *xFunc; const char *zName; };
+#define MKFUNC(name, impl) { 1, impl, #name }
+`);
+    write('fn.c', `
+#include "fn.h"
+static void absImpl(int *ctx) {}
+static void lenImpl(int *ctx) {}
+static struct FuncDef builtins[] = {
+    MKFUNC(abs, absImpl),
+    MKFUNC(len, lenImpl),
+};
+void invoke(struct FuncDef *p, int *x) { p->xFunc(x); }
+`);
+    const edges = await load();
+    expect(has(edges, 'invoke', 'absImpl')).toBe(true);
+    expect(has(edges, 'invoke', 'lenImpl')).toBe(true);
+    expect(edges.every((e) => e.via === 'FuncDef.xFunc')).toBe(true);
+  });
 });
