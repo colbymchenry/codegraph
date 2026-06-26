@@ -18,7 +18,9 @@
  * pointer to the socket path the daemon chose.
  */
 
+import { execFileSync } from 'child_process';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { getCodeGraphDir } from '../directory';
@@ -32,6 +34,58 @@ function projectHash(projectRoot: string): string {
 }
 
 /**
+ * Per-device cache for AF_UNIX socket support. Keyed by `fs.statSync().dev`
+ * so the probe runs at most once per mounted filesystem.
+ */
+const socketSupportCache = new Map<number, boolean>();
+
+/**
+ * Probe whether `dir` lives on a filesystem that supports AF_UNIX sockets.
+ * ExFAT, NTFS-3G, some FUSE mounts, and network shares don't — `listen()`
+ * fails with ENOTSUP / EOPNOTSUPP. The result is cached per device so
+ * subsequent calls for the same mount are free.
+ *
+ * Exported for testing.
+ */
+export function canSocketInDir(dir: string): boolean {
+  let dev: number;
+  try {
+    dev = fs.statSync(dir).dev;
+  } catch {
+    return true; // can't stat → optimistic, let listen() fail naturally
+  }
+  const cached = socketSupportCache.get(dev);
+  if (cached !== undefined) return cached;
+
+  const probe = path.join(dir, `.sock-probe-${process.pid}`);
+  try {
+    // getDaemonSocketPath is synchronous but net.Server.listen is async.
+    // Bridge with execFileSync: spawn a short-lived child that attempts to
+    // bind a Unix socket and exits 0 (success) or 1 (ENOTSUP / similar).
+    execFileSync(process.execPath, [
+      '-e',
+      `const n=require("net"),f=require("fs"),p=${JSON.stringify(probe)};` +
+        'const s=n.createServer();' +
+        's.on("error",()=>{try{f.unlinkSync(p)}catch{};process.exit(1)});' +
+        's.listen(p,()=>{s.close();try{f.unlinkSync(p)}catch{};process.exit(0)})',
+    ], { timeout: 3000, stdio: 'ignore' });
+    socketSupportCache.set(dev, true);
+    return true;
+  } catch {
+    try { fs.unlinkSync(probe); } catch { /* probe may not exist */ }
+    socketSupportCache.set(dev, false);
+    return false;
+  }
+}
+
+/**
+ * Clear the socket-support cache. Exported for testing only.
+ */
+export function clearSocketSupportCache(): void {
+  socketSupportCache.clear();
+}
+
+/**
  * Compute the socket / named-pipe path the daemon should listen on (and the
  * proxy should connect to) for `projectRoot`. Deterministic given a project
  * root, so independent processes converge without coordination.
@@ -41,9 +95,11 @@ export function getDaemonSocketPath(projectRoot: string): string {
     return `\\\\.\\pipe\\codegraph-${projectHash(projectRoot)}`;
   }
   const inProject = path.join(getCodeGraphDir(projectRoot), 'daemon.sock');
-  if (inProject.length <= POSIX_SOCKET_PATH_LIMIT) return inProject;
-  // Long project paths (deep monorepos, Bazel out dirs) need tmpdir fallback
-  // or `bind` returns EADDRINUSE / ENAMETOOLONG. Hash keeps it project-scoped.
+  if (inProject.length <= POSIX_SOCKET_PATH_LIMIT && canSocketInDir(path.dirname(inProject))) {
+    return inProject;
+  }
+  // Long project paths, or filesystem doesn't support AF_UNIX sockets
+  // (ExFAT, NTFS-3G, etc. — #997). Hash keeps it project-scoped.
   return path.join(os.tmpdir(), `codegraph-${projectHash(projectRoot)}.sock`);
 }
 
