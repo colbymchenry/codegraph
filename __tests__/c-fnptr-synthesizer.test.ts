@@ -231,4 +231,40 @@ void invoke(struct FuncDef *p, int *x) { p->xFunc(x); }
     expect(has(edges, 'invoke', 'lenImpl')).toBe(true);
     expect(edges.every((e) => e.via === 'FuncDef.xFunc')).toBe(true);
   });
+
+  // The vim command-table shape: a table-building macro and the struct are both
+  // behind `#ifdef`, defined INLINE with the array (`struct cmd_entry {…} table[]`)
+  // in a header that a `.c` #includes after setting the switch macro, and the
+  // dispatch is a parenthesized array subscript through the file-scope table
+  // (`(cmd_table[i].handler)(x)`). Exercises #ifdef evaluation, the conditionally
+  // redefined macro, the inline struct (never a node), and array/global dispatch.
+  it('bridges an #ifdef-guarded inline-struct table dispatched by array subscript', async () => {
+    write('cmds.h', `
+#ifdef DECLARE_TABLE
+# define CMD(id, name, fn) { name, fn }
+typedef void (*cmd_fn)(int arg);
+static struct cmd_entry { const char *cmd_name; cmd_fn handler; } cmd_table[] =
+#else
+# define CMD(id, name, fn)  id
+enum cmd_id
+#endif
+{
+CMD(C_a, "a", do_a),
+CMD(C_b, "b", do_b),
+};
+`);
+    write('main.c', `
+#define DECLARE_TABLE
+#include "cmds.h"
+static void do_a(int arg) {}
+static void do_b(int arg) {}
+static void unused(int arg) {}     /* defined, NOT in the table */
+void run(int idx, int x) { (cmd_table[idx].handler)(x); }
+`);
+    const edges = await load();
+    expect(has(edges, 'run', 'do_a')).toBe(true);
+    expect(has(edges, 'run', 'do_b')).toBe(true);
+    expect(edges.every((e) => e.via === 'cmd_entry.handler')).toBe(true);
+    expect(has(edges, 'run', 'unused')).toBe(false);
+  });
 });

@@ -24,13 +24,18 @@
  *     (the `hook_demo.c` shape: `h->func = found->fn`) still resolves.
  *
  * Also handles **macro-built tables** (#991) — the dominant real-world shape,
- * e.g. redis' command table and sqlite's builtin functions. The fn-pointer arg
- * lives inside a macro call (`MAKE_CMD(…,proc,…)` / `FUNCTION(…,xFunc)`) in a
- * generated, `#include`-d file, the table's struct type may itself be an object
- * macro alias, and the field may use a function-TYPE typedef. The registration
- * pass reads each `#include`-d file as a unit with the includer's effective
- * macro env (own + header) in scope, expands object/function macros, and peels a
- * brace-wrapped element before reading the positional/designated bindings.
+ * e.g. redis' command table, sqlite's builtin functions, and vim's `:ex` /
+ * normal-mode commands. The fn-pointer arg lives inside a macro call
+ * (`MAKE_CMD(…,proc,…)` / `FUNCTION(…,xFunc)` / `EXCMD(…,fn,…)`) in a generated
+ * or `#include`-d file; the table's struct type may itself be an object-macro
+ * alias; the field may use a function-TYPE typedef; the struct may be defined
+ * INLINE with the array; and the whole thing may sit behind `#ifdef` switched on
+ * by the includer. The registration pass reads each `#include`-d file as a unit
+ * with the includer's effective macro env (own + headers) in scope, evaluates
+ * its `#ifdef`s against the includer's defined set, expands object/function
+ * macros, peels a brace-wrapped element, and parses an inline struct in place —
+ * then reads the positional/designated bindings. Dispatch additionally resolves
+ * an array subscript through a file-scope table (`(cmdnames[i].cmd_func)(…)`).
  *
  * Whole-graph pass after base resolution; all edges are `provenance:'heuristic'`
  * (`synthesizedBy:'fn-pointer-dispatch'`). High precision via the (type, field)
@@ -146,6 +151,84 @@ function parseObjectMacros(stripped: string): Map<string, string> {
   let m: RegExpExecArray | null;
   while ((m = RE.exec(joined))) out.set(m[1]!, m[2]!.trim());
   return out;
+}
+
+/** All macro names a file `#define`s (value-ful or not) — the "defined" set for #ifdef. */
+function parseDefinedNames(stripped: string): Set<string> {
+  const out = new Set<string>();
+  if (!stripped.includes('#define') && !stripped.includes('# define')) return out;
+  const RE = /^[ \t]*#[ \t]*define[ \t]+(\w+)/gm;
+  let m: RegExpExecArray | null;
+  while ((m = RE.exec(stripped))) out.add(m[1]!);
+  return out;
+}
+
+/**
+ * Drop the inactive arms of `#ifdef`/`#ifndef`/`#if defined(X)`/`#else`/`#elif`/
+ * `#endif` given a set of defined macro names, keeping line offsets (inactive
+ * lines are blanked, not removed). A conditional whose expression we can't
+ * evaluate (`#if SOME_EXPR`) keeps its body — better to over-keep than to drop
+ * live code. This is what makes a header included with a switch macro defined
+ * (vim's `ex_cmds.h` under `DO_DECLARE_EXCMD`) expose only its active table.
+ */
+function evalConditionals(text: string, defined: Set<string>): string {
+  if (!/#\s*if/.test(text)) return text;
+  const lines = text.split('\n');
+  // stack frame: parentActive = enclosing kept?; active = this arm kept?; taken = any arm taken yet
+  const stack: { parentActive: boolean; active: boolean; taken: boolean }[] = [];
+  const activeNow = (): boolean => (stack.length === 0 ? true : stack[stack.length - 1]!.active);
+  const condDefined = (expr: string): boolean | null => {
+    let mm = expr.match(/^defined\s*\(?\s*(\w+)\s*\)?$/);
+    if (mm) return defined.has(mm[1]!);
+    mm = expr.match(/^!\s*defined\s*\(?\s*(\w+)\s*\)?$/);
+    if (mm) return !defined.has(mm[1]!);
+    return null; // unevaluable
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i]!.trim();
+    let mm: RegExpMatchArray | null;
+    if ((mm = t.match(/^#\s*ifdef\s+(\w+)/))) {
+      const pa = activeNow();
+      const cond = defined.has(mm[1]!);
+      stack.push({ parentActive: pa, active: pa && cond, taken: cond });
+      lines[i] = '';
+      continue;
+    }
+    if ((mm = t.match(/^#\s*ifndef\s+(\w+)/))) {
+      const pa = activeNow();
+      const cond = !defined.has(mm[1]!);
+      stack.push({ parentActive: pa, active: pa && cond, taken: cond });
+      lines[i] = '';
+      continue;
+    }
+    if ((mm = t.match(/^#\s*if\s+(.+)$/))) {
+      const pa = activeNow();
+      const c = condDefined(mm[1]!.trim());
+      const cond = c === null ? true : c; // unevaluable → keep
+      stack.push({ parentActive: pa, active: pa && cond, taken: cond });
+      lines[i] = '';
+      continue;
+    }
+    if (/^#\s*elif\b/.test(t)) {
+      const top = stack[stack.length - 1];
+      if (top) { top.active = top.parentActive && !top.taken; top.taken = true; }
+      lines[i] = '';
+      continue;
+    }
+    if (/^#\s*else\b/.test(t)) {
+      const top = stack[stack.length - 1];
+      if (top) { top.active = top.parentActive && !top.taken; top.taken = true; }
+      lines[i] = '';
+      continue;
+    }
+    if (/^#\s*endif\b/.test(t)) {
+      stack.pop();
+      lines[i] = '';
+      continue;
+    }
+    if (!activeNow()) lines[i] = ''; // blank an inactive line (keep the newline)
+  }
+  return lines.join('\n');
 }
 
 /** Resolve a type token through object-like macro aliases (transitive, capped). */
@@ -279,15 +362,9 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
   const structLayout = new Map<string, FieldInfo[]>();
   const allStructFields = new Map<string, FieldInfo[][]>();
   const fieldToStructs = new Map<string, Set<string>>();
-  for (const st of ctx.getNodesByKind('struct')) {
-    if (!C_CPP_EXT.test(st.filePath)) continue;
-    const s = srcCache.get(st.filePath) ?? src(st.filePath);
-    if (!s) continue;
-    const body = sliceLines(s, st.startLine, st.endLine);
-    const open = body.indexOf('{');
-    const close = open >= 0 ? matchBrace(body, open) : -1;
-    if (open < 0 || close < 0) continue;
-    const inner = body.slice(open + 1, close);
+
+  // Parse a struct body (the text between its `{` and `}`) into ordered fields.
+  const parseStructFields = (inner: string): FieldInfo[] => {
     const fields: FieldInfo[] = [];
     let idx = 0;
     for (const rawDecl of splitTopLevel(inner, ';')) {
@@ -320,18 +397,39 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
         // union, exotic declarator) still occupies one slot, and macro-expanded
         // positional tables (redis' MAKE_CMD) only align if every field counts.
         fields.push({ name: name ?? '', index: idx, isFnPtr: !!name && isFnPtr, type });
-        if (name && isFnPtr) {
-          if (!fieldToStructs.has(name)) fieldToStructs.set(name, new Set());
-          fieldToStructs.get(name)!.add(st.name);
-        }
         idx++;
       }
     }
-    if (!allStructFields.has(st.name)) allStructFields.set(st.name, []);
-    allStructFields.get(st.name)!.push(fields);
-    if (fields.some((f) => f.isFnPtr)) structLayout.set(st.name, fields);
+    return fields;
+  };
+
+  // Register a parsed struct under `name` into the three indexes.
+  const registerStructLayout = (name: string, fields: FieldInfo[]): void => {
+    if (!allStructFields.has(name)) allStructFields.set(name, []);
+    allStructFields.get(name)!.push(fields);
+    for (const f of fields) {
+      if (f.name && f.isFnPtr) {
+        if (!fieldToStructs.has(f.name)) fieldToStructs.set(f.name, new Set());
+        fieldToStructs.get(f.name)!.add(name);
+      }
+    }
+    if (fields.some((f) => f.isFnPtr)) structLayout.set(name, fields);
+  };
+
+  for (const st of ctx.getNodesByKind('struct')) {
+    if (!C_CPP_EXT.test(st.filePath)) continue;
+    const s = srcCache.get(st.filePath) ?? src(st.filePath);
+    if (!s) continue;
+    const body = sliceLines(s, st.startLine, st.endLine);
+    const open = body.indexOf('{');
+    const close = open >= 0 ? matchBrace(body, open) : -1;
+    if (open < 0 || close < 0) continue;
+    registerStructLayout(st.name, parseStructFields(body.slice(open + 1, close)));
   }
-  if (structLayout.size === 0) return [];
+  // NB: no early return on an empty structLayout here — an inline `struct TAG
+  // { … } var[]` table whose struct never became a node (vim's `cmdname`, broken
+  // up by `#ifdef`) is discovered later during the unit scan. The `reg.size === 0`
+  // guard after registration still short-circuits when nothing bridges.
 
   const fnPtrFieldOf = (struct: string, field: string): boolean =>
     !!structLayout.get(struct)?.some((f) => f.name === field && f.isFnPtr);
@@ -423,6 +521,12 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
     if (!m) { m = parseObjectMacros(src(file) ?? ''); objMacroCache.set(file, m); }
     return m;
   };
+  const definedCache = new Map<string, Set<string>>();
+  const fileDefinedNames = (file: string): Set<string> => {
+    let d = definedCache.get(file);
+    if (!d) { d = parseDefinedNames(src(file) ?? ''); definedCache.set(file, d); }
+    return d;
+  };
   const includeCache = new Map<string, string[]>();
   const localIncludesOf = (file: string): string[] => {
     let out = includeCache.get(file);
@@ -453,20 +557,26 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
     seen: Set<string>,
     fn: Map<string, MacroDef>,
     obj: Map<string, string>,
+    def: Set<string>,
   ): void => {
     if (depth < 0 || seen.has(file)) return;
     seen.add(file);
     for (const [k, v] of fileFnMacros(file)) if (!fn.has(k)) fn.set(k, v);
     for (const [k, v] of fileObjMacros(file)) if (!obj.has(k)) obj.set(k, v);
-    for (const inc of localIncludesOf(file)) buildEnv(inc, depth - 1, seen, fn, obj);
+    for (const n of fileDefinedNames(file)) def.add(n);
+    for (const inc of localIncludesOf(file)) buildEnv(inc, depth - 1, seen, fn, obj, def);
   };
 
   // Registration units: every indexed C file, plus the local headers/tables it
-  // `#include`s that are NOT independently indexed (e.g. redis' generated
-  // `commands.def`). An included file is scanned with the INCLUDER's effective
-  // env — it is textually pasted in, so its `MAKE_CMD(…)` resolves there. The
-  // same `.def` included by two files with different macro defs is processed
-  // once per includer; `reg` is a Set, so the (correct) union is what survives.
+  // `#include`s. A non-indexed include (redis' generated `commands.def`) is
+  // always scanned; an INDEXED header is re-scanned in an includer's context
+  // ONLY when that includer switches on conditional code the header guards — it
+  // `#define`s a name the header itself doesn't and the header has `#if` (vim's
+  // `ex_cmds.h`, whose command table is behind `#ifdef DO_DECLARE_EXCMD` set by
+  // `ex_docmd.c`). The include is scanned with the includer's effective macro
+  // env (its `MAKE_CMD(…)` resolves there) and its conditionals evaluated
+  // against the includer's defined set. `reg` is a Set, so unioning across
+  // multiple includers is safe.
   interface Unit {
     text: string;
     file: string;
@@ -479,25 +589,105 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
   for (const file of files) {
     const env = new Map<string, MacroDef>();
     const objEnv = new Map<string, string>();
-    buildEnv(file, 2, new Set(), env, objEnv);
+    const defined = new Set<string>();
+    buildEnv(file, 2, new Set(), env, objEnv, defined);
     const s = src(file);
     if (s) units.push({ text: s, file, env, objEnv });
     for (const target of localIncludesOf(file)) {
-      if (indexedSet.has(target) || seenInclude.has(`${file}>${target}`)) continue;
-      seenInclude.add(`${file}>${target}`);
+      if (seenInclude.has(`${file}>${target}`)) continue;
       const incSrc = src(target);
-      if (incSrc) units.push({ text: incSrc, file: target, env, objEnv });
+      if (!incSrc) continue;
+      if (indexedSet.has(target)) {
+        // Re-scan an indexed header only when this includer unlocks guarded code.
+        const ownDef = fileDefinedNames(target);
+        const adds = [...defined].some((n) => !ownDef.has(n));
+        if (!adds || !/#\s*if/.test(incSrc)) continue;
+      }
+      seenInclude.add(`${file}>${target}`);
+      // The include is pasted into the includer — evaluate its conditionals in
+      // the includer's defined set (a no-op when it has none). Re-parse the
+      // included file's OWN macros from that resolved text so a macro it defines
+      // conditionally (vim's `EXCMD`, whose plain last-wins parse picks the enum
+      // arm) overrides with the ARM THAT IS ACTUALLY ACTIVE here.
+      const text = evalConditionals(incSrc, defined);
+      const incEnv = new Map(env);
+      for (const [k, v] of parseFunctionMacros(text)) incEnv.set(k, v);
+      const incObjEnv = new Map(objEnv);
+      for (const [k, v] of parseObjectMacros(text)) incObjEnv.set(k, v);
+      units.push({ text, file: target, env: incEnv, objEnv: incObjEnv });
     }
   }
+
+  // Global variable → struct type, for resolving a dispatch through a file-scope
+  // table by subscript (`cmdnames[i].cmd_func(…)`).
+  const globalVarType = new Map<string, string>();
+
+  // Process a `{ … }` initializer body (array of elements or a single struct).
+  const processInit = (
+    struct: string,
+    body: string,
+    isArray: boolean,
+    file: string,
+    env: Map<string, MacroDef>,
+  ): void => {
+    if (isArray) {
+      for (const el of splitTopLevel(body, ',')) {
+        const t = el.trim();
+        if (t.startsWith('{')) {
+          const e = matchBrace(t, 0);
+          if (e > 0) registerStructValue(struct, t.slice(1, e), file, env);
+        } else if (t) {
+          // an element built by a macro (`MAKE_CMD(…)`/`FUNCTION(…)`) or a bare value
+          registerStructValue(struct, t, file, env);
+        }
+      }
+    } else {
+      registerStructValue(struct, body, file, env);
+    }
+  };
 
   // `(?:struct )?TYPE name[opt] = {` initializers, where TYPE is a struct that
   // has ≥1 fn-pointer field. Handles both single (`= {…}`) and array
   // (`[] = { {…}, {…} }`) forms. Macro calls inside an element are expanded first.
   const INIT_RE =
     /(?:^|[;{}])\s*(?:(?:static|const|extern|register|volatile)\s+)*(?:struct\s+)?(\w+)\s+(\w+)\s*(\[[^\]]*\])?\s*=\s*\{/g;
+  // `struct TAG { … } var[opt] [= {…}]` — the struct is defined INLINE with the
+  // table (vim's `cmdname`/`nv_cmd`); its layout never became a node, so parse it
+  // here and register it before reading the entries. No leading anchor: a
+  // `struct TAG {` with a brace body is always a definition (it may be preceded
+  // by a `#define …` line ending in a digit, as in vim), and the trailing
+  // `var … = {` check below is what distinguishes a TABLE from a plain type.
+  const INLINE_STRUCT_RE = /\bstruct\s+(\w+)\s*\{/g;
   for (const unit of units) {
     const s = unit.text;
-    if (!s || !s.includes('=')) continue;
+    if (!s || !s.includes('{')) continue;
+
+    INLINE_STRUCT_RE.lastIndex = 0;
+    let im: RegExpExecArray | null;
+    while ((im = INLINE_STRUCT_RE.exec(s))) {
+      const tag = im[1]!;
+      const sOpen = im.index + im[0].length - 1; // the struct body's `{`
+      const sClose = matchBrace(s, sOpen);
+      if (sClose < 0) continue;
+      // After `}`, expect `var [opt] [= {…}]` to be a table; else it's a plain type.
+      const after = s.slice(sClose + 1);
+      const vm = after.match(/^\s*(\w+)\s*(\[[^\]]*\])?\s*(=\s*\{)?/);
+      if (!vm || !vm[1]) continue;
+      const fields = parseStructFields(s.slice(sOpen + 1, sClose));
+      if (!fields.some((f) => f.isFnPtr)) continue; // only tables of fn pointers matter
+      if (!structLayout.has(tag)) registerStructLayout(tag, fields);
+      globalVarType.set(vm[1]!, tag);
+      if (vm[3]) {
+        const aOpen = sClose + 1 + after.indexOf('{', vm[0].length - 1);
+        const aClose = matchBrace(s, aOpen);
+        if (aClose > 0) {
+          processInit(tag, s.slice(aOpen + 1, aClose), !!vm[2], unit.file, unit.env);
+          INLINE_STRUCT_RE.lastIndex = aClose;
+        }
+      }
+    }
+
+    if (!s.includes('=')) continue;
     INIT_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = INIT_RE.exec(s))) {
@@ -508,22 +698,8 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
       const open = m.index + m[0].length - 1; // points at the `{`
       const close = matchBrace(s, open);
       if (close < 0) continue;
-      const body = s.slice(open + 1, close);
-      if (isArray) {
-        // top-level `{ … }` element groups
-        for (const el of splitTopLevel(body, ',')) {
-          const t = el.trim();
-          if (t.startsWith('{')) {
-            const e = matchBrace(t, 0);
-            if (e > 0) registerStructValue(struct, t.slice(1, e), unit.file, unit.env);
-          } else if (t) {
-            // array of bare values (rare for structs) — treat as one positional slot
-            registerStructValue(struct, t, unit.file, unit.env);
-          }
-        }
-      } else {
-        registerStructValue(struct, body, unit.file, unit.env);
-      }
+      globalVarType.set(m[2]!, struct);
+      processInit(struct, s.slice(open + 1, close), isArray, unit.file, unit.env);
       INIT_RE.lastIndex = close;
     }
   }
@@ -542,6 +718,7 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
 
   // Declared type of a local/param `v` — ANY type token, not just fn-pointer
   // structs (the base of a chained receiver needn't carry a fn pointer itself).
+  // Falls back to a file-scope table variable (`cmdnames` in `cmdnames[i].fn()`).
   const escapeRe = (x: string): string => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const varTypeIn = (fnSrc: string, v: string): string | null => {
     const re = new RegExp(`(?:struct\\s+)?(\\w+)\\s*\\*?\\s*\\b${escapeRe(v)}\\b\\s*(?:[,)=;]|\\[)`, 'g');
@@ -549,14 +726,15 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
     while ((m = re.exec(fnSrc))) {
       if (!C_TYPE_KEYWORDS.has(m[1]!)) return m[1]!;
     }
-    return null;
+    return globalVarType.get(v) ?? null;
   };
 
   // Resolve a member-access chain (`c->cmd`, or just `p`) to a struct type,
   // walking each segment's declared field type. `c->cmd->proc` dispatch:
   // base chain `c->cmd` → client.cmd's type `redisCommand`, the proc owner.
+  // Array subscripts (`cmdnames[i]`) are stripped — an index yields one element.
   const resolveChainType = (fnSrc: string, chain: string): string | null => {
-    const segs = chain.split(/\s*(?:->|\.)\s*/).filter(Boolean);
+    const segs = chain.replace(/\s*\[[^\]]*\]/g, '').split(/\s*(?:->|\.)\s*/).filter(Boolean);
     if (segs.length === 0) return null;
     let t = varTypeIn(fnSrc, segs[0]!);
     for (let i = 1; t && i < segs.length; i++) {
@@ -611,8 +789,10 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
 
   // ---- Pass E: dispatch sites → edges ----
   // `base->…->field(` or `base.…field(` where `field` is a known fn-pointer field.
-  // The base may be a chain (`c->cmd->proc`), resolved through field types.
-  const DISPATCH_RE = /((?:\w+\s*(?:->|\.)\s*)+)(\w+)\s*\(/g;
+  // The base may be a chain (`c->cmd->proc`) or carry array subscripts
+  // (`cmdnames[i].cmd_func`). An optional `)` before the call covers the
+  // parenthesized form `(cmdnames[i].cmd_func)(&ea)` vim uses.
+  const DISPATCH_RE = /((?:\w+(?:\s*\[[^\][]*\])?\s*(?:->|\.)\s*)+)(\w+)\s*\)?\s*\(/g;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const fn of cFns) {
@@ -632,7 +812,7 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
       // 3) else fall back to a field name that belongs to exactly one struct.
       let struct = resolveChainType(body, baseChain);
       if (!struct || !owners.has(struct)) {
-        const lastSeg = baseChain.split(/\s*(?:->|\.)\s*/).pop()!;
+        const lastSeg = baseChain.replace(/\s*\[[^\]]*\]/g, '').split(/\s*(?:->|\.)\s*/).pop()!;
         const t = recvTypeIn(body, lastSeg);
         struct = t && owners.has(t) ? t : null;
       }
