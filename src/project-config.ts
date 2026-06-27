@@ -42,12 +42,24 @@ export interface ProjectConfig {
    * are never discovered or indexed (#970, #976).
    */
   includeIgnored?: string[];
+  /**
+   * Gitignore-style patterns for paths to keep OUT of the index — even when
+   * they are git-TRACKED, which `.gitignore` cannot do (#999). The escape hatch
+   * for a committed vendor/theme/SDK directory (e.g. a checked-in Metronic theme
+   * under `static/`) that bloats the graph and slows indexing but isn't really
+   * your code. Matched against project-root-relative paths, so a directory like
+   * `"static/"`, a double-star vendor glob, or `"assets/theme"` all work.
+   * Absent/empty (the default) excludes nothing beyond the built-in defaults
+   * and your `.gitignore`.
+   */
+  exclude?: string[];
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
 interface ParsedConfig {
   extensions: Record<string, Language>;
   includeIgnored: string[];
+  exclude: string[];
 }
 
 interface CacheEntry {
@@ -68,6 +80,7 @@ const EMPTY_EXTENSIONS: Record<string, Language> = Object.freeze({});
 const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   extensions: EMPTY_EXTENSIONS,
   includeIgnored: Object.freeze([]) as unknown as string[],
+  exclude: Object.freeze([]) as unknown as string[],
 });
 
 /**
@@ -118,8 +131,11 @@ function parseConfig(file: string): ParsedConfig {
 
   const extensions = extractExtensions(parsed, file);
   const includeIgnored = extractIncludeIgnored(parsed, file);
-  if (extensions === EMPTY_EXTENSIONS && includeIgnored.length === 0) return EMPTY_CONFIG;
-  return { extensions, includeIgnored };
+  const exclude = extractExclude(parsed, file);
+  if (extensions === EMPTY_EXTENSIONS && includeIgnored.length === 0 && exclude.length === 0) {
+    return EMPTY_CONFIG;
+  }
+  return { extensions, includeIgnored, exclude };
 }
 
 /**
@@ -165,6 +181,32 @@ function extractIncludeIgnored(parsed: object, file: string): string[] {
   for (const entry of raw) {
     if (typeof entry !== 'string' || !entry.trim()) {
       logWarn(`Ignoring an "includeIgnored" entry in ${PROJECT_CONFIG_FILENAME}: every pattern must be a non-empty string`, { file });
+      continue;
+    }
+    out.push(entry.trim());
+  }
+  return out;
+}
+
+/**
+ * Validate the `exclude` patterns: an array of non-empty gitignore-style
+ * strings naming paths to keep out of the index even when git-tracked (#999). A
+ * non-array value or a non-string/blank entry warns-and-skips; never throws.
+ * Patterns are kept verbatim (trimmed) so they match exactly as a `.gitignore`
+ * line would, against project-root-relative paths.
+ */
+function extractExclude(parsed: object, file: string): string[] {
+  const raw = (parsed as ProjectConfig).exclude;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    logWarn(`Ignoring "exclude" in ${PROJECT_CONFIG_FILENAME}: must be an array of gitignore-style patterns`, { file });
+    return [];
+  }
+
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      logWarn(`Ignoring an "exclude" entry in ${PROJECT_CONFIG_FILENAME}: every pattern must be a non-empty string`, { file });
       continue;
     }
     out.push(entry.trim());
@@ -219,6 +261,18 @@ export function loadExtensionOverrides(rootDir: string): Record<string, Language
  */
 export function loadIncludeIgnoredPatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).includeIgnored;
+}
+
+/**
+ * Load the validated `exclude` patterns for a project, mtime-cached.
+ *
+ * These name paths to keep OUT of the index even when git-tracked — the escape
+ * hatch for a committed vendor/theme/SDK directory `.gitignore` can't drop
+ * (#999). An empty result — the zero-config default — excludes nothing beyond
+ * the built-in defaults and the project's `.gitignore`.
+ */
+export function loadExcludePatterns(rootDir: string): string[] {
+  return loadParsedConfig(rootDir).exclude;
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */

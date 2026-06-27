@@ -61,3 +61,35 @@ export function supervisionLostReason(state: SupervisionState): string | null {
   }
   return null;
 }
+
+/** Default PPID poll cadence (ms). Shared by the MCP server and CLI commands. */
+export const DEFAULT_PPID_POLL_MS = 5000;
+
+/**
+ * Resolve the PPID watchdog poll interval from an env override
+ * (`CODEGRAPH_PPID_POLL_MS`). A value of `0` disables the watchdog entirely
+ * (escape hatch for embedded scenarios where the parent legitimately re-parents
+ * the process on purpose). Anything non-numeric or negative falls back to the
+ * default.
+ */
+export function parsePpidPollMs(raw: string | undefined): number {
+  if (raw === undefined || raw === '') return DEFAULT_PPID_POLL_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return DEFAULT_PPID_POLL_MS;
+  if (parsed < 0) return DEFAULT_PPID_POLL_MS;
+  return Math.floor(parsed);
+}
+
+/**
+ * Parse the host PID propagated across the `--liftoff-only` re-exec
+ * (`CODEGRAPH_HOST_PPID`). Returns a positive integer PID, or null when
+ * unset/invalid — the direct-launch path, where the watchdog falls back to
+ * `process.ppid` divergence. PIDs of 0/1 are rejected (0 = unknown, 1 = init,
+ * i.e. already orphaned), so the watchdog doesn't latch onto init.
+ */
+export function parseHostPpid(raw: string | undefined): number | null {
+  if (raw === undefined || raw === '') return null;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 1) return null;
+  return parsed;
+}

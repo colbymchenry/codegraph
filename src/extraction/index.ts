@@ -19,7 +19,7 @@ import {
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns } from '../project-config';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -284,6 +284,20 @@ function loadIncludeIgnoredMatcher(rootDir: string): Ignore | null {
 }
 
 /**
+ * Matcher for the project's `codegraph.json` `exclude` patterns — paths to keep
+ * OUT of the index even when git-tracked, which `.gitignore` cannot do (#999).
+ * The escape hatch for a committed vendor/theme/SDK directory. Returns `null`
+ * when nothing is excluded (the zero-config default → no overhead). Matched
+ * against project-root-relative paths, so it applies uniformly across the whole
+ * workspace, including inside embedded repos (excluding `static/` means gone
+ * everywhere). Built once per scan/sync/scope operation from the scan root.
+ */
+function loadExcludeMatcher(rootDir: string): Ignore | null {
+  const patterns = loadExcludePatterns(rootDir);
+  return patterns.length > 0 ? ignore().add(patterns) : null;
+}
+
+/**
  * `git ls-files --directory` collapses a wholly-untracked/ignored directory into
  * one entry — and when the command's own cwd is such a directory (the indexed
  * root is itself a git-ignored subdir of an enclosing repo), git emits the
@@ -421,12 +435,25 @@ function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
 export class ScopeIgnore {
   private embedded: Array<{ root: string; matcher: Ignore }>;
   private defaults: Ignore = defaultsOnlyIgnore();
-  constructor(private rootMatcher: Ignore, embedded: Array<{ root: string; matcher: Ignore }>) {
+  constructor(
+    private rootMatcher: Ignore,
+    embedded: Array<{ root: string; matcher: Ignore }>,
+    /**
+     * Project `codegraph.json` `exclude` patterns (#999), matched against the
+     * full root-relative path. Wins over everything else — an explicit user
+     * exclude applies even to tracked files and even inside embedded repos.
+     */
+    private exclude: Ignore | null = null,
+  ) {
     // Longest root first so paths in nested embedded repos hit the innermost matcher.
     this.embedded = [...embedded].sort((a, b) => b.root.length - a.root.length);
   }
 
   ignores(rel: string): boolean {
+    // User `exclude` (#999) is checked first and against the full root-relative
+    // path: it must drop git-TRACKED paths (which `.gitignore` can't) and apply
+    // everywhere, including ancestors of embedded repos.
+    if (this.exclude && this.exclude.ignores(rel)) return true;
     for (const { root, matcher } of this.embedded) {
       if (rel.startsWith(root)) {
         const inner = rel.slice(root.length);
@@ -455,6 +482,7 @@ export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<strin
   return new ScopeIgnore(
     buildDefaultIgnore(rootDir),
     roots.map((root) => ({ root, matcher: buildDefaultIgnore(path.join(rootDir, root)) })),
+    loadExcludeMatcher(rootDir),
   );
 }
 
@@ -678,14 +706,14 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
     // Custom extension → language overrides from the project's codegraph.json,
     // so change detection sees the same custom-extension files the full index does.
     const overrides = loadExtensionOverrides(rootDir);
-    collectGitStatus(rootDir, '', changes, overrides, loadIncludeIgnoredMatcher(rootDir));
+    collectGitStatus(rootDir, '', changes, overrides, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir));
     return changes;
   } catch {
     return null;
   }
 }
 
-function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null): void {
+function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null): void {
   const output = execFileSync(
     'git',
     ['status', '--porcelain', '--no-renames'],
@@ -732,6 +760,11 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
     // Added (`??`) / modified files inside an excluded dir must not enter the
     // index — match against the repo-relative path, same as the full scan. (#766)
     if (ig.ignores(rel)) continue;
+    // User `codegraph.json` `exclude` (#999) is project-root-relative, so it's
+    // matched against the full path — sync must not re-add a tracked file the
+    // full index now keeps out. Deletions above stay unfiltered so a file that
+    // WAS indexed before an exclude was added still cleans itself out.
+    if (exclude && exclude.ignores(filePath)) continue;
 
     if (statusCode === '??') {
       out.added.push(filePath);
@@ -747,11 +780,11 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
   // and they are left alone (#970, #976), mirroring the full-index scan.
   for (const rel of untrackedDirs) {
     for (const repoRel of findNestedGitRepos(path.join(repoDir, rel), rel)) {
-      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out, overrides, includeIgnored);
+      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out, overrides, includeIgnored, exclude);
     }
   }
   for (const rel of findIgnoredEmbeddedRepos(repoDir, includeIgnored, prefix)) {
-    collectGitStatus(path.join(repoDir, rel), prefix + rel, out, overrides, includeIgnored);
+    collectGitStatus(path.join(repoDir, rel), prefix + rel, out, overrides, includeIgnored, exclude);
   }
 }
 
@@ -936,7 +969,13 @@ function scanDirectoryWalk(
 
   // Seed a base matcher with the built-in default ignores (merged with the root
   // .gitignore so a negation can override). Nested .gitignores still layer per-dir.
-  walk(rootDir, [{ dir: rootDir, ig: buildDefaultIgnore(rootDir) }]);
+  const baseMatchers: ScopedIgnore[] = [{ dir: rootDir, ig: buildDefaultIgnore(rootDir) }];
+  // Project `codegraph.json` `exclude` patterns (#999), rooted at the project so
+  // `isIgnored` matches them against root-relative paths — same coverage the
+  // git path gets via ScopeIgnore, for non-git projects.
+  const exclude = loadExcludeMatcher(rootDir);
+  if (exclude) baseMatchers.push({ dir: rootDir, ig: exclude });
+  walk(rootDir, baseMatchers);
   return files;
 }
 

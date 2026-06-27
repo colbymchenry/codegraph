@@ -50,17 +50,10 @@ import {
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import { getDaemonSocketPath } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
-import { supervisionLostReason } from './ppid-watchdog';
+import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from './ppid-watchdog';
 import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
-
-/**
- * How often to poll `process.ppid` to detect parent process death (see #277).
- * 5s is a deliberate trade-off: the failure mode being guarded against is rare
- * (parent SIGKILL'd), and longer poll = less wakeup overhead while idle.
- */
-const DEFAULT_PPID_POLL_MS = 5000;
 
 /**
  * Env var that marks a process as the *detached daemon* itself (set by
@@ -93,34 +86,6 @@ const TAKEOVER_RETRY_DELAY_MS = 100;
 // path, this narrows the "No such tool available" race window.
 const DAEMON_CONNECT_MAX_RETRIES = 240;
 const DAEMON_CONNECT_RETRY_DELAY_MS = 25;
-
-/**
- * Resolve the PPID watchdog poll interval from an env override. A value of
- * `0` disables the watchdog entirely (escape hatch for embedded scenarios
- * where the parent legitimately re-parents the server on purpose). Anything
- * non-numeric or negative falls back to the default.
- */
-function parsePpidPollMs(raw: string | undefined): number {
-  if (raw === undefined || raw === '') return DEFAULT_PPID_POLL_MS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return DEFAULT_PPID_POLL_MS;
-  if (parsed < 0) return DEFAULT_PPID_POLL_MS;
-  return Math.floor(parsed);
-}
-
-/**
- * Parse the host PID propagated across the `--liftoff-only` re-exec
- * ({@link HOST_PPID_ENV}). Returns a positive integer PID, or null when
- * unset/invalid — the direct-launch path, where the watchdog falls back to
- * `process.ppid` divergence. PIDs of 0/1 are rejected (0 = unknown, 1 = init,
- * i.e. already orphaned), so the watchdog doesn't latch onto init.
- */
-function parseHostPpid(raw: string | undefined): number | null {
-  if (raw === undefined || raw === '') return null;
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 1) return null;
-  return parsed;
-}
 
 /** Whether `CODEGRAPH_NO_DAEMON` was set to a truthy value. */
 function daemonOptOutSet(): boolean {

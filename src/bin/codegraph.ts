@@ -34,6 +34,7 @@ import { getGlyphs } from '../ui/glyphs';
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { installFatalHandlers } from './fatal-handler';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
+import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 
@@ -506,19 +507,25 @@ program
       // Indexing runs by default now. The legacy -i/--index flag is still
       // accepted (so existing muscle memory and scripts don't break) but is a
       // no-op — initializing always builds the initial index.
+      // Supervise the index: self-terminate if orphaned or wedged (#999).
+      const supervision = installCommandSupervision('init');
       let result: IndexResult;
-      if (options.verbose) {
-        result = await cg.indexAll({
-          onProgress: createVerboseProgress(),
-          verbose: true,
-        });
-      } else {
-        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-        const progress = createShimmerProgress();
-        result = await cg.indexAll({
-          onProgress: progress.onProgress,
-        });
-        await progress.stop();
+      try {
+        if (options.verbose) {
+          result = await cg.indexAll({
+            onProgress: createVerboseProgress(),
+            verbose: true,
+          });
+        } else {
+          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+          const progress = createShimmerProgress();
+          result = await cg.indexAll({
+            onProgress: progress.onProgress,
+          });
+          await progress.stop();
+        }
+      } finally {
+        supervision.stop();
       }
       printIndexResult(clack, result, projectPath);
       await recordIndexTelemetry(cg, result);
@@ -627,51 +634,58 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
-      if (options.quiet) {
-        // Quiet mode: no UI, just run. `index` is a full re-index, so clear the
-        // existing graph and rebuild from scratch (see the note below — #874).
+      // Supervise the indexer: self-terminate if orphaned (parent shim killed)
+      // or if the main thread wedges — neither was guarded on this path (#999).
+      const supervision = installCommandSupervision('index');
+      try {
+        if (options.quiet) {
+          // Quiet mode: no UI, just run. `index` is a full re-index, so clear the
+          // existing graph and rebuild from scratch (see the note below — #874).
+          cg.clear();
+          const result = await cg.indexAll();
+          if (!result.success) process.exit(1);
+          cg.destroy();
+          return;
+        }
+
+        const clack = await importESM('@clack/prompts');
+        clack.intro('Indexing project');
+
+        // `index` is a FULL re-index: clear the existing graph and rebuild it from
+        // scratch so the result is identical to a fresh `init`. Without the clear,
+        // indexAll() skips every unchanged file by its content hash and reports
+        // "0 nodes, 0 edges" against the already-populated graph — which reads as
+        // "index wiped my index" (#874). For fast incremental updates use `sync`.
         cg.clear();
-        const result = await cg.indexAll();
-        if (!result.success) process.exit(1);
+
+        let result: IndexResult;
+
+        if (options.verbose) {
+          result = await cg.indexAll({
+            onProgress: createVerboseProgress(),
+            verbose: true,
+          });
+        } else {
+          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+          const progress = createShimmerProgress();
+          result = await cg.indexAll({
+            onProgress: progress.onProgress,
+          });
+          await progress.stop();
+        }
+
+        printIndexResult(clack, result, projectPath);
+        await recordIndexTelemetry(cg, result);
+
+        if (!result.success) {
+          process.exit(1);
+        }
+
+        clack.outro('Done');
         cg.destroy();
-        return;
+      } finally {
+        supervision.stop();
       }
-
-      const clack = await importESM('@clack/prompts');
-      clack.intro('Indexing project');
-
-      // `index` is a FULL re-index: clear the existing graph and rebuild it from
-      // scratch so the result is identical to a fresh `init`. Without the clear,
-      // indexAll() skips every unchanged file by its content hash and reports
-      // "0 nodes, 0 edges" against the already-populated graph — which reads as
-      // "index wiped my index" (#874). For fast incremental updates use `sync`.
-      cg.clear();
-
-      let result: IndexResult;
-
-      if (options.verbose) {
-        result = await cg.indexAll({
-          onProgress: createVerboseProgress(),
-          verbose: true,
-        });
-      } else {
-        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-        const progress = createShimmerProgress();
-        result = await cg.indexAll({
-          onProgress: progress.onProgress,
-        });
-        await progress.stop();
-      }
-
-      printIndexResult(clack, result, projectPath);
-      await recordIndexTelemetry(cg, result);
-
-      if (!result.success) {
-        process.exit(1);
-      }
-
-      clack.outro('Done');
-      cg.destroy();
     } catch (err) {
       error(`Failed to index: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
