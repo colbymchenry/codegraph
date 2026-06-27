@@ -16,7 +16,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { DatabaseConnection } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
-import { Node } from '../src/types';
+import { Node, UnresolvedReference } from '../src/types';
 
 function makeNode(id: string, name = id): Node {
   return {
@@ -171,6 +171,40 @@ describe('insertEdges endpoint validation', () => {
       q.insertEdges([{ source: 'source', target: 'target', kind: 'calls' }])
     ).not.toThrow();
     expect(q.getOutgoingEdges('source')).toEqual([]);
+  });
+});
+
+describe('deleteResolvedReferences', () => {
+  let dir: string;
+  let db: DatabaseConnection;
+  let q: QueryBuilder;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-perf-delete-refs-'));
+    db = DatabaseConnection.initialize(path.join(dir, 'test.db'));
+    q = new QueryBuilder(db.getDb());
+  });
+
+  afterEach(() => {
+    db.close();
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('handles batches over the SQLite parameter limit when deleting resolved refs', () => {
+    q.insertNodes(Array.from({ length: 1500 }, (_, i) => makeNode(`n${i}`)));
+    const refs: UnresolvedReference[] = Array.from({ length: 1500 }, (_, i) => ({
+      fromNodeId: `n${i}`,
+      referenceName: `target${i}`,
+      referenceKind: 'calls',
+      line: 1,
+      column: 0,
+      filePath: 'a.ts',
+      language: 'typescript',
+    }));
+    q.insertUnresolvedRefsBatch(refs);
+
+    expect(() => q.deleteResolvedReferences(refs.map((ref) => ref.fromNodeId))).not.toThrow();
+    expect(q.getUnresolvedReferencesCount()).toBe(0);
   });
 });
 

@@ -1731,8 +1731,11 @@ export class QueryBuilder {
    */
   deleteResolvedReferences(fromNodeIds: string[]): void {
     if (fromNodeIds.length === 0) return;
-    const placeholders = fromNodeIds.map(() => '?').join(',');
-    this.db.prepare(`DELETE FROM unresolved_refs WHERE from_node_id IN (${placeholders})`).run(...fromNodeIds);
+    for (let i = 0; i < fromNodeIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = fromNodeIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      this.db.prepare(`DELETE FROM unresolved_refs WHERE from_node_id IN (${placeholders})`).run(...chunk);
+    }
   }
 
   /**
