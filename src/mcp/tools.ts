@@ -414,6 +414,34 @@ export interface ToolDefinition {
     properties: Record<string, PropertySchema>;
     required?: string[];
   };
+  /** Behavioral hints for clients (see {@link ToolAnnotations}). */
+  annotations?: ToolAnnotations;
+}
+
+/**
+ * MCP ToolAnnotations — behavioral hints a client MAY use to decide how, or
+ * whether, to run a tool (introduced in the 2025-03-26 spec, carried in
+ * 2025-06-18). They are advisory and never to be trusted for security, but
+ * clients gate on them: Cursor's Ask mode, for one, refuses any MCP tool that
+ * doesn't advertise `readOnlyHint: true` (issue #1018).
+ *
+ * The field is purely additive — a client that predates annotations ignores it
+ * — so codegraph advertises these even though `initialize` still negotiates the
+ * 2024-11-05 protocol version.
+ *
+ * https://modelcontextprotocol.io/specification/2025-06-18/schema#toolannotations
+ */
+export interface ToolAnnotations {
+  /** Human-readable title for the tool. */
+  title?: string;
+  /** If true, the tool does not modify its environment. Default (unset): false. */
+  readOnlyHint?: boolean;
+  /** Meaningful only when NOT read-only: may the tool perform destructive updates? */
+  destructiveHint?: boolean;
+  /** If true, repeat calls with the same arguments have no additional effect. */
+  idempotentHint?: boolean;
+  /** If true, the tool interacts with an open world of external entities. */
+  openWorldHint?: boolean;
 }
 
 interface PropertySchema {
@@ -440,6 +468,24 @@ export interface ToolResult {
 const projectPathProperty: PropertySchema = {
   type: 'string',
   description: 'Absolute path to the project to query (or any directory inside it) — codegraph uses the nearest .codegraph/ index at or above that path. Omit to use this session\'s default project. Pass it to query a second codebase, or when the server root has no index of its own (e.g. a monorepo where only sub-projects are indexed, so there is no default project).',
+};
+
+/**
+ * EVERY codegraph tool is query-only: it reads the pre-built index and never
+ * mutates the workspace (indexing is the user's explicit CLI call, never the
+ * agent's). Advertising this read-only contract lets clients that gate on it run
+ * the tools where a possibly-mutating tool would be blocked — most concretely,
+ * Cursor's Ask mode, which rejects any MCP tool lacking `readOnlyHint: true`
+ * (issue #1018). `idempotentHint`: a repeated query has no additional effect.
+ * `openWorldHint: false`: the domain is the closed local index, not an open
+ * external world. Shared so the contract is declared once; a hypothetical
+ * mutating tool would simply not reference it.
+ */
+const READ_ONLY_ANNOTATIONS: ToolAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
 };
 
 /**
@@ -476,6 +522,7 @@ export const tools: ToolDefinition[] = [
       },
       required: ['query'],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_callers',
@@ -500,6 +547,7 @@ export const tools: ToolDefinition[] = [
       },
       required: ['symbol'],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_callees',
@@ -524,6 +572,7 @@ export const tools: ToolDefinition[] = [
       },
       required: ['symbol'],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_impact',
@@ -548,6 +597,7 @@ export const tools: ToolDefinition[] = [
       },
       required: ['symbol'],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_node',
@@ -589,6 +639,7 @@ export const tools: ToolDefinition[] = [
       },
       required: [],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_explore',
@@ -609,6 +660,7 @@ export const tools: ToolDefinition[] = [
       },
       required: ['query'],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_status',
@@ -619,6 +671,7 @@ export const tools: ToolDefinition[] = [
         projectPath: projectPathProperty,
       },
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_files',
@@ -652,6 +705,7 @@ export const tools: ToolDefinition[] = [
         projectPath: projectPathProperty,
       },
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
 ];
 
