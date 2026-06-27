@@ -411,6 +411,14 @@ Builds the per-project knowledge graph index, which then auto-syncs on every fil
 
 That's it — your agent will use CodeGraph tools automatically when a `.codegraph/` directory exists.
 
+### Use as an agent skill
+
+For skill-aware agents that should call the standalone CLI directly instead of
+connecting to MCP, load [`skills/codegraph-cli/SKILL.md`](skills/codegraph-cli/SKILL.md).
+It documents the `codegraph` commands agents can run against an indexed repo,
+including `query`, `context`, `callers`, `callees`, `impact`, `files`, and
+`affected`.
+
 <details>
 <summary><strong>Manual Setup (Alternative)</strong></summary>
 
