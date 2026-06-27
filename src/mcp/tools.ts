@@ -656,6 +656,36 @@ export const tools: ToolDefinition[] = [
 ];
 
 /**
+ * Return `defs` with `projectPath` marked `required` in each tool's inputSchema.
+ *
+ * Used for the NO-DEFAULT-PROJECT tool surface (issue #993): when the MCP server
+ * has no default project to fall back to — a gateway server started outside any
+ * repo, or a monorepo root whose `.codegraph/` indexes live only in sub-projects
+ * — every call MUST carry an explicit `projectPath`, so the schema should say so.
+ * A `required` field is a HIGH-salience channel (MCP clients surface and often
+ * validate it), unlike the instructions text the reporter found too weak to stop
+ * the agent omitting the param. When a default project IS open, callers leave
+ * projectPath optional and never call this.
+ *
+ * Pure: clones each tool's schema rather than mutating the shared module-level
+ * `tools` array (reused by every session and the static surface). A tool that
+ * doesn't expose projectPath, or already requires it, is returned untouched;
+ * explore's `['query']` becomes `['query', 'projectPath']`, and a tool with no
+ * `required` list (status/files) gains `['projectPath']`.
+ */
+function withRequiredProjectPath(defs: ToolDefinition[]): ToolDefinition[] {
+  return defs.map((tool) => {
+    if (!tool.inputSchema.properties.projectPath) return tool;
+    const required = tool.inputSchema.required ?? [];
+    if (required.includes('projectPath')) return tool;
+    return {
+      ...tool,
+      inputSchema: { ...tool.inputSchema, required: [...required, 'projectPath'] },
+    };
+  });
+}
+
+/**
  * Allowlist-filtered tool definitions WITHOUT an engine — the static surface the
  * proxy answers `tools/list` with before any project is open. Mirrors
  * `ToolHandler.getTools()` in the no-CodeGraph case (the dynamic per-repo budget
@@ -835,7 +865,17 @@ export class ToolHandler {
     let visible = allow
       ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
       : tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
-    if (!this.cg) return visible;
+    // No default project loaded → no-root-index case (#993): a gateway server
+    // started outside any repo, or a monorepo root whose indexes live in
+    // sub-projects. With nothing to fall back to, EVERY call needs an explicit
+    // projectPath, so mark it required in the schema — a high-salience nudge the
+    // agent acts on, where SERVER_INSTRUCTIONS_NO_ROOT_INDEX's prose alone
+    // wasn't enough (the reporter had to add an AGENTS.md note). `this.cg` is
+    // settled by `retryInitIfNeeded()` before `handleToolsList` calls us, so a
+    // null here means "genuinely no default", not a startup race. When a default
+    // IS open we leave projectPath optional (below): a bare call falls back to
+    // it, exactly as in the common single-project launch.
+    if (!this.cg) return withRequiredProjectPath(visible);
 
     try {
       const stats = this.cg.getStats();
