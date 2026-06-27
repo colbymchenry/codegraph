@@ -48,7 +48,7 @@ import {
   tryAcquireDaemonLock,
 } from './daemon';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
-import { getDaemonSocketPath } from './daemon-paths';
+import { getDaemonSocketCandidates } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
 import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from './ppid-watchdog';
 import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
@@ -376,17 +376,34 @@ export class MCPServer {
    * never wedges a session.
    */
   private async runProxyWithLocalHandshake(root: string): Promise<void> {
-    const socketPath = getDaemonSocketPath(root);
+    // The daemon may relocate its socket past an in-project filesystem that can't
+    // host one (ExFAT/FAT volumes, WSL2 DrvFs; #997) to the deterministic tmpdir
+    // fallback. We don't read the bound path from the lockfile — both sides walk
+    // the SAME ordered candidate list, so we converge on whichever the daemon
+    // bound with zero coordination. The in-project candidate is tried first, so a
+    // normal repo pays nothing extra (it connects on the very first probe).
+    const candidates = getDaemonSocketCandidates(root);
+    const connectAnyCandidate = async (): Promise<Awaited<ReturnType<typeof connectWithHello>>> => {
+      for (const candidate of candidates) {
+        const s = await connectWithHello(candidate);
+        // A wrong-version daemon IS up — definitive; propagate so the caller
+        // serves in-process instead of spawning + polling for 6s. Don't keep
+        // probing fallbacks past it.
+        if (s === 'version-mismatch') return s;
+        if (s) return s;
+      }
+      return null;
+    };
     const getDaemonSocket = async () => {
-      // Fast path: a daemon may already be listening.
-      const probe = await connectWithHello(socketPath);
+      // Fast path: a daemon may already be listening (on either candidate).
+      const probe = await connectAnyCandidate();
       if (probe === 'version-mismatch') return null; // definitive — serve in-process, don't poll for 6s
       if (probe) return probe;
       // None reachable — spawn one (detached) and poll for its bind.
       spawnDetachedDaemon(root);
       for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
         await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
-        const s = await connectWithHello(socketPath);
+        const s = await connectAnyCandidate();
         if (s === 'version-mismatch') return null;
         if (s) return s;
       }
