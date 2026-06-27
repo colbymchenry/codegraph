@@ -1,9 +1,9 @@
 ---
 title: Configuration
-description: CodeGraph is zero-config by default, with one optional codegraph.json for custom extensions and indexing nested git repositories.
+description: CodeGraph is zero-config by default, with one optional codegraph.json for custom extensions, excluding tracked directories, and indexing nested git repositories.
 ---
 
-Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions) and [indexing nested git repositories](#indexing-nested-git-repositories).
+Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions), [excluding tracked directories](#excluding-a-tracked-directory), and [indexing nested git repositories](#indexing-nested-git-repositories).
 
 ## What it skips out of the box
 
@@ -16,6 +16,20 @@ Next to none — CodeGraph is **zero-config by default**, with nothing to write 
 To keep something else out, add it to `.gitignore`. To pull a default-excluded directory back **in** (e.g. you really want a vendored dependency indexed), add a negation — `!vendor/`.
 
 The defaults apply uniformly, so committing a dependency or build directory doesn't force it into the graph — the `.gitignore` negation is the explicit opt-in.
+
+## Excluding a tracked directory
+
+`.gitignore` only affects files git **doesn't already track** — it can't drop a directory you've committed. So a vendored theme, SDK, or asset bundle that's checked into the repo (say a Metronic admin theme under `static/`, with hundreds of `.js` files) can't be excluded that way. For those, list them under `exclude` in `codegraph.json`:
+
+```json
+{
+  "exclude": ["static/", "**/vendor/**"]
+}
+```
+
+Each entry is a gitignore-style pattern, matched against project-root-relative paths, and honored everywhere CodeGraph looks at files — the full index, incremental `sync`, and file-watching. It applies even to tracked files (that's the whole point) and takes precedence over everything else, so it's the right tool for a large committed dependency that bloats the graph but isn't really your code. (This is the opposite of [`includeIgnored`](#indexing-nested-git-repositories), which pulls gitignored directories back *in*.)
+
+Re-index (`codegraph index`) after adding or changing `exclude`.
 
 ## Custom file extensions
 
