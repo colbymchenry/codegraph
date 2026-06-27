@@ -40,6 +40,7 @@ function setHome(dir: string): { restore: () => void } {
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
     HERMES_HOME: process.env.HERMES_HOME,
     COPILOT_HOME: process.env.COPILOT_HOME,
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
   };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
@@ -47,6 +48,9 @@ function setHome(dir: string): { restore: () => void } {
   process.env.XDG_CONFIG_HOME = path.join(dir, '.config');
   delete process.env.HERMES_HOME;
   delete process.env.COPILOT_HOME;
+  // Clear CLAUDE_CONFIG_DIR so a custom profile in the real environment
+  // doesn't leak into tests that assume the default ~/.claude profile.
+  delete process.env.CLAUDE_CONFIG_DIR;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
@@ -55,6 +59,7 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prev.XDG_CONFIG_HOME;
       if (prev.HERMES_HOME === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = prev.HERMES_HOME;
       if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
+      if (prev.CLAUDE_CONFIG_DIR === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev.CLAUDE_CONFIG_DIR;
     },
   };
 }
@@ -1010,6 +1015,31 @@ describe('Installer targets — partial-state idempotency', () => {
     claude.install('global', { autoAllow: false });
     const cfg = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude.json'), 'utf-8'));
     expect(cfg.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('claude: global install honors CLAUDE_CONFIG_DIR, leaving ~/.claude untouched', () => {
+    const claude = getTarget('claude')!;
+    const profile = path.join(tmpHome, '.claude-gc');
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = profile;
+    try {
+      claude.install('global', { autoAllow: true });
+
+      // MCP entry, settings.json, and CLAUDE.md all land in the custom
+      // profile dir — Claude Code keeps .claude.json *inside* it when the
+      // env var is set.
+      const mcp = JSON.parse(fs.readFileSync(path.join(profile, '.claude.json'), 'utf-8'));
+      expect(mcp.mcpServers.codegraph).toBeDefined();
+      expect(fs.existsSync(path.join(profile, 'settings.json'))).toBe(true);
+      expect(fs.existsSync(path.join(profile, 'CLAUDE.md'))).toBe(true);
+
+      // The default profile must be left alone.
+      expect(fs.existsSync(path.join(tmpHome, '.claude.json'))).toBe(false);
+      expect(fs.existsSync(path.join(tmpHome, '.claude'))).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = prev;
+    }
   });
 
   it('claude: local install migrates a legacy ./.claude.json codegraph entry into ./.mcp.json', () => {
