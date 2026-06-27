@@ -343,6 +343,8 @@ function matchesNonProductionDir(lowerPath: string): boolean {
 export function nameMatchBonus(nodeName: string, query: string): number {
   const nameLower = nodeName.toLowerCase();
 
+  if (query.trim().length === 0) return 0;
+
   // Split query into word-level terms (handles "CacheBuilder build" → ["cache","builder","build"])
   const rawTerms = query
     .replace(/([a-z])([A-Z])/g, '$1 $2')
