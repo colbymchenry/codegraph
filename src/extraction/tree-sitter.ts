@@ -1343,7 +1343,8 @@ export class TreeSitterExtractor {
       parentNode.kind === 'interface' ||
       parentNode.kind === 'trait' ||
       parentNode.kind === 'enum' ||
-      parentNode.kind === 'module'
+      parentNode.kind === 'module' ||
+      parentNode.kind === 'component'
     );
   }
 
