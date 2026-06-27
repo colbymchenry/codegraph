@@ -986,32 +986,46 @@ export class TreeSitterExtractor {
       this.scanFnRefSubtree(node, 0);
       skipChildren = true; // extractVariable handles children
     }
-    // Swift stored properties inside a type. Swift instance properties aren't
-    // extracted as their own nodes, but a property's PROPERTY WRAPPER
-    // (`@Argument`/`@Published`/`@State`/custom) and declared type ARE
-    // dependencies — attribute them to the enclosing type so the wrapper/type
-    // files get dependents. Don't skipChildren: an initializer's calls still
-    // matter. (Other languages extract properties via property/field types.)
+    // Swift properties inside a type. A stored instance property becomes a `field`
+    // node; a `static let`/`static var` member becomes `constant`/`variable`
+    // (Swift's `static`-namespacing idiom — value-reference edges can then target
+    // it); a COMPUTED property (getter block, no stored value) becomes a `property`
+    // node whose getter is walked below so its calls attribute to it. A property's
+    // PROPERTY WRAPPER (`@Argument`/`@Published`/`@State`/custom) and declared type
+    // are dependencies attributed to the enclosing type. (Other languages extract
+    // properties via property/field types.)
     else if (
       this.language === 'swift' &&
-      nodeType === 'property_declaration' &&
+      (nodeType === 'property_declaration' || nodeType === 'protocol_property_declaration') &&
       this.isInsideClassLikeNode()
     ) {
       const ownerId = this.nodeStack[this.nodeStack.length - 1];
-      // A `static let`/`static var` member is a SHARED constant of the type
-      // (Swift's `static`-namespacing idiom, esp. in `enum`/`struct`) — extract
-      // it as `constant`/`variable` so value-reference edges can target it. An
-      // instance stored property stays a `field` (per-instance; Swift instance
-      // properties otherwise aren't own nodes — that's unchanged). A *computed*
-      // property (getter, no stored value) is never a constant — skip the node.
       const { nameNode, isLet, isComputed } = swiftPropertyInfo(node, this.source);
-      if (nameNode && !isComputed) {
-        const isStatic = this.extractor.isStatic?.(node) ?? false;
-        this.createNode(isStatic ? (isLet ? 'constant' : 'variable') : 'field',
-          getNodeText(nameNode, this.source), node, {
+      let computedPropId: string | undefined;
+      if (nameNode) {
+        if (isComputed) {
+          // Computed property — accessed like a property but its getter holds real
+          // logic. Index as `property` so search/explore find it (#1020: computed
+          // props such as a heavily-read `var isCloudProxy: Bool` returned "No
+          // results found"); pushed below so the getter's calls attribute to it
+          // rather than flattening onto the owning type (SwiftUI `var body: some
+          // View { … }` — the whole subview tree — is the canonical case).
+          const prop = this.createNode('property', getNodeText(nameNode, this.source), node, {
             visibility: this.extractor.getVisibility?.(node),
-            isStatic,
+            isStatic: this.extractor.isStatic?.(node) ?? false,
           });
+          computedPropId = prop?.id;
+        } else {
+          // A `static let`/`static var` member is a SHARED constant of the type
+          // (esp. in `enum`/`struct`); an instance stored property stays a `field`
+          // (per-instance — Swift instance properties otherwise aren't own nodes).
+          const isStatic = this.extractor.isStatic?.(node) ?? false;
+          this.createNode(isStatic ? (isLet ? 'constant' : 'variable') : 'field',
+            getNodeText(nameNode, this.source), node, {
+              visibility: this.extractor.getVisibility?.(node),
+              isStatic,
+            });
+        }
       }
       if (ownerId) {
         this.extractDecoratorsFor(node, ownerId);
@@ -1035,6 +1049,23 @@ export class TreeSitterExtractor {
           };
           walkAttrArgs(modifiers);
         }
+      }
+      // A computed property's getter holds real logic — walk it with the property
+      // node pushed so its calls/instantiations attribute to the property (a
+      // SwiftUI `body`'s subview tree becomes the property's callees). skipChildren
+      // then stops the generic walker from re-walking the getter (and the
+      // modifiers/type annotation already handled above).
+      if (computedPropId) {
+        const getter = node.namedChildren.find(
+          (c: SyntaxNode) =>
+            c.type === 'computed_property' || c.type === 'protocol_property_requirements',
+        );
+        if (getter) {
+          this.nodeStack.push(computedPropId);
+          this.visitFunctionBody(getter, '');
+          this.nodeStack.pop();
+        }
+        skipChildren = true;
       }
     }
     // `export_statement` itself is not extracted — the walker descends

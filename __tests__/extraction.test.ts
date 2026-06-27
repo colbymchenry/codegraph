@@ -1437,6 +1437,88 @@ protocol UploadConvertible: URLRequestConvertible {
     // UploadConvertible extends URLRequestConvertible
     expect(extendsRefs.find((r) => r.referenceName === 'URLRequestConvertible')).toBeDefined();
   });
+
+  it('indexes Swift properties so they are findable: computed → property, stored → field, static → constant/variable (#1020)', () => {
+    const code = `
+struct ReproConfig {
+    let reproStoredValue: Int
+    var reproComputedFlag: Bool {
+        reproStoredValue > 0
+    }
+    static let sharedLimit = 10
+    static var sharedCount = 0
+    func reproControlMethod() -> Bool {
+        reproComputedFlag
+    }
+}
+
+final class ReproService {
+    private let reproClassStored: String = "x"
+    var reproClassComputed: Int { reproClassStored.count }
+}
+`;
+    const result = extractFromSource('Repro.swift', code);
+    const byName = (name: string) => result.nodes.find((n) => n.name === name);
+
+    // Computed properties are the regression this fix targets: before #1020 they
+    // were dropped entirely, so search/explore returned nothing for them.
+    expect(byName('reproComputedFlag')?.kind).toBe('property');
+    expect(byName('reproClassComputed')?.kind).toBe('property');
+
+    // Stored instance properties stay `field` (fixed earlier in #708 — guard it).
+    expect(byName('reproStoredValue')?.kind).toBe('field');
+    expect(byName('reproClassStored')?.kind).toBe('field');
+
+    // `static let`/`static var` members remain shared constant/variable nodes.
+    expect(byName('sharedLimit')?.kind).toBe('constant');
+    expect(byName('sharedCount')?.kind).toBe('variable');
+
+    // The control method is unaffected.
+    expect(byName('reproControlMethod')?.kind).toBe('method');
+  });
+
+  it("attributes a computed property's getter calls to the property, not the type (SwiftUI body flow) (#1020)", () => {
+    const code = `
+struct GreetingView {
+    let name: String
+    var body: some View {
+        let prefix = "Hi"
+        return VStack {
+            Text(greeting(prefix))
+        }
+    }
+    func greeting(_ p: String) -> String { p }
+}
+`;
+    const result = extractFromSource('View.swift', code);
+    const body = result.nodes.find((n) => n.kind === 'property' && n.name === 'body');
+    expect(body).toBeDefined();
+
+    // The getter's call to greeting() must originate from `body` (so a SwiftUI
+    // view's render flow is reachable through the property), not flatten onto the
+    // enclosing struct.
+    const callsFromBody = result.unresolvedReferences.filter(
+      (r) => r.fromNodeId === body!.id && r.referenceKind === 'calls'
+    );
+    expect(callsFromBody.some((r) => r.referenceName === 'greeting')).toBe(true);
+
+    // The getter is walked as a body, so a local declared inside it is NOT
+    // node-ified (locals are the data-flow frontier we leave uncovered). Before
+    // this fix the generic walker treated such a local as a struct `field`.
+    expect(result.nodes.find((n) => n.name === 'prefix')).toBeUndefined();
+  });
+
+  it('indexes a Swift protocol property requirement as a findable property (#1020)', () => {
+    const code = `
+protocol Themable {
+    var accentColor: Color { get }
+    var title: String { get set }
+}
+`;
+    const result = extractFromSource('Themable.swift', code);
+    expect(result.nodes.find((n) => n.name === 'accentColor')?.kind).toBe('property');
+    expect(result.nodes.find((n) => n.name === 'title')?.kind).toBe('property');
+  });
 });
 
 describe('Kotlin Extraction', () => {
