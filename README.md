@@ -764,6 +764,15 @@ Framework routing is validated the same way, on a canonical app per framework: E
 
 **Missing symbols** — The MCP server auto-syncs on save (wait a couple seconds). Run `codegraph sync` manually if needed. Check that the file's language is supported and isn't inside a `.gitignore`d or default-excluded directory (e.g. `node_modules`, `dist`).
 
+**Local checkout changes do not appear** — Rebuild and reinstall the checkout, then force a re-index in the target project so new extraction logic, including QML / Qt Quick support, is reflected:
+
+```bash
+npm run build
+npm install -g .
+cd your-project
+codegraph index --force
+```
+
 **Sharing one checkout between Windows and WSL** — Don't point both at the same `.codegraph/`: the background-server lock and the SQLite index are tied to the OS that wrote them, and SQLite locking across the WSL2/Windows filesystem boundary is unreliable. Give each side its own index in the same tree by setting `CODEGRAPH_DIR` to a distinct name on one of them — e.g. `CODEGRAPH_DIR=.codegraph-win` on Windows, leaving WSL on the default `.codegraph`. CodeGraph skips any sibling `.codegraph-*` directory when indexing and watching, so the two never trip over each other.
 
 ## Star History
