@@ -226,6 +226,21 @@ const RUST_SPEC: FnRefSpec = {
   ]),
 };
 
+// Zig has no closures, so a callback is an inline anonymous-struct method passed
+// by value: `std.sort.sort(items, ctx, struct { fn cmp(_,a,b) bool {…} }.cmp)`.
+// The value is a `field_expression` (.cmp); comptime dispatch tables use
+// `.{ .add = addKernel }` (field_initializer) and `.{ a, b }` (initializer_list).
+const ZIG_SPEC: FnRefSpec = {
+  idTypes: new Set(['identifier']),
+  dispatch: new Map<string, CaptureRule>([
+    ['arguments', { mode: 'args' }],
+    ['assignment_expression', { mode: 'rhs', field: 'right' }],
+    ['field_initializer', { mode: 'value' }],
+    ['initializer_list', { mode: 'list' }],
+  ]),
+  special: new Set(['field_expression']),
+};
+
 const JAVA_SPEC: FnRefSpec = {
   // No bare-identifier function values in Java — only method references.
   idTypes: new Set<string>(),
@@ -384,6 +399,7 @@ export const FN_REF_SPECS: Record<string, FnRefSpec | undefined> = {
   python: PYTHON_SPEC,
   go: GO_SPEC,
   rust: RUST_SPEC,
+  zig: ZIG_SPEC,
   java: JAVA_SPEC,
   kotlin: KOTLIN_SPEC,
   csharp: CSHARP_SPEC,
@@ -615,6 +631,17 @@ function normalizeSpecial(
   source: string
 ): NormalizedRef[] {
   switch (type) {
+    // Zig `Container.member` used as a value — the inline-anonymous-struct
+    // callback idiom `struct { fn cmp(…) {} }.cmp` (Zig's closure substitute).
+    // Capture the member; the same-file gate keeps only members naming a
+    // function defined here, so ordinary `obj.field` data reads drop out.
+    case 'field_expression': {
+      const member = getChildByField(node, 'member');
+      return member && member.type === 'identifier'
+        ? [{ name: getNodeText(member, source), node: member }]
+        : [];
+    }
+
     // Java method references. Receiver decides the resolution route (#808):
     //   `this::run0` / `super::close` → `this.<m>` (class-scoped resolver;
     //     super rides the inherited-member supertype pass)

@@ -25,6 +25,12 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   python: 'tree-sitter-python.wasm',
   go: 'tree-sitter-go.wasm',
   rust: 'tree-sitter-rust.wasm',
+  // Vendored: built from tree-sitter-zig patched for Zig 0.16 (asm-clobbers
+  // struct, de-keyworded async/await/suspend/resume, error-set field types,
+  // reserved-word block labels, conditional slice/pointer element types) — not
+  // in tree-sitter-wasms. 100% parse across the Zig 0.16 standard library,
+  // Ghostty, TigerBeetle, libxev and http.zig.
+  zig: 'tree-sitter-zig.wasm',
   java: 'tree-sitter-java.wasm',
   c: 'tree-sitter-c.wasm',
   cpp: 'tree-sitter-cpp.wasm',
@@ -76,6 +82,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.pyw': 'python',
   '.go': 'go',
   '.rs': 'rust',
+  '.zig': 'zig',
   '.java': 'java',
   '.c': 'c',
   '.h': 'c', // Could also be C++, defaulting to C
@@ -289,7 +296,7 @@ export async function initGrammars(): Promise<void> {
  * the vendored wasm together.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
-  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
+  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'zig', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
@@ -621,6 +628,7 @@ export function getLanguageDisplayName(language: Language): string {
     python: 'Python',
     go: 'Go',
     rust: 'Rust',
+    zig: 'Zig',
     r: 'R',
     java: 'Java',
     c: 'C',
