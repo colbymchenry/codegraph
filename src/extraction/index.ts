@@ -520,6 +520,27 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
         }
       }
     } catch { /* untracked listing failed — ignored-side discovery still runs */ }
+    // Unexpanded gitlinks (mode 160000) with a real checkout on disk — embedded
+    // repos `git add`ed without `.gitmodules`, or submodules not active here. The
+    // untracked listing above can't see them (they're tracked), so find them the
+    // same way collectGitFiles does, keeping watcher scope == indexer scope.
+    // (#1031, #1033)
+    try {
+      const staged = execFileSync(
+        'git',
+        ['ls-files', '-z', '-s', '--recurse-submodules'],
+        { cwd: repoAbs, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+      );
+      for (const entry of staged.split('\0')) {
+        if (!entry || entry.slice(0, 6) !== '160000') continue;
+        const tab = entry.indexOf('\t');
+        if (tab === -1) continue;
+        const rel = entry.slice(tab + 1);
+        const relDir = rel.endsWith('/') ? rel : rel + '/';
+        if (defaults.ignores(relDir)) continue;
+        if (classifyGitDir(path.join(repoAbs, rel)) === 'embedded') candidates.push(relDir);
+      }
+    } catch { /* staged listing failed — other discovery still runs */ }
     candidates.push(...findIgnoredEmbeddedRepos(repoAbs, includeIgnored, prefix));
     for (const rel of candidates) {
       const full = normalizePath(prefix + rel);
@@ -585,13 +606,35 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
   // Without this, monorepos using submodules index 0 files. (See issue #147.)
   // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
   // can't be combined with -o, so untracked files are gathered separately below.
+  //
+  // We use --stage (-s) rather than -c so each entry carries its file mode. That
+  // lets us spot gitlink entries (mode 160000) that --recurse-submodules did NOT
+  // expand: a nested repo `git add`ed without a `.gitmodules` entry, or a
+  // submodule that isn't active/initialized in this checkout. Such a gitlink
+  // falls through every pass — it's tracked, so the untracked `-o` listing below
+  // never reports it, and --recurse-submodules only expands ACTIVE submodules —
+  // so its source would be silently skipped, leaving only the super-repo's own
+  // files indexed. We collect those gitlinks here and recurse into them below.
+  // (An active submodule is expanded inline by --recurse-submodules and so never
+  // surfaces as a 160000 entry — only the unhandled gitlinks do.) (#1031, #1033)
+  //
   // -z gives NUL-separated, unquoted output so non-ASCII (e.g. CJK) paths
   // survive verbatim. Without it git octal-escapes and double-quotes such paths
   // (the core.quotepath default), and the quoted form never matches a real file
-  // on disk → those files are silently dropped from the index. (#541)
-  const tracked = execFileSync('git', ['ls-files', '-z', '-c', '--recurse-submodules'], gitOpts);
-  for (const rel of tracked.split('\0')) {
-    if (rel) files.add(normalizePath(prefix + rel));
+  // on disk → those files are silently dropped from the index. (#541) With -s the
+  // path follows a TAB after the `<mode> <object> <stage>` prefix.
+  const gitlinkRels: string[] = [];
+  const tracked = execFileSync('git', ['ls-files', '-z', '-s', '--recurse-submodules'], gitOpts);
+  for (const entry of tracked.split('\0')) {
+    if (!entry) continue;
+    const tab = entry.indexOf('\t');
+    if (tab === -1) continue; // --stage always emits "<mode> <object> <stage>\t<path>"
+    const rel = entry.slice(tab + 1);
+    if (entry.slice(0, 6) === '160000') {
+      gitlinkRels.push(rel); // an unexpanded gitlink — recursed into below, not a source file itself
+      continue;
+    }
+    files.add(normalizePath(prefix + rel));
   }
 
   // Untracked files (submodules manage their own untracked state). Embedded git
@@ -616,6 +659,24 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
       continue;
     }
     files.add(normalizePath(prefix + rel));
+  }
+
+  // Gitlink entries (mode 160000) that --recurse-submodules left unexpanded —
+  // an embedded repo `git add`ed without `.gitmodules`, or a submodule not
+  // active/initialized in this checkout. When such a gitlink has a real working
+  // tree on disk it is distinct first-party code we must index as its own
+  // embedded repo: the tracked pass skipped its contents and the untracked pass
+  // never sees it (it's tracked, not "other"). A gitlink with no checkout on disk
+  // (an uninitialized submodule — empty dir, no `.git`) has nothing to index and
+  // is left alone, as is a submodule worktree (a duplicate view, #945). (#1031, #1033)
+  for (const rel of gitlinkRels) {
+    const relDir = rel.endsWith('/') ? rel : rel + '/';
+    if (defaultsOnlyIgnore().ignores(relDir)) continue;
+    const childDir = path.join(repoDir, rel);
+    // 'embedded' = a real .git checkout on disk; 'worktree' and 'none' are skipped.
+    if (classifyGitDir(childDir) !== 'embedded') continue;
+    embeddedRoots?.add(normalizePath(prefix + relDir));
+    collectGitFiles(childDir, prefix + relDir, files, embeddedRoots, includeIgnored);
   }
 
   // Embedded repos hidden by THIS repo's ignore rules (`/packages/` in a
