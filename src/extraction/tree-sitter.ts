@@ -28,6 +28,7 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { normalizeCppReturnType } from './languages/c-cpp';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -4241,6 +4242,33 @@ export class TreeSitterExtractor {
         if (anonBody) {
           this.extractAnonymousClass(node, anonBody);
           return;
+        }
+      } else if (this.language === 'cpp' && nodeType === 'declaration') {
+        // C++ stack-allocation `ClassName var(args)` is parsed as a `declaration`
+        // node — unlike `new ClassName(args)` (a `new_expression` in
+        // INSTANTIATION_KINDS), it never reaches extractInstantiation.
+        // Detect by finding an `init_declarator` with an `argument_list` child
+        // and a non-primitive declared type, then emit an `instantiates` edge.
+        const typeNode = getChildByField(node, 'type');
+        const typeName = typeNode
+          ? normalizeCppReturnType(getNodeText(typeNode, this.source))
+          : undefined;
+        if (typeName && this.nodeStack.length > 0) {
+          for (let i = 0; i < node.namedChildCount; i++) {
+            const child = node.namedChild(i);
+            if (child?.type === 'init_declarator') {
+              const hasArgList = child.namedChildren.some((c) => c.type === 'argument_list');
+              if (hasArgList) {
+                this.unresolvedReferences.push({
+                  fromNodeId: this.nodeStack[this.nodeStack.length - 1]!,
+                  referenceName: typeName,
+                  referenceKind: 'instantiates',
+                  line: node.startPosition.row + 1,
+                  column: node.startPosition.column,
+                });
+              }
+            }
+          }
         }
       } else if (this.extractor!.extractBareCall) {
         const calleeName = this.extractor!.extractBareCall(node, this.source);
