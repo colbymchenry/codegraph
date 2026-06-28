@@ -1108,7 +1108,7 @@ export class ReferenceResolver {
     // those resolutions makes the graph wrong, not cleaner. We only filter
     // when there's no user node with this name — then name-matching would
     // produce zero edges anyway and the filter just short-circuits work.
-    if (ref.language === 'c' || ref.language === 'cpp') {
+    if (ref.language === 'c' || ref.language === 'cpp' || ref.language === 'cuda') {
       // C++ std:: namespace prefix — safe to filter unconditionally,
       // since `std::foo` is never a user-defined qualified name in
       // tree-sitter output.

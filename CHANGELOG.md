@@ -9,6 +9,13 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes CUDA (.cu / .cuh) and IEC 61131-3 ST (.scl / .st) files. CUDA reuses the C++ parser and shares its resolution paths — `#include` headers, function calls, struct definitions, and cross-language references between `.cu`, `.cpp`, and `.c`/`.h` files all resolve correctly. SCL files are tracked at the file-record level (no symbol extraction, matching the YAML and Twig conventions).
+
+### Fixes
+
+- SCL (.scl / .st) files were silently dropped during single-file indexing instead of being tracked as file records, because `isLanguageSupported` returned `false` for the language. They now behave consistently across both the batch and single-file indexing paths.
 
 ## [1.1.2] - 2026-06-28
 

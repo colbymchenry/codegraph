@@ -3686,6 +3686,7 @@ export class TreeSitterExtractor {
             } else if (
               (this.language === 'cpp' ||
                 this.language === 'c' ||
+                this.language === 'cuda' ||
                 this.language === 'kotlin' ||
                 this.language === 'swift' ||
                 this.language === 'rust' ||

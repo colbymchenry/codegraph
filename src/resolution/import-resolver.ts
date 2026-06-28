@@ -31,6 +31,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   java: ['.java'],
   c: ['.h', '.c'],
   cpp: ['.h', '.hpp', '.hxx', '.cpp', '.cc', '.cxx'],
+  cuda: ['.h', '.cuh', '.hpp', '.hxx', '.cpp', '.cc', '.cxx', '.cu'],
   csharp: ['.cs'],
   php: ['.php'],
   ruby: ['.rb'],
@@ -69,7 +70,7 @@ export function resolveImportPath(
   // C/C++ include directory search: when neither relative nor aliased
   // resolution found a match, search -I directories from
   // compile_commands.json or heuristic probing.
-  if (language === 'c' || language === 'cpp') {
+  if (language === 'c' || language === 'cpp' || language === 'cuda') {
     return resolveCppIncludePath(importPath, language, context);
   }
 
@@ -189,7 +190,7 @@ function isExternalImport(
     return true;
   }
 
-  if (language === 'c' || language === 'cpp') {
+  if (language === 'c' || language === 'cpp' || language === 'cuda') {
     // C/C++ standard library headers — both C-style (<stdio.h>) and
     // C++-style (<cstdio>, <vector>) forms. Checked against the import
     // path (which the extractor strips of <> or "" delimiters).
@@ -602,7 +603,7 @@ export function extractImportMappings(
     mappings.push(...extractJavaImports(content));
   } else if (language === 'php') {
     mappings.push(...extractPHPImports(content));
-  } else if (language === 'c' || language === 'cpp') {
+  } else if (language === 'c' || language === 'cpp' || language === 'cuda') {
     mappings.push(...extractCppImports(content));
   }
 
@@ -1131,7 +1132,7 @@ export function resolveViaImport(
   // include-dir scan path inside resolveImportPath never produces an
   // edge — resolveViaImport's symbol lookup below would search the
   // resolved file for a symbol named like the file extension and fail.
-  if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports') {
+  if ((ref.language === 'c' || ref.language === 'cpp' || ref.language === 'cuda') && ref.referenceKind === 'imports') {
     // C/C++ quoted includes (`#include "X.h"`) resolve relative to the
     // INCLUDING file's own directory first (the C standard's quoted-include
     // search order). Prefer a same-directory header over an -I directory or a
