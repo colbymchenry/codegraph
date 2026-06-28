@@ -727,6 +727,11 @@ export class QueryBuilder {
     return rows.map(rowToNode);
   }
 
+  getAllEdges(): Edge[] {
+    const rows = this.db.prepare('SELECT * FROM edges').all() as EdgeRow[];
+    return rows.map(rowToEdge);
+  }
+
   /**
    * Get nodes by exact name match (uses idx_nodes_name index)
    */

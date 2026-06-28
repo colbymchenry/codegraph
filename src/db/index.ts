@@ -93,6 +93,25 @@ export class DatabaseConnection {
   }
 
   /**
+   * Create an ephemeral in-memory database (no disk writes).
+   * Caller is responsible for calling close() when done.
+   */
+  static initializeInMemory(): DatabaseConnection {
+    const { db, backend } = createDatabase(':memory:');
+    configureConnection(db);
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    db.exec(schema);
+    const currentVersion = getCurrentVersion(db);
+    if (currentVersion < CURRENT_SCHEMA_VERSION) {
+      db.prepare(
+        'INSERT OR IGNORE INTO schema_versions (version, applied_at, description) VALUES (?, ?, ?)'
+      ).run(CURRENT_SCHEMA_VERSION, Date.now(), 'Initial schema includes all migrations');
+    }
+    return new DatabaseConnection(db, ':memory:', backend);
+  }
+
+  /**
    * Open an existing database
    */
   static open(dbPath: string): DatabaseConnection {

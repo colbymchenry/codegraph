@@ -9,6 +9,7 @@ import * as path from 'path';
 import {
   Node,
   Edge,
+  ExtractionError,
   FileRecord,
   ExtractionResult,
   Subgraph,
@@ -96,6 +97,23 @@ export interface InitOptions {
 
   /** Progress callback for indexing */
   onProgress?: (progress: IndexProgress) => void;
+}
+
+/**
+ * Result of an in-memory index: all nodes, edges, and stats without disk I/O.
+ */
+export interface InMemoryIndexResult {
+  success: boolean;
+  nodes: Node[];
+  edges: Edge[];
+  files: number;
+  errors: ExtractionError[];
+  stats: {
+    filesIndexed: number;
+    nodesCreated: number;
+    edgesCreated: number;
+    durationMs: number;
+  };
 }
 
 /**
@@ -280,6 +298,55 @@ export class CodeGraph {
     const queries = new QueryBuilder(db.getDb());
 
     return new CodeGraph(db, queries, resolvedRoot);
+  }
+
+  /**
+   * Index a project entirely in memory — no .codegraph/ directory, no disk DB.
+   * Runs the full pipeline (extraction + resolution) and returns all nodes and
+   * edges. The in-memory DB is closed before returning.
+   */
+  static async indexInMemory(projectRoot: string): Promise<InMemoryIndexResult> {
+    await initGrammars();
+    const resolvedRoot = path.resolve(projectRoot);
+    const db = DatabaseConnection.initializeInMemory();
+    const queries = new QueryBuilder(db.getDb());
+
+    try {
+      const orchestrator = new ExtractionOrchestrator(resolvedRoot, queries);
+      const resolver = createResolver(resolvedRoot, queries);
+
+      const start = Date.now();
+      const result = await orchestrator.indexAll();
+
+      if (result.success && result.filesIndexed > 0) {
+        resolver.initialize();
+        resolver.runPostExtract();
+        await resolver.resolveAndPersistBatched();
+        resolver.resolveChainedCallsViaConformance();
+        resolver.resolveDeferredThisMemberRefs();
+      }
+
+      const nodes = queries.getAllNodes();
+      const edges = queries.getAllEdges();
+      const durationMs = Date.now() - start;
+      const fileCount = (db.getDb().prepare('SELECT COUNT(*) AS c FROM files').get() as any)?.c ?? 0;
+
+      return {
+        success: result.success,
+        nodes,
+        edges,
+        files: fileCount,
+        errors: result.errors,
+        stats: {
+          filesIndexed: result.filesIndexed,
+          nodesCreated: nodes.length,
+          edgesCreated: edges.length,
+          durationMs,
+        },
+      };
+    } finally {
+      db.close();
+    }
   }
 
   /**
