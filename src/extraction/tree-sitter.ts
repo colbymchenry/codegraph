@@ -242,6 +242,35 @@ function swiftPropertyInfo(
 
 /** True when `node` is (transitively) inside a C function body — i.e. a local,
  * not a file/namespace-scope declaration. Walks the parent chain to the root. */
+function stripQuotes(s: string): string {
+  if (s.length >= 6) {
+    if ((s.startsWith('"""') && s.endsWith('"""')) || (s.startsWith("'''") && s.endsWith("'''"))) {
+      return s.slice(3, -3);
+    }
+  }
+  if (s.length >= 2) {
+    const f = s[0], l = s[s.length - 1];
+    if ((f === '"' && l === '"') || (f === "'" && l === "'") || (f === '`' && l === '`')) {
+      return s.slice(1, -1);
+    }
+  }
+  return s;
+}
+
+const STRING_LITERAL_TYPES = new Set([
+  'string', 'string_literal', 'raw_string_literal', 'interpreted_string_literal',
+  'string_content', 'encapsed_string', 'char_literal', 'rune_literal',
+  'string_value', 'quoted_string',
+]);
+
+const RAW_STRING_TYPES = new Set(['raw_string_literal', 'raw_string']);
+
+const TEMPLATE_TYPES = new Set(['template_string', 'template_literal_type']);
+
+const INTERPOLATION_TYPES = new Set([
+  'template_substitution', 'string_interpolation', 'interpolation',
+]);
+
 function hasFunctionAncestor(node: SyntaxNode): boolean {
   let p = node.parent;
   while (p) {
@@ -3436,6 +3465,8 @@ export class TreeSitterExtractor {
 
     // Get the function/method being called
     let calleeName = '';
+    let callReceiver: string | undefined;
+    let callMethod: string | undefined;
 
     // Java/Kotlin method_invocation has 'object' + 'name' fields instead of 'function'
     // PHP member_call_expression has 'object' + 'name', scoped_call_expression has 'scope' + 'name'
@@ -3466,12 +3497,19 @@ export class TreeSitterExtractor {
           calleeName = methodName;
         }
         if (calleeName) {
+          const literalArgs = this.extractLiteralArgs(node);
           this.unresolvedReferences.push({
             fromNodeId: callerId,
             referenceName: calleeName,
             referenceKind: 'calls',
             line: node.startPosition.row + 1,
             column: node.startPosition.column,
+            ...(methodName || literalArgs ? {
+              metadata: {
+                ...(methodName ? { method: methodName } : {}),
+                ...(literalArgs ? { literalArgs } : {}),
+              },
+            } : {}),
           });
         }
         return;
@@ -3493,12 +3531,19 @@ export class TreeSitterExtractor {
         const innerName = getChildByField(objectField, 'name');
         if (innerObj && innerName) {
           calleeName = `${getNodeText(innerObj, this.source)}.${getNodeText(innerName, this.source)}().${methodName}`;
+          const literalArgs = this.extractLiteralArgs(node);
           this.unresolvedReferences.push({
             fromNodeId: callerId,
             referenceName: calleeName,
             referenceKind: 'calls',
             line: node.startPosition.row + 1,
             column: node.startPosition.column,
+            ...(methodName || literalArgs ? {
+              metadata: {
+                ...(methodName ? { method: methodName } : {}),
+                ...(literalArgs ? { literalArgs } : {}),
+              },
+            } : {}),
           });
           return;
         }
@@ -3526,7 +3571,9 @@ export class TreeSitterExtractor {
           calleeName = methodName;
         } else {
           calleeName = `${receiverName}.${methodName}`;
+          callReceiver = receiverName;
         }
+        callMethod = methodName;
       }
     } else if (node.type === 'message_expression') {
       // ObjC message expressions emit one `method` field child per selector
@@ -3564,6 +3611,8 @@ export class TreeSitterExtractor {
           const receiverName = getNodeText(receiverField, this.source);
           if (receiverName && !SKIP_RECEIVERS.has(receiverName)) {
             calleeName = `${receiverName}.${methodName}`;
+            callReceiver = receiverName;
+            callMethod = methodName;
             // A CLASS-message receiver (`[SDImageCache alloc]`,
             // `[SDImageCache sharedCache]`) is a capitalized class name. The
             // call resolves the method (`alloc`/`sharedCache`), but the CLASS
@@ -3649,9 +3698,11 @@ export class TreeSitterExtractor {
               const receiverName = getNodeText(receiver, this.source);
               if (!SKIP_RECEIVERS.has(receiverName)) {
                 calleeName = `${receiverName}.${methodName}`;
+                callReceiver = receiverName;
               } else {
                 calleeName = methodName;
               }
+              callMethod = methodName;
             } else if (
               (this.language === 'cpp' ||
                 this.language === 'c' ||
@@ -3732,6 +3783,7 @@ export class TreeSitterExtractor {
           } else {
             calleeName = getNodeText(func, this.source);
           }
+          if (methodName) callMethod = methodName;
         } else {
           calleeName = getNodeText(func, this.source);
         }
@@ -3749,14 +3801,73 @@ export class TreeSitterExtractor {
     }
 
     if (calleeName) {
+      const literalArgs = this.extractLiteralArgs(node);
+      const hasCallSite = callReceiver || callMethod || literalArgs;
       this.unresolvedReferences.push({
         fromNodeId: callerId,
         referenceName: calleeName,
         referenceKind: 'calls',
         line: node.startPosition.row + 1,
         column: node.startPosition.column,
+        ...(hasCallSite ? {
+          metadata: {
+            ...(callReceiver ? { receiver: callReceiver } : {}),
+            ...(callMethod ? { method: callMethod } : {}),
+            ...(literalArgs ? { literalArgs } : {}),
+          },
+        } : {}),
       });
     }
+  }
+
+  private extractStringLiteral(node: SyntaxNode): { value: string; kind: 'string' | 'raw_string' | 'template_no_expr' } | null {
+    const type = node.type;
+
+    if (TEMPLATE_TYPES.has(type)) {
+      if (node.namedChildren.some(c => INTERPOLATION_TYPES.has(c.type))) return null;
+      return { value: stripQuotes(getNodeText(node, this.source)), kind: 'template_no_expr' };
+    }
+
+    if (RAW_STRING_TYPES.has(type)) {
+      return { value: stripQuotes(getNodeText(node, this.source)), kind: 'raw_string' };
+    }
+
+    if (STRING_LITERAL_TYPES.has(type)) {
+      if (node.namedChildren.some(c => INTERPOLATION_TYPES.has(c.type))) return null;
+      return { value: stripQuotes(getNodeText(node, this.source)), kind: 'string' };
+    }
+
+    if (node.namedChildCount === 1) {
+      const child = node.namedChild(0);
+      if (child && STRING_LITERAL_TYPES.has(child.type)) {
+        if (child.namedChildren.some(c => INTERPOLATION_TYPES.has(c.type))) return null;
+        return { value: stripQuotes(getNodeText(node, this.source)), kind: 'string' };
+      }
+    }
+
+    return null;
+  }
+
+  private extractLiteralArgs(node: SyntaxNode, maxArgs: number = 3): Array<{ index: number; value: string; kind: 'string' | 'raw_string' | 'template_no_expr' }> | undefined {
+    const argsNode = getChildByField(node, 'arguments')
+      || node.namedChildren.find(c => c.type === 'argument_list' || c.type === 'arguments' || c.type === 'actual_parameters');
+    if (!argsNode) return undefined;
+
+    const result: Array<{ index: number; value: string; kind: 'string' | 'raw_string' | 'template_no_expr' }> = [];
+    let argIndex = 0;
+
+    for (let i = 0; i < argsNode.namedChildCount && result.length < maxArgs; i++) {
+      const arg = argsNode.namedChild(i);
+      if (!arg) continue;
+      if (arg.type === ',' || arg.type === '(' || arg.type === ')') continue;
+      const literal = this.extractStringLiteral(arg);
+      if (literal) {
+        result.push({ index: argIndex, ...literal });
+      }
+      argIndex++;
+    }
+
+    return result.length > 0 ? result : undefined;
   }
 
   /**

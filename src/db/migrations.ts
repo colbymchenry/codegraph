@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /**
  * Migration definition
@@ -72,6 +72,16 @@ const migrations: Migration[] = [
     up: (db) => {
       db.exec(`
         ALTER TABLE nodes ADD COLUMN return_type TEXT;
+      `);
+    },
+  },
+  {
+    version: 6,
+    description:
+      'Add unresolved_refs.metadata — call-site metadata (receiver, method, literal args) for resolution pipeline',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE unresolved_refs ADD COLUMN metadata TEXT;
       `);
     },
   },

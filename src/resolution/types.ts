@@ -26,6 +26,8 @@ export interface UnresolvedRef {
   language: Language;
   /** Possible qualified names it might resolve to */
   candidates?: string[];
+  /** Call-site metadata from extraction */
+  metadata?: Record<string, unknown>;
 }
 
 /**

@@ -313,6 +313,9 @@ export interface UnresolvedReference {
 
   /** Possible qualified names it might resolve to */
   candidates?: string[];
+
+  /** Call-site metadata (receiver, method, literal args) for calls edges */
+  metadata?: Record<string, unknown>;
 }
 
 // =============================================================================

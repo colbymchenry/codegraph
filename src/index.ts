@@ -45,6 +45,7 @@ import {
   ResolutionResult,
 } from './resolution';
 import { GraphTraverser, GraphQueryManager } from './graph';
+export { GraphTraverser } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
@@ -114,6 +115,17 @@ export interface InMemoryIndexResult {
     edgesCreated: number;
     durationMs: number;
   };
+}
+
+/**
+ * Handle returned by indexInMemoryOpen(). Keeps the in-memory DB alive so
+ * callers can run graph traversals (callers, callees, impact, path-finding)
+ * before closing.
+ */
+export interface InMemoryGraph extends InMemoryIndexResult {
+  traverser: GraphTraverser;
+  queries: QueryBuilder;
+  close(): void;
 }
 
 /**
@@ -347,6 +359,53 @@ export class CodeGraph {
     } finally {
       db.close();
     }
+  }
+
+  /**
+   * Index a project in memory and return a handle with live graph traversal.
+   * The caller MUST call close() when done.
+   */
+  static async indexInMemoryOpen(projectRoot: string): Promise<InMemoryGraph> {
+    await initGrammars();
+    const resolvedRoot = path.resolve(projectRoot);
+    const db = DatabaseConnection.initializeInMemory();
+    const queries = new QueryBuilder(db.getDb());
+
+    const orchestrator = new ExtractionOrchestrator(resolvedRoot, queries);
+    const resolver = createResolver(resolvedRoot, queries);
+
+    const start = Date.now();
+    const result = await orchestrator.indexAll();
+
+    if (result.success && result.filesIndexed > 0) {
+      resolver.initialize();
+      resolver.runPostExtract();
+      await resolver.resolveAndPersistBatched();
+      resolver.resolveChainedCallsViaConformance();
+      resolver.resolveDeferredThisMemberRefs();
+    }
+
+    const nodes = queries.getAllNodes();
+    const edges = queries.getAllEdges();
+    const durationMs = Date.now() - start;
+    const fileCount = (db.getDb().prepare('SELECT COUNT(*) AS c FROM files').get() as any)?.c ?? 0;
+
+    return {
+      success: result.success,
+      nodes,
+      edges,
+      files: fileCount,
+      errors: result.errors,
+      stats: {
+        filesIndexed: result.filesIndexed,
+        nodesCreated: nodes.length,
+        edgesCreated: edges.length,
+        durationMs,
+      },
+      traverser: new GraphTraverser(queries),
+      queries,
+      close() { db.close(); },
+    };
   }
 
   /**
