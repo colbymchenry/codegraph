@@ -114,7 +114,23 @@ export function hashContent(content: string): string {
  * vendored blobs blow the WASM heap and the worker-recycle budget for no useful
  * symbols. 1 MB covers essentially all hand-written source.
  */
-const MAX_FILE_SIZE = 1024 * 1024;
+const DEFAULT_MAX_FILE_SIZE = 1024 * 1024;
+
+/**
+ * Resolve the max-file-size threshold (bytes), allowing an override via the
+ * `CODEGRAPH_MAX_FILE_SIZE` environment variable for repos with legitimately
+ * large hand-written sources. Falls back to the 1 MB default when the value is
+ * unset, non-numeric, or not a positive number.
+ */
+export function resolveMaxFileSize(): number {
+  const raw = process.env.CODEGRAPH_MAX_FILE_SIZE;
+  if (raw === undefined || raw === '') return DEFAULT_MAX_FILE_SIZE;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX_FILE_SIZE;
+  return Math.floor(parsed);
+}
+
+const MAX_FILE_SIZE = resolveMaxFileSize();
 
 /**
  * Directory names that are dependency, build, cache, or tooling output across the
