@@ -20,6 +20,7 @@ import {
   detectWorktreeIndexMismatch,
   worktreeMismatchWarning,
   gitWorktreeRoot,
+  gitCommonDir,
 } from '../src/sync/worktree';
 import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
@@ -260,5 +261,102 @@ describe('worktree mismatch verdict re-resolves when the index root changes (iss
 
     const after = await handler.execute('codegraph_status', {});
     expect(after.content[0].text).not.toContain('different git working tree');
+  });
+});
+
+/**
+ * A nested repo (submodule / embedded clone) whose files the PARENT index
+ * already covers must NOT be flagged as a borrowed worktree: indexing a
+ * super-repo descends into its submodules and gitlinked clones, so a query run
+ * from inside one resolves up to the parent index — which genuinely contains
+ * that nested repo's symbols. The warning's premise is false there, and its
+ * "run codegraph init -i" advice would fragment the unified index. (#1031, #1033)
+ */
+describe('detectWorktreeIndexMismatch — nested repos covered by the parent index (#1031, #1033)', () => {
+  let parent: string;     // super-repo that owns the .codegraph index
+  let subSource: string;  // separate repo used as the submodule source
+
+  beforeEach(() => {
+    parent = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-wt-parent-'));
+    subSource = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-wt-subsrc-'));
+    for (const r of [parent, subSource]) {
+      git(r, 'init', '-q');
+      git(r, 'config', 'user.email', 'test@example.com');
+      git(r, 'config', 'user.name', 'Test');
+      git(r, 'config', 'commit.gpgsign', 'false');
+    }
+    fs.writeFileSync(path.join(subSource, 'lib.ts'), 'export const x = 1;\n');
+    git(subSource, 'add', '.');
+    git(subSource, 'commit', '-q', '-m', 'sub');
+    fs.writeFileSync(path.join(parent, 'README.md'), '# parent\n');
+    git(parent, 'add', '.');
+    git(parent, 'commit', '-q', '-m', 'init');
+  });
+
+  afterEach(() => {
+    fs.rmSync(parent, { recursive: true, force: true });
+    fs.rmSync(subSource, { recursive: true, force: true });
+  });
+
+  function addSubmodule(name: string): string {
+    execFileSync(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subSource, name],
+      { cwd: parent, stdio: ['ignore', 'ignore', 'ignore'] },
+    );
+    git(parent, 'commit', '-q', '-m', 'add submodule');
+    return path.join(parent, name);
+  }
+
+  function addBareGitlink(name: string): string {
+    const dir = path.join(parent, name);
+    fs.mkdirSync(dir);
+    git(dir, 'init', '-q');
+    git(dir, 'config', 'user.email', 'test@example.com');
+    git(dir, 'config', 'user.name', 'Test');
+    git(dir, 'config', 'commit.gpgsign', 'false');
+    fs.writeFileSync(path.join(dir, 'tool.ts'), 'export const y = 2;\n');
+    git(dir, 'add', '.');
+    git(dir, 'commit', '-q', '-m', 'tool');
+    git(parent, 'add', name); // records a 160000 gitlink, no .gitmodules
+    git(parent, 'commit', '-q', '-m', 'gitlink');
+    return dir;
+  }
+
+  it('does NOT flag an active submodule covered by the parent index', () => {
+    const sub = addSubmodule('service-a');
+    // The submodule IS its own working-tree root (so the old logic flagged it)…
+    expect(gitWorktreeRoot(sub)).toBe(real(sub));
+    // …but the parent index covers it, so there must be no warning.
+    expect(detectWorktreeIndexMismatch(sub, parent)).toBeNull();
+    expect(detectWorktreeIndexMismatch(path.join(sub, 'src'), parent)).toBeNull();
+  });
+
+  it('does NOT flag a bare gitlink (embedded clone, no .gitmodules) covered by the parent index', () => {
+    const embedded = addBareGitlink('embedded');
+    expect(gitWorktreeRoot(embedded)).toBe(real(embedded));
+    expect(detectWorktreeIndexMismatch(embedded, parent)).toBeNull();
+  });
+
+  it('gitCommonDir differs for a nested repo vs the parent (the discriminator)', () => {
+    const sub = addSubmodule('service-a');
+    const subCommon = gitCommonDir(sub);
+    const parentCommon = gitCommonDir(parent);
+    expect(subCommon).not.toBeNull();
+    expect(parentCommon).not.toBeNull();
+    expect(subCommon).not.toBe(parentCommon); // different repository → suppress
+  });
+
+  it('still flags a genuine linked worktree (same repo, different branch)', () => {
+    // A real worktree shares the parent's git common dir, so it stays flagged —
+    // the suppression must not weaken the issue-#155 case.
+    const wt = path.join(parent, 'wt');
+    git(parent, 'worktree', 'add', '-q', '-b', 'feature', wt);
+    try {
+      expect(gitCommonDir(wt)).toBe(gitCommonDir(parent)); // SAME repository
+      expect(detectWorktreeIndexMismatch(wt, parent)).not.toBeNull();
+    } finally {
+      try { git(parent, 'worktree', 'remove', '--force', wt); } catch { /* best effort */ }
+    }
   });
 });
