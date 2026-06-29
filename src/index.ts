@@ -48,6 +48,8 @@ import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
+import { getCodeGraphDir } from './directory';
+import { deriveProjectNameTokens } from './search/query-utils';
 import { CodeGraphPackageVersion } from './mcp/version';
 
 // Re-export types for consumers
@@ -130,11 +132,14 @@ export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
   private projectRoot: string;
-  private orchestrator: ExtractionOrchestrator;
-  private resolver: ReferenceResolver;
-  private graphManager: GraphQueryManager;
-  private traverser: GraphTraverser;
-  private contextBuilder: ContextBuilder;
+  // Assigned via wireLayers() from the constructor (and again on reopen) — the
+  // `!` tells TS these are definitely set even though the assignment is one
+  // method call away from the constructor body.
+  private orchestrator!: ExtractionOrchestrator;
+  private resolver!: ReferenceResolver;
+  private graphManager!: GraphQueryManager;
+  private traverser!: GraphTraverser;
+  private contextBuilder!: ContextBuilder;
 
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
@@ -154,17 +159,65 @@ export class CodeGraph {
     this.queries = queries;
     this.projectRoot = projectRoot;
     this.fileLock = new FileLock(
-      path.join(projectRoot, '.codegraph', 'codegraph.lock')
+      path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
     );
-    this.orchestrator = new ExtractionOrchestrator(projectRoot, queries);
-    this.resolver = createResolver(projectRoot, queries);
-    this.graphManager = new GraphQueryManager(queries);
-    this.traverser = new GraphTraverser(queries);
+    this.wireLayers();
+  }
+
+  /**
+   * (Re)build the query/extraction/graph layers over the current `this.queries`
+   * (which wraps `this.db`). Factored out of the constructor so `reopenIfReplaced`
+   * can rebuild them against a fresh connection without duplicating the wiring.
+   * The path-based `fileLock` is independent of the DB handle, so it stays put.
+   */
+  private wireLayers(): void {
+    // Down-weight the project name as a query term in search ranking — it names
+    // the whole repo, not a symbol, so it has no discriminative value (#720).
+    try {
+      this.queries.setProjectNameTokens(deriveProjectNameTokens(this.projectRoot));
+    } catch {
+      // Best-effort: ranking still works without it.
+    }
+    this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
+    this.resolver = createResolver(this.projectRoot, this.queries);
+    this.graphManager = new GraphQueryManager(this.queries);
+    this.traverser = new GraphTraverser(this.queries);
     this.contextBuilder = createContextBuilder(
-      projectRoot,
-      queries,
+      this.projectRoot,
+      this.queries,
       this.traverser
     );
+  }
+
+  /**
+   * Heal a stale database handle in place. If `.codegraph/` was removed and
+   * recreated at the SAME path while this instance held the DB open — a git
+   * worktree removed and re-added, or `rm -rf .codegraph` + `codegraph init` —
+   * our open fd points at the now-unlinked inode and can never see the new
+   * index, so every query returns the pre-removal snapshot until the process
+   * restarts (#925). When that's detected, open the live file at the same path,
+   * rebuild the query layers, and swap them IN PLACE, so every holder of this
+   * instance (the MCP daemon's default project, cached projectPath connections)
+   * heals without a restart. Returns true iff it reopened.
+   *
+   * POSIX-only in practice: `isReplacedOnDisk` never fires on Windows (an open
+   * file can't be unlinked there, and st_ino is unreliable).
+   */
+  reopenIfReplaced(): boolean {
+    if (!this.db.isReplacedOnDisk()) return false;
+    const dbPath = this.db.getPath();
+    // Open the live file FIRST — if that throws (e.g. mid-recreate), the old
+    // handle stays in place and the caller retries on the next query, rather
+    // than leaving this instance with no connection at all.
+    const fresh = DatabaseConnection.open(dbPath);
+    const stale = this.db;
+    this.db = fresh;
+    this.queries = new QueryBuilder(fresh.getDb());
+    this.wireLayers();
+    // Releasing the dead handle also frees the leaked db/-wal/-shm fds that were
+    // pinning the unlinked inode (#925).
+    try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
+    return true;
   }
 
   // ===========================================================================
@@ -367,6 +420,15 @@ export class CodeGraph {
               total,
             });
           });
+
+          // Second pass: chained calls whose method lives on a supertype the
+          // receiver conforms to (protocol-extension / inherited / default-
+          // interface). Needs the implements/extends edges the main pass just
+          // built, so it runs after resolution (#750).
+          this.resolver.resolveChainedCallsViaConformance();
+          // Same lifecycle for `this.<member>` callback registrations whose
+          // member is inherited from a supertype (#808).
+          this.resolver.resolveDeferredThisMemberRefs();
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -483,6 +545,14 @@ export class CodeGraph {
               });
             });
           }
+
+          // Second pass: chained calls whose method lives on a supertype the
+          // receiver conforms to (protocol-extension / inherited). Needs the
+          // implements/extends edges built above (#750).
+          this.resolver.resolveChainedCallsViaConformance();
+          // Same lifecycle for `this.<member>` callback registrations whose
+          // member is inherited from a supertype (#808).
+          this.resolver.resolveDeferredThisMemberRefs();
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -556,6 +626,23 @@ export class CodeGraph {
    */
   isWatching(): boolean {
     return this.watcher?.isActive() ?? false;
+  }
+
+  /**
+   * True once live watching has permanently degraded (OS watch-resource
+   * exhaustion, or a write lock held past the retry budget) and auto-sync is
+   * disabled until the next {@link watch} call. Distinct from `!isWatching()`:
+   * a stopped/never-started watcher is inactive but NOT degraded. MCP tools use
+   * this to surface a whole-index "results may be stale" notice, since
+   * `getPendingFiles()` goes empty once watching stops (#876).
+   */
+  isWatcherDegraded(): boolean {
+    return this.watcher?.isDegraded() ?? false;
+  }
+
+  /** The reason live watching degraded, or null if it is healthy (#876). */
+  getWatcherDegradedReason(): string | null {
+    return this.watcher?.getDegradedReason() ?? null;
   }
 
   /**
@@ -744,6 +831,17 @@ export class CodeGraph {
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
     return this.queries.searchNodes(query, options);
+  }
+
+  /**
+   * Normalized project-name tokens (go.mod / package.json / repo dir) used to
+   * down-weight the non-discriminative project name in search ranking (#720).
+   * Exposed so explore can exclude it from the PascalCase type-disambiguation
+   * bias, which would otherwise pull overloaded tokens toward whichever stack
+   * embeds the project name.
+   */
+  getProjectNameTokens(): Set<string> {
+    return this.queries.getProjectNameTokens();
   }
 
   /**

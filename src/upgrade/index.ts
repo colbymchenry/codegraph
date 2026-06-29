@@ -340,16 +340,21 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
     return 0;
   }
 
-  // Dispatch by install method.
+  // Dispatch by install method. bundle/npm perform a real binary update, so
+  // after they succeed we self-heal the front-load hook (below); npx/source/
+  // unknown don't update anything here, so they return directly.
+  let code: number;
   switch (method.kind) {
     case 'bundle':
-      return method.os === 'windows'
+      code = await (method.os === 'windows'
         ? upgradeWindowsBundle(method, latest, deps)
-        : upgradeUnixBundle(method, opts.version ? latest : undefined, deps);
+        : upgradeUnixBundle(method, opts.version ? latest : undefined, deps));
+      break;
     case 'npm':
       // npm version specs have no leading "v" (`@0.9.8`, not `@v0.9.8` — the
       // latter resolves as a nonexistent dist-tag).
-      return upgradeNpm(method, opts.version ? stripV(latest) : 'latest', deps);
+      code = await upgradeNpm(method, opts.version ? stripV(latest) : 'latest', deps);
+      break;
     case 'npx':
       deps.log(c.green('npx always runs the latest version on demand — nothing to upgrade.'));
       deps.log(c.dim(`Force a fresh fetch with: npx ${NPM_PACKAGE}@latest`));
@@ -362,6 +367,38 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
       deps.error(`Couldn’t determine how CodeGraph was installed (${method.reason}).`);
       deps.log(c.dim(`Reinstall manually — see https://github.com/${REPO}#install`));
       return 1;
+  }
+
+  // After a successful update, ensure the front-load prompt hook is wired for an
+  // already-configured global Claude install — so existing users pick it up on
+  // upgrade, not only on a fresh `install` (the hook config is version-agnostic,
+  // so the still-running old binary can write it safely). Idempotent + gated on
+  // an existing Claude config, and skipped entirely by the kill-switch. Never
+  // fatal to the upgrade.
+  if (code === 0) {
+    try {
+      await selfHealPromptHook(deps);
+    } catch {
+      /* a hook-wiring hiccup must not fail the upgrade */
+    }
+  }
+  return code;
+}
+
+/**
+ * Wire the Claude `UserPromptSubmit` front-load hook on upgrade for an
+ * already-configured global Claude install. No-op when Claude isn't configured,
+ * when the hook is already present, or when the kill-switch is set.
+ */
+async function selfHealPromptHook(deps: UpgradeDeps): Promise<void> {
+  if (process.env.CODEGRAPH_NO_PROMPT_HOOK === '1' || process.env.CODEGRAPH_PROMPT_HOOK === '0') return;
+  const { claudeTarget, writePromptHookEntry } = await import('../installer/targets/claude');
+  if (!claudeTarget.detect('global').alreadyConfigured) return;
+  const res = writePromptHookEntry('global');
+  if (res.action === 'created' || res.action === 'updated') {
+    deps.log(
+      c.dim('Enabled the CodeGraph front-load hook for Claude Code (structural prompts). Disable any time: CODEGRAPH_NO_PROMPT_HOOK=1'),
+    );
   }
 }
 

@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory } from '../src/extraction';
+import { extractFromSource, scanDirectory, buildDefaultIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { normalizePath } from '../src/utils';
 
@@ -182,6 +182,89 @@ export class PaymentService {
     expect(methodNodes.length).toBeGreaterThanOrEqual(1);
     const chargeMethod = methodNodes.find((m) => m.name === 'charge');
     expect(chargeMethod).toBeDefined();
+  });
+
+  it('captures docstrings for export- and const-wrapped declarations (#780)', () => {
+    const code = `
+// plain class control
+class Ledger {}
+
+// exported class
+export class Invoice {}
+
+// export default
+export default function settle() { return true; }
+
+// exported arrow const
+export const refund = (amount: number) => amount;
+
+// non-export arrow const
+const audit = (amount: number) => amount;
+`;
+    const byName = new Map(extractFromSource('doc.ts', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('Ledger')?.docstring).toBe('plain class control'); // control still works
+    expect(byName.get('Invoice')?.docstring).toBe('exported class');
+    expect(byName.get('settle')?.docstring).toBe('export default');
+    expect(byName.get('refund')?.docstring).toBe('exported arrow const');
+    expect(byName.get('audit')?.docstring).toBe('non-export arrow const');
+  });
+
+  it('does not mis-attribute a class comment to an uncommented member (#780)', () => {
+    const code = `
+// Comment for Box
+export class Box {
+  noComment() {}
+  // own comment
+  withComment() {}
+}
+`;
+    const byName = new Map(extractFromSource('box.ts', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('Box')?.docstring).toBe('Comment for Box');
+    expect(byName.get('noComment')?.docstring ?? null).toBeNull(); // no over-walk
+    expect(byName.get('withComment')?.docstring).toBe('own comment');
+  });
+
+  it('captures docstrings for decorated Python declarations, stripping `#` (#780)', () => {
+    const code = [
+      '# decorated function',
+      '@app.route("/x")',
+      'def py_handler():',
+      '    return 1',
+      '',
+      '',
+      '# plain function control',
+      'def py_plain():',
+      '    return 1',
+      '',
+      '',
+      '# decorated class',
+      '@dataclass',
+      'class PyModel:',
+      '    pass',
+      '',
+    ].join('\n');
+    const byName = new Map(extractFromSource('mod.py', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('py_handler')?.docstring).toBe('decorated function');
+    expect(byName.get('py_plain')?.docstring).toBe('plain function control'); // `#` stripped
+    expect(byName.get('PyModel')?.docstring).toBe('decorated class');
+  });
+
+  it('cleans comment markers across language styles (#780)', () => {
+    const doc = (file: string, code: string, name: string) =>
+      new Map(extractFromSource(file, code).nodes.map((n) => [n.name, n])).get(name)?.docstring;
+
+    // Rust doc lines (`///`, `//!`) — the trailing slash used to leak through.
+    expect(doc('m.rs', '/// rust doc line\nfn rs_fn() {}', 'rs_fn')).toBe('rust doc line');
+    // Lua line + long-bracket comments.
+    expect(doc('m.lua', '-- lua line\nfunction lua_fn() end', 'lua_fn')).toBe('lua line');
+    expect(doc('b.lua', '--[[ lua block ]]\nfunction lua_b() end', 'lua_b')).toBe('lua block');
+    // Pascal brace and paren-star comments.
+    const pasUnit = (c: string) =>
+      `unit U;\ninterface\n${c}\nprocedure P;\nimplementation\nprocedure P;\nbegin\nend;\nend.\n`;
+    expect(doc('a.pas', pasUnit('{ pascal brace }'), 'P')).toBe('pascal brace');
+    expect(doc('c.pas', pasUnit('(* pascal paren *)'), 'P')).toBe('pascal paren');
+    // C block comment still clean (no regression).
+    expect(doc('m.c', '/* c block */\nvoid c_fn(void) {}', 'c_fn')).toBe('c block');
   });
 
   it('should extract interfaces', () => {
@@ -450,6 +533,59 @@ type Internal = string;
     const exported = typeAliases.filter((n) => n.isExported);
     expect(exported).toHaveLength(2);
     expect(exported.map((n) => n.name).sort()).toEqual(['DateFormat', 'UnitSystem']);
+  });
+
+  // A service/contract registry written as a tuple of generic instantiations —
+  // the names are string-literal type arguments, not declarations, so static
+  // extraction otherwise never indexes them (issue #634).
+  it('extracts string-literal contract names from a generic tuple type alias (#634)', () => {
+    const code = `
+interface Service<Name extends string, Req, Resp> { name: Name; }
+export type MyServiceList = [
+  Service<'query_apply_record', { pageNo: number }, { ok: boolean }>,
+  Service<'apply_confirm', { code: string }, { ok: boolean }>
+];
+`;
+    const result = extractFromSource('services/api.ts', code);
+
+    const names = result.nodes.filter(
+      (n) => n.kind === 'method' && n.qualifiedName.startsWith('MyServiceList::')
+    );
+    expect(names.map((n) => n.name).sort()).toEqual(['apply_confirm', 'query_apply_record']);
+
+    const queryNode = names.find((n) => n.name === 'query_apply_record');
+    expect(queryNode?.qualifiedName).toBe('MyServiceList::query_apply_record');
+    // Signature carries the full contract entry so search results show context.
+    expect(queryNode?.signature).toContain("Service<'query_apply_record'");
+
+    // The string-literal name is contained by the type alias.
+    const alias = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'MyServiceList');
+    const containsEdge = result.edges.find(
+      (e) => e.kind === 'contains' && e.source === alias?.id && e.target === queryNode?.id
+    );
+    expect(containsEdge).toBeDefined();
+  });
+
+  it('does not extract string literals from utility types or nested generics (#634)', () => {
+    const code = `
+interface User { id: string; name: string; }
+interface Service<Name extends string, Req, Resp> { name: Name; }
+export type Picked = Pick<User, 'id' | 'name'>;
+export type Rec = Record<'foo' | 'bar', number>;
+// Tuple entry, but the name is a non-identifier route path; the nested Pick's
+// 'id' must also stay out (only DIRECT literal args of a tuple's generic count).
+export type Routes = [Service<'/api/users', Pick<User, 'id'>, {}>];
+// Bare string-literal tuple — not generic type arguments.
+export type Names = ['alpha', 'beta'];
+`;
+    const result = extractFromSource('noise.ts', code);
+
+    const leaked = result.nodes.filter(
+      (n) =>
+        (n.kind === 'method' || n.kind === 'property') &&
+        ['id', 'name', 'foo', 'bar', 'alpha', 'beta'].includes(n.name)
+    );
+    expect(leaked).toEqual([]);
   });
 });
 
@@ -1014,6 +1150,40 @@ public class OrderService
     expect(classNode?.visibility).toBe('public');
   });
 
+  it('indexes every record form with the right kind (#831)', () => {
+    // The grammar parses ALL record forms as record_declaration — there is no
+    // record_struct_declaration node — so the value-type forms are told apart
+    // by their `struct` keyword child. Positional one-liners have no body
+    // block and must still index (the no-body gate is for C/C++ forward
+    // declarations, not records).
+    const code = `
+namespace Fixture;
+
+public record SimplePositional(int A);
+public record WithBody(int A) { public int DoubleIt() => A * 2; }
+public record class ExplicitClassRec(string Name);
+public record struct ValueRec(int X);
+public readonly record struct ReadonlyRec(int X, int Y);
+public record DerivedRec(int A, string B) : SimplePositional(A);
+public record GenericRec<T>(T Value);
+public partial record PartialRec(int A);
+`;
+    const result = extractFromSource('Records.cs', code);
+    const kindOf = (name: string) => result.nodes.find((n) => n.name === name)?.kind;
+
+    expect(kindOf('SimplePositional')).toBe('class');
+    expect(kindOf('WithBody')).toBe('class');
+    expect(kindOf('ExplicitClassRec')).toBe('class');
+    expect(kindOf('DerivedRec')).toBe('class');
+    expect(kindOf('GenericRec')).toBe('class');
+    expect(kindOf('PartialRec')).toBe('class');
+    // Value-type records are structs, not classes.
+    expect(kindOf('ValueRec')).toBe('struct');
+    expect(kindOf('ReadonlyRec')).toBe('struct');
+    // Members of a bodied record still extract.
+    expect(kindOf('DoubleIt')).toBe('method');
+  });
+
   it('indexes primary-constructor classes, including keyed-DI attribute params (#237)', () => {
     // C# 12 primary constructors (`class Foo(IDep dep) { … }`) are parsed
     // natively by the vendored tree-sitter-c-sharp 0.23.x grammar. The worst
@@ -1266,6 +1436,88 @@ protocol UploadConvertible: URLRequestConvertible {
     expect(extendsRefs.find((r) => r.referenceName === 'RawRepresentable')).toBeDefined();
     // UploadConvertible extends URLRequestConvertible
     expect(extendsRefs.find((r) => r.referenceName === 'URLRequestConvertible')).toBeDefined();
+  });
+
+  it('indexes Swift properties so they are findable: computed → property, stored → field, static → constant/variable (#1020)', () => {
+    const code = `
+struct ReproConfig {
+    let reproStoredValue: Int
+    var reproComputedFlag: Bool {
+        reproStoredValue > 0
+    }
+    static let sharedLimit = 10
+    static var sharedCount = 0
+    func reproControlMethod() -> Bool {
+        reproComputedFlag
+    }
+}
+
+final class ReproService {
+    private let reproClassStored: String = "x"
+    var reproClassComputed: Int { reproClassStored.count }
+}
+`;
+    const result = extractFromSource('Repro.swift', code);
+    const byName = (name: string) => result.nodes.find((n) => n.name === name);
+
+    // Computed properties are the regression this fix targets: before #1020 they
+    // were dropped entirely, so search/explore returned nothing for them.
+    expect(byName('reproComputedFlag')?.kind).toBe('property');
+    expect(byName('reproClassComputed')?.kind).toBe('property');
+
+    // Stored instance properties stay `field` (fixed earlier in #708 — guard it).
+    expect(byName('reproStoredValue')?.kind).toBe('field');
+    expect(byName('reproClassStored')?.kind).toBe('field');
+
+    // `static let`/`static var` members remain shared constant/variable nodes.
+    expect(byName('sharedLimit')?.kind).toBe('constant');
+    expect(byName('sharedCount')?.kind).toBe('variable');
+
+    // The control method is unaffected.
+    expect(byName('reproControlMethod')?.kind).toBe('method');
+  });
+
+  it("attributes a computed property's getter calls to the property, not the type (SwiftUI body flow) (#1020)", () => {
+    const code = `
+struct GreetingView {
+    let name: String
+    var body: some View {
+        let prefix = "Hi"
+        return VStack {
+            Text(greeting(prefix))
+        }
+    }
+    func greeting(_ p: String) -> String { p }
+}
+`;
+    const result = extractFromSource('View.swift', code);
+    const body = result.nodes.find((n) => n.kind === 'property' && n.name === 'body');
+    expect(body).toBeDefined();
+
+    // The getter's call to greeting() must originate from `body` (so a SwiftUI
+    // view's render flow is reachable through the property), not flatten onto the
+    // enclosing struct.
+    const callsFromBody = result.unresolvedReferences.filter(
+      (r) => r.fromNodeId === body!.id && r.referenceKind === 'calls'
+    );
+    expect(callsFromBody.some((r) => r.referenceName === 'greeting')).toBe(true);
+
+    // The getter is walked as a body, so a local declared inside it is NOT
+    // node-ified (locals are the data-flow frontier we leave uncovered). Before
+    // this fix the generic walker treated such a local as a struct `field`.
+    expect(result.nodes.find((n) => n.name === 'prefix')).toBeUndefined();
+  });
+
+  it('indexes a Swift protocol property requirement as a findable property (#1020)', () => {
+    const code = `
+protocol Themable {
+    var accentColor: Color { get }
+    var title: String { get set }
+}
+`;
+    const result = extractFromSource('Themable.swift', code);
+    expect(result.nodes.find((n) => n.name === 'accentColor')?.kind).toBe('property');
+    expect(result.nodes.find((n) => n.name === 'title')?.kind).toBe('property');
   });
 });
 
@@ -2194,6 +2446,43 @@ use Closure;
       expect(names).toContain('Illuminate\\Support\\Str');
       expect(names).toContain('Closure');
     });
+
+    it('should extract include/require (+_once) static paths as imports (#660)', () => {
+      const code = `<?php
+require_once("lib.php");
+include 'other.php';
+require 'r.php';
+include_once("io.php");
+`;
+      const result = extractFromSource('page.php', code);
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('lib.php');
+      expect(names).toContain('other.php');
+      expect(names).toContain('r.php');
+      expect(names).toContain('io.php');
+    });
+
+    it('should skip dynamic include/require with no static path (#660)', () => {
+      const code = `<?php
+require_once(__DIR__ . '/dyn.php');
+include $file;
+include "tpl/{$name}.php";
+`;
+      const result = extractFromSource('page.php', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import');
+      expect(imports).toHaveLength(0);
+    });
+
+    it('should extract include alongside namespace use without interference (#660)', () => {
+      const code = `<?php
+use App\\Service\\Mailer;
+require_once("bootstrap.php");
+`;
+      const result = extractFromSource('page.php', code);
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('App\\Service\\Mailer');
+      expect(names).toContain('bootstrap.php');
+    });
   });
 
   describe('Ruby imports', () => {
@@ -2313,6 +2602,122 @@ end
       const authMethod = result.nodes.find((n) => n.name === 'authenticate');
       expect(authMethod).toBeDefined();
       expect(authMethod?.qualifiedName).toBe('Discourse::Auth::AuthProvider::authenticate');
+    });
+  });
+
+  describe('PHP return type capture (#608)', () => {
+    it('captures self/static factory returns as the `self` marker; primitives as undefined', () => {
+      const code = `<?php
+class ApiClient {
+    public static function for(string $c): self { return new self; }
+    public static function make(): static { return new static; }
+    public function send(array $p): array { return []; }
+}`;
+      const result = extractFromSource('ApiClient.php', code);
+      expect(result.nodes.find((n) => n.name === 'for' && n.kind === 'method')?.returnType).toBe('self');
+      expect(result.nodes.find((n) => n.name === 'make' && n.kind === 'method')?.returnType).toBe('self');
+      // `array` is not a class to chain on → no return type recorded.
+      expect(result.nodes.find((n) => n.name === 'send' && n.kind === 'method')?.returnType).toBeUndefined();
+    });
+
+    it('captures a concrete return type as its short class name', () => {
+      const code = `<?php
+namespace App;
+class WidgetFactory { public static function make(): Widget { return new Widget(); } }`;
+      const result = extractFromSource('WidgetFactory.php', code);
+      expect(result.nodes.find((n) => n.name === 'make' && n.kind === 'method')?.returnType).toBe('Widget');
+    });
+  });
+
+  describe('C/C++ return type capture (#645)', () => {
+    it('captures the normalized return type of a C++ method/function', () => {
+      const code = `
+struct Widget { void draw(); };
+class Factory { public: static Widget create(); };
+Widget Factory::create() { return Widget(); }
+void doNothing() {}
+`;
+      const result = extractFromSource('f.cpp', code);
+
+      const create = result.nodes.find(
+        (n) => n.name === 'create' && (n.kind === 'method' || n.kind === 'function')
+      );
+      expect(create?.returnType).toBe('Widget');
+
+      // A `void` return records no type, so resolution never tries to resolve a
+      // method on it.
+      const doNothing = result.nodes.find((n) => n.name === 'doNothing');
+      expect(doNothing).toBeDefined();
+      expect(doNothing?.returnType).toBeUndefined();
+    });
+
+    it('unwraps a smart-pointer return type to its pointee', () => {
+      const code = `
+#include <memory>
+struct Widget {};
+std::unique_ptr<Widget> makeWidget() { return nullptr; }
+`;
+      const result = extractFromSource('f.cpp', code);
+
+      const make = result.nodes.find((n) => n.name === 'makeWidget');
+      expect(make?.returnType).toBe('Widget');
+    });
+  });
+
+  describe('C++ macro-prefixed class/struct misparse (#946)', () => {
+    // An export/visibility macro before the class name plus a base clause
+    // (`class MACRO Name : public Base { … }`) makes tree-sitter read `class
+    // MACRO` as an elaborated type and the whole declaration as a
+    // function_definition named after the class, spanning the entire body — a
+    // phantom `function` that polluted callers/impact/blast-radius. It's dropped.
+    it('does not mint a phantom function for a macro-annotated class that inherits', () => {
+      const code = `#pragma once
+#define MAPCORE_EXPORT __attribute__((visibility("default")))
+
+class DataProvider {
+public:
+    virtual bool Request(void* param) = 0;
+};
+
+class MAPCORE_EXPORT LocalDataProvider : public DataProvider
+{
+public:
+    LocalDataProvider(int dataType);
+    virtual bool Request(void* param) override;
+};
+`;
+      // A header rich in C++ (class / public: / virtual) detects as C++ — the
+      // issue's exact scenario (a `.h` file). Guard it so a detection regression
+      // can't make this test pass for the wrong reason.
+      expect(detectLanguage('provider.h', code)).toBe('cpp');
+      const result = extractFromSource('provider.h', code);
+
+      // The misparse used to surface as `function | LocalDataProvider` spanning
+      // the whole class body — a false caller in the graph. It's gone now.
+      expect(
+        result.nodes.find((n) => n.name === 'LocalDataProvider' && n.kind === 'function')
+      ).toBeUndefined();
+
+      // The sibling class without the macro is unaffected — still a class.
+      expect(result.nodes.find((n) => n.name === 'DataProvider')?.kind).toBe('class');
+    });
+
+    it('drops the struct variant too, without dropping a genuine class', () => {
+      const code = `
+#define API __declspec(dllexport)
+struct API Widget : public Base { int x; };
+class Plain : public Base { public: int y; };
+`;
+      const result = extractFromSource('widget.cpp', code);
+
+      // `struct MACRO Name : Base { … }` misparses the same way — no phantom function.
+      expect(
+        result.nodes.find((n) => n.name === 'Widget' && n.kind === 'function')
+      ).toBeUndefined();
+
+      // A normal class with a base clause and no macro must still be a class — the
+      // drop is precise, not a blanket "class with inheritance" filter.
+      expect(result.nodes.find((n) => n.name === 'Plain')?.kind).toBe('class');
     });
   });
 
@@ -5051,6 +5456,133 @@ describe('Git Submodules', () => {
   });
 });
 
+describe('Nested gitlink repos (#1031, #1033)', () => {
+  let tempDir: string;
+  // Helper: make a self-contained git repo at `dir` with one committed TS file.
+  const makeRepo = async (dir: string, base: string) => {
+    const { execFileSync } = await import('child_process');
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
+    fs.mkdirSync(dir, { recursive: true });
+    git('init', '-q');
+    git('config', 'user.email', 'test@test.com');
+    git('config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(dir, `${base}.ts`), `export const ${base} = 1;`);
+    git('add', '-A');
+    git('commit', '-q', '-m', `${base} init`);
+  };
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  // The #1031 case: a nested repo `git add`ed inside the super-repo becomes a
+  // gitlink (mode 160000) with NO `.gitmodules`. It is tracked (so it never shows
+  // in the untracked `-o` listing) yet not an active submodule (so
+  // `--recurse-submodules` won't expand it) — it used to fall through both passes
+  // and only the super-repo's own files got indexed.
+  it('indexes a bare gitlink (git add\'ed embedded repo, no .gitmodules), recursively', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+
+    // An embedded clone, itself holding a further nested clone (untracked inside it).
+    await makeRepo(path.join(root, 'embedded'), 'inner');
+    await makeRepo(path.join(root, 'embedded', 'deep'), 'deep');
+
+    // `git add embedded` records it as a 160000 gitlink (no fetch, no .gitmodules).
+    git(root, 'add', 'embedded');
+    git(root, 'commit', '-q', '-m', 'add embedded as gitlink');
+    expect(fs.existsSync(path.join(root, '.gitmodules'))).toBe(false);
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('app.ts');
+    expect(files).toContain('embedded/inner.ts'); // the gitlink's own source
+    expect(files).toContain('embedded/deep/deep.ts'); // recursion continues into its nested repo
+  });
+
+  // The -c → -s switch must not regress active submodules (#147): a repo can hold
+  // BOTH an active submodule (expanded by --recurse-submodules) and a bare gitlink
+  // (handled by the new pass), and the mixed 160000/100644 modes must parse right.
+  it('indexes a gitlink alongside an active submodule', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const lib = path.join(tempDir, '_lib');
+    await makeRepo(lib, 'lib');
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+
+    // A proper, active submodule.
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'libs/lib'], { cwd: root, stdio: 'pipe' });
+    git(root, 'commit', '-q', '-m', 'add submodule');
+
+    // A bare gitlink in the same repo (under a non-ignored dir name).
+    await makeRepo(path.join(root, 'external', 'tool'), 'tool');
+    git(root, 'add', 'external/tool');
+    git(root, 'commit', '-q', '-m', 'add gitlink');
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('app.ts');
+    expect(files).toContain('libs/lib/lib.ts'); // active submodule still expands (#147)
+    expect(files).toContain('external/tool/tool.ts'); // bare gitlink now indexed
+  });
+
+  // A gitlink under a built-in default-ignored directory (vendor/, node_modules/,
+  // …) stays excluded — a committed dependency doesn't become project code just
+  // because it's a nested repo. Mirrors how the untracked-embedded path treats
+  // the same dirs (#407), so the two passes agree.
+  it('does not index a gitlink under a default-ignored directory (e.g. vendor/)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+    await makeRepo(path.join(root, 'vendor', 'pkg'), 'dep');
+    git(root, 'add', 'vendor/pkg');
+    git(root, 'commit', '-q', '-m', 'add vendored gitlink');
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('app.ts');
+    expect(files).not.toContain('vendor/pkg/dep.ts');
+  });
+
+  // A gitlink with NO working tree on disk (the common "cloned without
+  // --recurse-submodules" state) has nothing to index — we must leave it alone,
+  // not fabricate entries, and must not break the rest of the scan.
+  it('leaves an uninitialized submodule (no checkout on disk) alone', async () => {
+    const { execFileSync } = await import('child_process');
+
+    const lib = path.join(tempDir, '_lib');
+    await makeRepo(lib, 'lib');
+
+    const sup = path.join(tempDir, 'super');
+    await makeRepo(sup, 'app');
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'libs/lib'], { cwd: sup, stdio: 'pipe' });
+    execFileSync('git', ['commit', '-q', '-m', 'add submodule'], { cwd: sup, stdio: 'pipe' });
+
+    // Clone the super-repo WITHOUT --recurse-submodules → libs/lib is an empty
+    // gitlink dir (mode 160000, no `.git` inside, no files).
+    const clone = path.join(tempDir, 'clone');
+    execFileSync('git', ['clone', '-q', sup, clone], { stdio: 'pipe' });
+    expect(fs.readdirSync(path.join(clone, 'libs', 'lib'))).toHaveLength(0);
+
+    const files = scanDirectory(clone);
+
+    expect(files).toContain('app.ts');
+    expect(files).not.toContain('libs/lib/lib.ts'); // not on disk → correctly absent
+  });
+});
+
 describe('Nested non-submodule git repos', () => {
   let tempDir: string;
 
@@ -5119,6 +5651,54 @@ describe('Nested non-submodule git repos', () => {
 
     expect(files).toContain('sub_repo/src/real.ts');
     expect(files).not.toContain('sub_repo/src/generated.ts');
+  });
+
+  // A .gitignore the `ignore` library can't compile to a regex must not abort
+  // the whole scan — the bad pattern is dropped, valid ones still apply (#682).
+  it('does not crash on a .gitignore with an uncompilable pattern (#682)', () => {
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'real.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'out.ts'), 'export const y = 2;');
+    // `\\[` makes the matcher build an unterminated character class — the throw
+    // is lazy (at match time), which is what escaped and killed sync.
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'build/\n\\\\[\n');
+
+    let files: string[] = [];
+    expect(() => {
+      files = scanDirectory(tempDir);
+    }).not.toThrow();
+    expect(files).toContain('src/real.ts');
+    // The still-valid `build/` rule is honored; only the bad line was dropped.
+    expect(files.some((f) => f.startsWith('build/'))).toBe(false);
+  });
+
+  // A .gitignore that isn't valid UTF-8 — e.g. encrypted in place by corporate
+  // DLP / endpoint software (UTF-16 header + ciphertext) — is skipped whole,
+  // not fed to the matcher as garbage patterns (#682).
+  it('does not crash on a non-UTF-8 (DLP-encrypted) .gitignore (#682)', () => {
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'real.ts'), 'export const x = 1;');
+    const header = Buffer.concat([
+      Buffer.from([0x00, 0x00]),
+      Buffer.from('[notice][user]', 'utf16le'),
+    ]);
+    const junk = Buffer.from([0x5b, 0x99, 0xc3, 0x28, 0x5c, 0x5b, 0xff, 0xfd]);
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), Buffer.concat([header, junk]));
+
+    let files: string[] = [];
+    expect(() => {
+      files = scanDirectory(tempDir);
+    }).not.toThrow();
+    expect(files).toContain('src/real.ts');
+  });
+
+  it('buildDefaultIgnore survives a bad .gitignore and still applies valid rules (#682)', () => {
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'dist/\n\\\\[\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(() => ig.ignores('src/app.ts')).not.toThrow();
+    expect(ig.ignores('dist/')).toBe(true); // valid rule survives
+    expect(ig.ignores('src/app.ts')).toBe(false);
   });
 });
 
@@ -5608,6 +6188,218 @@ const value = 42;
     expect(componentNode).toBeDefined();
 
     // Should have containment edges from component to child nodes
+    const containEdges = result.edges.filter(
+      (e) => e.source === componentNode!.id && e.kind === 'contains'
+    );
+    expect(containEdges.length).toBeGreaterThan(0);
+  });
+});
+
+describe('Astro Extraction', () => {
+  it('should detect Astro files', () => {
+    expect(detectLanguage('src/pages/index.astro')).toBe('astro');
+    expect(detectLanguage('Layout.astro')).toBe('astro');
+    expect(isLanguageSupported('astro')).toBe(true);
+  });
+
+  it('should extract component node from an .astro file', () => {
+    const code = `---
+const title = 'Hello';
+---
+<h1>{title}</h1>
+`;
+    const result = extractFromSource('Card.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Card');
+    expect(componentNode?.language).toBe('astro');
+    expect(componentNode?.isExported).toBe(true);
+  });
+
+  it('should extract frontmatter symbols with correct line numbers (#768)', () => {
+    const code = `---
+import { formatDate } from '../utils/format';
+
+function getIconNode(name: string): string {
+  return name;
+}
+
+const { title } = Astro.props;
+---
+<span>{title}</span>
+`;
+    const result = extractFromSource('navs.astro', code);
+
+    // The #768 repro: a function defined in frontmatter must be found
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'getIconNode');
+    expect(fn).toBeDefined();
+    expect(fn?.language).toBe('astro');
+    expect(fn?.startLine).toBe(4);
+
+    const imp = result.nodes.find((n) => n.kind === 'import');
+    expect(imp).toBeDefined();
+    expect(imp?.startLine).toBe(2);
+  });
+
+  it('should extract exported getStaticPaths from frontmatter', () => {
+    const code = `---
+export async function getStaticPaths() {
+  return [];
+}
+const { slug } = Astro.params;
+---
+<p>{slug}</p>
+`;
+    const result = extractFromSource('[slug].astro', code);
+
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'getStaticPaths');
+    expect(fn).toBeDefined();
+    expect(fn?.isExported).toBe(true);
+  });
+
+  it('should extract calls from template expressions', () => {
+    const code = `---
+import { formatDate } from '../utils/format';
+const date = new Date();
+---
+<time>{formatDate(date)}</time>
+`;
+    const result = extractFromSource('Stamp.astro', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'formatDate' && ref.line === 5
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('should extract calls from a multiline expression opening line', () => {
+    const code = `---
+const posts = [];
+---
+<ul>
+  {posts.map((post) => (
+    <li>{render(post)}</li>
+  ))}
+</ul>
+`;
+    const result = extractFromSource('List.astro', code);
+
+    const mapCall = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'posts.map'
+    );
+    expect(mapCall).toBeDefined();
+    const innerCall = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'render'
+    );
+    expect(innerCall).toBeDefined();
+  });
+
+  it('should extract PascalCase component usages from the template', () => {
+    const code = `---
+import Layout from '../layouts/Layout.astro';
+import PostCard from '../components/PostCard.astro';
+---
+<Layout title="Home">
+  <PostCard />
+  <Fragment slot="head" />
+  <div class="plain-html" />
+</Layout>
+`;
+    const result = extractFromSource('index.astro', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    const names = refs.map((r) => r.referenceName);
+    expect(names).toContain('Layout');
+    expect(names).toContain('PostCard');
+    // Astro built-ins and lowercase HTML are not component references
+    expect(names).not.toContain('Fragment');
+    expect(names).not.toContain('div');
+  });
+
+  it('should not extract template patterns from frontmatter, script, or style content', () => {
+    const code = `---
+// <FakeComponent /> inside frontmatter comment
+const x = { y: maybeCall(1) };
+---
+<div>real</div>
+<script>
+  const z = { w: scriptCall(2) };
+</script>
+<style>
+  .a { color: red; }
+</style>
+`;
+    const result = extractFromSource('Guard.astro', code);
+
+    const templateRefs = result.unresolvedReferences.filter(
+      (r) => r.referenceKind === 'references' && r.referenceName === 'FakeComponent'
+    );
+    expect(templateRefs).toHaveLength(0);
+
+    // maybeCall/scriptCall come from the delegated TS extraction (once),
+    // not double-counted by the template scanner
+    const maybeCalls = result.unresolvedReferences.filter(
+      (r) => r.referenceName === 'maybeCall' && r.referenceKind === 'calls'
+    );
+    expect(maybeCalls.length).toBeLessThanOrEqual(1);
+  });
+
+  it('should extract <script> block symbols with correct line numbers', () => {
+    const code = `---
+const a = 1;
+---
+<div>hi</div>
+<script>
+function trackView(page: string) {
+  console.log(page);
+}
+</script>
+`;
+    const result = extractFromSource('Tracker.astro', code);
+
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'trackView');
+    expect(fn).toBeDefined();
+    expect(fn?.startLine).toBe(6);
+    expect(fn?.language).toBe('astro');
+  });
+
+  it('should create component node for a frontmatter-less template-only file', () => {
+    const code = `<div>Static content</div>
+`;
+    const result = extractFromSource('Static.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Static');
+    expect(componentNode?.language).toBe('astro');
+  });
+
+  it('should treat an unclosed frontmatter fence as no frontmatter', () => {
+    const code = `---
+const broken = true;
+<div>never closed</div>
+`;
+    const result = extractFromSource('Broken.astro', code);
+
+    // No TS delegation happened (the fence never closes), but the component
+    // node still exists and nothing throws.
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(result.nodes.find((n) => n.name === 'broken')).toBeUndefined();
+  });
+
+  it('should create containment edges from component to frontmatter nodes', () => {
+    const code = `---
+const value = 42;
+---
+<div>{value}</div>
+`;
+    const result = extractFromSource('Contained.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+
     const containEdges = result.edges.filter(
       (e) => e.source === componentNode!.id && e.kind === 'contains'
     );
@@ -6265,6 +7057,34 @@ describe('Go cross-package composite literals (blast-radius recall)', () => {
     }
   });
 
+  it('attributes a call inside a top-level closure (cobra RunE) to the var, not the file (#693)', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      // Wire is called ONLY from the anonymous RunE closure inside a top-level
+      // `var rootCmd = &Cmd{...}` — previously the call leaked to the file node,
+      // so `callers(Wire)` surfaced a file (or read as "no caller"). It must now
+      // attribute to the enclosing var.
+      fs.writeFileSync(path.join(dir, 'factory.go'), `package main\n\nfunc Wire() error { return nil }\n`);
+      fs.writeFileSync(
+        path.join(dir, 'root.go'),
+        `package main\n\ntype Cmd struct{ RunE func() error }\n\nvar rootCmd = &Cmd{\n\tRunE: func() error { return Wire() },\n}\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      const wire = cg.getNodesByName('Wire').find((n) => n.kind === 'function');
+      expect(wire).toBeDefined();
+      const callers = cg.getCallers(wire!.id).map((c) => c.node);
+      expect(callers.some((n) => n.kind === 'variable' && n.name === 'rootCmd')).toBe(true);
+      expect(callers.some((n) => n.kind === 'file')).toBe(false);
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
   it('links a parenthesized pointer type conversion `(*T)(x)` to the type', async () => {
     const dir = createTempDir();
     try {
@@ -6454,5 +7274,156 @@ describe('Swift property wrappers / attributes (blast-radius recall)', () => {
       expect(cg.getFileDependents('Sources/M/Wrap.swift')).toContain('Sources/M/Cmd.swift');
       cg.destroy();
     } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('R Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect R files (both extension cases)', () => {
+      expect(detectLanguage('analysis.R')).toBe('r');
+      expect(detectLanguage('scripts/clean.r')).toBe('r');
+    });
+
+    it('should report R as supported', () => {
+      expect(isLanguageSupported('r')).toBe(true);
+      expect(getSupportedLanguages()).toContain('r');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('extracts every assignment form, lambdas, and nested functions', () => {
+      const code = `
+clean_data <- function(df, threshold = 0.5) {
+  helper <- function(d) scale(d)
+  helper(df)
+}
+normalize = function(v) (v - mean(v)) / sd(v)
+double_it <- \\(x) x * 2
+`;
+      const result = extractFromSource('analysis.R', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('clean_data');
+      expect(funcs).toContain('normalize');
+      expect(funcs).toContain('double_it');
+      expect(funcs).toContain('helper'); // nested, inside clean_data's scope
+      const cleanData = result.nodes.find((n) => n.name === 'clean_data');
+      expect(cleanData?.language).toBe('r');
+      expect(cleanData?.signature).toBe('(df, threshold = 0.5)');
+    });
+
+    it('attributes body calls to the enclosing function', () => {
+      const code = `
+prep <- function(d) scale(d)
+fit_model <- function(data) {
+  lm(y ~ x, data = prep(data))
+}
+`;
+      const result = extractFromSource('models.R', code);
+      const prepCall = result.unresolvedReferences.find(
+        (r) => r.referenceName === 'prep' && r.referenceKind === 'calls'
+      );
+      expect(prepCall).toBeDefined();
+      const fitModel = result.nodes.find((n) => n.name === 'fit_model');
+      expect(prepCall?.fromNodeId).toBe(fitModel?.id);
+    });
+  });
+
+  describe('Imports', () => {
+    it('extracts library/require/source as imports, not calls', () => {
+      const code = `
+library(dplyr)
+require(stats)
+requireNamespace("jsonlite")
+source("helpers.R")
+`;
+      const result = extractFromSource('main.R', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('dplyr');
+      expect(imports).toContain('stats');
+      expect(imports).toContain('jsonlite');
+      expect(imports).toContain('helpers.R');
+      // Claimed by the hook — no call references to the import machinery.
+      const libCalls = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && (r.referenceName === 'library' || r.referenceName === 'source')
+      );
+      expect(libCalls).toHaveLength(0);
+    });
+  });
+
+  describe('Variables and constants', () => {
+    it('extracts top-level assignments; ALL_CAPS as constants; right-assign too', () => {
+      const code = `
+ALPHA <- 0.05
+max_iter = 100
+compute_stats(df) -> stats_result
+inner <- function() {
+  local_var <- 1
+}
+`;
+      const result = extractFromSource('config.R', code);
+      const constant = result.nodes.find((n) => n.name === 'ALPHA');
+      expect(constant?.kind).toBe('constant');
+      const variable = result.nodes.find((n) => n.name === 'max_iter');
+      expect(variable?.kind).toBe('variable');
+      const rightAssigned = result.nodes.find((n) => n.name === 'stats_result');
+      expect(rightAssigned?.kind).toBe('variable');
+      // Locals inside functions are deliberately NOT extracted.
+      expect(result.nodes.find((n) => n.name === 'local_var')).toBeUndefined();
+    });
+  });
+
+  describe('Classes', () => {
+    it('extracts S4/R5/R6 class calls as classes with their list methods', () => {
+      const code = `
+setClass("Patient", representation(id = "character"))
+Account <- setRefClass("Account",
+  fields = list(balance = "numeric"),
+  methods = list(deposit = function(x) { balance <<- balance + x })
+)
+Stack <- R6Class("Stack",
+  public = list(push = function(v) invisible(v))
+)
+setGeneric("describe", function(obj) standardGeneric("describe"))
+setMethod("describe", "Patient", function(obj) paste(obj@id))
+`;
+      const result = extractFromSource('classes.R', code);
+      const classes = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(classes).toContain('Patient');
+      expect(classes).toContain('Account');
+      expect(classes).toContain('Stack');
+      const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+      expect(methods).toContain('deposit');
+      expect(methods).toContain('push');
+      // setGeneric/setMethod produce functions named by their string argument.
+      const describes = result.nodes.filter((n) => n.name === 'describe' && n.kind === 'function');
+      expect(describes.length).toBeGreaterThanOrEqual(2);
+      // The class-assignment idiom must not ALSO produce a variable node.
+      expect(result.nodes.find((n) => n.name === 'Account' && n.kind === 'variable')).toBeUndefined();
+    });
+
+    it('extracts ggproto classes with direct-arg methods and the parent as extends', () => {
+      // ggplot2's OO system — every Geom/Stat/Scale in the ecosystem uses it.
+      const code = `
+GeomPoint <- ggproto("GeomPoint", Geom,
+  required_aes = c("x", "y"),
+  draw_panel = function(data, panel_params, coord) {
+    coords <- coord$transform(data, panel_params)
+    grid::pointsGrob(coords$x, coords$y)
+  },
+  draw_key = draw_key_point
+)
+`;
+      const result = extractFromSource('geom-point.R', code);
+      const cls = result.nodes.find((n) => n.name === 'GeomPoint' && n.kind === 'class');
+      expect(cls).toBeDefined();
+      const method = result.nodes.find((n) => n.name === 'draw_panel' && n.kind === 'method');
+      expect(method).toBeDefined();
+      const ext = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'extends' && r.referenceName === 'Geom'
+      );
+      expect(ext?.fromNodeId).toBe(cls?.id);
+      // No twin variable for the assignment.
+      expect(result.nodes.find((n) => n.name === 'GeomPoint' && n.kind === 'variable')).toBeUndefined();
+    });
   });
 });

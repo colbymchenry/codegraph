@@ -2,6 +2,46 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/** Kotlin return types that can't be a chained-call receiver (no class to chain on). */
+const KOTLIN_NON_CLASS_RETURN = new Set(['Unit', 'Nothing']);
+
+/**
+ * A Kotlin function's declared return type, normalized to the bare class name a
+ * chained `Foo.getInstance().bar()` could be called on (the #645/#608 mechanism).
+ * tree-sitter-kotlin exposes no field names, so the return type is found
+ * positionally: the first `user_type` / `nullable_type` that FOLLOWS
+ * `function_value_parameters` (an extension receiver's type sits before the
+ * params, so it's never mistaken for the return). An inferred return (expression
+ * body with no `: Type`), a lambda return type, or `Unit` / `Nothing` → undefined.
+ */
+function extractKotlinReturnType(node: SyntaxNode, source: string): string | undefined {
+  let seenParams = false;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    if (child.type === 'function_value_parameters') {
+      seenParams = true;
+      continue;
+    }
+    if (!seenParams) continue;
+    // The return type is the type node right after the params. If we reach the
+    // body or a `where`-clause first, there's no declared return type.
+    if (child.type === 'function_body' || child.type === 'type_constraints') return undefined;
+    if (child.type === 'user_type' || child.type === 'nullable_type') {
+      const ut =
+        child.type === 'nullable_type'
+          ? (child.namedChildren.find((c: SyntaxNode) => c.type === 'user_type') ?? child)
+          : child;
+      const typeId = ut.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+      const name = getNodeText(typeId ?? ut, source).trim();
+      if (!name || !/^[A-Za-z_]\w*$/.test(name)) return undefined;
+      if (KOTLIN_NON_CLASS_RETURN.has(name)) return undefined;
+      return name;
+    }
+  }
+  return undefined;
+}
+
 /** Check if a node matches the `fun interface` misparse pattern */
 function isFunInterfaceNode(node: SyntaxNode): boolean {
   let hasFun = false;
@@ -45,6 +85,51 @@ export const kotlinExtractor: LanguageExtractor = {
   nameField: 'simple_identifier',
   bodyField: 'function_body',
   visitNode: (node, ctx) => {
+    // Kotlin properties (`val` / `var` / `const val`). The name nests as
+    // property_declaration → variable_declaration → simple_identifier, which the
+    // generic variable/field path can't read — so nothing was extracted before.
+    // Kind by enclosing scope: a singleton `object` / `companion object` (and a
+    // top-level property) holds *shared* values — `val`→`constant`,
+    // `var`→`variable` (the Scala-object rule; a `const val` is a `val`). A
+    // `class`/`interface`/`enum` instance `val`/`var` is per-instance state →
+    // `field` (never a value-ref target, like a Java instance `final`). A
+    // property inside a function body / `init` block / lambda is a local and is
+    // skipped entirely.
+    if (node.type === 'property_declaration') {
+      const varDecl = node.namedChildren.find((c) => c.type === 'variable_declaration');
+      const nameNode = varDecl?.namedChildren.find((c) => c.type === 'simple_identifier');
+      if (!nameNode) return false; // destructuring `val (a,b)` etc. — leave to default
+      const name = getNodeText(nameNode, ctx.source);
+      if (!name) return false;
+
+      // Walk to the nearest enclosing definition: a function body / init / lambda
+      // means it's a local; `object`/`companion object` is a constant scope; a
+      // `class_declaration` (covers class/interface/enum) is an instance scope.
+      let scope: 'local' | 'const' | 'instance' = 'const';
+      for (let p = node.parent; p; p = p.parent) {
+        const pt = p.type;
+        if (
+          pt === 'function_body' || pt === 'function_declaration' ||
+          pt === 'lambda_literal' || pt === 'anonymous_initializer' ||
+          pt === 'control_structure_body' || pt === 'getter' || pt === 'setter'
+        ) { scope = 'local'; break; }
+        if (pt === 'companion_object' || pt === 'object_declaration') { scope = 'const'; break; }
+        if (pt === 'class_declaration') { scope = 'instance'; break; }
+      }
+      if (scope === 'local') return true; // a local — don't extract
+
+      const binding = node.namedChildren.find((c) => c.type === 'binding_pattern_kind');
+      const isVal = binding != null && getNodeText(binding, ctx.source) === 'val';
+      const kind = scope === 'instance' ? 'field' : isVal ? 'constant' : 'variable';
+
+      const typeNode = node.childForFieldName('type');
+      const sig = typeNode
+        ? `${isVal ? 'val' : 'var'} ${name}: ${getNodeText(typeNode, ctx.source)}`
+        : undefined;
+      ctx.createNode(kind, name, node, { signature: sig });
+      return true;
+    }
+
     // Handle Kotlin `fun interface` declarations.
     // Tree-sitter-kotlin doesn't support `fun interface` syntax (Kotlin 1.4+).
     // It produces two different misparse patterns:
@@ -130,6 +215,7 @@ export const kotlinExtractor: LanguageExtractor = {
   },
   paramsField: 'function_value_parameters',
   returnField: 'type',
+  getReturnType: extractKotlinReturnType,
   resolveBody: (node, _bodyField) => {
     // Kotlin's tree-sitter grammar doesn't use field names, so getChildByField fails.
     // Find body by type: function_body for functions/methods, class_body for classes,

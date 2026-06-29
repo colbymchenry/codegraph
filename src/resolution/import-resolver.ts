@@ -24,6 +24,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   // `.svelte`/`.vue` file resolve to nothing, so barrel callers vanish (#629).
   svelte: ['.ts', '.js', '.svelte', '.tsx', '.jsx', '/index.ts', '/index.js', '/index.svelte'],
   vue: ['.ts', '.js', '.vue', '.tsx', '.jsx', '/index.ts', '/index.js', '/index.vue'],
+  astro: ['.ts', '.js', '.astro', '.tsx', '.jsx', '/index.ts', '/index.js', '/index.astro'],
   python: ['.py', '/__init__.py'],
   go: ['.go'],
   rust: ['.rs', '/mod.rs'],
@@ -530,6 +531,47 @@ function resolveCppIncludePath(
 }
 
 /**
+ * Is this reference a PHP include/require PATH (vs a namespace `use` symbol)?
+ *
+ * include/require emit a file path ("lib.php", "inc/db.php", "../x.php"),
+ * whereas namespace use is an FQN (App\Foo\Bar) or a bare class symbol
+ * (Closure). PHP identifiers contain neither '/' nor '.', so a slash or dot
+ * marks a path-shaped include. Such references resolve to files only — never
+ * to a same-named symbol — so callers must not fall back to the name-matcher.
+ */
+export function isPhpIncludePathRef(ref: UnresolvedRef): boolean {
+  return (
+    ref.language === 'php' &&
+    ref.referenceKind === 'imports' &&
+    (ref.referenceName.includes('/') || ref.referenceName.includes('.'))
+  );
+}
+
+/**
+ * Resolve a PHP include/require path to a project-relative file path.
+ *
+ * PHP resolves includes relative to the including file's directory (the
+ * common case for procedural codebases); php.ini `include_path` is not
+ * modeled. Callers pass an already-extracted static literal path.
+ */
+function resolvePhpIncludePath(
+  includePath: string,
+  fromFile: string,
+  context: ResolutionContext
+): string | null {
+  const projectRoot = context.getProjectRoot();
+  const fromDir = path.dirname(path.join(projectRoot, fromFile));
+  const basePath = path.resolve(fromDir, includePath);
+  const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');
+  if (context.fileExists(relativePath)) return relativePath;
+  // The literal may omit the .php extension (e.g. include "config").
+  for (const ext of EXTENSION_RESOLUTION.php ?? []) {
+    if (context.fileExists(relativePath + ext)) return relativePath + ext;
+  }
+  return null;
+}
+
+/**
  * Extract import mappings from a file
  */
 export function extractImportMappings(
@@ -541,9 +583,10 @@ export function extractImportMappings(
 
   if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx') {
     mappings.push(...extractJSImports(content));
-  } else if (language === 'svelte' || language === 'vue') {
+  } else if (language === 'svelte' || language === 'vue' || language === 'astro') {
     // Svelte/Vue single-file components import via plain ES6 inside their
-    // `<script>` block. Without this, a `.svelte`/`.vue` consumer produces
+    // `<script>` block (Astro: the `---` frontmatter). Without this, a
+    // `.svelte`/`.vue`/`.astro` consumer produces
     // zero import mappings, so `resolveViaImport` can't run and a barrel
     // import (`import { Foo } from './lib'`) falls back to name-matching —
     // which silently fails whenever the re-export alias differs from the
@@ -1122,6 +1165,36 @@ export function resolveViaImport(
     return null;
   }
 
+  // PHP include/require — resolve the static string path to a file→file
+  // edge, mirroring the C/C++ branch above. Distinguish include PATHS from
+  // namespace `use` symbols by shape: an include path contains a slash or a
+  // file extension ("lib.php", "inc/db.php", "../x.php"), whereas a namespace
+  // use is an FQN (App\Foo\Bar) or a bare class symbol (Closure) — PHP
+  // identifiers contain neither '/' nor '.'. Only path-shaped references are
+  // includes; symbol references fall through to the namespace resolution.
+  if (isPhpIncludePathRef(ref)) {
+    const resolvedPath = resolvePhpIncludePath(ref.referenceName, ref.filePath, context);
+    if (resolvedPath) {
+      const basename = resolvedPath.split('/').pop()!;
+      const fileNode = context
+        .getNodesByName(basename)
+        .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+      if (fileNode) {
+        return {
+          original: ref,
+          targetNodeId: fileNode.id,
+          confidence: 0.9,
+          resolvedBy: 'import',
+        };
+      }
+    }
+    // A path-shaped include that doesn't resolve to a known project file is a
+    // dead end. Return unresolved rather than falling through to the symbol
+    // name-matcher, which would mis-connect e.g. "inc/db.php" to an unrelated
+    // db.php elsewhere in the tree — a wrong edge is worse than a missing one.
+    return null;
+  }
+
   // Use cached import mappings (avoids re-reading and re-parsing per ref)
   const imports = context.getImportMappings(ref.filePath, ref.language);
   if (imports.length === 0 && !context.readFile(ref.filePath)) {
@@ -1223,6 +1296,25 @@ export function resolveViaImport(
         );
 
         if (targetNode) {
+          // `Foo.bar()` / `Foo.CONST` — a NAMED (non-namespace) class import
+          // accessed through a member. `findExportedSymbol` resolved `Foo` to
+          // the class itself; descend into it so the reference links to the
+          // member `bar`, not the class. Without this the edge points at the
+          // class and `createEdges` then mis-promotes the call to an
+          // `instantiates` edge, so the static method shows zero callers and a
+          // hollow impact radius. (#825)
+          if (!imp.isNamespace && ref.referenceName.startsWith(imp.localName + '.')) {
+            const memberNode = resolveStaticMember(targetNode, ref, imp.localName, context);
+            if (memberNode) {
+              return {
+                original: ref,
+                targetNodeId: memberNode.id,
+                confidence: 0.9,
+                resolvedBy: 'import',
+              };
+            }
+          }
+
           return {
             original: ref,
             targetNodeId: targetNode.id,
@@ -1822,4 +1914,47 @@ function findExportedSymbol(
   }
 
   return undefined;
+}
+
+/** Node kinds that own static members reachable as `Container.member`. */
+const STATIC_MEMBER_CONTAINERS = new Set<Node['kind']>([
+  'class', 'struct', 'interface', 'enum', 'trait', 'protocol',
+]);
+
+/**
+ * Resolve `Container.member` — a static method/property access on a NAMED class
+ * import (`import { Foo } …; Foo.bar()`) — to the member node, given the
+ * already-resolved container class.
+ *
+ * Members carry a `Container::member` qualifiedName, so we look up
+ * `${container.qualifiedName}::${member}` within the container's own file (the
+ * file filter disambiguates same-named classes in other modules). Returns
+ * undefined when the container isn't a member-owning kind or the member isn't
+ * found, so the caller falls back to the container itself (prior behavior) —
+ * languages whose members aren't `::`-qualified, and genuine class references,
+ * are unaffected. See #825.
+ */
+function resolveStaticMember(
+  container: Node,
+  ref: UnresolvedRef,
+  localName: string,
+  context: ResolutionContext
+): Node | undefined {
+  if (!STATIC_MEMBER_CONTAINERS.has(container.kind)) return undefined;
+  // First segment after the receiver: `Foo.bar.baz` → `bar`.
+  const member = ref.referenceName.slice(localName.length + 1).split('.')[0];
+  if (!member) return undefined;
+
+  const candidates = context
+    .getNodesByQualifiedName(`${container.qualifiedName}::${member}`)
+    .filter((n) => n.filePath === container.filePath);
+  if (candidates.length === 0) return undefined;
+
+  // When the reference is a call, prefer a callable member if several nodes
+  // share the qualifiedName (e.g. a static property and a method).
+  if (ref.referenceKind === 'calls') {
+    const callable = candidates.find((n) => n.kind === 'method' || n.kind === 'function');
+    if (callable) return callable;
+  }
+  return candidates[0];
 }

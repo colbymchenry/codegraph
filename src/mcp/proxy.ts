@@ -23,14 +23,36 @@ import * as net from 'net';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 import { DaemonClientHello, DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
 import { supervisionLostReason } from './ppid-watchdog';
+import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { CodeGraphPackageVersion } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
+import { getTelemetry, ClientInfo } from '../telemetry';
 import type { MCPEngine } from './engine';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
 const DEFAULT_PPID_POLL_MS = 5000;
+
+/**
+ * Env var that opts INTO the "attached to shared daemon" log line. Off by
+ * default: the line is benign INFO, but MCP hosts render any server stderr at
+ * error level (and append an `undefined` data field), so on every session start
+ * a healthy attach showed up as `[error] … undefined`. Set to `1` to surface it
+ * when debugging daemon attach. (#618; approach from #640 by @mturac)
+ */
+const LOG_ATTACH_ENV = 'CODEGRAPH_MCP_LOG_ATTACH';
+
+/**
+ * Log a successful daemon attach — gated behind {@link LOG_ATTACH_ENV} so it is
+ * silent by default (see #618). Exported for tests.
+ */
+export function logAttachedDaemon(socketPath: string, hello: DaemonHello): void {
+  if (process.env[LOG_ATTACH_ENV] !== '1') return;
+  process.stderr.write(
+    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
+  );
+}
 
 export interface ProxyResult {
   /**
@@ -89,9 +111,7 @@ export async function runProxy(
     return { outcome: 'fallback-needed', reason: 'version mismatch' };
   }
 
-  process.stderr.write(
-    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
-  );
+  logAttachedDaemon(socketPath, hello);
 
   sendClientHello(socket);
   startPpidWatchdog(socket);
@@ -115,6 +135,16 @@ export async function connectWithHello(
   if (process.platform !== 'win32' && !fs.existsSync(socketPath)) return null;
   const socket = net.createConnection(socketPath);
   socket.setEncoding('utf8');
+  // Keep an 'error' listener attached for the socket's ENTIRE life. readHelloLine
+  // attaches its own and then REMOVES it on success (its cleanup()), which left a
+  // window — from here until the caller attaches its onDaemonLost handler — where
+  // a socket 'error' had NO listener. In Node an unhandled socket 'error' is
+  // re-thrown as an uncaughtException, which the global fatal handler turns into
+  // process.exit(1); to an MCP client that surfaces as a bare "Transport closed"
+  // (#974). The window is rarely hit on a healthy FS but is common on flaky
+  // AF_UNIX-over-DrvFs (WSL2 /mnt drives). A no-op guard makes the error
+  // recoverable: the follow-up 'close' drives the caller's normal fallback.
+  socket.on('error', () => { /* absorbed — see #974; 'close' drives the fallback */ });
   const hello = await readHelloLine(socket).catch(() => null);
   if (!hello) {
     socket.destroy();
@@ -130,9 +160,7 @@ export async function connectWithHello(
     socket.destroy();
     return 'version-mismatch';
   }
-  process.stderr.write(
-    `[CodeGraph MCP] Attached to shared daemon on ${socketPath} (pid ${hello.pid}, v${hello.codegraph}).\n`
-  );
+  logAttachedDaemon(socketPath, hello);
   sendClientHello(socket);
   return socket;
 }
@@ -187,6 +215,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let daemonStatus: 'connecting' | 'ready' | 'failed' = 'connecting';
   let daemonSocket: net.Socket | null = null;
   let clientInitId: unknown = undefined;   // suppress the daemon's reply to the forwarded initialize
+  // Telemetry attribution for the in-process fallback only — calls routed to
+  // the daemon are counted by the daemon's own session (which receives the
+  // forwarded initialize, clientInfo included), never double-counted here.
+  let telemetryClient: ClientInfo | undefined;
   const pending: string[] = [];            // client lines buffered until the daemon resolves
   let engine: MCPEngine | null = null;
   let engineReady: Promise<void> | null = null;
@@ -229,6 +261,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
         const result = await engine!.getToolHandler().execute(params.name, params.arguments || {});
         writeClient({ jsonrpc: '2.0', id, result });
+        getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
       } catch (err) {
         writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: err instanceof Error ? err.message : String(err) } });
       }
@@ -265,6 +298,13 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { routeToDaemon(line); continue; }
       if (msg.method === 'initialize') {
         clientInitId = msg.id;
+        const initParams = (msg.params ?? {}) as { clientInfo?: { name?: unknown; version?: unknown } };
+        if (initParams.clientInfo) {
+          telemetryClient = {
+            name: typeof initParams.clientInfo.name === 'string' ? initParams.clientInfo.name : undefined,
+            version: typeof initParams.clientInfo.version === 'string' ? initParams.clientInfo.version : undefined,
+          };
+        }
         writeClient({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: SERVER_INSTRUCTIONS } });
         routeToDaemon(line); // prime the daemon so it resolves the project (its reply is suppressed below)
       } else if (msg.method === 'tools/list') {
@@ -282,15 +322,21 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       }
     }
   });
-  process.stdin.on('end', shutdown);
-  process.stdin.on('close', shutdown);
+  // Shut down when stdin ends/closes — and also on a stdin `'error'`, which a
+  // socket-backed stdin (the VS Code stdio shape) can emit on client death
+  // instead of a clean close; destroying the stream stops a hung fd from
+  // busy-spinning the event loop (#799).
+  treatStdinFailureAsShutdown(shutdown);
   startPpidWatchdogNoSocket(shutdown);
 
   // ---- daemon connection (background) ----
   let socket: net.Socket | null = null;
   try { socket = await deps.getDaemonSocket(); } catch { socket = null; }
 
-  if (socket && !shuttingDown) {
+  // `!socket.destroyed`: the connect-window error guard above can absorb an
+  // 'error' that already destroyed the socket before we got here (#974) — treat
+  // a dead socket as "no daemon" so we cleanly fall back to the in-process engine.
+  if (socket && !socket.destroyed && !shuttingDown) {
     daemonSocket = socket;
     daemonStatus = 'ready';
     let sockBuf = '';
@@ -443,10 +489,16 @@ function pipeUntilClose(socket: net.Socket): Promise<void> {
       try { socket.end(); } catch { /* ignore */ }
       done();
     });
-    process.stdin.on('close', () => {
+    // 'close' and 'error' both tear down: a socket-backed stdin can fail with
+    // an 'error' (ECONNRESET/hangup) rather than a clean close; destroying it
+    // stops a hung fd from busy-spinning the event loop (#799).
+    const teardown = () => {
+      try { process.stdin.destroy(); } catch { /* ignore */ }
       try { socket.destroy(); } catch { /* ignore */ }
       done();
-    });
+    };
+    process.stdin.on('close', teardown);
+    process.stdin.on('error', teardown);
 
     socket.on('data', (chunk) => {
       try { process.stdout.write(chunk); } catch { /* ignore */ }

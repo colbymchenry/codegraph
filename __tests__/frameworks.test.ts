@@ -944,6 +944,78 @@ describe('goResolver.extract', () => {
   });
 });
 
+import { goframeResolver } from '../src/resolution/frameworks/goframe';
+
+describe('goframeResolver', () => {
+  it('detects GoFrame from a gogf/gf dependency in go.mod', () => {
+    const ctx: any = {
+      readFile: (f: string) =>
+        f === 'go.mod' ? 'module example.com/app\nrequire github.com/gogf/gf/v2 v2.7.0\n' : null,
+    };
+    expect(goframeResolver.detect(ctx)).toBe(true);
+    const noGf: any = { readFile: (f: string) => (f === 'go.mod' ? 'module example.com/app\n' : null) };
+    expect(goframeResolver.detect(noGf)).toBe(false);
+  });
+
+  it('extracts a route node from a g.Meta request struct (method upper-cased)', () => {
+    const src = `package v1
+import "github.com/gogf/gf/v2/frame/g"
+type SignInReq struct {
+	g.Meta   \`path:"/user/sign-in" method:"post" tags:"User" summary:"Sign in"\`
+	Passport string
+}
+type SignInRes struct{}
+`;
+    const { nodes } = goframeResolver.extract!('api/user/v1/user_sign_in.go', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].kind).toBe('route');
+    expect(nodes[0].name).toBe('POST /user/sign-in');
+    // The package-qualified request type is encoded for the synthesizer join.
+    expect(nodes[0].qualifiedName).toContain('::goframe-route:v1.SignInReq');
+  });
+
+  it('is independent of g.Meta tag attribute order', () => {
+    const src = `type DeptSearchReq struct {
+	g.Meta \`path:"/dept/list" tags:"Dept" method:"get" summary:"列表"\`
+}`;
+    const { nodes } = goframeResolver.extract!('api/system/dept.go', src);
+    expect(nodes[0].name).toBe('GET /dept/list');
+    expect(nodes[0].qualifiedName).toContain('::goframe-route:DeptSearchReq');
+  });
+
+  it('skips a response g.Meta that has no path (mime-only) and other non-route metadata', () => {
+    const src = `type ListRes struct {
+	g.Meta \`mime:"application/json"\`
+	Items []string
+}`;
+    const { nodes } = goframeResolver.extract!('api/x.go', src);
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('defaults method to ANY when method: is omitted', () => {
+    const src = `type PingReq struct {
+	g.Meta \`path:"/ping"\`
+}`;
+    const { nodes } = goframeResolver.extract!('api/ping.go', src);
+    expect(nodes[0].name).toBe('ANY /ping');
+  });
+
+  it('extracts every request struct in a multi-route api file', () => {
+    const src = `type DeptListReq struct { g.Meta \`path:"/dept/list" method:"get"\` }
+type DeptListRes struct { g.Meta \`mime:"application/json"\` }
+type DeptAddReq struct { g.Meta \`path:"/dept/add" method:"post"\` }
+type DeptAddRes struct {}
+`;
+    const { nodes } = goframeResolver.extract!('api/dept.go', src);
+    expect(nodes.map((n) => n.name).sort()).toEqual(['GET /dept/list', 'POST /dept/add']);
+  });
+
+  it('returns nothing for a non-go file or a file without g.Meta', () => {
+    expect(goframeResolver.extract!('main.ts', 'const x = 1').nodes).toHaveLength(0);
+    expect(goframeResolver.extract!('main.go', 'package main\nfunc main() {}\n').nodes).toHaveLength(0);
+  });
+});
+
 import { rustResolver } from '../src/resolution/frameworks/rust';
 
 describe('rustResolver.extract', () => {
@@ -1373,6 +1445,7 @@ func boot(routes: RoutesBuilder) throws {
 
 import { reactResolver } from '../src/resolution/frameworks/react';
 import { svelteResolver } from '../src/resolution/frameworks/svelte';
+import { astroResolver } from '../src/resolution/frameworks/astro';
 
 describe('reactResolver.extract — React Router', () => {
   it('extracts a v6 <Route path element={<Comp/>}>', () => {
@@ -1425,6 +1498,77 @@ describe('svelteResolver.extract (smoke)', () => {
     const result = svelteResolver.extract!('+page.svelte', '');
     expect(result).toHaveProperty('nodes');
     expect(result).toHaveProperty('references');
+  });
+});
+
+describe('astroResolver.extract — src/pages file-based routing', () => {
+  const routeNames = (filePath: string): string[] =>
+    astroResolver.extract!(filePath, '').nodes.filter((n) => n.kind === 'route').map((n) => n.name);
+
+  it('maps index.astro to /', () => {
+    expect(routeNames('src/pages/index.astro')).toEqual(['/']);
+  });
+
+  it('maps nested index and plain pages', () => {
+    expect(routeNames('src/pages/blog/index.astro')).toEqual(['/blog']);
+    expect(routeNames('src/pages/about.astro')).toEqual(['/about']);
+  });
+
+  it('converts [param] and [...rest] syntax', () => {
+    expect(routeNames('src/pages/blog/[slug].astro')).toEqual(['/blog/:slug']);
+    expect(routeNames('src/pages/[...path].astro')).toEqual(['/*path']);
+  });
+
+  it('maps .ts endpoints under src/pages to routes', () => {
+    expect(routeNames('src/pages/api/posts.ts')).toEqual(['/api/posts']);
+    expect(routeNames('src/pages/rss.xml.js')).toEqual(['/rss.xml']);
+  });
+
+  it('excludes underscore-prefixed segments and config files', () => {
+    expect(routeNames('src/pages/_partial.astro')).toEqual([]);
+    expect(routeNames('src/pages/blog/_components/Card.astro')).toEqual([]);
+    expect(routeNames('src/pages/vite.config.ts')).toEqual([]);
+  });
+
+  it('ignores .astro files outside src/pages', () => {
+    expect(routeNames('src/components/Button.astro')).toEqual([]);
+    expect(routeNames('docs/pages/guide.astro')).toEqual([]);
+  });
+});
+
+describe('astroResolver.resolve — Astro global and virtual modules', () => {
+  const ctx = {} as never;
+  const baseRef = {
+    fromNodeId: 'component:a',
+    line: 1,
+    column: 0,
+    filePath: 'src/pages/index.astro',
+    language: 'astro',
+  };
+
+  it('claims Astro.* global references as framework-provided', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'Astro.props', referenceKind: 'references' } as never,
+      ctx
+    );
+    expect(res?.resolvedBy).toBe('framework');
+    expect(res?.confidence).toBe(1.0);
+  });
+
+  it('claims astro:content virtual module imports', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'astro:content', referenceKind: 'imports' } as never,
+      ctx
+    );
+    expect(res?.resolvedBy).toBe('framework');
+  });
+
+  it('leaves ordinary names alone', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'astrolabe', referenceKind: 'calls' } as never,
+      { getNodesByName: () => [] } as never
+    );
+    expect(res).toBeNull();
   });
 });
 

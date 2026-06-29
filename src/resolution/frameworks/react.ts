@@ -9,7 +9,12 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 
 export const reactResolver: FrameworkResolver = {
   name: 'react',
-  languages: ['javascript', 'typescript'],
+  // Includes 'tsx'/'jsx' so route extraction runs on JSX files (where
+  // `<Route element={<X/>}>` routes live) — without them the .tsx/.jsx grammars
+  // were filtered out of the extract pass and those routes were never indexed.
+  // (resolve() is unaffected — it runs for every detected framework regardless
+  // of language; only the extract pass filters on `languages`.)
+  languages: ['javascript', 'typescript', 'tsx', 'jsx'],
 
   detect(context: ResolutionContext): boolean {
     // Check for React in package.json
@@ -32,8 +37,19 @@ export const reactResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
-    // Pattern 1: Component references (PascalCase)
-    if (isPascalCase(ref.referenceName) && !isBuiltInType(ref.referenceName)) {
+    // Pattern 1: Component references (PascalCase). Only from JSX-capable
+    // files — a component is USED in markup, which only parses in .tsx/.jsx.
+    // Without this gate, every PascalCase TYPE reference in plain .ts files
+    // went through component resolution: in a monorepo with same-named
+    // classes per package (#764, amplication), a `.ts` GraphQL-types file's
+    // own `Account` type alias lost to an arbitrary `Account` CLASS in
+    // another package (the framework's 0.8 outranked the name-matcher's
+    // proximity-correct 0.7).
+    if (
+      (ref.language === 'tsx' || ref.language === 'jsx') &&
+      isPascalCase(ref.referenceName) &&
+      !isBuiltInType(ref.referenceName)
+    ) {
       const result = resolveComponent(ref.referenceName, ref.filePath, context);
       if (result) {
         return {
@@ -79,70 +95,17 @@ export const reactResolver: FrameworkResolver = {
     const references: UnresolvedRef[] = [];
     const now = Date.now();
 
-    // Extract component definitions
-    // function Component() or const Component = () =>
-    const componentPatterns = [
-      // Function components
-      /(?:export\s+)?function\s+([A-Z][a-zA-Z0-9]*)\s*\(/g,
-      // Arrow function components
-      /(?:export\s+)?(?:const|let)\s+([A-Z][a-zA-Z0-9]*)\s*=\s*(?:\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_]*)\s*=>/g,
-      // forwardRef components
-      /(?:export\s+)?(?:const|let)\s+([A-Z][a-zA-Z0-9]*)\s*=\s*(?:React\.)?forwardRef/g,
-      // memo components
-      /(?:export\s+)?(?:const|let)\s+([A-Z][a-zA-Z0-9]*)\s*=\s*(?:React\.)?memo/g,
-    ];
-
-    for (const pattern of componentPatterns) {
-      let match;
-      while ((match = pattern.exec(content)) !== null) {
-        const [fullMatch, name] = match;
-        const line = content.slice(0, match.index).split('\n').length;
-
-        // Check if it returns JSX (rough heuristic)
-        const afterMatch = content.slice(match.index + fullMatch.length, match.index + fullMatch.length + 500);
-        const hasJSX = afterMatch.includes('<') && (afterMatch.includes('/>') || afterMatch.includes('</'));
-
-        if (hasJSX) {
-          nodes.push({
-            id: `component:${filePath}:${name}:${line}`,
-            kind: 'component',
-            name: name!,
-            qualifiedName: `${filePath}::${name}`,
-            filePath,
-            startLine: line,
-            endLine: line,
-            startColumn: 0,
-            endColumn: fullMatch.length,
-            language: filePath.endsWith('.tsx') ? 'tsx' : 'jsx',
-            isExported: fullMatch.includes('export'),
-            updatedAt: now,
-          });
-        }
-      }
-    }
-
-    // Extract custom hooks
-    const hookPattern = /(?:export\s+)?(?:function|const|let)\s+(use[A-Z][a-zA-Z0-9]*)\s*[=(]/g;
-    let hookMatch;
-    while ((hookMatch = hookPattern.exec(content)) !== null) {
-      const [fullMatch, name] = hookMatch;
-      const line = content.slice(0, hookMatch.index).split('\n').length;
-
-      nodes.push({
-        id: `hook:${filePath}:${name}:${line}`,
-        kind: 'function',
-        name: name!,
-        qualifiedName: `${filePath}::${name}`,
-        filePath,
-        startLine: line,
-        endLine: line,
-        startColumn: 0,
-        endColumn: fullMatch.length,
-        language: filePath.endsWith('.ts') || filePath.endsWith('.tsx') ? 'typescript' : 'javascript',
-        isExported: fullMatch.includes('export'),
-        updatedAt: now,
-      });
-    }
+    // Components and custom hooks are NOT extracted here. The tree-sitter
+    // extractor already emits them natively across .ts/.tsx/.js/.jsx — function
+    // and arrow components as `function` nodes, HOC-wrapped components
+    // (`forwardRef`/`memo`/`styled`) as `component` nodes (#841), and `useX`
+    // hooks as `function` nodes. Re-deriving them here with regex only ran on
+    // .ts/.js anyway (this resolver's `languages` didn't include the 'tsx'/'jsx'
+    // grammars), and it DUPLICATED those tree-sitter nodes (e.g. a `useAuth`
+    // ended up as two `function` nodes). This `extract` now contributes only
+    // what tree-sitter can't: route nodes (React Router + Next.js conventions),
+    // which is why 'tsx'/'jsx' are now in `languages` — `<Route>`/`element={<X/>}`
+    // routes live in JSX files and were previously skipped entirely.
 
     // React Router: <Route path="/x" component={Comp}/> (v5) or
     // <Route path="/x" element={<Comp/>}/> (v6). Attributes appear in any order,
@@ -305,7 +268,10 @@ function resolveComponent(
   );
   if (preferred.length > 0) return preferred[0]!.id;
 
-  return components[0]!.id;
+  // No positional signal: only an UNAMBIGUOUS name may resolve. Returning
+  // components[0] here picked an arbitrary same-named class anywhere in the
+  // repo (#764) — let the name-matcher's proximity scoring decide instead.
+  return components.length === 1 ? components[0]!.id : null;
 }
 
 /**

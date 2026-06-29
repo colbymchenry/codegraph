@@ -17,13 +17,18 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
 
   const listed = () => new ToolHandler(null).getTools().map(t => t.name).sort();
 
-  it('exposes the full tool surface when unset', () => {
+  it('exposes ONLY codegraph_explore by default when unset', () => {
     delete process.env[ENV];
-    const all = listed();
-    expect(all).toContain('codegraph_explore');
-    expect(all).not.toContain('codegraph_context');
-    expect(all).not.toContain('codegraph_trace');
-    expect(all.length).toBeGreaterThanOrEqual(8);
+    // The default set (see DEFAULT_MCP_TOOLS) is pared to explore alone — the one
+    // tool that earns its place (verbatim source grouped by file).
+    // node/search/callers/callees/impact/files/status stay defined and executable
+    // but unlisted; CODEGRAPH_MCP_TOOLS re-enables them.
+    expect(listed()).toEqual(['codegraph_explore']);
+  });
+
+  it('re-enables an unlisted tool via the allowlist (impact)', () => {
+    process.env[ENV] = 'explore,impact';
+    expect(listed()).toEqual(['codegraph_explore', 'codegraph_impact']);
   });
 
   it('filters ListTools to the allowlisted short names', () => {
@@ -36,9 +41,9 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
     expect(listed()).toEqual(['codegraph_explore', 'codegraph_search']);
   });
 
-  it('treats an empty/whitespace value as unset (full surface)', () => {
+  it('treats an empty/whitespace value as unset (default surface)', () => {
     process.env[ENV] = '   ';
-    expect(listed().length).toBeGreaterThanOrEqual(8);
+    expect(listed()).toEqual(['codegraph_explore']);
   });
 
   it('rejects a disabled tool on execute (defense in depth)', async () => {

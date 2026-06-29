@@ -41,6 +41,9 @@ const GENERATED_PATTERNS: ReadonlyArray<RegExp> = [
   /\.pb\.[jt]s$/,
   /_pb\.[jt]s$/,
   /_grpc_pb\.[jt]s$/,
+  // Minified bundles vendored into a repo (docs sites, examples). Their
+  // single-letter symbols make name-based edges pure noise.
+  /\.min\.m?js$/,
   // Python — protobuf / gRPC / openapi-codegen
   /_pb2(_grpc)?\.py$/,
   /_pb2\.pyi$/,

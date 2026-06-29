@@ -143,13 +143,16 @@ export class VueExtractor {
       // Detect <script setup>
       const isSetup = /\bsetup\b/.test(attrs);
 
-      // Calculate start line of the script content (line after <script>)
+      // Calculate the 0-indexed line where the content begins. The content
+      // starts right after the opening tag's `>` — its leading `\n` is part
+      // of the content, so relative line 1 sits ON the tag's closing line
+      // (adding 1 here double-counted the embedded newline and shifted every
+      // script-block symbol down a line).
       const beforeScript = this.source.substring(0, match.index);
       const scriptTagLine = (beforeScript.match(/\n/g) || []).length;
-      // The content starts on the line after the opening <script> tag
       const openingTag = match[0].substring(0, match[0].indexOf('>') + 1);
       const openingTagLines = (openingTag.match(/\n/g) || []).length;
-      const contentStartLine = scriptTagLine + openingTagLines + 1; // 0-indexed line
+      const contentStartLine = scriptTagLine + openingTagLines; // 0-indexed line
 
       blocks.push({
         content,

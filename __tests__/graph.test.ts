@@ -293,6 +293,25 @@ export { main };
 
       expect(Array.isArray(callees)).toBe(true);
     });
+
+    it('treats class instantiation as a caller/callee of the class (#774)', () => {
+      // main() does `new DerivedClass(10, 'test')`. Constructing a class is
+      // calling its constructor, so main is a caller of DerivedClass and
+      // DerivedClass is a callee of main. Before #774 the `instantiates` edge
+      // was excluded from the caller/callee traversal, so `callers <Class>`
+      // returned the importing file (or nothing) and missed every
+      // construction site.
+      const derived = cg.getNodesByKind('class').find((n) => n.name === 'DerivedClass');
+      const main = cg.getNodesByKind('function').find((n) => n.name === 'main');
+      expect(derived).toBeDefined();
+      expect(main).toBeDefined();
+
+      const callerNames = cg.getCallers(derived!.id).map((c) => c.node.name);
+      expect(callerNames).toContain('main');
+
+      const calleeNames = cg.getCallees(main!.id).map((c) => c.node.name);
+      expect(calleeNames).toContain('DerivedClass');
+    });
   });
 
   describe('getImpactRadius()', () => {

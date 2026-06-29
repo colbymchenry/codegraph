@@ -1,0 +1,4 @@
+# Copy to .dev.vars for local development (`npm run dev`) and so that
+# `wrangler types` includes POSTHOG_KEY in the generated Env.
+# The real key lives only in the deployed secret (`wrangler secret put POSTHOG_KEY`).
+POSTHOG_KEY="phc_dev_placeholder"

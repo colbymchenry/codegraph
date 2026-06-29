@@ -1,5 +1,42 @@
+import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
+
+/**
+ * A Go function's declared return type, normalized to the bare type a chained
+ * `New().Method()` could be called on (the #645/#608 mechanism). Reads the
+ * `result` field: a pointer `*Foo` is unwrapped to `Foo`, a multi-return
+ * `(*Foo, error)` takes the first result (the idiomatic value-or-error shape),
+ * a qualified `pkg.Foo` reduces to its last segment, and generics to the base.
+ * Built-ins / unnamed results simply fail the later existence check.
+ */
+function extractGoReturnType(node: SyntaxNode, source: string): string | undefined {
+  let result = getChildByField(node, 'result');
+  if (!result) return undefined;
+  // Multi-return `(T, error)` → the first result's type.
+  if (result.type === 'parameter_list') {
+    const first = result.namedChildren.find((c: SyntaxNode) => c.type === 'parameter_declaration');
+    if (!first) return undefined;
+    result = getChildByField(first, 'type') ?? first;
+  }
+  // Unwrap a pointer `*Foo` → `Foo`.
+  if (result?.type === 'pointer_type') {
+    result =
+      result.namedChildren.find(
+        (c: SyntaxNode) =>
+          c.type === 'type_identifier' || c.type === 'qualified_type' || c.type === 'generic_type',
+      ) ?? result;
+  }
+  if (!result) return undefined;
+  const text = getNodeText(result, source)
+    .trim()
+    .replace(/^\*/, '')
+    .replace(/<[^>]*>/g, '')
+    .replace(/\[[^\]]*\]/g, ''); // strip generic args `Foo[T]`
+  const last = text.split('.').pop()?.trim(); // qualified `pkg.Foo` → `Foo`
+  if (!last || !/^[A-Za-z_]\w*$/.test(last)) return undefined;
+  return last;
+}
 
 export const goExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration'],
@@ -17,6 +54,7 @@ export const goExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'result',
+  getReturnType: extractGoReturnType,
   getSignature: (node, source) => {
     const params = getChildByField(node, 'parameters');
     const result = getChildByField(node, 'result');
