@@ -1741,3 +1741,165 @@ export class UsersController {
     expect(references.map((r) => r.referenceName)).toEqual(['real']);
   });
 });
+
+import { strawberryResolver, grapheneResolver } from '../src/resolution/frameworks/graphql';
+
+describe('strawberryResolver.extract', () => {
+  it('extracts @strawberry.field methods on Query class', () => {
+    const src = `
+import strawberry
+
+@strawberry.type
+class Query:
+    @strawberry.field
+    async def product_by_id(self, info, product_id: strawberry.ID) -> Product:
+        pass
+
+    @strawberry.field(description='Get all products')
+    async def products(self, info) -> list[Product]:
+        pass
+`;
+    const { nodes, references } = strawberryResolver.extract!('app/graphql/query.py', src);
+    expect(nodes).toHaveLength(2);
+    expect(nodes[0]!.kind).toBe('route');
+    expect(nodes[0]!.name).toBe('QUERY product_by_id');
+    expect(nodes[1]!.name).toBe('QUERY products');
+    expect(references).toHaveLength(2);
+    expect(references[0]!.referenceName).toBe('product_by_id');
+    expect(references[0]!.fromNodeId).toBe(nodes[0]!.id);
+    expect(references[1]!.referenceName).toBe('products');
+  });
+
+  it('extracts strawberry.field(resolver=...) assignments', () => {
+    const src = `
+import strawberry
+from resolvers import alt_resolver
+
+@strawberry.type
+class Query:
+    alternative_products: list[Product] = strawberry.field(
+        resolver=alt_resolver.resolve_alternatives,
+    )
+`;
+    const { nodes, references } = strawberryResolver.extract!('app/graphql/query.py', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]!.name).toBe('QUERY alternative_products');
+    expect(references).toHaveLength(1);
+    expect(references[0]!.referenceName).toBe('resolve_alternatives');
+    expect(references[0]!.metadata?.graphqlResolver).toBe('alt_resolver.resolve_alternatives');
+  });
+
+  it('extracts Mutation fields', () => {
+    const src = `
+import strawberry
+
+@strawberry.type
+class Mutation:
+    @strawberry.field
+    async def create_product(self, info, input: ProductInput) -> Product:
+        pass
+`;
+    const { nodes } = strawberryResolver.extract!('app/graphql/mutation.py', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]!.name).toBe('MUTATION create_product');
+  });
+
+  it('skips non-root types (no Query/Mutation/Subscription in name)', () => {
+    const src = `
+import strawberry
+
+@strawberry.type
+class Product:
+    @strawberry.field
+    async def manufacturer(self, info) -> Producer:
+        pass
+`;
+    const { nodes } = strawberryResolver.extract!('app/graphql/models/product.py', src);
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('ignores files without strawberry import', () => {
+    const src = `
+class Query:
+    def get_products(self):
+        pass
+`;
+    const { nodes } = strawberryResolver.extract!('app/views.py', src);
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('handles mixed decorated methods and field assignments', () => {
+    const src = `
+import strawberry
+
+@strawberry.type
+class Query:
+    @strawberry.field
+    async def product_by_id(self, info, product_id: strawberry.ID) -> Product:
+        pass
+
+    alternative_products: list[Product] = strawberry.field(
+        resolver=resolve_alternatives,
+    )
+
+    @strawberry.field
+    async def categories(self, info) -> list[Category]:
+        pass
+`;
+    const { nodes } = strawberryResolver.extract!('app/graphql/query.py', src);
+    expect(nodes).toHaveLength(3);
+    expect(nodes.map((n) => n.name)).toEqual([
+      'QUERY product_by_id',
+      'QUERY categories',
+      'QUERY alternative_products',
+    ]);
+  });
+
+  it('skips private/dunder methods', () => {
+    const src = `
+import strawberry
+
+@strawberry.type
+class Query:
+    @strawberry.field
+    async def products(self, info) -> list[Product]:
+        pass
+
+    def __init__(self):
+        pass
+`;
+    const { nodes } = strawberryResolver.extract!('app/graphql/query.py', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]!.name).toBe('QUERY products');
+  });
+});
+
+describe('grapheneResolver.extract', () => {
+  it('extracts resolve_ methods on ObjectType subclass named Query', () => {
+    const src = `
+import graphene
+
+class Query(graphene.ObjectType):
+    products = graphene.List(ProductType)
+
+    def resolve_products(self, info):
+        return Product.objects.all()
+`;
+    const { nodes, references } = grapheneResolver.extract!('app/schema.py', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]!.name).toBe('QUERY products');
+    expect(references[0]!.referenceName).toBe('resolve_products');
+  });
+
+  it('skips non-root ObjectType classes', () => {
+    const src = `
+import graphene
+
+class ProductType(graphene.ObjectType):
+    def resolve_name(self, info):
+        return self.name
+`;
+    const { nodes } = grapheneResolver.extract!('app/schema.py', src);
+    expect(nodes).toHaveLength(0);
+  });
+});

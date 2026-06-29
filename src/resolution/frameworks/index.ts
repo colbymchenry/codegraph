@@ -27,6 +27,7 @@ import { swiftObjcBridgeResolver } from './swift-objc';
 import { reactNativeBridgeResolver } from './react-native';
 import { expoModulesResolver } from './expo-modules';
 import { fabricViewResolver } from './fabric';
+import { strawberryResolver, grapheneResolver } from './graphql';
 
 /**
  * All registered framework resolvers
@@ -46,6 +47,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   djangoResolver,
   flaskResolver,
   fastapiResolver,
+  strawberryResolver,
+  grapheneResolver,
   // Ruby
   railsResolver,
   // Java
@@ -146,3 +149,4 @@ export { swiftObjcBridgeResolver } from './swift-objc';
 export { reactNativeBridgeResolver } from './react-native';
 export { expoModulesResolver } from './expo-modules';
 export { fabricViewResolver } from './fabric';
+export { strawberryResolver, grapheneResolver } from './graphql';
