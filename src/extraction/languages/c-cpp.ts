@@ -209,7 +209,58 @@ function isMacroMisparsedTypeDecl(node: SyntaxNode): boolean {
   return true;
 }
 
+/**
+ * Blank a leading export-annotation macro in a `class`/`struct` *definition*
+ * header so tree-sitter parses the type normally. Runs as `preParse`, before
+ * the grammar sees the source.
+ *
+ * Unreal Engine — and many C++ libraries — annotate every exported type with an
+ * ALL-CAPS macro between the `class`/`struct` keyword and the type name:
+ *
+ *   class MYMODULE_API UMyComponent : public UActorComponent { ... };
+ *
+ * tree-sitter has no preprocessor, so it reads `class MYMODULE_API` as an
+ * elaborated type specifier and the rest as a function — the whole declaration
+ * surfaces as a `function_definition` that {@link isMacroMisparsedTypeDecl}
+ * then drops as unrecoverable (#946). Both the class node AND its base
+ * (`extends`) edge are lost, so "find subclasses / type hierarchy / impact
+ * through inheritance" return nothing for these types — effectively every
+ * gameplay class in a UE project.
+ *
+ * Blanking the macro token with EQUAL-LENGTH spaces — the same offset-preserving
+ * trick {@link blankCsharpPreprocessorDirectives} uses (#237) — rewrites the
+ * header to `class               UMyComponent : public UActorComponent`, which
+ * parses as an ordinary `class_specifier` with a `base_class_clause`. The class
+ * node is then indexed and the existing base-clause extraction emits the
+ * `extends` edge, with every symbol's line/column unchanged (only spaces swap
+ * in for the macro on the same line).
+ *
+ * Scope is deliberately tight so valid code is never touched:
+ *  - the macro must be ALL-CAPS (>= 2 chars) — the export-macro convention;
+ *  - it must sit between `class`/`struct` and the type name (two identifiers in
+ *    a row, which a genuine definition never has — the first MUST be a macro);
+ *  - the type name must be followed by `final`, a base clause (`:`) or the body
+ *    (`{`), i.e. a real definition. So `class Foo {` (one identifier),
+ *    `template<class T>`, `enum class E {`, and an ALL-CAPS class name with no
+ *    macro (`class FOO : public Bar`) are all left alone.
+ *
+ * Function-like export macros (`class MACRO(x) Name`) and macros containing
+ * lowercase letters aren't matched here — they still fall through to the
+ * {@link isMacroMisparsedTypeDecl} drop path (no node, but no regression).
+ */
+export function blankCppExportMacros(source: string): string {
+  if (source.indexOf('class') === -1 && source.indexOf('struct') === -1) return source;
+  return source.replace(
+    /\b(class|struct)(\s+)([A-Z][A-Z0-9_]+)(?=\s+[A-Za-z_]\w*\s*(?:final\b|[:{]))/g,
+    (_m, kw: string, ws: string, macro: string) => kw + ws + ' '.repeat(macro.length)
+  );
+}
+
 export const cppExtractor: LanguageExtractor = {
+  // Strip UE-style `*_API` (and similar ALL-CAPS) export macros from class/struct
+  // headers before parsing, so macro-annotated types keep their node + `extends`
+  // edge instead of being dropped as a misparsed function (#946).
+  preParse: blankCppExportMacros,
   functionTypes: ['function_definition'],
   classTypes: ['class_specifier'],
   methodTypes: ['function_definition'],
