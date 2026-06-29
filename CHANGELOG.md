@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- CodeGraph again respects `.gitignore` for nested repositories that git tracks as gitlinks. The recent change that taught CodeGraph to descend into nested repos recorded as `160000` "commit" pointers (#1031, #1033) did so even when your `.gitignore` excludes the directory those repos live in — so a gitignored reference or benchmark corpus full of cloned repositories got pulled into the index anyway. One project with a gitignored `benchmark/repos/` of 19 cloned repos saw over 138,000 files swept in and a 4.8 GiB graph, and a full index then stalled in the "Resolving refs" phase until the watchdog killed it. CodeGraph now treats a gitignored gitlink the same as any other gitignored embedded repo: excluded by default, and re-included only when you opt the directory in with `codegraph.json` `includeIgnored`. Nested repos in non-ignored locations — the case #1031/#1033 fixed — are unchanged. Thanks @AriaShishegaran for the detailed report. (#1065)
 
 ## [1.1.3] - 2026-06-29
 

@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory, buildDefaultIgnore } from '../src/extraction';
+import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { stripCppTemplateArgs } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
@@ -5658,6 +5658,55 @@ describe('Nested gitlink repos (#1031, #1033)', () => {
 
     expect(files).toContain('app.ts');
     expect(files).not.toContain('libs/lib/lib.ts'); // not on disk → correctly absent
+  });
+
+  // #1065: a gitlink under a path the super-repo's OWN `.gitignore` covers is the
+  // tracked-gitlink twin of the untracked-ignored embedded repo (#514, #970). The
+  // gitlink-discovery pass must honor that `.gitignore` the same way — otherwise a
+  // gitignored reference/benchmark corpus full of `git add`ed clones gets pulled
+  // into the index (the 138k-file blow-up the reporter hit). Respect it by default;
+  // re-include only via `codegraph.json` `includeIgnored`.
+  it('does not index a gitlink under a gitignored directory by default (#1065)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+    // An embedded clone under a path the super-repo gitignores (a benchmark corpus).
+    await makeRepo(path.join(root, 'benchmark', 'repos', 'ref'), 'ref');
+    git(root, 'add', 'benchmark/repos/ref'); // tracked as a 160000 gitlink
+    fs.writeFileSync(path.join(root, '.gitignore'), 'benchmark/repos/\n');
+    git(root, 'add', '.gitignore');
+    git(root, 'commit', '-q', '-m', 'add gitignored gitlink + ignore rule');
+
+    const files = scanDirectory(root);
+    expect(files).toContain('app.ts');
+    expect(files).not.toContain('benchmark/repos/ref/ref.ts'); // gitignored → excluded
+
+    // The watcher path agrees: the ignored root is never discovered, and the dir is
+    // pruned (the reporter's exact clue — `ignores('benchmark/repos/')` was false).
+    expect(discoverEmbeddedRepoRoots(root)).toEqual([]);
+    expect(buildScopeIgnore(root).ignores('benchmark/repos/')).toBe(true);
+    expect(buildScopeIgnore(root).ignores('benchmark/repos/ref/ref.ts')).toBe(true);
+  });
+
+  it('re-includes a gitignored gitlink when codegraph.json includeIgnored opts in (#1065)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+    await makeRepo(path.join(root, 'benchmark', 'repos', 'ref'), 'ref');
+    git(root, 'add', 'benchmark/repos/ref');
+    fs.writeFileSync(path.join(root, '.gitignore'), 'benchmark/repos/\n');
+    fs.writeFileSync(path.join(root, 'codegraph.json'), JSON.stringify({ includeIgnored: ['benchmark/repos/'] }));
+    git(root, 'add', '.gitignore', 'codegraph.json');
+    git(root, 'commit', '-q', '-m', 'opt the gitignored gitlink back in');
+
+    const files = scanDirectory(root);
+    expect(files).toContain('app.ts');
+    expect(files).toContain('benchmark/repos/ref/ref.ts'); // opted in → indexed
+    expect(discoverEmbeddedRepoRoots(root)).toContain('benchmark/repos/ref/');
   });
 });
 
