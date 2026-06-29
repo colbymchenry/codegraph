@@ -964,15 +964,18 @@ program
         } else {
           console.log(chalk.bold(`\nSearch Results for "${search}":\n`));
 
+          // Results arrive already ranked by relevance, so the order conveys
+          // it. We don't print the raw score: it's an unbounded BM25/FTS value
+          // (relative-ranking only), and the old `(score * 100)%` rendered it
+          // as nonsensical percentages like "12042%" (#1045). The MCP search
+          // tool likewise shows no score. Raw `score` stays in --json output.
           for (const result of results) {
             const node = result.node;
             const location = `${node.filePath}:${node.startLine}`;
-            const score = chalk.dim(`(${(result.score * 100).toFixed(0)}%)`);
 
             console.log(
               chalk.cyan(node.kind.padEnd(12)) +
-              chalk.white(node.name) +
-              ' ' + score
+              chalk.white(node.name)
             );
             console.log(chalk.dim(`  ${location}`));
             if (node.signature) {
