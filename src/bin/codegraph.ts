@@ -1140,21 +1140,32 @@ program
   });
 
 /**
- * codegraph node <name>
+ * codegraph node [name]
  *
  * The CLI face of the MCP codegraph_node tool: one symbol's source +
  * caller/callee trail, or a whole file with line numbers + dependents
  * (Read-parity). Same subagent/non-MCP rationale as `explore`.
+ *
+ * `name` is OPTIONAL because `--file` (file-read mode) carries no symbol —
+ * a required `<name>` made `codegraph node -f <file>` unreachable (#1044).
  */
 program
-  .command('node <name>')
+  .command('node [name]')
   .description('One symbol\'s source + caller/callee trail, or read a file with line numbers + dependents (same output as the codegraph_node MCP tool)')
   .option('-p, --path <path>', 'Project path')
   .option('-f, --file <file>', 'Treat as file mode (or disambiguate a symbol to this file)')
   .option('--offset <number>', 'File mode: 1-based start line')
   .option('--limit <number>', 'File mode: maximum lines')
   .option('--symbols-only', 'File mode: just the symbol map + dependents')
-  .action(async (name: string, options: { path?: string; file?: string; offset?: string; limit?: string; symbolsOnly?: boolean }) => {
+  .action(async (name: string | undefined, options: { path?: string; file?: string; offset?: string; limit?: string; symbolsOnly?: boolean }) => {
+    // Need a symbol (positional) OR a file (--file / a path-like positional).
+    // With [name] optional, a bare `codegraph node` reaches here with neither
+    // and must be told what to pass, rather than crashing downstream.
+    if (!name && !options.file) {
+      error("Pass a symbol name (e.g. 'codegraph node parseToken') or a file (e.g. 'codegraph node -f src/auth.ts', or 'codegraph node src/auth.ts').");
+      process.exit(1);
+    }
+
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1177,9 +1188,9 @@ program
       if (options.file) {
         args.file = options.file;
         if (name && name !== options.file) args.symbol = name;
-      } else if (name.includes('/') || name.includes('\\')) {
+      } else if (name && (name.includes('/') || name.includes('\\'))) {
         args.file = name.replace(/\\/g, '/');
-      } else {
+      } else if (name) {
         args.symbol = name;
         args.includeCode = true;
       }
