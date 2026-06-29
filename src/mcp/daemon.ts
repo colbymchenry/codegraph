@@ -70,6 +70,45 @@ const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
  */
 const DEFAULT_MAX_IDLE_MS = 1_800_000; // 30 min
 
+/**
+ * Windows-only shutdown backstop. On Windows, calling `process.exit()` while a
+ * recursive `fs.watch` handle is still tearing down aborts the process with a
+ * libuv `UV_HANDLE_CLOSING` assertion (`0xC0000409`) — reproducible whenever the
+ * watched tree contains a nested repo (submodule / embedded clone), since that's
+ * what keeps a watch active at shutdown. The fix is to let the event loop drain
+ * so libuv finishes closing those handles, then exit naturally; this timer only
+ * force-exits if some unexpected handle keeps the loop alive past the grace
+ * window. Kept short so shutdown stays snappy in that fallback. See
+ * `finalizeDaemonExit`.
+ */
+const DAEMON_SHUTDOWN_BACKSTOP_MS = 2_000;
+
+/**
+ * Finalize daemon shutdown. On POSIX, exit immediately — it's clean and fast.
+ * On Windows, do NOT force an exit while watchers may still be closing (that
+ * trips the libuv assertion above); instead mark success and let the loop drain
+ * to a natural exit, with an UNREF'd backstop that force-exits only if a stray
+ * handle would otherwise hang shutdown. Pure and platform-injected so both
+ * branches are unit-testable off-Windows. Returns the backstop timer (Windows)
+ * so callers/tests can clear it.
+ */
+export function finalizeDaemonExit(
+  platform: NodeJS.Platform,
+  exit: (code: number) => void,
+): NodeJS.Timeout | null {
+  if (platform === 'win32') {
+    process.exitCode = 0;
+    const backstop = setTimeout(() => exit(0), DAEMON_SHUTDOWN_BACKSTOP_MS);
+    // Unref so it never keeps the loop alive: a natural drain (watchers closed,
+    // nothing else pending) exits before it fires; it only fires when some other
+    // handle is keeping the loop running, which is exactly when we need it.
+    backstop.unref?.();
+    return backstop;
+  }
+  exit(0);
+  return null;
+}
+
 /** How often the daemon sweeps connected clients for a dead peer process (#692). */
 const DEFAULT_CLIENT_SWEEP_MS = 30_000;
 
@@ -306,7 +345,10 @@ export class Daemon {
     if (process.platform !== 'win32') {
       try { fs.unlinkSync(this.socketPath); } catch { /* may already be gone */ }
     }
-    process.exit(0);
+    // POSIX exits here; Windows drains first (engine.stop() above began closing
+    // the file watcher, and exiting mid-teardown aborts the process). See
+    // finalizeDaemonExit / DAEMON_SHUTDOWN_BACKSTOP_MS.
+    finalizeDaemonExit(process.platform, (code) => process.exit(code));
   }
 
   private handleConnection(socket: net.Socket): void {
