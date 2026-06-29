@@ -11,6 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
+import { stripCppTemplateArgs } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -2718,6 +2719,47 @@ class Plain : public Base { public: int y; };
       // A normal class with a base clause and no macro must still be a class — the
       // drop is precise, not a blanket "class with inheritance" filter.
       expect(result.nodes.find((n) => n.name === 'Plain')?.kind).toBe('class');
+    });
+  });
+
+  describe('C++ templated base-class inheritance (#1043)', () => {
+    // Inheriting from a template (`class D : public Base<int>`) recorded the base
+    // ref as the full instantiation `Base<int>`, which never name-matched the
+    // template indexed as the bare node `Base`. The `<…>` args are stripped so the
+    // `extends` reference matches.
+    it('strips template args from a templated base so the extends ref is the bare name', () => {
+      const code = `
+template<typename T> class Base {};
+template<typename D> class CRTPBase {};
+namespace ns { template<typename T> class Tpl {}; }
+class Plain {};
+
+class Widget : public Base<int> {};
+class App : public CRTPBase<App> {};
+class Q : public ns::Tpl<int> {};
+class Both : public Base<char>, public Plain {};
+`;
+      const extendsRefs = extractFromSource('f.cpp', code).unresolvedReferences.filter(
+        (r) => r.referenceKind === 'extends'
+      );
+      const names = extendsRefs.map((r) => r.referenceName);
+
+      // Templated bases carry the bare name, NOT the `<…>` instantiation.
+      expect(names).toContain('Base'); // from Base<int> / Base<char>
+      expect(names).toContain('CRTPBase'); // from CRTPBase<App> (CRTP)
+      expect(names).toContain('ns::Tpl'); // qualified head preserved, args dropped
+      expect(names).toContain('Plain'); // non-templated base unchanged
+      // No reference still carries angle brackets.
+      expect(names.find((n) => n.includes('<'))).toBeUndefined();
+    });
+
+    it('stripCppTemplateArgs removes balanced <…> at any depth and is a no-op without them', () => {
+      expect(stripCppTemplateArgs('Base<int>')).toBe('Base');
+      expect(stripCppTemplateArgs('ns::Tpl<int>')).toBe('ns::Tpl');
+      expect(stripCppTemplateArgs('ns::Tpl<Foo<int>>')).toBe('ns::Tpl'); // nested
+      expect(stripCppTemplateArgs('Outer<int>::Inner')).toBe('Outer::Inner'); // mid-name
+      expect(stripCppTemplateArgs('Base')).toBe('Base'); // no-op
+      expect(stripCppTemplateArgs('ns::Plain')).toBe('ns::Plain'); // no-op qualified
     });
   });
 

@@ -85,6 +85,33 @@ export function normalizeCppReturnType(raw: string): string | undefined {
 }
 
 /**
+ * Strip C++ template arguments from a base-type reference name so it matches the
+ * bare class/struct the template was DEFINED as. `template<typename T> class
+ * Base { … }` is indexed as a node named `Base`, but a derived class
+ * `class D : public Base<int>` records its base as the full `Base<int>` (and
+ * `class Q : public ns::Tpl<int>` as `ns::Tpl<int>`) — neither name-matches
+ * `Base` / `ns::Tpl`, so the `extends` edge never resolves and the derived class
+ * looks like it inherits from nothing (#1043).
+ *
+ * Removes every balanced `<…>` group regardless of nesting or position, so
+ * `Base<int>` → `Base`, `ns::Tpl<Foo<int>>` → `ns::Tpl`, and the rare
+ * `Outer<int>::Inner` → `Outer::Inner`. The remaining qualified head is exactly
+ * what the non-templated base case already produces, so resolution treats them
+ * identically. A name with no template args passes through unchanged.
+ */
+export function stripCppTemplateArgs(name: string): string {
+  if (!name.includes('<')) return name;
+  let out = '';
+  let depth = 0;
+  for (const ch of name) {
+    if (ch === '<') depth++;
+    else if (ch === '>') { if (depth > 0) depth--; }
+    else if (depth === 0) out += ch;
+  }
+  return out.trim();
+}
+
+/**
  * A function/method's return type lives in the `function_definition`'s `type`
  * field (`Metrics& Metrics::instance()` → `Metrics`). Constructors, destructors,
  * and conversion operators have no `type` field → undefined.

@@ -2173,6 +2173,51 @@ func main() {
     });
   });
 
+  describe('C++ templated base-class inheritance (#1043)', () => {
+    // A class deriving from a TEMPLATE — `class D : public Base<int>` (or a CRTP
+    // `class W : public CRTPBase<W>`, or a qualified `class Q : public ns::Tpl<int>`)
+    // recorded its base as the full instantiation text (`Base<int>`), which never
+    // name-matched the template, indexed as the bare node `Base`. The `<…>` args
+    // are now stripped so the `extends` edge resolves end-to-end.
+    it('resolves an extends edge to a templated base (plain, CRTP, struct, multi-base)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'lib.hpp'),
+        `#pragma once
+template<typename T> class Base { public: void foo(); };
+template<typename Derived> class CRTPBase {};
+class Plain {};
+
+class Widget : public Base<int> {};            // plain template base
+class App : public CRTPBase<App> {};           // CRTP (curiously-recurring)
+struct Node : public Base<double> {};          // struct inheriting a template
+class Both : public Base<char>, public Plain {}; // templated + plain in one clause
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const edges = db
+        .getDb()
+        .prepare(
+          `select src.name as fromName, dst.name as toName
+             from edges e
+             join nodes src on e.source = src.id
+             join nodes dst on e.target = dst.id
+            where e.kind = 'extends'`
+        )
+        .all() as Array<{ fromName: string; toName: string }>;
+      const has = (from: string, to: string) =>
+        edges.some((r) => r.fromName === from && r.toName === to);
+
+      // Every templated base now resolves to the bare template node.
+      expect(has('Widget', 'Base'), 'Widget : Base<int>').toBe(true);
+      expect(has('App', 'CRTPBase'), 'App : CRTPBase<App> (CRTP)').toBe(true);
+      expect(has('Node', 'Base'), 'struct Node : Base<double>').toBe(true);
+      // A mixed clause resolves BOTH the templated and the plain base.
+      expect(has('Both', 'Base'), 'Both : Base<char>').toBe(true);
+      expect(has('Both', 'Plain'), 'Both : Plain (non-templated, regression guard)').toBe(true);
+    });
+  });
+
   describe('PHP Include Resolution', () => {
     it('isPhpIncludePathRef distinguishes include paths from namespace use (#660)', () => {
       const mk = (name: string, over: Partial<UnresolvedRef> = {}): UnresolvedRef => ({
