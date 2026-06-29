@@ -26,7 +26,7 @@
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -34,6 +34,7 @@ import { getGlyphs } from '../ui/glyphs';
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { installFatalHandlers } from './fatal-handler';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
+import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 
@@ -506,19 +507,25 @@ program
       // Indexing runs by default now. The legacy -i/--index flag is still
       // accepted (so existing muscle memory and scripts don't break) but is a
       // no-op — initializing always builds the initial index.
+      // Supervise the index: self-terminate if orphaned or wedged (#999).
+      const supervision = installCommandSupervision('init');
       let result: IndexResult;
-      if (options.verbose) {
-        result = await cg.indexAll({
-          onProgress: createVerboseProgress(),
-          verbose: true,
-        });
-      } else {
-        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-        const progress = createShimmerProgress();
-        result = await cg.indexAll({
-          onProgress: progress.onProgress,
-        });
-        await progress.stop();
+      try {
+        if (options.verbose) {
+          result = await cg.indexAll({
+            onProgress: createVerboseProgress(),
+            verbose: true,
+          });
+        } else {
+          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+          const progress = createShimmerProgress();
+          result = await cg.indexAll({
+            onProgress: progress.onProgress,
+          });
+          await progress.stop();
+        }
+      } finally {
+        supervision.stop();
       }
       printIndexResult(clack, result, projectPath);
       await recordIndexTelemetry(cg, result);
@@ -627,51 +634,58 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
-      if (options.quiet) {
-        // Quiet mode: no UI, just run. `index` is a full re-index, so clear the
-        // existing graph and rebuild from scratch (see the note below — #874).
+      // Supervise the indexer: self-terminate if orphaned (parent shim killed)
+      // or if the main thread wedges — neither was guarded on this path (#999).
+      const supervision = installCommandSupervision('index');
+      try {
+        if (options.quiet) {
+          // Quiet mode: no UI, just run. `index` is a full re-index, so clear the
+          // existing graph and rebuild from scratch (see the note below — #874).
+          cg.clear();
+          const result = await cg.indexAll();
+          if (!result.success) process.exit(1);
+          cg.destroy();
+          return;
+        }
+
+        const clack = await importESM('@clack/prompts');
+        clack.intro('Indexing project');
+
+        // `index` is a FULL re-index: clear the existing graph and rebuild it from
+        // scratch so the result is identical to a fresh `init`. Without the clear,
+        // indexAll() skips every unchanged file by its content hash and reports
+        // "0 nodes, 0 edges" against the already-populated graph — which reads as
+        // "index wiped my index" (#874). For fast incremental updates use `sync`.
         cg.clear();
-        const result = await cg.indexAll();
-        if (!result.success) process.exit(1);
+
+        let result: IndexResult;
+
+        if (options.verbose) {
+          result = await cg.indexAll({
+            onProgress: createVerboseProgress(),
+            verbose: true,
+          });
+        } else {
+          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+          const progress = createShimmerProgress();
+          result = await cg.indexAll({
+            onProgress: progress.onProgress,
+          });
+          await progress.stop();
+        }
+
+        printIndexResult(clack, result, projectPath);
+        await recordIndexTelemetry(cg, result);
+
+        if (!result.success) {
+          process.exit(1);
+        }
+
+        clack.outro('Done');
         cg.destroy();
-        return;
+      } finally {
+        supervision.stop();
       }
-
-      const clack = await importESM('@clack/prompts');
-      clack.intro('Indexing project');
-
-      // `index` is a FULL re-index: clear the existing graph and rebuild it from
-      // scratch so the result is identical to a fresh `init`. Without the clear,
-      // indexAll() skips every unchanged file by its content hash and reports
-      // "0 nodes, 0 edges" against the already-populated graph — which reads as
-      // "index wiped my index" (#874). For fast incremental updates use `sync`.
-      cg.clear();
-
-      let result: IndexResult;
-
-      if (options.verbose) {
-        result = await cg.indexAll({
-          onProgress: createVerboseProgress(),
-          verbose: true,
-        });
-      } else {
-        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-        const progress = createShimmerProgress();
-        result = await cg.indexAll({
-          onProgress: progress.onProgress,
-        });
-        await progress.stop();
-      }
-
-      printIndexResult(clack, result, projectPath);
-      await recordIndexTelemetry(cg, result);
-
-      if (!result.success) {
-        process.exit(1);
-      }
-
-      clack.outro('Done');
-      cg.destroy();
     } catch (err) {
       error(`Failed to index: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
@@ -1053,11 +1067,15 @@ program
       try { input = JSON.parse(raw); } catch { return; }
       const prompt = String(input.prompt || '');
 
-      // Gate: only structural / flow / impact / where-how prompts get context.
-      // A cheap regex keeps every other prompt ("fix this typo") a zero-cost
-      // no-op so we never add latency where there's no structural answer to give.
-      const STRUCTURAL = /\b(how|where|trace|flow|path|reach(?:es|ed)?|call(?:s|ed|er|ers|ee)?|depend|impact|affect|wired?|connect|implement|architect|structure|breaks?|what calls|why does)\b/i;
-      if (!prompt || !STRUCTURAL.test(prompt)) return;
+      // Gate: only structural / flow / impact / where-how prompts get context, so
+      // every other prompt ("fix this typo") stays a zero-cost no-op. Language-aware
+      // (English + CJK keywords, plus code-shaped tokens) so it fires for non-English
+      // prompts too (issue #994). A keyword fires on its own; a code-token is only a
+      // CANDIDATE — verified against the graph below, so a tech brand ("JavaScript")
+      // that looks like a symbol but isn't one here doesn't inject spurious context.
+      const keyworded = hasStructuralKeyword(prompt);
+      const codeTokens = keyworded ? [] : extractCodeTokens(prompt);
+      if (!keyworded && codeTokens.length === 0) return;
 
       // Decide what to inject, shaped by WHERE the index(es) are: the nearest
       // indexed ancestor of cwd, or — when cwd is an un-indexed workspace root
@@ -1079,6 +1097,12 @@ program
         const { default: CodeGraph } = await loadCodeGraph();
         const cg = await CodeGraph.open(plan.exploreRoot);
         try {
+          // Code-token-only prompt: require that at least one token is a REAL symbol
+          // in THIS index before front-loading. Without it, a brand name or common
+          // word that merely looks like code ("JavaScript", "GitHub") would run
+          // explore and inject ~16KB of low-relevance context (issue #994 follow-up).
+          // A keyword-bearing prompt skips this — the keyword is signal enough.
+          if (!keyworded && !codeTokens.some((t) => cg.getNodesByName(t).length > 0)) return;
           const { ToolHandler } = await import('../mcp/tools');
           const handler = new ToolHandler(cg);
           const result = await handler.execute('codegraph_explore', { query: prompt });

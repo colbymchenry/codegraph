@@ -1731,8 +1731,16 @@ export class QueryBuilder {
    */
   deleteResolvedReferences(fromNodeIds: string[]): void {
     if (fromNodeIds.length === 0) return;
-    const placeholders = fromNodeIds.map(() => '?').join(',');
-    this.db.prepare(`DELETE FROM unresolved_refs WHERE from_node_id IN (${placeholders})`).run(...fromNodeIds);
+    // Chunk under SQLite's parameter limit, matching every other IN-list in
+    // this file. The internal resolution path uses deleteSpecificResolvedReferences
+    // instead, but QueryBuilder is part of the public API, so a library consumer
+    // passing more ids than SQLITE_MAX_VARIABLE_NUMBER (32766 on the bundled
+    // node:sqlite) would otherwise hit "too many SQL variables". (#540, #1001)
+    for (let i = 0; i < fromNodeIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = fromNodeIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      this.db.prepare(`DELETE FROM unresolved_refs WHERE from_node_id IN (${placeholders})`).run(...chunk);
+    }
   }
 
   /**

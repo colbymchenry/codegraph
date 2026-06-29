@@ -97,6 +97,50 @@ describe('getNodesByIds (batch lookup)', () => {
   });
 });
 
+describe('deleteResolvedReferences (chunking)', () => {
+  let dir: string;
+  let db: DatabaseConnection;
+  let q: QueryBuilder;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-perf-delref-'));
+    db = DatabaseConnection.initialize(path.join(dir, 'test.db'));
+    q = new QueryBuilder(db.getDb());
+  });
+
+  afterEach(() => {
+    db.close();
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('deletes unresolved refs for more ids than the SQLite parameter limit (#1001)', () => {
+    // Regression: this method bound every id as one parameter in a single
+    // IN (...), so passing more ids than SQLITE_MAX_VARIABLE_NUMBER (32766 on
+    // the bundled node:sqlite) threw "too many SQL variables". Use 33000 to
+    // clear that ceiling. from_node_id has a FK to nodes, so insert nodes first.
+    const nodes = Array.from({ length: 33000 }, (_, i) => makeNode(`n${i}`));
+    q.insertNodes(nodes);
+    q.insertUnresolvedRefsBatch(
+      nodes.map((n) => ({
+        fromNodeId: n.id,
+        referenceName: 'someName',
+        referenceKind: 'calls',
+        line: 1,
+        column: 0,
+      }))
+    );
+    expect(q.getUnresolvedReferencesCount()).toBe(33000);
+
+    const ids = nodes.map((n) => n.id);
+    expect(() => q.deleteResolvedReferences(ids)).not.toThrow();
+    expect(q.getUnresolvedReferencesCount()).toBe(0);
+  });
+
+  it('handles an empty input array', () => {
+    expect(() => q.deleteResolvedReferences([])).not.toThrow();
+  });
+});
+
 describe('insertNode cache invalidation', () => {
   let dir: string;
   let db: DatabaseConnection;

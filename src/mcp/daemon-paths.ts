@@ -16,6 +16,16 @@
  * an absolute-path hash under `os.tmpdir()`. The pidfile always stays in the
  * project (it doesn't have a length limit) — and acts as the authoritative
  * pointer to the socket path the daemon chose.
+ *
+ * Second special-case (#997, #974): some filesystems can't host an AF_UNIX node
+ * AT ALL — ExFAT/FAT external volumes, certain network mounts, WSL2 DrvFs — so
+ * `listen()` throws ENOTSUP/EACCES regardless of path length. We can't cheaply
+ * tell those apart from a normal volume up front, so instead of guessing we
+ * expose an ORDERED candidate list (`getDaemonSocketCandidates`): the in-project
+ * path first, the deterministic tmpdir path as the fallback of last resort. The
+ * daemon binds the first that works (relocating past a capability error); the
+ * proxy connects the first that answers. Both walk the SAME list, so they still
+ * converge on whichever the daemon bound with zero coordination.
  */
 
 import * as crypto from 'crypto';
@@ -32,19 +42,50 @@ function projectHash(projectRoot: string): string {
 }
 
 /**
- * Compute the socket / named-pipe path the daemon should listen on (and the
- * proxy should connect to) for `projectRoot`. Deterministic given a project
- * root, so independent processes converge without coordination.
+ * The deterministic tmpdir socket path for `projectRoot` — the fallback used
+ * when the in-project location can't host a socket (too long, or an FS that
+ * doesn't support AF_UNIX). Hash keeps it project-scoped, and being purely a
+ * function of the root means the daemon and the proxy compute the identical
+ * path without talking to each other.
  */
-export function getDaemonSocketPath(projectRoot: string): string {
+function tmpdirSocketPath(projectRoot: string): string {
+  return path.join(os.tmpdir(), `codegraph-${projectHash(projectRoot)}.sock`);
+}
+
+/**
+ * Ordered socket / named-pipe path candidates the daemon should try to bind (and
+ * the proxy should try to connect) for `projectRoot`, most-preferred first.
+ * Deterministic given a project root, so independent processes converge without
+ * coordination — even when the preferred candidate is unusable and both fall
+ * through to the same fallback.
+ *
+ *   - Windows: a single named pipe (lives in the kernel pipe namespace, not on
+ *     the project FS, so neither the length nor the ExFAT hazard applies).
+ *   - Short in-project path: `[ .codegraph/daemon.sock , <tmpdir> ]` — try the
+ *     project first, fall back to tmpdir if its FS can't host a socket (#997).
+ *   - Long in-project path (deep monorepos, Bazel out dirs): `[ <tmpdir> ]` only
+ *     — bind would throw ENAMETOOLONG, so we skip straight to tmpdir.
+ */
+export function getDaemonSocketCandidates(projectRoot: string): string[] {
   if (process.platform === 'win32') {
-    return `\\\\.\\pipe\\codegraph-${projectHash(projectRoot)}`;
+    return [`\\\\.\\pipe\\codegraph-${projectHash(projectRoot)}`];
   }
   const inProject = path.join(getCodeGraphDir(projectRoot), 'daemon.sock');
-  if (inProject.length <= POSIX_SOCKET_PATH_LIMIT) return inProject;
-  // Long project paths (deep monorepos, Bazel out dirs) need tmpdir fallback
-  // or `bind` returns EADDRINUSE / ENAMETOOLONG. Hash keeps it project-scoped.
-  return path.join(os.tmpdir(), `codegraph-${projectHash(projectRoot)}.sock`);
+  const tmp = tmpdirSocketPath(projectRoot);
+  if (inProject.length > POSIX_SOCKET_PATH_LIMIT) return [tmp];
+  return [inProject, tmp];
+}
+
+/**
+ * The PREFERRED (primary) socket path — candidate 0. Use this only where a
+ * single representative path is wanted (the lockfile's informational
+ * `socketPath` field, status display). For binding/connecting, walk the full
+ * {@link getDaemonSocketCandidates} list — the daemon may bind a fallback when
+ * candidate 0 is unusable.
+ */
+export function getDaemonSocketPath(projectRoot: string): string {
+  // The candidate list is never empty (≥1 on every platform), so [0] is safe.
+  return getDaemonSocketCandidates(projectRoot)[0]!;
 }
 
 /** Absolute path to the daemon pid lockfile for `projectRoot`. */

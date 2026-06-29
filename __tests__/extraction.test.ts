@@ -1437,6 +1437,88 @@ protocol UploadConvertible: URLRequestConvertible {
     // UploadConvertible extends URLRequestConvertible
     expect(extendsRefs.find((r) => r.referenceName === 'URLRequestConvertible')).toBeDefined();
   });
+
+  it('indexes Swift properties so they are findable: computed → property, stored → field, static → constant/variable (#1020)', () => {
+    const code = `
+struct ReproConfig {
+    let reproStoredValue: Int
+    var reproComputedFlag: Bool {
+        reproStoredValue > 0
+    }
+    static let sharedLimit = 10
+    static var sharedCount = 0
+    func reproControlMethod() -> Bool {
+        reproComputedFlag
+    }
+}
+
+final class ReproService {
+    private let reproClassStored: String = "x"
+    var reproClassComputed: Int { reproClassStored.count }
+}
+`;
+    const result = extractFromSource('Repro.swift', code);
+    const byName = (name: string) => result.nodes.find((n) => n.name === name);
+
+    // Computed properties are the regression this fix targets: before #1020 they
+    // were dropped entirely, so search/explore returned nothing for them.
+    expect(byName('reproComputedFlag')?.kind).toBe('property');
+    expect(byName('reproClassComputed')?.kind).toBe('property');
+
+    // Stored instance properties stay `field` (fixed earlier in #708 — guard it).
+    expect(byName('reproStoredValue')?.kind).toBe('field');
+    expect(byName('reproClassStored')?.kind).toBe('field');
+
+    // `static let`/`static var` members remain shared constant/variable nodes.
+    expect(byName('sharedLimit')?.kind).toBe('constant');
+    expect(byName('sharedCount')?.kind).toBe('variable');
+
+    // The control method is unaffected.
+    expect(byName('reproControlMethod')?.kind).toBe('method');
+  });
+
+  it("attributes a computed property's getter calls to the property, not the type (SwiftUI body flow) (#1020)", () => {
+    const code = `
+struct GreetingView {
+    let name: String
+    var body: some View {
+        let prefix = "Hi"
+        return VStack {
+            Text(greeting(prefix))
+        }
+    }
+    func greeting(_ p: String) -> String { p }
+}
+`;
+    const result = extractFromSource('View.swift', code);
+    const body = result.nodes.find((n) => n.kind === 'property' && n.name === 'body');
+    expect(body).toBeDefined();
+
+    // The getter's call to greeting() must originate from `body` (so a SwiftUI
+    // view's render flow is reachable through the property), not flatten onto the
+    // enclosing struct.
+    const callsFromBody = result.unresolvedReferences.filter(
+      (r) => r.fromNodeId === body!.id && r.referenceKind === 'calls'
+    );
+    expect(callsFromBody.some((r) => r.referenceName === 'greeting')).toBe(true);
+
+    // The getter is walked as a body, so a local declared inside it is NOT
+    // node-ified (locals are the data-flow frontier we leave uncovered). Before
+    // this fix the generic walker treated such a local as a struct `field`.
+    expect(result.nodes.find((n) => n.name === 'prefix')).toBeUndefined();
+  });
+
+  it('indexes a Swift protocol property requirement as a findable property (#1020)', () => {
+    const code = `
+protocol Themable {
+    var accentColor: Color { get }
+    var title: String { get set }
+}
+`;
+    const result = extractFromSource('Themable.swift', code);
+    expect(result.nodes.find((n) => n.name === 'accentColor')?.kind).toBe('property');
+    expect(result.nodes.find((n) => n.name === 'title')?.kind).toBe('property');
+  });
 });
 
 describe('Kotlin Extraction', () => {
@@ -5371,6 +5453,133 @@ describe('Git Submodules', () => {
 
     expect(files).toContain('app.ts');
     expect(files).toContain('libs/lib/lib.ts');
+  });
+});
+
+describe('Nested gitlink repos (#1031, #1033)', () => {
+  let tempDir: string;
+  // Helper: make a self-contained git repo at `dir` with one committed TS file.
+  const makeRepo = async (dir: string, base: string) => {
+    const { execFileSync } = await import('child_process');
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
+    fs.mkdirSync(dir, { recursive: true });
+    git('init', '-q');
+    git('config', 'user.email', 'test@test.com');
+    git('config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(dir, `${base}.ts`), `export const ${base} = 1;`);
+    git('add', '-A');
+    git('commit', '-q', '-m', `${base} init`);
+  };
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  // The #1031 case: a nested repo `git add`ed inside the super-repo becomes a
+  // gitlink (mode 160000) with NO `.gitmodules`. It is tracked (so it never shows
+  // in the untracked `-o` listing) yet not an active submodule (so
+  // `--recurse-submodules` won't expand it) — it used to fall through both passes
+  // and only the super-repo's own files got indexed.
+  it('indexes a bare gitlink (git add\'ed embedded repo, no .gitmodules), recursively', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+
+    // An embedded clone, itself holding a further nested clone (untracked inside it).
+    await makeRepo(path.join(root, 'embedded'), 'inner');
+    await makeRepo(path.join(root, 'embedded', 'deep'), 'deep');
+
+    // `git add embedded` records it as a 160000 gitlink (no fetch, no .gitmodules).
+    git(root, 'add', 'embedded');
+    git(root, 'commit', '-q', '-m', 'add embedded as gitlink');
+    expect(fs.existsSync(path.join(root, '.gitmodules'))).toBe(false);
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('app.ts');
+    expect(files).toContain('embedded/inner.ts'); // the gitlink's own source
+    expect(files).toContain('embedded/deep/deep.ts'); // recursion continues into its nested repo
+  });
+
+  // The -c → -s switch must not regress active submodules (#147): a repo can hold
+  // BOTH an active submodule (expanded by --recurse-submodules) and a bare gitlink
+  // (handled by the new pass), and the mixed 160000/100644 modes must parse right.
+  it('indexes a gitlink alongside an active submodule', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const lib = path.join(tempDir, '_lib');
+    await makeRepo(lib, 'lib');
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+
+    // A proper, active submodule.
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'libs/lib'], { cwd: root, stdio: 'pipe' });
+    git(root, 'commit', '-q', '-m', 'add submodule');
+
+    // A bare gitlink in the same repo (under a non-ignored dir name).
+    await makeRepo(path.join(root, 'external', 'tool'), 'tool');
+    git(root, 'add', 'external/tool');
+    git(root, 'commit', '-q', '-m', 'add gitlink');
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('app.ts');
+    expect(files).toContain('libs/lib/lib.ts'); // active submodule still expands (#147)
+    expect(files).toContain('external/tool/tool.ts'); // bare gitlink now indexed
+  });
+
+  // A gitlink under a built-in default-ignored directory (vendor/, node_modules/,
+  // …) stays excluded — a committed dependency doesn't become project code just
+  // because it's a nested repo. Mirrors how the untracked-embedded path treats
+  // the same dirs (#407), so the two passes agree.
+  it('does not index a gitlink under a default-ignored directory (e.g. vendor/)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+    await makeRepo(path.join(root, 'vendor', 'pkg'), 'dep');
+    git(root, 'add', 'vendor/pkg');
+    git(root, 'commit', '-q', '-m', 'add vendored gitlink');
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('app.ts');
+    expect(files).not.toContain('vendor/pkg/dep.ts');
+  });
+
+  // A gitlink with NO working tree on disk (the common "cloned without
+  // --recurse-submodules" state) has nothing to index — we must leave it alone,
+  // not fabricate entries, and must not break the rest of the scan.
+  it('leaves an uninitialized submodule (no checkout on disk) alone', async () => {
+    const { execFileSync } = await import('child_process');
+
+    const lib = path.join(tempDir, '_lib');
+    await makeRepo(lib, 'lib');
+
+    const sup = path.join(tempDir, 'super');
+    await makeRepo(sup, 'app');
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'libs/lib'], { cwd: sup, stdio: 'pipe' });
+    execFileSync('git', ['commit', '-q', '-m', 'add submodule'], { cwd: sup, stdio: 'pipe' });
+
+    // Clone the super-repo WITHOUT --recurse-submodules → libs/lib is an empty
+    // gitlink dir (mode 160000, no `.git` inside, no files).
+    const clone = path.join(tempDir, 'clone');
+    execFileSync('git', ['clone', '-q', sup, clone], { stdio: 'pipe' });
+    expect(fs.readdirSync(path.join(clone, 'libs', 'lib'))).toHaveLength(0);
+
+    const files = scanDirectory(clone);
+
+    expect(files).toContain('app.ts');
+    expect(files).not.toContain('libs/lib/lib.ts'); // not on disk → correctly absent
   });
 });
 

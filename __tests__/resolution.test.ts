@@ -270,6 +270,168 @@ describe('Resolution Module', () => {
     });
   });
 
+  describe('Ubiquitous-name ceiling (#999)', () => {
+    // A vendored theme/SDK re-declares the same method name across thousands of
+    // files (Metronic's `init`/`update`/… on every widget). The fuzzy strategies
+    // used to score every same-named candidate per ref — O(K) per ref, O(K²)
+    // total — which pinned a core for 15-28 min at "Resolving refs … 94%". Above
+    // the ceiling they must DECLINE instead, since no proximity/word-overlap
+    // score can pick the one true target among thousands anyway.
+    const CEILING = 500;
+
+    // A spy context: counts how many nodes the strategy actually inspects, so we
+    // can assert the cap short-circuits BEFORE the O(K) scoring (not just that it
+    // returns null).
+    const makeManyMethods = (n: number, name: string): Node[] =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `method:widget${i}.js:Widget${i}.${name}:1`,
+        kind: 'method' as const,
+        name,
+        qualifiedName: `widget${i}.js::Widget${i}::${name}`,
+        filePath: `static/theme/widget${i}.js`,
+        language: 'javascript' as const,
+        startLine: 1,
+        endLine: 5,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      }));
+
+    const spyContext = (nodes: Node[]): { ctx: ResolutionContext; lookups: () => number } => {
+      let scanned = 0;
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => {
+          const hit = nodes.filter((n) => n.name === name);
+          scanned += hit.length;
+          return hit;
+        },
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      return { ctx, lookups: () => scanned };
+    };
+
+    it('declines a method call (`obj.init`) above the ceiling instead of scoring K candidates', () => {
+      const { ctx } = spyContext(makeManyMethods(CEILING + 1, 'init'));
+      const ref = {
+        fromNodeId: 'method:caller.js:caller:1',
+        referenceName: 'widget.init',
+        referenceKind: 'calls' as const,
+        line: 2,
+        column: 4,
+        filePath: 'static/theme/caller.js',
+        language: 'javascript' as const,
+      };
+      expect(matchReference(ref, ctx)).toBeNull();
+    });
+
+    it('declines a bare exact-name ref above the ceiling', () => {
+      const { ctx } = spyContext(makeManyMethods(CEILING + 1, 'render'));
+      const ref = {
+        fromNodeId: 'method:caller.js:caller:1',
+        referenceName: 'render',
+        referenceKind: 'calls' as const,
+        line: 2,
+        column: 4,
+        filePath: 'static/theme/caller.js',
+        language: 'javascript' as const,
+      };
+      expect(matchReference(ref, ctx)).toBeNull();
+    });
+
+    it('still resolves a SAME-FILE definition when one exists (precise path unaffected)', () => {
+      // Strategy 1 (class-name) and same-file matching are precise — a ubiquitous
+      // name with an unambiguous local target still resolves.
+      const nodes = makeManyMethods(CEILING + 1, 'init');
+      const local: Node = {
+        id: 'class:static/theme/caller.js:Widgetly:1',
+        kind: 'class',
+        name: 'Widgetly',
+        qualifiedName: 'static/theme/caller.js::Widgetly',
+        filePath: 'static/theme/caller.js',
+        language: 'javascript',
+        startLine: 1, endLine: 9, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const localMethod: Node = {
+        id: 'method:static/theme/caller.js:Widgetly.init:2',
+        kind: 'method',
+        name: 'init',
+        qualifiedName: 'static/theme/caller.js::Widgetly::init',
+        filePath: 'static/theme/caller.js',
+        language: 'javascript',
+        startLine: 2, endLine: 4, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const all = [...nodes, local, localMethod];
+      const ctx: ResolutionContext = {
+        getNodesInFile: (fp) => all.filter((n) => n.filePath === fp),
+        getNodesByName: (name) => all.filter((n) => n.name === name),
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      // `Widgetly.init` names the class explicitly → Strategy 1 resolves it.
+      const ref = {
+        fromNodeId: 'method:static/theme/caller.js:caller:6',
+        referenceName: 'Widgetly.init',
+        referenceKind: 'calls' as const,
+        line: 6,
+        column: 4,
+        filePath: 'static/theme/caller.js',
+        language: 'javascript' as const,
+      };
+      const result = matchReference(ref, ctx);
+      expect(result?.targetNodeId).toBe('method:static/theme/caller.js:Widgetly.init:2');
+    });
+
+    it('still scores normally JUST below the ceiling (no behavior change for normal repos)', () => {
+      // Real repos top out near ~40 same-named methods; this proves a sub-ceiling
+      // collision still resolves via proximity, so the cap is invisible to them.
+      const nodes = makeManyMethods(CEILING - 1, 'update');
+      // Make ONE candidate share the caller's directory so proximity picks it.
+      nodes[0] = {
+        ...nodes[0]!,
+        id: 'method:static/theme/app/Widget0.update:1',
+        qualifiedName: 'static/theme/app/widget.js::Widget0::update',
+        filePath: 'static/theme/app/widget.js',
+      };
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => nodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      const ref = {
+        fromNodeId: 'method:static/theme/app/caller.js:caller:1',
+        referenceName: 'update',
+        referenceKind: 'calls' as const,
+        line: 2,
+        column: 4,
+        filePath: 'static/theme/app/caller.js',
+        language: 'javascript' as const,
+      };
+      // Below the ceiling the fuzzy path runs and resolves SOMETHING (not capped).
+      expect(matchReference(ref, ctx)).not.toBeNull();
+    });
+  });
+
   describe('Import Resolver', () => {
     it('should resolve relative import paths', () => {
       const context: ResolutionContext = {

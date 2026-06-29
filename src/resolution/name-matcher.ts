@@ -8,6 +8,33 @@ import { Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
 
 /**
+ * Ceiling on how many same-named definitions a FUZZY name-match strategy will
+ * score. A name defined more times than this is "ubiquitous" — a method/symbol
+ * re-declared across a vendored theme or SDK (e.g. `init`/`update`/`render` on
+ * every widget of a committed Metronic theme — #999). No directory-proximity or
+ * receiver-word-overlap score can reliably pick THE one true target among
+ * thousands, so the fuzzy strategies (matchByExactName's findBestMatch, and
+ * matchMethodCall Strategy 3) decline above the ceiling instead of emitting a
+ * low-confidence, almost-certainly-wrong edge. This also caps their per-ref cost
+ * at O(ceiling): without it, K same-named refs each scored K candidates — the
+ * O(K²) blow-up that pinned a core for 15-28 min at "Resolving refs … 94%" on a
+ * repo vendoring a large JS/TS theme (#999). The PRECISE strategies are
+ * unaffected: qualified-name, import-based, and class-name (Strategy 1/2)
+ * resolution all still run and resolve a ubiquitous name when the context names
+ * its exact target. Real repos top out near ~40 same-named methods, so a normal
+ * codebase never reaches this; only bulk-vendored code does. Tune via
+ * `CODEGRAPH_AMBIGUOUS_NAME_CEILING`.
+ */
+const DEFAULT_AMBIGUOUS_NAME_CEILING = 500;
+function resolveAmbiguousNameCeiling(): number {
+  const raw = process.env.CODEGRAPH_AMBIGUOUS_NAME_CEILING;
+  if (!raw) return DEFAULT_AMBIGUOUS_NAME_CEILING;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_AMBIGUOUS_NAME_CEILING;
+}
+const AMBIGUOUS_NAME_CEILING = resolveAmbiguousNameCeiling();
+
+/**
  * Try to resolve a path-like reference (e.g., "snippets/drawer-menu.liquid")
  * by matching the filename against file nodes.
  */
@@ -342,6 +369,15 @@ export function matchByExactName(
       confidence: isCrossLanguage ? 0.5 : 0.9,
       resolvedBy: 'exact-match',
     };
+  }
+
+  // Ubiquitous-name ceiling (#999): above it, picking one target among K
+  // same-named defs by directory proximity is unreliable AND O(K) per ref — the
+  // quadratic behind the "Resolving refs" wedge on theme/SDK-vendoring repos.
+  // Decline; the precise strategies (qualified-name, import, class-name) already
+  // ran. Falls through to fuzzy, which itself only resolves a UNIQUE candidate.
+  if (candidates.length > AMBIGUOUS_NAME_CEILING) {
+    return null;
   }
 
   // Multiple matches - try to narrow down
@@ -1067,6 +1103,15 @@ export function matchMethodCall(
   // names like permissionEngine → PermissionRuleEngine.
   if (methodName) {
     const methodCandidates = context.getNodesByName(methodName!);
+    // Ubiquitous-method ceiling (#999): a method name re-declared across a
+    // vendored theme/SDK (Metronic's `init`/`update`/… on every widget) yields
+    // K candidates that receiver-word overlap can't reliably disambiguate —
+    // and filtering + scoring all K per call is the O(K²) cost that wedged
+    // "Resolving refs" for 15-28 min. Bail before the O(K) work; Strategy 1/2
+    // (class-name match) already had their precise shot above.
+    if (methodCandidates.length > AMBIGUOUS_NAME_CEILING) {
+      return null;
+    }
     const methods = methodCandidates.filter(
       (n) => n.kind === 'method' && n.name === methodName
     );
