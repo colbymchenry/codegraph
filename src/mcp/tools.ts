@@ -338,6 +338,12 @@ function numberSourceLines(slice: string, firstLineNumber: number): string {
  * (`reasoning/reasoner.ts`) both key off to cut on whole file sections.
  */
 const FILE_SECTION_PREFIX = '**`';
+// Placeholder for codegraph_explore's "Found N symbols across M files." line.
+// The honest N/M can only be known after the final truncation drops trailing
+// sections (#1046), so the header is emitted as this sentinel and substituted
+// at the very end. This bracketed token never occurs in rendered source or a
+// file path, so the final string-replace can't collide.
+const SUMMARY_SENTINEL = '[[codegraph-explore-summary]]';
 function fileSectionHeader(filePath: string, suffix: string): string {
   return suffix
     ? `${FILE_SECTION_PREFIX}${filePath}\`** — ${suffix}`
@@ -2833,9 +2839,16 @@ export class ToolHandler {
     const lines: string[] = [
       `**Exploration: ${query}**`,
       '',
-      `Found ${subgraph.nodes.size} symbols across ${fileGroups.size} files.`,
+      // Curated summary — filled in after the source loop (see below). We do NOT
+      // report `subgraph.nodes.size` / `fileGroups.size` here: that's the raw
+      // candidate gather, which a broad natural-language query inflates wildly
+      // (260 symbols / 124 files on a 636-file repo) even though only a handful
+      // render. Reporting the pool read as "260 results to wade through" when the
+      // real, correctly-ranked answer is the few files below (#1046).
+      '',
       '',
     ];
+    const summaryLineIdx = 2;
 
     // Blast radius (always-on, compact): for the entry symbols, who depends on
     // them + which tests cover them — locations only, no source — so the agent
@@ -2943,6 +2956,9 @@ export class ToolHandler {
 
     let totalChars = lines.join('\n').length;
     let filesIncluded = 0;
+    // Paths we actually render source for below. Drives the curated header count
+    // (#1046) — it must reflect what we show, not the raw candidate gather.
+    const renderedFilePaths: string[] = [];
     let anyFileTrimmed = false;
 
     for (const [filePath, group] of sortedFiles) {
@@ -3082,6 +3098,7 @@ export class ToolHandler {
             : 'skeleton (signatures only — codegraph_explore a name for its full body; do NOT Read)';
           lines.push(fileSectionHeader(filePath, `${names} · ${tag}`), '', '```' + lang, skel.join('\n'), '```', '');
           totalChars += skel.join('\n').length + 120;
+          renderedFilePaths.push(filePath);
           filesIncluded++;
           continue;
         }
@@ -3132,6 +3149,7 @@ export class ToolHandler {
         }
         lines.push(wholeHeader, '', '```' + lang, wholeSection, '```', '');
         totalChars += wholeSection.length + 200;
+        renderedFilePaths.push(filePath);
         filesIncluded++;
         continue;
       }
@@ -3416,8 +3434,15 @@ export class ToolHandler {
       lines.push('');
 
       totalChars += fileSection.length + 200;
+      renderedFilePaths.push(filePath);
       filesIncluded++;
     }
+
+    // The curated header count is computed from the files that SURVIVE the final
+    // truncation (see end of method) — `filesIncluded` can over-count when the
+    // hard ceiling drops trailing sections — so leave a sentinel here and fill it
+    // in once the output is final.
+    lines[summaryLineIdx] = SUMMARY_SENTINEL;
 
     // Add remaining files as references (from both relevant and peripheral files).
     // Small projects (per budget) skip this — the relevant story already fits
@@ -3477,6 +3502,7 @@ export class ToolHandler {
     const output = flow.text + lines.join('\n');
 
     const hardCeiling = Math.min(Math.round(budget.maxOutputChars * 1.5), 25000);
+    let finalText: string;
     if (output.length > hardCeiling) {
       // Cut at a FILE-SECTION boundary (the last ``**` `` file header before the
       // ceiling) so we drop whole trailing file-sections rather than slicing
@@ -3487,9 +3513,33 @@ export class ToolHandler {
       const lastSection = cut.lastIndexOf('\n' + FILE_SECTION_PREFIX);
       const boundary = lastSection > hardCeiling * 0.5 ? lastSection : cut.lastIndexOf('\n');
       const safe = boundary > 0 ? cut.slice(0, boundary) : cut;
-      return this.textResult(safe + '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)');
+      finalText = safe + '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)';
+    } else {
+      finalText = output;
     }
-    return this.textResult(output);
+
+    // Curated header (#1046): substitute the sentinel with the count of files
+    // whose source SURVIVES in the final text — not `subgraph`/`fileGroups` (the
+    // raw gather a broad query inflates) and not `filesIncluded` (which can
+    // over-count when the ceiling above drops trailing sections). A file counts
+    // only if its section header is still present; its relevant (non-import)
+    // symbols are summed for N. Files we couldn't fit are still named under "Not
+    // shown above" + the budget note, so nothing is silently dropped.
+    const survivors = renderedFilePaths.filter((fp) =>
+      finalText.includes(`${FILE_SECTION_PREFIX}${fp}\``));
+    const shownSymbols = survivors.reduce((sum, fp) => {
+      const g = fileGroups.get(fp);
+      if (!g) return sum;
+      return sum + new Set(
+        g.nodes.filter((n) => n.kind !== 'import' && n.kind !== 'export').map((n) => n.id),
+      ).size;
+    }, 0);
+    const summaryLine = survivors.length > 0
+      ? `Found ${shownSymbols} symbol${shownSymbols === 1 ? '' : 's'} across ${survivors.length} file${survivors.length === 1 ? '' : 's'}.`
+      : `Found ${subgraph.nodes.size} symbol${subgraph.nodes.size === 1 ? '' : 's'} across ${fileGroups.size} file${fileGroups.size === 1 ? '' : 's'}.`;
+    finalText = finalText.replace(SUMMARY_SENTINEL, summaryLine);
+
+    return this.textResult(finalText);
   }
 
   /**
