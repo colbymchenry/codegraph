@@ -2763,6 +2763,42 @@ class Both : public Base<char>, public Plain {};
     });
   });
 
+  describe('C++ stack-allocation construction (#1035)', () => {
+    // `Calculator calc(0)` (direct-init) and `Widget w{1, 2}` (brace-init) carry
+    // the constructor args directly on the declarator — no call/new node — so
+    // they emitted no constructor reference, unlike heap `new Calculator(0)`. An
+    // `instantiates` ref to the constructed type is now emitted for both.
+    const instNames = (code: string) =>
+      extractFromSource('f.cpp', `void run() {\n${code}\n}`)
+        .unresolvedReferences.filter((r) => r.referenceKind === 'instantiates')
+        .map((r) => r.referenceName);
+
+    it('emits an instantiates ref for direct-init and brace-init', () => {
+      expect(instNames('Calculator calc(0);')).toEqual(['Calculator']);
+      expect(instNames('Widget w{1, 2};')).toEqual(['Widget']);
+    });
+
+    it('strips template args and namespace to the bare class name', () => {
+      // `std::vector<int> v(10)` → `vector`; `ns::Widget w(0)` → `Widget`.
+      expect(instNames('std::vector<int> v(10);')).toEqual(['vector']);
+      expect(instNames('ns::Widget w(0);')).toEqual(['Widget']);
+    });
+
+    it('does not emit for primitives, default construction, or the most-vexing parse', () => {
+      expect(instNames('int x(5);')).toEqual([]); // primitive direct-init
+      expect(instNames('int y{6};')).toEqual([]); // primitive brace-init
+      expect(instNames('auto z = make();')).toEqual([]); // auto + call (handled elsewhere)
+      expect(instNames('Calculator deferred;')).toEqual([]); // default construction, no args
+      expect(instNames('Calculator calc();')).toEqual([]); // function declaration (most-vexing parse)
+    });
+
+    it('emits a single instantiates ref for a multi-declarator statement', () => {
+      // `Calculator a(1), b(2);` shares one `type` field; both construct a
+      // Calculator, so one ref suffices (it dedups to one edge regardless).
+      expect(instNames('Calculator a(1), b(2);')).toEqual(['Calculator']);
+    });
+  });
+
   describe('C/C++ imports', () => {
     it('should extract system include', () => {
       const code = `#include <iostream>`;

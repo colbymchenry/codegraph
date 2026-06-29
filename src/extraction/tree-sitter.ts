@@ -3883,6 +3883,47 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Is this C++ `declaration` a stack/direct-initialization object construction
+   * that invokes a constructor — `Calculator calc(0)` (direct-init) or
+   * `Widget w{1, 2}` (brace-init) — as opposed to a plain variable or a
+   * function declaration? Used to emit an `instantiates` edge for the
+   * call-less construction syntax (#1035); heap `new T(...)` is handled
+   * separately by INSTANTIATION_KINDS.
+   *
+   * Two signals, both required:
+   *  - the `type` field is a class-like NAMED type (`type_identifier`,
+   *    `template_type`, or `qualified_identifier`). Primitives (`int x(0)`),
+   *    `auto` (`placeholder_type_specifier` — that form always carries a real
+   *    `call_expression`, already handled), and sized specifiers are excluded —
+   *    they construct no class; and
+   *  - a declarator carries constructor arguments: an `init_declarator` whose
+   *    `value` is an `argument_list` (`(args)`) or `initializer_list` (`{args}`).
+   *    This skips default construction `Calculator c;` (no value) and the
+   *    most-vexing-parse `Calculator c();` (a bodyless `function_declarator`,
+   *    a function decl — not a construction).
+   */
+  private isCppStackConstruction(node: SyntaxNode): boolean {
+    const typeNode = getChildByField(node, 'type');
+    if (
+      !typeNode ||
+      (typeNode.type !== 'type_identifier' &&
+        typeNode.type !== 'template_type' &&
+        typeNode.type !== 'qualified_identifier')
+    ) {
+      return false;
+    }
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child?.type !== 'init_declarator') continue;
+      const value = getChildByField(child, 'value');
+      if (value && (value.type === 'argument_list' || value.type === 'initializer_list')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Static-member / value-read pass. A type/enum/class used only via a member
    * VALUE — `Enum.value`, `Type.CONST`, `Colors.red`, `Foo::BAR` — recorded no
    * edge, because the body walker only handled CALLS (`Type.method()`). So a
@@ -4257,6 +4298,19 @@ export class TreeSitterExtractor {
             });
           }
         }
+      }
+
+      // C++ stack / direct-initialization construction — `Calculator calc(0)`
+      // and `Widget w{1, 2}`. Unlike heap `new Calculator(0)` (a new_expression
+      // handled above), these carry the constructor arguments directly on the
+      // declarator with NO call/new node, so the body walker saw no constructor
+      // invocation and recorded no `instantiates` edge (#1035). A declaration's
+      // `type` field IS the constructed class name, so reuse extractInstantiation
+      // (which strips template args / namespace and emits the `instantiates`
+      // ref). Children still recurse below, so a nested ctor-arg call
+      // (`Calculator calc(make())`) keeps its own `calls` ref.
+      if (nodeType === 'declaration' && this.language === 'cpp' && this.isCppStackConstruction(node)) {
+        this.extractInstantiation(node);
       }
 
       // Static-member / value-read: `Enum.value`, `Type.CONST`, `Foo::BAR`.

@@ -930,6 +930,43 @@ def bootstrap():
       expect(callsToUserService).toHaveLength(0);
     });
 
+    it('records instantiates for C++ stack/brace construction, targeting the class (#1035)', async () => {
+      // `Calculator calc(0)` (direct-init) and `Widget w{1, 2}` (brace-init)
+      // carry the constructor args directly on the declarator — there's no
+      // call/new node — so they recorded no `instantiates` edge, while heap
+      // `new Calculator(0)` did. Both stack forms now do.
+      fs.writeFileSync(
+        path.join(tempDir, 'm.cpp'),
+        `class Calculator { public: Calculator(int seed) {} int add(int a, int b){ return a+b; } };
+class Widget { public: Widget(int a, int b) {} };
+
+int runStack(int a, int b) { Calculator calc(0); return calc.add(a, b); }
+int runBrace() { Widget w{1, 2}; return 0; }
+int runHeap(int a, int b) { Calculator* c = new Calculator(0); return c->add(a, b); }
+void noise() { int x(5); int y{6}; Calculator deferred; }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const fn = (name: string) => cg.getNodesByKind('function').find((n) => n.name === name)!;
+      const instTargets = (name: string) =>
+        cg
+          .getOutgoingEdges(fn(name).id)
+          .filter((e) => e.kind === 'instantiates')
+          .map((e) => cg.getNode(e.target)!);
+
+      // Direct-init (the issue) and brace-init both instantiate, targeting the
+      // CLASS node — not the same-named constructor method.
+      const stack = instTargets('runStack');
+      expect(stack.map((n) => `${n.kind}:${n.name}`)).toContain('class:Calculator');
+      expect(instTargets('runBrace').map((n) => `${n.kind}:${n.name}`)).toContain('class:Widget');
+      // Heap still works (regression guard).
+      expect(instTargets('runHeap').map((n) => `${n.kind}:${n.name}`)).toContain('class:Calculator');
+      // Primitives (`int x(0)`/`int y{6}`) and bare default construction
+      // (`Calculator deferred;`) must NOT mint an instantiates edge.
+      expect(instTargets('noise')).toHaveLength(0);
+    });
+
     it('resolves a cross-file static method call to the method, not the class (#825)', async () => {
       // `Foo.bar()` where `Foo` is an imported class must link to the static
       // method `Foo::bar`, NOT to the class `Foo`. Previously the import
