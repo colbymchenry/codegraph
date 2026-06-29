@@ -2,17 +2,27 @@
  * Project-scoped configuration: a committed `codegraph.json` at the project
  * root that a team shares through version control.
  *
- * Today it carries one thing — `extensions`, an opt-in map from a custom file
- * extension to one of CodeGraph's supported languages. The built-in
- * extension → language table (`EXTENSION_MAP` in `extraction/grammars.ts`) is
- * otherwise hardcoded, so a codebase that uses a non-standard extension for a
- * supported language (e.g. `.dota_lua` for Lua) sees those files silently
- * skipped. This lets the project map them once, in a version-controlled file:
+ * Today it carries:
+ *   - `extensions` — an opt-in map from a custom file extension to one of
+ *     CodeGraph's supported languages. The built-in extension → language table
+ *     (`EXTENSION_MAP` in `extraction/grammars.ts`) is otherwise hardcoded, so a
+ *     codebase that uses a non-standard extension for a supported language (e.g.
+ *     `.dota_lua` for Lua) sees those files silently skipped.
+ *   - `exclude` — gitignore-style patterns for git-tracked paths to keep OUT of
+ *     the index (#999), e.g. a committed vendor theme under `static/`.
+ *   - `includeIgnored` — gitignore-style patterns naming gitignored directories
+ *     whose embedded git repos should be indexed anyway (#622, #699).
+ *   - `csharp.mediatrHandlerInterfaces` — additional C# handler interface names
+ *     (e.g. `ICommandHandler`, `IQueryHandler`) for MediatR dispatch bridging.
+ *
+ * Example:
  *
  *   {
- *     "extensions": {
- *       ".dota_lua": "lua",
- *       ".tpl": "php"
+ *     "extensions": { ".dota_lua": "lua" },
+ *     "exclude": ["static/"],
+ *     "includeIgnored": ["packages/"],
+ *     "csharp": {
+ *       "mediatrHandlerInterfaces": ["ICommandHandler", "IQueryHandler"]
  *     }
  *   }
  *
@@ -53,6 +63,11 @@ export interface ProjectConfig {
    * and your `.gitignore`.
    */
   exclude?: string[];
+  /** C#-specific options. */
+  csharp?: {
+    /** Additional handler interface names for MediatR dispatch bridging. */
+    mediatrHandlerInterfaces?: string[];
+  };
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -60,6 +75,7 @@ interface ParsedConfig {
   extensions: Record<string, Language>;
   includeIgnored: string[];
   exclude: string[];
+  mediatrHandlerInterfaces: string[];
 }
 
 interface CacheEntry {
@@ -77,11 +93,19 @@ const cache = new Map<string, CacheEntry>();
 
 /** Shared frozen empties so the no-config path allocates nothing. */
 const EMPTY_EXTENSIONS: Record<string, Language> = Object.freeze({});
+const EMPTY_MEDIATR_HANDLER_INTERFACES: string[] = Object.freeze([]) as unknown as string[];
 const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   extensions: EMPTY_EXTENSIONS,
   includeIgnored: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
+  mediatrHandlerInterfaces: EMPTY_MEDIATR_HANDLER_INTERFACES,
 });
+
+/** Built-in MediatR handler interfaces — always recognized; config duplicates are ignored. */
+const BUILTIN_MEDIATR_HANDLER_INTERFACES = new Set(['IRequestHandler', 'INotificationHandler']);
+
+/** A C# identifier suitable for an interface name in handler detection. */
+const CSHARP_IDENTIFIER_RE = /^[A-Za-z_]\w*$/;
 
 /**
  * Normalize a user-provided extension key to the `.ext` lowercase form used by
@@ -132,10 +156,16 @@ function parseConfig(file: string): ParsedConfig {
   const extensions = extractExtensions(parsed, file);
   const includeIgnored = extractIncludeIgnored(parsed, file);
   const exclude = extractExclude(parsed, file);
-  if (extensions === EMPTY_EXTENSIONS && includeIgnored.length === 0 && exclude.length === 0) {
+  const mediatrHandlerInterfaces = extractCsharpMediatrHandlerInterfaces(parsed, file);
+  if (
+    extensions === EMPTY_EXTENSIONS &&
+    includeIgnored.length === 0 &&
+    exclude.length === 0 &&
+    mediatrHandlerInterfaces.length === 0
+  ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude };
+  return { extensions, includeIgnored, exclude, mediatrHandlerInterfaces };
 }
 
 /**
@@ -215,6 +245,56 @@ function extractExclude(parsed: object, file: string): string[] {
 }
 
 /**
+ * Validate `csharp.mediatrHandlerInterfaces`: an array of C# interface names
+ * to treat as MediatR handlers in addition to the built-in IRequestHandler /
+ * INotificationHandler. Invalid entries warn-and-skip; never throws.
+ */
+function extractCsharpMediatrHandlerInterfaces(parsed: object, file: string): string[] {
+  const csharp = (parsed as ProjectConfig).csharp;
+  if (!csharp || typeof csharp !== 'object' || Array.isArray(csharp)) {
+    if (csharp !== undefined) {
+      logWarn(`Ignoring "csharp" in ${PROJECT_CONFIG_FILENAME}: must be an object`, { file });
+    }
+    return [];
+  }
+
+  const raw = csharp.mediatrHandlerInterfaces;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    logWarn(
+      `Ignoring "csharp.mediatrHandlerInterfaces" in ${PROJECT_CONFIG_FILENAME}: must be an array of interface names`,
+      { file },
+    );
+    return [];
+  }
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      logWarn(
+        `Ignoring a "csharp.mediatrHandlerInterfaces" entry in ${PROJECT_CONFIG_FILENAME}: every name must be a non-empty string`,
+        { file },
+      );
+      continue;
+    }
+    const name = entry.trim();
+    if (!CSHARP_IDENTIFIER_RE.test(name)) {
+      logWarn(
+        `Ignoring "csharp.mediatrHandlerInterfaces" entry "${entry}" in ${PROJECT_CONFIG_FILENAME}: not a valid C# identifier`,
+        { file },
+      );
+      continue;
+    }
+    if (BUILTIN_MEDIATR_HANDLER_INTERFACES.has(name)) continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
+}
+
+/**
  * Load the parsed `codegraph.json` for a project, mtime-cached. A missing or
  * malformed file yields the zero-config default. One `stat` (and at most one
  * read/parse) while a single config file is in force, shared across every field.
@@ -273,6 +353,15 @@ export function loadIncludeIgnoredPatterns(rootDir: string): string[] {
  */
 export function loadExcludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).exclude;
+}
+
+/**
+ * Load additional C# MediatR handler interface names from `csharp.mediatrHandlerInterfaces`,
+ * mtime-cached. Built-in `IRequestHandler` / `INotificationHandler` are always recognized
+ * by the synthesizer; this returns only the user-configured extras. Empty when absent.
+ */
+export function loadMediatrHandlerInterfaces(rootDir: string): string[] {
+  return loadParsedConfig(rootDir).mediatrHandlerInterfaces;
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */

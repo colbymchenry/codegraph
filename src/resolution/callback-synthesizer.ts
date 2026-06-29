@@ -28,6 +28,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
+import { loadMediatrHandlerInterfaces } from '../project-config';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -2319,7 +2320,24 @@ function springEventEdges(ctx: ResolutionContext): Edge[] {
 // type must be a known handler request type (so a same-named non-request DTO is never bridged).
 // C# has no `signature` on method nodes, so the handler's request type is read from the class
 // base-list source (`: IRequestHandler<X,…>`), not a param signature.
-const MEDIATR_HANDLER_BASE_RE = /(?:IRequestHandler|INotificationHandler)\s*<\s*([A-Za-z_]\w*)/;
+// base-list source (`: IRequestHandler<X,…>` or a configured alias like
+// `: ICommandHandler<X,…>`), not a param signature. Additional handler interface
+// names come from `codegraph.json` → `csharp.mediatrHandlerInterfaces`.
+const DEFAULT_MEDIATR_HANDLER_INTERFACES = ['IRequestHandler', 'INotificationHandler'];
+
+function buildMediatrHandlerBaseRe(extra: string[]): RegExp {
+  const names = [...DEFAULT_MEDIATR_HANDLER_INTERFACES, ...extra];
+  const escaped = names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  return new RegExp(`(?:${escaped})\\s*<\\s*([A-Za-z_]\\w*)`);
+}
+
+function fileMightHaveMediatrHandlers(content: string, extra: string[]): boolean {
+  for (const name of [...DEFAULT_MEDIATR_HANDLER_INTERFACES, ...extra]) {
+    if (content.includes(`${name}<`)) return true;
+  }
+  return false;
+}
+
 const MEDIATR_DISPATCH_RE = /([A-Za-z_][\w.]*)\s*\.\s*(?:Send|Publish)\s*\(\s*(new\s+[A-Z]\w*|[A-Za-z_]\w*)/g;
 const MEDIATR_RECEIVER_RE = /(?:mediator|sender|publisher)/i;
 const MEDIATR_CS_EXT = /\.cs$/;
@@ -2349,18 +2367,21 @@ function resolveMediatrArgType(arg: string, lines: string[], methodStart: number
 }
 
 function mediatrDispatchEdges(ctx: ResolutionContext): Edge[] {
+  const extra = loadMediatrHandlerInterfaces(ctx.getProjectRoot());
+  const handlerRe = buildMediatrHandlerBaseRe(extra);
+
   // Pass 1 — request/notification type → the Handle method of each handler class.
   const handlers = new Map<string, Node[]>();
   for (const file of ctx.getAllFiles()) {
     if (!MEDIATR_CS_EXT.test(file)) continue;
     const content = ctx.readFile(file);
-    if (!content || (!content.includes('IRequestHandler<') && !content.includes('INotificationHandler<'))) continue;
+    if (!content || !fileMightHaveMediatrHandlers(content, extra)) continue;
     const lines = content.split('\n');
     const nodesInFile = ctx.getNodesInFile(file);
     for (const cls of nodesInFile) {
       if (cls.kind !== 'class') continue;
       const decl = lines.slice(cls.startLine - 1, cls.startLine - 1 + MEDIATR_HANDLER_DECL_LOOKAHEAD).join('\n');
-      const m = MEDIATR_HANDLER_BASE_RE.exec(decl);
+      const m = handlerRe.exec(decl);
       if (!m) continue;
       const type = m[1]!;
       const end = cls.endLine ?? cls.startLine;

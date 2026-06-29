@@ -15,11 +15,18 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { CodeGraph } from '../src';
+import { clearProjectConfigCache } from '../src/project-config';
 
 describe('mediatr-dispatch synthesizer', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mediatr-dispatch-')); });
-  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mediatr-dispatch-'));
+    clearProjectConfigCache();
+  });
+  afterEach(() => {
+    clearProjectConfigCache();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
 
   const write = (rel: string, body: string) => {
     const p = path.join(dir, rel);
@@ -105,6 +112,102 @@ public class ThingsController {
     expect(edges.some((r: any) => r.via === 'UnhandledCommand')).toBe(false);
     expect(edges.some((r: any) => r.source === 'ViaMessagingCenter')).toBe(false);
 
+    cg.close?.();
+  });
+
+  it('bridges Send to handlers implementing configured derived handler interfaces', async () => {
+    write('codegraph.json', JSON.stringify({
+      csharp: { mediatrHandlerInterfaces: ['ICommandHandler', 'IQueryHandler'] },
+    }));
+    write('Requests.cs', `namespace Shop;
+using MediatR;
+public record GetThingsQuery : IRequest<ThingsVm>;
+public record CreateThingCommand(string Name) : IRequest<int>;
+`);
+    write('Handlers.cs', `namespace Shop;
+using System.Threading;
+using System.Threading.Tasks;
+public class GetThingsQueryHandler : IQueryHandler<GetThingsQuery, ThingsVm> {
+    public Task<ThingsVm> Handle(GetThingsQuery request, CancellationToken ct) => Task.FromResult(new ThingsVm());
+}
+public class CreateThingCommandHandler : ICommandHandler<CreateThingCommand, int> {
+    public Task<int> Handle(CreateThingCommand request, CancellationToken ct) => Task.FromResult(1);
+}
+`);
+    write('ThingsController.cs', `namespace Shop;
+using System.Threading.Tasks;
+public class ThingsController {
+    private readonly ISender _mediator;
+    public ThingsController(ISender mediator) { _mediator = mediator; }
+
+    public async Task GetThings() {
+        await _mediator.Send(new GetThingsQuery());
+    }
+    public async Task Create(CreateThingCommand command) {
+        await _mediator.Send(command);
+    }
+}
+`);
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+
+    const edges = db
+      .prepare(
+        `SELECT s.name source, t.name target, json_extract(e.metadata,'$.via') via
+         FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'mediatr-dispatch'`
+      )
+      .all();
+
+    expect(edges.map((r: any) => r.source).sort()).toEqual(['Create', 'GetThings']);
+    expect([...new Set(edges.map((r: any) => r.via))].sort()).toEqual([
+      'CreateThingCommand', 'GetThingsQuery',
+    ]);
+    expect(edges.every((r: any) => r.target === 'Handle')).toBe(true);
+
+    cg.close?.();
+  });
+
+  it('does not bridge derived handler interfaces without codegraph.json config', async () => {
+    write('Requests.cs', `namespace Shop;
+using MediatR;
+public record GetThingsQuery : IRequest<ThingsVm>;
+public record CreateThingCommand(string Name) : IRequest<int>;
+`);
+    write('Handlers.cs', `namespace Shop;
+using System.Threading;
+using System.Threading.Tasks;
+public class GetThingsQueryHandler : IQueryHandler<GetThingsQuery, ThingsVm> {
+    public Task<ThingsVm> Handle(GetThingsQuery request, CancellationToken ct) => Task.FromResult(new ThingsVm());
+}
+public class CreateThingCommandHandler : ICommandHandler<CreateThingCommand, int> {
+    public Task<int> Handle(CreateThingCommand request, CancellationToken ct) => Task.FromResult(1);
+}
+`);
+    write('ThingsController.cs', `namespace Shop;
+using System.Threading.Tasks;
+public class ThingsController {
+    private readonly ISender _mediator;
+    public ThingsController(ISender mediator) { _mediator = mediator; }
+
+    public async Task GetThings() {
+        await _mediator.Send(new GetThingsQuery());
+    }
+    public async Task Create(CreateThingCommand command) {
+        await _mediator.Send(command);
+    }
+}
+`);
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const count = db
+      .prepare(`SELECT count(*) c FROM edges WHERE json_extract(metadata,'$.synthesizedBy') = 'mediatr-dispatch'`)
+      .get();
+    expect(count.c).toBe(0);
     cg.close?.();
   });
 
