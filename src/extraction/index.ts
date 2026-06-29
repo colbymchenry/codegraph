@@ -168,12 +168,35 @@ const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
   '.cache',
 ]);
 
+/**
+ * Android resource directory types. A `res/` tree holds ONLY non-code resources —
+ * layouts, drawables, value bags (strings/colors/styles), menus, navigation
+ * graphs — split into one typed subdirectory per kind, optionally density/locale/
+ * version-qualified (`values-es`, `drawable-hdpi`, `layout-v21`, …). None of it
+ * yields an extractable code symbol, yet on an Android app it DOMINATES the tree
+ * (one report: 26k XML files = 97% of the project, 0 symbols), bloating the DB,
+ * slowing indexing, and skewing both the file count and `codegraph_explore`
+ * results (#1047). So these are excluded by default. The structure is
+ * self-identifying — a non-Android project has no `res/layout/` etc., so it's
+ * untouched — and the only XML that DOES produce symbols (MyBatis mappers) lives
+ * under `src/main/resources/`, never `res/`, so nothing useful is dropped.
+ * `res/raw/` is deliberately NOT here: it holds arbitrary bundled assets that can
+ * be code-ish (a `.sql` schema, a `.js`), so we leave it indexed. Override any of
+ * these with a `.gitignore` negation (e.g. `!res/values/`).
+ */
+const ANDROID_RES_TYPES: readonly string[] = [
+  'anim', 'animator', 'color', 'drawable', 'font', 'layout',
+  'menu', 'mipmap', 'navigation', 'transition', 'values', 'xml',
+];
+
 /** Gitignore-style patterns for the `ignore` matcher: the dirs above plus a few globs. */
 const DEFAULT_IGNORE_PATTERNS: string[] = [
   ...Array.from(DEFAULT_IGNORE_DIRS, (d) => `${d}/`),
   '*.egg-info/',     // Python packaging metadata
   'cmake-build-*/',  // CLion / CMake build trees
   'bazel-*/',        // Bazel output symlink trees
+  // Android resource dirs at any depth, with their qualifier variants (#1047).
+  ...ANDROID_RES_TYPES.map((t) => `**/res/${t}*/`),
 ];
 
 /** True if `buf` decodes as strict UTF-8 (no invalid byte sequences). */
