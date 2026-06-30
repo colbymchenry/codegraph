@@ -221,31 +221,45 @@ function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionContext): 
     registrars.set(field, arr);
   };
 
+  const nodesByFile = new Map<string, Node[]>();
   for (const m of methodAndFunctionNodes(queries)) {
-    const content = ctx.readFile(m.filePath);
-    const src = content && sliceLines(content, m.startLine, m.endLine);
-    if (!src) continue;
-    const hasForEach = src.includes('.forEach');
-    const hasAppend = src.includes('.append(') || src.includes('.add(') || src.includes('.push(') || src.includes('.insert(');
-    if (!hasForEach && !hasAppend) continue;
-    const lineAt = (idx: number) => (m.startLine ?? 1) + src.slice(0, idx).split('\n').length - 1;
+    const arr = nodesByFile.get(m.filePath) ?? [];
+    arr.push(m);
+    nodesByFile.set(m.filePath, arr);
+  }
 
-    if (hasForEach) {
-      CC_DISPATCH_RE.lastIndex = 0;
-      let d: RegExpExecArray | null;
-      while ((d = CC_DISPATCH_RE.exec(src))) {
-        const arr = dispatchers.get(d[1]!) ?? [];
-        if (!arr.some((n) => n.node.id === m.id)) arr.push({ node: m, line: lineAt(d.index) });
-        dispatchers.set(d[1]!, arr);
+  for (const [filePath, nodes] of nodesByFile) {
+    if (isGeneratedFile(filePath)) continue;
+    const content = ctx.readFile(filePath);
+    if (!content) continue;
+    const newlineCount = (content.match(/\n/g)?.length ?? 0) + 1;
+    if (content.length / newlineCount > 200) continue;
+
+    for (const m of nodes) {
+      const src = sliceLines(content, m.startLine, m.endLine);
+      if (!src) continue;
+      const hasForEach = src.includes('.forEach');
+      const hasAppend = src.includes('.append(') || src.includes('.add(') || src.includes('.push(') || src.includes('.insert(');
+      if (!hasForEach && !hasAppend) continue;
+      const lineAt = (idx: number) => (m.startLine ?? 1) + src.slice(0, idx).split('\n').length - 1;
+
+      if (hasForEach) {
+        CC_DISPATCH_RE.lastIndex = 0;
+        let d: RegExpExecArray | null;
+        while ((d = CC_DISPATCH_RE.exec(src))) {
+          const arr = dispatchers.get(d[1]!) ?? [];
+          if (!arr.some((n) => n.node.id === m.id)) arr.push({ node: m, line: lineAt(d.index) });
+          dispatchers.set(d[1]!, arr);
+        }
       }
-    }
-    if (hasAppend) {
-      CC_APPEND_WRITE_RE.lastIndex = 0;
-      let w: RegExpExecArray | null;
-      while ((w = CC_APPEND_WRITE_RE.exec(src))) addReg(w[2] || w[1], m, lineAt(w.index)); // nested `$0.streams` else the `.write` receiver
-      CC_APPEND_DIRECT_RE.lastIndex = 0;
-      let a: RegExpExecArray | null;
-      while ((a = CC_APPEND_DIRECT_RE.exec(src))) addReg(a[1], m, lineAt(a.index));
+      if (hasAppend) {
+        CC_APPEND_WRITE_RE.lastIndex = 0;
+        let w: RegExpExecArray | null;
+        while ((w = CC_APPEND_WRITE_RE.exec(src))) addReg(w[2] || w[1], m, lineAt(w.index)); // nested `$0.streams` else the `.write` receiver
+        CC_APPEND_DIRECT_RE.lastIndex = 0;
+        let a: RegExpExecArray | null;
+        while ((a = CC_APPEND_DIRECT_RE.exec(src))) addReg(a[1], m, lineAt(a.index));
+      }
     }
   }
 

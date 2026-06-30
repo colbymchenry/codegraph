@@ -121,4 +121,75 @@ describe('closure-collection synthesizer', () => {
     expect(rows.some((r: any) => r.field === 'names')).toBe(false);
     expect(rows.some((r: any) => r.target_name === 'addName')).toBe(false);
   });
+
+  it('skips minified-style closure-collection files while still indexing their methods', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'Request.swift'),
+      `class Request {
+    var validators: [() -> Void] = []
+
+    func didCompleteTask() {
+        validators.forEach { $0() }
+    }
+}
+`
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'DataRequest.swift'),
+      `class DataRequest: Request {
+    func validate(_ validation: @escaping () -> Void) -> Self {
+        let validator: () -> Void = { validation() }
+        validators.append(validator)
+        return self
+    }
+}
+`
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'Minified.swift'),
+      `class MinifiedRequest { var handlers: [() -> Void] = []; func runHandlers() { handlers.forEach { $0() } } } class MinifiedDataRequest: MinifiedRequest { func addHandler(_ handler: @escaping () -> Void) -> Self { handlers.append(handler); return self } } // ${'x'.repeat(280)}`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+
+    const db = (cg as any).db.db;
+    const rows = db
+      .prepare(
+        `SELECT s.name source_name, s.file_path source_file,
+                t.name target_name, t.file_path target_file,
+                json_extract(e.metadata,'$.registeredAt') registeredAt
+         FROM edges e
+         JOIN nodes s ON s.id = e.source
+         JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'closure-collection'
+         ORDER BY s.file_path, t.file_path`
+      )
+      .all();
+    const minifiedMethods = db
+      .prepare(
+        `SELECT name
+         FROM nodes
+         WHERE file_path = 'Minified.swift' AND kind = 'method'
+         ORDER BY name`
+      )
+      .all()
+      .map((r: any) => r.name);
+    cg.close?.();
+
+    expect(minifiedMethods).toEqual(['addHandler', 'runHandlers']);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      source_name: 'didCompleteTask',
+      source_file: 'Request.swift',
+      target_name: 'validate',
+      target_file: 'DataRequest.swift',
+    });
+    expect(rows[0].registeredAt).toMatch(/DataRequest\.swift:\d+/);
+    expect(rows.some((r: any) => r.target_name === 'addHandler')).toBe(false);
+    expect(rows.some((r: any) => String(r.registeredAt).includes('Minified.swift'))).toBe(false);
+  });
 });
