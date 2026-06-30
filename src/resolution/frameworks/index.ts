@@ -27,7 +27,7 @@ import { swiftObjcBridgeResolver } from './swift-objc';
 import { reactNativeBridgeResolver } from './react-native';
 import { expoModulesResolver } from './expo-modules';
 import { fabricViewResolver } from './fabric';
-import { qmlQtResolver } from './qml-qt';
+import { qtResolver } from './qt';
 
 /**
  * All registered framework resolvers
@@ -71,7 +71,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   expoModulesResolver,
   // React Native Fabric / Codegen view components — TS spec → component nodes
   fabricViewResolver,
-  qmlQtResolver,
+  qtResolver,
 ];
 
 /**
@@ -85,7 +85,8 @@ export function getAllFrameworkResolvers(): FrameworkResolver[] {
  * Get a resolver by name
  */
 export function getFrameworkResolver(name: string): FrameworkResolver | undefined {
-  return FRAMEWORK_RESOLVERS.find((r) => r.name === name);
+  const lookupName = name === 'qml-qt' ? 'qt' : name;
+  return FRAMEWORK_RESOLVERS.find((r) => r.name === lookupName);
 }
 
 /**
@@ -148,4 +149,5 @@ export { swiftObjcBridgeResolver } from './swift-objc';
 export { reactNativeBridgeResolver } from './react-native';
 export { expoModulesResolver } from './expo-modules';
 export { fabricViewResolver } from './fabric';
+export { qtResolver } from './qt';
 export { qmlQtResolver } from './qml-qt';
