@@ -7688,4 +7688,69 @@ import foo.cfm;
       expect(containsFn).toBeDefined();
     });
   });
+
+  describe('<cfscript> nested inside control-flow tags (<cfif>/<cfloop>/<cftry>)', () => {
+    it('should delegate a <cfscript> body nested inside <cfif> within a <cffunction>', () => {
+      const code = `<cfcomponent>
+<cffunction name="doStuff">
+  <cfif true>
+    <cfscript>
+      helper();
+    </cfscript>
+  </cfif>
+</cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('Nested.cfc', code);
+      const doStuff = result.nodes.find((n) => n.kind === 'method' && n.name === 'doStuff');
+      expect(doStuff).toBeDefined();
+      const helperCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'helper'
+      );
+      expect(helperCall?.fromNodeId).toBe(doStuff?.id);
+    });
+
+    it('should delegate a <cfscript> body nested inside <cfif> at top-level component scope', () => {
+      const code = `<cfcomponent>
+<cfif true>
+  <cfscript>
+    topLevelHelper();
+  </cfscript>
+</cfif>
+</cfcomponent>
+`;
+      const result = extractFromSource('Nested2.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls).toBeDefined();
+      const helperCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'topLevelHelper'
+      );
+      expect(helperCall?.fromNodeId).toBe(cls?.id);
+    });
+  });
+
+  describe('<cfquery> SQL bodies (cfquery grammar)', () => {
+    it('should extract a call expression embedded in a #hash# inside the SQL body', () => {
+      const code = `<cfcomponent>
+<cffunction name="getUsers">
+  <cfquery name="qUsers" datasource="#variables.dsn#">
+    SELECT id, name FROM users WHERE owner = #getCurrentUser().getId()#
+  </cfquery>
+  <cfreturn qUsers>
+</cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('Query.cfc', code);
+      const getUsers = result.nodes.find((n) => n.kind === 'method' && n.name === 'getUsers');
+      expect(getUsers).toBeDefined();
+      const getCurrentUserCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'getCurrentUser'
+      );
+      expect(getCurrentUserCall?.fromNodeId).toBe(getUsers?.id);
+      const getIdCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'getId'
+      );
+      expect(getIdCall?.fromNodeId).toBe(getUsers?.id);
+    });
+  });
 });

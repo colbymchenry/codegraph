@@ -150,6 +150,10 @@ export class CfmlExtractor {
         this.extractFunctionTag(child, undefined, fileNodeId);
       } else if (child.type === 'cf_script_tag') {
         this.delegateScriptTag(child, fileNodeId);
+      } else if (child.type === 'cf_query_tag') {
+        this.delegateQueryTag(child, fileNodeId);
+      } else {
+        this.delegateNestedTags(child, fileNodeId);
       }
       child = child.nextSibling;
     }
@@ -224,6 +228,10 @@ export class CfmlExtractor {
         this.extractFunctionTag(sibling, classNode.id, classNode.id);
       } else if (sibling.type === 'cf_script_tag') {
         this.delegateScriptTag(sibling, classNode.id);
+      } else if (sibling.type === 'cf_query_tag') {
+        this.delegateQueryTag(sibling, classNode.id);
+      } else {
+        this.delegateNestedTags(sibling, classNode.id);
       }
       lastNode = sibling;
       sibling = sibling.nextSibling;
@@ -273,11 +281,32 @@ export class CfmlExtractor {
       this.edges.push({ source: containerId, target: fnNode.id, kind: 'contains' });
     }
 
-    // Delegate any <cfscript> bodies nested inside this function.
-    for (let i = 0; i < tag.namedChildCount; i++) {
-      const child = tag.namedChild(i);
-      if (child?.type === 'cf_script_tag') {
-        this.delegateScriptTag(child, fnNode.id);
+    // Delegate any <cfscript>/<cfquery> bodies nested inside this function, at
+    // any depth (e.g. inside <cfif>/<cfloop>/<cftry> control-flow tags).
+    this.delegateNestedTags(tag, fnNode.id);
+  }
+
+  /**
+   * Recursively delegates any `cf_script_tag`/`cf_query_tag` found within
+   * `node`'s subtree — e.g. a `<cfscript>`/`<cfquery>` nested inside
+   * `<cfif>`/`<cfloop>`/`<cftry>` control-flow tags, which (unlike
+   * `<cfcomponent>`'s body — see the implicit-end-tag note on `extractComponent`)
+   * ARE normal children, just possibly several levels deep, so a direct-children
+   * check misses them. Does not descend into a nested `cf_function_tag` — that
+   * has its own scope and is walked separately.
+   */
+  private delegateNestedTags(node: SyntaxNode, containerId: string | undefined): void {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (!child) continue;
+      if (child.type === 'cf_script_tag') {
+        this.delegateScriptTag(child, containerId);
+      } else if (child.type === 'cf_query_tag') {
+        this.delegateQueryTag(child, containerId);
+      } else if (child.type === 'cf_function_tag') {
+        continue;
+      } else {
+        this.delegateNestedTags(child, containerId);
       }
     }
   }
@@ -322,6 +351,40 @@ export class CfmlExtractor {
       // top-level script in a .cfm template, or any statement directly in
       // the snippet body) attribute to the filtered-out snippet file node by
       // default — redirect those (and any genuinely unset ones) to parentId.
+      if ((!ref.fromNodeId || ref.fromNodeId === innerFileNodeId) && parentId) ref.fromNodeId = parentId;
+      this.unresolvedReferences.push(ref);
+    }
+    for (const error of result.errors) {
+      if (error.line) error.line += startLine;
+      this.errors.push(error);
+    }
+  }
+
+  /**
+   * Delegate a `<cfquery>...</cfquery>` tag's SQL body to the `cfquery` grammar.
+   * `#hash#` expressions inside the SQL (e.g. `#getCurrentUser().getId()#` in a
+   * WHERE clause) are real CFML calls/references — tree-sitter-cfml's `cfquery`
+   * grammar parses them structurally (same `call_expression`/`member_expression`
+   * shape as cfscript), so without this delegation they're silently dropped as
+   * opaque SQL text. The grammar models no other symbols, so only call/reference
+   * extraction is relevant here — unlike `delegateScriptTag`, there are no nodes
+   * or contains-edges to merge.
+   */
+  private delegateQueryTag(queryTag: SyntaxNode, parentId: string | undefined): void {
+    const content = queryTag.namedChildren.find((c: SyntaxNode) => c.type === 'cf_query_content');
+    if (!content) return;
+
+    const sql = this.source.substring(content.startIndex, content.endIndex);
+    const startLine = content.startPosition.row;
+
+    const extractor = new TreeSitterExtractor(this.filePath, sql, 'cfquery');
+    const result = extractor.extract();
+
+    const innerFileNodeId = result.nodes.find((n) => n.kind === 'file')?.id;
+    for (const ref of result.unresolvedReferences) {
+      ref.line += startLine;
+      ref.filePath = this.filePath;
+      ref.language = this.language;
       if ((!ref.fromNodeId || ref.fromNodeId === innerFileNodeId) && parentId) ref.fromNodeId = parentId;
       this.unresolvedReferences.push(ref);
     }

@@ -41,6 +41,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   objc: 'tree-sitter-objc.wasm',
   cfml: 'tree-sitter-cfml.wasm',
   cfscript: 'tree-sitter-cfscript.wasm',
+  cfquery: 'tree-sitter-cfquery.wasm',
 };
 
 /**
@@ -206,11 +207,12 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
     languages = [...languages, 'typescript', 'javascript'];
   }
 
-  // CFML (.cfc/.cfm) delegates bare-script content and <cfscript> tag bodies to
-  // the cfscript grammar (see injections.scm in tree-sitter-cfml) — load it even
-  // when no standalone .cfs file is in the index set.
+  // CFML (.cfc/.cfm) delegates bare-script content, <cfscript> tag bodies, and
+  // <cfquery> SQL bodies to the cfscript/cfquery grammars (see injections.scm in
+  // tree-sitter-cfml) — load both even when no standalone .cfs file is in the
+  // index set.
   if (languages.some((l) => l === 'cfml')) {
-    languages = [...languages, 'cfscript'];
+    languages = [...languages, 'cfscript', 'cfquery'];
   }
 
   // Deduplicate and filter to languages that have WASM grammars and aren't already loaded
@@ -235,7 +237,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
       // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
       // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -452,6 +454,7 @@ export function getLanguageDisplayName(language: Language): string {
     properties: 'Java properties',
     cfml: 'CFML',
     cfscript: 'CFScript',
+    cfquery: 'CFQuery (SQL)',
     unknown: 'Unknown',
   };
   return names[language] || language;

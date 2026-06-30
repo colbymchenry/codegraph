@@ -97,6 +97,7 @@ export const LANGUAGES = [
   'properties',
   'cfml',
   'cfscript',
+  'cfquery',
   'unknown',
 ] as const;
 
