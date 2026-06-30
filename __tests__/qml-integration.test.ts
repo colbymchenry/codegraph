@@ -1663,6 +1663,7 @@ Item {
     const graph = cg!;
     await graph.indexAll();
 
-    expect(graph.getDetectedFrameworks()).toContain('qml-qt');
+    expect(graph.getDetectedFrameworks()).toContain('qt');
+    expect(graph.getDetectedFrameworks()).not.toContain('qml-qt');
   });
 });

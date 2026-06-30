@@ -19,7 +19,12 @@ describe('FrameworkResolver.extract interface', () => {
   });
 });
 
-import { getApplicableFrameworks } from '../src/resolution/frameworks';
+import {
+  getApplicableFrameworks,
+  getFrameworkResolver,
+  qmlQtResolver,
+  qtResolver,
+} from '../src/resolution/frameworks';
 import type { FrameworkResolver } from '../src/resolution/types';
 
 describe('getApplicableFrameworks', () => {
@@ -35,6 +40,15 @@ describe('getApplicableFrameworks', () => {
   it('returns anyFw-only when language has no matches', () => {
     const result = getApplicableFrameworks([pyFw, jsFw, anyFw], 'rust');
     expect(result.map(r => r.name)).toEqual(['any']);
+  });
+});
+
+describe('Qt framework resolver compatibility aliases', () => {
+  it('registers qt as the public resolver and keeps qml-qt as a lookup alias', () => {
+    expect(qtResolver.name).toBe('qt');
+    expect(qmlQtResolver).toBe(qtResolver);
+    expect(getFrameworkResolver('qt')).toBe(qtResolver);
+    expect(getFrameworkResolver('qml-qt')).toBe(qtResolver);
   });
 });
 
