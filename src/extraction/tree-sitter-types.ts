@@ -56,6 +56,8 @@ export interface ExtractorContext {
   visitFunctionBody(body: SyntaxNode, functionId: string): void;
   /** Add an unresolved reference */
   addUnresolvedReference(ref: UnresolvedReference): void;
+  /** Extract type references (type_identifier nodes) from an AST subtree and emit unresolved 'references' edges */
+  extractTypeAnnotations(node: SyntaxNode, nodeId: string): void;
   /** Push a node ID onto the scope stack (for containment/qualified name building) */
   pushScope(nodeId: string): void;
   /** Pop the last node ID from the scope stack */

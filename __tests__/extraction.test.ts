@@ -7643,3 +7643,265 @@ GeomPoint <- ggproto("GeomPoint", Geom,
     });
   });
 });
+
+describe('ReScript Extraction', () => {
+  it('should extract function declarations', () => {
+    const code = `
+let makeUser = (id: int, name: string): user => {
+  {id, name}
+}
+`;
+    const result = extractFromSource('User.res', code);
+
+    const funcNode = result.nodes.find((n) => n.kind === 'function');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.name).toBe('makeUser');
+    expect(funcNode?.signature).toContain('(id: int, name: string)');
+    expect(funcNode?.language).toBe('rescript');
+  });
+
+  it('should extract constant declarations (immutable let bindings)', () => {
+    const code = `
+let greeting = "Hello"
+let count = 42
+`;
+    const result = extractFromSource('Vars.res', code);
+
+    const constants = result.nodes.filter((n) => n.kind === 'constant');
+    expect(constants.length).toBe(2);
+    expect(constants.find((n) => n.name === 'greeting')).toBeDefined();
+    expect(constants.find((n) => n.name === 'count')).toBeDefined();
+  });
+
+  it('should extract module declarations', () => {
+    const code = `
+module Utils = {
+  let add = (a: int, b: int): int => {
+    a + b
+  }
+}
+`;
+    const result = extractFromSource('Utils.res', code);
+
+    const moduleNode = result.nodes.find((n) => n.kind === 'module');
+    expect(moduleNode).toBeDefined();
+    expect(moduleNode?.name).toBe('Utils');
+
+    const funcNode = result.nodes.find((n) => n.kind === 'function');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.name).toBe('add');
+  });
+
+  it('should extract record types as structs', () => {
+    const code = `
+type user = {
+  id: int,
+  name: string,
+}
+`;
+    const result = extractFromSource('Types.res', code);
+
+    const structNode = result.nodes.find((n) => n.kind === 'struct');
+    expect(structNode).toBeDefined();
+    expect(structNode?.name).toBe('user');
+
+    const fields = result.nodes.filter((n) => n.kind === 'field');
+    expect(fields.length).toBe(2);
+    expect(fields.find((n) => n.name === 'id')).toBeDefined();
+    expect(fields.find((n) => n.name === 'name')).toBeDefined();
+  });
+
+  it('should extract variant types as enums', () => {
+    const code = `
+type status = | Pending | Done | Error
+`;
+    const result = extractFromSource('Status.res', code);
+
+    const enumNode = result.nodes.find((n) => n.kind === 'enum');
+    expect(enumNode).toBeDefined();
+    expect(enumNode?.name).toBe('status');
+
+    const members = result.nodes.filter((n) => n.kind === 'enum_member');
+    expect(members.length).toBe(3);
+    expect(members.find((n) => n.name === 'Pending')).toBeDefined();
+    expect(members.find((n) => n.name === 'Done')).toBeDefined();
+    expect(members.find((n) => n.name === 'Error')).toBeDefined();
+  });
+
+  it('should extract open statements as imports', () => {
+    const code = `
+open Belt
+`;
+    const result = extractFromSource('Imports.res', code);
+
+    const importNode = result.nodes.find((n) => n.kind === 'import');
+    expect(importNode).toBeDefined();
+    expect(importNode?.name).toBe('Belt');
+  });
+
+  it('should extract call expressions', () => {
+    const code = `
+let greet = () => {
+  Js.log("hello")
+  Belt.Array.map([1, 2], x => x)
+}
+`;
+    const result = extractFromSource('Calls.res', code);
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    expect(calls.find((r) => r.referenceName === 'Js.log')).toBeDefined();
+    expect(calls.find((r) => r.referenceName === 'Belt.Array.map')).toBeDefined();
+  });
+
+  it('should emit references edges for function parameter and return types', () => {
+    const code = `
+let makeUser = (id: int, name: string): user => {
+  {id, name}
+}
+`;
+    const result = extractFromSource('TypeRefs.res', code);
+
+    const typeRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(typeRefs.find((r) => r.referenceName === 'user')).toBeDefined();
+    expect(typeRefs.find((r) => r.referenceName === 'int')).toBeUndefined();
+    expect(typeRefs.find((r) => r.referenceName === 'string')).toBeUndefined();
+  });
+
+  it('should emit references edges for record field types', () => {
+    const code = `
+type user = {
+  id: int,
+  name: string,
+  role: role_type,
+}
+`;
+    const result = extractFromSource('RecordTypeRefs.res', code);
+
+    const typeRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(typeRefs.find((r) => r.referenceName === 'role_type')).toBeDefined();
+    expect(typeRefs.find((r) => r.referenceName === 'int')).toBeUndefined();
+    expect(typeRefs.find((r) => r.referenceName === 'string')).toBeUndefined();
+  });
+
+  it('should emit references edges for generic types', () => {
+    const code = `
+let process = (x: myOption<int>): myResult<int, string> => {
+  x
+}
+`;
+    const result = extractFromSource('GenericTypeRefs.res', code);
+
+    const typeRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(typeRefs.find((r) => r.referenceName === 'myOption')).toBeDefined();
+    expect(typeRefs.find((r) => r.referenceName === 'myResult')).toBeDefined();
+    expect(typeRefs.find((r) => r.referenceName === 'int')).toBeUndefined();
+    expect(typeRefs.find((r) => r.referenceName === 'string')).toBeUndefined();
+  });
+
+  it('should emit references edges for typed variable declarations', () => {
+    const code = `
+let x: userId = 42
+`;
+    const result = extractFromSource('TypedVar.res', code);
+
+    const typeRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    expect(typeRefs.find((r) => r.referenceName === 'userId')).toBeDefined();
+  });
+
+  it('should extract abstract type aliases', () => {
+    const code = `
+type userId
+`;
+    const result = extractFromSource('AbstractType.res', code);
+
+    const aliasNode = result.nodes.find((n) => n.kind === 'type_alias');
+    expect(aliasNode).toBeDefined();
+    expect(aliasNode?.name).toBe('userId');
+  });
+
+  it('should extract nested modules', () => {
+    const code = `
+module Outer = {
+  module Inner = {
+    let value = 1
+  }
+}
+`;
+    const result = extractFromSource('NestedModules.res', code);
+
+    const modules = result.nodes.filter((n) => n.kind === 'module');
+    expect(modules.length).toBe(2);
+    expect(modules.find((n) => n.name === 'Outer')).toBeDefined();
+    expect(modules.find((n) => n.name === 'Inner')).toBeDefined();
+
+    const constant = result.nodes.find((n) => n.name === 'value' && n.kind === 'constant');
+    expect(constant).toBeDefined();
+  });
+
+  it('should gracefully skip destructuring patterns', () => {
+    const code = `
+let {id, name} = user
+`;
+    const result = extractFromSource('Destructuring.res', code);
+
+    const namedNodes = result.nodes.filter((n) => n.name === 'id' || n.name === 'name');
+    expect(namedNodes.length).toBe(0);
+    expect(result.errors.length).toBe(0);
+  });
+
+  it('should create contains edges from module to its members', () => {
+    const code = `
+module Utils = {
+  let add = (a: int, b: int): int => {
+    a + b
+  }
+}
+`;
+    const result = extractFromSource('Utils.res', code);
+
+    const moduleNode = result.nodes.find((n) => n.kind === 'module');
+    const funcNode = result.nodes.find((n) => n.kind === 'function');
+    expect(moduleNode).toBeDefined();
+    expect(funcNode).toBeDefined();
+
+    const containsEdge = result.edges.find(
+      (e) => e.source === moduleNode?.id && e.target === funcNode?.id && e.kind === 'contains'
+    );
+    expect(containsEdge).toBeDefined();
+  });
+
+  it('should extract unit functions (no parameters)', () => {
+    const code = `
+let init = () => {
+  Js.log("init")
+}
+`;
+    const result = extractFromSource('UnitFunc.res', code);
+
+    const funcNode = result.nodes.find((n) => n.kind === 'function');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.name).toBe('init');
+    expect(funcNode?.signature).toBe('()');
+  });
+
+  it('should extract decorators as decorates references', () => {
+    const code = `
+@react.component
+let make = (~name: string) => {
+  <div> {React.string(name)} </div>
+}
+`;
+    const result = extractFromSource('Decorator.res', code);
+
+    const funcNode = result.nodes.find((n) => n.kind === 'function');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.name).toBe('make');
+
+    const decoratorRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'decorates' && r.referenceName === 'react.component'
+    );
+    expect(decoratorRef).toBeDefined();
+    expect(decoratorRef?.fromNodeId).toBe(funcNode?.id);
+  });
+});
