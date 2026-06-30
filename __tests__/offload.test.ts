@@ -34,7 +34,8 @@ describe('reasoning offload', () => {
     'CODEGRAPH_OFFLOAD_URL', 'CODEGRAPH_OFFLOAD_MODEL', 'CODEGRAPH_OFFLOAD_KEY',
     'CODEGRAPH_OFFLOAD_EFFORT', 'CODEGRAPH_OFFLOAD_STYLE', 'CODEGRAPH_OFFLOAD_TIMEOUT_MS',
     'CODEGRAPH_OFFLOAD_MAXTOKENS', 'CODEGRAPH_OFFLOAD_STRIP', 'CODEGRAPH_OFFLOAD_DEBUG',
-    'CODEGRAPH_OFFLOAD_DISABLE', 'CODEGRAPH_OFFLOAD_USAGE_LOG', 'CEREBRAS_API_KEY',
+    'CODEGRAPH_OFFLOAD_DISABLE', 'CODEGRAPH_OFFLOAD_USAGE_LOG', 'CODEGRAPH_OFFLOAD_PROVIDERS',
+    'CEREBRAS_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY',
   ];
   let saved: Record<string, string | undefined>;
 
@@ -115,6 +116,44 @@ describe('reasoning offload', () => {
       const c = resolveOffload();
       expect(c.apiKey).toBe('sk-direct');
       expect(c.keySource).toBe('CODEGRAPH_OFFLOAD_KEY');
+    });
+
+    it('resolves an ordered provider chain from config without persisting secrets', () => {
+      writeOffloadConfig({
+        providers: [
+          { name: 'ollama', url: 'http://localhost:11434/v1', model: 'qwen3' },
+          { name: 'openai', url: 'https://api.openai.com/v1', model: 'gpt-4.1-mini', keyEnv: 'OPENAI_API_KEY' },
+          { name: 'gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash', keyEnv: 'GEMINI_API_KEY' },
+        ],
+      });
+      process.env.OPENAI_API_KEY = 'sk-openai';
+      process.env.GEMINI_API_KEY = 'sk-gemini';
+
+      const c = resolveOffload();
+      expect(c.enabled).toBe(true);
+      expect(c.providers.map((p) => p.name)).toEqual(['ollama', 'openai', 'gemini']);
+      expect(c.url).toBe('http://localhost:11434/v1');
+      expect(c.model).toBe('qwen3');
+      expect(c.providers[1].apiKey).toBe('sk-openai');
+      expect(c.providers[2].apiKey).toBe('sk-gemini');
+
+      const raw = fs.readFileSync(path.join(home, '.codegraph', 'config.json'), 'utf8');
+      expect(raw).toContain('OPENAI_API_KEY');
+      expect(raw).not.toContain('sk-openai');
+      expect(raw).not.toContain('sk-gemini');
+    });
+
+    it('lets CODEGRAPH_OFFLOAD_PROVIDERS replace the file chain for ephemeral provider fallback', () => {
+      writeOffloadConfig({ providers: [{ name: 'file', url: 'https://file.example/v1' }] });
+      process.env.CODEGRAPH_OFFLOAD_PROVIDERS = JSON.stringify([
+        { name: 'ollama', url: 'http://localhost:11434/v1', model: 'qwen3' },
+        { name: 'openai', url: 'https://api.openai.com/v1', model: 'gpt-4.1-mini', key: 'sk-env-only' },
+      ]);
+      const c = resolveOffload();
+      expect(c.origin).toBe('env');
+      expect(c.providers.map((p) => p.name)).toEqual(['ollama', 'openai']);
+      expect(c.providers[1].apiKey).toBe('sk-env-only');
+      expect(c.providers[1].keySource).toBe('CODEGRAPH_OFFLOAD_PROVIDERS');
     });
   });
 
@@ -225,6 +264,53 @@ describe('reasoning offload', () => {
       expect(body.model).toBe('gpt-oss-120b');
       expect(body.messages[1].content).toContain('source here');
       expect(body.messages[1].content).toContain('how does X work');
+    });
+
+    it('falls back across provider endpoints when the first provider is rate-limited', async () => {
+      writeOffloadConfig({
+        providers: [
+          { name: 'ollama', url: 'http://localhost:11434/v1', model: 'qwen3' },
+          { name: 'openai', url: 'https://api.openai.com/v1', model: 'gpt-4.1-mini', keyEnv: 'OPENAI_API_KEY' },
+          { name: 'gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash', keyEnv: 'GEMINI_API_KEY' },
+        ],
+      });
+      process.env.OPENAI_API_KEY = 'sk-openai';
+      process.env.GEMINI_API_KEY = 'sk-gemini';
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({ ok: false, status: 429, text: async () => 'rate limited' })
+        .mockResolvedValueOnce({
+          ok: true, status: 200,
+          json: async () => ({ choices: [{ message: { content: 'Coverage: full.\nOpenAI answer.' }, finish_reason: 'stop' }] }),
+        });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const out = await synthesizeOffload({ query: 'q', context: 'ctx' });
+      expect(out).toContain('OpenAI answer.');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[0][0]).toBe('http://localhost:11434/v1/chat/completions');
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body as string).model).toBe('qwen3');
+      expect(fetchMock.mock.calls[0][1].headers.authorization).toBeUndefined();
+      expect(fetchMock.mock.calls[1][0]).toBe('https://api.openai.com/v1/chat/completions');
+      expect((fetchMock.mock.calls[1][1].headers as Record<string, string>).authorization).toBe('Bearer sk-openai');
+      expect(JSON.parse(fetchMock.mock.calls[1][1].body as string).model).toBe('gpt-4.1-mini');
+    });
+
+    it('tries the next provider after an empty answer and returns null only after all providers fail', async () => {
+      writeOffloadConfig({
+        providers: [
+          { name: 'ollama', url: 'http://localhost:11434/v1', model: 'qwen3' },
+          { name: 'gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash', keyEnv: 'GEMINI_API_KEY' },
+        ],
+      });
+      process.env.GEMINI_API_KEY = 'sk-gemini';
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '   ' } }] }) })
+        .mockResolvedValueOnce({ ok: false, status: 500, text: async () => 'boom' });
+      vi.stubGlobal('fetch', fetchMock);
+
+      expect(await synthesizeOffload({ query: 'q', context: 'ctx' })).toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls[1][0]).toBe('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions');
     });
   });
 
