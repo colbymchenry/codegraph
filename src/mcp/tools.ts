@@ -6,7 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot } from '../directory';
+import { findNearestCodeGraphRoot, canonicalRootKey } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -1082,6 +1082,16 @@ export class ToolHandler {
       );
     }
 
+    // Identity-key the open connection by FILESYSTEM identity (dev:ino), not the
+    // path string. Two spellings of one repo — a symlinked checkout, or a
+    // case-variant on a case-insensitive mount (NTFS, or WSL DrvFs `/mnt/c`) —
+    // must share ONE connection; a second connection to the same
+    // `.codegraph/codegraph.db` corrupts the index (#1057, same second-connection
+    // mechanism as #238 below). realpath alone can't dedupe case-variants (it
+    // preserves the caller's casing), so we key on the inode, which is identical
+    // for every spelling.
+    const rootKey = canonicalRootKey(resolvedRoot);
+
     // If the path resolves to the default project, reuse the already-open
     // default instance rather than opening a SECOND connection to the same DB.
     // A duplicate connection serializes reads against the watcher's auto-sync
@@ -1089,18 +1099,19 @@ export class ToolHandler {
     // support) that surfaces as intermittent
     // "database is locked" on concurrent tool calls. See issue #238. The
     // default instance is owned/closed by the server, so it's never cached.
-    if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
+    if (this.cg && canonicalRootKey(this.cg.getProjectRoot()) === rootKey) {
       return this.freshen(this.cg);
     }
 
-    // Cache the open DB connection by RESOLVED ROOT only — never by the input
-    // path. One key per instance means closeAll() closes each exactly once, and
-    // a changed resolution maps to a different entry instead of a stale hit.
-    const cached = this.projectCache.get(resolvedRoot);
+    // Cache the open DB connection by ROOT IDENTITY only — never by the input
+    // path. One key per physical index means closeAll() closes each exactly
+    // once, and a changed resolution maps to a different entry instead of a
+    // stale hit.
+    const cached = this.projectCache.get(rootKey);
     if (cached) return this.freshen(cached);
 
     const cg = loadCodeGraph().openSync(resolvedRoot);
-    this.projectCache.set(resolvedRoot, cg);
+    this.projectCache.set(rootKey, cg);
     return cg;
   }
 

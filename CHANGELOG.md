@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Fixed index corruption that could happen when the same project was opened through two different path spellings — a symlinked checkout, or upper/lowercase variants of one path on a case-insensitive drive (Windows NTFS, or a WSL `/mnt` drive). CodeGraph now recognizes these as the same project and shares a single database connection instead of opening a second one that could corrupt the index. (#1057)
+
 
 ## [1.5.0] - 2026-07-21
 
