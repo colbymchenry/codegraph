@@ -10,7 +10,7 @@ import * as path from 'path';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -37,7 +37,9 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   scala: 'tree-sitter-scala.wasm',
   elixir: 'tree-sitter-elixir.wasm',
   lua: 'tree-sitter-lua.wasm',
+  r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
+  objc: 'tree-sitter-objc.wasm',
 };
 
 /**
@@ -46,9 +48,15 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
 export const EXTENSION_MAP: Record<string, Language> = {
   '.ts': 'typescript',
   '.tsx': 'tsx',
+  // ESM/CJS TypeScript module extensions — parsed as TS (no JSX). (#366)
+  '.mts': 'typescript',
+  '.cts': 'typescript',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
+  // SAP HANA XS Classic server-side JavaScript. (#556)
+  '.xsjs': 'javascript',
+  '.xsjslib': 'javascript',
   '.jsx': 'jsx',
   '.py': 'python',
   '.pyw': 'python',
@@ -63,7 +71,21 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.hpp': 'cpp',
   '.hxx': 'cpp',
   '.cs': 'csharp',
+  // ASP.NET Razor / Blazor markup — custom RazorExtractor (links @model/@inject/
+  // component tags to their C# types; markup isn't a tree-sitter grammar).
+  '.cshtml': 'razor',
+  '.razor': 'razor',
   '.php': 'php',
+  // Drupal-specific PHP file extensions
+  '.module': 'php',
+  '.install': 'php',
+  '.theme': 'php',
+  '.inc': 'php',
+  // YAML (used for Drupal routing files; no symbol extraction, file-level tracking only)
+  '.yml': 'yaml',
+  '.yaml': 'yaml',
+  // Twig templates (file-level tracking only, no symbol extraction)
+  '.twig': 'twig',
   '.rb': 'ruby',
   '.rake': 'ruby',
   '.swift': 'swift',
@@ -73,6 +95,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.liquid': 'liquid',
   '.svelte': 'svelte',
   '.vue': 'vue',
+  '.astro': 'astro',
+  '.r': 'r',
   '.pas': 'pascal',
   '.dpr': 'pascal',
   '.dpk': 'pascal',
@@ -85,7 +109,58 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.exs': 'elixir',
   '.lua': 'lua',
   '.luau': 'luau',
+  '.m': 'objc',
+  '.mm': 'objc',
+  // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
+  // shape and emits SQL-statement nodes (other XML returns empty).
+  '.xml': 'xml',
+  // Spring config: `application.properties` / `application-*.properties`. Same
+  // shape as the `.yml` variants — the YAML/properties extractor emits one node
+  // per leaf key, and the Spring resolver links `@Value("${k}")` references.
+  '.properties': 'properties',
 };
+
+/**
+ * Whether a file is one CodeGraph can parse, based purely on its extension.
+ * This is the single source of truth for "should we index this file" — derived
+ * from EXTENSION_MAP so parser support and indexing selection never drift.
+ *
+ * `overrides` is the project's validated custom extension → language map (from
+ * `codegraph.json`); when present its extensions count as indexable in addition
+ * to the built-ins. Omitting it is byte-identical to the zero-config behavior.
+ */
+export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
+  if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
+  if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
+  const dot = filePath.lastIndexOf('.');
+  if (dot < 0) return false;
+  const ext = filePath.slice(dot).toLowerCase();
+  return ext in EXTENSION_MAP || (!!overrides && ext in overrides);
+}
+
+/**
+ * Shopify OS 2.0 JSON template (`templates/*.json`) or section group
+ * (`sections/*.json`) — these reference sections by `"type"`, so the Liquid
+ * extractor links them. (config/ + locales/ JSON have no section refs.)
+ */
+export function isShopifyLiquidJson(filePath: string): boolean {
+  // Allow nested template dirs (`templates/customers/login.json`), not just
+  // top-level (`templates/product.json`).
+  return /(^|\/)(templates|sections)\/.+\.json$/i.test(filePath);
+}
+
+/**
+ * Play Framework routes file: the extensionless `conf/routes` (and included
+ * `conf/*.routes`). No grammar — route extraction is done by the Play framework
+ * resolver, so it's processed through the no-grammar (`yaml`-style) path.
+ */
+export function isPlayRoutesFile(filePath: string): boolean {
+  return (
+    filePath === 'conf/routes' ||
+    filePath.endsWith('/conf/routes') ||
+    filePath.endsWith('.routes')
+  );
+}
 
 /**
  * Caches for loaded grammars and parsers
@@ -119,6 +194,14 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
     await initGrammars();
   }
 
+  // SFC languages (svelte/vue/astro) have no grammar of their own — their
+  // extractors delegate <script>/frontmatter content to the TS/JS extractor,
+  // so those grammars must be loaded even when no plain .ts/.js file is in
+  // the index set (e.g. a pure-.astro content site).
+  if (languages.some((l) => l === 'svelte' || l === 'vue' || l === 'astro')) {
+    languages = [...languages, 'typescript', 'javascript'];
+  }
+
   // Deduplicate and filter to languages that have WASM grammars and aren't already loaded
   const toLoad = [...new Set(languages)].filter(
     (lang): lang is GrammarLanguage =>
@@ -136,8 +219,12 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
       // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
       // 0.25 (drops nested calls/imports on every file after the first); we
-      // vendor the upstream ABI-15 wasm instead.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau')
+      // vendor the upstream ABI-15 wasm instead. C#: the tree-sitter-wasms
+      // build (ABI 13) has no primary-constructor support and parses
+      // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
+      // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
+      // primary constructors natively.
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -187,15 +274,26 @@ export function getParser(language: Language): Parser | null {
 }
 
 /**
- * Detect language from file extension
+ * Detect language from file extension.
+ *
+ * `overrides` is the project's validated custom extension → language map (from
+ * `codegraph.json`); when present its mappings take precedence over the built-in
+ * `EXTENSION_MAP`. Omitting it is byte-identical to the zero-config behavior.
  */
-export function detectLanguage(filePath: string, source?: string): Language {
+export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>): Language {
+  // Play `conf/routes` has no grammar — route through the no-symbol path; the
+  // Play framework resolver extracts route nodes from it.
+  if (isPlayRoutesFile(filePath)) return 'yaml';
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
-  const lang = EXTENSION_MAP[ext] || 'unknown';
+  // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
+  // links each section `"type"` to its `sections/<type>.liquid`).
+  if (isShopifyLiquidJson(filePath)) return 'liquid';
+  const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
-  // .h files could be C or C++ — check source content for C++ features
+  // .h files could be C, C++, or Objective-C — check source content
   if (lang === 'c' && ext === '.h' && source) {
     if (looksLikeCpp(source)) return 'cpp';
+    if (looksLikeObjc(source)) return 'objc';
   }
 
   return lang;
@@ -211,13 +309,27 @@ function looksLikeCpp(source: string): boolean {
 }
 
 /**
+ * Heuristic: does a .h file contain Objective-C constructs?
+ */
+function looksLikeObjc(source: string): boolean {
+  const sample = source.substring(0, 8192);
+  return /@(?:interface|implementation|protocol|synthesize)\b/.test(sample);
+}
+
+/**
  * Check if a language is supported (has a grammar defined).
  * Returns true if the grammar exists, even if not yet loaded.
  */
 export function isLanguageSupported(language: Language): boolean {
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'vue') return true; // custom extractor (script block delegation)
+  if (language === 'astro') return true; // custom extractor (frontmatter/script block delegation)
   if (language === 'liquid') return true; // custom regex extractor
+  if (language === 'razor') return true; // custom RazorExtractor (.cshtml/.razor markup)
+  if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver
+  if (language === 'twig') return true; // file-level tracking only
+  if (language === 'xml') return true; // MyBatis mapper extractor
+  if (language === 'properties') return true; // Spring config keys
   if (language === 'unknown') return false;
   return language in WASM_GRAMMAR_FILES;
 }
@@ -226,15 +338,30 @@ export function isLanguageSupported(language: Language): boolean {
  * Check if a grammar has been loaded and is ready for parsing.
  */
 export function isGrammarLoaded(language: Language): boolean {
-  if (language === 'svelte' || language === 'vue' || language === 'liquid') return true;
+  if (language === 'svelte' || language === 'vue' || language === 'astro' || language === 'liquid' || language === 'razor') return true;
+  if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
+  if (language === 'xml' || language === 'properties') return true; // no WASM grammar needed
   return languageCache.has(language);
+}
+
+/**
+ * Languages tracked at the file-record level only: parsing emits zero symbol
+ * nodes, but the file is still stored (and framework resolvers may add per-file
+ * references later, e.g. Drupal routing yml, Spring `@Value` against
+ * application.properties). This is the canonical set behind the no-symbol
+ * branch in `tree-sitter.ts`; `xml` is intentionally excluded because its
+ * MyBatis extractor emits a file node. Callers use this to count such files as
+ * indexed rather than skipped, so it must stay in sync with that branch.
+ */
+export function isFileLevelOnlyLanguage(language: Language): boolean {
+  return language === 'yaml' || language === 'twig' || language === 'properties';
 }
 
 /**
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'astro', 'liquid'];
 }
 
 /**
@@ -288,10 +415,12 @@ export function getLanguageDisplayName(language: Language): string {
     python: 'Python',
     go: 'Go',
     rust: 'Rust',
+    r: 'R',
     java: 'Java',
     c: 'C',
     cpp: 'C++',
     csharp: 'C#',
+    razor: 'Razor/Blazor',
     php: 'PHP',
     ruby: 'Ruby',
     swift: 'Swift',
@@ -299,12 +428,18 @@ export function getLanguageDisplayName(language: Language): string {
     dart: 'Dart',
     svelte: 'Svelte',
     vue: 'Vue',
+    astro: 'Astro',
     liquid: 'Liquid',
     pascal: 'Pascal / Delphi',
     scala: 'Scala',
     elixir: 'Elixir',
     lua: 'Lua',
     luau: 'Luau',
+    objc: 'Objective-C',
+    yaml: 'YAML',
+    twig: 'Twig',
+    xml: 'XML',
+    properties: 'Java properties',
     unknown: 'Unknown',
   };
   return names[language] || language;

@@ -7,7 +7,6 @@
 
 import * as path from 'path';
 import {
-  CodeGraphConfig,
   Node,
   Edge,
   FileRecord,
@@ -23,9 +22,8 @@ import {
   BuildContextOptions,
   FindRelevantContextOptions,
 } from './types';
-import { DatabaseConnection, getDatabasePath } from './db';
+import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { QueryBuilder } from './db/queries';
-import { loadConfig, saveConfig, createDefaultConfig } from './config';
 import {
   isInitialized,
   createDirectory,
@@ -48,12 +46,20 @@ import {
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
-import { FileWatcher, WatchOptions } from './sync';
+import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
+import { EXTRACTION_VERSION } from './extraction/extraction-version';
+import { getCodeGraphDir } from './directory';
+import { deriveProjectNameTokens } from './search/query-utils';
+import { CodeGraphPackageVersion } from './mcp/version';
 
 // Re-export types for consumers
 export * from './types';
-export { getDatabasePath } from './db';
-export { getConfigPath } from './config';
+// Storage building blocks for embedded/SDK consumers that drive the graph
+// directly (open a DB, run prepared queries) rather than through the CodeGraph
+// facade. Exposed from the package entry so they no longer require deep imports
+// into dist/ (issue #354).
+export { getDatabasePath, DatabaseConnection } from './db';
+export { QueryBuilder } from './db/queries';
 export {
   getCodeGraphDir,
   isInitialized,
@@ -78,16 +84,13 @@ export {
   defaultLogger,
 } from './errors';
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
-export { FileWatcher, WatchOptions } from './sync';
+export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 export { MCPServer } from './mcp';
 
 /**
  * Options for initializing a new CodeGraph project
  */
 export interface InitOptions {
-  /** Custom configuration overrides */
-  config?: Partial<CodeGraphConfig>;
-
   /** Whether to run initial indexing after init */
   index?: boolean;
 
@@ -128,13 +131,15 @@ export interface IndexOptions {
 export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
-  private config: CodeGraphConfig;
   private projectRoot: string;
-  private orchestrator: ExtractionOrchestrator;
-  private resolver: ReferenceResolver;
-  private graphManager: GraphQueryManager;
-  private traverser: GraphTraverser;
-  private contextBuilder: ContextBuilder;
+  // Assigned via wireLayers() from the constructor (and again on reopen) — the
+  // `!` tells TS these are definitely set even though the assignment is one
+  // method call away from the constructor body.
+  private orchestrator!: ExtractionOrchestrator;
+  private resolver!: ReferenceResolver;
+  private graphManager!: GraphQueryManager;
+  private traverser!: GraphTraverser;
+  private contextBuilder!: ContextBuilder;
 
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
@@ -148,25 +153,71 @@ export class CodeGraph {
   private constructor(
     db: DatabaseConnection,
     queries: QueryBuilder,
-    config: CodeGraphConfig,
     projectRoot: string
   ) {
     this.db = db;
     this.queries = queries;
-    this.config = config;
     this.projectRoot = projectRoot;
     this.fileLock = new FileLock(
-      path.join(projectRoot, '.codegraph', 'codegraph.lock')
+      path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
     );
-    this.orchestrator = new ExtractionOrchestrator(projectRoot, config, queries);
-    this.resolver = createResolver(projectRoot, queries);
-    this.graphManager = new GraphQueryManager(queries);
-    this.traverser = new GraphTraverser(queries);
+    this.wireLayers();
+  }
+
+  /**
+   * (Re)build the query/extraction/graph layers over the current `this.queries`
+   * (which wraps `this.db`). Factored out of the constructor so `reopenIfReplaced`
+   * can rebuild them against a fresh connection without duplicating the wiring.
+   * The path-based `fileLock` is independent of the DB handle, so it stays put.
+   */
+  private wireLayers(): void {
+    // Down-weight the project name as a query term in search ranking — it names
+    // the whole repo, not a symbol, so it has no discriminative value (#720).
+    try {
+      this.queries.setProjectNameTokens(deriveProjectNameTokens(this.projectRoot));
+    } catch {
+      // Best-effort: ranking still works without it.
+    }
+    this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
+    this.resolver = createResolver(this.projectRoot, this.queries);
+    this.graphManager = new GraphQueryManager(this.queries);
+    this.traverser = new GraphTraverser(this.queries);
     this.contextBuilder = createContextBuilder(
-      projectRoot,
-      queries,
+      this.projectRoot,
+      this.queries,
       this.traverser
     );
+  }
+
+  /**
+   * Heal a stale database handle in place. If `.codegraph/` was removed and
+   * recreated at the SAME path while this instance held the DB open — a git
+   * worktree removed and re-added, or `rm -rf .codegraph` + `codegraph init` —
+   * our open fd points at the now-unlinked inode and can never see the new
+   * index, so every query returns the pre-removal snapshot until the process
+   * restarts (#925). When that's detected, open the live file at the same path,
+   * rebuild the query layers, and swap them IN PLACE, so every holder of this
+   * instance (the MCP daemon's default project, cached projectPath connections)
+   * heals without a restart. Returns true iff it reopened.
+   *
+   * POSIX-only in practice: `isReplacedOnDisk` never fires on Windows (an open
+   * file can't be unlinked there, and st_ino is unreliable).
+   */
+  reopenIfReplaced(): boolean {
+    if (!this.db.isReplacedOnDisk()) return false;
+    const dbPath = this.db.getPath();
+    // Open the live file FIRST — if that throws (e.g. mid-recreate), the old
+    // handle stays in place and the caller retries on the next query, rather
+    // than leaving this instance with no connection at all.
+    const fresh = DatabaseConnection.open(dbPath);
+    const stale = this.db;
+    this.db = fresh;
+    this.queries = new QueryBuilder(fresh.getDb());
+    this.wireLayers();
+    // Releasing the dead handle also frees the leaked db/-wal/-shm fds that were
+    // pinning the unlinked inode (#925).
+    try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
+    return true;
   }
 
   // ===========================================================================
@@ -194,19 +245,12 @@ export class CodeGraph {
     // Create directory structure
     createDirectory(resolvedRoot);
 
-    // Create and save configuration
-    const config = createDefaultConfig(resolvedRoot);
-    if (options.config) {
-      Object.assign(config, options.config);
-    }
-    saveConfig(resolvedRoot, config);
-
     // Initialize database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    const instance = new CodeGraph(db, queries, config, resolvedRoot);
+    const instance = new CodeGraph(db, queries, resolvedRoot);
 
     // Run initial indexing if requested
     if (options.index) {
@@ -219,7 +263,7 @@ export class CodeGraph {
   /**
    * Initialize synchronously (without indexing)
    */
-  static initSync(projectRoot: string, options: Omit<InitOptions, 'index' | 'onProgress'> = {}): CodeGraph {
+  static initSync(projectRoot: string): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if already initialized
@@ -230,19 +274,12 @@ export class CodeGraph {
     // Create directory structure
     createDirectory(resolvedRoot);
 
-    // Create and save configuration
-    const config = createDefaultConfig(resolvedRoot);
-    if (options.config) {
-      Object.assign(config, options.config);
-    }
-    saveConfig(resolvedRoot, config);
-
     // Initialize database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.initialize(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, config, resolvedRoot);
+    return new CodeGraph(db, queries, resolvedRoot);
   }
 
   /**
@@ -267,15 +304,12 @@ export class CodeGraph {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
-    // Load configuration
-    const config = loadConfig(resolvedRoot);
-
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    const instance = new CodeGraph(db, queries, config, resolvedRoot);
+    const instance = new CodeGraph(db, queries, resolvedRoot);
 
     // Sync if requested
     if (options.sync) {
@@ -283,6 +317,54 @@ export class CodeGraph {
     }
 
     return instance;
+  }
+
+  /**
+   * Rebuild the project's database from scratch and return a fresh, empty
+   * instance — the "same result as a fresh init" semantics that `codegraph
+   * index` documents.
+   *
+   * Unlike `open()` followed by `clear()`, this DISCARDS the existing
+   * `.codegraph/codegraph.db` (and its `-wal`/`-shm` sidecars) before
+   * re-initializing, instead of opening the old database and DELETE-ing every
+   * row. On a large or pre-fix poisoned index — e.g. an old graph that scanned
+   * an ignored gitlink corpus (#1065) into ~1.6M nodes with a multi-GB WAL —
+   * the per-row `nodes_fts` delete-trigger churn blocks the main thread long
+   * enough to trip the #850 liveness watchdog before indexing even starts, so a
+   * full re-index could never recover the bad state (#1067). Discarding the
+   * files is O(1) regardless of size, reclaims the disk, and sidesteps opening
+   * (and running migrations against) the poisoned database entirely.
+   */
+  static async recreate(projectRoot: string): Promise<CodeGraph> {
+    await initGrammars();
+    const resolvedRoot = path.resolve(projectRoot);
+
+    // Check if initialized — recreate REBUILDS an existing project; it is not a
+    // first-time `init`.
+    if (!isInitialized(resolvedRoot)) {
+      throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
+    }
+
+    const dbPath = getDatabasePath(resolvedRoot);
+    try {
+      removeDatabaseFiles(dbPath);
+    } catch (err) {
+      // POSIX unlinks an open file fine; this fires mainly on Windows when a
+      // live daemon/MCP server still holds the database. Turn the raw EBUSY into
+      // an actionable instruction instead of a generic failure.
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Could not rebuild the index — the database file is in use (${reason}). ` +
+          `Stop any running CodeGraph MCP server/daemon for this project and retry, ` +
+          `or remove the ${getCodeGraphDir(resolvedRoot)} directory and run "codegraph init".`
+      );
+    }
+
+    // Re-create an empty, freshly-schema'd database at the same path.
+    const db = DatabaseConnection.initialize(dbPath);
+    const queries = new QueryBuilder(db.getDb());
+
+    return new CodeGraph(db, queries, resolvedRoot);
   }
 
   /**
@@ -302,15 +384,12 @@ export class CodeGraph {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
-    // Load configuration
-    const config = loadConfig(resolvedRoot);
-
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
-    return new CodeGraph(db, queries, config, resolvedRoot);
+    return new CodeGraph(db, queries, resolvedRoot);
   }
 
   /**
@@ -328,32 +407,6 @@ export class CodeGraph {
     // Release file lock if held
     this.fileLock.release();
     this.db.close();
-  }
-
-  // ===========================================================================
-  // Configuration
-  // ===========================================================================
-
-  /**
-   * Get the current configuration
-   */
-  getConfig(): CodeGraphConfig {
-    return { ...this.config };
-  }
-
-  /**
-   * Update configuration
-   */
-  updateConfig(updates: Partial<CodeGraphConfig>): void {
-    Object.assign(this.config, updates);
-    saveConfig(this.projectRoot, this.config);
-    // Recreate orchestrator and resolver with new config
-    this.orchestrator = new ExtractionOrchestrator(
-      this.projectRoot,
-      this.config,
-      this.queries
-    );
-    this.resolver = createResolver(this.projectRoot, this.queries);
   }
 
   /**
@@ -380,7 +433,22 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
+        const before = this.queries.getNodeAndEdgeCount();
         const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
+
+        // Re-detect frameworks now that the index is populated. The resolver
+        // is constructed with createResolver() before any files exist, so
+        // framework resolvers whose detect() consults the indexed file list
+        // (e.g. UIKit/SwiftUI scanning for imports, swift-objc-bridge looking
+        // for both Swift and ObjC files) all return false on that initial pass
+        // and silently drop themselves. Re-initializing here gives them a
+        // chance to see the actual project before resolution runs.
+        if (result.success && result.filesIndexed > 0) {
+          this.resolver.initialize();
+          // Cross-file finalization (e.g. NestJS RouterModule prefixes). Runs
+          // before resolution so updated names show up in subsequent reads.
+          this.resolver.runPostExtract();
+        }
 
         // Resolve references to create call/import/extends edges
         if (result.success && result.filesIndexed > 0) {
@@ -400,6 +468,42 @@ export class CodeGraph {
               total,
             });
           });
+
+          // Second pass: chained calls whose method lives on a supertype the
+          // receiver conforms to (protocol-extension / inherited / default-
+          // interface). Needs the implements/extends edges the main pass just
+          // built, so it runs after resolution (#750).
+          this.resolver.resolveChainedCallsViaConformance();
+          // Same lifecycle for `this.<member>` callback registrations whose
+          // member is inherited from a supertype (#808).
+          this.resolver.resolveDeferredThisMemberRefs();
+        }
+
+        // Refresh planner stats + checkpoint the WAL after bulk writes.
+        // Cheap and non-blocking; never load-bearing for correctness.
+        if (result.success && result.filesIndexed > 0) {
+          this.db.runMaintenance();
+        }
+
+        // The orchestrator only sees extraction-phase counts; resolution and
+        // synthesizer edges (often >50% of the graph on JVM repos) come later.
+        // Recompute against the DB so the CLI summary reports the true totals.
+        if (result.success && result.filesIndexed > 0) {
+          const after = this.queries.getNodeAndEdgeCount();
+          result.nodesCreated = after.nodes - before.nodes;
+          result.edgesCreated = after.edges - before.edges;
+        }
+
+        // Stamp the index with the engine that built it, so `codegraph status`
+        // and `codegraph upgrade` can recommend a re-index when the running
+        // engine produces richer extraction than the one on disk. Only on a
+        // real full index — a sync touches a subset, so it must NOT advance the
+        // extraction stamp (the bulk would still be stale). See extraction-version.ts.
+        if (result.success && result.filesIndexed > 0) {
+          try {
+            this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
+            this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
+          } catch { /* metadata is advisory — never fail an index over it */ }
         }
 
         return result;
@@ -444,6 +548,14 @@ export class CodeGraph {
       try {
         const result = await this.orchestrator.sync(options.onProgress);
 
+        // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
+        // every sync that touched files so edits to `app.module.ts` propagate
+        // to controllers in unchanged files. The pass is idempotent and cheap
+        // (regex over *.module.ts only).
+        if (result.filesAdded > 0 || result.filesModified > 0) {
+          this.resolver.runPostExtract();
+        }
+
         // Resolve references if files were updated
         if (result.filesAdded > 0 || result.filesModified > 0) {
           if (result.changedFilePaths) {
@@ -481,6 +593,19 @@ export class CodeGraph {
               });
             });
           }
+
+          // Second pass: chained calls whose method lives on a supertype the
+          // receiver conforms to (protocol-extension / inherited). Needs the
+          // implements/extends edges built above (#750).
+          this.resolver.resolveChainedCallsViaConformance();
+          // Same lifecycle for `this.<member>` callback registrations whose
+          // member is inherited from a supertype (#808).
+          this.resolver.resolveDeferredThisMemberRefs();
+        }
+
+        // Refresh planner stats + checkpoint the WAL after bulk writes.
+        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
+          this.db.runMaintenance();
         }
 
         return result;
@@ -515,9 +640,16 @@ export class CodeGraph {
 
     this.watcher = new FileWatcher(
       this.projectRoot,
-      this.config,
       async () => {
         const result = await this.sync();
+        // sync() returns this exact zero-shape iff it failed to acquire the
+        // file lock (a real empty sync always has filesChecked > 0 because
+        // scanDirectory ran). Surface that to the watcher as a typed error
+        // so it keeps pendingFiles + reschedules instead of clearing them
+        // (#449).
+        if (result.filesChecked === 0 && result.durationMs === 0) {
+          throw new LockUnavailableError();
+        }
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
         return { filesChanged, durationMs: result.durationMs };
       },
@@ -545,10 +677,87 @@ export class CodeGraph {
   }
 
   /**
+   * True once live watching has permanently degraded (OS watch-resource
+   * exhaustion, or a write lock held past the retry budget) and auto-sync is
+   * disabled until the next {@link watch} call. Distinct from `!isWatching()`:
+   * a stopped/never-started watcher is inactive but NOT degraded. MCP tools use
+   * this to surface a whole-index "results may be stale" notice, since
+   * `getPendingFiles()` goes empty once watching stops (#876).
+   */
+  isWatcherDegraded(): boolean {
+    return this.watcher?.isDegraded() ?? false;
+  }
+
+  /** The reason live watching degraded, or null if it is healthy (#876). */
+  getWatcherDegradedReason(): string | null {
+    return this.watcher?.getDegradedReason() ?? null;
+  }
+
+  /**
+   * Files seen by the file watcher since the last successful sync —
+   * the per-file "stale" signal MCP tools attach to responses so an agent
+   * can fall back to {@link Read} for just the affected file without
+   * waiting for a debounced sync to complete (issue #403).
+   *
+   * Returns an empty list when the watcher isn't active, or no events have
+   * arrived. Each entry includes `firstSeenMs` and `lastSeenMs` (wall-clock
+   * `Date.now()` values) so callers can render "edited Nms ago", plus an
+   * `indexing` flag indicating whether the in-flight sync (if any) will
+   * absorb that file.
+   */
+  getPendingFiles(): PendingFile[] {
+    return this.watcher?.getPendingFiles() ?? [];
+  }
+
+  /**
+   * Resolves once the file watcher has installed its watch set. Useful for
+   * tests that need a deterministic boundary before asserting on
+   * `getPendingFiles()`. Resolves immediately when no watcher is active.
+   */
+  waitUntilWatcherReady(timeoutMs?: number): Promise<void> {
+    return this.watcher ? this.watcher.waitUntilReady(timeoutMs) : Promise.resolve();
+  }
+
+  /**
    * Get files that have changed since last index
    */
   getChangedFiles(): { added: string[]; modified: string[]; removed: string[] } {
     return this.orchestrator.getChangedFiles();
+  }
+
+  /**
+   * Most recent index timestamp (ms since epoch) across all tracked files, or
+   * null when nothing is indexed yet. Lets library consumers check index
+   * freshness without shelling out to `codegraph status --json`. (#329)
+   */
+  getLastIndexedAt(): number | null {
+    return this.queries.getLastIndexedAt();
+  }
+
+  /**
+   * Which engine built the current index: the package version + extraction
+   * version stamped at the last full `indexAll`. Either field is null for an
+   * index built before stamping existed (treated as stale). See
+   * `extraction-version.ts` and `isIndexStale()`.
+   */
+  getIndexBuildInfo(): { version: string | null; extractionVersion: number | null } {
+    const version = this.queries.getMetadata('indexed_with_version');
+    const ev = this.queries.getMetadata('indexed_with_extraction_version');
+    const parsed = ev != null ? parseInt(ev, 10) : NaN;
+    return { version, extractionVersion: Number.isFinite(parsed) ? parsed : null };
+  }
+
+  /**
+   * True when the on-disk index was built by an engine whose extraction is
+   * older than the one now running — i.e. a re-index would add data a migration
+   * can't backfill. False when there's no index yet (nothing to refresh) or the
+   * stamp is current. This is the signal behind `codegraph status`'s re-index
+   * hint and `codegraph upgrade`'s reminder.
+   */
+  isIndexStale(): boolean {
+    if (this.queries.getLastIndexedAt() == null) return false;
+    const { extractionVersion } = this.getIndexBuildInfo();
+    return extractionVersion == null || extractionVersion < EXTRACTION_VERSION;
   }
 
   /**
@@ -613,13 +822,22 @@ export class CodeGraph {
   }
 
   /**
-   * Active SQLite backend for this project's connection. `wasm` means
-   * the native better-sqlite3 install failed and the WASM fallback is
-   * serving requests at 5-10x the latency. Surfaced via `codegraph
-   * status` and the `codegraph_status` MCP tool.
+   * Active SQLite backend for this project's connection (`node-sqlite` — Node's
+   * built-in real-SQLite module). Surfaced via `codegraph status` and the
+   * `codegraph_status` MCP tool alongside the effective journal mode.
    */
   getBackend(): import('./db').SqliteBackend {
     return this.db.getBackend();
+  }
+
+  /**
+   * The journal mode actually in effect ('wal', 'delete', …). 'wal' means
+   * readers never block on a concurrent writer; anything else means they can,
+   * which is the precondition for the "database is locked" failures in issue
+   * #238. Surfaced via `codegraph status` and the `codegraph_status` MCP tool.
+   */
+  getJournalMode(): string {
+    return this.db.getJournalMode();
   }
 
   // ===========================================================================
@@ -648,10 +866,57 @@ export class CodeGraph {
   }
 
   /**
+   * Get ALL nodes with an exact name (direct index lookup, not FTS-ranked/capped).
+   * Used to enumerate every overload of a heavily-overloaded name so the specific
+   * definition the caller wants is never dropped below a search cut.
+   */
+  getNodesByName(name: string): Node[] {
+    return this.queries.getNodesByName(name);
+  }
+
+  /**
    * Search nodes by text
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
     return this.queries.searchNodes(query, options);
+  }
+
+  /**
+   * Normalized project-name tokens (go.mod / package.json / repo dir) used to
+   * down-weight the non-discriminative project name in search ranking (#720).
+   * Exposed so explore can exclude it from the PascalCase type-disambiguation
+   * bias, which would otherwise pull overloaded tokens toward whichever stack
+   * embeds the project name.
+   */
+  getProjectNameTokens(): Set<string> {
+    return this.queries.getProjectNameTokens();
+  }
+
+  /**
+   * Find the project's "primary route file" — the file with the densest
+   * concentration of framework-emitted `route` nodes (≥3 routes, ≥30%
+   * of all non-test routes). Used to inline the routing config in
+   * `codegraph_explore` responses on small realworld template repos
+   * (rails-realworld, laravel-realworld, drupal-admintoolbar, …) where
+   * Glob+Read of `routes.rb`/`urls.py`/etc. otherwise beats codegraph.
+   */
+  getTopRouteFile(): { filePath: string; routeCount: number; totalRoutes: number } | null {
+    return this.queries.getTopRouteFile();
+  }
+
+  /**
+   * Build a URL → handler routing manifest from the index. Each entry
+   * pairs a route node (URL + method) with its handler function/method
+   * via the `references` edge that framework resolvers emit. Returns
+   * null when fewer than 3 valid (non-test) routes exist.
+   */
+  getRoutingManifest(limit?: number): {
+    entries: Array<{ url: string; handler: string; handlerFile: string; handlerLine: number; handlerKind: string }>;
+    topHandlerFile: string | null;
+    topHandlerFileCount: number;
+    totalRoutes: number;
+  } | null {
+    return this.queries.getRoutingManifest(limit);
   }
 
   // ===========================================================================

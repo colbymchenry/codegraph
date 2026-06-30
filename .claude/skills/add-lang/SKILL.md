@@ -189,8 +189,8 @@ Read each `parse-run.mjs` summary printed by `run-all.sh`: tool calls, file
 - **CHANGELOG.md**: add an `## [Unreleased]` section at the top (above the
   latest version) with `### Added` → a user-perspective bullet, e.g.
   *"CodeGraph now indexes **<Lang>** (`.ext`) — functions, classes, imports, and
-  call edges."* If `## [Unreleased]` already exists, append under it. (`/publish`
-  folds this into the next versioned block at release time.)
+  call edges."* If `## [Unreleased]` already exists, append under it. (It's
+  folded into the next versioned block at release time.)
 
 ### Step 10 — Report (do NOT commit)
 
@@ -204,8 +204,8 @@ Summarize for review:
 - **Gaps / follow-ups** (node types not yet mapped, resolution edges missing,
   framework routes, etc.).
 
-Hand the changes to the user. **Do not** run `git commit`/`push`,
-`npm publish`, or `scripts/release.sh`.
+Hand the changes to the user. **Do not** run `git commit`/`push` or publish —
+releases go through the GitHub Actions Release workflow.
 
 ## Notes
 - The A/B spawns real **paid** `claude -p` runs (opus, `--max-budget-usd`),

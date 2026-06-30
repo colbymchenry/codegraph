@@ -23,6 +23,14 @@ function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
   return spawn(process.execPath, [BIN, 'serve', '--mcp'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
+    // Pin to direct (in-process) mode. #172 is a contract about the in-process
+    // server's init ordering — the "File watcher active" log this test observes
+    // is emitted in-process. In daemon mode the watcher runs in the detached
+    // daemon (logging to .codegraph/daemon.log, not the child's stderr); the
+    // same response-before-init guarantee lives in the shared session code and
+    // is covered by mcp-daemon.test.ts. Direct mode also avoids leaking a
+    // detached daemon from this suite.
+    env: { ...process.env, CODEGRAPH_NO_DAEMON: '1' },
   }) as ChildProcessWithoutNullStreams;
 }
 
@@ -146,4 +154,30 @@ describe('MCP initialize handshake (issue #172)', () => {
     expect(json.id).toBe(0);
     expect(json.result.serverInfo.name).toBe('codegraph');
   }, 20000);
+
+  it('answers resources/list and prompts/list with empty lists, not -32601 (issue #621)', async () => {
+    child = spawnServer(tempDir);
+    const events = tagStreams(child);
+    sendInitialize(child, tempDir);
+    await waitFor(events, (e) => e.stream === 'stdout', 5000); // initialize reply
+
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'resources/list', params: {} }) + '\n');
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'prompts/list', params: {} }) + '\n');
+
+    const replyFor = async (id: number) => {
+      const ev = await waitFor(events, (e) => {
+        if (e.stream !== 'stdout') return false;
+        try { return JSON.parse(e.text).id === id; } catch { return false; }
+      }, 5000);
+      return JSON.parse(ev.text);
+    };
+
+    const resources = await replyFor(1);
+    expect(resources.error).toBeUndefined();
+    expect(resources.result.resources).toEqual([]);
+
+    const prompts = await replyFor(2);
+    expect(prompts.error).toBeUndefined();
+    expect(prompts.result.prompts).toEqual([]);
+  }, 15000);
 });

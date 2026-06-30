@@ -1,0 +1,30 @@
+// codegraph telemetry ingest — see README.md and docs/design/telemetry.md.
+// Secrets are NOT configured here: POSTHOG_KEY is set via `wrangler secret put POSTHOG_KEY`.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "codegraph-telemetry",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-12",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // First-party endpoint. The custom domain auto-provisions DNS + cert when the
+  // getcodegraph.com zone is on the deploying account. workers.dev stays off so
+  // the only public surface is the documented one.
+  "routes": [{ "pattern": "telemetry.getcodegraph.com", "custom_domain": true }],
+  "workers_dev": false,
+
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+
+  // Non-secret config. Swap host here if the backend ever moves (EU, self-hosted…).
+  "vars": { "POSTHOG_HOST": "https://us.i.posthog.com" },
+
+  // Per-machine_id rate limit. Legit clients flush a handful of times per day;
+  // 6/min absorbs install+index bursts while capping abuse.
+  "ratelimits": [
+    {
+      "name": "MACHINE_RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 6, "period": 60 }
+    }
+  ]
+}

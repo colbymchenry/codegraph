@@ -12,7 +12,6 @@ import * as path from 'path';
 import * as os from 'os';
 import { watchDisabledReason } from '../src/sync/watch-policy';
 import { FileWatcher } from '../src/sync/watcher';
-import type { CodeGraphConfig } from '../src/types';
 
 describe('watchDisabledReason', () => {
   it('returns a reason when CODEGRAPH_NO_WATCH=1', () => {
@@ -63,18 +62,6 @@ describe('watchDisabledReason', () => {
 describe('FileWatcher honors the watch policy', () => {
   let testDir: string;
 
-  const baseConfig: CodeGraphConfig = {
-    version: 1,
-    rootDir: '.',
-    include: ['**/*.ts'],
-    exclude: ['**/node_modules/**'],
-    languages: [],
-    frameworks: [],
-    maxFileSize: 1024 * 1024,
-    extractDocstrings: true,
-    trackCallSites: true,
-  };
-
   afterEach(() => {
     delete process.env.CODEGRAPH_NO_WATCH;
     if (testDir && fs.existsSync(testDir)) {
@@ -87,7 +74,7 @@ describe('FileWatcher honors the watch policy', () => {
     process.env.CODEGRAPH_NO_WATCH = '1';
 
     const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
-    const watcher = new FileWatcher(testDir, baseConfig, syncFn);
+    const watcher = new FileWatcher(testDir, syncFn);
 
     expect(watcher.start()).toBe(false);
     expect(watcher.isActive()).toBe(false);

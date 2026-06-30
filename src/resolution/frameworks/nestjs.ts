@@ -31,6 +31,12 @@ import {
 } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 
+// ---------------------------------------------------------------------------
+// Public surface — see comment at top of file. This file owns four NestJS
+// concerns: HTTP routes, GraphQL ops, microservice handlers, WebSocket
+// handlers, and (in postExtract below) cross-file RouterModule prefixing.
+// ---------------------------------------------------------------------------
+
 type JsLang = 'typescript' | 'javascript';
 
 const HTTP_METHODS = ['Get', 'Post', 'Put', 'Patch', 'Delete', 'Head', 'Options', 'All'];
@@ -184,6 +190,79 @@ export const nestjsResolver: FrameworkResolver = {
     }
 
     return { nodes, references };
+  },
+
+  /**
+   * Cross-file finalization for `RouterModule.register([...])`. The per-file
+   * extract() above only sees `@Controller(prefix) + @Get(path)` — it can't
+   * learn about the route prefix supplied by a sibling `app.module.ts` like:
+   *
+   *   RouterModule.register([
+   *     { path: 'admin', module: AdminModule, children: [
+   *       { path: 'users', module: UsersModule } ] } ])
+   *
+   * This pass scans every `*.module.{ts,js}` file, walks the registration
+   * tree to build a `Module → /full/prefix` map, walks each `@Module({
+   * controllers: [...] })` to build a `Controller → Module` map, and rewrites
+   * affected route nodes so `GET /` becomes `GET /admin/users` (and
+   * `@Controller('foo') + @Get(':id')` under that same module becomes
+   * `GET /admin/users/foo/:id`).
+   *
+   * The route node's `id` and `qualifiedName` are deliberately preserved
+   * across the update: `id` because existing route→handler edges reference
+   * it, `qualifiedName` because it still encodes the *original* in-file
+   * `method:path` — which keeps this pass idempotent (a second run recovers
+   * the same input regardless of how many times it has already prefixed).
+   */
+  postExtract(context: ResolutionContext): Node[] {
+    const moduleToPrefix = new Map<string, string>();
+    const controllerToModule = new Map<string, string>();
+
+    for (const filePath of context.getAllFiles()) {
+      if (!/\.module\.(m?[jt]s|cjs)$/.test(filePath)) continue;
+      const content = context.readFile(filePath);
+      if (!content) continue;
+      const safe = stripCommentsForRegex(content, detectLanguage(filePath));
+      collectRouterModuleRegistrations(safe, moduleToPrefix);
+      collectModuleControllers(safe, controllerToModule);
+    }
+
+    const controllerToPrefix = new Map<string, string>();
+    for (const [controller, module] of controllerToModule) {
+      const prefix = moduleToPrefix.get(module);
+      // `''` and `'/'` are no-op prefixes; skip them so we don't run updates
+      // that would set name to the value it already has.
+      if (prefix && prefix !== '' && prefix !== '/') {
+        controllerToPrefix.set(controller, prefix);
+      }
+    }
+
+    if (controllerToPrefix.size === 0) return [];
+
+    const updates: Node[] = [];
+    for (const [controllerName, prefix] of controllerToPrefix) {
+      const classes = context
+        .getNodesByName(controllerName)
+        .filter((n) => n.kind === 'class');
+      for (const cls of classes) {
+        const routes = context
+          .getNodesInFile(cls.filePath)
+          .filter((n) => n.kind === 'route');
+        for (const route of routes) {
+          // Multiple controllers can live in one file (covered by the
+          // existing "attributes methods to the right controller" test);
+          // each route must be associated with the controller whose line
+          // range contains it.
+          if (route.startLine < cls.startLine || route.startLine > cls.endLine) {
+            continue;
+          }
+          const updated = applyModulePrefix(route, prefix);
+          if (updated && updated.name !== route.name) updates.push(updated);
+        }
+      }
+    }
+
+    return updates;
   },
 };
 
@@ -435,4 +514,253 @@ function lineAt(safe: string, index: number): number {
 function detectLanguage(filePath: string): JsLang {
   if (filePath.endsWith('.ts') || filePath.endsWith('.tsx')) return 'typescript';
   return 'javascript';
+}
+
+// ---------------------------------------------------------------------------
+// RouterModule + @Module walkers (used by postExtract above)
+// ---------------------------------------------------------------------------
+
+/**
+ * Walk every `RouterModule.register([...])` call (and the equivalent
+ * `RouterModule.forRoot([...])` and `forChild([...])` aliases) and populate
+ * `out` with `Module → /full/prefix`. Recursive `children` arrays inherit
+ * their parent's prefix.
+ *
+ * First-write-wins: if the same module appears in two registrations we keep
+ * the first prefix seen rather than overwriting. NestJS itself does the same.
+ */
+function collectRouterModuleRegistrations(safe: string, out: Map<string, string>): void {
+  const re = /\bRouterModule\s*\.\s*(?:register|forRoot|forChild)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(safe)) !== null) {
+    const openIndex = m.index + m[0].length - 1;
+    const parsed = readArgs(safe, openIndex);
+    if (!parsed) continue;
+    const items = parseRoutesArray(parsed.args);
+    walkRoutesTree(items, '', out);
+    re.lastIndex = parsed.end;
+  }
+}
+
+interface RouteItem {
+  path: string;
+  moduleName: string | null;
+  children: RouteItem[];
+}
+
+/**
+ * Parse a `[ {...}, {...} ]` argument list into a list of `RouteItem`s. The
+ * args are expected to be an inline literal — references to a `const routes:
+ * Routes = [...]` declared earlier in the file aren't followed (rare in
+ * practice; the registration is usually inline).
+ */
+function parseRoutesArray(args: string): RouteItem[] {
+  const trimmed = args.trim();
+  if (!trimmed.startsWith('[')) return [];
+  // Strip outer [ ... ] respecting balanced brackets.
+  const close = matchingClose(trimmed, 0);
+  if (close < 0) return [];
+  return parseRouteObjects(trimmed.slice(1, close));
+}
+
+function parseRouteObjects(s: string): RouteItem[] {
+  const items: RouteItem[] = [];
+  for (const obj of splitTopLevelObjects(s)) {
+    const path = parseStringField(obj, 'path');
+    const moduleName = parseIdentField(obj, 'module');
+    const childrenStr = parseArrayField(obj, 'children');
+    const children = childrenStr ? parseRouteObjects(childrenStr) : [];
+    items.push({ path, moduleName, children });
+  }
+  return items;
+}
+
+function walkRoutesTree(
+  items: RouteItem[],
+  parentPrefix: string,
+  out: Map<string, string>
+): void {
+  for (const item of items) {
+    const myPrefix = joinHttpPath(parentPrefix, item.path);
+    if (item.moduleName && !out.has(item.moduleName)) {
+      out.set(item.moduleName, myPrefix);
+    }
+    if (item.children.length > 0) {
+      walkRoutesTree(item.children, myPrefix, out);
+    }
+  }
+}
+
+/**
+ * Walk every `@Module(...)` decorator and populate `out` with
+ * `Controller → enclosingModuleClassName`, based on the decorator's
+ * `controllers: [...]` field and the class declaration that follows the
+ * decorator (skipping stacked decorators and export/default/abstract
+ * modifiers).
+ */
+function collectModuleControllers(safe: string, out: Map<string, string>): void {
+  for (const hit of findDecorators(safe, ['Module'])) {
+    const className = classNameAfter(safe, hit.end);
+    if (!className) continue;
+    for (const controller of parseControllersField(hit.args)) {
+      // First-write-wins, same as RouterModule, so a controller listed in two
+      // modules picks up the one declared earliest in source.
+      if (!out.has(controller)) out.set(controller, className);
+    }
+  }
+}
+
+function parseControllersField(args: string): string[] {
+  const inner = parseArrayField(args, 'controllers');
+  if (inner === null) return [];
+  return inner
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => /^[A-Za-z_$][\w$]*$/.test(s));
+}
+
+/**
+ * Starting just after a class decorator's `)`, return the name of the class
+ * it decorates. Mirrors `methodNameAfter` for methods: skips stacked
+ * decorators and `export`/`default`/`abstract` modifiers.
+ */
+function classNameAfter(safe: string, start: number): string | null {
+  let i = start;
+  const ws = /\s*/y;
+  const decoName = /@[\w.]+/y;
+  const classDecl = /(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/y;
+
+  const eatWs = (): void => {
+    ws.lastIndex = i;
+    if (ws.exec(safe)) i = ws.lastIndex;
+  };
+
+  for (;;) {
+    eatWs();
+    if (safe[i] !== '@') break;
+    decoName.lastIndex = i;
+    if (!decoName.exec(safe)) break;
+    i = decoName.lastIndex;
+    eatWs();
+    if (safe[i] === '(') {
+      const parsed = readArgs(safe, i);
+      if (!parsed) return null;
+      i = parsed.end;
+    }
+  }
+
+  eatWs();
+  classDecl.lastIndex = i;
+  const m = classDecl.exec(safe);
+  return m ? m[1]! : null;
+}
+
+/**
+ * Recompute a route node's `name` by prepending `prefix` to the *original*
+ * in-file path. The original is recovered from `qualifiedName`, which the
+ * per-file extract emits as `${filePath}::${method}:${path}` and which this
+ * pass deliberately never mutates — that's what keeps the update idempotent.
+ */
+function applyModulePrefix(route: Node, prefix: string): Node | null {
+  const sep = '::';
+  const idx = route.qualifiedName.indexOf(sep);
+  if (idx < 0) return null;
+  const tail = route.qualifiedName.slice(idx + sep.length);
+  const colon = tail.indexOf(':');
+  if (colon < 0) return null;
+  const method = tail.slice(0, colon);
+  const original = tail.slice(colon + 1);
+  const newName = `${method} ${joinHttpPath(prefix, original)}`;
+  return { ...route, name: newName, updatedAt: Date.now() };
+}
+
+// ---------------------------------------------------------------------------
+// Small string utilities (object/array literal splitters)
+// ---------------------------------------------------------------------------
+
+/** Return the index of the bracket that closes the one at `open`, or -1. */
+function matchingClose(s: string, open: number): number {
+  const opener = s[open];
+  if (opener !== '[' && opener !== '{' && opener !== '(') return -1;
+  let depth = 0;
+  let inStr: string | null = null;
+  for (let i = open; i < s.length; i++) {
+    const ch = s[i]!;
+    if (inStr) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; continue; }
+    if (ch === '{' || ch === '[' || ch === '(') depth++;
+    else if (ch === '}' || ch === ']' || ch === ')') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Split `s` into the contents of each top-level object literal. Brackets and
+ * string literals are balanced so nested arrays/objects/strings inside an
+ * object don't cause an early split.
+ */
+function splitTopLevelObjects(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let objStart = -1;
+  let inStr: string | null = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]!;
+    if (inStr) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; continue; }
+    if (depth === 0 && ch === '{') {
+      depth = 1;
+      objStart = i;
+      continue;
+    }
+    if (ch === '{' || ch === '[' || ch === '(') depth++;
+    else if (ch === '}' || ch === ']' || ch === ')') {
+      depth--;
+      if (depth === 0 && objStart >= 0 && ch === '}') {
+        out.push(s.slice(objStart + 1, i));
+        objStart = -1;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Read a string-valued field — `key: 'value'` — out of one object literal's
+ * body. Returns `''` if not present. The leading character class guards
+ * against matching a field whose name *contains* the target as a suffix.
+ */
+function parseStringField(obj: string, name: string): string {
+  const re = new RegExp(`(?:^|[,{\\s])${name}\\s*:\\s*['"\`]([^'"\`]*)['"\`]`);
+  const m = obj.match(re);
+  return m ? m[1]! : '';
+}
+
+/** Read an identifier-valued field — `key: SomeIdent` — out of one object body. */
+function parseIdentField(obj: string, name: string): string | null {
+  const re = new RegExp(`(?:^|[,{\\s])${name}\\s*:\\s*([A-Za-z_$][\\w$]*)`);
+  const m = obj.match(re);
+  return m ? m[1]! : null;
+}
+
+/** Read an array-valued field — `key: [ ... ]` — as the raw inner text. */
+function parseArrayField(obj: string, name: string): string | null {
+  const re = new RegExp(`(?:^|[,{\\s])${name}\\s*:\\s*\\[`);
+  const m = re.exec(obj);
+  if (!m) return null;
+  const open = m.index + m[0].length - 1;
+  const close = matchingClose(obj, open);
+  if (close < 0) return null;
+  return obj.slice(open + 1, close);
 }

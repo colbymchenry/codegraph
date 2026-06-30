@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     is_abstract INTEGER DEFAULT 0,
     decorators TEXT, -- JSON array
     type_parameters TEXT, -- JSON array
+    return_type TEXT, -- normalized return/result type name (e.g. C++ method return, for receiver-type inference)
     updated_at INTEGER NOT NULL
 );
 
@@ -131,6 +132,17 @@ END;
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target, kind);
+
+-- Edge identity uniqueness. An edge IS uniquely (source, target, kind, line,
+-- col); insertEdge uses `INSERT OR IGNORE`, but without something UNIQUE to
+-- conflict on it behaved like a plain INSERT, so two passes emitting the same
+-- edge produced byte-identical duplicate rows that inflated counts and flowed
+-- into callers/impact (#1034). IFNULL folds the nullable line/col so
+-- coordinate-less edges (synthesized / file-level) dedup too — SQLite treats
+-- each NULL as distinct otherwise. Migration v6 dedups existing rows + adds
+-- this on older databases.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
+  ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
 
 -- File indexes
 CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
