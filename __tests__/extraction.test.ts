@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -2665,13 +2665,17 @@ std::unique_ptr<Widget> makeWidget() { return nullptr; }
     });
   });
 
-  describe('C++ macro-prefixed class/struct misparse (#946)', () => {
-    // An export/visibility macro before the class name plus a base clause
-    // (`class MACRO Name : public Base { … }`) makes tree-sitter read `class
-    // MACRO` as an elaborated type and the whole declaration as a
-    // function_definition named after the class, spanning the entire body — a
-    // phantom `function` that polluted callers/impact/blast-radius. It's dropped.
-    it('does not mint a phantom function for a macro-annotated class that inherits', () => {
+  describe('C++ macro-prefixed class/struct misparse (#946 → recovered in #1061)', () => {
+    // An export/visibility macro before the class name (`class MACRO Name :
+    // public Base { … }`) makes tree-sitter read `class MACRO` as an elaborated
+    // type and the whole declaration as a function_definition named after the
+    // class — a phantom `function` that polluted callers/impact/blast-radius.
+    // #946 dropped that phantom; #1061's preParse (`blankCppExportMacros`) now
+    // blanks the ALL-CAPS macro before parsing, so the class parses normally and
+    // is *recovered* — node, members, and base edge all present — not just
+    // de-phantomed. The #946 drop survives as the fallback for any residual
+    // misparse the blanking doesn't catch.
+    it('recovers a macro-annotated class that inherits (no phantom, real class + base edge)', () => {
       const code = `#pragma once
 #define MAPCORE_EXPORT __attribute__((visibility("default")))
 
@@ -2694,16 +2698,25 @@ public:
       const result = extractFromSource('provider.h', code);
 
       // The misparse used to surface as `function | LocalDataProvider` spanning
-      // the whole class body — a false caller in the graph. It's gone now.
+      // the whole class body — a false caller in the graph. It's gone.
       expect(
         result.nodes.find((n) => n.name === 'LocalDataProvider' && n.kind === 'function')
       ).toBeUndefined();
+
+      // …and the class is now recovered (was dropped under #946), with its
+      // `extends DataProvider` edge — the whole point of #1061.
+      expect(result.nodes.find((n) => n.name === 'LocalDataProvider')?.kind).toBe('class');
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'DataProvider'
+        )
+      ).toBeTruthy();
 
       // The sibling class without the macro is unaffected — still a class.
       expect(result.nodes.find((n) => n.name === 'DataProvider')?.kind).toBe('class');
     });
 
-    it('drops the struct variant too, without dropping a genuine class', () => {
+    it('recovers the struct variant too, without disturbing a genuine class', () => {
       const code = `
 #define API __declspec(dllexport)
 struct API Widget : public Base { int x; };
@@ -2711,14 +2724,90 @@ class Plain : public Base { public: int y; };
 `;
       const result = extractFromSource('widget.cpp', code);
 
-      // `struct MACRO Name : Base { … }` misparses the same way — no phantom function.
+      // `struct MACRO Name : Base { … }` misparses the same way — no phantom
+      // function, and the struct is recovered with its base edge.
       expect(
         result.nodes.find((n) => n.name === 'Widget' && n.kind === 'function')
       ).toBeUndefined();
+      expect(result.nodes.find((n) => n.name === 'Widget')?.kind).toBe('struct');
 
-      // A normal class with a base clause and no macro must still be a class — the
-      // drop is precise, not a blanket "class with inheritance" filter.
+      // A normal class with a base clause and no macro is untouched.
       expect(result.nodes.find((n) => n.name === 'Plain')?.kind).toBe('class');
+      const exts = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'extends')
+        .map((r) => r.referenceName);
+      expect(exts.filter((n) => n === 'Base').length).toBe(2); // Widget + Plain both extend Base
+    });
+  });
+
+  describe('C++ export-macro class recovery (#1061)', () => {
+    // Unreal-Engine style: `class MYGAME_API UMyComponent : public UActorComponent`.
+    // The leading `*_API` macro alone (base clause or not) triggers the #946
+    // misparse and dropped the class — breaking subclass / type-hierarchy /
+    // inheritance-impact queries for effectively every gameplay class in a UE
+    // project. blankCppExportMacros recovers them.
+    it('recovers UE *_API classes and the inheritance edge (the issue repro)', () => {
+      const code = `class ENGINE_API UActorComponent { };
+class MYGAME_API UMyComponent : public UActorComponent { };
+`;
+      const result = extractFromSource('ue.cpp', code);
+      const classes = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(classes).toContain('UActorComponent'); // macro, no base — also was dropped
+      expect(classes).toContain('UMyComponent');
+      expect(result.nodes.find((n) => n.kind === 'function')).toBeUndefined(); // no phantom
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'UActorComponent'
+        )
+      ).toBeTruthy();
+    });
+
+    it('blankCppExportMacros blanks only the header macro, offset-preserving', () => {
+      // Blanking replaces the macro with equal-length spaces, so the output is
+      // byte-for-byte the same length and identical *except* the macro is gone —
+      // every downstream line/column stays exact.
+      const check = (inp: string, macro: string, rest: string) => {
+        const out = blankCppExportMacros(inp);
+        expect(out.length).toBe(inp.length); // every byte offset preserved
+        expect(out).not.toContain(macro); // the macro token is blanked
+        expect(out.replace(/ +/g, ' ')).toBe(rest); // nothing else changed
+      };
+      // Generalizes across the export-macro space: UE _API, Qt/Boost _EXPORT,
+      // LLVM _ABI, bare API.
+      check(
+        'class MYGAME_API UMyComponent : public UActorComponent { };',
+        'MYGAME_API',
+        'class UMyComponent : public UActorComponent { };'
+      );
+      check('struct MAPCORE_EXPORT W : B {}', 'MAPCORE_EXPORT', 'struct W : B {}');
+      check('class LLVM_ABI Foo {}', 'LLVM_ABI', 'class Foo {}');
+    });
+
+    it('does NOT blank an all-caps class NAME or an elaborated-type var decl', () => {
+      // The name itself being ALL-CAPS (with or without a base) must survive —
+      // the macro is only the token *before* the name, gated on a `: { ` def.
+      for (const c of [
+        'class FOO { int x; };',
+        'class FOO : public Base { int x; };',
+        'struct BAR : public Base { int y; };',
+        'enum class COLOR { Red, Green };',
+        // elaborated-type variable declarations end in ; = [ — never : {
+        'struct FOO bar;',
+        'class FOO obj = make();',
+        'struct FOO arr[10];',
+        // a *_API macro used as an ordinary value elsewhere
+        'int x = SOME_API; void f() { use(MYMODULE_API); }',
+      ]) {
+        expect(blankCppExportMacros(c)).toBe(c);
+      }
+      // And the all-caps-named class keeps its base edge through real extraction.
+      const result = extractFromSource('ctrl.cpp', 'class FOO : public Base { int x; };');
+      expect(result.nodes.find((n) => n.name === 'FOO')?.kind).toBe('class');
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'Base'
+        )
+      ).toBeTruthy();
     });
   });
 
