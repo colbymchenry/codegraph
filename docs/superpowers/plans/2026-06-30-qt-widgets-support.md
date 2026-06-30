@@ -4,61 +4,77 @@
 
 **Goal:** Add real Qt Widgets support to the unified `qt` framework resolver while preserving existing QML / Qt Quick behavior.
 
-**Architecture:** Extend the existing Qt package under `src/resolution/frameworks/qt/`. `cpp-meta.ts` remains the shared Qt C++ meta-object registry, `widgets.ts` owns Widgets connect and auto-connect behavior, and `ui-xml.ts` owns `.ui` XML facts. The public resolver name remains `qt`; there is no `qml-qt` compatibility path.
+**Architecture:** Use a dedicated Qt Widgets synthesized-edge pass instead of unresolved-reference metadata. `cpp-meta.ts` provides a qualified, overload-aware Qt C++ fact registry; `ui-xml.ts` provides `.ui` facts; `qt-widgets-synthesizer.ts` joins those facts with existing graph nodes and inserts conservative `calls` edges.
 
-**Tech Stack:** TypeScript, Vitest, SQLite-backed CodeGraph integration tests, existing tree-sitter C/C++ extraction, conservative regex parsing for Qt meta-object and connect facts.
+**Tech Stack:** TypeScript, Vitest, SQLite-backed CodeGraph integration tests, existing tree-sitter C/C++ extraction, direct synthesized edges via `QueryBuilder.insertEdges`.
 
 ---
 
+## Execution Prerequisites
+
+This repo may have unrelated local changes. Before executing this plan:
+
+- Work on a clean feature branch or worktree.
+- Record the base with `BASE_REF=$(git merge-base HEAD origin/develop)` or the branch base chosen by the maintainer.
+- Stage only files named in the current task.
+- Do not use hardcoded ranges such as `HEAD~7`; use `$BASE_REF..HEAD` for final review.
+
 ## Scope
 
-This plan implements Qt Widgets in four incremental phases:
+This plan implements:
 
-1. C++ language routing, Widgets detection, and typed connect support.
-2. Legacy macro and overload connect forms.
-3. `.ui` XML, `ui->objectName`, and auto-connect handlers.
-4. Documentation, final verification, and real-repo probe commands.
+1. C/C++ routing and Qt Widgets detection.
+2. An overload-aware, qualified Qt C++ registry.
+3. A typed-connect synthesizer.
+4. Macro and overload connect forms.
+5. `.ui` XML, code-behind, and auto-connect synthesis.
+6. Sync regressions and final verification.
 
-The implementation must not execute Qt build tooling, moc, qmake, cmake, or project scripts. It must prefer missing edges over fabricated edges.
+The plan does not add `UnresolvedRef.metadata` or a DB schema migration. Widgets facts are derived in a synthesizer after normal extraction/resolution.
 
 ## File Structure
 
 - Modify: `src/resolution/frameworks/qt/index.ts`
-  - Add C/C++ languages to `qtResolver.languages`.
-  - Keep routing QML refs to `resolveQmlQt` and route non-QML refs to `resolveQtWidgets`.
-
-- Modify: `src/resolution/frameworks/qt/cpp-meta.ts`
-  - Extend `QtCppClassFacts`, `QtCppMethodFact`, and registry helpers for Widgets.
-  - Parse signal/slot signatures, method arity, visibility, inheritance names, and QObject/QWidget evidence.
-  - Export helper functions for Widgets resolution.
+  - Add `cpp` and `c` to `qtResolver.languages`.
 
 - Modify: `src/resolution/frameworks/qt/widgets.ts`
-  - Implement Widgets detection.
-  - Extract connect facts from C++ files.
-  - Resolve typed, macro, overload, `.ui`, and auto-connect references conservatively.
+  - Implement Widgets project detection helpers.
+  - Keep framework resolver extraction/resolution conservative; real Widgets edges live in the synthesizer.
+
+- Modify: `src/resolution/frameworks/qt/cpp-meta.ts`
+  - Add qualified class indexes.
+  - Represent overloaded methods with arrays/signature keys.
+  - Attach method facts to existing C++ method nodes.
 
 - Modify: `src/resolution/frameworks/qt/ui-xml.ts`
-  - Parse `.ui` XML object names, widget classes, actions, and `<connections>`.
-  - Expose a cache/registry consumed by `widgets.ts`.
+  - Parse `.ui` form, object, action, and connection facts.
+  - Expose a cached registry for the synthesizer.
 
-- Modify: `__tests__/frameworks.test.ts`
-  - Add resolver language routing coverage for `cpp` and `c`.
+- Create: `src/resolution/qt-widgets-synthesizer.ts`
+  - Scan indexed C/C++ sources and `.ui` facts.
+  - Synthesize connect-site -> slot, signal -> slot, and emit-site -> signal edges.
+
+- Modify: `src/resolution/callback-synthesizer.ts`
+  - Import and call the Qt Widgets synthesizer from `synthesizeCallbackEdges`, following existing framework synthesizer patterns.
 
 - Create: `__tests__/qt-widgets-integration.test.ts`
-  - End-to-end Widgets tests for detection, typed connects, macro/overload connects, `.ui`, auto-connect, and negative cases.
+  - End-to-end tests for detection, typed connect, macro/overload connect, `.ui`, auto-connect, negative cases, and sync.
+
+- Modify: `__tests__/frameworks.test.ts`
+  - Add C/C++ language routing coverage for `qtResolver`.
 
 - Modify: `CHANGELOG.md`
-  - Add a user-facing note that `qt` now covers Qt Widgets signal-slot and `.ui` relationships.
+  - Add a user-facing Widgets support note.
 
-## Task 1: Add Failing Widgets Routing and Detection Tests
+## Task 1: Add Failing Routing and Detection Tests
 
 **Files:**
 - Modify: `__tests__/frameworks.test.ts`
 - Create: `__tests__/qt-widgets-integration.test.ts`
 
-- [ ] **Step 1: Add resolver language routing assertions**
+- [ ] **Step 1: Add framework routing assertions**
 
-In `__tests__/frameworks.test.ts`, extend the Qt public identity describe block with:
+In `__tests__/frameworks.test.ts`, extend the Qt public identity describe block:
 
 ```ts
   it('routes Qt framework extraction to C and C++ files for Widgets support', () => {
@@ -69,7 +85,7 @@ In `__tests__/frameworks.test.ts`, extend the Qt public identity describe block 
   });
 ```
 
-- [ ] **Step 2: Create the Qt Widgets integration test file**
+- [ ] **Step 2: Create the Widgets integration test scaffold**
 
 Create `__tests__/qt-widgets-integration.test.ts`:
 
@@ -86,11 +102,11 @@ describe('Qt Widgets graph support', () => {
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-qt-widgets-'));
-    graph = new CodeGraph(tmpDir);
+    graph = CodeGraph.initSync(tmpDir);
   });
 
-  afterEach(async () => {
-    if (graph) await graph.close();
+  afterEach(() => {
+    graph?.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -116,7 +132,7 @@ int main(int argc, char **argv) {
 });
 ```
 
-- [ ] **Step 3: Run the failing tests**
+- [ ] **Step 3: Verify RED**
 
 Run:
 
@@ -127,23 +143,23 @@ npx vitest run __tests__/qt-widgets-integration.test.ts -t "detects Qt Widgets"
 
 Expected:
 
-- The framework routing test fails because `qtResolver.languages` does not include `cpp`/`c`.
-- The Widgets detection test fails because `detectQtWidgets()` returns `false`.
+- routing test fails because `qtResolver.languages` lacks `cpp`/`c`
+- detection test fails because `detectQtWidgets()` returns `false`
 
-- [ ] **Step 4: Commit the failing tests**
+- [ ] **Step 4: Commit failing tests**
 
 ```bash
 git add __tests__/frameworks.test.ts __tests__/qt-widgets-integration.test.ts
 git commit -m "test: define qt widgets routing"
 ```
 
-## Task 2: Implement Widgets Detection and C++ Routing
+## Task 2: Implement C/C++ Routing and Widgets Detection
 
 **Files:**
 - Modify: `src/resolution/frameworks/qt/index.ts`
 - Modify: `src/resolution/frameworks/qt/widgets.ts`
 
-- [ ] **Step 1: Route Qt framework extraction to C/C++**
+- [ ] **Step 1: Add C/C++ languages to `qtResolver`**
 
 In `src/resolution/frameworks/qt/index.ts`, change:
 
@@ -157,9 +173,9 @@ to:
   languages: ['qml', 'yaml', 'xml', 'cpp', 'c'],
 ```
 
-- [ ] **Step 2: Add conservative Widgets detection**
+- [ ] **Step 2: Implement Widgets detection**
 
-In `src/resolution/frameworks/qt/widgets.ts`, replace `detectQtWidgets` with:
+In `src/resolution/frameworks/qt/widgets.ts`, replace `detectQtWidgets`:
 
 ```ts
 const qtWidgetsProjectPattern =
@@ -174,50 +190,192 @@ export function detectQtWidgets(context: ResolutionContext): boolean {
 }
 ```
 
-- [ ] **Step 3: Keep Widgets extraction no-op for now**
-
-Do not implement `extractQtWidgets` yet. This task only proves routing and detection.
-
-- [ ] **Step 4: Run routing and detection tests**
-
-Run:
+- [ ] **Step 3: Run tests**
 
 ```bash
 npx vitest run __tests__/frameworks.test.ts -t "routes Qt framework extraction"
 npx vitest run __tests__/qt-widgets-integration.test.ts -t "detects Qt Widgets"
-```
-
-Expected: both pass.
-
-- [ ] **Step 5: Run QML regression tests**
-
-Run:
-
-```bash
 npx vitest run __tests__/qml-integration.test.ts
 ```
 
-Expected: all QML tests pass.
+Expected: all pass.
 
-- [ ] **Step 6: Commit routing and detection**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add src/resolution/frameworks/qt/index.ts src/resolution/frameworks/qt/widgets.ts
 git commit -m "feat: detect qt widgets projects"
 ```
 
-## Task 3: Extend the Qt C++ Meta Registry for Widgets
+## Task 3: Make `cpp-meta.ts` Overload-Aware and Qualified
 
 **Files:**
 - Modify: `src/resolution/frameworks/qt/cpp-meta.ts`
 - Modify: `__tests__/qt-widgets-integration.test.ts`
 
-- [ ] **Step 1: Add a failing typed connect test**
+- [ ] **Step 1: Add a failing duplicate class safety test**
 
 Append to `__tests__/qt-widgets-integration.test.ts`:
 
 ```ts
-  it('resolves typed signal-slot connects to the receiver slot', async () => {
+  it('does not connect slots across duplicate class names in different namespaces', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include <QPushButton>
+
+namespace App {
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+private slots:
+  void onButtonClicked();
+};
+}
+
+namespace Other {
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+private slots:
+  void onButtonClicked();
+};
+void MainWindow::onButtonClicked() {}
+}
+
+App::MainWindow::MainWindow() {
+  auto *button = new QPushButton(this);
+  connect(button, &QPushButton::clicked, this, &App::MainWindow::onButtonClicked);
+}
+
+void App::MainWindow::onButtonClicked() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!.getNodesByName('MainWindow').find((node) => node.kind === 'method' && node.qualifiedName.endsWith('App::MainWindow::MainWindow'));
+    const appSlot = graph!.getNodesByName('onButtonClicked').find((node) => node.kind === 'method' && node.qualifiedName.endsWith('App::MainWindow::onButtonClicked'));
+    const otherSlot = graph!.getNodesByName('onButtonClicked').find((node) => node.kind === 'method' && node.qualifiedName.endsWith('Other::MainWindow::onButtonClicked'));
+
+    expect(constructor).toBeDefined();
+    expect(appSlot).toBeDefined();
+    expect(otherSlot).toBeDefined();
+    const edges = graph!.getOutgoingEdges(constructor!.id);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === appSlot!.id)).toBe(true);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === otherSlot!.id)).toBe(false);
+  });
+```
+
+This test will remain red until the typed synthesizer exists, but it defines the required qualified-name behavior.
+
+- [ ] **Step 2: Replace single method facts with overload-capable facts**
+
+In `cpp-meta.ts`, change class method storage from a single fact per name to arrays:
+
+```ts
+export interface QtCppMethodFact {
+  name: string;
+  qualifiedName?: string;
+  invokable: boolean;
+  publicSlot: boolean;
+  privateOrProtectedSlot?: boolean;
+  signal?: boolean;
+  visibility?: 'public' | 'protected' | 'private';
+  signature?: string;
+  arity?: number;
+  parameterTypes: string[];
+  nodeId?: string;
+}
+
+export interface QtCppClassFacts {
+  name: string;
+  qualifiedName?: string;
+  classNodeId?: string;
+  baseClassNames: string[];
+  methodsByName: Map<string, QtCppMethodFact[]>;
+  properties: Map<string, QtCppPropertyFact>;
+  signals: Set<string>;
+  hasQmlExposureEvidence: boolean;
+  hasWidgetsEvidence: boolean;
+}
+
+export interface QtCppMetaRegistry {
+  classes: Map<string, QtCppClassFacts>;
+  classesByQualifiedName: Map<string, QtCppClassFacts>;
+  classesBySimpleName: Map<string, QtCppClassFacts[]>;
+}
+```
+
+- [ ] **Step 3: Add signature helpers**
+
+Add and export:
+
+```ts
+export function normalizeCppType(typeName: string): string {
+  return typeName
+    .replace(/\bconst\b/g, '')
+    .replace(/[&*]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function parseQtParameterTypes(params: string): string[] {
+  const trimmed = params.trim();
+  if (!trimmed || trimmed === 'void') return [];
+  return trimmed
+    .split(',')
+    .map((part) => normalizeCppType(part.replace(/\s+[A-Za-z_][A-Za-z0-9_]*\s*$/, '')))
+    .filter(Boolean);
+}
+
+export function normalizeQtSignature(signature: string): { name: string; parameterTypes: string[] } | null {
+  const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*$/.exec(signature);
+  if (!match) return null;
+  return { name: match[1]!, parameterTypes: parseQtParameterTypes(match[2] ?? '') };
+}
+```
+
+- [ ] **Step 4: Attach method node ids by qualified name**
+
+Update node attachment so `App::MainWindow::onButtonClicked` attaches only to `App::MainWindow`, not another `MainWindow`. If a method cannot be attached uniquely, leave `nodeId` undefined.
+
+- [ ] **Step 5: Preserve QML bridge APIs**
+
+Update `qt/qml.ts` usages from `methods.get(name)` to a helper that returns the unique method fact for a name when overloads are not relevant. QML bridge tests must keep passing.
+
+- [ ] **Step 6: Run registry and QML tests**
+
+```bash
+npx vitest run __tests__/qml-integration.test.ts -t "C\\+\\+/QML bridge|private or protected slots|aliased and versioned"
+npx vitest run __tests__/qt-widgets-integration.test.ts -t "duplicate class"
+```
+
+Expected:
+
+- QML tests pass.
+- duplicate class test still fails until Task 4 creates synthesized edges.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/resolution/frameworks/qt/cpp-meta.ts src/resolution/frameworks/qt/qml.ts __tests__/qt-widgets-integration.test.ts
+git commit -m "refactor: make qt cpp meta overload aware"
+```
+
+## Task 4: Add Typed Connect Synthesizer
+
+**Files:**
+- Create: `src/resolution/qt-widgets-synthesizer.ts`
+- Modify: `src/resolution/callback-synthesizer.ts`
+- Modify: `__tests__/qt-widgets-integration.test.ts`
+
+- [ ] **Step 1: Add typed connect tests**
+
+Append to `__tests__/qt-widgets-integration.test.ts`:
+
+```ts
+  it('synthesizes typed signal-slot connects to the receiver slot', async () => {
     fs.writeFileSync(
       path.join(tmpDir, 'mainwindow.cpp'),
       `#include <QMainWindow>
@@ -244,221 +402,12 @@ void MainWindow::onButtonClicked() {}
 
     const constructor = graph!.getNodesByName('MainWindow').find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
     const slot = graph!.getNodesByName('onButtonClicked').find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::onButtonClicked'));
-
     expect(constructor).toBeDefined();
     expect(slot).toBeDefined();
     expect(graph!.getOutgoingEdges(constructor!.id).some((edge) => edge.kind === 'calls' && edge.target === slot!.id)).toBe(true);
   });
-```
 
-- [ ] **Step 2: Run the test and verify failure**
-
-Run:
-
-```bash
-npx vitest run __tests__/qt-widgets-integration.test.ts -t "typed signal-slot"
-```
-
-Expected: fail because no Widgets connect edge exists.
-
-- [ ] **Step 3: Extend Qt method facts**
-
-In `src/resolution/frameworks/qt/cpp-meta.ts`, extend `QtCppMethodFact`:
-
-```ts
-export interface QtCppMethodFact {
-  name: string;
-  invokable: boolean;
-  publicSlot: boolean;
-  privateOrProtectedSlot?: boolean;
-  signal?: boolean;
-  visibility?: 'public' | 'protected' | 'private';
-  signature?: string;
-  arity?: number;
-  parameterTypes?: string[];
-  nodeId?: string;
-}
-```
-
-Extend `QtCppClassFacts`:
-
-```ts
-export interface QtCppClassFacts {
-  name: string;
-  classNodeId?: string;
-  baseClassNames: string[];
-  methods: Map<string, QtCppMethodFact>;
-  properties: Map<string, QtCppPropertyFact>;
-  signals: Set<string>;
-  hasQmlExposureEvidence: boolean;
-  hasWidgetsEvidence: boolean;
-}
-```
-
-- [ ] **Step 4: Add method signature helpers**
-
-Add helper functions near `simpleCppTypeName`:
-
-```ts
-function normalizeCppType(typeName: string): string {
-  return typeName
-    .replace(/\bconst\b/g, '')
-    .replace(/[&*]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function parseParameterTypes(params: string): string[] {
-  const trimmed = params.trim();
-  if (!trimmed || trimmed === 'void') return [];
-  return trimmed
-    .split(',')
-    .map((part) => normalizeCppType(part.replace(/\s+[A-Za-z_][A-Za-z0-9_]*\s*$/, '')))
-    .filter(Boolean);
-}
-```
-
-- [ ] **Step 5: Track method node ids**
-
-Update `attachQtCppNodes` so method nodes attach to class method facts:
-
-```ts
-  for (const node of context.getNodesByKind('method')) {
-    if (node.language !== 'cpp') continue;
-    const owner = node.qualifiedName.includes('::') ? node.qualifiedName.split('::').slice(-2, -1)[0] : undefined;
-    if (!owner) continue;
-    const facts = registry.classes.get(owner);
-    const method = facts?.methods.get(node.name);
-    if (method) method.nodeId = node.id;
-  }
-```
-
-- [ ] **Step 6: Preserve QML behavior**
-
-Keep `hasQmlExposureEvidence` semantics unchanged for QML bridge tests. Widgets metadata must add fields without changing which QML methods are considered invokable or public slots.
-
-- [ ] **Step 7: Run QML bridge and Widgets typed tests**
-
-Run:
-
-```bash
-npx vitest run __tests__/qml-integration.test.ts -t "C\\+\\+/QML bridge|private or protected slots|aliased and versioned"
-npx vitest run __tests__/qt-widgets-integration.test.ts -t "typed signal-slot"
-```
-
-Expected: QML tests pass; Widgets test still fails until Task 4 implements connect extraction.
-
-- [ ] **Step 8: Commit registry extension**
-
-```bash
-git add src/resolution/frameworks/qt/cpp-meta.ts __tests__/qt-widgets-integration.test.ts
-git commit -m "refactor: extend qt cpp meta for widgets"
-```
-
-## Task 4: Implement Typed Connect Extraction and Resolution
-
-**Files:**
-- Modify: `src/resolution/frameworks/qt/widgets.ts`
-- Modify: `src/resolution/frameworks/qt/cpp-meta.ts`
-
-- [ ] **Step 1: Add Widgets unresolved reference metadata type**
-
-In `widgets.ts`, add:
-
-```ts
-interface QtWidgetConnectRef {
-  pattern: 'typed';
-  signalClass: string;
-  signalName: string;
-  receiverClass: string;
-  slotName: string;
-}
-```
-
-Encode this metadata in `UnresolvedRef.metadata` when extracting connect calls.
-
-- [ ] **Step 2: Parse typed connect expressions**
-
-Add a parser in `widgets.ts`:
-
-```ts
-const typedConnectPattern =
-  /\b(?:QObject::)?connect\s*\(\s*[^,]+,\s*&([A-Za-z_][A-Za-z0-9_:]*)::([A-Za-z_][A-Za-z0-9_]*)\s*,\s*[^,]+,\s*&([A-Za-z_][A-Za-z0-9_:]*)::([A-Za-z_][A-Za-z0-9_]*)\s*\)/g;
-```
-
-For each match, emit an unresolved reference:
-
-```ts
-{
-  fromNodeId: '',
-  fromName: '<connect-site>',
-  referenceName: `${receiverClass}::${slotName}`,
-  referenceKind: 'calls',
-  filePath,
-  line,
-  column,
-  language: 'cpp',
-  metadata: {
-    framework: 'qt',
-    qtWidgetConnect: {
-      pattern: 'typed',
-      signalClass,
-      signalName,
-      receiverClass,
-      slotName,
-    },
-  },
-}
-```
-
-Use the enclosing method/function node when possible. Follow existing framework extractors for unresolved reference shape.
-
-- [ ] **Step 3: Implement `claimsQtWidgetsReference`**
-
-Return true only for refs with `metadata.framework === 'qt'` and `metadata.qtWidgetConnect`.
-
-- [ ] **Step 4: Implement `resolveQtWidgets`**
-
-Use `getQtCppMetaRegistry(context)` to resolve:
-
-1. Receiver class facts by `receiverClass`
-2. Slot method fact by `slotName`
-3. Unique `nodeId` on the slot method
-
-If no unique node exists, return `null`.
-
-Return:
-
-```ts
-{
-  targetNodeId: slot.nodeId,
-  confidence: 0.9,
-  resolvedBy: 'framework',
-  metadata: {
-    framework: 'qt',
-    pattern: 'qt-widget-connect',
-    signalClass,
-    signalName,
-  },
-}
-```
-
-- [ ] **Step 5: Run typed connect test**
-
-Run:
-
-```bash
-npx vitest run __tests__/qt-widgets-integration.test.ts -t "typed signal-slot"
-```
-
-Expected: pass.
-
-- [ ] **Step 6: Add negative typed connect test**
-
-Add to `__tests__/qt-widgets-integration.test.ts`:
-
-```ts
-  it('does not resolve typed connects when the receiver slot is missing', async () => {
+  it('does not synthesize typed connects when the receiver slot is missing', async () => {
     fs.writeFileSync(
       path.join(tmpDir, 'mainwindow.cpp'),
       `#include <QMainWindow>
@@ -485,33 +434,70 @@ MainWindow::MainWindow() {
   });
 ```
 
-- [ ] **Step 7: Run Widgets suite**
-
-Run:
+- [ ] **Step 2: Verify RED**
 
 ```bash
-npx vitest run __tests__/qt-widgets-integration.test.ts
+npx vitest run __tests__/qt-widgets-integration.test.ts -t "typed signal-slot|receiver slot is missing|duplicate class"
 ```
 
-Expected: all Widgets tests pass.
+Expected: typed positive and duplicate class tests fail; negative missing-slot test passes or fails only if an incorrect edge exists.
 
-- [ ] **Step 8: Commit typed connect support**
+- [ ] **Step 3: Implement `qt-widgets-synthesizer.ts`**
+
+Create `src/resolution/qt-widgets-synthesizer.ts` and export a `qtWidgetsEdges(queries: QueryBuilder): Edge[]` entry point. The implementation must:
+
+- read only files already indexed by CodeGraph
+- find enclosing method/function nodes by file and line range
+- skip connects with no enclosing node
+- parse multiline typed connect calls by collecting balanced parentheses after `connect(`
+- resolve receiver class using qualified class lookup first, unique simple-name lookup second
+- require a unique slot method node id
+- emit `Edge` objects:
+
+```ts
+{
+  source: connectSiteNode.id,
+  target: slot.nodeId,
+  kind: 'calls',
+  provenance: 'heuristic',
+  metadata: {
+    synthesizedBy: 'qt-widget-connect',
+    pattern: 'typed',
+    via: `${signalClass}::${signalName}`,
+    registeredAt: `${filePath}:${line}`,
+  },
+}
+```
+
+- [ ] **Step 4: Wire synthesizer into `synthesizeCallbackEdges`**
+
+In `src/resolution/callback-synthesizer.ts`, import `qtWidgetsEdges` and merge its returned edges with the other synthesized edges before insertion.
+
+- [ ] **Step 5: Run typed connect tests**
 
 ```bash
-git add src/resolution/frameworks/qt/widgets.ts src/resolution/frameworks/qt/cpp-meta.ts __tests__/qt-widgets-integration.test.ts
-git commit -m "feat: resolve qt widgets typed connects"
+npx vitest run __tests__/qt-widgets-integration.test.ts -t "typed signal-slot|receiver slot is missing|duplicate class"
 ```
 
-## Task 5: Add Legacy Macro and Overload Connect Support
+Expected: all pass.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/resolution/qt-widgets-synthesizer.ts src/resolution/callback-synthesizer.ts __tests__/qt-widgets-integration.test.ts
+git commit -m "feat: synthesize qt widgets typed connects"
+```
+
+## Task 5: Add Macro and Overload Connect Support
 
 **Files:**
-- Modify: `src/resolution/frameworks/qt/widgets.ts`
+- Modify: `src/resolution/qt-widgets-synthesizer.ts`
 - Modify: `src/resolution/frameworks/qt/cpp-meta.ts`
 - Modify: `__tests__/qt-widgets-integration.test.ts`
 
-- [ ] **Step 1: Add failing tests for macro and overload forms**
+- [ ] **Step 1: Add RED tests**
 
-Add tests covering:
+Add tests for:
 
 ```cpp
 connect(button, SIGNAL(clicked()), this, SLOT(onButtonClicked()));
@@ -520,78 +506,53 @@ connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainW
 connect(spin, static_cast<void (QSpinBox::*)(int)>(&QSpinBox::valueChanged), this, &MainWindow::onValueChanged);
 ```
 
-Each test should assert the connect site function/method has a `calls` edge to the receiver slot.
+Each test asserts the connect-site node has a `calls` edge to the receiver slot. Add a negative overloaded signal test where the expression does not disambiguate parameter types and assert no edge is created.
 
-- [ ] **Step 2: Run tests and verify failure**
-
-Run:
+- [ ] **Step 2: Verify RED**
 
 ```bash
-npx vitest run __tests__/qt-widgets-integration.test.ts -t "macro|qOverload|QOverload|static_cast"
+npx vitest run __tests__/qt-widgets-integration.test.ts -t "SIGNAL|qOverload|QOverload|static_cast|ambiguous overload"
 ```
 
-Expected: fail because only typed connect is supported.
+Expected: positive tests fail until support is implemented.
 
-- [ ] **Step 3: Implement signature normalization**
+- [ ] **Step 3: Implement macro parsing**
 
-In `cpp-meta.ts`, export:
+Parse `SIGNAL(name(types))` and `SLOT(name(types))`. For `this` receiver, infer receiver class from the enclosing connect-site node qualified name. Skip when the enclosing class cannot be inferred.
 
-```ts
-export function normalizeQtSignature(signature: string): { name: string; parameterTypes: string[] } | null {
-  const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*$/.exec(signature);
-  if (!match) return null;
-  return {
-    name: match[1]!,
-    parameterTypes: parseParameterTypes(match[2] ?? ''),
-  };
-}
-```
+- [ ] **Step 4: Implement overload parsing**
 
-- [ ] **Step 4: Implement macro connect parsing**
+Parse:
 
-In `widgets.ts`, parse `SIGNAL(...)` and `SLOT(...)`. For macro receiver `this`, infer the enclosing class from the connect site node's qualified name.
+- `qOverload<types...>(&Class::signal)`
+- `QOverload<types...>::of(&Class::signal)`
+- `static_cast<void (Class::*)(types...)>(&Class::signal)`
 
-Return `null` when receiver class cannot be inferred.
+Use normalized parameter types against method fact arrays. If zero or more than one target remains, skip.
 
-- [ ] **Step 5: Implement overload connect parsing**
-
-Add parsers for:
-
-- `qOverload<...>(&Class::signal)`
-- `QOverload<...>::of(&Class::signal)`
-- `static_cast<void (Class::*)(...)>(&Class::signal)`
-
-Use normalized parameter types to disambiguate overloaded methods. If multiple candidates remain, do not resolve.
-
-- [ ] **Step 6: Run overload tests**
-
-Run:
+- [ ] **Step 5: Run tests**
 
 ```bash
-npx vitest run __tests__/qt-widgets-integration.test.ts -t "macro|qOverload|QOverload|static_cast"
+npx vitest run __tests__/qt-widgets-integration.test.ts -t "SIGNAL|qOverload|QOverload|static_cast|ambiguous overload"
 ```
 
-Expected: pass.
+Expected: all pass.
 
-- [ ] **Step 7: Add ambiguous overload negative test**
-
-Add a test where a signal name has multiple overloads and the connect expression does not specify types. Assert no edge is created.
-
-- [ ] **Step 8: Commit macro and overload support**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/resolution/frameworks/qt/widgets.ts src/resolution/frameworks/qt/cpp-meta.ts __tests__/qt-widgets-integration.test.ts
-git commit -m "feat: resolve qt widgets overload connects"
+git add src/resolution/qt-widgets-synthesizer.ts src/resolution/frameworks/qt/cpp-meta.ts __tests__/qt-widgets-integration.test.ts
+git commit -m "feat: synthesize qt widgets overload connects"
 ```
 
-## Task 6: Add `.ui` XML Object and Connection Parsing
+## Task 6: Add `.ui` Registry and Connection Synthesis
 
 **Files:**
 - Modify: `src/resolution/frameworks/qt/ui-xml.ts`
-- Modify: `src/resolution/frameworks/qt/widgets.ts`
+- Modify: `src/resolution/qt-widgets-synthesizer.ts`
 - Modify: `__tests__/qt-widgets-integration.test.ts`
 
-- [ ] **Step 1: Add failing `.ui` connection test**
+- [ ] **Step 1: Add RED `.ui` connection test**
 
 Add a test with `mainwindow.ui`:
 
@@ -612,30 +573,11 @@ Add a test with `mainwindow.ui`:
 </ui>
 ```
 
-and C++:
+and a C++ `MainWindow::onButtonClicked` slot. Assert a synthesized calls edge reaches the slot.
 
-```cpp
-class MainWindow : public QMainWindow {
-  Q_OBJECT
-public slots:
-  void onButtonClicked();
-};
+- [ ] **Step 2: Implement `.ui` registry types**
 
-void MainWindow::onButtonClicked() {}
-```
-
-Assert the `.ui` connection resolves to the C++ slot method.
-
-- [ ] **Step 2: Implement `.ui` registry**
-
-In `ui-xml.ts`, parse:
-
-- `<class>...`
-- `<widget class="..." name="...">`
-- `<action name="...">`
-- `<connection>` sender/signal/receiver/slot
-
-Expose:
+In `ui-xml.ts`, export:
 
 ```ts
 export interface QtUiObjectFact {
@@ -651,21 +593,30 @@ export interface QtUiConnectionFact {
   slot: string;
   filePath: string;
 }
+
+export interface QtUiFileFacts {
+  filePath: string;
+  formClass?: string;
+  objects: QtUiObjectFact[];
+  connections: QtUiConnectionFact[];
+}
 ```
 
-Add cached `getQtUiRegistry(context)`.
+Add `parseQtUiXml(filePath, content)` and `getQtUiRegistryFromFiles(files)` helpers. Do not use unresolved refs for `.ui` connections.
 
-- [ ] **Step 3: Emit framework references from `.ui` extraction**
+- [ ] **Step 3: Synthesize `.ui` connection edges**
 
-`extractQtUiXml()` should emit unresolved references for `<connections>` with metadata `{ framework: 'qt', qtUiConnection: ... }`.
+In `qt-widgets-synthesizer.ts`, read indexed `.ui` files, parse registries, resolve receiver slots through the Qt C++ registry, and emit `calls` edges with metadata:
 
-- [ ] **Step 4: Resolve `.ui` connection refs in `resolveQtWidgets`**
+```ts
+{
+  synthesizedBy: 'qt-ui-connection',
+  via: `${sender}.${signal}`,
+  registeredAt: `${uiFilePath}:1`,
+}
+```
 
-Use `normalizeQtSignature()` and `getQtCppMetaRegistry(context)` to resolve receiver slot methods.
-
-- [ ] **Step 5: Run `.ui` test**
-
-Run:
+- [ ] **Step 4: Run `.ui` tests**
 
 ```bash
 npx vitest run __tests__/qt-widgets-integration.test.ts -t "\\.ui connection"
@@ -673,23 +624,23 @@ npx vitest run __tests__/qt-widgets-integration.test.ts -t "\\.ui connection"
 
 Expected: pass.
 
-- [ ] **Step 6: Commit `.ui` connection support**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add src/resolution/frameworks/qt/ui-xml.ts src/resolution/frameworks/qt/widgets.ts __tests__/qt-widgets-integration.test.ts
-git commit -m "feat: resolve qt ui connections"
+git add src/resolution/frameworks/qt/ui-xml.ts src/resolution/qt-widgets-synthesizer.ts __tests__/qt-widgets-integration.test.ts
+git commit -m "feat: synthesize qt ui connections"
 ```
 
-## Task 7: Add `ui->objectName` and Auto-Connect Support
+## Task 7: Add `ui->objectName`, Auto-Connect, and Sync Regressions
 
 **Files:**
-- Modify: `src/resolution/frameworks/qt/widgets.ts`
+- Modify: `src/resolution/qt-widgets-synthesizer.ts`
 - Modify: `src/resolution/frameworks/qt/ui-xml.ts`
 - Modify: `__tests__/qt-widgets-integration.test.ts`
 
-- [ ] **Step 1: Add failing `ui->objectName` test**
+- [ ] **Step 1: Add RED `ui->objectName` connect test**
 
-Create C++ with:
+Use:
 
 ```cpp
 MainWindow::MainWindow() {
@@ -698,9 +649,9 @@ MainWindow::MainWindow() {
 }
 ```
 
-and a `.ui` object named `pushButton`. Assert the connect resolves to `onButtonClicked`.
+and a `.ui` object named `pushButton`. Assert the connect-site node calls `onButtonClicked`.
 
-- [ ] **Step 2: Add failing auto-connect test**
+- [ ] **Step 2: Add RED auto-connect test**
 
 Use `.ui` object `pushButton` and C++ slot:
 
@@ -708,45 +659,41 @@ Use `.ui` object `pushButton` and C++ slot:
 void MainWindow::on_pushButton_clicked() {}
 ```
 
-Assert a synthesized calls edge exists from the `.ui` object/signal or owner class setup path to the auto-connect slot.
+Assert a synthesized edge reaches the auto-connect slot with metadata `synthesizedBy: 'qt-ui-autoconnect'`.
 
-- [ ] **Step 3: Implement form owner inference**
+- [ ] **Step 3: Add sync regression tests**
 
-In `widgets.ts`, detect `ui->setupUi(this)` inside a class method/constructor and map the owning C++ class to matching `.ui` form facts.
+Add tests that:
 
-- [ ] **Step 4: Implement `ui->objectName` sender type inference**
+- change `.ui` object `pushButton` to `saveButton`, call `graph.sync()`, and assert the old auto-connect edge disappears and the new one appears
+- change `onButtonClicked()` to `onRenamedClicked()`, call `graph.sync()`, and assert old connect edges disappear
+- change `ui->setupUi(this)` owner context so form ownership no longer matches, call `graph.sync()`, and assert owner-based edges disappear
 
-When parsing connect sender expressions, recognize `ui->name` and get the object class from `getQtUiRegistry(context)`.
+- [ ] **Step 4: Implement form owner inference**
 
-- [ ] **Step 5: Implement auto-connect synthesis**
+Detect `ui->setupUi(this)` inside class methods/constructors and map the owner class to matching `.ui` form facts. If multiple forms match ambiguously, skip.
 
-For each `.ui` object and each C++ method matching:
+- [ ] **Step 5: Implement `ui->objectName` sender type inference**
 
-```text
-on_<objectName>_<signalName>
-```
+When a connect sender expression is `ui->name`, get the sender class from the `.ui` registry for the inferred owner.
 
-create a conservative framework resolution edge to the method when:
+- [ ] **Step 6: Implement auto-connect synthesis**
 
-- the owner class can be inferred
-- the method exists uniquely
-- the object exists in exactly one matching `.ui` form for that owner
+For each `.ui` object and each C++ method matching `on_<objectName>_<signalName>`, emit a conservative `calls` edge when the owner class and method node are unique.
 
-- [ ] **Step 6: Run auto-connect tests**
-
-Run:
+- [ ] **Step 7: Run tests**
 
 ```bash
-npx vitest run __tests__/qt-widgets-integration.test.ts -t "ui->|auto-connect"
+npx vitest run __tests__/qt-widgets-integration.test.ts -t "ui->|auto-connect|sync"
 ```
 
-Expected: pass.
+Expected: all pass.
 
-- [ ] **Step 7: Commit code-behind support**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/resolution/frameworks/qt/widgets.ts src/resolution/frameworks/qt/ui-xml.ts __tests__/qt-widgets-integration.test.ts
-git commit -m "feat: resolve qt ui codebehind links"
+git add src/resolution/qt-widgets-synthesizer.ts src/resolution/frameworks/qt/ui-xml.ts __tests__/qt-widgets-integration.test.ts
+git commit -m "feat: synthesize qt ui codebehind links"
 ```
 
 ## Task 8: Documentation and Final Verification
@@ -757,7 +704,7 @@ git commit -m "feat: resolve qt ui codebehind links"
 
 - [ ] **Step 1: Update changelog**
 
-Under `## [Unreleased] > ### New Features`, append a sentence to the Qt bullet:
+Under `## [Unreleased] > ### New Features`, append:
 
 ```md
 Qt Widgets projects now resolve high-confidence signal-slot relationships from typed connects, legacy macro connects, overload-disambiguated connects, `.ui` connections, and auto-connect handlers.
@@ -765,11 +712,9 @@ Qt Widgets projects now resolve high-confidence signal-slot relationships from t
 
 - [ ] **Step 2: Check MCP guidance**
 
-Open `src/mcp/server-instructions.ts`. If it names QML/Qt only, update it to say the `qt` resolver covers QML / Qt Quick and Qt Widgets. Do not add claims about unsupported forms.
+Open `src/mcp/server-instructions.ts`. If it names QML/Qt only, update it to say `qt` covers QML / Qt Quick and Qt Widgets. Do not claim unsupported lambda/functor inference.
 
-- [ ] **Step 3: Run targeted tests**
-
-Run:
+- [ ] **Step 3: Run targeted verification**
 
 ```bash
 npx vitest run __tests__/qt-widgets-integration.test.ts
@@ -780,9 +725,7 @@ npm run build
 
 Expected: all pass.
 
-- [ ] **Step 4: Run full test suite**
-
-Run:
+- [ ] **Step 4: Run full suite**
 
 ```bash
 npm test
@@ -792,17 +735,15 @@ Expected: pass, or document existing unrelated Windows/MCP/multi-repo failures i
 
 - [ ] **Step 5: Inspect final diff**
 
-Run:
-
 ```bash
-git diff --stat HEAD~7..HEAD
+git diff --stat "$BASE_REF"..HEAD
 git status --short
 ```
 
 Expected:
 
-- Qt Widgets changes are committed in focused commits.
-- Existing unrelated local files remain unstaged unless they are part of this plan.
+- committed files match the plan
+- unrelated local changes remain unstaged
 
 - [ ] **Step 6: Commit docs**
 
@@ -813,15 +754,15 @@ git commit -m "docs: note qt widgets support"
 
 ## Real-Repo Probe Checklist
 
-After implementation passes deterministic tests, probe at least:
+After deterministic tests pass, probe:
 
 - a tiny hand-written Qt Widgets sample
-- a CMake Qt Widgets project using `find_package(Qt6 COMPONENTS Widgets)`
+- a CMake project using `find_package(Qt6 COMPONENTS Widgets)`
 - a qmake project using `QT += widgets`
 - a project with `.ui` files and auto-connect slots
 
-Use CodeGraph tools to verify:
+Verify:
 
 - `getDetectedFrameworks()` contains `qt`
 - `codegraph_explore` on a slot surfaces connect sites and `.ui` context
-- no broad false-positive edges appear for missing or ambiguous slots
+- missing/ambiguous slots do not produce broad false-positive edges

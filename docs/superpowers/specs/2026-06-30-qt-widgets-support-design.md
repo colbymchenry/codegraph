@@ -2,154 +2,156 @@
 
 ## Goal
 
-Add real Qt Widgets code intelligence under the unified public `qt` framework resolver. QML / Qt Quick remains supported through the existing `qt/qml.ts` path, while Widgets support lives under `qt/widgets.ts` and shares Qt C++ meta-object facts from `qt/cpp-meta.ts`.
+Add real Qt Widgets code intelligence under the unified public `qt` framework resolver. QML / Qt Quick continues to use `src/resolution/frameworks/qt/qml.ts`; Widgets support is added through Qt-specific C++ facts and a synthesized-edge pass.
 
-The finished feature should let CodeGraph answer practical questions in Qt Widgets projects:
+The feature should let CodeGraph answer practical Widgets questions:
 
 - which slot handles a button or action signal
-- which emit sites can reach a slot through a signal-slot connection
+- which connect sites register a slot
+- which emit sites can reach connected slots
 - which `.ui` object backs a `ui->objectName` reference
 - which auto-connect handler corresponds to a `.ui` object and signal
 
 ## Current State
 
-The repository already has general C/C++ graph extraction. It can index classes, methods, functions, inheritance, calls, and includes. That layer answers "what C++ symbols exist?"
+CodeGraph already has general C/C++ graph extraction. It indexes files, classes, structs, methods, functions, inheritance, includes, and ordinary call references.
 
 The Qt-specific layer is separate:
 
-- `src/resolution/frameworks/qt/index.ts` is the single public `qt` framework resolver.
+- `src/resolution/frameworks/qt/index.ts` is the only public `qt` framework resolver.
 - `src/resolution/frameworks/qt/qml.ts` implements QML / Qt Quick framework behavior.
 - `src/resolution/frameworks/qt/cpp-meta.ts` parses Qt meta-object facts such as `Q_OBJECT`, `Q_PROPERTY`, `Q_INVOKABLE`, `signals:`, and slots.
 - `src/resolution/frameworks/qt/widgets.ts` is currently a no-op scaffold.
 - `src/resolution/frameworks/qt/ui-xml.ts` is currently a no-op `.ui` scaffold.
 
-`cpp-meta.ts` does not replace the C++ graph. It annotates existing C++ graph nodes with Qt meaning: signal, slot, invokable, property, and QObject-style exposure. Widgets support should extend this role instead of building a parallel C++ parser.
+`cpp-meta.ts` does not replace the C++ graph. It answers "what do these C++ symbols mean to Qt?" and attaches those facts back to existing C++ nodes.
 
-## Recommended Architecture
+## Architectural Decision: Synthesizer, Not Unresolved Metadata
 
-### 1. Keep One Public Qt Resolver
+Qt Widgets facts should not be transported through `UnresolvedRef.metadata`. The current unresolved-reference contract and DB schema do not persist arbitrary metadata, and unresolved refs without real source node ids are filtered out during extraction.
 
-The public framework identity remains `qt`. There is no `qml-qt` compatibility alias. Internally, `qtResolver` delegates by language and file kind:
+Widgets support should therefore use a post-resolution synthesized-edge pass, following the existing dynamic-dispatch pattern used by callback, function-pointer, framework, and event synthesizers:
 
-- QML and `qmldir` behavior: `qt/qml.ts`
-- Qt Widgets C++ behavior: `qt/widgets.ts`
-- `.ui` XML behavior: `qt/ui-xml.ts`
-- shared C++ meta-object facts: `qt/cpp-meta.ts`
+1. Existing extraction indexes C++ and XML files normally.
+2. The Qt C++ registry reads indexed files and existing nodes to build Qt facts.
+3. A new `qt-widgets-synthesizer.ts` scans source files and `.ui` registries for connect facts.
+4. The synthesizer emits `Edge[]` directly with `provenance: 'heuristic'` and metadata such as `synthesizedBy: 'qt-widget-connect'`.
+5. The resolver pipeline persists those synthesized edges after ordinary resolution, and sync re-runs the synthesizer so stale edges are removed/rebuilt with the rest of the graph.
 
-`qtResolver.languages` must include the C/C++ languages needed for Widgets, otherwise the framework extractor will never run on C++ source files.
+This design supports multiple edges per connect relationship:
 
-### 2. Extend the Qt C++ Meta Registry
+- connect-site function/method -> receiver slot
+- signal method -> receiver slot
+- emit-site function/method -> signal method where the signal method node exists
 
-`cpp-meta.ts` should become the shared Qt C++ fact registry for both QML and Widgets. It should continue parsing source text conservatively, then attach facts to existing indexed C++ nodes.
+## Public Resolver Shape
 
-Add facts for:
+The public framework identity remains `qt`. There is no `qml-qt` compatibility alias.
 
-- QObject-like class evidence: `Q_OBJECT`, `Q_GADGET`, `QObject` / `QWidget` inheritance, `QMainWindow`, `QDialog`, generated `Ui::` usage
-- method visibility sections: public / protected / private, public slots, protected slots, private slots
-- signals and signal signatures
-- slot methods and slot signatures
-- method arity and normalized parameter type strings where available
-- class inheritance names useful for resolving `this` and base class signals/slots
+`qtResolver` still delegates:
 
-The registry should expose helpers used by Widgets:
+- QML and `qmldir`: `qt/qml.ts`
+- `.ui` XML extraction facts: `qt/ui-xml.ts`
+- C++ Widgets detection and no-op framework extraction: `qt/widgets.ts`
 
-- find class facts by simple or qualified name
-- find signal by class and method name
-- find slot or ordinary callable by class and method name
-- resolve a member pointer expression such as `&MainWindow::onClicked`
-- normalize macro signatures such as `clicked()` and `valueChanged(int)`
+`qtResolver.languages` must include the C/C++ languages needed for Widgets detection and any framework extraction hooks, but core Widgets edges come from the synthesizer rather than `resolveQtWidgets()`.
 
-### 3. Add a Widgets Connection Model
+## Qt C++ Meta Registry
 
-`widgets.ts` should parse Qt connection facts from C++ source files and resolve them to graph edges.
+`cpp-meta.ts` should become a shared Qt C++ fact registry for QML and Widgets.
 
-Start with high-confidence typed connects:
+Required facts:
+
+- QObject-like class evidence: `Q_OBJECT`, `Q_GADGET`, `QObject` / `QWidget` / `QMainWindow` / `QDialog` inheritance, and `Ui::` usage.
+- class indexes by both qualified name and simple name.
+- method facts grouped by method name, because overloaded signals and slots need multiple facts per name.
+- normalized signatures: name, arity, parameter type list, visibility, signal/slot/invokable flags, and attached method node id.
+- base class names for conservative inherited signal/slot lookup.
+
+The registry should avoid global simple-name guesses. Simple-name lookup is allowed only when it produces a unique class in the project or in the relevant file/class context.
+
+## Widgets Connection Model
+
+Widgets connection parsing belongs in the synthesizer and should be conservative.
+
+Supported forms, phased:
 
 ```cpp
 connect(button, &QPushButton::clicked, this, &MainWindow::onButtonClicked);
 QObject::connect(sender, &Worker::finished, receiver, &Controller::handleFinished);
-```
-
-Then add the legacy and overload forms:
-
-```cpp
 connect(button, SIGNAL(clicked()), this, SLOT(onButtonClicked()));
 connect(combo, qOverload<int>(&QComboBox::currentIndexChanged), this, &MainWindow::onIndexChanged);
 connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::onIndexChanged);
 connect(spin, static_cast<void (QSpinBox::*)(int)>(&QSpinBox::valueChanged), this, &MainWindow::onValueChanged);
 ```
 
-The connection model should be explicit and conservative:
+No edge should be created when:
 
-- connect site function/method -> slot method as a `calls` edge
-- emit site -> signal method as a `calls` edge when the signal method node exists
-- signal method -> connected slot method as a synthesized `calls` edge
-- optional metadata on synthesized edges should identify the connect site and pattern
+- the enclosing connect-site node cannot be identified
+- receiver class cannot be inferred
+- the slot method is missing
+- overload resolution is ambiguous
+- a class name collision cannot be narrowed by qualified name, namespace, file, or owner context
 
-If the sender or receiver type is unknown, the signal/slot is ambiguous, or overload resolution cannot pick a single target, no edge should be created. A dynamic-dispatch boundary can be reported later, but fabricated edges are worse than missing edges.
+## `.ui` XML and Code-Behind Model
 
-### 4. Add `.ui` XML and Code-Behind Support
+`.ui` parsing should produce a registry, not arbitrary unresolved refs:
 
-`.ui` parsing should extract enough structure to support Widgets workflows:
-
+- form class
 - widget/action object names
-- widget class names
-- `<connections>` sender/signal/receiver/slot relationships
-- top-level form class where available
+- widget/action class names
+- `<connection>` sender/signal/receiver/slot facts
 
-Code-behind support should connect C++ to `.ui` facts:
+Widgets synthesis then uses this registry to:
 
-- `ui->setupUi(this)` marks a class as the form owner
-- `ui->pushButton` references the `.ui` object named `pushButton`
-- `connect(ui->pushButton, &QPushButton::clicked, this, &MainWindow::onClicked)` can resolve sender type from `.ui`
-- auto-connect methods such as `on_pushButton_clicked()` resolve from `.ui` object `pushButton` signal `clicked`
+- resolve `.ui` `<connections>` to C++ slots
+- infer sender type for `ui->pushButton`
+- link `ui->objectName` member reads to `.ui` object nodes when those nodes exist
+- synthesize auto-connect edges for methods matching `on_<objectName>_<signalName>()`
 
-### 5. Error Handling and Safety
+`ui->setupUi(this)` should be used to infer the owner C++ class for a form. If multiple `.ui` forms match the same owner ambiguously, skip the synthesized edge.
 
-Qt Widgets support must remain conservative:
+## Sync Requirements
+
+Widgets support introduces cross-file derived state, so sync coverage is mandatory. Tests must cover:
+
+- changing a slot name/signature removes the old edge and adds the new edge
+- changing a `.ui` object name updates `ui->objectName` and auto-connect edges
+- changing a `.ui` connection updates the connected slot
+- changing `ui->setupUi(this)` owner context removes stale owner-based edges
+
+## Safety Rules
 
 - Do not execute moc, qmake, cmake, or user build scripts.
 - Do not require Qt headers to be installed.
 - Prefer missing edges over wrong edges.
-- Treat overloaded signals/slots as unresolved unless the connect expression disambiguates them.
-- Lambda/functor connects should only connect to a lambda/enclosing callable when the existing graph can identify it confidently; otherwise leave them as dynamic boundaries.
+- Treat overloads as unresolved unless the expression disambiguates them.
+- Lambda/functor connects are dynamic boundaries unless an existing graph node can be identified confidently.
 
 ## Phased Delivery
 
-### Phase A: Typed Connect Core
+### Phase A: Routing, Detection, and Typed Connect Synthesizer
 
-Build the C++ language gate, Widgets detection, Qt C++ registry extensions, and typed connect edges. This phase makes modern Qt5/Qt6 Widgets projects useful without handling every legacy form.
+Enable `qt` on C/C++ languages, detect Widgets projects, extend the Qt C++ registry for overloaded methods and qualified class lookup, and synthesize high-confidence typed connect edges.
 
-### Phase B: Overload and Macro Connects
+### Phase B: Macro and Overload Connects
 
-Add `SIGNAL` / `SLOT`, `qOverload`, `QOverload`, and `static_cast` handling with negative tests for ambiguous overloads.
+Add `SIGNAL` / `SLOT`, `qOverload`, `QOverload`, and `static_cast` support with ambiguity tests.
 
 ### Phase C: `.ui` XML and Auto-Connect
 
-Parse `.ui` XML structure, connect `ui->objectName` references, resolve `.ui` `<connections>`, and synthesize auto-connect edges.
+Parse `.ui` registries, resolve `.ui` `<connections>`, support `ui->objectName` sender type inference, and synthesize auto-connect edges.
 
-### Phase D: Hardening and Evaluation
+### Phase D: Hardening and Real-Repo Validation
 
-Run targeted unit and integration tests, then probe real small/medium/large Qt Widgets repositories. Update MCP/server guidance if needed so agents understand that `qt` covers QML and Widgets.
-
-## Test Strategy
-
-Each phase needs tests at three levels:
-
-- deterministic unit tests for parsers and registry helpers
-- integration tests with small Qt Widgets projects indexed by CodeGraph
-- negative tests proving unresolved or ambiguous cases do not create false edges
-
-Existing QML / Qt Quick tests must stay green. Any Widgets changes to `cpp-meta.ts` must preserve QML bridge behavior.
+Run focused tests, full QML regressions, sync regressions, full build/test where feasible, and real Qt Widgets repository probes.
 
 ## Out of Scope
 
-The first implementation plan should not attempt:
+The first implementation should not attempt:
 
-- executing moc or build systems
-- full C++ type inference beyond local declarations and existing graph facts
-- complete template metaprogramming support
-- perfect overload resolution for all C++ forms
-- semantic understanding of arbitrary lambdas or functor objects
-
-Those can be added after the core connection model is reliable.
+- executing Qt build tooling
+- perfect C++ type inference
+- arbitrary template metaprogramming
+- guaranteed lambda/functor target identification
+- broad edges for ambiguous overloads or duplicate class names
