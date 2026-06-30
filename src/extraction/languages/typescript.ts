@@ -1,10 +1,48 @@
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
+import type { Node as SyntaxNode } from 'web-tree-sitter';
+
+/**
+ * A TS/JS class field (`public_field_definition` / `field_definition`) is a
+ * METHOD only when its value is callable — an arrow function, a function
+ * expression, or a HOF call wrapping one (`onScroll = throttle(() => {…})`),
+ * exactly mirroring what `resolveBody` below knows how to walk. Everything
+ * else (`public fonts: Fonts;`, `count = 0`, `static defaults = {…}`) is a
+ * PROPERTY. Previously every field extracted as method-kind (#808), which
+ * misrepresented class shape and defeated kind-based filtering — the reason
+ * #756's function-ref resolution had to restrict TS/JS bare identifiers to
+ * function targets.
+ */
+export function classifyTsClassMember(node: SyntaxNode): 'method' | 'property' {
+  if (node.type !== 'public_field_definition' && node.type !== 'field_definition') {
+    return 'method'; // method_definition, getters/setters — untouched
+  }
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    if (child.type === 'arrow_function' || child.type === 'function_expression') {
+      return 'method';
+    }
+    if (child.type === 'call_expression') {
+      const args = getChildByField(child, 'arguments');
+      if (args) {
+        for (let j = 0; j < args.namedChildCount; j++) {
+          const arg = args.namedChild(j);
+          if (arg && (arg.type === 'arrow_function' || arg.type === 'function_expression')) {
+            return 'method';
+          }
+        }
+      }
+    }
+  }
+  return 'property';
+}
 
 export const typescriptExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration', 'arrow_function', 'function_expression'],
   classTypes: ['class_declaration', 'abstract_class_declaration'],
   methodTypes: ['method_definition', 'public_field_definition'],
+  classifyMethodNode: classifyTsClassMember,
   interfaceTypes: ['interface_declaration'],
   structTypes: [],
   enumTypes: ['enum_declaration'],

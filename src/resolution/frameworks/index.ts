@@ -13,13 +13,20 @@ import { nestjsResolver } from './nestjs';
 import { reactResolver } from './react';
 import { svelteResolver } from './svelte';
 import { vueResolver } from './vue';
+import { astroResolver } from './astro';
 import { djangoResolver, flaskResolver, fastapiResolver } from './python';
 import { railsResolver } from './ruby';
 import { springResolver } from './java';
+import { playResolver } from './play';
 import { goResolver } from './go';
+import { goframeResolver } from './goframe';
 import { rustResolver } from './rust';
 import { aspnetResolver } from './csharp';
 import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
+import { swiftObjcBridgeResolver } from './swift-objc';
+import { reactNativeBridgeResolver } from './react-native';
+import { expoModulesResolver } from './expo-modules';
+import { fabricViewResolver } from './fabric';
 
 /**
  * All registered framework resolvers
@@ -34,6 +41,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   reactResolver,
   svelteResolver,
   vueResolver,
+  astroResolver,
   // Python
   djangoResolver,
   flaskResolver,
@@ -42,8 +50,10 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   railsResolver,
   // Java
   springResolver,
+  playResolver,
   // Go
   goResolver,
+  goframeResolver,
   // Rust
   rustResolver,
   // C#
@@ -52,6 +62,14 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   swiftUIResolver,
   uikitResolver,
   vaporResolver,
+  // Swift ↔ Objective-C cross-language bridging (mixed iOS apps)
+  swiftObjcBridgeResolver,
+  // React Native JS ↔ native bridge (legacy + TurboModules)
+  reactNativeBridgeResolver,
+  // Expo Modules — Function/AsyncFunction/Property DSL on Swift/Kotlin
+  expoModulesResolver,
+  // React Native Fabric / Codegen view components — TS spec → component nodes
+  fabricViewResolver,
 ];
 
 /**
@@ -114,10 +132,17 @@ export { nestjsResolver } from './nestjs';
 export { reactResolver } from './react';
 export { svelteResolver } from './svelte';
 export { vueResolver } from './vue';
+export { astroResolver } from './astro';
 export { djangoResolver, flaskResolver, fastapiResolver } from './python';
 export { railsResolver } from './ruby';
 export { springResolver } from './java';
+export { playResolver } from './play';
 export { goResolver } from './go';
+export { goframeResolver } from './goframe';
 export { rustResolver } from './rust';
 export { aspnetResolver } from './csharp';
 export { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
+export { swiftObjcBridgeResolver } from './swift-objc';
+export { reactNativeBridgeResolver } from './react-native';
+export { expoModulesResolver } from './expo-modules';
+export { fabricViewResolver } from './fabric';

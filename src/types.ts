@@ -75,6 +75,7 @@ export const LANGUAGES = [
   'c',
   'cpp',
   'csharp',
+  'razor',
   'php',
   'ruby',
   'swift',
@@ -82,6 +83,7 @@ export const LANGUAGES = [
   'dart',
   'svelte',
   'vue',
+  'astro',
   'liquid',
   'pascal',
   'scala',
@@ -89,8 +91,12 @@ export const LANGUAGES = [
   'luau',
   'gdscript',
   'godot_resource',
+  'objc',
+  'r',
   'yaml',
   'twig',
+  'xml',
+  'properties',
   'unknown',
 ] as const;
 
@@ -160,6 +166,15 @@ export interface Node {
 
   /** Generic type parameters */
   typeParameters?: string[];
+
+  /**
+   * Normalized return/result type name for a function/method (the bare class
+   * name, smart-pointer pointee unwrapped). Captured for C/C++ so resolution
+   * can infer a chained receiver's type from what the inner call returns —
+   * `Foo::instance().bar()` resolves `bar` on `Foo` (issue #645). Undefined for
+   * languages/symbols where it isn't captured.
+   */
+  returnType?: string;
 
   /** When the node was last updated */
   updatedAt: number;
@@ -268,6 +283,14 @@ export interface ExtractionError {
 }
 
 /**
+ * Kinds an unresolved reference can carry. `function_ref` is internal-only —
+ * a function name used as a VALUE (callback registration, #756). It never
+ * becomes an edge kind: resolution maps it to a `references` edge targeting
+ * function/method nodes only (see `matchFunctionRef`).
+ */
+export type ReferenceKind = EdgeKind | 'function_ref';
+
+/**
  * A reference that couldn't be resolved during extraction
  */
 export interface UnresolvedReference {
@@ -278,7 +301,7 @@ export interface UnresolvedReference {
   referenceName: string;
 
   /** Type of reference (call, type, import, etc.) */
-  referenceKind: EdgeKind;
+  referenceKind: ReferenceKind;
 
   /** Location of the reference */
   line: number;
@@ -310,6 +333,15 @@ export interface Subgraph {
 
   /** Root node IDs (entry points) */
   roots: string[];
+
+  /**
+   * Retrieval confidence for context-style queries. `'low'` means the query
+   * resolved only to isolated common-word matches (no entry point corroborated
+   * by 2+ distinct query terms) — callers should surface an honest handoff to
+   * explore/trace rather than present the results as comprehensive. Undefined
+   * for graph traversals that don't run the search-ranking path.
+   */
+  confidence?: 'high' | 'low';
 }
 
 /**
@@ -368,7 +400,12 @@ export interface SearchResult {
   /** Matching node */
   node: Node;
 
-  /** Relevance score (0-1) */
+  /**
+   * Relevance score for relative ranking only — higher is more relevant.
+   * NOT normalized and NOT a 0-1 fraction: the FTS path returns an unbounded
+   * BM25 magnitude (often in the tens or hundreds), while the fuzzy/exact
+   * paths return ~0-1. Use it to order results, not as an absolute percentage.
+   */
   score: number;
 
   /** Matched text snippets for highlighting */

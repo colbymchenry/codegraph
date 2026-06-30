@@ -81,25 +81,38 @@ for _ in $(seq 1 120); do
 done
 [ "$started" = 1 ] || { echo "agent never started working"; cap; tmux kill-session -t "$SESSION" 2>/dev/null; exit 1; }
 
-# Poll for idle: not busy AND ❯ present, for 10 consecutive polls (~5s) to ride
-# out mid-conversation thinking gaps that briefly drop the spinner. Up to ~15min.
-consec=0
-for _ in $(seq 1 1800); do
-  pane=$(cap)
-  if echo "$pane" | grep -qE "$BUSY_RE"; then
-    consec=0
-  elif echo "$pane" | grep -q "❯"; then
-    consec=$((consec+1)); [ "$consec" -ge 10 ] && break
+# Poll for idle. CRITICAL: Opus 4.8 (extended thinking) renders NO spinner /
+# "esc to interrupt" / timer while it STREAMS its final answer — those appear
+# only during the thinking + tool-use phases ("✻ Marinating… (32s · ↓ 1.3k
+# tokens · thinking with max effort)"). So BUSY_RE reads "not busy" for the whole
+# 10-30s answer stream, and any short not-busy threshold kills the run mid-answer
+# (the truncation bug). We therefore detect "done" by CONTENT STABILITY, not by a
+# spinner string: while the agent streams, the captured pane changes every poll,
+# so stability never accrues; it accrues only once the agent has finished and the
+# static "✻ Brewed for 1m 9s" summary is all that is left. BUSY_RE still hard-
+# resets stability (covers thinking/tool-use/live-timer, where text can briefly
+# sit still). Need STABLE_NEEDED polls (~8s) of zero pane change + ❯ present.
+# Content-stability is model-agnostic — it survives future spinner re-wordings.
+STABLE_NEEDED=16
+prev=""; stable=0
+for _ in $(seq 1 2400); do            # up to ~20 min
+  pane="$(cap)"
+  sig="$(printf '%s' "$pane" | tr -s '[:space:]' ' ')"
+  if printf '%s' "$pane" | grep -qE "$BUSY_RE"; then
+    stable=0                          # thinking / tool use / live timer → busy
+  elif [ -n "$sig" ] && [ "$sig" = "$prev" ] && printf '%s' "$pane" | grep -q "❯"; then
+    stable=$((stable+1)); [ "$stable" -ge "$STABLE_NEEDED" ] && break
   else
-    consec=0
+    stable=0                          # answer still streaming → pane changing
   fi
+  prev="$sig"
   sleep 0.5
 done
 sleep 1
 
 tmux capture-pane -p -t "$SESSION" -S - > "$OUT"
 echo "captured $(wc -l < "$OUT") lines -> $OUT"
-grep -oE "Done \([^)]*\)" "$OUT" | tail -1
+grep -oE "Done \([^)]*\)|[A-Z][a-z]+ for ([0-9]+m )?[0-9]+s" "$OUT" | tail -1
 grep -oE "[0-9.]+k?/[0-9.]+M" "$OUT" | tail -1 | sed 's/^/Context /'
 tmux kill-session -t "$SESSION" 2>/dev/null
 

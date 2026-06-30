@@ -25,7 +25,7 @@ cd "$REPO" || exit 1
 claude -p "$PROMPT" \
   --output-format stream-json --verbose \
   --permission-mode bypassPermissions \
-  --model opus \
+  --model "${MODEL:-sonnet}" --effort "${EFFORT:-high}" \
   --max-budget-usd 2 \
   --strict-mcp-config --mcp-config "$MCP_CONFIG" \
   > "$OUT" 2>"$OUT_DIR/run-${LABEL}.err"
