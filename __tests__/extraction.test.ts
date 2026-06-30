@@ -4264,6 +4264,81 @@ std::string use() {
       expect(reached.some((p) => p.endsWith('user.cc')), `${fn.name} should be called from user.cc`).toBe(true);
     }
   });
+
+  it('names a reference-returning free function from its name node (not `& Name(...)`)', async () => {
+    const src = path.join(tempDir, 'src');
+    fs.mkdirSync(src, { recursive: true });
+
+    // `const std::string& GetRef(a::Ctx&)` wraps the function_declarator in a
+    // reference_declarator. The generic declarator-text fallback kept the
+    // leading `&` and the whole signature, indexing it as
+    // `& GetRef(a::Ctx& c)` — unsearchable, so callers never resolved.
+    fs.writeFileSync(
+      path.join(src, 'ref.cc'),
+      `#include <string>
+namespace a { struct Ctx {}; }
+const std::string& GetRef(a::Ctx& c) { static std::string s; return s; }
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'use_ref.cc'),
+      `#include <string>
+namespace a { struct Ctx {}; }
+void useRef(a::Ctx& c) { (void)GetRef(c); }
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const fns = cg.getNodesByKind('function');
+    const getRef = fns.find((n) => n.name === 'GetRef');
+    expect(getRef, 'GetRef extracted under its real name (not "& GetRef(...)")').toBeDefined();
+    expect(fns.some((n) => n.name.includes('&')), 'no function indexed with a stray "&" in its name').toBe(false);
+
+    const reached = [...cg.getImpactRadius(getRef!.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+    expect(reached.some((p) => p.endsWith('use_ref.cc')), 'GetRef should be called from use_ref.cc').toBe(true);
+  });
+
+  it('resolves a fully-qualified call `ns::a::Func(...)` to its definition', async () => {
+    const src = path.join(tempDir, 'src');
+    fs.mkdirSync(src, { recursive: true });
+
+    // The callee node is stored under its SIMPLE name (`GetInsured`), but the
+    // call site uses the fully-qualified `ns::insured::GetInsured(...)`. Storing
+    // the full qualified text as the callee left the name-based resolver unable
+    // to link the `calls` edge, so `GetInsured` reported no callers.
+    fs.writeFileSync(
+      path.join(src, 'insured.cc'),
+      `#include <string>
+namespace mmpayinspolicymgrao { namespace insured {
+std::string GetInsured(const std::string& id) { return id; }
+} }
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'caller.cc'),
+      `#include <string>
+std::string CallIt() {
+  return mmpayinspolicymgrao::insured::GetInsured("x");
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const getInsured = cg.getNodesByKind('function').find((n) => n.name === 'GetInsured');
+    expect(getInsured, 'GetInsured extracted').toBeDefined();
+
+    const reached = [...cg.getImpactRadius(getInsured!.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+    expect(
+      reached.some((p) => p.endsWith('caller.cc')),
+      'qualified call ns::insured::GetInsured should resolve to caller.cc',
+    ).toBe(true);
+  });
 });
 
 describe('Dart mixins and type references', () => {
