@@ -2532,11 +2532,19 @@ export class ToolHandler {
     // trace endpoint picker uses) and inject it as an entry, so every symbol the
     // agent explicitly named is in the subgraph and its file is scored.
     const namedSeedIds = new Set<string>();
+    // The subset of named seeds that earns the named-FIRST sort tier. We still
+    // SEED every ≤3-def name (so RWR / flow ranking is unchanged), but only the
+    // most-substantive def is tiered — a bare name's unrelated namesakes (Go's
+    // `NewClient` = real client + test fake + xds pool) must not fill the tier
+    // and crowd out the real answer file (grpc's `dialoptions.go`). Corroborated
+    // overloads (the query also named the type) all earn it. (#1064)
+    const tierSeedIds = new Set<string>();
     {
       const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro)$/i;
       const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
       const isTestPath = (p: string) => /(^|\/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)\//i.test(p) || /\.(test|spec)\.[a-z]+$/i.test(p);
       const bodyLines = (n: Node) => Math.max(0, (n.endLine ?? n.startLine) - n.startLine);
+      const callerCount = (n: Node) => { try { return cg.getCallers(n.id).length; } catch { return 0; } };
       const tokens = [...new Set(
         query.split(/[\s,()[\]]+/)
           .map((t) => t.replace(FILE_EXT, '').trim())
@@ -2577,11 +2585,22 @@ export class ToolHandler {
         // capped; else fall back to the single most-substantive def. This is the
         // explore-side mirror of codegraph_node's overload disambiguation.
         let picks: Node[];
+        let tierPicks: Node[]; // subset that earns the named-first tier (#1064)
         if (cands.length <= 3) {
           picks = cands;
+          // Centrality de-noise: tier the most-substantive def PLUS any co-named
+          // def of comparable centrality (a real overload/wrapper — excalidraw's
+          // `mutateElement` lives in mutateElement.ts, App.tsx AND Scene.ts, all
+          // within ~2x callers). EXCLUDE a vastly-less-central namesake (Go's
+          // `NewClient`: real client 492 callers vs xds-pool 11, test-fake 3 →
+          // ratio <0.025) so it doesn't fill the tier and crowd out the answer.
+          const counts = new Map(cands.map((c) => [c.id, callerCount(c)]));
+          const maxCallers = Math.max(1, ...counts.values());
+          tierPicks = cands.filter((c, i) => i === 0 || (counts.get(c.id) ?? 0) >= maxCallers * 0.25);
         } else {
           const ctx = cands.filter(inNamedContext);
           picks = ctx.length > 0 ? ctx.slice(0, 4) : cands.slice(0, 1);
+          tierPicks = picks; // corroborated overloads (or the single fallback) all earn it
         }
         for (const n of picks) {
           if (!subgraph.nodes.has(n.id)) subgraph.nodes.set(n.id, n);
@@ -2592,6 +2611,7 @@ export class ToolHandler {
           // so a named symbol FTS already gathered never sorted to the top.)
           namedSeedIds.add(n.id);
         }
+        for (const n of tierPicks) tierSeedIds.add(n.id);
       }
     }
 
@@ -2604,6 +2624,38 @@ export class ToolHandler {
     for (const edge of subgraph.edges) {
       if (entryNodeIds.has(edge.source)) connectedToEntry.add(edge.target);
       if (entryNodeIds.has(edge.target)) connectedToEntry.add(edge.source);
+    }
+
+    // CHANGE SURFACE (#1064): a named method's signature types — its parameter
+    // and return types — are part of what you'd edit to "add a parameter to X",
+    // yet they can be lexically dissimilar to the query ("add a parameter to
+    // NewClient" shares no words with `dialoptions.go`, which defines NewClient's
+    // `DialOption`) and sit a hop away. COLLECT them here from each named-seed
+    // callable's outgoing signature edges (full graph — the type is often not in
+    // the subgraph); the decision to surface one is DEFERRED to the buried-rescue
+    // pass below, which fires only when the type's file would otherwise be
+    // dropped — so a well-connected type (excalidraw's element types, Alamofire's
+    // `DataRequest` on a flow query) is left to rank on its own and never
+    // displaces a flow-central file. Bounded: only the few named seeds, only the
+    // types in their signatures.
+    const CALLABLE_KINDS = new Set(['method', 'function', 'component', 'constructor']);
+    const TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'protocol', 'enum', 'type_alias']);
+    const SIG_EDGE = new Set(['references', 'type_of', 'returns']);
+    const changeSurfaceCandidates: Node[] = [];
+    const seenChangeSurface = new Set<string>();
+    for (const seedId of tierSeedIds) {
+      const seedNode = subgraph.nodes.get(seedId);
+      if (!seedNode || !CALLABLE_KINDS.has(seedNode.kind)) continue;
+      let outs: Edge[] = [];
+      try { outs = cg.getOutgoingEdges(seedId); } catch { continue; }
+      for (const e of outs) {
+        if (!SIG_EDGE.has(e.kind)) continue;
+        const tgt = cg.getNode(e.target);
+        if (!tgt || !TYPE_KINDS.has(tgt.kind) || namedSeedIds.has(tgt.id)) continue;
+        if (seenChangeSurface.has(tgt.id)) continue;
+        seenChangeSurface.add(tgt.id);
+        changeSurfaceCandidates.push(tgt);
+      }
     }
 
     for (const node of subgraph.nodes.values()) {
@@ -2735,6 +2787,29 @@ export class ToolHandler {
       const n = subgraph.nodes.get(id);
       if (n) entryFiles.add(n.filePath);
     }
+    // Buried-rescue pass (#1064): surface a named method's signature type ONLY
+    // when its file is genuinely buried — near-zero graph mass AND not lexically
+    // matched. That is the invisible case (grpc's `DialOption` → `dialoptions.go`,
+    // g≈0, 0 term hits): reachable but ranked nowhere, so the agent greps. A
+    // well-connected type file (excalidraw element types, Alamofire `DataRequest`)
+    // is NOT buried and is left alone — rescuing it would displace a flow-central
+    // file (App.tsx, Validation.swift). Buried is judged on the PRE-rescue graph,
+    // so injecting the type below can't make it look connected. A rescued file is
+    // injected (so it renders), force-kept (gate + relevantFiles), and tiered.
+    const changeSurfaceFiles = new Set<string>();
+    for (const t of changeSurfaceCandidates) {
+      const fp = t.filePath;
+      const buried = (fileGraphScore.get(fp) ?? 0) < maxGraph * 0.06
+        && (fileTermHits.get(fp) ?? 0) < 2;
+      if (!buried) continue;
+      changeSurfaceFiles.add(fp);
+      if (!subgraph.nodes.has(t.id)) subgraph.nodes.set(t.id, t);
+      let group = fileGroups.get(fp);
+      if (!group) { group = { nodes: [], score: 0 }; fileGroups.set(fp, group); }
+      if (!group.nodes.some((n) => n.id === t.id)) group.nodes.push(t);
+      group.score = Math.max(group.score, 45);
+      if (!relevantFiles.some(([f]) => f === fp)) relevantFiles.push([fp, group]);
+    }
 
     // Relevance gate (so the generous budget is a CEILING, not a target): keep a
     // file only if it is STRUCTURALLY relevant by ANY of:
@@ -2753,6 +2828,7 @@ export class ToolHandler {
         (fileGraphScore.get(fp) ?? 0) >= maxGraph * 0.06
         || centralFiles.has(fp)
         || entryFiles.has(fp)
+        || changeSurfaceFiles.has(fp)
         || (fileTermHits.get(fp) ?? 0) >= 2,
       );
       if (gated.length >= 2) relevantFiles = gated;
@@ -2768,10 +2844,14 @@ export class ToolHandler {
     // in other files (`Validation.swift`), falls outside the budget, and the
     // agent Reads it. The named file is the answer — rank it at the top.
     const namedSeedFiles = new Set<string>();
-    for (const id of namedSeedIds) {
+    for (const id of tierSeedIds) {
       const n = subgraph.nodes.get(id);
       if (n) namedSeedFiles.add(n.filePath);
     }
+    // A rescued change-surface file (only the genuinely-buried ones — see the
+    // buried-rescue pass) is the lexically-dissimilar answer; give it the named
+    // tier so it isn't buried under files that merely share surface words (#1064).
+    for (const fp of changeSurfaceFiles) namedSeedFiles.add(fp);
 
     // Multi-term corroboration tier: a file that is BOTH (a) an entry/central file
     // (a search root, named seed, or graph-central hub — i.e. structurally part of
