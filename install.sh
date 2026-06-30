@@ -84,7 +84,33 @@ ln -sfn "$dest" "$INSTALL_DIR/current"
 echo "Installed to $dest"
 echo "Linked     $BIN_DIR/codegraph"
 
-# 5. PATH sanity. Two ways this install can fail to be the codegraph that runs:
+# 5. Prune older bundles so they don't pile up across upgrades (issue #1074).
+# Each release lives in its own versions/<v> dir (~50 MB with the vendored Node
+# runtime). `codegraph upgrade` re-runs this script, which drops in a new dir
+# and re-points `current` + the launcher — but it never removed the old dirs, so
+# they accumulated indefinitely. Keep only what we just installed ($dest) and
+# delete the rest. Safe even if a daemon is still executing an older bundle: on
+# POSIX the inode stays alive until that process exits, so removing the dir can't
+# break a running process. (Windows installs overwrite a single dir in place and
+# never reach this.) The markers below let a unit test run this exact block.
+# >>> CODEGRAPH_PRUNE_OLD_VERSIONS
+pruned=0
+if [ -d "$INSTALL_DIR/versions" ]; then
+  for d in "$INSTALL_DIR/versions"/*; do
+    [ -d "$d" ] || continue
+    if [ "$d" != "$dest" ]; then
+      if rm -rf "$d"; then
+        pruned=$((pruned + 1))
+      fi
+    fi
+  done
+fi
+if [ "$pruned" -gt 0 ]; then
+  echo "Removed    $pruned older version(s)"
+fi
+# <<< CODEGRAPH_PRUNE_OLD_VERSIONS
+
+# 6. PATH sanity. Two ways this install can fail to be the codegraph that runs:
 #   1. $BIN_DIR isn't on PATH at all.
 #   2. A *different* codegraph sits earlier on PATH and shadows ours — most
 #      often a stale `npm i -g @colbymchenry/codegraph`, whose launcher keeps
