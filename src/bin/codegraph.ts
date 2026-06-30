@@ -319,6 +319,8 @@ type IndexResult = {
   filesErrored: number;
   nodesCreated: number;
   edgesCreated: number;
+  totalNodes?: number;
+  totalEdges?: number;
   errors: Array<{ message: string; filePath?: string; severity: string; code?: string }>;
   durationMs: number;
 };
@@ -352,7 +354,22 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
     } else {
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
     }
-    clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+    // `nodesCreated`/`edgesCreated` are this run's *net delta*. On a re-index of
+    // unchanged files the delta is 0 even though the index is fully populated,
+    // which read as a misleading "0 nodes, 0 edges" (#874). Prefer the absolute
+    // totals when available and the delta is 0, so the summary reflects the real
+    // index size; otherwise fall back to the delta.
+    const showTotals =
+      result.nodesCreated === 0 &&
+      result.edgesCreated === 0 &&
+      result.totalNodes !== undefined &&
+      result.totalEdges !== undefined &&
+      (result.totalNodes > 0 || result.totalEdges > 0);
+    if (showTotals) {
+      clack.log.info(`${formatNumber(result.totalNodes!)} nodes, ${formatNumber(result.totalEdges!)} edges in ${formatDuration(result.durationMs)} (index already up to date)`);
+    } else {
+      clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+    }
   } else if (hasErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
   } else {

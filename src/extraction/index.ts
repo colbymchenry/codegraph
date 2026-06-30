@@ -85,6 +85,17 @@ export interface IndexResult {
   filesErrored: number;
   nodesCreated: number;
   edgesCreated: number;
+  /**
+   * Absolute node/edge totals in the index after this operation. Unlike
+   * `nodesCreated`/`edgesCreated` (which are the *net delta* of this run),
+   * these reflect the full graph size. On a re-index of unchanged files the
+   * delta is 0 even though the index is fully populated, so the CLI prefers
+   * these totals to avoid reporting a misleading "0 nodes, 0 edges" (#874).
+   * Optional/back-compat: only set by `CodeGraph.indexAll`, not the raw
+   * orchestrator path.
+   */
+  totalNodes?: number;
+  totalEdges?: number;
   errors: ExtractionError[];
   durationMs: number;
 }
