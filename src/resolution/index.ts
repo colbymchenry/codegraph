@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isNixPathImportRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
@@ -664,6 +664,15 @@ export class ReferenceResolver {
       return null;
     }
 
+    const isPathImportRef =
+      ref.referenceKind === 'imports' &&
+      (
+        ref.language === 'c' ||
+        ref.language === 'cpp' ||
+        isPhpIncludePathRef(ref) ||
+        isNixPathImportRef(ref)
+      );
+
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
@@ -671,6 +680,7 @@ export class ReferenceResolver {
     // from './auth'`) intentionally call a name that has no
     // declaration anywhere — only the renamed upstream symbol does.
     if (
+      !isPathImportRef &&
       !this.hasAnyPossibleMatch(ref.referenceName) &&
       !this.matchesAnyImport(ref) &&
       !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))

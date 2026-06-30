@@ -39,6 +39,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  nix: 'tree-sitter-nix.wasm',
 };
 
 /**
@@ -108,6 +109,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
+  '.nix': 'nix',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -221,7 +223,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
       // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
       // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'nix')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -432,6 +434,7 @@ export function getLanguageDisplayName(language: Language): string {
     lua: 'Lua',
     luau: 'Luau',
     objc: 'Objective-C',
+    nix: 'Nix',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',

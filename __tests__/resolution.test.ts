@@ -3714,4 +3714,86 @@ procedure Helper; var t: TTgt; begin t.Hit; end;
       expect(callerNamesOf('TTgt::Hit')).toEqual(['DoStuff', 'Helper']);
     });
   });
+
+  describe('Nix path import resolution', () => {
+    function fileNode(filePath: string) {
+      return cg.getNodesByKind('file').find((n) => n.filePath === filePath);
+    }
+
+    function importedFilePaths(fromFile: string): string[] {
+      const source = fileNode(fromFile);
+      expect(source, `${fromFile} file node`).toBeDefined();
+      return cg
+        .getOutgoingEdges(source!.id)
+        .filter((edge) => edge.kind === 'imports')
+        .map((edge) => cg.getNodesByKind('file').find((n) => n.id === edge.target)?.filePath)
+        .filter((filePath): filePath is string => Boolean(filePath))
+        .sort();
+    }
+
+    it('resolves relative Nix imports to indexed file nodes', async () => {
+      fs.mkdirSync(path.join(tempDir, 'core'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'data'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'core', 'ports.nix'), '{ http = 80; https = 443; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'data', 'postgresql.nix'),
+        `let
+  ports = import ../core/ports.nix;
+in
+{
+  port = ports.https;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('data/postgresql.nix')).toEqual(['core/ports.nix']);
+    });
+
+    it('resolves Nix directory imports through default.nix and deduplicates called imports', async () => {
+      fs.mkdirSync(path.join(tempDir, 'dir'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'dir', 'default.nix'), '{ value = 1; }');
+      fs.writeFileSync(path.join(tempDir, 'x.nix'), '{ value = 2; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'main.nix'),
+        `let
+  dir = import ./dir;
+  x = import ./x.nix {};
+in
+{
+  inherit dir x;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('main.nix')).toEqual(['dir/default.nix', 'x.nix']);
+    });
+
+    it('does not resolve Nix angle-bracket, attribute, or variable imports as project file edges', async () => {
+      fs.writeFileSync(path.join(tempDir, 'nixpkgs.nix'), '{ bogus = true; }');
+      fs.writeFileSync(path.join(tempDir, 'selectedPath.nix'), '{ bogus = true; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'main.nix'),
+        `let
+  pkgs = import <nixpkgs> {};
+  fromSources = import sources.nixpkgs {};
+  dynamic = import selectedPath;
+in
+{
+  inherit pkgs fromSources dynamic;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('main.nix')).toEqual([]);
+    });
+  });
 });

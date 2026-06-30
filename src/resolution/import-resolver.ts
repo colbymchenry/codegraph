@@ -35,7 +35,17 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   php: ['.php'],
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
+  nix: ['.nix', '/default.nix'],
 };
+
+export function isNixPathImportRef(ref: UnresolvedRef): boolean {
+  return (
+    ref.language === 'nix' &&
+    ref.referenceKind === 'imports' &&
+    (ref.referenceName.startsWith('./') || ref.referenceName.startsWith('../')) &&
+    !/[\s{}()[\];"'<>$]/.test(ref.referenceName)
+  );
+}
 
 /**
  * Resolve an import path to an actual file
@@ -1192,6 +1202,30 @@ export function resolveViaImport(
     // dead end. Return unresolved rather than falling through to the symbol
     // name-matcher, which would mis-connect e.g. "inc/db.php" to an unrelated
     // db.php elsewhere in the tree — a wrong edge is worse than a missing one.
+    return null;
+  }
+
+  // Nix static project-path imports (`import ./x.nix`, `builtins.import ./dir`,
+  // `import ./x.nix {}`) resolve to file nodes only. Do not resolve
+  // angle-bracket channels, attribute expressions, variables, or other dynamic
+  // expressions as project files.
+  if (isNixPathImportRef(ref)) {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
     return null;
   }
 
