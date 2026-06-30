@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- `codegraph index` can now rebuild an existing oversized index from an older version, instead of hanging until the watchdog kills it. The previous fix (#1065) stopped *new* indexes from sweeping in a gitignored corpus of nested repos, but a project that had already built the multi-gigabyte graph before upgrading couldn't recover: `codegraph index` is meant to rebuild from scratch, yet it cleared the old graph by deleting every row one at a time, and on a graph of well over a million symbols that took longer than the 60-second responsiveness watchdog allows — so the command was killed before indexing even started, leaving the bad index in place. A full re-index now discards the old database outright and starts fresh, which is near-instant regardless of the old size and also frees the disk the bloated database was holding. Thanks @AriaShishegaran for the detailed follow-up report. (#1067)
 
 ## [1.1.5] - 2026-06-30
 

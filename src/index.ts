@@ -22,7 +22,7 @@ import {
   BuildContextOptions,
   FindRelevantContextOptions,
 } from './types';
-import { DatabaseConnection, getDatabasePath } from './db';
+import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { QueryBuilder } from './db/queries';
 import {
   isInitialized,
@@ -317,6 +317,54 @@ export class CodeGraph {
     }
 
     return instance;
+  }
+
+  /**
+   * Rebuild the project's database from scratch and return a fresh, empty
+   * instance — the "same result as a fresh init" semantics that `codegraph
+   * index` documents.
+   *
+   * Unlike `open()` followed by `clear()`, this DISCARDS the existing
+   * `.codegraph/codegraph.db` (and its `-wal`/`-shm` sidecars) before
+   * re-initializing, instead of opening the old database and DELETE-ing every
+   * row. On a large or pre-fix poisoned index — e.g. an old graph that scanned
+   * an ignored gitlink corpus (#1065) into ~1.6M nodes with a multi-GB WAL —
+   * the per-row `nodes_fts` delete-trigger churn blocks the main thread long
+   * enough to trip the #850 liveness watchdog before indexing even starts, so a
+   * full re-index could never recover the bad state (#1067). Discarding the
+   * files is O(1) regardless of size, reclaims the disk, and sidesteps opening
+   * (and running migrations against) the poisoned database entirely.
+   */
+  static async recreate(projectRoot: string): Promise<CodeGraph> {
+    await initGrammars();
+    const resolvedRoot = path.resolve(projectRoot);
+
+    // Check if initialized — recreate REBUILDS an existing project; it is not a
+    // first-time `init`.
+    if (!isInitialized(resolvedRoot)) {
+      throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
+    }
+
+    const dbPath = getDatabasePath(resolvedRoot);
+    try {
+      removeDatabaseFiles(dbPath);
+    } catch (err) {
+      // POSIX unlinks an open file fine; this fires mainly on Windows when a
+      // live daemon/MCP server still holds the database. Turn the raw EBUSY into
+      // an actionable instruction instead of a generic failure.
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Could not rebuild the index — the database file is in use (${reason}). ` +
+          `Stop any running CodeGraph MCP server/daemon for this project and retry, ` +
+          `or remove the ${getCodeGraphDir(resolvedRoot)} directory and run "codegraph init".`
+      );
+    }
+
+    // Re-create an empty, freshly-schema'd database at the same path.
+    const db = DatabaseConnection.initialize(dbPath);
+    const queries = new QueryBuilder(db.getDb());
+
+    return new CodeGraph(db, queries, resolvedRoot);
   }
 
   /**

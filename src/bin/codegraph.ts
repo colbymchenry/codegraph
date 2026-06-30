@@ -632,16 +632,23 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
+      // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
+      // than opening the old graph and DELETE-ing every row. The clear-then-index
+      // approach reported "0 nodes" without the clear (#874); the recreate keeps
+      // that fixed AND avoids the failure mode where, on a large or pre-fix
+      // poisoned index, the per-row FTS delete churn wedged the main thread long
+      // enough to trip the liveness watchdog before scanning even began (#1067).
+      // recreate() hands back a fresh, empty instance — no clear() needed. For
+      // fast incremental updates use `sync`.
+      const cg = await CodeGraph.recreate(projectPath);
 
       // Supervise the indexer: self-terminate if orphaned (parent shim killed)
       // or if the main thread wedges — neither was guarded on this path (#999).
       const supervision = installCommandSupervision('index');
       try {
         if (options.quiet) {
-          // Quiet mode: no UI, just run. `index` is a full re-index, so clear the
-          // existing graph and rebuild from scratch (see the note below — #874).
-          cg.clear();
+          // Quiet mode: no UI, just run against the freshly-recreated graph.
           const result = await cg.indexAll();
           if (!result.success) process.exit(1);
           cg.destroy();
@@ -650,13 +657,6 @@ program
 
         const clack = await importESM('@clack/prompts');
         clack.intro('Indexing project');
-
-        // `index` is a FULL re-index: clear the existing graph and rebuild it from
-        // scratch so the result is identical to a fresh `init`. Without the clear,
-        // indexAll() skips every unchanged file by its content hash and reports
-        // "0 nodes, 0 edges" against the already-populated graph — which reads as
-        // "index wiped my index" (#874). For fast incremental updates use `sync`.
-        cg.clear();
 
         let result: IndexResult;
 
