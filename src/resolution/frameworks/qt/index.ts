@@ -9,7 +9,7 @@ function detectQt(context: ResolutionContext): boolean {
 
 export const qtResolver: FrameworkResolver = {
   name: 'qt',
-  languages: ['qml', 'yaml'],
+  languages: ['qml', 'yaml', 'xml'],
   detect: detectQt,
   claimsReference(name: string, ref?: UnresolvedRef): boolean {
     return claimsQmlQtReference(name, ref) || claimsQtWidgetsReference(name, ref);

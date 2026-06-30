@@ -25,6 +25,7 @@ import {
   qmlQtResolver,
   qtResolver,
 } from '../src/resolution/frameworks';
+import { qmlQtResolver as qmlQtShimResolver } from '../src/resolution/frameworks/qml-qt';
 import type { FrameworkResolver } from '../src/resolution/types';
 
 describe('getApplicableFrameworks', () => {
@@ -47,8 +48,15 @@ describe('Qt framework resolver compatibility aliases', () => {
   it('registers qt as the public resolver and keeps qml-qt as a lookup alias', () => {
     expect(qtResolver.name).toBe('qt');
     expect(qmlQtResolver).toBe(qtResolver);
+    expect(qmlQtShimResolver).toBe(qtResolver);
     expect(getFrameworkResolver('qt')).toBe(qtResolver);
     expect(getFrameworkResolver('qml-qt')).toBe(qtResolver);
+  });
+
+  it('keeps the Qt .ui no-op extraction hook reachable through XML files', () => {
+    expect(qtResolver.languages).toContain('xml');
+    expect(getApplicableFrameworks([qtResolver], 'xml')).toEqual([qtResolver]);
+    expect(qtResolver.extract?.('forms/MainWindow.ui', '<ui version="4.0" />')).toEqual({ nodes: [], references: [] });
   });
 });
 
