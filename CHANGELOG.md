@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- `codegraph_explore` now surfaces the options/config type behind a function when you ask, in plain language, what to change to add a parameter to it. A question like "what do I need to change to add a new parameter to X" shares no words with the file that actually defines X's options — for example a functional-options struct and its `With…` builders living in a separate `options.go`, reachable only through X's signature — so that file scored near-zero on every text and connectivity signal and got dropped: explore returned X itself but not the file you'd edit, and the agent fell back to grep. Explore now follows a named function's parameter and return types and pulls in the file that defines them when ranking would otherwise bury it, so the options/config file shows up with its fields. Well-connected types that already rank are left untouched, so ordinary "how does X work" flow questions are unchanged. (The separate tools `codegraph_search`/`codegraph_impact`/`codegraph_node` remain available via `CODEGRAPH_MCP_TOOLS` for anyone who prefers driving each step explicitly.) Thanks @wauxhall for the detailed investigation. (#1064)
+
 
 ## [1.1.4] - 2026-06-29
 
