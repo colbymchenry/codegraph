@@ -95,6 +95,8 @@ export const LANGUAGES = [
   'twig',
   'xml',
   'properties',
+  'cfml',
+  'cfscript',
   'unknown',
 ] as const;
 

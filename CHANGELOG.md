@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **CFML** (`.cfc`, `.cfm`, `.cfs`) — both the classic tag-based style (`<cfcomponent>`/`<cffunction>`) and modern bare-script `component { ... }` syntax, including `extends`/`implements`, embedded `<cfscript>` blocks, and call edges.
 
 ## [1.1.3] - 2026-06-29
 

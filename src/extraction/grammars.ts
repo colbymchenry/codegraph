@@ -39,6 +39,8 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  cfml: 'tree-sitter-cfml.wasm',
+  cfscript: 'tree-sitter-cfscript.wasm',
 };
 
 /**
@@ -108,6 +110,11 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
+  // CFML: .cfc/.cfm parse with the tag-aware `cfml` grammar (custom CfmlExtractor
+  // dialect-switches to cfscript for bare-script content); .cfs is pure CFScript.
+  '.cfc': 'cfml',
+  '.cfm': 'cfml',
+  '.cfs': 'cfscript',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -199,6 +206,13 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
     languages = [...languages, 'typescript', 'javascript'];
   }
 
+  // CFML (.cfc/.cfm) delegates bare-script content and <cfscript> tag bodies to
+  // the cfscript grammar (see injections.scm in tree-sitter-cfml) — load it even
+  // when no standalone .cfs file is in the index set.
+  if (languages.some((l) => l === 'cfml')) {
+    languages = [...languages, 'cfscript'];
+  }
+
   // Deduplicate and filter to languages that have WASM grammars and aren't already loaded
   const toLoad = [...new Set(languages)].filter(
     (lang): lang is GrammarLanguage =>
@@ -221,7 +235,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
       // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
       // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -436,6 +450,8 @@ export function getLanguageDisplayName(language: Language): string {
     twig: 'Twig',
     xml: 'XML',
     properties: 'Java properties',
+    cfml: 'CFML',
+    cfscript: 'CFScript',
     unknown: 'Unknown',
   };
   return names[language] || language;

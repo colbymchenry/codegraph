@@ -29,6 +29,7 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { CfmlExtractor } from './cfml-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -2392,7 +2393,7 @@ export class TreeSitterExtractor {
 
     // Extract variable declarators based on language
     if (this.language === 'typescript' || this.language === 'javascript' ||
-        this.language === 'tsx' || this.language === 'jsx') {
+        this.language === 'tsx' || this.language === 'jsx' || this.language === 'cfscript') {
       // Handle lexical_declaration and variable_declaration
       // These contain one or more variable_declarator children
       for (let i = 0; i < node.namedChildCount; i++) {
@@ -4724,6 +4725,34 @@ export class TreeSitterExtractor {
       if (child.type === 'field_declaration_list' || child.type === 'class_heritage') {
         this.extractInheritance(child, classId);
       }
+
+      // CFML cfscript `component extends="Base" implements="IFoo,IBar" { ... }`
+      // (also covers `interface extends="IBase" { ... }`, which reuses the same
+      // component_attribute shape). Attributes are generic name=value pairs —
+      // (identifier label, expression value) — not a dedicated extends_clause,
+      // so filter by the label text. `implements` is a comma-separated list.
+      if (child.type === 'component_attribute' && node.type === 'component') {
+        const label = child.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+        const value = child.namedChildren.find((c: SyntaxNode) => c.type !== 'identifier');
+        if (label && value) {
+          const labelText = getNodeText(label, this.source).toLowerCase();
+          if (labelText === 'extends' || labelText === 'implements') {
+            const valueText = getNodeText(value, this.source).replace(/^["']|["']$/g, '');
+            const names = labelText === 'implements'
+              ? valueText.split(',').map((s) => s.trim()).filter(Boolean)
+              : [valueText.trim()].filter(Boolean);
+            for (const name of names) {
+              this.unresolvedReferences.push({
+                fromNodeId: classId,
+                referenceName: name,
+                referenceKind: labelText === 'implements' ? 'implements' : 'extends',
+                line: value.startPosition.row + 1,
+                column: value.startPosition.column,
+              });
+            }
+          }
+        }
+      }
     }
   }
 
@@ -5731,6 +5760,16 @@ export function extractFromSource(
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
     // file node so the watcher tracks it without emitting symbols.
     const extractor = new MyBatisExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'cfml' || detectedLanguage === 'cfscript') {
+    // Custom extractor for CFML (.cfc/.cfm) — dialect-switches between the
+    // tag-based cfml grammar and the bare-script cfscript grammar. Standalone
+    // `.cfs` files (language 'cfscript') are always pure script (never `<`-led),
+    // so routing them through here too gets them the same anonymous-component
+    // filename fallback as a bare-script `.cfc` — without it a `.cfs` whose
+    // `component { ... }` declares no name (the grammar has no `name` field;
+    // CFML never spells one in source) stays `<anonymous>`.
+    const extractor = new CfmlExtractor(filePath, source, detectedLanguage);
     result = extractor.extract();
   } else if (isFileLevelOnlyLanguage(detectedLanguage)) {
     // No symbol extraction at this stage — files are tracked at the file-record
