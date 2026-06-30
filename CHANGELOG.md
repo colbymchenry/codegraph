@@ -148,6 +148,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- **CodeGraph now indexes Erlang** (`.erl`, `.hrl`) — modules, functions (including multi-clause), records, type/opaque declarations, macros, imports/includes, exports, and call edges. Benchmarked on poolboy, cowboy, and EMQX.
 - **CodeGraph now indexes R** (`.R` / `.r`) — functions in every assignment form (`name <- function(...)`, `name = function(...)`, nested definitions), S4 / Reference / R6 classes with their methods, `setGeneric`/`setMethod` generics, top-level variables and constants, `library()` / `require()` imports, `source()` file references, and call edges — including calls inside tidyverse pipe chains. Statistical and research codebases get the full explore / impact / callers surface. (#828) (R)
 - **Workspaces holding multiple git repositories now index as a whole.** Running `codegraph init` at the root of a directory that contains several independent git repos — including the common "super-repo" layout where the parent repo's `.gitignore` hides the child repos to keep `git status` quiet — now indexes every nested project into one graph, with each child repo's own `.gitignore` respected. `codegraph sync` and live file watching pick up changes inside the nested repos too (previously change detection only consulted the parent repo, so edits in child repos were invisible until a full re-index). Git repositories inside `node_modules` (npm git-dependencies) remain excluded. (#514)
 

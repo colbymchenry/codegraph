@@ -35,6 +35,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   php: ['.php'],
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
+  erlang: ['.erl', '.hrl'],
 };
 
 /**
@@ -1165,6 +1166,53 @@ export function resolveViaImport(
     return null;
   }
 
+  // Erlang -include / -include_lib: file→file imports edge.
+  // The extractor's extractImport returns the quoted path as moduleName
+  // (e.g. "records.hrl", "kernel/include/file.hrl"). Resolve relative
+  // to the including file first, then fall back to project-wide search.
+  if (ref.language === 'erlang' && ref.referenceKind === 'imports') {
+    if (ref.referenceName.includes('.') || ref.referenceName.includes('/')) {
+      // 1. Same-directory match (matches -include behavior: relative to
+      //    the including file's directory).
+      const slash = ref.filePath.lastIndexOf('/');
+      const fromDir = slash >= 0 ? ref.filePath.slice(0, slash) : '';
+      const siblingPath = path.posix.normalize(
+        fromDir ? `${fromDir}/${ref.referenceName}` : ref.referenceName
+      );
+      const siblingBase = siblingPath.split('/').pop()!;
+      const sibling = context
+        .getNodesByName(siblingBase)
+        .find((n) => n.kind === 'file' && n.filePath === siblingPath);
+      if (sibling) {
+        return { original: ref, targetNodeId: sibling.id, confidence: 0.92, resolvedBy: 'import' };
+      }
+
+      // 2. resolveImportPath (uses EXTENSION_RESOLUTION for extension-less lookups)
+      const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+      if (resolvedPath) {
+        const basename = resolvedPath.split('/').pop()!;
+        const fileNode = context
+          .getNodesByName(basename)
+          .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+        if (fileNode) {
+          return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+        }
+      }
+
+      // 3. Project-wide search by filename (handles include_lib paths where
+      //    the OTP app is vendored under a different root, e.g. deps/kernel/include/file.hrl).
+      const fileName = ref.referenceName.split('/').pop()!;
+      const fileNode = context
+        .getNodesByName(fileName)
+        .find((n) => n.kind === 'file' && n.filePath.endsWith(fileName));
+      if (fileNode) {
+        return { original: ref, targetNodeId: fileNode.id, confidence: 0.8, resolvedBy: 'import' };
+      }
+
+      return null;
+    }
+  }
+
   // PHP include/require — resolve the static string path to a file→file
   // edge, mirroring the C/C++ branch above. Distinguish include PATHS from
   // namespace `use` symbols by shape: an include path contains a slash or a
@@ -1208,6 +1256,21 @@ export function resolveViaImport(
   if (ref.language === 'go') {
     const goResult = resolveGoCrossPackageReference(ref, imports, context);
     if (goResult) return goResult;
+  }
+
+  // Erlang remote call: `module:function()` — the module name maps directly
+  // to a file (`gen_server` → `gen_server.erl`). No import needed; the
+  // module prefix is the file stem.
+  if (ref.language === 'erlang') {
+    if (ref.referenceKind === 'implements') {
+      // Behaviour implements: only match module nodes. If the behaviour isn't
+      // in the project (OTP stdlib), return null WITHOUT falling through to
+      // the name-matcher — a wrong `implements` edge (e.g. module → field
+      // named "supervisor") is worse than none.
+      return resolveErlangBehaviourImplements(ref, context);
+    }
+    const erlResult = resolveErlangRemoteCall(ref, context);
+    if (erlResult) return erlResult;
   }
 
   // Java / Kotlin: imports are FQNs (`import com.example.Foo;`) — no
@@ -1809,6 +1872,64 @@ function resolveGoCrossPackageReference(
         };
       }
     }
+  }
+  return null;
+}
+
+/**
+ * Resolve an Erlang remote call (`module:function`) to the target function
+ * in the corresponding `.erl` file. Erlang module names are the file stem
+ * (`gen_server` → `gen_server.erl`), so we can resolve without imports.
+ */
+function resolveErlangRemoteCall(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const colonIdx = ref.referenceName.indexOf(':');
+  if (colonIdx <= 0) return null;
+  const moduleName = ref.referenceName.substring(0, colonIdx);
+  const funcName = ref.referenceName.substring(colonIdx + 1);
+  if (!funcName) return null;
+
+  // Find functions named `funcName` in Erlang files whose stem is `moduleName`.
+  const candidates = context.getNodesByName(funcName);
+  for (const node of candidates) {
+    if (node.language !== 'erlang') continue;
+    if (node.kind !== 'function') continue;
+    const stem = node.filePath.replace(/\\/g, '/').replace(/\.erl$/, '');
+    const base = stem.includes('/') ? stem.substring(stem.lastIndexOf('/') + 1) : stem;
+    if (base === moduleName) {
+      return {
+        original: ref,
+        targetNodeId: node.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve an Erlang `-behaviour(Name).` implements reference to the matching
+ * module node in the project. Only matches `module` nodes (not fields,
+ * functions, etc. that happen to share the name). Returns null when the
+ * behaviour is an OTP stdlib module not present in the project.
+ */
+function resolveErlangBehaviourImplements(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const candidates = context.getNodesByName(ref.referenceName);
+  for (const node of candidates) {
+    if (node.language !== 'erlang') continue;
+    if (node.kind !== 'module') continue;
+    return {
+      original: ref,
+      targetNodeId: node.id,
+      confidence: 0.9,
+      resolvedBy: 'exact-match',
+    };
   }
   return null;
 }

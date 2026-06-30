@@ -39,6 +39,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  erlang: 'tree-sitter-erlang.wasm',
 };
 
 /**
@@ -108,6 +109,10 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
+  '.erl': 'erlang',
+  '.hrl': 'erlang',
+  '.app.src': 'erlang',
+  '.app': 'erlang',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -129,6 +134,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
 export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
   if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
+  if (filePath.toLowerCase().endsWith('.app.src')) return true; // OTP app metadata
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
   const ext = filePath.slice(dot).toLowerCase();
@@ -221,7 +227,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
       // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
       // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'erlang')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -281,6 +287,8 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   // Play `conf/routes` has no grammar — route through the no-symbol path; the
   // Play framework resolver extracts route nodes from it.
   if (isPlayRoutesFile(filePath)) return 'yaml';
+  // .app.src is a double extension — lastIndexOf('.') only catches '.src'
+  if (filePath.toLowerCase().endsWith('.app.src')) return 'erlang';
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
   // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
   // links each section `"type"` to its `sections/<type>.liquid`).
@@ -432,6 +440,7 @@ export function getLanguageDisplayName(language: Language): string {
     lua: 'Lua',
     luau: 'Luau',
     objc: 'Objective-C',
+    erlang: 'Erlang',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',

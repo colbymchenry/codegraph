@@ -474,7 +474,7 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
 // and are added below; their concrete-side nodes can be a `struct` (Swift)
 // or an `object` (Scala) so the loop also iterates those kinds.
 const IFACE_OVERRIDE_LANGS = new Set([
-  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go', 'rust',
+  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go', 'rust', 'erlang',
 ]);
 /**
  * Go implicit interface satisfaction (#584). Go has no `implements` keyword — a
@@ -665,6 +665,60 @@ function kotlinExpectActualEdges(queries: QueryBuilder): Edge[] {
         },
       });
       added++;
+    }
+  }
+  return edges;
+}
+
+/**
+ * Erlang behaviour dispatch bridge. When a module declares
+ * `-behaviour(gen_server).` it creates an `implements` edge from the module
+ * node to the behaviour (if the behaviour module is in the project). This
+ * function bridges the gap by linking same-named functions: if module M
+ * implements behaviour B, and B contains a function `handle_call`, emit a
+ * `calls` edge `B.handle_call → M.handle_call` so trace/explore follows the
+ * dispatch. (If B is not in the project — the common case for OTP stdlib —
+ * there are no edges to bridge, which is correct.)
+ */
+function erlangBehaviourEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  for (const mod of queries.getNodesByKind('module')) {
+    if (mod.language !== 'erlang') continue;
+    const implEdges = queries.getOutgoingEdges(mod.id, ['implements']);
+    for (const impl of implEdges) {
+      const behNode = queries.getNodeById(impl.target);
+      if (!behNode) continue;
+      // Get functions in the behaviour (if it's in the project)
+      const behFunctions = new Map<string, string>();
+      for (const ce of queries.getOutgoingEdges(behNode.id, ['contains'])) {
+        const fn = queries.getNodeById(ce.target);
+        if (fn && fn.kind === 'function') behFunctions.set(fn.name, fn.id);
+      }
+      if (behFunctions.size === 0) continue;
+      // Get functions in the implementing module's file
+      const modFunctions = new Map<string, string>();
+      for (const ce of queries.getOutgoingEdges(mod.id, ['contains'])) {
+        const fn = queries.getNodeById(ce.target);
+        if (fn && fn.kind === 'function') modFunctions.set(fn.name, fn.id);
+      }
+      // Bridge: behaviour callback → module implementation
+      for (const [name, behFnId] of behFunctions) {
+        const modFnId = modFunctions.get(name);
+        if (!modFnId) continue;
+        const key = `${behFnId}>${modFnId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: behFnId,
+          target: modFnId,
+          kind: 'calls',
+          line: behNode.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'erlang-behaviour', via: name, registeredAt: `${mod.filePath}:${mod.startLine}` },
+        });
+      }
     }
   }
   return edges;
@@ -2693,6 +2747,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const rnXPlatEdges = rnCrossPlatformEdges(queries);
   const mybatisEdges = mybatisJavaXmlEdges(queries);
   const ginEdges = ginMiddlewareChainEdges(queries, ctx);
+  const erlangEdges = erlangBehaviourEdges(queries);
   const thunkEdges = reduxThunkEdges(queries, ctx);
   const registryEdges = objectRegistryEdges(ctx);
   const rtkEdges = rtkQueryEdges(queries, ctx);
@@ -2728,6 +2783,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...rnXPlatEdges,
     ...mybatisEdges,
     ...ginEdges,
+    ...erlangEdges,
     ...thunkEdges,
     ...registryEdges,
     ...rtkEdges,

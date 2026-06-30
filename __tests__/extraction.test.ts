@@ -102,6 +102,13 @@ describe('Language Detection', () => {
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
   });
 
+  it('should detect Erlang files', () => {
+    expect(detectLanguage('server.erl')).toBe('erlang');
+    expect(detectLanguage('records.hrl')).toBe('erlang');
+    expect(detectLanguage('my_app.app.src')).toBe('erlang');
+    expect(detectLanguage('ebin/cowboy.app')).toBe('erlang');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -3082,8 +3089,216 @@ import 'package:flutter/material.dart';
 });
 
 // =============================================================================
-// Pascal / Delphi Extraction
+// Erlang Extraction
 // =============================================================================
+
+describe('Erlang Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Erlang files', () => {
+      expect(detectLanguage('server.erl')).toBe('erlang');
+      expect(detectLanguage('records.hrl')).toBe('erlang');
+    });
+  });
+
+  it('should extract module declarations', () => {
+    const code = `
+-module(my_server).
+-behaviour(gen_server).
+
+-export([start_link/0, init/1]).
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+init([]) ->
+    {ok, #state{}}.
+`;
+    const result = extractFromSource('my_server.erl', code);
+
+    const moduleNode = result.nodes.find((n) => n.kind === 'module');
+    expect(moduleNode).toBeDefined();
+    expect(moduleNode?.name).toBe('my_server');
+
+    const functions = result.nodes.filter((n) => n.kind === 'function');
+    expect(functions.length).toBeGreaterThanOrEqual(2);
+    expect(functions.some((f) => f.name === 'start_link')).toBe(true);
+    expect(functions.some((f) => f.name === 'init')).toBe(true);
+  });
+
+  it('should extract record declarations', () => {
+    const code = `
+-module(records).
+-record(user, {
+    id :: integer(),
+    name :: string(),
+    email :: string()
+}).
+
+get_user(Id) ->
+    #user{id = Id, name = "test"}.
+`;
+    const result = extractFromSource('records.erl', code);
+
+    const structNode = result.nodes.find((n) => n.kind === 'struct');
+    expect(structNode).toBeDefined();
+    expect(structNode?.name).toBe('user');
+
+    const fields = result.nodes.filter((n) => n.kind === 'field');
+    expect(fields.length).toBe(3);
+    expect(fields.map((f) => f.name).sort()).toEqual(['email', 'id', 'name']);
+  });
+
+  it('should extract type declarations', () => {
+    const code = `
+-module(types).
+-type user_id() :: integer().
+-type user() :: #{id => user_id(), name => string()}.
+-opaque handle() :: term().
+
+make_handle() ->
+    {}.
+`;
+    const result = extractFromSource('types.erl', code);
+
+    const typeNodes = result.nodes.filter((n) => n.kind === 'type_alias');
+    expect(typeNodes.length).toBe(3);
+    expect(typeNodes.map((t) => t.name).sort()).toEqual(['handle', 'user', 'user_id']);
+  });
+
+  it('should extract imports and includes', () => {
+    const code = `
+-module(my_app).
+-include_lib("kernel/include/logger.hrl").
+-include("my_app.hrl").
+-import(lists, [map/2, filter/2]).
+
+main() ->
+    ok.
+`;
+    const result = extractFromSource('my_app.erl', code);
+
+    const imports = result.nodes.filter((n) => n.kind === 'import');
+    expect(imports.length).toBeGreaterThanOrEqual(2);
+    const importNames = imports.map((i) => i.name);
+    expect(importNames.some((n) => n.includes('kernel'))).toBe(true);
+    expect(importNames.some((n) => n.includes('lists'))).toBe(true);
+  });
+
+  it('should extract macros as constants', () => {
+    const code = `
+-module(config).
+-define(SERVER, ?MODULE).
+-define(MAX_RETRIES, 3).
+
+start() ->
+    ok.
+`;
+    const result = extractFromSource('config.erl', code);
+
+    const constants = result.nodes.filter((n) => n.kind === 'constant');
+    expect(constants.length).toBeGreaterThanOrEqual(2);
+    expect(constants.some((c) => c.name === 'SERVER')).toBe(true);
+    expect(constants.some((c) => c.name === 'MAX_RETRIES')).toBe(true);
+  });
+
+  it('should extract multi-clause functions', () => {
+    const code = `
+-module(patterns).
+handle_msg({ping, From}, State) ->
+    From ! {pong, self()},
+    {noreply, State};
+handle_msg({stop, Reason}, State) ->
+    {stop, Reason, State}.
+`;
+    const result = extractFromSource('patterns.erl', code);
+
+    const functions = result.nodes.filter((n) => n.kind === 'function');
+    // The grammar emits separate fun_decl nodes for each clause
+    expect(functions.length).toBe(2);
+    expect(functions.every((f) => f.name === 'handle_msg')).toBe(true);
+  });
+
+  it('should extract remote calls as qualified module:function references', () => {
+    const code = `
+-module(my_app).
+-export([start/0]).
+
+start() ->
+    gen_server:start_link({local, ?MODULE}, my_server, [], []),
+    gen_server:call(?MODULE, {get, id}),
+    my_db:lookup(42).
+`;
+    const result = extractFromSource('my_app.erl', code);
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const callNames = calls.map((c) => c.referenceName);
+    expect(callNames).toContain('gen_server:start_link');
+    expect(callNames).toContain('gen_server:call');
+    expect(callNames).toContain('my_db:lookup');
+  });
+
+  it('should emit implements reference for behaviour declarations', () => {
+    const code = `
+-module(my_server).
+-behaviour(gen_server).
+
+-export([init/1, handle_call/3, handle_cast/2]).
+
+init([]) ->
+    {ok, #state{}}.
+
+handle_call(_Request, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+`;
+    const result = extractFromSource('my_server.erl', code);
+
+    const modNode = result.nodes.find((n) => n.kind === 'module');
+    expect(modNode).toBeDefined();
+    expect(modNode?.name).toBe('my_server');
+
+    const implRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+    expect(implRefs.length).toBeGreaterThanOrEqual(1);
+    expect(implRefs.some((r) => r.referenceName === 'gen_server')).toBe(true);
+
+    // The fromNodeId should be the module node
+    if (modNode && implRefs.length > 0) {
+      expect(implRefs[0]?.fromNodeId).toBe(modNode.id);
+    }
+
+    // No import node for behaviour (it's now an implements ref)
+    const behaviourImports = result.nodes.filter((n) => n.kind === 'import' && n.name === 'gen_server');
+    expect(behaviourImports.length).toBe(0);
+  });
+
+  it('should extract OTP application metadata from .app.src files', () => {
+    const code = `{application, my_app, [
+    {description, "My application"},
+    {vsn, "1.0.0"},
+    {applications, [kernel, stdlib, crypto, ranch]},
+    {registered, [my_app_sup]},
+    {modules, [my_app, my_app_sup, my_app_worker]}
+]}.
+`;
+    const result = extractFromSource('src/my_app.app.src', code);
+
+    const moduleNode = result.nodes.find((n) => n.kind === 'module');
+    expect(moduleNode).toBeDefined();
+    expect(moduleNode?.name).toBe('my_app');
+
+    const imports = result.nodes.filter((n) => n.kind === 'import');
+    expect(imports.length).toBeGreaterThanOrEqual(3);
+    const importNames = imports.map((i) => i.name);
+    expect(importNames).toContain('kernel');
+    expect(importNames).toContain('stdlib');
+    expect(importNames).toContain('crypto');
+    expect(importNames).toContain('ranch');
+  });
+});
+
+
 
 describe('Pascal / Delphi Extraction', () => {
   describe('Language detection', () => {

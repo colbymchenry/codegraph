@@ -91,7 +91,7 @@ const CONTAINER_NODE_KINDS = new Set<NodeKind>([
 
 /** Last `::` / `.` / `/`-separated segment of a qualified symbol. */
 function lastQualifierPart(symbol: string): string {
-  const parts = symbol.split(/::|[./]/).filter((p) => p.length > 0);
+  const parts = symbol.split(/::|[.:/]/).filter((p) => p.length > 0);
   return parts[parts.length - 1] ?? symbol;
 }
 
@@ -4372,7 +4372,7 @@ export class ToolHandler {
     // Mirror the fallback in `findSymbol` for qualified queries — FTS
     // strips colons, so a module-qualified lookup needs a second pass
     // by the bare last part.
-    if (results.length === 0 && /[.\/]|::/.test(symbol)) {
+    if (results.length === 0 && /[.\/]|::|:/.test(symbol)) {
       const tail = lastQualifierPart(symbol);
       if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit: 50 });
     }

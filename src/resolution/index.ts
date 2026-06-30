@@ -626,6 +626,14 @@ export class ReferenceResolver {
       }
     }
 
+    // Erlang remote call: `module:function` — check the function part so the
+    // pre-filter doesn't drop the ref before resolveErlangRemoteCall sees it.
+    const singleColonIdx = name.indexOf(':');
+    if (singleColonIdx > 0 && name.indexOf('::') !== singleColonIdx) {
+      const funcName = name.substring(singleColonIdx + 1);
+      if (funcName && this.knownNames.has(funcName)) return true;
+    }
+
     // For path-like references (e.g., "snippets/drawer-menu.liquid"), check the filename
     const slashIdx = name.lastIndexOf('/');
     if (slashIdx > 0) {
@@ -750,7 +758,12 @@ export class ReferenceResolver {
     }
 
     // Strategy 3: Try name matching
-    const nameResult = this.gateLanguage(matchReference(ref, this.context), ref);
+    // Erlang behaviour implements: skip — the import-resolver already handled
+    // it with module-only matching; the name-matcher would land on a wrong
+    // same-named field/function (a wrong implements edge is worse than none).
+    const nameResult = (ref.language === 'erlang' && ref.referenceKind === 'implements')
+      ? null
+      : this.gateLanguage(matchReference(ref, this.context), ref);
     if (nameResult) {
       candidates.push(nameResult);
     }

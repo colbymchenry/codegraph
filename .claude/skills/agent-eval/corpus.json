@@ -379,6 +379,9 @@
     }
   ],
   "React Native Fabric (view components)": [
+    { "name": "react-native-segmented-control", "repo": "https://github.com/react-native-segmented-control/segmented-control", "size": "Small", "files": "~25", "question": "How does JSX `<SegmentedControl onChange={cb}/>` reach the native onChange handler on iOS/Android?" },
+    { "name": "react-native-screens", "repo": "https://github.com/software-mansion/react-native-screens", "size": "Medium", "files": "~1200", "question": "How does JSX `<ScreenStack>` reach the native RNSScreenStackView component?" },
+    { "name": "react-native-skia", "repo": "https://github.com/Shopify/react-native-skia", "size": "Large", "files": "~1000", "question": "How does a `<SkiaPictureView/>` JSX usage reach the iOS / Android native renderer?" },
     {
       "name": "react-native-segmented-control",
       "repo": "https://github.com/react-native-segmented-control/segmented-control",
@@ -400,6 +403,11 @@
       "files": "~1000",
       "question": "How does a `<SkiaPictureView/>` JSX usage reach the iOS / Android native renderer?"
     }
+  ],
+  "Erlang": [
+    { "name": "poolboy", "repo": "https://github.com/devinus/poolboy", "size": "Small", "files": "~15", "question": "How does poolboy manage worker checkout, checkin, and overflow?" },
+    { "name": "cowboy", "repo": "https://github.com/ninenines/cowboy", "size": "Medium", "files": "~100", "question": "How does Cowboy route an HTTP request to its handler?" },
+    { "name": "emqx", "repo": "https://github.com/emqx/emqx", "size": "Large", "files": "~1500", "question": "How does EMQX handle an MQTT CONNECT packet from a client?" }
   ],
   "R": [
     {

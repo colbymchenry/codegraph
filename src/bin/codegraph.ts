@@ -1618,7 +1618,10 @@ program
       const cg = await CodeGraph.open(projectPath);
       const limit = parseInt(options.limit || '20', 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      // Erlang remote calls use `module:function` — strip the module prefix
+      // so FTS can find the bare function name.
+      const bareName = symbol.includes('::') ? symbol : symbol.split(':').pop() ?? symbol;
+      const matches = cg.searchNodes(bareName, { limit: 50 });
       if (matches.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
@@ -1629,7 +1632,7 @@ program
       const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        const exactMatch = match.node.name === bareName || match.node.name.endsWith(`.${bareName}`) || match.node.name.endsWith(`::${bareName}`);
         if (!exactMatch && matches.length > 1) continue;
         for (const c of cg.getCallers(match.node.id)) {
           if (!seen.has(c.node.id)) {
@@ -1697,7 +1700,10 @@ program
       const cg = await CodeGraph.open(projectPath);
       const limit = parseInt(options.limit || '20', 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      // Erlang remote calls use `module:function` — strip the module prefix
+      // so FTS can find the bare function name.
+      const bareName = symbol.includes('::') ? symbol : symbol.split(':').pop() ?? symbol;
+      const matches = cg.searchNodes(bareName, { limit: 50 });
       if (matches.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
@@ -1708,7 +1714,7 @@ program
       const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        const exactMatch = match.node.name === bareName || match.node.name.endsWith(`.${bareName}`) || match.node.name.endsWith(`::${bareName}`);
         if (!exactMatch && matches.length > 1) continue;
         for (const c of cg.getCallees(match.node.id)) {
           if (!seen.has(c.node.id)) {
@@ -1775,7 +1781,10 @@ program
       const cg = await CodeGraph.open(projectPath);
       const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      // Erlang remote calls use `module:function` — strip the module prefix
+      // so FTS can find the bare function name.
+      const bareName = symbol.includes('::') ? symbol : symbol.split(':').pop() ?? symbol;
+      const matches = cg.searchNodes(bareName, { limit: 50 });
       if (matches.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
@@ -1788,7 +1797,7 @@ program
       let edgeCount = 0;
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        const exactMatch = match.node.name === bareName || match.node.name.endsWith(`.${bareName}`) || match.node.name.endsWith(`::${bareName}`);
         if (!exactMatch && matches.length > 1) continue;
         const impact = cg.getImpactRadius(match.node.id, depth);
         for (const [id, n] of impact.nodes) {

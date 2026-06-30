@@ -3647,6 +3647,27 @@ export class TreeSitterExtractor {
         }
       }
     } else {
+      // Erlang remote call: `module:function()` wraps a `call` node inside a
+      // `remote` parent. The generic path below would extract just the function
+      // name; emit `module:function` so the resolver can cross the file boundary.
+      if (this.language === 'erlang' && node.parent?.type === 'remote') {
+        const remoteModule = getChildByField(node.parent, 'module');
+        const moduleName = remoteModule
+          ? getNodeText(
+              getChildByField(remoteModule, 'module') ?? remoteModule,
+              this.source,
+            ).replace(/^['"]|['"]$/g, '')
+          : undefined;
+        const funcExpr = getChildByField(node, 'expr');
+        const funcName = funcExpr
+          ? getNodeText(funcExpr, this.source).replace(/^['"]|['"]$/g, '')
+          : undefined;
+        if (moduleName && funcName) {
+          calleeName = `${moduleName}:${funcName}`;
+        } else if (funcName) {
+          calleeName = funcName;
+        }
+      } else {
       const func = getChildByField(node, 'function') || node.namedChild(0);
 
       if (func) {
@@ -3768,6 +3789,7 @@ export class TreeSitterExtractor {
           calleeName = getNodeText(func, this.source);
         }
       }
+      } // end else (non-Erlang-remote generic path)
     }
 
     // Parenthesized type conversions — Go `(*T)(x)` / `(T)(x)` (and a
