@@ -81,6 +81,9 @@ export function simpleCppTypeName(typeName: string): string {
   return parts[parts.length - 1] ?? typeName.trim();
 }
 
+const qtCppSectionPattern =
+  /(^|\n)\s*(public\s+slots|protected\s+slots|private\s+slots|public\s+Q_SLOTS|protected\s+Q_SLOTS|private\s+Q_SLOTS|public|protected|private|signals|Q_SIGNALS)\s*:/gi;
+
 function getOrCreateClassFacts(
   registry: QtCppMetaRegistry,
   className: string
@@ -140,9 +143,7 @@ function parseQtCppProperties(classFacts: QtCppClassFacts, classBody: string): v
 }
 
 function parseQtCppSignals(classFacts: QtCppClassFacts, classBody: string): void {
-  const sectionPattern =
-    /(^|\n)\s*(public\s+slots|public\s+Q_SLOTS|public|protected|private|signals|Q_SIGNALS)\s*:/gi;
-  const sections = [...classBody.matchAll(sectionPattern)];
+  const sections = [...classBody.matchAll(qtCppSectionPattern)];
   for (let i = 0; i < sections.length; i++) {
     const section = sections[i]!;
     const label = section[2]?.toLowerCase() ?? '';
@@ -163,9 +164,7 @@ function parseQtCppMethods(classFacts: QtCppClassFacts, classBody: string): void
     if (name) addMethodFact(classFacts, name, { invokable: true });
   }
 
-  const sectionPattern =
-    /(^|\n)\s*(public\s+slots|public\s+Q_SLOTS|public|protected|private|signals|Q_SIGNALS)\s*:/gi;
-  const sections = [...classBody.matchAll(sectionPattern)];
+  const sections = [...classBody.matchAll(qtCppSectionPattern)];
   for (let i = 0; i < sections.length; i++) {
     const section = sections[i]!;
     const label = section[2]?.toLowerCase() ?? '';

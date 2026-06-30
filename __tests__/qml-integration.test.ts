@@ -1583,6 +1583,165 @@ Item {
     expect(graph.getOutgoingEdges(invalidOtherModelInstance!.id).some((edge) => edge.kind === 'references' && edge.target === otherModel!.id)).toBe(false);
   });
 
+  it('resolves aliased and versioned C++ QML registrations conservatively', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QtQml>
+
+class ThemeApiV1 : public QObject {
+  Q_OBJECT
+public:
+  Q_INVOKABLE QString color();
+};
+
+class ThemeApiV2 : public QObject {
+  Q_OBJECT
+public:
+  Q_INVOKABLE QString color();
+};
+
+class HiddenApi : public QObject {
+  Q_OBJECT
+public:
+  Q_INVOKABLE void refresh();
+};
+
+QString ThemeApiV1::color() { return "#111111"; }
+QString ThemeApiV2::color() { return "#222222"; }
+void HiddenApi::refresh() {}
+
+int main() {
+  qmlRegisterSingletonType<ThemeApiV1>("App.Controls", 1, 0, "ThemeApi", [](QQmlEngine*, QJSEngine*) -> QObject* {
+    return new ThemeApiV1();
+  });
+  qmlRegisterSingletonType<ThemeApiV2>("App.Controls", 2, 0, "ThemeApi", [](QQmlEngine*, QJSEngine*) -> QObject* {
+    return new ThemeApiV2();
+  });
+  qmlRegisterUncreatableType<HiddenApi>("App.Controls", 1, 0, "HiddenApi", "Only for typed properties");
+  return 0;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import App.Controls 2.0 as Controls
+
+Item {
+  property Controls.HiddenApi hidden
+  Component.onCompleted: {
+    Controls.ThemeApi.color()
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const v1Color = graph.getNodesByName('color').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ThemeApiV1::color'));
+    const v2Color = graph.getNodesByName('color').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ThemeApiV2::color'));
+    const hiddenApi = graph.getNodesByName('HiddenApi').find((n) => n.kind === 'class');
+
+    expect(onCompleted).toBeDefined();
+    expect(v1Color).toBeDefined();
+    expect(v2Color).toBeDefined();
+    expect(hiddenApi).toBeDefined();
+
+    const edges = graph.getOutgoingEdges(onCompleted!.id);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === v2Color!.id)).toBe(true);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === v1Color!.id)).toBe(false);
+
+    const hiddenProperty = graph.getNodesByName('hidden').find((n) => n.kind === 'property' && n.filePath === 'Main.qml');
+    expect(hiddenProperty).toBeDefined();
+    expect(graph.getOutgoingEdges(hiddenProperty!.id).some((edge) => edge.kind === 'references' && edge.target === hiddenApi!.id)).toBe(true);
+  });
+
+  it('does not expose private or protected slots to QML through the shared Qt registry', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+
+class ViewModel : public QObject {
+  Q_OBJECT
+public slots:
+  void visible();
+public Q_SLOTS:
+  void macroVisible();
+private slots:
+  void hidden();
+private Q_SLOTS:
+  void macroHidden();
+protected slots:
+  void alsoHidden();
+protected Q_SLOTS:
+  void macroAlsoHidden();
+};
+
+void ViewModel::visible() {}
+void ViewModel::macroVisible() {}
+void ViewModel::hidden() {}
+void ViewModel::macroHidden() {}
+void ViewModel::alsoHidden() {}
+void ViewModel::macroAlsoHidden() {}
+
+int main() {
+  QQmlApplicationEngine engine;
+  ViewModel vm;
+  engine.rootContext()->setContextProperty("viewModel", &vm);
+  return 0;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  Component.onCompleted: {
+    viewModel.visible()
+    viewModel.macroVisible()
+    viewModel.hidden()
+    viewModel.macroHidden()
+    viewModel.alsoHidden()
+    viewModel.macroAlsoHidden()
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const visible = graph.getNodesByName('visible').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::visible'));
+    const macroVisible = graph.getNodesByName('macroVisible').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::macroVisible'));
+    const hidden = graph.getNodesByName('hidden').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::hidden'));
+    const macroHidden = graph.getNodesByName('macroHidden').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::macroHidden'));
+    const alsoHidden = graph.getNodesByName('alsoHidden').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::alsoHidden'));
+    const macroAlsoHidden = graph.getNodesByName('macroAlsoHidden').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::macroAlsoHidden'));
+
+    expect(onCompleted).toBeDefined();
+    expect(visible).toBeDefined();
+    expect(macroVisible).toBeDefined();
+    expect(hidden).toBeDefined();
+    expect(macroHidden).toBeDefined();
+    expect(alsoHidden).toBeDefined();
+    expect(macroAlsoHidden).toBeDefined();
+
+    const edges = graph.getOutgoingEdges(onCompleted!.id);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === visible!.id)).toBe(true);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === macroVisible!.id)).toBe(true);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === hidden!.id)).toBe(false);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === macroHidden!.id)).toBe(false);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === alsoHidden!.id)).toBe(false);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === macroAlsoHidden!.id)).toBe(false);
+  });
+
   it('does not let C++ context properties steal shadowed QML names', async () => {
     fs.writeFileSync(
       path.join(tmpDir, 'main.cpp'),
