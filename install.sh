@@ -83,13 +83,38 @@ ln -sfn "$dest" "$INSTALL_DIR/current"
 
 echo "Installed to $dest"
 echo "Linked     $BIN_DIR/codegraph"
-case ":$PATH:" in
-  *":$BIN_DIR:"*) ;;
-  *)
-    echo ""
-    echo "$BIN_DIR is not on your PATH. Add it:"
-    echo "  export PATH=\"$BIN_DIR:\$PATH\""
-    ;;
-esac
+
+# 5. PATH sanity. Two ways this install can fail to be the codegraph that runs:
+#   1. $BIN_DIR isn't on PATH at all.
+#   2. A *different* codegraph sits earlier on PATH and shadows ours — most
+#      often a stale `npm i -g @colbymchenry/codegraph`, whose launcher keeps
+#      running its own version-pinned bundle, so `codegraph --version` disagrees
+#      with what we just installed (issue #1071).
+# Walk PATH once: note whether $BIN_DIR is present and which codegraph wins.
+on_path=0
+winner=""
+oldifs="$IFS"; IFS=:
+for dir in $PATH; do
+  [ -n "$dir" ] || continue
+  if [ "$dir" = "$BIN_DIR" ]; then on_path=1; fi
+  if [ -z "$winner" ] && [ -x "$dir/codegraph" ] && [ ! -d "$dir/codegraph" ]; then
+    winner="$dir/codegraph"
+  fi
+done
+IFS="$oldifs"
+
+if [ "$on_path" -eq 0 ]; then
+  echo ""
+  echo "$BIN_DIR is not on your PATH. Add it:"
+  echo "  export PATH=\"$BIN_DIR:\$PATH\""
+elif [ -n "$winner" ] && [ "$winner" != "$BIN_DIR/codegraph" ]; then
+  echo ""
+  echo "Warning: another codegraph is earlier on your PATH and will run instead:"
+  echo "  $winner"
+  echo "  (this install: $BIN_DIR/codegraph)"
+  echo "If 'codegraph --version' shows an unexpected version, remove the other copy"
+  echo "(e.g. 'npm rm -g @colbymchenry/codegraph') or put $BIN_DIR first on PATH."
+fi
+
 echo ""
 echo "Done. Run: codegraph --help"
