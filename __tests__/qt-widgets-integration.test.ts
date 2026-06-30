@@ -77,7 +77,7 @@ int main() {
     expect(graph!.getDetectedFrameworks()).not.toContain('qt');
   });
 
-  it.skip('resolves new-style connects to the matching duplicate class slot once Task 4 adds synthesis', async () => {
+  it('resolves new-style connects to the matching duplicate class slot', async () => {
     fs.writeFileSync(
       path.join(tmpDir, 'mainwindow.cpp'),
       `#include <QMainWindow>
@@ -149,6 +149,376 @@ void Other::MainWindow::onButtonClicked() {}
 
     expect(outgoingCalls).toContain(appSlot!.id);
     expect(outgoingCalls).not.toContain(otherSlot!.id);
+  });
+
+  it('uses the registration owner for simple receiver class names in duplicate Qt classes', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include <QPushButton>
+
+namespace App {
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+
+public:
+  MainWindow();
+
+public slots:
+  void onButtonClicked();
+};
+}
+
+namespace Other {
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+
+public slots:
+  void onButtonClicked();
+};
+}
+
+App::MainWindow::MainWindow() {
+  auto *button = new QPushButton(this);
+  connect(button, &QPushButton::clicked, this, &MainWindow::onButtonClicked);
+}
+
+void App::MainWindow::onButtonClicked() {}
+void Other::MainWindow::onButtonClicked() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!
+      .getNodesByName('MainWindow')
+      .find(
+        (node) =>
+          node.kind === 'method' &&
+          node.qualifiedName.endsWith('App::MainWindow::MainWindow')
+      );
+    const appSlot = graph!
+      .getNodesByName('onButtonClicked')
+      .find(
+        (node) =>
+          node.kind === 'method' &&
+          node.qualifiedName.endsWith('App::MainWindow::onButtonClicked')
+      );
+    const otherSlot = graph!
+      .getNodesByName('onButtonClicked')
+      .find(
+        (node) =>
+          node.kind === 'method' &&
+          node.qualifiedName.endsWith('Other::MainWindow::onButtonClicked')
+      );
+
+    expect(constructor).toBeDefined();
+    expect(appSlot).toBeDefined();
+    expect(otherSlot).toBeDefined();
+
+    const outgoingCalls = graph!
+      .getOutgoingEdges(constructor!.id)
+      .filter((edge) => edge.kind === 'calls')
+      .map((edge) => edge.target);
+
+    expect(outgoingCalls).toContain(appSlot!.id);
+    expect(outgoingCalls).not.toContain(otherSlot!.id);
+  });
+
+  it('does not synthesize member-pointer connect edges for non-Qt C++ APIs', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `class Source {
+public:
+  void changed();
+};
+
+class Receiver {
+public:
+  void handle();
+};
+
+void connect(Source *source, void (Source::*signal)(), Receiver *receiver, void (Receiver::*slot)()) {}
+
+void wire(Source *source, Receiver *receiver) {
+  connect(source, &Source::changed, receiver, &Receiver::handle);
+}
+
+void Source::changed() {}
+void Receiver::handle() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const wire = graph!.getNodesByName('wire').find((node) => node.kind === 'function');
+    const handle = graph!
+      .getNodesByName('handle')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('Receiver::handle'));
+
+    expect(wire).toBeDefined();
+    expect(handle).toBeDefined();
+    expect(
+      graph!
+        .getOutgoingEdges(wire!.id)
+        .some((edge) => edge.kind === 'calls' && edge.target === handle!.id)
+    ).toBe(false);
+  });
+
+  it('does not treat this receiver member-pointer connects as Qt evidence by itself', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `class Source {
+public:
+  void changed();
+};
+
+class Receiver {
+public:
+  void wire(Source *source);
+  void handle();
+};
+
+void connect(Source *source, void (Source::*signal)(), Receiver *receiver, void (Receiver::*slot)()) {}
+
+void Receiver::wire(Source *source) {
+  connect(source, &Source::changed, this, &Receiver::handle);
+}
+
+void Source::changed() {}
+void Receiver::handle() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const wire = graph!
+      .getNodesByName('wire')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('Receiver::wire'));
+    const handle = graph!
+      .getNodesByName('handle')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('Receiver::handle'));
+
+    expect(wire).toBeDefined();
+    expect(handle).toBeDefined();
+    expect(
+      graph!
+        .getOutgoingEdges(wire!.id)
+        .some((edge) => edge.kind === 'calls' && edge.target === handle!.id)
+    ).toBe(false);
+  });
+
+  it('does not synthesize Qt connect edges when the receiver slot is missing', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include <QPushButton>
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+public slots:
+  void existingSlot();
+};
+
+MainWindow::MainWindow() {
+  auto *button = new QPushButton(this);
+  connect(button, &QPushButton::clicked, this, &MainWindow::missingSlot);
+}
+
+void MainWindow::existingSlot() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!
+      .getNodesByName('MainWindow')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
+    const existingSlot = graph!
+      .getNodesByName('existingSlot')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::existingSlot'));
+
+    expect(constructor).toBeDefined();
+    expect(existingSlot).toBeDefined();
+    expect(
+      graph!
+        .getOutgoingEdges(constructor!.id)
+        .some((edge) => edge.kind === 'calls' && edge.target === existingSlot!.id)
+    ).toBe(false);
+  });
+
+  it('keeps untyped Qt connects unresolved for overloaded slots', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QComboBox>
+#include <QMainWindow>
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+public slots:
+  void onIndexChanged(int index);
+  void onIndexChanged(const QString &text);
+};
+
+MainWindow::MainWindow() {
+  auto *combo = new QComboBox(this);
+  connect(combo, &QComboBox::currentIndexChanged, this, &MainWindow::onIndexChanged);
+}
+
+void MainWindow::onIndexChanged(int index) {}
+void MainWindow::onIndexChanged(const QString &text) {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!
+      .getNodesByName('MainWindow')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
+    const slots = graph!
+      .getNodesByName('onIndexChanged')
+      .filter((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::onIndexChanged'));
+
+    expect(constructor).toBeDefined();
+    expect(slots).toHaveLength(2);
+    const outgoingCalls = graph!
+      .getOutgoingEdges(constructor!.id)
+      .filter((edge) => edge.kind === 'calls')
+      .map((edge) => edge.target);
+
+    for (const slot of slots) {
+      expect(outgoingCalls).not.toContain(slot.id);
+    }
+  });
+
+  it('resolves qOverload typed Qt connects to the matching overloaded slot', async () => {
+    const mainCpp = path.join(tmpDir, 'mainwindow.cpp');
+    fs.writeFileSync(
+      mainCpp,
+      `#include <QComboBox>
+#include <QMainWindow>
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+public slots:
+  void onIndexChanged(int index);
+  void onIndexChanged(const QString &text);
+};
+
+MainWindow::MainWindow() {
+  auto *combo = new QComboBox(this);
+  connect(combo, qOverload<int>(&QComboBox::currentIndexChanged), this, qOverload<int>(&MainWindow::onIndexChanged));
+}
+
+void MainWindow::onIndexChanged(int index) {}
+void MainWindow::onIndexChanged(const QString &text) {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!
+      .getNodesByName('MainWindow')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
+    const intSlot = methodNodeIdByLine(graph!, mainCpp, 'onIndexChanged', 'void MainWindow::onIndexChanged(int index)');
+    const textSlot = methodNodeIdByLine(graph!, mainCpp, 'onIndexChanged', 'void MainWindow::onIndexChanged(const QString &text)');
+    const outgoingCalls = graph!
+      .getOutgoingEdges(constructor!.id)
+      .filter((edge) => edge.kind === 'calls')
+      .map((edge) => edge.target);
+
+    expect(outgoingCalls).toContain(intSlot);
+    expect(outgoingCalls).not.toContain(textSlot);
+  });
+
+  it('resolves QOverload typed Qt connects to the matching overloaded slot', async () => {
+    const mainCpp = path.join(tmpDir, 'mainwindow.cpp');
+    fs.writeFileSync(
+      mainCpp,
+      `#include <QComboBox>
+#include <QMainWindow>
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+public slots:
+  void onIndexChanged(int index);
+  void onIndexChanged(const QString &text);
+};
+
+MainWindow::MainWindow() {
+  auto *combo = new QComboBox(this);
+  QObject::connect(combo, QOverload<const QString &>::of(&QComboBox::currentTextChanged), this, QOverload<const QString &>::of(&MainWindow::onIndexChanged));
+}
+
+void MainWindow::onIndexChanged(int index) {}
+void MainWindow::onIndexChanged(const QString &text) {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!
+      .getNodesByName('MainWindow')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
+    const intSlot = methodNodeIdByLine(graph!, mainCpp, 'onIndexChanged', 'void MainWindow::onIndexChanged(int index)');
+    const textSlot = methodNodeIdByLine(graph!, mainCpp, 'onIndexChanged', 'void MainWindow::onIndexChanged(const QString &text)');
+    const outgoingCalls = graph!
+      .getOutgoingEdges(constructor!.id)
+      .filter((edge) => edge.kind === 'calls')
+      .map((edge) => edge.target);
+
+    expect(outgoingCalls).not.toContain(intSlot);
+    expect(outgoingCalls).toContain(textSlot);
+  });
+
+  it('resolves static_cast typed Qt connects to the matching overloaded slot', async () => {
+    const mainCpp = path.join(tmpDir, 'mainwindow.cpp');
+    fs.writeFileSync(
+      mainCpp,
+      `#include <QMainWindow>
+#include <QSpinBox>
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+public slots:
+  void onValueChanged(int value);
+  void onValueChanged(double value);
+};
+
+MainWindow::MainWindow() {
+  auto *spin = new QSpinBox(this);
+  connect(spin, static_cast<void (QSpinBox::*)(int)>(&QSpinBox::valueChanged), this, static_cast<void (MainWindow::*)(int)>(&MainWindow::onValueChanged));
+}
+
+void MainWindow::onValueChanged(int value) {}
+void MainWindow::onValueChanged(double value) {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!
+      .getNodesByName('MainWindow')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
+    const intSlot = methodNodeIdByLine(graph!, mainCpp, 'onValueChanged', 'void MainWindow::onValueChanged(int value)');
+    const doubleSlot = methodNodeIdByLine(graph!, mainCpp, 'onValueChanged', 'void MainWindow::onValueChanged(double value)');
+    const outgoingCalls = graph!
+      .getOutgoingEdges(constructor!.id)
+      .filter((edge) => edge.kind === 'calls')
+      .map((edge) => edge.target);
+
+    expect(outgoingCalls).toContain(intSlot);
+    expect(outgoingCalls).not.toContain(doubleSlot);
   });
 
   it('resolves QML C++ bridge methods against qualified duplicate class names', async () => {

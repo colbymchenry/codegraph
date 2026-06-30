@@ -141,7 +141,7 @@ const cppTypeWords = new Set([
 
 function parameterTypeText(parameter: string): string {
   const withoutDefault = parameter.replace(/=.*/, '').replace(/\s+/g, ' ').trim();
-  const named = /^(.*\S)\s+([A-Za-z_][A-Za-z0-9_]*)$/.exec(withoutDefault);
+  const named = /^(.+[\s*&])([A-Za-z_][A-Za-z0-9_]*)$/.exec(withoutDefault);
   if (!named) return withoutDefault;
 
   const typePart = named[1]!.trim();
@@ -149,6 +149,7 @@ function parameterTypeText(parameter: string): string {
   const typeLastWord = typePart.split(/\s+/).pop() ?? '';
   const looksLikeUnnamedCompoundType = cppTypeWords.has(typeLastWord) && cppTypeWords.has(maybeName);
   if (looksLikeUnnamedCompoundType) return withoutDefault;
+  if (!cppTypeWords.has(maybeName)) return typePart;
 
   if (
     /[&*>)]$/.test(typePart) ||
@@ -347,7 +348,7 @@ function parseMethodDeclaration(rawDeclaration: string): QtCppMethodDeclaration 
     .replace(/\s+/g, ' ')
     .trim();
   const match =
-    /(?:^|\s)(?:operator\s*[^\s(]+|~?[A-Za-z_][A-Za-z0-9_]*)\s*\(([^()]*)\)\s*(const\b)?/.exec(
+    /(?:^|\s)(?:operator\s*[^\s(]+|~?(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)\s*\(([^()]*)\)\s*(const\b)?/.exec(
       declaration
     );
   if (!match) return null;
