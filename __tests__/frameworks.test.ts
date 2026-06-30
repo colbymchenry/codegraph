@@ -56,6 +56,13 @@ describe('Qt framework resolver public identity', () => {
     expect(getApplicableFrameworks([qtResolver], 'xml')).toEqual([qtResolver]);
     expect(qtResolver.extract?.('forms/MainWindow.ui', '<ui version="4.0" />')).toEqual({ nodes: [], references: [] });
   });
+
+  it('routes Qt framework extraction to C and C++ files for Widgets support', () => {
+    expect(qtResolver.languages).toContain('cpp');
+    expect(qtResolver.languages).toContain('c');
+    expect(getApplicableFrameworks([qtResolver], 'cpp')).toEqual([qtResolver]);
+    expect(getApplicableFrameworks([qtResolver], 'c')).toEqual([qtResolver]);
+  });
 });
 
 import { djangoResolver } from '../src/resolution/frameworks/python';
