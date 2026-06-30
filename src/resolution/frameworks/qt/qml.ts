@@ -2,6 +2,12 @@ import * as path from 'path';
 import type { Node } from '../../../types';
 import { isQmlDirFile, isQmlFile } from '../../../extraction/grammars';
 import type { FrameworkExtractionResult, ResolutionContext, ResolvedRef, UnresolvedRef } from '../../types';
+import {
+  getQtCppMetaRegistry,
+  getQtCppSources,
+  simpleCppTypeName,
+  type QtCppClassFacts,
+} from './cpp-meta';
 
 interface QmlDirComponent {
   name: string;
@@ -49,27 +55,6 @@ interface QmlCppRegistration {
   classNodeId?: string;
 }
 
-interface QmlCppMethodFact {
-  name: string;
-  invokable: boolean;
-  publicSlot: boolean;
-}
-
-interface QmlCppPropertyFact {
-  name: string;
-  read?: string;
-  notify?: string;
-}
-
-interface QmlCppClassFacts {
-  name: string;
-  classNodeId?: string;
-  methods: Map<string, QmlCppMethodFact>;
-  properties: Map<string, QmlCppPropertyFact>;
-  signals: Set<string>;
-  hasQmlExposureEvidence: boolean;
-}
-
 interface QmlCppContextProperty {
   name: string;
   cppType: string;
@@ -77,7 +62,7 @@ interface QmlCppContextProperty {
 }
 
 interface QmlCppBridgeRegistry {
-  classes: Map<string, QmlCppClassFacts>;
+  classes: Map<string, QtCppClassFacts>;
   registrations: QmlCppRegistration[];
   contextProperties: Map<string, QmlCppContextProperty>;
 }
@@ -85,12 +70,6 @@ interface QmlCppBridgeRegistry {
 interface QmlCppBridgeRegistryCacheEntry {
   key: string;
   registry: QmlCppBridgeRegistry;
-}
-
-interface QmlCppBridgeSourceCacheEntry {
-  versionKey: string;
-  key: string;
-  sources: Array<readonly [string, string | null]>;
 }
 
 interface QmlCppBridgeNameIndex {
@@ -107,43 +86,11 @@ interface QmlCppBridgeNameIndexCacheEntry {
 
 const moduleCache = new WeakMap<ResolutionContext, QmlDirModuleCacheEntry>();
 const importCache = new WeakMap<ResolutionContext, Map<string, QmlModuleImportCacheEntry>>();
-const bridgeSourceCache = new WeakMap<ResolutionContext, QmlCppBridgeSourceCacheEntry>();
 const bridgeNameIndexCache = new WeakMap<ResolutionContext, QmlCppBridgeNameIndexCacheEntry>();
 const bridgeRegistryCache = new WeakMap<ResolutionContext, QmlCppBridgeRegistryCacheEntry>();
 
 function hasQmlFiles(context: ResolutionContext): boolean {
   return context.getAllFiles().some((filePath) => isQmlFile(filePath));
-}
-
-function isCppBridgeFile(filePath: string): boolean {
-  return /\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx)$/i.test(filePath);
-}
-
-function cppBridgeFiles(context: ResolutionContext): string[] {
-  return context.getAllFiles().filter(isCppBridgeFile).sort();
-}
-
-function cppBridgeVersionKey(context: ResolutionContext): string {
-  return cppBridgeFiles(context)
-    .map((filePath) => {
-      const newestNodeUpdate = context
-        .getNodesInFile(filePath)
-        .reduce((max, node) => Math.max(max, node.updatedAt), 0);
-      return `${filePath}:${newestNodeUpdate}`;
-    })
-    .join('\0');
-}
-
-function getQmlCppBridgeSources(context: ResolutionContext): QmlCppBridgeSourceCacheEntry {
-  const versionKey = cppBridgeVersionKey(context);
-  const cached = bridgeSourceCache.get(context);
-  if (cached?.versionKey === versionKey) return cached;
-
-  const sources = cppBridgeFiles(context).map((filePath) => [filePath, context.readFile(filePath)] as const);
-  const key = sources.map(([filePath, source]) => `${filePath}\0${source ?? ''}`).join('\0');
-  const entry = { versionKey, key, sources };
-  bridgeSourceCache.set(context, entry);
-  return entry;
 }
 
 function dirname(filePath: string): string {
@@ -190,18 +137,20 @@ function parseQmlImports(context: ResolutionContext, filePath: string): QmlModul
   return imports;
 }
 
-function simpleCppTypeName(typeName: string): string {
-  const parts = typeName.trim().split('::').filter(Boolean);
-  return parts[parts.length - 1] ?? typeName.trim();
-}
-
-function getOrCreateClassFacts(
+function getOrCreateQmlCppClassFacts(
   registry: QmlCppBridgeRegistry,
   className: string
-): QmlCppClassFacts {
+): QtCppClassFacts {
   const simpleName = simpleCppTypeName(className);
   let facts = registry.classes.get(simpleName);
-  if (!facts) {
+  if (facts) {
+    facts = {
+      ...facts,
+      methods: new Map(facts.methods),
+      properties: new Map(facts.properties),
+      signals: new Set(facts.signals),
+    };
+  } else {
     facts = {
       name: simpleName,
       methods: new Map(),
@@ -209,104 +158,9 @@ function getOrCreateClassFacts(
       signals: new Set(),
       hasQmlExposureEvidence: false,
     };
-    registry.classes.set(simpleName, facts);
   }
+  registry.classes.set(simpleName, facts);
   return facts;
-}
-
-function addMethodFact(
-  classFacts: QmlCppClassFacts,
-  name: string,
-  flags: { invokable?: boolean; publicSlot?: boolean }
-): void {
-  const existing = classFacts.methods.get(name);
-  classFacts.methods.set(name, {
-    name,
-    invokable: Boolean(existing?.invokable || flags.invokable),
-    publicSlot: Boolean(existing?.publicSlot || flags.publicSlot),
-  });
-}
-
-function methodNamesFromCppDeclarations(source: string): string[] {
-  const names: string[] = [];
-  const methodPattern =
-    /(?:^|[;\n])\s*(?:virtual\s+)?(?:[\w:<>~*&\s]+?\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*(?:const\s*)?(?:;|\{)/gm;
-
-  for (const match of source.matchAll(methodPattern)) {
-    const name = match[1];
-    if (!name || ['if', 'for', 'while', 'switch', 'return'].includes(name)) continue;
-    names.push(name);
-  }
-  return names;
-}
-
-function parseQmlCppProperties(classFacts: QmlCppClassFacts, classBody: string): void {
-  const propertyPattern = /Q_PROPERTY\s*\(\s*[^\s()]+\s+([A-Za-z_][A-Za-z0-9_]*)\b([^)]*)\)/g;
-  for (const match of classBody.matchAll(propertyPattern)) {
-    const name = match[1];
-    if (!name) continue;
-    const tail = match[2] ?? '';
-    const read = /\bREAD\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(tail)?.[1];
-    const notify = /\bNOTIFY\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(tail)?.[1];
-    classFacts.properties.set(name, { name, read, notify });
-    if (notify) classFacts.signals.add(notify);
-  }
-}
-
-function parseQmlCppSignals(classFacts: QmlCppClassFacts, classBody: string): void {
-  const sectionPattern =
-    /(^|\n)\s*(public\s+slots|public\s+Q_SLOTS|public|protected|private|signals|Q_SIGNALS)\s*:/gi;
-  const sections = [...classBody.matchAll(sectionPattern)];
-  for (let i = 0; i < sections.length; i++) {
-    const section = sections[i]!;
-    const label = section[2]?.toLowerCase() ?? '';
-    if (label !== 'signals' && label !== 'q_signals') continue;
-    const start = section.index! + section[0].length;
-    const end = sections[i + 1]?.index ?? classBody.length;
-    for (const name of methodNamesFromCppDeclarations(classBody.slice(start, end))) {
-      classFacts.signals.add(name);
-    }
-  }
-}
-
-function parseQmlCppMethods(classFacts: QmlCppClassFacts, classBody: string): void {
-  const invokablePattern =
-    /Q_INVOKABLE\s+(?:[\w:<>~*&\s]+?\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
-  for (const match of classBody.matchAll(invokablePattern)) {
-    const name = match[1];
-    if (name) addMethodFact(classFacts, name, { invokable: true });
-  }
-
-  const sectionPattern =
-    /(^|\n)\s*(public\s+slots|public\s+Q_SLOTS|public|protected|private|signals|Q_SIGNALS)\s*:/gi;
-  const sections = [...classBody.matchAll(sectionPattern)];
-  for (let i = 0; i < sections.length; i++) {
-    const section = sections[i]!;
-    const label = section[2]?.toLowerCase() ?? '';
-    if (label !== 'public slots' && label !== 'public q_slots') continue;
-    const start = section.index! + section[0].length;
-    const end = sections[i + 1]?.index ?? classBody.length;
-    for (const name of methodNamesFromCppDeclarations(classBody.slice(start, end))) {
-      addMethodFact(classFacts, name, { publicSlot: true });
-    }
-  }
-}
-
-function parseQmlCppClasses(registry: QmlCppBridgeRegistry, source: string): void {
-  const classPattern = /\b(?:class|struct)\s+([A-Za-z_][A-Za-z0-9_:]*)\b[^{;]*\{([\s\S]*?)\s*\};/g;
-  for (const match of source.matchAll(classPattern)) {
-    const className = match[1];
-    const classBody = match[2];
-    if (!className || !classBody) continue;
-
-    const facts = getOrCreateClassFacts(registry, className);
-    if (/\bQ_OBJECT\b|\bQ_GADGET\b|\bQ_PROPERTY\s*\(|\bQ_INVOKABLE\b|\bsignals\s*:|\bQ_SIGNALS\s*:/.test(classBody)) {
-      facts.hasQmlExposureEvidence = true;
-    }
-    parseQmlCppProperties(facts, classBody);
-    parseQmlCppSignals(facts, classBody);
-    parseQmlCppMethods(facts, classBody);
-  }
 }
 
 function parseQmlCppRegistrations(registry: QmlCppBridgeRegistry, source: string): void {
@@ -334,7 +188,7 @@ function parseQmlCppRegistrations(registry: QmlCppBridgeRegistry, source: string
       version: `${major}.${minor}`,
       qmlName,
     });
-    getOrCreateClassFacts(registry, cppType).hasQmlExposureEvidence = true;
+    getOrCreateQmlCppClassFacts(registry, cppType).hasQmlExposureEvidence = true;
   }
 }
 
@@ -379,12 +233,12 @@ function parseQmlCppContextProperties(registry: QmlCppBridgeRegistry, source: st
     const cppType = localTypes.get(variableName);
     if (!cppType) continue;
     registry.contextProperties.set(name, { name, cppType });
-    getOrCreateClassFacts(registry, cppType).hasQmlExposureEvidence = true;
+    getOrCreateQmlCppClassFacts(registry, cppType).hasQmlExposureEvidence = true;
   }
 }
 
 function getQmlCppBridgeNameIndex(context: ResolutionContext): QmlCppBridgeNameIndex {
-  const sourceEntry = getQmlCppBridgeSources(context);
+  const sourceEntry = getQtCppSources(context);
   const cached = bridgeNameIndexCache.get(context);
   if (cached?.key === sourceEntry.key) return cached.index;
 
@@ -418,18 +272,7 @@ function getQmlCppBridgeNameIndex(context: ResolutionContext): QmlCppBridgeNameI
   return index;
 }
 
-function attachQmlCppNodes(context: ResolutionContext, registry: QmlCppBridgeRegistry): void {
-  for (const node of context.getNodesByKind('class')) {
-    if (node.language !== 'cpp') continue;
-    const facts = registry.classes.get(node.name);
-    if (facts) facts.classNodeId = node.id;
-  }
-  for (const node of context.getNodesByKind('struct')) {
-    if (node.language !== 'cpp') continue;
-    const facts = registry.classes.get(node.name);
-    if (facts) facts.classNodeId = node.id;
-  }
-
+function attachQmlCppBridgeNodes(registry: QmlCppBridgeRegistry): void {
   for (const registration of registry.registrations) {
     const facts = registry.classes.get(simpleCppTypeName(registration.cppType));
     registration.classNodeId = facts?.classNodeId;
@@ -441,22 +284,22 @@ function attachQmlCppNodes(context: ResolutionContext, registry: QmlCppBridgeReg
 }
 
 function getQmlCppBridgeRegistry(context: ResolutionContext): QmlCppBridgeRegistry {
-  const { key, sources } = getQmlCppBridgeSources(context);
+  const { key, sources } = getQtCppSources(context);
   const cached = bridgeRegistryCache.get(context);
   if (cached?.key === key) return cached.registry;
 
+  const meta = getQtCppMetaRegistry(context);
   const registry: QmlCppBridgeRegistry = {
-    classes: new Map(),
+    classes: new Map(meta.classes),
     registrations: [],
     contextProperties: new Map(),
   };
   for (const [, source] of sources) {
     if (!source) continue;
-    parseQmlCppClasses(registry, source);
     parseQmlCppRegistrations(registry, source);
     parseQmlCppContextProperties(registry, source);
   }
-  attachQmlCppNodes(context, registry);
+  attachQmlCppBridgeNodes(registry);
   bridgeRegistryCache.set(context, { key, registry });
   return registry;
 }
@@ -821,7 +664,7 @@ function findCppMethodNode(
 }
 
 function isQmlVisibleMethod(
-  classFacts: QmlCppClassFacts | undefined,
+  classFacts: QtCppClassFacts | undefined,
   methodName: string
 ): boolean {
   const method = classFacts?.methods.get(methodName);
@@ -832,7 +675,7 @@ function isQmlVisibleMethod(
 function resolveQmlCppMethod(
   ref: UnresolvedRef,
   context: ResolutionContext,
-  classFacts: QmlCppClassFacts | undefined,
+  classFacts: QtCppClassFacts | undefined,
   cppType: string,
   methodName: string
 ): ResolvedRef | null {
