@@ -1742,6 +1742,75 @@ Item {
     expect(edges.some((edge) => edge.kind === 'calls' && edge.target === macroAlsoHidden!.id)).toBe(false);
   });
 
+  it('updates QML C++ bridge edges when context property types change during sync', async () => {
+    const cppPath = path.join(tmpDir, 'main.cpp');
+    const qmlPath = path.join(tmpDir, 'Main.qml');
+
+    fs.writeFileSync(
+      cppPath,
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+
+class FirstModel : public QObject {
+  Q_OBJECT
+public:
+  Q_INVOKABLE void refresh();
+};
+
+class SecondModel : public QObject {
+  Q_OBJECT
+public:
+  Q_INVOKABLE void refresh();
+};
+
+void FirstModel::refresh() {}
+void SecondModel::refresh() {}
+
+int main() {
+  QQmlApplicationEngine engine;
+  FirstModel model;
+  engine.rootContext()->setContextProperty("viewModel", &model);
+  return 0;
+}
+`
+    );
+    fs.writeFileSync(
+      qmlPath,
+      `import QtQuick
+
+Item {
+  Component.onCompleted: viewModel.refresh()
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const firstRefresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('FirstModel::refresh'));
+    expect(firstRefresh).toBeDefined();
+
+    let onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    expect(onCompleted).toBeDefined();
+    expect(graph.getOutgoingEdges(onCompleted!.id).some((edge) => edge.kind === 'calls' && edge.target === firstRefresh!.id)).toBe(true);
+
+    fs.writeFileSync(
+      cppPath,
+      fs.readFileSync(cppPath, 'utf-8').replace('FirstModel model;', 'SecondModel model;')
+    );
+    await graph.sync();
+
+    const secondRefresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('SecondModel::refresh'));
+    onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    expect(secondRefresh).toBeDefined();
+    expect(onCompleted).toBeDefined();
+
+    const edges = graph.getOutgoingEdges(onCompleted!.id);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === secondRefresh!.id)).toBe(true);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === firstRefresh!.id)).toBe(false);
+  });
+
   it('does not let C++ context properties steal shadowed QML names', async () => {
     fs.writeFileSync(
       path.join(tmpDir, 'main.cpp'),
