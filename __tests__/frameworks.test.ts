@@ -22,10 +22,9 @@ describe('FrameworkResolver.extract interface', () => {
 import {
   getApplicableFrameworks,
   getFrameworkResolver,
-  qmlQtResolver,
   qtResolver,
 } from '../src/resolution/frameworks';
-import { qmlQtResolver as qmlQtShimResolver } from '../src/resolution/frameworks/qml-qt';
+import * as frameworkResolvers from '../src/resolution/frameworks';
 import type { FrameworkResolver } from '../src/resolution/types';
 
 describe('getApplicableFrameworks', () => {
@@ -44,13 +43,12 @@ describe('getApplicableFrameworks', () => {
   });
 });
 
-describe('Qt framework resolver compatibility aliases', () => {
-  it('registers qt as the public resolver and keeps qml-qt as a lookup alias', () => {
+describe('Qt framework resolver public identity', () => {
+  it('registers qt as the only public resolver name', () => {
     expect(qtResolver.name).toBe('qt');
-    expect(qmlQtResolver).toBe(qtResolver);
-    expect(qmlQtShimResolver).toBe(qtResolver);
     expect(getFrameworkResolver('qt')).toBe(qtResolver);
-    expect(getFrameworkResolver('qml-qt')).toBe(qtResolver);
+    expect(getFrameworkResolver('qml-qt')).toBeUndefined();
+    expect('qmlQtResolver' in frameworkResolvers).toBe(false);
   });
 
   it('keeps the Qt .ui no-op extraction hook reachable through XML files', () => {

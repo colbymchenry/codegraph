@@ -85,8 +85,7 @@ export function getAllFrameworkResolvers(): FrameworkResolver[] {
  * Get a resolver by name
  */
 export function getFrameworkResolver(name: string): FrameworkResolver | undefined {
-  const lookupName = name === 'qml-qt' ? 'qt' : name;
-  return FRAMEWORK_RESOLVERS.find((r) => r.name === lookupName);
+  return FRAMEWORK_RESOLVERS.find((r) => r.name === name);
 }
 
 /**
@@ -150,4 +149,3 @@ export { reactNativeBridgeResolver } from './react-native';
 export { expoModulesResolver } from './expo-modules';
 export { fabricViewResolver } from './fabric';
 export { qtResolver } from './qt';
-export { qmlQtResolver } from './qml-qt';
