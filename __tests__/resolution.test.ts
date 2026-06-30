@@ -270,6 +270,168 @@ describe('Resolution Module', () => {
     });
   });
 
+  describe('Ubiquitous-name ceiling (#999)', () => {
+    // A vendored theme/SDK re-declares the same method name across thousands of
+    // files (Metronic's `init`/`update`/… on every widget). The fuzzy strategies
+    // used to score every same-named candidate per ref — O(K) per ref, O(K²)
+    // total — which pinned a core for 15-28 min at "Resolving refs … 94%". Above
+    // the ceiling they must DECLINE instead, since no proximity/word-overlap
+    // score can pick the one true target among thousands anyway.
+    const CEILING = 500;
+
+    // A spy context: counts how many nodes the strategy actually inspects, so we
+    // can assert the cap short-circuits BEFORE the O(K) scoring (not just that it
+    // returns null).
+    const makeManyMethods = (n: number, name: string): Node[] =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `method:widget${i}.js:Widget${i}.${name}:1`,
+        kind: 'method' as const,
+        name,
+        qualifiedName: `widget${i}.js::Widget${i}::${name}`,
+        filePath: `static/theme/widget${i}.js`,
+        language: 'javascript' as const,
+        startLine: 1,
+        endLine: 5,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      }));
+
+    const spyContext = (nodes: Node[]): { ctx: ResolutionContext; lookups: () => number } => {
+      let scanned = 0;
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => {
+          const hit = nodes.filter((n) => n.name === name);
+          scanned += hit.length;
+          return hit;
+        },
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      return { ctx, lookups: () => scanned };
+    };
+
+    it('declines a method call (`obj.init`) above the ceiling instead of scoring K candidates', () => {
+      const { ctx } = spyContext(makeManyMethods(CEILING + 1, 'init'));
+      const ref = {
+        fromNodeId: 'method:caller.js:caller:1',
+        referenceName: 'widget.init',
+        referenceKind: 'calls' as const,
+        line: 2,
+        column: 4,
+        filePath: 'static/theme/caller.js',
+        language: 'javascript' as const,
+      };
+      expect(matchReference(ref, ctx)).toBeNull();
+    });
+
+    it('declines a bare exact-name ref above the ceiling', () => {
+      const { ctx } = spyContext(makeManyMethods(CEILING + 1, 'render'));
+      const ref = {
+        fromNodeId: 'method:caller.js:caller:1',
+        referenceName: 'render',
+        referenceKind: 'calls' as const,
+        line: 2,
+        column: 4,
+        filePath: 'static/theme/caller.js',
+        language: 'javascript' as const,
+      };
+      expect(matchReference(ref, ctx)).toBeNull();
+    });
+
+    it('still resolves a SAME-FILE definition when one exists (precise path unaffected)', () => {
+      // Strategy 1 (class-name) and same-file matching are precise — a ubiquitous
+      // name with an unambiguous local target still resolves.
+      const nodes = makeManyMethods(CEILING + 1, 'init');
+      const local: Node = {
+        id: 'class:static/theme/caller.js:Widgetly:1',
+        kind: 'class',
+        name: 'Widgetly',
+        qualifiedName: 'static/theme/caller.js::Widgetly',
+        filePath: 'static/theme/caller.js',
+        language: 'javascript',
+        startLine: 1, endLine: 9, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const localMethod: Node = {
+        id: 'method:static/theme/caller.js:Widgetly.init:2',
+        kind: 'method',
+        name: 'init',
+        qualifiedName: 'static/theme/caller.js::Widgetly::init',
+        filePath: 'static/theme/caller.js',
+        language: 'javascript',
+        startLine: 2, endLine: 4, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const all = [...nodes, local, localMethod];
+      const ctx: ResolutionContext = {
+        getNodesInFile: (fp) => all.filter((n) => n.filePath === fp),
+        getNodesByName: (name) => all.filter((n) => n.name === name),
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      // `Widgetly.init` names the class explicitly → Strategy 1 resolves it.
+      const ref = {
+        fromNodeId: 'method:static/theme/caller.js:caller:6',
+        referenceName: 'Widgetly.init',
+        referenceKind: 'calls' as const,
+        line: 6,
+        column: 4,
+        filePath: 'static/theme/caller.js',
+        language: 'javascript' as const,
+      };
+      const result = matchReference(ref, ctx);
+      expect(result?.targetNodeId).toBe('method:static/theme/caller.js:Widgetly.init:2');
+    });
+
+    it('still scores normally JUST below the ceiling (no behavior change for normal repos)', () => {
+      // Real repos top out near ~40 same-named methods; this proves a sub-ceiling
+      // collision still resolves via proximity, so the cap is invisible to them.
+      const nodes = makeManyMethods(CEILING - 1, 'update');
+      // Make ONE candidate share the caller's directory so proximity picks it.
+      nodes[0] = {
+        ...nodes[0]!,
+        id: 'method:static/theme/app/Widget0.update:1',
+        qualifiedName: 'static/theme/app/widget.js::Widget0::update',
+        filePath: 'static/theme/app/widget.js',
+      };
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => nodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      const ref = {
+        fromNodeId: 'method:static/theme/app/caller.js:caller:1',
+        referenceName: 'update',
+        referenceKind: 'calls' as const,
+        line: 2,
+        column: 4,
+        filePath: 'static/theme/app/caller.js',
+        language: 'javascript' as const,
+      };
+      // Below the ceiling the fuzzy path runs and resolves SOMETHING (not capped).
+      expect(matchReference(ref, ctx)).not.toBeNull();
+    });
+  });
+
   describe('Import Resolver', () => {
     it('should resolve relative import paths', () => {
       const context: ResolutionContext = {
@@ -766,6 +928,43 @@ def bootstrap():
         (e) => e.kind === 'calls' && e.target === instantiates!.target
       );
       expect(callsToUserService).toHaveLength(0);
+    });
+
+    it('records instantiates for C++ stack/brace construction, targeting the class (#1035)', async () => {
+      // `Calculator calc(0)` (direct-init) and `Widget w{1, 2}` (brace-init)
+      // carry the constructor args directly on the declarator — there's no
+      // call/new node — so they recorded no `instantiates` edge, while heap
+      // `new Calculator(0)` did. Both stack forms now do.
+      fs.writeFileSync(
+        path.join(tempDir, 'm.cpp'),
+        `class Calculator { public: Calculator(int seed) {} int add(int a, int b){ return a+b; } };
+class Widget { public: Widget(int a, int b) {} };
+
+int runStack(int a, int b) { Calculator calc(0); return calc.add(a, b); }
+int runBrace() { Widget w{1, 2}; return 0; }
+int runHeap(int a, int b) { Calculator* c = new Calculator(0); return c->add(a, b); }
+void noise() { int x(5); int y{6}; Calculator deferred; }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const fn = (name: string) => cg.getNodesByKind('function').find((n) => n.name === name)!;
+      const instTargets = (name: string) =>
+        cg
+          .getOutgoingEdges(fn(name).id)
+          .filter((e) => e.kind === 'instantiates')
+          .map((e) => cg.getNode(e.target)!);
+
+      // Direct-init (the issue) and brace-init both instantiate, targeting the
+      // CLASS node — not the same-named constructor method.
+      const stack = instTargets('runStack');
+      expect(stack.map((n) => `${n.kind}:${n.name}`)).toContain('class:Calculator');
+      expect(instTargets('runBrace').map((n) => `${n.kind}:${n.name}`)).toContain('class:Widget');
+      // Heap still works (regression guard).
+      expect(instTargets('runHeap').map((n) => `${n.kind}:${n.name}`)).toContain('class:Calculator');
+      // Primitives (`int x(0)`/`int y{6}`) and bare default construction
+      // (`Calculator deferred;`) must NOT mint an instantiates edge.
+      expect(instTargets('noise')).toHaveLength(0);
     });
 
     it('resolves a cross-file static method call to the method, not the class (#825)', async () => {
@@ -2008,6 +2207,51 @@ func main() {
       } finally {
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('C++ templated base-class inheritance (#1043)', () => {
+    // A class deriving from a TEMPLATE — `class D : public Base<int>` (or a CRTP
+    // `class W : public CRTPBase<W>`, or a qualified `class Q : public ns::Tpl<int>`)
+    // recorded its base as the full instantiation text (`Base<int>`), which never
+    // name-matched the template, indexed as the bare node `Base`. The `<…>` args
+    // are now stripped so the `extends` edge resolves end-to-end.
+    it('resolves an extends edge to a templated base (plain, CRTP, struct, multi-base)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'lib.hpp'),
+        `#pragma once
+template<typename T> class Base { public: void foo(); };
+template<typename Derived> class CRTPBase {};
+class Plain {};
+
+class Widget : public Base<int> {};            // plain template base
+class App : public CRTPBase<App> {};           // CRTP (curiously-recurring)
+struct Node : public Base<double> {};          // struct inheriting a template
+class Both : public Base<char>, public Plain {}; // templated + plain in one clause
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const edges = db
+        .getDb()
+        .prepare(
+          `select src.name as fromName, dst.name as toName
+             from edges e
+             join nodes src on e.source = src.id
+             join nodes dst on e.target = dst.id
+            where e.kind = 'extends'`
+        )
+        .all() as Array<{ fromName: string; toName: string }>;
+      const has = (from: string, to: string) =>
+        edges.some((r) => r.fromName === from && r.toName === to);
+
+      // Every templated base now resolves to the bare template node.
+      expect(has('Widget', 'Base'), 'Widget : Base<int>').toBe(true);
+      expect(has('App', 'CRTPBase'), 'App : CRTPBase<App> (CRTP)').toBe(true);
+      expect(has('Node', 'Base'), 'struct Node : Base<double>').toBe(true);
+      // A mixed clause resolves BOTH the templated and the plain base.
+      expect(has('Both', 'Base'), 'Both : Base<char>').toBe(true);
+      expect(has('Both', 'Plain'), 'Both : Plain (non-templated, regression guard)').toBe(true);
     });
   });
 

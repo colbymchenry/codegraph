@@ -8,6 +8,33 @@ import { Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
 
 /**
+ * Ceiling on how many same-named definitions a FUZZY name-match strategy will
+ * score. A name defined more times than this is "ubiquitous" — a method/symbol
+ * re-declared across a vendored theme or SDK (e.g. `init`/`update`/`render` on
+ * every widget of a committed Metronic theme — #999). No directory-proximity or
+ * receiver-word-overlap score can reliably pick THE one true target among
+ * thousands, so the fuzzy strategies (matchByExactName's findBestMatch, and
+ * matchMethodCall Strategy 3) decline above the ceiling instead of emitting a
+ * low-confidence, almost-certainly-wrong edge. This also caps their per-ref cost
+ * at O(ceiling): without it, K same-named refs each scored K candidates — the
+ * O(K²) blow-up that pinned a core for 15-28 min at "Resolving refs … 94%" on a
+ * repo vendoring a large JS/TS theme (#999). The PRECISE strategies are
+ * unaffected: qualified-name, import-based, and class-name (Strategy 1/2)
+ * resolution all still run and resolve a ubiquitous name when the context names
+ * its exact target. Real repos top out near ~40 same-named methods, so a normal
+ * codebase never reaches this; only bulk-vendored code does. Tune via
+ * `CODEGRAPH_AMBIGUOUS_NAME_CEILING`.
+ */
+const DEFAULT_AMBIGUOUS_NAME_CEILING = 500;
+function resolveAmbiguousNameCeiling(): number {
+  const raw = process.env.CODEGRAPH_AMBIGUOUS_NAME_CEILING;
+  if (!raw) return DEFAULT_AMBIGUOUS_NAME_CEILING;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_AMBIGUOUS_NAME_CEILING;
+}
+const AMBIGUOUS_NAME_CEILING = resolveAmbiguousNameCeiling();
+
+/**
  * Try to resolve a path-like reference (e.g., "snippets/drawer-menu.liquid")
  * by matching the filename against file nodes.
  */
@@ -317,7 +344,17 @@ export function matchByExactName(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref);
+  // `import`-kind nodes are import STATEMENTS, not definitions, so a reference
+  // resolving to a sibling file's `import` is a meaningless edge — the real
+  // import→definition resolution is the import resolver's job (resolveViaImport),
+  // never name-matching here. Excluding them also removes a quadratic blow-up:
+  // a ubiquitous package (`react`, `@superset-ui/core`, Python `logging`/`typing`)
+  // is re-declared as an `import` node in every file that imports it, so K
+  // unresolved import refs each scored K same-named import candidates through
+  // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
+  // large import-heavy (front-end + back-end) repos (#915).
+  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
+    .filter((n) => n.kind !== 'import');
 
   if (candidates.length === 0) {
     return null;
@@ -332,6 +369,15 @@ export function matchByExactName(
       confidence: isCrossLanguage ? 0.5 : 0.9,
       resolvedBy: 'exact-match',
     };
+  }
+
+  // Ubiquitous-name ceiling (#999): above it, picking one target among K
+  // same-named defs by directory proximity is unreliable AND O(K) per ref — the
+  // quadratic behind the "Resolving refs" wedge on theme/SDK-vendoring repos.
+  // Decline; the precise strategies (qualified-name, import, class-name) already
+  // ran. Falls through to fuzzy, which itself only resolves a UNIQUE candidate.
+  if (candidates.length > AMBIGUOUS_NAME_CEILING) {
+    return null;
   }
 
   // Multiple matches - try to narrow down
@@ -1057,6 +1103,15 @@ export function matchMethodCall(
   // names like permissionEngine → PermissionRuleEngine.
   if (methodName) {
     const methodCandidates = context.getNodesByName(methodName!);
+    // Ubiquitous-method ceiling (#999): a method name re-declared across a
+    // vendored theme/SDK (Metronic's `init`/`update`/… on every widget) yields
+    // K candidates that receiver-word overlap can't reliably disambiguate —
+    // and filtering + scoring all K per call is the O(K²) cost that wedged
+    // "Resolving refs" for 15-28 min. Bail before the O(K) work; Strategy 1/2
+    // (class-name match) already had their precise shot above.
+    if (methodCandidates.length > AMBIGUOUS_NAME_CEILING) {
+      return null;
+    }
     const methods = methodCandidates.filter(
       (n) => n.kind === 'method' && n.name === methodName
     );
@@ -1119,16 +1174,22 @@ function splitCamelCase(str: string): string[] {
 }
 
 /**
- * Compute directory proximity between two file paths.
- * Returns a score based on the number of shared directory segments.
+ * Compute directory proximity from a pre-split list of directory segments
+ * (`filePath1` minus its filename) and a second file path.
+ * Returns a score based on the number of shared leading directory segments.
  * Higher score = closer in directory tree.
+ *
+ * Split into a pre-split variant because findBestMatch scores every candidate
+ * against the SAME `ref.filePath`; re-splitting it per candidate was a hot spot
+ * on large repos (#915), so the caller splits it once and passes the segments.
  */
-function computePathProximity(filePath1: string, filePath2: string): number {
-  const dir1 = filePath1.split('/').slice(0, -1);
-  const dir2 = filePath2.split('/').slice(0, -1);
+function pathProximityFromDirs(dir1: string[], filePath2: string): number {
+  const dir2 = filePath2.split('/');
+  dir2.pop(); // drop filename — matches the original slice(0, -1) on both paths
 
   let shared = 0;
-  for (let i = 0; i < Math.min(dir1.length, dir2.length); i++) {
+  const limit = Math.min(dir1.length, dir2.length);
+  for (let i = 0; i < limit; i++) {
     if (dir1[i] === dir2[i]) {
       shared++;
     } else {
@@ -1138,6 +1199,16 @@ function computePathProximity(filePath1: string, filePath2: string): number {
 
   // Each shared directory segment contributes 15 points, capped at 80
   return Math.min(shared * 15, 80);
+}
+
+/**
+ * Compute directory proximity between two file paths.
+ * Returns a score based on the number of shared directory segments.
+ */
+function computePathProximity(filePath1: string, filePath2: string): number {
+  const dir1 = filePath1.split('/');
+  dir1.pop();
+  return pathProximityFromDirs(dir1, filePath2);
 }
 
 /**
@@ -1158,7 +1229,24 @@ function findBestMatch(
   let bestScore = -1;
   let bestNode: Node | null = null;
 
+  // Split the ref's path once (it's the same across every candidate) instead of
+  // re-splitting it inside computePathProximity per candidate (#915 hot spot).
+  const refDirs = ref.filePath.split('/');
+  refDirs.pop();
+
+  // A same-language candidate ALWAYS outscores a cross-language one: same-language
+  // scores at least +50 (language bonus), while a cross-language candidate maxes
+  // out at +35 (−80 language, +80 proximity, +25 kind, +10 exported; it can never
+  // be in the same file). So when any same-language candidate exists, skip the
+  // cross-language ones — provably the same winner, without paying the per-candidate
+  // scoring. Cuts the candidate set to same-language size on mixed front-end +
+  // back-end repos (#915). When ALL candidates are cross-language (a legitimate
+  // cross-language `calls` bridge), none are skipped and behavior is unchanged.
+  const hasSameLanguage = candidates.some((c) => c.language === ref.language);
+
   for (const candidate of candidates) {
+    if (hasSameLanguage && candidate.language !== ref.language) continue;
+
     let score = 0;
 
     // Same file bonus
@@ -1167,7 +1255,7 @@ function findBestMatch(
     }
 
     // Directory proximity bonus — strongly prefer same module/package
-    score += computePathProximity(ref.filePath, candidate.filePath);
+    score += pathProximityFromDirs(refDirs, candidate.filePath);
 
     // Language matching: strongly prefer same language, penalize cross-language
     if (candidate.language === ref.language) {

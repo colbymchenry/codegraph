@@ -26,7 +26,7 @@
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -34,6 +34,7 @@ import { getGlyphs } from '../ui/glyphs';
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { installFatalHandlers } from './fatal-handler';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
+import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 
@@ -506,19 +507,25 @@ program
       // Indexing runs by default now. The legacy -i/--index flag is still
       // accepted (so existing muscle memory and scripts don't break) but is a
       // no-op — initializing always builds the initial index.
+      // Supervise the index: self-terminate if orphaned or wedged (#999).
+      const supervision = installCommandSupervision('init');
       let result: IndexResult;
-      if (options.verbose) {
-        result = await cg.indexAll({
-          onProgress: createVerboseProgress(),
-          verbose: true,
-        });
-      } else {
-        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-        const progress = createShimmerProgress();
-        result = await cg.indexAll({
-          onProgress: progress.onProgress,
-        });
-        await progress.stop();
+      try {
+        if (options.verbose) {
+          result = await cg.indexAll({
+            onProgress: createVerboseProgress(),
+            verbose: true,
+          });
+        } else {
+          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+          const progress = createShimmerProgress();
+          result = await cg.indexAll({
+            onProgress: progress.onProgress,
+          });
+          await progress.stop();
+        }
+      } finally {
+        supervision.stop();
       }
       printIndexResult(clack, result, projectPath);
       await recordIndexTelemetry(cg, result);
@@ -625,53 +632,60 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
+      // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
+      // than opening the old graph and DELETE-ing every row. The clear-then-index
+      // approach reported "0 nodes" without the clear (#874); the recreate keeps
+      // that fixed AND avoids the failure mode where, on a large or pre-fix
+      // poisoned index, the per-row FTS delete churn wedged the main thread long
+      // enough to trip the liveness watchdog before scanning even began (#1067).
+      // recreate() hands back a fresh, empty instance — no clear() needed. For
+      // fast incremental updates use `sync`.
+      const cg = await CodeGraph.recreate(projectPath);
 
-      if (options.quiet) {
-        // Quiet mode: no UI, just run. `index` is a full re-index, so clear the
-        // existing graph and rebuild from scratch (see the note below — #874).
-        cg.clear();
-        const result = await cg.indexAll();
-        if (!result.success) process.exit(1);
+      // Supervise the indexer: self-terminate if orphaned (parent shim killed)
+      // or if the main thread wedges — neither was guarded on this path (#999).
+      const supervision = installCommandSupervision('index');
+      try {
+        if (options.quiet) {
+          // Quiet mode: no UI, just run against the freshly-recreated graph.
+          const result = await cg.indexAll();
+          if (!result.success) process.exit(1);
+          cg.destroy();
+          return;
+        }
+
+        const clack = await importESM('@clack/prompts');
+        clack.intro('Indexing project');
+
+        let result: IndexResult;
+
+        if (options.verbose) {
+          result = await cg.indexAll({
+            onProgress: createVerboseProgress(),
+            verbose: true,
+          });
+        } else {
+          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+          const progress = createShimmerProgress();
+          result = await cg.indexAll({
+            onProgress: progress.onProgress,
+          });
+          await progress.stop();
+        }
+
+        printIndexResult(clack, result, projectPath);
+        await recordIndexTelemetry(cg, result);
+
+        if (!result.success) {
+          process.exit(1);
+        }
+
+        clack.outro('Done');
         cg.destroy();
-        return;
+      } finally {
+        supervision.stop();
       }
-
-      const clack = await importESM('@clack/prompts');
-      clack.intro('Indexing project');
-
-      // `index` is a FULL re-index: clear the existing graph and rebuild it from
-      // scratch so the result is identical to a fresh `init`. Without the clear,
-      // indexAll() skips every unchanged file by its content hash and reports
-      // "0 nodes, 0 edges" against the already-populated graph — which reads as
-      // "index wiped my index" (#874). For fast incremental updates use `sync`.
-      cg.clear();
-
-      let result: IndexResult;
-
-      if (options.verbose) {
-        result = await cg.indexAll({
-          onProgress: createVerboseProgress(),
-          verbose: true,
-        });
-      } else {
-        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-        const progress = createShimmerProgress();
-        result = await cg.indexAll({
-          onProgress: progress.onProgress,
-        });
-        await progress.stop();
-      }
-
-      printIndexResult(clack, result, projectPath);
-      await recordIndexTelemetry(cg, result);
-
-      if (!result.success) {
-        process.exit(1);
-      }
-
-      clack.outro('Done');
-      cg.destroy();
     } catch (err) {
       error(`Failed to index: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
@@ -950,15 +964,18 @@ program
         } else {
           console.log(chalk.bold(`\nSearch Results for "${search}":\n`));
 
+          // Results arrive already ranked by relevance, so the order conveys
+          // it. We don't print the raw score: it's an unbounded BM25/FTS value
+          // (relative-ranking only), and the old `(score * 100)%` rendered it
+          // as nonsensical percentages like "12042%" (#1045). The MCP search
+          // tool likewise shows no score. Raw `score` stays in --json output.
           for (const result of results) {
             const node = result.node;
             const location = `${node.filePath}:${node.startLine}`;
-            const score = chalk.dim(`(${(result.score * 100).toFixed(0)}%)`);
 
             console.log(
               chalk.cyan(node.kind.padEnd(12)) +
-              chalk.white(node.name) +
-              ' ' + score
+              chalk.white(node.name)
             );
             console.log(chalk.dim(`  ${location}`));
             if (node.signature) {
@@ -1018,21 +1035,140 @@ program
   });
 
 /**
- * codegraph node <name>
+ * codegraph prompt-hook  (hidden)
+ *
+ * A Claude Code `UserPromptSubmit` hook entry point. Reads `{prompt, cwd}` JSON
+ * on stdin; for a structural/flow/impact prompt it runs `codegraph_explore` on
+ * the indexed project and prints the result to stdout, which Claude injects into
+ * the agent's context — so the agent's reflex grep/read has nothing left to find
+ * and reliably uses CodeGraph (the adoption problem). Installed by the installer
+ * into Claude's settings.json (opt-in, default-yes).
+ *
+ * LOAD-BEARING: this must NEVER break the user's prompt. Every failure path —
+ * kill-switch, non-structural prompt, no index, engine error — exits 0 with no
+ * output. The only effect is additive context when it can confidently provide it.
+ */
+program
+  .command('prompt-hook', { hidden: true })
+  .description('Claude UserPromptSubmit hook: inject CodeGraph context for structural prompts (reads {prompt,cwd} JSON on stdin)')
+  .action(async () => {
+    try {
+      // Kill-switch: lets a user disable the nudge without uninstalling /
+      // editing settings.json (CI, low-power machines, personal preference).
+      if (process.env.CODEGRAPH_NO_PROMPT_HOOK === '1' || process.env.CODEGRAPH_PROMPT_HOOK === '0') return;
+      if (process.stdin.isTTY) return; // invoked by hand, no piped payload
+
+      const raw = await new Promise<string>((resolve) => {
+        let data = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', (c) => { data += c; });
+        process.stdin.on('end', () => resolve(data));
+        process.stdin.on('error', () => resolve(data));
+      });
+
+      let input: { prompt?: string; cwd?: string } = {};
+      try { input = JSON.parse(raw); } catch { return; }
+      const prompt = String(input.prompt || '');
+
+      // Gate: only structural / flow / impact / where-how prompts get context, so
+      // every other prompt ("fix this typo") stays a zero-cost no-op. Language-aware
+      // (English + CJK keywords, plus code-shaped tokens) so it fires for non-English
+      // prompts too (issue #994). A keyword fires on its own; a code-token is only a
+      // CANDIDATE — verified against the graph below, so a tech brand ("JavaScript")
+      // that looks like a symbol but isn't one here doesn't inject spurious context.
+      const keyworded = hasStructuralKeyword(prompt);
+      const codeTokens = keyworded ? [] : extractCodeTokens(prompt);
+      if (!keyworded && codeTokens.length === 0) return;
+
+      // Decide what to inject, shaped by WHERE the index(es) are: the nearest
+      // indexed ancestor of cwd, or — when cwd is an un-indexed workspace root
+      // whose indexed project(s) live in sub-dirs (the monorepo case, #964) —
+      // the sub-project the prompt points at, plus a `projectPath` nudge for any
+      // others. Without the down-scan the hook injected nothing at a monorepo
+      // root (it only walked up), so the validated adoption lever never fired
+      // exactly where the agent most needs it.
+      const plan = planFrontload(String(input.cwd || process.cwd()), prompt);
+      if (!plan.exploreRoot && plan.nudgeProjects.length === 0) return; // nothing reachable — the agent's normal tools apply
+
+      // A "pass projectPath" line for indexed sub-projects we did NOT front-load.
+      // Follow-up codegraph_explore calls against a sub-project (cwd isn't its
+      // index root) need an explicit projectPath, so spell it out.
+      const nudge = (projects: string[], lead: string): string =>
+        `${lead}\n${projects.map((p) => `  - projectPath: "${p}"`).join('\n')}\n`;
+
+      if (plan.exploreRoot) {
+        const { default: CodeGraph } = await loadCodeGraph();
+        const cg = await CodeGraph.open(plan.exploreRoot);
+        try {
+          // Code-token-only prompt: require that at least one token is a REAL symbol
+          // in THIS index before front-loading. Without it, a brand name or common
+          // word that merely looks like code ("JavaScript", "GitHub") would run
+          // explore and inject ~16KB of low-relevance context (issue #994 follow-up).
+          // A keyword-bearing prompt skips this — the keyword is signal enough.
+          if (!keyworded && !codeTokens.some((t) => cg.getNodesByName(t).length > 0)) return;
+          const { ToolHandler } = await import('../mcp/tools');
+          const handler = new ToolHandler(cg);
+          const result = await handler.execute('codegraph_explore', { query: prompt });
+          const text = result.content[0]?.text ?? '';
+          if (!result.isError && text.trim()) {
+            // Cap the injection so a large-repo explore can't flood the prompt.
+            const MAX = 16000;
+            const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
+            // For a front-loaded SUB-project, a follow-up explore needs its path.
+            const more = plan.viaSubScan
+              ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
+              : 'call codegraph_explore for more';
+            const others = plan.nudgeProjects.length
+              ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
+              : '';
+            process.stdout.write(
+              `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
+            );
+          }
+        } finally {
+          cg.destroy();
+        }
+      } else {
+        // Several indexed sub-projects, none a clear match — don't guess; tell
+        // the agent they exist and how to query one.
+        process.stdout.write(
+          `<codegraph_context note="CodeGraph is available for this workspace's indexed sub-projects — query one by passing projectPath to codegraph_explore.">\n` +
+          nudge(plan.nudgeProjects, "This workspace's CodeGraph indexes live in sub-projects. To use CodeGraph, call codegraph_explore with the projectPath of the relevant one:") +
+          `</codegraph_context>\n`,
+        );
+      }
+    } catch {
+      // Degradable by contract: never surface an error to the prompt pipeline.
+    }
+  });
+
+/**
+ * codegraph node [name]
  *
  * The CLI face of the MCP codegraph_node tool: one symbol's source +
  * caller/callee trail, or a whole file with line numbers + dependents
  * (Read-parity). Same subagent/non-MCP rationale as `explore`.
+ *
+ * `name` is OPTIONAL because `--file` (file-read mode) carries no symbol —
+ * a required `<name>` made `codegraph node -f <file>` unreachable (#1044).
  */
 program
-  .command('node <name>')
+  .command('node [name]')
   .description('One symbol\'s source + caller/callee trail, or read a file with line numbers + dependents (same output as the codegraph_node MCP tool)')
   .option('-p, --path <path>', 'Project path')
   .option('-f, --file <file>', 'Treat as file mode (or disambiguate a symbol to this file)')
   .option('--offset <number>', 'File mode: 1-based start line')
   .option('--limit <number>', 'File mode: maximum lines')
   .option('--symbols-only', 'File mode: just the symbol map + dependents')
-  .action(async (name: string, options: { path?: string; file?: string; offset?: string; limit?: string; symbolsOnly?: boolean }) => {
+  .action(async (name: string | undefined, options: { path?: string; file?: string; offset?: string; limit?: string; symbolsOnly?: boolean }) => {
+    // Need a symbol (positional) OR a file (--file / a path-like positional).
+    // With [name] optional, a bare `codegraph node` reaches here with neither
+    // and must be told what to pass, rather than crashing downstream.
+    if (!name && !options.file) {
+      error("Pass a symbol name (e.g. 'codegraph node parseToken') or a file (e.g. 'codegraph node -f src/auth.ts', or 'codegraph node src/auth.ts').");
+      process.exit(1);
+    }
+
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1055,9 +1191,9 @@ program
       if (options.file) {
         args.file = options.file;
         if (name && name !== options.file) args.symbol = name;
-      } else if (name.includes('/') || name.includes('\\')) {
+      } else if (name && (name.includes('/') || name.includes('\\'))) {
         args.file = name.replace(/\\/g, '/');
-      } else {
+      } else if (name) {
         args.symbol = name;
         args.includeCode = true;
       }

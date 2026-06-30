@@ -176,6 +176,216 @@ export function findNearestCodeGraphRoot(startPath: string): string | null {
   return null;
 }
 
+/** Heavy/irrelevant directory names the sub-project scan never descends into. */
+const SUBPROJECT_SCAN_SKIP = new Set([
+  'node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', 'target',
+  'vendor', 'bin', 'obj', '.next', '.nuxt', '.svelte-kit', '.cache', 'coverage',
+  '.venv', 'venv', '__pycache__', '.turbo', '.idea', '.vscode', 'tmp', 'temp',
+]);
+
+/** Manifests that mark a directory as a project/workspace root. The down-scan
+ *  is gated on one of these so a non-project cwd (e.g. `$HOME`) is a cheap
+ *  no-op instead of a deep filesystem crawl. */
+const WORKSPACE_ROOT_MANIFESTS = [
+  'package.json', 'pnpm-workspace.yaml', 'lerna.json', 'nx.json', 'turbo.json',
+  'go.work', 'go.mod', 'Cargo.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts',
+  'settings.gradle', 'pyproject.toml', 'composer.json', 'Gemfile', 'rush.json',
+  'WORKSPACE', 'WORKSPACE.bazel',
+];
+
+function looksLikeProjectRoot(dir: string): boolean {
+  return WORKSPACE_ROOT_MANIFESTS.some((m) => fs.existsSync(path.join(dir, m)));
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Indexed sub-project roots beneath `root` (bounded breadth-first scan). For
+ * the monorepo case behind #964: the index lives in a CHILD
+ * (`packages/x/.codegraph/`), not at the workspace root the agent's cwd points
+ * at. Descent stops at the first indexed directory on a branch (a project's
+ * own sub-dirs aren't separate projects) and is bounded by depth + count so it
+ * never turns into a full-tree crawl on a large repo.
+ */
+export function findIndexedSubprojectRoots(
+  root: string,
+  opts: { maxDepth?: number; max?: number } = {},
+): string[] {
+  const maxDepth = opts.maxDepth ?? 4;
+  const max = opts.max ?? 64;
+  const out: string[] = [];
+  const walk = (dir: string, depth: number): void => {
+    if (out.length >= max || depth > maxDepth) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (out.length >= max) return;
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith('.') || SUBPROJECT_SCAN_SKIP.has(e.name)) continue;
+      const child = path.join(dir, e.name);
+      if (isInitialized(child)) { out.push(child); continue; } // don't descend into an indexed project
+      walk(child, depth + 1);
+    }
+  };
+  walk(root, 1);
+  return out;
+}
+
+/**
+ * English structural keywords, matched with `\b` word boundaries so a keyword
+ * inside a longer word doesn't false-positive ("flow" in "flower").
+ */
+const STRUCTURAL_EN = /\b(how|where|trace|flow|path|reach(?:es|ed)?|call(?:s|ed|er|ers|ee)?|depend|impact|affect|wired?|connect|implement|architect|structure|breaks?|what calls|why does)\b/i;
+
+/**
+ * Non-English (CJK) structural keywords, matched WITHOUT `\b`. JS's `\b` is
+ * ASCII-only — it only fires at `[A-Za-z0-9_]` boundaries, never between Han
+ * characters — so a Chinese keyword wrapped in `\b…\b` could never match. That
+ * was issue #994: the English-only gate silently no-op'd every Chinese prompt,
+ * so non-English users got no front-load nudge and no error to explain why. The
+ * set mirrors the English intent (如何=how, 在哪/哪里=where, 流程/流向=flow,
+ * 路径=path, 调用=call, 依赖=depend, 影响=impact/affect, 实现=implement,
+ * 架构=architect, 结构=structure, 追踪/跟踪=trace) plus structural-overview words
+ * with no single clean English equivalent (介绍/解析/分析/原理/机制).
+ */
+const STRUCTURAL_CJK = /如何|怎么|在哪|哪里|追踪|跟踪|流程|流向|路径|调用|依赖|影响|实现|架构|结构|介绍|解析|分析|原理|机制/;
+
+/** Doc/data/asset file extensions — a `name.ext` of this kind is a file
+ *  reference, not a code symbol, so it must not trip the member-access signal. */
+const DOC_DATA_EXT = /\.(md|markdown|txt|rst|json|ya?ml|toml|lock|csv|tsv|log|ini|cfg|conf|env|xml|html?|png|jpe?g|gif|svg|pdf)$/i;
+
+/**
+ * Does `prompt` contain an explicit structural keyword (English or CJK)? A
+ * keyword is a strong, self-contained signal, so the front-load hook fires on it
+ * directly — no graph check needed. (A *code-token* match, by contrast, is only
+ * a candidate the hook verifies against the graph first; see {@link extractCodeTokens}.)
+ */
+export function hasStructuralKeyword(prompt: string): boolean {
+  return !!prompt && (STRUCTURAL_EN.test(prompt) || STRUCTURAL_CJK.test(prompt));
+}
+
+/**
+ * Identifier-shaped tokens in `prompt` — camelCase / PascalCase-with-inner-cap,
+ * snake_case, a `name(` call, or the two sides of an `a.b` member access. Naming
+ * a symbol is a code question whatever the surrounding human language, and these
+ * shapes almost never occur in ordinary prose, so they catch the common
+ * "<symbol> 的调用链?" / "where is <symbol> 定義" prompts no keyword list would.
+ *
+ * These are *candidates*, not a verdict: a tech brand like `JavaScript` or
+ * `GitHub` is identifier-shaped too, so the front-load hook checks each token
+ * against the actual index ({@link getNodesByName}) and only fires when one is a
+ * real symbol here — otherwise a brand-name prompt would inject ~16KB of
+ * low-relevance context (issue #994 follow-up). A doc/data filename ("README.md")
+ * is excluded from the member-access form since it's a file reference, not a symbol.
+ */
+export function extractCodeTokens(prompt: string): string[] {
+  if (!prompt) return [];
+  const out = new Set<string>();
+  // camelCase / PascalCase-with-inner-cap (getUserId, parseToken, UserService) or
+  // snake_case (article_publish, get_user) — a whole identifier run that has an
+  // inner lower→upper transition or an underscore flanked by alphanumerics.
+  for (const m of prompt.matchAll(/[A-Za-z_$][\w$]*/g)) {
+    const w = m[0];
+    if (/[a-z][A-Z]/.test(w) || /[A-Za-z0-9]_[A-Za-z0-9]/.test(w)) out.add(w);
+  }
+  // call form: an identifier directly before '(' — parseToken(, render(). No
+  // whitespace before '(' so prose like "the function (entry point)" doesn't trip it.
+  for (const m of prompt.matchAll(/([A-Za-z_$][\w$]*)\(/g)) out.add(m[1]!);
+  // member access on identifiers (user.login) — but not a doc/data filename.
+  for (const m of prompt.matchAll(/([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)/g)) {
+    if (!DOC_DATA_EXT.test(m[0])) { out.add(m[1]!); out.add(m[2]!); }
+  }
+  return [...out];
+}
+
+/**
+ * Cheap, graph-free candidate gate for the front-load hook: could `prompt` be a
+ * structural / flow / impact / "where-how" question worth front-loading context
+ * for? True on an explicit keyword (English or CJK, issue #994) OR an
+ * identifier-shaped token. A keyword is sufficient to fire on its own; a
+ * token-only match is only a candidate the hook then verifies against the graph
+ * (a brand name like `JavaScript` is token-shaped but isn't a symbol). Every
+ * non-candidate prompt ("fix this typo", in any language) stays a zero-cost no-op.
+ */
+export function isStructuralPrompt(prompt: string): boolean {
+  return hasStructuralKeyword(prompt) || extractCodeTokens(prompt).length > 0;
+}
+
+/**
+ * What the front-load hook should do for a prompt issued from a directory.
+ */
+export interface FrontloadPlan {
+  /** Open + explore this project and inject its source as context. `null` when
+   *  there's no single project to front-load (none indexed, or several indexed
+   *  sub-projects with no clear match — see {@link nudgeProjects}). */
+  exploreRoot: string | null;
+  /** Indexed sub-projects to surface in a "pass `projectPath`" nudge: the rest
+   *  of a monorepo's indexed projects alongside `exploreRoot`, or — when no one
+   *  project clearly matches — the full list (with `exploreRoot` null). */
+  nudgeProjects: string[];
+  /** True when the plan came from scanning DOWN into sub-projects (cwd itself
+   *  is not under any index) — the monorepo case, where a follow-up
+   *  `codegraph_explore` needs an explicit `projectPath`. */
+  viaSubScan: boolean;
+}
+
+/**
+ * Decide what the front-load hook injects for a `prompt` issued from `cwd`,
+ * shaped by where the `.codegraph/` index(es) actually are:
+ *   1. **cwd (or an ancestor) is indexed** → front-load that project. The
+ *      normal single-project / nested-file case.
+ *   2. **cwd isn't indexed but looks like a workspace root** → the indexes live
+ *      in sub-projects (the monorepo case behind #964). One indexed
+ *      sub-project → front-load it; several → front-load the one the prompt
+ *      names (by relative path like `packages/api`, or package directory name)
+ *      and nudge about the rest; several with no match → nudge the full list so
+ *      the agent passes `projectPath`, rather than guessing wrong.
+ *   3. **nothing indexed reachable** → do nothing (the agent's own tools apply).
+ */
+export function planFrontload(cwd: string, prompt: string): FrontloadPlan {
+  const none: FrontloadPlan = { exploreRoot: null, nudgeProjects: [], viaSubScan: false };
+
+  // 1. up-walk — nearest indexed ancestor (incl. cwd). Cheap; covers the common
+  //    single-project case without a down-scan.
+  let dir = path.resolve(cwd);
+  for (let i = 0; i < 6; i++) {
+    if (isInitialized(dir)) return { exploreRoot: dir, nudgeProjects: [], viaSubScan: false };
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  // 2. down-scan — only from something that looks like a workspace root, so a
+  //    non-project cwd (e.g. $HOME) is a cheap no-op, not a deep crawl.
+  const base = path.resolve(cwd);
+  if (!looksLikeProjectRoot(base)) return none;
+  const subs = findIndexedSubprojectRoots(base);
+  if (subs.length === 0) return none;
+  if (subs.length === 1) return { exploreRoot: subs[0]!, nudgeProjects: [], viaSubScan: true };
+
+  // Several indexed sub-projects — pick the one the prompt points at, if any.
+  const p = prompt.toLowerCase();
+  let best: { root: string; score: number; relLen: number } | null = null;
+  for (const s of subs) {
+    const rel = path.relative(base, s);
+    const relLc = rel.split(path.sep).join('/').toLowerCase();
+    const name = path.basename(s).toLowerCase();
+    let score = 0;
+    if (relLc && p.includes(relLc)) score = 10;                         // "packages/api"
+    else if (name.length >= 3 && new RegExp(`\\b${escapeRegExp(name)}\\b`).test(p)) score = 5; // "api"
+    if (score > 0 && (!best || score > best.score || (score === best.score && rel.length < best.relLen))) {
+      best = { root: s, score, relLen: rel.length };
+    }
+  }
+  if (best) {
+    return { exploreRoot: best.root, nudgeProjects: subs.filter((s) => s !== best!.root), viaSubScan: true };
+  }
+  // No clear match — nudge the full list rather than front-load a guess.
+  return { exploreRoot: null, nudgeProjects: subs, viaSubScan: true };
+}
+
 /**
  * Contents of `.codegraph/.gitignore`. A single wildcard ignore keeps every
  * transient file in the index dir — the database, `daemon.pid`, the socket,

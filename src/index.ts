@@ -22,7 +22,7 @@ import {
   BuildContextOptions,
   FindRelevantContextOptions,
 } from './types';
-import { DatabaseConnection, getDatabasePath } from './db';
+import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { QueryBuilder } from './db/queries';
 import {
   isInitialized,
@@ -132,11 +132,14 @@ export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
   private projectRoot: string;
-  private orchestrator: ExtractionOrchestrator;
-  private resolver: ReferenceResolver;
-  private graphManager: GraphQueryManager;
-  private traverser: GraphTraverser;
-  private contextBuilder: ContextBuilder;
+  // Assigned via wireLayers() from the constructor (and again on reopen) — the
+  // `!` tells TS these are definitely set even though the assignment is one
+  // method call away from the constructor body.
+  private orchestrator!: ExtractionOrchestrator;
+  private resolver!: ReferenceResolver;
+  private graphManager!: GraphQueryManager;
+  private traverser!: GraphTraverser;
+  private contextBuilder!: ContextBuilder;
 
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
@@ -155,25 +158,66 @@ export class CodeGraph {
     this.db = db;
     this.queries = queries;
     this.projectRoot = projectRoot;
-    // Down-weight the project name as a query term in search ranking — it names
-    // the whole repo, not a symbol, so it has no discriminative value (#720).
-    try {
-      this.queries.setProjectNameTokens(deriveProjectNameTokens(projectRoot));
-    } catch {
-      // Best-effort: ranking still works without it.
-    }
     this.fileLock = new FileLock(
       path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
     );
-    this.orchestrator = new ExtractionOrchestrator(projectRoot, queries);
-    this.resolver = createResolver(projectRoot, queries);
-    this.graphManager = new GraphQueryManager(queries);
-    this.traverser = new GraphTraverser(queries);
+    this.wireLayers();
+  }
+
+  /**
+   * (Re)build the query/extraction/graph layers over the current `this.queries`
+   * (which wraps `this.db`). Factored out of the constructor so `reopenIfReplaced`
+   * can rebuild them against a fresh connection without duplicating the wiring.
+   * The path-based `fileLock` is independent of the DB handle, so it stays put.
+   */
+  private wireLayers(): void {
+    // Down-weight the project name as a query term in search ranking — it names
+    // the whole repo, not a symbol, so it has no discriminative value (#720).
+    try {
+      this.queries.setProjectNameTokens(deriveProjectNameTokens(this.projectRoot));
+    } catch {
+      // Best-effort: ranking still works without it.
+    }
+    this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
+    this.resolver = createResolver(this.projectRoot, this.queries);
+    this.graphManager = new GraphQueryManager(this.queries);
+    this.traverser = new GraphTraverser(this.queries);
     this.contextBuilder = createContextBuilder(
-      projectRoot,
-      queries,
+      this.projectRoot,
+      this.queries,
       this.traverser
     );
+  }
+
+  /**
+   * Heal a stale database handle in place. If `.codegraph/` was removed and
+   * recreated at the SAME path while this instance held the DB open — a git
+   * worktree removed and re-added, or `rm -rf .codegraph` + `codegraph init` —
+   * our open fd points at the now-unlinked inode and can never see the new
+   * index, so every query returns the pre-removal snapshot until the process
+   * restarts (#925). When that's detected, open the live file at the same path,
+   * rebuild the query layers, and swap them IN PLACE, so every holder of this
+   * instance (the MCP daemon's default project, cached projectPath connections)
+   * heals without a restart. Returns true iff it reopened.
+   *
+   * POSIX-only in practice: `isReplacedOnDisk` never fires on Windows (an open
+   * file can't be unlinked there, and st_ino is unreliable).
+   */
+  reopenIfReplaced(): boolean {
+    if (!this.db.isReplacedOnDisk()) return false;
+    const dbPath = this.db.getPath();
+    // Open the live file FIRST — if that throws (e.g. mid-recreate), the old
+    // handle stays in place and the caller retries on the next query, rather
+    // than leaving this instance with no connection at all.
+    const fresh = DatabaseConnection.open(dbPath);
+    const stale = this.db;
+    this.db = fresh;
+    this.queries = new QueryBuilder(fresh.getDb());
+    this.wireLayers();
+    // Releasing the dead handle also frees the leaked db/-wal/-shm fds that were
+    // pinning the unlinked inode (#925).
+    try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
+    return true;
   }
 
   // ===========================================================================
@@ -273,6 +317,54 @@ export class CodeGraph {
     }
 
     return instance;
+  }
+
+  /**
+   * Rebuild the project's database from scratch and return a fresh, empty
+   * instance — the "same result as a fresh init" semantics that `codegraph
+   * index` documents.
+   *
+   * Unlike `open()` followed by `clear()`, this DISCARDS the existing
+   * `.codegraph/codegraph.db` (and its `-wal`/`-shm` sidecars) before
+   * re-initializing, instead of opening the old database and DELETE-ing every
+   * row. On a large or pre-fix poisoned index — e.g. an old graph that scanned
+   * an ignored gitlink corpus (#1065) into ~1.6M nodes with a multi-GB WAL —
+   * the per-row `nodes_fts` delete-trigger churn blocks the main thread long
+   * enough to trip the #850 liveness watchdog before indexing even starts, so a
+   * full re-index could never recover the bad state (#1067). Discarding the
+   * files is O(1) regardless of size, reclaims the disk, and sidesteps opening
+   * (and running migrations against) the poisoned database entirely.
+   */
+  static async recreate(projectRoot: string): Promise<CodeGraph> {
+    await initGrammars();
+    const resolvedRoot = path.resolve(projectRoot);
+
+    // Check if initialized — recreate REBUILDS an existing project; it is not a
+    // first-time `init`.
+    if (!isInitialized(resolvedRoot)) {
+      throw new Error(`CodeGraph not initialized in ${resolvedRoot}. Run init() first.`);
+    }
+
+    const dbPath = getDatabasePath(resolvedRoot);
+    try {
+      removeDatabaseFiles(dbPath);
+    } catch (err) {
+      // POSIX unlinks an open file fine; this fires mainly on Windows when a
+      // live daemon/MCP server still holds the database. Turn the raw EBUSY into
+      // an actionable instruction instead of a generic failure.
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Could not rebuild the index — the database file is in use (${reason}). ` +
+          `Stop any running CodeGraph MCP server/daemon for this project and retry, ` +
+          `or remove the ${getCodeGraphDir(resolvedRoot)} directory and run "codegraph init".`
+      );
+    }
+
+    // Re-create an empty, freshly-schema'd database at the same path.
+    const db = DatabaseConnection.initialize(dbPath);
+    const queries = new QueryBuilder(db.getDb());
+
+    return new CodeGraph(db, queries, resolvedRoot);
   }
 
   /**

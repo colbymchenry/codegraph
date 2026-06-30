@@ -105,7 +105,7 @@ async function selfHealBundle() {
   // Already downloaded by a previous run? Use it even when downloads are
   // disabled — CODEGRAPH_NO_DOWNLOAD blocks fetching, not a cached bundle.
   var cached = launcherIn(dest);
-  if (cached) return cached;
+  if (cached) { pruneOldBundles(bundlesDir, dest); return cached; }
 
   if (process.env.CODEGRAPH_NO_DOWNLOAD) {
     fail('the network fallback is disabled (CODEGRAPH_NO_DOWNLOAD is set).');
@@ -149,6 +149,7 @@ async function selfHealBundle() {
 
   var ready = launcherIn(dest);
   if (!ready) fail('downloaded bundle is missing its launcher under ' + dest + '.');
+  pruneOldBundles(bundlesDir, dest);
   process.stderr.write('codegraph: bundle ready.\n');
   return ready;
 }
@@ -228,6 +229,27 @@ function extract(archive, destDir) {
 
 function rmrf(p) {
   try { fs.rmSync(p, { recursive: true, force: true }); } catch (e) { /* best effort */ }
+}
+
+// Drop sibling bundles for OTHER versions of this same platform target, keeping
+// only keepDir. The self-heal cache otherwise accumulates a full ~50 MB bundle
+// per version forever (issue #1074). Best-effort: a locked/busy dir (a
+// concurrent run still mapping an older node.exe on Windows) just stays — rmrf
+// already swallows its own errors, and the readdir is guarded — so cleanup can
+// never break a working command. Only this target's "<target>-<version>" dirs
+// are touched; other platforms' bundles and the ".dl-*" staging dirs are left
+// alone.
+function pruneOldBundles(bundlesDir, keepDir) {
+  var keep = path.basename(keepDir);
+  try {
+    var names = fs.readdirSync(bundlesDir);
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      if (name === keep) continue;
+      if (name.indexOf(target + '-') !== 0) continue;
+      rmrf(path.join(bundlesDir, name));
+    }
+  } catch (e) { /* best effort — never break a working run over cleanup */ }
 }
 
 function fail(reason) {

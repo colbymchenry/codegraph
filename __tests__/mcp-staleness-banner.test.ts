@@ -175,7 +175,7 @@ describe('MCP staleness banner', () => {
 
     const res = await handler.execute('codegraph_status', {});
     const text = res.content[0].text;
-    expect(text).toContain('### Pending sync:');
+    expect(text).toContain('**Pending sync:');
     expect(text).toContain('src/charlie-only.ts');
     // Status embeds the info first-class, so the auto-banner is suppressed.
     expect(text.startsWith('⚠️')).toBe(false);
@@ -204,7 +204,7 @@ describe('MCP staleness banner', () => {
 
     const res = await handler.execute('codegraph_status', {});
     const text = res.content[0].text;
-    expect(text).toContain('### Auto-sync disabled:');
+    expect(text).toContain('**Auto-sync disabled:');
     expect(text).toContain('OS watch/file limit exhausted');
     // status renders the notice inline, so the auto-banner is not also prepended.
     expect(text.startsWith('⚠️')).toBe(false);

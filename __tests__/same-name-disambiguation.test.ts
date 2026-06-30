@@ -99,7 +99,10 @@ describe('same-named symbols across apps (#764)', () => {
     expect(out).toContain('apps/billing/src/users/user.service.ts');
     // …and the billing section must list the billing controller, not admin's.
     const billingSection = out.slice(out.indexOf('apps/billing/src/users/user.service.ts'));
-    const billingBody = billingSection.slice(0, billingSection.indexOf('###', 3) > 0 ? billingSection.indexOf('###', 3) : undefined);
+    // The next definition heading is a line-start bold label (issue #778: ATX `###`
+    // headings became `**…**`); billingSection starts mid-heading, so `\n**` finds it.
+    const nextDef = billingSection.indexOf('\n**');
+    const billingBody = billingSection.slice(0, nextDef > 0 ? nextDef : undefined);
     expect(billingBody).toContain('apps/billing/src/users/user.controller.ts');
     expect(billingBody).not.toContain('apps/admin/src/users/user.controller.ts');
   });

@@ -1,7 +1,7 @@
 {
   "name": "@colbymchenry/codegraph",
-  "version": "1.0.1",
-  "description": "Supercharge Claude Code with semantic code intelligence. 94% fewer tool calls • 77% faster exploration • 100% local.",
+  "version": "1.1.6",
+  "description": "Supercharge AI coding agents with semantic code intelligence — surgical context, fewer tool calls, faster answers. 100% local.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {

@@ -22,14 +22,13 @@ import {
   resolveTargetFlag,
 } from './targets/registry';
 import type { AgentTarget, Location, TargetId } from './targets/types';
-import { getGlyphs } from '../ui/glyphs';
 // Import the lightweight submodules directly (not the ../sync barrel, which
 // re-exports FileWatcher and would transitively pull in ../extraction — the
 // installer must stay importable even when native modules can't load).
 import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
-import { getCodeGraphDir, codeGraphDirName, unsafeIndexRootReason } from '../directory';
-import { getTelemetry, recordIndexEvent, TELEMETRY_DOCS } from '../telemetry';
+import { getCodeGraphDir, codeGraphDirName } from '../directory';
+import { getTelemetry, TELEMETRY_DOCS } from '../telemetry';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -48,9 +47,6 @@ export type { InstallLocation } from './config-writer';
 const importESM = new Function('specifier', 'return import(specifier)') as
   (specifier: string) => Promise<typeof import('@clack/prompts')>;
 
-function formatNumber(n: number): string {
-  return n.toLocaleString();
-}
 
 function getVersion(): string {
   try {
@@ -205,6 +201,31 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
+  // Step 4¾: front-load prompt hook (Claude Code only). A UserPromptSubmit hook
+  // that runs `codegraph prompt-hook` — it injects codegraph_explore context on
+  // structural ("how / where / trace / impact") prompts so the agent reliably
+  // reaches for the graph instead of grepping. Opt-in, default-yes. Only Claude
+  // Code has UserPromptSubmit, so it's offered only when Claude is a target;
+  // other targets ignore the option. `undefined` (no Claude / not asked) leaves
+  // any existing hook untouched.
+  let promptHook: boolean | undefined;
+  if (targets.some((t) => t.id === 'claude')) {
+    if (useDefaults) {
+      promptHook = true; // --yes → on
+    } else {
+      const ans = await clack.confirm({
+        message:
+          'Front-load CodeGraph on “how / where / trace” prompts? Auto-injects structural context so answers need fewer steps (adds a moment to those prompts; Claude Code only).',
+        initialValue: true,
+      });
+      if (clack.isCancel(ans)) {
+        clack.cancel('Installation cancelled.');
+        process.exit(0);
+      }
+      promptHook = ans; // false → opt out; install() strips any prior hook
+    }
+  }
+
   // Step 5: per-target install loop.
   const installedIds: TargetId[] = [];
   let sawCreated = false;
@@ -216,7 +237,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = target.install(location, { autoAllow });
+    const result = target.install(location, { autoAllow, promptHook });
     installedIds.push(target.id);
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
@@ -243,14 +264,17 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     });
   }
 
-  // Step 6: for local install, initialize the project.
-  if (location === 'local') {
-    await initializeLocalProject(clack, useDefaults);
-  }
-
-  if (location === 'global') {
-    clack.note('cd your-project\ncodegraph init -i', 'Quick start');
-  }
+  // Step 6: install wires up agents only — it deliberately does NOT index.
+  // Building the per-project graph is the user's explicit `codegraph init`
+  // (or `index`), so they choose what gets indexed and when, and we never
+  // index a surprise directory (e.g. a shell sitting in $HOME). Same next step
+  // regardless of global/local scope.
+  clack.note(
+    location === 'local'
+      ? 'codegraph init        # build this project’s graph (one time; auto-syncs after)'
+      : 'cd <your-project>\ncodegraph init        # build a project’s graph (one time; auto-syncs after)',
+    'Next: index a project',
+  );
 
   // Deliver buffered telemetry while we're already in a long interactive
   // command — bounded (~1.5s worst case), invisible after a multi-second install.
@@ -490,73 +514,6 @@ async function resolveTargets(
     .filter((t): t is AgentTarget => t !== undefined);
 }
 
-/**
- * Initialize CodeGraph in the current project (for local installs), then
- * offer the watch fallback when the live watcher won't run here (see
- * offerWatchFallback). Agent-agnostic by nature.
- */
-async function initializeLocalProject(
-  clack: typeof import('@clack/prompts'),
-  useDefaults = false,
-): Promise<void> {
-  const projectPath = process.cwd();
-
-  // Never auto-index the home directory or a filesystem root. Running the
-  // installer from `$HOME` would otherwise index the entire home tree — a
-  // multi-GB index, constant watcher churn, and (pre-1.0 on macOS) fd
-  // exhaustion that crashed the machine (#845). The install itself still
-  // completes; we just skip the auto-index and point them at a real project.
-  const unsafe = unsafeIndexRootReason(projectPath);
-  if (unsafe) {
-    clack.log.warn(`Skipping automatic indexing — ${projectPath} looks like ${unsafe}.`);
-    clack.log.info('Indexing it would pull in caches, other projects, and your whole tree. Run "codegraph init" inside a specific project instead.');
-    return;
-  }
-
-  let CodeGraph: typeof import('../index').default;
-  try {
-    CodeGraph = (await import('../index')).default;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    clack.log.error(`Could not load native modules: ${msg}`);
-    clack.log.info('Skipping project initialization. Run "codegraph init -i" later.');
-    return;
-  }
-
-  // Check if already initialized
-  if (CodeGraph.isInitialized(projectPath)) {
-    clack.log.info('CodeGraph already initialized in this project');
-    await offerWatchFallback(clack, projectPath, { yes: useDefaults });
-    return;
-  }
-
-  // Initialize
-  const cg = await CodeGraph.init(projectPath);
-  clack.log.success('Created .codegraph/ directory');
-
-  // Index the project with shimmer progress (worker thread for smooth animation)
-  const { createShimmerProgress } = await import('../ui/shimmer-progress');
-  process.stdout.write(`\x1b[2m${getGlyphs().rail}\x1b[0m\n`);
-  const progress = createShimmerProgress();
-
-  const result = await cg.indexAll({
-    onProgress: progress.onProgress,
-  });
-
-  await progress.stop();
-
-  if (result.filesErrored > 0) {
-    clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files (${formatNumber(result.filesErrored)} failed, ${formatNumber(result.nodesCreated)} symbols)`);
-  } else {
-    clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files (${formatNumber(result.nodesCreated)} symbols)`);
-  }
-
-  recordIndexEvent(cg, result); // buffered; the installer flushes at the end
-
-  cg.close();
-
-  await offerWatchFallback(clack, projectPath, { yes: useDefaults });
-}
 
 /**
  * When the live file watcher will be disabled for this project (e.g. WSL2

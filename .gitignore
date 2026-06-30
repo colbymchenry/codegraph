@@ -45,6 +45,10 @@ npm-debug.log*
 # Parallels Windows VM SSH/connection config (local machine, see CLAUDE.md)
 .parallels
 
+# Confidential business / product / strategy docs — must NOT land in the
+# public engine repo (see the IP boundary in CLAUDE.md)
+docs/business/
+
 # CodeGraph data directories (in test projects)
 .codegraph/
 

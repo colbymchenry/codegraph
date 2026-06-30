@@ -21,7 +21,7 @@ import * as os from 'os';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
 import { uninstallTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
-import { cleanupLegacyHooks } from '../src/installer/targets/claude';
+import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -1031,7 +1031,7 @@ describe('Installer targets — partial-state idempotency', () => {
     // The unrelated GitKraken hook survives untouched.
     expect(stopCommands.some((c: string) => c.includes('gk') && c.includes('ai hook run'))).toBe(true);
     // Permissions still written as normal alongside the cleanup.
-    expect(after.permissions?.allow).toContain('mcp__codegraph__codegraph_search');
+    expect(after.permissions?.allow).toContain('mcp__codegraph__*');
   });
 
   it('claude: cleanupLegacyHooks preserves a sibling hook sharing our matcher group', () => {
@@ -1096,6 +1096,84 @@ describe('Installer targets — partial-state idempotency', () => {
     const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
     // Both events emptied → the whole `hooks` object is removed.
     expect(after.hooks).toBeUndefined();
+  });
+
+  // ---- Front-load prompt hook (UserPromptSubmit) — #841 follow-up ----
+  // Opt-in (default-yes in the installer) UserPromptSubmit hook that runs
+  // `codegraph prompt-hook`. Must write/remove surgically, be idempotent, and
+  // round-trip an opt-out — without disturbing the user's own hooks.
+  const promptCommands = (s: any): string[] =>
+    (s.hooks?.UserPromptSubmit ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
+
+  it('claude: install with promptHook:true writes the UserPromptSubmit hook (alongside permissions)', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true, promptHook: true });
+    const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+    expect(promptCommands(s)).toContain('codegraph prompt-hook');
+    expect(s.permissions?.allow).toContain('mcp__codegraph__*');
+  });
+
+  it('claude: install without promptHook does NOT add the hook', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true });
+    const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+    expect(promptCommands(s)).not.toContain('codegraph prompt-hook');
+  });
+
+  it('claude: install with promptHook:true is idempotent (no duplicate, byte-identical re-run)', () => {
+    const claude = getTarget('claude')!;
+    const file = path.join(tmpHome, '.claude', 'settings.json');
+    claude.install('global', { autoAllow: true, promptHook: true });
+    const first = fs.readFileSync(file, 'utf-8');
+    claude.install('global', { autoAllow: true, promptHook: true });
+    expect(fs.readFileSync(file, 'utf-8')).toBe(first);
+    const s = JSON.parse(first);
+    expect(promptCommands(s).filter((c: string) => c === 'codegraph prompt-hook')).toHaveLength(1);
+  });
+
+  it('claude: install with promptHook:false strips a hook a prior install wrote (opt-out round-trips)', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true, promptHook: true });
+    claude.install('global', { autoAllow: true, promptHook: false });
+    const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+    expect(promptCommands(s)).not.toContain('codegraph prompt-hook');
+  });
+
+  it('claude: writePromptHookEntry preserves a sibling UserPromptSubmit hook', () => {
+    const file = seedSettings('global', {
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'my-own-hook' }] }] },
+    });
+    expect(writePromptHookEntry('global').action).toBe('updated');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual(['my-own-hook', 'codegraph prompt-hook']);
+  });
+
+  it('claude: uninstall removes the prompt hook but keeps the user\'s sibling', () => {
+    const file = seedSettings('global', {
+      hooks: {
+        UserPromptSubmit: [
+          { hooks: [{ type: 'command', command: 'codegraph prompt-hook' }] },
+          { hooks: [{ type: 'command', command: 'my-own-hook' }] },
+        ],
+      },
+    });
+    getTarget('claude')!.uninstall('global');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual(['my-own-hook']);
+  });
+
+  it('claude: removePromptHookEntry leaves the legacy auto-sync hook untouched', () => {
+    const file = seedSettings('global', {
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'codegraph prompt-hook' }] }],
+        Stop: [{ hooks: [{ type: 'command', command: 'codegraph sync-if-dirty' }] }],
+      },
+    });
+    expect(removePromptHookEntry('global').action).toBe('removed');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).not.toContain('codegraph prompt-hook');
+    const stopCmds = (s.hooks?.Stop ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
+    expect(stopCmds).toContain('codegraph sync-if-dirty');
   });
 });
 

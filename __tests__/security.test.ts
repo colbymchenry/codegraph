@@ -232,6 +232,26 @@ describe('Symlink escape prevention (#527)', () => {
     expect(validatePathWithinRoot(root, 'src/inlink.ts')).not.toBeNull();
   });
 
+  // The INDEXING read path opts into following in-root symlinks the directory
+  // walk already descended into — discovery and the reader must agree, or files
+  // reached via an in-root symlink-to-outside fail to index (#935). The lexical
+  // `../` guard is NOT waived, and content-serving sinks never pass the flag.
+  it('allowSymlinkEscape follows an in-repo symlink to an out-of-root FILE (indexing read)', () => {
+    if (!link(path.join(root, 'escape'), path.join(outside, 'pkg', 'secret.txt'))) return;
+    expect(validatePathWithinRoot(root, 'escape', { allowSymlinkEscape: true })).not.toBeNull();
+  });
+
+  it('allowSymlinkEscape follows a path through an in-repo out-of-root DIR symlink (indexing read)', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+    expect(validatePathWithinRoot(root, 'escapedir/secret.txt', { allowSymlinkEscape: true })).not.toBeNull();
+  });
+
+  it('allowSymlinkEscape STILL rejects a lexical ../ traversal (guard not waived)', () => {
+    expect(
+      validatePathWithinRoot(root, `../${path.basename(outside)}/pkg/secret.txt`, { allowSymlinkEscape: true })
+    ).toBeNull();
+  });
+
   it('end-to-end: getCode never serves an out-of-root file reached via a dir symlink', async () => {
     fs.writeFileSync(path.join(outside, 'pkg', 'leak.ts'),
       'export function leaked() { return "LEAKED-ZZZ-9"; }\n');
@@ -245,6 +265,32 @@ describe('Symlink escape prevention (#527)', () => {
       for (const n of cg.getNodesByKind('function')) {
         const code = await cg.getCode(n.id);
         expect(code ?? '').not.toContain('LEAKED-ZZZ-9');
+      }
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('end-to-end (#935): indexes source reached through an in-root dir symlink to outside', async () => {
+    // The Dota custom-game layout symlinks `game/` and `content/` into an SDK
+    // tree outside the repo. Before #935 the batch reader's strict symlink-escape
+    // guard blocked every file under them, so nothing indexed — even though the
+    // directory walk deliberately followed the symlink to enumerate them. The
+    // reader now agrees with discovery: the file indexes.
+    fs.writeFileSync(path.join(outside, 'pkg', 'vendored.ts'),
+      'export function vendoredHelper() { return "LEAKED-ZZZ-9"; }\n');
+    if (!link(path.join(root, 'game'), path.join(outside, 'pkg'))) return;
+
+    const cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
+    try {
+      await cg.indexAll();
+      // The symlinked-in file is now part of the graph...
+      const names = cg.getNodesByKind('function').map((n) => n.name);
+      expect(names).toContain('vendoredHelper');
+      // ...but its out-of-root contents are STILL never served (the #527 sink
+      // stays strict — indexing relaxes only the read path, not getCode).
+      for (const n of cg.getNodesByKind('function')) {
+        expect((await cg.getCode(n.id)) ?? '').not.toContain('LEAKED-ZZZ-9');
       }
     } finally {
       cg.close();

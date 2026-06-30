@@ -121,13 +121,18 @@ export const EXTENSION_MAP: Record<string, Language> = {
  * Whether a file is one CodeGraph can parse, based purely on its extension.
  * This is the single source of truth for "should we index this file" — derived
  * from EXTENSION_MAP so parser support and indexing selection never drift.
+ *
+ * `overrides` is the project's validated custom extension → language map (from
+ * `codegraph.json`); when present its extensions count as indexable in addition
+ * to the built-ins. Omitting it is byte-identical to the zero-config behavior.
  */
-export function isSourceFile(filePath: string): boolean {
+export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
   if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
-  return filePath.slice(dot).toLowerCase() in EXTENSION_MAP;
+  const ext = filePath.slice(dot).toLowerCase();
+  return ext in EXTENSION_MAP || (!!overrides && ext in overrides);
 }
 
 /**
@@ -266,9 +271,13 @@ export function getParser(language: Language): Parser | null {
 }
 
 /**
- * Detect language from file extension
+ * Detect language from file extension.
+ *
+ * `overrides` is the project's validated custom extension → language map (from
+ * `codegraph.json`); when present its mappings take precedence over the built-in
+ * `EXTENSION_MAP`. Omitting it is byte-identical to the zero-config behavior.
  */
-export function detectLanguage(filePath: string, source?: string): Language {
+export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>): Language {
   // Play `conf/routes` has no grammar — route through the no-symbol path; the
   // Play framework resolver extracts route nodes from it.
   if (isPlayRoutesFile(filePath)) return 'yaml';
@@ -276,7 +285,7 @@ export function detectLanguage(filePath: string, source?: string): Language {
   // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
   // links each section `"type"` to its `sections/<type>.liquid`).
   if (isShopifyLiquidJson(filePath)) return 'liquid';
-  const lang = EXTENSION_MAP[ext] || 'unknown';
+  const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content
   if (lang === 'c' && ext === '.h' && source) {

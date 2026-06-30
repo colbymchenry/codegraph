@@ -51,6 +51,7 @@ import {
   decodeLockInfo,
   encodeLockInfo,
   getDaemonPidPath,
+  getDaemonSocketCandidates,
   getDaemonSocketPath,
 } from './daemon-paths';
 import { CodeGraphPackageVersion } from './version';
@@ -68,6 +69,45 @@ const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
  * Set generously so a real but momentarily-idle session isn't reaped mid-use.
  */
 const DEFAULT_MAX_IDLE_MS = 1_800_000; // 30 min
+
+/**
+ * Windows-only shutdown backstop. On Windows, calling `process.exit()` while a
+ * recursive `fs.watch` handle is still tearing down aborts the process with a
+ * libuv `UV_HANDLE_CLOSING` assertion (`0xC0000409`) — reproducible whenever the
+ * watched tree contains a nested repo (submodule / embedded clone), since that's
+ * what keeps a watch active at shutdown. The fix is to let the event loop drain
+ * so libuv finishes closing those handles, then exit naturally; this timer only
+ * force-exits if some unexpected handle keeps the loop alive past the grace
+ * window. Kept short so shutdown stays snappy in that fallback. See
+ * `finalizeDaemonExit`.
+ */
+const DAEMON_SHUTDOWN_BACKSTOP_MS = 2_000;
+
+/**
+ * Finalize daemon shutdown. On POSIX, exit immediately — it's clean and fast.
+ * On Windows, do NOT force an exit while watchers may still be closing (that
+ * trips the libuv assertion above); instead mark success and let the loop drain
+ * to a natural exit, with an UNREF'd backstop that force-exits only if a stray
+ * handle would otherwise hang shutdown. Pure and platform-injected so both
+ * branches are unit-testable off-Windows. Returns the backstop timer (Windows)
+ * so callers/tests can clear it.
+ */
+export function finalizeDaemonExit(
+  platform: NodeJS.Platform,
+  exit: (code: number) => void,
+): NodeJS.Timeout | null {
+  if (platform === 'win32') {
+    process.exitCode = 0;
+    const backstop = setTimeout(() => exit(0), DAEMON_SHUTDOWN_BACKSTOP_MS);
+    // Unref so it never keeps the loop alive: a natural drain (watchers closed,
+    // nothing else pending) exits before it fires; it only fires when some other
+    // handle is keeping the loop running, which is exactly when we need it.
+    backstop.unref?.();
+    return backstop;
+  }
+  exit(0);
+  return null;
+}
 
 /** How often the daemon sweeps connected clients for a dead peer process (#692). */
 const DEFAULT_CLIENT_SWEEP_MS = 30_000;
@@ -148,7 +188,12 @@ export class Daemon {
     this.pidPath = getDaemonPidPath(projectRoot);
     this.idleTimeoutMs = opts.idleTimeoutMs ?? resolveIdleTimeoutMs();
     this.maxIdleMs = opts.maxIdleMs ?? resolveMaxIdleMs();
-    this.engine = new MCPEngine();
+    // Daemon mode serves many concurrent clients on one event loop, so off-load
+    // read-tool dispatch to a worker pool — otherwise concurrent explores
+    // serialize and starve the MCP transport (clients time out). Direct mode
+    // (one stdio client) leaves the pool off; `CODEGRAPH_QUERY_POOL_SIZE=0`
+    // disables it here too.
+    this.engine = new MCPEngine({ queryPool: true });
     this.engine.setProjectPathHint(projectRoot);
   }
 
@@ -164,26 +209,60 @@ export class Daemon {
     // (cross-project tool calls only) shouldn't pay any open cost.
     void this.engine.ensureInitialized(this.projectRoot);
 
-    // Stale socket file (left over from a SIGKILL'd previous daemon) will
-    // wedge `listen` with EADDRINUSE. We arrived here holding the lockfile,
-    // which means there's no live daemon, so it's safe to clear.
-    if (process.platform !== 'win32') {
-      try { fs.unlinkSync(this.socketPath); } catch { /* not-exists is fine */ }
+    // Walk the ordered socket candidates and bind the first that works. The
+    // in-project path comes first; the deterministic tmpdir path is the fallback
+    // for a filesystem that can't host an AF_UNIX node at all (ExFAT/FAT external
+    // volumes, some network mounts, WSL2 DrvFs → ENOTSUP/EACCES; #997, #974). The
+    // `listen` closure clears a stale socket (left by a SIGKILL'd previous daemon)
+    // before each attempt — safe because we hold the lockfile, so no live daemon
+    // owns it; without it `listen` would wedge on EADDRINUSE.
+    const candidates = getDaemonSocketCandidates(this.projectRoot);
+    const listen = (socketPath: string): Promise<net.Server> =>
+      new Promise<net.Server>((resolve, reject) => {
+        if (process.platform !== 'win32') {
+          try { fs.unlinkSync(socketPath); } catch { /* not-exists is fine */ }
+        }
+        const server = net.createServer((socket) => this.handleConnection(socket));
+        server.once('error', reject);
+        server.listen(socketPath, () => {
+          // POSIX: tighten permissions to user-only — the socket lives under
+          // `.codegraph/` (git-ignored, maybe a shared FS) or tmpdir.
+          if (process.platform !== 'win32') {
+            try { fs.chmodSync(socketPath, 0o600); } catch { /* best-effort */ }
+          }
+          resolve(server);
+        });
+      });
+
+    let bound: { server: net.Server; socketPath: string };
+    try {
+      bound = await bindFirstUsableSocket(candidates, listen, {
+        onRelocate: (from, to, code) =>
+          process.stderr.write(
+            `[CodeGraph daemon] Socket ${from} unusable (${code}); relocating to ${to}.\n`
+          ),
+      });
+    } catch (err) {
+      // Every candidate failed (the last one, or a non-relocatable error like a
+      // racing EADDRINUSE). We already hold the lockfile `tryAcquireDaemonLock`
+      // wrote; release it and any partial sockets so the NEXT launcher doesn't
+      // spin respawning us on a stale lock pointing at our now-dying pid. Then
+      // re-throw so the caller (the bin's try/catch) exits this detached daemon
+      // cleanly and every launcher falls back to direct mode (#974).
+      this.cleanupLockfile();
+      if (process.platform !== 'win32') {
+        for (const candidate of candidates) {
+          try { fs.unlinkSync(candidate); } catch { /* may not exist */ }
+        }
+      }
+      throw err;
     }
 
-    await new Promise<void>((resolve, reject) => {
-      const server = net.createServer((socket) => this.handleConnection(socket));
-      server.once('error', (err) => reject(err));
-      server.listen(this.socketPath, () => {
-        // POSIX: tighten permissions to user-only — the socket lives under
-        // `.codegraph/`, which is git-ignored but may be on a shared FS.
-        if (process.platform !== 'win32') {
-          try { fs.chmodSync(this.socketPath, 0o600); } catch { /* best-effort */ }
-        }
-        this.server = server;
-        resolve();
-      });
-    });
+    this.server = bound.server;
+    // Adopt the path we ACTUALLY bound — it may be a tmpdir fallback past an
+    // unusable in-project location. Everything downstream (lockfile, registry,
+    // chmod, cleanup, status) keys off this real path, not the preferred guess.
+    this.socketPath = bound.socketPath;
 
     const lock: DaemonLockInfo = {
       pid: process.pid,
@@ -191,6 +270,19 @@ export class Daemon {
       socketPath: this.socketPath,
       startedAt: Date.now(),
     };
+
+    // `tryAcquireDaemonLock` wrote the pidfile with the PREFERRED path (candidate
+    // 0) before we knew which one would bind. If we relocated, rewrite it so the
+    // per-project record is honest. Atomic temp+rename; safe because we hold the
+    // lock and we're alive — `clearStaleDaemonLock` pid-verifies, so no racing
+    // candidate clears or clobbers a live daemon's lock.
+    if (this.socketPath !== candidates[0]) {
+      try {
+        const tmpPid = `${this.pidPath}.${process.pid}.relocate`;
+        fs.writeFileSync(tmpPid, encodeLockInfo(lock), { mode: 0o600 });
+        fs.renameSync(tmpPid, this.pidPath);
+      } catch { /* best-effort; the registry record below carries the real path */ }
+    }
 
     // Drop a discovery record so `codegraph list` / `stop --all` can find us.
     // Best-effort; a missing record only means list's liveness prune covers it.
@@ -253,7 +345,10 @@ export class Daemon {
     if (process.platform !== 'win32') {
       try { fs.unlinkSync(this.socketPath); } catch { /* may already be gone */ }
     }
-    process.exit(0);
+    // POSIX exits here; Windows drains first (engine.stop() above began closing
+    // the file watcher, and exiting mid-teardown aborts the process). See
+    // finalizeDaemonExit / DAEMON_SHUTDOWN_BACKSTOP_MS.
+    finalizeDaemonExit(process.platform, (code) => process.exit(code));
   }
 
   private handleConnection(socket: net.Socket): void {
@@ -415,6 +510,17 @@ export type AcquireResult =
  * the pidfile becomes visible in one step already containing a full record.
  * Whoever links first wins; everyone else gets EEXIST and reads a complete file.
  * There is no empty-file window at all.
+ *
+ * Filesystems without hard links (#997): ExFAT/FAT external volumes and some
+ * network mounts can't `link()` at all — it throws ENOTSUP/EPERM, which would
+ * otherwise kill the daemon before it ever reaches the socket bind. There we
+ * fall back to an O_EXCL create (`acquireLockViaExclusiveOpen`): still exclusive
+ * ("first writer wins"), but the full record is written through the fd in a
+ * second step, so the empty-file window the link approach removed is reopened —
+ * only on these filesystems, only for the microseconds between create and write
+ * (far narrower than the original bug, which the file watcher's startup latency
+ * widened). The race's worst case is two daemons briefly; on a single external
+ * drive that's strictly better than the daemon never starting at all.
  */
 export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
   const pidPath = getDaemonPidPath(projectRoot);
@@ -435,10 +541,21 @@ export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
   try {
     fs.writeFileSync(tmp, encodeLockInfo(info), { mode: 0o600 });
     try {
-      fs.linkSync(tmp, pidPath); // atomic + exclusive
+      fs.linkSync(tmp, pidPath); // atomic + exclusive (race-free; see must-fix 1)
       acquired = true;
     } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+        // Lost the race — another candidate already holds it. Fall through to read.
+      } else {
+        // link() failed for a non-conflict reason — nearly always "this filesystem
+        // has no hard links" (ExFAT/FAT external volumes, some network mounts),
+        // which surfaces as a DIFFERENT errno on every OS: ENOTSUP on macOS, EPERM
+        // on Linux, EISDIR on Windows (#997). Enumerating them is whack-a-mole and
+        // unnecessary: the `tmp` write above already proved this directory is
+        // writable, so an O_EXCL create is a valid atomic+exclusive substitute. If
+        // IT fails too, that's a genuine error and propagates. EEXIST ⇒ taken.
+        acquired = acquireLockViaExclusiveOpen(pidPath, info);
+      }
     }
   } finally {
     try { fs.unlinkSync(tmp); } catch { /* temp already gone */ }
@@ -454,6 +571,31 @@ export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
     existing = decodeLockInfo(fs.readFileSync(pidPath, 'utf8'));
   } catch { /* unreadable lockfile — treat as malformed */ }
   return { kind: 'taken', existing, pidPath };
+}
+
+/**
+ * Exclusive-create the pidfile (O_CREAT|O_EXCL via the `wx` flag) and write the
+ * full record through the same fd — the hard-link-free fallback used by
+ * {@link tryAcquireDaemonLock} on filesystems without `link()`. Returns true if
+ * we created it (acquired the lock), false on EEXIST (another candidate holds
+ * it). Any other error propagates. Still exclusive, so "first writer wins" holds
+ * exactly as the link path does; the only difference is the brief empty-file
+ * window between create and write. Exported for testing.
+ */
+export function acquireLockViaExclusiveOpen(pidPath: string, info: DaemonLockInfo): boolean {
+  let fd: number;
+  try {
+    fd = fs.openSync(pidPath, 'wx', 0o600); // O_CREAT | O_EXCL | O_WRONLY
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw err;
+  }
+  try {
+    fs.writeSync(fd, encodeLockInfo(info));
+  } finally {
+    fs.closeSync(fd);
+  }
+  return true;
 }
 
 /**
@@ -500,6 +642,58 @@ export function isProcessAlive(pid: number): boolean {
     if (e.code === 'EPERM') return true; // exists, just not ours to signal
     return false;
   }
+}
+
+/**
+ * The one `listen()` error we must NOT relocate past. EADDRINUSE means the path
+ * is genuinely occupied — a racing daemon that legitimately owns it, or a
+ * leftover node we couldn't clear (the #974 planted-dir case) — so relocating
+ * would abandon a path another daemon owns; the caller instead releases its lock
+ * and falls back to direct mode. EVERY OTHER bind error just means "this path
+ * didn't work," almost always a filesystem that can't host an AF_UNIX node at all
+ * (ExFAT/FAT, network mounts, WSL2 DrvFs), which reports a DIFFERENT errno per OS
+ * (ENOTSUP macOS, EPERM Linux; #997). Enumerating the "unsupported" codes is
+ * whack-a-mole, so we relocate on anything-but-conflict instead — robust and
+ * self-correcting: if the deterministic tmpdir fallback ALSO fails, that error
+ * propagates from the last candidate. (ENAMETOOLONG never reaches here — the
+ * candidate list already routes over-long paths straight to tmpdir.)
+ */
+const SOCKET_BIND_CONFLICT_CODE = 'EADDRINUSE';
+
+/**
+ * Bind the first usable socket from an ordered candidate list, relocating past
+ * any path that fails to bind for a non-conflict reason (see {@link
+ * SOCKET_BIND_CONFLICT_CODE}). The injected `listen` does the real
+ * `net.Server.listen` (and stale-socket clear); abstracted so the relocation
+ * policy is unit-testable without a real unsupported filesystem. Returns the
+ * server plus the path actually bound. An EADDRINUSE, or any error on the LAST
+ * candidate, propagates — the caller releases the lockfile and falls back to
+ * direct mode (#974). Exported for testing.
+ */
+export async function bindFirstUsableSocket(
+  candidates: string[],
+  listen: (socketPath: string) => Promise<net.Server>,
+  opts: { onRelocate?: (from: string, to: string, code: string) => void } = {},
+): Promise<{ server: net.Server; socketPath: string }> {
+  let lastErr: unknown;
+  for (let i = 0; i < candidates.length; i++) {
+    const socketPath = candidates[i]!; // i < length, so always defined
+    const isLast = i === candidates.length - 1;
+    try {
+      const server = await listen(socketPath);
+      return { server, socketPath };
+    } catch (err) {
+      lastErr = err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (!isLast && code !== SOCKET_BIND_CONFLICT_CODE) {
+        opts.onRelocate?.(socketPath, candidates[i + 1]!, code ?? ''); // !isLast ⇒ i+1 in range
+        continue;
+      }
+      throw err;
+    }
+  }
+  // Only reachable with an empty candidate list — a programmer error.
+  throw lastErr ?? new Error('no socket candidates to bind');
 }
 
 function resolveIdleTimeoutMs(): number {

@@ -20,7 +20,7 @@ Answer, in aggregate and anonymously:
 - Which install targets people pick, local vs global, fresh vs upgrade.
 - Which MCP tools and CLI commands get used, how often, and how often they error.
 - Which languages people index (prioritize extractor/framework work by real usage).
-- Version adoption speed, OS/arch/Node mix, native-vs-wasm SQLite backend share.
+- Version adoption speed, OS/arch/Node mix. (The SQLite backend is always the built-in `node:sqlite` now — there is no native-vs-wasm split left to measure.)
 
 ## Non-goals / never collected
 
@@ -63,11 +63,10 @@ Common envelope on every batch (computed once per process):
 Event types:
 
 - **`install`** — one per installer run. Props: `targets` (e.g. `["claude","cursor"]`),
-  `scope` (`local`/`global`), `kind` (`fresh`/`upgrade`/`reinstall`), `sqlite_backend`
-  (`native`/`wasm`).
+  `scope` (`local`/`global`), `kind` (`fresh`/`upgrade`/`reinstall`).
 - **`index`** — one per full index (`init`/`index`, not per `sync`). Props: `languages`
   (names only, e.g. `["typescript","go"]`), `file_count_bucket` (`<100`, `100-1k`, `1k-10k`,
-  `10k+`), `duration_bucket` (`<10s`, `10-60s`, `1-5m`, `5m+`), `sqlite_backend`.
+  `10k+`), `duration_bucket` (`<10s`, `10-60s`, `1-5m`, `5m+`).
 - **`usage_rollup`** — the workhorse. One event per `(day, kind, name)` per machine,
   aggregated locally. Props: `kind` (`mcp_tool`/`cli_command`), `name`
   (e.g. `codegraph_explore`, `affected`), `count`, `error_count`, and for MCP:

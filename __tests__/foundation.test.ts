@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { Node, Edge } from '../src/types';
 import { isInitialized, getCodeGraphDir, validateDirectory, codeGraphDirName, isCodeGraphDataDir } from '../src/directory';
-import { DatabaseConnection, getDatabasePath } from '../src/db';
+import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from '../src/db';
 
 // Create a temporary directory for each test
 function createTempDir(): string {
@@ -23,6 +23,13 @@ function cleanupTempDir(dir: string): void {
   if (fs.existsSync(dir)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** Normalize a PRAGMA read across return shapes (array | object | scalar). */
+function pragmaValue(raw: unknown, key: string): unknown {
+  const row = Array.isArray(raw) ? raw[0] : raw;
+  if (row !== null && typeof row === 'object') return (row as Record<string, unknown>)[key];
+  return row;
 }
 
 describe('CodeGraph Foundation', () => {
@@ -141,6 +148,87 @@ describe('CodeGraph Foundation', () => {
       expect(stats.nodeCount).toBe(0);
 
       cg.close();
+    });
+  });
+
+  // recreate() backs `codegraph index`: it discards the existing DB and returns
+  // a fresh, empty instance rather than DELETE-clearing in place — the path that
+  // recovers a poisoned/oversized prior index without wedging (#1067).
+  describe('Recreate (#1067)', () => {
+    it('returns a fresh, empty, usable instance', async () => {
+      const cg = CodeGraph.initSync(tempDir);
+      // Give the DB some content so "empty afterwards" is meaningful.
+      fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export function f() { return 1; }\n');
+      await cg.indexAll();
+      expect(cg.getStats().nodeCount).toBeGreaterThan(0);
+      cg.close();
+
+      const fresh = await CodeGraph.recreate(tempDir);
+      try {
+        // Empty graph, but a working instance: re-indexing repopulates it.
+        expect(fresh.getStats().nodeCount).toBe(0);
+        const result = await fresh.indexAll();
+        expect(result.success).toBe(true);
+        expect(fresh.getStats().nodeCount).toBeGreaterThan(0);
+      } finally {
+        fresh.close();
+      }
+    });
+
+    it('discards the old database file rather than emptying it in place', async () => {
+      const cg = CodeGraph.initSync(tempDir);
+      await cg.indexAll();
+      cg.close();
+
+      // Stamp a sentinel into the existing DB header. PRAGMA user_version is
+      // untouched by DELETE, so an in-place clear() would preserve it — but a
+      // from-scratch recreate cannot. (An inode-equality check is unreliable:
+      // ext4/overlayfs recycle the inode number after unlink+recreate, so a
+      // "new inode" assertion false-fails on Linux while passing on macOS.)
+      const dbPath = getDatabasePath(tempDir);
+      const stamp = DatabaseConnection.open(dbPath);
+      stamp.getDb().pragma('user_version = 4242');
+      stamp.close();
+
+      const fresh = await CodeGraph.recreate(tempDir);
+      fresh.close();
+
+      // The file exists, and the sentinel is gone — proof the old DB was
+      // discarded and rebuilt, not row-DELETE'd in place (the path that wedged
+      // on a poisoned graph, #1067).
+      expect(fs.existsSync(dbPath)).toBe(true);
+      const check = DatabaseConnection.open(dbPath);
+      const userVersion = pragmaValue(check.getDb().pragma('user_version'), 'user_version');
+      check.close();
+      expect(Number(userVersion)).not.toBe(4242);
+    });
+
+    it('throws a clear error when the project is not initialized', async () => {
+      await expect(CodeGraph.recreate(tempDir)).rejects.toThrow(/not initialized/i);
+    });
+  });
+
+  describe('removeDatabaseFiles (#1067)', () => {
+    it('deletes the database and its -wal/-shm sidecars', () => {
+      const cg = CodeGraph.initSync(tempDir);
+      cg.close();
+      const dbPath = getDatabasePath(tempDir);
+      // Materialise the WAL sidecars so we can prove they're cleaned up too.
+      fs.writeFileSync(dbPath + '-wal', 'x');
+      fs.writeFileSync(dbPath + '-shm', 'x');
+      expect(fs.existsSync(dbPath)).toBe(true);
+
+      removeDatabaseFiles(dbPath);
+
+      expect(fs.existsSync(dbPath)).toBe(false);
+      expect(fs.existsSync(dbPath + '-wal')).toBe(false);
+      expect(fs.existsSync(dbPath + '-shm')).toBe(false);
+    });
+
+    it('is a no-op (does not throw) when the files are already gone', () => {
+      const dbPath = getDatabasePath(tempDir);
+      expect(fs.existsSync(dbPath)).toBe(false);
+      expect(() => removeDatabaseFiles(dbPath)).not.toThrow();
     });
   });
 
@@ -282,7 +370,7 @@ describe('Database Connection', () => {
 
     const version = db.getSchemaVersion();
     expect(version).not.toBeNull();
-    expect(version?.version).toBe(5);
+    expect(version?.version).toBe(6);
 
     db.close();
   });

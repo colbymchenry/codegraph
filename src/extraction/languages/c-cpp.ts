@@ -85,6 +85,33 @@ export function normalizeCppReturnType(raw: string): string | undefined {
 }
 
 /**
+ * Strip C++ template arguments from a base-type reference name so it matches the
+ * bare class/struct the template was DEFINED as. `template<typename T> class
+ * Base { … }` is indexed as a node named `Base`, but a derived class
+ * `class D : public Base<int>` records its base as the full `Base<int>` (and
+ * `class Q : public ns::Tpl<int>` as `ns::Tpl<int>`) — neither name-matches
+ * `Base` / `ns::Tpl`, so the `extends` edge never resolves and the derived class
+ * looks like it inherits from nothing (#1043).
+ *
+ * Removes every balanced `<…>` group regardless of nesting or position, so
+ * `Base<int>` → `Base`, `ns::Tpl<Foo<int>>` → `ns::Tpl`, and the rare
+ * `Outer<int>::Inner` → `Outer::Inner`. The remaining qualified head is exactly
+ * what the non-templated base case already produces, so resolution treats them
+ * identically. A name with no template args passes through unchanged.
+ */
+export function stripCppTemplateArgs(name: string): string {
+  if (!name.includes('<')) return name;
+  let out = '';
+  let depth = 0;
+  for (const ch of name) {
+    if (ch === '<') depth++;
+    else if (ch === '>') { if (depth > 0) depth--; }
+    else if (depth === 0) out += ch;
+  }
+  return out.trim();
+}
+
+/**
  * A function/method's return type lives in the `function_definition`'s `type`
  * field (`Metrics& Metrics::instance()` → `Metrics`). Constructors, destructors,
  * and conversion operators have no `type` field → undefined.
@@ -148,7 +175,74 @@ export const cExtractor: LanguageExtractor = {
   },
 };
 
+/**
+ * Detect tree-sitter's misparse of a macro-annotated class/struct, e.g.
+ * `class MACRO Name { … }` or `class MACRO Name : public Base { … }` (#946).
+ * Not knowing `MACRO` is a macro, tree-sitter reads `class MACRO` as an
+ * *elaborated type specifier* (a bodyless `class_specifier`/`struct_specifier`
+ * whose "type name" is the macro) and the rest as a function: `Name` becomes the
+ * declarator and the `{ … }` a function body — so the whole declaration surfaces
+ * as a `function_definition` named after the class, with a line range spanning
+ * the entire class body. (A base clause, when present, additionally lands in an
+ * `ERROR` node, but it isn't required — the leading macro alone triggers this.)
+ *
+ * Two structural signals pin it down with no risk to genuine code:
+ *  - the `type` field is a *bodyless* class/struct specifier — an elaborated
+ *    type, not a real inline-defined return type like
+ *    `struct P { int x; } makeP() { … }` (which carries a field list); and
+ *  - the declarator is not a `function_declarator` — a real function definition
+ *    always has one, which also leaves the legal-but-rare `class Foo f() { … }`
+ *    (an elaborated return type on a genuine function) alone.
+ *
+ * The class body is mangled by the same misparse and is unrecoverable, so —
+ * matching how macro-prefixed C prototypes are handled — we drop the spurious
+ * node rather than mint a misleading whole-body `function` that pollutes
+ * callers/impact and skews kind statistics.
+ */
+function isMacroMisparsedTypeDecl(node: SyntaxNode): boolean {
+  const typeNode = getChildByField(node, 'type');
+  if (!typeNode) return false;
+  if (typeNode.type !== 'class_specifier' && typeNode.type !== 'struct_specifier') return false;
+  if (typeNode.namedChildren.some((c: SyntaxNode) => c.type === 'field_declaration_list')) return false;
+  const declarator = getChildByField(node, 'declarator');
+  if (declarator && declarator.type === 'function_declarator') return false;
+  return true;
+}
+
+/**
+ * Blank an export/visibility macro in a `class/struct EXPORT_MACRO Name …`
+ * *definition* header before parsing. Not knowing the macro, tree-sitter reads
+ * `class EXPORT_MACRO` as an elaborated type specifier and the rest as a
+ * function, so the whole class — its name, base clause, and members — drops out
+ * of the index (#946 catches the resulting phantom function but can't recover
+ * the class), which silently breaks type-hierarchy / inheritance-impact queries
+ * for effectively every Unreal-Engine (`*_API`), Qt/Boost (`*_EXPORT`), LLVM
+ * (`*_ABI`), … class. Replacing the macro with equal-length spaces preserves
+ * every byte offset (and thus line/column), so the declaration then parses as a
+ * normal class_specifier and the existing extraction emits the node, members,
+ * and `extends` edge. (#1061, follow-up to #946.)
+ *
+ * Matched tightly so it can't touch the same macro used as an ordinary value
+ * elsewhere (`int x = SOME_API;`): the macro is the ALL-CAPS token sitting
+ * *between* `class`/`struct` and the type name, and the trailing `[:{]`
+ * definition-guard fires only when a base clause or body follows — the only
+ * shape that misparses. That guard also leaves elaborated-type variable
+ * declarations (`struct FOO var;`, `class FOO obj = …`) untouched, since those
+ * end in `;` / `=` / `[`, never `:` / `{`. C++-only (wired into cppExtractor),
+ * so C's heavier use of `struct TAG var;` never reaches it.
+ */
+export function blankCppExportMacros(source: string): string {
+  if (source.indexOf('class') === -1 && source.indexOf('struct') === -1) return source;
+  return source.replace(
+    /\b(class|struct)(\s+)([A-Z][A-Z0-9_]+)(?=\s+[A-Za-z_]\w*(?:\s+final)?\s*[:{])/g,
+    (_m, kw, ws, macro) => kw + ws + ' '.repeat(macro.length)
+  );
+}
+
 export const cppExtractor: LanguageExtractor = {
+  // Recover macro-annotated class/struct definitions (`class MYMODULE_API Foo : Base`)
+  // that tree-sitter otherwise misparses into a phantom function (#1061/#946).
+  preParse: blankCppExportMacros,
   functionTypes: ['function_definition'],
   classTypes: ['class_specifier'],
   methodTypes: ['function_definition'],
@@ -192,14 +286,19 @@ export const cppExtractor: LanguageExtractor = {
     }
     return undefined;
   },
-  isMisparsedFunction: (name) => {
+  isMisparsedFunction: (name, node) => {
     // C++ macros like NLOHMANN_JSON_NAMESPACE_BEGIN cause tree-sitter to misparse
     // namespace blocks as function_definitions (e.g. name = "namespace detail").
     // Also filter C++ keywords that tree-sitter occasionally misinterprets as
     // function/method names (e.g. switch statements inside macro-confused scopes).
     if (name.startsWith('namespace')) return true;
     const cppKeywords = ['switch', 'if', 'for', 'while', 'do', 'case', 'return'];
-    return cppKeywords.includes(name);
+    if (cppKeywords.includes(name)) return true;
+    // `class MACRO Name : public Base { … }` misparses to a function_definition
+    // named after the class. `blankCppExportMacros` (preParse) recovers the
+    // common ALL-CAPS export-macro shape; this drop is the fallback for any
+    // residual misparse it doesn't blank — still no phantom function (#1061/#946).
+    return isMacroMisparsedTypeDecl(node);
   },
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();
