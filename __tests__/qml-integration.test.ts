@@ -1742,6 +1742,366 @@ Item {
     expect(edges.some((edge) => edge.kind === 'calls' && edge.target === macroAlsoHidden!.id)).toBe(false);
   });
 
+  it('does not let same-file QML callables steal explicit C++ bridge calls', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QtQml>
+
+class ViewModel : public QObject {
+  Q_OBJECT
+
+public:
+  Q_INVOKABLE void refresh();
+};
+
+class ThemeApi : public QObject {
+  Q_OBJECT
+
+public:
+  Q_INVOKABLE QString color();
+};
+
+void ViewModel::refresh() {}
+QString ThemeApi::color() { return "#123456"; }
+
+int main() {
+  QQmlApplicationEngine engine;
+  ViewModel vm;
+  engine.rootContext()->setContextProperty("viewModel", &vm);
+  qmlRegisterSingletonType<ThemeApi>("App.Controls", 1, 0, "ThemeApi", [](QQmlEngine*, QJSEngine*) -> QObject* {
+    return new ThemeApi();
+  });
+  return 0;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import App.Controls 1.0
+
+Item {
+  id: root
+
+  function refresh() {}
+  function color() {}
+
+  Component.onCompleted: {
+    viewModel.refresh()
+    ThemeApi.color()
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const localRefresh = graph.getNodesByName('refresh').find((n) => n.kind === 'function' && n.filePath === 'Main.qml');
+    const localColor = graph.getNodesByName('color').find((n) => n.kind === 'function' && n.filePath === 'Main.qml');
+    const viewModelRefresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ViewModel::refresh'));
+    const themeColor = graph.getNodesByName('color').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ThemeApi::color'));
+
+    expect(onCompleted).toBeDefined();
+    expect(localRefresh).toBeDefined();
+    expect(localColor).toBeDefined();
+    expect(viewModelRefresh).toBeDefined();
+    expect(themeColor).toBeDefined();
+
+    const edges = graph.getOutgoingEdges(onCompleted!.id);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === viewModelRefresh!.id)).toBe(true);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === themeColor!.id)).toBe(true);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === localRefresh!.id)).toBe(false);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === localColor!.id)).toBe(false);
+  });
+
+  it('infers C++ context-property types from pointer and auto allocation declarations', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+
+class PointerModel : public QObject {
+  Q_OBJECT
+
+public:
+  Q_INVOKABLE void refresh();
+};
+
+class SpacedPointerModel : public QObject {
+  Q_OBJECT
+
+public:
+  Q_INVOKABLE void save();
+};
+
+class AutoModel : public QObject {
+  Q_OBJECT
+
+public:
+  Q_INVOKABLE void reload();
+};
+
+void PointerModel::refresh() {}
+void SpacedPointerModel::save() {}
+void AutoModel::reload() {}
+
+int main() {
+  QQmlApplicationEngine engine;
+  PointerModel* pointerModel = new PointerModel();
+  SpacedPointerModel *spacedModel = new SpacedPointerModel();
+  auto *autoModel = new AutoModel();
+  engine.rootContext()->setContextProperty("pointerModel", pointerModel);
+  engine.rootContext()->setContextProperty("spacedModel", spacedModel);
+  engine.rootContext()->setContextProperty("autoModel", autoModel);
+  return 0;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  id: root
+
+  Component.onCompleted: {
+    pointerModel.refresh()
+    spacedModel.save()
+    autoModel.reload()
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const pointerRefresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('PointerModel::refresh'));
+    const spacedSave = graph.getNodesByName('save').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('SpacedPointerModel::save'));
+    const autoReload = graph.getNodesByName('reload').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('AutoModel::reload'));
+
+    expect(onCompleted).toBeDefined();
+    expect(pointerRefresh).toBeDefined();
+    expect(spacedSave).toBeDefined();
+    expect(autoReload).toBeDefined();
+
+    const edges = graph.getOutgoingEdges(onCompleted!.id);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === pointerRefresh!.id)).toBe(true);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === spacedSave!.id)).toBe(true);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === autoReload!.id)).toBe(true);
+  });
+
+  it('resolves singleton instance QML registrations to C++ methods', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QtQml>
+
+class ThemeApi : public QObject {
+  Q_OBJECT
+public:
+  Q_INVOKABLE QString color();
+};
+
+QString ThemeApi::color() { return "#123456"; }
+
+int main() {
+  ThemeApi theme;
+  qmlRegisterSingletonInstance<ThemeApi>("App.Controls", 1, 0, "ThemeApi", &theme);
+  return 0;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import App.Controls 1.0
+
+Item {
+  Component.onCompleted: ThemeApi.color()
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const color = graph.getNodesByName('color').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ThemeApi::color'));
+
+    expect(onCompleted).toBeDefined();
+    expect(color).toBeDefined();
+    expect(graph.getOutgoingEdges(onCompleted!.id).some((edge) => edge.kind === 'calls' && edge.target === color!.id)).toBe(true);
+  });
+
+  it('resolves anonymous QML registrations only for explicit property type references', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QtQml>
+
+class Payload : public QObject {
+  Q_OBJECT
+public:
+  Q_INVOKABLE void refresh();
+};
+
+void Payload::refresh() {}
+
+int main() {
+  qmlRegisterAnonymousType<Payload>("App.Controls", 1);
+  return 0;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+import App.Controls 1.0
+
+Item {
+  property Payload payload
+  Component.onCompleted: Payload.refresh()
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const payloadProperty = graph.getNodesByName('payload').find((n) => n.kind === 'property' && n.filePath === 'Main.qml');
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const payloadClass = graph.getNodesByName('Payload').find((n) => n.kind === 'class' && n.filePath === 'main.cpp');
+    const refresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('Payload::refresh'));
+
+    expect(payloadProperty).toBeDefined();
+    expect(onCompleted).toBeDefined();
+    expect(payloadClass).toBeDefined();
+    expect(refresh).toBeDefined();
+
+    expect(graph.getOutgoingEdges(payloadProperty!.id).some((edge) => edge.kind === 'references' && edge.target === payloadClass!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(onCompleted!.id).some((edge) => edge.kind === 'calls' && edge.target === refresh!.id)).toBe(false);
+  });
+
+  it('infers C++ context-property types from this and smart pointer accessors', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <memory>
+
+template <typename T>
+class QScopedPointer {
+public:
+  T *data() const;
+};
+
+class AppController : public QObject {
+  Q_OBJECT
+public:
+  void expose(QQmlApplicationEngine &engine);
+  Q_INVOKABLE void reload();
+};
+
+class UniqueModel : public QObject {
+  Q_OBJECT
+public:
+  Q_INVOKABLE void refresh();
+};
+
+class ScopedModel : public QObject {
+  Q_OBJECT
+public:
+  Q_INVOKABLE void save();
+};
+
+void AppController::expose(QQmlApplicationEngine &engine) {
+  std::unique_ptr<UniqueModel> uniqueModel;
+  QScopedPointer<ScopedModel> scopedModel;
+  engine.rootContext()->setContextProperty("app", this);
+  engine.rootContext()->setContextProperty("uniqueModel", uniqueModel.get());
+  engine.rootContext()->setContextProperty("scopedModel", scopedModel.data());
+}
+
+void AppController::reload() {}
+void UniqueModel::refresh() {}
+void ScopedModel::save() {}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  Component.onCompleted: {
+    app.reload()
+    uniqueModel.refresh()
+    scopedModel.save()
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const reload = graph.getNodesByName('reload').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('AppController::reload'));
+    const refresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('UniqueModel::refresh'));
+    const save = graph.getNodesByName('save').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('ScopedModel::save'));
+
+    expect(onCompleted).toBeDefined();
+    expect(reload).toBeDefined();
+    expect(refresh).toBeDefined();
+    expect(save).toBeDefined();
+
+    const edges = graph.getOutgoingEdges(onCompleted!.id);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === reload!.id)).toBe(true);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === refresh!.id)).toBe(true);
+    expect(edges.some((edge) => edge.kind === 'calls' && edge.target === save!.id)).toBe(true);
+  });
+
+  it('resolves Loader.setSource literal QML URLs without resolving dynamic QML object strings', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  id: root
+  Loader { id: loader }
+
+  Component.onCompleted: {
+    loader.setSource("LazyPanel.qml")
+    Qt.createQmlObject("import QtQuick; Item {}", root)
+  }
+}
+`
+    );
+    fs.writeFileSync(path.join(tmpDir, 'LazyPanel.qml'), 'import QtQuick\nRectangle { id: lazyRoot }\n');
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const lazyPanel = graph.getNodesByName('LazyPanel').find((n) => n.kind === 'component' && n.filePath === 'LazyPanel.qml');
+
+    expect(onCompleted).toBeDefined();
+    expect(lazyPanel).toBeDefined();
+
+    const qmlFileReferences = graph
+      .getOutgoingEdges(onCompleted!.id)
+      .filter((edge) => edge.kind === 'references' && edge.target === lazyPanel!.id);
+    expect(qmlFileReferences).toHaveLength(1);
+  });
+
   it('updates QML C++ bridge edges when context property types change during sync', async () => {
     const cppPath = path.join(tmpDir, 'main.cpp');
     const qmlPath = path.join(tmpDir, 'Main.qml');
@@ -1877,6 +2237,176 @@ Item {
     expect(graph.getOutgoingEdges(connections!.id).some((edge) => edge.kind === 'references' && edge.target === viewModelClass!.id)).toBe(false);
   });
 
+  it('resolves dynamic context-property forwarding tables with declared QObject values', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+
+class PageService : public QObject {
+  Q_OBJECT
+public:
+  Q_INVOKABLE void open();
+};
+
+void PageService::open() {}
+
+void expose(QQmlApplicationEngine &engine, QObject *contextObject) {
+  const char *pageServiceKey = "pageService";
+  contextObject->setProperty("pageService", QVariant::fromValue(new PageService()));
+  engine.rootContext()->setContextProperty(pageServiceKey, contextObject->property("pageService"));
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  Component.onCompleted: {
+    pageService.open()
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const open = graph.getNodesByName('open').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('PageService::open'));
+
+    expect(onCompleted).toBeDefined();
+    expect(open).toBeDefined();
+    expect(graph.getOutgoingEdges(onCompleted!.id).some((edge) => edge.kind === 'calls' && edge.target === open!.id)).toBe(true);
+  });
+
+  it('resolves module context objects forwarded through dynamicPropertyNames', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+
+namespace modules::work::presentation {
+class WorkPageViewModel : public QObject {
+  Q_OBJECT
+public:
+  Q_INVOKABLE void refresh();
+};
+}
+
+namespace modules::work {
+class WorkModule {
+public:
+  void createQmlContextObject();
+  QObject* getQmlContextObject();
+private:
+  QObject *m_qmlContextObject = nullptr;
+  presentation::WorkPageViewModel *m_viewModel = nullptr;
+};
+}
+
+void modules::work::presentation::WorkPageViewModel::refresh() {}
+
+void modules::work::WorkModule::createQmlContextObject() {
+  m_viewModel = new presentation::WorkPageViewModel();
+  m_qmlContextObject = new QObject();
+  m_qmlContextObject->setProperty("workViewModel", QVariant::fromValue(static_cast<QObject*>(m_viewModel)));
+}
+
+QObject* modules::work::WorkModule::getQmlContextObject() {
+  return m_qmlContextObject;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'PageService.cpp'),
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+
+void applyContextProperties(QQmlApplicationEngine *engine, QObject *contextObject) {
+  const auto propertyNames = contextObject->dynamicPropertyNames();
+  for (const auto& name : propertyNames) {
+    const QString key = QString::fromUtf8(name);
+    engine->rootContext()->setContextProperty(key, contextObject->property(name));
+  }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  Component.onCompleted: {
+    workViewModel.refresh()
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onCompleted = graph.getNodesByName('Component.onCompleted').find((n) => n.kind === 'method' && n.filePath === 'Main.qml');
+    const refresh = graph.getNodesByName('refresh').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('modules::work::presentation::WorkPageViewModel::refresh'));
+
+    expect(onCompleted).toBeDefined();
+    expect(refresh).toBeDefined();
+    expect(graph.getOutgoingEdges(onCompleted!.id).some((edge) => edge.kind === 'calls' && edge.target === refresh!.id)).toBe(true);
+  });
+
+  it('prefers QML C++ bridge targets over same-named local QML functions', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.cpp'),
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+
+namespace modules {
+class WorkPageViewModel : public QObject {
+  Q_OBJECT
+public slots:
+  void requestLogoutAndExit();
+};
+}
+
+void modules::WorkPageViewModel::requestLogoutAndExit() {}
+
+void expose(QQmlApplicationEngine *engine) {
+  auto *viewModel = new modules::WorkPageViewModel();
+  engine->rootContext()->setContextProperty("workViewModel", QVariant::fromValue(static_cast<QObject*>(viewModel)));
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.qml'),
+      `import QtQuick
+
+Item {
+  function requestLogoutAndExit() {
+    if (workViewModel && typeof workViewModel.requestLogoutAndExit === "function") {
+      workViewModel.requestLogoutAndExit()
+    }
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const qmlFunction = graph.getNodesByName('requestLogoutAndExit').find((n) => n.language === 'qml' && n.kind === 'function');
+    const cppSlot = graph.getNodesByName('requestLogoutAndExit').find((n) => n.language === 'cpp' && n.kind === 'method');
+
+    expect(qmlFunction).toBeDefined();
+    expect(cppSlot).toBeDefined();
+    expect(graph.getOutgoingEdges(qmlFunction!.id).some((edge) => edge.kind === 'calls' && edge.target === cppSlot!.id)).toBe(true);
+  });
+
   it('uses the QML Qt framework resolver for QML-specific cross-file references', async () => {
     fs.writeFileSync(
       path.join(tmpDir, 'Main.qml'),
@@ -1893,5 +2423,391 @@ Item {
 
     expect(graph.getDetectedFrameworks()).toContain('qt');
     expect(graph.getDetectedFrameworks()).not.toContain('qml-qt');
+  });
+
+  it('resolves QML login clicks through C++ services and async lambda callbacks', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'LoginPageViewModel.h'),
+      `#include <QObject>
+
+namespace app::application {
+class LoginService;
+}
+
+namespace app::presentation {
+class LOGIN_EXPORT LoginPageViewModel : public QObject {
+  Q_OBJECT
+public slots:
+  void handleLogin();
+  void cancelLogin();
+private:
+  void submitLoginRequest();
+  application::LoginService *m_loginService = nullptr;
+};
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'LoginFlow.cpp'),
+      `#include "LoginPageViewModel.h"
+#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+
+#define LOGIN_EXPORT
+
+namespace app {
+class AuthApiClient {
+public:
+  template <typename Callback>
+  void loginAsync(Callback callback) { callback(); }
+};
+
+class AuthService : public QObject {
+  Q_OBJECT
+public:
+  void login();
+  void handleLoginResult();
+private:
+  AuthApiClient *m_authApiClient = nullptr;
+};
+
+namespace application {
+class LoginService : public QObject {
+  Q_OBJECT
+public:
+  void login();
+signals:
+  void loginSucceeded();
+private:
+  AuthService *m_authService = nullptr;
+};
+}
+
+void presentation::LoginPageViewModel::handleLogin() {
+  submitLoginRequest();
+}
+
+void presentation::LoginPageViewModel::cancelLogin() {}
+
+void presentation::LoginPageViewModel::submitLoginRequest() {
+  m_loginService->login();
+}
+
+void application::LoginService::login() {
+  m_authService->login();
+}
+
+void AuthService::login() {
+  m_authApiClient->loginAsync([this]() {
+    handleLoginResult();
+  });
+}
+
+void AuthService::handleLoginResult() {}
+
+void expose(QQmlApplicationEngine *engine) {
+  auto *viewModel = new app::presentation::LoginPageViewModel();
+  engine->rootContext()->setContextProperty("loginViewModel", viewModel);
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'LoginFormPanel.qml'),
+      `import QtQuick
+
+Item {
+  id: root
+  property var loginViewModel: loginViewModel
+
+  MouseArea {
+    onClicked: {
+      root.closeDropdowns()
+      if (root.loginViewModel.loginActionBusy)
+        root.loginViewModel.cancelLogin()
+      else
+        root.loginViewModel.handleLogin()
+    }
+  }
+
+  function closeDropdowns() {}
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onClicked = graph.getNodesByName('onClicked').find((n) => n.kind === 'method' && n.filePath === 'LoginFormPanel.qml');
+    const handleLogin = graph.getNodesByName('handleLogin').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('LoginPageViewModel::handleLogin'));
+    const cancelLogin = graph.getNodesByName('cancelLogin').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('LoginPageViewModel::cancelLogin'));
+    const submitLoginRequest = graph.getNodesByName('submitLoginRequest').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('LoginPageViewModel::submitLoginRequest'));
+    const loginServiceLogin = graph.getNodesByName('login').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('LoginService::login'));
+    const authServiceLogin = graph.getNodesByName('login').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('AuthService::login'));
+    const handleLoginResult = graph.getNodesByName('handleLoginResult').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('AuthService::handleLoginResult'));
+
+    expect(onClicked).toBeDefined();
+    expect(handleLogin).toBeDefined();
+    expect(cancelLogin).toBeDefined();
+    expect(submitLoginRequest).toBeDefined();
+    expect(loginServiceLogin).toBeDefined();
+    expect(authServiceLogin).toBeDefined();
+    expect(handleLoginResult).toBeDefined();
+
+    expect(graph.getOutgoingEdges(onClicked!.id).some((edge) => edge.kind === 'calls' && edge.target === handleLogin!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(onClicked!.id).some((edge) => edge.kind === 'calls' && edge.target === cancelLogin!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(handleLogin!.id).some((edge) => edge.kind === 'calls' && edge.target === submitLoginRequest!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(submitLoginRequest!.id).some((edge) => edge.kind === 'calls' && edge.target === loginServiceLogin!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(loginServiceLogin!.id).some((edge) => edge.kind === 'calls' && edge.target === authServiceLogin!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(authServiceLogin!.id).some((edge) => edge.kind === 'calls' && edge.target === handleLoginResult!.id)).toBe(true);
+  });
+
+  it('resolves QML calls through parent-injected context properties', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'LoginFlow.cpp'),
+      `#include <QObject>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QVariant>
+
+namespace modules::login::presentation {
+class LoginPageViewModel : public QObject {
+  Q_OBJECT
+public slots:
+  void handleLogin();
+};
+}
+
+namespace modules::login {
+class LoginModule {
+public:
+  void createQmlContextObject();
+  QObject* getQmlContextObject();
+private:
+  QObject *m_qmlContextObject = nullptr;
+  presentation::LoginPageViewModel *m_loginViewModel = nullptr;
+};
+}
+
+void modules::login::presentation::LoginPageViewModel::handleLogin() {}
+
+void modules::login::LoginModule::createQmlContextObject() {
+  m_loginViewModel = new presentation::LoginPageViewModel();
+  m_qmlContextObject = new QObject();
+  m_qmlContextObject->setProperty(
+    "loginViewModel", QVariant::fromValue(static_cast<QObject*>(m_loginViewModel)));
+}
+
+QObject* modules::login::LoginModule::getQmlContextObject() {
+  return m_qmlContextObject;
+}
+
+void applyContextProperties(QQmlApplicationEngine *engine, QObject *contextObject) {
+  const auto propertyNames = contextObject->dynamicPropertyNames();
+  for (const auto& name : propertyNames) {
+    const QString key = QString::fromUtf8(name);
+    engine->rootContext()->setContextProperty(key, contextObject->property(name));
+  }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'LoginPage.qml'),
+      `import QtQuick
+
+Item {
+  id: root
+  readonly property var injectedLoginViewModel: (typeof loginViewModel !== "undefined") ? loginViewModel : null
+
+  Component {
+    id: loginFormPanelComponent
+    LoginFormPanel {
+      loginViewModel: root.injectedLoginViewModel
+    }
+  }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'LoginFormPanel.qml'),
+      `import QtQuick
+
+Item {
+  id: root
+  property var loginViewModel: null
+
+  MouseArea {
+    onClicked: {
+      root.loginViewModel.handleLogin()
+    }
+  }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const onClicked = graph.getNodesByName('onClicked').find((n) => n.kind === 'method' && n.filePath === 'LoginFormPanel.qml');
+    const handleLogin = graph.getNodesByName('handleLogin').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('modules::login::presentation::LoginPageViewModel::handleLogin'));
+
+    expect(onClicked).toBeDefined();
+    expect(handleLogin).toBeDefined();
+    expect(graph.getOutgoingEdges(onClicked!.id).some((edge) => edge.kind === 'calls' && edge.target === handleLogin!.id)).toBe(true);
+  });
+
+  it('resolves typed Qt-style event bus publish calls to subscribed handlers', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'LoginEvents.cpp'),
+      `#include <QObject>
+
+namespace app {
+struct LoginSessionReadyEvent {};
+struct LoginSuccessEvent {};
+
+class EventBus {
+public:
+  template <typename Event, typename Receiver, typename Handler>
+  void subscribe(Receiver *receiver, Handler handler) {}
+
+  template <typename Event>
+  void publish(const Event &event) {}
+};
+
+EventBus &eventBus();
+
+class AuthService : public QObject {
+  Q_OBJECT
+public:
+  void handleLoginResult();
+};
+
+class AppShellFlowCoordinator : public QObject {
+  Q_OBJECT
+public:
+  void wire();
+  void handleLoginSessionReadyEvent(const LoginSessionReadyEvent &event);
+  void handleLoginSuccessEvent(const LoginSuccessEvent &event);
+};
+
+void AppShellFlowCoordinator::wire() {
+  eventBus().subscribe<LoginSessionReadyEvent>(
+      this, [this](const LoginSessionReadyEvent &event) {
+        handleLoginSessionReadyEvent(event);
+      });
+  eventBus().subscribeScoped<LoginSuccessEvent>(
+      this, QStringLiteral("login"), [this](const LoginSuccessEvent &event) {
+        handleLoginSuccessEvent(event);
+      });
+}
+
+void AuthService::handleLoginResult() {
+  eventBus().publish(LoginSessionReadyEvent());
+  eventBus().publish(LoginSuccessEvent());
+}
+
+void AppShellFlowCoordinator::handleLoginSessionReadyEvent(const LoginSessionReadyEvent &) {}
+void AppShellFlowCoordinator::handleLoginSuccessEvent(const LoginSuccessEvent &) {}
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const handleLoginResult = graph.getNodesByName('handleLoginResult').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('AuthService::handleLoginResult'));
+    const handleSessionReady = graph.getNodesByName('handleLoginSessionReadyEvent').find((n) => n.kind === 'method');
+    const handleSuccess = graph.getNodesByName('handleLoginSuccessEvent').find((n) => n.kind === 'method');
+
+    expect(handleLoginResult).toBeDefined();
+    expect(handleSessionReady).toBeDefined();
+    expect(handleSuccess).toBeDefined();
+    expect(graph.getOutgoingEdges(handleLoginResult!.id).some((edge) => edge.kind === 'calls' && edge.target === handleSessionReady!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(handleLoginResult!.id).some((edge) => edge.kind === 'calls' && edge.target === handleSuccess!.id)).toBe(true);
+  });
+
+  it('resolves typed C++ command and query dispatch calls to registered handlers', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'TypedDispatch.cpp'),
+      `namespace app {
+struct Result {};
+
+struct Command {};
+struct Query {};
+struct OpenWorkCommand : Command {};
+struct VisibleRangeQuery : Query {};
+
+class CommandHandler {
+public:
+  void handle(const Command &command);
+};
+
+class QueryHandler {
+public:
+  Result handle(const VisibleRangeQuery &query);
+};
+
+class CommandRegistry {
+public:
+  template <typename CommandType>
+  void registerScopedHandler(const char *scope, CommandHandler *handler) {}
+};
+
+class QueryRegistry {
+public:
+  template <typename QueryType>
+  void registerHandler(QueryHandler *handler) {}
+};
+
+class CommandBus {
+public:
+  Result dispatch(const Command &command);
+};
+
+class QueryBus {
+public:
+  template <typename QueryType>
+  Result dispatch(const QueryType &query);
+};
+
+class Runtime {
+public:
+  void wire(CommandRegistry *commandRegistry, QueryRegistry *queryRegistry);
+  void run(CommandBus *commandBus, QueryBus *queryBus);
+private:
+  CommandHandler *m_commandHandler = nullptr;
+  QueryHandler *m_queryHandler = nullptr;
+};
+
+void Runtime::wire(CommandRegistry *commandRegistry, QueryRegistry *queryRegistry) {
+  commandRegistry->registerScopedHandler<OpenWorkCommand>("work", m_commandHandler);
+  queryRegistry->registerHandler<VisibleRangeQuery>(m_queryHandler);
+}
+
+void Runtime::run(CommandBus *commandBus, QueryBus *queryBus) {
+  OpenWorkCommand command;
+  VisibleRangeQuery query;
+  commandBus->dispatch(command);
+  queryBus->dispatch(query);
+}
+
+void CommandHandler::handle(const Command &) {}
+Result QueryHandler::handle(const VisibleRangeQuery &) { return {}; }
+}
+`
+    );
+
+    const graph = cg!;
+    await graph.indexAll();
+
+    const run = graph.getNodesByName('run').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('Runtime::run'));
+    const commandHandle = graph.getNodesByName('handle').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('CommandHandler::handle'));
+    const queryHandle = graph.getNodesByName('handle').find((n) => n.kind === 'method' && n.qualifiedName.endsWith('QueryHandler::handle'));
+
+    expect(run).toBeDefined();
+    expect(commandHandle).toBeDefined();
+    expect(queryHandle).toBeDefined();
+    expect(graph.getOutgoingEdges(run!.id).some((edge) => edge.kind === 'calls' && edge.target === commandHandle!.id)).toBe(true);
+    expect(graph.getOutgoingEdges(run!.id).some((edge) => edge.kind === 'calls' && edge.target === queryHandle!.id)).toBe(true);
   });
 });

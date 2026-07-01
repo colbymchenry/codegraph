@@ -466,12 +466,18 @@ function resolveMethodOnType(
   // The previous same-file approach missed the latter — the typical C++ layout.
   const methodCandidates = context.getNodesByName(methodName);
   const want = `${typeName}::${methodName}`;
+  const simpleWant = `${cppLastSegment(typeName)}::${methodName}`;
   const matches: Node[] = [];
   for (const m of methodCandidates) {
     if (m.kind !== 'method') continue;
     if (m.language !== ref.language) continue;
     const qn = m.qualifiedName;
-    if (qn === want || qn.endsWith(`::${want}`)) {
+    if (
+      qn === want ||
+      qn.endsWith(`::${want}`) ||
+      qn === simpleWant ||
+      qn.endsWith(`::${simpleWant}`)
+    ) {
       matches.push(m);
     }
   }
@@ -577,6 +583,13 @@ function inferCppReceiverType(
     const declaratorMatch = line.match(declaratorRegex);
     if (declaratorMatch) {
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
+      const beforeMatch = line.slice(0, declaratorMatch.index ?? 0).trim();
+      const looksLikeDeclaration =
+        beforeMatch === '' ||
+        /^(?:template\s*<[^>]+>\s*)?(?:(?:public|private|protected)\s*:)?\s*$/.test(beforeMatch);
+      if (!looksLikeDeclaration) {
+        continue;
+      }
       if (normalized === 'auto') {
         // `auto x = Foo::instance();` — the declared type is deduced; recover it
         // from the initializer (call return type / construction) (#645).

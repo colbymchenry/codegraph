@@ -74,6 +74,11 @@ interface QtCppMethodDeclaration {
 const qtCppSourceCache = new WeakMap<ResolutionContext, QtCppSourceCacheEntry>();
 const qtCppMetaRegistryCache = new WeakMap<ResolutionContext, QtCppMetaRegistryCacheEntry>();
 
+export function clearQtCppMetaCaches(context: ResolutionContext): void {
+  qtCppSourceCache.delete(context);
+  qtCppMetaRegistryCache.delete(context);
+}
+
 export function isCppBridgeFile(filePath: string): boolean {
   return /\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx)$/i.test(filePath);
 }
@@ -94,10 +99,10 @@ export function cppBridgeVersionKey(context: ResolutionContext): string {
 }
 
 export function getQtCppSources(context: ResolutionContext): QtCppSourceCacheEntry {
-  const versionKey = cppBridgeVersionKey(context);
   const cached = qtCppSourceCache.get(context);
-  if (cached?.versionKey === versionKey) return cached;
+  if (cached) return cached;
 
+  const versionKey = cppBridgeVersionKey(context);
   const sources = cppBridgeFiles(context).map(
     (filePath) => [filePath, context.readFile(filePath)] as const
   );
@@ -481,7 +486,7 @@ function matchingBraceOffset(source: string, openBraceOffset: number): number {
 
 function parseQtCppClasses(registry: QtCppMetaRegistry, source: string): void {
   const ranges = namespaceRanges(source);
-  const classPattern = /\b(?:class|struct)\s+([A-Za-z_][A-Za-z0-9_:]*)\b([^{;]*)\{([\s\S]*?)\s*\};/g;
+  const classPattern = /\b(?:class|struct)\s+(?:(?:[A-Z][A-Z0-9_]*_EXPORT|[A-Z][A-Z0-9_]*_API)\s+)?([A-Za-z_][A-Za-z0-9_:]*)\b([^{;]*)\{([\s\S]*?)\s*\};/g;
   for (const match of source.matchAll(classPattern)) {
     const className = match[1];
     const classHeader = match[0].slice(0, match[0].indexOf('{'));
@@ -501,7 +506,7 @@ function parseQtCppClasses(registry: QtCppMetaRegistry, source: string): void {
     if (/\bQ_OBJECT\b|\bQ_GADGET\b|\bQ_PROPERTY\s*\(|\bQ_INVOKABLE\b|\bsignals\s*:|\bQ_SIGNALS\s*:/.test(classBody)) {
       facts.hasQmlExposureEvidence = true;
     }
-    if (/\bQWidget\b|\bQMainWindow\b|\bQDialog\b|\bQPushButton\b|\bQApplication\b/.test(`${classHeader}${classTail}${classBody}`)) {
+    if (/\bQObject\b|\bQWidget\b|\bQFrame\b|\bQMainWindow\b|\bQDialog\b|\bQPushButton\b|\bQApplication\b/.test(`${classHeader}${classTail}${classBody}`)) {
       facts.hasWidgetsEvidence = true;
     }
     parseQtCppProperties(facts, classBody);

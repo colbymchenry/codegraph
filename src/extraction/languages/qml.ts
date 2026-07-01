@@ -266,7 +266,7 @@ function scanStaticReferences(
     const calleeNode = getChildByField(node, 'function');
     const calleeName = staticReferenceName(calleeNode, ctx.source);
     const argsNode = getChildByField(node, 'arguments');
-    if (calleeName === 'Qt.createComponent') {
+    if (calleeName === 'Qt.createComponent' || calleeName?.endsWith('.setSource')) {
       const firstArgument = argsNode?.namedChildren[0] ?? null;
       addStaticReference(
         literalQmlUrl(firstArgument, ctx.source),

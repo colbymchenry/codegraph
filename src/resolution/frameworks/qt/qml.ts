@@ -48,7 +48,7 @@ interface QmlModuleImportCacheEntry {
   imports: QmlModuleImport[];
 }
 
-type QmlCppRegistrationKind = 'type' | 'singleton' | 'uncreatable';
+type QmlCppRegistrationKind = 'type' | 'singleton' | 'uncreatable' | 'anonymous';
 
 interface QmlCppRegistration {
   kind: QmlCppRegistrationKind;
@@ -90,10 +90,32 @@ interface QmlCppBridgeNameIndexCacheEntry {
   index: QmlCppBridgeNameIndex;
 }
 
+interface QmlCppMethodNodeIndex {
+  byId: Map<string, Node>;
+  byName: Map<string, Node[]>;
+}
+
+interface QmlCppMethodNodeIndexCacheEntry {
+  key: string;
+  index: QmlCppMethodNodeIndex;
+}
+
+interface QmlShadowScopeCacheEntry {
+  source: string | null;
+  ranges: QmlObjectRange[];
+  shadowNodesByName: Map<string, Node[]>;
+}
+
 const moduleCache = new WeakMap<ResolutionContext, QmlDirModuleCacheEntry>();
 const importCache = new WeakMap<ResolutionContext, Map<string, QmlModuleImportCacheEntry>>();
 const bridgeNameIndexCache = new WeakMap<ResolutionContext, QmlCppBridgeNameIndexCacheEntry>();
 const bridgeRegistryCache = new WeakMap<ResolutionContext, QmlCppBridgeRegistryCacheEntry>();
+const cppMethodNodeIndexCache = new WeakMap<ResolutionContext, QmlCppMethodNodeIndexCacheEntry>();
+const qmlShadowScopeCache = new WeakMap<ResolutionContext, Map<string, QmlShadowScopeCacheEntry>>();
+const QML_CPP_STRING_DECLARATION_RE =
+  /\b(?:const\s+)?(?:(?:char\s*(?:const\s*)?\*)|QString|QByteArray|std::string)\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(['"])([^'"]+)\2/g;
+const QML_CPP_SET_PROPERTY_RE =
+  /\b[A-Za-z_][A-Za-z0-9_]*\s*(?:->|\.)setProperty\s*\(\s*([^,]+)\s*,\s*([\s\S]*?)\s*\)\s*;/g;
 
 function hasQmlFiles(context: ResolutionContext): boolean {
   return context.getAllFiles().some((filePath) => isQmlFile(filePath));
@@ -112,6 +134,59 @@ function normalizeProjectPath(filePath: string): string {
 
 function joinProjectPath(dir: string, relativePath: string): string {
   return normalizeProjectPath(dir ? `${dir}/${relativePath}` : relativePath);
+}
+
+function matchingParenOffset(source: string, openParenOffset: number): number {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let index = openParenOffset; index < source.length; index++) {
+    const char = source[index];
+    const previous = source[index - 1];
+    if (quote) {
+      if (char === quote && previous !== '\\') quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '(') depth++;
+    else if (char === ')') {
+      depth--;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function splitTopLevelArguments(source: string): string[] {
+  const args: string[] = [];
+  let depth = 0;
+  let angleDepth = 0;
+  let quote: string | null = null;
+  let start = 0;
+  for (let index = 0; index < source.length; index++) {
+    const char = source[index];
+    const previous = source[index - 1];
+    if (quote) {
+      if (char === quote && previous !== '\\') quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '(' || char === '[' || char === '{') depth++;
+    else if (char === ')' || char === ']' || char === '}') depth = Math.max(0, depth - 1);
+    else if (char === '<') angleDepth++;
+    else if (char === '>') angleDepth = Math.max(0, angleDepth - 1);
+    else if (char === ',' && depth === 0 && angleDepth === 0) {
+      args.push(source.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  args.push(source.slice(start).trim());
+  return args.filter(Boolean);
 }
 
 function parseQmlImports(context: ResolutionContext, filePath: string): QmlModuleImport[] {
@@ -263,7 +338,7 @@ function cloneQtCppMetaRegistry(meta: QtCppMetaRegistry): {
 
 function parseQmlCppRegistrations(registry: QmlCppBridgeRegistry, source: string): void {
   const registrationPattern =
-    /\b(qmlRegisterType|qmlRegisterSingletonType|qmlRegisterUncreatableType)\s*<\s*([A-Za-z_][A-Za-z0-9_:]*)\s*>\s*\(\s*(['"])([^'"]+)\3\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"])([^'"]+)\7/g;
+    /\b(qmlRegisterType|qmlRegisterSingletonType|qmlRegisterSingletonInstance|qmlRegisterUncreatableType)\s*<\s*([A-Za-z_][A-Za-z0-9_:]*)\s*>\s*\(\s*(['"])([^'"]+)\3\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"])([^'"]+)\7/g;
   for (const match of source.matchAll(registrationPattern)) {
     const api = match[1];
     const cppType = match[2];
@@ -274,7 +349,7 @@ function parseQmlCppRegistrations(registry: QmlCppBridgeRegistry, source: string
     if (!api || !cppType || !uri || !major || !minor || !qmlName) continue;
 
     const kind: QmlCppRegistrationKind =
-      api === 'qmlRegisterSingletonType'
+      api === 'qmlRegisterSingletonType' || api === 'qmlRegisterSingletonInstance'
         ? 'singleton'
         : api === 'qmlRegisterUncreatableType'
           ? 'uncreatable'
@@ -288,16 +363,58 @@ function parseQmlCppRegistrations(registry: QmlCppBridgeRegistry, source: string
     });
     getOrCreateQmlCppClassFacts(registry, cppType).hasQmlExposureEvidence = true;
   }
+
+  const anonymousPattern =
+    /\bqmlRegisterAnonymousType\s*<\s*([A-Za-z_][A-Za-z0-9_:]*)\s*>\s*\(\s*(['"])([^'"]+)\2\s*,\s*(\d+)\s*\)/g;
+  for (const match of source.matchAll(anonymousPattern)) {
+    const cppType = match[1];
+    const uri = match[3];
+    const major = match[4];
+    if (!cppType || !uri || !major) continue;
+    registry.registrations.push({
+      kind: 'anonymous',
+      cppType,
+      uri,
+      version: `${major}.0`,
+      qmlName: simpleCppTypeName(cppType),
+    });
+    getOrCreateQmlCppClassFacts(registry, cppType).hasQmlExposureEvidence = true;
+  }
 }
 
-function parseQmlCppContextProperties(registry: QmlCppBridgeRegistry, source: string): void {
+function hasDynamicContextPropertyForwarding(source: string): boolean {
+  return /\bdynamicPropertyNames\s*\(\s*\)/.test(source) &&
+    /\bsetContextProperty\s*\([\s\S]*?\bproperty\s*\(/.test(source);
+}
+
+function parseQmlCppContextProperties(
+  registry: QmlCppBridgeRegistry,
+  source: string,
+  exposeDynamicProperties: boolean
+): void {
   const localTypes = new Map<string, string>();
+  const stringValues = new Map<string, string>();
+  const dynamicProperties = new Map<string, string>();
   const typedDeclarationPattern =
     /\b([A-Za-z_][A-Za-z0-9_:]*)\s*(?:[*&]\s*)+([A-Za-z_][A-Za-z0-9_]*)\s*(?:[;=({])/g;
   const valueDeclarationPattern =
     /\b([A-Za-z_][A-Za-z0-9_:]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:[;=({])/g;
   const autoNewPattern =
     /\bauto\s*(?:[*&]\s*)+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*new\s+([A-Za-z_][A-Za-z0-9_:]*)\b/g;
+  const assignmentNewPattern =
+    /\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*new\s+([A-Za-z_][A-Za-z0-9_:]*)\b/g;
+  const smartPointerPattern =
+    /\b(?:std::unique_ptr|std::shared_ptr|QScopedPointer|QSharedPointer)\s*<\s*([A-Za-z_][A-Za-z0-9_:]*)\s*>\s+([A-Za-z_][A-Za-z0-9_]*)\b/g;
+  const methodOwners = new Map<string, string>();
+  for (const match of source.matchAll(/\b([A-Za-z_][A-Za-z0-9_:]*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*(?:const\s*)?\{/g)) {
+    const owner = match[1];
+    if (!owner) continue;
+    const openBrace = source.indexOf('{', match.index);
+    const closeBrace = openBrace >= 0 ? matchingBraceOffset(source, openBrace) : -1;
+    if (openBrace >= 0 && closeBrace >= 0) {
+      methodOwners.set(`${openBrace}:${closeBrace}`, owner);
+    }
+  }
   const addLocalType = (typeName: string | undefined, variableName: string | undefined): void => {
     if (!typeName || !variableName) return;
     if (['return', 'new', 'class', 'struct', 'public', 'private', 'protected', 'auto'].includes(typeName)) {
@@ -321,14 +438,78 @@ function parseQmlCppContextProperties(registry: QmlCppBridgeRegistry, source: st
     const typeName = match[2];
     addLocalType(typeName, variableName);
   }
+  for (const match of source.matchAll(assignmentNewPattern)) {
+    const variableName = match[1];
+    const typeName = match[2];
+    addLocalType(typeName, variableName);
+  }
+  for (const match of source.matchAll(smartPointerPattern)) {
+    const typeName = match[1];
+    const variableName = match[2];
+    addLocalType(typeName, variableName);
+  }
+  for (const match of source.matchAll(QML_CPP_STRING_DECLARATION_RE)) {
+    const variableName = match[1];
+    const value = match[3];
+    if (variableName && value) stringValues.set(variableName, value);
+  }
+  const literalOrStringValue = (expression: string | undefined): string | null => {
+    const trimmed = expression?.trim();
+    if (!trimmed) return null;
+    const literal = /^(['"])([^'"]+)\1$/.exec(trimmed)?.[2];
+    if (literal) return literal;
+    return stringValues.get(trimmed) ?? null;
+  };
+  const typeForExpression = (expression: string): string | undefined => {
+    const trimmed = expression.trim();
+    const newType = /\bnew\s+([A-Za-z_][A-Za-z0-9_:]*)\b/.exec(trimmed)?.[1];
+    if (newType) return newType;
+
+    const staticCastVariable = /static_cast\s*<\s*QObject\s*\*\s*>\s*\(\s*&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/.exec(trimmed)?.[1];
+    if (staticCastVariable) return localTypes.get(staticCastVariable);
+
+    const fromValueArgument = /QVariant\s*::\s*fromValue\s*\(\s*([\s\S]*?)\s*\)\s*$/.exec(trimmed)?.[1];
+    if (fromValueArgument) return typeForExpression(fromValueArgument);
+
+    return localTypes.get(trimmed.replace(/^&/, '').replace(/\.(?:get|data)\s*\(\s*\)$/, ''));
+  };
+  for (const match of source.matchAll(QML_CPP_SET_PROPERTY_RE)) {
+    const propertyName = literalOrStringValue(match[1]);
+    const valueExpression = match[2]?.trim();
+    if (!propertyName || !valueExpression) continue;
+    const cppType = typeForExpression(valueExpression);
+    if (cppType) dynamicProperties.set(propertyName, cppType);
+  }
+  if (exposeDynamicProperties) {
+    for (const [name, cppType] of dynamicProperties) {
+      registry.contextProperties.set(name, { name, cppType });
+      getOrCreateQmlCppClassFacts(registry, cppType).hasQmlExposureEvidence = true;
+    }
+  }
+  const propertyExpressionName = (expression: string): string | null => {
+    const match = /\bproperty\s*\(\s*([^)]+)\)/.exec(expression);
+    return match ? literalOrStringValue(match[1]) : null;
+  };
 
   const contextPropertyPattern =
-    /(?:[A-Za-z_][A-Za-z0-9_]*(?:\.|->)rootContext\(\)\s*(?:\.|->)|[A-Za-z_][A-Za-z0-9_]*\s*(?:\.|->))setContextProperty\s*\(\s*(['"])([^'"]+)\1\s*,\s*&?\s*([A-Za-z_][A-Za-z0-9_]*)/g;
+    /(?:[A-Za-z_][A-Za-z0-9_]*(?:\.|->)rootContext\(\)\s*(?:\.|->)|[A-Za-z_][A-Za-z0-9_]*\s*(?:\.|->))setContextProperty\s*\(/g;
   for (const match of source.matchAll(contextPropertyPattern)) {
-    const name = match[2];
-    const variableName = match[3];
-    if (!name || !variableName) continue;
-    const cppType = localTypes.get(variableName);
+    const openParen = (match.index ?? 0) + match[0].length - 1;
+    const closeParen = openParen >= 0 ? matchingParenOffset(source, openParen) : -1;
+    if (openParen < 0 || closeParen < 0) continue;
+    const args = splitTopLevelArguments(source.slice(openParen + 1, closeParen));
+    const name = literalOrStringValue(args[0]);
+    const expression = args[1]?.trim();
+    if (!name || !expression) continue;
+    const cppType =
+      expression === 'this'
+        ? [...methodOwners.entries()]
+            .find(([range]) => {
+              const [start, end] = range.split(':').map(Number);
+              return Number.isFinite(start) && Number.isFinite(end) && (match.index ?? -1) >= start! && (match.index ?? -1) <= end!;
+            })?.[1]
+        : dynamicProperties.get(propertyExpressionName(expression) ?? '') ??
+          typeForExpression(expression);
     if (!cppType) continue;
     registry.contextProperties.set(name, { name, cppType });
     getOrCreateQmlCppClassFacts(registry, cppType).hasQmlExposureEvidence = true;
@@ -347,23 +528,27 @@ function getQmlCppBridgeNameIndex(context: ResolutionContext): QmlCppBridgeNameI
     uncreatableTypes: new Set(),
   };
   const registrationPattern =
-    /\b(qmlRegisterType|qmlRegisterSingletonType|qmlRegisterUncreatableType)\s*<\s*[A-Za-z_][A-Za-z0-9_:]*\s*>\s*\(\s*(['"])([^'"]+)\2\s*,\s*\d+\s*,\s*\d+\s*,\s*(['"])([^'"]+)\4/g;
-  const contextPropertyPattern =
-    /setContextProperty\s*\(\s*(['"])([^'"]+)\1\s*,\s*&?\s*[A-Za-z_][A-Za-z0-9_]*/g;
-
+    /\b(qmlRegisterType|qmlRegisterSingletonType|qmlRegisterSingletonInstance|qmlRegisterUncreatableType)\s*<\s*[A-Za-z_][A-Za-z0-9_:]*\s*>\s*\(\s*(['"])([^'"]+)\2\s*,\s*\d+\s*,\s*\d+\s*,\s*(['"])([^'"]+)\4/g;
+  const anonymousRegistrationPattern =
+    /\bqmlRegisterAnonymousType\s*<\s*([A-Za-z_][A-Za-z0-9_:]*)\s*>\s*\(\s*(['"])([^'"]+)\2\s*,\s*\d+\s*\)/g;
   for (const [, source] of sourceEntry.sources) {
     if (!source) continue;
     for (const match of source.matchAll(registrationPattern)) {
       const api = match[1];
       const qmlName = match[5];
       if (!api || !qmlName) continue;
-      if (api === 'qmlRegisterSingletonType') index.singletonTypes.add(qmlName);
+      if (api === 'qmlRegisterSingletonType' || api === 'qmlRegisterSingletonInstance') index.singletonTypes.add(qmlName);
       else if (api === 'qmlRegisterUncreatableType') index.uncreatableTypes.add(qmlName);
       else index.creatableTypes.add(qmlName);
     }
-    for (const match of source.matchAll(contextPropertyPattern)) {
-      if (match[2]) index.contextProperties.add(match[2]);
+    for (const match of source.matchAll(anonymousRegistrationPattern)) {
+      if (match[1]) index.uncreatableTypes.add(simpleCppTypeName(match[1]));
     }
+  }
+
+  const registry = getQmlCppBridgeRegistry(context);
+  for (const contextProperty of registry.contextProperties.values()) {
+    index.contextProperties.add(contextProperty.name);
   }
 
   bridgeNameIndexCache.set(context, { key: sourceEntry.key, index });
@@ -395,10 +580,13 @@ function getQmlCppBridgeRegistry(context: ResolutionContext): QmlCppBridgeRegist
     registrations: [],
     contextProperties: new Map(),
   };
+  const exposeDynamicProperties = sources.some(([, source]) =>
+    source ? hasDynamicContextPropertyForwarding(source) : false
+  );
   for (const [, source] of sources) {
     if (!source) continue;
     parseQmlCppRegistrations(registry, source);
-    parseQmlCppContextProperties(registry, source);
+    parseQmlCppContextProperties(registry, source, exposeDynamicProperties);
   }
   attachQmlCppBridgeNodes(registry);
   bridgeRegistryCache.set(context, { key, registry });
@@ -766,27 +954,53 @@ function uniqueQtCppSignalFact(
   return signalMethods.length === 1 ? signalMethods[0] : undefined;
 }
 
+function getQmlCppMethodNodeIndex(context: ResolutionContext): QmlCppMethodNodeIndex {
+  const sourceEntry = getQtCppSources(context);
+  const cached = cppMethodNodeIndexCache.get(context);
+  if (cached?.key === sourceEntry.key) return cached.index;
+
+  const byId = new Map<string, Node>();
+  const byName = new Map<string, Node[]>();
+  for (const node of context.getNodesByKind('method')) {
+    if (node.language !== 'cpp') continue;
+    byId.set(node.id, node);
+    const nodes = byName.get(node.name) ?? [];
+    nodes.push(node);
+    byName.set(node.name, nodes);
+  }
+
+  const index = { byId, byName };
+  cppMethodNodeIndexCache.set(context, { key: sourceEntry.key, index });
+  return index;
+}
+
 function findCppMethodNodeByFact(
   context: ResolutionContext,
   classFacts: QtCppClassFacts | undefined,
   method: QtCppMethodFact
 ): Node | null {
+  const nodeIndex = getQmlCppMethodNodeIndex(context);
   if (method.nodeId) {
-    return context.getNodesByName(method.name).find((node) => node.id === method.nodeId) ?? null;
+    return nodeIndex.byId.get(method.nodeId) ?? null;
   }
 
   const qualifiedName = method.qualifiedName;
   if (!qualifiedName) return null;
-  const sourceMatches = context
-    .getNodesByName(method.name)
-    .filter(
-      (node) =>
-        node.language === 'cpp' &&
-        node.kind === 'method' &&
-        (node.qualifiedName === qualifiedName || node.qualifiedName.endsWith(`::${qualifiedName}`))
-    );
+  const namedNodes = nodeIndex.byName.get(method.name) ?? [];
+  const sourceMatches = namedNodes.filter(
+    (node) =>
+      node.qualifiedName === qualifiedName || node.qualifiedName.endsWith(`::${qualifiedName}`)
+  );
 
-  if (sourceMatches.length <= 1) return sourceMatches[0] ?? null;
+  if (sourceMatches.length === 1) return sourceMatches[0]!;
+
+  if (sourceMatches.length === 0 && classFacts?.name) {
+    const simpleOwnerMatches = namedNodes.filter((node) =>
+      node.qualifiedName.endsWith(`${classFacts.name}::${method.name}`)
+    );
+    if (simpleOwnerMatches.length === 1) return simpleOwnerMatches[0]!;
+    return null;
+  }
 
   const signatureMatches = sourceMatches.filter((node) => {
     const source = context.readFile(node.filePath);
@@ -802,7 +1016,12 @@ function findCppMethodNodeByFact(
   if (signatureMatches.length === 1) return signatureMatches[0]!;
 
   if (classFacts?.classNodeId) {
-    const ownerScopedMatches = sourceMatches.filter((node) => node.filePath === sourceMatches[0]?.filePath);
+    const classNode =
+      context.getNodeById?.(classFacts.classNodeId) ??
+      context.getNodesByName(classFacts.name).find((node) => node.id === classFacts.classNodeId);
+    const ownerScopedMatches = classNode
+      ? sourceMatches.filter((node) => node.filePath === classNode.filePath)
+      : [];
     if (ownerScopedMatches.length === 1) return ownerScopedMatches[0]!;
   }
 
@@ -845,21 +1064,25 @@ function resolveQmlCppBridgeCall(
   if (parts.length < 2) return null;
 
   const methodName = parts[parts.length - 1]!;
+  const registry = getQmlCppBridgeRegistry(context);
+  const resolveContextPropertyMethod = (receiver: string, respectQmlShadowing: boolean): ResolvedRef | null => {
+    if (respectQmlShadowing && isShadowedQmlContextProperty(context, ref, receiver)) return null;
+    if (!getQmlCppBridgeNameIndex(context).contextProperties.has(receiver)) return null;
+    const contextProperty = registry.contextProperties.get(receiver);
+    if (!contextProperty) return null;
+    const classFacts = findQmlCppClassFacts(registry, contextProperty.cppType);
+    return resolveQmlCppMethod(ref, context, classFacts, contextProperty.cppType, methodName);
+  };
+
   if (parts.length === 2) {
     const receiver = parts[0]!;
-    if (isShadowedQmlContextProperty(context, ref, receiver)) return null;
-
     const bridgeNames = getQmlCppBridgeNameIndex(context);
     if (!bridgeNames.contextProperties.has(receiver) && !bridgeNames.singletonTypes.has(receiver)) {
       return null;
     }
 
-    const registry = getQmlCppBridgeRegistry(context);
-    const contextProperty = registry.contextProperties.get(receiver);
-    if (contextProperty) {
-      const classFacts = findQmlCppClassFacts(registry, contextProperty.cppType);
-      return resolveQmlCppMethod(ref, context, classFacts, contextProperty.cppType, methodName);
-    }
+    const contextPropertyResult = resolveContextPropertyMethod(receiver, true);
+    if (contextPropertyResult) return contextPropertyResult;
 
     const registration = importedBridgeRegistration(
       context,
@@ -874,6 +1097,10 @@ function resolveQmlCppBridgeCall(
     }
     return null;
   }
+
+  const nestedContextPropertyReceiver = parts[parts.length - 2]!;
+  const nestedContextPropertyResult = resolveContextPropertyMethod(nestedContextPropertyReceiver, false);
+  if (nestedContextPropertyResult) return nestedContextPropertyResult;
 
   if (parts.length === 3) {
     const alias = parts[0]!;
@@ -965,17 +1192,48 @@ function qmlObjectRanges(source: string): QmlObjectRange[] {
 }
 
 function innermostQmlObjectRange(
-  source: string,
+  ranges: QmlObjectRange[],
   offset: number
 ): QmlObjectRange | null {
   return (
-    qmlObjectRanges(source)
+    ranges
       .filter((range) => range.openBrace <= offset && offset <= range.closeBrace)
       .sort(
         (left, right) =>
           left.closeBrace - left.openBrace - (right.closeBrace - right.openBrace)
       )[0] ?? null
   );
+}
+
+function getQmlShadowScopeCache(
+  context: ResolutionContext,
+  filePath: string,
+  source: string | null
+): QmlShadowScopeCacheEntry {
+  let perContext = qmlShadowScopeCache.get(context);
+  if (!perContext) {
+    perContext = new Map();
+    qmlShadowScopeCache.set(context, perContext);
+  }
+
+  const cached = perContext.get(filePath);
+  if (cached?.source === source) return cached;
+
+  const shadowNodesByName = new Map<string, Node[]>();
+  for (const node of context.getNodesInFile(filePath)) {
+    if (!isShadowingQmlNode(node, node.name)) continue;
+    const nodes = shadowNodesByName.get(node.name) ?? [];
+    nodes.push(node);
+    shadowNodesByName.set(node.name, nodes);
+  }
+
+  const entry = {
+    source,
+    ranges: source ? qmlObjectRanges(source) : [],
+    shadowNodesByName,
+  };
+  perContext.set(filePath, entry);
+  return entry;
 }
 
 function isShadowedQmlContextProperty(
@@ -986,11 +1244,11 @@ function isShadowedQmlContextProperty(
   const source = context.readFile(ref.filePath);
   if (!source) return false;
 
+  const scopeCache = getQmlShadowScopeCache(context, ref.filePath, source);
   const refOffset = offsetFromLineColumn(source, ref.line, ref.column);
-  return context.getNodesInFile(ref.filePath).some((node) => {
-    if (!isShadowingQmlNode(node, name)) return false;
+  return (scopeCache.shadowNodesByName.get(name) ?? []).some((node) => {
     const declarationOffset = offsetFromLineColumn(source, node.startLine, node.startColumn);
-    const declarationScope = innermostQmlObjectRange(source, declarationOffset);
+    const declarationScope = innermostQmlObjectRange(scopeCache.ranges, declarationOffset);
     return (
       declarationScope != null &&
       declarationScope.openBrace <= refOffset &&
@@ -1166,7 +1424,7 @@ function resolveQmlCppRegisteredTypeReference(
     registry,
     ref.filePath,
     componentName,
-    new Set<QmlCppRegistrationKind>(['type', 'uncreatable']),
+    new Set<QmlCppRegistrationKind>(['type', 'uncreatable', 'anonymous']),
     alias
   );
   if (!registration?.classNodeId) return null;

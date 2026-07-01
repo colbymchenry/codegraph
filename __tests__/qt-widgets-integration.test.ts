@@ -30,6 +30,17 @@ describe('Qt Widgets graph support', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  function outgoingSynthesizedEdges(sourceId: string, synthesizedBy: string) {
+    return graph!
+      .getOutgoingEdges(sourceId)
+      .filter(
+        (edge) =>
+          edge.kind === 'calls' &&
+          edge.metadata &&
+          (edge.metadata as Record<string, unknown>).synthesizedBy === synthesizedBy
+      );
+  }
+
   it('detects Qt Widgets projects from QApplication and QWidget usage', async () => {
     fs.writeFileSync(
       path.join(tmpDir, 'main.cpp'),
@@ -306,6 +317,806 @@ void Receiver::handle() {}
         .getOutgoingEdges(wire!.id)
         .some((edge) => edge.kind === 'calls' && edge.target === handle!.id)
     ).toBe(false);
+  });
+
+  it('does not synthesize custom connect helpers inside Qt classes', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+
+class Source {
+public:
+  void changed();
+};
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  void wire(Source *source);
+  void handle();
+};
+
+void connect(Source *source, void (Source::*signal)(), MainWindow *receiver, void (MainWindow::*slot)()) {}
+
+void MainWindow::wire(Source *source) {
+  connect(source, &Source::changed, this, &MainWindow::handle);
+}
+
+void Source::changed() {}
+void MainWindow::handle() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const wire = graph!
+      .getNodesByName('wire')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::wire'));
+    const handle = graph!
+      .getNodesByName('handle')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::handle'));
+
+    expect(wire).toBeDefined();
+    expect(handle).toBeDefined();
+    expect(
+      graph!
+        .getOutgoingEdges(wire!.id)
+        .some((edge) => edge.kind === 'calls' && edge.target === handle!.id)
+    ).toBe(false);
+  });
+
+  it('resolves legacy SIGNAL/SLOT connects to the matching slot', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include <QPushButton>
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  void wire(QPushButton *button);
+public slots:
+  void onClicked();
+};
+
+void MainWindow::wire(QPushButton *button) {
+  connect(button, SIGNAL(clicked()), this, SLOT(onClicked()));
+}
+
+void MainWindow::onClicked() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const wire = graph!
+      .getNodesByName('wire')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::wire'));
+    const onClicked = graph!
+      .getNodesByName('onClicked')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::onClicked'));
+
+    expect(wire).toBeDefined();
+    expect(onClicked).toBeDefined();
+    expect(outgoingSynthesizedEdges(wire!.id, 'qt-widgets-connect').some((edge) => edge.target === onClicked!.id)).toBe(true);
+  });
+
+  it('resolves legacy SIGNAL/SLOT connects with typed non-this receivers', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include <QPushButton>
+
+class PerformanceWidget : public QObject {
+  Q_OBJECT
+public slots:
+  void reload();
+};
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  void wire(QPushButton *button);
+private:
+  PerformanceWidget *m_pPerformanceWidget;
+};
+
+void MainWindow::wire(QPushButton *button) {
+  connect(button, SIGNAL(clicked()), m_pPerformanceWidget, SLOT(reload()));
+}
+
+void PerformanceWidget::reload() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const wire = graph!
+      .getNodesByName('wire')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::wire'));
+    const reload = graph!
+      .getNodesByName('reload')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('PerformanceWidget::reload'));
+
+    expect(wire).toBeDefined();
+    expect(reload).toBeDefined();
+    expect(outgoingSynthesizedEdges(wire!.id, 'qt-widgets-connect').some((edge) => edge.target === reload!.id)).toBe(true);
+  });
+
+  it('links emitted Qt signals to slots registered elsewhere', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'login.cpp'),
+      `#include <QMainWindow>
+#include <QObject>
+#include <QPushButton>
+
+class HttpLogin : public QObject {
+  Q_OBJECT
+public:
+  void userLogin(QPushButton *button);
+  void slot_userLoginFinish();
+signals:
+  void signal_userLoginFinish(bool ok);
+};
+
+class UserNameLoginPage : public QObject {
+  Q_OBJECT
+public:
+  void initConnections(QPushButton *button);
+  void slot_login_button_clicked();
+  void loginAfterUpdateCheck();
+public slots:
+  void slot_loginFinished(bool ok);
+signals:
+  void signal_httpLoginFinish(bool ok);
+};
+
+class LoginWidget : public QMainWindow {
+  Q_OBJECT
+public:
+  void initConnection();
+public slots:
+  void slot_userLoginFinish(bool ok);
+  void slot_triggerAppCheck();
+private:
+  UserNameLoginPage *loginPage_;
+};
+
+void HttpLogin::userLogin(QPushButton *button) {
+  connect(button, SIGNAL(clicked()), this, SLOT(slot_userLoginFinish()));
+}
+
+void HttpLogin::slot_userLoginFinish() {
+  emit signal_userLoginFinish(true);
+}
+
+void UserNameLoginPage::initConnections(QPushButton *button) {
+  connect(button, &QPushButton::clicked, this, &UserNameLoginPage::slot_login_button_clicked);
+}
+
+void UserNameLoginPage::slot_login_button_clicked() {
+  loginAfterUpdateCheck();
+}
+
+void UserNameLoginPage::loginAfterUpdateCheck() {
+  HttpLogin *client = new HttpLogin;
+  connect(client, &HttpLogin::signal_userLoginFinish, this, &UserNameLoginPage::slot_loginFinished);
+}
+
+void UserNameLoginPage::slot_loginFinished(bool ok) {
+  emit signal_httpLoginFinish(ok);
+}
+
+void LoginWidget::initConnection() {
+  connect(loginPage_, &UserNameLoginPage::signal_httpLoginFinish, this, &LoginWidget::slot_userLoginFinish);
+}
+
+void LoginWidget::slot_userLoginFinish(bool ok) {
+  if (ok) {
+    slot_triggerAppCheck();
+  }
+}
+
+void LoginWidget::slot_triggerAppCheck() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const httpFinish = graph!
+      .getNodesByName('slot_userLoginFinish')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('HttpLogin::slot_userLoginFinish'));
+    const pageFinish = graph!
+      .getNodesByName('slot_loginFinished')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('UserNameLoginPage::slot_loginFinished'));
+    const widgetFinish = graph!
+      .getNodesByName('slot_userLoginFinish')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('LoginWidget::slot_userLoginFinish'));
+    const triggerAppCheck = graph!
+      .getNodesByName('slot_triggerAppCheck')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('LoginWidget::slot_triggerAppCheck'));
+
+    expect(httpFinish).toBeDefined();
+    expect(pageFinish).toBeDefined();
+    expect(widgetFinish).toBeDefined();
+    expect(triggerAppCheck).toBeDefined();
+    expect(outgoingSynthesizedEdges(httpFinish!.id, 'qt-widgets-connect').some((edge) => edge.target === pageFinish!.id)).toBe(true);
+    expect(outgoingSynthesizedEdges(pageFinish!.id, 'qt-widgets-connect').some((edge) => edge.target === widgetFinish!.id)).toBe(true);
+    expect(
+      graph!
+        .getOutgoingEdges(widgetFinish!.id)
+        .some((edge) => edge.kind === 'calls' && edge.target === triggerAppCheck!.id)
+    ).toBe(true);
+  });
+
+  it('links emitted Qt signals when Qt meta declarations are incomplete', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'login.h'),
+      `#include <QFrame>
+#include <QObject>
+#include <QWidget>
+
+class HttpLogin : public QObject {
+  Q_OBJECT
+public:
+  void userLogin();
+private slots:
+  void slot_userLoginFinish();
+signals:
+  void signal_userLoginFinish(bool ok, int code, QString desc);
+};
+
+class UserNameLoginPage : public QFrame {
+  Q_OBJECT
+public:
+  void initConnections();
+  void loginAfterUpdateCheck();
+public slots:
+  void slot_loginFinished(bool ok, int code, QString desc);
+signals:
+  void signal_httpLoginFinish(bool ok, int code, QString desc);
+};
+
+class LoginWidget : public QWidget {
+  Q_OBJECT
+public:
+  void initConnection();
+private slots:
+  void slot_userLoginFinish(bool ok, int code, QString desc);
+  void slot_triggerAppCheck();
+private:
+  UserNameLoginPage *loginPage_;
+};
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'login.cpp'),
+      `#include "login.h"
+
+void HttpLogin::userLogin() {
+  connect(this, SIGNAL(signal_userLoginFinish(bool, int, QString)), this, SLOT(slot_userLoginFinish()));
+}
+
+void HttpLogin::slot_userLoginFinish() {
+  emit signal_userLoginFinish(true, 0, QString());
+}
+
+void UserNameLoginPage::initConnections() {
+  loginAfterUpdateCheck();
+}
+
+void UserNameLoginPage::loginAfterUpdateCheck() {
+  HttpLogin *pLoginClient = new HttpLogin;
+  connect(pLoginClient, &HttpLogin::signal_userLoginFinish, this, &UserNameLoginPage::slot_loginFinished);
+}
+
+void UserNameLoginPage::slot_loginFinished(bool ok, int code, QString desc) {
+  emit signal_httpLoginFinish(ok, code, desc);
+}
+
+void LoginWidget::initConnection() {
+  connect(loginPage_, &UserNameLoginPage::signal_httpLoginFinish, this, &LoginWidget::slot_userLoginFinish);
+}
+
+void LoginWidget::slot_userLoginFinish(bool ok, int, QString) {
+  if (ok) {
+    slot_triggerAppCheck();
+  }
+}
+
+void LoginWidget::slot_triggerAppCheck() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const httpFinish = graph!
+      .getNodesByName('slot_userLoginFinish')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('HttpLogin::slot_userLoginFinish'));
+    const pageFinish = graph!
+      .getNodesByName('slot_loginFinished')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('UserNameLoginPage::slot_loginFinished'));
+    const widgetFinish = graph!
+      .getNodesByName('slot_userLoginFinish')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('LoginWidget::slot_userLoginFinish'));
+
+    expect(httpFinish).toBeDefined();
+    expect(pageFinish).toBeDefined();
+    expect(widgetFinish).toBeDefined();
+    expect(outgoingSynthesizedEdges(httpFinish!.id, 'qt-widgets-connect').some((edge) => edge.target === pageFinish!.id)).toBe(true);
+    expect(outgoingSynthesizedEdges(pageFinish!.id, 'qt-widgets-connect').some((edge) => edge.target === widgetFinish!.id)).toBe(true);
+  });
+
+  it('keeps methods after old-style Qt SIGNAL/SLOT macros with typed arguments', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'loginwidget.cpp'),
+      `#include <QMainWindow>
+#include <QUrl>
+
+class LoginWidget : public QMainWindow {
+  Q_OBJECT
+public:
+  void initConnection();
+  void LodingInit();
+public slots:
+  void slot_anchorClicked(const QUrl&);
+  void slot_userLoginFinish(bool, int, QString);
+  void slot_triggerAppCheck();
+};
+
+void LoginWidget::initConnection() {
+  connect(ui.errorTipLab, SIGNAL(anchorClicked(const QUrl&)), this, SLOT(slot_anchorClicked(const QUrl&)));
+}
+
+void LoginWidget::LodingInit() {
+  movie->start();
+}
+
+void LoginWidget::slot_userLoginFinish(bool bSuccess, int, QString) {
+  if (bSuccess) {
+    slot_triggerAppCheck();
+  }
+}
+
+void LoginWidget::slot_triggerAppCheck() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const lodingInit = graph!
+      .getNodesByName('LodingInit')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('LoginWidget::LodingInit'));
+    const widgetFinish = graph!
+      .getNodesByName('slot_userLoginFinish')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('LoginWidget::slot_userLoginFinish'));
+    const triggerAppCheck = graph!
+      .getNodesByName('slot_triggerAppCheck')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('LoginWidget::slot_triggerAppCheck'));
+
+    expect(lodingInit).toBeDefined();
+    expect(widgetFinish).toBeDefined();
+    expect(triggerAppCheck).toBeDefined();
+    expect(
+      graph!
+        .getOutgoingEdges(widgetFinish!.id)
+        .some((edge) => edge.kind === 'calls' && edge.target === triggerAppCheck!.id)
+    ).toBe(true);
+  });
+
+  it('resolves lambda receiver connects to the lambda callback body', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include <QPushButton>
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  void wire(QPushButton *button);
+  void updateUi();
+};
+
+void MainWindow::wire(QPushButton *button) {
+  connect(button, &QPushButton::clicked, this, [this]() {
+    updateUi();
+  });
+}
+
+void MainWindow::updateUi() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const wire = graph!
+      .getNodesByName('wire')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::wire'));
+    const updateUi = graph!
+      .getNodesByName('updateUi')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::updateUi'));
+
+    expect(wire).toBeDefined();
+    expect(updateUi).toBeDefined();
+    expect(outgoingSynthesizedEdges(wire!.id, 'qt-widgets-connect').some((edge) => edge.target === updateUi!.id)).toBe(true);
+  });
+
+  it('resolves functor receiver connects to a unique operator call', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include <QPushButton>
+
+class ClickFunctor {
+public:
+  void operator()();
+};
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  void wire(QPushButton *button);
+};
+
+void MainWindow::wire(QPushButton *button) {
+  ClickFunctor functor;
+  connect(button, &QPushButton::clicked, functor);
+}
+
+void ClickFunctor::operator()() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const wire = graph!
+      .getNodesByName('wire')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::wire'));
+    const callOperator = graph!
+      .getNodesByName('operator()')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('ClickFunctor::operator()'));
+
+    expect(wire).toBeDefined();
+    expect(callOperator).toBeDefined();
+    expect(outgoingSynthesizedEdges(wire!.id, 'qt-widgets-connect').some((edge) => edge.target === callOperator!.id)).toBe(true);
+  });
+
+  it('resolves .ui auto-connect slots when setupUi is called without explicit connect text', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include "ui_mainwindow.h"
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+private slots:
+  void on_okButton_clicked();
+};
+
+MainWindow::MainWindow() {
+  setupUi(this);
+}
+
+void MainWindow::on_okButton_clicked() {}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.ui'),
+      `<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <widget class="QPushButton" name="okButton" />
+ </widget>
+</ui>
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!
+      .getNodesByName('MainWindow')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
+    const slot = graph!
+      .getNodesByName('on_okButton_clicked')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_okButton_clicked'));
+
+    expect(constructor).toBeDefined();
+    expect(slot).toBeDefined();
+    expect(outgoingSynthesizedEdges(constructor!.id, 'qt-widgets-autoconnect').some((edge) => edge.target === slot!.id)).toBe(true);
+  });
+
+  it('resolves .ui auto-connect slots through generated ui.setupUi(this) members', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include "ui_mainwindow.h"
+
+namespace Ui { class MainWindow; }
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+private slots:
+  void on_tabs_currentChanged();
+  void on_results_itemClicked();
+  void on_actionRefresh_triggered();
+private:
+  Ui::MainWindow ui;
+};
+
+MainWindow::MainWindow() {
+  ui.setupUi(this);
+}
+
+void MainWindow::on_tabs_currentChanged() {}
+void MainWindow::on_results_itemClicked() {}
+void MainWindow::on_actionRefresh_triggered() {}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.ui'),
+      `<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <widget class="QTabWidget" name="tabs" />
+  <widget class="QListWidget" name="results" />
+  <action name="actionRefresh" />
+ </widget>
+</ui>
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!
+      .getNodesByName('MainWindow')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
+    const tabs = graph!
+      .getNodesByName('on_tabs_currentChanged')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_tabs_currentChanged'));
+    const results = graph!
+      .getNodesByName('on_results_itemClicked')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_results_itemClicked'));
+    const action = graph!
+      .getNodesByName('on_actionRefresh_triggered')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_actionRefresh_triggered'));
+
+    expect(constructor).toBeDefined();
+    expect(tabs).toBeDefined();
+    expect(results).toBeDefined();
+    expect(action).toBeDefined();
+
+    const edges = outgoingSynthesizedEdges(constructor!.id, 'qt-widgets-autoconnect');
+    expect(edges.some((edge) => edge.target === tabs!.id)).toBe(true);
+    expect(edges.some((edge) => edge.target === results!.id)).toBe(true);
+    expect(edges.some((edge) => edge.target === action!.id)).toBe(true);
+  });
+
+  it('keeps .ui auto-connect limited to widget classes and known Qt signal names', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include "ui_mainwindow.h"
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+private slots:
+  void on_okButton_clicked();
+  void on_okButton_notASignal();
+  void on_gridLayout_clicked();
+};
+
+MainWindow::MainWindow() {
+  setupUi(this);
+}
+
+void MainWindow::on_okButton_clicked() {}
+void MainWindow::on_okButton_notASignal() {}
+void MainWindow::on_gridLayout_clicked() {}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.ui'),
+      `<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <layout class="QGridLayout" name="gridLayout" />
+  <widget class="QPushButton" name="okButton" />
+ </widget>
+</ui>
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!
+      .getNodesByName('MainWindow')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
+    const clicked = graph!
+      .getNodesByName('on_okButton_clicked')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_okButton_clicked'));
+    const notASignal = graph!
+      .getNodesByName('on_okButton_notASignal')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_okButton_notASignal'));
+    const layoutSlot = graph!
+      .getNodesByName('on_gridLayout_clicked')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_gridLayout_clicked'));
+
+    expect(constructor).toBeDefined();
+    expect(clicked).toBeDefined();
+    expect(notASignal).toBeDefined();
+    expect(layoutSlot).toBeDefined();
+
+    const autoConnectEdges = outgoingSynthesizedEdges(constructor!.id, 'qt-widgets-autoconnect');
+    expect(autoConnectEdges.some((edge) => edge.target === clicked!.id)).toBe(true);
+    expect(autoConnectEdges.some((edge) => edge.target === notASignal!.id)).toBe(false);
+    expect(autoConnectEdges.some((edge) => edge.target === layoutSlot!.id)).toBe(false);
+  });
+
+  it('uses local .ui ownership evidence when duplicate form classes exist', async () => {
+    fs.mkdirSync(path.join(tmpDir, 'app'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'other'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'app', 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include "ui_mainwindow.h"
+
+namespace App {
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+private slots:
+  void on_appButton_clicked();
+  void on_otherButton_clicked();
+};
+}
+
+App::MainWindow::MainWindow() {
+  setupUi(this);
+}
+
+void App::MainWindow::on_appButton_clicked() {}
+void App::MainWindow::on_otherButton_clicked() {}
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'app', 'mainwindow.ui'),
+      `<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <widget class="QPushButton" name="appButton" />
+ </widget>
+</ui>
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'other', 'mainwindow.ui'),
+      `<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <widget class="QPushButton" name="otherButton" />
+ </widget>
+</ui>
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!
+      .getNodesByName('MainWindow')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('App::MainWindow::MainWindow'));
+    const appSlot = graph!
+      .getNodesByName('on_appButton_clicked')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('App::MainWindow::on_appButton_clicked'));
+    const otherSlot = graph!
+      .getNodesByName('on_otherButton_clicked')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('App::MainWindow::on_otherButton_clicked'));
+
+    expect(constructor).toBeDefined();
+    expect(appSlot).toBeDefined();
+    expect(otherSlot).toBeDefined();
+
+    const autoConnectEdges = outgoingSynthesizedEdges(constructor!.id, 'qt-widgets-autoconnect');
+    expect(autoConnectEdges.some((edge) => edge.target === appSlot!.id)).toBe(true);
+    expect(autoConnectEdges.some((edge) => edge.target === otherSlot!.id)).toBe(false);
+  });
+
+  it('does not synthesize edges for pure .ui projects without C++ auto-connect code', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.ui'),
+      `<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <widget class="QPushButton" name="okButton" />
+ </widget>
+</ui>
+`
+    );
+
+    await graph!.indexAll();
+
+    const synthesizedEdges = graph!
+      .getNodesByKind('file')
+      .flatMap((node) => graph!.getOutgoingEdges(node.id))
+      .filter((edge) => edge.metadata && (edge.metadata as Record<string, unknown>).synthesizedBy === 'qt-widgets-autoconnect');
+    expect(synthesizedEdges).toHaveLength(0);
+  });
+
+  it('updates .ui auto-connect edges when form widgets change during sync', async () => {
+    const cppPath = path.join(tmpDir, 'mainwindow.cpp');
+    const uiPath = path.join(tmpDir, 'mainwindow.ui');
+    fs.writeFileSync(
+      cppPath,
+      `#include <QMainWindow>
+#include "ui_mainwindow.h"
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+private slots:
+  void on_okButton_clicked();
+  void on_cancelButton_clicked();
+};
+
+MainWindow::MainWindow() {
+  setupUi(this);
+}
+
+void MainWindow::on_okButton_clicked() {}
+void MainWindow::on_cancelButton_clicked() {}
+`
+    );
+    fs.writeFileSync(
+      uiPath,
+      `<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <widget class="QPushButton" name="okButton" />
+ </widget>
+</ui>
+`
+    );
+
+    await graph!.indexAll();
+
+    const constructor = graph!
+      .getNodesByName('MainWindow')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
+    const okSlot = graph!
+      .getNodesByName('on_okButton_clicked')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_okButton_clicked'));
+    const cancelSlot = graph!
+      .getNodesByName('on_cancelButton_clicked')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_cancelButton_clicked'));
+
+    expect(constructor).toBeDefined();
+    expect(okSlot).toBeDefined();
+    expect(cancelSlot).toBeDefined();
+    expect(outgoingSynthesizedEdges(constructor!.id, 'qt-widgets-autoconnect').some((edge) => edge.target === okSlot!.id)).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.writeFileSync(
+      uiPath,
+      `<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <widget class="QPushButton" name="cancelButton" />
+ </widget>
+</ui>
+`
+    );
+    await graph!.sync();
+
+    const autoConnectEdges = outgoingSynthesizedEdges(constructor!.id, 'qt-widgets-autoconnect');
+    expect(autoConnectEdges.some((edge) => edge.target === okSlot!.id)).toBe(false);
+    expect(autoConnectEdges.some((edge) => edge.target === cancelSlot!.id)).toBe(true);
   });
 
   it('does not synthesize Qt connect edges when the receiver slot is missing', async () => {
@@ -1023,5 +1834,167 @@ Item {
         .getOutgoingEdges(handler!.id)
         .some((edge) => edge.kind === 'references' && edge.target === signal!.id)
     ).toBe(true);
+  });
+
+  it('resolves QTimer singleShot legacy slots to the receiving object method', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include <QTimer>
+
+class Worker : public QObject {
+  Q_OBJECT
+public slots:
+  void reload();
+};
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  void schedule();
+private:
+  Worker *worker;
+};
+
+void MainWindow::schedule() {
+  QTimer::singleShot(100, worker, SLOT(reload()));
+}
+
+void Worker::reload() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const schedule = graph!
+      .getNodesByName('schedule')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::schedule'));
+    const reload = graph!
+      .getNodesByName('reload')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('Worker::reload'));
+
+    expect(schedule).toBeDefined();
+    expect(reload).toBeDefined();
+    expect(outgoingSynthesizedEdges(schedule!.id, 'qt-widgets-connect').some((edge) => edge.target === reload!.id)).toBe(true);
+  });
+
+  it('resolves QMetaObject invokeMethod string targets conservatively', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include <QMetaObject>
+
+class Worker : public QObject {
+  Q_OBJECT
+public slots:
+  void reload();
+};
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  void invoke();
+private:
+  Worker *worker;
+};
+
+void MainWindow::invoke() {
+  QMetaObject::invokeMethod(worker, "reload");
+}
+
+void Worker::reload() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const invoke = graph!
+      .getNodesByName('invoke')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::invoke'));
+    const reload = graph!
+      .getNodesByName('reload')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('Worker::reload'));
+
+    expect(invoke).toBeDefined();
+    expect(reload).toBeDefined();
+    expect(outgoingSynthesizedEdges(invoke!.id, 'qt-widgets-connect').some((edge) => edge.target === reload!.id)).toBe(true);
+  });
+
+  it('resolves QTimer singleShot lambda callbacks to owner methods', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include <QTimer>
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  void schedule();
+  void refresh();
+};
+
+void MainWindow::schedule() {
+  QTimer::singleShot(100, this, [this]() {
+    refresh();
+  });
+}
+
+void MainWindow::refresh() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const schedule = graph!
+      .getNodesByName('schedule')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::schedule'));
+    const refresh = graph!
+      .getNodesByName('refresh')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::refresh'));
+
+    expect(schedule).toBeDefined();
+    expect(refresh).toBeDefined();
+    expect(outgoingSynthesizedEdges(schedule!.id, 'qt-widgets-connect').some((edge) => edge.target === refresh!.id)).toBe(true);
+  });
+
+  it('resolves QMetaObject invokeMethod typed member-pointer targets', async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'mainwindow.cpp'),
+      `#include <QCoreApplication>
+#include <QMainWindow>
+#include <QMetaObject>
+
+class AppController : public QObject {
+  Q_OBJECT
+public slots:
+  void quit();
+};
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  void invoke(AppController *app);
+};
+
+void MainWindow::invoke(AppController *app) {
+  QMetaObject::invokeMethod(app, &AppController::quit);
+}
+
+void AppController::quit() {}
+`
+    );
+
+    await graph!.indexAll();
+
+    const invoke = graph!
+      .getNodesByName('invoke')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::invoke'));
+    const quit = graph!
+      .getNodesByName('quit')
+      .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('AppController::quit'));
+
+    expect(invoke).toBeDefined();
+    expect(quit).toBeDefined();
+    expect(outgoingSynthesizedEdges(invoke!.id, 'qt-widgets-connect').some((edge) => edge.target === quit!.id)).toBe(true);
   });
 });

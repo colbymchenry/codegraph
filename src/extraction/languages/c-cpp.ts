@@ -95,6 +95,13 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
   return normalizeCppReturnType(getNodeText(typeNode, source));
 }
 
+function blankQtMacroTypedArguments(source: string): string {
+  if (!/\b(?:SIGNAL|SLOT)\s*\(/.test(source)) return source;
+  return source.replace(/\b(SIGNAL|SLOT)\s*\(([^\n]*)\)/g, (_match, keyword: string, args: string) => {
+    return `${keyword}(${args.replace(/[^\n]/g, ' ')})`;
+  });
+}
+
 export const cExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
   classTypes: [],
@@ -183,6 +190,7 @@ function isMacroMisparsedTypeDecl(node: SyntaxNode): boolean {
 }
 
 export const cppExtractor: LanguageExtractor = {
+  preParse: blankQtMacroTypedArguments,
   functionTypes: ['function_definition'],
   classTypes: ['class_specifier'],
   methodTypes: ['function_definition'],

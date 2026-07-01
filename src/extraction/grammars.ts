@@ -42,6 +42,16 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   qml: 'tree-sitter-qmljs.wasm',
 };
 
+const VENDORED_WASM_GRAMMAR_LANGUAGES = new Set<GrammarLanguage>([
+  'csharp',
+  'lua',
+  'luau',
+  'pascal',
+  'qml',
+  'r',
+  'scala',
+]);
+
 /**
  * File extension to Language mapping
  */
@@ -113,6 +123,9 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
+  // Qt Designer forms are XML and are consumed by the Qt Widgets resolver for
+  // auto-connect slot synthesis.
+  '.ui': 'xml',
   // Spring config: `application.properties` / `application-*.properties`. Same
   // shape as the `.yml` variants — the YAML/properties extractor emits one node
   // per leaf key, and the Spring resolver links `@Value("${k}")` references.
@@ -232,10 +245,9 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // build (ABI 13) has no primary-constructor support and parses
       // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
       // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
-      // primary constructors natively.
-      const wasmPath = lang === 'qml'
-        ? require.resolve('@lumis-sh/wasm-qmljs/tree-sitter-qmljs.wasm')
-        : (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r')
+      // primary constructors natively. QML is not available in tree-sitter-wasms,
+      // so it follows the same vendored-asset path.
+      const wasmPath = VENDORED_WASM_GRAMMAR_LANGUAGES.has(lang)
           ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);

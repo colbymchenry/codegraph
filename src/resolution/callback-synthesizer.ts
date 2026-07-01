@@ -2320,6 +2320,320 @@ function springEventEdges(ctx: ResolutionContext): Edge[] {
 // type must be a known handler request type (so a same-named non-request DTO is never bridged).
 // C# has no `signature` on method nodes, so the handler's request type is read from the class
 // base-list source (`: IRequestHandler<X,…>`), not a param signature.
+// C++ typed pub/sub dispatch. Many C++ codebases model callback dispatch through
+// typed subscription APIs:
+//   bus.subscribe<LoginSuccessEvent>(this, &Coordinator::handleLoginSuccessEvent);
+//   bus.publish(LoginSuccessEvent(...));
+// Command/query buses use the same callback shape:
+//   registry.registerScopedHandler<OpenWorkCommand>(scope, handler);
+//   commandBus.dispatch(command);
+// Bridge dispatch sites to registered callback methods by the payload type.
+const CPP_TYPED_PUBSUB_EXT = /\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx)$/i;
+const CPP_TYPED_PUBSUB_SUBSCRIBE_RE =
+  /(?:\.|->)(?:subscribeScoped|subscribe|listen|on)\s*<\s*([A-Za-z_][A-Za-z0-9_:]*)\s*>\s*\([\s\S]{0,800}?&\s*([A-Za-z_][A-Za-z0-9_:]*)\s*::\s*([A-Za-z_~][A-Za-z0-9_~]*)/g;
+const CPP_TYPED_PUBSUB_REGISTER_RE =
+  /(?:\.|->)(?:registerScopedHandler|registerHandler)\s*<\s*([A-Za-z_][A-Za-z0-9_:]*)\s*>\s*\(/g;
+const CPP_TYPED_PUBSUB_DISPATCH_RE =
+  /(?:\.|->)(?:publish|publishEvent|dispatch)\s*(?:<\s*([A-Za-z_][A-Za-z0-9_:]*)\s*>)?\s*\(/g;
+const CPP_TYPED_PUBSUB_FANOUT_CAP = 80;
+
+function matchingDelimiterOffset(source: string, openOffset: number, openChar: string, closeChar: string): number {
+  let depth = 0;
+  for (let index = openOffset; index < source.length; index++) {
+    const char = source[index];
+    if (char === openChar) depth++;
+    else if (char === closeChar) {
+      depth--;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function cppSimpleName(ref: string): string {
+  const parts = ref.split('::').filter(Boolean);
+  return parts[parts.length - 1] ?? ref;
+}
+
+function cppOwnerQualifiedClassName(node: Node): string | null {
+  if (node.kind !== 'method') return null;
+  const owner = node.qualifiedName.split('::').slice(0, -1).join('::');
+  return owner || null;
+}
+
+function cppMethodPointerTarget(ctx: ResolutionContext, className: string, methodName: string): Node | null {
+  const qualified = `${className}::${methodName}`;
+  const candidates = ctx
+    .getNodesByName(methodName)
+    .filter(
+      (node) =>
+        node.kind === 'method' &&
+        node.language === 'cpp' &&
+        (node.qualifiedName === qualified ||
+          node.qualifiedName.endsWith(`::${qualified}`) ||
+          node.qualifiedName.endsWith(`::${cppSimpleName(className)}::${methodName}`))
+    );
+  return candidates.length === 1 ? candidates[0]! : null;
+}
+
+function splitCppTopLevelArguments(source: string): string[] {
+  const args: string[] = [];
+  let depth = 0;
+  let angleDepth = 0;
+  let start = 0;
+  for (let index = 0; index < source.length; index++) {
+    const char = source[index];
+    if (char === '(' || char === '[' || char === '{') depth++;
+    else if (char === ')' || char === ']' || char === '}') depth = Math.max(0, depth - 1);
+    else if (char === '<') angleDepth++;
+    else if (char === '>') angleDepth = Math.max(0, angleDepth - 1);
+    else if (char === ',' && depth === 0 && angleDepth === 0) {
+      args.push(source.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  args.push(source.slice(start).trim());
+  return args.filter(Boolean);
+}
+
+function cppTemplatedCallExpressions(
+  source: string,
+  pattern: RegExp
+): Array<{ text: string; line: number; typeName: string | null }> {
+  const safe = stripCommentsForRegex(source, 'cpp');
+  const calls: Array<{ text: string; line: number; typeName: string | null }> = [];
+  pattern.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(safe))) {
+    const openParen = safe.indexOf('(', match.index);
+    const closeParen = matchingDelimiterOffset(safe, openParen, '(', ')');
+    if (openParen < 0 || closeParen < 0) continue;
+    calls.push({
+      text: source.slice(match.index, closeParen + 1),
+      line: safe.slice(0, match.index).split('\n').length,
+      typeName: match[1] ?? null,
+    });
+    pattern.lastIndex = closeParen + 1;
+  }
+  return calls;
+}
+
+function cppTypedPubSubSubscribeCalls(source: string): Array<{ text: string; line: number }> {
+  return cppTemplatedCallExpressions(
+    source,
+    /(?:\.|->)(?:subscribeScoped|subscribe|listen|on)\s*<\s*([A-Za-z_][A-Za-z0-9_:]*)\s*>\s*\(/g
+  );
+}
+
+function cppEventTypeFromSubscribeCall(callText: string): string | null {
+  return /(?:\.|->)(?:subscribeScoped|subscribe|listen|on)\s*<\s*([A-Za-z_][A-Za-z0-9_:]*)\s*>/.exec(callText)?.[1] ?? null;
+}
+
+function cppLambdaBody(argument: string): string | null {
+  const captureEnd = argument.indexOf(']');
+  const openBrace = argument.indexOf('{', captureEnd + 1);
+  if (captureEnd < 0 || openBrace < 0) return null;
+  const closeBrace = matchingDelimiterOffset(argument, openBrace, '{', '}');
+  return closeBrace >= 0 ? argument.slice(openBrace + 1, closeBrace) : null;
+}
+
+function cppTypedPubSubLambdaTargets(ctx: ResolutionContext, fromNode: Node, callText: string): Node[] {
+  const body = cppLambdaBody(callText);
+  const owner = cppOwnerQualifiedClassName(fromNode);
+  if (!body || !owner) return [];
+  const targets: Node[] = [];
+  for (const match of body.matchAll(/(?:this\s*(?:->|\.)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)) {
+    const methodName = match[1];
+    if (!methodName || ['if', 'for', 'while', 'switch', 'return', 'connect', 'subscribe'].includes(methodName)) continue;
+    const target = cppMethodPointerTarget(ctx, owner, methodName);
+    if (target) targets.push(target);
+  }
+  return [...new Map(targets.map((target) => [target.id, target])).values()];
+}
+
+function normalizeCppHandlerExpression(expression: string): string {
+  return expression
+    .trim()
+    .replace(/^\(([\s\S]+)\)$/, '$1')
+    .replace(/^&/, '')
+    .replace(/^[*&]+/, '')
+    .replace(/^this\s*(?:->|\.)\s*/, '')
+    .replace(/\.(?:get|data)\s*\(\s*\)\s*$/, '')
+    .replace(/->(?:get|data)\s*\(\s*\)\s*$/, '')
+    .trim();
+}
+
+function cppVisibleTypeForName(source: string, fromNode: Node, name: string): string | null {
+  if (name === 'this') return cppOwnerQualifiedClassName(fromNode);
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const smartPointer = new RegExp(
+    `\\b(?:std::)?(?:shared_ptr|unique_ptr|weak_ptr|QSharedPointer|QScopedPointer)<\\s*([A-Za-z_][A-Za-z0-9_:]*)\\s*>\\s+${escaped}\\b`
+  );
+  const smartMatch = smartPointer.exec(source);
+  if (smartMatch) return smartMatch[1]!;
+
+  const pointerOrValuePatterns = [
+    new RegExp(`\\b([A-Za-z_][A-Za-z0-9_:]*)\\s*(?:[*&]\\s*)+${escaped}\\b`),
+    new RegExp(`\\b([A-Za-z_][A-Za-z0-9_:]*)\\s+${escaped}\\b`),
+  ];
+  for (const pattern of pointerOrValuePatterns) {
+    const match = pattern.exec(source);
+    if (!match) continue;
+    const typeName = match[1]!;
+    if (!['return', 'new', 'class', 'struct', 'public', 'private', 'protected', 'auto', 'const'].includes(typeName)) {
+      return typeName;
+    }
+  }
+  return null;
+}
+
+function cppHandlerTargetFromExpression(
+  ctx: ResolutionContext,
+  source: string,
+  fromNode: Node,
+  expression: string
+): Node | null {
+  const normalized = normalizeCppHandlerExpression(expression);
+  const name = /^[A-Za-z_][A-Za-z0-9_]*$/.test(normalized) ? normalized : null;
+  if (!name) return null;
+  const typeName = cppVisibleTypeForName(source, fromNode, name) ?? cppVisibleTypeForName(source, fromNode, `m_${name}`);
+  return typeName ? cppMethodPointerTarget(ctx, typeName, 'handle') : null;
+}
+
+function cppRegisterHandlerTargets(
+  ctx: ResolutionContext,
+  source: string,
+  fromNode: Node,
+  callText: string
+): Node[] {
+  const openParen = callText.indexOf('(');
+  const argsText = openParen >= 0 ? callText.slice(openParen + 1, -1) : '';
+  const args = splitCppTopLevelArguments(argsText);
+  const handlerArg = args[args.length - 1];
+  if (!handlerArg) return [];
+  const target = cppHandlerTargetFromExpression(ctx, source, fromNode, handlerArg);
+  return target ? [target] : [];
+}
+
+function cppTypeOfDispatchArgument(source: string, fromNode: Node, argument: string, line: number): string | null {
+  const inline = /^(?:new\s+)?([A-Za-z_][A-Za-z0-9_:]*)\s*(?:\(|\{)/.exec(argument.trim());
+  if (inline) return inline[1]!;
+  const name = argument.trim().replace(/^[*&]+/, '');
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return null;
+  const lines = source.split('\n').slice(Math.max(0, fromNode.startLine - 1), Math.max(0, line));
+  const visibleSource = lines.join('\n');
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const autoConstruct = new RegExp(`\\bauto\\s+${escaped}\\s*=\\s*([A-Za-z_][A-Za-z0-9_:]*)\\s*(?:\\(|\\{)`);
+  const autoMatch = autoConstruct.exec(visibleSource);
+  if (autoMatch) return autoMatch[1]!;
+  return cppVisibleTypeForName(visibleSource, fromNode, name);
+}
+
+function cppTypedPubSubEdges(ctx: ResolutionContext): Edge[] {
+  const listeners = new Map<string, Map<string, Node>>();
+  const add = (eventType: string, handler: Node) => {
+    const simpleEvent = cppSimpleName(eventType);
+    let entries = listeners.get(simpleEvent);
+    if (!entries) {
+      entries = new Map();
+      listeners.set(simpleEvent, entries);
+    }
+    entries.set(handler.id, handler);
+  };
+
+  for (const file of ctx.getAllFiles()) {
+    if (!CPP_TYPED_PUBSUB_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (
+      !content ||
+      (!content.includes('subscribe<') &&
+        !content.includes('subscribeScoped<') &&
+        !content.includes('registerHandler<') &&
+        !content.includes('registerScopedHandler<'))
+    ) continue;
+    const safe = stripCommentsForRegex(content, 'cpp');
+    CPP_TYPED_PUBSUB_SUBSCRIBE_RE.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = CPP_TYPED_PUBSUB_SUBSCRIBE_RE.exec(safe))) {
+      const eventType = match[1];
+      const className = match[2];
+      const methodName = match[3];
+      if (!eventType || !className || !methodName) continue;
+      const handler = cppMethodPointerTarget(ctx, className, methodName);
+      if (handler) add(eventType, handler);
+    }
+    const nodesInFile = ctx.getNodesInFile(file);
+    for (const call of cppTypedPubSubSubscribeCalls(content)) {
+      const eventType = cppEventTypeFromSubscribeCall(call.text);
+      if (!eventType || !call.text.includes(']')) continue;
+      const fromNode = enclosingFn(nodesInFile, call.line);
+      if (!fromNode) continue;
+      for (const target of cppTypedPubSubLambdaTargets(ctx, fromNode, call.text)) {
+        add(eventType, target);
+      }
+    }
+    for (const call of cppTemplatedCallExpressions(content, CPP_TYPED_PUBSUB_REGISTER_RE)) {
+      if (!call.typeName) continue;
+      const fromNode = enclosingFn(nodesInFile, call.line);
+      if (!fromNode) continue;
+      for (const target of cppRegisterHandlerTargets(ctx, content, fromNode, call.text)) {
+        add(call.typeName, target);
+      }
+    }
+  }
+  if (!listeners.size) return [];
+
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!CPP_TYPED_PUBSUB_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (
+      !content ||
+      (!content.includes('.publish') &&
+        !content.includes('->publish') &&
+        !content.includes('.dispatch') &&
+        !content.includes('->dispatch'))
+    ) continue;
+    const nodesInFile = ctx.getNodesInFile(file);
+    let added = 0;
+    for (const call of cppTemplatedCallExpressions(content, CPP_TYPED_PUBSUB_DISPATCH_RE)) {
+      if (added >= CPP_TYPED_PUBSUB_FANOUT_CAP) break;
+      const line = call.line;
+      const dispatcher = enclosingFn(nodesInFile, line);
+      if (!dispatcher) continue;
+      const openParen = call.text.indexOf('(');
+      const argsText = openParen >= 0 ? call.text.slice(openParen + 1, -1) : '';
+      const firstArg = splitCppTopLevelArguments(argsText)[0];
+      const eventType = cppSimpleName(
+        call.typeName ?? (firstArg ? cppTypeOfDispatchArgument(content, dispatcher, firstArg, line) : '') ?? ''
+      );
+      const targets = listeners.get(eventType);
+      if (!targets || targets.size === 0) continue;
+      for (const target of targets.values()) {
+        if (target.id === dispatcher.id) continue;
+        const key = `${dispatcher.id}>${target.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: dispatcher.id,
+          target: target.id,
+          kind: 'calls',
+          line,
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'cpp-typed-pubsub',
+            via: eventType,
+            registeredAt: `${file}:${line}`,
+          },
+        });
+        added++;
+      }
+    }
+  }
+  return edges;
+}
+
 const MEDIATR_HANDLER_BASE_RE = /(?:IRequestHandler|INotificationHandler)\s*<\s*([A-Za-z_]\w*)/;
 const MEDIATR_DISPATCH_RE = /([A-Za-z_][\w.]*)\s*\.\s*(?:Send|Publish)\s*\(\s*(new\s+[A-Z]\w*|[A-Za-z_]\w*)/g;
 const MEDIATR_RECEIVER_RE = /(?:mediator|sender|publisher)/i;
@@ -2659,7 +2973,11 @@ function laravelEventEdges(ctx: ResolutionContext): Edge[] {
  * Sidekiq Worker.perform_async → #perform + Laravel event(new X) → listener handle).
  * Returns the count added. Never throws into indexing — callers wrap in try/catch.
  */
-export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
+export function synthesizeCallbackEdges(
+  queries: QueryBuilder,
+  ctx: ResolutionContext,
+  onProgress?: () => void
+): number {
   // Cross-file Go method→type `contains` edges must be synthesized AND persisted
   // FIRST: a method declared in a different file from its receiver type is
   // otherwise orphaned from the struct, and goImplementsEdges (next) derives a
@@ -2667,6 +2985,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   // under-count the interfaces a cross-file struct satisfies. (#583)
   const goMethodContains = goCrossFileMethodContainsEdges(queries);
   if (goMethodContains.length > 0) queries.insertEdges(goMethodContains);
+  onProgress?.();
 
   // Go implicit `implements` edges must be synthesized AND persisted next: the
   // interface-dispatch bridge below reads `implements` edges from the DB, and
@@ -2674,6 +2993,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   // edges from extraction, so they don't need this pre-pass.)
   const goImpl = goImplementsEdges(queries);
   if (goImpl.length > 0) queries.insertEdges(goImpl);
+  onProgress?.();
 
   const fieldEdges = fieldChannelEdges(queries, ctx);
   const closureCollEdges = closureCollectionEdges(queries, ctx);
@@ -2701,12 +3021,14 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const vuexEdges = vuexDispatchEdges(ctx);
   const celeryEdges = celeryDispatchEdges(ctx);
   const springEdges = springEventEdges(ctx);
+  const cppTypedPubSubEdgesList = cppTypedPubSubEdges(ctx);
   const mediatrEdges = mediatrDispatchEdges(ctx);
   const sidekiqEdges = sidekiqDispatchEdges(ctx);
   const laravelEdges = laravelEventEdges(ctx);
   const cFnPtrEdges = cFnPointerDispatchEdges(queries, ctx);
   const goframeEdges = goframeRouteEdges(ctx);
-  const qtWidgetsEdges = qtWidgetsConnectEdges(queries, ctx);
+  const qtWidgetsEdges = qtWidgetsConnectEdges(queries, ctx, onProgress);
+  onProgress?.();
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -2737,6 +3059,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...vuexEdges,
     ...celeryEdges,
     ...springEdges,
+    ...cppTypedPubSubEdgesList,
     ...mediatrEdges,
     ...sidekiqEdges,
     ...laravelEdges,

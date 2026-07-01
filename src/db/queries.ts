@@ -1307,6 +1307,16 @@ export class QueryBuilder {
     this.stmts.deleteEdgesBySource.run(sourceId);
   }
 
+  deleteSynthesizedEdges(): void {
+    this.db
+      .prepare(
+        `DELETE FROM edges
+         WHERE metadata IS NOT NULL
+           AND json_extract(metadata, '$.synthesizedBy') IS NOT NULL`
+      )
+      .run();
+  }
+
   /**
    * Get outgoing edges from a node
    */

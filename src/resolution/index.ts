@@ -26,6 +26,7 @@ import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packa
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
+import { clearQtCppMetaCaches } from './frameworks/qt/cpp-meta';
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -326,6 +327,7 @@ export class ReferenceResolver {
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
+    clearQtCppMetaCaches(this.context);
   }
 
   /**
@@ -716,7 +718,6 @@ export class ReferenceResolver {
     }
 
     const qmlResult = this.resolveQmlReference(ref);
-    if (qmlResult) return qmlResult;
 
     const candidates: ResolvedRef[] = [];
 
@@ -731,6 +732,14 @@ export class ReferenceResolver {
         if (result.confidence >= 0.9) return result; // High confidence, return immediately
         candidates.push(result);
       }
+    }
+
+    if (qmlResult) {
+      // Low-confidence QML same-file fallbacks must not steal explicit Qt/C++
+      // bridge calls. Keep them as normal candidates so imported or bridge
+      // evidence can still win later in the resolver chain.
+      if (qmlResult.confidence >= 0.9) return qmlResult;
+      candidates.push(qmlResult);
     }
 
     // Strategy 2: Try import-based resolution
@@ -865,6 +874,19 @@ export class ReferenceResolver {
   }
 
   /**
+   * Best-effort dynamic-edge synthesis for callback and Qt connect patterns.
+   * Runs after base resolution has persisted edges.
+   */
+  synthesizeCallbackEdges(onProgress?: () => void): number {
+    try {
+      this.queries.deleteSynthesizedEdges();
+      return synthesizeCallbackEdges(this.queries, this.context, onProgress);
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
    * Second resolution pass for chained static-factory / fluent calls whose
    * chained method is defined on a SUPERTYPE the receiver's type conforms to —
    * a protocol-extension / inherited / default-interface method (#750). The
@@ -933,7 +955,9 @@ export class ReferenceResolver {
       const batch = this.queries.getUnresolvedReferencesBatch(0, batchSize);
       if (batch.length === 0) break;
 
-      const result = this.resolveAll(batch);
+      const result = this.resolveAll(batch, (batchCurrent) => {
+        onProgress?.(processed + batchCurrent, total);
+      });
 
       // Persist edges immediately
       const edges = this.createEdges(result.resolved);
@@ -979,10 +1003,6 @@ export class ReferenceResolver {
 
       // If nothing was resolved or removed in this batch, we'd loop forever
       // on the same rows. Break to avoid infinite loop.
-      if (result.resolved.length === 0 && result.unresolved.length === batch.length) {
-        break;
-      }
-
       // Non-progress guard (defense-in-depth). Because we re-read from offset 0
       // each pass, the unresolved_refs table MUST shrink every iteration — both
       // resolved and unresolved refs are deleted above. If it didn't shrink, a
@@ -996,15 +1016,9 @@ export class ReferenceResolver {
       prevRemaining = remaining;
     }
 
-    // Dynamic-edge synthesis: now that all base `calls` edges are persisted,
-    // synthesize observer/callback dispatch edges (dispatcher → registered
-    // callbacks) that static parsing leaves out. Best-effort — never fail the
-    // index on it. See docs/design/callback-edge-synthesis.md.
-    try {
-      aggregateStats.byMethod['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
-    } catch {
-      // synthesis is additive and optional; ignore failures
-    }
+    aggregateStats.byMethod['callback-synthesis'] = this.synthesizeCallbackEdges(
+      () => onProgress?.(processed, total)
+    );
 
     return {
       resolved: [],

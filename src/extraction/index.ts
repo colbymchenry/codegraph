@@ -56,6 +56,16 @@ const SYNC_RECONCILE_YIELD_INTERVAL = 1000;
  */
 const PARSE_TIMEOUT_MS = 10_000;
 
+function resolveParseTimeoutMs(envVal: string | undefined): number {
+  if (envVal !== undefined && envVal !== '') {
+    const n = Number(envVal);
+    if (Number.isFinite(n) && n >= 1_000) {
+      return Math.floor(n);
+    }
+  }
+  return PARSE_TIMEOUT_MS;
+}
+
 /**
  * Number of files to parse before recycling the worker thread.
  * WASM linear memory can grow but NEVER shrink (WebAssembly spec limitation).
@@ -325,6 +335,12 @@ function literalDynamicQmlTargets(filePath: string, source: string): Set<string>
     if (target) targets.add(target);
   }
 
+  const setSourcePattern = /\b[A-Za-z_][A-Za-z0-9_]*\.setSource\s*\(\s*(['"])([^'"]+\.qml)\1/gi;
+  for (const match of source.matchAll(setSourcePattern)) {
+    const target = qmlLiteralUrlTarget(filePath, match[2]);
+    if (target) targets.add(target);
+  }
+
   return targets;
 }
 
@@ -335,7 +351,7 @@ function hasLiteralLoaderSource(source: string): boolean {
   for (const match of source.matchAll(loaderPattern)) {
     if (isDynamicQmlLoaderAlias(match[1], aliases)) return true;
   }
-  return false;
+  return /\b[A-Za-z_][A-Za-z0-9_]*\.setSource\s*\(\s*['"][^'"]+\.qml['"]/.test(source);
 }
 
 function parseQmlLocalImportDirs(filePath: string, source: string): Set<string> {
@@ -1607,15 +1623,16 @@ export class ExtractionOrchestrator {
       // CODEGRAPH_PARSE_WORKERS: explicit worker count; 1 = the old single-worker
       // behaviour (the conservative rollback). Unset → clamp(cores-1, 1, 8).
       const poolSize = resolveParsePoolSize(process.env.CODEGRAPH_PARSE_WORKERS, os.cpus().length);
+      const parseTimeoutMs = resolveParseTimeoutMs(process.env.CODEGRAPH_PARSE_TIMEOUT_MS);
       pool = new ParseWorkerPool({
         languages: neededLanguages,
         size: poolSize,
         workerScriptPath: parseWorkerPath,
         recycleInterval: WORKER_RECYCLE_INTERVAL,
-        parseTimeoutMs: PARSE_TIMEOUT_MS,
+        parseTimeoutMs,
         log,
       });
-      log(`Parse worker pool: ${poolSize} worker(s)`);
+      log(`Parse worker pool: ${poolSize} worker(s), timeout ${parseTimeoutMs}ms`);
     } else {
       // In-process fallback: load grammars locally and parse on the main thread.
       await loadGrammarsForLanguages(neededLanguages);

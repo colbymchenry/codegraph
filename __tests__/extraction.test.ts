@@ -117,6 +117,11 @@ describe('Language Detection', () => {
     expect(isSourceFile('Main.qml')).toBe(true);
   });
 
+  it('should track Qt Designer .ui files as XML inputs', () => {
+    expect(detectLanguage('forms/MainWindow.ui')).toBe('xml');
+    expect(isSourceFile('forms/MainWindow.ui')).toBe(true);
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
