@@ -163,6 +163,14 @@ export interface LanguageExtractor {
   extraClassNodeTypes?: string[];
   /** Whether methods can be top-level without enclosing class (Go: true) */
   methodsAreTopLevel?: boolean;
+  /**
+   * Skip a bodiless class node as a forward declaration / elaborated type,
+   * mirroring the bodiless-struct/enum skip. Set only for languages where a
+   * bodiless `class` specifier is NOT a complete definition — C/C++
+   * (`class Foo;` is a forward decl). Leave unset for languages where a
+   * bodiless class IS complete (Kotlin `class Empty`, Scala `case object`). (#1093)
+   */
+  skipBodilessClass?: boolean;
   /** NodeKind to use for interface-like declarations (Rust: 'trait'). Default: 'interface' */
   interfaceKind?: NodeKind;
 
