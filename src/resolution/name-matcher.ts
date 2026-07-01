@@ -151,6 +151,10 @@ const LANGUAGE_FAMILY: Record<string, string> = {
   // Razor/Blazor markup names C# types — same family so `@model Foo` /
   // `<MyComponent/>` resolve to their `.cs` class through the cross-family gate.
   csharp: 'dotnet', razor: 'dotnet',
+  // A GDScript node-path reference (`$MarginContainer/StatusIconTemplate`)
+  // names a node declared in a `.tscn` scene — same family so it resolves
+  // through the cross-family gate instead of being dropped as unrelated.
+  gdscript: 'godot', godot_resource: 'godot',
 };
 export function sameLanguageFamily(a: string, b: string): boolean {
   if (a === b) return true;
