@@ -247,27 +247,45 @@ export function blankCppExportMacros(source: string): string {
  * becomes the return type and, for a non-primitive return, the return type gets
  * glued onto the name (`GetName` → `"FString GetName"`), so the function can't
  * be found by name and its callers don't link. This is pervasive in Unreal
- * Engine, where inline helpers are written `FORCEINLINE <ret> <name>(…)`.
- * Replacing the macro with equal-length spaces preserves every byte offset (so
- * line/column stay exact) and the declaration then parses as an ordinary
- * function — recovering the real name AND the return type — mirroring how
- * `blankCppExportMacros` recovers macro-annotated classes (#946/#1061).
+ * Engine (`FORCEINLINE <ret> <name>(…)`) and in vendored third-party libraries
+ * that define their own inline macro (pugixml's `PUGI__FN`, Godot's
+ * `_FORCE_INLINE_`, Boost's `BOOST_FORCEINLINE`, …). Replacing the macro with
+ * equal-length spaces preserves every byte offset (so line/column stay exact)
+ * and the declaration then parses as an ordinary function — recovering the real
+ * name AND the return type — mirroring how `blankCppExportMacros` recovers
+ * macro-annotated classes (#946/#1061).
  *
  * Matched tightly so it can't touch an ordinary identifier: only the exact,
- * well-known UE inline specifiers, and only in specifier position — immediately
- * followed by whitespace and the identifier that starts the return type or name.
- * That lookahead leaves value/expression uses (`x = FORCEINLINE ? …`), string
- * literals, and `FORCEINLINE_SOMETHINGELSE` (word-boundary) alone. To cover a
- * new codebase's inline macro, add its exact token here.
+ * curated inline-specifier tokens below (never an arbitrary all-caps token, so a
+ * real return type like `HRESULT DoIt()` is untouched), and only in specifier
+ * position — immediately followed by whitespace and the identifier that starts
+ * the return type or name. That lookahead leaves value/expression uses
+ * (`x = FORCEINLINE ? …`), string literals, and longer words
+ * (`FORCEINLINE_SOMETHINGELSE`, word-boundary) alone. To cover a new codebase's
+ * inline macro, add its exact token to the list.
  */
-const CPP_INLINE_MACROS = ['FORCEINLINE_DEBUGGABLE', 'FORCENOINLINE', 'FORCEINLINE'] as const;
+const CPP_INLINE_MACROS = [
+  // Unreal Engine
+  'FORCEINLINE_DEBUGGABLE', 'FORCENOINLINE', 'FORCEINLINE',
+  // pugixml (ubiquitous vendored XML parser): `#define PUGI__FN inline` before
+  // the return type, plus `PUGIXML_FUNCTION` (linkage macro) between the return
+  // type and the name — the blank mechanism handles both positions.
+  'PUGI__FN_NO_INLINE', 'PUGI__FN', 'PUGIXML_FUNCTION',
+  // Godot
+  '_ALWAYS_INLINE_', '_FORCE_INLINE_',
+  // Boost
+  'BOOST_FORCEINLINE', 'BOOST_NOINLINE',
+  // Common cross-ecosystem inline/attribute hints
+  'ALWAYS_INLINE', 'FORCE_INLINE', 'NOINLINE',
+] as const;
+// One alternation, longest token first so a longer macro wins over a prefix.
+const CPP_INLINE_MACRO_RE = new RegExp(
+  `\\b(${[...CPP_INLINE_MACROS].sort((a, b) => b.length - a.length).join('|')})\\b(?=\\s+[A-Za-z_])`,
+  'g'
+);
 export function blankCppInlineMacros(source: string): string {
   if (!CPP_INLINE_MACROS.some((m) => source.indexOf(m) !== -1)) return source;
-  return source.replace(
-    // `FORCEINLINE_DEBUGGABLE` before `FORCEINLINE` so the longer token wins.
-    /\b(FORCEINLINE_DEBUGGABLE|FORCENOINLINE|FORCEINLINE)\b(?=\s+[A-Za-z_])/g,
-    (_m, macro) => ' '.repeat(macro.length)
-  );
+  return source.replace(CPP_INLINE_MACRO_RE, (m) => ' '.repeat(m.length));
 }
 
 /** C/C++ source pre-processing before tree-sitter: recover both macro-annotated
