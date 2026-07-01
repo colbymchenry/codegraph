@@ -3048,6 +3048,25 @@ class APXCharacter {  // the one real definition
       expect(namesOf('V8_INLINE MaybeLocal Get(int i) { return H(i); }')).toContain('Get');
       expect(namesOf('RAPIDJSON_FORCEINLINE bool Parse(const char* s) { return H(s); }')).toContain('Parse');
     });
+
+    it('curated list spans the broader ecosystem (Mozilla, GLM, Bullet, OpenCV, Skia, EASTL, protobuf, fmt, Windows conventions)', () => {
+      const info = (c: string) =>
+        extractFromSource('x.cpp', c).nodes
+          .filter((n) => n.kind === 'method' || n.kind === 'function')
+          .map((n) => ({ name: n.name, ret: n.returnType }));
+      expect(info('MOZ_ALWAYS_INLINE Value get(int i) { return H(i); }')).toEqual([{ name: 'get', ret: 'Value' }]);
+      expect(info('GLM_FUNC_QUALIFIER vec3 cross(const vec3& a) { return H(a); }')).toEqual([{ name: 'cross', ret: 'vec3' }]);
+      expect(info('SIMD_FORCE_INLINE btScalar dot(const btVector3& v) const { return H(v); }')).toEqual([{ name: 'dot', ret: 'btScalar' }]);
+      expect(info('CV_INLINE Mat clone() const { return H(); }')).toEqual([{ name: 'clone', ret: 'Mat' }]);
+      expect(namesOf('PROTOBUF_ALWAYS_INLINE int size() const { return H(); }')).toContain('size');
+      expect(namesOf('FMT_CONSTEXPR auto parse(int x) { return H(x); }')).toContain('parse');
+      expect(namesOf('SK_ALWAYS_INLINE SkScalar width() const { return H(); }')).toContain('width');
+      expect(namesOf('EA_FORCE_INLINE size_type size() const { return H(); }')).toContain('size');
+      // Windows calling-convention macros sit between return type and name; the
+      // macro is blanked so the real return type survives.
+      expect(info('HRESULT WINAPI CreateThing(int x) { return H(x); }')).toEqual([{ name: 'CreateThing', ret: 'HRESULT' }]);
+      expect(info('ULONG STDMETHODCALLTYPE AddRef() { return H(); }')).toEqual([{ name: 'AddRef', ret: 'ULONG' }]);
+    });
   });
 
   describe('C++ templated base-class inheritance (#1043)', () => {

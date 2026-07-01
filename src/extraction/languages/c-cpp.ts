@@ -286,6 +286,29 @@ const CPP_INLINE_MACROS = [
   'V8_INLINE', 'V8_NOINLINE',
   'EIGEN_STRONG_INLINE', 'EIGEN_ALWAYS_INLINE', 'EIGEN_DEVICE_FUNC',
   'RAPIDJSON_FORCEINLINE',
+  // Mozilla / SpiderMonkey
+  'MOZ_ALWAYS_INLINE', 'MOZ_NEVER_INLINE',
+  // Protocol Buffers
+  'PROTOBUF_ALWAYS_INLINE', 'PROTOBUF_NOINLINE',
+  // {fmt} / spdlog
+  'FMT_CONSTEXPR20', 'FMT_CONSTEXPR', 'FMT_INLINE',
+  // Hedley + nlohmann/json (bundles Hedley)
+  'JSON_HEDLEY_ALWAYS_INLINE', 'JSON_HEDLEY_NEVER_INLINE',
+  'HEDLEY_ALWAYS_INLINE', 'HEDLEY_NEVER_INLINE',
+  // GLM (graphics math — pervasive in games/rendering)
+  'GLM_FUNC_QUALIFIER', 'GLM_FUNC_DECL', 'GLM_CONSTEXPR', 'GLM_INLINE',
+  // Bullet Physics / Skia / OpenCV / EASTL / Cocos2d-x / Chromium-WebKit
+  'SIMD_FORCE_INLINE',
+  'SK_ALWAYS_INLINE',
+  'CV_ALWAYS_INLINE', 'CV_INLINE',
+  'EA_FORCE_INLINE', 'EA_NOINLINE',
+  'CC_INLINE',
+  'NEVER_INLINE',
+  // C libraries: GLib, SQLite (internal linkage)
+  'G_INLINE_FUNC', 'SQLITE_PRIVATE', 'SQLITE_API',
+  // Windows calling conventions (linkage position — recover the return type; the
+  // name is salvaged regardless). Only the unambiguous, non-word-like ones.
+  'STDMETHODCALLTYPE', 'WINAPIV', 'WINAPI', 'APIENTRY',
   // Common cross-ecosystem inline/attribute hints
   'ALWAYS_INLINE', 'FORCE_INLINE', 'NOINLINE',
 ] as const;
