@@ -28,6 +28,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
+import { createYielder, type MaybeYield } from './cooperative-yield';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -139,11 +140,13 @@ function* methodAndFunctionNodes(queries: QueryBuilder): IterableIterator<Node> 
 }
 
 /** Phase 1: field-backed observer channels (registrar/dispatcher share a store). */
-function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const registrars: Array<{ node: Node; field: string }> = [];
   const dispatchers: Array<{ node: Node; field: string }> = [];
 
+  let scanned = 0;
   for (const m of methodAndFunctionNodes(queries)) {
+    if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     const isReg = REGISTRAR_NAME.test(m.name);
     const isDisp = DISPATCHER_NAME.test(m.name);
     if (!isReg && !isDisp) continue;
@@ -210,7 +213,7 @@ function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[
  * subclass `DataRequest.validate`), bounded by a fan-out cap so a generic field
  * name shared across unrelated classes can't fan out into noise.
  */
-function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+async function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const dispatchers = new Map<string, Array<{ node: Node; line: number }>>(); // field → dispatcher methods + forEach line
   const registrars = new Map<string, Array<{ node: Node; line: number }>>();   // field → registrar methods + append line
 
@@ -221,7 +224,12 @@ function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionContext): 
     registrars.set(field, arr);
   };
 
+  // Slices EVERY method/function's source (no cheap name-gate), so on a repo
+  // with a huge file this is the heaviest synthesis pass — yield mid-scan so it
+  // can't wedge the #850 watchdog on its own (#1091).
+  let scanned = 0;
   for (const m of methodAndFunctionNodes(queries)) {
+    if ((++scanned & 127) === 0) await onYield();
     const content = ctx.readFile(m.filePath);
     const src = content && sliceLines(content, m.startLine, m.endLine);
     if (!src) continue;
@@ -271,11 +279,13 @@ function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionContext): 
 }
 
 /** Phase 2: string-keyed EventEmitter channels (on('e', fn) ↔ emit('e')). */
-function eventEmitterEdges(ctx: ResolutionContext): Edge[] {
+async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const emitsByEvent = new Map<string, Set<string>>();          // event → dispatcher node ids
   const handlersByEvent = new Map<string, Map<string, string>>(); // event → handler id → registration site (file:line)
 
+  let scanned = 0;
   for (const file of ctx.getAllFiles()) {
+    if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     const content = ctx.readFile(file);
     if (!content) continue;
     const hasEmit = content.includes('.emit(') || content.includes('.fire(') || content.includes('.dispatchEvent(');
@@ -842,11 +852,13 @@ function goGrpcStubImplEdges(queries: QueryBuilder): Edge[] {
  * component/function/class node — TS generics like `Array<Foo>` resolve to a type
  * (or nothing) and are dropped.
  */
-function reactJsxChildEdges(ctx: ResolutionContext): Edge[] {
+async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const PARENT_KINDS = new Set(['method', 'function', 'component']);
+  let scanned = 0;
   for (const file of ctx.getAllFiles()) {
+    if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     const content = ctx.readFile(file);
     if (!content || (!content.includes('</') && !content.includes('/>'))) continue; // JSX-file gate
     const parents = ctx.getNodesInFile(file).filter((n) => PARENT_KINDS.has(n.kind));
@@ -1792,10 +1804,12 @@ function resolveRegistryHandler(ctx: ResolutionContext, name: string, chained: s
   return cands.find((n) => n.kind === 'method') ?? null;
 }
 
-function objectRegistryEdges(ctx: ResolutionContext): Edge[] {
+async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  let scanned = 0;
   for (const file of ctx.getAllFiles()) {
+    if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     if (!REGISTRY_JS_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     // Cheap pre-filter: a computed member access BY NAME (`ident[ident`) — the dispatch shape.
@@ -2658,7 +2672,16 @@ function laravelEventEdges(ctx: ResolutionContext): Edge[] {
  * Sidekiq Worker.perform_async → #perform + Laravel event(new X) → listener handle).
  * Returns the count added. Never throws into indexing — callers wrap in try/catch.
  */
-export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
+export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): Promise<number> {
+  // Each sub-pass below is a whole-graph scan, and there are ~30 of them, all
+  // running synchronously on the indexer's main thread. Their AGGREGATE can run
+  // for well over a minute on a large repo — long enough for the #850 liveness
+  // watchdog to SIGKILL the process mid-index (#1091), since its heartbeat lives
+  // on this same thread. Yield between passes so the heartbeat can fire; a pass
+  // that itself hangs (a real wedge) never reaches the next yield, so the
+  // watchdog still catches that. See ./cooperative-yield.
+  const yieldToLoop = createYielder();
+
   // Cross-file Go method→type `contains` edges must be synthesized AND persisted
   // FIRST: a method declared in a different file from its receiver type is
   // otherwise orphaned from the struct, and goImplementsEdges (next) derives a
@@ -2666,6 +2689,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   // under-count the interfaces a cross-file struct satisfies. (#583)
   const goMethodContains = goCrossFileMethodContainsEdges(queries);
   if (goMethodContains.length > 0) queries.insertEdges(goMethodContains);
+  await yieldToLoop();
 
   // Go implicit `implements` edges must be synthesized AND persisted next: the
   // interface-dispatch bridge below reads `implements` edges from the DB, and
@@ -2673,38 +2697,39 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   // edges from extraction, so they don't need this pre-pass.)
   const goImpl = goImplementsEdges(queries);
   if (goImpl.length > 0) queries.insertEdges(goImpl);
+  await yieldToLoop();
 
-  const fieldEdges = fieldChannelEdges(queries, ctx);
-  const closureCollEdges = closureCollectionEdges(queries, ctx);
-  const emitterEdges = eventEmitterEdges(ctx);
-  const renderEdges = reactRenderEdges(queries, ctx);
-  const jsxEdges = reactJsxChildEdges(ctx);
-  const vueEdges = vueTemplateEdges(ctx);
-  const svelteKitEdges = svelteKitLoadEdges(ctx);
-  const pascalEdges = pascalFormEdges(ctx);
-  const flutterEdges = flutterBuildEdges(queries, ctx);
-  const cppEdges = cppOverrideEdges(queries);
-  const ifaceEdges = interfaceOverrideEdges(queries);
-  const kotlinExpectActual = kotlinExpectActualEdges(queries);
-  const goGrpcEdges = goGrpcStubImplEdges(queries);
-  const rnEventEdgesList = rnEventEdges(ctx);
-  const fabricNativeEdges = fabricNativeImplEdges(ctx);
-  const expoXPlatEdges = expoCrossPlatformEdges(queries);
-  const rnXPlatEdges = rnCrossPlatformEdges(queries);
-  const mybatisEdges = mybatisJavaXmlEdges(queries);
-  const ginEdges = ginMiddlewareChainEdges(queries, ctx);
-  const thunkEdges = reduxThunkEdges(queries, ctx);
-  const registryEdges = objectRegistryEdges(ctx);
-  const rtkEdges = rtkQueryEdges(queries, ctx);
-  const piniaEdges = piniaStoreEdges(ctx);
-  const vuexEdges = vuexDispatchEdges(ctx);
-  const celeryEdges = celeryDispatchEdges(ctx);
-  const springEdges = springEventEdges(ctx);
-  const mediatrEdges = mediatrDispatchEdges(ctx);
-  const sidekiqEdges = sidekiqDispatchEdges(ctx);
-  const laravelEdges = laravelEventEdges(ctx);
-  const cFnPtrEdges = cFnPointerDispatchEdges(queries, ctx);
-  const goframeEdges = goframeRouteEdges(ctx);
+  const fieldEdges = await fieldChannelEdges(queries, ctx, yieldToLoop); await yieldToLoop();
+  const closureCollEdges = await closureCollectionEdges(queries, ctx, yieldToLoop); await yieldToLoop();
+  const emitterEdges = await eventEmitterEdges(ctx, yieldToLoop); await yieldToLoop();
+  const renderEdges = reactRenderEdges(queries, ctx); await yieldToLoop();
+  const jsxEdges = await reactJsxChildEdges(ctx, yieldToLoop); await yieldToLoop();
+  const vueEdges = vueTemplateEdges(ctx); await yieldToLoop();
+  const svelteKitEdges = svelteKitLoadEdges(ctx); await yieldToLoop();
+  const pascalEdges = pascalFormEdges(ctx); await yieldToLoop();
+  const flutterEdges = flutterBuildEdges(queries, ctx); await yieldToLoop();
+  const cppEdges = cppOverrideEdges(queries); await yieldToLoop();
+  const ifaceEdges = interfaceOverrideEdges(queries); await yieldToLoop();
+  const kotlinExpectActual = kotlinExpectActualEdges(queries); await yieldToLoop();
+  const goGrpcEdges = goGrpcStubImplEdges(queries); await yieldToLoop();
+  const rnEventEdgesList = rnEventEdges(ctx); await yieldToLoop();
+  const fabricNativeEdges = fabricNativeImplEdges(ctx); await yieldToLoop();
+  const expoXPlatEdges = expoCrossPlatformEdges(queries); await yieldToLoop();
+  const rnXPlatEdges = rnCrossPlatformEdges(queries); await yieldToLoop();
+  const mybatisEdges = mybatisJavaXmlEdges(queries); await yieldToLoop();
+  const ginEdges = ginMiddlewareChainEdges(queries, ctx); await yieldToLoop();
+  const thunkEdges = reduxThunkEdges(queries, ctx); await yieldToLoop();
+  const registryEdges = await objectRegistryEdges(ctx, yieldToLoop); await yieldToLoop();
+  const rtkEdges = rtkQueryEdges(queries, ctx); await yieldToLoop();
+  const piniaEdges = piniaStoreEdges(ctx); await yieldToLoop();
+  const vuexEdges = vuexDispatchEdges(ctx); await yieldToLoop();
+  const celeryEdges = celeryDispatchEdges(ctx); await yieldToLoop();
+  const springEdges = springEventEdges(ctx); await yieldToLoop();
+  const mediatrEdges = mediatrDispatchEdges(ctx); await yieldToLoop();
+  const sidekiqEdges = sidekiqDispatchEdges(ctx); await yieldToLoop();
+  const laravelEdges = laravelEventEdges(ctx); await yieldToLoop();
+  const cFnPtrEdges = cFnPointerDispatchEdges(queries, ctx); await yieldToLoop();
+  const goframeEdges = goframeRouteEdges(ctx); await yieldToLoop();
 
   const merged: Edge[] = [];
   const seen = new Set<string>();

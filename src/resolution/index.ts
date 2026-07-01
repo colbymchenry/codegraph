@@ -20,6 +20,7 @@ import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCall
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
+import { createYielder, type MaybeYield } from './cooperative-yield';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
@@ -874,7 +875,7 @@ export class ReferenceResolver {
    * (re-resolving an already-resolved ref is a no-op since it's been deleted).
    * Returns the number of newly-created edges.
    */
-  resolveChainedCallsViaConformance(): number {
+  async resolveChainedCallsViaConformance(): Promise<number> {
     const deferred = this.deferredChainRefs;
     this.deferredChainRefs = [];
     if (deferred.length === 0) return 0;
@@ -883,6 +884,10 @@ export class ReferenceResolver {
     // these refs were deferred). matchDottedCallChain now resolves a method on a
     // supertype via context.getSupertypes -> resolveMethodOnType's conformance walk.
     this.clearCaches();
+    // This post-pass runs synchronously on the indexer's main thread; yield
+    // periodically so the #850 liveness watchdog heartbeat can fire on a repo
+    // with many deferred chained calls (#1091).
+    const maybeYield = createYielder();
     const resolved: ResolvedRef[] = [];
     for (const ref of deferred) {
       // `::`-receiver languages (Rust) split on `::` (matchScopedCallChain);
@@ -892,6 +897,7 @@ export class ReferenceResolver {
         : matchDottedCallChain(ref, this.context);
       const match = this.gateLanguage(chainMatch, ref);
       if (match) resolved.push(match);
+      await maybeYield();
     }
     if (resolved.length === 0) return 0;
 
@@ -904,6 +910,42 @@ export class ReferenceResolver {
   }
 
   /**
+   * Resolve one batch in smaller sub-chunks, yielding to the event loop between
+   * them so the #850 liveness heartbeat can fire on a slow/dense batch (#1091).
+   * Behaviourally identical to a single `resolveAll(batch)`: `warmCaches()` is
+   * idempotent (guarded) and `resolveOne` is independent per ref, so splitting
+   * and re-merging changes only timing, never which edges get created. Falls
+   * through to a plain `resolveAll` when the batch is already small.
+   */
+  private async resolveBatchYielding(
+    batch: UnresolvedReference[],
+    maybeYield: MaybeYield,
+    subChunkSize: number = 500
+  ): Promise<ResolutionResult> {
+    if (batch.length <= subChunkSize) return this.resolveAll(batch);
+
+    const resolved: ResolvedRef[] = [];
+    const unresolved: UnresolvedRef[] = [];
+    const byMethod: Record<string, number> = {};
+    let total = 0;
+    let resolvedCount = 0;
+    let unresolvedCount = 0;
+    for (let i = 0; i < batch.length; i += subChunkSize) {
+      const chunk = this.resolveAll(batch.slice(i, i + subChunkSize));
+      for (const r of chunk.resolved) resolved.push(r);
+      for (const u of chunk.unresolved) unresolved.push(u);
+      total += chunk.stats.total;
+      resolvedCount += chunk.stats.resolved;
+      unresolvedCount += chunk.stats.unresolved;
+      for (const [m, c] of Object.entries(chunk.stats.byMethod)) {
+        byMethod[m] = (byMethod[m] || 0) + c;
+      }
+      await maybeYield();
+    }
+    return { resolved, unresolved, stats: { total, resolved: resolvedCount, unresolved: unresolvedCount, byMethod } };
+  }
+
+  /**
    * Resolve and persist in batches to keep memory bounded.
    * Processes unresolved references in chunks, persisting edges and cleaning
    * up resolved refs after each batch to avoid accumulating large arrays.
@@ -913,6 +955,14 @@ export class ReferenceResolver {
     batchSize: number = 5000
   ): Promise<ResolutionResult> {
     this.warmCaches();
+
+    // Resolution runs on the indexer's MAIN thread, and the #850 liveness
+    // watchdog SIGKILLs a process whose event loop stalls past its window (60s
+    // by default). A single dense batch's resolveAll — or the synthesis pass
+    // below — can exceed that on a large repo, killing a VALID in-progress index
+    // (#1091). A shared yielder lets both give the watchdog heartbeat a regular
+    // window to fire; see ./cooperative-yield.
+    const maybeYield = createYielder();
 
     const total = this.queries.getUnresolvedReferencesCount();
     let processed = 0;
@@ -930,7 +980,7 @@ export class ReferenceResolver {
       const batch = this.queries.getUnresolvedReferencesBatch(0, batchSize);
       if (batch.length === 0) break;
 
-      const result = this.resolveAll(batch);
+      const result = await this.resolveBatchYielding(batch, maybeYield);
 
       // Persist edges immediately
       const edges = this.createEdges(result.resolved);
@@ -998,7 +1048,7 @@ export class ReferenceResolver {
     // callbacks) that static parsing leaves out. Best-effort — never fail the
     // index on it. See docs/design/callback-edge-synthesis.md.
     try {
-      aggregateStats.byMethod['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
+      aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(this.queries, this.context);
     } catch {
       // synthesis is additive and optional; ignore failures
     }
@@ -1257,14 +1307,18 @@ export class ReferenceResolver {
    * Mirrors resolveChainedCallsViaConformance's lifecycle. Returns the number
    * of newly-created edges.
    */
-  resolveDeferredThisMemberRefs(): number {
+  async resolveDeferredThisMemberRefs(): Promise<number> {
     const deferred = this.deferredThisMemberRefs;
     this.deferredThisMemberRefs = [];
     if (deferred.length === 0) return 0;
 
     this.clearCaches();
+    // Synchronous main-thread post-pass with a per-ref supertype BFS — yield
+    // periodically so the #850 liveness watchdog heartbeat can fire (#1091).
+    const maybeYield = createYielder();
     const resolved: ResolvedRef[] = [];
     for (const ref of deferred) {
+      await maybeYield();
       const member = ref.referenceName.slice('this.'.length);
       const fromNode = this.queries.getNodeById(ref.fromNodeId);
       if (!fromNode || !member) continue;
