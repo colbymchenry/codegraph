@@ -239,10 +239,48 @@ export function blankCppExportMacros(source: string): string {
   );
 }
 
+/**
+ * Blank a known inline-specifier macro sitting in front of a function's return
+ * type (`FORCEINLINE FString GetName(…)`), before parsing. Not knowing the
+ * macro, tree-sitter can't reconcile `MACRO <return-type> <name>(` — an extra
+ * type-like token before the name — and drops into error recovery: the macro
+ * becomes the return type and, for a non-primitive return, the return type gets
+ * glued onto the name (`GetName` → `"FString GetName"`), so the function can't
+ * be found by name and its callers don't link. This is pervasive in Unreal
+ * Engine, where inline helpers are written `FORCEINLINE <ret> <name>(…)`.
+ * Replacing the macro with equal-length spaces preserves every byte offset (so
+ * line/column stay exact) and the declaration then parses as an ordinary
+ * function — recovering the real name AND the return type — mirroring how
+ * `blankCppExportMacros` recovers macro-annotated classes (#946/#1061).
+ *
+ * Matched tightly so it can't touch an ordinary identifier: only the exact,
+ * well-known UE inline specifiers, and only in specifier position — immediately
+ * followed by whitespace and the identifier that starts the return type or name.
+ * That lookahead leaves value/expression uses (`x = FORCEINLINE ? …`), string
+ * literals, and `FORCEINLINE_SOMETHINGELSE` (word-boundary) alone. To cover a
+ * new codebase's inline macro, add its exact token here.
+ */
+const CPP_INLINE_MACROS = ['FORCEINLINE_DEBUGGABLE', 'FORCENOINLINE', 'FORCEINLINE'] as const;
+export function blankCppInlineMacros(source: string): string {
+  if (!CPP_INLINE_MACROS.some((m) => source.indexOf(m) !== -1)) return source;
+  return source.replace(
+    // `FORCEINLINE_DEBUGGABLE` before `FORCEINLINE` so the longer token wins.
+    /\b(FORCEINLINE_DEBUGGABLE|FORCENOINLINE|FORCEINLINE)\b(?=\s+[A-Za-z_])/g,
+    (_m, macro) => ' '.repeat(macro.length)
+  );
+}
+
+/** C/C++ source pre-processing before tree-sitter: recover both macro-annotated
+ * class definitions and macro-prefixed function definitions. Offset-preserving. */
+function preParseCppSource(source: string): string {
+  return blankCppInlineMacros(blankCppExportMacros(source));
+}
+
 export const cppExtractor: LanguageExtractor = {
-  // Recover macro-annotated class/struct definitions (`class MYMODULE_API Foo : Base`)
-  // that tree-sitter otherwise misparses into a phantom function (#1061/#946).
-  preParse: blankCppExportMacros,
+  // Recover macro-annotated class/struct definitions (`class MYMODULE_API Foo : Base`,
+  // #1061/#946) and macro-prefixed functions (`FORCEINLINE FString Foo()`, #1093
+  // follow-up) that tree-sitter otherwise misparses.
+  preParse: preParseCppSource,
   functionTypes: ['function_definition'],
   classTypes: ['class_specifier'],
   // A bodiless `class_specifier` is a forward declaration (`class Foo;`) or an
