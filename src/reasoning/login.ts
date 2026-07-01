@@ -77,7 +77,9 @@ export async function pollForToken(deviceCode: string, intervalSec: number, expi
 export async function openBrowser(url: string): Promise<void> {
   const [cmd, args] =
     process.platform === 'darwin' ? ['open', [url]]
-    : process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]]
+    // Avoid `cmd /c start`: cmd.exe re-parses shell metacharacters (& | ^ ") in the
+    // server-supplied URL. rundll32 receives the URL as a single, opaque argument.
+    : process.platform === 'win32' ? ['rundll32', ['url.dll,FileProtocolHandler', url]]
     : ['xdg-open', [url]];
   try {
     const child = spawn(cmd as string, args as string[], { stdio: 'ignore', detached: true, windowsHide: true });
