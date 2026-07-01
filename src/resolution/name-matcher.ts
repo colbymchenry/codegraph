@@ -420,27 +420,66 @@ export function matchByQualifiedName(
     };
   }
 
-  // Try partial qualified name match
+  // Several symbols share this exact qualified name (e.g. `Logger::log` declared
+  // in two files — an ODR clash or separate translation units): prefer the one
+  // in the call site's own file before the partial-match fallback below, else
+  // the first-indexed def wins and a call in `b/svc` targets `a/svc` (#1079).
+  if (candidates.length > 1) {
+    const ordered = preferCallSiteFile(candidates, ref.filePath);
+    if (ordered[0]!.filePath === ref.filePath) {
+      return {
+        original: ref,
+        targetNodeId: ordered[0]!.id,
+        confidence: 0.95,
+        resolvedBy: 'qualified-name',
+      };
+    }
+  }
+
+  // Try partial qualified name match — again preferring the call site's own
+  // file when more than one symbol's qualifiedName ends with the reference.
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
-    const partialCandidates = context.getNodesByName(lastName);
-    for (const candidate of partialCandidates) {
-      if (candidate.qualifiedName.endsWith(ref.referenceName)) {
-        return {
-          original: ref,
-          targetNodeId: candidate.id,
-          confidence: 0.85,
-          resolvedBy: 'qualified-name',
-        };
-      }
+    const partialCandidates = context
+      .getNodesByName(lastName)
+      .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName));
+    const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
+    if (chosen) {
+      return {
+        original: ref,
+        targetNodeId: chosen.id,
+        confidence: 0.85,
+        resolvedBy: 'qualified-name',
+      };
     }
   }
 
   return null;
 }
 
-function resolveMethodOnType(
+/**
+ * When a symbol name is ambiguous across files, prefer the candidate(s) declared
+ * in the call site's own file, keeping the rest in their original order (#1079).
+ * A same-file definition is the strongest language-agnostic signal for which of
+ * several same-named symbols a call means; without it, resolution collapses onto
+ * whichever was indexed first, so a call in `b/svc` wrongly targets `a/svc`.
+ * No-op when there are <2 candidates or none share the call site's file.
+ */
+export function preferCallSiteFile(nodes: Node[], callSiteFile: string): Node[] {
+  if (nodes.length < 2) return nodes;
+  const same: Node[] = [];
+  const other: Node[] = [];
+  for (const n of nodes) {
+    if (n.filePath === callSiteFile) same.push(n);
+    else other.push(n);
+  }
+  return same.length ? [...same, ...other] : nodes;
+}
+
+// Exported for the precedence unit tests (#1079): they assert the
+// preferredFqn → same-file → matches[0] ordering directly.
+export function resolveMethodOnType(
   typeName: string,
   methodName: string,
   ref: UnresolvedRef,
@@ -511,9 +550,19 @@ function resolveMethodOnType(
     }
   }
 
+  // Language-agnostic disambiguation: when several same-named methods survive
+  // (e.g. two files each declaring `class Logger { void log(); }` — an ODR
+  // clash, an anonymous-namespace type, or separate translation units), prefer
+  // the definition in the CALL SITE's own file. Without this, every ambiguous
+  // call collapses onto the first-indexed definition, so a call in `b/svc.cpp`
+  // wrongly points at `a/svc.cpp` (#1079). This runs AFTER the `preferredFqn`
+  // block, so Java/Kotlin import disambiguation — whose target is intentionally
+  // in ANOTHER file (#314) — is unaffected: that block returns early whenever
+  // an import FQN pins the class.
+  const ordered = preferCallSiteFile(matches, ref.filePath);
   return {
     original: ref,
-    targetNodeId: matches[0]!.id,
+    targetNodeId: ordered[0]!.id,
     confidence,
     resolvedBy,
   };
@@ -1041,8 +1090,15 @@ export function matchMethodCall(
     }
   }
 
-  // Strategy 1: Direct class name match (existing logic)
-  const classCandidates = context.getNodesByName(objectOrClass!);
+  // Strategy 1: Direct class name match (existing logic). When the receiver
+  // names a class that exists in several files (`Logger.log()` / `Logger::log()`
+  // with a `Logger` in both `a/` and `b/`), try the class in the call site's
+  // own file first — otherwise the first-indexed class wins and a call in `b/`
+  // resolves to `a/`'s method (#1079).
+  const classCandidates = preferCallSiteFile(
+    context.getNodesByName(objectOrClass!),
+    ref.filePath,
+  );
 
   for (const classNode of classCandidates) {
     if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
@@ -1072,7 +1128,10 @@ export function matchMethodCall(
   // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
   const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
   if (capitalizedReceiver !== objectOrClass) {
-    const fuzzyClassCandidates = context.getNodesByName(capitalizedReceiver);
+    const fuzzyClassCandidates = preferCallSiteFile(
+      context.getNodesByName(capitalizedReceiver),
+      ref.filePath,
+    );
     for (const classNode of fuzzyClassCandidates) {
       if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
         // Skip cross-language class matches
@@ -1136,7 +1195,10 @@ export function matchMethodCall(
       let bestMatch: typeof targetMethods[0] | undefined;
       let bestScore = 0;
 
-      for (const method of targetMethods) {
+      // Same-file candidates first, so a score tie (`score > bestScore` keeps
+      // the first seen) resolves to the call site's own file rather than the
+      // first-indexed duplicate (#1079).
+      for (const method of preferCallSiteFile(targetMethods, ref.filePath)) {
         const classWords = splitCamelCase(method.qualifiedName);
         let score = receiverWords.filter(w =>
           classWords.some(cw => cw.toLowerCase() === w.toLowerCase())

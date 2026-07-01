@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
-import { matchReference } from '../src/resolution/name-matcher';
+import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile } from '../src/resolution/name-matcher';
 import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
@@ -1440,6 +1440,213 @@ func main() {
       const calls = cg.getOutgoingEdges(mainFn!.id).filter((e) => e.kind === 'calls');
       // No spurious in-project edge — fmt.* must stay unresolved/external.
       expect(calls).toHaveLength(0);
+    });
+  });
+
+  describe('Same-name method disambiguation (#1079)', () => {
+    // resolveMethodOnType picks among several methods that share a
+    // `Type::method` qualifiedName. The precedence is:
+    //   1. preferredFqn (Java/Kotlin import — target is intentionally in
+    //      ANOTHER file, #314),
+    //   2. the call site's OWN file (language-agnostic, #1079),
+    //   3. matches[0] (first-indexed) as a last resort.
+    const methodNode = (
+      id: string,
+      filePath: string,
+      language: Node['language'] = 'cpp',
+      qualifiedName = 'Logger::log',
+      name = 'log',
+    ): Node => ({
+      id, kind: 'method', name, qualifiedName, filePath, language,
+      startLine: 1, endLine: 1, startColumn: 0, endColumn: 0, updatedAt: 0,
+    });
+    const callRef = (filePath: string, language: Node['language'] = 'cpp'): UnresolvedRef => ({
+      fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
+      line: 2, column: 0, filePath, language,
+    });
+    const ctxFor = (candidates: Node[]): ResolutionContext => ({
+      getNodesInFile: () => [],
+      getNodesByName: (name) => candidates.filter((c) => c.name === name),
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      fileExists: () => false,
+      readFile: () => null,
+      getProjectRoot: () => '',
+      getAllFiles: () => [],
+    });
+
+    it('prefers the definition in the call site\'s own file (#1079)', () => {
+      // matches[0] is the a/ definition; the call comes from b/, so it must
+      // resolve to b/ — not collapse onto the first-indexed match.
+      const logA = methodNode('m:a', 'a/svc.cpp');
+      const logB = methodNode('m:b', 'b/svc.cpp');
+      const result = resolveMethodOnType(
+        'Logger', 'log', callRef('b/svc.cpp'), ctxFor([logA, logB]), 0.9, 'instance-method',
+      );
+      expect(result?.targetNodeId).toBe('m:b');
+    });
+
+    it('lets an import FQN pin a cross-file target over the same-file preference (#314)', () => {
+      // Java: two `Bar::doIt` in different packages. The import FQN pins the
+      // alpha package; even though the call site lives in beta's file, the FQN
+      // must win — the same-file preference runs only AFTER preferredFqn.
+      const alpha = methodNode('m:alpha', 'com/example/alpha/Bar.java', 'java', 'Bar::doIt', 'doIt');
+      const beta = methodNode('m:beta', 'com/example/beta/Bar.java', 'java', 'Bar::doIt', 'doIt');
+      const result = resolveMethodOnType(
+        'Bar', 'doIt', callRef('com/example/beta/Bar.java', 'java'),
+        ctxFor([alpha, beta]), 0.9, 'instance-method', 'com.example.alpha.Bar',
+      );
+      expect(result?.targetNodeId).toBe('m:alpha');
+    });
+
+    it('falls back to the first match when nothing disambiguates', () => {
+      // Call site is a third file: no FQN, no same-file candidate → matches[0].
+      const logA = methodNode('m:a', 'a/svc.cpp');
+      const logB = methodNode('m:b', 'b/svc.cpp');
+      const result = resolveMethodOnType(
+        'Logger', 'log', callRef('c/other.cpp'), ctxFor([logA, logB]), 0.9, 'instance-method',
+      );
+      expect(result?.targetNodeId).toBe('m:a');
+    });
+
+    it('resolves C++ calls end-to-end to same-named classes in different files (#1079)', async () => {
+      // The exact repro from the issue: two files, each with its own
+      // `Logger::log`. Before the fix both callers pointed at the first def.
+      fs.mkdirSync(path.join(tempDir, 'a'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'b'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'a', 'svc.cpp'),
+        `class Logger { public: void log() { int a = 1; } };\nvoid useA() { Logger lg; lg.log(); }\n`,
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'b', 'svc.cpp'),
+        `class Logger { public: void log() { int b = 2; } };\nvoid useB() { Logger lg; lg.log(); }\n`,
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const logInDir = (dir: string) =>
+        cg.getNodesByKind('method').find(
+          (n) => n.name === 'log' && n.filePath.replace(/\\/g, '/').endsWith(`${dir}/svc.cpp`),
+        )!;
+      const callTargets = (fnName: string) =>
+        cg
+          .getOutgoingEdges(cg.getNodesByKind('function').find((n) => n.name === fnName)!.id)
+          .filter((e) => e.kind === 'calls')
+          .map((e) => e.target);
+
+      const logA = logInDir('a');
+      const logB = logInDir('b');
+      expect(logA).toBeDefined();
+      expect(logB).toBeDefined();
+      expect(logA.id).not.toBe(logB.id);
+
+      // Each caller resolves to the Logger::log in its OWN file.
+      expect(callTargets('useA')).toContain(logA.id);
+      expect(callTargets('useB')).toContain(logB.id);
+    });
+
+    it('preferCallSiteFile puts same-file candidates first and is otherwise a no-op', () => {
+      const a = methodNode('m:a', 'a/svc.cpp');
+      const b = methodNode('m:b', 'b/svc.cpp');
+      // Same-file first; the rest keep their original order (stable).
+      expect(preferCallSiteFile([a, b], 'b/svc.cpp').map((n) => n.id)).toEqual(['m:b', 'm:a']);
+      expect(preferCallSiteFile([a, b], 'a/svc.cpp').map((n) => n.id)).toEqual(['m:a', 'm:b']);
+      // No same-file match → unchanged; <2 candidates → returned as-is.
+      expect(preferCallSiteFile([a, b], 'c/other.cpp').map((n) => n.id)).toEqual(['m:a', 'm:b']);
+      expect(preferCallSiteFile([a], 'z/none.cpp')).toHaveLength(1);
+    });
+
+    it('matchByQualifiedName prefers the same-file target when a qualified name is ambiguous (#1079)', () => {
+      // Two `Logger::log` definitions; an explicit `Logger::log()` call from b/
+      // must resolve to b/'s definition, not the first-indexed one.
+      const a = methodNode('m:a', 'a/svc.cpp');
+      const b = methodNode('m:b', 'b/svc.cpp');
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => [a, b].filter((n) => n.name === name),
+        getNodesByQualifiedName: (q) => (q === 'Logger::log' ? [a, b] : []),
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      };
+      const ref: UnresolvedRef = {
+        fromNodeId: 'caller', referenceName: 'Logger::log', referenceKind: 'calls',
+        line: 2, column: 0, filePath: 'b/svc.cpp', language: 'cpp',
+      };
+      expect(matchByQualifiedName(ref, ctx)?.targetNodeId).toBe('m:b');
+    });
+
+    it('resolves a static/class-receiver call to the class in the caller\'s file (#1079)', async () => {
+      // `Logger.log()` — the receiver is the class NAME, so this routes through
+      // the class-name-receiver strategy (not the C++ instance path). It was
+      // file-blind across languages; verified here on TypeScript.
+      fs.mkdirSync(path.join(tempDir, 'a'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'b'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'a', 'svc.ts'),
+        `class Logger { static log() { return 1; } }\nexport function useA() { return Logger.log(); }\n`,
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'b', 'svc.ts'),
+        `class Logger { static log() { return 2; } }\nexport function useB() { return Logger.log(); }\n`,
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const logInDir = (dir: string) =>
+        cg.getNodesByKind('method').find(
+          (n) => n.name === 'log' && n.filePath.replace(/\\/g, '/').endsWith(`${dir}/svc.ts`),
+        )!;
+      const callTargets = (fnName: string) =>
+        cg
+          .getOutgoingEdges(cg.getNodesByKind('function').find((n) => n.name === fnName)!.id)
+          .filter((e) => e.kind === 'calls')
+          .map((e) => e.target);
+
+      const logA = logInDir('a');
+      const logB = logInDir('b');
+      expect(logA?.id).not.toBe(logB?.id);
+      expect(callTargets('useA')).toContain(logA.id);
+      expect(callTargets('useB')).toContain(logB.id);
+    });
+
+    it('resolves an explicitly-qualified call to the definition in the caller\'s file (#1079)', async () => {
+      // `Logger::log()` with two `Logger::log` definitions routes through the
+      // qualified-name strategy, whose partial match previously picked the first.
+      fs.mkdirSync(path.join(tempDir, 'a'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'b'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'a', 'svc.cpp'),
+        `class Logger { public: static void log() { int a = 1; } };\nvoid useA() { Logger::log(); }\n`,
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'b', 'svc.cpp'),
+        `class Logger { public: static void log() { int b = 2; } };\nvoid useB() { Logger::log(); }\n`,
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const logInDir = (dir: string) =>
+        cg.getNodesByKind('method').find(
+          (n) => n.name === 'log' && n.filePath.replace(/\\/g, '/').endsWith(`${dir}/svc.cpp`),
+        )!;
+      const callTargets = (fnName: string) =>
+        cg
+          .getOutgoingEdges(cg.getNodesByKind('function').find((n) => n.name === fnName)!.id)
+          .filter((e) => e.kind === 'calls')
+          .map((e) => e.target);
+
+      const logA = logInDir('a');
+      const logB = logInDir('b');
+      expect(logA?.id).not.toBe(logB?.id);
+      expect(callTargets('useA')).toContain(logA.id);
+      expect(callTargets('useB')).toContain(logB.id);
     });
   });
 
