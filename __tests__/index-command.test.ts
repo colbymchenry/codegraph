@@ -22,11 +22,11 @@ import { CodeGraph } from '../src';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
-function runCodegraph(args: string[], cwd: string): string {
+function runCodegraph(args: string[], cwd: string, env: Record<string, string> = {}): string {
   return execFileSync(process.execPath, [BIN, ...args], {
     cwd,
     encoding: 'utf-8',
-    env: { ...process.env, CODEGRAPH_NO_DAEMON: '1' },
+    env: { ...process.env, CODEGRAPH_NO_DAEMON: '1', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 }
@@ -103,5 +103,134 @@ describe('codegraph index — full re-index keeps the graph populated (#874)', (
 
     expect(afterIndex.nodes).toBe(afterInit.nodes);
     expect(afterIndex.edges).toBe(afterInit.edges);
+  });
+
+  it('--quiet keeps the liveness watchdog fed while indexing Qt Widgets code', () => {
+    fs.writeFileSync(
+      path.join(tempDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include <QPushButton>
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+private slots:
+  void on_okButton_clicked();
+};
+
+MainWindow::MainWindow() {
+  setupUi(this);
+  QMetaObject::connectSlotsByName(this);
+}
+
+void MainWindow::on_okButton_clicked() {}
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'mainwindow.ui'),
+      `<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <widget class="QPushButton" name="okButton" />
+ </widget>
+</ui>
+`
+    );
+
+    runCodegraph(['init'], tempDir);
+    runCodegraph(['index', '--quiet'], tempDir, {
+      CODEGRAPH_WATCHDOG_TIMEOUT_MS: '750',
+    });
+
+    const cg = CodeGraph.openSync(tempDir);
+    try {
+      const constructor = cg
+        .getNodesByName('MainWindow')
+        .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
+      const slot = cg
+        .getNodesByName('on_okButton_clicked')
+        .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_okButton_clicked'));
+      expect(constructor).toBeDefined();
+      expect(slot).toBeDefined();
+      expect(cg.getOutgoingEdges(constructor!.id).some((edge) => edge.kind === 'calls' && edge.target === slot!.id)).toBe(true);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('sync --quiet runs under command supervision while refreshing Qt Widgets edges', () => {
+    fs.writeFileSync(
+      path.join(tempDir, 'mainwindow.cpp'),
+      `#include <QMainWindow>
+#include "ui_mainwindow.h"
+
+class MainWindow : public QMainWindow {
+  Q_OBJECT
+public:
+  MainWindow();
+private slots:
+  void on_okButton_clicked();
+  void on_cancelButton_clicked();
+};
+
+MainWindow::MainWindow() {
+  setupUi(this);
+}
+
+void MainWindow::on_okButton_clicked() {}
+void MainWindow::on_cancelButton_clicked() {}
+`
+    );
+    const uiPath = path.join(tempDir, 'mainwindow.ui');
+    fs.writeFileSync(
+      uiPath,
+      `<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <widget class="QPushButton" name="okButton" />
+ </widget>
+</ui>
+`
+    );
+
+    runCodegraph(['init'], tempDir);
+    fs.writeFileSync(
+      uiPath,
+      `<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <widget class="QPushButton" name="cancelButton" />
+ </widget>
+</ui>
+`
+    );
+
+    runCodegraph(['sync', '--quiet'], tempDir, {
+      CODEGRAPH_WATCHDOG_TIMEOUT_MS: '750',
+    });
+
+    const cg = CodeGraph.openSync(tempDir);
+    try {
+      const constructor = cg
+        .getNodesByName('MainWindow')
+        .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::MainWindow'));
+      const okSlot = cg
+        .getNodesByName('on_okButton_clicked')
+        .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_okButton_clicked'));
+      const cancelSlot = cg
+        .getNodesByName('on_cancelButton_clicked')
+        .find((node) => node.kind === 'method' && node.qualifiedName.endsWith('MainWindow::on_cancelButton_clicked'));
+      expect(constructor).toBeDefined();
+      expect(okSlot).toBeDefined();
+      expect(cancelSlot).toBeDefined();
+      const autoConnectEdges = cg
+        .getOutgoingEdges(constructor!.id)
+        .filter((edge) => edge.metadata?.synthesizedBy === 'qt-widgets-autoconnect');
+      expect(autoConnectEdges.some((edge) => edge.target === okSlot!.id)).toBe(false);
+      expect(autoConnectEdges.some((edge) => edge.target === cancelSlot!.id)).toBe(true);
+    } finally {
+      cg.close();
+    }
   });
 });

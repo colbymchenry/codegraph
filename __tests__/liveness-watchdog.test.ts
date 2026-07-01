@@ -57,11 +57,12 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   function runChild(
     env: Record<string, string>,
     body: string,
-    hardTimeoutMs: number
+    hardTimeoutMs: number,
+    installAutomatically: boolean = true
   ): Promise<{ code: number | null; signal: NodeJS.Signals | 'TIMEOUT' | null }> {
     const src = `
       const { installMainThreadWatchdog } = require(${JSON.stringify(MODULE)});
-      installMainThreadWatchdog();
+      ${installAutomatically ? 'installMainThreadWatchdog();' : ''}
       ${body}
     `;
     const child = spawn(process.execPath, ['-e', src], {
@@ -117,6 +118,29 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
     );
     expect(signal).toBeNull(); // never signalled
     expect(code).toBe(7); // exited on its own terms
+  }, 12000);
+
+  it('does NOT kill synchronous work that manually beats the watchdog', async () => {
+    const { code, signal } = await runChild(
+      { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '500' },
+      `
+        const watchdog = installMainThreadWatchdog();
+        const end = Date.now() + 1500;
+        let nextBeat = 0;
+        while (Date.now() < end) {
+          if (Date.now() >= nextBeat) {
+            watchdog.beat();
+            nextBeat = Date.now() + 50;
+          }
+        }
+        watchdog.stop();
+        process.exit(9);
+      `,
+      8000,
+      false
+    );
+    expect(signal).toBeNull();
+    expect(code).toBe(9);
   }, 12000);
 
   it('does NOT kill a wedged process when CODEGRAPH_NO_WATCHDOG=1', async () => {

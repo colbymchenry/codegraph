@@ -36,6 +36,49 @@ describe('Resolution Module', () => {
     }
   });
 
+  describe('Batched Resolution Progress', () => {
+    it('reports progress from inside each batch before the batch finishes', async () => {
+      const dbPath = path.join(tempDir, '.codegraph', 'codegraph.db');
+      const db = DatabaseConnection.initialize(dbPath);
+      const queries = new QueryBuilder(db.getDb());
+      const resolver = new ReferenceResolver(tempDir, queries);
+      const now = Date.now();
+
+      queries.insertNode({
+        id: 'function:src/main.ts:caller:1',
+        kind: 'function',
+        name: 'caller',
+        qualifiedName: 'src/main.ts::caller',
+        filePath: 'src/main.ts',
+        language: 'typescript',
+        startLine: 1,
+        endLine: 1,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: now,
+      });
+      queries.insertUnresolvedRefsBatch(
+        Array.from({ length: 300 }, (_, index) => ({
+          fromNodeId: 'function:src/main.ts:caller:1',
+          referenceName: `missing${index}`,
+          referenceKind: 'calls' as const,
+          line: index + 1,
+          column: 0,
+          filePath: 'src/main.ts',
+          language: 'typescript' as const,
+        }))
+      );
+
+      const progress: number[] = [];
+      await resolver.resolveAndPersistBatched((current) => progress.push(current), 200);
+      db.close();
+
+      expect(progress.some((current) => current > 0 && current < 200)).toBe(true);
+      expect(progress).toContain(200);
+      expect(progress.at(-1)).toBe(300);
+    });
+  });
+
   describe('Name Matcher', () => {
     it('should match exact name references', () => {
       // Create a mock context

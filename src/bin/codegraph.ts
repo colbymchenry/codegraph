@@ -638,11 +638,13 @@ program
       // or if the main thread wedges — neither was guarded on this path (#999).
       const supervision = installCommandSupervision('index');
       try {
+        const supervisionProgress = () => supervision.beat();
+
         if (options.quiet) {
           // Quiet mode: no UI, just run. `index` is a full re-index, so clear the
           // existing graph and rebuild from scratch (see the note below — #874).
           cg.clear();
-          const result = await cg.indexAll();
+          const result = await cg.indexAll({ onProgress: supervisionProgress });
           if (!result.success) process.exit(1);
           cg.destroy();
           return;
@@ -712,40 +714,49 @@ program
 
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
+      const supervision = installCommandSupervision('sync');
+      const supervisionProgress = () => supervision.beat();
 
-      if (options.quiet) {
-        await cg.sync();
+      try {
+        if (options.quiet) {
+          await cg.sync({ onProgress: supervisionProgress });
+          cg.destroy();
+          return;
+        }
+
+        const clack = await importESM('@clack/prompts');
+        clack.intro('Syncing CodeGraph');
+
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+        const progress = createShimmerProgress();
+
+        const result = await cg.sync({
+          onProgress: (event) => {
+            supervisionProgress();
+            progress.onProgress(event);
+          },
+        });
+
+        await progress.stop();
+
+        const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
+
+        if (totalChanges === 0) {
+          clack.log.info('Already up to date');
+        } else {
+          clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
+          const details: string[] = [];
+          if (result.filesAdded > 0) details.push(`Added: ${result.filesAdded}`);
+          if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
+          if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
+          clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
+        }
+
+        clack.outro('Done');
         cg.destroy();
-        return;
+      } finally {
+        supervision.stop();
       }
-
-      const clack = await importESM('@clack/prompts');
-      clack.intro('Syncing CodeGraph');
-
-      process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-      const progress = createShimmerProgress();
-
-      const result = await cg.sync({
-        onProgress: progress.onProgress,
-      });
-
-      await progress.stop();
-
-      const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
-
-      if (totalChanges === 0) {
-        clack.log.info('Already up to date');
-      } else {
-        clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
-        const details: string[] = [];
-        if (result.filesAdded > 0) details.push(`Added: ${result.filesAdded}`);
-        if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
-        if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
-        clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
-      }
-
-      clack.outro('Done');
-      cg.destroy();
     } catch (err) {
       if (!options.quiet) {
         error(`Failed to sync: ${err instanceof Error ? err.message : String(err)}`);

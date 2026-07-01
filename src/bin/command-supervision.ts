@@ -24,6 +24,9 @@ import { isProcessAlive } from '../mcp/daemon-registry';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
 export interface CommandSupervision {
+  /** Emit one liveness heartbeat immediately. Safe to call from long sync loops. */
+  beat(): void;
+
   /** Tear down both watchdogs. Idempotent; call when the command finishes. */
   stop(): void;
 }
@@ -67,6 +70,9 @@ export function installCommandSupervision(label: string): CommandSupervision {
 
   let stopped = false;
   return {
+    beat(): void {
+      liveness?.beat();
+    },
     stop(): void {
       if (stopped) return;
       stopped = true;

@@ -421,26 +421,32 @@ export class CodeGraph {
             });
           });
 
+          options.onProgress?.({ phase: 'resolving', current: unresolvedCount, total: unresolvedCount });
           // Second pass: chained calls whose method lives on a supertype the
           // receiver conforms to (protocol-extension / inherited / default-
           // interface). Needs the implements/extends edges the main pass just
           // built, so it runs after resolution (#750).
           this.resolver.resolveChainedCallsViaConformance();
+          options.onProgress?.({ phase: 'resolving', current: unresolvedCount, total: unresolvedCount });
           // Same lifecycle for `this.<member>` callback registrations whose
           // member is inherited from a supertype (#808).
           this.resolver.resolveDeferredThisMemberRefs();
+          options.onProgress?.({ phase: 'resolving', current: unresolvedCount, total: unresolvedCount });
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         // Cheap and non-blocking; never load-bearing for correctness.
         if (result.success && result.filesIndexed > 0) {
+          options.onProgress?.({ phase: 'resolving', current: 0, total: 1 });
           this.db.runMaintenance();
+          options.onProgress?.({ phase: 'resolving', current: 1, total: 1 });
         }
 
         // The orchestrator only sees extraction-phase counts; resolution and
         // synthesizer edges (often >50% of the graph on JVM repos) come later.
         // Recompute against the DB so the CLI summary reports the true totals.
         if (result.success && result.filesIndexed > 0) {
+          options.onProgress?.({ phase: 'resolving', current: 1, total: 1 });
           const after = this.queries.getNodeAndEdgeCount();
           result.nodesCreated = after.nodes - before.nodes;
           result.edgesCreated = after.edges - before.edges;
@@ -452,6 +458,7 @@ export class CodeGraph {
         // real full index — a sync touches a subset, so it must NOT advance the
         // extraction stamp (the bulk would still be stale). See extraction-version.ts.
         if (result.success && result.filesIndexed > 0) {
+          options.onProgress?.({ phase: 'resolving', current: 1, total: 1 });
           try {
             this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
             this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
@@ -528,6 +535,18 @@ export class CodeGraph {
                 total,
               });
             });
+            options.onProgress?.({
+              phase: 'resolving',
+              current: unresolvedRefs.length,
+              total: unresolvedRefs.length,
+            });
+            this.resolver.synthesizeCallbackEdges(() => {
+              options.onProgress?.({
+                phase: 'resolving',
+                current: unresolvedRefs.length,
+                total: unresolvedRefs.length,
+              });
+            });
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
@@ -551,14 +570,34 @@ export class CodeGraph {
           // receiver conforms to (protocol-extension / inherited). Needs the
           // implements/extends edges built above (#750).
           this.resolver.resolveChainedCallsViaConformance();
+          options.onProgress?.({
+            phase: 'resolving',
+            current: 1,
+            total: 1,
+          });
           // Same lifecycle for `this.<member>` callback registrations whose
           // member is inherited from a supertype (#808).
           this.resolver.resolveDeferredThisMemberRefs();
+          options.onProgress?.({
+            phase: 'resolving',
+            current: 1,
+            total: 1,
+          });
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
+          options.onProgress?.({
+            phase: 'resolving',
+            current: 0,
+            total: 1,
+          });
           this.db.runMaintenance();
+          options.onProgress?.({
+            phase: 'resolving',
+            current: 1,
+            total: 1,
+          });
         }
 
         return result;

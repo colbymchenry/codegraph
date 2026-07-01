@@ -21,11 +21,11 @@
  * parent, so the wedge cannot touch it; it kills via the kernel, which honours
  * SIGKILL regardless of what the parent's threads are doing.
  *
- * **How.** The parent writes a heartbeat byte to the child's stdin every
+ * **How.** The parent sends a heartbeat over a dedicated IPC channel every
  * `checkMs` from a timer — firing at all means the event loop is turning. The
- * child resets a kill-timer on each byte; if none arrives for `timeoutMs` it
+ * child resets a kill-timer on each heartbeat; if none arrives for `timeoutMs` it
  * `SIGKILL`s the parent so a fresh daemon starts on the next connection. When
- * the parent exits normally the pipe closes and the child exits too (no
+ * the parent exits normally the IPC channel closes and the child exits too (no
  * orphan).
  *
  * **Won't fire on real work.** Heavy parsing runs in the parse worker
@@ -70,6 +70,9 @@ function debug(msg: string): void {
 }
 
 export interface WatchdogHandle {
+  /** Emit one heartbeat immediately. Safe to call from long synchronous loops. */
+  beat(): void;
+
   /** Stop heartbeating and shut the watchdog child down. Idempotent. */
   stop(): void;
 }
@@ -93,10 +96,8 @@ function kill() {
   process.exit(0);
 }
 let timer = setTimeout(kill, timeoutMs);
-process.stdin.on('data', () => { clearTimeout(timer); timer = setTimeout(kill, timeoutMs); });
-process.stdin.on('end', () => process.exit(0));   // parent closed the pipe (exited) -> no orphan
-process.stdin.on('error', () => process.exit(0)); // pipe broke -> parent gone
-process.stdin.resume();
+process.on('message', () => { clearTimeout(timer); timer = setTimeout(kill, timeoutMs); });
+process.on('disconnect', () => process.exit(0)); // parent closed the IPC channel (exited) -> no orphan
 `;
 
 /**
@@ -120,7 +121,7 @@ export function installMainThreadWatchdog(): WatchdogHandle | null {
       process.execPath,
       ['-e', CHILD_SOURCE, String(process.pid), String(timeoutMs)],
       {
-        stdio: ['pipe', 'ignore', 'inherit'],
+        stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
         windowsHide: true,
         // The watchdog touches no files; keep its cwd off the project/temp dir
         // so it can't hold one open (Windows EPERM-on-cleanup, mirrors the
@@ -133,37 +134,36 @@ export function installMainThreadWatchdog(): WatchdogHandle | null {
     return null;
   }
 
-  const stdin = child.stdin;
-  if (!stdin) {
-    debug('child has no stdin pipe; not arming');
+  if (!child.send) {
+    debug('child has no IPC channel; not arming');
     try { child.kill(); } catch { /* ignore */ }
     return null;
   }
-  // Writing after the child exits surfaces EPIPE on the stream — swallow it so
-  // it can't escalate to the global handler (which now exits, #850).
-  stdin.on('error', () => { /* child gone; heartbeat writes are best-effort */ });
   child.on('error', (err) => debug(`child error: ${err.message}`));
 
-  // Heartbeat: a byte per tick. When the main thread wedges, these stop and the
+  const beat = (): void => {
+    try { child.send?.('beat'); } catch { /* child gone */ }
+  };
+
+  // Heartbeat: one IPC message per tick. When the main thread wedges, these stop and the
   // child's timeout fires. unref'd so it never keeps the process alive itself.
-  const heartbeat = setInterval(() => {
-    try { stdin.write('\n'); } catch { /* child gone */ }
-  }, checkMs);
+  const heartbeat = setInterval(beat, checkMs);
   heartbeat.unref();
 
-  // Neither the child nor its pipe should keep the parent alive past its work.
+  // Neither the child nor its IPC channel should keep the parent alive past its work.
   child.unref();
-  try { (stdin as unknown as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
+  try { child.channel?.unref?.(); } catch { /* ignore */ }
 
   debug(`armed (child pid ${child.pid ?? '?'}): timeoutMs=${timeoutMs} checkMs=${checkMs}`);
 
   let stopped = false;
   return {
+    beat,
     stop(): void {
       if (stopped) return;
       stopped = true;
       clearInterval(heartbeat);
-      try { stdin.end(); } catch { /* ignore */ } // EOF -> child exits cleanly
+      try { child.disconnect(); } catch { /* ignore */ } // IPC close -> child exits cleanly
       try { child.kill(); } catch { /* ignore */ } // belt-and-suspenders
     },
   };
