@@ -1120,6 +1120,22 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
       return [
         new RegExp(`\\$?${r}\\b\\s*=\\s*new\\s+([A-Za-z_\\\\][\\w\\\\]*)`), // $lg = new Logger()
       ];
+    case 'lua':
+    case 'luau':
+      return [
+        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w]*)\\.new\\b`), // local lg = Logger.new()
+        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w]*)\\s*\\(`), // local lg = Logger(...)  (callable table)
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // Luau: local lg: Logger  / typed param
+      ];
+    case 'r':
+      return [
+        new RegExp(`\\b${r}\\b\\s*(?:<-|<<-|=)\\s*([A-Z][\\w.]*)\\$new\\b`), // lg <- Logger$new()  (R6)
+      ];
+    case 'pascal':
+      return [
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w]*)`), // var lg: TLogger  / param lg: TLogger
+        new RegExp(`\\b${r}\\b\\s*:=\\s*([A-Z][\\w.]*)\\.Create\\b`), // lg := TLogger.Create
+      ];
     default:
       return [];
   }
@@ -1196,20 +1212,33 @@ export function matchMethodCall(
   // `Guard.Against.X()`) matched no pattern and never resolved.
   const dotMatch = ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/);
   const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);
+  // Lua/Luau method calls use a single colon (`lg:log`); R uses `$` (`lg$log`).
+  // Recognize these receiver/method separators so local-variable receiver-type
+  // inference (#1108) applies to them too — extraction already emits the ref in
+  // this shape, but the resolver otherwise only understood `.` and `::`.
+  const luaColonMatch = (ref.language === 'lua' || ref.language === 'luau')
+    ? ref.referenceName.match(/^([\w.]+):(\w+)$/)
+    : null;
+  const rDollarMatch = ref.language === 'r'
+    ? ref.referenceName.match(/^([\w.]+)\$(\w+)$/)
+    : null;
 
-  const match = dotMatch || colonMatch;
+  const match = dotMatch || colonMatch || luaColonMatch || rDollarMatch;
   if (!match) {
     return null;
   }
 
   const [, objectOrClass, methodName] = match;
+  // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
+  // receiver type we can try to infer from its local declaration.
+  const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
 
   // Infer the receiver's type from its local declaration/initializer in the
   // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
   // dedicated inferrer (header scan + `auto`); every other language uses the
   // shared source-based inferrer. resolveMethodOnType validates the method
   // exists on the inferred type, so a mis-inference produces no edge.
-  if (dotMatch) {
+  if (inferableReceiver) {
     const inferredType =
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context)

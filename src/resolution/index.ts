@@ -627,6 +627,22 @@ export class ReferenceResolver {
       }
     }
 
+    // Lua/Luau method calls use a single `:` (`lg:log`); R uses `$` (`lg$log`).
+    // Check the member (and receiver) around these separators too, so the ref
+    // isn't dropped here before the method-call resolver ever sees it. The `:`
+    // case is skipped when the name actually contains `::` (handled above).
+    for (const sep of [':', '$']) {
+      if (sep === ':' && name.includes('::')) continue;
+      const sepIdx = name.indexOf(sep);
+      if (sepIdx > 0) {
+        const receiver = name.substring(0, sepIdx);
+        const member = name.substring(sepIdx + 1);
+        if (this.knownNames.has(member) || this.knownNames.has(receiver)) return true;
+        const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
+        if (this.knownNames.has(capitalized)) return true;
+      }
+    }
+
     // For path-like references (e.g., "snippets/drawer-menu.liquid"), check the filename
     const slashIdx = name.lastIndexOf('/');
     if (slashIdx > 0) {

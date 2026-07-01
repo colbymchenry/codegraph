@@ -1683,6 +1683,14 @@ func main() {
         src: `class Logger { def log(): Int = 1 }\nobject A { def use(): Int = { val lg = new Logger(); lg.log() } }\n` },
       { lang: 'Ruby (x = T.new)', file: 'svc.rb',
         src: `class Logger\n  def log\n    1\n  end\nend\ndef use\n  lg = Logger.new\n  lg.log\nend\n` },
+      { lang: 'Lua (x = T.new(); x:log())', file: 'svc.lua',
+        src: `local Logger = {}\nLogger.__index = Logger\nfunction Logger.new() return setmetatable({}, Logger) end\nfunction Logger:log() return 1 end\nlocal function use() local lg = Logger.new(); return lg:log() end\nreturn use\n` },
+      { lang: 'Luau (x = T.new(); x:log())', file: 'svc.luau',
+        src: `local Logger = {}\nLogger.__index = Logger\nfunction Logger.new() return setmetatable({}, Logger) end\nfunction Logger:log(): number return 1 end\nlocal function use(): number local lg = Logger.new(); return lg:log() end\nreturn use\n` },
+      { lang: 'R (x <- T$new(); x$log())', file: 'svc.R',
+        src: `Logger <- R6::R6Class("Logger", public = list(log = function() 1))\nuse <- function() { lg <- Logger$new(); lg$log() }\n` },
+      { lang: 'Pascal (var x: T; x.Method)', file: 'svc.pas',
+        src: `unit A;\ninterface\ntype TLogger = class function Log: Integer; end;\nimplementation\nfunction TLogger.Log: Integer; begin Result := 1; end;\nprocedure Use;\nvar lg: TLogger;\nbegin\n  lg := TLogger.Create;\n  lg.Log;\nend;\nend.\n` },
     ];
 
     for (const c of cases) {
