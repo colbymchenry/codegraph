@@ -4882,7 +4882,7 @@ export class TreeSitterExtractor {
    * Languages that support type annotations (TypeScript, etc.)
    */
   private readonly TYPE_ANNOTATION_LANGUAGES = new Set([
-    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp', 'scala', 'php',
+    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp', 'scala', 'php', 'zig',
   ]);
 
   /**
@@ -4942,6 +4942,7 @@ export class TreeSitterExtractor {
       this.extractPhpTypeRefs(node, nodeId);
       return;
     }
+
 
     // Dart: a `method_signature` wraps the real `function_signature` (where the
     // params and return type live), and the return type is a bare

@@ -1168,6 +1168,19 @@ export class ReferenceResolver {
       }
     }
 
+    // Zig standard library and builtins. The `std` namespace and `@`-prefixed
+    // builtin functions are always external — no project declares symbols there.
+    if (ref.language === 'zig') {
+      // @-prefixed compiler builtins: @import, @sizeOf, @intFromPtr, etc.
+      if (name.startsWith('@')) return true;
+      // std library namespace: std.debug.print, std.mem.eql, std.ArrayList, etc.
+      if (name.startsWith('std.')) return true;
+      // builtin module: builtin.is_test, builtin.mode, etc.
+      if (name.startsWith('builtin.')) return true;
+      // root module reference
+      if (name === 'root') return true;
+    }
+
     return false;
   }
 
