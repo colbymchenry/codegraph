@@ -75,6 +75,7 @@ type CliSearchNode = {
   qualifiedName: string;
   startLine?: number;
   signature?: string;
+  language?: string;
 };
 
 function nodeMatchesSymbol(node: CliSearchNode, symbol: string): boolean {
@@ -101,7 +102,7 @@ function findCliSymbolMatches(
 
 function isGodotSceneInstanceComponent(node: CliSearchNode): boolean {
   const signature = 'signature' in node && typeof node.signature === 'string' ? node.signature : '';
-  return node.kind === 'component' && node.filePath.endsWith('.tscn') && signature.includes('instance=ExtResource');
+  return node.kind === 'component' && node.language === 'godot_resource' && node.filePath.endsWith('.tscn') && signature.includes('instance=ExtResource');
 }
 
 const importESM = new Function('specifier', 'return import(specifier)') as
