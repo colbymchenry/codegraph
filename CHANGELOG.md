@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- C++ forward declarations no longer crowd out the real class definition. A `class Foo;` forward declaration — common in large C++ and Unreal Engine codebases, where a heavily used class is forward-declared across dozens of headers — was indexed as its own class node every time it appeared. So exploring that class returned mostly forward-declaration sites, and could even pick one of them as the representative for blast-radius, burying the actual definition and its members and callers. Bodiless forward declarations are now skipped for C and C++, exactly as forward-declared structs and enums already were, so only the real definition is indexed. Languages where a class with no body is a complete definition — such as Kotlin's `class Empty` and Scala — are unaffected. Thanks @luoyxy for the report and root-cause analysis. (#1093)
+
 
 ## [1.1.6] - 2026-06-30
 

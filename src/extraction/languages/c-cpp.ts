@@ -245,6 +245,12 @@ export const cppExtractor: LanguageExtractor = {
   preParse: blankCppExportMacros,
   functionTypes: ['function_definition'],
   classTypes: ['class_specifier'],
+  // A bodiless `class_specifier` is a forward declaration (`class Foo;`) or an
+  // elaborated type reference, not a definition. Skip it so dozens of forward
+  // decls across headers don't mint phantom `class` nodes that crowd out — and
+  // get picked as the blast-radius representative over — the single real
+  // definition, exactly as bodiless struct/enum specifiers are already skipped. (#1093)
+  skipBodilessClass: true,
   methodTypes: ['function_definition'],
   interfaceTypes: [],
   structTypes: ['struct_specifier'],
