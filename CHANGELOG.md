@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes GDScript and Godot scene/resource files (`.gd`, `.tscn`, `.tres`), so Godot 4 projects get the same code intelligence as every other supported language. GDScript classes, methods, signals, constants, and variables are extracted with full type signatures, and Godot scenes are parsed into their own node graph — scene node containment, `ExtResource`/instanced-scene references, and a script's `res://` path all resolve to the real files and symbols they point to. Cross-file GDScript call graphs, `codegraph query`, `codegraph callers`, and the MCP tools all work against Godot projects as a result — previously CodeGraph produced no index at all for `.gd`/`.tscn`/`.tres` files. Thanks @KirisamaMarisa for the original GDScript/Godot support. (#364)
 
 ## [1.1.6] - 2026-06-30
 
