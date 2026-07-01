@@ -399,7 +399,12 @@ export interface SearchResult {
   /** Matching node */
   node: Node;
 
-  /** Relevance score (0-1) */
+  /**
+   * Relevance score for relative ranking only — higher is more relevant.
+   * NOT normalized and NOT a 0-1 fraction: the FTS path returns an unbounded
+   * BM25 magnitude (often in the tens or hundreds), while the fuzzy/exact
+   * paths return ~0-1. Use it to order results, not as an absolute percentage.
+   */
   score: number;
 
   /** Matched text snippets for highlighting */

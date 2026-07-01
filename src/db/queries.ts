@@ -1419,6 +1419,32 @@ export class QueryBuilder {
     return rows.map((r) => r.fp);
   }
 
+  /**
+   * Cross-file edges whose TARGET is a node in `filePath` and whose SOURCE is a
+   * node in a *different* file, paired with the target node's (name, kind) so a
+   * caller can re-resolve the edge to the re-indexed target's new ID (node IDs
+   * are `sha256(filePath:kind:name:line)`, so any line shift in the callee file
+   * changes target IDs and a naive re-insert by old ID silently drops them).
+   * Used by `storeExtractionResult` to preserve incoming edges across a file
+   * re-index (issue #899). Same edge-kind rules as
+   * {@link getDependentFilePaths}: all kinds except `contains`.
+   */
+  getCrossFileIncomingEdgesWithTarget(filePath: string): Array<Edge & { targetName: string; targetKind: NodeKind }> {
+    const sql = `SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind
+      FROM edges e
+      JOIN nodes tgt ON tgt.id = e.target
+      JOIN nodes src ON src.id = e.source
+      WHERE tgt.file_path = ?
+        AND e.kind != 'contains'
+        AND src.file_path != ?`;
+    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<EdgeRow & { target_name: string; target_kind: NodeKind }>;
+    return rows.map(row => ({
+      ...rowToEdge(row),
+      targetName: row.target_name,
+      targetKind: row.target_kind,
+    }));
+  }
+
   // ===========================================================================
   // File Operations
   // ===========================================================================
@@ -1705,8 +1731,16 @@ export class QueryBuilder {
    */
   deleteResolvedReferences(fromNodeIds: string[]): void {
     if (fromNodeIds.length === 0) return;
-    const placeholders = fromNodeIds.map(() => '?').join(',');
-    this.db.prepare(`DELETE FROM unresolved_refs WHERE from_node_id IN (${placeholders})`).run(...fromNodeIds);
+    // Chunk under SQLite's parameter limit, matching every other IN-list in
+    // this file. The internal resolution path uses deleteSpecificResolvedReferences
+    // instead, but QueryBuilder is part of the public API, so a library consumer
+    // passing more ids than SQLITE_MAX_VARIABLE_NUMBER (32766 on the bundled
+    // node:sqlite) would otherwise hit "too many SQL variables". (#540, #1001)
+    for (let i = 0; i < fromNodeIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = fromNodeIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      this.db.prepare(`DELETE FROM unresolved_refs WHERE from_node_id IN (${placeholders})`).run(...chunk);
+    }
   }
 
   /**

@@ -206,8 +206,8 @@ describe('codegraph_explore output respects the adaptive budget', () => {
     const text = result.content?.[0]?.text ?? '';
     // Either there are relationships, or no edges were significant — both are fine.
     // We just want to confirm we did not accidentally gate it off.
-    const hasRelationships = text.includes('### Relationships');
-    const sourceFollowsHeader = text.indexOf('### Source Code') > 0;
+    const hasRelationships = text.includes('**Relationships');
+    const sourceFollowsHeader = text.indexOf('**Source Code') > 0;
     expect(hasRelationships || sourceFollowsHeader).toBe(true);
   });
 

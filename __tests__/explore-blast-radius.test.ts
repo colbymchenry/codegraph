@@ -55,7 +55,7 @@ describe('codegraph_explore — blast radius', () => {
     const res = await handler.execute('codegraph_explore', { query: 'target' });
     const text = res.content[0].text;
 
-    expect(text).toContain('### Blast radius');
+    expect(text).toContain('**Blast radius');
     expect(text).toContain('`target`');
     expect(text).toMatch(/caller/); // a caller count is reported
     // It names WHERE (the caller file) — not the caller's source body.

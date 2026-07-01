@@ -175,6 +175,20 @@ export interface LanguageExtractor {
   visitNode?: (node: SyntaxNode, ctx: ExtractorContext) => boolean;
 
   /**
+   * Synthesize members that exist at compile time but not in the source AST,
+   * called at the end of class extraction with the class still on the scope
+   * stack (so `ctx.createNode` attaches containment + qualified names) and the
+   * class's real members already extracted (so the hook can skip a member the
+   * source explicitly declares). Used by Java for Lombok-generated accessors
+   * (`@Getter`/`@Setter`/`@Data`/`@Value`/`@Builder` → `getX`/`setX`/`builder`/
+   * `equals`/`hashCode`/`toString` + the `log` field), which are otherwise
+   * invisible and break call-chain analysis (#912). The created nodes carry a
+   * `lombok` decorator + a docstring naming the generating annotation, so an
+   * agent can tell them apart from hand-written code.
+   */
+  synthesizeMembers?: (classNode: SyntaxNode, ctx: ExtractorContext) => void;
+
+  /**
    * Classify a class_declaration node when the grammar reuses one node type
    * for multiple concepts (e.g. Swift uses class_declaration for classes, structs, and enums).
    */

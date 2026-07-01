@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /**
  * Migration definition
@@ -72,6 +72,31 @@ const migrations: Migration[] = [
     up: (db) => {
       db.exec(`
         ALTER TABLE nodes ADD COLUMN return_type TEXT;
+      `);
+    },
+  },
+  {
+    version: 6,
+    description:
+      'Dedup duplicate edge rows and add a UNIQUE identity index so INSERT OR IGNORE actually dedups (#1034)',
+    up: (db) => {
+      // `insertEdge` has always used `INSERT OR IGNORE`, but the edges table had
+      // no UNIQUE constraint, so nothing conflicted and byte-identical rows
+      // accumulated whenever two passes emitted the same edge. Collapse each
+      // identity group to its lowest id, then add the constraint that makes
+      // `OR IGNORE` keep its promise. IFNULL folds nullable line/col so
+      // coordinate-less edges dedup too (SQLite treats each NULL as distinct) —
+      // and it MUST match the GROUP BY exactly, or the index creation would
+      // fail on a pair the DELETE left behind. Idempotent: the index is
+      // `IF NOT EXISTS` and the DELETE is a no-op once the table is unique.
+      db.exec(`
+        DELETE FROM edges
+        WHERE id NOT IN (
+          SELECT MIN(id) FROM edges
+          GROUP BY source, target, kind, IFNULL(line, -1), IFNULL(col, -1)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
+          ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
       `);
     },
   },

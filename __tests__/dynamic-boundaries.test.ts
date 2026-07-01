@@ -8,13 +8,26 @@
  * showing nothing. Deterministic, query-time only, no graph mutation, and a
  * fully connected flow must never produce the section.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
 import { scanDynamicDispatch } from '../src/mcp/dynamic-boundaries';
+
+// These suites assert on the RAW codegraph_explore output (the Flow / boundary
+// sections). The managed reasoning-offload, when configured on the dev machine
+// (~/.codegraph/config.json `{"offload":{"managed":true}}`), REPLACES that output
+// with a remote Cerebras synthesis — so the structural assertions only hold with
+// the offload off. Disable it for this file so the suite is hermetic regardless
+// of machine config, then restore.
+let _prevOffloadDisable: string | undefined;
+beforeAll(() => { _prevOffloadDisable = process.env.CODEGRAPH_OFFLOAD_DISABLE; process.env.CODEGRAPH_OFFLOAD_DISABLE = '1'; });
+afterAll(() => {
+  if (_prevOffloadDisable === undefined) delete process.env.CODEGRAPH_OFFLOAD_DISABLE;
+  else process.env.CODEGRAPH_OFFLOAD_DISABLE = _prevOffloadDisable;
+});
 
 // ---------------------------------------------------------------------------
 // Unit: the scanner
@@ -171,7 +184,7 @@ describe('codegraph_explore — dynamic boundaries', () => {
     const res = await handler.execute('codegraph_explore', { query: 'routeSave onSave' });
     const text = res.content[0].text as string;
 
-    expect(text).toContain('## Dynamic boundaries');
+    expect(text).toContain('**Dynamic boundaries');
     expect(text).toContain('computed member call');
     expect(text).toMatch(/router\.ts:6/); // the exact dispatch site
     expect(text).toContain('candidates for key `save`');
@@ -199,7 +212,7 @@ describe('codegraph_explore — dynamic boundaries', () => {
     const res = await handler.execute('codegraph_explore', { query: 'route onSave' });
     const text = res.content[0].text as string;
 
-    expect(text).toContain('## Dynamic boundaries');
+    expect(text).toContain('**Dynamic boundaries');
     expect(text).toContain('computed member call');
     expect(text).not.toContain('candidates for key'); // runtime key → no shortlist to claim
   });
@@ -221,7 +234,7 @@ describe('codegraph_explore — dynamic boundaries', () => {
     // `processPayment` does not exist anywhere — only `route` resolves.
     const res = await handler.execute('codegraph_explore', { query: 'route processPayment' });
     const text = res.content[0].text as string;
-    expect(text).toContain('## Dynamic boundaries');
+    expect(text).toContain('**Dynamic boundaries');
   });
 
   it('renders a direct synthesized emit→handler hop as a dynamic-dispatch link (#687 criterion 1)', async () => {
@@ -254,11 +267,11 @@ describe('codegraph_explore — dynamic boundaries', () => {
     const res = await handler.execute('codegraph_explore', { query: 'completeCheckout settleInvoice' });
     const text = res.content[0].text as string;
 
-    expect(text).toContain('## Dynamic-dispatch links among your symbols');
+    expect(text).toContain('**Dynamic-dispatch links among your symbols');
     expect(text).toMatch(/completeCheckout → settleInvoice/);
     expect(text).toContain('invoice.settled');
     // Connected via the synthesized edge — no boundary to announce.
-    expect(text).not.toContain('## Dynamic boundaries');
+    expect(text).not.toContain('**Dynamic boundaries');
   });
 
   it('never adds the section to a fully connected flow', async () => {
@@ -272,8 +285,8 @@ describe('codegraph_explore — dynamic boundaries', () => {
 
     const res = await handler.execute('codegraph_explore', { query: 'stepOne stepThree' });
     const text = res.content[0].text as string;
-    expect(text).toContain('## Flow');
-    expect(text).not.toContain('## Dynamic boundaries');
+    expect(text).toContain('**Flow');
+    expect(text).not.toContain('**Dynamic boundaries');
   });
 
   it('python getattr dispatch surfaces with a prefix-key candidate', async () => {
@@ -292,8 +305,102 @@ describe('codegraph_explore — dynamic boundaries', () => {
     const res = await handler.execute('codegraph_explore', { query: 'process handle_save' });
     const text = res.content[0].text as string;
 
-    expect(text).toContain('## Dynamic boundaries');
+    expect(text).toContain('**Dynamic boundaries');
     expect(text).toContain('getattr');
     expect(text).toContain('handle_save');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration: interface/registry dispatch (a named method has many impls)
+// ---------------------------------------------------------------------------
+
+describe('codegraph_explore — interface dispatch', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+  let handler: ToolHandler;
+
+  const setup = async (files: Record<string, string>, include: string[]) => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-iface-'));
+    const src = path.join(testDir, 'src');
+    fs.mkdirSync(src, { recursive: true });
+    for (const [name, content] of Object.entries(files)) {
+      fs.writeFileSync(path.join(src, name), content);
+    }
+    cg = CodeGraph.initSync(testDir, { config: { include, exclude: [] } });
+    await cg.indexAll();
+    handler = new ToolHandler(cg);
+  };
+
+  afterEach(() => {
+    if (cg) cg.destroy();
+    if (testDir && fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  // 9 classes implement INodeType, each with execute(); a runtime registry lookup
+  // dispatches to one. The agent names the static entry + `execute`, which can't
+  // resolve to a single impl — the boundary IS the answer.
+  const nodeFamily = (n: number) => {
+    const names = ['Http', 'Set', 'If', 'Merge', 'Code', 'Webhook', 'Cron', 'Func', 'NoOp', 'Switch', 'Wait', 'Filter'];
+    return [
+      'export interface INodeType { execute(): unknown; }',
+      ...names.slice(0, n).map((nm, i) => `export class ${nm}Node implements INodeType { execute() { return ${i}; } }`),
+    ].join('\n');
+  };
+  const engine = [
+    "import { registry } from './registry';",
+    'export class WorkflowExecute {',
+    '  processRunExecutionData() { return this.runNode(); }',
+    '  runNode() { return this.executeNode(); }',
+    '  executeNode() {',
+    "    const nodeType = registry.get('http');",
+    '    return nodeType.execute();',
+    '  }',
+    '}',
+  ].join('\n');
+  const registry = [
+    "import type { INodeType } from './nodes';",
+    'class Registry {',
+    '  private m: Record<string, INodeType> = {};',
+    '  get(k: string): INodeType { return this.m[k]!; }',
+    '}',
+    'export const registry = new Registry();',
+  ].join('\n');
+
+  it('announces the interface, the TRUE implementer count, and sample targets', async () => {
+    await setup({ 'nodes.ts': nodeFamily(9), 'registry.ts': registry, 'engine.ts': engine }, ['**/*.ts']);
+
+    const res = await handler.execute('codegraph_explore', { query: 'processRunExecutionData executeNode execute' });
+    const text = res.content[0].text as string;
+
+    expect(text).toContain('**Interface dispatch (a named method has many implementations)');
+    expect(text).toMatch(/`execute` → runtime dispatch to \*\*9\*\* types implementing `INodeType`/);
+    // a couple of concrete targets, with file:line
+    expect(text).toMatch(/\b\w+Node\.execute` \(/);
+    // never steer to Read
+    expect(text).not.toMatch(/\buse Read\b/i);
+  });
+
+  it('stays SILENT on a fully connected flow with no polymorphic family', async () => {
+    await setup({
+      'pipeline.ts': [
+        'export function stepOne() { return stepTwo(); }',
+        'export function stepTwo() { return stepThree(); }',
+        'export function stepThree() { return 3; }',
+      ].join('\n'),
+    }, ['**/*.ts']);
+
+    const res = await handler.execute('codegraph_explore', { query: 'stepOne stepThree' });
+    const text = res.content[0].text as string;
+    expect(text).toContain('**Flow');
+    expect(text).not.toContain('**Interface dispatch');
+  });
+
+  it('stays SILENT when the interface family is below the polymorphism threshold (3 impls)', async () => {
+    await setup({ 'nodes.ts': nodeFamily(3), 'registry.ts': registry, 'engine.ts': engine }, ['**/*.ts']);
+
+    const res = await handler.execute('codegraph_explore', { query: 'processRunExecutionData executeNode execute' });
+    const text = res.content[0].text as string;
+    expect(text).not.toContain('**Interface dispatch');
   });
 });

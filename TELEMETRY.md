@@ -39,7 +39,7 @@ Every payload carries this envelope:
 | `os` / `arch` | `darwin` / `arm64` | platform identifiers only |
 | `node_major` | `22` | major version only |
 | `ci` | `false` | whether the `CI` env var was set |
-| `schema_version` | `1` | bumped when this page changes |
+| `schema_version` | `2` | bumped when this page changes (v2 dropped the `index` event's `sqlite_backend` field) |
 
 And one of four events:
 
@@ -48,8 +48,7 @@ And one of four events:
   an upgrade, or a re-run.
 - **`index`** — when a full index completes: the **language names** present (e.g.
   `["typescript","go"]`), the file count as a **coarse bucket** (`<100`, `100-1k`,
-  `1k-10k`, `10k+`), the duration as a bucket (`<10s`, `10-60s`, `1-5m`, `5m+`), and the
-  SQLite backend (`native`/`wasm`).
+  `1k-10k`, `10k+`), and the duration as a bucket (`<10s`, `10-60s`, `1-5m`, `5m+`).
 - **`usage_rollup`** — one line per day per tool: the tool or CLI command **name** (e.g.
   `codegraph_explore`, `init`), how many times it ran, how many errored, and — for MCP
   tools — the connecting agent's name and version from the MCP handshake (e.g.

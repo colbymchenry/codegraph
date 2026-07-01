@@ -7,10 +7,10 @@ description: Full index, incremental sync, and the file watcher.
 
 ```bash
 cd your-project
-codegraph init -i      # initialize + full index
+codegraph init      # creates .codegraph/ and builds the full graph — one step
 ```
 
-`init` creates `.codegraph/`; `-i`/`--index` builds the index immediately. To initialize without indexing, drop the flag and run `codegraph index` later.
+`codegraph init` creates the local `.codegraph/` directory and builds the full graph in the same step — one command, done. There's no separate index step to run afterward, and from here the graph [stays fresh automatically](#stay-fresh-automatically).
 
 ## Full vs. incremental
 
@@ -20,7 +20,7 @@ codegraph index --force   # re-index from scratch
 codegraph sync            # incremental — only changed files
 ```
 
-`sync` is fast because it only reparses what changed. Use it after a branch switch or a batch of edits.
+`sync` is fast because it only reparses what changed — it's what the file watcher runs for you on every edit (see [Stay fresh automatically](#stay-fresh-automatically)). You rarely need to run it by hand.
 
 ## Stay fresh automatically
 

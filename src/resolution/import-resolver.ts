@@ -1296,6 +1296,25 @@ export function resolveViaImport(
         );
 
         if (targetNode) {
+          // `Foo.bar()` / `Foo.CONST` — a NAMED (non-namespace) class import
+          // accessed through a member. `findExportedSymbol` resolved `Foo` to
+          // the class itself; descend into it so the reference links to the
+          // member `bar`, not the class. Without this the edge points at the
+          // class and `createEdges` then mis-promotes the call to an
+          // `instantiates` edge, so the static method shows zero callers and a
+          // hollow impact radius. (#825)
+          if (!imp.isNamespace && ref.referenceName.startsWith(imp.localName + '.')) {
+            const memberNode = resolveStaticMember(targetNode, ref, imp.localName, context);
+            if (memberNode) {
+              return {
+                original: ref,
+                targetNodeId: memberNode.id,
+                confidence: 0.9,
+                resolvedBy: 'import',
+              };
+            }
+          }
+
           return {
             original: ref,
             targetNodeId: targetNode.id,
@@ -1895,4 +1914,47 @@ function findExportedSymbol(
   }
 
   return undefined;
+}
+
+/** Node kinds that own static members reachable as `Container.member`. */
+const STATIC_MEMBER_CONTAINERS = new Set<Node['kind']>([
+  'class', 'struct', 'interface', 'enum', 'trait', 'protocol',
+]);
+
+/**
+ * Resolve `Container.member` — a static method/property access on a NAMED class
+ * import (`import { Foo } …; Foo.bar()`) — to the member node, given the
+ * already-resolved container class.
+ *
+ * Members carry a `Container::member` qualifiedName, so we look up
+ * `${container.qualifiedName}::${member}` within the container's own file (the
+ * file filter disambiguates same-named classes in other modules). Returns
+ * undefined when the container isn't a member-owning kind or the member isn't
+ * found, so the caller falls back to the container itself (prior behavior) —
+ * languages whose members aren't `::`-qualified, and genuine class references,
+ * are unaffected. See #825.
+ */
+function resolveStaticMember(
+  container: Node,
+  ref: UnresolvedRef,
+  localName: string,
+  context: ResolutionContext
+): Node | undefined {
+  if (!STATIC_MEMBER_CONTAINERS.has(container.kind)) return undefined;
+  // First segment after the receiver: `Foo.bar.baz` → `bar`.
+  const member = ref.referenceName.slice(localName.length + 1).split('.')[0];
+  if (!member) return undefined;
+
+  const candidates = context
+    .getNodesByQualifiedName(`${container.qualifiedName}::${member}`)
+    .filter((n) => n.filePath === container.filePath);
+  if (candidates.length === 0) return undefined;
+
+  // When the reference is a call, prefer a callable member if several nodes
+  // share the qualifiedName (e.g. a static property and a method).
+  if (ref.referenceKind === 'calls') {
+    const callable = candidates.find((n) => n.kind === 'method' || n.kind === 'function');
+    if (callable) return callable;
+  }
+  return candidates[0];
 }

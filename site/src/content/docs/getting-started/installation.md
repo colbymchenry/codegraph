@@ -14,9 +14,10 @@ The installer will:
 - Ask which agent(s) to configure — auto-detecting installed ones from **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, and **Kiro**.
 - Prompt to install `codegraph` on your `PATH` (so agents can launch the MCP server).
 - Ask whether configs apply to all your projects or just this one.
-- Write each chosen agent's MCP server config plus an instructions file (e.g. `CLAUDE.md`, `.cursor/rules/codegraph.mdc`, `~/.codex/AGENTS.md`).
+- Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`). Cursor and Kiro get the MCP config only. Removed cleanly by `codegraph uninstall`.
 - Set up auto-allow permissions when Claude Code is one of the targets.
-- Initialize your current project (local installs only).
+
+The installer **wires up your agents only — it does not index your code.** After it finishes, build each project's graph yourself with `codegraph init` (step 3 below).
 
 ## Non-interactive (scripting / CI)
 
@@ -43,10 +44,10 @@ Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent /
 
 ```bash
 cd your-project
-codegraph init -i
+codegraph init
 ```
 
-This builds the per-project knowledge graph index and wires up any project-local agent surfaces, so a single global `codegraph install` works in every project you open.
+`codegraph init` creates the local `.codegraph/` directory and builds the full graph in the same step — one command. A single global `codegraph install` covers every project; you run `codegraph init` once per project.
 
 ## Supported platforms
 

@@ -136,18 +136,29 @@ export const scalaExtractor: LanguageExtractor = {
       const name = getValVarName(node, ctx.source);
       if (!name) return false;
 
-      const isInClass = ctx.nodeStack.length > 0 &&
-        (() => {
-          const parentId = ctx.nodeStack[ctx.nodeStack.length - 1];
-          const parentNode = ctx.nodes.find((n) => n.id === parentId);
-          return parentNode != null && (
-            parentNode.kind === 'class' || parentNode.kind === 'trait' ||
-            parentNode.kind === 'interface' || parentNode.kind === 'struct' ||
-            parentNode.kind === 'enum' || parentNode.kind === 'module'
-          );
-        })();
+      // An `object` is a singleton: its `val`s are shared constants (the Scala
+      // idiom for `static final` — `object Config { val Timeout = 30 }`), so
+      // emit them as `constant`/`variable` like a top-level val, which lets
+      // value-reference edges target them. A `class`/`trait`/`enum`/`given` val
+      // is a per-instance immutable field. Both an `object` and a `class`
+      // extract as `class` kind, so the AST node type of the enclosing
+      // definition — not the parent node's kind — is what distinguishes them.
+      let enclosingDef: string | null = null;
+      for (let p = node.parent; p; p = p.parent) {
+        if (
+          p.type === 'class_definition' || p.type === 'trait_definition' ||
+          p.type === 'enum_definition' || p.type === 'given_definition' ||
+          p.type === 'object_definition'
+        ) {
+          enclosingDef = p.type;
+          break;
+        }
+      }
+      const isInstanceField =
+        enclosingDef === 'class_definition' || enclosingDef === 'trait_definition' ||
+        enclosingDef === 'enum_definition' || enclosingDef === 'given_definition';
 
-      const kind = isInClass ? 'field' : (t === 'val_definition' ? 'constant' : 'variable');
+      const kind = isInstanceField ? 'field' : (t === 'val_definition' ? 'constant' : 'variable');
       const typeNode = node.childForFieldName('type');
       const sig = typeNode
         ? `${t === 'val_definition' ? 'val' : 'var'} ${name}: ${getNodeText(typeNode, ctx.source)}`

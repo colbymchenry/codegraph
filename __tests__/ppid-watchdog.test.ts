@@ -10,7 +10,7 @@
  * stubbing `isAlive` and `platform`.
  */
 import { describe, it, expect } from 'vitest';
-import { supervisionLostReason } from '../src/mcp/ppid-watchdog';
+import { supervisionLostReason, parsePpidPollMs, parseHostPpid, DEFAULT_PPID_POLL_MS } from '../src/mcp/ppid-watchdog';
 
 const alive = () => true;
 const dead = () => false;
@@ -134,5 +134,34 @@ describe('supervisionLostReason', () => {
       });
       expect(reason).toBe('ppid 100 -> 1');
     });
+  });
+});
+
+describe('parsePpidPollMs', () => {
+  it('defaults when unset / empty / non-numeric / negative', () => {
+    expect(parsePpidPollMs(undefined)).toBe(DEFAULT_PPID_POLL_MS);
+    expect(parsePpidPollMs('')).toBe(DEFAULT_PPID_POLL_MS);
+    expect(parsePpidPollMs('abc')).toBe(DEFAULT_PPID_POLL_MS);
+    expect(parsePpidPollMs('-5')).toBe(DEFAULT_PPID_POLL_MS);
+  });
+  it('honours a positive override and floors it', () => {
+    expect(parsePpidPollMs('200')).toBe(200);
+    expect(parsePpidPollMs('150.9')).toBe(150);
+  });
+  it('treats 0 as the explicit "disable" sentinel (caller skips the timer)', () => {
+    expect(parsePpidPollMs('0')).toBe(0);
+  });
+});
+
+describe('parseHostPpid', () => {
+  it('returns null for unset / empty / non-integer / orphan-sentinel pids', () => {
+    expect(parseHostPpid(undefined)).toBeNull();
+    expect(parseHostPpid('')).toBeNull();
+    expect(parseHostPpid('x')).toBeNull();
+    expect(parseHostPpid('0')).toBeNull();  // unknown
+    expect(parseHostPpid('1')).toBeNull();  // init = already orphaned
+  });
+  it('returns a real positive pid', () => {
+    expect(parseHostPpid('4242')).toBe(4242);
   });
 });
