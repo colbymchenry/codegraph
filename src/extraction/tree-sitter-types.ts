@@ -133,6 +133,16 @@ export interface LanguageExtractor {
   /** Override symbol name extraction (e.g. ObjC multi-part selectors). */
   resolveName?: (node: SyntaxNode, source: string) => string | undefined;
 
+  /**
+   * Post-process an already-extracted name to recover a real identifier from a
+   * name still mangled by a macro the pre-parse didn't blank (C/C++:
+   * `MACRO Ret name(` misparses to the name "Ret name"). Applied to every name
+   * this extractor produces, so it MUST be a no-op on a well-formed name — only
+   * C/C++ set it, because a mangled name there is unambiguous (an internal space),
+   * whereas e.g. Kotlin/Scala backtick identifiers legitimately contain spaces.
+   */
+  recoverMangledName?: (name: string) => string;
+
   /** Extract property name when the generic name walk fails (e.g. ObjC @property). */
   extractPropertyName?: (node: SyntaxNode, source: string) => string | null;
 

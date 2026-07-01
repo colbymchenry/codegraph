@@ -123,6 +123,8 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
 }
 
 export const cExtractor: LanguageExtractor = {
+  // Universal net: recover a real name from any macro-mangled function name.
+  recoverMangledName: recoverMangledCppName,
   functionTypes: ['function_definition'],
   classTypes: [],
   methodTypes: [],
@@ -275,6 +277,15 @@ const CPP_INLINE_MACROS = [
   '_ALWAYS_INLINE_', '_FORCE_INLINE_',
   // Boost
   'BOOST_FORCEINLINE', 'BOOST_NOINLINE',
+  // Qt (per-method markers + inline)
+  'Q_INVOKABLE', 'Q_SCRIPTABLE', 'Q_ALWAYS_INLINE', 'Q_SLOT', 'Q_SIGNAL',
+  // Folly / Abseil / LLVM / V8 / Eigen / rapidjson
+  'FOLLY_ALWAYS_INLINE', 'FOLLY_NOINLINE',
+  'ABSL_ATTRIBUTE_ALWAYS_INLINE', 'ABSL_ATTRIBUTE_NOINLINE',
+  'LLVM_ATTRIBUTE_ALWAYS_INLINE', 'LLVM_ATTRIBUTE_NOINLINE',
+  'V8_INLINE', 'V8_NOINLINE',
+  'EIGEN_STRONG_INLINE', 'EIGEN_ALWAYS_INLINE', 'EIGEN_DEVICE_FUNC',
+  'RAPIDJSON_FORCEINLINE',
   // Common cross-ecosystem inline/attribute hints
   'ALWAYS_INLINE', 'FORCE_INLINE', 'NOINLINE',
 ] as const;
@@ -288,6 +299,40 @@ export function blankCppInlineMacros(source: string): string {
   return source.replace(CPP_INLINE_MACRO_RE, (m) => ' '.repeat(m.length));
 }
 
+// Bare C/C++ type/qualifier tokens that must never be taken as a recovered
+// function name (guards `recoverMangledCppName` against the `Ret (name)` idiom,
+// where the token before the params is the return type, not the name).
+const CPP_PRIMITIVE_NAMES = new Set([
+  'bool', 'void', 'int', 'char', 'short', 'long', 'float', 'double', 'unsigned',
+  'signed', 'wchar_t', 'char8_t', 'char16_t', 'char32_t', 'char_t', 'size_t',
+  'auto', 'const', 'struct', 'class', 'enum', 'union', 'typename',
+]);
+
+/**
+ * Universal fallback (any macro, no list) for a C/C++ function name still mangled
+ * because a macro we don't blank sat in front of the return type: `MACRO Ret
+ * name(…)` / `Ret MACRO name(…)` misparse so the return type is glued onto the
+ * name ("Ret name", "char_t* to_str(double v)"). Recover the real identifier —
+ * the token immediately before the parameter list (or the last token). This runs
+ * AFTER the curated pre-parse blank, so it only ever sees the residual tail that
+ * blanking didn't already fix cleanly (which also recovers the return type).
+ *
+ * Safe by construction: only touches an ALREADY-mangled name — one with an
+ * internal space that isn't a legit `operator …`/destructor — so a well-formed
+ * name is returned unchanged. Guarded against the two ways it could mis-pick:
+ * the `Ret (name)` parenthesized-name idiom (left as-is, ambiguous), and a token
+ * that is a bare primitive/keyword rather than a real identifier.
+ */
+export function recoverMangledCppName(name: string): string {
+  if (!/\s/.test(name) || name.startsWith('operator') || name.startsWith('~')) return name;
+  if (/^\S+\s+\([A-Za-z_]\w*\)/.test(name)) return name; // `Ret (name)` idiom — leave alone
+  const beforeParams = name.includes('(') ? name.slice(0, name.indexOf('(')) : name;
+  const tokens = beforeParams.trim().split(/\s+/);
+  const candidate = tokens[tokens.length - 1];
+  if (!candidate || !/^[A-Za-z_]\w*$/.test(candidate) || CPP_PRIMITIVE_NAMES.has(candidate)) return name;
+  return candidate;
+}
+
 /** C/C++ source pre-processing before tree-sitter: recover both macro-annotated
  * class definitions and macro-prefixed function definitions. Offset-preserving. */
 function preParseCppSource(source: string): string {
@@ -299,6 +344,8 @@ export const cppExtractor: LanguageExtractor = {
   // #1061/#946) and macro-prefixed functions (`FORCEINLINE FString Foo()`, #1093
   // follow-up) that tree-sitter otherwise misparses.
   preParse: preParseCppSource,
+  // Universal net for any macro the curated blank list misses.
+  recoverMangledName: recoverMangledCppName,
   functionTypes: ['function_definition'],
   classTypes: ['class_specifier'],
   // A bodiless `class_specifier` is a forward declaration (`class Foo;`) or an

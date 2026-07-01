@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -2992,6 +2992,61 @@ class APXCharacter {  // the one real definition
       expect(blankCppInlineMacros('x = FORCEINLINE + 1;')).toBe('x = FORCEINLINE + 1;');
       expect(blankCppInlineMacros('int FORCEINLINE_COUNT = 3;')).toBe('int FORCEINLINE_COUNT = 3;');
       expect(blankCppInlineMacros('no macros here')).toBe('no macros here');
+    });
+  });
+
+  describe('C++ universal macro-mangled name recovery', () => {
+    // Curated pre-parse blanking can't list every library's inline macro, so a
+    // post-parse salvage recovers the real function name from ANY leftover
+    // `MACRO Ret name(…)` mangle — no list needed. It only ever touches an
+    // already-mangled name, so it can't corrupt a clean one.
+    const namesOf = (code: string, file = 's.cpp') =>
+      extractFromSource(file, code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+
+    it('recovers the name from a completely unknown macro (no list entry)', () => {
+      expect(namesOf('WEBKIT_EXPORT WTFString computeThing(int x) { return H(x); }')).toContain('computeThing');
+      expect(namesOf('SOMELIB_INLINE MyResult doWork(int x) { return H(x); }')).toContain('doWork');
+      expect(namesOf('MZ_FORCEINLINE char_t* to_str(double v) { return H(v); }')).toContain('to_str');
+    });
+
+    it('recoverMangledCppName only touches already-mangled names, with guards', () => {
+      // Recovered:
+      expect(recoverMangledCppName('WTFString computeThing')).toBe('computeThing');
+      expect(recoverMangledCppName('char_t* to_str(double v)')).toBe('to_str');
+      expect(recoverMangledCppName('unspecified_bool_type() const')).toBe('unspecified_bool_type');
+      // Left unchanged — clean names, operators, destructors, the `Ret (name)`
+      // idiom, and non-identifier tails:
+      expect(recoverMangledCppName('computeThing')).toBe('computeThing');
+      expect(recoverMangledCppName('operator EALSMovementState')).toBe('operator EALSMovementState');
+      expect(recoverMangledCppName('~Widget')).toBe('~Widget');
+      expect(recoverMangledCppName('bool (likely)')).toBe('bool (likely)');
+      expect(recoverMangledCppName('void (free)')).toBe('void (free)');
+      expect(recoverMangledCppName('QDockWidget *')).toBe('QDockWidget *');
+    });
+
+    it('does not disturb clean C++ names or non-C++ (Kotlin backtick) names', () => {
+      expect(namesOf('int foo(int x) { return x; }')).toEqual(['foo']);
+      // Kotlin backtick identifiers legitimately contain spaces; the salvage is
+      // C/C++-only, so they are untouched.
+      const kt = extractFromSource('T.kt', 'class T {\n  fun `decode simple cert`() { }\n}').nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+      expect(kt).toContain('`decode simple cert`');
+    });
+
+    it('curated list now also covers Qt / Folly / Abseil / LLVM / V8 / Eigen / rapidjson (full recovery)', () => {
+      const info = (c: string) =>
+        extractFromSource('x.cpp', c).nodes
+          .filter((n) => n.kind === 'method' || n.kind === 'function')
+          .map((n) => ({ name: n.name, ret: n.returnType }));
+      expect(info('FOLLY_ALWAYS_INLINE Str f(int x) { return H(x); }')).toEqual([{ name: 'f', ret: 'Str' }]);
+      expect(namesOf('Q_INVOKABLE void onClicked() { H(); }')).toContain('onClicked');
+      expect(namesOf('ABSL_ATTRIBUTE_ALWAYS_INLINE int hash(int x) { return H(x); }')).toContain('hash');
+      expect(namesOf('EIGEN_STRONG_INLINE Scalar dot(const V& v) { return H(v); }')).toContain('dot');
+      expect(namesOf('V8_INLINE MaybeLocal Get(int i) { return H(i); }')).toContain('Get');
+      expect(namesOf('RAPIDJSON_FORCEINLINE bool Parse(const char* s) { return H(s); }')).toContain('Parse');
     });
   });
 

@@ -63,6 +63,14 @@ const VUE_STORE_FILE_SIGNAL = /\bdefineStore\b|\bcreateStore\b|\bVuex\b|\bmutati
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
+  const name = extractNameRaw(node, source, extractor);
+  // Universal fallback: recover a real identifier from a name still mangled by a
+  // macro the pre-parse didn't blank (C/C++ only — see recoverMangledName). A
+  // no-op on well-formed names, so a clean name is never altered.
+  return extractor.recoverMangledName ? extractor.recoverMangledName(name) : name;
+}
+
+function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
   const hookName = extractor.resolveName?.(node, source);
   if (hookName) return hookName;
 
