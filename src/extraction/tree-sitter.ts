@@ -3497,6 +3497,63 @@ export class TreeSitterExtractor {
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
 
+    // Ruby `call` nodes use `receiver` + `method` fields (tree-sitter-ruby), not
+    // the `object`/`name`/`function` fields the branches below expect — so
+    // without this they fell through to the generic path, which took the
+    // receiver as the callee and DROPPED the method name: `lg.log()` produced a
+    // `calls` ref to `lg` (unresolvable) and no method edge was ever recorded,
+    // so a Ruby method's callers/impact were invisible (#1108 follow-up). Build
+    // `receiver.method` so the resolver — and local-variable type inference —
+    // can link it; `Foo.new` stays an instantiation.
+    if (this.language === 'ruby' && (node.type === 'call' || node.type === 'method_call')) {
+      const methodNode = getChildByField(node, 'method');
+      const methodName = methodNode ? getNodeText(methodNode, this.source) : '';
+      if (!methodName) return; // operator/element-reference call with no method name
+      const receiverNode = getChildByField(node, 'receiver');
+      const line = node.startPosition.row + 1;
+      const column = node.startPosition.column;
+      if (!receiverNode) {
+        // Bare `foo(...)` — just the method name (unchanged behavior).
+        this.unresolvedReferences.push({ fromNodeId: callerId, referenceName: methodName, referenceKind: 'calls', line, column });
+        return;
+      }
+      const receiverName = getNodeText(receiverNode, this.source);
+      // `Foo.new` / `Foo::Bar.new` is construction — emit an `instantiates` ref to
+      // the class (last `::` segment), preserving the "what creates X" edge.
+      if (methodName === 'new') {
+        const className = receiverName.includes('::')
+          ? receiverName.slice(receiverName.lastIndexOf('::') + 2)
+          : receiverName;
+        if (/^[A-Z]/.test(className)) {
+          this.unresolvedReferences.push({ fromNodeId: callerId, referenceName: className, referenceKind: 'instantiates', line, column });
+          return;
+        }
+      }
+      const SKIP_RECEIVERS = new Set(['self', 'super']);
+      const skip = SKIP_RECEIVERS.has(receiverName);
+      this.unresolvedReferences.push({
+        fromNodeId: callerId,
+        referenceName: skip ? methodName : `${receiverName}.${methodName}`,
+        referenceKind: 'calls',
+        line,
+        column,
+      });
+      // A capitalized (constant) receiver — `Foo.bar`, a class/module method call
+      // — is itself a dependency on that constant; emit a `references` ref so a
+      // class used only via its class methods still records a dependent (the edge
+      // the old receiver-only callee happened to provide, now made explicit).
+      if (!skip && receiverNode.type === 'constant') {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: receiverName,
+          referenceKind: 'references',
+          line: receiverNode.startPosition.row + 1,
+          column: receiverNode.startPosition.column,
+        });
+      }
+      return;
+    }
+
     // Get the function/method being called
     let calleeName = '';
 

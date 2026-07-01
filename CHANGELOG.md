@@ -12,6 +12,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New Features
 
 - Method calls made through a local variable now resolve to the method in many more languages. When code does `const logger = new Logger(); logger.log();` (or the equivalent), CodeGraph infers the local variable's type from its declaration or initializer and links the call to the right method — so these calls now show up in callers, impact/blast-radius, and `codegraph_explore` flow traces instead of being dropped. Previously only C++ handled this; it now also covers TypeScript, JavaScript, Python, Java, C#, Kotlin, Swift, Go, Rust, Dart, Scala, and PHP. (#1108)
+- Ruby method calls made on a receiver (`logger.log`) now record an edge to the method. Previously the Ruby indexer kept only the receiver and discarded the method name, so a method called through a variable or object had no recorded callers and was missing from impact/blast-radius and flow traces; combined with the local-variable type inference above, `logger = Logger.new; logger.log` now links to `Logger#log`. Calls to a class method (`Foo.bar`) and object construction (`Foo.new`) are still recorded too. (#1110)
 
 ### Fixes
 

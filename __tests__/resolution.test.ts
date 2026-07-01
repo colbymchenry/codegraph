@@ -1681,6 +1681,8 @@ func main() {
         src: `<?php\nclass Logger { function log() { return 1; } }\nfunction useIt() { $lg = new Logger(); return $lg->log(); }\n` },
       { lang: 'Scala (val x = new T)', file: 'Svc.scala',
         src: `class Logger { def log(): Int = 1 }\nobject A { def use(): Int = { val lg = new Logger(); lg.log() } }\n` },
+      { lang: 'Ruby (x = T.new)', file: 'svc.rb',
+        src: `class Logger\n  def log\n    1\n  end\nend\ndef use\n  lg = Logger.new\n  lg.log\nend\n` },
     ];
 
     for (const c of cases) {
@@ -1702,6 +1704,28 @@ func main() {
         ).toBeGreaterThan(0);
       });
     }
+
+    it('Ruby: builds receiver.method and keeps Foo.new as an instantiation', async () => {
+      // The Ruby extractor previously took the receiver as the callee and
+      // dropped the method name (`lg.log()` -> a call to `lg`). Now it builds
+      // `lg.log`, while `Logger.new` must still record an instantiation.
+      fs.writeFileSync(
+        path.join(tempDir, 'svc.rb'),
+        `class Logger\n  def log\n    1\n  end\nend\ndef run\n  lg = Logger.new\n  lg.log\nend\n`,
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const run = cg.getNodesByKind('function').find((n) => n.name === 'run')!;
+      const logMethod = cg.getNodesByKind('method').find((n) => n.name === 'log')!;
+      const logger = cg.getNodesByKind('class').find((n) => n.name === 'Logger')!;
+      const out = cg.getOutgoingEdges(run.id);
+
+      // lg.log resolved to the method (the receiver-type inference kicked in).
+      expect(out.some((e) => e.kind === 'calls' && e.target === logMethod.id)).toBe(true);
+      // Logger.new is still an instantiation of the class.
+      expect(out.some((e) => e.kind === 'instantiates' && e.target === logger.id)).toBe(true);
+    });
   });
 
   describe('Name Matcher: kind bias for new ref kinds', () => {
