@@ -1650,6 +1650,60 @@ func main() {
     });
   });
 
+  describe('Local-variable receiver-type inference (#1108)', () => {
+    // `lg.log()` where `lg` is a local whose type is inferred from its
+    // declaration/initializer. Before this, only C++ resolved these; every
+    // other language produced no method edge. Each case is one file with a
+    // single Logger + a caller using a local-variable receiver — a correct
+    // resolution makes the caller a caller of `log`.
+    const cases: Array<{ lang: string; file: string; src: string }> = [
+      { lang: 'TypeScript (= new T)', file: 'svc.ts',
+        src: `class Logger { log() { return 1; } }\nexport function use() { const lg = new Logger(); return lg.log(); }\n` },
+      { lang: 'JavaScript (= new T)', file: 'svc.js',
+        src: `class Logger { log() { return 1; } }\nexport function use() { const lg = new Logger(); return lg.log(); }\n` },
+      { lang: 'Python (= T())', file: 'svc.py',
+        src: `class Logger:\n    def log(self):\n        return 1\ndef use():\n    lg = Logger()\n    return lg.log()\n` },
+      { lang: 'Java (T x = new T)', file: 'Svc.java',
+        src: `class Logger { void log() { int a = 1; } }\nclass Use { void run() { Logger lg = new Logger(); lg.log(); } }\n` },
+      { lang: 'C# (var x = new T)', file: 'Svc.cs',
+        src: `class Logger { void Log() { int a = 1; } }\nclass Use { void Run() { var lg = new Logger(); lg.Log(); } }\n` },
+      { lang: 'Kotlin (val x = T())', file: 'Svc.kt',
+        src: `class Logger { fun log(): Int { return 1 } }\nfun use(): Int { val lg = Logger(); return lg.log() }\n` },
+      { lang: 'Swift (let x = T())', file: 'svc.swift',
+        src: `class Logger { func log() -> Int { return 1 } }\nfunc use() -> Int { let lg = Logger(); return lg.log() }\n` },
+      { lang: 'Go (x := T{})', file: 'svc.go',
+        src: `package a\ntype Logger struct{}\nfunc (l Logger) Log() int { return 1 }\nfunc Use() int { lg := Logger{}; return lg.Log() }\n` },
+      { lang: 'Rust (let x = T{})', file: 'svc.rs',
+        src: `pub struct Logger { n: i32 }\nimpl Logger { pub fn log(&self) -> i32 { self.n } }\npub fn use_it() -> i32 { let lg = Logger { n: 1 }; lg.log() }\n` },
+      { lang: 'Dart (var x = T())', file: 'svc.dart',
+        src: `class Logger { int log() { return 1; } }\nint use() { var lg = Logger(); return lg.log(); }\n` },
+      { lang: 'PHP ($x = new T)', file: 'svc.php',
+        src: `<?php\nclass Logger { function log() { return 1; } }\nfunction useIt() { $lg = new Logger(); return $lg->log(); }\n` },
+      { lang: 'Scala (val x = new T)', file: 'Svc.scala',
+        src: `class Logger { def log(): Int = 1 }\nobject A { def use(): Int = { val lg = new Logger(); lg.log() } }\n` },
+    ];
+
+    for (const c of cases) {
+      it(`resolves a local-variable method call — ${c.lang}`, async () => {
+        fs.writeFileSync(path.join(tempDir, c.file), c.src);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        cg.resolveReferences();
+
+        const logMethod = cg
+          .getNodesByKind('method')
+          .find((n) => n.name.toLowerCase() === 'log');
+        expect(logMethod, `${c.lang}: log method should be indexed`).toBeDefined();
+
+        // The enclosing caller resolves through the local variable to `log`.
+        const callers = cg.getCallers(logMethod!.id).map((x) => x.node.name);
+        expect(
+          callers.length,
+          `${c.lang}: log should have a caller (got [${callers.join(', ')}])`,
+        ).toBeGreaterThan(0);
+      });
+    }
+  });
+
   describe('Name Matcher: kind bias for new ref kinds', () => {
     const baseContext = (candidates: Node[]): ResolutionContext => ({
       getNodesInFile: () => [],

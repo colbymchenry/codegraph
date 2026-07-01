@@ -4,7 +4,7 @@
  * Handles symbol name matching for reference resolution.
  */
 
-import { Node } from '../types';
+import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
 
 /**
@@ -1019,6 +1019,165 @@ function inferJavaFieldReceiverType(
   return lastPart;
 }
 
+// ── Local-variable receiver-type inference (#1108) ──────────────────────────
+//
+// Instance calls through a local variable (`const lg = new Logger(); lg.log()`)
+// only resolved in C++ before this — no other language could learn the
+// receiver's type. Local variables are not indexed as nodes (node-explosion),
+// so, like the C++ inferrer above, we read the enclosing function's source and
+// match the receiver's declaration/initializer to recover its type. The type is
+// then handed to resolveMethodOnType, which VALIDATES that the type actually
+// declares the method, so a mis-inference produces NO edge — the safety net
+// that lets the patterns below stay simple. C++ keeps its dedicated inferrer
+// (header scan + `auto`); this covers every other language.
+
+// Tokens a loose pattern might capture that are never a user-defined type.
+const NON_TYPE_RECEIVER_TOKENS = new Set([
+  'this', 'self', 'super', 'new', 'return', 'await', 'yield', 'typeof',
+  'null', 'nil', 'None', 'true', 'false', 'True', 'False', 'undefined',
+]);
+
+/**
+ * Normalize a captured type expression to a simple type name: drop generic
+ * args and pointer/ref markers, take the last `.`/`::`-qualified segment, and
+ * reject obvious non-types.
+ */
+function normalizeInferredTypeName(raw: string): string | null {
+  const cleaned = raw.replace(/<[^>]*>/g, '').replace(/[&*]/g, '').trim();
+  const seg = cleaned.split(/[.:]+/).filter(Boolean).pop();
+  if (!seg) return null;
+  if (NON_TYPE_RECEIVER_TOKENS.has(seg)) return null;
+  return seg;
+}
+
+/**
+ * Per-language patterns that recover a local variable's (or typed parameter's)
+ * type from its declaration/initializer. Each regex captures the type in group
+ * 1; `r` is the already-escaped receiver name. Ordered most-specific first.
+ * PascalCase is required in the capture where the language convention allows,
+ * as a cheap false-positive guard on top of resolveMethodOnType's validation.
+ */
+function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
+  switch (language) {
+    case 'typescript':
+    case 'javascript':
+    case 'tsx':
+    case 'jsx':
+      return [
+        new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), // = new Logger()
+        new RegExp(`\\b(?:const|let|var)\\s+${r}\\s*:\\s*([A-Z][\\w.$]*)`), // lg: Logger
+      ];
+    case 'python':
+      return [
+        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // lg = Logger(...)
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // lg: Logger  (PEP 526)
+      ];
+    case 'java':
+      return [
+        new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_][\\w.]*)`), // = new Logger()
+        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;,)]`), // Logger lg;  / param
+      ];
+    case 'kotlin':
+      return [
+        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // val lg = Logger(...)
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // val lg: Logger  / param
+      ];
+    case 'csharp':
+      return [
+        new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_][\\w.]*)`), // = new Logger()
+        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;,)]`), // Logger lg;  / param
+      ];
+    case 'swift':
+      return [
+        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // let lg = Logger(...)
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // let lg: Logger  / param
+      ];
+    case 'rust':
+      return [
+        new RegExp(`\\blet\\s+(?:mut\\s+)?${r}\\b(?:\\s*:[^=]+)?=\\s*&?(?:mut\\s+)?([A-Z][\\w]*)`), // let lg = Logger::new()/Logger{}/Logger
+        new RegExp(`\\blet\\s+(?:mut\\s+)?${r}\\s*:\\s*&?(?:mut\\s+)?([A-Z][\\w]*)`), // let lg: Logger
+      ];
+    case 'go':
+      return [
+        new RegExp(`\\b${r}\\b\\s*:=\\s*&?([A-Za-z_][\\w.]*)\\s*{`), // lg := Logger{} / &Logger{}
+        new RegExp(`\\bvar\\s+${r}\\s+\\*?([A-Za-z_][\\w.]*)`), // var lg Logger / *Logger
+      ];
+    case 'ruby':
+      return [
+        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w:]*)\\.new\\b`), // lg = Logger.new
+      ];
+    case 'scala':
+      return [
+        new RegExp(`\\b${r}\\b\\s*=\\s*(?:new\\s+)?([A-Z][\\w.]*)`), // val lg = new Logger / Logger(...)
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // val lg: Logger  / param
+      ];
+    case 'dart':
+      return [
+        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // var lg = Logger(...)
+        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;]`), // Logger lg = ...
+      ];
+    case 'php':
+      return [
+        new RegExp(`\\$?${r}\\b\\s*=\\s*new\\s+([A-Za-z_\\\\][\\w\\\\]*)`), // $lg = new Logger()
+      ];
+    default:
+      return [];
+  }
+}
+
+/** 1-based start line of the tightest function/method enclosing the call. */
+function enclosingScopeStartLine(ref: UnresolvedRef, context: ResolutionContext): number {
+  let start = 1;
+  for (const n of context.getNodesInFile(ref.filePath)) {
+    if (n.kind !== 'function' && n.kind !== 'method') continue;
+    if (n.language !== ref.language) continue;
+    const end = n.endLine ?? n.startLine;
+    if (n.startLine <= ref.line && end >= ref.line && n.startLine >= start) {
+      start = n.startLine;
+    }
+  }
+  return start;
+}
+
+/**
+ * Infer a receiver's type from its local declaration/initializer in the
+ * enclosing function body. Language-dispatched; returns null for languages
+ * without patterns or when no declaration is found. Bounded to the enclosing
+ * scope so a same-named variable in another function can't leak in.
+ */
+function inferLocalReceiverType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const patterns = localReceiverTypePatterns(
+    ref.language,
+    receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+  );
+  if (patterns.length === 0) return null;
+
+  const source = context.readFile(ref.filePath);
+  if (!source) return null;
+
+  const lines = source.split(/\r?\n/);
+  const callIdx = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
+  const startIdx = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+
+  // Nearest declaration wins: scan backward from the call to the scope start.
+  for (let i = callIdx; i >= startIdx; i--) {
+    const line = lines[i];
+    if (!line) continue;
+    for (const re of patterns) {
+      const m = line.match(re);
+      if (m && m[1]) {
+        const type = normalizeInferredTypeName(m[1]);
+        if (type) return type;
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * Try to resolve by method name on a class/object
  */
@@ -1045,9 +1204,25 @@ export function matchMethodCall(
 
   const [, objectOrClass, methodName] = match;
 
-  if (ref.language === 'cpp' && dotMatch) {
-    const inferredType = inferCppReceiverType(objectOrClass!, ref, context);
+  // Infer the receiver's type from its local declaration/initializer in the
+  // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
+  // dedicated inferrer (header scan + `auto`); every other language uses the
+  // shared source-based inferrer. resolveMethodOnType validates the method
+  // exists on the inferred type, so a mis-inference produces no edge.
+  if (dotMatch) {
+    const inferredType =
+      ref.language === 'cpp'
+        ? inferCppReceiverType(objectOrClass!, ref, context)
+        : inferLocalReceiverType(objectOrClass!, ref, context);
     if (inferredType) {
+      // Java/Kotlin: when two classes share the simple name, the file's import
+      // pins WHICH one (#314). Other languages disambiguate by call-site file.
+      const importedFqn =
+        ref.language === 'java' || ref.language === 'kotlin'
+          ? context
+              .getImportMappings(ref.filePath, ref.language)
+              .find((i) => i.localName === inferredType)?.source
+          : undefined;
       const typedMatch = resolveMethodOnType(
         inferredType,
         methodName!,
@@ -1055,6 +1230,7 @@ export function matchMethodCall(
         context,
         0.9,
         'instance-method',
+        importedFqn,
       );
       if (typedMatch) {
         return typedMatch;

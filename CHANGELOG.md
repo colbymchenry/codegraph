@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Method calls made through a local variable now resolve to the method in many more languages. When code does `const logger = new Logger(); logger.log();` (or the equivalent), CodeGraph infers the local variable's type from its declaration or initializer and links the call to the right method — so these calls now show up in callers, impact/blast-radius, and `codegraph_explore` flow traces instead of being dropped. Previously only C++ handled this; it now also covers TypeScript, JavaScript, Python, Java, C#, Kotlin, Swift, Go, Rust, Dart, Scala, and PHP. (#1108)
+
 ### Fixes
 
 - Indexing a large project no longer gets killed partway through with a "Main thread unresponsive — killing the wedged process" message. The safety watchdog that stops a genuinely stuck index was mistaking slow-but-normal work for a hang: on a big repo, linking up references and cross-file relationships can legitimately run for a while, and that work now regularly yields so the watchdog can tell real progress from a true stall. Projects that previously failed to finish `codegraph init` / `codegraph index` (and had to fall back to `CODEGRAPH_NO_WATCHDOG=1`) now complete normally, while a genuinely hung process is still caught. Thanks @zmcrazy, @YoungLiao, and @GeeLab-Mob for the reports. (#1091)
