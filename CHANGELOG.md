@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- C++ `class Foo;` forward declarations are no longer indexed as classes, so a heavily used type is no longer buried under phantom copies of itself. A forward declaration is just a promise that a type exists — it has no body, members, or base classes — but CodeGraph still minted a full `class` node for each one. In a large C++/Unreal-Engine codebase a hot class such as `APXCharacter` is forward-declared (`class APXCharacter;`) at the top of dozens of headers, so the graph ended up with dozens of bodiless `APXCharacter` nodes competing with the single real definition; `codegraph_explore` then returned a spray of forward-declaration sites — and picked one as the blast-radius representative — while the actual definition (with its members and callers) was crowded out of the results. Bodiless class specifiers are now skipped, exactly as bodiless structs (#831) and enums already were, so only the real definition is indexed. The skip is gated to C/C++, where a bodiless class is always a forward declaration; languages in which a bodiless class is a complete definition (Kotlin `class Empty`, Scala) are unaffected. Thanks @luoyxy for the report and fix.
 
 ## [1.1.6] - 2026-06-30
 

@@ -1528,6 +1528,18 @@ export class TreeSitterExtractor {
   private extractClass(node: SyntaxNode, kind: NodeKind = 'class'): void {
     if (!this.extractor) return;
 
+    // Resolve the body once up front so a bodiless class can be skipped before a
+    // node is minted (mirrors extractStruct/extractEnum). In C++ a `class Foo;`
+    // forward declaration is a bodiless `class_specifier`; without this guard
+    // every such forward decl — repeated across dozens of headers — mints a
+    // phantom `class Foo` node that competes with and MASKS the single real
+    // definition in query results (the real one carries the members/callers).
+    // Gated on `skipBodilessClass` (C/C++ only) because Kotlin/Scala treat a
+    // bodiless class as a complete definition.
+    let body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    if (!body && this.extractor.skipBodilessClass) return;
+
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
@@ -1551,8 +1563,6 @@ export class TreeSitterExtractor {
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
-    let body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
-      ?? getChildByField(node, this.extractor.bodyField);
     if (!body) body = node;
 
     // Visit all children for methods and properties
