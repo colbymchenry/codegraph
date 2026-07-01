@@ -165,6 +165,18 @@ export interface LanguageExtractor {
   methodsAreTopLevel?: boolean;
   /** NodeKind to use for interface-like declarations (Rust: 'trait'). Default: 'interface' */
   interfaceKind?: NodeKind;
+  /**
+   * When true, a class node with no body is a forward declaration / elaborated
+   * type reference — NOT a definition — and is skipped, mirroring the bodiless
+   * skip already applied to structs (#831) and enums. In C++ a `class Foo;`
+   * forward declaration parses as a bodiless `class_specifier`; repeated across
+   * dozens of headers it mints one phantom `class Foo` node per header that
+   * competes with — and in `codegraph_explore` results MASKS — the single real
+   * definition (the phantom, bodiless nodes crowd out the one that carries the
+   * members and callers). Off by default because some languages (Kotlin `class
+   * Empty`, Scala) treat a bodiless class as a complete definition. C/C++-only.
+   */
+  skipBodilessClass?: boolean;
 
   // --- New hooks ---
 

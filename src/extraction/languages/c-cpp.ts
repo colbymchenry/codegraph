@@ -243,6 +243,11 @@ export const cppExtractor: LanguageExtractor = {
   // Recover macro-annotated class/struct definitions (`class MYMODULE_API Foo : Base`)
   // that tree-sitter otherwise misparses into a phantom function (#1061/#946).
   preParse: blankCppExportMacros,
+  // A bodiless `class_specifier` in C++ is a forward declaration (`class Foo;`)
+  // or an elaborated type reference, never a definition — skip it so repeated
+  // forward decls across headers don't mint phantom class nodes that mask the
+  // real definition (matches the bodiless skip structs/enums already get).
+  skipBodilessClass: true,
   functionTypes: ['function_definition'],
   classTypes: ['class_specifier'],
   methodTypes: ['function_definition'],
