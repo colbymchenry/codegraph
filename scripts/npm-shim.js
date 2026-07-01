@@ -45,7 +45,7 @@ async function main() {
   // Happy path: the npm-installed optional dependency. Fall back to a download
   // when the registry didn't deliver it.
   var resolved = resolveInstalledBundle() || (await selfHealBundle());
-  var res = childProcess.spawnSync(resolved.command, resolved.args, { stdio: 'inherit' });
+  var res = childProcess.spawnSync(resolved.command, resolved.args, { stdio: 'inherit', windowsHide: true });
   if (res.error) {
     process.stderr.write('codegraph: ' + res.error.message + '\n');
     process.exit(1);
@@ -222,7 +222,7 @@ function extract(archive, destDir) {
   var args = isWindows
     ? ['-xf', archive, '-C', destDir, '--strip-components=1']
     : ['-xzf', archive, '-C', destDir, '--strip-components=1'];
-  var res = childProcess.spawnSync('tar', args, { stdio: 'ignore' });
+  var res = childProcess.spawnSync('tar', args, { stdio: 'ignore', windowsHide: true });
   if (res.error) throw new Error('tar unavailable: ' + res.error.message);
   if (res.status !== 0) throw new Error('tar exited ' + res.status);
 }

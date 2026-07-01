@@ -80,7 +80,7 @@ export async function openBrowser(url: string): Promise<void> {
     : process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]]
     : ['xdg-open', [url]];
   try {
-    const child = spawn(cmd as string, args as string[], { stdio: 'ignore', detached: true });
+    const child = spawn(cmd as string, args as string[], { stdio: 'ignore', detached: true, windowsHide: true });
     child.on('error', () => {});
     child.unref();
   } catch {
