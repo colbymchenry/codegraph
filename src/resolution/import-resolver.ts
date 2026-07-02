@@ -34,6 +34,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   csharp: ['.cs'],
   php: ['.php'],
   ruby: ['.rb'],
+  elixir: ['.ex', '.exs'],
   objc: ['.h', '.m', '.mm'],
 };
 

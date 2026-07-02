@@ -130,6 +130,9 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('pascal');
+    expect(languages).toContain('scala');
+    expect(languages).toContain('elixir');
   });
 });
 
@@ -6442,6 +6445,424 @@ def processData(): Unit = {
       const result = extractFromSource('processor.scala', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
       expect(calls.length).toBeGreaterThan(0);
+    });
+  });
+});
+
+// =============================================================================
+// Elixir
+// =============================================================================
+
+describe('Elixir Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Elixir files', () => {
+      expect(detectLanguage('lib/foo.ex')).toBe('elixir');
+      expect(detectLanguage('script.exs')).toBe('elixir');
+      expect(detectLanguage('test/foo_test.exs')).toBe('elixir');
+    });
+
+    it('should report Elixir as supported', () => {
+      expect(isLanguageSupported('elixir')).toBe(true);
+      expect(getSupportedLanguages()).toContain('elixir');
+    });
+  });
+
+  describe('Module extraction', () => {
+    it('should extract a top-level defmodule as a module node', () => {
+      const code = `
+defmodule Foo do
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'Foo');
+      expect(mod).toBeDefined();
+      expect(mod?.language).toBe('elixir');
+    });
+
+    it('should preserve the full dotted module name', () => {
+      const code = `
+defmodule Talkie.Accounts.User do
+end
+`;
+      const result = extractFromSource('lib/talkie/accounts/user.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module');
+      expect(mod?.name).toBe('Talkie.Accounts.User');
+    });
+
+    it('should attach @moduledoc as docstring', () => {
+      const code = `
+defmodule Foo do
+  @moduledoc "A demo module."
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'Foo');
+      expect(mod?.docstring).toContain('A demo module.');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract def with arity in the name', () => {
+      const code = `
+defmodule Foo do
+  def hello(name), do: name
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function');
+      expect(fns.find((f) => f.name === 'hello/1')).toBeDefined();
+    });
+
+    it('should mark defp as private', () => {
+      const code = `
+defmodule Foo do
+  defp secret(x), do: x
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'secret/1');
+      expect(fn).toBeDefined();
+      expect(fn?.visibility).toBe('private');
+    });
+
+    it('should extract zero-arity functions as name/0', () => {
+      const code = `
+defmodule Foo do
+  def greeting, do: "hi"
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'greeting/0');
+      expect(fn).toBeDefined();
+    });
+
+    it('should merge multi-clause defs into one node per name/arity', () => {
+      const code = `
+defmodule Foo do
+  def add(0, y), do: y
+  def add(x, 0), do: x
+  def add(x, y), do: x + y
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const adds = result.nodes.filter((n) => n.kind === 'function' && n.name === 'add/2');
+      expect(adds.length).toBe(1);
+    });
+
+    it('should emit a contains edge from the enclosing module', () => {
+      const code = `
+defmodule Foo do
+  def hello, do: :ok
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'Foo');
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'hello/0');
+      const edge = result.edges.find(
+        (e) => e.source === mod?.id && e.target === fn?.id && e.kind === 'contains'
+      );
+      expect(edge).toBeDefined();
+    });
+
+    it('should mark defmacro/defmacrop with metadata.macro', () => {
+      const code = `
+defmodule Foo do
+  defmacro do_thing(x), do: quote do: unquote(x)
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'do_thing/1');
+      expect(fn).toBeDefined();
+    });
+  });
+
+  describe('Alias / import / require / use', () => {
+    it('should extract a single-target alias as an import node', () => {
+      const code = `
+defmodule Foo do
+  alias Bar.Baz
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const imp = result.nodes.find((n) => n.kind === 'import' && n.name === 'Bar.Baz');
+      expect(imp).toBeDefined();
+      expect(imp?.language).toBe('elixir');
+    });
+
+    it('should expand alias Foo.{A, B} into two import nodes', () => {
+      const code = `
+defmodule Foo do
+  alias Bar.{Baz, Qux}
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import');
+      expect(imports.find((i) => i.name === 'Bar.Baz')).toBeDefined();
+      expect(imports.find((i) => i.name === 'Bar.Qux')).toBeDefined();
+    });
+
+    it('should record import/require/use with distinct mechanisms in signature', () => {
+      const code = `
+defmodule Foo do
+  import Ecto.Query
+  require Logger
+  use Phoenix.LiveView
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const importNode = result.nodes.find((n) => n.kind === 'import' && n.name === 'Ecto.Query');
+      const requireNode = result.nodes.find((n) => n.kind === 'import' && n.name === 'Logger');
+      const useNode = result.nodes.find((n) => n.kind === 'import' && n.name === 'Phoenix.LiveView');
+      expect(importNode?.signature).toContain('import');
+      expect(requireNode?.signature).toContain('require');
+      expect(useNode?.signature).toContain('use');
+    });
+
+    it('should emit an imports unresolved-reference from the enclosing module', () => {
+      const code = `
+defmodule Foo do
+  alias Bar.Baz
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'Foo');
+      const ref = result.unresolvedReferences.find(
+        (r) => r.fromNodeId === mod?.id && r.referenceName === 'Bar.Baz' && r.referenceKind === 'imports'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should emit a calls reference for a plain local call', () => {
+      const code = `
+defmodule Foo do
+  def caller, do: helper(1, 2)
+  def helper(a, b), do: a + b
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const caller = result.nodes.find((n) => n.kind === 'function' && n.name === 'caller/0');
+      const ref = result.unresolvedReferences.find(
+        (r) => r.fromNodeId === caller?.id && r.referenceName === 'helper/2' && r.referenceKind === 'calls'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    it('should emit a calls reference for a remote call with arity', () => {
+      const code = `
+defmodule Foo do
+  def go(x) do
+    String.upcase(x)
+  end
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const go = result.nodes.find((n) => n.kind === 'function' && n.name === 'go/1');
+      const ref = result.unresolvedReferences.find(
+        (r) =>
+          r.fromNodeId === go?.id &&
+          r.referenceName === 'String.upcase/1' &&
+          r.referenceKind === 'calls'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    it('should count the pipeline LHS as an extra argument', () => {
+      const code = `
+defmodule Foo do
+  def go(x), do: x |> String.upcase()
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const go = result.nodes.find((n) => n.kind === 'function' && n.name === 'go/1');
+      const ref = result.unresolvedReferences.find(
+        (r) =>
+          r.fromNodeId === go?.id &&
+          r.referenceName === 'String.upcase/1' &&
+          r.referenceKind === 'calls'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    it('should not emit calls refs for declaration forms (def, alias, ...)', () => {
+      const code = `
+defmodule Foo do
+  alias Bar.Baz
+
+  def hello, do: :ok
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'Foo');
+      const stray = result.unresolvedReferences.find(
+        (r) =>
+          r.fromNodeId === mod?.id &&
+          (r.referenceName.startsWith('def') || r.referenceName.startsWith('alias'))
+      );
+      expect(stray).toBeUndefined();
+    });
+  });
+
+  describe('Struct, protocol, behaviour', () => {
+    it('should extract defstruct as a struct node with field children', () => {
+      const code = `
+defmodule Point do
+  defstruct [:x, :y]
+end
+`;
+      const result = extractFromSource('lib/point.ex', code);
+      const struct_ = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Point');
+      expect(struct_).toBeDefined();
+      const fieldNames = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fieldNames).toContain('x');
+      expect(fieldNames).toContain('y');
+    });
+
+    it('should treat defexception the same as defstruct', () => {
+      const code = `
+defmodule MyError do
+  defexception [:message, :reason]
+end
+`;
+      const result = extractFromSource('lib/my_error.ex', code);
+      const struct_ = result.nodes.find((n) => n.kind === 'struct' && n.name === 'MyError');
+      expect(struct_).toBeDefined();
+      const fieldNames = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fieldNames).toContain('message');
+      expect(fieldNames).toContain('reason');
+    });
+
+    it('should extract defprotocol as a protocol node with abstract functions', () => {
+      const code = `
+defprotocol Sizable do
+  def size(thing)
+end
+`;
+      const result = extractFromSource('lib/sizable.ex', code);
+      const proto = result.nodes.find((n) => n.kind === 'protocol' && n.name === 'Sizable');
+      expect(proto).toBeDefined();
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'size/1');
+      expect(fn).toBeDefined();
+      expect(fn?.isAbstract).toBe(true);
+    });
+
+    it('should emit an implements reference for defimpl', () => {
+      const code = `
+defimpl Sizable, for: List do
+  def size(list), do: length(list)
+end
+`;
+      const result = extractFromSource('lib/sizable_list.ex', code);
+      const impl = result.nodes.find((n) => n.kind === 'module' && n.name === 'Sizable.List');
+      expect(impl).toBeDefined();
+      const ref = result.unresolvedReferences.find(
+        (r) =>
+          r.fromNodeId === impl?.id &&
+          r.referenceName === 'Sizable' &&
+          r.referenceKind === 'implements'
+      );
+      expect(ref).toBeDefined();
+    });
+
+    it('should emit an implements reference for @behaviour', () => {
+      const code = `
+defmodule MyServer do
+  @behaviour GenServer
+end
+`;
+      const result = extractFromSource('lib/my_server.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'MyServer');
+      const ref = result.unresolvedReferences.find(
+        (r) =>
+          r.fromNodeId === mod?.id &&
+          r.referenceName === 'GenServer' &&
+          r.referenceKind === 'implements'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
+
+  describe('Module attributes: @doc, @spec, @callback', () => {
+    it('should attach @doc to the next def as docstring', () => {
+      const code = `
+defmodule Foo do
+  @doc "greets the user by name."
+  def hello(name), do: name
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'hello/1');
+      expect(fn?.docstring).toContain('greets the user by name.');
+    });
+
+    it('should attach @spec to the next def as signature', () => {
+      const code = `
+defmodule Foo do
+  @spec hello(String.t()) :: String.t()
+  def hello(name), do: name
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'hello/1');
+      expect(fn?.signature).toContain('String.t()');
+    });
+
+    it('should emit @callback as an abstract function in the enclosing module', () => {
+      const code = `
+defmodule MyBehaviour do
+  @callback do_thing(term) :: term
+end
+`;
+      const result = extractFromSource('lib/my_behaviour.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'do_thing/1');
+      expect(fn).toBeDefined();
+      expect(fn?.isAbstract).toBe(true);
+    });
+  });
+
+  describe('Alias-aware reference rewriting (phase 3)', () => {
+    it('should rewrite a short-name call to its aliased full path', () => {
+      const code = `
+defmodule Foo do
+  alias My.Deep.Module, as: Mod
+  def call_it(x), do: Mod.frobnicate(x, 2)
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'Mod.frobnicate/2'
+      );
+      expect(ref).toBeDefined();
+      expect(ref?.candidates).toContain('My.Deep.Module.frobnicate/2');
+    });
+
+    it('should expand single-segment aliases (alias My.Deep.Module → Module)', () => {
+      const code = `
+defmodule Foo do
+  alias My.Deep.Module
+  def call_it(x), do: Module.frobnicate(x)
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'Module.frobnicate/1'
+      );
+      expect(ref?.candidates).toContain('My.Deep.Module.frobnicate/1');
+    });
+
+    it('should NOT expand a receiver that is not aliased in scope', () => {
+      const code = `
+defmodule Foo do
+  def call_it(x), do: NotAliased.frobnicate(x)
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'NotAliased.frobnicate/1'
+      );
+      expect(ref).toBeDefined();
+      expect(ref?.candidates ?? []).not.toContain('Foo.NotAliased.frobnicate/1');
     });
   });
 });

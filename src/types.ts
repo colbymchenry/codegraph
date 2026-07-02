@@ -87,6 +87,7 @@ export const LANGUAGES = [
   'liquid',
   'pascal',
   'scala',
+  'elixir',
   'lua',
   'luau',
   'objc',

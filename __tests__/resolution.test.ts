@@ -2033,6 +2033,69 @@ func main() {
       expect(callers.some((c) => c.node.filePath === 'src/main.ts')).toBe(true);
     });
 
+    it('resolves an Elixir cross-file call through a dotted module path', async () => {
+      // `Talkie.Accounts.User.changeset/2` is called from another file; the
+      // resolver must bridge the dotted Elixir reference name (`Foo.Bar.func/2`)
+      // to the codegraph qualifiedName which uses `::` between module and member
+      // (`Foo.Bar::func/2`).
+      fs.mkdirSync(path.join(tempDir, 'lib/my_app'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'lib/my_app/user.ex'),
+        `defmodule MyApp.User do
+  def changeset(user, attrs), do: {user, attrs}
+end
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'lib/my_app/accounts.ex'),
+        `defmodule MyApp.Accounts do
+  def create(attrs) do
+    MyApp.User.changeset(%{}, attrs)
+  end
+end
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const changeset = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'changeset/2' && n.filePath.endsWith('user.ex'));
+      expect(changeset).toBeDefined();
+      const callers = cg.getCallers(changeset!.id);
+      expect(callers.some((c) => c.node.filePath.endsWith('accounts.ex'))).toBe(true);
+    });
+
+    it('resolves an Elixir imports edge to the right module across files', async () => {
+      fs.mkdirSync(path.join(tempDir, 'lib/my_app'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'lib/my_app/repo.ex'),
+        `defmodule MyApp.Repo do
+  def all, do: []
+end
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'lib/my_app/accounts.ex'),
+        `defmodule MyApp.Accounts do
+  alias MyApp.Repo
+end
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const repo = cg
+        .getNodesByKind('module')
+        .find((n) => n.name === 'MyApp.Repo');
+      expect(repo).toBeDefined();
+      const incoming = cg.getIncomingEdges(repo!.id);
+      // `imports` edge from the Accounts module to the Repo module.
+      expect(incoming.some((e) => e.kind === 'imports')).toBe(true);
+    });
+
     it('follows a renamed named re-export (export { foo as bar } from ...)', async () => {
       // The chase has to look up `foo` in the upstream module even
       // though the importer asked for `bar` — exercises the rename

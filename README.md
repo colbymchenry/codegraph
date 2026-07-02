@@ -244,7 +244,7 @@ The reliable, universal payoff is **surgical context and speed**: CodeGraph coll
 | **Full-Text Search** | Find code by name instantly across your entire codebase, powered by FTS5 |
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
-| **20+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Objective-C, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
+| **20+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Objective-C, Swift, Kotlin, Scala, Elixir, Dart, Lua, Luau, R, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
 | **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 17 frameworks |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
@@ -711,6 +711,7 @@ is written):
 | Astro | `.astro` | Full support (frontmatter + script extraction, template component/call references, `src/pages/` routes) |
 | Liquid | `.liquid` | Full support |
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX form files) |
+| Elixir | `.ex`, `.exs` | Full support (modules, def/defp with arity, alias/import/require/use, defstruct, defprotocol/defimpl, @behaviour, pipe-aware call extraction, Mix-convention resolution) |
 | Lua | `.lua` | Full support (functions, methods with receivers, local variables, `require` imports, call edges) |
 | R | `.R` `.r` | Full support (functions in every assignment form, S4/R5/R6 classes with methods, `library`/`require` imports, `source()` file references, call edges) |
 | Luau | `.luau` | Full support (everything in Lua, plus `type`/`export type` aliases, typed signatures, and Roblox instance-path `require`) |
