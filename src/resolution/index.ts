@@ -721,6 +721,23 @@ export class ReferenceResolver {
       return null;
     }
 
+    // CFML component paths in inheritance (#1152): `extends="coldbox.system.web.
+    // Controller"` names the supertype by its dot-separated path (or `extends=
+    // "../base"` by relative file path) — the graph indexes the class under its
+    // final segment only, so these die at the fast pre-filter below and never
+    // resolved. Handled by a dedicated path-corroborated matcher, gated to
+    // inheritance refs only (a dotted `calls` ref is a member-access chain, not
+    // a component path). No fallthrough on miss: the full path string can only
+    // ever mis-match downstream, and an unresolvable supertype usually lives in
+    // an out-of-repo library (mxunit, testbox) — silent beats wrong.
+    if (
+      (ref.language === 'cfml' || ref.language === 'cfscript') &&
+      (ref.referenceKind === 'extends' || ref.referenceKind === 'implements') &&
+      (ref.referenceName.includes('.') || ref.referenceName.includes('/'))
+    ) {
+      return this.resolveCfmlComponentPath(ref);
+    }
+
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
@@ -1321,6 +1338,99 @@ export class ReferenceResolver {
     if (found.size !== 1) return null;
     const target = found.values().next().value!;
     return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
+  }
+
+  /**
+   * Resolve a CFML inheritance reference written as a component path (#1152).
+   * Two forms exist in real code:
+   *
+   * - Dotted: `extends="coldbox.system.web.Controller"` — dots are directory
+   *   separators from the webroot or a CFML mapping. Mappings live in server
+   *   config / Application.cfc, so the leading segments may not exist in the
+   *   repo at all (in the coldbox repo itself the path is `system/web/
+   *   Controller.cfc` — the `coldbox.` root IS the repo). Matched by final
+   *   segment (the class), corroborated right-to-left against the candidate's
+   *   parent directories.
+   * - Relative: `extends="../base"` / `extends="./base"` (the FW/1 style) —
+   *   resolved against the referencing file's own directory.
+   *
+   * Conservative by design: a candidate needs at least one corroborating
+   * directory segment (a dotted path whose only same-named class sits in an
+   * unrelated directory is almost always an out-of-repo library supertype —
+   * mxunit/testbox/coldbox-as-dependency), and a corroboration tie yields no
+   * edge. Directory comparison is case-insensitive (CFML path resolution is);
+   * the class segment itself is matched exactly, which real code satisfies —
+   * dotted paths are written to match the on-disk file name.
+   */
+  private resolveCfmlComponentPath(ref: UnresolvedRef): ResolvedRef | null {
+    const cfmlCandidates = (name: string): Node[] =>
+      this.context
+        .getNodesByName(name)
+        .filter(
+          (n) =>
+            (n.kind === 'class' || n.kind === 'interface') &&
+            (n.language === 'cfml' || n.language === 'cfscript')
+        );
+    const norm = (p: string): string => p.replace(/\\/g, '/').toLowerCase();
+
+    // Relative-path form: `../base`, `./base`, `sub/thing` — resolve against
+    // the referencing file's directory and require an exact (case-insensitive)
+    // file match.
+    if (ref.referenceName.includes('/')) {
+      const rel = ref.referenceName.replace(/\.cfc$/i, '');
+      const fromDir = ref.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
+      const parts = [...fromDir];
+      for (const seg of rel.split('/')) {
+        if (seg === '' || seg === '.') continue;
+        if (seg === '..') {
+          if (parts.length === 0) return null; // escapes the project root
+          parts.pop();
+        } else {
+          parts.push(seg);
+        }
+      }
+      const wantPath = norm(parts.join('/') + '.cfc');
+      const className = parts[parts.length - 1];
+      if (!className) return null;
+      const target = cfmlCandidates(className).find((c) => norm(c.filePath) === wantPath);
+      return target
+        ? { original: ref, targetNodeId: target.id, confidence: 0.95, resolvedBy: 'file-path' }
+        : null;
+    }
+
+    // Dotted form.
+    const segments = ref.referenceName.split('.').map((s) => s.trim()).filter(Boolean);
+    if (segments.length < 2) return null;
+    const className = segments[segments.length - 1]!;
+    const dirSegments = segments.slice(0, -1);
+
+    let best: Node | null = null;
+    let bestScore = 0;
+    let tie = false;
+    for (const cand of cfmlCandidates(className)) {
+      const dirs = cand.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
+      // Count matching directory segments right-to-left: for
+      // `coldbox.system.web.Controller` vs `system/web/Controller.cfc`,
+      // `web` and `system` match, then the repo root ends the run → score 2.
+      let score = 0;
+      while (
+        score < dirSegments.length &&
+        score < dirs.length &&
+        dirSegments[dirSegments.length - 1 - score]!.toLowerCase() ===
+          dirs[dirs.length - 1 - score]!.toLowerCase()
+      ) {
+        score++;
+      }
+      if (score > bestScore) {
+        best = cand;
+        bestScore = score;
+        tie = false;
+      } else if (score === bestScore && score > 0) {
+        tie = true;
+      }
+    }
+    if (!best || bestScore === 0 || tie) return null;
+    return { original: ref, targetNodeId: best.id, confidence: 0.9, resolvedBy: 'qualified-name' };
   }
 
   /**
