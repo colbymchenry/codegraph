@@ -85,8 +85,10 @@ export interface LanguageExtractor {
    * grammar mis-parses inside enum bodies). MUST preserve byte offsets (replace
    * removed text with spaces, keep newlines) so node positions and getNodeText
    * stay correct; the returned string is used for both parsing and extraction.
+   * `filePath` lets a transform key off the concrete file extension when one
+   * language id serves several dialects (C++ also parses `.metal` shaders).
    */
-  preParse?: (source: string) => string;
+  preParse?: (source: string, filePath?: string) => string;
 
   // --- Node type mappings ---
 

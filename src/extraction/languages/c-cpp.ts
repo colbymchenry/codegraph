@@ -356,10 +356,42 @@ export function recoverMangledCppName(name: string): string {
   return candidate;
 }
 
+/**
+ * Blank Metal Shading Language `[[attribute]]` annotations before parsing.
+ * MSL (≈ C++14) puts attributes AFTER the declarator — `float4 position
+ * [[position]];`, `constant Uniforms &u [[buffer(0)]]` — a position
+ * tree-sitter-cpp can't reconcile: a struct field with a trailing attribute
+ * misparses into a shape that emits a spurious `extends` reference from the
+ * struct to the field's *type* (`VertexIn extends float3`), which becomes a
+ * wrong inheritance edge whenever the repo defines that type itself (simd
+ * typedefs in a shared ShaderTypes.h are common). Replacing the attribute with
+ * equal-length spaces preserves every byte offset and lets fields and
+ * parameters parse as ordinary declarations, mirroring the macro blanks above.
+ *
+ * Matched tightly to the attribute shape — `[[ident]]`, `[[ident(args)]]`, and
+ * comma-separated lists (`[[buffer(0), raster_order_group(0)]]`) — so a
+ * subscripted lambda call (`arr[[]{ … }()]`, the only other way `[[` appears in
+ * C++-family source) can never match: after `[[` a lambda continues with `]`,
+ * never an identifier followed by `]]`. Applied ONLY to `.metal` files — in
+ * regular C++ the pre-declarator attribute position (`[[nodiscard]] int f()`)
+ * is legal syntax the grammar parses natively, and blanking it would be pure
+ * blast radius. (#1121)
+ */
+const METAL_ATTRIBUTE_RE =
+  /\[\[\s*[A-Za-z_]\w*(?:\s*\([^()\n]*\))?(?:\s*,\s*[A-Za-z_]\w*(?:\s*\([^()\n]*\))?)*\s*\]\]/g;
+export function blankMetalAttributes(source: string): string {
+  if (source.indexOf('[[') === -1) return source;
+  return source.replace(METAL_ATTRIBUTE_RE, (m) => ' '.repeat(m.length));
+}
+
 /** C/C++ source pre-processing before tree-sitter: recover both macro-annotated
- * class definitions and macro-prefixed function definitions. Offset-preserving. */
-function preParseCppSource(source: string): string {
-  return blankCppInlineMacros(blankCppExportMacros(source));
+ * class definitions and macro-prefixed function definitions — plus, for `.metal`
+ * shaders (parsed with the C++ grammar), MSL attribute annotations. Offset-preserving. */
+function preParseCppSource(source: string, filePath?: string): string {
+  const blanked = blankCppInlineMacros(blankCppExportMacros(source));
+  return filePath && filePath.toLowerCase().endsWith('.metal')
+    ? blankMetalAttributes(blanked)
+    : blanked;
 }
 
 export const cppExtractor: LanguageExtractor = {

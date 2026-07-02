@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -100,6 +100,11 @@ describe('Language Detection', () => {
     const objcHeader = '@interface Foo : NSObject\n@end\n';
     expect(detectLanguage('Foo.h', objcHeader)).toBe('objc');
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
+  });
+
+  it('should detect Metal shader files as C++ (#1121)', () => {
+    expect(detectLanguage('Shaders.metal')).toBe('cpp');
+    expect(isSourceFile('Renderer/Shaders.metal')).toBe(true);
   });
 
   it('should return unknown for unsupported extensions', () => {
@@ -2808,6 +2813,118 @@ class MYGAME_API UMyComponent : public UActorComponent { };
           (r) => r.referenceKind === 'extends' && r.referenceName === 'Base'
         )
       ).toBeTruthy();
+    });
+  });
+
+  describe('Metal shader extraction (#1121)', () => {
+    // Metal Shading Language (≈ C++14) parses with the C++ grammar. MSL puts
+    // `[[attribute]]` annotations AFTER the declarator — a position
+    // tree-sitter-cpp misparses: a struct field with a trailing attribute
+    // emitted a spurious `extends` ref from the struct to the field's own type.
+    // blankMetalAttributes (preParse, `.metal`-gated) blanks them so extraction
+    // matches plain C++.
+    const METAL = `#include <metal_stdlib>
+using namespace metal;
+
+struct VertexIn {
+    float3 position [[attribute(0)]];
+    float2 texCoord [[attribute(1)]];
+};
+
+struct VertexOut {
+    float4 position [[position]];
+    float2 texCoord;
+};
+
+struct Uniforms {
+    float4x4 modelViewProjection;
+};
+
+static float4 applyGamma(float4 color) {
+    return pow(color, float4(1.0 / 2.2));
+}
+
+vertex VertexOut vertexShader(VertexIn in [[stage_in]],
+                              constant Uniforms &uniforms [[buffer(0)]]) {
+    VertexOut out;
+    out.position = uniforms.modelViewProjection * float4(in.position, 1.0);
+    out.texCoord = in.texCoord;
+    return out;
+}
+
+fragment float4 fragmentShader(VertexOut in [[stage_in]],
+                               texture2d<float> colorTexture [[texture(0)]],
+                               sampler textureSampler [[sampler(0)]]) {
+    float4 color = colorTexture.sample(textureSampler, in.texCoord);
+    return applyGamma(color);
+}
+
+kernel void computeBlur(texture2d<float, access::read> inTexture [[texture(0)]],
+                        texture2d<float, access::write> outTexture [[texture(1)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    float4 color = inTexture.read(gid);
+    outTexture.write(color, gid);
+}
+`;
+
+    it('extracts vertex/fragment/kernel functions, structs, and calls from a .metal file', () => {
+      const result = extractFromSource('Shaders.metal', METAL);
+      expect(result.errors).toHaveLength(0);
+
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(functions).toEqual(
+        expect.arrayContaining(['applyGamma', 'vertexShader', 'fragmentShader', 'computeBlur'])
+      );
+      const structs = result.nodes.filter((n) => n.kind === 'struct').map((n) => n.name);
+      expect(structs).toEqual(expect.arrayContaining(['VertexIn', 'VertexOut', 'Uniforms']));
+      expect(result.nodes.find((n) => n.kind === 'import')?.name).toBe('metal_stdlib');
+
+      // Attribute blanking is offset-preserving, so positions stay exact.
+      const vertexFn = result.nodes.find((n) => n.name === 'vertexShader')!;
+      expect(vertexFn.startLine).toBe(22);
+
+      // The shader call graph connects: fragmentShader → applyGamma.
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'calls' && r.referenceName === 'applyGamma'
+        )
+      ).toBeTruthy();
+
+      // The regression the blanking fixes: field attributes (`float3 position
+      // [[attribute(0)]];`) misparsed into `extends` refs from the struct to the
+      // field's type — a wrong inheritance edge whenever the repo defines that
+      // type itself (simd typedefs in a shared ShaderTypes.h are common).
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'extends')).toHaveLength(0);
+    });
+
+    it('blankMetalAttributes blanks every attribute form, offset-preserving', () => {
+      const inp = [
+        'float4 position [[position]];',
+        'constant Uniforms &u [[buffer(0)]]',
+        'float2 uv [[user(locn0)]];',
+        'device float *out [[buffer(0), raster_order_group(0)]]',
+      ].join('\n');
+      const out = blankMetalAttributes(inp);
+      expect(out.length).toBe(inp.length); // every byte offset preserved
+      expect(out).not.toContain('[[');
+      // Nothing but the attributes changed: collapsing the blank runs gives the
+      // plain declarations back, newlines untouched.
+      expect(out.split('\n').map((l) => l.replace(/ +/g, ' ').trimEnd())).toEqual([
+        'float4 position ;',
+        'constant Uniforms &u',
+        'float2 uv ;',
+        'device float *out',
+      ]);
+    });
+
+    it('blankMetalAttributes never touches non-attribute [[ sequences', () => {
+      for (const c of [
+        'auto x = arr[[]{ return 0; }()];', // lambda in subscript — the only other [[ in C++-family code
+        'int y = a[b[i]];', // nested subscript
+        'int z = 1;', // no [[ at all — early-return path
+      ]) {
+        expect(blankMetalAttributes(c)).toBe(c);
+      }
     });
   });
 

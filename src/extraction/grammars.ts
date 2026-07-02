@@ -108,6 +108,10 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
+  // Metal Shading Language ≈ C++14: the C++ grammar extracts its functions,
+  // structs, and calls. MSL-specific `[[attribute]]` annotations are blanked
+  // pre-parse for `.metal` files (see blankMetalAttributes in c-cpp.ts). (#1121)
+  '.metal': 'cpp',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
