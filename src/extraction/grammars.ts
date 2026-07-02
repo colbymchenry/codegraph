@@ -34,6 +34,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   kotlin: 'tree-sitter-kotlin.wasm',
   dart: 'tree-sitter-dart.wasm',
   pascal: 'tree-sitter-pascal.wasm',
+  mql5: 'tree-sitter-mql5.wasm',
   scala: 'tree-sitter-scala.wasm',
   lua: 'tree-sitter-lua.wasm',
   r: 'tree-sitter-r.wasm',
@@ -102,6 +103,9 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.lpr': 'pascal',
   '.dfm': 'pascal',
   '.fmx': 'pascal',
+  '.mq5': 'mql5',
+  '.mqh': 'mql5',
+  '.mql5': 'mql5',
   '.scala': 'scala',
   '.sc': 'scala',
   '.lua': 'lua',
@@ -221,7 +225,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
       // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
       // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r')
+      const wasmPath = (lang === 'pascal' || lang === 'mql5' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -428,6 +432,7 @@ export function getLanguageDisplayName(language: Language): string {
     astro: 'Astro',
     liquid: 'Liquid',
     pascal: 'Pascal / Delphi',
+    mql5: 'MQL5',
     scala: 'Scala',
     lua: 'Lua',
     luau: 'Luau',

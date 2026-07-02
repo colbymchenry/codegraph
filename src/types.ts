@@ -86,6 +86,7 @@ export const LANGUAGES = [
   'astro',
   'liquid',
   'pascal',
+  'mql5',
   'scala',
   'lua',
   'luau',
