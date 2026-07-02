@@ -1072,8 +1072,8 @@ program
 
       // Gate: only structural / flow / impact / where-how prompts get context, so
       // every other prompt ("fix this typo") stays a zero-cost no-op. Language-aware
-      // (English + CJK keywords, plus code-shaped tokens) so it fires for non-English
-      // prompts too (issue #994). A keyword fires on its own; a code-token is only a
+      // (multilingual keywords, plus code-shaped tokens) so it fires for non-English
+      // prompts too (#994, #1126). A keyword fires on its own; a code-token is only a
       // CANDIDATE — verified against the graph below, so a tech brand ("JavaScript")
       // that looks like a symbol but isn't one here doesn't inject spurious context.
       const keyworded = hasStructuralKeyword(prompt);

@@ -234,36 +234,123 @@ export function findIndexedSubprojectRoots(
 }
 
 /**
- * English structural keywords, matched with `\b` word boundaries so a keyword
- * inside a longer word doesn't false-positive ("flow" in "flower").
+ * Unicode-aware word-boundary emulation for the keyword lists below. JS's `\b`
+ * is ASCII-only — it fires only at `[A-Za-z0-9_]` edges — so it can never bound
+ * a keyword whose first or last character is accented or non-Latin: `/\boù\b/`
+ * NEVER matches "où est …" (ù isn't an ASCII word char, so no boundary exists
+ * next to it). That is the #994 CJK mechanism resurfaced for Latin scripts and
+ * Cyrillic (#1126). A lookaround — "not flanked by a letter, digit, or
+ * underscore" — is the script-independent equivalent.
  */
-const STRUCTURAL_EN = /\b(how|where|trace|flow|path|reach(?:es|ed)?|call(?:s|ed|er|ers|ee)?|depend|impact|affect|wired?|connect|implement|architect|structure|breaks?|what calls|why does)\b/i;
+const NOT_WORD_BEFORE = /(?<![\p{L}\p{N}_])/u.source;
+const NOT_WORD_AFTER = /(?![\p{L}\p{N}_])/u.source;
 
 /**
- * Non-English (CJK) structural keywords, matched WITHOUT `\b`. JS's `\b` is
- * ASCII-only — it only fires at `[A-Za-z0-9_]` boundaries, never between Han
- * characters — so a Chinese keyword wrapped in `\b…\b` could never match. That
- * was issue #994: the English-only gate silently no-op'd every Chinese prompt,
- * so non-English users got no front-load nudge and no error to explain why. The
- * set mirrors the English intent (如何=how, 在哪/哪里=where, 流程/流向=flow,
- * 路径=path, 调用=call, 依赖=depend, 影响=impact/affect, 实现=implement,
- * 架构=architect, 结构=structure, 追踪/跟踪=trace) plus structural-overview words
- * with no single clean English equivalent (介绍/解析/分析/原理/机制).
+ * Structural keywords matched as EXACT words (boundary on both sides): short
+ * or ambiguous tokens where prefix matching would false-positive ("flow" in
+ * "flower", "path" in "pathological"). Grouped by language; a term appears once
+ * even when several languages share it ("como" is Portuguese for how AND
+ * unaccented-typed Spanish "cómo").
  */
-const STRUCTURAL_CJK = /如何|怎么|在哪|哪里|追踪|跟踪|流程|流向|路径|调用|依赖|影响|实现|架构|结构|介绍|解析|分析|原理|机制/;
+const STRUCTURAL_WORDS = [
+  // English — the pre-#1126 list minus what moved to STRUCTURAL_STEMS: the
+  // bare-stem entries never matched their own derived forms (`\barchitect\b`
+  // can't match "architecture"), and "what calls" is subsumed by the "call" stem.
+  'how', 'where', 'tracing', 'flows?', 'paths?', 'reach(?:es|ed)?', 'wired?', 'breaks?', 'why does',
+  // French (où=where, flux=flow, chemin=path, casse=breaks)
+  'comment', 'où', 'flux', 'chemins?', 'casse',
+  // Spanish (cómo/como=how, dónde/donde=where, flujo=flow, ruta/camino=path,
+  // rompe=breaks, llaman / quién llama = call(s) — bare "llama" is excluded:
+  // it's also the animal/model name in English prompts)
+  'cómo', 'dónde', 'donde', 'flujos?', 'rutas?', 'caminos?', 'rompe', 'llaman', 'quién llama', 'quien llama',
+  // Portuguese (como=how — also covers unaccented Spanish; onde=where,
+  // fluxo=flow, caminho=path)
+  'como', 'onde', 'fluxos?', 'caminhos?',
+  // German (wie=how, wo/woher/wohin=where, Pfad=path, Fluss/Ablauf=flow,
+  // bricht/kaputt=breaks, ruft=calls, hängt=depends — "hängt … von X ab"
+  // splits the separable verb "abhängen", so the "abhäng" stem can't catch it)
+  'wie', 'wo', 'woher', 'wohin', 'pfade?', 'fluss', 'ablauf', 'bricht', 'kaputt', 'ruft', 'hängt',
+  // Italian (dove=where, flusso=flow, percorso/i=path)
+  'dove', 'flusso', 'percors[oi]',
+  // Russian (как=how, где=where, путь/пути=path, работает=works)
+  'как', 'где', 'путь', 'пути', 'работает',
+];
+
+/**
+ * Structural keyword STEMS matched as word PREFIXES (boundary on the left
+ * only), so derived forms match without enumerating each: "architect" fires on
+ * architecture/architectural, "depend" on depends/dependency/dependencies,
+ * "вызыва" on вызывает/вызывается. Mid-word occurrences stay excluded —
+ * "restructure"/"independent" don't fire — so precision stays close to the
+ * exact-word class. Add a stem only when every plausible completion is still a
+ * structural word.
+ */
+const STRUCTURAL_STEMS = [
+  // English + the Latin-script languages that share the spelling (French
+  // architecture/structure/trace/impact, Spanish depende/implementa/impacto, …)
+  'architect', 'structur', 'depend', 'implement', 'connect', 'impact', 'affect', 'trace', 'call', 'explain',
+  // French (appel(le)=call, dépend=depends, implément(e)=implement,
+  // connex(ion)=connection, expliqu(e)=explain, fonctionn(e/ement)=works)
+  'appel', 'dépend', 'implément', 'connex', 'expliqu', 'fonctionn',
+  // Spanish (llamad(a)=call, afect(a)=affect, conect(a)/conexi(ón)=connect,
+  // arquitec(tura)=architecture, estructur(a)=structure, funcion(a)=works,
+  // traza(r)=trace, explica=explain)
+  'llamad', 'afect', 'conect', 'conexi', 'arquitec', 'estructur', 'funcion', 'traza', 'explica',
+  // Portuguese (chama(da)=call, afeta=affect, arquitet(ura)=architecture,
+  // estrutur(a)=structure, quebra(do)=breaks)
+  'chama', 'afeta', 'arquitet', 'estrutur', 'quebra',
+  // German (abhäng(t)=depend, Auswirkung=impact, beeinfluss(t)=affect,
+  // verbind(et)=connect, Architektur, Struktur, funktionier(t)=works,
+  // Aufruf/aufgerufen=call, erklär(t)=explain, verfolg(en)=trace)
+  'abhäng', 'auswirkung', 'beeinfluss', 'verbind', 'architekt', 'struktur', 'funktionier', 'aufruf', 'aufgerufen', 'erklär', 'verfolg',
+  // Italian (chiam(a/ata)=call, dipend(e/enza)=depend, impatt(o)=impact,
+  // connett(e)/conness(ione)=connect, architett(ura), struttur(a),
+  // funzion(a/amento)=works, tracci(a)=trace, spiega(mi)=explain)
+  'chiam', 'dipend', 'impatt', 'connett', 'conness', 'architett', 'struttur', 'funzion', 'tracci', 'spiega',
+  // Russian (вызыва(ет)=calls, завис(ит)=depends, влия(ет)=affects,
+  // реализ(ация)=implementation, структур(а), архитектур(а),
+  // трассир(овка)=trace, лома(ет)=breaks, объясн(и)=explain, поток=flow)
+  'вызыва', 'завис', 'влия', 'реализ', 'структур', 'архитектур', 'трассир', 'лома', 'объясн', 'поток',
+];
+
+const STRUCTURAL_WORDS_RE = new RegExp(`${NOT_WORD_BEFORE}(?:${STRUCTURAL_WORDS.join('|')})${NOT_WORD_AFTER}`, 'iu');
+const STRUCTURAL_STEMS_RE = new RegExp(`${NOT_WORD_BEFORE}(?:${STRUCTURAL_STEMS.join('|')})`, 'iu');
+
+/**
+ * Structural keywords for scripts written without word separators — Chinese
+ * (simplified AND traditional; the original #994 set was simplified-only),
+ * Japanese, and Korean (spaced, but particles attach directly to the noun:
+ * 구조가/구조를, so a bounded match would miss them) — matched as bare
+ * substrings. JS's `\b` can never fire between Han characters, which was issue
+ * #994: the English-only gate silently no-op'd every Chinese prompt, so
+ * non-English users got no front-load nudge and no error to explain why. The
+ * sets mirror the English intent (如何/怎么/怎麼/どうやって/どのように/어떻게=how,
+ * 在哪/哪里/哪裡/어디=where, 流程/流向/流れ/흐름=flow, 路径/路徑/経路/경로=path,
+ * 调用/調用/呼び出/호출=call, 依赖/依賴/依存/의존=depend, 影响/影響/영향=impact/affect,
+ * 实现/實現/実装/구현=implement, 架构/架構/アーキテクチャ/아키텍처=architecture,
+ * 结构/結構/構造/구조=structure, 追踪/跟踪/追蹤/追跡/トレース/추적=trace) plus
+ * structural-overview words with no single clean English equivalent
+ * (介绍/介紹/解析/分析/原理/机制/機制/仕組み/説明/설명/動作/동작/작동).
+ */
+const STRUCTURAL_UNSEGMENTED = /如何|怎么|怎麼|在哪|哪里|哪裡|追踪|跟踪|追蹤|追跡|トレース|流程|流向|流れ|路径|路徑|経路|调用|調用|呼び出|依赖|依賴|依存|影响|影響|实现|實現|実装|架构|架構|アーキテクチャ|结构|結構|構造|介绍|介紹|解析|分析|原理|机制|機制|仕組み|説明|動作|どうやって|どのように|어떻게|어디|호출|흐름|경로|의존|영향|구현|구조|아키텍처|추적|동작|작동|설명/;
 
 /** Doc/data/asset file extensions — a `name.ext` of this kind is a file
  *  reference, not a code symbol, so it must not trip the member-access signal. */
 const DOC_DATA_EXT = /\.(md|markdown|txt|rst|json|ya?ml|toml|lock|csv|tsv|log|ini|cfg|conf|env|xml|html?|png|jpe?g|gif|svg|pdf)$/i;
 
 /**
- * Does `prompt` contain an explicit structural keyword (English or CJK)? A
- * keyword is a strong, self-contained signal, so the front-load hook fires on it
- * directly — no graph check needed. (A *code-token* match, by contrast, is only
- * a candidate the hook verifies against the graph first; see {@link extractCodeTokens}.)
+ * Does `prompt` contain an explicit structural keyword? A keyword is a strong,
+ * self-contained signal, so the front-load hook fires on it directly — no graph
+ * check needed. (A *code-token* match, by contrast, is only a candidate the
+ * hook verifies against the graph first; see {@link extractCodeTokens}.)
+ * Coverage is multilingual: English, the major Latin-script languages, and
+ * Cyrillic (#1126), plus Chinese/Japanese/Korean (#994).
  */
 export function hasStructuralKeyword(prompt: string): boolean {
-  return !!prompt && (STRUCTURAL_EN.test(prompt) || STRUCTURAL_CJK.test(prompt));
+  return (
+    !!prompt &&
+    (STRUCTURAL_WORDS_RE.test(prompt) || STRUCTURAL_STEMS_RE.test(prompt) || STRUCTURAL_UNSEGMENTED.test(prompt))
+  );
 }
 
 /**
@@ -303,7 +390,7 @@ export function extractCodeTokens(prompt: string): string[] {
 /**
  * Cheap, graph-free candidate gate for the front-load hook: could `prompt` be a
  * structural / flow / impact / "where-how" question worth front-loading context
- * for? True on an explicit keyword (English or CJK, issue #994) OR an
+ * for? True on an explicit keyword in any covered language (#994, #1126) OR an
  * identifier-shaped token. A keyword is sufficient to fire on its own; a
  * token-only match is only a candidate the hook then verifies against the graph
  * (a brand name like `JavaScript` is token-shaped but isn't a symbol). Every

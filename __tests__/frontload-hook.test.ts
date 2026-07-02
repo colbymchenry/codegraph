@@ -130,7 +130,7 @@ describe('findIndexedSubprojectRoots', () => {
 });
 
 describe('hasStructuralKeyword — keyword signal fires the hook directly (#994)', () => {
-  it('English keywords match, with `\\b` so "flow" ≠ "flower"', () => {
+  it('English keywords match with word boundaries so "flow" ≠ "flower"', () => {
     expect(hasStructuralKeyword('how does article publish work')).toBe(true);
     expect(hasStructuralKeyword('where is the token validated')).toBe(true);
     expect(hasStructuralKeyword('trace the request flow')).toBe(true);
@@ -149,6 +149,60 @@ describe('hasStructuralKeyword — keyword signal fires the hook directly (#994)
   it('a bare code-token is NOT a keyword — it needs graph verification', () => {
     expect(hasStructuralKeyword('看看 get_user 这段逻辑')).toBe(false);
     expect(hasStructuralKeyword('I really love JavaScript')).toBe(false);
+  });
+});
+
+describe('hasStructuralKeyword — Latin-script languages, Cyrillic, JA/KO (#1126)', () => {
+  it('French structural prompts fire — including the prompts from the report', () => {
+    expect(hasStructuralKeyword('comment marche la state machine des commandes ?')).toBe(true);
+    expect(hasStructuralKeyword("explique l'architecture du module de stock")).toBe(true);
+    expect(hasStructuralKeyword('qui appelle cette fonction de parsing ?')).toBe(true);
+    expect(hasStructuralKeyword('de quoi dépend le module de paiement ?')).toBe(true);
+  });
+
+  it('accented keyword edges match — ASCII `\\b` could never bound "où"', () => {
+    expect(hasStructuralKeyword('où est validé le token ?')).toBe(true);
+    expect(hasStructuralKeyword("d'où vient cette valeur ?")).toBe(true);
+  });
+
+  it('Spanish / Portuguese / German / Italian fire', () => {
+    expect(hasStructuralKeyword('¿cómo funciona la máquina de estados de pedidos?')).toBe(true);
+    expect(hasStructuralKeyword('¿qué rompe este cambio?')).toBe(true);
+    expect(hasStructuralKeyword('como funciona a máquina de estados dos pedidos?')).toBe(true);
+    expect(hasStructuralKeyword('qual é a arquitetura do módulo de estoque?')).toBe(true);
+    expect(hasStructuralKeyword('wie funktioniert die Zustandsmaschine für Bestellungen?')).toBe(true);
+    expect(hasStructuralKeyword('wovon hängt das Zahlungsmodul ab?')).toBe(true);
+    expect(hasStructuralKeyword('come funziona la macchina a stati degli ordini?')).toBe(true);
+    expect(hasStructuralKeyword('spiegami la struttura del modulo ordini')).toBe(true);
+  });
+
+  it('Russian / Japanese / Korean / traditional Chinese fire', () => {
+    expect(hasStructuralKeyword('как работает конечный автомат заказов?')).toBe(true);
+    expect(hasStructuralKeyword('от чего зависит модуль оплаты?')).toBe(true);
+    expect(hasStructuralKeyword('注文のステートマシンの仕組みを説明して')).toBe(true);
+    expect(hasStructuralKeyword('この関数の呼び出しの流れは?')).toBe(true);
+    expect(hasStructuralKeyword('주문 상태 머신은 어떻게 작동하나요?')).toBe(true);
+    expect(hasStructuralKeyword('訂單狀態機的架構是怎麼實現的?')).toBe(true);
+  });
+
+  it('English derived forms fire — "architecture"/"dependencies" failed the old exact-word list', () => {
+    expect(hasStructuralKeyword('explain the architecture of the stock module')).toBe(true);
+    expect(hasStructuralKeyword('what are the dependencies of the parser?')).toBe(true);
+  });
+
+  it('stems match only at word start — no mid-word false positives', () => {
+    expect(hasStructuralKeyword('restructure this paragraph')).toBe(false); // "structur" mid-word
+    expect(hasStructuralKeyword('an independent module')).toBe(false);      // "depend" mid-word
+    expect(hasStructuralKeyword('water the flower')).toBe(false);           // unchanged guarantee
+  });
+
+  it('non-structural prose stays a no-op in every covered language', () => {
+    expect(hasStructuralKeyword('corrige cette faute de frappe')).toBe(false);   // FR "fix this typo"
+    expect(hasStructuralKeyword('arregla este error tipográfico')).toBe(false);  // ES
+    expect(hasStructuralKeyword('behebe diesen Tippfehler')).toBe(false);        // DE
+    expect(hasStructuralKeyword('исправь эту опечатку')).toBe(false);            // RU
+    expect(hasStructuralKeyword('このタイプミスを直して')).toBe(false);            // JA
+    expect(hasStructuralKeyword('이 오타를 수정해줘')).toBe(false);                // KO
   });
 });
 
