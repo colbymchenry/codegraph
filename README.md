@@ -555,10 +555,12 @@ codegraph view --file campaign.ts    # only this file's symbols + their 1-hop ne
 codegraph view --symbol run_campaign # only this symbol + its immediate neighborhood
 codegraph view --include-imports     # show import/export/reference edges too (noisy on real repos)
 codegraph view --max-nodes 400       # raise the whole-graph node cap (default 250)
-codegraph view -o graph.html         # choose the output file (default codegraph_view.html)
+codegraph view -o graph.html         # choose the output file
 ```
 
-Without `--open` it writes the HTML and prints its path. With `--open` it also
+By default the HTML is written to `<project>/.codegraph/codegraph_view.html`
+(inside the gitignored index directory, so it never litters your working tree);
+pass `-o` to write it elsewhere. Without `--open` it writes the HTML and prints its path. With `--open` it also
 starts a loopback-only HTTP server and opens the graph in your default browser;
 press Ctrl+C to stop.
 

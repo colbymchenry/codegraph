@@ -70,6 +70,13 @@ describe('codegraph view', () => {
     expect(html.length).toBeGreaterThan(100_000);
   });
 
+  it('defaults the output into the .codegraph/ directory (not the working tree)', () => {
+    const { code } = runView(tempDir, []); // no -o
+    expect(code).toBe(0);
+    const defaultOut = path.join(tempDir, '.codegraph', 'codegraph_view.html');
+    expect(fs.existsSync(defaultOut)).toBe(true);
+  });
+
   it('--symbol scopes the title and payload to that symbol', () => {
     const out = path.join(tempDir, 's.html');
     const { code } = runView(tempDir, ['--symbol', 'add', '-o', out]);

@@ -1436,7 +1436,7 @@ program
   .command('view')
   .description('Render the index as an interactive HTML graph you can open in a browser')
   .option('-p, --path <path>', 'Project path')
-  .option('-o, --output <file>', 'Output HTML file', 'codegraph_view.html')
+  .option('-o, --output <file>', 'Output HTML file (default: <project>/.codegraph/codegraph_view.html)')
   .option('--file <substring>', 'Only show symbols from files matching this substring, plus 1-hop neighbors')
   .option('--symbol <name>', 'Only show this symbol and its immediate neighborhood')
   .option('--include-imports', 'Include import/export/reference edges (noisy on real repos, off by default)')
@@ -1494,7 +1494,12 @@ program
           : '';
       const html = renderViewerHtml(data, titleSuffix);
 
-      const outPath = path.resolve(options.output || 'codegraph_view.html');
+      // Default output lives inside the project's .codegraph/ directory (which
+      // is gitignored), so a `view` never litters the working tree. An explicit
+      // -o is honored as-is, resolved against the current directory.
+      const outPath = options.output
+        ? path.resolve(options.output)
+        : path.join(getCodeGraphDir(projectPath), 'codegraph_view.html');
       fs.writeFileSync(outPath, html, 'utf-8');
       success(
         `Wrote ${data.stats.totalNodes} nodes / ${data.stats.totalEdges} edges to ${outPath}`
