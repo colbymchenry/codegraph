@@ -1,9 +1,9 @@
 # codegraph telemetry ingest worker
 
-The first-party endpoint behind `telemetry.getcodegraph.com`. This directory is in the
-public repo **on purpose**: it is the exact code that receives codegraph's anonymous usage
-telemetry, so anyone can audit what is stored. The schema contract (every event, every
-field, and everything that is never collected) is in
+This optional worker is a self-hosted telemetry endpoint template. This directory is in the
+public repo **on purpose**: it is the exact code that can receive codegraph anonymous usage
+telemetry when you configure `CODEGRAPH_TELEMETRY_ENDPOINT`, so anyone can audit what is stored.
+The schema contract (every event, every field, and everything that is never collected) is in
 [`docs/design/telemetry.md`](../docs/design/telemetry.md).
 
 What it does, in one breath: validates incoming batches against a strict allowlist (unknown
@@ -22,8 +22,8 @@ with the npm package — the engine's `files` allowlist excludes it.
 
 ## Deploy
 
-Prereqs: the `getcodegraph.com` zone on the deploying Cloudflare account (the custom
-domain route auto-provisions DNS + cert), wrangler ≥ 4.36 (the `ratelimits` binding).
+Prereqs: a telemetry domain you control if you enable a custom Cloudflare route, plus
+wrangler 4.36+ (the `ratelimits` binding).
 
 ```bash
 cd telemetry-worker

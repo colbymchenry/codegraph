@@ -1,5 +1,5 @@
 /**
- * codegraph telemetry ingest — telemetry.getcodegraph.com
+ * codegraph telemetry ingest
  *
  * This file is public on purpose: it is the exact code that receives codegraph's
  * anonymous usage telemetry, so anyone can audit what is (and is not) stored.
@@ -23,9 +23,9 @@ const LABEL_RE = /^[A-Za-z0-9_.:+/ @()-]+$/;
 const INFO_TEXT = `codegraph anonymous-telemetry ingest.
 
 What gets collected (and what never does) is documented field-by-field:
-https://github.com/colbymchenry/codegraph/blob/main/docs/design/telemetry.md
+https://github.com/zren-zing/codegraph-qt/blob/main/docs/design/telemetry.md
 This endpoint's full source:
-https://github.com/colbymchenry/codegraph/tree/main/telemetry-worker
+https://github.com/zren-zing/codegraph-qt/tree/main/telemetry-worker
 
 Disable any time: codegraph telemetry off  |  CODEGRAPH_TELEMETRY=0  |  DO_NOT_TRACK=1
 `;

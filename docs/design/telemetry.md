@@ -43,9 +43,9 @@ Answer, in aggregate and anonymously:
    Every failure mode is silence.
 3. **Off is off.** When disabled, no process opens a socket to the telemetry endpoint — not
    even an "opted out" ping.
-4. **First-party endpoint.** Clients only ever talk to `telemetry.getcodegraph.com`. The URL
-   baked into a published npm version POSTs there forever, so the domain must be ours; the
-   backend behind it can change without a client release.
+4. **First-party endpoint.** Clients only talk to an explicit `CODEGRAPH_TELEMETRY_ENDPOINT`.
+   Fork builds ship with no default endpoint, so the publisher must configure a domain
+   they control before enabling telemetry.
 
 ## Events
 
@@ -86,25 +86,16 @@ cheaper, no person profiles, unique-machine counts still work on `distinct_id` =
 
 Resolution order (first match wins):
 
-1. `DO_NOT_TRACK=1` (community standard — always honored) → off
-2. `CODEGRAPH_TELEMETRY=0|1` → forced off/on for that process
-3. Global config `~/.codegraph/telemetry.json` → stored user choice
-4. Default: **on**, gated by the first-run notice below
+1. `DO_NOT_TRACK=1` (community standard, always honored) -> off
+2. `CODEGRAPH_TELEMETRY=0|1` -> forced off/on for that process
+3. Global config `~/.codegraph/telemetry.json` -> stored user choice
+4. Default: **off**
 
 Surfaces:
 
-- **Installer (interactive):** a visible clack toggle in the existing prompt flow —
-  "Share anonymous usage data? (no code, paths, or names — see TELEMETRY.md)" — default
-  yes. Choice persisted with `consent_source: "installer"`. Re-runs/upgrades respect the
-  stored choice and don't re-ask.
-- **Headless paths** (`npx codegraph init`, MCP server — no TTY, never prompt): right
-  before the **first actual send** (recording only buffers locally and stays silent — so
-  the installer's explicit toggle always precedes any notice), print one line to
-  **stderr** and record `first_run_notice_shown`:
-  `codegraph collects anonymous usage stats (no code or paths) — "codegraph telemetry off" or CODEGRAPH_TELEMETRY=0 disables. Details: TELEMETRY.md`
-- **CLI:** `codegraph telemetry status|on|off` (status prints the machine ID, current
-  state, and what decided it). Deleting `~/.codegraph/telemetry.json` resets everything,
-  including the machine ID.
+- **Installer:** does not prompt for telemetry in this fork.
+- **CLI:** `codegraph telemetry status|on|off` (status prints the machine ID, current state, and what decided it). Deleting `~/.codegraph/telemetry.json` resets everything, including the machine ID.
+- **Endpoint:** enabling telemetry only records/sends data when `CODEGRAPH_TELEMETRY_ENDPOINT` points to an endpoint operated by the publisher/user.
 
 `~/.codegraph/telemetry.json`:
 
@@ -117,10 +108,6 @@ Surfaces:
   "updated_at": "2026-06-12T00:00:00Z"
 }
 ```
-
-(`~/.codegraph/` is new — today nothing global exists. Coexists by filename if a user ever
-indexes `$HOME` itself, since per-project data lives in `<project>/.codegraph/` with fixed
-other filenames.)
 
 ## Client architecture
 
@@ -137,8 +124,8 @@ New module `src/telemetry/` (single small module, no deps):
   opportunistically — at the start of long-running commands (`init`/`index`/`sync`/
   `uninit`/`upgrade`), on an unref'd interval in the long-lived MCP server/daemon, and
   awaited-with-cap at the end of `install`/`init`/`index`/`uninit` where a second is
-  invisible. Sends POST completed-day rollups + lifecycle events to
-  `https://telemetry.getcodegraph.com/v1/events` with `AbortSignal.timeout(1500)`,
+  invisible. Sends POST completed-day rollups + lifecycle events to the URL in
+  `CODEGRAPH_TELEMETRY_ENDPOINT` with `AbortSignal.timeout(1500)`,
   fire-and-forget: any response (or none) is final — no retry, no error surfaced. The
   queue is claimed by atomic rename so concurrent processes can't double-send (a crashed
   sender's claim merges back after an hour). `CODEGRAPH_TELEMETRY_DEBUG=1` echoes
@@ -148,9 +135,9 @@ New module `src/telemetry/` (single small module, no deps):
 
 ## Ingest endpoint (Cloudflare Worker)
 
-`telemetry.getcodegraph.com` → small Worker living at `telemetry-worker/` in this repo —
-public on purpose, so anyone can audit exactly what the endpoint stores. It ships nowhere
-with the npm package (excluded by the `files` allowlist):
+The optional endpoint can be the small Worker living at `telemetry-worker/` in this repo.
+It is public on purpose, so anyone can audit exactly what the endpoint stores.
+It ships nowhere with the npm package (excluded by the `files` allowlist):
 
 - `POST /v1/events`: validate against the event/property allowlist (drop unknown events,
   strip unknown props), enforce sane sizes, **never forward or log the client IP**

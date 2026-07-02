@@ -7,26 +7,27 @@ the complete list of what is collected. If a field isn't on this page, it isn't 
 the ingest endpoint enforces this list as an allowlist and is itself
 [public, auditable code](telemetry-worker/) in this repository.
 
-## Turning it off
+## Telemetry is default-off
 
-Any of these works, permanently:
+This fork does not send telemetry unless you explicitly enable it and provide an endpoint you control.
+
+To enable telemetry for a self-hosted endpoint:
+
+```bash
+codegraph telemetry on
+export CODEGRAPH_TELEMETRY_ENDPOINT=https://your-domain.example/v1/events
+```
+
+Any of these disables it again:
 
 ```bash
 codegraph telemetry off        # stores your choice (and deletes any unsent data)
-```
-
-```bash
 export CODEGRAPH_TELEMETRY=0   # per-shell / per-CI override
-export DO_NOT_TRACK=1          # the cross-tool standard — always honored
+export DO_NOT_TRACK=1          # the cross-tool standard, always honored
 ```
 
 `codegraph telemetry status` shows the current state, what decided it, and your machine ID.
-The interactive installer (`codegraph install`) asks up front with a visible default-on
-toggle and never re-asks. If you never saw the installer (e.g. `npx` straight into `init`),
-a one-line notice is printed to stderr before the first time anything is sent.
-
-Off means off: when disabled, CodeGraph records nothing, opens no connection to the
-telemetry endpoint, and sends no "opted out" ping.
+Off means off: when disabled, CodeGraph records nothing, opens no connection to a telemetry endpoint, and sends no "opted out" ping.
 
 ## What is collected
 
@@ -72,14 +73,9 @@ per-call event stream, and nothing is sent in real time.
 
 ## How it travels
 
-Events POST to `telemetry.getcodegraph.com` — a first-party endpoint whose complete
-source lives in [`telemetry-worker/`](telemetry-worker/) in this repository. It validates
-every event and property against the allowlist above (anything else is dropped), strips
-IPs, rate-limits, and forwards to a managed analytics store (PostHog, US region) as
-anonymous events. Sends are fire-and-forget with a short timeout: offline or air-gapped
-machines buffer a bounded local file (256 KB cap) and never retry-loop, log errors, or
-slow a command down. Telemetry never adds latency to MCP tool calls — recording is an
-in-memory counter.
+When telemetry is enabled and `CODEGRAPH_TELEMETRY_ENDPOINT` is set, events POST to that endpoint. The optional Cloudflare Worker in [`telemetry-worker/`](telemetry-worker/) is a self-hosting template: it validates every event and property against the allowlist above, strips IPs, rate-limits, and forwards to a managed analytics store such as PostHog.
+
+Sends are fire-and-forget with a short timeout: offline or air-gapped machines buffer a bounded local file (256 KB cap) and never retry-loop, log errors, or slow a command down. Telemetry never adds latency to MCP tool calls; recording is an in-memory counter.
 
 The engineering contract behind all of this — including the rule that schema changes must
 update this page, the client, and the public endpoint in one PR — is in

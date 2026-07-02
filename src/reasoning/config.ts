@@ -20,7 +20,7 @@ import * as os from 'os';
 import { readOffloadToken } from './credentials';
 
 /** Managed tier ("CodeGraph AI") — the metered gateway used when logged in. */
-export const MANAGED_DEFAULT_URL = 'https://ai.getcodegraph.com/v1';
+export const MANAGED_DEFAULT_URL = '';
 /** The gateway's public model id (it translates this to the upstream provider id). */
 export const MANAGED_DEFAULT_MODEL = 'openai/gpt-oss-120b';
 
@@ -126,7 +126,7 @@ export function resolveOffload(env: NodeJS.ProcessEnv = process.env): ResolvedOf
   if (managed) {
     // Managed tier: default to the CodeGraph AI gateway + its public model id; the
     // bearer is the org token from `codegraph offload login` (or an env override).
-    url = envUrl ?? trimmed(c.url) ?? MANAGED_DEFAULT_URL;
+    url = envUrl ?? trimmed(c.url) ?? trimmed(MANAGED_DEFAULT_URL);
     model = trimmed(env.CODEGRAPH_OFFLOAD_MODEL) ?? trimmed(c.model) ?? MANAGED_DEFAULT_MODEL;
     if (envKey) { apiKey = envKey; keySource = 'CODEGRAPH_OFFLOAD_KEY'; }
     else { const t = readOffloadToken(); if (t) { apiKey = t; keySource = 'codegraph login'; } }

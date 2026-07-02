@@ -27,8 +27,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { randomUUID } from 'crypto';
 
-export const TELEMETRY_ENDPOINT = 'https://telemetry.getcodegraph.com/v1/events';
-export const TELEMETRY_DOCS = 'https://github.com/colbymchenry/codegraph/blob/main/TELEMETRY.md';
+export const TELEMETRY_ENDPOINT = '';
+export const TELEMETRY_DOCS = 'https://github.com/zren-zing/codegraph-qt/blob/main/TELEMETRY.md';
 
 // v2: dropped the `sqlite_backend` field from the `index` event — node:sqlite is
 // now the only backend (the better-sqlite3-native / wasm-fallback split is gone),
@@ -199,7 +199,7 @@ export class Telemetry {
     if (config) {
       return { enabled: config.enabled, decidedBy: 'config', machineId, configPath: this.configPath };
     }
-    return { enabled: true, decidedBy: 'default', machineId, configPath: this.configPath };
+    return { enabled: false, decidedBy: 'default', machineId, configPath: this.configPath };
   }
 
   isEnabled(): boolean {
@@ -493,7 +493,8 @@ export class Telemetry {
       ci: this.env.CI !== undefined && this.env.CI !== '' && this.env.CI !== '0' && this.env.CI !== 'false',
       schema_version: SCHEMA_VERSION,
     };
-    const endpoint = this.env.CODEGRAPH_TELEMETRY_ENDPOINT || TELEMETRY_ENDPOINT;
+    const endpoint = this.env.CODEGRAPH_TELEMETRY_ENDPOINT?.trim() || TELEMETRY_ENDPOINT;
+    if (!endpoint) return [];
     for (let i = 0; i < events.length; i += MAX_EVENTS_PER_REQUEST) {
       const chunk = events.slice(i, i + MAX_EVENTS_PER_REQUEST);
       const body = JSON.stringify({ ...envelope, events: chunk });

@@ -1,7 +1,7 @@
 {
   "name": "codegraph-telemetry-worker",
   "private": true,
-  "description": "First-party ingest endpoint for codegraph's anonymous usage telemetry (telemetry.getcodegraph.com)",
+  "description": "Optional self-hosted ingest endpoint for codegraph anonymous usage telemetry",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

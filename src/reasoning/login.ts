@@ -5,13 +5,13 @@
  * their account; the CLI meanwhile polls for the minted, org-scoped token and
  * stores it (see ./credentials + ./config) to turn on managed reasoning.
  *
- * This talks to the DASHBOARD (app.getcodegraph.com), not the metered gateway —
- * it's a plain OAuth-style device handshake (RFC 8628 shape), nothing proprietary.
+ * This talks to the configured dashboard, not the metered gateway. It is a
+ * plain OAuth-style device handshake (RFC 8628 shape), nothing proprietary.
  * The resulting token is what authenticates the managed reasoning calls (./reasoner).
  */
 import { spawn } from 'child_process';
 
-const DEFAULT_BASE = 'https://app.getcodegraph.com';
+const DEFAULT_BASE = '';
 
 /** Dashboard base for the device-login endpoints; override for testing via CODEGRAPH_LOGIN_URL. */
 export function loginBaseUrl(): string {
@@ -35,6 +35,9 @@ export interface DeviceStart {
 /** Begin a device-authorization request. */
 export async function startDeviceLogin(): Promise<DeviceStart> {
   const base = loginBaseUrl();
+  if (!base) {
+    throw new Error('managed login is not configured; set CODEGRAPH_LOGIN_URL to your dashboard URL');
+  }
   const res = await fetch(`${base}/api/cli/device/start`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -52,6 +55,9 @@ export async function pollForToken(deviceCode: string, intervalSec: number, expi
   const deadline = Date.now() + Math.max(30, expiresInSec || 600) * 1000;
   let waitMs = Math.max(2, intervalSec || 5) * 1000;
   const base = loginBaseUrl();
+  if (!base) {
+    throw new Error('managed login is not configured; set CODEGRAPH_LOGIN_URL to your dashboard URL');
+  }
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, waitMs));
     const res = await fetch(`${base}/api/cli/device/token`, {

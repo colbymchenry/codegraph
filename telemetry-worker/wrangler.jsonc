@@ -7,10 +7,9 @@
   "compatibility_date": "2026-06-12",
   "compatibility_flags": ["nodejs_compat"],
 
-  // First-party endpoint. The custom domain auto-provisions DNS + cert when the
-  // getcodegraph.com zone is on the deploying account. workers.dev stays off so
-  // the only public surface is the documented one.
-  "routes": [{ "pattern": "telemetry.getcodegraph.com", "custom_domain": true }],
+  // Optional self-hosted endpoint. Replace this with a domain you control before
+  // deploying and set CODEGRAPH_TELEMETRY_ENDPOINT in clients that should use it.
+  "routes": [],
   "workers_dev": false,
 
   "observability": { "enabled": true, "head_sampling_rate": 1 },

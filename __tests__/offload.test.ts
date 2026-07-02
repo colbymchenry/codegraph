@@ -122,6 +122,7 @@ describe('reasoning offload', () => {
     it('forces the offload off even when managed + signed in', () => {
       writeOffloadConfig({ managed: true });
       writeOffloadToken('cgai_live');
+      process.env.CODEGRAPH_OFFLOAD_URL = 'https://managed.example/v1';
       expect(resolveOffload().enabled).toBe(true); // sanity: on without the flag
       process.env.CODEGRAPH_OFFLOAD_DISABLE = '1';
       const c = resolveOffload();
@@ -264,13 +265,15 @@ describe('reasoning offload', () => {
       }
     });
 
-    it('resolves managed mode to the gateway URL + public model id + login token', () => {
+    it('resolves managed mode to the configured gateway URL + public model id + login token', () => {
       writeOffloadConfig({ managed: true });
       writeOffloadToken('cgai_live');
+      process.env.CODEGRAPH_OFFLOAD_URL = 'https://managed.example/v1';
       const c = resolveOffload();
       expect(c.enabled).toBe(true);
       expect(c.managed).toBe(true);
-      expect(c.url).toBe(MANAGED_DEFAULT_URL);
+      expect(MANAGED_DEFAULT_URL).toBe('');
+      expect(c.url).toBe('https://managed.example/v1');
       expect(c.model).toBe(MANAGED_DEFAULT_MODEL);
       expect(c.apiKey).toBe('cgai_live');
       expect(c.keySource).toBe('codegraph login');
