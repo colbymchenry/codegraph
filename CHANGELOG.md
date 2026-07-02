@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes Slint (`.slint`) UI files, including components, globals, interfaces, structs, enums, properties, callbacks, functions, imports, and call edges. (#648, #916)
 
 ## [1.2.0] - 2026-07-02
 

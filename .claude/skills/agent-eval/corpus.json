@@ -247,6 +247,29 @@
       "question": "How do shadcn-svelte components compose and apply their styling?"
     }
   ],
+  "Slint": [
+    {
+      "name": "slint-nodejs-template",
+      "repo": "https://github.com/slint-ui/slint-nodejs-template",
+      "size": "Small",
+      "files": "~6",
+      "question": "How does the JavaScript entry point load the Slint UI and update the MainWindow state?"
+    },
+    {
+      "name": "SurrealismUI",
+      "repo": "https://github.com/Surrealism-All/SurrealismUI",
+      "size": "Medium",
+      "files": "~3000",
+      "question": "How does SurrealismUI define and compose a Button component from shared style and theme primitives?"
+    },
+    {
+      "name": "slint",
+      "repo": "https://github.com/slint-ui/slint",
+      "size": "Large",
+      "files": "~4300",
+      "question": "How does the Slint example gallery UI compose component definitions and callback handlers from .slint files into the viewer runtime?"
+    }
+  ],
   "Lua": [
     {
       "name": "lualine.nvim",
