@@ -1065,7 +1065,14 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
     case 'jsx':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), // = new Logger()
-        new RegExp(`\\b(?:const|let|var)\\s+${r}\\s*:\\s*([A-Z][\\w.$]*)`), // lg: Logger
+        // No keyword requirement, so this matches BOTH a local annotation
+        // (`const lg: Logger`) and a typed parameter (`function use(lg: Logger)`
+        // / `(lg: Logger) =>`) — the parameter case the old `const|let|var`
+        // prefix excluded (#1125). Mirrors Kotlin/Swift/Scala; the capture stops
+        // at `<` so a generic-typed param (`repo: Repository<User>`) still yields
+        // `Repository`. resolveMethodOnType validates the type actually declares
+        // the method, so the looser match produces no edge on a mis-inference.
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*)`), // lg: Logger  (annotation or typed param)
       ];
     case 'python':
       return [

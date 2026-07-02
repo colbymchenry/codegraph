@@ -1734,6 +1734,47 @@ func main() {
       // Logger.new is still an instantiation of the class.
       expect(out.some((e) => e.kind === 'instantiates' && e.target === logger.id)).toBe(true);
     });
+
+    it('TypeScript: infers a typed-parameter receiver, disambiguating same-named methods (#1125)', async () => {
+      // A typed function parameter used as a receiver — `function use(lg: Logger)`
+      // — never matched the old TS/JS pattern (it required a const|let|var
+      // prefix), so `lg.log()` fell through to no edge once a second class shared
+      // the method name. Two ambiguous classes are load-bearing here: a
+      // single-class version resolves via a same-name fallback even without
+      // inference, so only the collision proves type inference actually fired.
+      fs.writeFileSync(
+        path.join(tempDir, 'svc.ts'),
+        `class Logger { log() { return 1; } }\n` +
+          `class Other { log() { return 2; } }\n` +
+          `export function use(lg: Logger) { return lg.log(); }\n` +
+          `export function useOther(o: Other) { return o.log(); }\n`,
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const classes = cg.getNodesByKind('class');
+      const logger = classes.find((n) => n.name === 'Logger')!;
+      const other = classes.find((n) => n.name === 'Other')!;
+      const logs = cg.getNodesByKind('method').filter((n) => n.name === 'log');
+      expect(logs.length, 'both log methods should be indexed').toBe(2);
+
+      // Associate each same-named `log` with its class by line containment.
+      const inClass = (m: (typeof logs)[number], c: typeof logger) =>
+        m.startLine >= c.startLine && m.startLine <= (c.endLine ?? c.startLine);
+      const loggerLog = logs.find((m) => inClass(m, logger))!;
+      const otherLog = logs.find((m) => inClass(m, other))!;
+      expect(loggerLog, "Logger's log").toBeDefined();
+      expect(otherLog, "Other's log").toBeDefined();
+
+      const loggerCallers = cg.getCallers(loggerLog.id).map((x) => x.node.name);
+      const otherCallers = cg.getCallers(otherLog.id).map((x) => x.node.name);
+
+      // Each typed-param call routes to its OWN class's method, not the other's.
+      expect(loggerCallers).toContain('use');
+      expect(loggerCallers).not.toContain('useOther');
+      expect(otherCallers).toContain('useOther');
+      expect(otherCallers).not.toContain('use');
+    });
   });
 
   describe('Name Matcher: kind bias for new ref kinds', () => {
