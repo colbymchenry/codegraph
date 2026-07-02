@@ -685,6 +685,15 @@ describe('Tree-sitter WASM Setup', () => {
     expect(pkg.dependencies['tree-sitter-wasms']).toBeDefined();
   });
 
+  it('should vendor the QML grammar instead of requiring a separate runtime package', () => {
+    const pkgPath = path.join(__dirname, '..', 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+    const qmlWasmPath = path.join(__dirname, '..', 'src', 'extraction', 'wasm', 'tree-sitter-qmljs.wasm');
+
+    expect(pkg.dependencies['@lumis-sh/wasm-qmljs']).toBeUndefined();
+    expect(fs.existsSync(qmlWasmPath)).toBe(true);
+  });
+
   it('should not have native tree-sitter in dependencies', () => {
     const pkgPath = path.join(__dirname, '..', 'package.json');
     const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));

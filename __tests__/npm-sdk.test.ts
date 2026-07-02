@@ -3,12 +3,12 @@
  *
  * The published main package is a thin shim: the CLI `bin` (npm-shim.js) execs
  * the bundled Node, while `main` (npm-sdk.js) lets embedded consumers
- * `require("@colbymchenry/codegraph")` on their OWN Node by re-exporting the
+ * `require("@zren-zing/codegraph-qt")` on their OWN Node by re-exporting the
  * compiled library that ships inside the per-platform optionalDependency
- * (@colbymchenry/codegraph-<target>/lib/dist/index.js).
+ * (@zren-zing/codegraph-qt-<target>/lib/dist/index.js).
  *
  * These tests stand up a temp main-package dir with a fake platform package as a
- * resolvable sibling, then require the SDK in a child process — so resolution,
+ * resolvable sibling, then require the SDK in a child process -so resolution,
  * the self-heal cache fallback, and the missing-bundle error are exercised
  * hermetically with no real bundle, network, or registry.
  */
@@ -29,15 +29,15 @@ function mkTmp(label: string): string {
 
 // A temp node_modules with the main package (npm-sdk.js + package.json). The
 // fake platform package, when present, is written as a resolvable sibling so the
-// SDK's `require.resolve('@colbymchenry/codegraph-<target>/...')` walks to it.
+// SDK's `require.resolve('@zren-zing/codegraph-qt-<target>/...')` walks to it.
 function makeConsumer(): { root: string; mainPkg: string } {
   const root = mkTmp('consumer');
-  const mainPkg = path.join(root, 'node_modules', '@colbymchenry', 'codegraph');
+  const mainPkg = path.join(root, 'node_modules', '@zren-zing', 'codegraph-qt');
   fs.mkdirSync(mainPkg, { recursive: true });
   fs.copyFileSync(SDK_SRC, path.join(mainPkg, 'npm-sdk.js'));
   fs.writeFileSync(
     path.join(mainPkg, 'package.json'),
-    JSON.stringify({ name: '@colbymchenry/codegraph', version: VERSION, main: 'npm-sdk.js' }) + '\n'
+    JSON.stringify({ name: '@zren-zing/codegraph-qt', version: VERSION, main: 'npm-sdk.js' }) + '\n'
   );
   return { root, mainPkg };
 }
@@ -53,11 +53,11 @@ function writeFakeLib(libDistDir: string, sentinel: string): void {
 }
 
 function installPlatformPackage(root: string, sentinel: string): void {
-  const pkgRoot = path.join(root, 'node_modules', '@colbymchenry', `codegraph-${target}`);
+  const pkgRoot = path.join(root, 'node_modules', '@zren-zing', `codegraph-qt-${target}`);
   writeFakeLib(path.join(pkgRoot, 'lib', 'dist'), sentinel);
   fs.writeFileSync(
     path.join(pkgRoot, 'package.json'),
-    JSON.stringify({ name: `@colbymchenry/codegraph-${target}`, version: VERSION }) + '\n'
+    JSON.stringify({ name: `@zren-zing/codegraph-qt-${target}`, version: VERSION }) + '\n'
   );
 }
 
@@ -100,7 +100,7 @@ describe('npm-sdk programmatic entry', () => {
     const { root, mainPkg } = makeConsumer(); // no platform package, empty cache
     const r = requireSdk(mainPkg, { CODEGRAPH_INSTALL_DIR: path.join(root, '.empty-cache') });
     expect(r.status).toBe(7);
-    expect(r.stderr).toContain(`@colbymchenry/codegraph-${target}`);
+    expect(r.stderr).toContain(`@zren-zing/codegraph-qt-${target}`);
     expect(r.stderr).toContain('not installed');
     expect(r.stderr).toContain('registry.npmjs.org');
   });

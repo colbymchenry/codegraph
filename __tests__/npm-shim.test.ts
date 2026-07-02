@@ -2,13 +2,13 @@
  * npm thin-installer launcher (`scripts/npm-shim.js`) tests.
  *
  * The shim runs on the user's own Node, locates the per-platform optionalDependency
- * bundle, and — when a registry mirror failed to deliver it (issue #303) — falls
+ * bundle, and -when a registry mirror failed to deliver it (issue #303) -falls
  * back to downloading the bundle from GitHub Releases. These tests exercise that
  * shim as a real subprocess from a temp "main package" dir (its own package.json
  * + node_modules), so resolution and version lookup behave hermetically.
  *
  * The download/checksum paths run against a local self-signed HTTPS server via
- * CODEGRAPH_DOWNLOAD_BASE — no real network, no published release needed. The
+ * CODEGRAPH_DOWNLOAD_BASE -no real network, no published release needed. The
  * shim is launched with async `spawn` (not spawnSync), so the test's event loop
  * stays free to serve those requests.
  *
@@ -39,12 +39,12 @@ function mkTmp(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-shim-${label}-`));
 }
 
-// A temp dir standing in for the installed @colbymchenry/codegraph main package.
+// A temp dir standing in for the installed @zren-zing/codegraph-qt main package.
 function makePkg(version = '9.9.9-test'): string {
   const dir = mkTmp('pkg');
   fs.copyFileSync(SHIM_SRC, path.join(dir, 'npm-shim.js'));
   fs.writeFileSync(path.join(dir, 'package.json'),
-    JSON.stringify({ name: '@colbymchenry/codegraph', version }) + '\n');
+    JSON.stringify({ name: '@zren-zing/codegraph-qt', version }) + '\n');
   return dir;
 }
 
@@ -74,10 +74,10 @@ function runShim(pkgDir: string, args: string[], env: Record<string, string>) {
 describe.skipIf(isWindows)('npm-shim launcher', () => {
   it('runs the installed optional-dependency bundle without any download', async () => {
     const pkg = makePkg();
-    const platformPkg = path.join(pkg, 'node_modules', '@colbymchenry', `codegraph-${target}`);
+    const platformPkg = path.join(pkg, 'node_modules', '@zren-zing', `codegraph-qt-${target}`);
     writeLauncher(path.join(platformPkg, 'bin'));
     fs.writeFileSync(path.join(platformPkg, 'package.json'),
-      JSON.stringify({ name: `@colbymchenry/codegraph-${target}`, version: '9.9.9-test' }) + '\n');
+      JSON.stringify({ name: `@zren-zing/codegraph-qt-${target}`, version: '9.9.9-test' }) + '\n');
     const cache = mkTmp('cache');
     const r = await runShim(pkg, ['--probe-abc'], { CODEGRAPH_INSTALL_DIR: cache });
 
@@ -112,7 +112,7 @@ describe.skipIf(isWindows)('npm-shim launcher', () => {
 
     expect(r.status).toBe(1);
     expect(r.stderr).toContain(`no prebuilt bundle for ${target}`);
-    expect(r.stderr).toContain(`@colbymchenry/codegraph-${target}`);
+    expect(r.stderr).toContain(`@zren-zing/codegraph-qt-${target}`);
     expect(r.stderr).toContain('--registry=https://registry.npmjs.org');
     expect(r.stderr).toContain('install.sh');
   });

@@ -3,14 +3,14 @@
 # Assemble the npm thin-installer packages from built bundles (esbuild pattern).
 #
 # Produces, under release/npm/:
-#   codegraph-<target>/   one per built bundle — the vendored Node + app, tagged
+#   codegraph-<target>/   one per built bundle -the vendored Node + app, tagged
 #                         with os/cpu so npm installs only the matching one.
-#   main/                 the @colbymchenry/codegraph shim package: a tiny bin
+#   main/                 the @zren-zing/codegraph-qt shim package: a tiny bin
 #                         that execs the matching platform bundle, with every
 #                         platform package in optionalDependencies.
 #
 # The release pipeline then `npm publish`es each dir. This does NOT touch the
-# repo's package.json — the dev/from-source path keeps working; the *published*
+# repo's package.json -the dev/from-source path keeps working; the *published*
 # main package's shape is generated here.
 #
 # Prereq: run build-bundle.sh for each target first (release/codegraph-*.tar.gz).
@@ -19,7 +19,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="${1:-$(node -p "require('$ROOT/package.json').version")}"
-SCOPE="@colbymchenry"
+SCOPE="@zren-zing"
 REL="$ROOT/release"
 NPM="$REL/npm"
 
@@ -28,7 +28,7 @@ mkdir -p "$NPM/main"
 
 shopt -s nullglob
 archives=("$REL"/codegraph-*.tar.gz "$REL"/codegraph-*.zip)
-[ ${#archives[@]} -gt 0 ] || { echo "[pack-npm] no bundles in $REL — run build-bundle.sh first" >&2; exit 1; }
+[ ${#archives[@]} -gt 0 ] || { echo "[pack-npm] no bundles in $REL -run build-bundle.sh first" >&2; exit 1; }
 
 targets=()
 for archive in "${archives[@]}"; do
@@ -59,7 +59,7 @@ for archive in "${archives[@]}"; do
     node -e '
       const fs=require("fs");
       fs.writeFileSync(process.argv[1], JSON.stringify({
-        name: `${process.env.SCOPE}/codegraph-${process.env.TARGET}`,
+        name: `${process.env.SCOPE}/codegraph-qt-${process.env.TARGET}`,
         version: process.env.VERSION,
         description: `CodeGraph self-contained bundle for ${process.env.TARGET}`,
         os: [process.env.OSV], cpu: [process.env.ARCHV],
@@ -68,13 +68,13 @@ for archive in "${archives[@]}"; do
       }, null, 2) + "\n");
     ' "$pkgdir/package.json"
   targets+=("$target")
-  echo "[pack-npm] ${SCOPE}/codegraph-${target}@${VERSION}"
+  echo "[pack-npm] ${SCOPE}/codegraph-qt-${target}@${VERSION}"
 done
 
 # Main shim package.
-#   npm-shim.js  CLI/MCP launcher (execs the bundled Node) — the `bin`.
+#   npm-shim.js  CLI/MCP launcher (execs the bundled Node) -the `bin`.
 #   npm-sdk.js   programmatic/embedded entry (#354): re-exports the installed
-#                platform bundle's compiled library — the `main`.
+#                platform bundle's compiled library -the `main`.
 #   dist/        the .d.ts tree only (types). The runtime .js stays in the
 #                per-platform bundle so its deps aren't duplicated here.
 cp "$ROOT/scripts/npm-shim.js" "$NPM/main/npm-shim.js"
@@ -97,11 +97,11 @@ VERSION="$VERSION" SCOPE="$SCOPE" TARGETS="${targets[*]}" \
     const fs=require("fs");
     const opt={};
     for (const t of process.env.TARGETS.split(/\s+/).filter(Boolean))
-      opt[`${process.env.SCOPE}/codegraph-${t}`]=process.env.VERSION;
+      opt[`${process.env.SCOPE}/codegraph-qt-${t}`]=process.env.VERSION;
     fs.writeFileSync(process.argv[1], JSON.stringify({
-      name: `${process.env.SCOPE}/codegraph`,
+      name: `${process.env.SCOPE}/codegraph-qt`,
       version: process.env.VERSION,
-      description: "Local-first code intelligence for AI agents (MCP). Self-contained — bundles its own runtime.",
+      description: "CodeGraph fork with Qt/QML and Qt Widgets code intelligence. Self-contained bundles its own runtime.",
       bin: { codegraph: "npm-shim.js" },
       main: "npm-sdk.js",
       types: "dist/index.d.ts",
@@ -115,5 +115,5 @@ VERSION="$VERSION" SCOPE="$SCOPE" TARGETS="${targets[*]}" \
     }, null, 2) + "\n");
   ' "$NPM/main/package.json"
 
-echo "[pack-npm] ${SCOPE}/codegraph@${VERSION} (${#targets[@]} platform packages in optionalDependencies)"
+echo "[pack-npm] ${SCOPE}/codegraph-qt@${VERSION} (${#targets[@]} platform packages in optionalDependencies)"
 echo "[pack-npm] output: $NPM"

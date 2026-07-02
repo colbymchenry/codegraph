@@ -46,9 +46,9 @@ linux/amd64`).
    Releases, symlinks `codegraph` onto PATH. Re-run to upgrade; `--uninstall` to
    remove.
 2. **npm** ([`scripts/npm-shim.js`](scripts/npm-shim.js)) — preserves
-   `npm i -g @colbymchenry/codegraph`. The main package is a tiny shim; the
+   `npm i -g @zren-zing/codegraph-qt`. The main package is a tiny shim; the
    bundles ship as per-platform `optionalDependencies`
-   (`@colbymchenry/codegraph-<target>` with `os`/`cpu`), so npm installs only the
+   (`@zren-zing/codegraph-qt-<target>` with `os`/`cpu`), so npm installs only the
    matching one. The shim — run by the user's Node — execs the bundle, so the
    real work runs on the bundled Node 24. Works even on old Node. On Windows it
    invokes the bundled `node.exe` against the app entry directly (not the `.cmd`

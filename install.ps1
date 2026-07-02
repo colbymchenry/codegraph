@@ -3,7 +3,7 @@
 # Downloads a self-contained bundle (a vendored Node runtime + the app) from
 # GitHub Releases. No Node.js, no build tools required.
 #
-#   irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/zren-zing/codegraph-qt/main/install.ps1 | iex
 #
 # Upgrade with `codegraph upgrade` (or just re-run this). To uninstall: remove
 # $env:LOCALAPPDATA\codegraph and drop its \current\bin entry from your user PATH.
@@ -13,7 +13,7 @@
 #   CODEGRAPH_INSTALL_DIR  install location (default: %LOCALAPPDATA%\codegraph)
 
 $ErrorActionPreference = 'Stop'
-$repo = 'colbymchenry/codegraph'
+$repo = 'zren-zing/codegraph-qt'
 $installDir = if ($env:CODEGRAPH_INSTALL_DIR) { $env:CODEGRAPH_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'codegraph' }
 
 # 1. Detect architecture -> target matching the release archives.

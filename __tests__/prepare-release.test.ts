@@ -171,7 +171,7 @@ describe('prepare-release.mjs', () => {
       run(dir);
       const result = fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8');
       expect(result).toContain(
-        '[1.2.3]: https://github.com/colbymchenry/codegraph/releases/tag/v1.2.3',
+        '[1.2.3]: https://github.com/zren-zing/codegraph-qt/releases/tag/v1.2.3',
       );
     });
 
@@ -182,12 +182,12 @@ describe('prepare-release.mjs', () => {
       run(dir);
       const result = fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8');
       expect(result).toContain(
-        '[1.2.3]: https://github.com/colbymchenry/codegraph/releases/tag/v1.2.3',
+        '[1.2.3]: https://github.com/zren-zing/codegraph-qt/releases/tag/v1.2.3',
       );
     });
 
     it('does not double-add an existing link reference', () => {
-      const ref = '[1.2.3]: https://github.com/colbymchenry/codegraph/releases/tag/v1.2.3';
+      const ref = '[1.2.3]: https://github.com/zren-zing/codegraph-qt/releases/tag/v1.2.3';
       dir = setup(
         HEADER +
           `## [Unreleased]\n\n### Added\n- x\n\n## [1.2.2] - 2026-01-01\n\n${ref}\n`,

@@ -26,7 +26,7 @@ export function buildNode25BlockBanner(nodeVersion: string): string {
     'Node.js 25.x has a V8 WASM JIT (turboshaft) Zone allocator bug that',
     'crashes with `Fatal process out of memory: Zone` when CodeGraph',
     'compiles tree-sitter grammars. CodeGraph WILL crash on this Node',
-    'version mid-indexing. See https://github.com/colbymchenry/codegraph/issues/81',
+    'version mid-indexing. See https://github.com/zren-zing/codegraph-qt/issues/81',
     '',
     'Fix: install Node.js 22 LTS:',
     '  nvm install 22 && nvm use 22                          # nvm',

@@ -6,7 +6,7 @@ description: Install CodeGraph and configure your AI coding agents.
 ## 1. Run the installer
 
 ```bash
-npx @colbymchenry/codegraph
+npx @zren-zing/codegraph-qt
 ```
 
 The installer will:

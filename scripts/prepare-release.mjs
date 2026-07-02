@@ -241,7 +241,7 @@ function main() {
 }
 
 /**
- * Append a `[X.Y.Z]: https://github.com/colbymchenry/codegraph/releases/tag/vX.Y.Z`
+ * Append a `[X.Y.Z]: https://github.com/zren-zing/codegraph-qt/releases/tag/vX.Y.Z`
  * link reference at the end of the file IF one doesn't already exist. The
  * link ref is what makes `## [X.Y.Z]` heading text auto-link to its tag in
  * GitHub's renderer; without it the heading still renders, just unlinked.
@@ -251,7 +251,7 @@ function main() {
  * which CommonMark accepts regardless.
  */
 function appendLinkRef(text, version) {
-  const refLine = `[${version}]: https://github.com/colbymchenry/codegraph/releases/tag/v${version}`;
+  const refLine = `[${version}]: https://github.com/zren-zing/codegraph-qt/releases/tag/v${version}`;
   // Already there? Look for a line that EQUALS this (anywhere in the file)
   // to keep idempotency robust against the scattered-vs-block layout.
   const lines = text.split('\n');

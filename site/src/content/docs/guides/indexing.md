@@ -86,7 +86,7 @@ Almost never. The edge cases:
 
 Otherwise: just use it. The watcher + banner + connect-sync covers the AI-assisted workflow end-to-end. If you're seeing files genuinely missed after the debounce window has passed, that's a bug — please file an issue with a reproduction.
 
-> See the v0.9.5 release notes for the [staleness banner (#403)](https://github.com/colbymchenry/codegraph/releases/tag/v0.9.5) and the connect-time catch-up (#414); both shipped together.
+> See the v0.9.5 release notes for the [staleness banner (#403)](https://github.com/zren-zing/codegraph-qt/releases/tag/v0.9.5) and the connect-time catch-up (#414); both shipped together.
 
 ## Check status
 

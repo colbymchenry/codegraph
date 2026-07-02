@@ -8,7 +8,7 @@
  *     canonical installer script (single source of truth) so the download /
  *     version-resolution / PATH logic never drifts between first-install and
  *     upgrade.
- *   - **npm** — installed via `npm i -g @colbymchenry/codegraph`. Upgrading
+ *   - **npm** — installed via `npm i -g @zren-zing/codegraph-qt`. Upgrading
  *     shells out to npm.
  *   - **npx** — ephemeral; nothing to upgrade (next `npx` fetches latest).
  *   - **source** — a git checkout running its own `dist/`; `git pull` + rebuild.
@@ -29,8 +29,8 @@ import * as path from 'path';
 import * as https from 'https';
 import { spawnSync } from 'child_process';
 
-export const REPO = 'colbymchenry/codegraph';
-export const NPM_PACKAGE = '@colbymchenry/codegraph';
+export const REPO = 'zren-zing/codegraph-qt';
+export const NPM_PACKAGE = '@zren-zing/codegraph-qt';
 const RAW_BASE = `https://raw.githubusercontent.com/${REPO}/main`;
 export const INSTALL_SH_URL = `${RAW_BASE}/install.sh`;
 
@@ -111,7 +111,7 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
 
   const norm = toPosix(input.filename);
 
-  // npx cache: <…>/_npx/<hash>/node_modules/@colbymchenry/codegraph/…
+  // npx cache: <…>/_npx/<hash>/node_modules/@zren-zing/codegraph-qt/…
   if (norm.includes('/_npx/')) {
     return { kind: 'npx' };
   }

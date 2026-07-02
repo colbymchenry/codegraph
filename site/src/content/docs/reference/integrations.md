@@ -16,14 +16,14 @@ The interactive installer auto-detects and configures each supported agent — w
 - **Antigravity IDE**
 - **Kiro**
 
-Run `npx @colbymchenry/codegraph` and pick your agent(s); see [Installation](/codegraph/getting-started/installation/) for the non-interactive flags.
+Run `npx @zren-zing/codegraph-qt` and pick your agent(s); see [Installation](/codegraph/getting-started/installation/) for the non-interactive flags.
 
 ## Manual setup
 
 If you'd rather wire it up yourself, install globally:
 
 ```bash
-npm install -g @colbymchenry/codegraph
+npm install -g @zren-zing/codegraph-qt
 ```
 
 Add the MCP server to `~/.claude.json`:
