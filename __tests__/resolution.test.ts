@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
-import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile } from '../src/resolution/name-matcher';
+import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile, matchMethodCall } from '../src/resolution/name-matcher';
 import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
@@ -1647,6 +1647,181 @@ func main() {
       expect(logA?.id).not.toBe(logB?.id);
       expect(callTargets('useA')).toContain(logA.id);
       expect(callTargets('useB')).toContain(logB.id);
+    });
+  });
+
+  describe('Watchdog-safe resolution on collision-heavy repos (#1122)', () => {
+    // On a large Java-style repo, per-ref resolution cost is unbounded in the
+    // worst case (a colliding method name whose candidate set misses the LRU
+    // re-fetches tens of thousands of rows, and receiver inference re-splits
+    // the whole source file). v1.2.0 yielded only every 500 refs, so a dense
+    // pocket multiplied that cost past the #850 watchdog window and a VALID
+    // `init` was SIGKILLed at "Resolving refs". These pin the three guards:
+    // per-ref yield checkpoints, the (type, method) match memo, and the
+    // per-file lines cache with its generated/minified-line skip.
+    const methodNode = (
+      id: string,
+      filePath: string,
+      qualifiedName: string,
+      name: string,
+      language: Node['language'] = 'typescript',
+      kind: Node['kind'] = 'method',
+    ): Node => ({
+      id, kind, name, qualifiedName, filePath, language,
+      startLine: 1, endLine: 1, startColumn: 0, endColumn: 0, updatedAt: 0,
+    });
+
+    it('resolveMethodOnType consults the method-match memo and still disambiguates per call site', () => {
+      const logA = methodNode('m:a', 'a/svc.ts', 'Logger::log', 'log');
+      const logB = methodNode('m:b', 'b/svc.ts', 'Logger::log', 'log');
+      const shared = [logA, logB]; // one cached array served to every caller
+      let memoCalls = 0;
+      let rawNameLookups = 0;
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => { rawNameLookups++; return shared; },
+        getMethodMatches: () => { memoCalls++; return shared; },
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      };
+      const refFrom = (filePath: string): UnresolvedRef => ({
+        fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
+        line: 2, column: 0, filePath, language: 'typescript',
+      });
+
+      // Both call sites read the SAME memoized array, yet each still resolves
+      // to its own file — per-ref disambiguation runs after the memo (#1079).
+      const fromA = resolveMethodOnType('Logger', 'log', refFrom('a/svc.ts'), ctx, 0.9, 'instance-method');
+      const fromB = resolveMethodOnType('Logger', 'log', refFrom('b/svc.ts'), ctx, 0.9, 'instance-method');
+      expect(fromA?.targetNodeId).toBe('m:a');
+      expect(fromB?.targetNodeId).toBe('m:b');
+      expect(memoCalls).toBe(2);
+      expect(rawNameLookups).toBe(0); // memo bypasses the unbounded name fetch
+    });
+
+    it('the production resolver context memoizes method matches per (language, type, method)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'svc.ts'),
+        `class Logger { log() { return 1; } }\nexport function use() { const lg = new Logger(); return lg.log(); }\n`,
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const resolver = (cg as unknown as { resolver: ReferenceResolver }).resolver;
+      const ctx = (resolver as unknown as { context: ResolutionContext }).context;
+
+      const first = ctx.getMethodMatches!('Logger', 'log', 'typescript');
+      const second = ctx.getMethodMatches!('Logger', 'log', 'typescript');
+      expect(first.map((n) => n.qualifiedName)).toEqual(['Logger::log']);
+      // Same array instance = served from the memo, not recomputed.
+      expect(second).toBe(first);
+
+      resolver.clearCaches();
+      const afterClear = ctx.getMethodMatches!('Logger', 'log', 'typescript');
+      expect(afterClear).not.toBe(first);
+      expect(afterClear.map((n) => n.qualifiedName)).toEqual(['Logger::log']);
+    });
+
+    it('resolveBatchYielding offers a yield checkpoint for every ref', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'a.ts'),
+        `export function fnA() { return 1; }\nexport function fnB() { return fnA(); }\nexport function fnC() { return fnB(); }\n`,
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'b.ts'),
+        `import { fnA } from './a';\nexport function fnD() { return fnA(); }\n`,
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const resolver = (cg as unknown as { resolver: ReferenceResolver }).resolver;
+
+      // `init({ index: true })` already ran resolution, so feed the batch
+      // directly — resolveBatchYielding takes it as an argument; whether each
+      // ref resolves is irrelevant to the checkpoint contract.
+      const refs: UnresolvedReference[] = ['fnA', 'fnB', 'nosuchFn', 'fnA', 'alsoMissing'].map((name, i) => ({
+        fromNodeId: `caller-${i}`,
+        referenceName: name,
+        referenceKind: 'calls',
+        line: i + 1,
+        column: 0,
+        filePath: 'a.ts',
+        language: 'typescript',
+      }));
+
+      let checkpoints = 0;
+      const countingYield = async () => { checkpoints++; };
+      const result = await (resolver as unknown as {
+        resolveBatchYielding(batch: UnresolvedReference[], maybeYield: () => Promise<void>): Promise<{ stats: { total: number } }>;
+      }).resolveBatchYielding(refs, countingYield);
+
+      // One checkpoint per ref: a pocket of pathologically slow refs can never
+      // run more than ONE ref past the yield budget before the heartbeat gets
+      // a window — the #1122 kill required 500.
+      expect(checkpoints).toBe(refs.length);
+      expect(result.stats.total).toBe(refs.length);
+    });
+
+    it('receiver inference reads lines through getFileLines when the context provides it', () => {
+      const loggerClass = methodNode('c:logger', 'svc.ts', 'Logger', 'Logger', 'typescript', 'class');
+      const logMethod = methodNode('m:log', 'svc.ts', 'Logger::log', 'log');
+      const otherLog = methodNode('m:other', 'other.ts', 'Other::log', 'log');
+      const byName: Record<string, Node[]> = {
+        Logger: [loggerClass],
+        log: [logMethod, otherLog], // ambiguous bare name → only inference can resolve
+      };
+      const lines = ['const lg = new Logger();', 'lg.log();'];
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => byName[name] ?? [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        // Reading the raw source must not be needed when lines are provided.
+        readFile: () => { throw new Error('readFile must not be called when getFileLines exists'); },
+        getFileLines: () => lines,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      };
+      const ref: UnresolvedRef = {
+        fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
+        line: 2, column: 0, filePath: 'svc.ts', language: 'typescript',
+      };
+      expect(matchMethodCall(ref, ctx)?.targetNodeId).toBe('m:log');
+    });
+
+    it('receiver inference skips generated/minified lines instead of regex-scanning them', () => {
+      const loggerClass = methodNode('c:logger', 'svc.ts', 'Logger', 'Logger', 'typescript', 'class');
+      const logMethod = methodNode('m:log', 'svc.ts', 'Logger::log', 'log');
+      const otherLog = methodNode('m:other', 'other.ts', 'Other::log', 'log');
+      const byName: Record<string, Node[]> = {
+        Logger: [loggerClass],
+        log: [logMethod, otherLog],
+      };
+      const ctxWithLines = (lines: string[]): ResolutionContext => ({
+        getNodesInFile: () => [],
+        getNodesByName: (name) => byName[name] ?? [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getFileLines: () => lines,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      });
+      const ref: UnresolvedRef = {
+        fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
+        line: 1, column: 0, filePath: 'svc.ts', language: 'typescript',
+      };
+
+      // Control: the declaration on a normal-length line resolves.
+      const normal = matchMethodCall(ref, ctxWithLines(['const lg = new Logger(); lg.log();']));
+      expect(normal?.targetNodeId).toBe('m:log');
+
+      // The same declaration buried in a >10K-char generated/minified line is
+      // skipped — no resolution, and no per-ref regex pass over the huge line.
+      const minified = 'var pad="' + 'x'.repeat(10_000) + '";const lg = new Logger(); lg.log();';
+      expect(matchMethodCall(ref, ctxWithLines([minified]))).toBeNull();
     });
   });
 

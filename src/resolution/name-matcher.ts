@@ -503,15 +503,25 @@ export function resolveMethodOnType(
   // in-class (`class Foo { int bar() { ... } }`) or out-of-line in a separate
   // file (`int Foo::bar() { ... }` in foo.cpp while class Foo is in foo.hpp).
   // The previous same-file approach missed the latter — the typical C++ layout.
-  const methodCandidates = context.getNodesByName(methodName);
-  const want = `${typeName}::${methodName}`;
-  const matches: Node[] = [];
-  for (const m of methodCandidates) {
-    if (m.kind !== 'method') continue;
-    if (m.language !== ref.language) continue;
-    const qn = m.qualifiedName;
-    if (qn === want || qn.endsWith(`::${want}`)) {
-      matches.push(m);
+  // Prefer the context's per-(type, method) memo: the raw name lookup fetches
+  // EVERY node sharing the method name — tens of thousands of rows for a
+  // collision-heavy Java name like `execute` — and re-filtering that per ref
+  // was a dominant term in the #1122 watchdog kill on large repos. Only the
+  // ref-independent filter is memoized; per-ref disambiguation stays below.
+  let matches: Node[];
+  if (context.getMethodMatches) {
+    matches = context.getMethodMatches(typeName, methodName, ref.language);
+  } else {
+    const methodCandidates = context.getNodesByName(methodName);
+    const want = `${typeName}::${methodName}`;
+    matches = [];
+    for (const m of methodCandidates) {
+      if (m.kind !== 'method') continue;
+      if (m.language !== ref.language) continue;
+      const qn = m.qualifiedName;
+      if (qn === want || qn.endsWith(`::${want}`)) {
+        matches.push(m);
+      }
     }
   }
   if (matches.length === 0) {
@@ -610,10 +620,14 @@ function inferCppReceiverType(
   context: ResolutionContext,
   depth = 0,
 ): string | null {
-  const source = context.readFile(ref.filePath);
-  if (!source) return null;
+  // Per-file lines cache when available — this runs per `receiver->method()`
+  // ref and re-splitting the file each time is the same quadratic as the
+  // shared inferrer's (#1122).
+  const lines = context.getFileLines
+    ? context.getFileLines(ref.filePath)
+    : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
+  if (!lines || lines.length === 0) return null;
 
-  const lines = source.split(/\r?\n/);
   const callLineIndex = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
   const escapedReceiver = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const receiverPattern = new RegExp(`\\b${escapedReceiver}\\b`);
@@ -646,10 +660,12 @@ function inferCppReceiverType(
 
   for (const headerPath of headerCandidates) {
     if (!context.fileExists(headerPath)) continue;
-    const headerSource = context.readFile(headerPath);
-    if (!headerSource) continue;
+    const headerLines = context.getFileLines
+      ? context.getFileLines(headerPath)
+      : (context.readFile(headerPath)?.split(/\r?\n/) ?? null);
+    if (!headerLines) continue;
 
-    for (const line of headerSource.split(/\r?\n/)) {
+    for (const line of headerLines) {
       if (!receiverPattern.test(line)) continue;
       const declaratorMatch = line.match(declaratorRegex);
       if (!declaratorMatch) continue;
@@ -1205,10 +1221,14 @@ function inferLocalReceiverType(
   );
   if (patterns.length === 0) return null;
 
-  const source = context.readFile(ref.filePath);
-  if (!source) return null;
+  // Split through the context's per-file lines cache when available: this runs
+  // for EVERY `receiver.method()` ref, and re-splitting the whole file per ref
+  // was ~20% of total index CPU on Java-heavy repos (#1122).
+  const lines = context.getFileLines
+    ? context.getFileLines(ref.filePath)
+    : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
+  if (!lines || lines.length === 0) return null;
 
-  const lines = source.split(/\r?\n/);
   const callIdx = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
   const startIdx = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
 
@@ -1216,6 +1236,10 @@ function inferLocalReceiverType(
   for (let i = callIdx; i >= startIdx; i--) {
     const line = lines[i];
     if (!line) continue;
+    // A generated/minified line (one multi-KB statement) is not something a
+    // human-written local declaration lives on, and regexing it per ref is
+    // pure waste — skip it rather than scan it.
+    if (line.length > 10_000) continue;
     for (const re of patterns) {
       const m = line.match(re);
       if (m && m[1]) {

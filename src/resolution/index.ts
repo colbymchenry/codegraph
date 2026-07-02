@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Node, UnresolvedReference, Edge } from '../types';
+import { Language, Node, UnresolvedReference, Edge } from '../types';
 import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
@@ -227,6 +227,8 @@ export class ReferenceResolver {
   private nameCache: LRUCache<string, Node[]>; // name → nodes cache
   private lowerNameCache: LRUCache<string, Node[]>; // lower(name) → nodes cache
   private qualifiedNameCache: LRUCache<string, Node[]>; // qualified_name → nodes cache
+  private fileLinesCache: LRUCache<string, string[] | null>; // file → split lines cache
+  private methodMatchCache: LRUCache<string, Node[]>; // lang\0Type::method → matching method nodes
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
@@ -254,6 +256,10 @@ export class ReferenceResolver {
     this.nameCache = new LRUCache(limit);
     this.lowerNameCache = new LRUCache(limit);
     this.qualifiedNameCache = new LRUCache(limit);
+    // Split-lines arrays are heavier than content strings; refs arrive
+    // file-ordered, so a small cache still hits nearly always.
+    this.fileLinesCache = new LRUCache(contentLimit);
+    this.methodMatchCache = new LRUCache(limit);
 
     this.context = this.createContext();
   }
@@ -324,9 +330,28 @@ export class ReferenceResolver {
     this.nameCache.clear();
     this.lowerNameCache.clear();
     this.qualifiedNameCache.clear();
+    this.fileLinesCache.clear();
+    this.methodMatchCache.clear();
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
+  }
+
+  /** `readFile` through the LRU content cache (null = read failed, also cached). */
+  private readFileCached(filePath: string): string | null {
+    if (this.fileCache.has(filePath)) {
+      return this.fileCache.get(filePath)!;
+    }
+    const fullPath = path.join(this.projectRoot, filePath);
+    try {
+      const content = fs.readFileSync(fullPath, 'utf-8');
+      this.fileCache.set(filePath, content);
+      return content;
+    } catch (error) {
+      logDebug('Failed to read file for resolution', { filePath, error: String(error) });
+      this.fileCache.set(filePath, null);
+      return null;
+    }
   }
 
   /**
@@ -347,6 +372,27 @@ export class ReferenceResolver {
         const result = this.queries.getNodesByName(name);
         this.nameCache.set(name, result);
         return result;
+      },
+
+      getMethodMatches: (typeName: string, methodName: string, language: Language) => {
+        const key = `${language} ${typeName}::${methodName}`;
+        const cached = this.methodMatchCache.get(key);
+        if (cached !== undefined) return cached;
+        let candidates = this.nameCache.get(methodName);
+        if (candidates === undefined) {
+          candidates = this.queries.getNodesByName(methodName);
+          this.nameCache.set(methodName, candidates);
+        }
+        const want = `${typeName}::${methodName}`;
+        const matches: Node[] = [];
+        for (const m of candidates) {
+          if (m.kind !== 'method') continue;
+          if (m.language !== language) continue;
+          const qn = m.qualifiedName;
+          if (qn === want || qn.endsWith(`::${want}`)) matches.push(m);
+        }
+        this.methodMatchCache.set(key, matches);
+        return matches;
       },
 
       getNodesByQualifiedName: (qualifiedName: string) => {
@@ -379,21 +425,15 @@ export class ReferenceResolver {
         }
       },
 
-      readFile: (filePath: string) => {
-        if (this.fileCache.has(filePath)) {
-          return this.fileCache.get(filePath)!;
-        }
+      readFile: (filePath: string) => this.readFileCached(filePath),
 
-        const fullPath = path.join(this.projectRoot, filePath);
-        try {
-          const content = fs.readFileSync(fullPath, 'utf-8');
-          this.fileCache.set(filePath, content);
-          return content;
-        } catch (error) {
-          logDebug('Failed to read file for resolution', { filePath, error: String(error) });
-          this.fileCache.set(filePath, null);
-          return null;
-        }
+      getFileLines: (filePath: string) => {
+        const cached = this.fileLinesCache.get(filePath);
+        if (cached !== undefined) return cached;
+        const source = this.readFileCached(filePath);
+        const lines = source === null ? null : source.split(/\r?\n/);
+        this.fileLinesCache.set(filePath, lines);
+        return lines;
       },
 
       getProjectRoot: () => this.projectRoot,
@@ -926,39 +966,58 @@ export class ReferenceResolver {
   }
 
   /**
-   * Resolve one batch in smaller sub-chunks, yielding to the event loop between
-   * them so the #850 liveness heartbeat can fire on a slow/dense batch (#1091).
-   * Behaviourally identical to a single `resolveAll(batch)`: `warmCaches()` is
-   * idempotent (guarded) and `resolveOne` is independent per ref, so splitting
-   * and re-merging changes only timing, never which edges get created. Falls
-   * through to a plain `resolveAll` when the batch is already small.
+   * Resolve one batch with a yield checkpoint between EVERY ref so the #850
+   * liveness heartbeat can fire on a slow/dense batch (#1091). The checkpoint
+   * granularity is per-ref — not per-N-refs — because per-ref cost is unbounded
+   * in the worst case (a collision-heavy method name whose candidate set misses
+   * the LRU re-fetches tens of thousands of rows): any fixed N multiplies that
+   * worst case into the watchdog window, which is how v1.2.0 still got killed
+   * at "Resolving refs" on large Java monorepos (#1122). `maybeYield()` is a
+   * ~ns time check when under budget, so per-ref checkpoints cost nothing.
+   * Behaviourally identical to `resolveAll(batch)`: `warmCaches()` is
+   * idempotent (guarded) and `resolveOne` is independent per ref, so yielding
+   * between refs changes only timing, never which edges get created.
    */
   private async resolveBatchYielding(
     batch: UnresolvedReference[],
-    maybeYield: MaybeYield,
-    subChunkSize: number = 500
+    maybeYield: MaybeYield
   ): Promise<ResolutionResult> {
-    if (batch.length <= subChunkSize) return this.resolveAll(batch);
+    this.warmCaches();
 
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
     const byMethod: Record<string, number> = {};
-    let total = 0;
-    let resolvedCount = 0;
-    let unresolvedCount = 0;
-    for (let i = 0; i < batch.length; i += subChunkSize) {
-      const chunk = this.resolveAll(batch.slice(i, i + subChunkSize));
-      for (const r of chunk.resolved) resolved.push(r);
-      for (const u of chunk.unresolved) unresolved.push(u);
-      total += chunk.stats.total;
-      resolvedCount += chunk.stats.resolved;
-      unresolvedCount += chunk.stats.unresolved;
-      for (const [m, c] of Object.entries(chunk.stats.byMethod)) {
-        byMethod[m] = (byMethod[m] || 0) + c;
+
+    for (const raw of batch) {
+      const ref: UnresolvedRef = {
+        fromNodeId: raw.fromNodeId,
+        referenceName: raw.referenceName,
+        referenceKind: raw.referenceKind,
+        line: raw.line,
+        column: raw.column,
+        filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
+        language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+      };
+      const result = this.resolveOne(ref);
+      if (result) {
+        resolved.push(result);
+        byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
+      } else {
+        unresolved.push(ref);
       }
       await maybeYield();
     }
-    return { resolved, unresolved, stats: { total, resolved: resolvedCount, unresolved: unresolvedCount, byMethod } };
+
+    return {
+      resolved,
+      unresolved,
+      stats: {
+        total: batch.length,
+        resolved: resolved.length,
+        unresolved: unresolved.length,
+        byMethod,
+      },
+    };
   }
 
   /**
