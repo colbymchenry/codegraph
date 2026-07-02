@@ -75,6 +75,9 @@ export async function pollForToken(deviceCode: string, intervalSec: number, expi
 
 /** Best-effort: open a URL in the default browser. Never throws — the URL is also printed. */
 export async function openBrowser(url: string): Promise<void> {
+  // The OS handlers below (open / rundll32 / xdg-open) execute file and UNC
+  // paths as readily as they open URLs — never hand them a non-http(s) string.
+  if (!/^https?:\/\//i.test(url)) return;
   const [cmd, args] =
     process.platform === 'darwin' ? ['open', [url]]
     // Avoid `cmd /c start`: cmd.exe re-parses shell metacharacters (& | ^ ") in the

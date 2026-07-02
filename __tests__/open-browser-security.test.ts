@@ -38,5 +38,29 @@ describe('openBrowser — Windows shell-injection hardening (#1114)', () => {
     // The server-supplied URL is passed to the launcher as one intact argument,
     // never concatenated into a shell command string.
     expect(args).toContain(url);
+
+    // And never through a shell at all.
+    const options = spawnMock.mock.calls[0][2] as { shell?: boolean } | undefined;
+    expect(options?.shell).toBeFalsy();
+  });
+
+  it.each([
+    ['file:///C:/Windows/System32/calc.exe'],
+    ['\\\\evil.example\\share\\payload.exe'],
+    ['C:\\Windows\\System32\\calc.exe'],
+    ['javascript:alert(1)'],
+  ])('refuses to launch a non-http(s) target: %s', async (target) => {
+    // rundll32 url.dll,FileProtocolHandler (like `open` / `xdg-open`) hands the
+    // string to the OS handler, which happily executes file/UNC paths — so the
+    // server-supplied string must be scheme-checked before launching anything.
+    await openBrowser(target);
+
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('still launches plain http:// URLs', async () => {
+    await openBrowser('http://localhost:8080/device?user_code=ABCD-1234');
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
   });
 });
