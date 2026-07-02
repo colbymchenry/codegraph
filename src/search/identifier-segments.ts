@@ -129,12 +129,32 @@ export function extractProseCandidates(prompt: string): string[] {
 /**
  * Lookup variants for a prose word: the word itself plus light plural folding
  * ("services" → service, "dependencies" → dependencie/dependency is NOT
- * attempted — only trailing s/es strip), so common plurals still hit their
+ * attempted — only a trailing s/es strip), so common plurals still hit their
  * singular segment. Returned variants map back to the same original word.
+ *
+ * The strips are keyed on English plural spelling (#1145), in three classes:
+ * - UNAMBIGUOUS `-es` (after x/sh/ss/zz: boxes, hashes, classes, quizzes) —
+ *   strip 2 only. Stripping 1 minted a bogus sibling ("classes" → classe).
+ * - AMBIGUOUS endings (`-ches`/`-ses`/`-zes`/`-oes`): spelling alone can't
+ *   split patches(+es) from caches(+s), lenses from databases, heroes from
+ *   shoes — emit BOTH candidate keys and let the vocab lookup decide; a miss
+ *   is an ignored key, a wrong exclusive guess would LOSE the real match.
+ * - Everything else ending in `-s` — a bare `-s` plural (services, machines,
+ *   cookies): strip 1 only. Stripping 2 minted "services" → servic.
+ * A trailing `-ss` is a singular (class, process), not a plural: no strip —
+ * that used to mint "class" → clas.
  */
 export function segmentLookupVariants(word: string): string[] {
   const variants = [word];
-  if (word.endsWith('es') && word.length >= MIN_PROSE_CHARS + 2) variants.push(word.slice(0, -2));
-  if (word.endsWith('s') && word.length >= MIN_PROSE_CHARS + 1) variants.push(word.slice(0, -1));
+  const canStrip2 = word.length >= MIN_PROSE_CHARS + 2;
+  const canStrip1 = word.length >= MIN_PROSE_CHARS + 1;
+  if (/(?:x|sh|ss|zz)es$/.test(word)) {
+    if (canStrip2) variants.push(word.slice(0, -2));
+  } else if (/(?:ch|s|z|o)es$/.test(word)) {
+    if (canStrip2) variants.push(word.slice(0, -2));
+    if (canStrip1) variants.push(word.slice(0, -1));
+  } else if (word.endsWith('s') && !word.endsWith('ss')) {
+    if (canStrip1) variants.push(word.slice(0, -1));
+  }
   return variants;
 }

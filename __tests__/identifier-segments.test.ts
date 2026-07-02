@@ -73,9 +73,31 @@ describe('segmentLookupVariants — light plural folding', () => {
   it('folds trailing s/es so plurals hit singular segments', () => {
     expect(segmentLookupVariants('services')).toContain('service');
     expect(segmentLookupVariants('machines')).toContain('machine');
+    expect(segmentLookupVariants('classes')).toContain('class');
+  });
+
+  it('bare-s plurals no longer mint a bogus -es sibling (#1145)', () => {
+    expect(segmentLookupVariants('services')).toEqual(['services', 'service']);
+    expect(segmentLookupVariants('machines')).toEqual(['machines', 'machine']);
+  });
+
+  it('unambiguous sibilant-es plurals no longer mint a bogus -s sibling (#1145)', () => {
+    expect(segmentLookupVariants('classes')).toEqual(['classes', 'class']);
+    expect(segmentLookupVariants('hashes')).toEqual(['hashes', 'hash']);
+  });
+
+  it('a trailing -ss is a singular, not a plural — no strip (#1145)', () => {
+    expect(segmentLookupVariants('class')).toEqual(['class']);
+    expect(segmentLookupVariants('process')).toEqual(['process']);
+  });
+
+  it('ambiguous endings emit BOTH candidate keys — a wrong exclusive guess would lose the real match', () => {
+    expect(segmentLookupVariants('caches')).toEqual(['caches', 'cach', 'cache']);       // cache + s
+    expect(segmentLookupVariants('databases')).toEqual(['databases', 'databas', 'database']); // database + s
   });
 
   it('never strips a word below the minimum', () => {
     expect(segmentLookupVariants('bus')).toEqual(['bus']);
+    expect(segmentLookupVariants('boxes')).toEqual(['boxes']); // -es strip would go sub-minimum
   });
 });

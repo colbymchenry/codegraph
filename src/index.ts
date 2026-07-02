@@ -935,10 +935,14 @@ export class CodeGraph {
     }
     const variants = [...variantToWord.keys()];
 
-    // Tier A: co-occurrence. minSegments=2 counts VARIANTS, so fold a name's
-    // matched variants back to distinct words before trusting the coverage.
+    // Tier A: co-occurrence. The SQL folds variants back to their original
+    // word (#1146), so minWords=2 means two distinct PROMPT WORDS — a name
+    // matching both `service` and `services` can't tie with (or crowd past
+    // the LIMIT) a genuine two-word match. The JS re-check below recomputes
+    // the fold from live segments as the honesty layer.
+    const variantPairs = [...variantToWord.entries()].map(([segment, word]) => ({ segment, word }));
     const candidates: Array<{ name: string; matchedWords: Set<string> }> = [];
-    for (const hit of this.queries.getSegmentCoOccurrence(variants, 2, 24)) {
+    for (const hit of this.queries.getSegmentCoOccurrence(variantPairs, 2, 24)) {
       const matched = this.wordsMatchingName(hit.name, variantToWord);
       if (matched.size >= 2) candidates.push({ name: hit.name, matchedWords: matched });
     }
@@ -970,7 +974,12 @@ export class CodeGraph {
     }
 
     // Verify against nodes (the honesty gate) and pick a representative
-    // definition per name — prefer a real symbol over a file/import node.
+    // definition per name. A name whose only nodes are file/import kind has
+    // no real definition to point at — surfacing the import statement instead
+    // reads as a matched symbol but isn't one (#1144) — so it's skipped, the
+    // same way an orphaned vocab row is. (Import names no longer enter the
+    // vocab at write time, but rows written before that exclusion persist
+    // until the next full index.)
     const out: SegmentMatch[] = [];
     const seen = new Set<string>();
     candidates.sort((a, b) => b.matchedWords.size - a.matchedWords.size || a.name.length - b.name.length);
@@ -980,7 +989,8 @@ export class CodeGraph {
       seen.add(candidate.name);
       const nodes = this.queries.getNodesByName(candidate.name);
       if (nodes.length === 0) continue; // orphaned vocab row — name no longer exists
-      const rep = nodes.find((n) => n.kind !== 'file' && n.kind !== 'import') ?? nodes[0]!;
+      const rep = nodes.find((n) => n.kind !== 'file' && n.kind !== 'import');
+      if (!rep) continue; // no real definition — don't surface an import/file as one
       out.push({
         name: candidate.name,
         kind: rep.kind,
@@ -1010,9 +1020,42 @@ export class CodeGraph {
   }
 
   /**
+   * One-shot upgrade heal for callers that open the graph WITHOUT syncing —
+   * concretely the prompt hook, whose MEDIUM tier reads the segment
+   * vocabulary: a database migrated from before the vocab table existed
+   * starts with it empty, and the only other backfill lives inside `sync()`,
+   * which such callers never run (#1142). Returns true when the vocab is
+   * usable (already populated — the overwhelmingly common one-SELECT case —
+   * or healed here); false when it isn't (empty graph, or another process
+   * holds the index lock — that process's own sync heals it).
+   */
+  async healSegmentVocabIfEmpty(): Promise<boolean> {
+    const empty = (() => {
+      try { return this.queries.isNameSegmentVocabEmpty(); } catch { return false; }
+    })();
+    if (!empty) return true;
+    if (this.queries.getNodeAndEdgeCount().nodes === 0) return false;
+    return this.indexMutex.withLock(async () => {
+      try {
+        this.fileLock.acquire();
+      } catch {
+        return false; // an index/sync is running — it backfills the vocab itself
+      }
+      try {
+        if (!this.queries.isNameSegmentVocabEmpty()) return true; // raced: healed meanwhile
+        await this.rebuildNameSegmentVocab();
+        return true;
+      } finally {
+        this.fileLock.release();
+      }
+    });
+  }
+
+  /**
    * Rebuild the segment vocabulary from the current graph, batched and
    * yielding — the upgrade-heal path for indexes built before the vocab table
-   * existed. Runs inside sync's mutex/lock (callers hold them).
+   * existed. Runs inside the index mutex/lock (sync and
+   * healSegmentVocabIfEmpty hold them).
    */
   private async rebuildNameSegmentVocab(): Promise<void> {
     const maybeYield = createYielder();

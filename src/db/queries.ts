@@ -319,8 +319,19 @@ export class QueryBuilder {
     // before use, and a full index clears the table at its start. File nodes
     // are excluded: a file's basename duplicates the symbols inside it
     // (state-machine.ts / OrderStateMachine), which double-counts every
-    // concept and defeats the singleton-vs-cluster rarity statistics.
-    if (node.kind !== 'file') this.insertNameSegments(node.name);
+    // concept and defeats the singleton-vs-cluster rarity statistics. Import
+    // nodes are excluded too (#1144): they're named after module specifiers
+    // ("external-unindexed-pkg", "./utils/helpers"), not symbols — an
+    // import-only name can never be surfaced (getSegmentMatches requires a
+    // real definition), so its rows would only inflate the rarity statistics.
+    if (this.isSegmentableKind(node.kind)) this.insertNameSegments(node.name);
+  }
+
+  /** Which node kinds contribute their name to the segment vocabulary — the
+   *  single gate shared by insertNode, updateNode, and the rebuild page query
+   *  (getDistinctNodeNames), so the write paths can't drift apart. */
+  private isSegmentableKind(kind: string): boolean {
+    return kind !== 'file' && kind !== 'import';
   }
 
   /** Write `name`'s segments into name_segment_vocab (idempotent). */
@@ -412,6 +423,16 @@ export class QueryBuilder {
       returnType: node.returnType ?? null,
       updatedAt: node.updatedAt ?? Date.now(),
     });
+
+    // updateNode is a second real write path to `nodes` — framework
+    // post-extract passes rewrite names through it (NestJS route prefixing),
+    // and a renamed node's new name must reach the segment vocabulary just
+    // like an inserted one's (#1141). Without this the rename left the new
+    // name permanently unsearchable: the old name's rows became honest-gate
+    // orphans and the only backfill is gated on the vocab being EMPTY.
+    // insertNameSegments is idempotent (in-memory set + INSERT OR IGNORE),
+    // so no name-changed check is needed.
+    if (this.isSegmentableKind(node.kind)) this.insertNameSegments(node.name);
   }
 
   /**
@@ -461,11 +482,12 @@ export class QueryBuilder {
     return row === undefined;
   }
 
-  /** One page of distinct non-file node names, for batched vocab rebuilds
-   *  (file basenames are excluded from the vocab — see insertNode). */
+  /** One page of distinct segmentable node names, for batched vocab rebuilds
+   *  (file basenames and import specifiers are excluded from the vocab — see
+   *  insertNode). */
   getDistinctNodeNames(limit: number, offset: number): string[] {
     const rows = this.db
-      .prepare("SELECT DISTINCT name FROM nodes WHERE kind != 'file' ORDER BY name LIMIT ? OFFSET ?")
+      .prepare("SELECT DISTINCT name FROM nodes WHERE kind NOT IN ('file', 'import') ORDER BY name LIMIT ? OFFSET ?")
       .all(limit, offset) as Array<{ name: string }>;
     return rows.map((r) => r.name);
   }
@@ -478,17 +500,29 @@ export class QueryBuilder {
   }
 
   /**
-   * Names whose segments cover at least `minSegments` of the given segments —
+   * Names whose segments cover at least `minWords` distinct PROMPT WORDS —
    * the co-occurrence probe behind the prompt hook's medium tier: the words
    * "state" and "machine" both being segments of `OrderStateMachine` is strong
    * evidence the prompt names that symbol in prose. Ordered by coverage.
+   *
+   * Takes (segment variant → original word) pairs and folds variants back to
+   * their word INSIDE the SQL: a name matching both `service` and `services`
+   * counts ONE word, not two. Counting raw variants let plural-variant pairs
+   * of a single word tie with genuine two-word matches and — because ORDER
+   * BY/LIMIT run here, before any JS-side re-check — crowd a real match past
+   * the LIMIT on vocab-heavy repos (#1146).
    */
-  getSegmentCoOccurrence(segments: string[], minSegments: number, limit: number): Array<{ name: string; matches: number }> {
-    if (segments.length === 0) return [];
-    const placeholders = segments.map(() => '?').join(', ');
+  getSegmentCoOccurrence(
+    variants: Array<{ segment: string; word: string }>,
+    minWords: number,
+    limit: number,
+  ): Array<{ name: string; matches: number }> {
+    if (variants.length === 0) return [];
+    const placeholders = variants.map(() => '?').join(', ');
+    const whens = variants.map(() => 'WHEN ? THEN ?').join(' ');
     const rows = this.db
       .prepare(
-        `SELECT name, COUNT(DISTINCT segment) AS matches
+        `SELECT name, COUNT(DISTINCT CASE segment ${whens} END) AS matches
          FROM name_segment_vocab
          WHERE segment IN (${placeholders})
          GROUP BY name
@@ -496,7 +530,12 @@ export class QueryBuilder {
          ORDER BY matches DESC, length(name) ASC
          LIMIT ?`,
       )
-      .all(...segments, minSegments, limit) as Array<{ name: string; matches: number }>;
+      .all(
+        ...variants.flatMap((v) => [v.segment, v.word]),
+        ...variants.map((v) => v.segment),
+        minWords,
+        limit,
+      ) as Array<{ name: string; matches: number }>;
     return rows;
   }
 

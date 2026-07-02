@@ -141,4 +141,81 @@ export function writeConfig(): void {}
     // UNTOUCHED file's names must come from the backfill.
     expect(cg.getSegmentMatches(['checkout']).map((m) => m.name)).toContain('CheckoutService');
   });
+
+  it('healSegmentVocabIfEmpty backfills WITHOUT a sync — the prompt-hook open path (#1142)', async () => {
+    // The hook opens the graph without syncing, and a database migrated from
+    // before the vocab table existed starts with it empty — sync's backfill
+    // never runs on that path, leaving the MEDIUM tier permanently dormant.
+    const queries = (cg as unknown as {
+      queries: { clearNameSegmentVocab(): void; isNameSegmentVocabEmpty(): boolean };
+    }).queries;
+    queries.clearNameSegmentVocab();
+    expect(queries.isNameSegmentVocabEmpty()).toBe(true);
+    await expect(cg.healSegmentVocabIfEmpty()).resolves.toBe(true);
+    expect(queries.isNameSegmentVocabEmpty()).toBe(false);
+    expect(cg.getSegmentMatches(['state', 'machine']).map((m) => m.name)).toContain('OrderStateMachine');
+    // Populated vocab: the fast path (one SELECT) still reports usable.
+    await expect(cg.healSegmentVocabIfEmpty()).resolves.toBe(true);
+  });
+
+  it('a rename through updateNode reaches the vocab — the framework post-extract path (#1141)', () => {
+    // Framework resolvers rewrite node names after extraction (NestJS route
+    // prefixing) via updateNode. The new name must become prose-searchable;
+    // the old name's rows become orphans the honesty gate drops.
+    const queries = (cg as unknown as {
+      queries: {
+        getNodesByName(name: string): Array<Record<string, unknown>>;
+        updateNode(node: Record<string, unknown>): void;
+      };
+    }).queries;
+    const node = queries.getNodesByName('OrderStateMachine')[0]!;
+    queries.updateNode({ ...node, name: 'RenamedWorkflowEngine', qualifiedName: 'RenamedWorkflowEngine' });
+    expect(cg.getSegmentMatches(['renamed', 'workflow']).map((m) => m.name)).toContain('RenamedWorkflowEngine');
+    expect(cg.getSegmentMatches(['state', 'machine'])).toEqual([]);
+  });
+
+  it('a name that exists only as an import statement is never surfaced (#1144)', async () => {
+    // Import nodes are named after module specifiers, not symbols. The write
+    // path no longer segments them; and even against legacy vocab rows (a DB
+    // populated before that exclusion), the representative picker must skip
+    // the name rather than surface the import line as a matched symbol.
+    fs.writeFileSync(
+      path.join(dir, 'src', 'consumer.ts'),
+      `import { Thing } from 'external-unindexed-pkg';\nexport function useIt(): void {}\n`,
+    );
+    await cg.sync();
+    expect(cg.getSegmentMatches(['external', 'unindexed'])).toEqual([]);
+    // Legacy rows: plant the vocab entries a pre-exclusion version wrote.
+    const queries = (cg as unknown as { queries: { insertNameSegmentsBatch(names: string[]): void } }).queries;
+    queries.insertNameSegmentsBatch(['external-unindexed-pkg']);
+    expect(cg.getSegmentMatches(['external', 'unindexed'])).toEqual([]);
+  });
+
+  it('co-occurrence counts distinct WORDS, not variants — plural pairs cannot pose as two words (#1146)', () => {
+    const queries = (cg as unknown as {
+      queries: {
+        insertNameSegmentsBatch(names: string[]): void;
+        getSegmentCoOccurrence(
+          variants: Array<{ segment: string; word: string }>,
+          minWords: number,
+          limit: number,
+        ): Array<{ name: string; matches: number }>;
+      };
+    }).queries;
+    // BillingServicesService carries BOTH the `services` and `service`
+    // segments — two variants of ONE prompt word. It must not meet minWords=2.
+    queries.insertNameSegmentsBatch(['BillingServicesService']);
+    const hits = queries.getSegmentCoOccurrence(
+      [
+        { segment: 'services', word: 'services' },
+        { segment: 'service', word: 'services' },
+        { segment: 'checkout', word: 'checkout' },
+      ],
+      2,
+      24,
+    );
+    const names = hits.map((h) => h.name);
+    expect(names).toContain('CheckoutService'); // checkout + service(s) — two real words
+    expect(names).not.toContain('BillingServicesService'); // services + service — one word
+  });
 });

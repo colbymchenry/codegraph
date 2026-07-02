@@ -1156,6 +1156,16 @@ program
           // scored, each hit re-verified to exist (see getSegmentMatches). The
           // payload names the symbols but does NOT run explore — the agent owns
           // the query where the hook's confidence is only "these are related".
+          //
+          // A database indexed before the vocab table existed starts with it
+          // EMPTY, and only sync() backfills it — which this hook never runs
+          // (#1142). Heal it here: on a populated vocab this is one SELECT;
+          // the actual backfill is a one-time batched pass whose cost the MCP
+          // server's own catch-up sync usually pays first (it runs at every
+          // session start). A distinct noop outcome keeps a dormant vocab
+          // from polluting the noop-unverified recall signal.
+          const vocabReady = await cg.healSegmentVocabIfEmpty().catch(() => false);
+          if (!vocabReady) { gate('noop-vocab-empty'); return; }
           const related = cg.getSegmentMatches(proseWords);
           if (related.length === 0) { gate('noop-unverified'); return; }
           const lines = related
