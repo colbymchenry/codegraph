@@ -394,7 +394,16 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
  */
 function looksLikeCpp(source: string): boolean {
   const sample = source.substring(0, 8192);
-  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
+  // The `class MACRO Name : Base` / `class MACRO Name { … }` branch mirrors what
+  // `blankCppExportMacros` recovers: an ALL-CAPS export/visibility macro
+  // (`ENGINE_API`, `MYMODULE_API`, `*_EXPORT`, …) sitting between `class`/`struct`
+  // and the type name. Without it, a header whose ONLY C++ signal is such a
+  // macro-annotated class — common for lean Unreal-Engine types that carry just
+  // `GENERATED_BODY()` and no explicit `public:`/`virtual` — is misdetected as C,
+  // routed through the C extractor (which extracts no classes), and its class
+  // definition silently vanishes. The two-token shape (`<KW> <MACRO> <Name>`
+  // before a `[:{]`) never occurs in valid C, so this can't misclassify C headers.
+  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\b(?:class|struct)\s+[A-Z][A-Z0-9_]+\s+\w+\s*(?:final\s*)?[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
 }
 
 /**

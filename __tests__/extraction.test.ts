@@ -150,6 +150,31 @@ describe('Language Detection', () => {
     expect(isSourceFile('default.nix')).toBe(true);
   });
 
+  it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
+    // Lean Unreal-Engine style header: the class is annotated with an export
+    // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
+    // so the macro-blind `class\s+\w+\s*[:{]` branch alone can't see it. It must
+    // still detect as C++ — otherwise the C extractor (classTypes: []) drops the
+    // class definition entirely. (#1093 follow-up)
+    const macroClassHeader = `#pragma once
+#include "CoreMinimal.h"
+
+UCLASS()
+class ENGINE_API UNetConnectionRepControl : public UObject
+{
+\tGENERATED_BODY()
+\tbool IsRepControlEnable() const;
+};
+`;
+    expect(detectLanguage('NetConnectionRepControl.h', macroClassHeader)).toBe('cpp');
+    // Macro class with no base clause, brace on the next line, still C++.
+    expect(detectLanguage('Foo.h', 'MYMODULE_API_DECL\nclass MYMODULE_API FFoo\n{\n\tint X;\n};\n')).toBe('cpp');
+    // Export-macro struct with inheritance is likewise C++-only.
+    expect(detectLanguage('Bar.h', 'struct ENGINE_API FBar : public FBase {};\n')).toBe('cpp');
+    // Guard: a genuine C header must NOT be dragged to C++ by the new branch.
+    expect(detectLanguage('cfoo.h', '#ifndef CFOO_H\nstruct Point { int x; int y; };\nvoid f(struct Point p);\n#endif\n')).toBe('c');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
