@@ -36,6 +36,10 @@ export function gitWorktreeRoot(dir: string): string | null {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       windowsHide: true,
+      // Bounded like every git call in extraction/: this runs (memoized) on
+      // the daemon's main event loop, where an unbounded hang would trip the
+      // 60s liveness watchdog and SIGKILL a healthy daemon (#1139).
+      timeout: 5000,
     }).trim();
     return out ? realpath(out) : null;
   } catch {
@@ -58,6 +62,7 @@ export function gitCommonDir(dir: string): string | null {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       windowsHide: true,
+      timeout: 5000, // same rationale as gitWorktreeRoot
     }).trim();
     if (!out) return null;
     // `--git-common-dir` is relative to cwd unless already absolute.

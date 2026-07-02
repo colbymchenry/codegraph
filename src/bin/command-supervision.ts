@@ -17,6 +17,16 @@
  * available to a one-shot command. Best-effort and self-disabling: a missing
  * watchdog never blocks the command from running. Both honour the same env
  * switches as `serve` (`CODEGRAPH_NO_WATCHDOG`, `CODEGRAPH_PPID_POLL_MS=0`).
+ *
+ * Unlike the daemon — whose main thread only does fast, bounded work — the
+ * `index`/`init` path runs reference resolution and dynamic-edge synthesis
+ * SYNCHRONOUSLY on this thread, and on a large repo that is legitimately many
+ * seconds of work. So those spans yield cooperatively to the event loop
+ * (`src/resolution/cooperative-yield.ts`) to keep the heartbeat alive; without
+ * that the watchdog would SIGKILL a valid, in-progress index (#1091). The
+ * distinction it must preserve — kill a TRUE wedge, spare slow-but-progressing
+ * work — is exactly what cooperative yielding buys: a genuinely stuck span never
+ * reaches its next yield, so it still trips the timeout.
  */
 import { installMainThreadWatchdog } from '../mcp/liveness-watchdog';
 import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from '../mcp/ppid-watchdog';

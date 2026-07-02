@@ -546,7 +546,7 @@ export function hasCommand(cmd: string): boolean {
 }
 
 export function defaultRun(cmd: string, args: string[], env?: NodeJS.ProcessEnv): number {
-  const r = spawnSync(cmd, args, { stdio: 'inherit', env: env ?? process.env });
+  const r = spawnSync(cmd, args, { stdio: 'inherit', env: env ?? process.env, windowsHide: true });
   if (r.error) return -1;
   return r.status ?? -1;
 }

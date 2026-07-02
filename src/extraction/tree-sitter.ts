@@ -64,18 +64,42 @@ const VUE_STORE_FILE_SIGNAL = /\bdefineStore\b|\bcreateStore\b|\bVuex\b|\bmutati
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
+  const name = extractNameRaw(node, source, extractor);
+  // Universal fallback: recover a real identifier from a name still mangled by a
+  // macro the pre-parse didn't blank (C/C++ only — see recoverMangledName). A
+  // no-op on well-formed names, so a clean name is never altered.
+  return extractor.recoverMangledName ? extractor.recoverMangledName(name) : name;
+}
+
+function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
   const hookName = extractor.resolveName?.(node, source);
   if (hookName) return hookName;
 
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
   if (nameNode) {
-    // Unwrap pointer_declarator(s) for C/C++ pointer return types
+    // Unwrap pointer_declarator / reference_declarator for C/C++ pointer and
+    // reference return types (`int* f()`, `int& f()`, `int&& f()`). Without
+    // unwrapping the reference wrapper an inline reference-returning method is
+    // named "& f() const" instead of "f" — common in Unreal Engine gameplay
+    // headers (`const FGameplayTagContainer& GetActiveTags() const`). Out-of-line
+    // defs (`T& C::f()`) already resolve via the qualified-name hook. A
+    // pointer_declarator exposes its inner through a `declarator` field; a
+    // reference_declarator has none, so it's reached via namedChild(0).
     let resolved = nameNode;
-    while (resolved.type === 'pointer_declarator') {
+    while (resolved.type === 'pointer_declarator' || resolved.type === 'reference_declarator') {
       const inner = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
       if (!inner) break;
       resolved = inner;
+    }
+    // C++ user-defined conversion operator: the declarator is an `operator_cast`
+    // whose first child is the target type and second is the `() const` tail. Name
+    // it `operator <type>` (the conventional spelling) rather than the whole
+    // `operator EALSMovementState() const` declarator, so it matches symbolic
+    // overloads (`operator+`) and is findable by the type name.
+    if (resolved.type === 'operator_cast') {
+      const typeNode = resolved.namedChild(0);
+      return typeNode ? `operator ${getNodeText(typeNode, source).trim()}` : getNodeText(resolved, source);
     }
     // Handle complex declarators (C/C++)
     if (resolved.type === 'function_declarator' || resolved.type === 'declarator') {
@@ -400,7 +424,7 @@ export class TreeSitterExtractor {
       // this.source so downstream getNodeText reads the same bytes the parser
       // saw (identical outside the blanked directive lines).
       if (this.extractor?.preParse) {
-        this.source = this.extractor.preParse(this.source);
+        this.source = this.extractor.preParse(this.source, this.filePath);
       }
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
@@ -1529,6 +1553,15 @@ export class TreeSitterExtractor {
   private extractClass(node: SyntaxNode, kind: NodeKind = 'class'): void {
     if (!this.extractor) return;
 
+    // Skip forward declarations / elaborated type references (`class Foo;`) in
+    // languages that opt in — bodiless there means "not a definition", so it
+    // would otherwise mint a phantom node competing with the real definition
+    // (#1093). Languages where a bodiless class is complete (Kotlin, Scala)
+    // leave the flag unset. Resolved once here and reused for the body walk.
+    const resolvedBody = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    if (this.extractor.skipBodilessClass && !resolvedBody) return;
+
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
@@ -1552,9 +1585,7 @@ export class TreeSitterExtractor {
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
-    let body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
-      ?? getChildByField(node, this.extractor.bodyField);
-    if (!body) body = node;
+    const body = resolvedBody ?? node;
 
     // Visit all children for methods and properties
     for (let i = 0; i < body.namedChildCount; i++) {
@@ -3466,6 +3497,63 @@ export class TreeSitterExtractor {
 
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
+
+    // Ruby `call` nodes use `receiver` + `method` fields (tree-sitter-ruby), not
+    // the `object`/`name`/`function` fields the branches below expect — so
+    // without this they fell through to the generic path, which took the
+    // receiver as the callee and DROPPED the method name: `lg.log()` produced a
+    // `calls` ref to `lg` (unresolvable) and no method edge was ever recorded,
+    // so a Ruby method's callers/impact were invisible (#1108 follow-up). Build
+    // `receiver.method` so the resolver — and local-variable type inference —
+    // can link it; `Foo.new` stays an instantiation.
+    if (this.language === 'ruby' && (node.type === 'call' || node.type === 'method_call')) {
+      const methodNode = getChildByField(node, 'method');
+      const methodName = methodNode ? getNodeText(methodNode, this.source) : '';
+      if (!methodName) return; // operator/element-reference call with no method name
+      const receiverNode = getChildByField(node, 'receiver');
+      const line = node.startPosition.row + 1;
+      const column = node.startPosition.column;
+      if (!receiverNode) {
+        // Bare `foo(...)` — just the method name (unchanged behavior).
+        this.unresolvedReferences.push({ fromNodeId: callerId, referenceName: methodName, referenceKind: 'calls', line, column });
+        return;
+      }
+      const receiverName = getNodeText(receiverNode, this.source);
+      // `Foo.new` / `Foo::Bar.new` is construction — emit an `instantiates` ref to
+      // the class (last `::` segment), preserving the "what creates X" edge.
+      if (methodName === 'new') {
+        const className = receiverName.includes('::')
+          ? receiverName.slice(receiverName.lastIndexOf('::') + 2)
+          : receiverName;
+        if (/^[A-Z]/.test(className)) {
+          this.unresolvedReferences.push({ fromNodeId: callerId, referenceName: className, referenceKind: 'instantiates', line, column });
+          return;
+        }
+      }
+      const SKIP_RECEIVERS = new Set(['self', 'super']);
+      const skip = SKIP_RECEIVERS.has(receiverName);
+      this.unresolvedReferences.push({
+        fromNodeId: callerId,
+        referenceName: skip ? methodName : `${receiverName}.${methodName}`,
+        referenceKind: 'calls',
+        line,
+        column,
+      });
+      // A capitalized (constant) receiver — `Foo.bar`, a class/module method call
+      // — is itself a dependency on that constant; emit a `references` ref so a
+      // class used only via its class methods still records a dependent (the edge
+      // the old receiver-only callee happened to provide, now made explicit).
+      if (!skip && receiverNode.type === 'constant') {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: receiverName,
+          referenceKind: 'references',
+          line: receiverNode.startPosition.row + 1,
+          column: receiverNode.startPosition.column,
+        });
+      }
+      return;
+    }
 
     // Get the function/method being called
     let calleeName = '';

@@ -71,6 +71,23 @@ function runShim(pkgDir: string, args: string[], env: Record<string, string>) {
   });
 }
 
+// Static source guard (all platforms): every child spawn in the shim must set
+// windowsHide, or a console (conhost) window flashes when the shim runs as a
+// background MCP server on Windows (issue #1092). windowsHide is a Windows-only
+// spawn behavior that can't be observed from these POSIX-only subprocess tests,
+// so we assert it at the source level instead — and this also catches any new
+// spawn site added to the shim later.
+describe('npm-shim windowsHide (#1092)', () => {
+  it('sets windowsHide: true on every spawn in the shim', () => {
+    const src = fs.readFileSync(SHIM_SRC, 'utf8');
+    const spawnLines = src.split('\n').filter((l) => /\.spawn(Sync)?\(/.test(l));
+    expect(spawnLines.length).toBeGreaterThan(0); // guard against a false pass if the calls move
+    for (const line of spawnLines) {
+      expect(line, `spawn without windowsHide: ${line.trim()}`).toContain('windowsHide: true');
+    }
+  });
+});
+
 describe.skipIf(isWindows)('npm-shim launcher', () => {
   it('runs the installed optional-dependency bundle without any download', async () => {
     const pkg = makePkg();
@@ -101,6 +118,33 @@ describe.skipIf(isWindows)('npm-shim launcher', () => {
     expect(r.stdout).toContain('FAKE_BUNDLE_RAN');
     expect(r.stdout).toContain('--probe-xyz');
     expect(r.stderr).toBe('');
+  });
+
+  it('prunes older cached bundles for this target, keeping the current one (#1074)', async () => {
+    const pkg = makePkg('2.0.0-keep');
+    const cache = mkTmp('cache');
+    const bundles = path.join(cache, 'bundles');
+    // current (matches pkg version) + an older bundle for the same target
+    writeLauncher(path.join(bundles, `${target}-2.0.0-keep`, 'bin'));
+    writeLauncher(path.join(bundles, `${target}-1.0.0-old`, 'bin'));
+    // a different platform's bundle and an in-flight staging dir must survive
+    const otherTarget = target === 'linux-x64' ? 'darwin-arm64' : 'linux-x64';
+    writeLauncher(path.join(bundles, `${otherTarget}-1.0.0`, 'bin'));
+    fs.mkdirSync(path.join(bundles, '.dl-inflight'), { recursive: true });
+
+    const r = await runShim(pkg, ['--probe-prune'], {
+      CODEGRAPH_INSTALL_DIR: cache,
+      CODEGRAPH_NO_DOWNLOAD: '1',
+    });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('FAKE_BUNDLE_RAN');
+    // older same-target bundle pruned; current kept
+    expect(fs.existsSync(path.join(bundles, `${target}-1.0.0-old`))).toBe(false);
+    expect(fs.existsSync(path.join(bundles, `${target}-2.0.0-keep`))).toBe(true);
+    // unrelated target + staging dir untouched
+    expect(fs.existsSync(path.join(bundles, `${otherTarget}-1.0.0`))).toBe(true);
+    expect(fs.existsSync(path.join(bundles, '.dl-inflight'))).toBe(true);
   });
 
   it('prints actionable guidance and exits 1 when disabled with no bundle', async () => {
@@ -180,6 +224,24 @@ describe.skipIf(!CAN_NET)('npm-shim download fallback (local HTTPS)', () => {
     expect(r.stdout).toContain('FAKE_BUNDLE_RAN');
     expect(r.stdout).toContain('--probe-net');
     expect(fs.existsSync(path.join(cache, 'bundles', `${target}-5.0.0-net`, 'bin', 'codegraph'))).toBe(true);
+  }, 20000);
+
+  it('prunes older cached bundles after downloading a new one (#1074)', async () => {
+    sumsBody = `${fixtureSha}  ${asset}\n`;
+    const pkg = makePkg('6.0.0-new');
+    const cache = mkTmp('cache');
+    const bundles = path.join(cache, 'bundles');
+    // a stale bundle from a previous version (same target) left by an earlier run
+    writeLauncher(path.join(bundles, `${target}-5.0.0-stale`, 'bin'));
+
+    const r = await runShim(pkg, ['--probe-newdl'], netEnv(cache));
+
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('downloading');
+    expect(r.stdout).toContain('FAKE_BUNDLE_RAN');
+    // freshly downloaded version present, stale one pruned
+    expect(fs.existsSync(path.join(bundles, `${target}-6.0.0-new`, 'bin', 'codegraph'))).toBe(true);
+    expect(fs.existsSync(path.join(bundles, `${target}-5.0.0-stale`))).toBe(false);
   }, 20000);
 
   it('aborts (exit 1) on a checksum mismatch and caches nothing', async () => {

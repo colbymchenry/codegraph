@@ -282,8 +282,47 @@ function statInode(p: string): string | null {
 export const DATABASE_FILENAME = 'codegraph.db';
 
 /**
+ * SQLite's sidecar files in WAL mode — the write-ahead log and its shared-memory
+ * index. They sit beside the main DB file and are removed alongside it when the
+ * database is discarded (see `removeDatabaseFiles`).
+ */
+const WAL_SIDECAR_SUFFIXES = ['-wal', '-shm'] as const;
+
+/**
  * Get the default database path for a project
  */
 export function getDatabasePath(projectRoot: string): string {
   return path.join(getCodeGraphDir(projectRoot), DATABASE_FILENAME);
+}
+
+/**
+ * Delete a database file and its WAL sidecars (`-wal`/`-shm`).
+ *
+ * This is how a FULL re-index discards an existing database — rather than
+ * opening the old graph and DELETE-ing every row. On a large or pre-fix
+ * poisoned index (e.g. an old graph that scanned an ignored gitlink corpus into
+ * ~1.6M nodes with a multi-GB WAL, #1065) the per-row `nodes_fts` delete-trigger
+ * churn blocks the main thread long enough to trip the #850 liveness watchdog
+ * before indexing even starts, so the rebuild could never recover the bad state
+ * (#1067). Unlinking is O(1) regardless of DB size and also reclaims the disk
+ * the bloated WAL would otherwise keep.
+ *
+ * POSIX removes the directory entry even while another process (a daemon/MCP
+ * server) still holds the file open; that holder heals via `reopenIfReplaced`
+ * (#925). On Windows a live holder can make the unlink fail with EBUSY/EPERM —
+ * that is thrown for the caller to surface ("stop the other process and retry").
+ * The `-wal`/`-shm` sidecars are best-effort: SQLite recreates them on the next
+ * open, so a leftover sidecar is harmless.
+ */
+export function removeDatabaseFiles(dbPath: string): void {
+  // The main DB file first — its removal is the operation that must succeed (or
+  // report why it couldn't). force:true treats an already-missing file as done.
+  fs.rmSync(dbPath, { force: true });
+  for (const suffix of WAL_SIDECAR_SUFFIXES) {
+    try {
+      fs.rmSync(dbPath + suffix, { force: true });
+    } catch {
+      // A sidecar still held/locked is harmless — SQLite rebuilds it on open.
+    }
+  }
 }

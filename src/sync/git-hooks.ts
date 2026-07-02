@@ -45,6 +45,7 @@ export function isGitRepo(projectRoot: string): boolean {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       windowsHide: true,
+      timeout: 5000, // fail fast instead of hanging init/sync on a stuck git (#1139)
     }).trim();
     return out === 'true';
   } catch {
@@ -63,6 +64,7 @@ function gitHooksDir(projectRoot: string): string | null {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       windowsHide: true,
+      timeout: 5000, // same rationale as isGitRepo
     }).trim();
     if (!out) return null;
     return path.isAbsolute(out) ? out : path.resolve(projectRoot, out);

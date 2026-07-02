@@ -9,9 +9,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory, buildDefaultIgnore } from '../src/extraction';
+import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -100,6 +100,11 @@ describe('Language Detection', () => {
     const objcHeader = '@interface Foo : NSObject\n@end\n';
     expect(detectLanguage('Foo.h', objcHeader)).toBe('objc');
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
+  });
+
+  it('should detect Metal shader files as C++ (#1121)', () => {
+    expect(detectLanguage('Shaders.metal')).toBe('cpp');
+    expect(isSourceFile('Renderer/Shaders.metal')).toBe(true);
   });
 
   it('should return unknown for unsupported extensions', () => {
@@ -2665,13 +2670,17 @@ std::unique_ptr<Widget> makeWidget() { return nullptr; }
     });
   });
 
-  describe('C++ macro-prefixed class/struct misparse (#946)', () => {
-    // An export/visibility macro before the class name plus a base clause
-    // (`class MACRO Name : public Base { … }`) makes tree-sitter read `class
-    // MACRO` as an elaborated type and the whole declaration as a
-    // function_definition named after the class, spanning the entire body — a
-    // phantom `function` that polluted callers/impact/blast-radius. It's dropped.
-    it('does not mint a phantom function for a macro-annotated class that inherits', () => {
+  describe('C++ macro-prefixed class/struct misparse (#946 → recovered in #1061)', () => {
+    // An export/visibility macro before the class name (`class MACRO Name :
+    // public Base { … }`) makes tree-sitter read `class MACRO` as an elaborated
+    // type and the whole declaration as a function_definition named after the
+    // class — a phantom `function` that polluted callers/impact/blast-radius.
+    // #946 dropped that phantom; #1061's preParse (`blankCppExportMacros`) now
+    // blanks the ALL-CAPS macro before parsing, so the class parses normally and
+    // is *recovered* — node, members, and base edge all present — not just
+    // de-phantomed. The #946 drop survives as the fallback for any residual
+    // misparse the blanking doesn't catch.
+    it('recovers a macro-annotated class that inherits (no phantom, real class + base edge)', () => {
       const code = `#pragma once
 #define MAPCORE_EXPORT __attribute__((visibility("default")))
 
@@ -2694,16 +2703,25 @@ public:
       const result = extractFromSource('provider.h', code);
 
       // The misparse used to surface as `function | LocalDataProvider` spanning
-      // the whole class body — a false caller in the graph. It's gone now.
+      // the whole class body — a false caller in the graph. It's gone.
       expect(
         result.nodes.find((n) => n.name === 'LocalDataProvider' && n.kind === 'function')
       ).toBeUndefined();
+
+      // …and the class is now recovered (was dropped under #946), with its
+      // `extends DataProvider` edge — the whole point of #1061.
+      expect(result.nodes.find((n) => n.name === 'LocalDataProvider')?.kind).toBe('class');
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'DataProvider'
+        )
+      ).toBeTruthy();
 
       // The sibling class without the macro is unaffected — still a class.
       expect(result.nodes.find((n) => n.name === 'DataProvider')?.kind).toBe('class');
     });
 
-    it('drops the struct variant too, without dropping a genuine class', () => {
+    it('recovers the struct variant too, without disturbing a genuine class', () => {
       const code = `
 #define API __declspec(dllexport)
 struct API Widget : public Base { int x; };
@@ -2711,14 +2729,460 @@ class Plain : public Base { public: int y; };
 `;
       const result = extractFromSource('widget.cpp', code);
 
-      // `struct MACRO Name : Base { … }` misparses the same way — no phantom function.
+      // `struct MACRO Name : Base { … }` misparses the same way — no phantom
+      // function, and the struct is recovered with its base edge.
       expect(
         result.nodes.find((n) => n.name === 'Widget' && n.kind === 'function')
       ).toBeUndefined();
+      expect(result.nodes.find((n) => n.name === 'Widget')?.kind).toBe('struct');
 
-      // A normal class with a base clause and no macro must still be a class — the
-      // drop is precise, not a blanket "class with inheritance" filter.
+      // A normal class with a base clause and no macro is untouched.
       expect(result.nodes.find((n) => n.name === 'Plain')?.kind).toBe('class');
+      const exts = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'extends')
+        .map((r) => r.referenceName);
+      expect(exts.filter((n) => n === 'Base').length).toBe(2); // Widget + Plain both extend Base
+    });
+  });
+
+  describe('C++ export-macro class recovery (#1061)', () => {
+    // Unreal-Engine style: `class MYGAME_API UMyComponent : public UActorComponent`.
+    // The leading `*_API` macro alone (base clause or not) triggers the #946
+    // misparse and dropped the class — breaking subclass / type-hierarchy /
+    // inheritance-impact queries for effectively every gameplay class in a UE
+    // project. blankCppExportMacros recovers them.
+    it('recovers UE *_API classes and the inheritance edge (the issue repro)', () => {
+      const code = `class ENGINE_API UActorComponent { };
+class MYGAME_API UMyComponent : public UActorComponent { };
+`;
+      const result = extractFromSource('ue.cpp', code);
+      const classes = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(classes).toContain('UActorComponent'); // macro, no base — also was dropped
+      expect(classes).toContain('UMyComponent');
+      expect(result.nodes.find((n) => n.kind === 'function')).toBeUndefined(); // no phantom
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'UActorComponent'
+        )
+      ).toBeTruthy();
+    });
+
+    it('blankCppExportMacros blanks only the header macro, offset-preserving', () => {
+      // Blanking replaces the macro with equal-length spaces, so the output is
+      // byte-for-byte the same length and identical *except* the macro is gone —
+      // every downstream line/column stays exact.
+      const check = (inp: string, macro: string, rest: string) => {
+        const out = blankCppExportMacros(inp);
+        expect(out.length).toBe(inp.length); // every byte offset preserved
+        expect(out).not.toContain(macro); // the macro token is blanked
+        expect(out.replace(/ +/g, ' ')).toBe(rest); // nothing else changed
+      };
+      // Generalizes across the export-macro space: UE _API, Qt/Boost _EXPORT,
+      // LLVM _ABI, bare API.
+      check(
+        'class MYGAME_API UMyComponent : public UActorComponent { };',
+        'MYGAME_API',
+        'class UMyComponent : public UActorComponent { };'
+      );
+      check('struct MAPCORE_EXPORT W : B {}', 'MAPCORE_EXPORT', 'struct W : B {}');
+      check('class LLVM_ABI Foo {}', 'LLVM_ABI', 'class Foo {}');
+    });
+
+    it('does NOT blank an all-caps class NAME or an elaborated-type var decl', () => {
+      // The name itself being ALL-CAPS (with or without a base) must survive —
+      // the macro is only the token *before* the name, gated on a `: { ` def.
+      for (const c of [
+        'class FOO { int x; };',
+        'class FOO : public Base { int x; };',
+        'struct BAR : public Base { int y; };',
+        'enum class COLOR { Red, Green };',
+        // elaborated-type variable declarations end in ; = [ — never : {
+        'struct FOO bar;',
+        'class FOO obj = make();',
+        'struct FOO arr[10];',
+        // a *_API macro used as an ordinary value elsewhere
+        'int x = SOME_API; void f() { use(MYMODULE_API); }',
+      ]) {
+        expect(blankCppExportMacros(c)).toBe(c);
+      }
+      // And the all-caps-named class keeps its base edge through real extraction.
+      const result = extractFromSource('ctrl.cpp', 'class FOO : public Base { int x; };');
+      expect(result.nodes.find((n) => n.name === 'FOO')?.kind).toBe('class');
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'Base'
+        )
+      ).toBeTruthy();
+    });
+  });
+
+  describe('Metal shader extraction (#1121)', () => {
+    // Metal Shading Language (≈ C++14) parses with the C++ grammar. MSL puts
+    // `[[attribute]]` annotations AFTER the declarator — a position
+    // tree-sitter-cpp misparses: a struct field with a trailing attribute
+    // emitted a spurious `extends` ref from the struct to the field's own type.
+    // blankMetalAttributes (preParse, `.metal`-gated) blanks them so extraction
+    // matches plain C++.
+    const METAL = `#include <metal_stdlib>
+using namespace metal;
+
+struct VertexIn {
+    float3 position [[attribute(0)]];
+    float2 texCoord [[attribute(1)]];
+};
+
+struct VertexOut {
+    float4 position [[position]];
+    float2 texCoord;
+};
+
+struct Uniforms {
+    float4x4 modelViewProjection;
+};
+
+static float4 applyGamma(float4 color) {
+    return pow(color, float4(1.0 / 2.2));
+}
+
+vertex VertexOut vertexShader(VertexIn in [[stage_in]],
+                              constant Uniforms &uniforms [[buffer(0)]]) {
+    VertexOut out;
+    out.position = uniforms.modelViewProjection * float4(in.position, 1.0);
+    out.texCoord = in.texCoord;
+    return out;
+}
+
+fragment float4 fragmentShader(VertexOut in [[stage_in]],
+                               texture2d<float> colorTexture [[texture(0)]],
+                               sampler textureSampler [[sampler(0)]]) {
+    float4 color = colorTexture.sample(textureSampler, in.texCoord);
+    return applyGamma(color);
+}
+
+kernel void computeBlur(texture2d<float, access::read> inTexture [[texture(0)]],
+                        texture2d<float, access::write> outTexture [[texture(1)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    float4 color = inTexture.read(gid);
+    outTexture.write(color, gid);
+}
+`;
+
+    it('extracts vertex/fragment/kernel functions, structs, and calls from a .metal file', () => {
+      const result = extractFromSource('Shaders.metal', METAL);
+      expect(result.errors).toHaveLength(0);
+
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(functions).toEqual(
+        expect.arrayContaining(['applyGamma', 'vertexShader', 'fragmentShader', 'computeBlur'])
+      );
+      const structs = result.nodes.filter((n) => n.kind === 'struct').map((n) => n.name);
+      expect(structs).toEqual(expect.arrayContaining(['VertexIn', 'VertexOut', 'Uniforms']));
+      expect(result.nodes.find((n) => n.kind === 'import')?.name).toBe('metal_stdlib');
+
+      // Attribute blanking is offset-preserving, so positions stay exact.
+      const vertexFn = result.nodes.find((n) => n.name === 'vertexShader')!;
+      expect(vertexFn.startLine).toBe(22);
+
+      // The shader call graph connects: fragmentShader → applyGamma.
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'calls' && r.referenceName === 'applyGamma'
+        )
+      ).toBeTruthy();
+
+      // The regression the blanking fixes: field attributes (`float3 position
+      // [[attribute(0)]];`) misparsed into `extends` refs from the struct to the
+      // field's type — a wrong inheritance edge whenever the repo defines that
+      // type itself (simd typedefs in a shared ShaderTypes.h are common).
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'extends')).toHaveLength(0);
+    });
+
+    it('blankMetalAttributes blanks every attribute form, offset-preserving', () => {
+      const inp = [
+        'float4 position [[position]];',
+        'constant Uniforms &u [[buffer(0)]]',
+        'float2 uv [[user(locn0)]];',
+        'device float *out [[buffer(0), raster_order_group(0)]]',
+      ].join('\n');
+      const out = blankMetalAttributes(inp);
+      expect(out.length).toBe(inp.length); // every byte offset preserved
+      expect(out).not.toContain('[[');
+      // Nothing but the attributes changed: collapsing the blank runs gives the
+      // plain declarations back, newlines untouched.
+      expect(out.split('\n').map((l) => l.replace(/ +/g, ' ').trimEnd())).toEqual([
+        'float4 position ;',
+        'constant Uniforms &u',
+        'float2 uv ;',
+        'device float *out',
+      ]);
+    });
+
+    it('blankMetalAttributes never touches non-attribute [[ sequences', () => {
+      for (const c of [
+        'auto x = arr[[]{ return 0; }()];', // lambda in subscript — the only other [[ in C++-family code
+        'int y = a[b[i]];', // nested subscript
+        'int z = 1;', // no [[ at all — early-return path
+      ]) {
+        expect(blankMetalAttributes(c)).toBe(c);
+      }
+    });
+  });
+
+  describe('C++ forward declarations do not mint phantom class nodes (#1093)', () => {
+    // `class Foo;` parses as a bodiless class_specifier. Repeated across headers,
+    // each forward decl minted a phantom bodiless `class` node that crowded out —
+    // and could be picked as the blast-radius representative over — the single
+    // real definition. Bodiless struct/enum specifiers were already skipped;
+    // classes now are too, but ONLY for C/C++ (opt-in flag), never for languages
+    // where a bodiless class is a complete definition.
+    it('keeps only the real definition, dropping repeated forward decls', () => {
+      const code = `
+class APXCharacter;   // forward decl (header 1)
+class APXCharacter;   // forward decl (header 2)
+friend class APXCharacter;   // elaborated / friend forward reference
+
+class APXCharacter {  // the one real definition
+  int hp;
+  void takeDamage(int amount) { hp -= amount; }
+};
+`;
+      const result = extractFromSource('character.cpp', code);
+      const classes = result.nodes.filter(
+        (n) => n.kind === 'class' && n.name === 'APXCharacter'
+      );
+      // Exactly one class node, and it's the definition (carries the member).
+      expect(classes).toHaveLength(1);
+      expect(classes[0].startLine).toBe(6);
+      expect(
+        result.nodes.some((n) => n.kind === 'method' && n.name === 'takeDamage')
+      ).toBe(true);
+    });
+
+    it('elaborated type references in declarations create no phantom class', () => {
+      // `class Foo obj;` is a variable declaration using an elaborated type, not
+      // a class definition — it must not mint a `Foo` class node.
+      const result = extractFromSource('use.cpp', 'class Foo;\nvoid f() { class Foo *p = nullptr; (void)p; }\n');
+      expect(result.nodes.filter((n) => n.kind === 'class' && n.name === 'Foo')).toHaveLength(0);
+    });
+
+    it('does NOT affect languages where a bodiless class is complete', () => {
+      // Kotlin `class Empty` and Scala `trait`/`case object`/`class` with no body
+      // are complete definitions — the C/C++-only skip must leave them indexed.
+      const kt = extractFromSource('Empty.kt', 'class Empty\nclass Full { val x = 1 }\n');
+      const ktClasses = kt.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(ktClasses).toContain('Empty');
+      expect(ktClasses).toContain('Full');
+
+      const scala = extractFromSource('M.scala', 'trait Marker\ncase object Red\nclass Foo\n');
+      const scalaNames = scala.nodes
+        .filter((n) => ['class', 'trait', 'interface'].includes(n.kind))
+        .map((n) => n.name);
+      expect(scalaNames).toEqual(expect.arrayContaining(['Marker', 'Red', 'Foo']));
+    });
+  });
+
+  describe('C++ reference-return method/function names (#1093 follow-up)', () => {
+    // An inline method/function returning a reference parses with a
+    // `reference_declarator` wrapping the `function_declarator`. That wrapper
+    // wasn't unwrapped (only `pointer_declarator` was), so the name captured the
+    // whole declarator — `const int& getRef() const {…}` became the method named
+    // "& getRef() const" instead of "getRef", polluting search and callers. Very
+    // common in Unreal Engine headers (`const FGameplayTagContainer& GetActiveTags() const`).
+    const namesOf = (code: string) =>
+      extractFromSource('r.cpp', code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+
+    it('names an inline reference-returning method by its identifier, not the declarator', () => {
+      const names = namesOf('class C {\npublic:\n  const int& getRef() const { return x; }\n  int& mutRef() { return x; }\n  int x;\n};');
+      expect(names).toContain('getRef');
+      expect(names).toContain('mutRef');
+      // No name leaks the reference sigil or the parameter/qualifier tail.
+      expect(names.some((n) => /[&()]/.test(n))).toBe(false);
+    });
+
+    it('handles rvalue-reference returns and reference-returning free functions', () => {
+      expect(namesOf('class C { int&& take() { return 1; } };')).toContain('take');
+      expect(namesOf('const int& globalRef() { static int x; return x; }')).toContain('globalRef');
+    });
+
+    it('leaves pointer, value, and out-of-line reference returns unchanged (controls)', () => {
+      expect(namesOf('class C { int* getPtr() { return &x; } int x; };')).toContain('getPtr');
+      expect(namesOf('class C { int getVal() const { return x; } int x; };')).toContain('getVal');
+      // Out-of-line `T& C::f()` already resolves via the qualified-name hook.
+      expect(namesOf('const int& C::getRef() const { return x; }')).toContain('getRef');
+    });
+  });
+
+  describe('C++ user-defined conversion operator names (#1093 follow-up)', () => {
+    // A conversion operator's declarator is an `operator_cast` (target type +
+    // `() const` tail). It was named with the whole declarator —
+    // `operator EALSMovementState() const` — so it didn't match the symbolic-
+    // overload style (`operator+`) and carried parameter noise. It's now named
+    // `operator <type>`. Common in Unreal Engine enum-wrapper structs.
+    const namesOf = (code: string) =>
+      extractFromSource('o.cpp', code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+
+    it('names a conversion operator as "operator <type>", not the full declarator', () => {
+      const names = namesOf('struct S {\n  operator int() const { return 1; }\n  operator bool() { return true; }\n  int x;\n};');
+      expect(names).toContain('operator int');
+      expect(names).toContain('operator bool');
+      expect(names.some((n) => n.includes('(') || n.includes('const'))).toBe(false);
+    });
+
+    it('handles a user-type conversion operator', () => {
+      expect(
+        namesOf('struct FALSMovementState {\n  operator EALSMovementState() const { return State; }\n  EALSMovementState State;\n};')
+      ).toContain('operator EALSMovementState');
+    });
+
+    it('leaves symbolic operator overloads unchanged (control)', () => {
+      const names = namesOf('struct S {\n  S operator+(const S& o) const { return o; }\n  int& operator[](int i) { return x; }\n  int x;\n};');
+      expect(names).toContain('operator+');
+      expect(names).toContain('operator[]'); // reference-returning subscript, name still clean
+    });
+  });
+
+  describe('C++ macro-prefixed function names (#1093 follow-up)', () => {
+    // An unknown inline-specifier macro before the return type
+    // (`FORCEINLINE FString GetName(…)`) threw tree-sitter into error recovery:
+    // the macro became the return type and — for a non-primitive return — the
+    // return type was glued onto the name (`"FString GetName"`), so the function
+    // was unfindable by name and its callers didn't link. `blankCppInlineMacros`
+    // blanks the known UE inline macros before parsing (offset-preserving), the
+    // same recover-don't-drop approach as the macro-annotated-class fix. Pervasive
+    // in Unreal Engine (`FORCEINLINE`).
+    const infoOf = (code: string) =>
+      extractFromSource('m.cpp', code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => ({ name: n.name, ret: n.returnType }));
+
+    it('recovers the real name AND return type of a FORCEINLINE function', () => {
+      expect(infoOf('static FORCEINLINE FString GetName(int V) { return H(V); }')).toEqual([
+        { name: 'GetName', ret: 'FString' },
+      ]);
+    });
+
+    it('handles the templated UE helper shape (GetEnumerationToString)', () => {
+      const names = infoOf(
+        'template <typename E> static FORCEINLINE FString GetEnumerationToString(const E V) { return H(V); }'
+      ).map((x) => x.name);
+      expect(names).toContain('GetEnumerationToString');
+    });
+
+    it('handles FORCENOINLINE / FORCEINLINE_DEBUGGABLE, methods, void, and reference returns', () => {
+      expect(infoOf('FORCENOINLINE FString A(int V){return H(V);}').map((x) => x.name)).toContain('A');
+      expect(infoOf('FORCEINLINE_DEBUGGABLE FString B(int V){return H(V);}').map((x) => x.name)).toContain('B');
+      expect(infoOf('struct S { FORCEINLINE FString GetName(int V) { return H(V); } };').map((x) => x.name)).toContain('GetName');
+      expect(infoOf('static FORCEINLINE void DoThing(int V) { H(V); }').map((x) => x.name)).toContain('DoThing');
+      expect(infoOf('static FORCEINLINE const FString& GetRef(int V) { return H(V); }').map((x) => x.name)).toContain('GetRef');
+    });
+
+    it('handles common third-party inline macros (pugixml, Godot, Boost, generic)', () => {
+      // pugixml: PUGI__FN before the return type; PUGIXML_FUNCTION (linkage)
+      // between the return type and the name — both recovered.
+      expect(infoOf('PUGI__FN void* default_allocate(size_t n) { return H(n); }').map((x) => x.name)).toContain('default_allocate');
+      expect(infoOf('PUGI__FN_NO_INLINE bool strequal(const char_t* a) { return H(a); }').map((x) => x.name)).toContain('strequal');
+      expect(infoOf('std::string PUGIXML_FUNCTION as_utf8(const wchar_t* s) { return H(s); }').map((x) => x.name)).toContain('as_utf8');
+      // Godot / Boost / generic inline hints
+      expect(infoOf('_FORCE_INLINE_ String get_name() const { return H(); }').map((x) => x.name)).toContain('get_name');
+      expect(infoOf('_ALWAYS_INLINE_ Vector2 get_pos() { return H(); }').map((x) => x.name)).toContain('get_pos');
+      expect(infoOf('BOOST_FORCEINLINE result_type call() { return H(); }').map((x) => x.name)).toContain('call');
+      expect(infoOf('ALWAYS_INLINE MyType compute() { return H(); }').map((x) => x.name)).toContain('compute');
+    });
+
+    it('leaves ordinary functions and real all-caps return types untouched (controls)', () => {
+      expect(infoOf('FString GetName(int V) { return H(V); }')).toEqual([{ name: 'GetName', ret: 'FString' }]);
+      // A real all-caps type that is NOT a listed inline macro stays the return type.
+      expect(infoOf('HRESULT DoIt(int V) { return H(V); }')).toEqual([{ name: 'DoIt', ret: 'HRESULT' }]);
+    });
+
+    it('blankCppInlineMacros preserves offsets and only touches specifier-position macros', () => {
+      // Blanked with equal-length spaces (byte offsets preserved).
+      expect(blankCppInlineMacros('FORCEINLINE FString F()')).toBe('            FString F()');
+      expect(blankCppInlineMacros('FORCEINLINE FString F()')).toHaveLength('FORCEINLINE FString F()'.length);
+      // Not in specifier position → untouched: string literals, expressions,
+      // longer word (`FORCEINLINE_COUNT`), and the fast path.
+      expect(blankCppInlineMacros('const char* s = "FORCEINLINE";')).toBe('const char* s = "FORCEINLINE";');
+      expect(blankCppInlineMacros('x = FORCEINLINE + 1;')).toBe('x = FORCEINLINE + 1;');
+      expect(blankCppInlineMacros('int FORCEINLINE_COUNT = 3;')).toBe('int FORCEINLINE_COUNT = 3;');
+      expect(blankCppInlineMacros('no macros here')).toBe('no macros here');
+    });
+  });
+
+  describe('C++ universal macro-mangled name recovery', () => {
+    // Curated pre-parse blanking can't list every library's inline macro, so a
+    // post-parse salvage recovers the real function name from ANY leftover
+    // `MACRO Ret name(…)` mangle — no list needed. It only ever touches an
+    // already-mangled name, so it can't corrupt a clean one.
+    const namesOf = (code: string, file = 's.cpp') =>
+      extractFromSource(file, code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+
+    it('recovers the name from a completely unknown macro (no list entry)', () => {
+      expect(namesOf('WEBKIT_EXPORT WTFString computeThing(int x) { return H(x); }')).toContain('computeThing');
+      expect(namesOf('SOMELIB_INLINE MyResult doWork(int x) { return H(x); }')).toContain('doWork');
+      expect(namesOf('MZ_FORCEINLINE char_t* to_str(double v) { return H(v); }')).toContain('to_str');
+    });
+
+    it('recoverMangledCppName only touches already-mangled names, with guards', () => {
+      // Recovered:
+      expect(recoverMangledCppName('WTFString computeThing')).toBe('computeThing');
+      expect(recoverMangledCppName('char_t* to_str(double v)')).toBe('to_str');
+      expect(recoverMangledCppName('unspecified_bool_type() const')).toBe('unspecified_bool_type');
+      // Left unchanged — clean names, operators, destructors, the `Ret (name)`
+      // idiom, and non-identifier tails:
+      expect(recoverMangledCppName('computeThing')).toBe('computeThing');
+      expect(recoverMangledCppName('operator EALSMovementState')).toBe('operator EALSMovementState');
+      expect(recoverMangledCppName('~Widget')).toBe('~Widget');
+      expect(recoverMangledCppName('bool (likely)')).toBe('bool (likely)');
+      expect(recoverMangledCppName('void (free)')).toBe('void (free)');
+      expect(recoverMangledCppName('QDockWidget *')).toBe('QDockWidget *');
+    });
+
+    it('does not disturb clean C++ names or non-C++ (Kotlin backtick) names', () => {
+      expect(namesOf('int foo(int x) { return x; }')).toEqual(['foo']);
+      // Kotlin backtick identifiers legitimately contain spaces; the salvage is
+      // C/C++-only, so they are untouched.
+      const kt = extractFromSource('T.kt', 'class T {\n  fun `decode simple cert`() { }\n}').nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+      expect(kt).toContain('`decode simple cert`');
+    });
+
+    it('curated list now also covers Qt / Folly / Abseil / LLVM / V8 / Eigen / rapidjson (full recovery)', () => {
+      const info = (c: string) =>
+        extractFromSource('x.cpp', c).nodes
+          .filter((n) => n.kind === 'method' || n.kind === 'function')
+          .map((n) => ({ name: n.name, ret: n.returnType }));
+      expect(info('FOLLY_ALWAYS_INLINE Str f(int x) { return H(x); }')).toEqual([{ name: 'f', ret: 'Str' }]);
+      expect(namesOf('Q_INVOKABLE void onClicked() { H(); }')).toContain('onClicked');
+      expect(namesOf('ABSL_ATTRIBUTE_ALWAYS_INLINE int hash(int x) { return H(x); }')).toContain('hash');
+      expect(namesOf('EIGEN_STRONG_INLINE Scalar dot(const V& v) { return H(v); }')).toContain('dot');
+      expect(namesOf('V8_INLINE MaybeLocal Get(int i) { return H(i); }')).toContain('Get');
+      expect(namesOf('RAPIDJSON_FORCEINLINE bool Parse(const char* s) { return H(s); }')).toContain('Parse');
+    });
+
+    it('curated list spans the broader ecosystem (Mozilla, GLM, Bullet, OpenCV, Skia, EASTL, protobuf, fmt, Windows conventions)', () => {
+      const info = (c: string) =>
+        extractFromSource('x.cpp', c).nodes
+          .filter((n) => n.kind === 'method' || n.kind === 'function')
+          .map((n) => ({ name: n.name, ret: n.returnType }));
+      expect(info('MOZ_ALWAYS_INLINE Value get(int i) { return H(i); }')).toEqual([{ name: 'get', ret: 'Value' }]);
+      expect(info('GLM_FUNC_QUALIFIER vec3 cross(const vec3& a) { return H(a); }')).toEqual([{ name: 'cross', ret: 'vec3' }]);
+      expect(info('SIMD_FORCE_INLINE btScalar dot(const btVector3& v) const { return H(v); }')).toEqual([{ name: 'dot', ret: 'btScalar' }]);
+      expect(info('CV_INLINE Mat clone() const { return H(); }')).toEqual([{ name: 'clone', ret: 'Mat' }]);
+      expect(namesOf('PROTOBUF_ALWAYS_INLINE int size() const { return H(); }')).toContain('size');
+      expect(namesOf('FMT_CONSTEXPR auto parse(int x) { return H(x); }')).toContain('parse');
+      expect(namesOf('SK_ALWAYS_INLINE SkScalar width() const { return H(); }')).toContain('width');
+      expect(namesOf('EA_FORCE_INLINE size_type size() const { return H(); }')).toContain('size');
+      // Windows calling-convention macros sit between return type and name; the
+      // macro is blanked so the real return type survives.
+      expect(info('HRESULT WINAPI CreateThing(int x) { return H(x); }')).toEqual([{ name: 'CreateThing', ret: 'HRESULT' }]);
+      expect(info('ULONG STDMETHODCALLTYPE AddRef() { return H(); }')).toEqual([{ name: 'AddRef', ret: 'ULONG' }]);
     });
   });
 
@@ -5658,6 +6122,55 @@ describe('Nested gitlink repos (#1031, #1033)', () => {
 
     expect(files).toContain('app.ts');
     expect(files).not.toContain('libs/lib/lib.ts'); // not on disk → correctly absent
+  });
+
+  // #1065: a gitlink under a path the super-repo's OWN `.gitignore` covers is the
+  // tracked-gitlink twin of the untracked-ignored embedded repo (#514, #970). The
+  // gitlink-discovery pass must honor that `.gitignore` the same way — otherwise a
+  // gitignored reference/benchmark corpus full of `git add`ed clones gets pulled
+  // into the index (the 138k-file blow-up the reporter hit). Respect it by default;
+  // re-include only via `codegraph.json` `includeIgnored`.
+  it('does not index a gitlink under a gitignored directory by default (#1065)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+    // An embedded clone under a path the super-repo gitignores (a benchmark corpus).
+    await makeRepo(path.join(root, 'benchmark', 'repos', 'ref'), 'ref');
+    git(root, 'add', 'benchmark/repos/ref'); // tracked as a 160000 gitlink
+    fs.writeFileSync(path.join(root, '.gitignore'), 'benchmark/repos/\n');
+    git(root, 'add', '.gitignore');
+    git(root, 'commit', '-q', '-m', 'add gitignored gitlink + ignore rule');
+
+    const files = scanDirectory(root);
+    expect(files).toContain('app.ts');
+    expect(files).not.toContain('benchmark/repos/ref/ref.ts'); // gitignored → excluded
+
+    // The watcher path agrees: the ignored root is never discovered, and the dir is
+    // pruned (the reporter's exact clue — `ignores('benchmark/repos/')` was false).
+    expect(discoverEmbeddedRepoRoots(root)).toEqual([]);
+    expect(buildScopeIgnore(root).ignores('benchmark/repos/')).toBe(true);
+    expect(buildScopeIgnore(root).ignores('benchmark/repos/ref/ref.ts')).toBe(true);
+  });
+
+  it('re-includes a gitignored gitlink when codegraph.json includeIgnored opts in (#1065)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+    await makeRepo(path.join(root, 'benchmark', 'repos', 'ref'), 'ref');
+    git(root, 'add', 'benchmark/repos/ref');
+    fs.writeFileSync(path.join(root, '.gitignore'), 'benchmark/repos/\n');
+    fs.writeFileSync(path.join(root, 'codegraph.json'), JSON.stringify({ includeIgnored: ['benchmark/repos/'] }));
+    git(root, 'add', '.gitignore', 'codegraph.json');
+    git(root, 'commit', '-q', '-m', 'opt the gitignored gitlink back in');
+
+    const files = scanDirectory(root);
+    expect(files).toContain('app.ts');
+    expect(files).toContain('benchmark/repos/ref/ref.ts'); // opted in → indexed
+    expect(discoverEmbeddedRepoRoots(root)).toContain('benchmark/repos/ref/');
   });
 });
 
