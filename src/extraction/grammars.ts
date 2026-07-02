@@ -39,6 +39,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  arkts: 'tree-sitter-arkts.wasm',
 };
 
 /**
@@ -108,6 +109,10 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
+  // ArkTS (HarmonyOS / OpenHarmony declarative UI). `.ets` is the declarative
+  // form (@Component struct + build()); standard `.ts` in an ArkTS project is
+  // still parsed as TypeScript by the .ts mapping above.
+  '.ets': 'arkts',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -220,8 +225,11 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // build (ABI 13) has no primary-constructor support and parses
       // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
       // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
-      // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r')
+      // primary constructors natively. ArkTS: no published npm grammar — we
+      // vendor the prebuilt ABI-15 wasm from the Million-mo/tree-sitter-arkts
+      // v0.1.7 GitHub release (models @Component struct / build() / @Builder
+      // natively, which a plain TS grammar would parse as ERROR nodes).
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'arkts')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -432,6 +440,7 @@ export function getLanguageDisplayName(language: Language): string {
     lua: 'Lua',
     luau: 'Luau',
     objc: 'Objective-C',
+    arkts: 'ArkTS',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',

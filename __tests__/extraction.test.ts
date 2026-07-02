@@ -7901,3 +7901,165 @@ GeomPoint <- ggproto("GeomPoint", Geom,
     });
   });
 });
+
+// =============================================================================
+// ArkTS (HarmonyOS / OpenHarmony declarative UI — `.ets`)
+// =============================================================================
+
+describe('ArkTS Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect ArkTS files', () => {
+      expect(detectLanguage('Index.ets')).toBe('arkts');
+      expect(detectLanguage('pages/Home.ets')).toBe('arkts');
+      // Standard `.ts` in an ArkTS project is still TypeScript.
+      expect(detectLanguage('model/user.ts')).toBe('typescript');
+    });
+
+    it('should report ArkTS as supported', () => {
+      expect(isLanguageSupported('arkts')).toBe(true);
+      expect(getSupportedLanguages()).toContain('arkts');
+    });
+  });
+
+  describe('Component extraction (@Component struct)', () => {
+    const code = `
+@Entry
+@Component
+struct Index {
+  @State message: string = 'Hello';
+  @Prop count: number = 0;
+
+  aboutToAppear() {
+    this.load();
+  }
+
+  load() {
+    this.message = 'loaded';
+  }
+
+  build() {
+    Column() {
+      Text(this.message)
+    }
+  }
+}
+`;
+
+    it('should extract an @Component struct as a component node', () => {
+      const result = extractFromSource('Index.ets', code);
+      const comp = result.nodes.find((n) => n.kind === 'component' && n.name === 'Index');
+      expect(comp).toBeDefined();
+      expect(comp?.language).toBe('arkts');
+      // Decorators are surfaced on the node.
+      expect(comp?.decorators).toEqual(expect.arrayContaining(['Entry', 'Component']));
+    });
+
+    it('should extract the build() method and component methods with qualified names', () => {
+      const result = extractFromSource('Index.ets', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const build = methods.find((m) => m.qualifiedName === 'Index::build');
+      expect(build).toBeDefined();
+      expect(methods.find((m) => m.qualifiedName === 'Index::aboutToAppear')).toBeDefined();
+      expect(methods.find((m) => m.qualifiedName === 'Index::load')).toBeDefined();
+    });
+
+    it('should extract @State / @Prop members as properties with their types', () => {
+      const result = extractFromSource('Index.ets', code);
+      const message = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::message');
+      expect(message).toBeDefined();
+      expect(message?.signature).toBe('string message');
+      expect(message?.decorators).toContain('State');
+      const count = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::count');
+      expect(count?.decorators).toContain('Prop');
+    });
+
+    it('should resolve intra-component method calls (this.load())', () => {
+      const result = extractFromSource('Index.ets', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName.endsWith('load')
+      );
+      expect(call).toBeDefined();
+    });
+  });
+
+  describe('Standard TypeScript constructs', () => {
+    it('should extract classes, methods, enums, interfaces and type aliases', () => {
+      const code = `
+export enum Color { Red, Green = 2, Blue }
+
+export interface Shape {
+  area(): number;
+}
+
+export type Handler = (e: string) => void;
+
+export class Service {
+  private count: number = 0;
+  doWork(x: number): number {
+    return this.helper(x);
+  }
+  helper(n: number): number { return n * 2; }
+}
+`;
+      const result = extractFromSource('service.ets', code);
+      expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'Service')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'Color')).toBeDefined();
+      const members = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.qualifiedName);
+      expect(members).toEqual(expect.arrayContaining(['Color::Red', 'Color::Green', 'Color::Blue']));
+      expect(result.nodes.find((n) => n.kind === 'interface' && n.name === 'Shape')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Handler')).toBeDefined();
+      const doWork = result.nodes.find((n) => n.qualifiedName === 'Service::doWork');
+      expect(doWork?.kind).toBe('method');
+      expect(doWork?.signature).toBe('(x: number): number');
+      // this.helper(x) resolves to a call reference.
+      expect(
+        result.unresolvedReferences.find((r) => r.referenceKind === 'calls' && r.referenceName.endsWith('helper'))
+      ).toBeDefined();
+    });
+  });
+
+  describe('Global @Builder functions', () => {
+    it('should extract a decorated global @Builder function with its signature', () => {
+      const code = `
+@Builder
+function GlobalCard(title: string) {
+  Text(title).fontSize(20)
+}
+`;
+      const result = extractFromSource('builders.ets', code);
+      const card = result.nodes.find((n) => n.kind === 'function' && n.name === 'GlobalCard');
+      expect(card).toBeDefined();
+      expect(card?.signature).toBe('(title: string)');
+      expect(card?.decorators).toContain('Builder');
+    });
+
+    it('should extract a plain top-level function', () => {
+      const code = `
+function plain(a: string): void {
+  console.log(a);
+}
+`;
+      const result = extractFromSource('plain.ets', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'plain');
+      expect(fn).toBeDefined();
+      expect(fn?.signature).toBe('(a: string): void');
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should extract module names from named and default imports', () => {
+      const code = `
+import { Foo, Bar } from '../common/foo';
+import router from '@ohos.router';
+`;
+      const result = extractFromSource('imports.ets', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('../common/foo');
+      expect(imports).toContain('@ohos.router');
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === '@ohos.router'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
+});

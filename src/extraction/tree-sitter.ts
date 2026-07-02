@@ -914,6 +914,11 @@ export class TreeSitterExtractor {
         this.extractInterface(node);
       } else if (classification === 'trait') {
         this.extractClass(node, 'trait');
+      } else if (classification === 'component') {
+        // ArkTS `@Component struct` — a UI component that extracts members like
+        // a class (see isInsideClassLikeNode, which treats a 'component' parent
+        // as class-like for ArkTS so its methods/`build()`/state extract).
+        this.extractClass(node, 'component');
       } else {
         this.extractClass(node);
       }
@@ -1368,7 +1373,13 @@ export class TreeSitterExtractor {
       parentNode.kind === 'interface' ||
       parentNode.kind === 'trait' ||
       parentNode.kind === 'enum' ||
-      parentNode.kind === 'module'
+      parentNode.kind === 'module' ||
+      // ArkTS `@Component struct` is a `component`-kind node whose members
+      // (methods, `build()`, @State props) must extract like class members.
+      // Guarded to ArkTS so React `component` nodes (JS/TS arrow components,
+      // whose bodies are walked via visitFunctionBody, not member iteration)
+      // are unaffected.
+      (parentNode.kind === 'component' && this.language === 'arkts')
     );
   }
 
@@ -1887,6 +1898,10 @@ export class TreeSitterExtractor {
           c => c.type !== 'modifier' && c.type !== 'modifiers'
             && c.type !== 'identifier' && c.type !== 'accessor_list'
             && c.type !== 'accessors' && c.type !== 'equals_value_clause'
+            // A decorator (`@State`) or initializer value (`expression`) is never
+            // the property's declared type — ArkTS nests both as named children
+            // around the `type_annotation`, so skip them and let the real type win.
+            && c.type !== 'decorator' && c.type !== 'expression'
         );
     const typeText = typeNode
       ? getNodeText(typeNode, this.source).replace(/^:\s*/, '')
