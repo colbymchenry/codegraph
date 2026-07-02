@@ -27,6 +27,7 @@ import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
+import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -1070,15 +1071,30 @@ program
       try { input = JSON.parse(raw); } catch { return; }
       const prompt = String(input.prompt || '');
 
-      // Gate: only structural / flow / impact / where-how prompts get context, so
-      // every other prompt ("fix this typo") stays a zero-cost no-op. Language-aware
-      // (multilingual keywords, plus code-shaped tokens) so it fires for non-English
-      // prompts too (#994, #1126). A keyword fires on its own; a code-token is only a
-      // CANDIDATE — verified against the graph below, so a tech brand ("JavaScript")
-      // that looks like a symbol but isn't one here doesn't inject spurious context.
+      // Gate telemetry: how often each tier fires vs. no-ops — counter names
+      // only, NEVER prompt content (see TELEMETRY.md). This is the data that
+      // turns "is the gate any good" from vibes into a measured recall rate.
+      const gate = (outcome: string): void => {
+        try { getTelemetry().recordUsage('cli_command', `prompt-hook-gate-${outcome}`, true); } catch { /* never break the hook */ }
+      };
+
+      // Gate, tiered by confidence (#994, #1126):
+      //   HIGH   — a structural keyword (any covered language), or a code-shaped
+      //            token verified in the index → full explore injection.
+      //   MEDIUM — no keyword/token, but prose words match indexed symbol-name
+      //            SEGMENTS ("state machine" → OrderStateMachine, in any
+      //            language): inject a short list of the matching symbols and
+      //            let the AGENT write the explore query — the graph-derived
+      //            tier, no vocabulary involved.
+      //   silent — nothing verified. Every other prompt ("fix this typo")
+      //            stays a zero-cost no-op.
+      // Keywords fire on their own; a token or prose word is only a CANDIDATE
+      // verified against the graph below, so a tech brand ("JavaScript") that
+      // merely looks like code doesn't inject spurious context.
       const keyworded = hasStructuralKeyword(prompt);
       const codeTokens = keyworded ? [] : extractCodeTokens(prompt);
-      if (!keyworded && codeTokens.length === 0) return;
+      const proseWords = keyworded ? [] : extractProseCandidates(prompt);
+      if (!keyworded && codeTokens.length === 0 && proseWords.length === 0) { gate('noop-shape'); return; }
 
       // Decide what to inject, shaped by WHERE the index(es) are: the nearest
       // indexed ancestor of cwd, or — when cwd is an un-indexed workspace root
@@ -1088,7 +1104,7 @@ program
       // root (it only walked up), so the validated adoption lever never fired
       // exactly where the agent most needs it.
       const plan = planFrontload(String(input.cwd || process.cwd()), prompt);
-      if (!plan.exploreRoot && plan.nudgeProjects.length === 0) return; // nothing reachable — the agent's normal tools apply
+      if (!plan.exploreRoot && plan.nudgeProjects.length === 0) { gate('noop-no-index'); return; } // nothing reachable — the agent's normal tools apply
 
       // A "pass projectPath" line for indexed sub-projects we did NOT front-load.
       // Follow-up codegraph_explore calls against a sub-project (cwd isn't its
@@ -1100,31 +1116,55 @@ program
         const { default: CodeGraph } = await loadCodeGraph();
         const cg = await CodeGraph.open(plan.exploreRoot);
         try {
-          // Code-token-only prompt: require that at least one token is a REAL symbol
-          // in THIS index before front-loading. Without it, a brand name or common
-          // word that merely looks like code ("JavaScript", "GitHub") would run
-          // explore and inject ~16KB of low-relevance context (issue #994 follow-up).
-          // A keyword-bearing prompt skips this — the keyword is signal enough.
-          if (!keyworded && !codeTokens.some((t) => cg.getNodesByName(t).length > 0)) return;
-          const { ToolHandler } = await import('../mcp/tools');
-          const handler = new ToolHandler(cg);
-          const result = await handler.execute('codegraph_explore', { query: prompt });
-          const text = result.content[0]?.text ?? '';
-          if (!result.isError && text.trim()) {
-            // Cap the injection so a large-repo explore can't flood the prompt.
-            const MAX = 16000;
-            const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
-            // For a front-loaded SUB-project, a follow-up explore needs its path.
-            const more = plan.viaSubScan
-              ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
-              : 'call codegraph_explore for more';
-            const others = plan.nudgeProjects.length
-              ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
-              : '';
-            process.stdout.write(
-              `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
-            );
+          const others = plan.nudgeProjects.length
+            ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
+            : '';
+
+          // Tier decision against THIS index (issue #994 follow-up: candidates
+          // must be real here — a brand name or prose about another domain
+          // must not inject). Keyword-bearing prompts skip verification — the
+          // keyword is signal enough.
+          const tokenVerified = !keyworded && codeTokens.some((t) => cg.getNodesByName(t).length > 0);
+          if (keyworded || tokenVerified) {
+            const { ToolHandler } = await import('../mcp/tools');
+            const handler = new ToolHandler(cg);
+            const result = await handler.execute('codegraph_explore', { query: prompt });
+            const text = result.content[0]?.text ?? '';
+            if (!result.isError && text.trim()) {
+              // Cap the injection so a large-repo explore can't flood the prompt.
+              const MAX = 16000;
+              const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
+              // For a front-loaded SUB-project, a follow-up explore needs its path.
+              const more = plan.viaSubScan
+                ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
+                : 'call codegraph_explore for more';
+              process.stdout.write(
+                `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
+              );
+            }
+            gate(keyworded ? 'high-keyword' : 'high-token');
+            return;
           }
+
+          // MEDIUM: prose words → symbol-name segments, co-occurrence/rarity
+          // scored, each hit re-verified to exist (see getSegmentMatches). The
+          // payload names the symbols but does NOT run explore — the agent owns
+          // the query where the hook's confidence is only "these are related".
+          const related = cg.getSegmentMatches(proseWords);
+          if (related.length === 0) { gate('noop-unverified'); return; }
+          const lines = related
+            .map((m) => `  - ${m.name} (${m.kind} — ${m.filePath}:${m.startLine})`)
+            .join('\n');
+          const exampleQuery = related.slice(0, 3).map((m) => m.name).join(' ');
+          const projectHint = plan.viaSubScan ? ` with projectPath: "${plan.exploreRoot}"` : '';
+          process.stdout.write(
+            `<codegraph_context note="CodeGraph found indexed symbols matching this prompt — query the graph before searching files.">\n` +
+            `This project's CodeGraph index contains symbols matching this request:\n${lines}\n` +
+            `Call codegraph_explore ONCE${projectHint} with the relevant names in one query (e.g. "${exampleQuery}") ` +
+            `to get their source, call paths, and blast radius — cheaper and more complete than Read/Grep.\n${others}` +
+            `</codegraph_context>\n`,
+          );
+          gate('medium-segment');
         } finally {
           cg.destroy();
         }
@@ -1136,6 +1176,7 @@ program
           nudge(plan.nudgeProjects, "This workspace's CodeGraph indexes live in sub-projects. To use CodeGraph, call codegraph_explore with the projectPath of the relevant one:") +
           `</codegraph_context>\n`,
         );
+        gate('nudge-projects');
       }
     } catch {
       // Degradable by contract: never surface an error to the prompt pipeline.

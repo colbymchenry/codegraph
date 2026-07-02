@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 /**
  * Migration definition
@@ -97,6 +97,25 @@ const migrations: Migration[] = [
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
           ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
+      `);
+    },
+  },
+  {
+    version: 7,
+    description:
+      'Add name_segment_vocab — prose-word → symbol-name lookup for the prompt hook’s graph-derived gate',
+    up: (db) => {
+      // DDL only — instant on any size database (the row-churn hazards of #1067
+      // don't apply). The table starts EMPTY on migrated databases; `sync`
+      // detects that over a populated graph and backfills batched+yielding
+      // (CodeGraph.rebuildNameSegmentVocab), and any full index rebuilds it
+      // from scratch. Keep the definition in lockstep with schema.sql.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS name_segment_vocab (
+          segment TEXT NOT NULL,
+          name TEXT NOT NULL,
+          PRIMARY KEY (segment, name)
+        ) WITHOUT ROWID;
       `);
     },
   },
