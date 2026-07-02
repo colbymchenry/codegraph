@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to CodeGraph are documented here. Each entry also ships as
-a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
+a [GitHub Release](https://github.com/zren-zing/codegraph-qt/releases) tagged
 `vX.Y.Z`, which is where most people will look.
 
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
@@ -134,7 +134,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`codegraph_explore` now explains where a flow ends instead of going silent.** When the symbols you ask about don't connect statically — because the code dispatches through a runtime mechanism like a computed call (`handlers[action.type](...)`), Python's `getattr`, a command/mediator bus (`sender.Send(new DeleteCommand(...))`), reflection, or `new Proxy` — explore now announces the exact dispatch site (file and line) where the static path stops, and when the dispatch key is visible in the source it shortlists the likely runtime targets (for example pointing a MediatR command straight at its `Handler.Handle` method). Detection is deterministic and runs only when a flow fails to connect; fully connected flows are unchanged, and nothing about indexing or the graph itself changes. Relatedly, a custom event bus whose emit and handler connect through a single synthesized hop now shows that hop explicitly (with the registration site) — it previously rendered nothing because the connection was "too short" for the flow section. (#687)
 
-- **Anonymous usage telemetry, documented field-by-field and easy to turn off.** CodeGraph now collects a small set of anonymous usage statistics — which commands and MCP tools get used, which languages get indexed, which agents connect — so language and agent support work goes where real usage is. Never any code, file paths, file or symbol names, search queries, or IP addresses; usage aggregates locally into daily totals before anything is sent, and the ingest endpoint is public, auditable code in the repository that enforces the documented field list. The installer asks up front with a visible default-on toggle (and never re-asks); everywhere else a one-line notice prints before the first send. Disable any time with `codegraph telemetry off`, `CODEGRAPH_TELEMETRY=0`, or the cross-tool `DO_NOT_TRACK=1` standard — off means off: nothing is recorded, nothing is sent, and buffered data is deleted. `TELEMETRY.md` documents every field.
+- **Anonymous usage telemetry is default-off in this fork.** CodeGraph still documents the anonymous telemetry schema field-by-field, but fork builds do not send anything unless the user explicitly enables telemetry and provides `CODEGRAPH_TELEMETRY_ENDPOINT` for an endpoint they control. `codegraph telemetry off`, `CODEGRAPH_TELEMETRY=0`, and `DO_NOT_TRACK=1` remain honored; off means off: nothing is recorded, nothing is sent, and buffered data is deleted. `TELEMETRY.md` documents every field.
 - **Subagents and non-MCP agents can now reach CodeGraph.** Two new CLI commands — `codegraph explore "<symbols or question>"` and `codegraph node <symbol-or-file>` — print exactly what the matching MCP tools return (relevant symbols' source + call paths; one symbol's source + callers; file reads with line numbers), so any agent with a shell can use the graph. And `codegraph install` now writes a small marker-fenced CodeGraph section into each agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`) pointing at both surfaces — that file is what Task-tool subagents actually see, where the MCP server's own guidance only reaches the main agent. Measured on a delegated code-exploration task: subagents went from almost never using CodeGraph (~1 in 9 runs) to using it in every run, including runs with zero grep/file-reading fallback. The section is small, survives your own content, upgrades cleanly from the old long block, and `codegraph uninstall` removes it. Thanks @liuyao37511. (#704)
 - **The MCP tool list is now a focused default of four** — `codegraph_explore`, `codegraph_node`, `codegraph_search`, and `codegraph_callers`. The other four (`codegraph_callees`, `codegraph_impact`, `codegraph_files`, `codegraph_status`) remain fully functional — the CLI and library API are unchanged, and `CODEGRAPH_MCP_TOOLS` re-enables any of them — but they're no longer listed to agents by default: measured agent behavior shows they're never or rarely picked, and the information they carry already arrives inline on the tools agents do use (explore's blast-radius section, node's dependents note, a symbol's own body as its callee list). A leaner list saves context tokens every session and steers agents to the right tool by presence alone.
 - **CodeGraph now goes quiet instead of failing loudly in unindexed projects.** When an AI agent's session starts in a workspace that has no CodeGraph index, the MCP server now announces itself as inactive with a short note and lists no tools at all — instead of presenting the full toolset and erroring on every call, which taught agents to distrust CodeGraph even where it works. Querying another project that isn't indexed likewise returns clear guidance (use your regular tools for that codebase; the user can run `codegraph init` there to enable CodeGraph) instead of an error, and genuine internal errors now tell the agent to retry once rather than give up on CodeGraph entirely. Indexing stays your decision — agents are told not to run it themselves. (#769)
@@ -487,23 +487,23 @@ Thanks @andreinknv for the substantive draft this release was based on.
 
 - Fixed the `codegraph` command failing with `permission denied` right after a fresh global install — the 0.7.5 package shipped the CLI without its executable bit, so your shell refused to run it. New installs work out of the box. If you're stuck on 0.7.5, upgrade to 0.7.6 or unblock yourself in place by making the installed binary executable with `chmod +x`.
 
-[0.9.7]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.7
-[0.9.6]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.6
-[0.9.5]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.5
-[0.9.4]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.4
-[0.9.3]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.3
-[0.9.2]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.2
-[0.9.1]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.1
-[0.9.0]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.0
-[0.8.0]: https://github.com/colbymchenry/codegraph/releases/tag/v0.8.0
-[0.7.10]: https://github.com/colbymchenry/codegraph/releases/tag/v0.7.10
-[0.7.9]: https://github.com/colbymchenry/codegraph/releases/tag/v0.7.9
-[0.7.7]: https://github.com/colbymchenry/codegraph/releases/tag/v0.7.7
-[0.7.6]: https://github.com/colbymchenry/codegraph/releases/tag/v0.7.6
-[0.9.8]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.8
-[0.9.9]: https://github.com/colbymchenry/codegraph/releases/tag/v0.9.9
-[1.0.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.0.0
-[1.0.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.0.1
-[1.1.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.0
-[1.1.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.1
-[1.1.2]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.2
+[0.9.7]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.9.7
+[0.9.6]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.9.6
+[0.9.5]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.9.5
+[0.9.4]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.9.4
+[0.9.3]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.9.3
+[0.9.2]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.9.2
+[0.9.1]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.9.1
+[0.9.0]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.9.0
+[0.8.0]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.8.0
+[0.7.10]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.7.10
+[0.7.9]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.7.9
+[0.7.7]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.7.7
+[0.7.6]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.7.6
+[0.9.8]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.9.8
+[0.9.9]: https://github.com/zren-zing/codegraph-qt/releases/tag/v0.9.9
+[1.0.0]: https://github.com/zren-zing/codegraph-qt/releases/tag/v1.0.0
+[1.0.1]: https://github.com/zren-zing/codegraph-qt/releases/tag/v1.0.1
+[1.1.0]: https://github.com/zren-zing/codegraph-qt/releases/tag/v1.1.0
+[1.1.1]: https://github.com/zren-zing/codegraph-qt/releases/tag/v1.1.1
+[1.1.2]: https://github.com/zren-zing/codegraph-qt/releases/tag/v1.1.2
