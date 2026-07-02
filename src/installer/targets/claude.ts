@@ -290,7 +290,9 @@ function isLegacyCodegraphHookCommand(command: unknown): boolean {
   if (typeof command !== 'string') return false;
   return (
     command.includes('codegraph mark-dirty') ||
-    command.includes('codegraph sync-if-dirty')
+    command.includes('codegraph sync-if-dirty') ||
+    command.includes('@zren-zing/codegraph-qt mark-dirty') ||
+    command.includes('@zren-zing/codegraph-qt sync-if-dirty')
   );
 }
 
