@@ -316,12 +316,23 @@ const STRUCTURAL_WORDS = [
  * "вызыва" on вызывает/вызывается. Mid-word occurrences stay excluded —
  * "restructure"/"independent" don't fire — so precision stays close to the
  * exact-word class. Add a stem only when every plausible completion is still a
- * structural word.
+ * structural word; a stem with ordinary-English completions must instead
+ * enumerate its structural suffixes and re-assert the right boundary (see the
+ * four bounded English entries below, #1138).
  */
 const STRUCTURAL_STEMS = [
   // English + the Latin-script languages that share the spelling (French
-  // architecture/structure/trace/impact, Spanish depende/implementa/impacto, …)
-  'architect', 'structur', 'depend', 'implement', 'connect', 'impact', 'affect', 'trace', 'call', 'explain',
+  // architecture/structure/trace/impact, Spanish depende/implementa/impacto, …).
+  // call/trace/affect/connect are NOT safe as open prefixes — callus,
+  // calligraphy, Connecticut, connective, affectionate, Tracey are ordinary
+  // words that would false-fire the full-explore tier (#1138) — so they carry
+  // an enumerated suffix set + right boundary. "tracing" lives in
+  // STRUCTURAL_WORDS (the e is dropped, so no trace-prefix form matches it).
+  'architect', 'structur', 'depend', 'implement', 'impact', 'explain',
+  `call(?:s|ing|ed|ers?|backs?|able|sites?)?${NOT_WORD_AFTER}`,
+  `trace(?:s|d|rs?)?${NOT_WORD_AFTER}`,
+  `affect(?:s|ed|ing)?${NOT_WORD_AFTER}`,
+  `connect(?:s|ed|ing|ions?|ors?|ivity)?${NOT_WORD_AFTER}`,
   // French (appel(le)=call, dépend=depends, implément(e)=implement,
   // connex(ion)=connection, expliqu(e)=explain, fonctionn(e/ement)=works)
   'appel', 'dépend', 'implément', 'connex', 'expliqu', 'fonctionn',
@@ -417,6 +428,16 @@ const STRUCTURAL_STEMS_RE = new RegExp(`${NOT_WORD_BEFORE}(?:${STRUCTURAL_STEMS.
  * يعمل/تعمل/ทำงาน=works) plus structural-overview words with no single clean
  * English equivalent (介绍/介紹/解析/分析/原理/机制/機制/仕組み/説明/설명/動作/동작/작동/
  * اشرح/شرح/توضیح/הסבר/อธิบาย=explain).
+ *
+ * KNOWN, ACCEPTED false-positive class (#1140): substring matching cannot see
+ * homograph compounds — Korean 구조 (structure) also fires inside 구조대
+ * (rescue squad). Verified unfixable at this layer: ICU word segmentation
+ * (Intl.Segmenter) returns 구조대 and the particle form 구조가 (which the gate
+ * MUST keep matching) as equally opaque single segments, and a 구조대 denylist
+ * would break 구조대로 ("according to the structure" — 구조 + the 대로
+ * particle), a legitimate structural prompt. The miss rate this design avoids
+ * (silently no-op'ing every prompt in these languages, #994) outweighs the
+ * occasional off-domain fire.
  */
 const STRUCTURAL_UNSEGMENTED = /如何|怎么|怎麼|在哪|哪里|哪裡|追踪|跟踪|追蹤|追跡|トレース|流程|流向|流れ|路径|路徑|経路|调用|調用|呼び出|依赖|依賴|依存|影响|影響|实现|實現|実装|架构|架構|アーキテクチャ|结构|結構|構造|介绍|介紹|解析|分析|原理|机制|機制|仕組み|説明|動作|どうやって|どのように|어떻게|어디|호출|흐름|경로|의존|영향|구현|구조|아키텍처|추적|동작|작동|설명|كيف|أين|اين|يستدعي|استدعاء|يعتمد|تعتمد|يؤثر|تأثير|معماري|بنية|هيكل|تدفق|مسار|تتبع|يعمل|تعمل|اشرح|شرح|چگونه|چطور|کجا|فراخوان|وابسته|تأثیر|معماری|ساختار|مسیر|توضیح|איך|איפה|קורא|תלוי|משפיע|ארכיטקטור|מבנה|זרימה|נתיב|הסבר|อย่างไร|ยังไง|ที่ไหน|เรียกใช้|ขึ้นอยู่กับ|ผลกระทบ|สถาปัตยกรรม|โครงสร้าง|เส้นทาง|ติดตาม|ทำงาน|อธิบาย/;
 

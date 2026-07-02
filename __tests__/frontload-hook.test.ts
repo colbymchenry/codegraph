@@ -232,6 +232,32 @@ describe('hasStructuralKeyword — Latin-script languages, Cyrillic, JA/KO (#112
     expect(hasStructuralKeyword('water the flower')).toBe(false);           // unchanged guarantee
   });
 
+  it('bounded stems reject ordinary-English completions (#1138)', () => {
+    expect(hasStructuralKeyword('he has a callus on his palm')).toBe(false);
+    expect(hasStructuralKeyword('a lovely calligraphy font')).toBe(false);
+    expect(hasStructuralKeyword('Connecticut is a state')).toBe(false);
+    expect(hasStructuralKeyword('connective tissue damage')).toBe(false);
+    expect(hasStructuralKeyword('she is very affectionate')).toBe(false);
+    expect(hasStructuralKeyword('Tracey went home early')).toBe(false);
+  });
+
+  it('bounded stems keep every structural derived form (#1138)', () => {
+    // call
+    expect(hasStructuralKeyword('list the callers of parseToken')).toBe(true);
+    expect(hasStructuralKeyword('what callbacks fire on save')).toBe(true);
+    expect(hasStructuralKeyword('is submitOrder callable from the worker')).toBe(true);
+    expect(hasStructuralKeyword('find every call site of dispose')).toBe(true);
+    expect(hasStructuralKeyword('who called setupRouter')).toBe(true);
+    // trace ("tracing" is covered by the exact-word list — the e drops)
+    expect(hasStructuralKeyword('trace the request')).toBe(true);
+    expect(hasStructuralKeyword('we traced it to the cache layer')).toBe(true);
+    expect(hasStructuralKeyword('add tracing to the pipeline')).toBe(true);
+    // affect / connect
+    expect(hasStructuralKeyword('which modules are affected by this change')).toBe(true);
+    expect(hasStructuralKeyword('how do the connections get pooled')).toBe(true);
+    expect(hasStructuralKeyword('the connector registers itself at boot')).toBe(true);
+  });
+
   it('non-structural prose stays a no-op in every covered language', () => {
     expect(hasStructuralKeyword('corrige cette faute de frappe')).toBe(false);   // FR "fix this typo"
     expect(hasStructuralKeyword('arregla este error tipográfico')).toBe(false);  // ES
