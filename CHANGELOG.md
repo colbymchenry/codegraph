@@ -12,6 +12,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - Lua and Luau method calls with capitalized names (`obj:Method()` — the standard Roblox convention) now link to the right method. Because Lua's method-call syntax looks identical to a Luau type annotation, a capitalized call like `lg:Log()` was misread as declaring the variable's type, so whenever two or more classes shared a method name (`Init`, `Update`, `Destroy`, …) the call was silently dropped from callers, impact/blast-radius, and flow traces. Lowercase method names were unaffected. Thanks @inth3shadows for the precise root-cause analysis and repro. (#1124)
+- Removed dead code left behind by the discontinued managed-reasoning feature. Its `codegraph login` flow was unplugged before ever shipping in a release, but the unused module still shipped inside the platform bundles, and a security review flagged its Windows browser-open step (it routed the login URL through `cmd`, which would have been unsafe had the flow ever been wired back up). The leftover module and its tests are now fully deleted. Thanks @inth3shadows for the report. (#1114)
 
 ## [1.2.0] - 2026-07-02
 

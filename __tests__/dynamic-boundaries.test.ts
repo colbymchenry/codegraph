@@ -8,26 +8,13 @@
  * showing nothing. Deterministic, query-time only, no graph mutation, and a
  * fully connected flow must never produce the section.
  */
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
 import { scanDynamicDispatch } from '../src/mcp/dynamic-boundaries';
-
-// These suites assert on the RAW codegraph_explore output (the Flow / boundary
-// sections). The managed reasoning-offload, when configured on the dev machine
-// (~/.codegraph/config.json `{"offload":{"managed":true}}`), REPLACES that output
-// with a remote Cerebras synthesis — so the structural assertions only hold with
-// the offload off. Disable it for this file so the suite is hermetic regardless
-// of machine config, then restore.
-let _prevOffloadDisable: string | undefined;
-beforeAll(() => { _prevOffloadDisable = process.env.CODEGRAPH_OFFLOAD_DISABLE; process.env.CODEGRAPH_OFFLOAD_DISABLE = '1'; });
-afterAll(() => {
-  if (_prevOffloadDisable === undefined) delete process.env.CODEGRAPH_OFFLOAD_DISABLE;
-  else process.env.CODEGRAPH_OFFLOAD_DISABLE = _prevOffloadDisable;
-});
 
 // ---------------------------------------------------------------------------
 // Unit: the scanner

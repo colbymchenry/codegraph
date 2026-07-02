@@ -334,8 +334,7 @@ function numberSourceLines(slice: string, firstLineNumber: number): string {
  * extension) stop blowing every header up to H1–H4. The path is bold + a code
  * span so it still reads as a header, and the leading ``**` `` stays a UNIQUE,
  * greppable marker — no other explore line begins with it — that the explore
- * truncation boundary (`handleExplore`) and the offload chunker
- * (`reasoning/reasoner.ts`) both key off to cut on whole file sections.
+ * truncation boundary (`handleExplore`) keys off to cut on whole file sections.
  */
 const FILE_SECTION_PREFIX = '**`';
 // Placeholder for codegraph_explore's "Found N symbols across M files." line.
