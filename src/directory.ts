@@ -274,6 +274,39 @@ const STRUCTURAL_WORDS = [
   'dove', 'flusso', 'percors[oi]',
   // Russian (как=how, где=where, путь/пути=path, работает=works)
   'как', 'где', 'путь', 'пути', 'работает',
+  // Ukrainian (як=how, де=where, потік=flow — обліque cases reuse the RU
+  // "поток" stem; працює=works)
+  'як', 'де', 'потік', 'працює',
+  // Dutch (hoe=how, waar=where, roept=calls, werkt=works, aangeroepen=called —
+  // the ge- participle escapes the "aanroep" stem)
+  'hoe', 'waar', 'roept', 'werkt', 'aangeroepen',
+  // Polish + Czech (jak=how — shared; gdzie/kde=where, cesta=path)
+  'jak', 'gdzie', 'kde', 'cesta',
+  // Romanian (cum=how, unde=where; flux is shared with French)
+  'cum', 'unde',
+  // Hungarian (hogyan=how, hol=where)
+  'hogyan', 'hol',
+  // Turkish (nasıl=how, mimari=architecture, takip=trace/follow)
+  'nasıl', 'mimari', 'takip',
+  // Indonesian/Malay (bagaimana=how, di mana/dimana=where, alur=flow, jalur=path)
+  'bagaimana', 'di mana', 'dimana', 'alur', 'jalur',
+  // Vietnamese — spaced Latin with heavy diacritics, the exact class ASCII `\b`
+  // breaks (làm sao/thế nào=how, ở đâu=where, gọi=call, phụ thuộc=depend,
+  // ảnh hưởng=affect, kiến trúc=architecture, cấu trúc=structure, luồng=flow,
+  // đường dẫn=path, hoạt động=works, giải thích=explain, theo dõi=trace)
+  'làm sao', 'thế nào', 'ở đâu', 'gọi', 'phụ thuộc', 'ảnh hưởng', 'kiến trúc',
+  'cấu trúc', 'luồng', 'đường dẫn', 'hoạt động', 'giải thích', 'theo dõi',
+  // Swedish / Danish / Norwegian (hur/hvordan=how, hvor=where, beror=depends,
+  // flöde=flow)
+  'hur', 'hvordan', 'hvor', 'beror', 'flöde',
+  // Finnish (miten=how, missä=where, toimii=works)
+  'miten', 'missä', 'toimii',
+  // Greek (πώς=how, πού=where — accented forms only: unaccented πως/που are
+  // ubiquitous conjunctions; καλεί=calls, δομή=structure, ροή=flow)
+  'πώς', 'πού', 'καλεί', 'δομή', 'ροή',
+  // Hindi (कैसे=how, कहाँ/कहां=where, कॉल=call, निर्भर=depends,
+  // संरचना=structure, प्रवाह=flow)
+  'कैसे', 'कहाँ', 'कहां', 'कॉल', 'निर्भर', 'संरचना', 'प्रवाह',
 ];
 
 /**
@@ -311,28 +344,81 @@ const STRUCTURAL_STEMS = [
   // реализ(ация)=implementation, структур(а), архитектур(а),
   // трассир(овка)=trace, лома(ет)=breaks, объясн(и)=explain, поток=flow)
   'вызыва', 'завис', 'влия', 'реализ', 'структур', 'архитектур', 'трассир', 'лома', 'объясн', 'поток',
+  // Ukrainian — і/и spellings diverge from Russian (виклика(є)=calls,
+  // залеж(ить)=depends, вплива(є)=affects, архітектур(а), реаліз(ація),
+  // поясн(и)=explain, шлях(у)=path; структур(а) is shared with Russian)
+  'виклика', 'залеж', 'вплива', 'архітектур', 'реаліз', 'поясн', 'шлях',
+  // Dutch (aanroep(en)=call, afhankelijk(heid)=depends, beïnvloed(t)=affects,
+  // structuur — "structur" can't reach the uu; uitleg(gen)=explain)
+  'aanroep', 'afhankelijk', 'beïnvloed', 'structuur', 'uitleg',
+  // Polish (wywoł(uje)=calls, zależ(y)=depends, wpływ(a)=affects/impact,
+  // przepływ=flow, ścieżk(a)=path, działa(nie)=works, wyjaśni(j)=explain,
+  // śledz(enie)=trace; architektura/struktura fire via the German stems)
+  'wywoł', 'zależ', 'wpływ', 'przepływ', 'ścieżk', 'działa', 'wyjaśni', 'śledz',
+  // Czech (volá(ní)=calls, závis(í)=depends, ovlivň(uje)=affects,
+  // funguj(e)=works, vysvětl(i)=explain)
+  'volá', 'závis', 'ovlivň', 'funguj', 'vysvětl',
+  // Romanian (apel(ează)=calls, depind(e)=depends — i not e, so "depend" misses
+  // it; arhitectur(a) — no c; funcțion(ează)=works, explică=explain)
+  'apel', 'depind', 'arhitectur', 'funcțion', 'explică',
+  // Hungarian (hív(ja)=calls, függ(őség)=depends, működ(ik)=works,
+  // struktúr(a) — ú escapes "struktur"; magyaráz(d)=explain;
+  // architektúra fires via the German stem)
+  'hív', 'függ', 'működ', 'struktúr', 'magyaráz',
+  // Turkish — agglutinative, so stems beat exact words (nere(de/ye/den)=where,
+  // çağır/çağrı=call, bağıml(ı)=depends, bağlant(ı)=connection, akış(ı)=flow,
+  // etkile(r)/etkisi=affects/impact)
+  'nere', 'çağır', 'çağrı', 'bağıml', 'bağlant', 'akış', 'etkile', 'etkisi',
+  // Indonesian/Malay — me-/di-/ber- prefixes block a bare stem, so affixed
+  // forms are listed too (panggil(an)/memanggil/dipanggil=call,
+  // bergantung/tergantung=depends, pengaruh/mempengaruhi/memengaruhi=affect,
+  // arsitektur=architecture, fungsi/berfungsi=works,
+  // jelaskan/menjelaskan=explain)
+  'panggil', 'memanggil', 'dipanggil', 'bergantung', 'tergantung', 'pengaruh',
+  'mempengaruhi', 'memengaruhi', 'arsitektur', 'fungsi', 'berfungsi', 'jelaskan', 'menjelaskan',
+  // Swedish / Danish / Norwegian (anrop(ar)=calls, påverk(ar)/påvirk(er)=affects,
+  // afhæng(er)/avheng(er)=depends, förklar(a)/forklar=explain,
+  // arkitektur — k not ch; funger(ar/er)=works)
+  'anrop', 'påverk', 'påvirk', 'afhæng', 'avheng', 'förklar', 'forklar', 'arkitektur', 'funger',
+  // Finnish (kutsu(u)=calls, riippu(u)=depends, arkkitehtuur(i),
+  // rakente(en)=structure, selit(ä)=explain)
+  'kutsu', 'riippu', 'arkkitehtuur', 'rakente', 'selit',
+  // Greek — accented and unaccented stem spellings both occur
+  // (εξαρτ(άται)=depends, επηρε(άζει)=affects, αρχιτεκτονικ(ή),
+  // διαδρομ(ή)=path, εξηγ/εξήγ(ησε)=explain)
+  'εξαρτ', 'επηρε', 'αρχιτεκτονικ', 'διαδρομ', 'εξηγ', 'εξήγ',
+  // Hindi (समझा(ओ/इए)=explain, आर्किटेक्चर=architecture)
+  'समझा', 'आर्किटेक्चर',
 ];
 
 const STRUCTURAL_WORDS_RE = new RegExp(`${NOT_WORD_BEFORE}(?:${STRUCTURAL_WORDS.join('|')})${NOT_WORD_AFTER}`, 'iu');
 const STRUCTURAL_STEMS_RE = new RegExp(`${NOT_WORD_BEFORE}(?:${STRUCTURAL_STEMS.join('|')})`, 'iu');
 
 /**
- * Structural keywords for scripts written without word separators — Chinese
- * (simplified AND traditional; the original #994 set was simplified-only),
- * Japanese, and Korean (spaced, but particles attach directly to the noun:
- * 구조가/구조를, so a bounded match would miss them) — matched as bare
- * substrings. JS's `\b` can never fire between Han characters, which was issue
- * #994: the English-only gate silently no-op'd every Chinese prompt, so
- * non-English users got no front-load nudge and no error to explain why. The
- * sets mirror the English intent (如何/怎么/怎麼/どうやって/どのように/어떻게=how,
- * 在哪/哪里/哪裡/어디=where, 流程/流向/流れ/흐름=flow, 路径/路徑/経路/경로=path,
- * 调用/調用/呼び出/호출=call, 依赖/依賴/依存/의존=depend, 影响/影響/영향=impact/affect,
- * 实现/實現/実装/구현=implement, 架构/架構/アーキテクチャ/아키텍처=architecture,
- * 结构/結構/構造/구조=structure, 追踪/跟踪/追蹤/追跡/トレース/추적=trace) plus
- * structural-overview words with no single clean English equivalent
- * (介绍/介紹/解析/分析/原理/机制/機制/仕組み/説明/설명/動作/동작/작동).
+ * Structural keywords matched as bare SUBSTRINGS, for languages where a
+ * boundary can't be relied on: scripts with no word separators (Chinese —
+ * simplified AND traditional; the original #994 set was simplified-only —
+ * Japanese, Thai), Korean (spaced, but particles attach directly to the noun:
+ * 구조가/구조를), and Arabic / Farsi / Hebrew (spaced, but proclitics attach to
+ * the word: وكيف "and-how", והמבנה "and-the-structure"). JS's `\b` can never
+ * fire between Han characters, which was issue #994: the English-only gate
+ * silently no-op'd every Chinese prompt, so non-English users got no front-load
+ * nudge and no error to explain why. The sets mirror the English intent
+ * (如何/怎么/怎麼/どうやって/どのように/어떻게/كيف/چگونه/چطور/איך/อย่างไร/ยังไง=how,
+ * 在哪/哪里/哪裡/어디/أين/كجا/איפה/ที่ไหน=where, 流程/流向/流れ/흐름/تدفق/זרימה=flow,
+ * 路径/路徑/経路/경로/مسار/مسیر/נתיב/เส้นทาง=path,
+ * 调用/調用/呼び出/호출/يستدعي/استدعاء/فراخوان/קורא/เรียกใช้=call,
+ * 依赖/依賴/依存/의존/يعتمد/تعتمد/وابسته/תלוי/ขึ้นอยู่กับ=depend,
+ * 影响/影響/영향/يؤثر/تأثير/تأثیر/משפיע/ผลกระทบ=impact/affect,
+ * 实现/實現/実装/구현=implement,
+ * 架构/架構/アーキテクチャ/아키텍처/معماري/معماری/ארכיטקטור/สถาปัตยกรรม=architecture,
+ * 结构/結構/構造/구조/بنية/هيكل/ساختار/מבנה/โครงสร้าง=structure,
+ * 追踪/跟踪/追蹤/追跡/トレース/추적/تتبع/ติดตาม=trace,
+ * يعمل/تعمل/ทำงาน=works) plus structural-overview words with no single clean
+ * English equivalent (介绍/介紹/解析/分析/原理/机制/機制/仕組み/説明/설명/動作/동작/작동/
+ * اشرح/شرح/توضیح/הסבר/อธิบาย=explain).
  */
-const STRUCTURAL_UNSEGMENTED = /如何|怎么|怎麼|在哪|哪里|哪裡|追踪|跟踪|追蹤|追跡|トレース|流程|流向|流れ|路径|路徑|経路|调用|調用|呼び出|依赖|依賴|依存|影响|影響|实现|實現|実装|架构|架構|アーキテクチャ|结构|結構|構造|介绍|介紹|解析|分析|原理|机制|機制|仕組み|説明|動作|どうやって|どのように|어떻게|어디|호출|흐름|경로|의존|영향|구현|구조|아키텍처|추적|동작|작동|설명/;
+const STRUCTURAL_UNSEGMENTED = /如何|怎么|怎麼|在哪|哪里|哪裡|追踪|跟踪|追蹤|追跡|トレース|流程|流向|流れ|路径|路徑|経路|调用|調用|呼び出|依赖|依賴|依存|影响|影響|实现|實現|実装|架构|架構|アーキテクチャ|结构|結構|構造|介绍|介紹|解析|分析|原理|机制|機制|仕組み|説明|動作|どうやって|どのように|어떻게|어디|호출|흐름|경로|의존|영향|구현|구조|아키텍처|추적|동작|작동|설명|كيف|أين|اين|يستدعي|استدعاء|يعتمد|تعتمد|يؤثر|تأثير|معماري|بنية|هيكل|تدفق|مسار|تتبع|يعمل|تعمل|اشرح|شرح|چگونه|چطور|کجا|فراخوان|وابسته|تأثیر|معماری|ساختار|مسیر|توضیح|איך|איפה|קורא|תלוי|משפיע|ארכיטקטור|מבנה|זרימה|נתיב|הסבר|อย่างไร|ยังไง|ที่ไหน|เรียกใช้|ขึ้นอยู่กับ|ผลกระทบ|สถาปัตยกรรม|โครงสร้าง|เส้นทาง|ติดตาม|ทำงาน|อธิบาย/;
 
 /** Doc/data/asset file extensions — a `name.ext` of this kind is a file
  *  reference, not a code symbol, so it must not trip the member-access signal. */
@@ -343,8 +429,10 @@ const DOC_DATA_EXT = /\.(md|markdown|txt|rst|json|ya?ml|toml|lock|csv|tsv|log|in
  * self-contained signal, so the front-load hook fires on it directly — no graph
  * check needed. (A *code-token* match, by contrast, is only a candidate the
  * hook verifies against the graph first; see {@link extractCodeTokens}.)
- * Coverage is multilingual: English, the major Latin-script languages, and
- * Cyrillic (#1126), plus Chinese/Japanese/Korean (#994).
+ * Coverage is multilingual (#994, #1126): the ~29 languages with the largest
+ * developer populations, across Latin, Cyrillic, Greek, CJK, Hangul, Arabic,
+ * Hebrew, Thai, and Devanagari scripts. Languages beyond the keyword table
+ * still fire through the language-agnostic code-token path.
  */
 export function hasStructuralKeyword(prompt: string): boolean {
   return (

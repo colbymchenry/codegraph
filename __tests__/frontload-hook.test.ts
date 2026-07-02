@@ -190,6 +190,42 @@ describe('hasStructuralKeyword — Latin-script languages, Cyrillic, JA/KO (#112
     expect(hasStructuralKeyword('what are the dependencies of the parser?')).toBe(true);
   });
 
+  it('second-tier languages fire — VI/TR/ID/PL/UA/NL/CS/RO/HU/EL/SV/NO/FI/HI', () => {
+    expect(hasStructuralKeyword('state machine của đơn hàng hoạt động thế nào?')).toBe(true);   // Vietnamese
+    expect(hasStructuralKeyword('sipariş durum makinesi nasıl çalışıyor?')).toBe(true);          // Turkish
+    expect(hasStructuralKeyword('bu fonksiyonun bağımlılıkları neler?')).toBe(true);             // Turkish (stem)
+    expect(hasStructuralKeyword('bagaimana cara kerja mesin status pesanan?')).toBe(true);       // Indonesian
+    expect(hasStructuralKeyword('jak działa maszyna stanów zamówień?')).toBe(true);              // Polish
+    expect(hasStructuralKeyword('co wywołuje tę funkcję?')).toBe(true);                          // Polish (stem)
+    expect(hasStructuralKeyword('як працює кінцевий автомат замовлень?')).toBe(true);            // Ukrainian
+    expect(hasStructuralKeyword('від чого залежить модуль оплати?')).toBe(true);                 // Ukrainian (stem)
+    expect(hasStructuralKeyword('hoe werkt de state machine van bestellingen?')).toBe(true);     // Dutch
+    expect(hasStructuralKeyword('jak funguje stavový automat objednávek?')).toBe(true);          // Czech
+    expect(hasStructuralKeyword('cum funcționează mașina de stări a comenzilor?')).toBe(true);   // Romanian
+    expect(hasStructuralKeyword('hogyan működik a rendelések állapotgépe?')).toBe(true);         // Hungarian
+    expect(hasStructuralKeyword('πώς λειτουργεί η μηχανή καταστάσεων παραγγελιών;')).toBe(true); // Greek
+    expect(hasStructuralKeyword('hur fungerar orderns tillståndsmaskin?')).toBe(true);           // Swedish
+    expect(hasStructuralKeyword('hvordan fungerer ordrenes tilstandsmaskin?')).toBe(true);       // Norwegian/Danish
+    expect(hasStructuralKeyword('miten tilausten tilakone toimii?')).toBe(true);                 // Finnish
+    expect(hasStructuralKeyword('ऑर्डर स्टेट मशीन कैसे काम करती है?')).toBe(true);                 // Hindi
+  });
+
+  it('RTL scripts and Thai fire — proclitics/unsegmented text uses substring matching', () => {
+    expect(hasStructuralKeyword('كيف تعمل آلة حالات الطلبات؟')).toBe(true);        // Arabic
+    expect(hasStructuralKeyword('وكيف يعتمد هذا على قاعدة البيانات؟')).toBe(true); // Arabic, proclitic و attached
+    expect(hasStructuralKeyword('ماشین وضعیت سفارش‌ها چگونه کار می‌کند؟')).toBe(true); // Farsi
+    expect(hasStructuralKeyword('איך עובדת מכונת המצבים של ההזמנות?')).toBe(true);  // Hebrew
+    expect(hasStructuralKeyword('สถาปัตยกรรมของระบบทำงานอย่างไร')).toBe(true);       // Thai
+  });
+
+  it('terms that collide with English or code words are deliberately excluded', () => {
+    expect(hasStructuralKeyword('pad the buffer with zeros')).toBe(false);     // NL pad=path skipped
+    expect(hasStructuralKeyword('declare a var for the count')).toBe(false);   // SV var=where skipped
+    expect(hasStructuralKeyword('refresh the token')).toBe(false);             // CS tok=flow skipped
+    expect(hasStructuralKeyword('run the llama model locally')).toBe(false);   // ES bare llama skipped
+    expect(hasStructuralKeyword('come back to this later')).toBe(false);       // IT bare come skipped
+  });
+
   it('stems match only at word start — no mid-word false positives', () => {
     expect(hasStructuralKeyword('restructure this paragraph')).toBe(false); // "structur" mid-word
     expect(hasStructuralKeyword('an independent module')).toBe(false);      // "depend" mid-word
@@ -203,6 +239,10 @@ describe('hasStructuralKeyword — Latin-script languages, Cyrillic, JA/KO (#112
     expect(hasStructuralKeyword('исправь эту опечатку')).toBe(false);            // RU
     expect(hasStructuralKeyword('このタイプミスを直して')).toBe(false);            // JA
     expect(hasStructuralKeyword('이 오타를 수정해줘')).toBe(false);                // KO
+    expect(hasStructuralKeyword('sửa lỗi chính tả này')).toBe(false);            // VI
+    expect(hasStructuralKeyword('bu yazım hatasını düzelt')).toBe(false);        // TR
+    expect(hasStructuralKeyword('popraw tę literówkę')).toBe(false);             // PL
+    expect(hasStructuralKeyword('صحح هذا الخطأ الإملائي')).toBe(false);          // AR
   });
 });
 
