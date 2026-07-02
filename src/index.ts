@@ -25,6 +25,7 @@ import {
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { QueryBuilder } from './db/queries';
+import { buildGraphViewData, GraphViewData, GraphViewOptions } from './graph/viewer';
 import {
   isInitialized,
   createDirectory,
@@ -940,6 +941,15 @@ export class CodeGraph {
     const stats = this.queries.getStats();
     stats.dbSizeBytes = this.db.getSize();
     return stats;
+  }
+
+  /**
+   * Assemble the node/edge payload for the interactive graph viewer
+   * (`codegraph view`). Keeps the raw SQLite handle internal — callers get a
+   * typed, render-ready projection rather than direct DB access.
+   */
+  getGraphView(options: GraphViewOptions = {}): GraphViewData {
+    return buildGraphViewData(this.db.getDb(), options);
   }
 
   /**
