@@ -39,6 +39,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  elixir: 'tree-sitter-elixir.wasm',
 };
 
 /**
@@ -96,6 +97,9 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.vue': 'vue',
   '.astro': 'astro',
   '.r': 'r',
+  // Elixir source (.ex) and scripts (.exs)
+  '.ex': 'elixir',
+  '.exs': 'elixir',
   '.pas': 'pascal',
   '.dpr': 'pascal',
   '.dpk': 'pascal',
@@ -413,6 +417,7 @@ export function getLanguageDisplayName(language: Language): string {
     go: 'Go',
     rust: 'Rust',
     r: 'R',
+    elixir: 'Elixir',
     java: 'Java',
     c: 'C',
     cpp: 'C++',
