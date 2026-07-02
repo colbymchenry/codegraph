@@ -8137,11 +8137,17 @@ import foo.cfm;
 </cfcomponent>
 `;
 
-    it('should extract the component name from the cfcomponent tag attribute', () => {
+    it('should name the component from the file name when the tag has no name attribute', () => {
       const result = extractFromSource('TagStyle.cfc', code);
       const cls = result.nodes.find((n) => n.kind === 'class');
       expect(cls?.name).toBe('TagStyle');
       expect(cls?.language).toBe('cfml');
+    });
+
+    it('should prefer an explicit name attribute on the cfcomponent tag', () => {
+      const named = `<cfcomponent name="ExplicitName">\n<cffunction name="a"><cfreturn 1></cffunction>\n</cfcomponent>`;
+      const result = extractFromSource('File.cfc', named);
+      expect(result.nodes.find((n) => n.kind === 'class')?.name).toBe('ExplicitName');
     });
 
     it('should extract cffunction tags as methods with access-derived visibility', () => {
@@ -8264,6 +8270,59 @@ import foo.cfm;
         (r) => r.referenceKind === 'calls' && r.referenceName === 'getId'
       );
       expect(getIdCall?.fromNodeId).toBe(getUsers?.id);
+    });
+  });
+
+  describe('UTF-8 BOM handling (common in CFML saved by Windows editors)', () => {
+    it('should route a BOM-prefixed tag-based .cfc to the tag grammar, not the script grammar', () => {
+      const code = `\uFEFF<cfcomponent output="false">\n<cffunction name="configure" access="public">\n<cfreturn 1>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('ModuleConfig.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls?.name).toBe('ModuleConfig');
+      const configure = result.nodes.find((n) => n.kind === 'method' && n.name === 'configure');
+      expect(configure).toBeDefined();
+    });
+
+    it('should still treat a BOM-prefixed bare-script .cfc as script', () => {
+      const code = `\uFEFFcomponent {\n  function ping() { return "pong"; }\n}\n`;
+      const result = extractFromSource('Ping.cfc', code);
+      expect(result.nodes.find((n) => n.kind === 'class')?.name).toBe('Ping');
+      expect(result.nodes.find((n) => n.kind === 'method')?.name).toBe('ping');
+    });
+  });
+
+  describe('Unquoted tag attribute values (legal in older CFML)', () => {
+    it('should extract functions and inheritance from unquoted attributes', () => {
+      const code = `<cfcomponent extends=Base>\n<cffunction name=doThing access=private>\n<cfreturn 1>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Unquoted.cfc', code);
+      const doThing = result.nodes.find((n) => n.kind === 'method' && n.name === 'doThing');
+      expect(doThing).toBeDefined();
+      expect(doThing?.visibility).toBe('private');
+      const extendsRef = result.unresolvedReferences.find((r) => r.referenceKind === 'extends');
+      expect(extendsRef?.referenceName).toBe('Base');
+    });
+  });
+
+  describe('Functions in a component-level <cfscript> block', () => {
+    it('should classify them as methods of the component (ColdBox ModuleConfig shape)', () => {
+      const code = `<cfcomponent output="false">\n<cfscript>\nfunction configure() {\n  return settings();\n}\nfunction onLoad() {\n  return 1;\n}\n</cfscript>\n</cfcomponent>\n`;
+      const result = extractFromSource('ModuleConfig.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+      expect(methods).toEqual(expect.arrayContaining(['configure', 'onLoad']));
+      expect(result.nodes.filter((n) => n.kind === 'function')).toHaveLength(0);
+      const configure = result.nodes.find((n) => n.kind === 'method' && n.name === 'configure');
+      const containsEdge = result.edges.find(
+        (e) => e.source === cls?.id && e.target === configure?.id && e.kind === 'contains'
+      );
+      expect(containsEdge).toBeDefined();
+    });
+
+    it('should keep kind function for a <cfscript> inside a cffunction body', () => {
+      const code = `<cfcomponent>\n<cffunction name="outer">\n<cfscript>\nfunction innerHelper() { return 1; }\n</cfscript>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Outer.cfc', code);
+      expect(result.nodes.find((n) => n.name === 'outer')?.kind).toBe('method');
+      expect(result.nodes.find((n) => n.name === 'innerHelper')?.kind).toBe('function');
     });
   });
 });

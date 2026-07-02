@@ -227,11 +227,11 @@ export class CfmlExtractor {
       if (sibling.type === 'cf_function_tag') {
         this.extractFunctionTag(sibling, classNode.id, classNode.id);
       } else if (sibling.type === 'cf_script_tag') {
-        this.delegateScriptTag(sibling, classNode.id);
+        this.delegateScriptTag(sibling, classNode.id, true);
       } else if (sibling.type === 'cf_query_tag') {
         this.delegateQueryTag(sibling, classNode.id);
       } else {
-        this.delegateNestedTags(sibling, classNode.id);
+        this.delegateNestedTags(sibling, classNode.id, true);
       }
       lastNode = sibling;
       sibling = sibling.nextSibling;
@@ -293,26 +293,34 @@ export class CfmlExtractor {
    * `<cfcomponent>`'s body — see the implicit-end-tag note on `extractComponent`)
    * ARE normal children, just possibly several levels deep, so a direct-children
    * check misses them. Does not descend into a nested `cf_function_tag` — that
-   * has its own scope and is walked separately.
+   * has its own scope and is walked separately. `parentIsClass` rides along so
+   * a `<cfscript>` at component scope classifies its functions as methods.
    */
-  private delegateNestedTags(node: SyntaxNode, containerId: string | undefined): void {
+  private delegateNestedTags(node: SyntaxNode, containerId: string | undefined, parentIsClass = false): void {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (!child) continue;
       if (child.type === 'cf_script_tag') {
-        this.delegateScriptTag(child, containerId);
+        this.delegateScriptTag(child, containerId, parentIsClass);
       } else if (child.type === 'cf_query_tag') {
         this.delegateQueryTag(child, containerId);
       } else if (child.type === 'cf_function_tag') {
         continue;
       } else {
-        this.delegateNestedTags(child, containerId);
+        this.delegateNestedTags(child, containerId, parentIsClass);
       }
     }
   }
 
-  /** Delegate a `<cfscript>...</cfscript>` tag body to the cfscript grammar. */
-  private delegateScriptTag(scriptTag: SyntaxNode, parentId: string | undefined): void {
+  /**
+   * Delegate a `<cfscript>...</cfscript>` tag body to the cfscript grammar.
+   * With `parentIsClass`, functions declared at the script's top level are the
+   * component's methods (`<cfcomponent><cfscript>function configure(){}` — the
+   * standard ColdBox ModuleConfig shape), so they're re-kinded `function` →
+   * `method` to match how the same function classifies in a script-style CFC.
+   * Functions nested inside another function (closures) keep kind `function`.
+   */
+  private delegateScriptTag(scriptTag: SyntaxNode, parentId: string | undefined, parentIsClass = false): void {
     const content = scriptTag.namedChildren.find((c: SyntaxNode) => c.type === 'cf_script_content');
     if (!content) return;
 
@@ -328,11 +336,22 @@ export class CfmlExtractor {
     // (see createFileNode); the per-node `parentId` contains-edge below
     // already links every emitted symbol into the real tree.
     const innerFileNodeId = result.nodes.find((n) => n.kind === 'file')?.id;
+    // Snippet-top-level symbols are the ones the inner extractor attached
+    // directly to its (dropped) snippet file node — as opposed to closures
+    // nested inside another function.
+    const topLevelIds = new Set(
+      result.edges
+        .filter((e) => e.kind === 'contains' && e.source === innerFileNodeId)
+        .map((e) => e.target)
+    );
     for (const node of result.nodes) {
       if (node.kind === 'file') continue;
       node.startLine += startLine;
       node.endLine += startLine;
       node.language = this.language;
+      if (parentIsClass && node.kind === 'function' && topLevelIds.has(node.id)) {
+        node.kind = 'method';
+      }
       this.nodes.push(node);
       if (parentId) {
         this.edges.push({ source: parentId, target: node.id, kind: 'contains' });
@@ -413,7 +432,11 @@ export class CfmlExtractor {
       if (!nameNode) continue;
       const text = this.source.substring(nameNode.startIndex, nameNode.endIndex);
       if (text.toLowerCase() !== attrName.toLowerCase()) continue;
-      const valueWrapper = attr.namedChildren.find((c: SyntaxNode) => c.type === 'quoted_cf_attribute_value');
+      // Values come wrapped as `quoted_cf_attribute_value` (name="init") or bare
+      // `cf_attribute_value` (name=init — legal and common in older CFML).
+      const valueWrapper = attr.namedChildren.find(
+        (c: SyntaxNode) => c.type === 'quoted_cf_attribute_value' || c.type === 'cf_attribute_value'
+      );
       const valueNode = valueWrapper?.namedChildren.find((c: SyntaxNode) => c.type === 'attribute_value');
       if (!valueNode) return '';
       return this.source.substring(valueNode.startIndex, valueNode.endIndex);
@@ -429,16 +452,18 @@ export class CfmlExtractor {
 
 /**
  * Sniff whether CFML source is bare-script (`component { ... }`, modern style)
- * vs tag-based (`<cfcomponent>`, `<cfif>`, HTML). Skips leading whitespace and
- * `//`/`/* *\/` comments to find the first real token; tag-based files start
- * with `<`, script-based files don't.
+ * vs tag-based (`<cfcomponent>`, `<cfif>`, HTML). Skips a leading UTF-8 BOM
+ * (endemic in CFML's Windows-editor history — 17% of ColdBox's files carry
+ * one; both grammars parse fine with it once routed correctly), whitespace,
+ * and `//`/`/* *\/` comments to find the first real token; tag-based files
+ * start with `<`, script-based files don't.
  */
 export function isBareScriptCfml(source: string): boolean {
   let i = 0;
   const len = source.length;
   while (i < len) {
     const ch = source[i];
-    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\uFEFF') {
       i++;
     } else if (ch === '/' && source[i + 1] === '/') {
       const nl = source.indexOf('\n', i);
