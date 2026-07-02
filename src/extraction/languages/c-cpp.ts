@@ -384,11 +384,91 @@ export function blankMetalAttributes(source: string): string {
   return source.replace(METAL_ATTRIBUTE_RE, (m) => ' '.repeat(m.length));
 }
 
-/** C/C++ source pre-processing before tree-sitter: recover both macro-annotated
- * class definitions and macro-prefixed function definitions — plus, for `.metal`
- * shaders (parsed with the C++ grammar), MSL attribute annotations. Offset-preserving. */
+/**
+ * Blank annotation-style macro invocations that decorate a declaration but carry
+ * NO terminating semicolon — the pervasive Unreal-Engine reflection markup
+ * (`UPROPERTY(...)`, `UFUNCTION(...)`, `UCLASS(...)`, `GENERATED_BODY()`,
+ * `UE_DEPRECATED_FORGAME(...)`, `DECLARE_DELEGATE_*(...)`, …) that sits on its
+ * own line right before a member/type. tree-sitter's C++ grammar doesn't know
+ * these are macros, so each one drops into error recovery; in a big reflected
+ * class (`CharacterMovementComponent.h` has ~240 of them) the errors accumulate
+ * until the enclosing `class_specifier` can't close and collapses into an ERROR
+ * node — the whole class definition, its members, and its `extends` edges vanish
+ * from the graph. Neither `blankCppExportMacros` (class-header export macros) nor
+ * `blankCppInlineMacros` (return-type inline specifiers) touches these in-body
+ * markup macros. Replacing each with equal-length spaces preserves every byte
+ * offset (so line/column stay exact) and the class then parses normally.
+ *
+ * Deliberately name-list-FREE — UE alone has hundreds of such macros and projects
+ * add their own — so it keys on structure, not a curated list, matched tightly to
+ * avoid touching legitimate C++:
+ *  - the macro must be the FIRST non-whitespace token on its line (`^[ \t]*`),
+ *    which is where declaration markup lives — so a macro used inside an
+ *    expression or condition (`if (CHECK(x))`, `x = MACRO(a) + b`) is never
+ *    matched (it isn't line-leading);
+ *  - the name must be ALL-CAPS (`[A-Z][A-Z0-9_]{2,}`), since ordinary
+ *    function/type names called at line start are lower/mixed case;
+ *  - the char after the balanced `(...)` must START A DECLARATION — a letter,
+ *    `_`, `~` (destructor), or `#` (a following directive). Declaration markup is
+ *    always followed by the thing it decorates (`UPROPERTY(...)\n float X;`,
+ *    `UE_DEPRECATED(...) UPROPERTY(...)`), whereas a statement call is followed by
+ *    `;` (`FOO(x);`), an init-list item by `,`/`{`, and an expression fragment by
+ *    an operator (`MAKE(a) + 1`) — all rejected. String/char literals inside the
+ *    args are skipped so an embedded `)` can't mis-close the balance.
+ *
+ * C++-only (wired into cppExtractor). A blanked macro inside a block comment is
+ * harmless (comments don't parse), and the rare line-leading no-semicolon
+ * ALL-CAPS call that isn't markup only loses that one annotation, never a whole
+ * class.
+ */
+export function blankCppAnnotationMacroCalls(source: string): string {
+  if (!/^[ \t]*[A-Z][A-Z0-9_]{2,}\s*\(/m.test(source)) return source;
+  const chars = source.split('');
+  const re = /^([ \t]*)([A-Z][A-Z0-9_]{2,})(\s*)\(/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const macroStart = m.index + (m[1] ?? '').length; // skip leading indent
+    let i = m.index + m[0].length - 1; // index of the opening '('
+    let depth = 0;
+    let end = -1;
+    for (; i < source.length; i++) {
+      const c = source[i];
+      if (c === '"' || c === "'") {
+        const quote = c;
+        i++;
+        while (i < source.length && source[i] !== quote) {
+          if (source[i] === '\\') i++;
+          i++;
+        }
+        continue;
+      }
+      if (c === '(') depth++;
+      else if (c === ')') {
+        depth--;
+        if (depth === 0) { end = i + 1; break; }
+      }
+    }
+    if (end < 0) continue;
+    let j = end;
+    while (j < source.length && /\s/.test(source[j] as string)) j++;
+    const after = source[j];
+    // Only markup is followed by the declaration it decorates; a statement call
+    // (`;`), init-list item (`,`/`{`), or expression fragment (operator) is not.
+    if (!after || !/[A-Za-z_~#]/.test(after)) continue;
+    for (let k = macroStart; k < end; k++) {
+      if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
+    }
+    re.lastIndex = end;
+  }
+  return chars.join('');
+}
+
+/** C/C++ source pre-processing before tree-sitter: recover macro-annotated class
+ * definitions, macro-prefixed function definitions, and macro-decorated members
+ * (Unreal-Engine reflection markup) — plus, for `.metal` shaders (parsed with the
+ * C++ grammar), MSL attribute annotations. Offset-preserving. */
 function preParseCppSource(source: string, filePath?: string): string {
-  const blanked = blankCppInlineMacros(blankCppExportMacros(source));
+  const blanked = blankCppAnnotationMacroCalls(blankCppInlineMacros(blankCppExportMacros(source)));
   return filePath && filePath.toLowerCase().endsWith('.metal')
     ? blankMetalAttributes(blanked)
     : blanked;
