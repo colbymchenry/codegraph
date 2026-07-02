@@ -882,6 +882,7 @@ export class ReferenceResolver {
           // tooling label "callback registration" and lets validation diff
           // exactly the edges this feature added.
           ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),
+          ...(ref.synthesizedBy ? { synthesizedBy: ref.synthesizedBy } : {}), 
         },
       };
     });

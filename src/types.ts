@@ -38,6 +38,7 @@ export const NODE_KINDS = [
   'export',
   'route',
   'component',
+  'arkui_page',
 ] as const;
 
 export type NodeKind = (typeof NODE_KINDS)[number];
@@ -90,6 +91,7 @@ export const LANGUAGES = [
   'lua',
   'luau',
   'objc',
+  'arkts',
   'r',
   'yaml',
   'twig',

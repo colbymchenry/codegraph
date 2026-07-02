@@ -397,6 +397,7 @@ export function kindBonus(kind: Node['kind']): number {
     enum: 5,
     component: 8,
     route: 9,
+    arkui_page: 9,
     module: 4,
     property: 3,
     field: 3,

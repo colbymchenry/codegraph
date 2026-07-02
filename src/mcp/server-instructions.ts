@@ -54,6 +54,18 @@ calls; a grep/read exploration is dozens.
 - **Reading or editing a file/symbol you can name** → put its name or file path in the \`codegraph_explore\` query — it returns that current line-numbered source (safe to \`Edit\` from) with the call path and blast radius attached, so you don't Read it separately. For an overloaded name it returns every matching definition's body in one call.
 - **Need more?** Call \`codegraph_explore\` again with more specific names — treat the source it returns as already Read.
 
+## ArkUI / HarmonyOS
+
+Codegraph synthesizes ArkUI component relationships that static analysis alone
+misses. These edges carry \`[ArkUI …]\` labels in output and flow through
+\`codegraph_explore\` just like direct calls:
+
+- **Component tree**: \`build()\` renders child components → \`[ArkUI render <Widget>]\`
+- **Event binding**: \`.onClick(this.handler)\` creates an edge from \`build()\` → handler
+- **State dependency**: a handler reading \`this.count\` links to the \`@State count\` property
+- **State chain**: any sibling method in the struct links to \`build()\` (potential re-render)
+- **@Builder**: \`this.myBuilder()\` in \`build()\` links to the \`@Builder\` method
+
 ## Anti-patterns
 
 - **Trust codegraph's results — don't re-verify them with grep.** They come from a full AST parse; re-checking with grep is slower, less accurate, and wastes context.

@@ -39,6 +39,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  arkts: 'tree-sitter-arkts.wasm',
 };
 
 /**
@@ -50,6 +51,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // ESM/CJS TypeScript module extensions — parsed as TS (no JSX). (#366)
   '.mts': 'typescript',
   '.cts': 'typescript',
+  '.ets': 'arkts',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
@@ -225,7 +227,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
       // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
       // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'arkts')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -436,6 +438,7 @@ export function getLanguageDisplayName(language: Language): string {
     lua: 'Lua',
     luau: 'Luau',
     objc: 'Objective-C',
+    arkts: 'ArkTS',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',

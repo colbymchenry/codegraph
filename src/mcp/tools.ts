@@ -516,7 +516,7 @@ export const tools: ToolDefinition[] = [
         kind: {
           type: 'string',
           description: 'Filter by node kind',
-          enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component'],
+          enum: ['function', 'method', 'class', 'struct', 'interface', 'type', 'variable', 'route', 'component', 'arkui_page'],
         },
         limit: {
           type: 'number',
@@ -1777,6 +1777,56 @@ export class ToolHandler {
       return {
         label: `renders ${child} (JSX child — dynamic dispatch)`,
         compact: `dynamic: renders ${child}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'arkui-route') {
+      return {
+        label: 'ArkUI Router — navigates to page',
+        compact: 'dynamic: ArkUI Router',
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'arkui-state-chain') {
+      const via = m.via ? `\`${String(m.via)}\`` : 'sibling method';
+      return {
+        label: `ArkUI state chain — ${via} triggers build() re-render (dynamic dispatch)`,
+        compact: `dynamic: ArkUI state chain via ${via}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'arkui-state-dep') {
+      const decorator = m.decorator ? `\`${String(m.decorator)}\`` : '@State';
+      const prop = m.property ? String(m.property) : 'property';
+      return {
+        label: `ArkUI state dep — reads ${decorator} ${prop} (dynamic dispatch)`,
+        compact: `dynamic: ArkUI reads ${decorator} ${prop}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'arkui-event-chain') {
+      const ev = m.event ? `\`${String(m.event)}\`` : 'an event';
+      const handler = m.handler ? `\`${String(m.handler)}\`` : 'handler';
+      return {
+        label: `ArkUI event chain — .on${String(m.event || 'Event')}() → ${handler} (dynamic dispatch)`,
+        compact: `dynamic: ArkUI ${ev} → ${handler}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'arkui-render') {
+      const widget = m.widget ? `<${String(m.widget)}>` : 'child widget';
+      const extra = (m.forEach ? ' in list' : '') + (m.conditional ? ' conditional' : '');
+      return {
+        label: `ArkUI render — renders ${widget}${extra} (dynamic dispatch)`,
+        compact: `dynamic: ArkUI renders ${widget}${extra}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'arkui-builder') {
+      const builder = m.builder ? `\`${String(m.builder)}\`` : 'method';
+      return {
+        label: `ArkUI builder — @Builder ${builder} (dynamic dispatch)`,
+        compact: `dynamic: ArkUI @Builder ${builder}${at}`,
         registeredAt,
       };
     }

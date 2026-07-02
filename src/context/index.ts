@@ -158,7 +158,7 @@ const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
  */
 const HIGH_VALUE_NODE_KINDS: NodeKind[] = [
   'function', 'method', 'class', 'interface', 'type_alias', 'struct', 'trait',
-  'component', 'route', 'variable', 'constant', 'enum', 'module', 'namespace',
+  'component', 'route', 'arkui_page', 'variable', 'constant', 'enum', 'module', 'namespace',
 ];
 
 /**
@@ -376,8 +376,12 @@ export class ContextBuilder {
     // "source>target".
     const synthByPair = new Map<string, string>();
     for (const e of subgraph.edges) {
-      if (e.kind !== 'calls' || e.provenance !== 'heuristic') continue;
       const m = e.metadata as Record<string, unknown> | undefined;
+      if (m?.synthesizedBy === 'arkui-route') {
+        synthByPair.set(`${e.source}>${e.target}`, 'navigates to');
+        continue;
+      }
+      if (e.kind !== 'calls' || e.provenance !== 'heuristic') continue;
       if (!m?.synthesizedBy) continue;
       const at = typeof m.registeredAt === 'string' ? ` @${m.registeredAt}` : '';
       const label = m.synthesizedBy === 'callback'
@@ -388,6 +392,18 @@ export class ContextBuilder {
         ? `renders <${String(m.via || 'child')}>`
         : m.synthesizedBy === 'vue-handler'
         ? `Vue @${String(m.event || 'event')} handler`
+        : m.synthesizedBy === 'arkui-state-chain'
+        ? `state chain via ${m.via ? `\`${String(m.via)}\`` : 'method'}${at}`
+        : m.synthesizedBy === 'arkui-state-dep'
+        ? `reads ${m.decorator ? `\`${String(m.decorator)}\`` : '@State'} ${String(m.property || 'prop')}`
+        : m.synthesizedBy === 'arkui-event-chain'
+        ? `event ${m.event ? `\`${String(m.event)}\`` : ''} → ${m.handler ? `\`${String(m.handler)}\`` : 'handler'}${at}`
+        : m.synthesizedBy === 'arkui-render'
+        ? `renders <${String(m.widget || 'widget')}>` +
+          (m.forEach ? ' (in list)' : '') +
+          (m.conditional ? ' (conditional)' : '')
+        : m.synthesizedBy === 'arkui-builder'
+        ? `@Builder ${m.builder ? `\`${String(m.builder)}\`` : 'method'}`
         : `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`;
       synthByPair.set(`${e.source}>${e.target}`, label);
     }
@@ -555,7 +571,7 @@ export class ContextBuilder {
           : ['file', 'module', 'class', 'struct', 'interface', 'trait', 'protocol',
              'function', 'method', 'property', 'field', 'variable', 'constant',
              'enum', 'enum_member', 'type_alias', 'namespace', 'export',
-             'route', 'component'] as NodeKind[];
+             'route', 'component', 'arkui_page'] as NodeKind[];
         for (const term of searchTerms) {
           const termResults = this.queries.searchNodes(term, {
             limit: opts.searchLimit * 2,

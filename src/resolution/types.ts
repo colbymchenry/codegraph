@@ -40,6 +40,8 @@ export interface ResolvedRef {
   confidence: number;
   /** How it was resolved */
   resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path' | 'function-ref';
+    /** Synthesized-by label for rendering (e.g. 'arkui-route', 'callback') */
+  synthesizedBy?: string;
 }
 
 /**

@@ -26,6 +26,9 @@ import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
+import { Node as SyntaxNode } from 'web-tree-sitter';
+import { getNodeText, getChildByField } from '../extraction/tree-sitter-helpers';
+import { getParser } from '../extraction/grammars';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
@@ -1660,6 +1663,668 @@ function svelteKitLoadEdges(ctx: ResolutionContext): Edge[] {
   return edges;
 }
 
+// =============================================================================
+// ArkUI (HarmonyOS) synthesis phases
+// =============================================================================
+// ArkUI structs are tree-sitter-parsed as `class` nodes in .ets files. Each
+// struct with a `build()` method is a component; inside it, `@State`/`@Prop`/
+// `@Link` properties drive re-renders, `@Builder` methods produce sub-trees,
+// and event bindings (`.onClick()`, `.onChange()`) invoke handlers.
+// Three phases close the static gap between these declaration-time concepts
+// and the runtime flow that tree-sitter can't see.
+
+/** ArkUI file extensions handled by these phases. */
+const ARKUI_EXT_RE = /\.ets$/;
+
+/** Set of known ArkUI reactive state decorator names (without @ prefix). */
+const STATE_DECORATOR_SET = new Set([
+  'State', 'Prop', 'Link', 'StorageLink', 'StorageProp', 'Provide', 'Consume',
+]);
+
+/** Regex for ArkUI reactive state decorators: @State / @Prop / @Link / @StorageLink / @Provide / @Consume. */
+const ARKUI_STATE_RE = /@(?:State|Prop|Link|StorageLink|StorageProp|Provide|Consume)\s*(?:\([^)]*\))?\s*(\w+)\s*[:=(]/g;
+
+/** Regex for ArkUI event bindings inside build(): .onClick(...), .onChange(...), etc. */
+const ARKUI_HANDLER_RE = /\.on(?:Click|Change|Appear|DisAppear|Touch|Gesture|DragStart|DragEnd|DragMove|Drop|DragEnter|DragLeave)\s*\([\s\S]*?this\.(\w+)/g;
+
+// --- Phase A: ArkUI state-chain edges ------------------------------------------
+
+/**
+ * Phase A: ArkUI state-chain edges.
+ *
+ * In ArkUI, `@State`/`@Prop` mutation triggers a re-render of `build()`.
+ * The framework-internal re-render hop is invisible to static analysis, so
+ * a flow like "onClick → this.count++ → rebuilt UI" dead-ends at the state
+ * mutation. Bridge it: for each ArkUI struct (class in .ets) with a `build()`
+ * method, link every sibling method → `build()`.
+ */
+export function arkuiStateChainEdges(queries: QueryBuilder, _ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  // ArkUI structs are tree-sitter kind 'struct'; TypeScript classes in .ets
+  // files (libraries, helpers) are kind 'class'. Query both.
+  for (const kind of ['class', 'struct'] as const) {
+  for (const cls of queries.getNodesByKind(kind)) {
+    if (!ARKUI_EXT_RE.test(cls.filePath)) continue;
+    const children = queries.getOutgoingEdges(cls.id, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n && n.kind === 'method');
+    const build = children.find((n) => n.name === 'build');
+    if (!build) continue;
+    let added = 0;
+    for (const m of children) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      if (m.id === build.id) continue;
+      const key = `${m.id}>${build.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: m.id, target: build.id, kind: 'calls', line: m.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'arkui-state-chain', via: m.name, registeredAt: `${build.filePath}:${build.startLine}` },
+      });
+      added++;
+    }
+  }
+  }
+  return edges;
+}
+
+// --- Phase B: ArkUI state-dependency edges ------------------------------------
+
+/**
+ * Phase B: ArkUI state-dependency edges.
+ *
+ * `@State`/`@Prop`/`@Link`/`@StorageLink`/`@Provide`/`@Consume` properties
+ * are the reactive primitives that drive ArkUI re-renders. When a `@Builder`
+ * method or regular method reads `this.<stateProp>`, link the method → the
+ * state property so data-flow traces show which state each method depends on.
+ */
+export function arkuiStateDepEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  // Build a map: structId/classId → methods for quick lookup.
+  const classMethods = new Map<string, { methods: Node[] }>();
+  // ArkUI structs are tree-sitter kind 'struct'; TypeScript classes in .ets
+  // files (libraries, helpers) are kind 'class'. Query both.
+  for (const kind of ['class', 'struct'] as const) {
+  for (const cls of queries.getNodesByKind(kind)) {
+    if (!ARKUI_EXT_RE.test(cls.filePath)) continue;
+    const children = queries.getOutgoingEdges(cls.id, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n && n.kind === 'method');
+    if (children.length > 0) classMethods.set(cls.id, { methods: children });
+  }
+  }
+  if (classMethods.size === 0) return edges;
+
+  for (const file of ctx.getAllFiles()) {
+    if (!ARKUI_EXT_RE.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content) continue;
+
+    const classScopes = ctx.getNodesInFile(file)
+      .filter((n) => (n.kind === 'class' || n.kind === 'struct') && classMethods.has(n.id))
+      .map((c) => ({ id: c.id, start: c.startLine, end: c.endLine }));
+
+    const safe = stripCommentsForRegex(content, 'typescript');
+    ARKUI_STATE_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ARKUI_STATE_RE.exec(safe))) {
+      const propName = m[1]!;
+      const line = safe.slice(0, m.index).split('\n').length;
+
+      // Find which class scope this property belongs to.
+      let classId: string | null = null;
+      for (const scope of classScopes) {
+        if (line >= scope.start && line <= scope.end) {
+          classId = scope.id;
+          break;
+        }
+      }
+      if (!classId) continue;
+
+      // Find the property node for this @State/@Prop/@Link property.
+      const propNode = ctx.getNodesInFile(file).find(
+        (n) => n.kind === 'property' && n.name === propName &&
+          n.startLine >= line && n.startLine <= line + 2
+      );
+      if (!propNode) continue;
+
+      const cm = classMethods.get(classId);
+      if (!cm) continue;
+
+      // For each method in this struct, check if it reads this.<propName>.
+      const refRe = new RegExp(
+        `this\\.${propName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`
+      );
+      for (const method of cm.methods) {
+        const methodSrc = sliceLines(content, method.startLine, method.endLine);
+        if (!methodSrc || !refRe.test(methodSrc)) continue;
+
+        const key = `${method.id}>${propNode.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: method.id, target: propNode.id, kind: 'calls', line: method.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'arkui-state-dep', decorator: m[0]!.split(/\s+/)[0]!, property: propName },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
+// --- Phase C: ArkUI event-chain edges -----------------------------------------
+
+/**
+ * Phase C: ArkUI event-chain edges.
+ *
+ * ArkUI `build()` bodies declare event bindings like
+ * `Button('OK').onClick(() => { this.handleOK() })`. The `handleOK` method
+ * is reachable only at runtime through the framework event system — no static
+ * call edge exists. Bridge it: for each `.ets` file, scan the body of every
+ * `build()` method for `.onXxx(this.handler)` patterns and link
+ * `build() → handlerMethod`.
+ */
+export function arkuiEventChainEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  for (const file of ctx.getAllFiles()) {
+    if (!ARKUI_EXT_RE.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || !/\.on(?:Click|Change|Appear|DisAppear|Touch|Gesture|DragStart|DragEnd|DragMove|Drop|DragEnter|DragLeave)\s*\(/.test(content)) continue;
+
+    const nodes = ctx.getNodesInFile(file);
+    const buildMethods = nodes.filter(
+      (n) => n.kind === 'method' && n.name === 'build' && ARKUI_EXT_RE.test(n.filePath)
+    );
+    if (buildMethods.length === 0) continue;
+
+    for (const build of buildMethods) {
+      const src = sliceLines(content, build.startLine, build.endLine);
+      if (!src) continue;
+
+      ARKUI_HANDLER_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = ARKUI_HANDLER_RE.exec(src))) {
+        const handlerName = m[1]!;
+        if (handlerName === 'build') continue;
+
+        // Resolve handler to a method in the same file.
+        const handler = nodes.find(
+          (n) => n.kind === 'method' && n.name === handlerName
+        );
+        if (!handler || handler.id === build.id) continue;
+
+        const key = `${build.id}>${handler.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: build.id, target: handler.id, kind: 'calls', line: build.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'arkui-event-chain', event: m[0]!.match(/\.on(\w+)/)?.[1] ?? '', handler: handlerName },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
+/**
+ * Recursively collect descendant SyntaxNodes matching any of the given types.
+ */
+function collectDescendantsOfType(node: SyntaxNode, types: string[], out: SyntaxNode[]): void {
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    if (types.includes(child.type)) out.push(child);
+    collectDescendantsOfType(child, types, out);
+  }
+}
+
+/**
+ * Extract the decorator name from a decorator node (e.g., `@State` → `"State"`).
+ */
+function getDecoratorName(decoratorNode: SyntaxNode, source: string): string | null {
+  for (let i = 0; i < decoratorNode.namedChildCount; i++) {
+    const child = decoratorNode.namedChild(i);
+    if (!child) continue;
+    if (child.type === 'identifier') {
+      return getNodeText(child, source);
+    }
+    // Decorator with arguments, e.g. @StorageLink('theme'): the identifier is
+    // nested inside a call_expression.
+    if (child.type === 'call_expression') {
+      const func = getChildByField(child, 'function');
+      if (func && func.type === 'identifier') {
+        return getNodeText(func, source);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract the handler method name from an event binding call expression.
+ * Handles both `.onClick(this.handler)` and `.onClick(() => { this.handler() })`.
+ */
+function extractEventHandlerName(callExpr: SyntaxNode, source: string): string | null {
+  const args = getChildByField(callExpr, 'arguments');
+  if (!args) return null;
+
+  for (let i = args.namedChildCount - 1; i >= 0; i--) {
+    const arg = args.namedChild(i);
+    if (!arg) continue;
+
+    if (arg.type === 'member_expression') {
+      const obj = getChildByField(arg, 'object');
+      const prop = getChildByField(arg, 'property');
+      if (obj && prop && obj.type === 'this') {
+        return getNodeText(prop, source);
+      }
+    }
+
+    if (arg.type === 'arrow_function' || arg.type === 'function_expression') {
+      const body = getChildByField(arg, 'body');
+      if (body) {
+        const memberExprs: SyntaxNode[] = [];
+        collectDescendantsOfType(body, ['member_expression'], memberExprs);
+        for (const me of memberExprs) {
+          const obj = getChildByField(me, 'object');
+          const prop = getChildByField(me, 'property');
+          if (obj && prop && obj.type === 'this') {
+            return getNodeText(prop, source);
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Find the outermost call_expression within an expression_statement node.
+ */
+function findOutermostCallExpression(node: SyntaxNode): SyntaxNode | null {
+  if (node.type === 'call_expression') return node;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    const found = findOutermostCallExpression(child);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * Extract the widget/component name from a call expression.
+ * E.g., `MyButton()` → `"MyButton"`, `ForEach()` → `"ForEach"`.
+ */
+function extractWidgetName(callExpr: SyntaxNode, source: string): string | null {
+  const func = getChildByField(callExpr, 'function');
+  if (!func) return null;
+  if (func.type === 'identifier') return getNodeText(func, source);
+  if (func.type === 'member_expression') {
+    const obj = getChildByField(func, 'object');
+    const prop = getChildByField(func, 'property');
+    if (obj && prop && obj.type === 'identifier' && getNodeText(obj, source) === 'ForEach') {
+      return 'ForEach';
+    }
+    return extractWidgetNameFromChain(func, source);
+  }
+  return null;
+}
+
+/**
+ * Walk a chained member expression to find the widget name.
+ * For patterns like `Column().width(100)` → `"Column"`.
+ */
+function extractWidgetNameFromChain(memberExpr: SyntaxNode, source: string): string | null {
+  const obj = getChildByField(memberExpr, 'object');
+  if (obj && obj.type === 'call_expression') {
+    return extractWidgetName(obj, source);
+  }
+  return null;
+}
+
+/**
+ * Walk the build() body AST recursively, emitting arkui-render edges for
+ * parent→child widget relationships. Handles ForEach bodies and if/else branches.
+ */
+function walkBuildBodyForUiTree(
+  bodyNode: SyntaxNode,
+  structNode: Node,
+  buildNode: Node,
+  methods: Map<string, { graphNode: Node; astNode: SyntaxNode }>,
+  fileNodes: Node[],
+  source: string,
+  addEdge: (src: string, tgt: string, meta: Record<string, unknown>, line?: number) => void,
+  parentWidgetId?: string,
+  metaExtras?: Record<string, unknown>,
+): void {
+  for (let i = 0; i < bodyNode.namedChildCount; i++) {
+    const child = bodyNode.namedChild(i);
+    if (!child) continue;
+
+    if (child.type === 'expression_statement') {
+      const callExpr = findOutermostCallExpression(child);
+      if (callExpr) {
+        processWidgetCall(callExpr, structNode, buildNode, methods, fileNodes, source, addEdge, parentWidgetId, metaExtras);
+      }
+    }
+
+    if (child.type === 'if_statement') {
+      const branchMeta = { ...metaExtras, conditional: true };
+      const cons = getChildByField(child, 'consequence');
+      if (cons) walkBuildBodyForUiTree(cons, structNode, buildNode, methods, fileNodes, source, addEdge, parentWidgetId, branchMeta);
+      const alt = getChildByField(child, 'alternative');
+      if (alt) {
+        if (alt.type === 'else_clause') {
+          walkBuildBodyForUiTree(alt, structNode, buildNode, methods, fileNodes, source, addEdge, parentWidgetId, branchMeta);
+        } else {
+          walkBuildBodyForUiTree(alt, structNode, buildNode, methods, fileNodes, source, addEdge, parentWidgetId, branchMeta);
+        }
+      }
+    }
+
+    if (child.type === 'statement_block') {
+      walkBuildBodyForUiTree(child, structNode, buildNode, methods, fileNodes, source, addEdge, parentWidgetId, metaExtras);
+    }
+
+    if (child.type === 'for_each_statement' || child.type === 'for_statement') {
+      const forBody = getChildByField(child, 'body');
+      if (forBody) {
+        walkBuildBodyForUiTree(forBody, structNode, buildNode, methods, fileNodes, source, addEdge, parentWidgetId, { ...metaExtras, forEach: true });
+      }
+    }
+  }
+}
+
+/**
+ * Process a widget call expression: emit arkui-render edge and recurse into
+ * the widget's trailing statement_block for child widgets.
+ */
+function processWidgetCall(
+  callExpr: SyntaxNode,
+  structNode: Node,
+  buildNode: Node,
+  methods: Map<string, { graphNode: Node; astNode: SyntaxNode }>,
+  fileNodes: Node[],
+  source: string,
+  addEdge: (src: string, tgt: string, meta: Record<string, unknown>, line?: number) => void,
+  parentWidgetId?: string,
+  metaExtras?: Record<string, unknown>,
+): void {
+  const widgetName = extractWidgetName(callExpr, source);
+  if (!widgetName) return;
+
+  if (widgetName === 'ForEach') {
+    const args = getChildByField(callExpr, 'arguments');
+    if (args) {
+      for (let i = 0; i < args.namedChildCount; i++) {
+        const arg = args.namedChild(i);
+        if (!arg) continue;
+        if (arg.type === 'arrow_function' || arg.type === 'function_expression') {
+          const body = getChildByField(arg, 'body');
+          if (body) {
+            walkBuildBodyForUiTree(body, structNode, buildNode, methods, fileNodes, source, addEdge, parentWidgetId, { ...metaExtras, forEach: true });
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  const widgetGraphNode = fileNodes.find(
+    (n) => n.name === widgetName &&
+      (n.kind === 'component' || n.kind === 'arkui_page' || n.kind === 'struct' || n.kind === 'class')
+  );
+
+  const widgetId = widgetGraphNode?.id;
+  const srcId = parentWidgetId ?? structNode.id;
+
+  if (widgetId) {
+    const meta: Record<string, unknown> = { synthesizedBy: 'arkui-render', widget: widgetName };
+    if (metaExtras) Object.assign(meta, metaExtras);
+    addEdge(srcId, widgetId, meta, buildNode.startLine);
+  }
+
+  const childParentId = widgetId ?? parentWidgetId ?? structNode.id;
+  for (let i = 0; i < callExpr.namedChildCount; i++) {
+    const child = callExpr.namedChild(i);
+    if (!child) continue;
+    if (child.type === 'statement_block') {
+      walkBuildBodyForUiTree(child, structNode, buildNode, methods, fileNodes, source, addEdge, childParentId, metaExtras);
+    }
+  }
+
+  const args = getChildByField(callExpr, 'arguments');
+  if (args) {
+    for (let i = 0; i < args.namedChildCount; i++) {
+      const arg = args.namedChild(i);
+      if (!arg) continue;
+      if (arg.type === 'statement_block') {
+        walkBuildBodyForUiTree(arg, structNode, buildNode, methods, fileNodes, source, addEdge, childParentId, metaExtras);
+      }
+    }
+  }
+}
+
+/**
+ * Phase C/D/E/F unified: ArkUI AST-based edge synthesis.
+ *
+ * Uses tree-sitter AST for precise analysis, handling nested closures,
+ * ForEach bodies, if/else branches, @Builder decorators, and state reads
+ * that regex approaches struggle with. One parse pass produces four edge types:
+ *   - arkui-render     (Phase D: UI tree — parent struct → child component)
+ *   - arkui-event-chain (Phase C: build() → event handler method)
+ *   - arkui-state-dep   (Phase E: method → @State/@Prop/@Link property)
+ *   - arkui-builder     (Phase F: build() → @Builder method)
+ */
+export function arkuiAstEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  const addEdge = (source: string, target: string, meta: Record<string, unknown>, line?: number): void => {
+    const key = `${source}>${target}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    edges.push({ source, target, kind: 'calls', line, provenance: 'heuristic', metadata: meta });
+  };
+
+  for (const file of ctx.getAllFiles()) {
+    if (!ARKUI_EXT_RE.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content) continue;
+    // Quick skip: only parse files that contain `build` and have UI patterns
+    if (!/\bbuild\b/.test(content)) continue;
+    if (!/\.on[A-Z]|Column|Row|Text|Button|Image|List|@Builder|@State|@Prop|ForEach/i.test(content)) continue;
+
+    const parser = getParser('arkts');
+    if (!parser) continue;
+    const tree = parser.parse(content);
+    if (!tree) continue;
+
+    const root = tree.rootNode;
+    const fileNodes = ctx.getNodesInFile(file);
+
+    // Find all struct/class declarations at the top level
+    const structLikeNodes: SyntaxNode[] = [];
+    for (let i = 0; i < root.namedChildCount; i++) {
+      const child = root.namedChild(i);
+      if (!child) continue;
+      if (child.type === 'struct_declaration' || child.type === 'class_declaration') {
+        structLikeNodes.push(child);
+      }
+    }
+
+    for (const structNode of structLikeNodes) {
+      const structNameNode = getChildByField(structNode, 'name');
+      if (!structNameNode) continue;
+      const structName = getNodeText(structNameNode, content);
+
+      const structGraphNode = fileNodes.find(
+        (n) => n.name === structName && (n.kind === 'class' || n.kind === 'struct')
+      );
+      if (!structGraphNode) continue;
+
+      const body = getChildByField(structNode, 'body');
+      if (!body) continue;
+
+      // ── Collect methods, @Builder methods, @State properties ──
+      const methods = new Map<string, { graphNode: Node; astNode: SyntaxNode }>();
+      const builderMethods = new Map<string, Node>();
+      const stateProps = new Map<string, { propNode: Node; decorator: string }>();
+      let buildGraphNode: Node | null = null;
+      let buildAstNode: SyntaxNode | null = null;
+
+      const structStart = structGraphNode.startLine;
+      const structEnd = structGraphNode.endLine;
+
+      let pendingBuilderDecorator = false;
+
+      for (let i = 0; i < body.namedChildCount; i++) {
+        const child = body.namedChild(i);
+        if (!child) continue;
+
+        if (child.type === 'decorator') {
+          const decName = getDecoratorName(child, content);
+          if (decName === 'Builder') pendingBuilderDecorator = true;
+          continue;
+        }
+
+        if (child.type === 'method_definition') {
+          const mn = getChildByField(child, 'name');
+          if (!mn) { pendingBuilderDecorator = false; continue; }
+          const mname = getNodeText(mn, content);
+          const graphNode = fileNodes.find(
+            (n) => n.kind === 'method' && n.name === mname &&
+              n.startLine >= structStart && n.startLine <= structEnd
+          );
+          if (!graphNode) { pendingBuilderDecorator = false; continue; }
+          methods.set(mname, { graphNode, astNode: child });
+          if (mname === 'build') { buildGraphNode = graphNode; buildAstNode = child; }
+          if (pendingBuilderDecorator) {
+            builderMethods.set(mname, graphNode);
+            pendingBuilderDecorator = false;
+          }
+          for (let j = 0; j < child.namedChildCount; j++) {
+            const dec = child.namedChild(j);
+            if (dec?.type === 'decorator') {
+              const decName = getDecoratorName(dec, content);
+              if (decName === 'Builder') builderMethods.set(mname, graphNode);
+            }
+          }
+        }
+
+        if (child.type === 'public_field_definition') {
+          const pn = getChildByField(child, 'name');
+          if (!pn) continue;
+          const pname = getNodeText(pn, content);
+          const propNode = fileNodes.find(
+            (n) => n.kind === 'property' && n.name === pname &&
+              n.startLine >= structStart && n.startLine <= structEnd
+          );
+          if (!propNode) continue;
+          for (let j = 0; j < child.namedChildCount; j++) {
+            const dec = child.namedChild(j);
+            if (dec?.type === 'decorator') {
+              const decName = getDecoratorName(dec, content);
+              if (decName && STATE_DECORATOR_SET.has(decName)) {
+                stateProps.set(pname, { propNode, decorator: decName });
+              }
+            }
+          }
+        }
+      }
+
+      if (!buildGraphNode || !buildAstNode) continue;
+
+      // ── Phase D: UI tree edges — walk build() body ──
+      const buildBodyNode = getChildByField(buildAstNode, 'body');
+      if (buildBodyNode) {
+        walkBuildBodyForUiTree(
+          buildBodyNode, structGraphNode, buildGraphNode,
+          methods, fileNodes, content, addEdge
+        );
+      }
+
+      // ── Phase C: Event chain edges — find .onXxx() in build() ──
+      if (buildBodyNode) {
+        const eventCallExprs: SyntaxNode[] = [];
+        collectDescendantsOfType(buildBodyNode, ['call_expression'], eventCallExprs);
+        for (const call of eventCallExprs) {
+          const func = getChildByField(call, 'function');
+          if (!func || func.type !== 'member_expression') continue;
+          const prop = getChildByField(func, 'property');
+          if (!prop) continue;
+          const propName = getNodeText(prop, content);
+          if (!/^on[A-Z]/.test(propName)) continue;
+          const eventName = propName.slice(2);
+          const handlerName = extractEventHandlerName(call, content);
+          if (!handlerName || handlerName === 'build') continue;
+          const handlerMethod = methods.get(handlerName);
+          if (!handlerMethod) continue;
+          addEdge(
+            structGraphNode.id, handlerMethod.graphNode.id,
+            { synthesizedBy: 'arkui-event-chain', event: eventName, handler: handlerName },
+            buildGraphNode.startLine
+          );
+        }
+      }
+
+      // ── Phase E: State dependency edges — this.<@State prop> in each method ──
+      for (const [mname, method] of methods) {
+        if (mname === 'build') continue;
+        const methodBody = getChildByField(method.astNode, 'body');
+        if (!methodBody) continue;
+        const memberExprs: SyntaxNode[] = [];
+        collectDescendantsOfType(methodBody, ['member_expression'], memberExprs);
+        for (const me of memberExprs) {
+          const obj = getChildByField(me, 'object');
+          const prop = getChildByField(me, 'property');
+          if (!obj || !prop || obj.type !== 'this') continue;
+          const accessedProp = getNodeText(prop, content);
+          const sp = stateProps.get(accessedProp);
+          if (!sp) continue;
+          addEdge(
+            method.graphNode.id, sp.propNode.id,
+            { synthesizedBy: 'arkui-state-dep', decorator: `@${sp.decorator}`, property: accessedProp },
+            method.graphNode.startLine
+          );
+        }
+      }
+
+      // ── Phase F: Builder edges — this.<@Builder method>() in build() ──
+      if (buildBodyNode && builderMethods.size > 0) {
+        const buildCallExprs: SyntaxNode[] = [];
+        collectDescendantsOfType(buildBodyNode, ['call_expression'], buildCallExprs);
+        for (const call of buildCallExprs) {
+          const func = getChildByField(call, 'function');
+          if (!func || func.type !== 'member_expression') continue;
+          const obj = getChildByField(func, 'object');
+          const prop = getChildByField(func, 'property');
+          if (!obj || !prop || obj.type !== 'this') continue;
+          const calledMethod = getNodeText(prop, content);
+          const builder = builderMethods.get(calledMethod);
+          if (!builder) continue;
+          addEdge(
+            structGraphNode.id, builder.id,
+            { synthesizedBy: 'arkui-builder', builder: calledMethod },
+            buildGraphNode.startLine
+          );
+        }
+      }
+    }
+  }
+
+  return edges;
+}
+
 /**
  * Redux-thunk dispatch chain. `export const X = createAsyncThunk(prefix, async (a, api) => {...})`
  * (or a wrapper like trezor's `createThunk(...)`) passes the async body as an ARGUMENT, so
@@ -2663,7 +3328,7 @@ function laravelEventEdges(ctx: ResolutionContext): Edge[] {
 
 /**
  * Synthesize dispatcher→callback edges (field observers + EventEmitters +
- * React re-render + JSX children + Vue templates + SvelteKit load + RN event
+ * React re-render + JSX children + Vue templates + SvelteKit load + ArkUI phases + RN event
  * channel + Fabric native-impl + MyBatis Java↔XML + Gin middleware chain +
  * Redux-thunk dispatch chain + object-literal registry dispatch + RTK Query
  * generated-hook → endpoint + Pinia useStore().action() + Vuex string dispatch +
@@ -2718,6 +3383,10 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   const rnXPlatEdges = rnCrossPlatformEdges(queries); await yieldToLoop();
   const mybatisEdges = mybatisJavaXmlEdges(queries); await yieldToLoop();
   const ginEdges = ginMiddlewareChainEdges(queries, ctx); await yieldToLoop();
+  const arkuiStateChainE = arkuiStateChainEdges(queries, ctx); await yieldToLoop();
+  const arkuiStateE = arkuiStateDepEdges(queries, ctx); await yieldToLoop();
+  const arkuiEventChainE = arkuiEventChainEdges(ctx); await yieldToLoop();
+  const arkuiAstE = arkuiAstEdges(ctx); await yieldToLoop();
   const thunkEdges = reduxThunkEdges(queries, ctx); await yieldToLoop();
   const registryEdges = await objectRegistryEdges(ctx, yieldToLoop); await yieldToLoop();
   const rtkEdges = rtkQueryEdges(queries, ctx); await yieldToLoop();
@@ -2753,6 +3422,10 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
     ...rnXPlatEdges,
     ...mybatisEdges,
     ...ginEdges,
+    ...arkuiStateChainE,
+    ...arkuiStateE,
+    ...arkuiEventChainE,
+    ...arkuiAstE,
     ...thunkEdges,
     ...registryEdges,
     ...rtkEdges,

@@ -1301,6 +1301,15 @@ export class ExtractionOrchestrator {
         log,
       });
       log(`Parse worker pool: ${poolSize} worker(s)`);
+    
+      // Load grammars in the main thread so post-extraction synthesis
+      // (e.g. ArkUI AST edge synthesis in callback-synthesizer.ts) can
+      // call getParser() successfully. When workers are used, the worker
+      // loads its own copy independently. loadGrammarsForLanguages is
+      // idempotent — already-loaded languages skip the WASM fetch.
+      if (neededLanguages.includes("arkts")){
+        await loadGrammarsForLanguages(neededLanguages);
+      }
     } else {
       // In-process fallback: load grammars locally and parse on the main thread.
       await loadGrammarsForLanguages(neededLanguages);

@@ -38,6 +38,53 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
+import type { Edge } from '../types';
+
+/**
+ * Return a compact edge annotation for heuristic/synthesized edges.
+ * Returns null for non-heuristic edges (tree-sitter direct calls).
+ */
+function synthEdgeCompact(edge: Edge): string | null {
+  const m = edge.metadata as Record<string, unknown> | undefined;
+  if (m?.synthesizedBy === 'arkui-route') return 'ArkUI Router';
+  if (edge.provenance !== 'heuristic') return null;
+  const at = typeof m?.registeredAt === 'string' ? ` @${m.registeredAt}` : '';
+  const s = m?.synthesizedBy;
+  if (s === 'arkui-render') {
+    const widget = m?.widget ? `<${String(m.widget)}>` : 'child';
+    const extra = (m?.forEach ? ' in list' : '') + (m?.conditional ? ' cond' : '');
+    return `ArkUI render ${widget}${extra}`;
+  }
+  if (s === 'arkui-builder') {
+    return `ArkUI @Builder ${m?.builder ? String(m.builder) : ''}`;
+  }
+  if (s === 'arkui-event-chain') {
+    const ev = m?.event ? String(m.event) : 'Event';
+    return `ArkUI ${ev}`;
+  }
+  if (s === 'arkui-state-dep') {
+    const dec = m?.decorator ? String(m.decorator) : '@State';
+    return `ArkUI ${dec}`;
+  }
+  if (s === 'arkui-state-chain') {
+    const via = m?.via ? String(m.via) : 'method';
+    return `ArkUI state chain ${via}`;
+  }
+  if (s === 'jsx-render') {
+    const v = m?.via ? `<${String(m.via)}>` : 'child';
+    return `JSX render ${v}`;
+  }
+  if (s === 'react-render') return 'React re-render';
+  if (s === 'vue-handler') {
+    const ev = m?.event ? `@${String(m.event)}` : 'event';
+    return `Vue ${ev}`;
+  }
+  if (s === 'callback') return 'callback' + at;
+  if (s === 'event-emitter') return 'event-emitter' + at;
+  if (s === 'interface-impl') return 'interface->impl' + at;
+  if (s === 'closure-collection') return 'closure' + at;
+  return 'dynamic' + at;
+}
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -1683,7 +1730,7 @@ program
       }
 
       const seen = new Set<string>();
-      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
+      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number; synthesizedBy?: string; edgeCompact?: string }> = [];
 
       for (const match of matches) {
         const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
@@ -1691,7 +1738,8 @@ program
         for (const c of cg.getCallers(match.node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+                        const ec = synthEdgeCompact(c.edge);
+            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine, synthesizedBy: c.edge.metadata?.synthesizedBy as string | undefined, edgeCompact: ec ?? undefined });
           }
         }
       }
@@ -1701,7 +1749,8 @@ program
         for (const c of cg.getCallers(matches[0].node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+                        const ec = synthEdgeCompact(c.edge);
+            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine, synthesizedBy: c.edge.metadata?.synthesizedBy as string | undefined, edgeCompact: ec ?? undefined });
           }
         }
       }
@@ -1709,16 +1758,22 @@ program
       const limited = allCallers.slice(0, limit);
 
       if (options.json) {
-        console.log(JSON.stringify({ symbol, callers: limited }, null, 2));
+                  const callersJson = limited.map(c => ({
+            name: c.name, kind: c.kind, filePath: c.filePath, startLine: c.startLine,
+            ...(c.synthesizedBy ? { synthesizedBy: c.synthesizedBy } : {}),
+          }));
+          console.log(JSON.stringify({ symbol, callers: callersJson }, null, 2));
       } else if (limited.length === 0) {
         info(`No callers found for "${symbol}"`);
       } else {
         console.log(chalk.bold(`\nCallers of "${symbol}" (${limited.length}):\n`));
         for (const node of limited) {
           const loc = node.startLine ? `:${node.startLine}` : '';
+          const edgeLabel = (node as any).edgeCompact ? chalk.yellow(` [${(node as any).edgeCompact}]`) : '';
           console.log(
             chalk.cyan(node.kind.padEnd(12)) +
-            chalk.white(node.name)
+            chalk.white(node.name) +
+            edgeLabel
           );
           console.log(chalk.dim(`  ${node.filePath}${loc}`));
           console.log();
@@ -1762,7 +1817,7 @@ program
       }
 
       const seen = new Set<string>();
-      const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
+      const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number; synthesizedBy?: string; edgeCompact?: string }> = [];
 
       for (const match of matches) {
         const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
@@ -1770,7 +1825,8 @@ program
         for (const c of cg.getCallees(match.node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+            const ec = synthEdgeCompact(c.edge);
+            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine, synthesizedBy: c.edge.metadata?.synthesizedBy as string | undefined, edgeCompact: ec ?? undefined });
           }
         }
       }
@@ -1779,7 +1835,8 @@ program
         for (const c of cg.getCallees(matches[0].node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+            const ec = synthEdgeCompact(c.edge);
+            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine, synthesizedBy: c.edge.metadata?.synthesizedBy as string | undefined, edgeCompact: ec ?? undefined });
           }
         }
       }
@@ -1787,16 +1844,22 @@ program
       const limited = allCallees.slice(0, limit);
 
       if (options.json) {
-        console.log(JSON.stringify({ symbol, callees: limited }, null, 2));
+                  const calleesJson = limited.map(c => ({
+            name: c.name, kind: c.kind, filePath: c.filePath, startLine: c.startLine,
+            ...(c.synthesizedBy ? { synthesizedBy: c.synthesizedBy } : {}),
+          }));
+          console.log(JSON.stringify({ symbol, callees: calleesJson }, null, 2));
       } else if (limited.length === 0) {
         info(`No callees found for "${symbol}"`);
       } else {
         console.log(chalk.bold(`\nCallees of "${symbol}" (${limited.length}):\n`));
         for (const node of limited) {
           const loc = node.startLine ? `:${node.startLine}` : '';
+          const edgeLabel = (node as any).edgeCompact ? chalk.yellow(` [${(node as any).edgeCompact}]`) : '';
           console.log(
             chalk.cyan(node.kind.padEnd(12)) +
-            chalk.white(node.name)
+            chalk.white(node.name) +
+            edgeLabel
           );
           console.log(chalk.dim(`  ${node.filePath}${loc}`));
           console.log();
@@ -2058,7 +2121,7 @@ program
  */
 program
   .command('install')
-  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
+  .description('Install codegraph MCP server into one or more agents (Chrys, Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity, Kiro)')
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "auto"|"all"|"none". Default: prompt')
   .option('-l, --location <where>', 'Install location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
@@ -2125,7 +2188,7 @@ program
  */
 program
   .command('uninstall')
-  .description('Remove codegraph from your agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
+  .description('Remove codegraph from your agents (Chrys, Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity, Kiro)')
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "all". Default: all')
   .option('-l, --location <where>', 'Uninstall location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=all')
