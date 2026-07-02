@@ -15,6 +15,7 @@ import {
   TraversalOptions,
   SearchOptions,
   SearchResult,
+  SegmentMatch,
   Context,
   GraphStats,
   TaskInput,
@@ -51,6 +52,8 @@ import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import { CodeGraphPackageVersion } from './mcp/version';
+import { segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
+import { createYielder } from './resolution/cooperative-yield';
 
 // Re-export types for consumers
 export * from './types';
@@ -434,6 +437,10 @@ export class CodeGraph {
       }
       try {
         const before = this.queries.getNodeAndEdgeCount();
+        // Segment vocabulary starts empty and is repopulated by the node write
+        // path as every file (re-)indexes below — so a full index is also the
+        // orphan-cleanup pass for names deleted since the last one.
+        try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
         const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
 
         // Re-detect frameworks now that the index is populated. The resolver
@@ -546,6 +553,14 @@ export class CodeGraph {
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
       }
       try {
+        // Captured BEFORE the sync runs: the sync's own incremental writes
+        // populate vocab rows for the files it touches, so an end-of-sync
+        // emptiness check would see "non-empty" and skip the backfill forever,
+        // leaving every unchanged file's names unsegmented.
+        const vocabWasEmpty = (() => {
+          try { return this.queries.isNameSegmentVocabEmpty(); } catch { return false; }
+        })();
+
         const result = await this.orchestrator.sync(options.onProgress);
 
         // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
@@ -607,6 +622,18 @@ export class CodeGraph {
         if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
           this.db.runMaintenance();
         }
+
+        // Heal the segment vocabulary on indexes built before the table
+        // existed (upgrade path): incremental writes above only cover changed
+        // files, so a vocab that was empty when this sync STARTED means the
+        // bulk was never segmented — backfill it (INSERT OR IGNORE, so the
+        // rows the sync just wrote are fine). Batched + yielding — sync can
+        // run on the daemon's liveness-watchdog thread (#850/#1091).
+        try {
+          if (vocabWasEmpty && this.queries.getNodeAndEdgeCount().nodes > 0) {
+            await this.rebuildNameSegmentVocab();
+          }
+        } catch { /* vocab is advisory — never fail a sync over it */ }
 
         return result;
       } finally {
@@ -879,6 +906,123 @@ export class CodeGraph {
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
     return this.queries.searchNodes(query, options);
+  }
+
+  /**
+   * Graph-derived prompt matching for the front-load hook's MEDIUM tier:
+   * which indexed symbols do these prose words name? "state machine des
+   * commandes" → `OrderStateMachine`, in any human language whose technical
+   * nouns are Latin script — no keyword list involved.
+   *
+   * Precision comes from the repo's own naming statistics, not vocabulary:
+   * - CO-OCCURRENCE: ≥2 words that are segments of the SAME name ("state" +
+   *   "machine" → OrderStateMachine) is strong evidence and always qualifies.
+   * - RARITY: a single matched word qualifies only when its segment is
+   *   discriminative here (≤ {@link SEGMENT_RARITY_CEILING} distinct names) —
+   *   "checkout" in a shop backend yes, "state" in a react app no.
+   * Every candidate is re-verified against `nodes` before being returned
+   * (vocab rows are proposals; deletions leave orphans by design), so a
+   * returned symbol is guaranteed to exist right now.
+   */
+  getSegmentMatches(words: string[], limit: number = 6): SegmentMatch[] {
+    if (words.length === 0) return [];
+    // Variant → original word (plural folding), for coverage accounting.
+    const variantToWord = new Map<string, string>();
+    for (const word of words) {
+      for (const variant of segmentLookupVariants(word)) {
+        if (!variantToWord.has(variant)) variantToWord.set(variant, word);
+      }
+    }
+    const variants = [...variantToWord.keys()];
+
+    // Tier A: co-occurrence. minSegments=2 counts VARIANTS, so fold a name's
+    // matched variants back to distinct words before trusting the coverage.
+    const candidates: Array<{ name: string; matchedWords: Set<string> }> = [];
+    for (const hit of this.queries.getSegmentCoOccurrence(variants, 2, 24)) {
+      const matched = this.wordsMatchingName(hit.name, variantToWord);
+      if (matched.size >= 2) candidates.push({ name: hit.name, matchedWords: matched });
+    }
+
+    // Tier B: single rare word. Only when co-occurrence found nothing — a
+    // co-occurring name is categorically stronger evidence — and under
+    // stricter rules, because one word is thin: the word must be ≥5 chars
+    // (measured FPs: "this", "typo"); the segment must appear in AT LEAST TWO
+    // names (a concept the codebase is about clusters across names —
+    // CheckoutService/CheckoutController — while a prose coincidence is a
+    // singleton: measured FP "deploy to PRODUCTION" → the one name
+    // matchesNonProductionDir); and the candidate name must have ≥2 segments
+    // (a bare common verb matching a bare function name — "write" → `write` —
+    // is prose coincidence, not the user naming a symbol).
+    if (candidates.length === 0) {
+      const singleWordVariants = variants.filter((v) => variantToWord.get(v)!.length >= 5);
+      const counts = this.queries.getSegmentNameCounts(singleWordVariants);
+      const rare = [...counts.entries()]
+        .filter(([, n]) => n >= 2 && n <= CodeGraph.SEGMENT_RARITY_CEILING)
+        .sort((a, b) => a[1] - b[1])
+        .slice(0, 2);
+      for (const [variant] of rare) {
+        const word = variantToWord.get(variant)!;
+        for (const name of this.queries.getNamesForSegment(variant, 12)) {
+          if (splitIdentifierSegments(name).length < 2) continue;
+          candidates.push({ name, matchedWords: new Set([word]) });
+        }
+      }
+    }
+
+    // Verify against nodes (the honesty gate) and pick a representative
+    // definition per name — prefer a real symbol over a file/import node.
+    const out: SegmentMatch[] = [];
+    const seen = new Set<string>();
+    candidates.sort((a, b) => b.matchedWords.size - a.matchedWords.size || a.name.length - b.name.length);
+    for (const candidate of candidates) {
+      if (out.length >= limit) break;
+      if (seen.has(candidate.name)) continue;
+      seen.add(candidate.name);
+      const nodes = this.queries.getNodesByName(candidate.name);
+      if (nodes.length === 0) continue; // orphaned vocab row — name no longer exists
+      const rep = nodes.find((n) => n.kind !== 'file' && n.kind !== 'import') ?? nodes[0]!;
+      out.push({
+        name: candidate.name,
+        kind: rep.kind,
+        filePath: rep.filePath,
+        startLine: rep.startLine ?? 0,
+        matchedWords: [...candidate.matchedWords].sort(),
+      });
+    }
+    return out;
+  }
+
+  /** A single word ("state") can match hundreds of names in a big repo — that
+   *  is noise, not signal. Ceiling for the single-word tier; co-occurrence is
+   *  exempt because two words on one name is already discriminative. */
+  private static readonly SEGMENT_RARITY_CEILING = 25;
+
+  /** Which of the prompt's original words match `name`'s segments (via
+   *  variants). Segments are recomputed in JS — a name-keyed vocab lookup
+   *  would scan the (segment, name) primary key. */
+  private wordsMatchingName(name: string, variantToWord: Map<string, string>): Set<string> {
+    const segments = new Set(splitIdentifierSegments(name));
+    const matched = new Set<string>();
+    for (const [variant, word] of variantToWord) {
+      if (segments.has(variant)) matched.add(word);
+    }
+    return matched;
+  }
+
+  /**
+   * Rebuild the segment vocabulary from the current graph, batched and
+   * yielding — the upgrade-heal path for indexes built before the vocab table
+   * existed. Runs inside sync's mutex/lock (callers hold them).
+   */
+  private async rebuildNameSegmentVocab(): Promise<void> {
+    const maybeYield = createYielder();
+    const BATCH = 2000;
+    for (let offset = 0; ; offset += BATCH) {
+      const names = this.queries.getDistinctNodeNames(BATCH, offset);
+      if (names.length === 0) break;
+      this.queries.insertNameSegmentsBatch(names);
+      await maybeYield();
+    }
   }
 
   /**

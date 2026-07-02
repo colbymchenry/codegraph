@@ -9,6 +9,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- The Claude Code context hook now recognizes prompts that describe code in plain words — in any language — by checking the prompt's words against the symbol names actually in your project's index. Asking about "the state machine des commandes" finds `OrderStateMachine` with no keyword involved. Confidence decides how much gets injected: structural questions and prompts naming a real symbol still get full context up front; a plain-words match gets a short pointer to the matching symbols so the agent queries them itself; everything else stays silent, exactly as before.
+- Anonymous usage telemetry now counts how often the context hook injected context, offered a hint, or stayed silent — fixed counter names only; the prompt's content is never stored or sent. This makes the hook's accuracy measurable instead of guessed.
+
 ### Fixes
 
 - The automatic context hook for Claude Code now fires for structural questions asked in nearly thirty languages — French, Spanish, Portuguese, German, Italian, Dutch, Polish, Czech, Romanian, Hungarian, Greek, Swedish, Danish, Norwegian, Finnish, Russian, Ukrainian, Turkish, Indonesian, Vietnamese, Thai, Hindi, Arabic, Farsi, Hebrew, Japanese, Korean, and both simplified and traditional Chinese — instead of just English and simplified Chinese. Previously a natural question like "comment marche la state machine des commandes ?" injected nothing unless it happened to contain a code-shaped symbol name, making the hook look broken for non-English teams. English questions phrased with derived word forms ("explain the architecture…", "what are the dependencies…") now fire too, and prompts in any other language still fire when they name a symbol from the index. Thanks @anthonyle-roy-lgtm for the report. (#1126)
