@@ -1775,6 +1775,51 @@ func main() {
       expect(otherCallers).toContain('useOther');
       expect(otherCallers).not.toContain('use');
     });
+
+    // The same typed-parameter gap existed in every language whose pattern set
+    // only matched keyword-anchored locals (let/var/:=/= new), not the bare
+    // parameter form — Rust, Go, Dart, PHP (#1125). Each case: two classes
+    // sharing a method name + two functions taking one as a typed param; a
+    // correct fix routes each call to its OWN type's method (the collision is
+    // load-bearing — a single class resolves via the same-name fallback either
+    // way). Method↔type association is by qualifiedName, robust where the method
+    // lives outside the type's line range (Rust `impl`, Go method decl).
+    const typedParamCases: Array<{
+      lang: string; file: string; method: string; callerA: string; callerB: string; src: string;
+    }> = [
+      { lang: 'Rust (fn f(x: &T))', file: 'svc.rs', method: 'log', callerA: 'use_it', callerB: 'use_other',
+        src: `pub struct Logger { n: i32 }\nimpl Logger { pub fn log(&self) -> i32 { self.n } }\npub struct Other { n: i32 }\nimpl Other { pub fn log(&self) -> i32 { self.n } }\npub fn use_it(lg: &Logger) -> i32 { lg.log() }\npub fn use_other(o: &Other) -> i32 { o.log() }\n` },
+      { lang: 'Go (func f(x T))', file: 'svc.go', method: 'Log', callerA: 'UseIt', callerB: 'UseOther',
+        src: `package a\ntype Logger struct{}\nfunc (l Logger) Log() int { return 1 }\ntype Other struct{}\nfunc (o Other) Log() int { return 2 }\nfunc UseIt(lg Logger) int { return lg.Log() }\nfunc UseOther(o Other) int { return o.Log() }\n` },
+      { lang: 'Dart (T f(U x))', file: 'svc.dart', method: 'log', callerA: 'useIt', callerB: 'useOther',
+        src: `class Logger { int log() { return 1; } }\nclass Other { int log() { return 2; } }\nint useIt(Logger lg) { return lg.log(); }\nint useOther(Other o) { return o.log(); }\n` },
+      { lang: 'PHP (f(T $x))', file: 'svc.php', method: 'log', callerA: 'useIt', callerB: 'useOther',
+        src: `<?php\nclass Logger { function log() { return 1; } }\nclass Other { function log() { return 2; } }\nfunction useIt(Logger $lg) { return $lg->log(); }\nfunction useOther(Other $o) { return $o->log(); }\n` },
+    ];
+
+    for (const c of typedParamCases) {
+      it(`infers a typed-parameter receiver, disambiguating same-named methods — ${c.lang} (#1125)`, async () => {
+        fs.writeFileSync(path.join(tempDir, c.file), c.src);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        cg.resolveReferences();
+
+        const methods = cg.getNodesByKind('method').filter((n) => n.name === c.method);
+        expect(methods.length, `${c.lang}: both ${c.method} methods indexed`).toBe(2);
+
+        const loggerLog = methods.find((m) => /Logger/.test(m.qualifiedName ?? ''));
+        const otherLog = methods.find((m) => /Other/.test(m.qualifiedName ?? ''));
+        expect(loggerLog, `${c.lang}: Logger's ${c.method}`).toBeDefined();
+        expect(otherLog, `${c.lang}: Other's ${c.method}`).toBeDefined();
+
+        const loggerCallers = cg.getCallers(loggerLog!.id).map((x) => x.node.name);
+        const otherCallers = cg.getCallers(otherLog!.id).map((x) => x.node.name);
+
+        expect(loggerCallers, `${c.lang}: Logger callers`).toContain(c.callerA);
+        expect(loggerCallers, `${c.lang}: Logger callers`).not.toContain(c.callerB);
+        expect(otherCallers, `${c.lang}: Other callers`).toContain(c.callerB);
+        expect(otherCallers, `${c.lang}: Other callers`).not.toContain(c.callerA);
+      });
+    }
   });
 
   describe('Name Matcher: kind bias for new ref kinds', () => {

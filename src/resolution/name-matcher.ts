@@ -1102,12 +1102,21 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
     case 'rust':
       return [
         new RegExp(`\\blet\\s+(?:mut\\s+)?${r}\\b(?:\\s*:[^=]+)?=\\s*&?(?:mut\\s+)?([A-Z][\\w]*)`), // let lg = Logger::new()/Logger{}/Logger
-        new RegExp(`\\blet\\s+(?:mut\\s+)?${r}\\s*:\\s*&?(?:mut\\s+)?([A-Z][\\w]*)`), // let lg: Logger
+        // No `let`, so this covers a `let lg: Logger` binding AND a typed
+        // parameter (`fn use(lg: &Logger)`, a closure `|lg: Logger|`) — the
+        // parameter case the old `let`-anchored pattern excluded (#1125).
+        new RegExp(`\\b${r}\\s*:\\s*&?(?:mut\\s+)?([A-Z][\\w]*)`), // lg: Logger  (binding or typed param)
       ];
     case 'go':
       return [
         new RegExp(`\\b${r}\\b\\s*:=\\s*&?([A-Za-z_][\\w.]*)\\s*{`), // lg := Logger{} / &Logger{}
         new RegExp(`\\bvar\\s+${r}\\s+\\*?([A-Za-z_][\\w.]*)`), // var lg Logger / *Logger
+        // A typed parameter / method receiver (`func use(lg Logger)`,
+        // `func (l Logger) M()`) — name-before-type with no `var`/`:=` (#1125).
+        // PascalCase-guarded (unlike the anchored patterns above) to keep the
+        // keyword-free `ident Type` shape from matching unrelated pairs; the
+        // enclosing-scope bound already excludes package-level struct fields.
+        new RegExp(`\\b${r}\\s+\\*?([A-Z][\\w.]*)`), // func use(lg Logger) / (l Logger)
       ];
     case 'ruby':
       return [
@@ -1121,11 +1130,18 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
     case 'dart':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // var lg = Logger(...)
-        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;]`), // Logger lg = ...
+        // Trailing `[=;,)]` (not just `[=;]`) so a typed parameter — `Logger lg)`
+        // / `Logger lg,` — matches too, not only `Logger lg = ...` / `Logger lg;`
+        // (#1125). Mirrors Java/C#.
+        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;,)]`), // Logger lg = ...  / param
       ];
     case 'php':
       return [
         new RegExp(`\\$?${r}\\b\\s*=\\s*new\\s+([A-Za-z_\\\\][\\w\\\\]*)`), // $lg = new Logger()
+        // A typed parameter (`function use(Logger $lg)`, `?Logger $lg`,
+        // `\\App\\Logger $lg`, `&$lg` by-ref) and a typed `catch (E $e)` — the
+        // type sits before the `$`-variable (#1125). Namespace `\\` allowed.
+        new RegExp(`\\b([A-Za-z_\\\\][\\w\\\\]*)\\s+&?\\$${r}\\b`), // Logger $lg  (typed param)
       ];
     case 'lua':
     case 'luau':
