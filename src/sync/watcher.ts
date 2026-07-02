@@ -46,8 +46,18 @@ import { watchDisabledReason } from './watch-policy';
  * few cycles) stays under this; a long-lived external writer crosses it.
  */
 const MAX_LOCK_RETRIES = 5;
-/** Cap on the exponential lock-retry backoff so it never sleeps absurdly long. */
-const MAX_LOCK_RETRY_DELAY_MS = 30_000;
+/**
+ * Number of consecutive GENERIC (non-lock) sync failures the watcher tolerates
+ * before it degrades auto-sync. A deterministic failure — a tree-sitter
+ * extractor that crashes on one file, DB corruption, `SQLITE_FULL`, an OOM in
+ * batched resolution — recurs every debounce cycle, so left unbounded it would
+ * retry forever (log + work spam) while the auto-update guarantee is silently
+ * dead (#1127). A single clean sync resets the streak, so a transient hiccup
+ * that recovers within the budget never degrades.
+ */
+const MAX_SYNC_FAILURE_RETRIES = 5;
+/** Cap on the exponential retry backoff (either mode) so it never sleeps absurdly long. */
+const MAX_RETRY_BACKOFF_MS = 30_000;
 
 /** Actionable degrade message; both exhaustion paths share it verbatim. */
 const EXHAUSTION_REASON =
@@ -167,8 +177,9 @@ export interface WatchOptions {
 
   /**
    * Callback fired ONCE when live watching degrades permanently and auto-sync
-   * is disabled — OS watch-resource exhaustion (EMFILE/ENFILE), or a write lock
-   * held past the retry budget. The string is an actionable, human-readable
+   * is disabled — OS watch-resource exhaustion (EMFILE/ENFILE), a write lock
+   * held past the retry budget, or a generic sync failure that persists past
+   * the retry budget (#1127). The string is an actionable, human-readable
    * reason. Lets a host (MCP server, daemon, CLI) tell the user that the index
    * will no longer auto-update instead of silently serving stale results.
    */
@@ -250,12 +261,15 @@ export class FileWatcher {
   private inotifyLimitWarned = false;
   /**
    * One-way latch: the reason live watching was permanently disabled at runtime
-   * (watch-resource exhaustion, or lock contention past the retry budget), or
-   * null while healthy. Set by {@link degrade}; cleared only by a fresh start().
+   * (watch-resource exhaustion, lock contention past the retry budget, or a
+   * persistent generic sync failure past the retry budget), or null while
+   * healthy. Set by {@link degrade}; cleared only by a fresh start().
    */
   private degradedReason: string | null = null;
   /** Consecutive lock-contention retries for watcher-triggered syncs. */
   private lockRetryCount = 0;
+  /** Consecutive generic (non-lock) sync failures; reset only by a clean sync. */
+  private syncFailureRetryCount = 0;
   /** Test-only inert mode: started, but with no OS watcher installed. */
   private inert = false;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -329,6 +343,7 @@ export class FileWatcher {
     this.stopped = false;
     this.degradedReason = null;
     this.lockRetryCount = 0;
+    this.syncFailureRetryCount = 0;
 
     // Some environments make filesystem watching unusable — most notably
     // WSL2 /mnt/ drives, where the underlying fs.watch calls block long
@@ -590,7 +605,8 @@ export class FileWatcher {
 
   /**
    * Permanently disable live watching after a terminal runtime failure
-   * (watch-resource exhaustion, or lock contention past the retry budget).
+   * (watch-resource exhaustion, lock contention past the retry budget, or a
+   * persistent generic sync failure past the retry budget).
    * Idempotent: logs one actionable warning, fires {@link WatchOptions.onDegraded}
    * once, and stops the watcher. A subsequent start() clears the latch.
    */
@@ -661,6 +677,7 @@ export class FileWatcher {
     this.dirCapWarned = false;
     this.inotifyLimitWarned = false;
     this.lockRetryCount = 0;
+    this.syncFailureRetryCount = 0;
     // NB: degradedReason is intentionally NOT reset here — it must survive the
     // stop() that degrade() triggers so isDegraded() stays true. start() clears it.
     this.inert = false;
@@ -762,6 +779,7 @@ export class FileWatcher {
     try {
       const result = await this.syncFn();
       this.lockRetryCount = 0; // a clean sync clears any contention backoff
+      this.syncFailureRetryCount = 0; // ...and any generic-failure backoff
       // Remove entries whose most recent event predates this sync — those
       // edits are now in the DB. Entries with lastSeenMs > syncStartedMs
       // arrived mid-sync; whether the in-flight sync captured them depends
@@ -796,10 +814,30 @@ export class FileWatcher {
           );
         }
       } else {
-        this.lockRetryCount = 0; // a non-lock failure isn't contention; reset backoff
+        this.lockRetryCount = 0; // a non-lock failure isn't contention; reset that streak
+        this.syncFailureRetryCount += 1;
         const error = err instanceof Error ? err : new Error(String(err));
-        logWarn('Watch sync failed', { error: error.message });
+        logWarn('Watch sync failed', {
+          error: error.message,
+          retryCount: this.syncFailureRetryCount,
+        });
         this.onSyncError?.(error);
+        // A persistent (deterministic) sync failure — a broken extractor on a
+        // specific file, DB corruption, SQLITE_FULL, an OOM in resolution —
+        // would otherwise retry forever at the debounce cadence, spamming logs
+        // and work while the auto-update guarantee is silently dead (#1127).
+        // Bound it exactly like lock contention: the `finally` block backs off
+        // exponentially, and past the budget we degrade so the dead guarantee
+        // is surfaced (onDegraded / isDegraded) instead of hidden. A single
+        // clean sync resets the streak, so a transient hiccup never degrades.
+        if (this.syncFailureRetryCount > MAX_SYNC_FAILURE_RETRIES) {
+          this.degrade(
+            `CodeGraph auto-sync failed ${this.syncFailureRetryCount} times in a row; ` +
+              'auto-sync disabled. Run `codegraph sync` (or install git sync hooks) to ' +
+              `refresh the graph after changes. Last error: ${error.message}`,
+            { error: error.message, retryCount: this.syncFailureRetryCount }
+          );
+        }
       }
       // Failure: leave pendingFiles untouched. Every edit it tracks is
       // still unindexed; the rescheduled sync sees the same set.
@@ -807,16 +845,19 @@ export class FileWatcher {
       this.syncing = false;
 
       // If pending files remain (mid-sync events, or this sync failed),
-      // schedule another pass. After lock contention, back off exponentially
-      // (debounceMs · 2^(n-1), capped) instead of retrying at the normal
-      // debounce cadence; a clean sync resets lockRetryCount so normal edits
-      // keep the fast debounce. A degrade() above already set `stopped`, so
-      // this won't reschedule a watcher that has given up.
+      // schedule another pass. After EITHER failure mode — lock contention or a
+      // generic sync failure — back off exponentially (debounceMs · 2^(n-1),
+      // capped) instead of retrying at the normal debounce cadence; a clean
+      // sync resets both counters so normal edits keep the fast debounce. Use
+      // the larger streak so interleaved failures still back off. A degrade()
+      // above already set `stopped`, so this won't reschedule a watcher that
+      // has given up.
       if (this.pendingFiles.size > 0 && !this.stopped) {
-        if (this.lockRetryCount > 0) {
+        const retryCount = Math.max(this.lockRetryCount, this.syncFailureRetryCount);
+        if (retryCount > 0) {
           const retryDelayMs = Math.min(
-            this.debounceMs * 2 ** Math.max(0, this.lockRetryCount - 1),
-            MAX_LOCK_RETRY_DELAY_MS
+            this.debounceMs * 2 ** Math.max(0, retryCount - 1),
+            MAX_RETRY_BACKOFF_MS
           );
           this.scheduleRetrySync(retryDelayMs);
         } else {
