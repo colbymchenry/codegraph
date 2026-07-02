@@ -7,25 +7,29 @@ It builds a local SQLite knowledge graph for a project, indexes symbols and
 relationships with tree-sitter, and exposes that graph through a CLI and MCP
 server. The CLI command remains `codegraph`.
 
-[![npm version](https://img.shields.io/npm/v/@zren-zing/codegraph-qt.svg)](https://www.npmjs.com/package/@zren-zing/codegraph-qt)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Install
 
-Install from npm:
+This fork is not published to npm yet. Until it is published, install it from
+this repository:
 
 ```bash
-npm i -g @zren-zing/codegraph-qt
+git clone https://github.com/zren-zing/codegraph-qt.git
+cd codegraph-qt
+npm install
+npm run build
+npm install -g .
 ```
 
-Or run without a global install:
+For local development, you can use a global symlink instead:
 
 ```bash
-npx @zren-zing/codegraph-qt
+npm run build
+npm link
 ```
 
-The published npm package name is `@zren-zing/codegraph-qt`, but the executable
-is still:
+After either local install method, the executable is:
 
 ```bash
 codegraph
@@ -33,9 +37,9 @@ codegraph
 
 ## Requirements
 
-The npm package supports Node.js `>=20.0.0 <25.0.0` for source/development
-usage. The CLI release path can also use self-contained platform bundles that
-include their own Node runtime.
+Source and local-install usage requires Node.js `>=20.0.0 <25.0.0`. A future
+npm release path can also use self-contained platform bundles that include
+their own Node runtime.
 
 For embedded library usage, the host runtime needs Node.js 22.5 or newer when
 opening a graph, because CodeGraph uses Node's built-in `node:sqlite` adapter.
@@ -291,7 +295,12 @@ This repository is configured for:
 - npm package: `@zren-zing/codegraph-qt`
 - CLI binary: `codegraph`
 
-For the first public publish of this scoped package, use:
+The package has not been published to npm yet, so commands such as
+`npm i -g @zren-zing/codegraph-qt` and `npx @zren-zing/codegraph-qt` will not
+work until the first publish is complete. Use the local install steps above for
+now.
+
+When the scoped package is ready for its first public publish, use:
 
 ```bash
 npm publish --access public
