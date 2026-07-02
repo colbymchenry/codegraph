@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCppAnnotationMacroCalls, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -2990,6 +2990,114 @@ public:
       ]) {
         expect(blankCppAnnotationMacroCalls(c)).toBe(c);
       }
+    });
+  });
+
+  describe('C++ member/method-level export macros do not orphan declarations (UE)', () => {
+    // The `*_API` visibility macro doesn't only prefix the class header — it
+    // prefixes almost every exported member/method of a big UE class
+    // (`ENGINE_API virtual void Tick(…)`, `static ENGINE_API void Foo(…)`).
+    // blankCppExportMacros only recovers the class-HEADER form; without blanking
+    // the member form, tree-sitter reads `MACRO <ret> <name>(` as an extra type
+    // token and each declaration drops into error recovery.
+    it('recovers a class + base + members when members are *_API-prefixed', () => {
+      const code = `class ENGINE_API AActor : public UObject
+{
+\tGENERATED_BODY()
+public:
+\tENGINE_API virtual void Tick(float DeltaSeconds);
+\tstatic ENGINE_API void AddReferencedObjects(int32 Count);
+\tENGINE_API float GetLifeSpan() const { return LifeSpan; }
+};
+`;
+      const result = extractFromSource('actor.cpp', code);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'AActor')).toBe(true);
+      // The inline definition (its body prefixed by ENGINE_API) is extracted —
+      // proof the class_specifier closed instead of collapsing into an ERROR.
+      expect(result.nodes.some((n) => n.name === 'GetLifeSpan')).toBe(true);
+      // The base clause survives (inheritance queries keep working).
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'UObject'
+        )
+      ).toBeTruthy();
+    });
+
+    it('blanks only the suffix macro before a declaration, offset-preserving', () => {
+      const inp = `ENGINE_API void Tick();\nstatic MYMOD_EXPORT int32 X;\nLLVM_ABI bool Y();\n`;
+      const out = blankCppApiPrefixMacros(inp);
+      expect(out.length).toBe(inp.length); // every byte offset preserved
+      expect(out).not.toContain('ENGINE_API');
+      expect(out).not.toContain('MYMOD_EXPORT');
+      expect(out).not.toContain('LLVM_ABI');
+      expect(out).toContain('void Tick();');
+      expect(out).toContain('int32 X;');
+      expect(out).toContain('bool Y();');
+      expect(out).toMatch(/static\s+int32 X;/); // `static` kept, only the macro blanked
+    });
+
+    it('does NOT blank an *_API token used as a value or in non-declaration position', () => {
+      for (const c of [
+        'int x = SOME_API;',              // rvalue — trailing ;
+        'if (mode == FOO_API) { g(); }',  // comparison — trailing )
+        'return DEFAULT_API, other;',     // comma operand
+        'auto v = NS_API::Make();',       // qualified name — trailing ::
+        'x = A_API + B_API;',             // operands of + / trailing ;
+      ]) {
+        expect(blankCppApiPrefixMacros(c)).toBe(c);
+      }
+    });
+
+    it('leaves a genuine _API-suffixed word alone when it is itself the name', () => {
+      // A longer word merely CONTAINING _API (not ending in it) must not match.
+      const inp = 'FOO_APIENTRY handler;';
+      expect(blankCppApiPrefixMacros(inp)).toBe(inp);
+    });
+  });
+
+  describe('C++ mid-line UE annotation macros do not collapse the enum/class (UE)', () => {
+    // UMETA / UPARAM / UE_DEPRECATED can sit MID-LINE (not line-leading), where
+    // blankCppAnnotationMacroCalls structurally can't reach them: an enum value's
+    // `UMETA(...)`, or a deprecation tag wedged into a class-scope `using`
+    // (`using X UE_DEPRECATED(5.5, "…") = …;`) — which alone collapsed UWorld in
+    // World.h. blankCppInlineAnnotationMacros strips them, offset-preserving.
+    it('recovers a class whose in-body using-alias carries a mid-line UE_DEPRECATED', () => {
+      const code = `class ENGINE_API UWorld : public UObject
+{
+\tGENERATED_BODY()
+public:
+\tusing FOnNetTickEvent UE_DEPRECATED(5.5, "use TMulticastDelegate<void(float)>") = TMulticastDelegate<void(float)>;
+\tENGINE_API float GetTimeSeconds() const { return TimeSeconds; }
+};
+`;
+      const result = extractFromSource('world.cpp', code);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'UWorld')).toBe(true);
+      // The member after the poison using-alias is reached — the class closed.
+      expect(result.nodes.some((n) => n.name === 'GetTimeSeconds')).toBe(true);
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'UObject'
+        )
+      ).toBeTruthy();
+    });
+
+    it('blanks mid-line UMETA/UPARAM/UE_DEPRECATED with balanced parens, offset-preserving', () => {
+      const inp = `enum class EMode : uint8 {\n\tWalk UMETA(DisplayName="Walk (fast), safe"),\n\tRun\n};\n`;
+      const out = blankCppInlineAnnotationMacros(inp);
+      expect(out.length).toBe(inp.length);
+      expect(out).not.toContain('UMETA');
+      expect(out).toContain('Walk');
+      expect(out).toContain('Run');
+      const inp2 = `void F(UPARAM(ref) int& x) {}\n`;
+      const out2 = blankCppInlineAnnotationMacros(inp2);
+      expect(out2.length).toBe(inp2.length);
+      expect(out2).not.toContain('UPARAM');
+      expect(out2).toContain('int& x');
+    });
+
+    it('does NOT touch source without those UE-only macro names', () => {
+      const c = 'enum class E { A, B };\nvoid metadata(int meta) { return; }\n';
+      expect(blankCppInlineAnnotationMacros(c)).toBe(c);
     });
   });
 
