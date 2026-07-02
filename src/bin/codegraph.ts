@@ -1141,8 +1141,14 @@ program
               process.stdout.write(
                 `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
               );
+              gate(keyworded ? 'high-keyword' : 'high-token');
+            } else {
+              // A high-* outcome must mean context was actually delivered —
+              // the funnel's noop-vs-high split is how gate recall is
+              // measured (#1143). An explore error or empty result is a
+              // delivery failure, not a gate success.
+              gate(keyworded ? 'noop-explore-keyword' : 'noop-explore-token');
             }
-            gate(keyworded ? 'high-keyword' : 'high-token');
             return;
           }
 

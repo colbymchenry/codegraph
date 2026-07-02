@@ -12,7 +12,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New Features
 
 - The Claude Code context hook now recognizes prompts that describe code in plain words — in any language — by checking the prompt's words against the symbol names actually in your project's index. Asking about "the state machine des commandes" finds `OrderStateMachine` with no keyword involved. Confidence decides how much gets injected: structural questions and prompts naming a real symbol still get full context up front; a plain-words match gets a short pointer to the matching symbols so the agent queries them itself; everything else stays silent, exactly as before.
-- Anonymous usage telemetry now counts how often the context hook injected context, offered a hint, or stayed silent — fixed counter names only; the prompt's content is never stored or sent. This makes the hook's accuracy measurable instead of guessed.
+- Anonymous usage telemetry now counts how often the context hook injected context, offered a hint, or stayed silent — fixed counter names only; the prompt's content is never stored or sent. This makes the hook's accuracy measurable instead of guessed. The counters record what actually happened, not what was attempted: a lookup that errors or comes back empty counts as a distinct silent outcome, never as delivered context (#1143, thanks @inth3shadows).
 
 ### Fixes
 
