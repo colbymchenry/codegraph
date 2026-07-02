@@ -1820,6 +1820,47 @@ func main() {
         expect(otherCallers, `${c.lang}: Other callers`).not.toContain(c.callerA);
       });
     }
+
+    // Lua/Luau: a PascalCase method call (`lg:Log()`, the Roblox convention)
+    // is the identical `receiver:Name` shape as a Luau type annotation, so it
+    // self-matched the annotation pattern on the call's own line and inferred
+    // "type = Log" (#1124). Two things are load-bearing in these fixtures:
+    // the declaration sits on an EARLIER line than the call (on one line,
+    // pattern order resolves it — the `.new` pattern wins first), and TWO
+    // classes share the method name (a single class resolves via the
+    // same-name fallback even when inference misfires). Luau's `useLogger`
+    // takes a typed param instead of calling `.new()`, pinning that the
+    // gated pattern still matches a genuine annotation.
+    const pascalMethodCases: Array<{ lang: string; file: string; src: string }> = [
+      { lang: 'Lua', file: 'svc.lua',
+        src: `local Logger = {}\nLogger.__index = Logger\nfunction Logger.new() return setmetatable({}, Logger) end\nfunction Logger:Log() return 1 end\n\nlocal Other = {}\nOther.__index = Other\nfunction Other.new() return setmetatable({}, Other) end\nfunction Other:Log() return 2 end\n\nlocal function useLogger()\n\tlocal lg = Logger.new()\n\treturn lg:Log()\nend\n\nlocal function useOther()\n\tlocal o = Other.new()\n\treturn o:Log()\nend\n\nreturn useLogger, useOther\n` },
+      { lang: 'Luau', file: 'svc.luau',
+        src: `local Logger = {}\nLogger.__index = Logger\nfunction Logger.new() return setmetatable({}, Logger) end\nfunction Logger:Log(): number return 1 end\n\nlocal Other = {}\nOther.__index = Other\nfunction Other.new() return setmetatable({}, Other) end\nfunction Other:Log(): number return 2 end\n\nlocal function useLogger(lg: Logger): number\n\treturn lg:Log()\nend\n\nlocal function useOther(): number\n\tlocal o = Other.new()\n\treturn o:Log()\nend\n\nreturn useLogger, useOther\n` },
+    ];
+
+    for (const c of pascalMethodCases) {
+      it(`resolves a PascalCase method call without self-matching the annotation pattern — ${c.lang} (#1124)`, async () => {
+        fs.writeFileSync(path.join(tempDir, c.file), c.src);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        cg.resolveReferences();
+
+        const methods = cg.getNodesByKind('method').filter((n) => n.name === 'Log');
+        expect(methods.length, `${c.lang}: both Log methods indexed`).toBe(2);
+
+        const loggerLog = methods.find((m) => /Logger/.test(m.qualifiedName ?? ''));
+        const otherLog = methods.find((m) => /Other/.test(m.qualifiedName ?? ''));
+        expect(loggerLog, `${c.lang}: Logger's Log`).toBeDefined();
+        expect(otherLog, `${c.lang}: Other's Log`).toBeDefined();
+
+        const loggerCallers = cg.getCallers(loggerLog!.id).map((x) => x.node.name);
+        const otherCallers = cg.getCallers(otherLog!.id).map((x) => x.node.name);
+
+        expect(loggerCallers, `${c.lang}: Logger callers`).toContain('useLogger');
+        expect(loggerCallers, `${c.lang}: Logger callers`).not.toContain('useOther');
+        expect(otherCallers, `${c.lang}: Other callers`).toContain('useOther');
+        expect(otherCallers, `${c.lang}: Other callers`).not.toContain('useLogger');
+      });
+    }
   });
 
   describe('Name Matcher: kind bias for new ref kinds', () => {

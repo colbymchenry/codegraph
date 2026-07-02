@@ -1148,7 +1148,17 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w]*)\\.new\\b`), // local lg = Logger.new()
         new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w]*)\\s*\\(`), // local lg = Logger(...)  (callable table)
-        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // Luau: local lg: Logger  / typed param
+        // Luau annotation (`local lg: Logger`) / typed param — but Lua's
+        // method-call syntax is the IDENTICAL `receiver:Name` shape, and the
+        // backward scan starts on the call's own line, so without a gate any
+        // PascalCase method call (`lg:Log()`, the Roblox convention)
+        // self-matches as "type = Log" before the scan reaches the real
+        // declaration (#1124). The lookahead rejects a capture followed by
+        // any of Lua's three call forms — `(args)`, `"s"`/`'s'`/`[[s]]`,
+        // `{t}` — and its leading `[\w.]` alternative stops backtracking from
+        // shrinking the capture to dodge the gate (`lg:Log()` would otherwise
+        // still match, as `Lo`).
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)(?![\\w.]|\\s*[({"'\\[])`), // local lg: Logger  / typed param
       ];
     case 'r':
       return [

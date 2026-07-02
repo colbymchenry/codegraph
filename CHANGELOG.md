@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Lua and Luau method calls with capitalized names (`obj:Method()` — the standard Roblox convention) now link to the right method. Because Lua's method-call syntax looks identical to a Luau type annotation, a capitalized call like `lg:Log()` was misread as declaring the variable's type, so whenever two or more classes shared a method name (`Init`, `Update`, `Destroy`, …) the call was silently dropped from callers, impact/blast-radius, and flow traces. Lowercase method names were unaffected. Thanks @inth3shadows for the precise root-cause analysis and repro. (#1124)
 
 ## [1.2.0] - 2026-07-02
 
