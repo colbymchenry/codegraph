@@ -71,6 +71,23 @@ function runShim(pkgDir: string, args: string[], env: Record<string, string>) {
   });
 }
 
+// Static source guard (all platforms): every child spawn in the shim must set
+// windowsHide, or a console (conhost) window flashes when the shim runs as a
+// background MCP server on Windows (issue #1092). windowsHide is a Windows-only
+// spawn behavior that can't be observed from these POSIX-only subprocess tests,
+// so we assert it at the source level instead — and this also catches any new
+// spawn site added to the shim later.
+describe('npm-shim windowsHide (#1092)', () => {
+  it('sets windowsHide: true on every spawn in the shim', () => {
+    const src = fs.readFileSync(SHIM_SRC, 'utf8');
+    const spawnLines = src.split('\n').filter((l) => /\.spawn(Sync)?\(/.test(l));
+    expect(spawnLines.length).toBeGreaterThan(0); // guard against a false pass if the calls move
+    for (const line of spawnLines) {
+      expect(line, `spawn without windowsHide: ${line.trim()}`).toContain('windowsHide: true');
+    }
+  });
+});
+
 describe.skipIf(isWindows)('npm-shim launcher', () => {
   it('runs the installed optional-dependency bundle without any download', async () => {
     const pkg = makePkg();

@@ -29,6 +29,7 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { CfmlExtractor } from './cfml-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -60,21 +61,68 @@ const VUE_STORE_FACTORY_CALLEES = new Set(['defineStore', 'createStore']);
 const VUE_STORE_FILE_SIGNAL = /\bdefineStore\b|\bcreateStore\b|\bVuex\b|\bmutations\b|\bactions\b|\bgetters\b|\bnamespaced\b/g;
 
 /**
+ * Erlang calls that take their real callee as (Module, Function, Args)
+ * ARGUMENTS — the spawn/apply family. Keys are the callee as the call site
+ * spells it: bare for auto-imported BIFs, `module:function` for remote calls.
+ * Used by the erlang branch of extractCall to lift a static MFA pair into a
+ * call edge (the spawned/applied function is otherwise invisible to the graph).
+ */
+/** Compiler-predefined Erlang macros — no `-define` exists to link a use to. */
+const ERLANG_PREDEFINED_MACROS = new Set([
+  'MODULE', 'MODULE_STRING', 'FILE', 'LINE', 'MACHINE',
+  'FUNCTION_NAME', 'FUNCTION_ARITY', 'OTP_RELEASE',
+  'FEATURE_AVAILABLE', 'FEATURE_ENABLED',
+]);
+
+const ERLANG_MFA_CALLS = new Set([
+  'spawn', 'spawn_link', 'spawn_monitor', 'spawn_opt', 'apply',
+  'erlang:spawn', 'erlang:spawn_link', 'erlang:spawn_monitor', 'erlang:spawn_opt', 'erlang:apply',
+  'proc_lib:spawn', 'proc_lib:spawn_link', 'proc_lib:spawn_opt', 'proc_lib:start', 'proc_lib:start_link',
+  'timer:apply_after', 'timer:apply_interval',
+  'rpc:call', 'rpc:cast', 'rpc:async_call',
+  'erpc:call', 'erpc:cast',
+]);
+
+/**
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
+  const name = extractNameRaw(node, source, extractor);
+  // Universal fallback: recover a real identifier from a name still mangled by a
+  // macro the pre-parse didn't blank (C/C++ only — see recoverMangledName). A
+  // no-op on well-formed names, so a clean name is never altered.
+  return extractor.recoverMangledName ? extractor.recoverMangledName(name) : name;
+}
+
+function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
   const hookName = extractor.resolveName?.(node, source);
   if (hookName) return hookName;
 
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
   if (nameNode) {
-    // Unwrap pointer_declarator(s) for C/C++ pointer return types
+    // Unwrap pointer_declarator / reference_declarator for C/C++ pointer and
+    // reference return types (`int* f()`, `int& f()`, `int&& f()`). Without
+    // unwrapping the reference wrapper an inline reference-returning method is
+    // named "& f() const" instead of "f" — common in Unreal Engine gameplay
+    // headers (`const FGameplayTagContainer& GetActiveTags() const`). Out-of-line
+    // defs (`T& C::f()`) already resolve via the qualified-name hook. A
+    // pointer_declarator exposes its inner through a `declarator` field; a
+    // reference_declarator has none, so it's reached via namedChild(0).
     let resolved = nameNode;
-    while (resolved.type === 'pointer_declarator') {
+    while (resolved.type === 'pointer_declarator' || resolved.type === 'reference_declarator') {
       const inner = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
       if (!inner) break;
       resolved = inner;
+    }
+    // C++ user-defined conversion operator: the declarator is an `operator_cast`
+    // whose first child is the target type and second is the `() const` tail. Name
+    // it `operator <type>` (the conventional spelling) rather than the whole
+    // `operator EALSMovementState() const` declarator, so it matches symbolic
+    // overloads (`operator+`) and is findable by the type name.
+    if (resolved.type === 'operator_cast') {
+      const typeNode = resolved.namedChild(0);
+      return typeNode ? `operator ${getNodeText(typeNode, source).trim()}` : getNodeText(resolved, source);
     }
     // Handle complex declarators (C/C++)
     if (resolved.type === 'function_declarator' || resolved.type === 'declarator') {
@@ -399,7 +447,7 @@ export class TreeSitterExtractor {
       // this.source so downstream getNodeText reads the same bytes the parser
       // saw (identical outside the blanked directive lines).
       if (this.extractor?.preParse) {
-        this.source = this.extractor.preParse(this.source);
+        this.source = this.extractor.preParse(this.source, this.filePath);
       }
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
@@ -1128,7 +1176,7 @@ export class TreeSitterExtractor {
     // produce an `instantiates` reference. Children still walked so
     // nested calls inside the constructor args (`new Foo(bar())`) get
     // their own `calls` refs.
-    else if (INSTANTIATION_KINDS.has(nodeType)) {
+    else if (INSTANTIATION_KINDS.has(nodeType) || this.isVbnetConstructorShapedArrayCreation(node)) {
       this.extractInstantiation(node);
       // Java/C# `new T(...) { ... }` — anonymous class with body. Without
       // extracting it as a class node + its methods, the interface→impl
@@ -1528,6 +1576,15 @@ export class TreeSitterExtractor {
   private extractClass(node: SyntaxNode, kind: NodeKind = 'class'): void {
     if (!this.extractor) return;
 
+    // Skip forward declarations / elaborated type references (`class Foo;`) in
+    // languages that opt in — bodiless there means "not a definition", so it
+    // would otherwise mint a phantom node competing with the real definition
+    // (#1093). Languages where a bodiless class is complete (Kotlin, Scala)
+    // leave the flag unset. Resolved once here and reused for the body walk.
+    const resolvedBody = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    if (this.extractor.skipBodilessClass && !resolvedBody) return;
+
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
@@ -1551,9 +1608,7 @@ export class TreeSitterExtractor {
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
-    let body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
-      ?? getChildByField(node, this.extractor.bodyField);
-    if (!body) body = node;
+    const body = resolvedBody ?? node;
 
     // Visit all children for methods and properties
     for (let i = 0; i < body.namedChildCount; i++) {
@@ -2392,7 +2447,7 @@ export class TreeSitterExtractor {
 
     // Extract variable declarators based on language
     if (this.language === 'typescript' || this.language === 'javascript' ||
-        this.language === 'tsx' || this.language === 'jsx') {
+        this.language === 'tsx' || this.language === 'jsx' || this.language === 'cfscript') {
       // Handle lexical_declaration and variable_declaration
       // These contain one or more variable_declarator children
       for (let i = 0; i < node.namedChildCount; i++) {
@@ -3460,11 +3515,344 @@ export class TreeSitterExtractor {
   /**
    * Extract a function call
    */
+  /**
+   * The module an Erlang gen_server target expression statically names, or
+   * null when it's dynamic (pid/var/tuple form). Static shapes:
+   *   - a bare atom — either this module or another one; OTP's dominant
+   *     registration convention (`{local, ?MODULE}`) names a server process
+   *     after its module, so `gen_server:call(other_mod, …)` reaches
+   *     `other_mod`'s handlers. A registered name that matches no module
+   *     resolves to nothing downstream (the qualified ref just drops).
+   *   - `?MODULE`, or a macro the file defines as `?MODULE`
+   *     (`-define(SERVER, ?MODULE)` — the standard self idiom)
+   *   - a macro the file defines as a bare atom
+   *     (`-define(STORE, kv_store)` — the cross-module variant)
+   * The macro tables are memoized per file (single entry — extraction is
+   * file-sequential).
+   */
+  private erlangServerMacroFile = '';
+  private erlangSelfMacros = new Set<string>();
+  private erlangAtomMacros = new Map<string, string>();
+
+  private resolveErlangGenServerTarget(target: SyntaxNode): string | null {
+    const ownModule = (this.filePath.split('/').pop() ?? '').replace(/\.erl$/, '');
+    if (target.type === 'atom') {
+      const name = getNodeText(target, this.source).replace(/^'([\s\S]*)'$/, '$1');
+      return name || null;
+    }
+    if (target.type !== 'macro_call_expr') return null;
+    const nameNode = getChildByField(target, 'name');
+    if (!nameNode) return null;
+    const macroName = getNodeText(nameNode, this.source);
+    if (macroName === 'MODULE') return ownModule || null;
+    if (this.erlangServerMacroFile !== this.filePath) {
+      this.erlangServerMacroFile = this.filePath;
+      this.erlangSelfMacros = new Set<string>();
+      this.erlangAtomMacros = new Map<string, string>();
+      let root: SyntaxNode = target;
+      while (root.parent) root = root.parent;
+      for (let i = 0; i < root.namedChildCount; i++) {
+        const form = root.namedChild(i);
+        if (form?.type !== 'pp_define') continue;
+        const lhs = getChildByField(form, 'lhs');
+        const defName = lhs ? getChildByField(lhs, 'name') : null;
+        const replacement = getChildByField(form, 'replacement');
+        if (!defName || !replacement) continue;
+        if (
+          replacement.type === 'macro_call_expr' &&
+          getChildByField(replacement, 'name') &&
+          getNodeText(getChildByField(replacement, 'name')!, this.source) === 'MODULE'
+        ) {
+          this.erlangSelfMacros.add(getNodeText(defName, this.source));
+        } else if (replacement.type === 'atom') {
+          this.erlangAtomMacros.set(
+            getNodeText(defName, this.source),
+            getNodeText(replacement, this.source).replace(/^'([\s\S]*)'$/, '$1'),
+          );
+        }
+      }
+    }
+    if (this.erlangSelfMacros.has(macroName)) return ownModule || null;
+    return this.erlangAtomMacros.get(macroName) ?? null;
+  }
+
   private extractCall(node: SyntaxNode): void {
     if (this.nodeStack.length === 0) return;
 
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
+
+    // VB.NET: `foo(args)` is syntactically ambiguous between a call and an
+    // index read, so the grammar parses non-empty parens as
+    // array_access_expression (field `array`, not `function`) — even Roslyn
+    // parses both as InvocationExpression and resolves during binding. Treat
+    // all three shapes as call sites: the callee is the member/identifier
+    // under the array/function field, qualified with a simple-identifier
+    // receiver for resolution. Index reads on collections simply never
+    // resolve to a callable, so they cost nothing.
+    if (
+      this.language === 'vbnet' &&
+      (node.type === 'array_access_expression' ||
+        node.type === 'invocation_expression' ||
+        node.type === 'generic_invocation_expression')
+    ) {
+      const fn = getChildByField(node, 'function') || getChildByField(node, 'array');
+      if (!fn) return;
+      let calleeName = '';
+      if (fn.type === 'member_access_expression') {
+        const member = getChildByField(fn, 'member');
+        const memberName = member ? getNodeText(member, this.source) : '';
+        if (!memberName) return;
+        const receiver = getChildByField(fn, 'object');
+        const SKIP = new Set(['me', 'mybase', 'myclass']);
+        if (receiver && receiver.type === 'identifier' && !SKIP.has(getNodeText(receiver, this.source).toLowerCase())) {
+          calleeName = `${getNodeText(receiver, this.source)}.${memberName}`;
+        } else {
+          calleeName = memberName;
+        }
+      } else if (fn.type === 'identifier') {
+        calleeName = getNodeText(fn, this.source);
+      } else {
+        return; // parenthesized/chained receivers: no static name to link
+      }
+      if (calleeName) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: calleeName,
+          referenceKind: 'calls',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+
+    // Erlang: a local call is `call(expr: atom, args)`; a remote call nests it
+    // under `remote(module: remote_module, fun: call)` — the module qualifier
+    // lives on the PARENT. Remote calls are emitted as `mod::fn`, which is
+    // byte-identical to the qualifiedName the module namespace gives every
+    // function (see packageTypes in languages/erlang.ts), so they resolve via
+    // matchByQualifiedName. A var/macro callee or module (`F(X)`, `?M(X)`,
+    // `Mod:handle(X)`) has no static target — except `?MODULE:fn(X)`, which the
+    // bare name + same-file preference resolves correctly. `fun name/1` /
+    // `fun mod:name/1` values are function REFERENCES (callback registration),
+    // and record construction/update/index/field-access are `references` to the
+    // record's struct node.
+    if (this.language === 'erlang') {
+      const line = node.startPosition.row + 1;
+      const column = node.startPosition.column;
+      const erlAtom = (n: SyntaxNode): string => getNodeText(n, this.source).replace(/^'([\s\S]*)'$/, '$1');
+      if (node.type === 'call') {
+        let callee = getChildByField(node, 'expr');
+        let moduleNode: SyntaxNode | null = null;
+        // remote(module, fun: call) — the shape the grammar produces today; the
+        // node-types also permit call(expr: remote), so handle both nestings.
+        if (node.parent?.type === 'remote') {
+          moduleNode = getChildByField(node.parent, 'module');
+        } else if (callee?.type === 'remote') {
+          moduleNode = getChildByField(callee, 'module');
+          callee = getChildByField(callee, 'fun');
+        }
+        if (callee?.type === 'atom') {
+          const fnBare = erlAtom(callee);
+          let calleeName = fnBare;
+          const moduleExpr = moduleNode ? getChildByField(moduleNode, 'module') : null;
+          if (moduleExpr?.type === 'atom') {
+            calleeName = `${erlAtom(moduleExpr)}::${calleeName}`;
+          } else if (moduleExpr) {
+            // Non-atom module qualifier. `?MODULE:f(X)` targets THIS module —
+            // keep the bare name so same-file preference resolves it. Anything
+            // else (`Mod:f(X)`) is behaviour-style dynamic dispatch with no
+            // static target: emitting the bare name would link an arbitrary
+            // same-named function, so stay silent instead.
+            const macroName =
+              moduleExpr.type === 'macro_call_expr' ? getChildByField(moduleExpr, 'name') : null;
+            if (!macroName || getNodeText(macroName, this.source) !== 'MODULE') return;
+          }
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: calleeName,
+            referenceKind: 'calls',
+            line,
+            column,
+          });
+          // gen_server dispatch: `gen_server:call(?SERVER, Msg)` /
+          // `gen_server:cast(other_mod, Msg)` — a request routes to the TARGET
+          // module's handle_call/handle_cast. The target is static when the
+          // first argument names a module: ?MODULE or a ?MODULE-defined macro
+          // (the self API-wrapper idiom), a bare atom (OTP's `{local, ?MODULE}`
+          // convention names a server after its module, so a cross-module
+          // registered name reaches that module's handlers — and a registered
+          // name matching no module resolves to nothing), or a macro defined
+          // as a bare atom. Pid/var/tuple targets stay silent.
+          if (
+            moduleExpr?.type === 'atom' &&
+            erlAtom(moduleExpr) === 'gen_server' &&
+            (fnBare === 'call' || fnBare === 'cast' || fnBare === 'send_request')
+          ) {
+            const argsNode = getChildByField(node, 'args');
+            const target = argsNode?.namedChild(0) ?? null;
+            const targetModule = target ? this.resolveErlangGenServerTarget(target) : null;
+            if (targetModule) {
+              this.unresolvedReferences.push({
+                fromNodeId: callerId,
+                referenceName: `${targetModule}::${fnBare === 'cast' ? 'handle_cast' : 'handle_call'}`,
+                referenceKind: 'calls',
+                line,
+                column,
+              });
+            }
+          }
+          // MFA-in-argument dispatch: the spawn/apply family names its real
+          // callee in ARGUMENT position — `proc_lib:spawn_link(?MODULE,
+          // request_process, [Req, Env, Middlewares])` — so the walker above
+          // sees only the spawn itself and the spawned function ends up with
+          // zero callers (measured on cowboy: request_process had no incoming
+          // edges and the agent Read the file to find it). When the (Module,
+          // Function) pair is static, lift it as a call edge. The pair is
+          // found positionally-agnostically (first adjacent module-atom/
+          // ?MODULE + atom pair) so every arity variant works: spawn/3,
+          // spawn(Node,M,F,A)/4, timer:apply_after(Time,M,F,A),
+          // rpc:call(Node,M,F,A). A var module or fun stays silent.
+          const familyKey = moduleExpr?.type === 'atom' ? `${erlAtom(moduleExpr)}:${fnBare}` : fnBare;
+          if (ERLANG_MFA_CALLS.has(familyKey)) {
+            const argsNode = getChildByField(node, 'args');
+            const argExprs = argsNode ? argsNode.namedChildren : [];
+            for (let i = 0; i + 1 < argExprs.length; i++) {
+              const m = argExprs[i]!;
+              const f = argExprs[i + 1]!;
+              if (f.type !== 'atom') continue;
+              const isLocalModule =
+                m.type === 'macro_call_expr' &&
+                getChildByField(m, 'name') !== null &&
+                getNodeText(getChildByField(m, 'name')!, this.source) === 'MODULE';
+              if (m.type !== 'atom' && !isLocalModule) continue;
+              this.unresolvedReferences.push({
+                fromNodeId: callerId,
+                referenceName: isLocalModule ? erlAtom(f) : `${erlAtom(m)}::${erlAtom(f)}`,
+                referenceKind: 'calls',
+                line: f.startPosition.row + 1,
+                column: f.startPosition.column,
+              });
+              break;
+            }
+          }
+        }
+        return;
+      }
+      if (node.type === 'internal_fun' || node.type === 'external_fun') {
+        const funNode = getChildByField(node, 'fun');
+        if (funNode?.type !== 'atom') return; // fun Mod:F/A with var parts — dynamic
+        let refName = erlAtom(funNode);
+        if (node.type === 'external_fun') {
+          const moduleWrapper = getChildByField(node, 'module');
+          const moduleAtom = moduleWrapper ? getChildByField(moduleWrapper, 'name') : null;
+          if (moduleAtom?.type !== 'atom') return;
+          refName = `${erlAtom(moduleAtom)}::${refName}`;
+        }
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: refName,
+          referenceKind: 'references',
+          line,
+          column,
+        });
+        return;
+      }
+      if (node.type === 'macro_call_expr') {
+        // Macro use site → the `-define` constant node. Function-like uses
+        // (`?LOG_AUDIT(X)` — args present) are inlined code, so they join the
+        // call chain and connect through the macro node to the body's calls
+        // (attributed there by handlePpDefine); bare reads (`?TIMEOUT`) are
+        // `references`, answering "where is this macro used" without
+        // polluting call paths. Compiler-predefined macros carry no
+        // definition to link. The use site's ARGUMENTS are children and keep
+        // walking, so a call nested in `?assertEqual(ok, do_thing())` still
+        // attributes to the enclosing function.
+        const macroName = getChildByField(node, 'name');
+        if (!macroName) return;
+        const name = getNodeText(macroName, this.source);
+        if (ERLANG_PREDEFINED_MACROS.has(name)) return;
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: name,
+          referenceKind: getChildByField(node, 'args') ? 'calls' : 'references',
+          line,
+          column,
+        });
+        return;
+      }
+      // record_expr / record_update_expr / record_index_expr / record_field_expr
+      const recordName = getChildByField(node, 'name');
+      const recordAtom = recordName?.type === 'record_name' ? getChildByField(recordName, 'name') : null;
+      if (recordAtom?.type === 'atom') {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: erlAtom(recordAtom),
+          referenceKind: 'references',
+          line,
+          column,
+        });
+      }
+      return;
+    }
+
+    // Ruby `call` nodes use `receiver` + `method` fields (tree-sitter-ruby), not
+    // the `object`/`name`/`function` fields the branches below expect — so
+    // without this they fell through to the generic path, which took the
+    // receiver as the callee and DROPPED the method name: `lg.log()` produced a
+    // `calls` ref to `lg` (unresolvable) and no method edge was ever recorded,
+    // so a Ruby method's callers/impact were invisible (#1108 follow-up). Build
+    // `receiver.method` so the resolver — and local-variable type inference —
+    // can link it; `Foo.new` stays an instantiation.
+    if (this.language === 'ruby' && (node.type === 'call' || node.type === 'method_call')) {
+      const methodNode = getChildByField(node, 'method');
+      const methodName = methodNode ? getNodeText(methodNode, this.source) : '';
+      if (!methodName) return; // operator/element-reference call with no method name
+      const receiverNode = getChildByField(node, 'receiver');
+      const line = node.startPosition.row + 1;
+      const column = node.startPosition.column;
+      if (!receiverNode) {
+        // Bare `foo(...)` — just the method name (unchanged behavior).
+        this.unresolvedReferences.push({ fromNodeId: callerId, referenceName: methodName, referenceKind: 'calls', line, column });
+        return;
+      }
+      const receiverName = getNodeText(receiverNode, this.source);
+      // `Foo.new` / `Foo::Bar.new` is construction — emit an `instantiates` ref to
+      // the class (last `::` segment), preserving the "what creates X" edge.
+      if (methodName === 'new') {
+        const className = receiverName.includes('::')
+          ? receiverName.slice(receiverName.lastIndexOf('::') + 2)
+          : receiverName;
+        if (/^[A-Z]/.test(className)) {
+          this.unresolvedReferences.push({ fromNodeId: callerId, referenceName: className, referenceKind: 'instantiates', line, column });
+          return;
+        }
+      }
+      const SKIP_RECEIVERS = new Set(['self', 'super']);
+      const skip = SKIP_RECEIVERS.has(receiverName);
+      this.unresolvedReferences.push({
+        fromNodeId: callerId,
+        referenceName: skip ? methodName : `${receiverName}.${methodName}`,
+        referenceKind: 'calls',
+        line,
+        column,
+      });
+      // A capitalized (constant) receiver — `Foo.bar`, a class/module method call
+      // — is itself a dependency on that constant; emit a `references` ref so a
+      // class used only via its class methods still records a dependent (the edge
+      // the old receiver-only callee happened to provide, now made explicit).
+      if (!skip && receiverNode.type === 'constant') {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: receiverName,
+          referenceKind: 'references',
+          line: receiverNode.startPosition.row + 1,
+          column: receiverNode.startPosition.column,
+        });
+      }
+      return;
+    }
 
     // Get the function/method being called
     let calleeName = '';
@@ -3741,6 +4129,21 @@ export class TreeSitterExtractor {
                 else reencode = !!innerCallee;
               }
               calleeName = reencode ? `${innerCallee}().${methodName}` : methodName;
+            } else if (
+              this.language === 'cfscript' &&
+              receiver &&
+              receiver.type === 'member_expression' &&
+              /^(variables|this|local|arguments)\.[A-Za-z_][\w]*$/i.test(getNodeText(receiver, this.source))
+            ) {
+              // CFML scope-prefixed member call — `variables.svc.save()` /
+              // `arguments.svc.save()`: the receiver is a component field,
+              // injected property, or typed argument reached through one of
+              // CFML's file-local scopes. Keep the full receiver chain so
+              // resolution can strip the scope prefix and infer the field's
+              // component type from its declaration (#1108). Gated to these
+              // scope keywords: such calls previously emitted a bare method
+              // name, which either failed to resolve or resolved ambiguously.
+              calleeName = `${getNodeText(receiver, this.source)}.${methodName}`;
             } else {
               calleeName = methodName;
             }
@@ -3800,6 +4203,24 @@ export class TreeSitterExtractor {
    * Children are still walked so nested calls inside the constructor
    * arguments (`new Foo(bar())`) get their own `calls` references.
    */
+  /**
+   * VB.NET `New Invoice(1)` is syntactically ambiguous between constructing
+   * Invoice with an argument and allocating an Invoice array of bound 1; the
+   * grammar parses the parenthesized form as array_creation_expression. A
+   * user-defined type with no `{...}` array initializer is overwhelmingly a
+   * constructor call, so treat it as an instantiation. Predefined element
+   * types (`New Byte(1023)`) and brace-initialized forms stay arrays.
+   */
+  private isVbnetConstructorShapedArrayCreation(node: SyntaxNode): boolean {
+    if (this.language !== 'vbnet' || node.type !== 'array_creation_expression') return false;
+    const typeNode = getChildByField(node, 'type');
+    if (!typeNode || typeNode.type === 'predefined_type' || typeNode.type === 'array_type') return false;
+    for (const child of node.namedChildren) {
+      if (child?.type === 'array_initializer') return false;
+    }
+    return true;
+  }
+
   private extractInstantiation(node: SyntaxNode): void {
     if (this.nodeStack.length === 0) return;
     const fromId = this.nodeStack[this.nodeStack.length - 1];
@@ -3861,6 +4282,13 @@ export class TreeSitterExtractor {
     // because no class is named with the angle-bracket suffix.
     const ltIdx = className.indexOf('<');
     if (ltIdx > 0) className = className.slice(0, ltIdx);
+    // VB.NET spells generics with parentheses: `New List(Of String)` /
+    // `New Dictionary(Of K, V)(cap)` — strip from the `(` so the bare
+    // type name is what resolution matches.
+    if (this.language === 'vbnet') {
+      const parenIdx = className.indexOf('(');
+      if (parenIdx > 0) className = className.slice(0, parenIdx);
+    }
     // For namespaced/qualified constructors (`new ns.Foo()`,
     // `new ns::Foo()`) keep the trailing identifier — that's what
     // matches a class node in the index.
@@ -4270,7 +4698,7 @@ export class TreeSitterExtractor {
 
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);
-      } else if (INSTANTIATION_KINDS.has(nodeType)) {
+      } else if (INSTANTIATION_KINDS.has(nodeType) || this.isVbnetConstructorShapedArrayCreation(node)) {
         // `new Foo()` inside a function body — emit an `instantiates`
         // reference. Without this branch the body walker only knew
         // about `call_expression`, so constructor invocations
@@ -4643,6 +5071,33 @@ export class TreeSitterExtractor {
         }
       }
 
+      // VB.NET: `Inherits Base` / `Implements IFoo, IBar(Of T)` are STATEMENTS
+      // inside the class body (children of the class node), not header clauses.
+      // Each name is a simple/qualified/generic reference; generics unwrap to
+      // the base identifier and dotted paths keep the trailing segment.
+      if (
+        this.language === 'vbnet' &&
+        (child.type === 'inherits_statement' || child.type === 'implements_statement')
+      ) {
+        const kind = child.type === 'inherits_statement' ? 'extends' : 'implements';
+        for (const ref of child.namedChildren) {
+          if (!ref || (ref.type !== 'simple_name' && ref.type !== 'qualified_name' && ref.type !== 'generic_name' && ref.type !== 'global_qualified_name')) continue;
+          let name = getNodeText(ref, this.source);
+          name = name.replace(/\(\s*Of\b[^)]*\)/gi, '');
+          const lastDot = name.lastIndexOf('.');
+          if (lastDot >= 0) name = name.slice(lastDot + 1);
+          name = name.trim();
+          if (!name) continue;
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: name,
+            referenceKind: kind,
+            line: ref.startPosition.row + 1,
+            column: ref.startPosition.column,
+          });
+        }
+      }
+
       // C#: `class Movie : BaseItem, IPlugin` → base_list with identifier children
       // base_list combines both base class and interfaces in a single colon-separated list.
       // We emit all as 'extends' since the syntax doesn't distinguish them.
@@ -4723,6 +5178,34 @@ export class TreeSitterExtractor {
       // class_heritage in TypeScript which wraps extends_clause/implements_clause)
       if (child.type === 'field_declaration_list' || child.type === 'class_heritage') {
         this.extractInheritance(child, classId);
+      }
+
+      // CFML cfscript `component extends="Base" implements="IFoo,IBar" { ... }`
+      // (also covers `interface extends="IBase" { ... }`, which reuses the same
+      // component_attribute shape). Attributes are generic name=value pairs —
+      // (identifier label, expression value) — not a dedicated extends_clause,
+      // so filter by the label text. `implements` is a comma-separated list.
+      if (child.type === 'component_attribute' && node.type === 'component') {
+        const label = child.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+        const value = child.namedChildren.find((c: SyntaxNode) => c.type !== 'identifier');
+        if (label && value) {
+          const labelText = getNodeText(label, this.source).toLowerCase();
+          if (labelText === 'extends' || labelText === 'implements') {
+            const valueText = getNodeText(value, this.source).replace(/^["']|["']$/g, '');
+            const names = labelText === 'implements'
+              ? valueText.split(',').map((s) => s.trim()).filter(Boolean)
+              : [valueText.trim()].filter(Boolean);
+            for (const name of names) {
+              this.unresolvedReferences.push({
+                fromNodeId: classId,
+                referenceName: name,
+                referenceKind: labelText === 'implements' ? 'implements' : 'extends',
+                line: value.startPosition.row + 1,
+                column: value.startPosition.column,
+              });
+            }
+          }
+        }
       }
     }
   }
@@ -5731,6 +6214,16 @@ export function extractFromSource(
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
     // file node so the watcher tracks it without emitting symbols.
     const extractor = new MyBatisExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'cfml' || detectedLanguage === 'cfscript') {
+    // Custom extractor for CFML (.cfc/.cfm) — dialect-switches between the
+    // tag-based cfml grammar and the bare-script cfscript grammar. Standalone
+    // `.cfs` files (language 'cfscript') are always pure script (never `<`-led),
+    // so routing them through here too gets them the same anonymous-component
+    // filename fallback as a bare-script `.cfc` — without it a `.cfs` whose
+    // `component { ... }` declares no name (the grammar has no `name` field;
+    // CFML never spells one in source) stays `<anonymous>`.
+    const extractor = new CfmlExtractor(filePath, source, detectedLanguage);
     result = extractor.extract();
   } else if (isFileLevelOnlyLanguage(detectedLanguage)) {
     // No symbol extraction at this stage — files are tracked at the file-record

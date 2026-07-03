@@ -123,6 +123,8 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
 }
 
 export const cExtractor: LanguageExtractor = {
+  // Universal net: recover a real name from any macro-mangled function name.
+  recoverMangledName: recoverMangledCppName,
   functionTypes: ['function_definition'],
   classTypes: [],
   methodTypes: [],
@@ -239,12 +241,174 @@ export function blankCppExportMacros(source: string): string {
   );
 }
 
+/**
+ * Blank a known inline-specifier macro sitting in front of a function's return
+ * type (`FORCEINLINE FString GetName(…)`), before parsing. Not knowing the
+ * macro, tree-sitter can't reconcile `MACRO <return-type> <name>(` — an extra
+ * type-like token before the name — and drops into error recovery: the macro
+ * becomes the return type and, for a non-primitive return, the return type gets
+ * glued onto the name (`GetName` → `"FString GetName"`), so the function can't
+ * be found by name and its callers don't link. This is pervasive in Unreal
+ * Engine (`FORCEINLINE <ret> <name>(…)`) and in vendored third-party libraries
+ * that define their own inline macro (pugixml's `PUGI__FN`, Godot's
+ * `_FORCE_INLINE_`, Boost's `BOOST_FORCEINLINE`, …). Replacing the macro with
+ * equal-length spaces preserves every byte offset (so line/column stay exact)
+ * and the declaration then parses as an ordinary function — recovering the real
+ * name AND the return type — mirroring how `blankCppExportMacros` recovers
+ * macro-annotated classes (#946/#1061).
+ *
+ * Matched tightly so it can't touch an ordinary identifier: only the exact,
+ * curated inline-specifier tokens below (never an arbitrary all-caps token, so a
+ * real return type like `HRESULT DoIt()` is untouched), and only in specifier
+ * position — immediately followed by whitespace and the identifier that starts
+ * the return type or name. That lookahead leaves value/expression uses
+ * (`x = FORCEINLINE ? …`), string literals, and longer words
+ * (`FORCEINLINE_SOMETHINGELSE`, word-boundary) alone. To cover a new codebase's
+ * inline macro, add its exact token to the list.
+ */
+const CPP_INLINE_MACROS = [
+  // Unreal Engine
+  'FORCEINLINE_DEBUGGABLE', 'FORCENOINLINE', 'FORCEINLINE',
+  // pugixml (ubiquitous vendored XML parser): `#define PUGI__FN inline` before
+  // the return type, plus `PUGIXML_FUNCTION` (linkage macro) between the return
+  // type and the name — the blank mechanism handles both positions.
+  'PUGI__FN_NO_INLINE', 'PUGI__FN', 'PUGIXML_FUNCTION',
+  // Godot
+  '_ALWAYS_INLINE_', '_FORCE_INLINE_',
+  // Boost
+  'BOOST_FORCEINLINE', 'BOOST_NOINLINE',
+  // Qt (per-method markers + inline)
+  'Q_INVOKABLE', 'Q_SCRIPTABLE', 'Q_ALWAYS_INLINE', 'Q_SLOT', 'Q_SIGNAL',
+  // Folly / Abseil / LLVM / V8 / Eigen / rapidjson
+  'FOLLY_ALWAYS_INLINE', 'FOLLY_NOINLINE',
+  'ABSL_ATTRIBUTE_ALWAYS_INLINE', 'ABSL_ATTRIBUTE_NOINLINE',
+  'LLVM_ATTRIBUTE_ALWAYS_INLINE', 'LLVM_ATTRIBUTE_NOINLINE',
+  'V8_INLINE', 'V8_NOINLINE',
+  'EIGEN_STRONG_INLINE', 'EIGEN_ALWAYS_INLINE', 'EIGEN_DEVICE_FUNC',
+  'RAPIDJSON_FORCEINLINE',
+  // Mozilla / SpiderMonkey
+  'MOZ_ALWAYS_INLINE', 'MOZ_NEVER_INLINE',
+  // Protocol Buffers
+  'PROTOBUF_ALWAYS_INLINE', 'PROTOBUF_NOINLINE',
+  // {fmt} / spdlog
+  'FMT_CONSTEXPR20', 'FMT_CONSTEXPR', 'FMT_INLINE',
+  // Hedley + nlohmann/json (bundles Hedley)
+  'JSON_HEDLEY_ALWAYS_INLINE', 'JSON_HEDLEY_NEVER_INLINE',
+  'HEDLEY_ALWAYS_INLINE', 'HEDLEY_NEVER_INLINE',
+  // GLM (graphics math — pervasive in games/rendering)
+  'GLM_FUNC_QUALIFIER', 'GLM_FUNC_DECL', 'GLM_CONSTEXPR', 'GLM_INLINE',
+  // Bullet Physics / Skia / OpenCV / EASTL / Cocos2d-x / Chromium-WebKit
+  'SIMD_FORCE_INLINE',
+  'SK_ALWAYS_INLINE',
+  'CV_ALWAYS_INLINE', 'CV_INLINE',
+  'EA_FORCE_INLINE', 'EA_NOINLINE',
+  'CC_INLINE',
+  'NEVER_INLINE',
+  // C libraries: GLib, SQLite (internal linkage)
+  'G_INLINE_FUNC', 'SQLITE_PRIVATE', 'SQLITE_API',
+  // Windows calling conventions (linkage position — recover the return type; the
+  // name is salvaged regardless). Only the unambiguous, non-word-like ones.
+  'STDMETHODCALLTYPE', 'WINAPIV', 'WINAPI', 'APIENTRY',
+  // Common cross-ecosystem inline/attribute hints
+  'ALWAYS_INLINE', 'FORCE_INLINE', 'NOINLINE',
+] as const;
+// One alternation, longest token first so a longer macro wins over a prefix.
+const CPP_INLINE_MACRO_RE = new RegExp(
+  `\\b(${[...CPP_INLINE_MACROS].sort((a, b) => b.length - a.length).join('|')})\\b(?=\\s+[A-Za-z_])`,
+  'g'
+);
+export function blankCppInlineMacros(source: string): string {
+  if (!CPP_INLINE_MACROS.some((m) => source.indexOf(m) !== -1)) return source;
+  return source.replace(CPP_INLINE_MACRO_RE, (m) => ' '.repeat(m.length));
+}
+
+// Bare C/C++ type/qualifier tokens that must never be taken as a recovered
+// function name (guards `recoverMangledCppName` against the `Ret (name)` idiom,
+// where the token before the params is the return type, not the name).
+const CPP_PRIMITIVE_NAMES = new Set([
+  'bool', 'void', 'int', 'char', 'short', 'long', 'float', 'double', 'unsigned',
+  'signed', 'wchar_t', 'char8_t', 'char16_t', 'char32_t', 'char_t', 'size_t',
+  'auto', 'const', 'struct', 'class', 'enum', 'union', 'typename',
+]);
+
+/**
+ * Universal fallback (any macro, no list) for a C/C++ function name still mangled
+ * because a macro we don't blank sat in front of the return type: `MACRO Ret
+ * name(…)` / `Ret MACRO name(…)` misparse so the return type is glued onto the
+ * name ("Ret name", "char_t* to_str(double v)"). Recover the real identifier —
+ * the token immediately before the parameter list (or the last token). This runs
+ * AFTER the curated pre-parse blank, so it only ever sees the residual tail that
+ * blanking didn't already fix cleanly (which also recovers the return type).
+ *
+ * Safe by construction: only touches an ALREADY-mangled name — one with an
+ * internal space that isn't a legit `operator …`/destructor — so a well-formed
+ * name is returned unchanged. Guarded against the two ways it could mis-pick:
+ * the `Ret (name)` parenthesized-name idiom (left as-is, ambiguous), and a token
+ * that is a bare primitive/keyword rather than a real identifier.
+ */
+export function recoverMangledCppName(name: string): string {
+  if (!/\s/.test(name) || name.startsWith('operator') || name.startsWith('~')) return name;
+  if (/^\S+\s+\([A-Za-z_]\w*\)/.test(name)) return name; // `Ret (name)` idiom — leave alone
+  const beforeParams = name.includes('(') ? name.slice(0, name.indexOf('(')) : name;
+  const tokens = beforeParams.trim().split(/\s+/);
+  const candidate = tokens[tokens.length - 1];
+  if (!candidate || !/^[A-Za-z_]\w*$/.test(candidate) || CPP_PRIMITIVE_NAMES.has(candidate)) return name;
+  return candidate;
+}
+
+/**
+ * Blank Metal Shading Language `[[attribute]]` annotations before parsing.
+ * MSL (≈ C++14) puts attributes AFTER the declarator — `float4 position
+ * [[position]];`, `constant Uniforms &u [[buffer(0)]]` — a position
+ * tree-sitter-cpp can't reconcile: a struct field with a trailing attribute
+ * misparses into a shape that emits a spurious `extends` reference from the
+ * struct to the field's *type* (`VertexIn extends float3`), which becomes a
+ * wrong inheritance edge whenever the repo defines that type itself (simd
+ * typedefs in a shared ShaderTypes.h are common). Replacing the attribute with
+ * equal-length spaces preserves every byte offset and lets fields and
+ * parameters parse as ordinary declarations, mirroring the macro blanks above.
+ *
+ * Matched tightly to the attribute shape — `[[ident]]`, `[[ident(args)]]`, and
+ * comma-separated lists (`[[buffer(0), raster_order_group(0)]]`) — so a
+ * subscripted lambda call (`arr[[]{ … }()]`, the only other way `[[` appears in
+ * C++-family source) can never match: after `[[` a lambda continues with `]`,
+ * never an identifier followed by `]]`. Applied ONLY to `.metal` files — in
+ * regular C++ the pre-declarator attribute position (`[[nodiscard]] int f()`)
+ * is legal syntax the grammar parses natively, and blanking it would be pure
+ * blast radius. (#1121)
+ */
+const METAL_ATTRIBUTE_RE =
+  /\[\[\s*[A-Za-z_]\w*(?:\s*\([^()\n]*\))?(?:\s*,\s*[A-Za-z_]\w*(?:\s*\([^()\n]*\))?)*\s*\]\]/g;
+export function blankMetalAttributes(source: string): string {
+  if (source.indexOf('[[') === -1) return source;
+  return source.replace(METAL_ATTRIBUTE_RE, (m) => ' '.repeat(m.length));
+}
+
+/** C/C++ source pre-processing before tree-sitter: recover both macro-annotated
+ * class definitions and macro-prefixed function definitions — plus, for `.metal`
+ * shaders (parsed with the C++ grammar), MSL attribute annotations. Offset-preserving. */
+function preParseCppSource(source: string, filePath?: string): string {
+  const blanked = blankCppInlineMacros(blankCppExportMacros(source));
+  return filePath && filePath.toLowerCase().endsWith('.metal')
+    ? blankMetalAttributes(blanked)
+    : blanked;
+}
+
 export const cppExtractor: LanguageExtractor = {
-  // Recover macro-annotated class/struct definitions (`class MYMODULE_API Foo : Base`)
-  // that tree-sitter otherwise misparses into a phantom function (#1061/#946).
-  preParse: blankCppExportMacros,
+  // Recover macro-annotated class/struct definitions (`class MYMODULE_API Foo : Base`,
+  // #1061/#946) and macro-prefixed functions (`FORCEINLINE FString Foo()`, #1093
+  // follow-up) that tree-sitter otherwise misparses.
+  preParse: preParseCppSource,
+  // Universal net for any macro the curated blank list misses.
+  recoverMangledName: recoverMangledCppName,
   functionTypes: ['function_definition'],
   classTypes: ['class_specifier'],
+  // A bodiless `class_specifier` is a forward declaration (`class Foo;`) or an
+  // elaborated type reference, not a definition. Skip it so dozens of forward
+  // decls across headers don't mint phantom `class` nodes that crowd out — and
+  // get picked as the blast-radius representative over — the single real
+  // definition, exactly as bodiless struct/enum specifiers are already skipped. (#1093)
+  skipBodilessClass: true,
   methodTypes: ['function_definition'],
   interfaceTypes: [],
   structTypes: ['struct_specifier'],

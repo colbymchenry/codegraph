@@ -21,6 +21,7 @@ import { safeJsonParse } from '../utils';
 import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
+import { splitIdentifierSegments } from '../search/identifier-segments';
 
 /**
  * Path-only heuristic for files that should not be candidates for
@@ -219,7 +220,15 @@ export class QueryBuilder {
     getDominantFile?: SqliteStatement;
     getTopRouteFile?: SqliteStatement;
     getRoutingManifest?: SqliteStatement;
+    insertNameSegment?: SqliteStatement;
   } = {};
+
+  // Names whose segments were already written this session — skips re-splitting
+  // and re-inserting for the same-named nodes that repeat across files ("get",
+  // "render", …). Purely a write-path fast path; INSERT OR IGNORE is the
+  // correctness backstop. Bounded so a pathological repo can't grow it forever.
+  private segmentedNames: Set<string> = new Set();
+  private static readonly MAX_SEGMENTED_NAMES = 65536;
 
   constructor(db: SqliteDatabase) {
     this.db = db;
@@ -303,6 +312,41 @@ export class QueryBuilder {
       returnType: node.returnType ?? null,
       updatedAt: node.updatedAt ?? Date.now(),
     });
+
+    // Segment vocabulary rides the same write path (and transaction) so it can
+    // never drift ahead of the nodes it describes. Deletes intentionally leave
+    // orphans behind — vocab rows are proposals re-verified against nodes
+    // before use, and a full index clears the table at its start. File nodes
+    // are excluded: a file's basename duplicates the symbols inside it
+    // (state-machine.ts / OrderStateMachine), which double-counts every
+    // concept and defeats the singleton-vs-cluster rarity statistics. Import
+    // nodes are excluded too (#1144): they're named after module specifiers
+    // ("external-unindexed-pkg", "./utils/helpers"), not symbols — an
+    // import-only name can never be surfaced (getSegmentMatches requires a
+    // real definition), so its rows would only inflate the rarity statistics.
+    if (this.isSegmentableKind(node.kind)) this.insertNameSegments(node.name);
+  }
+
+  /** Which node kinds contribute their name to the segment vocabulary — the
+   *  single gate shared by insertNode, updateNode, and the rebuild page query
+   *  (getDistinctNodeNames), so the write paths can't drift apart. */
+  private isSegmentableKind(kind: string): boolean {
+    return kind !== 'file' && kind !== 'import';
+  }
+
+  /** Write `name`'s segments into name_segment_vocab (idempotent). */
+  private insertNameSegments(name: string): void {
+    if (this.segmentedNames.has(name)) return;
+    if (this.segmentedNames.size >= QueryBuilder.MAX_SEGMENTED_NAMES) this.segmentedNames.clear();
+    this.segmentedNames.add(name);
+    if (!this.stmts.insertNameSegment) {
+      this.stmts.insertNameSegment = this.db.prepare(
+        'INSERT OR IGNORE INTO name_segment_vocab (segment, name) VALUES (?, ?)',
+      );
+    }
+    for (const segment of splitIdentifierSegments(name)) {
+      this.stmts.insertNameSegment.run(segment, name);
+    }
   }
 
   /**
@@ -379,6 +423,16 @@ export class QueryBuilder {
       returnType: node.returnType ?? null,
       updatedAt: node.updatedAt ?? Date.now(),
     });
+
+    // updateNode is a second real write path to `nodes` — framework
+    // post-extract passes rewrite names through it (NestJS route prefixing),
+    // and a renamed node's new name must reach the segment vocabulary just
+    // like an inserted one's (#1141). Without this the rename left the new
+    // name permanently unsearchable: the old name's rows became honest-gate
+    // orphans and the only backfill is gated on the vocab being EMPTY.
+    // insertNameSegments is idempotent (in-memory set + INSERT OR IGNORE),
+    // so no name-changed check is needed.
+    if (this.isSegmentableKind(node.kind)) this.insertNameSegments(node.name);
   }
 
   /**
@@ -407,6 +461,104 @@ export class QueryBuilder {
       }
     }
     this.stmts.deleteNodesByFile.run(filePath);
+  }
+
+  // ===========================================================================
+  // Name-segment vocabulary (prompt-hook graph-derived gate)
+  // ===========================================================================
+
+  /** Wipe the segment vocabulary. A full index calls this at its start; the
+   *  node write path repopulates it as files (re-)index, so the end state is
+   *  exactly the current names with no orphan rows. */
+  clearNameSegmentVocab(): void {
+    this.db.exec('DELETE FROM name_segment_vocab');
+    this.segmentedNames.clear();
+  }
+
+  /** True when the vocab has no rows — an index built before the table existed.
+   *  `sync` uses this to heal such databases (see rebuildNameSegmentVocabFrom). */
+  isNameSegmentVocabEmpty(): boolean {
+    const row = this.db.prepare('SELECT 1 FROM name_segment_vocab LIMIT 1').get();
+    return row === undefined;
+  }
+
+  /** One page of distinct segmentable node names, for batched vocab rebuilds
+   *  (file basenames and import specifiers are excluded from the vocab — see
+   *  insertNode). */
+  getDistinctNodeNames(limit: number, offset: number): string[] {
+    const rows = this.db
+      .prepare("SELECT DISTINCT name FROM nodes WHERE kind NOT IN ('file', 'import') ORDER BY name LIMIT ? OFFSET ?")
+      .all(limit, offset) as Array<{ name: string }>;
+    return rows.map((r) => r.name);
+  }
+
+  /** Insert segments for a batch of names in one transaction (vocab heal path). */
+  insertNameSegmentsBatch(names: string[]): void {
+    this.db.transaction(() => {
+      for (const name of names) this.insertNameSegments(name);
+    })();
+  }
+
+  /**
+   * Names whose segments cover at least `minWords` distinct PROMPT WORDS —
+   * the co-occurrence probe behind the prompt hook's medium tier: the words
+   * "state" and "machine" both being segments of `OrderStateMachine` is strong
+   * evidence the prompt names that symbol in prose. Ordered by coverage.
+   *
+   * Takes (segment variant → original word) pairs and folds variants back to
+   * their word INSIDE the SQL: a name matching both `service` and `services`
+   * counts ONE word, not two. Counting raw variants let plural-variant pairs
+   * of a single word tie with genuine two-word matches and — because ORDER
+   * BY/LIMIT run here, before any JS-side re-check — crowd a real match past
+   * the LIMIT on vocab-heavy repos (#1146).
+   */
+  getSegmentCoOccurrence(
+    variants: Array<{ segment: string; word: string }>,
+    minWords: number,
+    limit: number,
+  ): Array<{ name: string; matches: number }> {
+    if (variants.length === 0) return [];
+    const placeholders = variants.map(() => '?').join(', ');
+    const whens = variants.map(() => 'WHEN ? THEN ?').join(' ');
+    const rows = this.db
+      .prepare(
+        `SELECT name, COUNT(DISTINCT CASE segment ${whens} END) AS matches
+         FROM name_segment_vocab
+         WHERE segment IN (${placeholders})
+         GROUP BY name
+         HAVING matches >= ?
+         ORDER BY matches DESC, length(name) ASC
+         LIMIT ?`,
+      )
+      .all(
+        ...variants.flatMap((v) => [v.segment, v.word]),
+        ...variants.map((v) => v.segment),
+        minWords,
+        limit,
+      ) as Array<{ name: string; matches: number }>;
+    return rows;
+  }
+
+  /** How many distinct names each segment appears in — the rarity signal that
+   *  separates a discriminative word ("checkout") from a ubiquitous one ("state"). */
+  getSegmentNameCounts(segments: string[]): Map<string, number> {
+    if (segments.length === 0) return new Map();
+    const placeholders = segments.map(() => '?').join(', ');
+    const rows = this.db
+      .prepare(
+        `SELECT segment, COUNT(*) AS n FROM name_segment_vocab
+         WHERE segment IN (${placeholders}) GROUP BY segment`,
+      )
+      .all(...segments) as Array<{ segment: string; n: number }>;
+    return new Map(rows.map((r) => [r.segment, r.n]));
+  }
+
+  /** Names containing the given segment (rare-single-word tier). */
+  getNamesForSegment(segment: string, limit: number): string[] {
+    const rows = this.db
+      .prepare('SELECT name FROM name_segment_vocab WHERE segment = ? ORDER BY length(name) ASC LIMIT ?')
+      .all(segment, limit) as Array<{ name: string }>;
+    return rows.map((r) => r.name);
   }
 
   /**

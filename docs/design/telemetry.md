@@ -72,6 +72,19 @@ Event types:
   (e.g. `codegraph_explore`, `affected`), `count`, `error_count`, and for MCP:
   `client_name`/`client_version` from the `initialize` handshake (`src/mcp/session.ts`
   `case 'initialize'` — plumbing to add; currently unread).
+  The prompt hook additionally rolls up its gate DECISION as `cli_command`
+  counters named `prompt-hook-gate-<outcome>`, outcome ∈ `high-keyword` /
+  `high-token` / `medium-segment` / `nudge-projects` / `noop-shape` /
+  `noop-no-index` / `noop-unverified` / `noop-explore-keyword` /
+  `noop-explore-token` / `noop-vocab-empty` — decision names only, never
+  prompt content. This is the gate's measured recall/precision funnel: a
+  rising `noop-*` share against the `high`/`medium` tiers is the signal that
+  the gate (keyword table or segment matching) is missing real questions.
+  A `high-*` outcome means context was actually injected — a gate decision
+  whose `codegraph_explore` errored or returned nothing records
+  `noop-explore-<trigger>` instead (#1143), and a MEDIUM-eligible prompt
+  hitting a not-yet-backfilled segment vocabulary records `noop-vocab-empty`
+  rather than polluting `noop-unverified` (#1142).
 - **`uninstall`** — one per `uninstall`/`uninit` run (churn signal). Props: `targets`.
 
 Volume math: rollups mean monthly events ≈ active machines × active days × distinct

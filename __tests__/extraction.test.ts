@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs, blankCppExportMacros } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -100,6 +100,24 @@ describe('Language Detection', () => {
     const objcHeader = '@interface Foo : NSObject\n@end\n';
     expect(detectLanguage('Foo.h', objcHeader)).toBe('objc');
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
+  });
+
+  it('should detect Metal shader files as C++ (#1121)', () => {
+    expect(detectLanguage('Shaders.metal')).toBe('cpp');
+    expect(isSourceFile('Renderer/Shaders.metal')).toBe(true);
+  });
+
+  it('should detect Erlang files', () => {
+    expect(detectLanguage('src/my_server.erl')).toBe('erlang');
+    expect(detectLanguage('include/records.hrl')).toBe('erlang');
+    expect(detectLanguage('bin/release_tool.escript')).toBe('erlang');
+    // OTP app resource files route by full suffix — `.src` alone is too generic.
+    expect(detectLanguage('src/myapp.app.src')).toBe('erlang');
+    expect(detectLanguage('ebin/myapp.app')).toBe('erlang');
+    expect(detectLanguage('legacy/module.src')).toBe('unknown');
+    expect(isSourceFile('src/myapp.app.src')).toBe(true);
+    expect(isSourceFile('ebin/myapp.app')).toBe(true);
+    expect(isSourceFile('legacy/module.src')).toBe(false);
   });
 
   it('should detect Solidity files', () => {
@@ -2813,6 +2831,376 @@ class MYGAME_API UMyComponent : public UActorComponent { };
           (r) => r.referenceKind === 'extends' && r.referenceName === 'Base'
         )
       ).toBeTruthy();
+    });
+  });
+
+  describe('Metal shader extraction (#1121)', () => {
+    // Metal Shading Language (≈ C++14) parses with the C++ grammar. MSL puts
+    // `[[attribute]]` annotations AFTER the declarator — a position
+    // tree-sitter-cpp misparses: a struct field with a trailing attribute
+    // emitted a spurious `extends` ref from the struct to the field's own type.
+    // blankMetalAttributes (preParse, `.metal`-gated) blanks them so extraction
+    // matches plain C++.
+    const METAL = `#include <metal_stdlib>
+using namespace metal;
+
+struct VertexIn {
+    float3 position [[attribute(0)]];
+    float2 texCoord [[attribute(1)]];
+};
+
+struct VertexOut {
+    float4 position [[position]];
+    float2 texCoord;
+};
+
+struct Uniforms {
+    float4x4 modelViewProjection;
+};
+
+static float4 applyGamma(float4 color) {
+    return pow(color, float4(1.0 / 2.2));
+}
+
+vertex VertexOut vertexShader(VertexIn in [[stage_in]],
+                              constant Uniforms &uniforms [[buffer(0)]]) {
+    VertexOut out;
+    out.position = uniforms.modelViewProjection * float4(in.position, 1.0);
+    out.texCoord = in.texCoord;
+    return out;
+}
+
+fragment float4 fragmentShader(VertexOut in [[stage_in]],
+                               texture2d<float> colorTexture [[texture(0)]],
+                               sampler textureSampler [[sampler(0)]]) {
+    float4 color = colorTexture.sample(textureSampler, in.texCoord);
+    return applyGamma(color);
+}
+
+kernel void computeBlur(texture2d<float, access::read> inTexture [[texture(0)]],
+                        texture2d<float, access::write> outTexture [[texture(1)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    float4 color = inTexture.read(gid);
+    outTexture.write(color, gid);
+}
+`;
+
+    it('extracts vertex/fragment/kernel functions, structs, and calls from a .metal file', () => {
+      const result = extractFromSource('Shaders.metal', METAL);
+      expect(result.errors).toHaveLength(0);
+
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(functions).toEqual(
+        expect.arrayContaining(['applyGamma', 'vertexShader', 'fragmentShader', 'computeBlur'])
+      );
+      const structs = result.nodes.filter((n) => n.kind === 'struct').map((n) => n.name);
+      expect(structs).toEqual(expect.arrayContaining(['VertexIn', 'VertexOut', 'Uniforms']));
+      expect(result.nodes.find((n) => n.kind === 'import')?.name).toBe('metal_stdlib');
+
+      // Attribute blanking is offset-preserving, so positions stay exact.
+      const vertexFn = result.nodes.find((n) => n.name === 'vertexShader')!;
+      expect(vertexFn.startLine).toBe(22);
+
+      // The shader call graph connects: fragmentShader → applyGamma.
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'calls' && r.referenceName === 'applyGamma'
+        )
+      ).toBeTruthy();
+
+      // The regression the blanking fixes: field attributes (`float3 position
+      // [[attribute(0)]];`) misparsed into `extends` refs from the struct to the
+      // field's type — a wrong inheritance edge whenever the repo defines that
+      // type itself (simd typedefs in a shared ShaderTypes.h are common).
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'extends')).toHaveLength(0);
+    });
+
+    it('blankMetalAttributes blanks every attribute form, offset-preserving', () => {
+      const inp = [
+        'float4 position [[position]];',
+        'constant Uniforms &u [[buffer(0)]]',
+        'float2 uv [[user(locn0)]];',
+        'device float *out [[buffer(0), raster_order_group(0)]]',
+      ].join('\n');
+      const out = blankMetalAttributes(inp);
+      expect(out.length).toBe(inp.length); // every byte offset preserved
+      expect(out).not.toContain('[[');
+      // Nothing but the attributes changed: collapsing the blank runs gives the
+      // plain declarations back, newlines untouched.
+      expect(out.split('\n').map((l) => l.replace(/ +/g, ' ').trimEnd())).toEqual([
+        'float4 position ;',
+        'constant Uniforms &u',
+        'float2 uv ;',
+        'device float *out',
+      ]);
+    });
+
+    it('blankMetalAttributes never touches non-attribute [[ sequences', () => {
+      for (const c of [
+        'auto x = arr[[]{ return 0; }()];', // lambda in subscript — the only other [[ in C++-family code
+        'int y = a[b[i]];', // nested subscript
+        'int z = 1;', // no [[ at all — early-return path
+      ]) {
+        expect(blankMetalAttributes(c)).toBe(c);
+      }
+    });
+  });
+
+  describe('C++ forward declarations do not mint phantom class nodes (#1093)', () => {
+    // `class Foo;` parses as a bodiless class_specifier. Repeated across headers,
+    // each forward decl minted a phantom bodiless `class` node that crowded out —
+    // and could be picked as the blast-radius representative over — the single
+    // real definition. Bodiless struct/enum specifiers were already skipped;
+    // classes now are too, but ONLY for C/C++ (opt-in flag), never for languages
+    // where a bodiless class is a complete definition.
+    it('keeps only the real definition, dropping repeated forward decls', () => {
+      const code = `
+class APXCharacter;   // forward decl (header 1)
+class APXCharacter;   // forward decl (header 2)
+friend class APXCharacter;   // elaborated / friend forward reference
+
+class APXCharacter {  // the one real definition
+  int hp;
+  void takeDamage(int amount) { hp -= amount; }
+};
+`;
+      const result = extractFromSource('character.cpp', code);
+      const classes = result.nodes.filter(
+        (n) => n.kind === 'class' && n.name === 'APXCharacter'
+      );
+      // Exactly one class node, and it's the definition (carries the member).
+      expect(classes).toHaveLength(1);
+      expect(classes[0].startLine).toBe(6);
+      expect(
+        result.nodes.some((n) => n.kind === 'method' && n.name === 'takeDamage')
+      ).toBe(true);
+    });
+
+    it('elaborated type references in declarations create no phantom class', () => {
+      // `class Foo obj;` is a variable declaration using an elaborated type, not
+      // a class definition — it must not mint a `Foo` class node.
+      const result = extractFromSource('use.cpp', 'class Foo;\nvoid f() { class Foo *p = nullptr; (void)p; }\n');
+      expect(result.nodes.filter((n) => n.kind === 'class' && n.name === 'Foo')).toHaveLength(0);
+    });
+
+    it('does NOT affect languages where a bodiless class is complete', () => {
+      // Kotlin `class Empty` and Scala `trait`/`case object`/`class` with no body
+      // are complete definitions — the C/C++-only skip must leave them indexed.
+      const kt = extractFromSource('Empty.kt', 'class Empty\nclass Full { val x = 1 }\n');
+      const ktClasses = kt.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(ktClasses).toContain('Empty');
+      expect(ktClasses).toContain('Full');
+
+      const scala = extractFromSource('M.scala', 'trait Marker\ncase object Red\nclass Foo\n');
+      const scalaNames = scala.nodes
+        .filter((n) => ['class', 'trait', 'interface'].includes(n.kind))
+        .map((n) => n.name);
+      expect(scalaNames).toEqual(expect.arrayContaining(['Marker', 'Red', 'Foo']));
+    });
+  });
+
+  describe('C++ reference-return method/function names (#1093 follow-up)', () => {
+    // An inline method/function returning a reference parses with a
+    // `reference_declarator` wrapping the `function_declarator`. That wrapper
+    // wasn't unwrapped (only `pointer_declarator` was), so the name captured the
+    // whole declarator — `const int& getRef() const {…}` became the method named
+    // "& getRef() const" instead of "getRef", polluting search and callers. Very
+    // common in Unreal Engine headers (`const FGameplayTagContainer& GetActiveTags() const`).
+    const namesOf = (code: string) =>
+      extractFromSource('r.cpp', code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+
+    it('names an inline reference-returning method by its identifier, not the declarator', () => {
+      const names = namesOf('class C {\npublic:\n  const int& getRef() const { return x; }\n  int& mutRef() { return x; }\n  int x;\n};');
+      expect(names).toContain('getRef');
+      expect(names).toContain('mutRef');
+      // No name leaks the reference sigil or the parameter/qualifier tail.
+      expect(names.some((n) => /[&()]/.test(n))).toBe(false);
+    });
+
+    it('handles rvalue-reference returns and reference-returning free functions', () => {
+      expect(namesOf('class C { int&& take() { return 1; } };')).toContain('take');
+      expect(namesOf('const int& globalRef() { static int x; return x; }')).toContain('globalRef');
+    });
+
+    it('leaves pointer, value, and out-of-line reference returns unchanged (controls)', () => {
+      expect(namesOf('class C { int* getPtr() { return &x; } int x; };')).toContain('getPtr');
+      expect(namesOf('class C { int getVal() const { return x; } int x; };')).toContain('getVal');
+      // Out-of-line `T& C::f()` already resolves via the qualified-name hook.
+      expect(namesOf('const int& C::getRef() const { return x; }')).toContain('getRef');
+    });
+  });
+
+  describe('C++ user-defined conversion operator names (#1093 follow-up)', () => {
+    // A conversion operator's declarator is an `operator_cast` (target type +
+    // `() const` tail). It was named with the whole declarator —
+    // `operator EALSMovementState() const` — so it didn't match the symbolic-
+    // overload style (`operator+`) and carried parameter noise. It's now named
+    // `operator <type>`. Common in Unreal Engine enum-wrapper structs.
+    const namesOf = (code: string) =>
+      extractFromSource('o.cpp', code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+
+    it('names a conversion operator as "operator <type>", not the full declarator', () => {
+      const names = namesOf('struct S {\n  operator int() const { return 1; }\n  operator bool() { return true; }\n  int x;\n};');
+      expect(names).toContain('operator int');
+      expect(names).toContain('operator bool');
+      expect(names.some((n) => n.includes('(') || n.includes('const'))).toBe(false);
+    });
+
+    it('handles a user-type conversion operator', () => {
+      expect(
+        namesOf('struct FALSMovementState {\n  operator EALSMovementState() const { return State; }\n  EALSMovementState State;\n};')
+      ).toContain('operator EALSMovementState');
+    });
+
+    it('leaves symbolic operator overloads unchanged (control)', () => {
+      const names = namesOf('struct S {\n  S operator+(const S& o) const { return o; }\n  int& operator[](int i) { return x; }\n  int x;\n};');
+      expect(names).toContain('operator+');
+      expect(names).toContain('operator[]'); // reference-returning subscript, name still clean
+    });
+  });
+
+  describe('C++ macro-prefixed function names (#1093 follow-up)', () => {
+    // An unknown inline-specifier macro before the return type
+    // (`FORCEINLINE FString GetName(…)`) threw tree-sitter into error recovery:
+    // the macro became the return type and — for a non-primitive return — the
+    // return type was glued onto the name (`"FString GetName"`), so the function
+    // was unfindable by name and its callers didn't link. `blankCppInlineMacros`
+    // blanks the known UE inline macros before parsing (offset-preserving), the
+    // same recover-don't-drop approach as the macro-annotated-class fix. Pervasive
+    // in Unreal Engine (`FORCEINLINE`).
+    const infoOf = (code: string) =>
+      extractFromSource('m.cpp', code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => ({ name: n.name, ret: n.returnType }));
+
+    it('recovers the real name AND return type of a FORCEINLINE function', () => {
+      expect(infoOf('static FORCEINLINE FString GetName(int V) { return H(V); }')).toEqual([
+        { name: 'GetName', ret: 'FString' },
+      ]);
+    });
+
+    it('handles the templated UE helper shape (GetEnumerationToString)', () => {
+      const names = infoOf(
+        'template <typename E> static FORCEINLINE FString GetEnumerationToString(const E V) { return H(V); }'
+      ).map((x) => x.name);
+      expect(names).toContain('GetEnumerationToString');
+    });
+
+    it('handles FORCENOINLINE / FORCEINLINE_DEBUGGABLE, methods, void, and reference returns', () => {
+      expect(infoOf('FORCENOINLINE FString A(int V){return H(V);}').map((x) => x.name)).toContain('A');
+      expect(infoOf('FORCEINLINE_DEBUGGABLE FString B(int V){return H(V);}').map((x) => x.name)).toContain('B');
+      expect(infoOf('struct S { FORCEINLINE FString GetName(int V) { return H(V); } };').map((x) => x.name)).toContain('GetName');
+      expect(infoOf('static FORCEINLINE void DoThing(int V) { H(V); }').map((x) => x.name)).toContain('DoThing');
+      expect(infoOf('static FORCEINLINE const FString& GetRef(int V) { return H(V); }').map((x) => x.name)).toContain('GetRef');
+    });
+
+    it('handles common third-party inline macros (pugixml, Godot, Boost, generic)', () => {
+      // pugixml: PUGI__FN before the return type; PUGIXML_FUNCTION (linkage)
+      // between the return type and the name — both recovered.
+      expect(infoOf('PUGI__FN void* default_allocate(size_t n) { return H(n); }').map((x) => x.name)).toContain('default_allocate');
+      expect(infoOf('PUGI__FN_NO_INLINE bool strequal(const char_t* a) { return H(a); }').map((x) => x.name)).toContain('strequal');
+      expect(infoOf('std::string PUGIXML_FUNCTION as_utf8(const wchar_t* s) { return H(s); }').map((x) => x.name)).toContain('as_utf8');
+      // Godot / Boost / generic inline hints
+      expect(infoOf('_FORCE_INLINE_ String get_name() const { return H(); }').map((x) => x.name)).toContain('get_name');
+      expect(infoOf('_ALWAYS_INLINE_ Vector2 get_pos() { return H(); }').map((x) => x.name)).toContain('get_pos');
+      expect(infoOf('BOOST_FORCEINLINE result_type call() { return H(); }').map((x) => x.name)).toContain('call');
+      expect(infoOf('ALWAYS_INLINE MyType compute() { return H(); }').map((x) => x.name)).toContain('compute');
+    });
+
+    it('leaves ordinary functions and real all-caps return types untouched (controls)', () => {
+      expect(infoOf('FString GetName(int V) { return H(V); }')).toEqual([{ name: 'GetName', ret: 'FString' }]);
+      // A real all-caps type that is NOT a listed inline macro stays the return type.
+      expect(infoOf('HRESULT DoIt(int V) { return H(V); }')).toEqual([{ name: 'DoIt', ret: 'HRESULT' }]);
+    });
+
+    it('blankCppInlineMacros preserves offsets and only touches specifier-position macros', () => {
+      // Blanked with equal-length spaces (byte offsets preserved).
+      expect(blankCppInlineMacros('FORCEINLINE FString F()')).toBe('            FString F()');
+      expect(blankCppInlineMacros('FORCEINLINE FString F()')).toHaveLength('FORCEINLINE FString F()'.length);
+      // Not in specifier position → untouched: string literals, expressions,
+      // longer word (`FORCEINLINE_COUNT`), and the fast path.
+      expect(blankCppInlineMacros('const char* s = "FORCEINLINE";')).toBe('const char* s = "FORCEINLINE";');
+      expect(blankCppInlineMacros('x = FORCEINLINE + 1;')).toBe('x = FORCEINLINE + 1;');
+      expect(blankCppInlineMacros('int FORCEINLINE_COUNT = 3;')).toBe('int FORCEINLINE_COUNT = 3;');
+      expect(blankCppInlineMacros('no macros here')).toBe('no macros here');
+    });
+  });
+
+  describe('C++ universal macro-mangled name recovery', () => {
+    // Curated pre-parse blanking can't list every library's inline macro, so a
+    // post-parse salvage recovers the real function name from ANY leftover
+    // `MACRO Ret name(…)` mangle — no list needed. It only ever touches an
+    // already-mangled name, so it can't corrupt a clean one.
+    const namesOf = (code: string, file = 's.cpp') =>
+      extractFromSource(file, code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+
+    it('recovers the name from a completely unknown macro (no list entry)', () => {
+      expect(namesOf('WEBKIT_EXPORT WTFString computeThing(int x) { return H(x); }')).toContain('computeThing');
+      expect(namesOf('SOMELIB_INLINE MyResult doWork(int x) { return H(x); }')).toContain('doWork');
+      expect(namesOf('MZ_FORCEINLINE char_t* to_str(double v) { return H(v); }')).toContain('to_str');
+    });
+
+    it('recoverMangledCppName only touches already-mangled names, with guards', () => {
+      // Recovered:
+      expect(recoverMangledCppName('WTFString computeThing')).toBe('computeThing');
+      expect(recoverMangledCppName('char_t* to_str(double v)')).toBe('to_str');
+      expect(recoverMangledCppName('unspecified_bool_type() const')).toBe('unspecified_bool_type');
+      // Left unchanged — clean names, operators, destructors, the `Ret (name)`
+      // idiom, and non-identifier tails:
+      expect(recoverMangledCppName('computeThing')).toBe('computeThing');
+      expect(recoverMangledCppName('operator EALSMovementState')).toBe('operator EALSMovementState');
+      expect(recoverMangledCppName('~Widget')).toBe('~Widget');
+      expect(recoverMangledCppName('bool (likely)')).toBe('bool (likely)');
+      expect(recoverMangledCppName('void (free)')).toBe('void (free)');
+      expect(recoverMangledCppName('QDockWidget *')).toBe('QDockWidget *');
+    });
+
+    it('does not disturb clean C++ names or non-C++ (Kotlin backtick) names', () => {
+      expect(namesOf('int foo(int x) { return x; }')).toEqual(['foo']);
+      // Kotlin backtick identifiers legitimately contain spaces; the salvage is
+      // C/C++-only, so they are untouched.
+      const kt = extractFromSource('T.kt', 'class T {\n  fun `decode simple cert`() { }\n}').nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+      expect(kt).toContain('`decode simple cert`');
+    });
+
+    it('curated list now also covers Qt / Folly / Abseil / LLVM / V8 / Eigen / rapidjson (full recovery)', () => {
+      const info = (c: string) =>
+        extractFromSource('x.cpp', c).nodes
+          .filter((n) => n.kind === 'method' || n.kind === 'function')
+          .map((n) => ({ name: n.name, ret: n.returnType }));
+      expect(info('FOLLY_ALWAYS_INLINE Str f(int x) { return H(x); }')).toEqual([{ name: 'f', ret: 'Str' }]);
+      expect(namesOf('Q_INVOKABLE void onClicked() { H(); }')).toContain('onClicked');
+      expect(namesOf('ABSL_ATTRIBUTE_ALWAYS_INLINE int hash(int x) { return H(x); }')).toContain('hash');
+      expect(namesOf('EIGEN_STRONG_INLINE Scalar dot(const V& v) { return H(v); }')).toContain('dot');
+      expect(namesOf('V8_INLINE MaybeLocal Get(int i) { return H(i); }')).toContain('Get');
+      expect(namesOf('RAPIDJSON_FORCEINLINE bool Parse(const char* s) { return H(s); }')).toContain('Parse');
+    });
+
+    it('curated list spans the broader ecosystem (Mozilla, GLM, Bullet, OpenCV, Skia, EASTL, protobuf, fmt, Windows conventions)', () => {
+      const info = (c: string) =>
+        extractFromSource('x.cpp', c).nodes
+          .filter((n) => n.kind === 'method' || n.kind === 'function')
+          .map((n) => ({ name: n.name, ret: n.returnType }));
+      expect(info('MOZ_ALWAYS_INLINE Value get(int i) { return H(i); }')).toEqual([{ name: 'get', ret: 'Value' }]);
+      expect(info('GLM_FUNC_QUALIFIER vec3 cross(const vec3& a) { return H(a); }')).toEqual([{ name: 'cross', ret: 'vec3' }]);
+      expect(info('SIMD_FORCE_INLINE btScalar dot(const btVector3& v) const { return H(v); }')).toEqual([{ name: 'dot', ret: 'btScalar' }]);
+      expect(info('CV_INLINE Mat clone() const { return H(); }')).toEqual([{ name: 'clone', ret: 'Mat' }]);
+      expect(namesOf('PROTOBUF_ALWAYS_INLINE int size() const { return H(); }')).toContain('size');
+      expect(namesOf('FMT_CONSTEXPR auto parse(int x) { return H(x); }')).toContain('parse');
+      expect(namesOf('SK_ALWAYS_INLINE SkScalar width() const { return H(); }')).toContain('width');
+      expect(namesOf('EA_FORCE_INLINE size_type size() const { return H(); }')).toContain('size');
+      // Windows calling-convention macros sit between return type and name; the
+      // macro is blanked so the real return type survives.
+      expect(info('HRESULT WINAPI CreateThing(int x) { return H(x); }')).toEqual([{ name: 'CreateThing', ret: 'HRESULT' }]);
+      expect(info('ULONG STDMETHODCALLTYPE AddRef() { return H(); }')).toEqual([{ name: 'AddRef', ret: 'ULONG' }]);
     });
   });
 
@@ -7818,6 +8206,1264 @@ GeomPoint <- ggproto("GeomPoint", Geom,
       expect(ext?.fromNodeId).toBe(cls?.id);
       // No twin variable for the assignment.
       expect(result.nodes.find((n) => n.name === 'GeomPoint' && n.kind === 'variable')).toBeUndefined();
+    });
+  });
+});
+
+// =============================================================================
+// CFML (ColdFusion Markup Language — .cfc/.cfm tag-based and bare-script, .cfs)
+// =============================================================================
+
+describe('CFML Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect .cfc/.cfm as cfml and .cfs as cfscript', () => {
+      expect(detectLanguage('Service.cfc')).toBe('cfml');
+      expect(detectLanguage('index.cfm')).toBe('cfml');
+      expect(detectLanguage('Helper.cfs')).toBe('cfscript');
+    });
+
+    it('should report cfml and cfscript as supported', () => {
+      expect(isLanguageSupported('cfml')).toBe(true);
+      expect(isLanguageSupported('cfscript')).toBe(true);
+      expect(getSupportedLanguages()).toContain('cfml');
+      expect(getSupportedLanguages()).toContain('cfscript');
+    });
+  });
+
+  describe('Bare-script .cfc (component { ... })', () => {
+    const code = `
+component extends="BaseService" implements="IService" {
+
+    property name="name" type="string";
+
+    function init(required string name) {
+        variables.name = arguments.name;
+        return this;
+    }
+
+    public string function getName() {
+        return variables.name;
+    }
+
+    private void function logSomething(required string msg) {
+        writeLog(text=msg);
+    }
+}
+`;
+
+    it('should name the component from the file name (the grammar has no name field)', () => {
+      const result = extractFromSource('SampleService.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls).toBeDefined();
+      expect(cls?.name).toBe('SampleService');
+      expect(cls?.language).toBe('cfml');
+    });
+
+    it('should extract methods with visibility and contains edges to the class', () => {
+      const result = extractFromSource('SampleService.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.map((m) => m.name)).toEqual(
+        expect.arrayContaining(['init', 'getName', 'logSomething'])
+      );
+      const logSomething = methods.find((m) => m.name === 'logSomething');
+      expect(logSomething?.visibility).toBe('private');
+      const containsLog = result.edges.find(
+        (e) => e.source === cls?.id && e.target === logSomething?.id && e.kind === 'contains'
+      );
+      expect(containsLog).toBeDefined();
+    });
+
+    it('should extract extends/implements as unresolved references from the class', () => {
+      const result = extractFromSource('SampleService.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const extendsRef = result.unresolvedReferences.find((r) => r.referenceKind === 'extends');
+      expect(extendsRef?.referenceName).toBe('BaseService');
+      expect(extendsRef?.fromNodeId).toBe(cls?.id);
+      const implRef = result.unresolvedReferences.find((r) => r.referenceKind === 'implements');
+      expect(implRef?.referenceName).toBe('IService');
+      expect(implRef?.fromNodeId).toBe(cls?.id);
+    });
+  });
+
+  describe('Standalone .cfs (pure CFScript)', () => {
+    it('should also name an anonymous component from the file name', () => {
+      const code = `
+component {
+    function ping() {
+        return "pong";
+    }
+}
+`;
+      const result = extractFromSource('Sample.cfs', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls).toBeDefined();
+      expect(cls?.name).toBe('Sample');
+      expect(cls?.language).toBe('cfscript');
+    });
+
+    it('should extract top-level imports with no enclosing component', () => {
+      const code = `
+import com.foo.Bar;
+import foo.cfm;
+`;
+      const result = extractFromSource('Includes.cfs', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('com.foo.Bar');
+      expect(imports).toContain('foo.cfm');
+    });
+  });
+
+  describe('Tag-based .cfc (<cfcomponent>/<cffunction>)', () => {
+    const code = `<cfcomponent extends="Base" implements="IFoo,IBar" output="false">
+\t<cffunction name="getName" access="public" returntype="string">
+\t\t<cfreturn this.name>
+\t</cffunction>
+\t<cffunction name="doWork" access="private" returntype="void">
+\t\t<cfscript>
+\t\t\tvar x = helper();
+\t\t\tanotherCall(x);
+\t\t</cfscript>
+\t</cffunction>
+</cfcomponent>
+`;
+
+    it('should name the component from the file name when the tag has no name attribute', () => {
+      const result = extractFromSource('TagStyle.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls?.name).toBe('TagStyle');
+      expect(cls?.language).toBe('cfml');
+    });
+
+    it('should prefer an explicit name attribute on the cfcomponent tag', () => {
+      const named = `<cfcomponent name="ExplicitName">\n<cffunction name="a"><cfreturn 1></cffunction>\n</cfcomponent>`;
+      const result = extractFromSource('File.cfc', named);
+      expect(result.nodes.find((n) => n.kind === 'class')?.name).toBe('ExplicitName');
+    });
+
+    it('should extract cffunction tags as methods with access-derived visibility', () => {
+      const result = extractFromSource('TagStyle.cfc', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.map((m) => m.name)).toEqual(expect.arrayContaining(['getName', 'doWork']));
+      const getName = methods.find((m) => m.name === 'getName');
+      expect(getName?.visibility).toBe('public');
+      expect(getName?.returnType).toBe('string');
+      const doWork = methods.find((m) => m.name === 'doWork');
+      expect(doWork?.visibility).toBe('private');
+    });
+
+    it('should not double-extract symbols from the component body (implicit-end-tag walk)', () => {
+      const result = extractFromSource('TagStyle.cfc', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method' && n.name === 'getName');
+      expect(methods).toHaveLength(1);
+      const doWorkMethods = result.nodes.filter((n) => n.kind === 'method' && n.name === 'doWork');
+      expect(doWorkMethods).toHaveLength(1);
+    });
+
+    it('should delegate <cfscript> tag bodies to the cfscript grammar and attribute calls to the enclosing method', () => {
+      const result = extractFromSource('TagStyle.cfc', code);
+      const doWork = result.nodes.find((n) => n.kind === 'method' && n.name === 'doWork');
+      const helperCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'helper'
+      );
+      expect(helperCall?.fromNodeId).toBe(doWork?.id);
+    });
+
+    it('should produce exactly one correctly-ranged file node, not a leaked snippet-scoped one', () => {
+      const result = extractFromSource('TagStyle.cfc', code);
+      const fileNodes = result.nodes.filter((n) => n.kind === 'file');
+      expect(fileNodes).toHaveLength(1);
+      expect(fileNodes[0].startLine).toBe(1);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const containsClass = result.edges.find(
+        (e) => e.source === fileNodes[0].id && e.target === cls?.id && e.kind === 'contains'
+      );
+      expect(containsClass).toBeDefined();
+    });
+  });
+
+  describe('Top-level cffunction with no enclosing cfcomponent (.cfm template)', () => {
+    it('should extract as a top-level function contained by the file', () => {
+      const code = `<cffunction name="helper" access="public" returntype="string">
+\t<cfreturn "hi">
+</cffunction>
+`;
+      const result = extractFromSource('helper.cfm', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'helper');
+      expect(fn).toBeDefined();
+      const fileNode = result.nodes.find((n) => n.kind === 'file');
+      const containsFn = result.edges.find(
+        (e) => e.source === fileNode?.id && e.target === fn?.id && e.kind === 'contains'
+      );
+      expect(containsFn).toBeDefined();
+    });
+  });
+
+  describe('<cfscript> nested inside control-flow tags (<cfif>/<cfloop>/<cftry>)', () => {
+    it('should delegate a <cfscript> body nested inside <cfif> within a <cffunction>', () => {
+      const code = `<cfcomponent>
+<cffunction name="doStuff">
+  <cfif true>
+    <cfscript>
+      helper();
+    </cfscript>
+  </cfif>
+</cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('Nested.cfc', code);
+      const doStuff = result.nodes.find((n) => n.kind === 'method' && n.name === 'doStuff');
+      expect(doStuff).toBeDefined();
+      const helperCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'helper'
+      );
+      expect(helperCall?.fromNodeId).toBe(doStuff?.id);
+    });
+
+    it('should delegate a <cfscript> body nested inside <cfif> at top-level component scope', () => {
+      const code = `<cfcomponent>
+<cfif true>
+  <cfscript>
+    topLevelHelper();
+  </cfscript>
+</cfif>
+</cfcomponent>
+`;
+      const result = extractFromSource('Nested2.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls).toBeDefined();
+      const helperCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'topLevelHelper'
+      );
+      expect(helperCall?.fromNodeId).toBe(cls?.id);
+    });
+  });
+
+  describe('<cfquery> SQL bodies (cfquery grammar)', () => {
+    it('should extract a call expression embedded in a #hash# inside the SQL body', () => {
+      const code = `<cfcomponent>
+<cffunction name="getUsers">
+  <cfquery name="qUsers" datasource="#variables.dsn#">
+    SELECT id, name FROM users WHERE owner = #getCurrentUser().getId()#
+  </cfquery>
+  <cfreturn qUsers>
+</cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('Query.cfc', code);
+      const getUsers = result.nodes.find((n) => n.kind === 'method' && n.name === 'getUsers');
+      expect(getUsers).toBeDefined();
+      const getCurrentUserCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'getCurrentUser'
+      );
+      expect(getCurrentUserCall?.fromNodeId).toBe(getUsers?.id);
+      const getIdCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'getId'
+      );
+      expect(getIdCall?.fromNodeId).toBe(getUsers?.id);
+    });
+  });
+
+  describe('UTF-8 BOM handling (common in CFML saved by Windows editors)', () => {
+    it('should route a BOM-prefixed tag-based .cfc to the tag grammar, not the script grammar', () => {
+      const code = `\uFEFF<cfcomponent output="false">\n<cffunction name="configure" access="public">\n<cfreturn 1>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('ModuleConfig.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls?.name).toBe('ModuleConfig');
+      const configure = result.nodes.find((n) => n.kind === 'method' && n.name === 'configure');
+      expect(configure).toBeDefined();
+    });
+
+    it('should still treat a BOM-prefixed bare-script .cfc as script', () => {
+      const code = `\uFEFFcomponent {\n  function ping() { return "pong"; }\n}\n`;
+      const result = extractFromSource('Ping.cfc', code);
+      expect(result.nodes.find((n) => n.kind === 'class')?.name).toBe('Ping');
+      expect(result.nodes.find((n) => n.kind === 'method')?.name).toBe('ping');
+    });
+  });
+
+  describe('Unquoted tag attribute values (legal in older CFML)', () => {
+    it('should extract functions and inheritance from unquoted attributes', () => {
+      const code = `<cfcomponent extends=Base>\n<cffunction name=doThing access=private>\n<cfreturn 1>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Unquoted.cfc', code);
+      const doThing = result.nodes.find((n) => n.kind === 'method' && n.name === 'doThing');
+      expect(doThing).toBeDefined();
+      expect(doThing?.visibility).toBe('private');
+      const extendsRef = result.unresolvedReferences.find((r) => r.referenceKind === 'extends');
+      expect(extendsRef?.referenceName).toBe('Base');
+    });
+  });
+
+  describe('Functions in a component-level <cfscript> block', () => {
+    it('should classify them as methods of the component (ColdBox ModuleConfig shape)', () => {
+      const code = `<cfcomponent output="false">\n<cfscript>\nfunction configure() {\n  return settings();\n}\nfunction onLoad() {\n  return 1;\n}\n</cfscript>\n</cfcomponent>\n`;
+      const result = extractFromSource('ModuleConfig.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+      expect(methods).toEqual(expect.arrayContaining(['configure', 'onLoad']));
+      expect(result.nodes.filter((n) => n.kind === 'function')).toHaveLength(0);
+      const configure = result.nodes.find((n) => n.kind === 'method' && n.name === 'configure');
+      const containsEdge = result.edges.find(
+        (e) => e.source === cls?.id && e.target === configure?.id && e.kind === 'contains'
+      );
+      expect(containsEdge).toBeDefined();
+    });
+
+    it('should keep kind function for a <cfscript> inside a cffunction body', () => {
+      const code = `<cfcomponent>\n<cffunction name="outer">\n<cfscript>\nfunction innerHelper() { return 1; }\n</cfscript>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Outer.cfc', code);
+      expect(result.nodes.find((n) => n.name === 'outer')?.kind).toBe('method');
+      expect(result.nodes.find((n) => n.name === 'innerHelper')?.kind).toBe('function');
+    });
+  });
+});
+
+describe('COBOL Extraction', () => {
+  it('should detect .cbl/.cob/.cpy as cobol (case-insensitive)', () => {
+    expect(detectLanguage('app/cbl/CBACT01C.cbl')).toBe('cobol');
+    expect(detectLanguage('app/cbl/CBSTM03A.CBL')).toBe('cobol');
+    expect(detectLanguage('prog.cob')).toBe('cobol');
+    expect(detectLanguage('app/cpy/CVACT01Y.cpy')).toBe('cobol');
+    expect(isSourceFile('CBACT01C.cbl')).toBe(true);
+  });
+
+  const FIXED = (body: string) =>
+    body
+      .split('\n')
+      .map((l) => (l.length > 0 ? '       ' + l : l))
+      .join('\n');
+
+  const PROGRAM = FIXED(`IDENTIFICATION DIVISION.
+PROGRAM-ID. TESTPROG.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-TOTALS.
+    05  WS-COUNT            PIC 9(4) VALUE ZERO.
+    88  WS-DONE             VALUE 'Y'.
+77  WS-FLAG                 PIC X.
+COPY CVACT01Y.
+PROCEDURE DIVISION.
+MAIN-SECTION SECTION.
+0000-MAIN.
+    PERFORM 1000-INIT
+    PERFORM 2000-PROCESS THRU 2000-EXIT
+    CALL 'CBACT01C' USING WS-TOTALS
+    CALL WS-FLAG
+    GO TO 9999-END
+    .
+1000-INIT.
+    MOVE ZERO TO WS-COUNT.
+2000-PROCESS.
+    EXEC CICS LINK PROGRAM('COCOM01C') COMMAREA(WS-TOTALS)
+    END-EXEC.
+2000-EXIT.
+    EXIT.
+9999-END.
+    GOBACK.
+`);
+
+  it('should extract the program as a module node', () => {
+    const result = extractFromSource('TESTPROG.cbl', PROGRAM);
+    const moduleNode = result.nodes.find((n) => n.kind === 'module');
+    expect(moduleNode).toBeDefined();
+    expect(moduleNode?.name).toBe('TESTPROG');
+  });
+
+  it('should extract sections and paragraphs as functions with reconstructed extents', () => {
+    const result = extractFromSource('TESTPROG.cbl', PROGRAM);
+    const fns = result.nodes.filter((n) => n.kind === 'function');
+    const names = fns.map((f) => f.name);
+    expect(names).toContain('MAIN-SECTION');
+    expect(names).toContain('0000-MAIN');
+    expect(names).toContain('2000-PROCESS');
+    // A paragraph spans from its header to the next header, not just one line.
+    const main = fns.find((f) => f.name === '0000-MAIN');
+    expect(main).toBeDefined();
+    expect(main!.endLine).toBeGreaterThan(main!.startLine + 3);
+    // Paragraphs are contained in their section (qualified name includes it).
+    expect(main!.qualifiedName).toContain('MAIN-SECTION');
+  });
+
+  it('should extract PERFORM, PERFORM THRU, GO TO, and CALL literal as calls references', () => {
+    const result = extractFromSource('TESTPROG.cbl', PROGRAM);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const targets = calls.map((c) => c.referenceName);
+    expect(targets).toContain('1000-INIT');
+    expect(targets).toContain('2000-PROCESS'); // PERFORM ... THRU start
+    expect(targets).toContain('2000-EXIT'); // PERFORM ... THRU end
+    expect(targets).toContain('9999-END'); // GO TO
+    expect(targets).toContain('CBACT01C'); // CALL 'literal'
+    expect(targets).toContain('COCOM01C'); // EXEC CICS LINK PROGRAM('...')
+    // Dynamic CALL through a data name is skipped — announce, don't guess.
+    expect(targets).not.toContain('WS-FLAG');
+  });
+
+  it('should extract COPY as an import node and imports reference', () => {
+    const result = extractFromSource('TESTPROG.cbl', PROGRAM);
+    const importNode = result.nodes.find((n) => n.kind === 'import');
+    expect(importNode).toBeDefined();
+    expect(importNode?.name).toBe('CVACT01Y');
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports');
+    expect(importRefs.map((r) => r.referenceName)).toContain('CVACT01Y');
+  });
+
+  it('should extract data items as variables, fields, and 88-level constants', () => {
+    const result = extractFromSource('TESTPROG.cbl', PROGRAM);
+    const group = result.nodes.find((n) => n.name === 'WS-TOTALS');
+    expect(group?.kind).toBe('variable');
+    const nested = result.nodes.find((n) => n.name === 'WS-COUNT');
+    expect(nested?.kind).toBe('field');
+    expect(nested?.qualifiedName).toContain('WS-TOTALS');
+    const condition = result.nodes.find((n) => n.name === 'WS-DONE');
+    expect(condition?.kind).toBe('constant');
+    const standalone = result.nodes.find((n) => n.name === 'WS-FLAG');
+    expect(standalone?.kind).toBe('variable');
+  });
+
+  it('should extract EXEC SQL INCLUDE as an import', () => {
+    const code = FIXED(`IDENTIFICATION DIVISION.
+PROGRAM-ID. SQLPROG.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+EXEC SQL INCLUDE SQLCA END-EXEC.
+01  WS-X                    PIC X.
+PROCEDURE DIVISION.
+P1.
+    GOBACK.
+`);
+    const result = extractFromSource('SQLPROG.cbl', code);
+    const importNode = result.nodes.find((n) => n.kind === 'import' && n.name === 'SQLCA');
+    expect(importNode).toBeDefined();
+    // The EXEC block must not break the rest of the file.
+    expect(result.nodes.find((n) => n.name === 'WS-X')).toBeDefined();
+  });
+
+  it('should extract a standalone data copybook (.cpy fragment)', () => {
+    const code = FIXED(`01  ACCOUNT-RECORD.
+    05  ACCT-ID             PIC 9(11).
+    05  ACCT-CURR-BAL       PIC S9(10)V99.
+`);
+    const result = extractFromSource('CVACT01Y.cpy', code);
+    const record = result.nodes.find((n) => n.name === 'ACCOUNT-RECORD');
+    expect(record?.kind).toBe('variable');
+    const field = result.nodes.find((n) => n.name === 'ACCT-ID');
+    expect(field?.kind).toBe('field');
+  });
+
+  it('should extract a procedure copybook (.cpy fragment with paragraphs)', () => {
+    const code = FIXED(`EDIT-DATE.
+    MOVE 1 TO WS-X
+    PERFORM VALIDATE-YEAR.
+VALIDATE-YEAR.
+    CONTINUE.
+`);
+    const result = extractFromSource('CSUTLDPY.cpy', code);
+    const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(fns).toContain('EDIT-DATE');
+    expect(fns).toContain('VALIDATE-YEAR');
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    expect(calls.map((c) => c.referenceName)).toContain('VALIDATE-YEAR');
+  });
+
+  it('should emit write-site references for MOVE/ADD/COMPUTE targets', () => {
+    const code = FIXED(`IDENTIFICATION DIVISION.
+PROGRAM-ID. WRITEREF.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-TOTAL                 PIC S9(7)V99.
+01  WS-COUNT                 PIC 9(4).
+PROCEDURE DIVISION.
+P1.
+    MOVE ZERO TO WS-TOTAL
+    ADD 1 TO WS-COUNT
+    COMPUTE WS-TOTAL = WS-TOTAL + 1
+    SUBTRACT 1 FROM WS-COUNT
+    MOVE 1 TO RETURN-CODE.
+`);
+    const result = extractFromSource('WRITEREF.cbl', code);
+    const writes = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    const names = writes.map((w) => w.referenceName);
+    expect(names.filter((n) => n === 'WS-TOTAL').length).toBeGreaterThanOrEqual(2); // MOVE + COMPUTE
+    expect(names).toContain('WS-COUNT'); // ADD and SUBTRACT targets
+    // Special registers carry no declaration — never referenced.
+    expect(names).not.toContain('RETURN-CODE');
+  });
+
+  it('should emit cics-transid references for RETURN TRANSID, literal and via same-file VALUE', () => {
+    const code = FIXED(`IDENTIFICATION DIVISION.
+PROGRAM-ID. TXPROG.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-TRANID                PIC X(04) VALUE 'CB00'.
+PROCEDURE DIVISION.
+P1.
+    EXEC CICS RETURN TRANSID('CC00') COMMAREA(WS-X) END-EXEC
+    .
+P2.
+    EXEC CICS RETURN TRANSID(WS-TRANID) END-EXEC
+    .
+P3.
+    EXEC CICS XCTL PROGRAM(WS-UNKNOWN-VAR) END-EXEC
+    .
+`);
+    const result = extractFromSource('TXPROG.cbl', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const names = calls.map((c) => c.referenceName);
+    expect(names).toContain('cics-transid:CC00'); // literal
+    expect(names).toContain('cics-transid:CB00'); // dereferenced through WS-TRANID
+    // Un-derefable program variable: dynamic dispatch, no guessed edge.
+    expect(names.filter((n) => n.startsWith('cics-transid:')).length).toBe(2);
+  });
+
+  it('should shift free-format source so it still extracts (preParse)', () => {
+    const code = `IDENTIFICATION DIVISION.
+PROGRAM-ID. FREEPROG.
+PROCEDURE DIVISION.
+DO-WORK.
+    DISPLAY 'HI'.
+`;
+    const result = extractFromSource('freeprog.cbl', code);
+    expect(result.nodes.find((n) => n.kind === 'module')?.name).toBe('FREEPROG');
+    expect(result.nodes.find((n) => n.kind === 'function')?.name).toBe('DO-WORK');
+  });
+});
+
+// =============================================================================
+// VB.NET (.vb) — vendored patched govindbanura/tree-sitter-vbnet grammar
+// =============================================================================
+
+describe('VB.NET Extraction', () => {
+  it('should detect .vb as vbnet', () => {
+    expect(detectLanguage('Service.vb')).toBe('vbnet');
+    expect(detectLanguage('app/Forms/MainForm.vb')).toBe('vbnet');
+    expect(isSourceFile('Service.vb')).toBe(true);
+  });
+
+  const SAMPLE = `Imports System
+Imports System.Collections.Generic
+
+Namespace Acme.Billing
+
+    Public Interface IRepository
+        Function GetById(ByVal id As Integer) As Invoice
+    End Interface
+
+    Public Enum InvoiceState
+        Draft = 0
+        Sent
+        Paid
+    End Enum
+
+    Public Structure Money
+        Public Amount As Decimal
+    End Structure
+
+    Public MustInherit Class EntityBase
+        Public Property Id As Integer
+    End Class
+
+    Public Class Invoice
+        Inherits EntityBase
+        Implements IRepository
+
+        Private ReadOnly _lines As New List(Of String)
+        Public Const MaxLines As Integer = 100
+        Public Event Paid(ByVal amount As Decimal)
+
+        Public Property State As InvoiceState
+
+        Public Sub New(ByVal id As Integer)
+            Me.Id = id
+        End Sub
+
+        Public Function GetById(ByVal id As Integer) As Invoice Implements IRepository.GetById
+            Return New Invoice(id)
+        End Function
+
+        Public Sub AddLine(ByVal description As String)
+            _lines.Add(description)
+            Validate(description)
+        End Sub
+
+        Private Sub Validate(ByVal text As String)
+            If text.Length > MaxLines Then Throw New ArgumentException("too long")
+        End Sub
+    End Class
+
+    ' lowercase keywords: VB is case-insensitive
+    public module Helpers
+        public function Twice(byval n as integer) as integer
+            return n * 2
+        end function
+
+        Public Sub Run()
+            Dim inv = New Invoice(1)
+            inv.AddLine("widget")
+            Dim d As New Dictionary(Of String, Integer)
+            Helpers.Twice(21)
+        End Sub
+    end module
+End Namespace
+`;
+
+  it('should extract classes, modules, interfaces, structures, and enums', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const kinds = (kind: string) => result.nodes.filter((n) => n.kind === kind).map((n) => n.name);
+    expect(kinds('class')).toEqual(expect.arrayContaining(['EntityBase', 'Invoice', 'Helpers']));
+    expect(kinds('interface')).toContain('IRepository');
+    expect(kinds('struct')).toContain('Money');
+    expect(kinds('enum')).toContain('InvoiceState');
+    expect(kinds('enum_member')).toEqual(expect.arrayContaining(['Draft', 'Sent', 'Paid']));
+  });
+
+  it('should extract methods, constructors, properties, fields, and events (case-insensitive keywords)', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toEqual(expect.arrayContaining(['GetById', 'AddLine', 'Validate', 'Twice', 'Run']));
+    const props = result.nodes.filter((n) => n.kind === 'property').map((n) => n.name);
+    expect(props).toEqual(expect.arrayContaining(['Id', 'State']));
+    const fields = result.nodes.filter((n) => n.kind === 'field' || n.kind === 'constant').map((n) => n.name);
+    expect(fields).toEqual(expect.arrayContaining(['_lines', 'MaxLines']));
+    // Event declarations index as findable members
+    expect(fields).toContain('Paid');
+  });
+
+  it('should qualify types with their namespace', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const invoice = result.nodes.find((n) => n.kind === 'class' && n.name === 'Invoice');
+    expect(invoice?.qualifiedName).toContain('Acme.Billing');
+  });
+
+  it('should emit Inherits as extends and Implements as implements references', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+    expect(extendsRefs.map((r) => r.referenceName)).toContain('EntityBase');
+    const implementsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+    expect(implementsRefs.map((r) => r.referenceName)).toContain('IRepository');
+  });
+
+  it('should extract calls through both invocation and index-shaped parens', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    // `_lines.Add(description)` parses as array_access (non-empty parens) — still a call site
+    expect(calls).toContain('_lines.Add');
+    // bare call with args
+    expect(calls).toContain('Validate');
+    // qualified module call
+    expect(calls).toContain('Helpers.Twice');
+  });
+
+  it('should emit instantiates for New, with VB generic syntax stripped', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const insts = result.unresolvedReferences.filter((r) => r.referenceKind === 'instantiates').map((r) => r.referenceName);
+    expect(insts).toContain('Invoice');
+    // `As New Dictionary(Of String, Integer)` → bare type name, not `Dictionary(Of ...)`
+    expect(insts.some((n) => n.includes('(') || /\bOf\b/.test(n))).toBe(false);
+  });
+
+  it('should extract Imports as import nodes', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toEqual(expect.arrayContaining(['System', 'System.Collections.Generic']));
+  });
+
+  it('should parse a file without a trailing newline (preParse guard)', () => {
+    const code = 'Class Tail\n    Sub Go()\n        Log("x")\n    End Sub\nEnd Class';
+    const result = extractFromSource('Tail.vb', code);
+    expect(result.nodes.find((n) => n.kind === 'class')?.name).toBe('Tail');
+    expect(result.nodes.find((n) => n.kind === 'method')?.name).toBe('Go');
+  });
+});
+
+describe('VB.NET Extraction — scanner-backed constructs', () => {
+  it('should parse XML literals as opaque literals without breaking siblings', () => {
+    const code = `Class Muxer
+    Function WriteTags() As Object
+        Dim xml = <Tags>
+                      <%= From tag In Tags Select <Tag><Name><%= tag.Name %></Name></Tag> %>
+                  </Tags>
+        Return xml
+    End Function
+
+    Sub After()
+        Log("still extracted")
+    End Sub
+End Class
+`;
+    const result = extractFromSource('Muxer.vb', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toEqual(expect.arrayContaining(['WriteTags', 'After']));
+  });
+
+  it('should parse multi-line LINQ query clauses', () => {
+    const code = `Class T
+    Function Big() As Integer
+        Dim big = From l In _lines
+                  Where l.Length > 3
+                  Select l.Length
+        Return big.Sum()
+    End Function
+End Class
+`;
+    const result = extractFromSource('Linq.vb', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('big.Sum');
+    expect(result.nodes.find((n) => n.kind === 'method')?.name).toBe('Big');
+  });
+
+  it('should extract MustOverride members without derailing following members', () => {
+    const code = `MustInherit Class VideoEncoder
+    MustOverride ReadOnly Property OutputExt As String
+
+    Public MustOverride Sub ShowConfigDialog(Optional param As Object = Nothing)
+
+    MustOverride Function GetError() As String
+
+    Sub New()
+        CanEdit = True
+    End Sub
+End Class
+`;
+    const result = extractFromSource('VideoEncoder.vb', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toEqual(expect.arrayContaining(['ShowConfigDialog', 'GetError', 'New']));
+    const props = result.nodes.filter((n) => n.kind === 'property').map((n) => n.name);
+    expect(props).toContain('OutputExt');
+  });
+
+  it('should parse nullable declarator shorthand (Dim x? = expr)', () => {
+    const code = `Class T
+    Sub M(folderInfo As Object)
+        Dim SteamFolderData? = Parser.GetSteamNameAndID(folderInfo)
+        Use(SteamFolderData)
+    End Sub
+End Class
+`;
+    const result = extractFromSource('Factory.vb', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('Parser.GetSteamNameAndID');
+  });
+});
+
+// =============================================================================
+// Erlang (vendored WhatsApp/tree-sitter-erlang grammar — the ELP grammar)
+// =============================================================================
+
+describe('Erlang Extraction', () => {
+  describe('Language detection', () => {
+    it('should report Erlang as supported', () => {
+      expect(isLanguageSupported('erlang')).toBe(true);
+      expect(getSupportedLanguages()).toContain('erlang');
+      expect(isSourceFile('apps/app/src/foo.erl')).toBe(true);
+      expect(isSourceFile('include/foo.hrl')).toBe(true);
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should merge multi-clause functions into one node spanning all clauses', () => {
+      const code = `-module(m).
+-export([classify/1]).
+
+classify(X) when is_atom(X) ->
+    atom;
+classify(X) when is_binary(X) ->
+    binary;
+classify(_X) ->
+    other.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function' && n.name === 'classify');
+      expect(fns).toHaveLength(1);
+      expect(fns[0]!.startLine).toBe(4);
+      expect(fns[0]!.endLine).toBe(9);
+      expect(fns[0]!.language).toBe('erlang');
+    });
+
+    it('should qualify functions with the module namespace', () => {
+      const code = `-module(my_server).
+-export([start/0]).
+
+start() -> ok.
+helper() -> ok.
+`;
+      const result = extractFromSource('src/my_server.erl', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace');
+      expect(ns?.name).toBe('my_server');
+      const start = result.nodes.find((n) => n.kind === 'function' && n.name === 'start');
+      expect(start?.qualifiedName).toBe('my_server::start');
+    });
+
+    it('should flag exported functions and honor -compile(export_all)', () => {
+      const code = `-module(m).
+-export([api/0]).
+
+api() -> internal().
+internal() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const api = result.nodes.find((n) => n.name === 'api');
+      const internal = result.nodes.find((n) => n.name === 'internal');
+      expect(api?.isExported).toBe(true);
+      expect(internal?.isExported).toBe(false);
+
+      const all = extractFromSource('src/all.erl', `-module(all).
+-compile(export_all).
+
+anything() -> ok.
+`);
+      expect(all.nodes.find((n) => n.name === 'anything')?.isExported).toBe(true);
+    });
+
+    it('should use the preceding -spec as the signature and capture doc comments', () => {
+      const code = `-module(m).
+
+%% Fetches a value by key.
+-spec fetch(binary()) -> {ok, term()} | not_found.
+fetch(Key) ->
+    lookup(Key).
+
+lookup(_K) -> not_found.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const fetch = result.nodes.find((n) => n.name === 'fetch');
+      expect(fetch?.signature).toBe('-spec fetch(binary()) -> {ok, term()} | not_found.');
+      expect(fetch?.docstring).toBe('Fetches a value by key.');
+    });
+
+    it('should fall back to the clause header as the signature', () => {
+      const code = `-module(m).
+
+resize(W, H) when W > 0, H > 0 ->
+    {W, H}.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const resize = result.nodes.find((n) => n.name === 'resize');
+      expect(resize?.signature).toBe('resize(W, H) when W > 0, H > 0');
+    });
+  });
+
+  describe('Record and type extraction', () => {
+    it('should extract records as structs with fields', () => {
+      const code = `-module(m).
+
+-record(state, {
+    store = #{} :: map(),
+    counter = 0 :: non_neg_integer()
+}).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const rec = result.nodes.find((n) => n.kind === 'struct');
+      expect(rec?.name).toBe('state');
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fields).toContain('store');
+      expect(fields).toContain('counter');
+    });
+
+    it('should extract -type and -opaque as type aliases, without bogus type-call refs', () => {
+      const code = `-module(m).
+
+-type key() :: atom() | binary().
+-opaque handle() :: reference().
+-spec noop(key()) -> ok.
+noop(_K) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const aliases = result.nodes.filter((n) => n.kind === 'type_alias').map((n) => n.name);
+      expect(aliases).toContain('key');
+      expect(aliases).toContain('handle');
+      // Type-position expressions parse as `call` nodes — the spec/type subtrees
+      // must not leak `calls` refs to type names like atom()/binary().
+      const bogus = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && ['atom', 'binary', 'reference', 'key'].includes(r.referenceName)
+      );
+      expect(bogus).toHaveLength(0);
+    });
+
+    it('should extract -define macros as constants', () => {
+      const code = `-module(m).
+
+-define(TIMEOUT, 5000).
+-define(WRAP(X), {ok, X}).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const consts = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name);
+      expect(consts).toContain('TIMEOUT');
+      expect(consts).toContain('WRAP');
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should extract -include/-include_lib and -import', () => {
+      const code = `-module(m).
+
+-include("records.hrl").
+-include_lib("kernel/include/logger.hrl").
+-import(lists, [map/2]).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('records.hrl');
+      expect(imports).toContain('kernel/include/logger.hrl');
+      expect(imports).toContain('lists');
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'records.hrl'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should record local calls bare and remote calls module-qualified', () => {
+      const code = `-module(m).
+-export([run/1]).
+
+run(X) ->
+    Y = prepare(X),
+    other_mod:process(Y).
+
+prepare(X) -> X.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('prepare');
+      // `mod:fn(...)` is emitted as `mod::fn` — the same shape the module
+      // namespace gives every function's qualifiedName, so it resolves via
+      // the qualified-name matcher.
+      expect(calls).toContain('other_mod::process');
+    });
+
+    it('should not emit calls for dynamic dispatch (var module / var fun)', () => {
+      const code = `-module(m).
+-export([run/2]).
+
+run(Mod, F) ->
+    Mod:handle(x),
+    F(y).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).not.toContain('handle');
+      expect(calls).not.toContain('Mod::handle');
+      expect(calls).not.toContain('F');
+    });
+
+    it('should connect gen_server self-calls to the module handlers', () => {
+      const code = `-module(kv_store).
+-behaviour(gen_server).
+-export([get/1, put/2, drop/1]).
+-export([init/1, handle_call/3, handle_cast/2]).
+
+-define(SERVER, ?MODULE).
+
+get(Key) ->
+    gen_server:call(?SERVER, {get, Key}).
+
+put(Key, Value) ->
+    gen_server:cast(?MODULE, {put, Key, Value}).
+
+drop(Key) ->
+    gen_server:call(kv_store, {drop, Key}).
+
+init(_) -> {ok, #{}}.
+handle_call({get, K}, _From, S) -> {reply, maps:find(K, S), S};
+handle_call({drop, K}, _From, S) -> {reply, ok, maps:remove(K, S)}.
+handle_cast({put, K, V}, S) -> {noreply, maps:put(K, V, S)}.
+`;
+      const result = extractFromSource('src/kv_store.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      // ?SERVER (defined as ?MODULE), ?MODULE, and the module's own atom all
+      // count as self — public API wrappers connect to their handlers.
+      expect(calls.filter((c) => c === 'kv_store::handle_call')).toHaveLength(2);
+      expect(calls).toContain('kv_store::handle_cast');
+    });
+
+    it('should connect gen_server calls to a registered-name module, directly or via an atom macro', () => {
+      const code = `-module(kv_client).
+-export([fetch/1, evict/1]).
+
+-define(STORE, kv_store).
+
+fetch(Key) ->
+    gen_server:call(kv_store, {get, Key}).
+
+evict(Key) ->
+    gen_server:cast(?STORE, {evict, Key}).
+`;
+      const result = extractFromSource('src/kv_client.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      // OTP's {local, ?MODULE} convention names a server after its module —
+      // a cross-module registered name targets that module's handlers. A name
+      // matching no module simply never resolves downstream.
+      expect(calls).toContain('kv_store::handle_call');
+      expect(calls).toContain('kv_store::handle_cast');
+    });
+
+    it('should not connect gen_server calls with dynamic targets', () => {
+      const code = `-module(m).
+-export([go/2]).
+
+go(Pid, Msg) ->
+    gen_server:call(Pid, Msg),
+    gen_server:cast({global, some_name}, Msg),
+    gen_server:call({some_name, node()}, Msg).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls.filter((c) => c.includes('handle_call') || c.includes('handle_cast'))).toHaveLength(0);
+    });
+
+    it('should lift static MFA arguments of the spawn/apply family into call refs', () => {
+      const code = `-module(m).
+-export([boot/2]).
+
+boot(Req, Env) ->
+    Pid = proc_lib:spawn_link(?MODULE, request_process, [Req, Env]),
+    spawn(?MODULE, monitor_loop, [Pid]),
+    apply(other_mod, handle, [Req]),
+    timer:apply_after(500, other_mod, tick, []),
+    Pid.
+
+request_process(_R, _E) -> ok.
+monitor_loop(_P) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('request_process'); // ?MODULE → bare, same-file resolution
+      expect(calls).toContain('monitor_loop');
+      expect(calls).toContain('other_mod::handle');
+      expect(calls).toContain('other_mod::tick');
+    });
+
+    it('should stay silent on dynamic spawn/apply (var module, fun value, or plain fun)', () => {
+      const code = `-module(m).
+-export([go/3]).
+
+go(M, F, A) ->
+    spawn(M, F, A),
+    spawn(fun() -> helper() end),
+    apply(M, F, A).
+
+helper() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      // The fun body's call is still walked; no phantom MFA targets appear.
+      expect(calls).toContain('helper');
+      expect(calls.filter((c) => c !== 'spawn' && c !== 'apply' && c !== 'helper')).toHaveLength(0);
+    });
+
+    it('should treat ?MODULE:fn calls as local calls', () => {
+      const code = `-module(m).
+-export([kick/0]).
+
+kick() ->
+    ?MODULE:work().
+
+work() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('work');
+    });
+
+    it('should capture fun name/arity values as function references', () => {
+      const code = `-module(m).
+-export([wire/1]).
+
+wire(Pids) ->
+    lists:foreach(fun notify/1, Pids),
+    lists:map(fun m:notify/1, Pids).
+
+notify(_P) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references').map((r) => r.referenceName);
+      expect(refs).toContain('notify');
+      expect(refs).toContain('m::notify');
+    });
+
+    it('should reference records used in bodies and argument patterns', () => {
+      const code = `-module(m).
+-export([mk/1, get_id/1]).
+
+-record(req, {id, payload}).
+
+mk(Id) -> #req{id = Id}.
+get_id(#req{id = Id}) -> Id.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'references' && r.referenceName === 'req'
+      );
+      expect(refs.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('should attribute calls from every clause of a multi-clause function', () => {
+      const code = `-module(m).
+-export([handle/1]).
+
+handle({a, X}) ->
+    first(X);
+handle({b, X}) ->
+    second(X).
+
+first(X) -> X.
+second(X) -> X.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const handle = result.nodes.find((n) => n.kind === 'function' && n.name === 'handle');
+      const calls = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && r.fromNodeId === handle?.id
+      ).map((r) => r.referenceName);
+      expect(calls).toContain('first');
+      expect(calls).toContain('second');
+    });
+  });
+
+  describe('escript and app resource files', () => {
+    it('should extract functions and calls from an escript behind a shebang', () => {
+      const code = `#!/usr/bin/env escript
+%%! -smp enable
+
+main([Path]) ->
+    Result = analyze(Path),
+    io:format("~p~n", [Result]).
+
+analyze(Path) ->
+    {ok, Bin} = file:read_file(Path),
+    byte_size(Bin).
+`;
+      const result = extractFromSource('bin/tool.escript', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toContain('main');
+      expect(fns).toContain('analyze');
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('analyze');
+      expect(calls).toContain('io::format');
+    });
+
+    it('should link an app resource file to its callback module and dependency apps', () => {
+      const code = `{application, sample, [
+    {description, "Sample application"},
+    {vsn, "1.0.0"},
+    {registered, [sample_server]},
+    {mod, {sample_app, []}},
+    {applications, [kernel, stdlib, sample_core]},
+    {included_applications, [sample_extra]},
+    {env, [{limit, 100}]},
+    {modules, []}
+]}.
+`;
+      const result = extractFromSource('src/sample.app.src', code);
+      const refs = result.unresolvedReferences.map((r) => `${r.referenceKind}:${r.referenceName}`);
+      // The application-callback module is the app's entry point.
+      expect(refs).toContain('references:sample_app');
+      // Dependencies resolve to umbrella siblings; kernel/stdlib just drop.
+      expect(refs).toContain('imports:kernel');
+      expect(refs).toContain('imports:sample_core');
+      expect(refs).toContain('imports:sample_extra');
+      // Registered names, env values, and the like carry no graph structure.
+      expect(refs.filter((r) => r.endsWith(':sample_server'))).toHaveLength(0);
+      expect(refs.filter((r) => r.endsWith(':limit'))).toHaveLength(0);
+    });
+  });
+
+  describe('Macro linkage', () => {
+    it('should attribute macro-body calls to the macro and link function-like uses into the chain', () => {
+      const code = `-module(m).
+-export([do_thing/1]).
+
+-define(LOG_AUDIT(Event), audit_logger:log(Event, ?MODULE)).
+
+do_thing(X) ->
+    ?LOG_AUDIT({thing, X}),
+    ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const macro = result.nodes.find((n) => n.kind === 'constant' && n.name === 'LOG_AUDIT');
+      const doThing = result.nodes.find((n) => n.kind === 'function' && n.name === 'do_thing');
+      const refsFrom = (id?: string) =>
+        result.unresolvedReferences.filter((r) => r.fromNodeId === id).map((r) => `${r.referenceKind}:${r.referenceName}`);
+      // The body's remote call belongs to the macro node — true exactly once.
+      expect(refsFrom(macro?.id)).toContain('calls:audit_logger::log');
+      // The use site joins the call chain: do_thing -calls→ LOG_AUDIT.
+      expect(refsFrom(doThing?.id)).toContain('calls:LOG_AUDIT');
+    });
+
+    it('should reference bare macro reads without polluting call chains', () => {
+      const code = `-module(m).
+-export([wait/0]).
+
+-define(TIMEOUT, 5000).
+
+wait() ->
+    receive after ?TIMEOUT -> ok end.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.map((r) => `${r.referenceKind}:${r.referenceName}`);
+      expect(refs).toContain('references:TIMEOUT');
+      expect(refs).not.toContain('calls:TIMEOUT');
+    });
+
+    it('should skip compiler-predefined macros and keep walking macro-use arguments', () => {
+      const code = `-module(m).
+-export([check/0]).
+
+check() ->
+    ?assertEqual(ok, prepare()),
+    {?MODULE, ?LINE, ?FUNCTION_NAME}.
+
+prepare() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      // The nested call inside the macro's arguments still attributes to check/0.
+      expect(refs).toContain('prepare');
+      // ?assertEqual (an OTP header macro) is emitted and simply never resolves…
+      expect(refs).toContain('assertEqual');
+      // …but predefined macros have no definition to link.
+      expect(refs).not.toContain('MODULE');
+      expect(refs).not.toContain('LINE');
+      expect(refs).not.toContain('FUNCTION_NAME');
+    });
+
+    it('should chain macro-to-macro uses', () => {
+      const code = `-module(m).
+
+-define(TARGET, target_fn()).
+-define(ALIAS, ?TARGET).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const target = result.nodes.find((n) => n.kind === 'constant' && n.name === 'TARGET');
+      const alias = result.nodes.find((n) => n.kind === 'constant' && n.name === 'ALIAS');
+      const refsFrom = (id?: string) =>
+        result.unresolvedReferences.filter((r) => r.fromNodeId === id).map((r) => `${r.referenceKind}:${r.referenceName}`);
+      expect(refsFrom(target?.id)).toContain('calls:target_fn');
+      expect(refsFrom(alias?.id)).toContain('references:TARGET');
+    });
+  });
+
+  describe('Behaviour extraction', () => {
+    it('should emit an implements reference for -behaviour', () => {
+      const code = `-module(m).
+-behaviour(gen_server).
+
+init(_) -> {ok, #{}}.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const impl = result.unresolvedReferences.find((r) => r.referenceKind === 'implements');
+      expect(impl?.referenceName).toBe('gen_server');
+    });
+
+    it('should not create symbols from -callback declarations', () => {
+      const code = `-module(b).
+
+-callback handle_thing(term()) -> ok.
+-callback init(list()) -> {ok, term()}.
+`;
+      const result = extractFromSource('src/b.erl', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function');
+      expect(fns).toHaveLength(0);
     });
   });
 });

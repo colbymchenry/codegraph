@@ -424,6 +424,75 @@
       "question": "When a ggplot object is printed, how does the plot actually get built and drawn — trace the path from print/plot to where geoms render. Name the key functions in order."
     }
   ],
+  "COBOL": [
+    {
+      "name": "cics-genapp",
+      "repo": "https://github.com/cicsdev/cics-genapp",
+      "size": "Small",
+      "files": "~60",
+      "question": "When a new insurance policy is added through the LGTESTP1 CICS test harness, which programs handle the request on the way to the DB2 insert? Trace the path and name the programs in order."
+    },
+    {
+      "name": "carddemo",
+      "repo": "https://github.com/aws-samples/aws-mainframe-modernization-carddemo",
+      "size": "Medium",
+      "files": "~75",
+      "question": "How does the online bill-payment flow work — from the COBIL00C screen program to the transaction record being written? Name the paragraphs performed in order and the copybooks that define the records involved."
+    },
+    {
+      "name": "CobolCraft",
+      "repo": "https://github.com/meyfa/CobolCraft",
+      "size": "Medium",
+      "files": "~270",
+      "question": "How does an incoming player chat message travel from packet handling to being broadcast to the other connected players? Name the programs on the path in order."
+    }
+  ],
+  "VB.NET": [
+    {
+      "name": "policyplus",
+      "repo": "https://github.com/Fleex255/PolicyPlus",
+      "size": "Small",
+      "files": "~94",
+      "question": "When the user toggles a policy to Enabled in the policy-setting editor and clicks OK, how does the new state end up written into the loaded policy source (POL file or registry)? Trace the path from the EditSetting dialog to the concrete write."
+    },
+    {
+      "name": "scrawler",
+      "repo": "https://github.com/AAndyProgram/SCrawler",
+      "size": "Medium",
+      "files": "~320",
+      "question": "When a user download is started for a Reddit user, how does the request flow from the user-level download entry point through the shared downloader base into the Reddit site plugin, and where do downloaded media items get appended to the user's content list?"
+    },
+    {
+      "name": "staxrip",
+      "repo": "https://github.com/staxrip/staxrip",
+      "size": "Medium",
+      "files": "~145",
+      "question": "When a job finishes video encoding, how does staxrip decide which muxer runs and how does the muxer command line get built and executed? Trace from job processing to the mkvmerge invocation."
+    }
+  ],
+  "Erlang": [
+    {
+      "name": "cowboy",
+      "repo": "https://github.com/ninenines/cowboy",
+      "size": "Small",
+      "files": "~190",
+      "question": "How does an incoming HTTP request travel from cowboy's connection process to a user-defined handler's init/2 callback? Trace the path through the stream handler and middleware chain."
+    },
+    {
+      "name": "ejabberd",
+      "repo": "https://github.com/processone/ejabberd",
+      "size": "Medium",
+      "files": "~410",
+      "question": "When a client sends a chat message, how does the stanza get from the receiving C2S process to the recipient's session on the same node? Trace the path through the router and session manager."
+    },
+    {
+      "name": "emqx",
+      "repo": "https://github.com/emqx/emqx",
+      "size": "Large",
+      "files": "~2450",
+      "question": "How does a PUBLISH packet from an MQTT client reach the sessions of matching subscribers? Trace the flow from the connection/channel layer through the broker's routing to session delivery."
+    }
+  ],
   "Solidity": [
     {
       "name": "solmate",

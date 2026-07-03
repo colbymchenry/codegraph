@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Node, UnresolvedReference, Edge } from '../types';
+import { Language, Node, UnresolvedReference, Edge } from '../types';
 import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
@@ -17,9 +17,10 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
+import { createYielder, type MaybeYield } from './cooperative-yield';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
@@ -226,6 +227,8 @@ export class ReferenceResolver {
   private nameCache: LRUCache<string, Node[]>; // name → nodes cache
   private lowerNameCache: LRUCache<string, Node[]>; // lower(name) → nodes cache
   private qualifiedNameCache: LRUCache<string, Node[]>; // qualified_name → nodes cache
+  private fileLinesCache: LRUCache<string, string[] | null>; // file → split lines cache
+  private methodMatchCache: LRUCache<string, Node[]>; // lang\0Type::method → matching method nodes
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
@@ -253,6 +256,10 @@ export class ReferenceResolver {
     this.nameCache = new LRUCache(limit);
     this.lowerNameCache = new LRUCache(limit);
     this.qualifiedNameCache = new LRUCache(limit);
+    // Split-lines arrays are heavier than content strings; refs arrive
+    // file-ordered, so a small cache still hits nearly always.
+    this.fileLinesCache = new LRUCache(contentLimit);
+    this.methodMatchCache = new LRUCache(limit);
 
     this.context = this.createContext();
   }
@@ -323,9 +330,28 @@ export class ReferenceResolver {
     this.nameCache.clear();
     this.lowerNameCache.clear();
     this.qualifiedNameCache.clear();
+    this.fileLinesCache.clear();
+    this.methodMatchCache.clear();
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
+  }
+
+  /** `readFile` through the LRU content cache (null = read failed, also cached). */
+  private readFileCached(filePath: string): string | null {
+    if (this.fileCache.has(filePath)) {
+      return this.fileCache.get(filePath)!;
+    }
+    const fullPath = path.join(this.projectRoot, filePath);
+    try {
+      const content = fs.readFileSync(fullPath, 'utf-8');
+      this.fileCache.set(filePath, content);
+      return content;
+    } catch (error) {
+      logDebug('Failed to read file for resolution', { filePath, error: String(error) });
+      this.fileCache.set(filePath, null);
+      return null;
+    }
   }
 
   /**
@@ -346,6 +372,27 @@ export class ReferenceResolver {
         const result = this.queries.getNodesByName(name);
         this.nameCache.set(name, result);
         return result;
+      },
+
+      getMethodMatches: (typeName: string, methodName: string, language: Language) => {
+        const key = `${language} ${typeName}::${methodName}`;
+        const cached = this.methodMatchCache.get(key);
+        if (cached !== undefined) return cached;
+        let candidates = this.nameCache.get(methodName);
+        if (candidates === undefined) {
+          candidates = this.queries.getNodesByName(methodName);
+          this.nameCache.set(methodName, candidates);
+        }
+        const want = `${typeName}::${methodName}`;
+        const matches: Node[] = [];
+        for (const m of candidates) {
+          if (m.kind !== 'method') continue;
+          if (m.language !== language) continue;
+          const qn = m.qualifiedName;
+          if (qn === want || qn.endsWith(`::${want}`)) matches.push(m);
+        }
+        this.methodMatchCache.set(key, matches);
+        return matches;
       },
 
       getNodesByQualifiedName: (qualifiedName: string) => {
@@ -378,21 +425,15 @@ export class ReferenceResolver {
         }
       },
 
-      readFile: (filePath: string) => {
-        if (this.fileCache.has(filePath)) {
-          return this.fileCache.get(filePath)!;
-        }
+      readFile: (filePath: string) => this.readFileCached(filePath),
 
-        const fullPath = path.join(this.projectRoot, filePath);
-        try {
-          const content = fs.readFileSync(fullPath, 'utf-8');
-          this.fileCache.set(filePath, content);
-          return content;
-        } catch (error) {
-          logDebug('Failed to read file for resolution', { filePath, error: String(error) });
-          this.fileCache.set(filePath, null);
-          return null;
-        }
+      getFileLines: (filePath: string) => {
+        const cached = this.fileLinesCache.get(filePath);
+        if (cached !== undefined) return cached;
+        const source = this.readFileCached(filePath);
+        const lines = source === null ? null : source.split(/\r?\n/);
+        this.fileLinesCache.set(filePath, lines);
+        return lines;
       },
 
       getProjectRoot: () => this.projectRoot,
@@ -626,6 +667,22 @@ export class ReferenceResolver {
       }
     }
 
+    // Lua/Luau method calls use a single `:` (`lg:log`); R uses `$` (`lg$log`).
+    // Check the member (and receiver) around these separators too, so the ref
+    // isn't dropped here before the method-call resolver ever sees it. The `:`
+    // case is skipped when the name actually contains `::` (handled above).
+    for (const sep of [':', '$']) {
+      if (sep === ':' && name.includes('::')) continue;
+      const sepIdx = name.indexOf(sep);
+      if (sepIdx > 0) {
+        const receiver = name.substring(0, sepIdx);
+        const member = name.substring(sepIdx + 1);
+        if (this.knownNames.has(member) || this.knownNames.has(receiver)) return true;
+        const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
+        if (this.knownNames.has(capitalized)) return true;
+      }
+    }
+
     // For path-like references (e.g., "snippets/drawer-menu.liquid"), check the filename
     const slashIdx = name.lastIndexOf('/');
     if (slashIdx > 0) {
@@ -662,6 +719,23 @@ export class ReferenceResolver {
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
+    }
+
+    // CFML component paths in inheritance (#1152): `extends="coldbox.system.web.
+    // Controller"` names the supertype by its dot-separated path (or `extends=
+    // "../base"` by relative file path) — the graph indexes the class under its
+    // final segment only, so these die at the fast pre-filter below and never
+    // resolved. Handled by a dedicated path-corroborated matcher, gated to
+    // inheritance refs only (a dotted `calls` ref is a member-access chain, not
+    // a component path). No fallthrough on miss: the full path string can only
+    // ever mis-match downstream, and an unresolvable supertype usually lives in
+    // an out-of-repo library (mxunit, testbox) — silent beats wrong.
+    if (
+      (ref.language === 'cfml' || ref.language === 'cfscript') &&
+      (ref.referenceKind === 'extends' || ref.referenceKind === 'implements') &&
+      (ref.referenceName.includes('.') || ref.referenceName.includes('/'))
+    ) {
+      return this.resolveCfmlComponentPath(ref);
     }
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
@@ -741,7 +815,7 @@ export class ReferenceResolver {
     // If that didn't find the file, do NOT fall back to the symbol
     // name-matcher — it would mis-connect e.g. "inc/db.php" to an unrelated
     // db.php elsewhere in the tree (a wrong edge is worse than none, #660).
-    if (isPhpIncludePathRef(ref)) {
+    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref)) {
       return candidates.length > 0
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
@@ -874,7 +948,7 @@ export class ReferenceResolver {
    * (re-resolving an already-resolved ref is a no-op since it's been deleted).
    * Returns the number of newly-created edges.
    */
-  resolveChainedCallsViaConformance(): number {
+  async resolveChainedCallsViaConformance(): Promise<number> {
     const deferred = this.deferredChainRefs;
     this.deferredChainRefs = [];
     if (deferred.length === 0) return 0;
@@ -883,6 +957,10 @@ export class ReferenceResolver {
     // these refs were deferred). matchDottedCallChain now resolves a method on a
     // supertype via context.getSupertypes -> resolveMethodOnType's conformance walk.
     this.clearCaches();
+    // This post-pass runs synchronously on the indexer's main thread; yield
+    // periodically so the #850 liveness watchdog heartbeat can fire on a repo
+    // with many deferred chained calls (#1091).
+    const maybeYield = createYielder();
     const resolved: ResolvedRef[] = [];
     for (const ref of deferred) {
       // `::`-receiver languages (Rust) split on `::` (matchScopedCallChain);
@@ -892,6 +970,7 @@ export class ReferenceResolver {
         : matchDottedCallChain(ref, this.context);
       const match = this.gateLanguage(chainMatch, ref);
       if (match) resolved.push(match);
+      await maybeYield();
     }
     if (resolved.length === 0) return 0;
 
@@ -904,6 +983,61 @@ export class ReferenceResolver {
   }
 
   /**
+   * Resolve one batch with a yield checkpoint between EVERY ref so the #850
+   * liveness heartbeat can fire on a slow/dense batch (#1091). The checkpoint
+   * granularity is per-ref — not per-N-refs — because per-ref cost is unbounded
+   * in the worst case (a collision-heavy method name whose candidate set misses
+   * the LRU re-fetches tens of thousands of rows): any fixed N multiplies that
+   * worst case into the watchdog window, which is how v1.2.0 still got killed
+   * at "Resolving refs" on large Java monorepos (#1122). `maybeYield()` is a
+   * ~ns time check when under budget, so per-ref checkpoints cost nothing.
+   * Behaviourally identical to `resolveAll(batch)`: `warmCaches()` is
+   * idempotent (guarded) and `resolveOne` is independent per ref, so yielding
+   * between refs changes only timing, never which edges get created.
+   */
+  private async resolveBatchYielding(
+    batch: UnresolvedReference[],
+    maybeYield: MaybeYield
+  ): Promise<ResolutionResult> {
+    this.warmCaches();
+
+    const resolved: ResolvedRef[] = [];
+    const unresolved: UnresolvedRef[] = [];
+    const byMethod: Record<string, number> = {};
+
+    for (const raw of batch) {
+      const ref: UnresolvedRef = {
+        fromNodeId: raw.fromNodeId,
+        referenceName: raw.referenceName,
+        referenceKind: raw.referenceKind,
+        line: raw.line,
+        column: raw.column,
+        filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
+        language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+      };
+      const result = this.resolveOne(ref);
+      if (result) {
+        resolved.push(result);
+        byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
+      } else {
+        unresolved.push(ref);
+      }
+      await maybeYield();
+    }
+
+    return {
+      resolved,
+      unresolved,
+      stats: {
+        total: batch.length,
+        resolved: resolved.length,
+        unresolved: unresolved.length,
+        byMethod,
+      },
+    };
+  }
+
+  /**
    * Resolve and persist in batches to keep memory bounded.
    * Processes unresolved references in chunks, persisting edges and cleaning
    * up resolved refs after each batch to avoid accumulating large arrays.
@@ -913,6 +1047,14 @@ export class ReferenceResolver {
     batchSize: number = 5000
   ): Promise<ResolutionResult> {
     this.warmCaches();
+
+    // Resolution runs on the indexer's MAIN thread, and the #850 liveness
+    // watchdog SIGKILLs a process whose event loop stalls past its window (60s
+    // by default). A single dense batch's resolveAll — or the synthesis pass
+    // below — can exceed that on a large repo, killing a VALID in-progress index
+    // (#1091). A shared yielder lets both give the watchdog heartbeat a regular
+    // window to fire; see ./cooperative-yield.
+    const maybeYield = createYielder();
 
     const total = this.queries.getUnresolvedReferencesCount();
     let processed = 0;
@@ -930,7 +1072,7 @@ export class ReferenceResolver {
       const batch = this.queries.getUnresolvedReferencesBatch(0, batchSize);
       if (batch.length === 0) break;
 
-      const result = this.resolveAll(batch);
+      const result = await this.resolveBatchYielding(batch, maybeYield);
 
       // Persist edges immediately
       const edges = this.createEdges(result.resolved);
@@ -998,7 +1140,7 @@ export class ReferenceResolver {
     // callbacks) that static parsing leaves out. Best-effort — never fail the
     // index on it. See docs/design/callback-edge-synthesis.md.
     try {
-      aggregateStats.byMethod['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
+      aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(this.queries, this.context);
     } catch {
       // synthesis is additive and optional; ignore failures
     }
@@ -1199,6 +1341,99 @@ export class ReferenceResolver {
   }
 
   /**
+   * Resolve a CFML inheritance reference written as a component path (#1152).
+   * Two forms exist in real code:
+   *
+   * - Dotted: `extends="coldbox.system.web.Controller"` — dots are directory
+   *   separators from the webroot or a CFML mapping. Mappings live in server
+   *   config / Application.cfc, so the leading segments may not exist in the
+   *   repo at all (in the coldbox repo itself the path is `system/web/
+   *   Controller.cfc` — the `coldbox.` root IS the repo). Matched by final
+   *   segment (the class), corroborated right-to-left against the candidate's
+   *   parent directories.
+   * - Relative: `extends="../base"` / `extends="./base"` (the FW/1 style) —
+   *   resolved against the referencing file's own directory.
+   *
+   * Conservative by design: a candidate needs at least one corroborating
+   * directory segment (a dotted path whose only same-named class sits in an
+   * unrelated directory is almost always an out-of-repo library supertype —
+   * mxunit/testbox/coldbox-as-dependency), and a corroboration tie yields no
+   * edge. Directory comparison is case-insensitive (CFML path resolution is);
+   * the class segment itself is matched exactly, which real code satisfies —
+   * dotted paths are written to match the on-disk file name.
+   */
+  private resolveCfmlComponentPath(ref: UnresolvedRef): ResolvedRef | null {
+    const cfmlCandidates = (name: string): Node[] =>
+      this.context
+        .getNodesByName(name)
+        .filter(
+          (n) =>
+            (n.kind === 'class' || n.kind === 'interface') &&
+            (n.language === 'cfml' || n.language === 'cfscript')
+        );
+    const norm = (p: string): string => p.replace(/\\/g, '/').toLowerCase();
+
+    // Relative-path form: `../base`, `./base`, `sub/thing` — resolve against
+    // the referencing file's directory and require an exact (case-insensitive)
+    // file match.
+    if (ref.referenceName.includes('/')) {
+      const rel = ref.referenceName.replace(/\.cfc$/i, '');
+      const fromDir = ref.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
+      const parts = [...fromDir];
+      for (const seg of rel.split('/')) {
+        if (seg === '' || seg === '.') continue;
+        if (seg === '..') {
+          if (parts.length === 0) return null; // escapes the project root
+          parts.pop();
+        } else {
+          parts.push(seg);
+        }
+      }
+      const wantPath = norm(parts.join('/') + '.cfc');
+      const className = parts[parts.length - 1];
+      if (!className) return null;
+      const target = cfmlCandidates(className).find((c) => norm(c.filePath) === wantPath);
+      return target
+        ? { original: ref, targetNodeId: target.id, confidence: 0.95, resolvedBy: 'file-path' }
+        : null;
+    }
+
+    // Dotted form.
+    const segments = ref.referenceName.split('.').map((s) => s.trim()).filter(Boolean);
+    if (segments.length < 2) return null;
+    const className = segments[segments.length - 1]!;
+    const dirSegments = segments.slice(0, -1);
+
+    let best: Node | null = null;
+    let bestScore = 0;
+    let tie = false;
+    for (const cand of cfmlCandidates(className)) {
+      const dirs = cand.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
+      // Count matching directory segments right-to-left: for
+      // `coldbox.system.web.Controller` vs `system/web/Controller.cfc`,
+      // `web` and `system` match, then the repo root ends the run → score 2.
+      let score = 0;
+      while (
+        score < dirSegments.length &&
+        score < dirs.length &&
+        dirSegments[dirSegments.length - 1 - score]!.toLowerCase() ===
+          dirs[dirs.length - 1 - score]!.toLowerCase()
+      ) {
+        score++;
+      }
+      if (score > bestScore) {
+        best = cand;
+        bestScore = score;
+        tie = false;
+      } else if (score === bestScore && score > 0) {
+        tie = true;
+      }
+    }
+    if (!best || bestScore === 0 || tie) return null;
+    return { original: ref, targetNodeId: best.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+  }
+
+  /**
    * Resolve a `this.<member>` function-as-value reference (#756/#808) to the
    * ENCLOSING CLASS's own member — never a same-named symbol elsewhere. The
    * registration idiom (`btn.on('click', this.handleClick)`) names a member
@@ -1257,14 +1492,18 @@ export class ReferenceResolver {
    * Mirrors resolveChainedCallsViaConformance's lifecycle. Returns the number
    * of newly-created edges.
    */
-  resolveDeferredThisMemberRefs(): number {
+  async resolveDeferredThisMemberRefs(): Promise<number> {
     const deferred = this.deferredThisMemberRefs;
     this.deferredThisMemberRefs = [];
     if (deferred.length === 0) return 0;
 
     this.clearCaches();
+    // Synchronous main-thread post-pass with a per-ref supertype BFS — yield
+    // periodically so the #850 liveness watchdog heartbeat can fire (#1091).
+    const maybeYield = createYielder();
     const resolved: ResolvedRef[] = [];
     for (const ref of deferred) {
+      await maybeYield();
       const member = ref.referenceName.slice('this.'.length);
       const fromNode = this.queries.getNodeById(ref.fromNodeId);
       if (!fromNode || !member) continue;

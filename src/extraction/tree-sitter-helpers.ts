@@ -84,6 +84,7 @@ function cleanCommentMarkers(comment: string): string {
     .replace(/^\/\/[/!]?\s?/gm, '') // // , and Rust/Swift doc lines /// //!
     .replace(/^--\s?/gm, '') //        Lua/Luau line comments
     .replace(/^#\s?/gm, '') //         Python/Ruby/shell line comments
+    .replace(/^%+\s?/gm, '') //        Erlang line comments (% / %% / %%%)
     .replace(/^\s*\*\s?/gm, '') //     block-comment continuation (* foo)
     .trim();
 }

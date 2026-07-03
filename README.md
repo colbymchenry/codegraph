@@ -244,7 +244,7 @@ The reliable, universal payoff is **surgical context and speed**: CodeGraph coll
 | **Full-Text Search** | Find code by name instantly across your entire codebase, powered by FTS5 |
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
-| **20+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, PHP, Ruby, C, C++, Objective-C, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Solidity, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
+| **20+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Erlang, CFML, COBOL, Solidity, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
 | **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 17 frameworks |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
@@ -702,6 +702,7 @@ is written):
 | C | `.c`, `.h` | Full support |
 | C++ | `.cpp`, `.hpp`, `.cc` | Full support |
 | Objective-C | `.m`, `.mm`, `.h` | Partial support (classes, protocols, methods, `@property`, `#import`, message sends; `.mm` ObjC++ may parse incompletely) |
+| Metal | `.metal` | Full support (vertex/fragment/kernel functions, structs, type aliases, call edges — MSL parses as C++, with `[[attribute]]` annotations handled) |
 | Swift | `.swift` | Full support |
 | Kotlin | `.kt`, `.kts` | Full support |
 | Scala | `.scala`, `.sc` | Full support (classes, traits, methods, type aliases, Scala 3 enums) |
@@ -714,6 +715,10 @@ is written):
 | Lua | `.lua` | Full support (functions, methods with receivers, local variables, `require` imports, call edges) |
 | R | `.R` `.r` | Full support (functions in every assignment form, S4/R5/R6 classes with methods, `library`/`require` imports, `source()` file references, call edges) |
 | Luau | `.luau` | Full support (everything in Lua, plus `type`/`export type` aliases, typed signatures, and Roblox instance-path `require`) |
+| CFML | `.cfc`, `.cfm`, `.cfs` | Full support (tag-based `<cfcomponent>`/`<cffunction>` and bare-script `component { ... }` styles, `extends`/`implements`, embedded `<cfscript>` delegation, call edges) |
+| COBOL | `.cbl`, `.cob`, `.cpy` | Full support (programs, sections/paragraphs with PERFORM/GO TO call edges, CALL 'literal' cross-program calls, COPY copybook imports — including standalone `.cpy` files — DATA DIVISION records/fields/88-levels, EXEC CICS LINK/XCTL and EXEC SQL INCLUDE targets; fixed and free format) |
+| Visual Basic .NET | `.vb` | Full support (classes, Modules, interfaces, structures, enums, properties, events, `Declare` P/Invoke, `Handles`/`WithEvents`, `Inherits`/`Implements` edges, call edges through VB's call/index paren ambiguity, `As New` instantiation, interpolated strings, LINQ, Unicode identifiers) |
+| Erlang | `.erl`, `.hrl`, `.escript`, `.app.src`, `.app` | Full support (functions with multi-clause/multi-arity grouping, `-spec` signatures, records with fields, `-type`/`-opaque` aliases, `-define` macros, `-include`/`-include_lib`/`-import` edges, local and `mod:fn` remote call edges, `fun name/arity` references, `spawn`/`apply`/`proc_lib`/`timer`/`rpc` MFA-argument call edges, `gen_server:call/cast(?MODULE)` → own `handle_call`/`handle_cast` links, `-behaviour` links, `-export`-based visibility) |
 | Solidity | `.sol` | Full support (contracts, libraries, interfaces, structs, enums, modifiers, events, errors, state variables, `import`/`using` directives, `emit`/`revert` calls) |
 
 ## Measured cross-file coverage

@@ -115,7 +115,9 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       const s = clack.spinner();
       s.start('Installing codegraph CLI...');
       try {
-        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', windowsHide: true });
+        // Generous bound (slow networks / cold npm cache) — but bounded, so a
+        // wedged npm can't hang the interactive installer forever (#1139).
+        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', windowsHide: true, timeout: 120_000 });
         s.stop('Installed codegraph CLI on PATH');
       } catch {
         s.stop('Could not install (permission denied)');
