@@ -94,11 +94,13 @@ npx tree-sitter build --wasm -o tree-sitter-cobol.wasm   # needs emscripten or D
 The patches are written to be upstreamable — each is independent and comes
 with the failing construct documented above.
 
-## Upstreaming (prepared, not sent)
+## Upstreaming
 
-`git apply tree-sitter-cobol.patch` on upstream commit `e99dbdc3` reproduces
-the fork exactly, so the patch file IS the prepared series. Draft PR body,
-ready to post to yutaro-sakamoto/tree-sitter-cobol once approved:
+Sent as [yutaro-sakamoto/tree-sitter-cobol#41](https://github.com/yutaro-sakamoto/tree-sitter-cobol/pull/41)
+(branch `real-world-cobol-sources` on the colbymchenry fork). If upstream
+merges it, the vendored wasm can track upstream releases instead of this
+patch. Until then, `git apply tree-sitter-cobol.patch` on upstream commit
+`e99dbdc3` reproduces the fork exactly. The PR body as sent:
 
 > **Parse real-world CICS/DB2 and GnuCOBOL sources**
 >
@@ -124,5 +126,3 @@ ready to post to yutaro-sakamoto/tree-sitter-cobol once approved:
 > Happy to split any of these out or adjust naming/style. Each item is
 > independent; `tree-sitter test` passes minus the one pre-existing failure.
 
-The maintainer may prefer separate PRs per item — the diff hunks split
-cleanly along the list above.
