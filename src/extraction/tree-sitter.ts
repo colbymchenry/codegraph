@@ -4511,6 +4511,28 @@ export class TreeSitterExtractor {
   private extractDecoratorsFor(declNode: SyntaxNode, decoratedId: string): void {
     const consider = (n: SyntaxNode | null): void => {
       if (!n) return;
+      // Solidity `modifier_invocation` (unique to that grammar) sits
+      // decorator-position in the function header — OUTSIDE the `body:` field
+      // the call walker descends — but its body executes around the function
+      // via `_;`, so it is a real call-flow hop (`withdraw → onlyOwner →
+      // _checkRole` is the canonical audit trace). The same node type carries
+      // base-constructor invocations (`constructor() ERC20("T","TOK")`), the
+      // constructor-chain hop. Emit `calls`, not `decorates`, so flow
+      // traversal rides it.
+      if (n.type === 'modifier_invocation') {
+        const target = n.namedChild(0);
+        const name = target?.type === 'identifier' ? getNodeText(target, this.source) : undefined;
+        if (name) {
+          this.unresolvedReferences.push({
+            fromNodeId: decoratedId,
+            referenceName: name,
+            referenceKind: 'calls',
+            line: n.startPosition.row + 1,
+            column: n.startPosition.column,
+          });
+        }
+        return;
+      }
       // `marker_annotation` is Java's grammar for arg-less annotations
       // (`@Override`, `@Deprecated`); `attribute` is Swift's grammar for
       // attributes and PROPERTY WRAPPERS (`@objc`, `@Argument`, `@Published`,

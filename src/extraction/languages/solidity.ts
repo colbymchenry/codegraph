@@ -160,19 +160,9 @@ export const solidityExtractor: LanguageExtractor = {
       t === 'library_declaration' ||
       t === 'interface_declaration'
     ) {
-      // Defer to the generic dispatch for node creation; we just need a
-      // post-creation hook to attach extends refs. Find the most recently
-      // created node for THIS AST position once it exists. The simplest
-      // correct way is to do it here BEFORE generic creation by walking
-      // ancestors and queuing references against the soon-to-be-created
-      // node id — but we don't know that id yet. Instead, register a
-      // pre-emit step: emit the references later from the resolver layer.
-      //
-      // Practical compromise: mirror the generic class path by creating
-      // the node here AND emitting the extends refs AND walking the body —
-      // exactly what extractClass/extractInterface do, minus the inheritance
-      // walk we want to add. Returning `true` then short-circuits the
-      // generic dispatch.
+      // Mirror the generic class path — create the node (the extends refs
+      // need its id), emit the refs, walk the body — then return true to
+      // short-circuit the generic dispatch so nothing is doubled.
       const ancestors = getInheritanceAncestors(node, ctx.source);
       const nameNode = getChildByField(node, 'name');
       const body = getChildByField(node, 'body');
@@ -290,7 +280,3 @@ export const solidityExtractor: LanguageExtractor = {
     return { moduleName, signature: importText };
   },
 };
-
-// Make the inheritance helper accessible to the resolver layer if it ever needs
-// it (kept exported in case the framework resolver wants ancestor metadata).
-export { getInheritanceAncestors };

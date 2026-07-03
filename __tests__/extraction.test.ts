@@ -7590,6 +7590,38 @@ uint256 constant FILE_CONST = 42;
       // library call: balance.add(amount) — receiver-qualified
       expect(calls.some((c) => c === 'add' || c === 'balance.add')).toBe(true);
     });
+
+    it('should produce calls refs for modifier invocations and base-constructor invocations', () => {
+      // `withdraw(...) external onlyOwner` — the modifier sits in the function
+      // header, outside the body: field the call walker descends, so it goes
+      // through the decorator-position walk. It must emit `calls` (not
+      // `decorates`) so flow traversal rides the withdraw → onlyOwner →
+      // NotOwner audit path.
+      const result = extractFromSource('Vault.sol', code);
+      const withdrawNode = result.nodes.find((n) => n.kind === 'method' && n.name === 'withdraw');
+      const modifierCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'onlyOwner'
+      );
+      expect(modifierCall).toBeDefined();
+      expect(modifierCall?.fromNodeId).toBe(withdrawNode?.id);
+
+      // Base-constructor invocation parses as the same modifier_invocation
+      // node: `constructor(address o) ERC20("T", "TOK") Ownable(o)` — the
+      // constructor-chain hop.
+      const ctorCode = `pragma solidity ^0.8.20;
+contract MyToken is ERC20, Ownable {
+    constructor(address o) ERC20("Tok", "TOK") Ownable(o) {}
+    function grab(bytes32 r) external onlyRole(ADMIN_ROLE) returns (uint256) { return 1; }
+}
+`;
+      const ctorResult = extractFromSource('MyToken.sol', ctorCode);
+      const ctorCalls = ctorResult.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(ctorCalls).toEqual(expect.arrayContaining(['ERC20', 'Ownable']));
+      // modifier WITH arguments still resolves to the bare modifier name
+      expect(ctorCalls).toContain('onlyRole');
+    });
   });
 });
 
