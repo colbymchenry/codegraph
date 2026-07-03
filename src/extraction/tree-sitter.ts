@@ -3830,6 +3830,21 @@ export class TreeSitterExtractor {
                 else reencode = !!innerCallee;
               }
               calleeName = reencode ? `${innerCallee}().${methodName}` : methodName;
+            } else if (
+              this.language === 'cfscript' &&
+              receiver &&
+              receiver.type === 'member_expression' &&
+              /^(variables|this|local|arguments)\.[A-Za-z_][\w]*$/i.test(getNodeText(receiver, this.source))
+            ) {
+              // CFML scope-prefixed member call — `variables.svc.save()` /
+              // `arguments.svc.save()`: the receiver is a component field,
+              // injected property, or typed argument reached through one of
+              // CFML's file-local scopes. Keep the full receiver chain so
+              // resolution can strip the scope prefix and infer the field's
+              // component type from its declaration (#1108). Gated to these
+              // scope keywords: such calls previously emitted a bare method
+              // name, which either failed to resolve or resolved ambiguously.
+              calleeName = `${getNodeText(receiver, this.source)}.${methodName}`;
             } else {
               calleeName = methodName;
             }

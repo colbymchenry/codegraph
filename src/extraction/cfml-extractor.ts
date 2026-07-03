@@ -73,6 +73,12 @@ export class CfmlExtractor {
       if (node.name === '<anonymous>' && (node.kind === 'class' || node.kind === 'interface')) {
         node.name = componentName;
         node.qualifiedName = `${this.filePath}::${componentName}`;
+      } else if (node.qualifiedName === '<anonymous>' || node.qualifiedName.startsWith('<anonymous>::')) {
+        // Members were scoped under the anonymous component (`<anonymous>::save`)
+        // — carry the rename into their scope chains so type-validated method
+        // resolution (which wants `UserService::save`, see resolveMethodOnType)
+        // can match them. Inner genuinely-anonymous segments are untouched.
+        node.qualifiedName = componentName + node.qualifiedName.slice('<anonymous>'.length);
       }
       this.nodes.push(node);
     }
@@ -225,13 +231,13 @@ export class CfmlExtractor {
         break;
       }
       if (sibling.type === 'cf_function_tag') {
-        this.extractFunctionTag(sibling, classNode.id, classNode.id);
+        this.extractFunctionTag(sibling, classNode.id, classNode.id, classNode.name);
       } else if (sibling.type === 'cf_script_tag') {
-        this.delegateScriptTag(sibling, classNode.id, true);
+        this.delegateScriptTag(sibling, classNode.id, classNode.name);
       } else if (sibling.type === 'cf_query_tag') {
         this.delegateQueryTag(sibling, classNode.id);
       } else {
-        this.delegateNestedTags(sibling, classNode.id, true);
+        this.delegateNestedTags(sibling, classNode.id, classNode.name);
       }
       lastNode = sibling;
       sibling = sibling.nextSibling;
@@ -246,9 +252,11 @@ export class CfmlExtractor {
    * the `contains`-edge target (the class when inside one, otherwise the file
    * node for a bare top-level cffunction) — kept separate so a top-level
    * function still gets a containment edge without being misclassified as a
-   * method of the file.
+   * method of the file. A method's qualifiedName is scoped under
+   * `parentClassName` (`TagService::save`, the same `Class::member` shape the
+   * generic extractor produces) so type-validated method resolution can match.
    */
-  private extractFunctionTag(tag: SyntaxNode, parentClassId: string | undefined, containerId: string | undefined): void {
+  private extractFunctionTag(tag: SyntaxNode, parentClassId: string | undefined, containerId: string | undefined, parentClassName?: string): void {
     const name = this.tagAttr(tag, 'name');
     if (!name) return;
 
@@ -264,7 +272,7 @@ export class CfmlExtractor {
       id,
       kind,
       name,
-      qualifiedName: `${this.filePath}::${name}`,
+      qualifiedName: parentClassName ? `${parentClassName}::${name}` : `${this.filePath}::${name}`,
       filePath: this.filePath,
       language: this.language,
       startLine: tag.startPosition.row + 1,
@@ -293,34 +301,38 @@ export class CfmlExtractor {
    * `<cfcomponent>`'s body — see the implicit-end-tag note on `extractComponent`)
    * ARE normal children, just possibly several levels deep, so a direct-children
    * check misses them. Does not descend into a nested `cf_function_tag` — that
-   * has its own scope and is walked separately. `parentIsClass` rides along so
-   * a `<cfscript>` at component scope classifies its functions as methods.
+   * has its own scope and is walked separately. `parentClassName` rides along
+   * so a `<cfscript>` at component scope classifies its functions as methods
+   * scoped under the component.
    */
-  private delegateNestedTags(node: SyntaxNode, containerId: string | undefined, parentIsClass = false): void {
+  private delegateNestedTags(node: SyntaxNode, containerId: string | undefined, parentClassName?: string): void {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (!child) continue;
       if (child.type === 'cf_script_tag') {
-        this.delegateScriptTag(child, containerId, parentIsClass);
+        this.delegateScriptTag(child, containerId, parentClassName);
       } else if (child.type === 'cf_query_tag') {
         this.delegateQueryTag(child, containerId);
       } else if (child.type === 'cf_function_tag') {
         continue;
       } else {
-        this.delegateNestedTags(child, containerId, parentIsClass);
+        this.delegateNestedTags(child, containerId, parentClassName);
       }
     }
   }
 
   /**
    * Delegate a `<cfscript>...</cfscript>` tag body to the cfscript grammar.
-   * With `parentIsClass`, functions declared at the script's top level are the
-   * component's methods (`<cfcomponent><cfscript>function configure(){}` — the
-   * standard ColdBox ModuleConfig shape), so they're re-kinded `function` →
-   * `method` to match how the same function classifies in a script-style CFC.
-   * Functions nested inside another function (closures) keep kind `function`.
+   * With `parentClassName` set (the block sits at component scope), functions
+   * declared at the script's top level are the component's methods
+   * (`<cfcomponent><cfscript>function configure(){}` — the standard ColdBox
+   * ModuleConfig shape): they're re-kinded `function` → `method`, and every
+   * merged symbol's qualifiedName is prefixed with the component scope
+   * (`configure` → `ModuleConfig::configure`) so type-validated method
+   * resolution can match them. Functions nested inside another function
+   * (closures) keep kind `function`.
    */
-  private delegateScriptTag(scriptTag: SyntaxNode, parentId: string | undefined, parentIsClass = false): void {
+  private delegateScriptTag(scriptTag: SyntaxNode, parentId: string | undefined, parentClassName?: string): void {
     const content = scriptTag.namedChildren.find((c: SyntaxNode) => c.type === 'cf_script_content');
     if (!content) return;
 
@@ -349,8 +361,11 @@ export class CfmlExtractor {
       node.startLine += startLine;
       node.endLine += startLine;
       node.language = this.language;
-      if (parentIsClass && node.kind === 'function' && topLevelIds.has(node.id)) {
-        node.kind = 'method';
+      if (parentClassName) {
+        if (node.kind === 'function' && topLevelIds.has(node.id)) {
+          node.kind = 'method';
+        }
+        node.qualifiedName = `${parentClassName}::${node.qualifiedName}`;
       }
       this.nodes.push(node);
       if (parentId) {

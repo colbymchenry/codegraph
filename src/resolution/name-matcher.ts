@@ -1185,6 +1185,36 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w]*)`), // var lg: TLogger  / param lg: TLogger
         new RegExp(`\\b${r}\\b\\s*:=\\s*([A-Z][\\w.]*)\\.Create\\b`), // lg := TLogger.Create
       ];
+    case 'cfml':
+    case 'cfscript':
+      return [
+        // svc = new UserService() / new path.to.UserService() — dotted component
+        // paths reduce to their final segment via normalizeInferredTypeName.
+        // Also matches inside tag markup (`<cfset svc = new UserService()>`)
+        // since the scan reads raw source lines.
+        new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_][\\w.]*)`),
+        // The classic form: svc = createObject("component", "path.to.UserService")
+        // (casing of createObject varies in the wild), plus the modern
+        // single-argument form createObject("path.to.UserService").
+        new RegExp(`\\b${r}\\b\\s*=\\s*[Cc]reate[Oo]bject\\s*\\(\\s*["']component["']\\s*,\\s*["']([\\w.]+)["']`),
+        new RegExp(`\\b${r}\\b\\s*=\\s*[Cc]reate[Oo]bject\\s*\\(\\s*["']([\\w.]+)["']\\s*\\)`),
+        // Typed cfscript parameter: `function save(UserService svc)` /
+        // `required UserService svc` — CFML's built-in types (string, numeric,
+        // any, struct…) are lowercase by convention, so the PascalCase guard
+        // excludes them.
+        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;,)]`),
+        // Tag-form typed argument, either attribute order:
+        // <cfargument name="svc" type="path.to.UserService">
+        new RegExp(`\\bcfargument[^>\\n]*\\bname\\s*=\\s*["']${r}["'][^>\\n]*\\btype\\s*=\\s*["']([\\w.]+)["']`, 'i'),
+        new RegExp(`\\bcfargument[^>\\n]*\\btype\\s*=\\s*["']([\\w.]+)["'][^>\\n]*\\bname\\s*=\\s*["']${r}["']`, 'i'),
+        // Component property (incl. WireBox DI): `property name="svc"
+        // inject="UserService";` / `<cfproperty name="svc" type="UserService">`,
+        // either attribute order. An inject DSL value with a namespace
+        // (`inject="svc@core"`) captures only the leading name and simply
+        // fails type-validation — no edge, never a wrong one.
+        new RegExp(`\\b(?:cf)?property\\b[^;\\n]*\\bname\\s*=\\s*["']${r}["'][^;\\n]*\\b(?:type|inject)\\s*=\\s*["']([\\w.]+)["']`, 'i'),
+        new RegExp(`\\b(?:cf)?property\\b[^;\\n]*\\b(?:type|inject)\\s*=\\s*["']([\\w.]+)["'][^;\\n]*\\bname\\s*=\\s*["']${r}["']`, 'i'),
+      ];
     default:
       return [];
   }
@@ -1215,9 +1245,28 @@ function inferLocalReceiverType(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): string | null {
+  // CFML scope prefixes: `variables.svc` / `this.svc` name a COMPONENT-scoped
+  // field whose assignment or `property` declaration usually lives outside the
+  // calling function (the init-pseudoconstructor / WireBox-injection pattern),
+  // and `local.svc` is an explicit function-local. Strip the prefix so the
+  // declaration patterns match (`variables.svc = new X()`, `property
+  // name="svc" …`, `var svc = …` all bind the bare name), and widen the scan
+  // to the whole file for the component-scoped forms — nearest-declaration-
+  // backward still wins, so a function-local shadowing the field is preferred.
+  let scanReceiver = receiverName;
+  let componentScoped = false;
+  if (ref.language === 'cfml' || ref.language === 'cfscript') {
+    const scoped = receiverName.match(/^(variables|this|local|arguments)\.(.+)$/i);
+    if (scoped) {
+      scanReceiver = scoped[2]!;
+      const scope = scoped[1]!.toLowerCase();
+      componentScoped = scope === 'variables' || scope === 'this';
+    }
+  }
+
   const patterns = localReceiverTypePatterns(
     ref.language,
-    receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+    scanReceiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
   );
   if (patterns.length === 0) return null;
 
@@ -1230,22 +1279,40 @@ function inferLocalReceiverType(
   if (!lines || lines.length === 0) return null;
 
   const callIdx = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
-  const startIdx = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+  const startIdx = componentScoped
+    ? 0
+    : Math.max(0, enclosingScopeStartLine(ref, context) - 1);
 
-  // Nearest declaration wins: scan backward from the call to the scope start.
-  for (let i = callIdx; i >= startIdx; i--) {
+  const matchLine = (i: number): string | null => {
     const line = lines[i];
-    if (!line) continue;
+    if (!line) return null;
     // A generated/minified line (one multi-KB statement) is not something a
     // human-written local declaration lives on, and regexing it per ref is
     // pure waste — skip it rather than scan it.
-    if (line.length > 10_000) continue;
+    if (line.length > 10_000) return null;
     for (const re of patterns) {
       const m = line.match(re);
       if (m && m[1]) {
         const type = normalizeInferredTypeName(m[1]);
         if (type) return type;
       }
+    }
+    return null;
+  };
+
+  // Nearest declaration wins: scan backward from the call to the scope start.
+  for (let i = callIdx; i >= startIdx; i--) {
+    const type = matchLine(i);
+    if (type) return type;
+  }
+  // A component-scoped field's declaration is position-independent — the
+  // `variables.svc = new X()` pseudoconstructor assignment or `property`
+  // declaration may sit BELOW the calling function in the file — so when the
+  // backward pass finds nothing, sweep the remainder of the file too.
+  if (componentScoped) {
+    for (let i = callIdx + 1; i < lines.length; i++) {
+      const type = matchLine(i);
+      if (type) return type;
     }
   }
   return null;
