@@ -46,6 +46,14 @@ export function resolveImportPath(
   language: Language,
   context: ResolutionContext
 ): string | null {
+  // COBOL COPY/EXEC SQL INCLUDE names a copybook member, not a path — the
+  // compiler searches a library, so we match against indexed file basenames.
+  // Must run before isExternalImport: a bare member name would otherwise be
+  // misclassified as an external package.
+  if (language === 'cobol') {
+    return resolveCobolCopybook(importPath, fromFile, context);
+  }
+
   // Skip external/npm packages — but pass the context so the
   // bare-specifier heuristic can consult the project's tsconfig
   // alias map first (custom prefixes like `@components/*` would
@@ -74,6 +82,57 @@ export function resolveImportPath(
   }
 
   return null;
+}
+
+/**
+ * COBOL copybook lookup: `COPY CVACT01Y` (or `EXEC SQL INCLUDE X`) names a
+ * library member resolved by the compiler's copybook search path, so we match
+ * the member against indexed file basenames, case-insensitively. `.cpy` wins
+ * over a same-named program; a same-directory hit wins within a tier. The
+ * stem index is built once per resolution context (a per-ref scan of every
+ * file node would go quadratic on copybook-heavy repos).
+ */
+const cobolCopybookIndexes = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+function resolveCobolCopybook(
+  member: string,
+  fromFile: string,
+  context: ResolutionContext
+): string | null {
+  let index = cobolCopybookIndexes.get(context);
+  if (!index) {
+    index = new Map();
+    for (const fileNode of context.getNodesByKind('file')) {
+      const normalized = fileNode.filePath.replace(/\\/g, '/');
+      const base = normalized.split('/').pop() ?? '';
+      const dot = base.lastIndexOf('.');
+      const stem = (dot > 0 ? base.slice(0, dot) : base).toLowerCase();
+      const paths = index.get(stem);
+      if (paths) paths.push(fileNode.filePath);
+      else index.set(stem, [fileNode.filePath]);
+    }
+    cobolCopybookIndexes.set(context, index);
+  }
+
+  const candidates = index.get(member.toLowerCase());
+  if (!candidates || candidates.length === 0) return null;
+
+  const fromDir = fromFile.replace(/\\/g, '/').split('/').slice(0, -1).join('/');
+  let best: string | null = null;
+  let bestScore = -1;
+  for (const candidate of candidates) {
+    const normalized = candidate.replace(/\\/g, '/');
+    const ext = normalized.slice(normalized.lastIndexOf('.')).toLowerCase();
+    let score = 0;
+    if (ext === '.cpy') score += 4;
+    else if (ext === '.cbl' || ext === '.cob' || ext === '.cobol') score += 2;
+    if (normalized.split('/').slice(0, -1).join('/') === fromDir) score += 1;
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best;
 }
 
 /**
@@ -545,6 +604,15 @@ export function isPhpIncludePathRef(ref: UnresolvedRef): boolean {
     ref.referenceKind === 'imports' &&
     (ref.referenceName.includes('/') || ref.referenceName.includes('.'))
   );
+}
+
+/**
+ * Is this a COBOL COPY / EXEC SQL INCLUDE copybook reference? These resolve
+ * to files only (or stay unresolved for compiler-supplied members) — never
+ * to a same-named symbol via the name-matcher.
+ */
+export function isCobolCopybookRef(ref: UnresolvedRef): boolean {
+  return ref.language === 'cobol' && ref.referenceKind === 'imports';
 }
 
 /**
@@ -1154,6 +1222,29 @@ export function resolveViaImport(
     const basename = resolvedPath.split('/').pop()!;
     const fileNodes = context.getNodesByName(basename).filter((n) => n.kind === 'file');
     const fileNode = fileNodes.find((n) => n.filePath === resolvedPath);
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
+    return null;
+  }
+
+  // COBOL COPY / EXEC SQL INCLUDE — resolve the copybook member to a
+  // file→file edge, mirroring the C/C++ include branch above. A member that
+  // matches no indexed file (compiler-supplied copybooks like SQLCA/DFHAID)
+  // stays unresolved — callers must not fall back to the symbol name-matcher,
+  // which would connect it to a same-named import symbol elsewhere.
+  if (isCobolCopybookRef(ref)) {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language!, context);
+    if (!resolvedPath) return null;
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
     if (fileNode) {
       return {
         original: ref,

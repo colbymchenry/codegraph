@@ -30,6 +30,7 @@ import { objcExtractor } from './objc';
 import { odinExtractor } from './odin';
 import { cfscriptExtractor } from './cfscript';
 import { cfqueryExtractor } from './cfquery';
+import { cobolExtractor } from './cobol';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -57,4 +58,5 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   odin: odinExtractor,
   cfscript: cfscriptExtractor,
   cfquery: cfqueryExtractor,
+  cobol: cobolExtractor,
 };
