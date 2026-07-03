@@ -446,5 +446,28 @@
       "files": "~270",
       "question": "How does an incoming player chat message travel from packet handling to being broadcast to the other connected players? Name the programs on the path in order."
     }
+  ],
+  "VB.NET": [
+    {
+      "name": "policyplus",
+      "repo": "https://github.com/Fleex255/PolicyPlus",
+      "size": "Small",
+      "files": "~94",
+      "question": "When the user toggles a policy to Enabled in the policy-setting editor and clicks OK, how does the new state end up written into the loaded policy source (POL file or registry)? Trace the path from the EditSetting dialog to the concrete write."
+    },
+    {
+      "name": "scrawler",
+      "repo": "https://github.com/AAndyProgram/SCrawler",
+      "size": "Medium",
+      "files": "~320",
+      "question": "When a user download is started for a Reddit user, how does the request flow from the user-level download entry point through the shared downloader base into the Reddit site plugin, and where do downloaded media items get appended to the user's content list?"
+    },
+    {
+      "name": "staxrip",
+      "repo": "https://github.com/staxrip/staxrip",
+      "size": "Medium",
+      "files": "~145",
+      "question": "When a job finishes video encoding, how does staxrip decide which muxer runs and how does the muxer command line get built and executed? Trace from job processing to the mkvmerge invocation."
+    }
   ]
 }
