@@ -21,6 +21,7 @@ import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandida
 import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
+import { stripCppTemplateArgs } from './languages/c-cpp';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -28,6 +29,7 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { CfmlExtractor } from './cfml-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -62,18 +64,42 @@ const VUE_STORE_FILE_SIGNAL = /\bdefineStore\b|\bcreateStore\b|\bVuex\b|\bmutati
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
+  const name = extractNameRaw(node, source, extractor);
+  // Universal fallback: recover a real identifier from a name still mangled by a
+  // macro the pre-parse didn't blank (C/C++ only — see recoverMangledName). A
+  // no-op on well-formed names, so a clean name is never altered.
+  return extractor.recoverMangledName ? extractor.recoverMangledName(name) : name;
+}
+
+function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
   const hookName = extractor.resolveName?.(node, source);
   if (hookName) return hookName;
 
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
   if (nameNode) {
-    // Unwrap pointer_declarator(s) for C/C++ pointer return types
+    // Unwrap pointer_declarator / reference_declarator for C/C++ pointer and
+    // reference return types (`int* f()`, `int& f()`, `int&& f()`). Without
+    // unwrapping the reference wrapper an inline reference-returning method is
+    // named "& f() const" instead of "f" — common in Unreal Engine gameplay
+    // headers (`const FGameplayTagContainer& GetActiveTags() const`). Out-of-line
+    // defs (`T& C::f()`) already resolve via the qualified-name hook. A
+    // pointer_declarator exposes its inner through a `declarator` field; a
+    // reference_declarator has none, so it's reached via namedChild(0).
     let resolved = nameNode;
-    while (resolved.type === 'pointer_declarator') {
+    while (resolved.type === 'pointer_declarator' || resolved.type === 'reference_declarator') {
       const inner = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
       if (!inner) break;
       resolved = inner;
+    }
+    // C++ user-defined conversion operator: the declarator is an `operator_cast`
+    // whose first child is the target type and second is the `() const` tail. Name
+    // it `operator <type>` (the conventional spelling) rather than the whole
+    // `operator EALSMovementState() const` declarator, so it matches symbolic
+    // overloads (`operator+`) and is findable by the type name.
+    if (resolved.type === 'operator_cast') {
+      const typeNode = resolved.namedChild(0);
+      return typeNode ? `operator ${getNodeText(typeNode, source).trim()}` : getNodeText(resolved, source);
     }
     // Handle complex declarators (C/C++)
     if (resolved.type === 'function_declarator' || resolved.type === 'declarator') {
@@ -398,7 +424,7 @@ export class TreeSitterExtractor {
       // this.source so downstream getNodeText reads the same bytes the parser
       // saw (identical outside the blanked directive lines).
       if (this.extractor?.preParse) {
-        this.source = this.extractor.preParse(this.source);
+        this.source = this.extractor.preParse(this.source, this.filePath);
       }
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
@@ -986,32 +1012,46 @@ export class TreeSitterExtractor {
       this.scanFnRefSubtree(node, 0);
       skipChildren = true; // extractVariable handles children
     }
-    // Swift stored properties inside a type. Swift instance properties aren't
-    // extracted as their own nodes, but a property's PROPERTY WRAPPER
-    // (`@Argument`/`@Published`/`@State`/custom) and declared type ARE
-    // dependencies — attribute them to the enclosing type so the wrapper/type
-    // files get dependents. Don't skipChildren: an initializer's calls still
-    // matter. (Other languages extract properties via property/field types.)
+    // Swift properties inside a type. A stored instance property becomes a `field`
+    // node; a `static let`/`static var` member becomes `constant`/`variable`
+    // (Swift's `static`-namespacing idiom — value-reference edges can then target
+    // it); a COMPUTED property (getter block, no stored value) becomes a `property`
+    // node whose getter is walked below so its calls attribute to it. A property's
+    // PROPERTY WRAPPER (`@Argument`/`@Published`/`@State`/custom) and declared type
+    // are dependencies attributed to the enclosing type. (Other languages extract
+    // properties via property/field types.)
     else if (
       this.language === 'swift' &&
-      nodeType === 'property_declaration' &&
+      (nodeType === 'property_declaration' || nodeType === 'protocol_property_declaration') &&
       this.isInsideClassLikeNode()
     ) {
       const ownerId = this.nodeStack[this.nodeStack.length - 1];
-      // A `static let`/`static var` member is a SHARED constant of the type
-      // (Swift's `static`-namespacing idiom, esp. in `enum`/`struct`) — extract
-      // it as `constant`/`variable` so value-reference edges can target it. An
-      // instance stored property stays a `field` (per-instance; Swift instance
-      // properties otherwise aren't own nodes — that's unchanged). A *computed*
-      // property (getter, no stored value) is never a constant — skip the node.
       const { nameNode, isLet, isComputed } = swiftPropertyInfo(node, this.source);
-      if (nameNode && !isComputed) {
-        const isStatic = this.extractor.isStatic?.(node) ?? false;
-        this.createNode(isStatic ? (isLet ? 'constant' : 'variable') : 'field',
-          getNodeText(nameNode, this.source), node, {
+      let computedPropId: string | undefined;
+      if (nameNode) {
+        if (isComputed) {
+          // Computed property — accessed like a property but its getter holds real
+          // logic. Index as `property` so search/explore find it (#1020: computed
+          // props such as a heavily-read `var isCloudProxy: Bool` returned "No
+          // results found"); pushed below so the getter's calls attribute to it
+          // rather than flattening onto the owning type (SwiftUI `var body: some
+          // View { … }` — the whole subview tree — is the canonical case).
+          const prop = this.createNode('property', getNodeText(nameNode, this.source), node, {
             visibility: this.extractor.getVisibility?.(node),
-            isStatic,
+            isStatic: this.extractor.isStatic?.(node) ?? false,
           });
+          computedPropId = prop?.id;
+        } else {
+          // A `static let`/`static var` member is a SHARED constant of the type
+          // (esp. in `enum`/`struct`); an instance stored property stays a `field`
+          // (per-instance — Swift instance properties otherwise aren't own nodes).
+          const isStatic = this.extractor.isStatic?.(node) ?? false;
+          this.createNode(isStatic ? (isLet ? 'constant' : 'variable') : 'field',
+            getNodeText(nameNode, this.source), node, {
+              visibility: this.extractor.getVisibility?.(node),
+              isStatic,
+            });
+        }
       }
       if (ownerId) {
         this.extractDecoratorsFor(node, ownerId);
@@ -1035,6 +1075,23 @@ export class TreeSitterExtractor {
           };
           walkAttrArgs(modifiers);
         }
+      }
+      // A computed property's getter holds real logic — walk it with the property
+      // node pushed so its calls/instantiations attribute to the property (a
+      // SwiftUI `body`'s subview tree becomes the property's callees). skipChildren
+      // then stops the generic walker from re-walking the getter (and the
+      // modifiers/type annotation already handled above).
+      if (computedPropId) {
+        const getter = node.namedChildren.find(
+          (c: SyntaxNode) =>
+            c.type === 'computed_property' || c.type === 'protocol_property_requirements',
+        );
+        if (getter) {
+          this.nodeStack.push(computedPropId);
+          this.visitFunctionBody(getter, '');
+          this.nodeStack.pop();
+        }
+        skipChildren = true;
       }
     }
     // `export_statement` itself is not extracted — the walker descends
@@ -1496,6 +1553,15 @@ export class TreeSitterExtractor {
   private extractClass(node: SyntaxNode, kind: NodeKind = 'class'): void {
     if (!this.extractor) return;
 
+    // Skip forward declarations / elaborated type references (`class Foo;`) in
+    // languages that opt in — bodiless there means "not a definition", so it
+    // would otherwise mint a phantom node competing with the real definition
+    // (#1093). Languages where a bodiless class is complete (Kotlin, Scala)
+    // leave the flag unset. Resolved once here and reused for the body walk.
+    const resolvedBody = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    if (this.extractor.skipBodilessClass && !resolvedBody) return;
+
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
@@ -1519,9 +1585,7 @@ export class TreeSitterExtractor {
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
-    let body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
-      ?? getChildByField(node, this.extractor.bodyField);
-    if (!body) body = node;
+    const body = resolvedBody ?? node;
 
     // Visit all children for methods and properties
     for (let i = 0; i < body.namedChildCount; i++) {
@@ -2361,7 +2425,7 @@ export class TreeSitterExtractor {
 
     // Extract variable declarators based on language
     if (this.language === 'typescript' || this.language === 'javascript' ||
-        this.language === 'tsx' || this.language === 'jsx') {
+        this.language === 'tsx' || this.language === 'jsx' || this.language === 'cfscript') {
       // Handle lexical_declaration and variable_declaration
       // These contain one or more variable_declarator children
       for (let i = 0; i < node.namedChildCount; i++) {
@@ -3435,6 +3499,63 @@ export class TreeSitterExtractor {
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
 
+    // Ruby `call` nodes use `receiver` + `method` fields (tree-sitter-ruby), not
+    // the `object`/`name`/`function` fields the branches below expect — so
+    // without this they fell through to the generic path, which took the
+    // receiver as the callee and DROPPED the method name: `lg.log()` produced a
+    // `calls` ref to `lg` (unresolvable) and no method edge was ever recorded,
+    // so a Ruby method's callers/impact were invisible (#1108 follow-up). Build
+    // `receiver.method` so the resolver — and local-variable type inference —
+    // can link it; `Foo.new` stays an instantiation.
+    if (this.language === 'ruby' && (node.type === 'call' || node.type === 'method_call')) {
+      const methodNode = getChildByField(node, 'method');
+      const methodName = methodNode ? getNodeText(methodNode, this.source) : '';
+      if (!methodName) return; // operator/element-reference call with no method name
+      const receiverNode = getChildByField(node, 'receiver');
+      const line = node.startPosition.row + 1;
+      const column = node.startPosition.column;
+      if (!receiverNode) {
+        // Bare `foo(...)` — just the method name (unchanged behavior).
+        this.unresolvedReferences.push({ fromNodeId: callerId, referenceName: methodName, referenceKind: 'calls', line, column });
+        return;
+      }
+      const receiverName = getNodeText(receiverNode, this.source);
+      // `Foo.new` / `Foo::Bar.new` is construction — emit an `instantiates` ref to
+      // the class (last `::` segment), preserving the "what creates X" edge.
+      if (methodName === 'new') {
+        const className = receiverName.includes('::')
+          ? receiverName.slice(receiverName.lastIndexOf('::') + 2)
+          : receiverName;
+        if (/^[A-Z]/.test(className)) {
+          this.unresolvedReferences.push({ fromNodeId: callerId, referenceName: className, referenceKind: 'instantiates', line, column });
+          return;
+        }
+      }
+      const SKIP_RECEIVERS = new Set(['self', 'super']);
+      const skip = SKIP_RECEIVERS.has(receiverName);
+      this.unresolvedReferences.push({
+        fromNodeId: callerId,
+        referenceName: skip ? methodName : `${receiverName}.${methodName}`,
+        referenceKind: 'calls',
+        line,
+        column,
+      });
+      // A capitalized (constant) receiver — `Foo.bar`, a class/module method call
+      // — is itself a dependency on that constant; emit a `references` ref so a
+      // class used only via its class methods still records a dependent (the edge
+      // the old receiver-only callee happened to provide, now made explicit).
+      if (!skip && receiverNode.type === 'constant') {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: receiverName,
+          referenceKind: 'references',
+          line: receiverNode.startPosition.row + 1,
+          column: receiverNode.startPosition.column,
+        });
+      }
+      return;
+    }
+
     // Get the function/method being called
     let calleeName = '';
 
@@ -3710,6 +3831,21 @@ export class TreeSitterExtractor {
                 else reencode = !!innerCallee;
               }
               calleeName = reencode ? `${innerCallee}().${methodName}` : methodName;
+            } else if (
+              this.language === 'cfscript' &&
+              receiver &&
+              receiver.type === 'member_expression' &&
+              /^(variables|this|local|arguments)\.[A-Za-z_][\w]*$/i.test(getNodeText(receiver, this.source))
+            ) {
+              // CFML scope-prefixed member call — `variables.svc.save()` /
+              // `arguments.svc.save()`: the receiver is a component field,
+              // injected property, or typed argument reached through one of
+              // CFML's file-local scopes. Keep the full receiver chain so
+              // resolution can strip the scope prefix and infer the field's
+              // component type from its declaration (#1108). Gated to these
+              // scope keywords: such calls previously emitted a bare method
+              // name, which either failed to resolve or resolved ambiguously.
+              calleeName = `${getNodeText(receiver, this.source)}.${methodName}`;
             } else {
               calleeName = methodName;
             }
@@ -3849,6 +3985,47 @@ export class TreeSitterExtractor {
         column: node.startPosition.column,
       });
     }
+  }
+
+  /**
+   * Is this C++ `declaration` a stack/direct-initialization object construction
+   * that invokes a constructor — `Calculator calc(0)` (direct-init) or
+   * `Widget w{1, 2}` (brace-init) — as opposed to a plain variable or a
+   * function declaration? Used to emit an `instantiates` edge for the
+   * call-less construction syntax (#1035); heap `new T(...)` is handled
+   * separately by INSTANTIATION_KINDS.
+   *
+   * Two signals, both required:
+   *  - the `type` field is a class-like NAMED type (`type_identifier`,
+   *    `template_type`, or `qualified_identifier`). Primitives (`int x(0)`),
+   *    `auto` (`placeholder_type_specifier` — that form always carries a real
+   *    `call_expression`, already handled), and sized specifiers are excluded —
+   *    they construct no class; and
+   *  - a declarator carries constructor arguments: an `init_declarator` whose
+   *    `value` is an `argument_list` (`(args)`) or `initializer_list` (`{args}`).
+   *    This skips default construction `Calculator c;` (no value) and the
+   *    most-vexing-parse `Calculator c();` (a bodyless `function_declarator`,
+   *    a function decl — not a construction).
+   */
+  private isCppStackConstruction(node: SyntaxNode): boolean {
+    const typeNode = getChildByField(node, 'type');
+    if (
+      !typeNode ||
+      (typeNode.type !== 'type_identifier' &&
+        typeNode.type !== 'template_type' &&
+        typeNode.type !== 'qualified_identifier')
+    ) {
+      return false;
+    }
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child?.type !== 'init_declarator') continue;
+      const value = getChildByField(child, 'value');
+      if (value && (value.type === 'argument_list' || value.type === 'initializer_list')) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -4228,6 +4405,19 @@ export class TreeSitterExtractor {
         }
       }
 
+      // C++ stack / direct-initialization construction — `Calculator calc(0)`
+      // and `Widget w{1, 2}`. Unlike heap `new Calculator(0)` (a new_expression
+      // handled above), these carry the constructor arguments directly on the
+      // declarator with NO call/new node, so the body walker saw no constructor
+      // invocation and recorded no `instantiates` edge (#1035). A declaration's
+      // `type` field IS the constructed class name, so reuse extractInstantiation
+      // (which strips template args / namespace and emits the `instantiates`
+      // ref). Children still recurse below, so a nested ctor-arg call
+      // (`Calculator calc(make())`) keeps its own `calls` ref.
+      if (nodeType === 'declaration' && this.language === 'cpp' && this.isCppStackConstruction(node)) {
+        this.extractInstantiation(node);
+      }
+
       // Static-member / value-read: `Enum.value`, `Type.CONST`, `Foo::BAR`.
       this.extractStaticMemberRef(node);
 
@@ -4425,7 +4615,11 @@ export class TreeSitterExtractor {
 
       // C++ base classes: `class Derived : public Base, private Other` →
       // base_class_clause holds access specifiers + base type(s). Emit an extends
-      // ref per base type (skip the public/private/protected keywords).
+      // ref per base type (skip the public/private/protected keywords). A
+      // templated base (`Base<int>`, `ns::Tpl<int>`) arrives as a `template_type`
+      // or a `qualified_identifier` wrapping one; strip the `<…>` args so the ref
+      // matches the bare class the template was defined as — `Base`, `ns::Tpl` —
+      // instead of never resolving (#1043).
       if (child.type === 'base_class_clause') {
         for (const t of child.namedChildren) {
           if (
@@ -4435,7 +4629,7 @@ export class TreeSitterExtractor {
           ) {
             this.unresolvedReferences.push({
               fromNodeId: classId,
-              referenceName: getNodeText(t, this.source),
+              referenceName: stripCppTemplateArgs(getNodeText(t, this.source)),
               referenceKind: 'extends',
               line: t.startPosition.row + 1,
               column: t.startPosition.column,
@@ -4634,6 +4828,34 @@ export class TreeSitterExtractor {
       // class_heritage in TypeScript which wraps extends_clause/implements_clause)
       if (child.type === 'field_declaration_list' || child.type === 'class_heritage') {
         this.extractInheritance(child, classId);
+      }
+
+      // CFML cfscript `component extends="Base" implements="IFoo,IBar" { ... }`
+      // (also covers `interface extends="IBase" { ... }`, which reuses the same
+      // component_attribute shape). Attributes are generic name=value pairs —
+      // (identifier label, expression value) — not a dedicated extends_clause,
+      // so filter by the label text. `implements` is a comma-separated list.
+      if (child.type === 'component_attribute' && node.type === 'component') {
+        const label = child.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+        const value = child.namedChildren.find((c: SyntaxNode) => c.type !== 'identifier');
+        if (label && value) {
+          const labelText = getNodeText(label, this.source).toLowerCase();
+          if (labelText === 'extends' || labelText === 'implements') {
+            const valueText = getNodeText(value, this.source).replace(/^["']|["']$/g, '');
+            const names = labelText === 'implements'
+              ? valueText.split(',').map((s) => s.trim()).filter(Boolean)
+              : [valueText.trim()].filter(Boolean);
+            for (const name of names) {
+              this.unresolvedReferences.push({
+                fromNodeId: classId,
+                referenceName: name,
+                referenceKind: labelText === 'implements' ? 'implements' : 'extends',
+                line: value.startPosition.row + 1,
+                column: value.startPosition.column,
+              });
+            }
+          }
+        }
       }
     }
   }
@@ -5642,6 +5864,16 @@ export function extractFromSource(
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
     // file node so the watcher tracks it without emitting symbols.
     const extractor = new MyBatisExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'cfml' || detectedLanguage === 'cfscript') {
+    // Custom extractor for CFML (.cfc/.cfm) — dialect-switches between the
+    // tag-based cfml grammar and the bare-script cfscript grammar. Standalone
+    // `.cfs` files (language 'cfscript') are always pure script (never `<`-led),
+    // so routing them through here too gets them the same anonymous-component
+    // filename fallback as a bare-script `.cfc` — without it a `.cfs` whose
+    // `component { ... }` declares no name (the grammar has no `name` field;
+    // CFML never spells one in source) stays `<anonymous>`.
+    const extractor = new CfmlExtractor(filePath, source, detectedLanguage);
     result = extractor.extract();
   } else if (isFileLevelOnlyLanguage(detectedLanguage)) {
     // No symbol extraction at this stage — files are tracked at the file-record

@@ -13,11 +13,11 @@
  * so it survives and `listen()` fails with EADDRINUSE.
  */
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { Daemon, tryAcquireDaemonLock } from '../src/mcp/daemon';
+import { Daemon, tryAcquireDaemonLock, finalizeDaemonExit } from '../src/mcp/daemon';
 import { getDaemonPidPath, getDaemonSocketPath } from '../src/mcp/daemon-paths';
 
 const tmpRoots: string[] = [];
@@ -51,5 +51,45 @@ describe('Daemon.start() bind failure (#974)', () => {
 
     // The lockfile must be gone so the next launcher doesn't spin on a stale lock.
     expect(fs.existsSync(pidPath)).toBe(false);
+  });
+});
+
+/**
+ * Windows shutdown must not force `process.exit()` while the recursive file
+ * watcher is still tearing down — that aborts the daemon with a libuv
+ * `UV_HANDLE_CLOSING` assertion (0xC0000409), reproducible when the indexed tree
+ * contains a nested repo. `finalizeDaemonExit` drains on Windows and exits
+ * immediately elsewhere; both branches are exercised here by injecting the
+ * platform + exit fn (so it runs on any host).
+ */
+describe('finalizeDaemonExit — Windows drains instead of aborting mid-watcher-close', () => {
+  for (const platform of ['linux', 'darwin'] as const) {
+    it(`exits immediately on ${platform}`, () => {
+      const exit = vi.fn();
+      const backstop = finalizeDaemonExit(platform, exit);
+      expect(exit).toHaveBeenCalledTimes(1);
+      expect(exit).toHaveBeenCalledWith(0);
+      expect(backstop).toBeNull();
+    });
+  }
+
+  it('on win32 defers exit (lets the loop drain), then force-exits via an unref\'d backstop', () => {
+    vi.useFakeTimers();
+    const prevExitCode = process.exitCode;
+    const exit = vi.fn();
+    try {
+      const backstop = finalizeDaemonExit('win32', exit);
+      // No synchronous exit — the process must drain its closing watch handles first.
+      expect(exit).not.toHaveBeenCalled();
+      expect(backstop).not.toBeNull();
+      // Success code is set so a natural drain exits 0.
+      expect(process.exitCode).toBe(0);
+      // If a stray handle keeps the loop alive, the backstop still forces exit.
+      vi.advanceTimersByTime(2_000);
+      expect(exit).toHaveBeenCalledWith(0);
+    } finally {
+      vi.useRealTimers();
+      process.exitCode = prevExitCode; // don't leak a 0 exit code into the runner
+    }
   });
 });

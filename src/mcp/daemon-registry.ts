@@ -22,7 +22,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { getDaemonPidPath, getDaemonSocketPath, decodeLockInfo } from './daemon-paths';
+import { getDaemonPidPath, getDaemonSocketCandidates, decodeLockInfo } from './daemon-paths';
 
 export interface DaemonRecord {
   /** Realpath'd project root the daemon serves. */
@@ -118,8 +118,12 @@ export function listDaemons(opts: { prune?: boolean } = {}): DaemonRecord[] {
 function cleanupDaemonArtifacts(root: string): void {
   try { fs.unlinkSync(getDaemonPidPath(root)); } catch { /* gone */ }
   // POSIX sockets are real files; Windows named pipes vanish with the process.
+  // Sweep every candidate — a daemon that relocated past an unusable in-project
+  // FS (ExFAT/FAT; #997) left its socket at the tmpdir fallback, not candidate 0.
   if (process.platform !== 'win32') {
-    try { fs.unlinkSync(getDaemonSocketPath(root)); } catch { /* gone */ }
+    for (const candidate of getDaemonSocketCandidates(root)) {
+      try { fs.unlinkSync(candidate); } catch { /* gone */ }
+    }
   }
   deregisterDaemon(root);
 }

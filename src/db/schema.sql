@@ -123,6 +123,25 @@ CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
     VALUES (NEW.rowid, NEW.id, NEW.name, NEW.qualified_name, NEW.docstring, NEW.signature);
 END;
 
+-- Prose-word → symbol-name lookup for the prompt hook's graph-derived gate.
+-- One row per (segment, name): segment is a lowercased word of a symbol name
+-- ("OrderStateMachine" → order, state, machine — see identifier-segments.ts),
+-- which lets natural-language prompt words be verified against the graph in
+-- any language whose technical nouns are Latin script. File nodes are
+-- excluded — a file's basename duplicates the symbols inside it and skews the
+-- singleton-vs-cluster rarity statistics. FTS can't serve this lookup (its
+-- tokenizer keeps camelCase names as single tokens), so segments are
+-- materialized on the node write path.
+-- Deletions leave orphan rows ON PURPOSE: rows are PROPOSALS, always
+-- re-verified against nodes before being surfaced (CodeGraph.getSegmentMatches),
+-- and a full index clears the table at its start. Populated lazily on old
+-- databases (empty until the next index/sync heals it).
+CREATE TABLE IF NOT EXISTS name_segment_vocab (
+    segment TEXT NOT NULL,
+    name TEXT NOT NULL,
+    PRIMARY KEY (segment, name)
+) WITHOUT ROWID;
+
 -- Edge indexes.
 -- idx_edges_source / idx_edges_target are intentionally omitted —
 -- the (source, kind) and (target, kind) composites below cover the
@@ -132,6 +151,17 @@ END;
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target, kind);
+
+-- Edge identity uniqueness. An edge IS uniquely (source, target, kind, line,
+-- col); insertEdge uses `INSERT OR IGNORE`, but without something UNIQUE to
+-- conflict on it behaved like a plain INSERT, so two passes emitting the same
+-- edge produced byte-identical duplicate rows that inflated counts and flowed
+-- into callers/impact (#1034). IFNULL folds the nullable line/col so
+-- coordinate-less edges (synthesized / file-level) dedup too — SQLite treats
+-- each NULL as distinct otherwise. Migration v6 dedups existing rows + adds
+-- this on older databases.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
+  ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
 
 -- File indexes
 CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);

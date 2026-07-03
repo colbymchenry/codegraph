@@ -36,8 +36,37 @@ export function gitWorktreeRoot(dir: string): string | null {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       windowsHide: true,
+      // Bounded like every git call in extraction/: this runs (memoized) on
+      // the daemon's main event loop, where an unbounded hang would trip the
+      // 60s liveness watchdog and SIGKILL a healthy daemon (#1139).
+      timeout: 5000,
     }).trim();
     return out ? realpath(out) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Absolute, symlink-resolved git **common** directory for `dir` — the shared
+ * `.git` that all worktrees of one repository point at. Linked worktrees of the
+ * same repo report the SAME common dir; a submodule or an embedded clone is a
+ * DIFFERENT repository and reports its own (`…/.git/modules/<name>` or its own
+ * `.git`). That distinction is what separates a genuine "borrowed worktree"
+ * from a nested repo the parent index already covers. Null when not a repo.
+ */
+export function gitCommonDir(dir: string): string | null {
+  try {
+    const out = execFileSync('git', ['rev-parse', '--git-common-dir'], {
+      cwd: dir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+      timeout: 5000, // same rationale as gitWorktreeRoot
+    }).trim();
+    if (!out) return null;
+    // `--git-common-dir` is relative to cwd unless already absolute.
+    return realpath(path.isAbsolute(out) ? out : path.resolve(dir, out));
   } catch {
     return null;
   }
@@ -75,6 +104,20 @@ export function detectWorktreeIndexMismatch(
   // distinguishes "borrowed another worktree's index" from "index sits in a
   // plain ancestor directory", and avoids warning outside git entirely.
   if (gitWorktreeRoot(resolvedIndexRoot) !== resolvedIndexRoot) return null;
+
+  // Don't flag a nested repo (submodule / embedded clone) that `indexRoot`'s
+  // index ALREADY covers: indexing a super-repo descends into its submodules
+  // and gitlinked clones, so a query run from inside one resolves up to the
+  // parent index — whose graph *does* contain that nested repo's files. The
+  // warning's premise ("results are a different branch; symbols changed only
+  // here are missing") is false there, and its "run codegraph init -i" advice
+  // would needlessly fragment the unified workspace index. A genuine borrowed
+  // worktree and the index root are the SAME repository (they share a git
+  // common dir); a submodule/embedded clone is a DIFFERENT repository and does
+  // not — so suppress only when the two clearly differ. (#1031, #1033)
+  const worktreeCommon = gitCommonDir(worktreeRoot);
+  const indexCommon = gitCommonDir(resolvedIndexRoot);
+  if (worktreeCommon && indexCommon && worktreeCommon !== indexCommon) return null;
 
   return { worktreeRoot, indexRoot: resolvedIndexRoot };
 }

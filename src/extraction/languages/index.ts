@@ -28,6 +28,8 @@ import { rExtractor } from './r';
 import { luauExtractor } from './luau';
 import { objcExtractor } from './objc';
 import { odinExtractor } from './odin';
+import { cfscriptExtractor } from './cfscript';
+import { cfqueryExtractor } from './cfquery';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -53,4 +55,6 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   luau: luauExtractor,
   objc: objcExtractor,
   odin: odinExtractor,
+  cfscript: cfscriptExtractor,
+  cfquery: cfqueryExtractor,
 };

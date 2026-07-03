@@ -40,6 +40,9 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
   odin: 'tree-sitter-odin.wasm',
+  cfml: 'tree-sitter-cfml.wasm',
+  cfscript: 'tree-sitter-cfscript.wasm',
+  cfquery: 'tree-sitter-cfquery.wasm',
 };
 
 /**
@@ -109,6 +112,15 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
+  // CFML: .cfc/.cfm parse with the tag-aware `cfml` grammar (custom CfmlExtractor
+  // dialect-switches to cfscript for bare-script content); .cfs is pure CFScript.
+  '.cfc': 'cfml',
+  '.cfm': 'cfml',
+  '.cfs': 'cfscript',
+  // Metal Shading Language ≈ C++14: the C++ grammar extracts its functions,
+  // structs, and calls. MSL-specific `[[attribute]]` annotations are blanked
+  // pre-parse for `.metal` files (see blankMetalAttributes in c-cpp.ts). (#1121)
+  '.metal': 'cpp',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -201,6 +213,14 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
     languages = [...languages, 'typescript', 'javascript'];
   }
 
+  // CFML (.cfc/.cfm) delegates bare-script content, <cfscript> tag bodies, and
+  // <cfquery> SQL bodies to the cfscript/cfquery grammars (see injections.scm in
+  // tree-sitter-cfml) — load both even when no standalone .cfs file is in the
+  // index set.
+  if (languages.some((l) => l === 'cfml')) {
+    languages = [...languages, 'cfscript', 'cfquery'];
+  }
+
   // Deduplicate and filter to languages that have WASM grammars and aren't already loaded
   const toLoad = [...new Set(languages)].filter(
     (lang): lang is GrammarLanguage =>
@@ -223,7 +243,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
       // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
       // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'odin')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'odin' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -439,6 +459,9 @@ export function getLanguageDisplayName(language: Language): string {
     xml: 'XML',
     properties: 'Java properties',
     odin: 'Odin',
+    cfml: 'CFML',
+    cfscript: 'CFScript',
+    cfquery: 'CFQuery (SQL)',
     unknown: 'Unknown',
   };
   return names[language] || language;
