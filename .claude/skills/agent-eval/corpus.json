@@ -421,7 +421,30 @@
       "repo": "https://github.com/tidyverse/ggplot2",
       "size": "Large",
       "files": "~1150",
-      "question": "When a ggplot object is printed, how does the plot actually get built and drawn \u2014 trace the path from print/plot to where geoms render. Name the key functions in order."
+      "question": "When a ggplot object is printed, how does the plot actually get built and drawn — trace the path from print/plot to where geoms render. Name the key functions in order."
+    }
+  ],
+  "COBOL": [
+    {
+      "name": "cics-genapp",
+      "repo": "https://github.com/cicsdev/cics-genapp",
+      "size": "Small",
+      "files": "~60",
+      "question": "When a new insurance policy is added through the LGTESTP1 CICS test harness, which programs handle the request on the way to the DB2 insert? Trace the path and name the programs in order."
+    },
+    {
+      "name": "carddemo",
+      "repo": "https://github.com/aws-samples/aws-mainframe-modernization-carddemo",
+      "size": "Medium",
+      "files": "~75",
+      "question": "How does the online bill-payment flow work — from the COBIL00C screen program to the transaction record being written? Name the paragraphs performed in order and the copybooks that define the records involved."
+    },
+    {
+      "name": "CobolCraft",
+      "repo": "https://github.com/meyfa/CobolCraft",
+      "size": "Medium",
+      "files": "~270",
+      "question": "How does an incoming player chat message travel from packet handling to being broadcast to the other connected players? Name the programs on the path in order."
     }
   ]
 }

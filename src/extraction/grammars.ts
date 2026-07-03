@@ -42,6 +42,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   cfml: 'tree-sitter-cfml.wasm',
   cfscript: 'tree-sitter-cfscript.wasm',
   cfquery: 'tree-sitter-cfquery.wasm',
+  cobol: 'tree-sitter-cobol.wasm',
 };
 
 /**
@@ -123,6 +124,13 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
+  // COBOL: programs (.cbl/.cob) and copybooks (.cpy). Vendored grammar
+  // (patched yutaro-sakamoto/tree-sitter-cobol) handles fixed-format column
+  // rules, EXEC CICS/SQL blocks, and standalone copybook fragments.
+  '.cbl': 'cobol',
+  '.cob': 'cobol',
+  '.cobol': 'cobol',
+  '.cpy': 'cobol',
   // Spring config: `application.properties` / `application-*.properties`. Same
   // shape as the `.yml` variants — the YAML/properties extractor emits one node
   // per leaf key, and the Spring resolver links `@Value("${k}")` references.
@@ -241,7 +249,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
       // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
       // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -459,6 +467,7 @@ export function getLanguageDisplayName(language: Language): string {
     cfml: 'CFML',
     cfscript: 'CFScript',
     cfquery: 'CFQuery (SQL)',
+    cobol: 'COBOL',
     unknown: 'Unknown',
   };
   return names[language] || language;

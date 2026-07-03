@@ -29,6 +29,7 @@ import { luauExtractor } from './luau';
 import { objcExtractor } from './objc';
 import { cfscriptExtractor } from './cfscript';
 import { cfqueryExtractor } from './cfquery';
+import { cobolExtractor } from './cobol';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -55,4 +56,5 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   objc: objcExtractor,
   cfscript: cfscriptExtractor,
   cfquery: cfqueryExtractor,
+  cobol: cobolExtractor,
 };

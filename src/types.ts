@@ -98,6 +98,7 @@ export const LANGUAGES = [
   'cfml',
   'cfscript',
   'cfquery',
+  'cobol',
   'unknown',
 ] as const;
 

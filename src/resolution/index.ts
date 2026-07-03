@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
@@ -815,7 +815,7 @@ export class ReferenceResolver {
     // If that didn't find the file, do NOT fall back to the symbol
     // name-matcher — it would mis-connect e.g. "inc/db.php" to an unrelated
     // db.php elsewhere in the tree (a wrong edge is worse than none, #660).
-    if (isPhpIncludePathRef(ref)) {
+    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref)) {
       return candidates.length > 0
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
