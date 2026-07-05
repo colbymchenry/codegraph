@@ -373,10 +373,19 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
 /**
  * Heuristic: does a .h file contain C++ constructs?
  * Checks the first ~8KB for patterns that are unique to C++ and never valid C.
+ *
+ * The `class`/`struct` signals tolerate an optional all-caps export/visibility
+ * macro between the keyword and the type name — the ubiquitous Unreal Engine /
+ * library form `class ENGINE_API Foo : Base` (#1159). Without this, such a
+ * header (when it carries no other C++ tell like `public:` in the first 8KB)
+ * falls back to the C grammar and its whole class definition is dropped.
+ * `struct` is matched only in its base-clause form (`struct X : Base`) — that
+ * `:` is C++-exclusive, whereas a plain `struct X { … }` is valid C and must
+ * stay `c`.
  */
 function looksLikeCpp(source: string): boolean {
   const sample = source.substring(0, 8192);
-  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
+  return /\bnamespace\b|\bclass\s+(?:[A-Z_][A-Z0-9_]*\s+)?\w+\s*[:{]|\bstruct\s+(?:[A-Z_][A-Z0-9_]*\s+)?\w+\s*:|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
 }
 
 /**
