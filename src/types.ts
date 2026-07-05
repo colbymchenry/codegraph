@@ -293,8 +293,15 @@ export interface ExtractionError {
  * a function name used as a VALUE (callback registration, #756). It never
  * becomes an edge kind: resolution maps it to a `references` edge targeting
  * function/method nodes only (see `matchFunctionRef`).
+ *
+ * `property_read` is likewise internal-only (Swift): reading a COMPUTED
+ * property (`obj.isReady`) runs its getter — behaviourally a call, but written
+ * without parens, so the call extractor never saw it and a computed-property
+ * gate showed zero callers. Resolution maps it to a `calls` edge targeting
+ * computed-`property` nodes ONLY (see `matchPropertyRead`); reads of stored
+ * fields and stdlib members resolve to nothing and drop, so no new noise.
  */
-export type ReferenceKind = EdgeKind | 'function_ref';
+export type ReferenceKind = EdgeKind | 'function_ref' | 'property_read';
 
 /**
  * A reference that couldn't be resolved during extraction

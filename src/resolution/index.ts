@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
+import { matchReference, matchFunctionRef, matchPropertyRead, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -773,6 +773,14 @@ export class ReferenceResolver {
       return this.gateLanguage(matchFunctionRef(ref, this.context), ref);
     }
 
+    // Swift computed-property reads (`obj.isReady`) get a dedicated, strictly-
+    // gated path: computed-`property` targets only, same-file first, unique-only
+    // cross-file. They never reach the framework or fuzzy strategies below, so a
+    // stored-field or stdlib read that matches no computed property simply drops.
+    if (ref.referenceKind === 'property_read') {
+      return this.gateLanguage(matchPropertyRead(ref, this.context), ref);
+    }
+
     // JVM FQN imports skip framework/name-matcher: `import com.example.Bar`
     // resolves directly through the qualifiedName index, which is unambiguous
     // even when several `Bar` classes exist in different packages.
@@ -864,7 +872,13 @@ export class ReferenceResolver {
       // traverse `references`, so registration sites surface with no
       // graph-layer changes.
       let kind: Edge['kind'] =
-        ref.original.referenceKind === 'function_ref' ? 'references' : ref.original.referenceKind;
+        ref.original.referenceKind === 'function_ref'
+          ? 'references'
+          : ref.original.referenceKind === 'property_read'
+            // A computed-property read runs the getter — surface it as a `calls`
+            // edge so `callers`/`callees`/`impact` all traverse it.
+            ? 'calls'
+            : ref.original.referenceKind;
 
       // Promote "extends" to "implements" when a class/struct targets an interface
       if (kind === 'extends') {
