@@ -27,14 +27,61 @@ export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
  * on a writer, so this timeout only governs cross-process write contention
  * (e.g. the git-hook `codegraph sync` running while the MCP server writes).
  */
-function configureConnection(db: SqliteDatabase): void {
+export function configureConnection(db: SqliteDatabase, useWal: boolean): void {
   db.pragma('busy_timeout = 5000');      // MUST be first — see above
   db.pragma('foreign_keys = ON');
-  db.pragma('journal_mode = WAL');       // node:sqlite supports WAL on every platform
-  db.pragma('synchronous = NORMAL');     // safe with WAL mode
+  if (useWal) {
+    db.pragma('journal_mode = WAL');
+    db.pragma('synchronous = NORMAL');   // safe with WAL mode
+  } else {
+    // Filesystem can't sustain WAL (see walAvailable / #990) — fall back to the
+    // rollback journal. synchronous=NORMAL is only crash-safe under WAL, so use
+    // FULL here to keep durability guarantees in DELETE mode.
+    db.pragma('journal_mode = DELETE');
+    db.pragma('synchronous = FULL');
+  }
   db.pragma('cache_size = -64000');      // 64 MB page cache
   db.pragma('temp_store = MEMORY');      // temp tables in memory
   db.pragma('mmap_size = 268435456');    // 256 MB memory-mapped I/O
+}
+
+/**
+ * Probe whether the filesystem backing `dir` can actually sustain WAL mode.
+ *
+ * `PRAGMA journal_mode = WAL` reports success ("wal") even on filesystems that
+ * cannot support it: ntfs3, WSL2 `/mnt`, and some CIFS/NFS return EOPNOTSUPP for
+ * `mmap(MAP_SHARED)` on the WAL-index, and the failure only surfaces on the
+ * first write (SQLITE_IOERR) — by which point the real connection is already
+ * corrupted and can no longer be switched to another mode. So we exercise WAL
+ * on a throwaway database first and only enable it on the real connection when
+ * the probe survives an actual write. See #990.
+ */
+export function walAvailable(dir: string): boolean {
+  const probePath = path.join(dir, `.cg-wal-probe-${process.pid}-${Date.now()}.db`);
+  const cleanup = (): void => {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        fs.unlinkSync(probePath + suffix);
+      } catch {
+        // best-effort: nothing to remove if the file was never created
+      }
+    }
+  };
+  try {
+    const { db } = createDatabase(probePath);
+    try {
+      db.pragma('journal_mode = WAL');
+      // The write is what actually exercises the WAL-index mmap.
+      db.exec('CREATE TABLE _cg_wal_probe (x); DROP TABLE _cg_wal_probe;');
+    } finally {
+      db.close();
+    }
+    cleanup();
+    return true;
+  } catch {
+    cleanup();
+    return false;
+  }
 }
 
 /**
@@ -74,7 +121,7 @@ export class DatabaseConnection {
     // Create and configure database
     const { db, backend } = createDatabase(dbPath);
 
-    configureConnection(db);
+    configureConnection(db, walAvailable(dir));
 
     // Run schema initialization
     const schemaPath = path.join(__dirname, 'schema.sql');
@@ -102,7 +149,7 @@ export class DatabaseConnection {
 
     const { db, backend } = createDatabase(dbPath);
 
-    configureConnection(db);
+    configureConnection(db, walAvailable(path.dirname(dbPath)));
 
     // Check and run migrations if needed
     const conn = new DatabaseConnection(db, dbPath, backend);
@@ -141,12 +188,13 @@ export class DatabaseConnection {
   /**
    * The journal mode actually in effect (e.g. 'wal', 'delete').
    *
-   * SQLite silently keeps the prior mode if WAL can't be enabled — e.g. on
-   * filesystems without shared-memory support (some network/virtualized mounts,
-   * WSL2 /mnt). So the effective mode can differ
-   * from what `configureConnection` requested. Surfaced in `codegraph status` so
-   * a "database is locked" report is triageable: 'wal' ⇒ readers never block on a
-   * writer; anything else ⇒ they can. See issue #238.
+   * `configureConnection` picks the mode up front: WAL only when `walAvailable`
+   * proved the filesystem can sustain it, otherwise an explicit DELETE fallback
+   * (see #990). So this reflects that deliberate choice — not a silent SQLite
+   * downgrade. SQLite does NOT quietly fall back: it reports WAL as active and
+   * then fails on the first write, which is exactly why we probe. Surfaced in
+   * `codegraph status` so a "database is locked" report is triageable: 'wal' ⇒
+   * readers never block on a writer; anything else ⇒ they can. See issues #238, #990.
    */
   getJournalMode(): string {
     const raw = this.db.pragma('journal_mode');
