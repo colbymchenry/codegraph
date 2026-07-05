@@ -47,6 +47,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   erlang: 'tree-sitter-erlang.wasm',
   solidity: 'tree-sitter-solidity.wasm',
   terraform: 'tree-sitter-terraform.wasm',
+  enforcescript: 'tree-sitter-c_sharp.wasm',
 };
 
 /**
@@ -292,7 +293,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // ship HCL/Terraform at all, so we vendor the prebuilt
       // tree-sitter-terraform.wasm from @tree-sitter-grammars/tree-sitter-hcl
       // 1.2.0 (Apache-2.0) — byte-identical to the npm package's artifact.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol' || lang === 'vbnet' || lang === 'erlang' || lang === 'terraform')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'enforcescript' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol' || lang === 'vbnet' || lang === 'erlang' || lang === 'terraform')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -518,6 +519,7 @@ export function getLanguageDisplayName(language: Language): string {
     vbnet: 'Visual Basic .NET',
     erlang: 'Erlang',
     terraform: 'Terraform',
+    enforcescript: 'Enforce Script',
     unknown: 'Unknown',
   };
   return names[language] || language;
