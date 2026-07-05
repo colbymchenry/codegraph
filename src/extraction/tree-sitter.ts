@@ -4500,6 +4500,52 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Swift computed-property read (#1159 sibling). A `navigation_expression`
+   * value-read — `enc.header.isWellFormed` — that is NOT the callee of a call
+   * emits a `property_read` ref for its LAST member (`isWellFormed`). Reading a
+   * computed property runs its getter, so it is behaviourally a call, but the
+   * paren-free syntax parsed as neither a `call_expression` (the call extractor)
+   * nor a capitalized `Type.member` (the static-member pass) — so a heavily-used
+   * gate property (`isWellFormed`, `canPublishBundle`) showed zero callers.
+   *
+   * Works for instance (`enc.header.isWellFormed`) and static (`Store.can
+   * PublishBundle`) receivers alike. A capitalized `Type.member` receiver also
+   * gets a `references` edge to the TYPE from extractStaticMemberRef — a
+   * different target, so no double edge. Precision comes at resolution:
+   * `property_read` binds to computed-`property` nodes ONLY (matchPropertyRead),
+   * so `arr.count`, `obj.storedField`, `Type.CONST`, and enum values resolve to
+   * nothing and drop — no new noise. See {@link matchPropertyRead}.
+   */
+  private extractSwiftPropertyRead(node: SyntaxNode): void {
+    if (this.language !== 'swift' || node.type !== 'navigation_expression') return;
+    if (this.nodeStack.length === 0) return;
+    const ownerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!ownerId) return;
+
+    // Skip `obj.method()` — this navigation is the callee of a call, already
+    // linked by the call extractor as a `calls` edge.
+    const parent = node.parent;
+    if (parent?.type === 'call_expression') {
+      const callee = getChildByField(parent, 'function') ?? parent.namedChild(0);
+      if (callee && callee.startIndex === node.startIndex) return;
+    }
+
+    // Member name is the simple_identifier inside the trailing navigation_suffix.
+    const suffix = node.namedChild(node.namedChildCount - 1);
+    if (!suffix || suffix.type !== 'navigation_suffix') return;
+    const member = suffix.namedChildren.find((c: SyntaxNode) => c.type === 'simple_identifier');
+    if (!member) return;
+
+    this.unresolvedReferences.push({
+      fromNodeId: ownerId,
+      referenceName: getNodeText(member, this.source),
+      referenceKind: 'property_read',
+      line: member.startPosition.row + 1,
+      column: member.startPosition.column,
+    });
+  }
+
+  /**
    * Find a `class_body` child of an `object_creation_expression` — the
    * marker for an anonymous class (`new T() { ... }`). Returns the body
    * node so the caller can walk it as the anon class's members.
@@ -4908,6 +4954,11 @@ export class TreeSitterExtractor {
 
       // Static-member / value-read: `Enum.value`, `Type.CONST`, `Foo::BAR`.
       this.extractStaticMemberRef(node);
+
+      // Swift computed-property read: `obj.isReady` runs a getter — a call
+      // written without parens. Emit a `property_read` ref (resolved to
+      // computed-`property` nodes only) so gate properties show real callers.
+      this.extractSwiftPropertyRead(node);
 
       // Local variable type annotations inside a body — `const items: Foo[] = []`,
       // `const x: SomeType = svc.load()`. We deliberately do NOT create nodes for

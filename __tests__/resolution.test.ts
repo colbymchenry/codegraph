@@ -3490,6 +3490,41 @@ func runCaller() { Foo.make().onlyOther() }
     });
   });
 
+  describe('Swift computed-property read shows callers (property_read)', () => {
+    function callerNamesOf(kind: string, name: string): string[] {
+      const target = cg.getNodesByKind(kind).find((n) => n.name === name);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('a computed-property gate lists its readers; a stored field of the same shape does not', async () => {
+      // Reading a computed property runs its getter — behaviourally a call, but
+      // paren-free, so it produced no `calls` edge and a gate looked uncalled.
+      fs.writeFileSync(
+        path.join(tempDir, 'Gate.swift'),
+        `struct Header {
+    var counter: Int = 0
+    var isWellFormed: Bool { return counter >= 0 }
+}
+final class Receiver {
+    func receive(_ h: Header) { guard h.isWellFormed else { return } }
+    func check(_ h: Header) -> Bool { return h.isWellFormed }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // The computed property surfaces both readers as callers…
+      expect(callerNamesOf('property', 'isWellFormed')).toEqual(['check', 'receive']);
+      // …while a stored field read (`h.counter`) creates no bogus caller edge.
+      expect(callerNamesOf('field', 'counter')).toEqual([]);
+    });
+  });
+
   describe('Chained call resolves a method on a supertype (conformance, #750)', () => {
     function callerNamesOf(qualifiedName: string): string[] {
       const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);

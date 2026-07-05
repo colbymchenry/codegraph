@@ -338,6 +338,58 @@ export function matchFunctionRef(
 }
 
 /**
+ * Resolve a Swift computed-property read (`obj.isReady`). The ONLY strategy for
+ * a `property_read` ref, and deliberately strict — mirroring matchFunctionRef:
+ * computed-`property` targets only, same language family, same-file first, and
+ * cross-file only when the match is UNIQUE. No fuzzy fallback. Because Swift's
+ * stored properties extract as `field`/`constant`/`variable` (never `property`)
+ * and stdlib members aren't in the graph, restricting to `property` kind means a
+ * read of a stored field or a `.count` resolves to nothing and drops — a wrong
+ * "call" edge onto an unrelated same-named symbol is worse than none.
+ */
+export function matchPropertyRead(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const candidates = context
+    .getNodesByName(ref.referenceName)
+    .filter(
+      (n) =>
+        n.kind === 'property' &&
+        sameLanguageFamily(n.language, ref.language) &&
+        n.id !== ref.fromNodeId // a computed property reading itself is not an edge
+    );
+  if (candidates.length === 0) return null;
+
+  // Same-file definition wins outright.
+  const sameFile = candidates.filter((n) => n.filePath === ref.filePath);
+  let pool = sameFile;
+  if (pool.length === 0) {
+    // No same-file def — prefer a UNIQUE same-directory computed property (the
+    // locality signal pickClosestFileNode uses for file resolution). Symlinked /
+    // mirrored source trees — a test target re-exposing app files (Auris's
+    // tools/crypto-tests mirror of Crypto.swift) — put a second same-named
+    // property in a distant dir; the same-dir one is the real referent.
+    const dirOf = (p: string): string => {
+      const i = p.lastIndexOf('/');
+      return i >= 0 ? p.slice(0, i) : '';
+    };
+    const refDir = dirOf(ref.filePath);
+    pool = candidates.filter((n) => dirOf(n.filePath) === refDir);
+  }
+  // Unique-or-drop: refuse to guess between same-named computed properties we
+  // can't disambiguate without receiver-type inference — a wrong "call" edge is
+  // worse than none (the matchFunctionRef philosophy).
+  if (pool.length !== 1) return null;
+  return {
+    original: ref,
+    targetNodeId: pool[0]!.id,
+    confidence: 0.85,
+    resolvedBy: 'property-read',
+  };
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
