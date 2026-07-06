@@ -8,7 +8,7 @@ Already installed? Run `codegraph upgrade`
 
 Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
-### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, and Kiro with Semantic Code Intelligence
+### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Grok Build, Antigravity, and Kiro with Semantic Code Intelligence
 
 **Surgical context · fewer tool calls · faster answers · 100% local**
 
@@ -28,6 +28,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 [![opencode](https://img.shields.io/badge/opencode-supported-blueviolet.svg)](#supported-agents)
 [![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-supported-blueviolet.svg)](#supported-agents)
 [![Gemini](https://img.shields.io/badge/Gemini-supported-blueviolet.svg)](#supported-agents)
+[![Grok Build](https://img.shields.io/badge/Grok_Build-supported-blueviolet.svg)](#supported-agents)
 [![Antigravity](https://img.shields.io/badge/Antigravity-supported-blueviolet.svg)](#supported-agents)
 [![Kiro](https://img.shields.io/badge/Kiro-supported-blueviolet.svg)](#supported-agents)
 
@@ -76,7 +77,7 @@ In a **new terminal**, run the installer to connect CodeGraph to the agents you 
 codegraph install
 ```
 
-<sub>Detects and auto-configures Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, and Kiro — wiring the CodeGraph MCP server into each. **This is the step that connects CodeGraph to your agent;** installing the CLI in step 1 does not do it on its own. It only wires up your agent — it does **not** index any code; building each project's graph is the separate `codegraph init` in step 3. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs this in one go.)</sub>
+<sub>Detects and auto-configures Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Grok Build, Antigravity IDE, and Kiro — wiring the CodeGraph MCP server into each. **This is the step that connects CodeGraph to your agent;** installing the CLI in step 1 does not do it on its own. It only wires up your agent — it does **not** index any code; building each project's graph is the separate `codegraph init` in step 3. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs this in one go.)</sub>
 
 ### 3. Initialize each project
 
@@ -244,7 +245,7 @@ The reliable, universal payoff is **surgical context and speed**: CodeGraph coll
 | **Full-Text Search** | Find code by name instantly across your entire codebase, powered by FTS5 |
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
-| **20+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
+| **30+ Languages** | TypeScript, JavaScript, Python, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Elixir, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
 | **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 17 frameworks |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
@@ -342,7 +343,7 @@ npx @colbymchenry/codegraph
 ```
 
 The installer will:
-- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**
+- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Grok Build**, **Antigravity IDE**, **Kiro**
 - Prompt to install `codegraph` on your PATH (so agents can launch the MCP server)
 - Ask whether configs apply to all your projects or just this one
 - Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`) — that's how subagents and non-MCP agents learn the `codegraph explore` command, since the MCP server's own guidance only reaches the main agent. Removed cleanly by `codegraph uninstall`.
@@ -369,7 +370,7 @@ codegraph install --print-config codex               # print snippet, no file wr
 
 ### 2. Restart Your Agent
 
-Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro) for the MCP server to load.
+Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Grok Build / Antigravity IDE / Kiro) for the MCP server to load.
 
 ### 3. Initialize Projects
 
@@ -683,6 +684,7 @@ is written):
 - **opencode**
 - **Hermes Agent**
 - **Gemini CLI**
+- **Grok Build**
 - **Antigravity IDE**
 - **Kiro**
 
@@ -720,6 +722,7 @@ is written):
 | COBOL | `.cbl`, `.cob`, `.cpy` | Full support (programs, sections/paragraphs with PERFORM/GO TO call edges, CALL 'literal' cross-program calls, COPY copybook imports — including standalone `.cpy` files — DATA DIVISION records/fields/88-levels, EXEC CICS LINK/XCTL and EXEC SQL INCLUDE targets; fixed and free format) |
 | Visual Basic .NET | `.vb` | Full support (classes, Modules, interfaces, structures, enums, properties, events, `Declare` P/Invoke, `Handles`/`WithEvents`, `Inherits`/`Implements` edges, call edges through VB's call/index paren ambiguity, `As New` instantiation, interpolated strings, LINQ, Unicode identifiers) |
 | Erlang | `.erl`, `.hrl`, `.escript`, `.app.src`, `.app` | Full support (functions with multi-clause/multi-arity grouping, `-spec` signatures, records with fields, `-type`/`-opaque` aliases, `-define` macros, `-include`/`-include_lib`/`-import` edges, local and `mod:fn` remote call edges, `fun name/arity` references, `spawn`/`apply`/`proc_lib`/`timer`/`rpc` MFA-argument call edges, `gen_server:call/cast(?MODULE)` → own `handle_call`/`handle_cast` links, `-behaviour` links, `-export`-based visibility) |
+| Elixir | `.ex`, `.exs`, `.heex` | Full support (modules, functions, calls, imports) |
 | Solidity | `.sol` | Full support (contracts, libraries, interfaces, structs, enums, modifiers, events, errors, state variables, `import`/`using` directives, `emit`/`revert` calls) |
 | Terraform / OpenTofu | `.tf`, `.tfvars`, `.tofu` | Full support (resources, data sources, modules, variables, outputs, providers incl. aliases, `locals`; `var.`/`local.`/`module.`/resource references with Terraform's per-directory scoping enforced; module calls bridged across the boundary — inputs to the child module's variables, `module.M.out` to the child's output, `source` to the module's files; cloudposse/atmos `remote-state` cross-component wiring when the component is statically named; `provider = aws.east` selections resolved up the module tree; `moved`/`import`/`removed`/`check` block references; `.tfvars` assignments linked to the variables they set) |
 
@@ -791,7 +794,7 @@ MIT
 
 <div align="center">
 
-**Made for AI coding agents — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, and Kiro**
+**Made for AI coding agents — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Grok Build, Antigravity IDE, and Kiro**
 
 [Report Bug](https://github.com/colbymchenry/codegraph/issues) · [Request Feature](https://github.com/colbymchenry/codegraph/issues)
 
