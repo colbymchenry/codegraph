@@ -373,7 +373,7 @@ export class TreeSitterExtractor {
   // Value-reference edges (default ON; set CODEGRAPH_VALUE_REFS=0 to disable; see flushValueRefs).
   // Same-file reads of file-scope const/var symbols → `references` edges so impact analysis catches
   // value consumers ("change this constant/table, affect its readers").
-  private static readonly VALUE_REF_LANGS = new Set<string>(['typescript', 'javascript', 'tsx', 'go', 'python', 'rust', 'ruby', 'c', 'java', 'csharp', 'php', 'scala', 'kotlin', 'swift', 'dart', 'pascal']);
+  private static readonly VALUE_REF_LANGS = new Set<string>(['typescript', 'javascript', 'tsx', 'arkts', 'go', 'python', 'rust', 'ruby', 'c', 'java', 'csharp', 'php', 'scala', 'kotlin', 'swift', 'dart', 'pascal']);
   private static readonly MAX_VALUE_REF_NODES = 20_000;
   private readonly valueRefsEnabled = process.env.CODEGRAPH_VALUE_REFS !== '0';
   private fileScopeValues = new Map<string, string>();
@@ -1183,7 +1183,8 @@ export class TreeSitterExtractor {
     else if (
       nodeType === 'export_statement' &&
       (this.language === 'typescript' || this.language === 'tsx' ||
-       this.language === 'javascript' || this.language === 'jsx') &&
+       this.language === 'javascript' || this.language === 'jsx' ||
+       this.language === 'arkts') &&
       getChildByField(node, 'source')
     ) {
       const parentId = this.nodeStack[this.nodeStack.length - 1];
@@ -2487,7 +2488,8 @@ export class TreeSitterExtractor {
 
     // Extract variable declarators based on language
     if (this.language === 'typescript' || this.language === 'javascript' ||
-        this.language === 'tsx' || this.language === 'jsx' || this.language === 'cfscript') {
+        this.language === 'tsx' || this.language === 'jsx' || this.language === 'cfscript' ||
+        this.language === 'arkts') {
       // Handle lexical_declaration and variable_declaration
       // These contain one or more variable_declarator children
       for (let i = 0; i < node.namedChildCount; i++) {
@@ -2916,7 +2918,7 @@ export class TreeSitterExtractor {
         // property/method nodes under the type alias so `recorder.stop()`
         // can attach the call edge to `RecorderHandle.stop` instead of
         // an unrelated class method picked by path-proximity (#359).
-        if (this.language === 'typescript' || this.language === 'tsx') {
+        if (this.language === 'typescript' || this.language === 'tsx' || this.language === 'arkts') {
           this.extractTsTypeAliasMembers(value, typeAliasNode);
           // `type List = [ Service<'name', Req, Resp>, … ]` — surface each
           // entry's string-literal name as a searchable member (issue #634).
@@ -3132,7 +3134,8 @@ export class TreeSitterExtractor {
         // called/typed symbols still record a cross-file dependency (TS/JS only).
         if (
           this.language === 'typescript' || this.language === 'tsx' ||
-          this.language === 'javascript' || this.language === 'jsx'
+          this.language === 'javascript' || this.language === 'jsx' ||
+          this.language === 'arkts'
         ) {
           const parentId = this.nodeStack[this.nodeStack.length - 1];
           if (parentId) this.emitImportBindingRefs(node, parentId);
@@ -3892,6 +3895,176 @@ export class TreeSitterExtractor {
         });
       }
       return;
+    }
+
+    // ArkTS build()-DSL handling. Three shapes carry UI-attribute chains, and
+    // all of their attribute names are emitted with a LEADING DOT
+    // (`.titleStyle`, `.width`) — an impossible identifier that routes them to
+    // a dedicated matcher strategy resolving ONLY to decorator-marked
+    // attribute helpers (`@Extend`/`@Styles`/`@AnimatableExtend`/`@Builder`
+    // functions). Bare names would go through global name matching, where
+    // framework attributes (`.width`, `.fontSize`, appearing on nearly every
+    // UI line) hit arbitrary same-named symbols — measured on the OpenHarmony
+    // samples monorepo, that produced 36k wrong edges (17% of all calls),
+    // including single properties with 3,400+ false callers.
+    //
+    //   1. `Column({space:8}) { … }.height('100%')` — ONE
+    //      arkui_component_expression: `function:` = the component, chained
+    //      attributes as repeated `property:`/`arguments:` field pairs.
+    //      The component ref (`Column`, `TodoRow`) stays a PLAIN name — it
+    //      resolves to the child `@Component struct`, giving the parent→child
+    //      component-tree edge the way JSX children do for React.
+    //   2. `Image(x).width(10).onClick(this.f)` — ordinary nested
+    //      call_expressions whose `function:` is a member_expression chained
+    //      on a CALL RESULT (never a named receiver, so `svc.save()` /
+    //      `this.vm.load()` are untouched and fall through to the generic
+    //      paths below).
+    //   3. A nested component whose chain starts on the line AFTER its
+    //      closing `}` inside arkui_children — the grammar detaches the chain
+    //      into sibling `leading_dot_expression(identifier)` +
+    //      `parenthesized_expression(args)` statement pairs; reassemble from
+    //      the siblings.
+    //
+    // `.onXxx(this.handler)` METHOD-REFERENCE bindings (no call parens, so
+    // nothing else records them) additionally emit a call ref to the bare
+    // handler name — same-class resolution links the tap→handler hop.
+    // Arrow-function handlers need nothing: their bodies' calls already
+    // attribute to the enclosing build(). Children/argument subtrees are
+    // still walked by the caller, so nested components extract normally.
+    if (this.language === 'arkts') {
+      const emitAttr = (nameNode: SyntaxNode): void => {
+        const attrName = getNodeText(nameNode, this.source);
+        if (!attrName) return;
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: '.' + attrName,
+          referenceKind: 'calls',
+          line: nameNode.startPosition.row + 1,
+          column: nameNode.startPosition.column,
+        });
+      };
+      // Emit `handler` for each bare `this.handler` among an on-attribute's
+      // arguments.
+      const emitThisHandlers = (args: SyntaxNode | null): void => {
+        if (!args) return;
+        for (let j = 0; j < args.namedChildCount; j++) {
+          const arg = args.namedChild(j);
+          if (arg?.type !== 'member_expression') continue;
+          const obj = getChildByField(arg, 'object');
+          const prop = getChildByField(arg, 'property');
+          if (obj?.type === 'this' && prop) {
+            this.unresolvedReferences.push({
+              fromNodeId: callerId,
+              referenceName: getNodeText(prop, this.source),
+              referenceKind: 'calls',
+              line: arg.startPosition.row + 1,
+              column: arg.startPosition.column,
+            });
+          }
+        }
+      };
+
+      // Shape 1: arkui_component_expression with property/arguments pairs.
+      if (node.type === 'arkui_component_expression') {
+        const componentField = getChildByField(node, 'function');
+        if (componentField && componentField.type === 'identifier') {
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: getNodeText(componentField, this.source),
+            referenceKind: 'calls',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+        }
+        for (let i = 0; i < node.childCount; i++) {
+          const child = node.child(i);
+          if (!child || child.type !== 'property_identifier') continue;
+          emitAttr(child);
+          if (/^on[A-Z]/.test(getNodeText(child, this.source))) {
+            // The attribute's arguments node is the next `arguments`-typed
+            // child before the following attribute name.
+            let args: SyntaxNode | null = null;
+            for (let k = i + 1; k < node.childCount; k++) {
+              const next = node.child(k);
+              if (!next) continue;
+              if (next.type === 'property_identifier') break;
+              if (next.type === 'arguments') {
+                args = next;
+                break;
+              }
+            }
+            emitThisHandlers(args);
+          }
+        }
+        return;
+      }
+
+      // Shape 2: fluent chain on a call result —
+      // call_expression(function: member_expression(object: <call>)), or the
+      // grammar's DSL-specific arkui_dsl_decorator_member_expression (same
+      // object/property fields; produced e.g. by `Column() { … }.alignItems(x)`
+      // in some chain positions — it ONLY occurs in attribute chains).
+      if (node.type === 'call_expression') {
+        const fn = getChildByField(node, 'function');
+        if (fn?.type === 'member_expression' || fn?.type === 'arkui_dsl_decorator_member_expression') {
+          const obj = getChildByField(fn, 'object');
+          const prop = getChildByField(fn, 'property');
+          if (
+            prop &&
+            (fn.type === 'arkui_dsl_decorator_member_expression' ||
+              obj?.type === 'call_expression' ||
+              obj?.type === 'arkui_component_expression')
+          ) {
+            emitAttr(prop);
+            if (/^on[A-Z]/.test(getNodeText(prop, this.source))) {
+              emitThisHandlers(getChildByField(node, 'arguments'));
+            }
+            return;
+          }
+        }
+        // The INNERMOST call of a proper-form detached chain
+        // (`.alignItems(x).layoutWeight(1)…` under a leading_dot_expression)
+        // has a BARE IDENTIFIER function — the leading dot was consumed by
+        // the wrapper, so it masquerades as a plain `alignItems(...)` call.
+        // Walk up the member/call alternation; topping out at
+        // leading_dot_expression means the dot belongs to this chain.
+        if (fn?.type === 'identifier') {
+          let p: SyntaxNode | null = node.parent;
+          while (p && (p.type === 'member_expression' || p.type === 'call_expression')) {
+            p = p.parent;
+          }
+          if (p?.type === 'leading_dot_expression') {
+            emitAttr(fn);
+            if (/^on[A-Z]/.test(getNodeText(fn, this.source))) {
+              emitThisHandlers(getChildByField(node, 'arguments'));
+            }
+            return;
+          }
+        }
+        // Not a chained attribute — fall through to the generic call paths.
+      }
+
+      // Shape 3: detached chain segment — leading_dot_expression whose only
+      // named child is a bare identifier; its arguments sit in the NEXT
+      // sibling statement as a parenthesized_expression.
+      if (node.type === 'leading_dot_expression') {
+        const only = node.namedChildCount === 1 ? node.namedChild(0) : null;
+        if (only && only.type === 'identifier') {
+          emitAttr(only);
+          if (/^on[A-Z]/.test(getNodeText(only, this.source))) {
+            const stmt = node.parent; // expression_statement
+            const nextStmt = stmt?.nextNamedSibling;
+            const paren = nextStmt?.namedChild(0);
+            if (paren?.type === 'parenthesized_expression') {
+              emitThisHandlers(paren);
+            }
+          }
+        }
+        // The proper form (child is a call_expression chain, as inside
+        // `@Extend` bodies) needs nothing here — the walker descends into it
+        // and the inner call_expressions take the paths above.
+        return;
+      }
     }
 
     // Get the function/method being called
@@ -5442,7 +5615,7 @@ export class TreeSitterExtractor {
    * Languages that support type annotations (TypeScript, etc.)
    */
   private readonly TYPE_ANNOTATION_LANGUAGES = new Set([
-    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp', 'scala', 'php',
+    'typescript', 'tsx', 'arkts', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp', 'scala', 'php',
   ]);
 
   /**

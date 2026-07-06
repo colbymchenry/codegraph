@@ -354,6 +354,14 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
     }
     clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+    // A PARTIAL index (files silently dropped mid-pipeline) must not pass
+    // as a clean run — it's the difference between "indexed the repo" and
+    // "indexed most of the repo, quietly". Only the completeness
+    // reconciliation warning; per-file extractor warnings stay in the
+    // error-code summary below.
+    for (const w of result.errors.filter((e) => e.code === 'index_partial')) {
+      clack.log.warn(w.message);
+    }
   } else if (hasErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
   } else {
@@ -798,6 +806,7 @@ program
 
       const buildInfo = cg.getIndexBuildInfo();
       const reindexRecommended = cg.isIndexStale();
+      const indexState = cg.getIndexState();
 
       // JSON output mode
       if (options.json) {
@@ -829,6 +838,10 @@ program
             builtWithExtractionVersion: buildInfo.extractionVersion,
             currentExtractionVersion: EXTRACTION_VERSION,
             reindexRecommended,
+            // 'complete' | 'partial' (files silently dropped) | 'indexing'
+            // (a run was killed mid-index — the index is truncated) |
+            // 'failed' | null (predates the marker).
+            state: indexState,
           },
         }));
         cg.destroy();
@@ -841,6 +854,13 @@ program
       console.log(chalk.cyan('Project:'), projectPath);
       if (worktreeMismatch) {
         warn(worktreeMismatchWarning(worktreeMismatch));
+      }
+      if (indexState === 'indexing') {
+        warn('The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".');
+      } else if (indexState === 'partial') {
+        warn('The last index run silently dropped files — the index is partial. Re-run "codegraph index".');
+      } else if (indexState === 'failed') {
+        warn('The last index run failed — results may be incomplete. Re-run "codegraph index".');
       }
       console.log();
 

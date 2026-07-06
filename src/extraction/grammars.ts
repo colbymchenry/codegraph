@@ -47,6 +47,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   erlang: 'tree-sitter-erlang.wasm',
   solidity: 'tree-sitter-solidity.wasm',
   terraform: 'tree-sitter-terraform.wasm',
+  arkts: 'tree-sitter-arkts.wasm',
 };
 
 /**
@@ -58,6 +59,10 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // ESM/CJS TypeScript module extensions — parsed as TS (no JSX). (#366)
   '.mts': 'typescript',
   '.cts': 'typescript',
+  // ArkTS (HarmonyOS / OpenHarmony) — a TypeScript superset with declarative
+  // UI (`@Component struct` + `build()`). Own grammar (a tree-sitter-typescript
+  // -style fork); plain `.ts` in an ArkTS project stays TypeScript. (#648)
+  '.ets': 'arkts',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
@@ -292,7 +297,13 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // ship HCL/Terraform at all, so we vendor the prebuilt
       // tree-sitter-terraform.wasm from @tree-sitter-grammars/tree-sitter-hcl
       // 1.2.0 (Apache-2.0) — byte-identical to the npm package's artifact.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol' || lang === 'vbnet' || lang === 'erlang' || lang === 'terraform')
+      // ArkTS: tree-sitter-wasms doesn't ship it either; we vendor the prebuilt
+      // tree-sitter-arkts.wasm from the tree-sitter-arkts 0.2.0 npm package
+      // (harmony-contrib/tree-sitter-arkts, MIT) — byte-identical to the npm
+      // tarball's artifact. It extends the tree-sitter-javascript grammar the
+      // same way tree-sitter-typescript does, adding `struct_declaration` and
+      // the `arkui_component_expression` build() DSL.
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol' || lang === 'vbnet' || lang === 'erlang' || lang === 'terraform' || lang === 'arkts')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -518,6 +529,7 @@ export function getLanguageDisplayName(language: Language): string {
     vbnet: 'Visual Basic .NET',
     erlang: 'Erlang',
     terraform: 'Terraform',
+    arkts: 'ArkTS',
     unknown: 'Unknown',
   };
   return names[language] || language;

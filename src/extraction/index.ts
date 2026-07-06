@@ -83,6 +83,14 @@ export interface IndexResult {
   filesIndexed: number;
   filesSkipped: number;
   filesErrored: number;
+  /**
+   * How many indexable files the scan discovered — the ground truth the
+   * indexed/skipped/errored tallies must add up to. A shortfall means files
+   * were silently dropped mid-pipeline (e.g. a killed worker under load) and
+   * the index is PARTIAL; callers surface that rather than trusting the
+   * counts. Only set by full-index runs (indexAll), not indexFiles/sync.
+   */
+  filesDiscovered?: number;
   nodesCreated: number;
   edgesCreated: number;
   errors: ExtractionError[];
@@ -1512,6 +1520,7 @@ export class ExtractionOrchestrator {
         filesIndexed,
         filesSkipped,
         filesErrored,
+        filesDiscovered: total,
         nodesCreated: totalNodes,
         edgesCreated: totalEdges,
         errors: [{ message: 'Aborted', severity: 'error' }, ...errors],
@@ -1645,6 +1654,7 @@ export class ExtractionOrchestrator {
       filesIndexed,
       filesSkipped,
       filesErrored,
+      filesDiscovered: total,
       nodesCreated: totalNodes,
       edgesCreated: totalEdges,
       errors,

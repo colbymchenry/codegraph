@@ -437,6 +437,11 @@ export class CodeGraph {
       }
       try {
         const before = this.queries.getNodeAndEdgeCount();
+        // Mark the index as in-flight BEFORE any writes: a run killed
+        // mid-index (OOM, SIGKILL, the #850 liveness watchdog) leaves this
+        // marker behind, so `codegraph status` can tell a truncated index
+        // from a completed one instead of silently serving partial results.
+        try { this.queries.setMetadata('index_state', 'indexing'); } catch { /* metadata is advisory */ }
         // Segment vocabulary starts empty and is repopulated by the node write
         // path as every file (re-)indexes below — so a full index is also the
         // orphan-cleanup pass for names deleted since the last one.
@@ -512,6 +517,37 @@ export class CodeGraph {
             this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
           } catch { /* metadata is advisory — never fail an index over it */ }
         }
+
+        // Reconcile the scan's ground truth against what the pipeline
+        // accounted for. A shortfall means files were silently dropped
+        // (observed in the wild: a run under heavy load came up 37 files
+        // short with no error) — record it and tell the user, don't let the
+        // index pass as complete.
+        try {
+          if (!result.success) {
+            this.queries.setMetadata('index_state', 'failed');
+          } else {
+            const accounted = result.filesIndexed + result.filesSkipped + result.filesErrored;
+            const discovered = result.filesDiscovered;
+            const shortfall = discovered !== undefined ? discovered - accounted : 0;
+            if (discovered !== undefined && shortfall > 0) {
+              this.queries.setMetadata('index_state', 'partial');
+              this.queries.setMetadata('index_files_discovered', String(discovered));
+              this.queries.setMetadata('index_files_accounted', String(accounted));
+              result.errors.push({
+                message: `Index is missing ${shortfall} of ${discovered} discovered files (indexed ${result.filesIndexed}, skipped ${result.filesSkipped}, errored ${result.filesErrored}). The index is PARTIAL — re-run \`codegraph index\`.`,
+                severity: 'warning',
+                code: 'index_partial',
+              });
+            } else {
+              this.queries.setMetadata('index_state', 'complete');
+              if (discovered !== undefined) {
+                this.queries.setMetadata('index_files_discovered', String(discovered));
+                this.queries.setMetadata('index_files_accounted', String(accounted));
+              }
+            }
+          }
+        } catch { /* metadata is advisory — never fail an index over it */ }
 
         return result;
       } finally {
@@ -759,6 +795,22 @@ export class CodeGraph {
    */
   getLastIndexedAt(): number | null {
     return this.queries.getLastIndexedAt();
+  }
+
+  /**
+   * Completeness of the last full index run. `'complete'` is the only good
+   * state. `'indexing'` after the fact means a run was killed mid-index (OOM,
+   * SIGKILL, liveness watchdog) and the on-disk index is truncated;
+   * `'partial'` means the run finished but silently dropped files
+   * (discovered > indexed+skipped+errored); `'failed'` means it reported
+   * failure. `null` = index predates this marker. Surfaced by
+   * `codegraph status`.
+   */
+  getIndexState(): 'indexing' | 'complete' | 'partial' | 'failed' | null {
+    const raw = this.queries.getMetadata('index_state');
+    return raw === 'indexing' || raw === 'complete' || raw === 'partial' || raw === 'failed'
+      ? raw
+      : null;
   }
 
   /**

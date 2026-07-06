@@ -543,7 +543,7 @@ export class ReferenceResolver {
         // `.ts` index barrel and silently break the chain (#629). Re-key
         // the parse on the barrel's extension so the chase works no matter
         // what kind of file imports through it.
-        const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?)$/i.test(filePath);
+        const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?|ets)$/i.test(filePath);
         const reExports = extractReExports(content, isJsFamily ? 'typescript' : language);
         this.reExportCache.set(filePath, reExports);
         return reExports;
@@ -744,8 +744,15 @@ export class ReferenceResolver {
     // from './barrel'` where the barrel has `export { signIn as login }
     // from './auth'`) intentionally call a name that has no
     // declaration anywhere — only the renamed upstream symbol does.
+    // ArkTS chained-attribute refs carry a leading dot (`.titleStyle`) that
+    // routes them to the decorator-gated matcher; the symbol itself is
+    // indexed under the bare name, so the existence check strips the dot.
+    const existenceName =
+      ref.language === 'arkts' && ref.referenceName.startsWith('.')
+        ? ref.referenceName.slice(1)
+        : ref.referenceName;
     if (
-      !this.hasAnyPossibleMatch(ref.referenceName) &&
+      !this.hasAnyPossibleMatch(existenceName) &&
       !this.matchesAnyImport(ref) &&
       !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
     ) {
@@ -1169,10 +1176,18 @@ export class ReferenceResolver {
   private isBuiltInOrExternal(ref: UnresolvedRef): boolean {
     const name = ref.referenceName;
     const isJsTs = ref.language === 'typescript' || ref.language === 'javascript'
-      || ref.language === 'tsx' || ref.language === 'jsx';
+      || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'arkts';
 
     // JavaScript/TypeScript built-ins
     if (isJsTs && JS_BUILT_INS.has(name)) {
+      return true;
+    }
+
+    // ArkTS resource-reference intrinsics — `$r('app.string.x')` /
+    // `$rawfile('x.png')` are framework-provided and appear dozens of times
+    // per UI file; without this they can resolve to a stray same-named
+    // symbol (e.g. a checked-in hvigor wrapper's `$r`).
+    if (ref.language === 'arkts' && (name === '$r' || name === '$rawfile')) {
       return true;
     }
 
