@@ -68,6 +68,7 @@ export const LANGUAGES = [
   'javascript',
   'tsx',
   'jsx',
+  'arkts',
   'python',
   'go',
   'rust',

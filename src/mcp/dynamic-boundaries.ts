@@ -65,7 +65,7 @@ interface FormSpec {
   keyWindow?: number;
 }
 
-const JS_FAMILY = new Set(['typescript', 'javascript', 'tsx', 'jsx', 'vue', 'svelte', 'astro']);
+const JS_FAMILY = new Set(['typescript', 'javascript', 'tsx', 'jsx', 'vue', 'svelte', 'astro', 'arkts']);
 const PY = new Set(['python']);
 const RB = new Set(['ruby']);
 const PHP = new Set(['php']);
@@ -201,6 +201,7 @@ function commentLang(language: string): CommentLang | null {
     case 'vue':
     case 'svelte':
     case 'astro':
+    case 'arkts':
       return 'typescript';
     case 'java':
     case 'kotlin':
