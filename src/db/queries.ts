@@ -1856,7 +1856,12 @@ export class QueryBuilder {
       const chunkRows = this.db
         .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
         .all(...chunk) as UnresolvedRefRow[];
-      rows.push(...chunkRows);
+      // Append without spreading: `rows.push(...chunkRows)` passes every row as a
+      // separate argument, and a 500-file chunk of a large repo matches tens of
+      // thousands of refs — enough to blow V8's argument-stack limit with
+      // "Maximum call stack size exceeded" on `codegraph sync`. Chunking the
+      // file-path IN-list bounds the SQL params, NOT the returned row count.
+      for (const row of chunkRows) rows.push(row);
     }
 
     return rows.map((row) => ({
