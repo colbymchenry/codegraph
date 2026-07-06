@@ -493,6 +493,29 @@
       "question": "How does a PUBLISH packet from an MQTT client reach the sessions of matching subscribers? Trace the flow from the connection/channel layer through the broker's routing to session delivery."
     }
   ],
+  "Elixir": [
+    {
+      "name": "gen_stage",
+      "repo": "https://github.com/elixir-lang/gen_stage",
+      "size": "Small",
+      "files": "~25",
+      "question": "How does a GenStage producer demand signal flow from the consumer through to the producer's handle_demand callback?"
+    },
+    {
+      "name": "phoenix",
+      "repo": "https://github.com/phoenixframework/phoenix",
+      "size": "Medium",
+      "files": "~210",
+      "question": "How does a Phoenix request flow from the endpoint through the router to a controller, and how does the connection (conn) pipeline work?"
+    },
+    {
+      "name": "plausible",
+      "repo": "https://github.com/plausible/analytics",
+      "size": "Large",
+      "files": "~1650",
+      "question": "How does Plausible ingest, process, and store a pageview event from the HTTP request through to the database?"
+    }
+  ],
   "Solidity": [
     {
       "name": "solmate",
