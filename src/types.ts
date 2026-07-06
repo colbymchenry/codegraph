@@ -92,6 +92,7 @@ export const LANGUAGES = [
   'objc',
   'r',
   'solidity',
+  'fortran',
   'yaml',
   'twig',
   'xml',

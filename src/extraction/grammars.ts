@@ -47,6 +47,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   erlang: 'tree-sitter-erlang.wasm',
   solidity: 'tree-sitter-solidity.wasm',
   terraform: 'tree-sitter-terraform.wasm',
+  fortran: 'tree-sitter-fortran.wasm',
 };
 
 /**
@@ -133,6 +134,18 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // see c-cpp.ts) blanks the CUDA-only tokens. (#387)
   '.cu': 'cpp',
   '.cuh': 'cpp',
+  // Fortran: modern free-form (.f90/.f95/.f03/.f08/.f18) and legacy fixed-form
+  // (.f/.for/.f77/.ftn) plus preprocessor (.fpp). Keys are lowercased on lookup.
+  '.f90': 'fortran',
+  '.f95': 'fortran',
+  '.f03': 'fortran',
+  '.f08': 'fortran',
+  '.f18': 'fortran',
+  '.f': 'fortran',
+  '.for': 'fortran',
+  '.ftn': 'fortran',
+  '.f77': 'fortran',
+  '.fpp': 'fortran',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -292,7 +305,8 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // ship HCL/Terraform at all, so we vendor the prebuilt
       // tree-sitter-terraform.wasm from @tree-sitter-grammars/tree-sitter-hcl
       // 1.2.0 (Apache-2.0) — byte-identical to the npm package's artifact.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol' || lang === 'vbnet' || lang === 'erlang' || lang === 'terraform')
+      // Fortran: vendored tree-sitter-fortran.wasm (not in tree-sitter-wasms).
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol' || lang === 'vbnet' || lang === 'erlang' || lang === 'terraform' || lang === 'fortran')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -507,6 +521,7 @@ export function getLanguageDisplayName(language: Language): string {
     luau: 'Luau',
     objc: 'Objective-C',
     solidity: 'Solidity',
+    fortran: 'Fortran',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',

@@ -10238,3 +10238,233 @@ resource "aws_instance" "x" {
     });
   });
 });
+
+describe('Fortran Extraction', () => {
+  const SAMPLE = `
+module geometry_mod
+  implicit none
+  real, parameter :: PI = 3.14159_8
+
+  type :: point
+     real :: x
+     real :: y
+  end type point
+
+  type, extends(point) :: point3d
+     real :: z
+  end type point3d
+
+  interface area
+     module procedure circle_area
+  end interface area
+
+contains
+
+  function circle_area(r) result(a)
+    real, intent(in) :: r
+    real :: a
+    a = PI * r * r
+  end function circle_area
+
+  subroutine make_point(p, x, y)
+    type(point), intent(out) :: p
+    real, intent(in) :: x, y
+    p%x = x
+    p%y = y
+    call log_point(p)
+  end subroutine make_point
+
+  subroutine log_point(p)
+    type(point), intent(in) :: p
+    print *, p%x, p%y
+  end subroutine log_point
+end module geometry_mod
+
+program main
+  use geometry_mod
+  implicit none
+  type(point) :: p
+  call make_point(p, 1.0, 2.0)
+end program main
+`;
+
+  describe('Language detection', () => {
+    it('should detect Fortran files (free-form and legacy fixed-form)', () => {
+      expect(detectLanguage('solver.f90')).toBe('fortran');
+      expect(detectLanguage('mod_geometry.F90')).toBe('fortran');
+      expect(detectLanguage('legacy.f')).toBe('fortran');
+      expect(detectLanguage('legacy.for')).toBe('fortran');
+    });
+
+    it('should report Fortran as supported', () => {
+      expect(isLanguageSupported('fortran')).toBe(true);
+      expect(getSupportedLanguages()).toContain('fortran');
+    });
+  });
+
+  describe('Symbol extraction', () => {
+    let result: ReturnType<typeof extractFromSource>;
+    beforeAll(() => {
+      result = extractFromSource('geometry.f90', SAMPLE);
+    });
+    const byKind = (kind: string) => result.nodes.filter((n) => n.kind === kind).map((n) => n.name);
+
+    it('should extract modules and programs as module nodes', () => {
+      const modules = byKind('module');
+      expect(modules).toContain('geometry_mod');
+      expect(modules).toContain('main');
+      expect(result.nodes.find((n) => n.name === 'geometry_mod')?.language).toBe('fortran');
+    });
+
+    it('should extract subroutines and functions as functions', () => {
+      const funcs = byKind('function');
+      expect(funcs).toContain('circle_area');
+      expect(funcs).toContain('make_point');
+      expect(funcs).toContain('log_point');
+      const circle = result.nodes.find((n) => n.name === 'circle_area' && n.kind === 'function');
+      expect(circle?.qualifiedName).toBe('geometry_mod::circle_area');
+      expect(circle?.signature).toContain('circle_area(r)');
+    });
+
+    it('should extract derived types as structs with fields', () => {
+      expect(byKind('struct')).toEqual(expect.arrayContaining(['point', 'point3d']));
+      const fields = byKind('field');
+      expect(fields).toEqual(expect.arrayContaining(['x', 'y', 'z']));
+      const x = result.nodes.find((n) => n.name === 'x' && n.kind === 'field');
+      expect(x?.qualifiedName).toBe('geometry_mod::point::x');
+    });
+
+    it('should extract PARAMETER declarations as constants', () => {
+      expect(byKind('constant')).toContain('PI');
+    });
+
+    it('should extract named (generic) interfaces', () => {
+      expect(byKind('interface')).toContain('area');
+    });
+  });
+
+  describe('Reference extraction', () => {
+    let refs: NonNullable<ReturnType<typeof extractFromSource>['unresolvedReferences']>;
+    beforeAll(() => {
+      refs = extractFromSource('geometry.f90', SAMPLE).unresolvedReferences ?? [];
+    });
+
+    it('should record `use` statements as import references', () => {
+      const imports = refs.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+      expect(imports).toContain('geometry_mod');
+    });
+
+    it('should record CALL statements as call references', () => {
+      const calls = refs.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('make_point');
+      expect(calls).toContain('log_point');
+    });
+
+    it('should record type EXTENDS as an extends reference', () => {
+      const ext = refs.filter((r) => r.referenceKind === 'extends').map((r) => r.referenceName);
+      expect(ext).toContain('point');
+    });
+  });
+
+  describe('Type-bound procedures and member calls', () => {
+    const TBP_SAMPLE = `
+module engine_mod
+  implicit none
+
+  type, abstract :: base_engine_t
+  contains
+    procedure, pass :: Integrate => BaseIntegrate
+    procedure :: GetName
+    procedure(step_iface), deferred :: Step
+    generic :: Run => Integrate
+  end type base_engine_t
+
+  type, extends(base_engine_t) :: cpg_engine_t
+  contains
+    procedure :: Integrate => CpgIntegrate
+  end type cpg_engine_t
+
+contains
+
+  subroutine BaseIntegrate(this)
+    class(base_engine_t), intent(inout) :: this
+    call this%GetName()
+  end subroutine BaseIntegrate
+
+  subroutine CpgIntegrate(this)
+    class(cpg_engine_t), intent(inout) :: this
+  end subroutine CpgIntegrate
+
+  function GetName(this) result(name)
+    class(base_engine_t), intent(in) :: this
+    character(32) :: name
+    name = "base"
+  end function GetName
+
+  subroutine driver(eng, holder)
+    class(base_engine_t), intent(inout) :: eng
+    type(cpg_engine_t) :: holder
+    real :: y
+    call eng%Integrate()
+    call holder%sub%Execute(1)
+    call eng%GetName()
+    y = eng%fn(2.0)
+  end subroutine driver
+end module engine_mod
+`;
+    let result: ReturnType<typeof extractFromSource>;
+    beforeAll(() => {
+      result = extractFromSource('engine_mod.f90', TBP_SAMPLE);
+    });
+
+    it('should extract bindings as method nodes scoped under the derived type', () => {
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const names = methods.map((n) => n.name);
+      expect(names).toEqual(
+        expect.arrayContaining(['Integrate', 'GetName', 'Step', 'Run'])
+      );
+      const integrate = methods.find(
+        (n) => n.name === 'Integrate' && n.qualifiedName.includes('base_engine_t')
+      );
+      expect(integrate?.qualifiedName).toBe('engine_mod::base_engine_t::Integrate');
+      // The override on the extending type is a distinct method node
+      expect(
+        methods.some(
+          (n) => n.name === 'Integrate' && n.qualifiedName.includes('cpg_engine_t')
+        )
+      ).toBe(true);
+    });
+
+    it('should link each binding to its implementation via a calls reference', () => {
+      const refs = result.unresolvedReferences ?? [];
+      const methodIds = new Map(
+        result.nodes.filter((n) => n.kind === 'method').map((n) => [n.id, n])
+      );
+      const bindingRefs = refs.filter(
+        (r) => r.referenceKind === 'calls' && methodIds.has(r.fromNodeId)
+      );
+      const byName = bindingRefs.map((r) => r.referenceName);
+      expect(byName).toContain('BaseIntegrate'); // explicit => target
+      expect(byName).toContain('CpgIntegrate');
+      expect(byName).toContain('GetName'); // bare binding: impl shares the name
+      expect(byName).toContain('Integrate'); // GENERIC :: Run => Integrate
+      // DEFERRED bindings have no implementation to reference
+      const step = result.nodes.find((n) => n.kind === 'method' && n.name === 'Step');
+      expect(bindingRefs.some((r) => r.fromNodeId === step?.id)).toBe(false);
+    });
+
+    it('should normalize %-member calls to receiver.method references', () => {
+      const calls = (result.unresolvedReferences ?? [])
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('eng.Integrate'); // CALL eng%Integrate()
+      expect(calls).toContain('eng.GetName');
+      expect(calls).toContain('sub.Execute'); // chained holder%sub%Execute → component receiver
+      expect(calls).toContain('eng.fn'); // function-form member call in expression
+      // this/self receivers are kept (declared dummies → typed resolution)
+      expect(calls).toContain('this.GetName');
+      // No raw '%' name should survive extraction
+      expect(calls.some((c) => c.includes('%'))).toBe(false);
+    });
+  });
+});

@@ -466,6 +466,57 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
 }
 
 /**
+ * Phase 4d: Fortran type-bound dispatch. A call through a polymorphic
+ * `CLASS(base_t)` receiver (`CALL obj%Integrate()`) dispatches at runtime to
+ * the `EXTENDS(base_t)` subtype's overriding binding — Fortran's vtable
+ * indirection, no static call edge — so a flow stops at the abstract base
+ * binding. Bridge it like cpp-override: for each Fortran derived type
+ * (kind='struct') that extends a base, link each base method → the subtype
+ * method of the same name. Names compare case-insensitively because Fortran
+ * identifiers are case-insensitive (`Integrate` overrides `integrate`).
+ * Over-approximation accepted (reachability-correct); capped per type and
+ * gated to Fortran.
+ */
+function fortranOverrideEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const methodsOf = (typeId: string): Node[] =>
+    queries
+      .getOutgoingEdges(typeId, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n && n.kind === 'method');
+  for (const cls of queries.getNodesByKind('struct')) {
+    if (cls.language !== 'fortran') continue;
+    const subMethods = methodsOf(cls.id);
+    if (subMethods.length === 0) continue;
+    for (const ext of queries.getOutgoingEdges(cls.id, ['extends'])) {
+      const base = queries.getNodeById(ext.target);
+      if (!base || base.language !== 'fortran' || base.id === cls.id) continue;
+      const baseMethods = new Map(methodsOf(base.id).map((m) => [m.name.toLowerCase(), m]));
+      let added = 0;
+      for (const m of subMethods) {
+        if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+        const bm = baseMethods.get(m.name.toLowerCase());
+        if (!bm || bm.id === m.id) continue;
+        const key = `${bm.id}>${m.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: bm.id,
+          target: m.id,
+          kind: 'calls',
+          line: bm.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'fortran-override', via: m.name, registeredAt: `${m.filePath}:${m.startLine}` },
+        });
+        added++;
+      }
+    }
+  }
+  return edges;
+}
+
+/**
  * Phase 5.5: interface / abstract dispatch (Java, Kotlin). A call through an
  * injected interface (`@Autowired FooService svc; svc.list()`) or an abstract
  * base dispatches at runtime to the implementing class's override — a vtable
@@ -2888,6 +2939,7 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   const pascalEdges = pascalFormEdges(ctx); await yieldToLoop();
   const flutterEdges = flutterBuildEdges(queries, ctx); await yieldToLoop();
   const cppEdges = cppOverrideEdges(queries); await yieldToLoop();
+  const fortranEdges = fortranOverrideEdges(queries); await yieldToLoop();
   const ifaceEdges = interfaceOverrideEdges(queries); await yieldToLoop();
   const kotlinExpectActual = kotlinExpectActualEdges(queries); await yieldToLoop();
   const goGrpcEdges = goGrpcStubImplEdges(queries); await yieldToLoop();
@@ -2924,6 +2976,7 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
     ...pascalEdges,
     ...flutterEdges,
     ...cppEdges,
+    ...fortranEdges,
     ...ifaceEdges,
     ...kotlinExpectActual,
     ...goGrpcEdges,

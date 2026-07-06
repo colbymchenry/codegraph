@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
+import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily, CASE_INSENSITIVE_LANGS } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -230,6 +230,7 @@ export class ReferenceResolver {
   private fileLinesCache: LRUCache<string, string[] | null>; // file → split lines cache
   private methodMatchCache: LRUCache<string, Node[]>; // lang\0Type::method → matching method nodes
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
+  private knownNamesLower: Set<string> | null = null; // lowercased names, for case-insensitive languages
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
   // tsconfig/jsconfig path-alias map. `undefined` = not yet computed,
@@ -316,6 +317,12 @@ export class ReferenceResolver {
     // Cache all distinct symbol names for fast pre-filtering (just strings, not full nodes)
     this.knownNames = new Set(this.queries.getAllNodeNames());
 
+    // Case-insensitive languages (Fortran) declare in one case and call in
+    // another; a case-sensitive pre-filter would drop those refs before any
+    // matcher runs. Built unconditionally — it's just strings.
+    this.knownNamesLower = new Set<string>();
+    for (const n of this.knownNames) this.knownNamesLower.add(n.toLowerCase());
+
     this.cachesWarmed = true;
   }
 
@@ -333,6 +340,7 @@ export class ReferenceResolver {
     this.fileLinesCache.clear();
     this.methodMatchCache.clear();
     this.knownNames = null;
+    this.knownNamesLower = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
   }
@@ -626,18 +634,28 @@ export class ReferenceResolver {
    * Uses the pre-built knownNames set to skip expensive resolution
    * for names that definitely don't exist as symbols.
    */
-  private hasAnyPossibleMatch(name: string): boolean {
+  private hasAnyPossibleMatch(name: string, language?: string): boolean {
     if (!this.knownNames) return true; // no pre-filter available
 
+    // For case-insensitive languages (Fortran) the membership tests also
+    // consult the lowercased name set — Fortran declares `subroutine foo`
+    // and calls `CALL FOO()` interchangeably, and the case-sensitive set
+    // would reject the ref before any matcher could see it.
+    const folded = language !== undefined && CASE_INSENSITIVE_LANGS.has(language)
+      ? this.knownNamesLower
+      : null;
+    const known = (n: string): boolean =>
+      this.knownNames!.has(n) || (folded !== null && folded.has(n.toLowerCase()));
+
     // Direct name match
-    if (this.knownNames.has(name)) return true;
+    if (known(name)) return true;
 
     // For qualified names like "obj.method" or "Class::method", check the parts
     const dotIdx = name.indexOf('.');
     if (dotIdx > 0) {
       const receiver = name.substring(0, dotIdx);
       const member = name.substring(dotIdx + 1);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (known(receiver) || known(member)) return true;
       // Also check capitalized receiver (instance-method resolution)
       const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
       if (this.knownNames.has(capitalized)) return true;
@@ -647,14 +665,14 @@ export class ReferenceResolver {
       const lastDot = name.lastIndexOf('.');
       if (lastDot > dotIdx) {
         const tail = name.substring(lastDot + 1);
-        if (tail && this.knownNames.has(tail)) return true;
+        if (tail && known(tail)) return true;
       }
     }
     const colonIdx = name.indexOf('::');
     if (colonIdx > 0) {
       const receiver = name.substring(0, colonIdx);
       const member = name.substring(colonIdx + 2);
-      if (this.knownNames.has(receiver) || this.knownNames.has(member)) return true;
+      if (known(receiver) || known(member)) return true;
       // Multi-segment path `a::b::c` (a Rust/C++ module call like
       // `database::profiles::find`) — the only segment that names a symbol is
       // the last (`c`); `member` above is `b::c`, which never matches a node
@@ -745,7 +763,7 @@ export class ReferenceResolver {
     // from './auth'`) intentionally call a name that has no
     // declaration anywhere — only the renamed upstream symbol does.
     if (
-      !this.hasAnyPossibleMatch(ref.referenceName) &&
+      !this.hasAnyPossibleMatch(ref.referenceName, ref.language) &&
       !this.matchesAnyImport(ref) &&
       !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
     ) {

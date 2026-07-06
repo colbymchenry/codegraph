@@ -8,6 +8,64 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
 
 /**
+ * Languages whose identifiers are case-insensitive: a symbol declared as
+ * `subroutine foo` is legally referenced as `CALL FOO()`. Matchers fall back
+ * to the lowercase name index when the case-sensitive lookup comes up empty.
+ */
+export const CASE_INSENSITIVE_LANGS = new Set(['fortran']);
+
+/**
+ * Exact-name lookup with a case-insensitive fallback for languages where
+ * identifier case is not significant. Behavior is unchanged for every other
+ * language. The fallback also fires when the exact-case result contains no
+ * same-language node — in a mixed repo (Fortran + Python tooling) a
+ * case-mismatched Fortran call must not be captured by a same-spelling
+ * symbol from another language while the real (lowercased) target exists.
+ */
+function getNodesByNameCI(
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): Node[] {
+  const exact = context.getNodesByName(name);
+  if (!CASE_INSENSITIVE_LANGS.has(ref.language)) return exact;
+  if (exact.some((n) => n.language === ref.language)) return exact;
+  const lower = context.getNodesByLowerName(name.toLowerCase());
+  return lower.length > 0 ? lower : exact;
+}
+
+/**
+ * True when the reference originates from a method node — for Fortran,
+ * that means a type-bound-procedure binding ref (`PROCEDURE :: Name [=> Impl]`)
+ * rather than an ordinary call site. Uses the per-file node cache, so the
+ * lookup is cheap.
+ */
+function refFromMethodNode(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const inFile = context.getNodesInFile(ref.filePath);
+  const from = inFile.find((n) => n.id === ref.fromNodeId);
+  return from?.kind === 'method';
+}
+
+/**
+ * Node kinds that can never be the target of a Fortran `calls` reference.
+ * Fortran's grammar cannot distinguish `a(i)` array indexing from `f(i)`
+ * function calls, so extraction emits a `calls` ref for every parenthesized
+ * identifier — letting those resolve to variables/fields would flood the
+ * graph with array-subscript edges. Struct stays callable (constructor
+ * `base_t(...)`, promoted to `instantiates` downstream), and interface stays
+ * callable (Fortran generic interfaces are call targets).
+ */
+const FORTRAN_NON_CALLABLE_KINDS = new Set<Node['kind']>([
+  'variable', 'constant', 'field', 'property', 'parameter',
+  'enum', 'enum_member', 'import', 'file', 'namespace', 'type_alias',
+]);
+
+function filterFortranCallable(candidates: Node[], ref: UnresolvedRef): Node[] {
+  if (ref.language !== 'fortran' || ref.referenceKind !== 'calls') return candidates;
+  return candidates.filter((n) => !FORTRAN_NON_CALLABLE_KINDS.has(n.kind));
+}
+
+/**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
  * re-declared across a vendored theme or SDK (e.g. `init`/`update`/`render` on
@@ -353,8 +411,10 @@ export function matchByExactName(
   // unresolved import refs each scored K same-named import candidates through
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
-    .filter((n) => n.kind !== 'import');
+  const candidates = filterFortranCallable(
+    applyLanguageGate(getNodesByNameCI(ref.referenceName, ref, context), ref),
+    ref
+  ).filter((n) => n.kind !== 'import');
 
   if (candidates.length === 0) {
     return null;
@@ -362,6 +422,17 @@ export function matchByExactName(
 
   // If only one match, use it — but penalize cross-language matches
   if (candidates.length === 1) {
+    // A Fortran TBP binding ref (`PROCEDURE :: plainq` whose implementation
+    // isn't indexed) must not resolve to its own method node — a self-loop
+    // is worse than no edge. Ordinary recursion (function → itself) is NOT
+    // affected: its ref originates from a function node.
+    if (
+      candidates[0]!.id === ref.fromNodeId &&
+      CASE_INSENSITIVE_LANGS.has(ref.language) &&
+      refFromMethodNode(ref, context)
+    ) {
+      return null;
+    }
     const isCrossLanguage = candidates[0]!.language !== ref.language;
     return {
       original: ref,
@@ -441,8 +512,7 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
-    const partialCandidates = context
-      .getNodesByName(lastName)
+    const partialCandidates = getNodesByNameCI(lastName, ref, context)
       .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName));
     const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
     if (chosen) {
@@ -508,18 +578,23 @@ export function resolveMethodOnType(
   // collision-heavy Java name like `execute` — and re-filtering that per ref
   // was a dominant term in the #1122 watchdog kill on large repos. Only the
   // ref-independent filter is memoized; per-ref disambiguation stays below.
+  // Case-insensitive languages (Fortran) can't use the exact-case memo, so
+  // they take the case-folded scan branch below instead.
+  const ci = CASE_INSENSITIVE_LANGS.has(ref.language);
   let matches: Node[];
-  if (context.getMethodMatches) {
+  if (context.getMethodMatches && !ci) {
     matches = context.getMethodMatches(typeName, methodName, ref.language);
   } else {
-    const methodCandidates = context.getNodesByName(methodName);
+    const methodCandidates = getNodesByNameCI(methodName, ref, context);
     const want = `${typeName}::${methodName}`;
+    const wantLower = want.toLowerCase();
     matches = [];
     for (const m of methodCandidates) {
       if (m.kind !== 'method') continue;
       if (m.language !== ref.language) continue;
-      const qn = m.qualifiedName;
-      if (qn === want || qn.endsWith(`::${want}`)) {
+      const qn = ci ? m.qualifiedName.toLowerCase() : m.qualifiedName;
+      const target = ci ? wantLower : want;
+      if (qn === target || qn.endsWith(`::${target}`)) {
         matches.push(m);
       }
     }
@@ -1215,6 +1290,14 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
         new RegExp(`\\b(?:cf)?property\\b[^;\\n]*\\bname\\s*=\\s*["']${r}["'][^;\\n]*\\b(?:type|inject)\\s*=\\s*["']([\\w.]+)["']`, 'i'),
         new RegExp(`\\b(?:cf)?property\\b[^;\\n]*\\b(?:type|inject)\\s*=\\s*["']([\\w.]+)["'][^;\\n]*\\bname\\s*=\\s*["']${r}["']`, 'i'),
       ];
+    case 'fortran':
+      return [
+        // CLASS(engine_t) :: eng / TYPE(engine_t), INTENT(INOUT) :: eng, other —
+        // the receiver (incl. the passed-object dummy `this`/`self`) anywhere in
+        // the `::` declarator list. Case-insensitive to match the language;
+        // `[^!]` keeps the match out of trailing `!` comments.
+        new RegExp(`^\\s*(?:class|type)\\s*\\(\\s*([A-Za-z_]\\w*)\\s*\\)[^!]*?::(?:[^!]*?[\\s,])?${r}\\b`, 'i'),
+      ];
     default:
       return [];
   }
@@ -1419,13 +1502,24 @@ export function matchMethodCall(
     }
   }
 
+  // Fortran passed-object receiver (`this%Step()` / `self%Init()`, normalized
+  // to `this.Step` at extraction) whose CLASS declaration the shared scan
+  // above couldn't see: resolve the bare binding name — receiver-name
+  // word-overlap heuristics are meaningless for `this`. The original ref is
+  // preserved so the resolved row matches the persisted unresolved_refs
+  // triple on cleanup.
+  if (ref.language === 'fortran' && dotMatch && /^(?:this|self)$/i.test(objectOrClass!)) {
+    const bare = matchByExactName({ ...ref, referenceName: methodName! }, context);
+    return bare ? { ...bare, original: ref } : null;
+  }
+
   // Strategy 1: Direct class name match (existing logic). When the receiver
   // names a class that exists in several files (`Logger.log()` / `Logger::log()`
   // with a `Logger` in both `a/` and `b/`), try the class in the call site's
   // own file first — otherwise the first-indexed class wins and a call in `b/`
   // resolves to `a/`'s method (#1079).
   const classCandidates = preferCallSiteFile(
-    context.getNodesByName(objectOrClass!),
+    getNodesByNameCI(objectOrClass!, ref, context),
     ref.filePath,
   );
 
@@ -1490,7 +1584,7 @@ export function matchMethodCall(
   // name similarity with the containing class. Handles abbreviated variable
   // names like permissionEngine → PermissionRuleEngine.
   if (methodName) {
-    const methodCandidates = context.getNodesByName(methodName!);
+    const methodCandidates = getNodesByNameCI(methodName!, ref, context);
     // Ubiquitous-method ceiling (#999): a method name re-declared across a
     // vendored theme/SDK (Metronic's `init`/`update`/… on every widget) yields
     // K candidates that receiver-word overlap can't reliably disambiguate —
@@ -1500,8 +1594,12 @@ export function matchMethodCall(
     if (methodCandidates.length > AMBIGUOUS_NAME_CEILING) {
       return null;
     }
+    const ciLang = CASE_INSENSITIVE_LANGS.has(ref.language);
     const methods = methodCandidates.filter(
-      (n) => n.kind === 'method' && n.name === methodName
+      (n) =>
+        n.kind === 'method' &&
+        (n.name === methodName ||
+          (ciLang && n.name.toLowerCase() === methodName!.toLowerCase()))
     );
 
     // Filter to same-language candidates first
@@ -1608,7 +1706,7 @@ function computePathProximity(filePath1: string, filePath2: string): number {
 function findBestMatch(
   ref: UnresolvedRef,
   candidates: Node[],
-  _context: ResolutionContext
+  context: ResolutionContext
 ): Node | null {
   // Prioritization rules:
   // 1. Same file > different file
@@ -1695,6 +1793,21 @@ function findBestMatch(
     if (candidate.filePath === ref.filePath && candidate.startLine) {
       const distance = Math.abs(candidate.startLine - ref.line);
       score += Math.max(0, 20 - distance / 10);
+    }
+
+    // Penalize a Fortran TBP binding ref (`PROCEDURE :: GetName` — method
+    // node referencing the implementation subroutine of the same name)
+    // resolving back to its own method node purely on line-distance. Gated
+    // to method-origin Fortran refs: an unconditional penalty was shown to
+    // flip ordinary recursion edges in other languages whenever the
+    // recursive function shares its name with another same-file symbol
+    // (the 30-point penalty exceeds the 20-point line-proximity margin).
+    if (
+      candidate.id === ref.fromNodeId &&
+      CASE_INSENSITIVE_LANGS.has(ref.language) &&
+      refFromMethodNode(ref, context)
+    ) {
+      score -= 30;
     }
 
     if (score > bestScore) {

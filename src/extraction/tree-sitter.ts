@@ -4188,6 +4188,45 @@ export class TreeSitterExtractor {
               calleeName = methodName;
             }
           }
+        } else if (func.type === 'derived_type_member_expression') {
+          // Fortran member call: `CALL obj%method()` / `x = obj%fn(y)`.
+          // Normalize the `%` separator to `.` so the resolver's
+          // receiver.method matchers (pre-filter split, matchMethodCall
+          // regex, receiver-type inference) all apply. The raw text fallback
+          // below would emit "obj%method", which no matcher can split.
+          // Shape: derived_type_member_expression{base, type_member} where a
+          // chained receiver (`this%sub%Execute`) nests another
+          // derived_type_member_expression on the left — unwrap to the
+          // immediate component (`sub.Execute`), mirroring the Java
+          // `this.field.method()` unwrap above.
+          const members = func.namedChildren.filter((c: SyntaxNode) => c.type === 'type_member');
+          const methodName = members.length > 0
+            ? getNodeText(members[members.length - 1]!, this.source)
+            : '';
+          if (methodName) {
+            const base = func.namedChild(0);
+            let receiverName = '';
+            if (base?.type === 'identifier') {
+              receiverName = getNodeText(base, this.source);
+            } else if (base?.type === 'derived_type_member_expression') {
+              const innerMembers = base.namedChildren.filter((c: SyntaxNode) => c.type === 'type_member');
+              if (innerMembers.length > 0) {
+                receiverName = getNodeText(innerMembers[innerMembers.length - 1]!, this.source);
+              }
+            }
+            // Unlike other languages, `this`/`self` receivers are NOT
+            // stripped: Fortran's passed-object dummy is explicitly declared
+            // (`CLASS(base_t) :: this`), so the resolver's receiver-type
+            // inference turns `this.Step` into a precise binding match —
+            // the most reliable signal available for intra-type calls. The
+            // matcher falls back to bare-name resolution when inference
+            // fails.
+            if (receiverName) {
+              calleeName = `${receiverName}.${methodName}`;
+            } else {
+              calleeName = methodName;
+            }
+          }
         } else if (func.type === 'scoped_identifier' || func.type === 'scoped_call_expression') {
           // Scoped call: Module::function()
           calleeName = getNodeText(func, this.source);
