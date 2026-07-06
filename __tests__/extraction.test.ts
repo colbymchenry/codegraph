@@ -138,6 +138,13 @@ describe('Language Detection', () => {
     expect(detectLanguage('versions.tofu')).toBe('terraform');
   });
 
+  it('should detect Elixir and HEEx files', () => {
+    expect(detectLanguage('lib/my_app.ex')).toBe('elixir');
+    expect(detectLanguage('lib/my_app.exs')).toBe('elixir');
+    expect(detectLanguage('lib/my_app.html.heex')).toBe('heex');
+    expect(detectLanguage('lib/my_app.heex')).toBe('heex');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -167,6 +174,8 @@ describe('Language Support', () => {
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
+    expect(languages).toContain('elixir');
+    expect(languages).toContain('heex');
   });
 });
 
@@ -9837,6 +9846,246 @@ init(_) -> {ok, #{}}.
       const result = extractFromSource('src/b.erl', code);
       const fns = result.nodes.filter((n) => n.kind === 'function');
       expect(fns).toHaveLength(0);
+    });
+  });
+});
+
+// =============================================================================
+// Elixir
+// =============================================================================
+
+describe('Elixir Extraction', () => {
+  describe('Module extraction', () => {
+    it('should extract defmodule as a module node', () => {
+      const code = `
+defmodule MyModule do
+  def hello do
+    :world
+  end
+end
+`;
+      const result = extractFromSource('lib/my_module.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module' && n.name === 'MyModule');
+      expect(mod).toBeDefined();
+      expect(mod?.language).toBe('elixir');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract def as a public function node', () => {
+      const code = `
+defmodule M do
+  def foo do
+    :ok
+  end
+end
+`;
+      const result = extractFromSource('lib/foo_fn.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'foo');
+      expect(fn).toBeDefined();
+      expect(fn?.visibility).toBe('public');
+      expect(fn?.language).toBe('elixir');
+    });
+
+    it('should extract defp as a private function node', () => {
+      const code = `
+defmodule M do
+  defp bar do
+    :ok
+  end
+end
+`;
+      const result = extractFromSource('lib/bar_fn.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'bar');
+      expect(fn).toBeDefined();
+      expect(fn?.visibility).toBe('private');
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should extract alias as an import node', () => {
+      const code = `
+defmodule M do
+  alias MyApp.Greeter
+end
+`;
+      const result = extractFromSource('lib/alias_test.ex', code);
+      const imp = result.nodes.find((n) => n.kind === 'import');
+      expect(imp).toBeDefined();
+      expect(imp?.name).toBe('MyApp.Greeter');
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should record regular function calls', () => {
+      const code = `
+defmodule M do
+  def hello do
+    greet("world")
+  end
+end
+`;
+      const result = extractFromSource('lib/call_test.ex', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('greet');
+    });
+
+    it('should not extract pipe |> operators as calls', () => {
+      const code = `
+defmodule M do
+  def foo do
+    regular_call()
+    "hello" |> String.upcase()
+  end
+end
+`;
+      const result = extractFromSource('lib/pipe_test.ex', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('regular_call');
+      expect(calls).not.toContain('String.upcase');
+    });
+  });
+
+  describe('defguard extraction', () => {
+    it('should extract defguard as a function node', () => {
+      const code = `
+defmodule M do
+  defguard is_even(x) when rem(x, 2) == 0
+end
+`;
+      const result = extractFromSource('lib/defguard_test.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'is_even');
+      expect(fn).toBeDefined();
+      expect(fn?.language).toBe('elixir');
+      expect(fn?.visibility).toBe('public');
+    });
+  });
+
+  describe('defdelegate extraction', () => {
+    it('should extract defdelegate as a function node', () => {
+      const code = `
+defmodule M do
+  defdelegate foo(x), to: MyMod
+end
+`;
+      const result = extractFromSource('lib/defdelegate_test.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'foo');
+      expect(fn).toBeDefined();
+      expect(fn?.language).toBe('elixir');
+    });
+  });
+
+  describe('defstruct is skipped', () => {
+    it('should not produce struct or function nodes from defstruct', () => {
+      const code = `
+defmodule M do
+  defstruct [:x, :y]
+end
+`;
+      const result = extractFromSource('lib/defstruct_test.ex', code);
+      // No struct or function nodes should be created from defstruct
+      expect(result.nodes.find((n) => n.kind === 'struct')).toBeUndefined();
+      expect(result.nodes.find((n) => n.kind === 'function')).toBeUndefined();
+      // No call reference to defstruct keyword (it's in SKIP_CALLS)
+      expect(result.unresolvedReferences.find((r) => r.referenceName === 'defstruct')).toBeUndefined();
+    });
+  });
+
+  describe('defprotocol/defimpl extraction', () => {
+    it('should handle defprotocol without crashing', () => {
+      const code = `
+defprotocol P do
+  def bar(x)
+end
+`;
+      const result = extractFromSource('lib/defprotocol_test.ex', code);
+      // Currently defprotocol/defimpl are handled by PROTOCOL_CALLS → handleDefinition
+      // but module-name args (alias nodes) are not parsed by extractFunctionInfo,
+      // so no function node is produced. At minimum, verify no crash.
+      expect(result.errors.length).toBe(0);
+      expect(result.nodes.length).toBeGreaterThan(0);
+    });
+
+    it('should handle defimpl without crashing', () => {
+      const code = `
+defimpl P, for: Integer do
+  def bar(x), do: x
+end
+`;
+      const result = extractFromSource('lib/defimpl_test.ex', code);
+      expect(result.errors.length).toBe(0);
+      expect(result.nodes.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('defmacro extraction', () => {
+    it('should extract defmacro as a function node', () => {
+      const code = `
+defmodule M do
+  defmacro m(x) do
+    quote do: x
+  end
+end
+`;
+      const result = extractFromSource('lib/defmacro_test.ex', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'm');
+      expect(fn).toBeDefined();
+      expect(fn?.language).toBe('elixir');
+      expect(fn?.visibility).toBe('public');
+    });
+  });
+});
+
+// =============================================================================
+// HEEx
+// =============================================================================
+
+describe('HEEx Extraction', () => {
+  describe('Component extraction', () => {
+    it('should extract <.modal> as a component node', () => {
+      const code = `<.modal>
+  content
+</.modal>`;
+      const result = extractFromSource('lib/page.html.heex', code);
+      const comp = result.nodes.find((n) => n.kind === 'component' && n.name === 'modal');
+      expect(comp).toBeDefined();
+      expect(comp?.language).toBe('heex');
+    });
+
+    it('should extract <MyComponent> as a component node', () => {
+      const code = `<MyComponent>
+  content
+</MyComponent>`;
+      const result = extractFromSource('lib/pascal_component.html.heex', code);
+      const comp = result.nodes.find((n) => n.kind === 'component' && n.name === 'MyComponent');
+      expect(comp).toBeDefined();
+      expect(comp?.language).toBe('heex');
+    });
+  });
+
+  describe('Expression extraction', () => {
+    it('should extract calls from expression tags', () => {
+      const code = `<article>
+  {render("form")}
+</article>`;
+      const result = extractFromSource('lib/expr_test.html.heex', code);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('render');
+    });
+  });
+
+  describe('Directive extraction', () => {
+    it('should extract calls from directive tags', () => {
+      const code = `<article>
+  <%= render("form") %>
+</article>`;
+      const result = extractFromSource('lib/directive_test.html.heex', code);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('render');
     });
   });
 });
