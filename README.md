@@ -686,6 +686,21 @@ watch:
 }
 ```
 
+Conversely, when real source is gitignored on purpose — a project under a second
+VCS (SVN, Perforce) that `.gitignore`s its own source so it stays out of Git —
+force it back in with `include` (the opposite of `exclude`; `includeIgnored`
+only revives embedded git repos, not plain source):
+
+```json
+{
+  "include": ["Tools/", "Local/typescript/"]
+}
+```
+
+CodeGraph discovers those files off disk, overriding `.gitignore`, on index,
+sync, and watch. An explicit `exclude` still wins, and built-in skips
+(`node_modules`, `dist`, `.git`) are never re-included.
+
 ### Custom file extensions
 
 If your project uses a non-standard extension for a [supported

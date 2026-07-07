@@ -464,6 +464,70 @@ describe('Java end-to-end — field-injected bean trace (issue #389)', () => {
     cg.close();
   });
 
+  it('covers legacy iBatis <sqlMap> statements and keeps same-line vendor-split pairs (#1182)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ibatis-'));
+    const xmlDir = path.join(tmpDir, 'src/main/resources/sqlmaps');
+    fs.mkdirSync(xmlDir, { recursive: true });
+
+    // iBatis 2 sqlMap with an explicit namespace.
+    fs.writeFileSync(
+      path.join(xmlDir, 'Account.xml'),
+      '<?xml version="1.0" encoding="UTF-8"?>\n' +
+        '<!DOCTYPE sqlMap PUBLIC "-//iBATIS.com//DTD SQL Map 2.0//EN" "http://ibatis.apache.org/dtd/sql-map-2.dtd">\n' +
+        "<sqlMap namespace='Account'>\n" +
+        "  <sql id='cols'>id, name, email</sql>\n" +
+        "  <select id='getById' resultClass='Account'>SELECT <include refid='cols'/> FROM account WHERE id = #id#</select>\n" +
+        "  <insert id='insert' parameterClass='Account'>INSERT INTO account (id) VALUES (#id#)</insert>\n" +
+        '  <!-- <select id="disabled">SELECT 0</select> -->\n' +
+        '</sqlMap>\n'
+    );
+    // Namespace-less sqlMap whose ids carry the qualifier as `Map.statement`.
+    fs.writeFileSync(
+      path.join(xmlDir, 'LegacyDao.xml'),
+      '<sqlMap>\n' +
+        '  <select id="LegacyDao.findAll" resultClass="Row">SELECT * FROM t</select>\n' +
+        '</sqlMap>\n'
+    );
+    // MyBatis mapper with a vendor-split databaseId pair written on ONE line —
+    // same qualifiedName + same start line. Before the id-hash fold both nodes
+    // hashed identically and INSERT OR REPLACE dropped one.
+    fs.writeFileSync(
+      path.join(xmlDir, 'VendorMapper.xml'),
+      '<mapper namespace="com.example.VendorMapper">\n' +
+        '<select id="findUser" databaseId="oracle">SELECT 1 FROM dual</select><select id="findUser" databaseId="mysql">SELECT 1</select>\n' +
+        '</mapper>\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const xmlMethods = cg.getNodesByKind('method').filter((n) => n.language === 'xml');
+    const qnames = xmlMethods.map((n) => n.qualifiedName);
+
+    // iBatis statements now land in the graph (was zero coverage before #1182).
+    expect(qnames).toContain('Account::getById');
+    expect(qnames).toContain('Account::insert');
+    expect(qnames).toContain('Account::cols');
+    expect(qnames).toContain('LegacyDao::findAll');
+    // The commented-out statement produced no node.
+    expect(qnames).not.toContain('Account::disabled');
+
+    // <include refid='cols'/> resolves to the <sql> fragment in the same map.
+    const getById = xmlMethods.find((n) => n.qualifiedName === 'Account::getById');
+    const cols = xmlMethods.find((n) => n.qualifiedName === 'Account::cols');
+    expect(getById).toBeDefined();
+    expect(cols).toBeDefined();
+    const incEdge = cg.getOutgoingEdges(getById!.id).find((e) => e.target === cols!.id);
+    expect(incEdge, "iBatis <include refid='cols'/> should reach the <sql> fragment").toBeDefined();
+
+    // Both vendor-split statements survive the DB write (the collision fix).
+    const findUser = xmlMethods.filter((n) => n.name === 'findUser');
+    expect(findUser, 'both databaseId variants of findUser should survive').toHaveLength(2);
+    expect(new Set(findUser.map((n) => n.id)).size).toBe(2);
+
+    cg.close();
+  });
+
   it('binds @Value / @ConfigurationProperties to YAML + .properties keys (incl. relaxed binding)', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-spring-config-'));
     const javaDir = path.join(tmpDir, 'src/main/java/com/example');

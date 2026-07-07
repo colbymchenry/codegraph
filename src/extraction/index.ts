@@ -21,7 +21,7 @@ import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { ParseWorkerPool, resolveParsePoolSize } from './parse-pool';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns } from '../project-config';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -331,6 +331,158 @@ function loadExcludeMatcher(rootDir: string): Ignore | null {
 }
 
 /**
+ * Matcher for the project's `codegraph.json` `include` patterns — first-party
+ * source to force INTO the index even when `.gitignore` drops it (the general
+ * whitelist `includeIgnored` never was — that one only revives *embedded git
+ * repos*). The case it exists for: a project under a second VCS (SVN/Perforce)
+ * `.gitignore`s its own real source so it stays out of Git, yet we still want it
+ * indexed. Returns `null` when nothing is force-included (the zero-config
+ * default → no overhead, no extra walk). Built once per scan/sync/scope
+ * operation from the scan root.
+ */
+function loadIncludeMatcher(rootDir: string): Ignore | null {
+  const patterns = loadIncludePatterns(rootDir);
+  return patterns.length > 0 ? ignore().add(patterns) : null;
+}
+
+/** Glob metacharacters that end the static (literal) prefix of an `include` pattern. */
+const GLOB_META = /[*?[\]{}!]/;
+
+/**
+ * The static directory prefix of each `include` pattern — the literal leading
+ * path up to the first glob segment — trailing-slashed, used to (a) walk only
+ * the opted-in subtrees in `collectIncludedFiles` and (b) let `ScopeIgnore` keep
+ * the watcher descending toward them. `Tools/` stays `Tools/`; a recursive
+ * `Tools/**` glob yields `Tools/`; `src/local/file.ts` yields `src/local/` (the
+ * file's dir); a pattern that starts with a glob (like a leading `**`) yields
+ * `''`, meaning "no static root — walk the whole tree". Duplicates and roots
+ * nested under a broader root are collapsed so each subtree is walked once.
+ */
+function includeStaticRoots(patterns: string[]): string[] {
+  const roots = new Set<string>();
+  for (const pattern of patterns) {
+    let p = pattern.replace(/^\/+/, '');
+    const trailingSlash = p.endsWith('/');
+    if (trailingSlash) p = p.slice(0, -1);
+    const segs = p.split('/').filter(Boolean);
+    const lead: string[] = [];
+    for (const s of segs) {
+      if (GLOB_META.test(s)) break;
+      lead.push(s);
+    }
+    const hadWildcard = lead.length < segs.length;
+    // A wholly-literal pattern with no trailing slash names a file (or a dir we
+    // can't tell apart) — drop its last segment so we walk the containing dir
+    // and let the matcher pick the file. A trailing slash or a glob means the
+    // remaining `lead` is already the directory to walk.
+    if (!hadWildcard && !trailingSlash && lead.length > 0) lead.pop();
+    if (lead.length === 0) {
+      roots.clear();
+      roots.add('');
+      return ['']; // a top-level glob forces a whole-tree walk; nothing narrower matters
+    }
+    roots.add(lead.join('/') + '/');
+  }
+  // Collapse roots nested under a broader one (e.g. drop `a/b/` if `a/` is present).
+  const all = [...roots];
+  return all.filter((r) => !all.some((other) => other !== r && r.startsWith(other)));
+}
+
+/**
+ * Actively discover the source files an `include` whitelist forces in. `git
+ * ls-files` never lists gitignored files, so a filtered filesystem walk of just
+ * the opted-in subtrees (`includeStaticRoots`) is the only way to find them.
+ * Returns project-root-relative, normalized source-file paths.
+ *
+ * A file is collected when it MATCHES `include`, is NOT hit by `exclude` (an
+ * explicit exclude always wins), is a recognized source file, and does not live
+ * under a built-in default-ignored dir (`node_modules`, `dist`, …), `.git`, or
+ * CodeGraph's data dir — those are never resurfaced, mirroring `ScopeIgnore`.
+ * `.gitignore` is deliberately NOT consulted: overriding it is the whole point.
+ */
+function collectIncludedFiles(
+  rootDir: string,
+  include: Ignore,
+  exclude: Ignore | null,
+  roots: string[],
+  overrides: Record<string, Language>,
+): Set<string> {
+  const out = new Set<string>();
+  const defaults = defaultsOnlyIgnore();
+  const visited = new Set<string>();
+
+  const consider = (abs: string, rel: string, isDir: boolean): void => {
+    if (isDir) {
+      if (defaults.ignores(rel + '/')) return; // never node_modules/dist/… via include
+      // An explicit `exclude` always wins over `include`; prune the whole subtree
+      // here so a large excluded dir (a committed frontend's own vendored deps,
+      // build output, …) is never walked — the per-file guard below still catches
+      // anything a directory pattern doesn't, so this is a pure efficiency win.
+      if (exclude && exclude.ignores(rel + '/')) return;
+      walk(abs);
+    } else {
+      if (defaults.ignores(rel)) return;
+      if (!include.ignores(rel)) return;
+      if (exclude && exclude.ignores(rel)) return;
+      if (!isSourceFile(rel, overrides)) return;
+      out.add(rel);
+    }
+  };
+
+  function walk(absDir: string): void {
+    let realDir: string;
+    try {
+      realDir = fs.realpathSync(absDir);
+    } catch {
+      return;
+    }
+    if (visited.has(realDir)) return; // symlink-cycle guard
+    visited.add(realDir);
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(absDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name === '.git' || isCodeGraphDataDir(entry.name)) continue;
+      const abs = path.join(absDir, entry.name);
+      const rel = normalizePath(path.relative(rootDir, abs));
+      if (!rel || rel.startsWith('..')) continue;
+      if (entry.isSymbolicLink()) {
+        try {
+          const st = fs.statSync(fs.realpathSync(abs));
+          consider(abs, rel, st.isDirectory());
+        } catch {
+          // broken symlink — skip
+        }
+        continue;
+      }
+      consider(abs, rel, entry.isDirectory());
+    }
+  }
+
+  for (const root of roots) {
+    walk(root === '' ? rootDir : path.join(rootDir, root));
+  }
+  return out;
+}
+
+/**
+ * The included source files (`codegraph.json` `include`) for a scan root, or an
+ * empty set when nothing is force-included. Centralizes loading the matcher,
+ * roots, exclude, and overrides so both enumeration paths (git and filesystem
+ * walk) add the same files.
+ */
+function collectIncludedFilesForRoot(rootDir: string): Set<string> {
+  const include = loadIncludeMatcher(rootDir);
+  if (!include) return new Set();
+  const roots = includeStaticRoots(loadIncludePatterns(rootDir));
+  return collectIncludedFiles(rootDir, include, loadExcludeMatcher(rootDir), roots, loadExtensionOverrides(rootDir));
+}
+
+/**
  * `git ls-files --directory` collapses a wholly-untracked/ignored directory into
  * one entry — and when the command's own cwd is such a directory (the indexed
  * root is itself a git-ignored subdir of an enclosing repo), git emits the
@@ -477,6 +629,17 @@ export class ScopeIgnore {
      * exclude applies even to tracked files and even inside embedded repos.
      */
     private exclude: Ignore | null = null,
+    /**
+     * Project `codegraph.json` `include` patterns — first-party source forced
+     * INTO the index despite `.gitignore`. When a path matches, it is NOT
+     * ignored (so the watcher watches it), overriding `.gitignore`/`rootMatcher`
+     * — but never `exclude` (checked first) and never a built-in default-ignored
+     * dir. `includeRoots` are the static prefixes so a gitignored ANCESTOR
+     * directory of an included subtree still isn't pruned by the directory
+     * walker/watcher.
+     */
+    private include: Ignore | null = null,
+    private includeRoots: string[] = [],
   ) {
     // Longest root first so paths in nested embedded repos hit the innermost matcher.
     this.embedded = [...embedded].sort((a, b) => b.root.length - a.root.length);
@@ -487,6 +650,18 @@ export class ScopeIgnore {
     // path: it must drop git-TRACKED paths (which `.gitignore` can't) and apply
     // everywhere, including ancestors of embedded repos.
     if (this.exclude && this.exclude.ignores(rel)) return true;
+    // User `include`: force first-party source in despite `.gitignore`. Never
+    // resurfaces a built-in default-ignored dir (node_modules/dist/…), so an
+    // include pattern can't accidentally pull in dependency/build trees.
+    if (this.include && !this.defaults.ignores(rel)) {
+      if (rel.endsWith('/')) {
+        // A directory on (or leading to) an included subtree must stay walkable
+        // so the watcher/walker descends to reach the forced-in files.
+        if (this.includeRoots.some((r) => r.startsWith(rel) || rel.startsWith(r))) return false;
+      } else if (this.include.ignores(rel)) {
+        return false;
+      }
+    }
     for (const { root, matcher } of this.embedded) {
       if (rel.startsWith(root)) {
         const inner = rel.slice(root.length);
@@ -512,10 +687,13 @@ export class ScopeIgnore {
  */
 export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<string>): ScopeIgnore {
   const roots = embeddedRoots ? [...embeddedRoots] : discoverEmbeddedRepoRoots(rootDir);
+  const include = loadIncludeMatcher(rootDir);
   return new ScopeIgnore(
     buildDefaultIgnore(rootDir),
     roots.map((root) => ({ root, matcher: buildDefaultIgnore(path.join(rootDir, root)) })),
     loadExcludeMatcher(rootDir),
+    include,
+    include ? includeStaticRoots(loadIncludePatterns(rootDir)) : [],
   );
 }
 
@@ -807,7 +985,14 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     // not the parent's: the parent's .gitignore hides the child repo from git,
     // not from the index. (#514)
     const ig = buildScopeIgnore(rootDir, embeddedRoots);
-    return new Set([...files].filter((f) => !ig.ignores(f)));
+    const visible = new Set([...files].filter((f) => !ig.ignores(f)));
+    // Force-include first-party source the project whitelisted in
+    // `codegraph.json` `include`. These are gitignored, so `git ls-files` never
+    // listed them above — discover them directly off disk and add them. (The
+    // common SVN+Git dual-VCS case: source committed to SVN, gitignored out of
+    // Git, but still wanted in the graph.)
+    for (const f of collectIncludedFilesForRoot(rootDir)) visible.add(f);
+    return visible;
   } catch {
     return null;
   }
@@ -1114,6 +1299,20 @@ function scanDirectoryWalk(
   const exclude = loadExcludeMatcher(rootDir);
   if (exclude) baseMatchers.push({ dir: rootDir, ig: exclude });
   walk(rootDir, baseMatchers);
+
+  // Force-include first-party source whitelisted in `codegraph.json` `include`
+  // — the walk above honours `.gitignore`, so anything gitignored was dropped;
+  // add it back here (deduped). Mirrors the git path's union.
+  const included = collectIncludedFilesForRoot(rootDir);
+  if (included.size > 0) {
+    const seen = new Set(files);
+    for (const f of included) {
+      if (!seen.has(f)) {
+        files.push(f);
+        seen.add(f);
+      }
+    }
+  }
   return files;
 }
 
