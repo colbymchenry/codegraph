@@ -43,6 +43,21 @@ describe('Language Detection', () => {
     expect(detectLanguage('config.mjs')).toBe('javascript');
   });
 
+  it('should treat xsjs/xsjslib as plain JavaScript and skip framework extraction', () => {
+    const code = `
+      const app = express();
+      app.get('/health', (req, res) => res.send('ok'));
+    `;
+
+    const jsResult = extractFromSource('app.js', code, 'javascript', ['express']);
+    const xsjsResult = extractFromSource('app.xsjs', code, 'javascript', ['express']);
+    const xsjslibResult = extractFromSource('app.xsjslib', code, 'javascript', ['express']);
+
+    expect(jsResult.nodes.some((n) => n.kind === 'route')).toBe(true);
+    expect(xsjsResult.nodes.some((n) => n.kind === 'route')).toBe(false);
+    expect(xsjslibResult.nodes.some((n) => n.kind === 'route')).toBe(false);
+  });
+
   it('should detect Python files', () => {
     expect(detectLanguage('main.py')).toBe('python');
   });
