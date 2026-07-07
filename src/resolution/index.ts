@@ -229,6 +229,15 @@ export class ReferenceResolver {
   private qualifiedNameCache: LRUCache<string, Node[]>; // qualified_name → nodes cache
   private fileLinesCache: LRUCache<string, string[] | null>; // file → split lines cache
   private methodMatchCache: LRUCache<string, Node[]>; // lang\0Type::method → matching method nodes
+  // Node kinds are a small fixed set (~24), so this is a plain Map, not an LRU.
+  // getNodesByKind returns the FULL node list for a kind; it was previously
+  // uncached — a per-ref `SELECT * FROM nodes WHERE kind=?` + row-mapping. Called
+  // for every dotted call ref by the Spring resolver (constants) and every
+  // `hook_` ref by the Drupal resolver (functions), that scan dominated
+  // resolution on large repos (#1180). The node set is stable within a
+  // resolution pass (same lifetime assumption as nameCache); clearCaches() resets
+  // it between passes. Callers must treat the returned array as read-only.
+  private nodesByKindCache = new Map<Node['kind'], Node[]>();
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
@@ -332,6 +341,7 @@ export class ReferenceResolver {
     this.qualifiedNameCache.clear();
     this.fileLinesCache.clear();
     this.methodMatchCache.clear();
+    this.nodesByKindCache.clear();
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
@@ -404,7 +414,11 @@ export class ReferenceResolver {
       },
 
       getNodesByKind: (kind: Node['kind']) => {
-        return this.queries.getNodesByKind(kind);
+        const cached = this.nodesByKindCache.get(kind);
+        if (cached !== undefined) return cached;
+        const result = this.queries.getNodesByKind(kind);
+        this.nodesByKindCache.set(kind, result);
+        return result;
       },
 
       fileExists: (filePath: string) => {

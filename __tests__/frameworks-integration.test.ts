@@ -624,6 +624,64 @@ describe('Java end-to-end — field-injected bean trace (issue #389)', () => {
     cg.close();
   });
 
+  it('binds a config key only for `references` refs, never a same-named method call (#1180)', async () => {
+    // `service.process` is BOTH a yaml key and a `service.process()` method call.
+    // canonicalConfigKey collapses them to the same token, so before #1180 the
+    // method call (kind `calls`) fell into the Spring config-key branch and
+    // mis-resolved to the YAML constant at 0.9 confidence — a wrong edge, and the
+    // uncached constant scan that made large Java/Kotlin indexes take ~1h. The
+    // branch is now gated to `references` (only @Value/@ConfigurationProperties).
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-spring-kindgate-'));
+    const javaDir = path.join(tmpDir, 'src/main/java/com/example');
+    const resDir = path.join(tmpDir, 'src/main/resources');
+    fs.mkdirSync(javaDir, { recursive: true });
+    fs.mkdirSync(resDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'pom.xml'),
+      '<project><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter</artifactId></dependency></dependencies></project>\n'
+    );
+    fs.writeFileSync(path.join(resDir, 'application.yml'), 'service:\n  process: "enabled"\n');
+    fs.writeFileSync(
+      path.join(javaDir, 'Worker.java'),
+      'package com.example;\n' +
+        'import org.springframework.beans.factory.annotation.Value;\n' +
+        'class Processor { void process() {} }\n' +
+        'public class Worker {\n' +
+        '  private Processor service;\n' +
+        '  @Value("${service.process}") private String sp;\n' +
+        '  void run() { service.process(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const yamlKey = cg
+      .getNodesByKind('constant')
+      .find((n) => n.language === 'yaml' && n.qualifiedName === 'service.process');
+    expect(yamlKey, 'yaml key service.process should be indexed').toBeDefined();
+
+    // `references` ref (@Value) DOES bind to the config key.
+    const valueBind = cg
+      .getNodesByKind('constant')
+      .find((n) => n.id.startsWith('spring-value:') && n.name === 'service.process');
+    expect(valueBind).toBeDefined();
+    expect(
+      cg.getOutgoingEdges(valueBind!.id).some((e) => e.target === yamlKey!.id),
+      '@Value should still bind to the yaml key',
+    ).toBe(true);
+
+    // `calls` ref (service.process()) must NOT bind to the config key.
+    const run = cg.getNodesByKind('method').find((n) => n.name === 'run');
+    expect(run).toBeDefined();
+    expect(
+      cg.getOutgoingEdges(run!.id).some((e) => e.target === yamlKey!.id),
+      'a method call must never resolve to a config-key constant',
+    ).toBe(false);
+
+    cg.close();
+  });
+
   it('emits only a file node for non-MyBatis XML (pom.xml, beans.xml, log4j.xml)', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-xml-non-mybatis-'));
     fs.writeFileSync(

@@ -412,7 +412,21 @@ export function matchByQualifiedName(
     return null;
   }
 
-  const candidates = context.getNodesByQualifiedName(ref.referenceName);
+  // A method call `receiver.method()` can share an exact qualified name with a
+  // config-file key: `service.process()` (a `calls` ref named `service.process`)
+  // vs the yaml key `service.process`. Config keys are bound to their code refs
+  // upstream by the framework resolvers (`@Value` → `references`); a `calls` ref
+  // must never resolve to a yaml/properties config node — that's a wrong edge
+  // AND it hides the real callee. Drop those from both the exact and the partial
+  // candidate sets so resolution falls through to method resolution below (#1180).
+  const keepForRef = (nodes: Node[]): Node[] =>
+    ref.referenceKind === 'calls'
+      ? nodes.filter(
+          (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
+        )
+      : nodes;
+
+  const candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
 
   if (candidates.length === 1) {
     return {
@@ -444,8 +458,7 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
-    const partialCandidates = context
-      .getNodesByName(lastName)
+    const partialCandidates = keepForRef(context.getNodesByName(lastName))
       .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName));
     const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
     if (chosen) {
