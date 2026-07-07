@@ -716,6 +716,8 @@ export class ReferenceResolver {
    * Resolve a single reference
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    const frameworkDisabledForFile = this.isFrameworkDisabledForFile(ref.filePath);
+
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
@@ -757,7 +759,7 @@ export class ReferenceResolver {
       !isNixPathImportRef(ref) &&
       !this.hasAnyPossibleMatch(existenceName) &&
       !this.matchesAnyImport(ref) &&
-      !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
+      (!frameworkDisabledForFile && !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName)))
     ) {
       return null;
     }
@@ -806,11 +808,13 @@ export class ReferenceResolver {
     // JS → native `calls`) — `gateFrameworkLanguage` only drops a type/import
     // edge between two KNOWN families (see its doc), never a `calls` bridge or
     // a config↔code edge.
-    for (const framework of this.frameworks) {
-      const result = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
-      if (result) {
-        if (result.confidence >= 0.9) return result; // High confidence, return immediately
-        candidates.push(result);
+    if (!frameworkDisabledForFile) {
+      for (const framework of this.frameworks) {
+        const result = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
+        if (result) {
+          if (result.confidence >= 0.9) return result; // High confidence, return immediately
+          candidates.push(result);
+        }
       }
     }
 
@@ -1685,6 +1689,10 @@ export class ReferenceResolver {
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (tgt && ref.language && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
+  }
+
+  private isFrameworkDisabledForFile(filePath: string): boolean {
+    return /\.(xsjs|xsjslib)$/i.test(filePath);
   }
 }
 

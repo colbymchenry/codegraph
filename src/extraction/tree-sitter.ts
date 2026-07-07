@@ -6525,6 +6525,7 @@ export function extractFromSource(
 ): ExtractionResult {
   const detectedLanguage = language || detectLanguage(filePath, source);
   const fileExtension = path.extname(filePath).toLowerCase();
+  const isXsjsLike = fileExtension === '.xsjs' || fileExtension === '.xsjslib';
 
   let result: ExtractionResult;
 
@@ -6582,7 +6583,7 @@ export function extractFromSource(
   }
 
   // Framework-specific extraction (routes, middleware, etc.)
-  if (frameworkNames && frameworkNames.length > 0) {
+  if (!isXsjsLike && frameworkNames && frameworkNames.length > 0) {
     const allResolvers = getAllFrameworkResolvers();
     const applicable = getApplicableFrameworks(
       allResolvers.filter((r) => frameworkNames.includes(r.name)),
