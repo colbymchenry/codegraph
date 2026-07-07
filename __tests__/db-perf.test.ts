@@ -142,6 +142,53 @@ describe('deleteResolvedReferences (chunking)', () => {
   });
 });
 
+describe('getUnresolvedReferencesByFiles (large result set)', () => {
+  let dir: string;
+  let db: DatabaseConnection;
+  let q: QueryBuilder;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-perf-unresbyfiles-'));
+    db = DatabaseConnection.initialize(path.join(dir, 'test.db'));
+    q = new QueryBuilder(db.getDb());
+  });
+
+  afterEach(() => {
+    db.close();
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('does not overflow the stack when one file has more refs than the spread limit', () => {
+    // Regression: the method chunks the file-PATH list under SQLite's parameter
+    // limit, but then did `rows.push(...chunkRows)` — spreading every matched
+    // row as a separate call argument. On a large `codegraph sync` a single
+    // chunk of files matches hundreds of thousands of unresolved_refs rows,
+    // which blew V8's argument-stack limit with "Maximum call stack size
+    // exceeded" (the arg-spread threshold is ~125k). All refs here share ONE
+    // file_path so a single chunk returns the whole set. from_node_id has a FK
+    // to nodes, so a backing node must exist first.
+    const COUNT = 130_000; // just past the arg-spread ceiling
+    q.insertNode(makeNode('n1'));
+    q.insertUnresolvedRefsBatch(
+      Array.from({ length: COUNT }, (_, i) => ({
+        fromNodeId: 'n1',
+        referenceName: `ref${i}`,
+        referenceKind: 'calls' as const,
+        line: i + 1,
+        column: 0,
+        filePath: 'big.ts',
+        language: 'typescript' as const,
+      }))
+    );
+
+    let refs: ReturnType<typeof q.getUnresolvedReferencesByFiles> = [];
+    expect(() => {
+      refs = q.getUnresolvedReferencesByFiles(['big.ts']);
+    }).not.toThrow();
+    expect(refs.length).toBe(COUNT);
+  });
+});
+
 describe('insertNode cache invalidation', () => {
   let dir: string;
   let db: DatabaseConnection;
