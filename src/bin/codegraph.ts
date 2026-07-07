@@ -1429,19 +1429,19 @@ program
  * codegraph view
  *
  * Render the index as an interactive, zoomable, searchable graph in a single
- * self-contained HTML file (vis-network bundled locally, works offline). With
- * `--open`, serve it on a loopback port and open the default browser.
+ * self-contained HTML file (vis-network bundled locally, works offline).
+ * Opens the default browser automatically unless `--no-open` is passed.
  */
 program
   .command('view')
-  .description('Render the index as an interactive HTML graph you can open in a browser')
+  .description('Render the index as an interactive HTML graph and open it in your browser')
   .option('-p, --path <path>', 'Project path')
   .option('-o, --output <file>', 'Output HTML file (default: <project>/.codegraph/codegraph_view.html)')
   .option('--file <substring>', 'Only show symbols from files matching this substring, plus 1-hop neighbors')
   .option('--symbol <name>', 'Only show this symbol and its immediate neighborhood')
   .option('--include-imports', 'Include import/export/reference edges (noisy on real repos, off by default)')
   .option('--max-nodes <number>', 'Cap on nodes for whole-graph / file view (highest-degree kept)', '250')
-  .option('--open', 'Serve the graph on a loopback port and open it in your browser')
+  .option('--no-open', 'Write the HTML file without opening a browser')
   .action(async (options: {
     path?: string;
     output?: string;
@@ -1505,7 +1505,7 @@ program
         `Wrote ${data.stats.totalNodes} nodes / ${data.stats.totalEdges} edges to ${outPath}`
       );
 
-      if (options.open) {
+      if (options.open !== false) {
         await serveAndOpen(html, outPath);
         return;
       }
@@ -1520,7 +1520,7 @@ program
 /**
  * Serve a pre-rendered graph HTML on a loopback port and open the default
  * browser at it, then block until the user stops the process (Ctrl+C). Used by
- * `codegraph view --open`. Loopback-only bind so nothing is exposed off-box,
+ * `codegraph view` (default). Loopback-only bind so nothing is exposed off-box,
  * matching CodeGraph's local-first stance.
  */
 async function serveAndOpen(html: string, outPath: string): Promise<void> {
