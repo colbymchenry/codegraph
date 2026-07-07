@@ -96,6 +96,36 @@ function lastQualifierPart(symbol: string): string {
 }
 
 /**
+ * Normalize Erlang-native symbol spellings in an explore query into the shapes
+ * the rest of the pipeline already understands. Agents working Erlang code
+ * name symbols the way the language spells them — `mod:fn/3`, `init/2` — and
+ * those tokens previously died in both consumers: the flow-builder's token
+ * filter rejects `:` and `/arity` outright, and the search-side field parser
+ * eats `mod:fn` as an unknown `field:value`. Measured on cowboy: the agent
+ * named `cowboy_stream_h:request_process/3` in two queries, got no body back
+ * either time, and fell back to Read.
+ *
+ *   - `fn/3` → `fn` (arity tail after an identifier; a path segment like
+ *     `src/2fa` doesn't match because the tail must be all digits)
+ *   - `mod:fn` → `mod.fn` (exactly one colon between identifiers, so it rides
+ *     the existing Class.method qualified handling; `::`, URLs, drive letters,
+ *     and times don't match, and the query language's own field prefixes —
+ *     kind:/lang:/language:/path:/name: — are left alone)
+ *
+ * Safe cross-language: Lua's `t:m` spelling maps to the same `t.m` its
+ * qualified names use, and no other supported spelling contains a bare
+ * single-colon identifier pair.
+ */
+export function normalizeQuerySpelling(query: string): string {
+  return query
+    .replace(/\b([A-Za-z_][\w@]*)\/(\d{1,3})(?=$|[\s,()[\]/])/g, '$1')
+    .replace(
+      /(^|[\s,()[\]])(?!(?:kind|lang|language|path|name):)([a-z_][\w@]*):([A-Za-z_][\w@]*)(?=$|[\s,()[\]])/g,
+      '$1$2.$3'
+    );
+}
+
+/**
  * Calculate the recommended number of codegraph_explore calls based on project size.
  * Larger codebases need more exploration calls to cover their surface area,
  * but smaller ones should use fewer to avoid unnecessary overhead.
@@ -1854,7 +1884,7 @@ export class ToolHandler {
       // names (Class.method / Class::method) — the agent's most precise input,
       // resolved exactly by findAllSymbols. (The old strip mangled Class.method
       // into Class, throwing the method away.)
-      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro)$/i;
+      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
       const tokens = [...new Set(
         query.split(/[\s,()[\]]+/)
           .map((t) => t.replace(FILE_EXT, '').trim())
@@ -1914,11 +1944,18 @@ export class ToolHandler {
         }
         // Same token, non-callable synth endpoints (capped, precision-gated on an
         // actual heuristic edge so plain config constants never qualify).
+        // Per-token sub-cap so one token's many endpoints (10 nix option writes
+        // of `programs.git.enable` across test configs) can't fill the pool
+        // before later tokens (`home.file`) get a slot.
         if (dynNamed.size < 12) {
+          let tokenDyn = 0;
           for (const n of hits) {
             if (CALLABLE.has(n.kind) || !DYN_KINDS.has(n.kind) || dynNamed.has(n.id)) continue;
-            if (hasHeuristicEdge(n.id)) dynNamed.set(n.id, n);
-            if (dynNamed.size >= 12) break;
+            if (hasHeuristicEdge(n.id)) {
+              dynNamed.set(n.id, n);
+              tokenDyn++;
+            }
+            if (dynNamed.size >= 12 || tokenDyn >= 4) break;
           }
         }
         if (named.size > 40) break;
@@ -2457,8 +2494,11 @@ export class ToolHandler {
    * tax on small projects while earning its keep on large ones.
    */
   private async handleExplore(args: Record<string, unknown>): Promise<ToolResult> {
-    const query = this.validateString(args.query, 'query');
-    if (typeof query !== 'string') return query;
+    const rawQuery = this.validateString(args.query, 'query');
+    if (typeof rawQuery !== 'string') return rawQuery;
+    // One normalization point so the flow-builder, relevance search, and
+    // ranking all see the same canonical spelling (Erlang `mod:fn/arity`).
+    const query = normalizeQuerySpelling(rawQuery);
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
@@ -2539,7 +2579,7 @@ export class ToolHandler {
     // overloads (the query also named the type) all earn it. (#1064)
     const tierSeedIds = new Set<string>();
     {
-      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro)$/i;
+      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
       const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
       const isTestPath = (p: string) => /(^|\/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)\//i.test(p) || /\.(test|spec)\.[a-z]+$/i.test(p);
       const bodyLines = (n: Node) => Math.max(0, (n.endLine ?? n.startLine) - n.startLine);
@@ -3998,6 +4038,19 @@ export class ToolHandler {
       );
     }
 
+    // Non-zero at rest means a resolution pass was interrupted mid-run, so
+    // some files' call/impact edges are missing until the next sync sweeps
+    // the leftovers (#1187). Surface it — an agent trusting an incomplete
+    // blast radius is worse than one that knows to re-sync.
+    const pendingRefs = cg.getPendingReferenceCount();
+    if (pendingRefs > 0) {
+      lines.push(
+        `**Pending resolution:** ⚠ ${pendingRefs} references from an interrupted ` +
+        `index run — some caller/impact edges are missing until the next sync ` +
+        `(any file change triggers it, or run \`codegraph sync\`)`
+      );
+    }
+
     lines.push('', '**Nodes by Kind:**');
 
     for (const [kind, count] of Object.entries(stats.nodesByKind)) {
@@ -4366,6 +4419,26 @@ export class ToolHandler {
    * results across all matching symbols (e.g., multiple classes with an `execute` method).
    */
   private findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
+    // Nix option paths: the declaration is stored as `options.<path>` and
+    // config writes carry longer/quoted tails (`<path>."git/config".text`),
+    // so a dotted option token (`xdg.configFile`, `launchd.user.agents`) has
+    // no exact-name node and would degrade to bare-tail FTS soup — burying
+    // the declaration hub the nix-option-path edges hang off. Resolve the
+    // convention directly: declaration first, then the exact write, then a
+    // capped prefix scan of write sites. Three index hits; non-nix graphs
+    // fall straight through.
+    if (/^[a-z][\w'-]*(?:\.[\w'-]+)+$/.test(symbol)) {
+      const optionHits = [
+        ...cg.getNodesByName(`options.${symbol}`),
+        ...cg.getNodesByName(symbol),
+        ...cg.getNodesByNamePrefix(`${symbol}.`, 12),
+      ].filter((n) => n.language === 'nix');
+      if (optionHits.length > 0) {
+        const seen = new Set<string>();
+        const nodes = optionHits.filter((n) => !seen.has(n.id) && !!seen.add(n.id)).slice(0, 10);
+        return { nodes, note: '' };
+      }
+    }
     let results = cg.searchNodes(symbol, { limit: 50 });
 
     // Mirror the fallback in `findSymbol` for qualified queries — FTS

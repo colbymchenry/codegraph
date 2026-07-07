@@ -16,6 +16,11 @@ import { resolveWorkspaceImport } from './workspace-packages';
  */
 const EXTENSION_RESOLUTION: Record<string, string[]> = {
   typescript: ['.ts', '.tsx', '.d.ts', '.js', '.jsx', '/index.ts', '/index.tsx', '/index.js'],
+  // ArkTS imports both `.ets` components and plain `.ts` logic modules —
+  // HarmonyOS projects are always a mix. `/Index.ets` (capital I) is ohpm's
+  // module-entry convention, hit when a bare workspace import ("data") is
+  // rewritten to the member's directory; lowercase variants for safety.
+  arkts: ['.ets', '.ts', '.d.ts', '.js', '/Index.ets', '/index.ets', '/index.ts', '/index.js'],
   javascript: ['.js', '.jsx', '.mjs', '.cjs', '/index.js', '/index.jsx'],
   tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js'],
   jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
@@ -35,7 +40,17 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   php: ['.php'],
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
+  nix: ['.nix', '/default.nix'],
 };
+
+export function isNixPathImportRef(ref: UnresolvedRef): boolean {
+  return (
+    ref.language === 'nix' &&
+    ref.referenceKind === 'imports' &&
+    (ref.referenceName.startsWith('./') || ref.referenceName.startsWith('../')) &&
+    !/[\s{}()[\];"'<>$]/.test(ref.referenceName)
+  );
+}
 
 /**
  * Resolve an import path to an actual file
@@ -46,6 +61,14 @@ export function resolveImportPath(
   language: Language,
   context: ResolutionContext
 ): string | null {
+  // COBOL COPY/EXEC SQL INCLUDE names a copybook member, not a path — the
+  // compiler searches a library, so we match against indexed file basenames.
+  // Must run before isExternalImport: a bare member name would otherwise be
+  // misclassified as an external package.
+  if (language === 'cobol') {
+    return resolveCobolCopybook(importPath, fromFile, context);
+  }
+
   // Skip external/npm packages — but pass the context so the
   // bare-specifier heuristic can consult the project's tsconfig
   // alias map first (custom prefixes like `@components/*` would
@@ -74,6 +97,57 @@ export function resolveImportPath(
   }
 
   return null;
+}
+
+/**
+ * COBOL copybook lookup: `COPY CVACT01Y` (or `EXEC SQL INCLUDE X`) names a
+ * library member resolved by the compiler's copybook search path, so we match
+ * the member against indexed file basenames, case-insensitively. `.cpy` wins
+ * over a same-named program; a same-directory hit wins within a tier. The
+ * stem index is built once per resolution context (a per-ref scan of every
+ * file node would go quadratic on copybook-heavy repos).
+ */
+const cobolCopybookIndexes = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+function resolveCobolCopybook(
+  member: string,
+  fromFile: string,
+  context: ResolutionContext
+): string | null {
+  let index = cobolCopybookIndexes.get(context);
+  if (!index) {
+    index = new Map();
+    for (const fileNode of context.getNodesByKind('file')) {
+      const normalized = fileNode.filePath.replace(/\\/g, '/');
+      const base = normalized.split('/').pop() ?? '';
+      const dot = base.lastIndexOf('.');
+      const stem = (dot > 0 ? base.slice(0, dot) : base).toLowerCase();
+      const paths = index.get(stem);
+      if (paths) paths.push(fileNode.filePath);
+      else index.set(stem, [fileNode.filePath]);
+    }
+    cobolCopybookIndexes.set(context, index);
+  }
+
+  const candidates = index.get(member.toLowerCase());
+  if (!candidates || candidates.length === 0) return null;
+
+  const fromDir = fromFile.replace(/\\/g, '/').split('/').slice(0, -1).join('/');
+  let best: string | null = null;
+  let bestScore = -1;
+  for (const candidate of candidates) {
+    const normalized = candidate.replace(/\\/g, '/');
+    const ext = normalized.slice(normalized.lastIndexOf('.')).toLowerCase();
+    let score = 0;
+    if (ext === '.cpy') score += 4;
+    else if (ext === '.cbl' || ext === '.cob' || ext === '.cobol') score += 2;
+    if (normalized.split('/').slice(0, -1).join('/') === fromDir) score += 1;
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best;
 }
 
 /**
@@ -141,7 +215,7 @@ function isExternalImport(
   }
 
   // Common external patterns
-  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx') {
+  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx' || language === 'arkts') {
     // Node built-ins
     if (['fs', 'path', 'os', 'crypto', 'http', 'https', 'url', 'util', 'events', 'stream', 'child_process', 'buffer'].includes(importPath)) {
       return true;
@@ -548,6 +622,15 @@ export function isPhpIncludePathRef(ref: UnresolvedRef): boolean {
 }
 
 /**
+ * Is this a COBOL COPY / EXEC SQL INCLUDE copybook reference? These resolve
+ * to files only (or stay unresolved for compiler-supplied members) — never
+ * to a same-named symbol via the name-matcher.
+ */
+export function isCobolCopybookRef(ref: UnresolvedRef): boolean {
+  return ref.language === 'cobol' && ref.referenceKind === 'imports';
+}
+
+/**
  * Resolve a PHP include/require path to a project-relative file path.
  *
  * PHP resolves includes relative to the including file's directory (the
@@ -581,7 +664,7 @@ export function extractImportMappings(
 ): ImportMapping[] {
   const mappings: ImportMapping[] = [];
 
-  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx') {
+  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx' || language === 'arkts') {
     mappings.push(...extractJSImports(content));
   } else if (language === 'svelte' || language === 'vue' || language === 'astro') {
     // Svelte/Vue single-file components import via plain ES6 inside their
@@ -993,7 +1076,8 @@ export function extractReExports(content: string, language: Language): ReExport[
     language !== 'typescript' &&
     language !== 'javascript' &&
     language !== 'tsx' &&
-    language !== 'jsx'
+    language !== 'jsx' &&
+    language !== 'arkts'
   ) {
     return [];
   }
@@ -1165,6 +1249,29 @@ export function resolveViaImport(
     return null;
   }
 
+  // COBOL COPY / EXEC SQL INCLUDE — resolve the copybook member to a
+  // file→file edge, mirroring the C/C++ include branch above. A member that
+  // matches no indexed file (compiler-supplied copybooks like SQLCA/DFHAID)
+  // stays unresolved — callers must not fall back to the symbol name-matcher,
+  // which would connect it to a same-named import symbol elsewhere.
+  if (isCobolCopybookRef(ref)) {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language!, context);
+    if (!resolvedPath) return null;
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
+    return null;
+  }
+
   // PHP include/require — resolve the static string path to a file→file
   // edge, mirroring the C/C++ branch above. Distinguish include PATHS from
   // namespace `use` symbols by shape: an include path contains a slash or a
@@ -1192,6 +1299,30 @@ export function resolveViaImport(
     // dead end. Return unresolved rather than falling through to the symbol
     // name-matcher, which would mis-connect e.g. "inc/db.php" to an unrelated
     // db.php elsewhere in the tree — a wrong edge is worse than a missing one.
+    return null;
+  }
+
+  // Nix static project-path imports (`import ./x.nix`, `builtins.import ./dir`,
+  // `import ./x.nix {}`) resolve to file nodes only. Do not resolve
+  // angle-bracket channels, attribute expressions, variables, or other dynamic
+  // expressions as project files.
+  if (isNixPathImportRef(ref)) {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
     return null;
   }
 
@@ -1264,7 +1395,8 @@ export function resolveViaImport(
     ref.language === 'typescript' ||
     ref.language === 'tsx' ||
     ref.language === 'javascript' ||
-    ref.language === 'jsx'
+    ref.language === 'jsx' ||
+    ref.language === 'arkts'
   ) {
     const moduleFile = resolveModuleImportToFile(ref, imports, context);
     if (moduleFile) return moduleFile;

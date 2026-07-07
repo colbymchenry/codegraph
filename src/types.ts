@@ -68,6 +68,7 @@ export const LANGUAGES = [
   'javascript',
   'tsx',
   'jsx',
+  'arkts',
   'python',
   'go',
   'rust',
@@ -91,6 +92,8 @@ export const LANGUAGES = [
   'luau',
   'objc',
   'r',
+  'solidity',
+  'nix',
   'yaml',
   'twig',
   'xml',
@@ -98,6 +101,10 @@ export const LANGUAGES = [
   'cfml',
   'cfscript',
   'cfquery',
+  'cobol',
+  'vbnet',
+  'erlang',
+  'terraform',
   'unknown',
 ] as const;
 

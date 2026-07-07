@@ -31,6 +31,7 @@
 import { installMainThreadWatchdog } from '../mcp/liveness-watchdog';
 import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from '../mcp/ppid-watchdog';
 import { isProcessAlive } from '../mcp/daemon-registry';
+import { EARLY_PPID } from '../mcp/early-ppid';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
 export interface CommandSupervision {
@@ -52,7 +53,9 @@ export function installCommandSupervision(label: string): CommandSupervision {
 
   // PPID watchdog: detect that the parent (or the host threaded past the
   // relaunch shim) died and we've been orphaned, then exit instead of leaking.
-  const originalPpid = process.ppid;
+  // Baseline from the CLI entry's earliest-possible capture — reading
+  // process.ppid here would miss a launcher killed during startup (#1185).
+  const originalPpid = EARLY_PPID;
   const hostPpid = parseHostPpid(process.env[HOST_PPID_ENV]);
   const pollMs = parsePpidPollMs(process.env.CODEGRAPH_PPID_POLL_MS);
   let ppidTimer: ReturnType<typeof setInterval> | null = null;

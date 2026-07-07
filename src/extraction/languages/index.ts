@@ -29,6 +29,13 @@ import { luauExtractor } from './luau';
 import { objcExtractor } from './objc';
 import { cfscriptExtractor } from './cfscript';
 import { cfqueryExtractor } from './cfquery';
+import { cobolExtractor } from './cobol';
+import { vbnetExtractor } from './vbnet';
+import { erlangExtractor } from './erlang';
+import { solidityExtractor } from './solidity';
+import { terraformExtractor } from './terraform';
+import { arktsExtractor } from './arkts';
+import { nixExtractor } from './nix';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -55,4 +62,11 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   objc: objcExtractor,
   cfscript: cfscriptExtractor,
   cfquery: cfqueryExtractor,
+  cobol: cobolExtractor,
+  vbnet: vbnetExtractor,
+  erlang: erlangExtractor,
+  solidity: solidityExtractor,
+  terraform: terraformExtractor,
+  arkts: arktsExtractor,
+  nix: nixExtractor,
 };

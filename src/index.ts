@@ -437,6 +437,11 @@ export class CodeGraph {
       }
       try {
         const before = this.queries.getNodeAndEdgeCount();
+        // Mark the index as in-flight BEFORE any writes: a run killed
+        // mid-index (OOM, SIGKILL, the #850 liveness watchdog) leaves this
+        // marker behind, so `codegraph status` can tell a truncated index
+        // from a completed one instead of silently serving partial results.
+        try { this.queries.setMetadata('index_state', 'indexing'); } catch { /* metadata is advisory */ }
         // Segment vocabulary starts empty and is repopulated by the node write
         // path as every file (re-)indexes below — so a full index is also the
         // orphan-cleanup pass for names deleted since the last one.
@@ -513,6 +518,37 @@ export class CodeGraph {
           } catch { /* metadata is advisory — never fail an index over it */ }
         }
 
+        // Reconcile the scan's ground truth against what the pipeline
+        // accounted for. A shortfall means files were silently dropped
+        // (observed in the wild: a run under heavy load came up 37 files
+        // short with no error) — record it and tell the user, don't let the
+        // index pass as complete.
+        try {
+          if (!result.success) {
+            this.queries.setMetadata('index_state', 'failed');
+          } else {
+            const accounted = result.filesIndexed + result.filesSkipped + result.filesErrored;
+            const discovered = result.filesDiscovered;
+            const shortfall = discovered !== undefined ? discovered - accounted : 0;
+            if (discovered !== undefined && shortfall > 0) {
+              this.queries.setMetadata('index_state', 'partial');
+              this.queries.setMetadata('index_files_discovered', String(discovered));
+              this.queries.setMetadata('index_files_accounted', String(accounted));
+              result.errors.push({
+                message: `Index is missing ${shortfall} of ${discovered} discovered files (indexed ${result.filesIndexed}, skipped ${result.filesSkipped}, errored ${result.filesErrored}). The index is PARTIAL — re-run \`codegraph index\`.`,
+                severity: 'warning',
+                code: 'index_partial',
+              });
+            } else {
+              this.queries.setMetadata('index_state', 'complete');
+              if (discovered !== undefined) {
+                this.queries.setMetadata('index_files_discovered', String(discovered));
+                this.queries.setMetadata('index_files_accounted', String(accounted));
+              }
+            }
+          }
+        } catch { /* metadata is advisory — never fail an index over it */ }
+
         return result;
       } finally {
         this.fileLock.release();
@@ -572,7 +608,8 @@ export class CodeGraph {
         }
 
         // Resolve references if files were updated
-        if (result.filesAdded > 0 || result.filesModified > 0) {
+        const filesChanged = result.filesAdded > 0 || result.filesModified > 0;
+        if (filesChanged) {
           if (result.changedFilePaths) {
             // Scope resolution to changed files (git fast path — bounded set)
             const unresolvedRefs = this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths);
@@ -608,7 +645,38 @@ export class CodeGraph {
               });
             });
           }
+        }
 
+        // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
+        // daemon liveness watchdog's SIGKILL (#1122), Ctrl-C, a crash — leaves
+        // the refs it never reached in unresolved_refs, and the git-scoped fast
+        // path above never revisits them (it reads only the changed files'
+        // rows). Those files' call edges were then missing PERMANENTLY, with
+        // nothing to see except a too-small blast radius, until a full
+        // re-index. A completed pass deletes every row it processed (resolved
+        // or not), so any row still present now is such an orphan — or a row
+        // parked by an older engine whose scoped pass kept unresolvable refs.
+        // Grind them down with the batched resolver; this also makes a bare
+        // `codegraph sync` the recovery command for a wedged index. On a
+        // healthy index this is one COUNT query.
+        const orphanCount = this.queries.getUnresolvedReferencesCount();
+        if (orphanCount > 0) {
+          options.onProgress?.({
+            phase: 'resolving',
+            current: 0,
+            total: orphanCount,
+          });
+
+          await this.resolveReferencesBatched((current, total) => {
+            options.onProgress?.({
+              phase: 'resolving',
+              current,
+              total,
+            });
+          });
+        }
+
+        if (filesChanged || orphanCount > 0) {
           // Second pass: chained calls whose method lives on a supertype the
           // receiver conforms to (protocol-extension / inherited). Needs the
           // implements/extends edges built above (#750).
@@ -619,7 +687,7 @@ export class CodeGraph {
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
-        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
+        if (filesChanged || result.filesRemoved > 0 || orphanCount > 0) {
           this.db.runMaintenance();
         }
 
@@ -762,6 +830,22 @@ export class CodeGraph {
   }
 
   /**
+   * Completeness of the last full index run. `'complete'` is the only good
+   * state. `'indexing'` after the fact means a run was killed mid-index (OOM,
+   * SIGKILL, liveness watchdog) and the on-disk index is truncated;
+   * `'partial'` means the run finished but silently dropped files
+   * (discovered > indexed+skipped+errored); `'failed'` means it reported
+   * failure. `null` = index predates this marker. Surfaced by
+   * `codegraph status`.
+   */
+  getIndexState(): 'indexing' | 'complete' | 'partial' | 'failed' | null {
+    const raw = this.queries.getMetadata('index_state');
+    return raw === 'indexing' || raw === 'complete' || raw === 'partial' || raw === 'failed'
+      ? raw
+      : null;
+  }
+
+  /**
    * Which engine built the current index: the package version + extraction
    * version stamped at the last full `indexAll`. Either field is null for an
    * index built before stamping existed (treated as stale). See
@@ -819,6 +903,16 @@ export class CodeGraph {
    */
   async resolveReferencesBatched(onProgress?: (current: number, total: number) => void): Promise<ResolutionResult> {
     return this.resolver.resolveAndPersistBatched(onProgress);
+  }
+
+  /**
+   * References extracted but not yet resolved into edges. Zero on a healthy
+   * index — a completed resolution pass consumes every row. Non-zero at rest
+   * means a pass was interrupted mid-run (killed indexer, crash — #1187), so
+   * some files' call edges are missing; the next `sync` sweeps them.
+   */
+  getPendingReferenceCount(): number {
+    return this.queries.getUnresolvedReferencesCount();
   }
 
   /**
@@ -899,6 +993,11 @@ export class CodeGraph {
    */
   getNodesByName(name: string): Node[] {
     return this.queries.getNodesByName(name);
+  }
+
+  /** Nodes whose name starts with `prefix` (index range scan, capped). */
+  getNodesByNamePrefix(prefix: string, limit = 20): Node[] {
+    return this.queries.getNodesByNamePrefix(prefix, limit);
   }
 
   /**

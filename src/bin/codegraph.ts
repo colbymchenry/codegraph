@@ -23,6 +23,11 @@
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
+// FIRST import, before anything else loads: capture process.ppid while our
+// launcher is (almost certainly) still alive. A launcher killed mid-startup
+// otherwise blinds the PPID watchdog forever (#1185) — see early-ppid.ts.
+import '../mcp/early-ppid';
+
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -354,6 +359,14 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
     }
     clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+    // A PARTIAL index (files silently dropped mid-pipeline) must not pass
+    // as a clean run — it's the difference between "indexed the repo" and
+    // "indexed most of the repo, quietly". Only the completeness
+    // reconciliation warning; per-file extractor warnings stay in the
+    // error-code summary below.
+    for (const w of result.errors.filter((e) => e.code === 'index_partial')) {
+      clack.log.warn(w.message);
+    }
   } else if (hasErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
   } else {
@@ -798,6 +811,10 @@ program
 
       const buildInfo = cg.getIndexBuildInfo();
       const reindexRecommended = cg.isIndexStale();
+      const indexState = cg.getIndexState();
+      // Zero on a healthy index; non-zero at rest means a resolution pass was
+      // interrupted, so some files' call edges are missing (#1187).
+      const pendingRefs = cg.getPendingReferenceCount();
 
       // JSON output mode
       if (options.json) {
@@ -829,6 +846,14 @@ program
             builtWithExtractionVersion: buildInfo.extractionVersion,
             currentExtractionVersion: EXTRACTION_VERSION,
             reindexRecommended,
+            // 'complete' | 'partial' (files silently dropped) | 'indexing'
+            // (a run was killed mid-index — the index is truncated) |
+            // 'failed' | null (predates the marker).
+            state: indexState,
+            // References awaiting resolution. Non-zero at rest means an
+            // interrupted resolution pass left edges missing; the next
+            // sync sweeps them (#1187).
+            pendingRefs,
           },
         }));
         cg.destroy();
@@ -841,6 +866,16 @@ program
       console.log(chalk.cyan('Project:'), projectPath);
       if (worktreeMismatch) {
         warn(worktreeMismatchWarning(worktreeMismatch));
+      }
+      if (indexState === 'indexing') {
+        warn('The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".');
+      } else if (indexState === 'partial') {
+        warn('The last index run silently dropped files — the index is partial. Re-run "codegraph index".');
+      } else if (indexState === 'failed') {
+        warn('The last index run failed — results may be incomplete. Re-run "codegraph index".');
+      }
+      if (pendingRefs > 0) {
+        warn(`${formatNumber(pendingRefs)} references from an interrupted run are awaiting resolution — some callers/impact edges are missing. Run "codegraph sync" to resolve them.`);
       }
       console.log();
 

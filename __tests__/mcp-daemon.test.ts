@@ -362,15 +362,21 @@ describe('Shared MCP daemon (issue #411)', () => {
     }
   }, 30000);
 
-  // The over-the-wire client-hello → record → sweep path is covered by the
-  // deterministic `Daemon.reapDeadClients` unit test in daemon-client-liveness
-  // (a raw-socket variant here was flaky under heavy parallel load), plus the
-  // client-hello round-trip exercised by every test above (the real proxy now
-  // sends it). What stays here is the lifecycle behavior that needs real procs.
-  it('exits on the inactivity backstop even while a client stays connected (#692)', async () => {
+  // The over-the-wire client-hello → record → sweep path, and the inactivity
+  // backstop's liveness gate, are covered by the deterministic unit tests in
+  // daemon-client-liveness (`reapDeadClients`, `backstopShouldExit`) — a
+  // raw-socket variant here was flaky under heavy parallel load. What stays
+  // here is the lifecycle behavior that needs real procs: a live-but-quiet
+  // client must SURVIVE the inactivity backstop. Reaping it used to silently
+  // degrade the session (and any others sharing the daemon) to an in-process
+  // engine; on a real machine the backstop fired on live sessions far more
+  // often than on the phantoms it exists for. The phantom case it still covers
+  // (an unknown-pid connection) is the `backstopShouldExit` unit test.
+  it('does NOT reap a live-but-quiet client on the inactivity backstop (#692)', async () => {
     // Backstop short, idle timeout long: with a client connected the idle timer
-    // never arms, so only the inactivity backstop can take the daemon down.
-    const env = { CODEGRAPH_DAEMON_MAX_IDLE_MS: '1500', CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '60000' };
+    // never arms, so the inactivity backstop is the only thing that could take
+    // the daemon down — and it must not, because the client's peer is alive.
+    const env = { CODEGRAPH_DAEMON_MAX_IDLE_MS: '1200', CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '60000' };
     const server = spawnServer(tempDir, env);
     servers.push(server);
     sendInitialize(server.child, `file://${tempDir}`, 1);
@@ -379,11 +385,13 @@ describe('Shared MCP daemon (issue #411)', () => {
     const daemonPid = readLockPid(realRoot)!;
     expect(isAlive(daemonPid)).toBe(true);
 
-    // Send nothing further — the client stays connected but idle. The backstop
-    // should fire and the daemon should exit and clean up its lockfile.
-    expect(await waitProcessExit(daemonPid, 12000)).toBe(true);
-    expect(readDaemonLog(realRoot)).toContain('inactivity backstop');
-    expect(fs.existsSync(path.join(realRoot, '.codegraph', 'daemon.pid'))).toBe(false);
+    // Stay silent well past several backstop windows. The live session's peer is
+    // provably alive, so the daemon must keep running (and never log a backstop
+    // shutdown), with its lockfile intact.
+    await new Promise((r) => setTimeout(r, 4000)); // > 3× maxIdle
+    expect(isAlive(daemonPid)).toBe(true);
+    expect(readDaemonLog(realRoot)).not.toContain('inactivity backstop');
+    expect(readLockPid(realRoot)).toBe(daemonPid);
   }, 30000);
 
   it('daemon idle-times-out after the last client disconnects', async () => {
