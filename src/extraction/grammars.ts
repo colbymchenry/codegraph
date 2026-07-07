@@ -43,6 +43,12 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   cfscript: 'tree-sitter-cfscript.wasm',
   cfquery: 'tree-sitter-cfquery.wasm',
   cobol: 'tree-sitter-cobol.wasm',
+  vbnet: 'tree-sitter-vbnet.wasm',
+  erlang: 'tree-sitter-erlang.wasm',
+  solidity: 'tree-sitter-solidity.wasm',
+  terraform: 'tree-sitter-terraform.wasm',
+  arkts: 'tree-sitter-arkts.wasm',
+  nix: 'tree-sitter-nix.wasm',
 };
 
 /**
@@ -54,6 +60,10 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // ESM/CJS TypeScript module extensions — parsed as TS (no JSX). (#366)
   '.mts': 'typescript',
   '.cts': 'typescript',
+  // ArkTS (HarmonyOS / OpenHarmony) — a TypeScript superset with declarative
+  // UI (`@Component struct` + `build()`). Own grammar (a tree-sitter-typescript
+  // -style fork); plain `.ts` in an ArkTS project stays TypeScript. (#648)
+  '.ets': 'arkts',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
@@ -112,6 +122,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
+  '.sol': 'solidity',
   // CFML: .cfc/.cfm parse with the tag-aware `cfml` grammar (custom CfmlExtractor
   // dialect-switches to cfscript for bare-script content); .cfs is pure CFScript.
   '.cfc': 'cfml',
@@ -121,6 +132,14 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // structs, and calls. MSL-specific `[[attribute]]` annotations are blanked
   // pre-parse for `.metal` files (see blankMetalAttributes in c-cpp.ts). (#1121)
   '.metal': 'cpp',
+  // CUDA ≈ C++ plus execution-space specifiers (`__global__` …) and
+  // `<<<grid, block>>>` kernel-launch syntax: the C++ grammar extracts its
+  // functions/structs/classes/calls once blankCudaConstructs (pre-parse; gated
+  // by these extensions OR by content for CUDA living in `.h`/`.hpp` headers —
+  // see c-cpp.ts) blanks the CUDA-only tokens. (#387)
+  '.cu': 'cpp',
+  '.cuh': 'cpp',
+  '.nix': 'nix',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -131,10 +150,25 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cob': 'cobol',
   '.cobol': 'cobol',
   '.cpy': 'cobol',
+  // VB.NET: vendored grammar (patched govindbanura/tree-sitter-vbnet) — classes,
+  // modules, interfaces, structures, properties, events, Handles clauses, LINQ.
+  '.vb': 'vbnet',
+  // Erlang: modules (.erl) and header files (.hrl). Vendored WhatsApp/
+  // tree-sitter-erlang grammar (the ELP grammar).
+  '.erl': 'erlang',
+  '.hrl': 'erlang',
+  // escripts parse natively — the grammar has a first-class `shebang` node.
+  // (`.app`/`.app.src` resource files route via isErlangAppFile below: their
+  // last-dot extension is too generic for this map.)
+  '.escript': 'erlang',
   // Spring config: `application.properties` / `application-*.properties`. Same
   // shape as the `.yml` variants — the YAML/properties extractor emits one node
   // per leaf key, and the Spring resolver links `@Value("${k}")` references.
   '.properties': 'properties',
+  // Terraform / OpenTofu / HCL config — tree-sitter-terraform dialect of HCL.
+  '.tf': 'terraform',
+  '.tfvars': 'terraform',
+  '.tofu': 'terraform',
 };
 
 /**
@@ -149,6 +183,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
 export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
   if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
+  if (isErlangAppFile(filePath)) return true; // OTP `.app`/`.app.src` resource files
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
   const ext = filePath.slice(dot).toLowerCase();
@@ -164,6 +199,18 @@ export function isShopifyLiquidJson(filePath: string): boolean {
   // Allow nested template dirs (`templates/customers/login.json`), not just
   // top-level (`templates/product.json`).
   return /(^|\/)(templates|sections)\/.+\.json$/i.test(filePath);
+}
+
+/**
+ * OTP application resource file: `<app>.app.src` (checked into every rebar3/
+ * erlang.mk app) or its compiled `<app>.app`. Erlang TERMS, not forms — the
+ * grammar parses them as top-level expressions, and the Erlang extractor's
+ * application-tuple handler turns `{mod, {Mod, _}}` and `{applications, […]}`
+ * into entry-module and dependency edges. Routed by full suffix because the
+ * last-dot extension (`.src`) is far too generic for EXTENSION_MAP.
+ */
+export function isErlangAppFile(filePath: string): boolean {
+  return /\.app(?:\.src)?$/i.test(filePath);
 }
 
 /**
@@ -248,8 +295,22 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // build (ABI 13) has no primary-constructor support and parses
       // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
       // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
-      // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol')
+      // primary constructors natively. Terraform: tree-sitter-wasms does not
+      // ship HCL/Terraform at all, so we vendor the prebuilt
+      // tree-sitter-terraform.wasm from @tree-sitter-grammars/tree-sitter-hcl
+      // 1.2.0 (Apache-2.0) — byte-identical to the npm package's artifact.
+      // ArkTS: tree-sitter-wasms doesn't ship it either; we vendor the prebuilt
+      // tree-sitter-arkts.wasm from the tree-sitter-arkts 0.2.0 npm package
+      // (harmony-contrib/tree-sitter-arkts, MIT) — byte-identical to the npm
+      // tarball's artifact. It extends the tree-sitter-javascript grammar the
+      // same way tree-sitter-typescript does, adding `struct_declaration` and
+      // the `arkui_component_expression` build() DSL.
+      // Nix: tree-sitter-wasms doesn't ship it; we vendor a wasm built from
+      // nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli
+      // 0.25.10 (`generate` + `build --wasm`, ABI 15 — upstream's checked-in
+      // parser.c is still ABI 13; all 54 upstream corpus tests pass on the
+      // regenerated parser).
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol' || lang === 'vbnet' || lang === 'erlang' || lang === 'terraform' || lang === 'arkts' || lang === 'nix')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -313,6 +374,9 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
   // links each section `"type"` to its `sections/<type>.liquid`).
   if (isShopifyLiquidJson(filePath)) return 'liquid';
+  // OTP `.app`/`.app.src` resource files — Erlang terms the grammar parses as
+  // top-level expressions (last-dot ext `.src` is too generic for the map).
+  if (isErlangAppFile(filePath)) return 'erlang';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content
@@ -460,6 +524,8 @@ export function getLanguageDisplayName(language: Language): string {
     lua: 'Lua',
     luau: 'Luau',
     objc: 'Objective-C',
+    solidity: 'Solidity',
+    nix: 'Nix',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',
@@ -468,6 +534,10 @@ export function getLanguageDisplayName(language: Language): string {
     cfscript: 'CFScript',
     cfquery: 'CFQuery (SQL)',
     cobol: 'COBOL',
+    vbnet: 'Visual Basic .NET',
+    erlang: 'Erlang',
+    terraform: 'Terraform',
+    arkts: 'ArkTS',
     unknown: 'Unknown',
   };
   return names[language] || language;

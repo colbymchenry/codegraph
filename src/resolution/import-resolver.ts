@@ -16,6 +16,11 @@ import { resolveWorkspaceImport } from './workspace-packages';
  */
 const EXTENSION_RESOLUTION: Record<string, string[]> = {
   typescript: ['.ts', '.tsx', '.d.ts', '.js', '.jsx', '/index.ts', '/index.tsx', '/index.js'],
+  // ArkTS imports both `.ets` components and plain `.ts` logic modules —
+  // HarmonyOS projects are always a mix. `/Index.ets` (capital I) is ohpm's
+  // module-entry convention, hit when a bare workspace import ("data") is
+  // rewritten to the member's directory; lowercase variants for safety.
+  arkts: ['.ets', '.ts', '.d.ts', '.js', '/Index.ets', '/index.ets', '/index.ts', '/index.js'],
   javascript: ['.js', '.jsx', '.mjs', '.cjs', '/index.js', '/index.jsx'],
   tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js'],
   jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
@@ -35,7 +40,17 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   php: ['.php'],
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
+  nix: ['.nix', '/default.nix'],
 };
+
+export function isNixPathImportRef(ref: UnresolvedRef): boolean {
+  return (
+    ref.language === 'nix' &&
+    ref.referenceKind === 'imports' &&
+    (ref.referenceName.startsWith('./') || ref.referenceName.startsWith('../')) &&
+    !/[\s{}()[\];"'<>$]/.test(ref.referenceName)
+  );
+}
 
 /**
  * Resolve an import path to an actual file
@@ -200,7 +215,7 @@ function isExternalImport(
   }
 
   // Common external patterns
-  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx') {
+  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx' || language === 'arkts') {
     // Node built-ins
     if (['fs', 'path', 'os', 'crypto', 'http', 'https', 'url', 'util', 'events', 'stream', 'child_process', 'buffer'].includes(importPath)) {
       return true;
@@ -649,7 +664,7 @@ export function extractImportMappings(
 ): ImportMapping[] {
   const mappings: ImportMapping[] = [];
 
-  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx') {
+  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx' || language === 'arkts') {
     mappings.push(...extractJSImports(content));
   } else if (language === 'svelte' || language === 'vue' || language === 'astro') {
     // Svelte/Vue single-file components import via plain ES6 inside their
@@ -1061,7 +1076,8 @@ export function extractReExports(content: string, language: Language): ReExport[
     language !== 'typescript' &&
     language !== 'javascript' &&
     language !== 'tsx' &&
-    language !== 'jsx'
+    language !== 'jsx' &&
+    language !== 'arkts'
   ) {
     return [];
   }
@@ -1286,6 +1302,30 @@ export function resolveViaImport(
     return null;
   }
 
+  // Nix static project-path imports (`import ./x.nix`, `builtins.import ./dir`,
+  // `import ./x.nix {}`) resolve to file nodes only. Do not resolve
+  // angle-bracket channels, attribute expressions, variables, or other dynamic
+  // expressions as project files.
+  if (isNixPathImportRef(ref)) {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
+    return null;
+  }
+
   // Use cached import mappings (avoids re-reading and re-parsing per ref)
   const imports = context.getImportMappings(ref.filePath, ref.language);
   if (imports.length === 0 && !context.readFile(ref.filePath)) {
@@ -1355,7 +1395,8 @@ export function resolveViaImport(
     ref.language === 'typescript' ||
     ref.language === 'tsx' ||
     ref.language === 'javascript' ||
-    ref.language === 'jsx'
+    ref.language === 'jsx' ||
+    ref.language === 'arkts'
   ) {
     const moduleFile = resolveModuleImportToFile(ref, imports, context);
     if (moduleFile) return moduleFile;

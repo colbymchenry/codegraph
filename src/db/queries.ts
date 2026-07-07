@@ -211,6 +211,7 @@ export class QueryBuilder {
     deleteUnresolvedByNode?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
     getNodesByName?: SqliteStatement;
+    getNodesByNamePrefix?: SqliteStatement;
     getNodesByQualifiedNameExact?: SqliteStatement;
     getNodesByLowerName?: SqliteStatement;
     getUnresolvedCount?: SqliteStatement;
@@ -887,6 +888,20 @@ export class QueryBuilder {
       this.stmts.getNodesByName = this.db.prepare('SELECT * FROM nodes WHERE name = ?');
     }
     const rows = this.stmts.getNodesByName.all(name) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
+   * Nodes whose name starts with `prefix`, by index range scan (a LIKE would
+   * skip idx_nodes_name under SQLite's default case-insensitive LIKE).
+   */
+  getNodesByNamePrefix(prefix: string, limit = 20): Node[] {
+    if (!this.stmts.getNodesByNamePrefix) {
+      this.stmts.getNodesByNamePrefix = this.db.prepare(
+        'SELECT * FROM nodes WHERE name >= ? AND name < ? ORDER BY name LIMIT ?'
+      );
+    }
+    const rows = this.stmts.getNodesByNamePrefix.all(prefix, prefix + '￿', limit) as NodeRow[];
     return rows.map(rowToNode);
   }
 

@@ -27,7 +27,54 @@ function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefin
   return undefined;
 }
 
+/**
+ * Recover the real function name from the macro-definition idiom
+ * `MACRO_NAME(real_name, typed args…) { body }` — flash-attention's
+ * `DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, …) { … }`
+ * being the motivating case: tree-sitter parses the invocation as a
+ * function_definition NAMED after the macro, so every such kernel shared one
+ * name (`DEFINE_FLASH_FORWARD_KERNEL`) and the launch sites' calls to the real
+ * names (`flash_fwd_kernel<…><<<…>>>`) could never resolve.
+ *
+ * Deliberately narrow so name-in-first-arg is unambiguous — ALL of:
+ *  - the parsed name is macro-shaped: ALL-CAPS with at least one underscore
+ *    (`TEST` never matches; K&R C definitions have lowercase names);
+ *  - the first "parameter" is a LONE identifier (no type, no declarator)
+ *    containing a lowercase letter — the name being defined;
+ *  - at least one more parameter follows and NONE of them is another lone
+ *    identifier — a second bare arg means the first isn't the name (gtest's
+ *    `TEST_F(Fixture, Name)`, `PYBIND11_MODULE(ext, m)`,
+ *    google-benchmark's `BENCHMARK_DEFINE_F(Fix, name)` all bail here).
+ */
+function recoverCppMacroDefinedName(node: SyntaxNode, source: string): string | undefined {
+  if (node.type !== 'function_definition') return undefined;
+  const declarator = getChildByField(node, 'declarator');
+  if (declarator?.type !== 'function_declarator') return undefined;
+  const inner = getChildByField(declarator, 'declarator');
+  if (inner?.type !== 'identifier') return undefined;
+  const macroName = getNodeText(inner, source);
+  if (!/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(macroName)) return undefined;
+  const params = getChildByField(declarator, 'parameters');
+  if (!params || params.namedChildCount < 2) return undefined;
+  const loneIdentText = (p: SyntaxNode): string | null =>
+    p.type === 'parameter_declaration' &&
+    p.namedChildCount === 1 &&
+    p.namedChild(0)?.type === 'type_identifier'
+      ? getNodeText(p.namedChild(0)!, source)
+      : null;
+  const first = params.namedChild(0);
+  const name = first ? loneIdentText(first) : null;
+  if (!name || !/[a-z]/.test(name)) return undefined;
+  for (let i = 1; i < params.namedChildCount; i++) {
+    const p = params.namedChild(i);
+    if (p && loneIdentText(p) !== null) return undefined;
+  }
+  return name;
+}
+
 function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
+  const macroDefined = recoverCppMacroDefinedName(node, source);
+  if (macroDefined) return macroDefined;
   const declarator = getChildByField(node, 'declarator');
   if (!declarator) return undefined;
   const qid = findDeclaratorQualifiedId(declarator);
@@ -123,6 +170,8 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
 }
 
 export const cExtractor: LanguageExtractor = {
+  // CUDA in C-detected headers (content-gated blank; see preParseCSource).
+  preParse: preParseCSource,
   // Universal net: recover a real name from any macro-mangled function name.
   recoverMangledName: recoverMangledCppName,
   functionTypes: ['function_definition'],
@@ -384,14 +433,108 @@ export function blankMetalAttributes(source: string): string {
   return source.replace(METAL_ATTRIBUTE_RE, (m) => ' '.repeat(m.length));
 }
 
+/**
+ * Blank CUDA-specific constructs before parsing `.cu`/`.cuh` files (parsed with
+ * the C++ grammar). Three shapes tree-sitter-cpp can't reconcile, each replaced
+ * with equal-length whitespace so every byte offset survives (#387):
+ *
+ * 1. Execution-space / storage specifiers: in `__global__ void step(…)` or
+ *    `__shared__ float tile[256]` the specifier parses as the declaration's
+ *    TYPE and shunts the real return/value type into an ERROR node — mangling
+ *    signatures and, for `__shared__` arrays, the declared name itself. Blanked
+ *    unconditionally (no following-token lookahead) so extended lambdas
+ *    (`[=] __device__ (int i) { … }`) recover too. `__restrict__` is deliberately
+ *    absent: the grammar already parses it natively as a type_qualifier.
+ * 2. `__launch_bounds__(…)` between specifier and declarator — same misparse.
+ *    The parenthesized form is blanked first; a bare leftover token is caught
+ *    by the specifier list.
+ * 3. Kernel-launch configs `step<<<grid, block, smem, stream>>>(args)`: the
+ *    chevrons lex as shift operators around an empty-named template, so no
+ *    call_expression exists and the host→kernel call edge — the main reason to
+ *    index CUDA at all — is lost. Blanking the `<<<…>>>` span leaves
+ *    `step                              (args)`, a plain call the grammar
+ *    parses natively (templated launches `k<T, 256><<<…>>>(…)` included).
+ *
+ * The launch-config match is deliberately bounded — statement/brace characters
+ * excluded, span capped, newlines preserved by the replacer — so a stray `<<<`
+ * (a committed merge-conflict marker, a string literal) can never blank a run
+ * of real code: an unmatched launch degrades to the status quo for that call
+ * site (no call edge), never to corruption. Applied to `.cu`/`.cuh` files and —
+ * because much real CUDA lives in extension-less headers (cutlass launches the
+ * majority of its kernels from `.h`; flash-attention's launch templates are
+ * `.h`; llm.c keeps device helpers in C-detected `.h`) — to any C/C++-family
+ * file whose CONTENT carries a strong CUDA marker (`looksLikeCudaSource`).
+ * Unlike Metal's `[[attribute]]` (legal C++ syntax elsewhere, hence Metal's
+ * strict extension gate), no CUDA marker is valid C++ anywhere: `<<<` isn't
+ * legal syntax and the dunder specifiers are implementation-reserved names no
+ * real codebase defines — so a content-triggered blank on a non-CUDA file can
+ * only ever whitespace tokens inside comments or strings, which parse the same.
+ */
+const CUDA_LAUNCH_BOUNDS_RE = /\b__launch_bounds__\s*\([^()\n]*\)/g;
+const CUDA_SPECIFIER_RE =
+  /\b__(?:global|device|host|constant|shared|managed|grid_constant|forceinline|noinline|launch_bounds)__\b/g;
+// `;` stays excluded (launch configs are expressions; a stray `<<<` spanning
+// real statements always crosses one) and the span is capped. Braces are
+// allowed through the regex — `k<<<dim3{1,1,1}, dim3{256,1,1}>>>(…)` is a real
+// launch shape — but the replacer only blanks a BALANCED match: a merge
+// conflict's `<<<<<<< … >>>>>>>` region that dodges every `;` still opens
+// braces it never closes, so it fails the balance check and stays untouched.
+const CUDA_LAUNCH_CONFIG_RE = /<<<[^;]{0,400}?>>>/g;
+export function blankCudaConstructs(source: string): string {
+  let out = source;
+  if (out.indexOf('__') !== -1) {
+    out = out
+      .replace(CUDA_LAUNCH_BOUNDS_RE, (m) => ' '.repeat(m.length))
+      .replace(CUDA_SPECIFIER_RE, (m) => ' '.repeat(m.length));
+  }
+  if (out.indexOf('<<<') !== -1) {
+    out = out.replace(CUDA_LAUNCH_CONFIG_RE, (m) => {
+      let depth = 0;
+      for (let i = 0; i < m.length; i++) {
+        const ch = m.charCodeAt(i);
+        if (ch === 0x7b /* { */) depth++;
+        else if (ch === 0x7d /* } */ && --depth < 0) return m;
+      }
+      return depth === 0 ? m.replace(/[^\n]/g, ' ') : m;
+    });
+  }
+  return out;
+}
+
+/** Strong content markers for CUDA source in files without a CUDA extension
+ * (headers). The dunders are execution-space specifiers that only nvcc defines;
+ * `cudaStream_t` is the runtime's stream handle, pervasive in launcher headers
+ * that themselves declare no kernel. Deliberately excludes weak markers (`dim3`,
+ * `<<<`) that could plausibly appear in non-CUDA text. */
+function looksLikeCudaSource(source: string): boolean {
+  return (
+    source.indexOf('__global__') !== -1 ||
+    source.indexOf('__device__') !== -1 ||
+    source.indexOf('__constant__') !== -1 ||
+    source.indexOf('cudaStream_t') !== -1
+  );
+}
+
 /** C/C++ source pre-processing before tree-sitter: recover both macro-annotated
- * class definitions and macro-prefixed function definitions — plus, for `.metal`
- * shaders (parsed with the C++ grammar), MSL attribute annotations. Offset-preserving. */
+ * class definitions and macro-prefixed function definitions — plus the non-C++
+ * surface of the dialects parsed with the C++ grammar: `.metal` MSL attribute
+ * annotations, and CUDA specifiers + launch syntax (by `.cu`/`.cuh` extension
+ * or by content, for CUDA living in `.h`/`.hpp` headers). Offset-preserving. */
 function preParseCppSource(source: string, filePath?: string): string {
   const blanked = blankCppInlineMacros(blankCppExportMacros(source));
-  return filePath && filePath.toLowerCase().endsWith('.metal')
-    ? blankMetalAttributes(blanked)
-    : blanked;
+  const lower = filePath ? filePath.toLowerCase() : '';
+  if (lower.endsWith('.metal')) return blankMetalAttributes(blanked);
+  if (lower.endsWith('.cu') || lower.endsWith('.cuh') || looksLikeCudaSource(source)) {
+    return blankCudaConstructs(blanked);
+  }
+  return blanked;
+}
+
+/** C source pre-processing: C-detected headers in CUDA projects (llm.c keeps
+ * `__device__` helpers and kernel prototypes in plain `.h`) get the same
+ * content-gated CUDA blank as C++. */
+function preParseCSource(source: string): string {
+  return looksLikeCudaSource(source) ? blankCudaConstructs(source) : source;
 }
 
 export const cppExtractor: LanguageExtractor = {

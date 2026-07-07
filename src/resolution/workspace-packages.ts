@@ -31,6 +31,16 @@ import { logDebug } from '../errors';
 export interface WorkspacePackages {
   /** Member package `name` → directory relative to projectRoot (posix). */
   byName: Map<string, string>;
+  /**
+   * Member package `name` → its declared ENTRY FILE relative to projectRoot
+   * (posix), when the member's manifest names one (ohpm's oh-package.json5
+   * `"main": "Index.ets"`). Lets a bare `import { X } from "data"` resolve to
+   * the member's real barrel even when it doesn't follow an index-file
+   * convention — and independent of the CONSUMER's language (a `.ts` file
+   * importing an `.ets` barrel resolves without `.ets` in the TS candidate
+   * list). Absent for npm/pnpm members (their index conventions cover it).
+   */
+  entryByName?: Map<string, string>;
 }
 
 /**
@@ -43,10 +53,9 @@ export interface WorkspacePackages {
  * the same way it does {@link loadProjectAliases} / {@link loadGoModule}.
  */
 export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | null {
-  const patterns = readWorkspaceGlobs(projectRoot);
-  if (patterns.length === 0) return null;
-
   const byName = new Map<string, string>();
+
+  const patterns = readWorkspaceGlobs(projectRoot);
   for (const pattern of patterns) {
     for (const dir of expandWorkspaceGlob(projectRoot, pattern)) {
       const pkgName = readPackageName(path.join(projectRoot, dir));
@@ -54,10 +63,138 @@ export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | 
       if (pkgName && !byName.has(pkgName)) byName.set(pkgName, dir);
     }
   }
+
+  // HarmonyOS/OpenHarmony (ArkTS) modular projects: every module's
+  // oh-package.json5 declares its local siblings as `"data": "file:../../
+  // core/data"` dependencies, and code then imports the bare name
+  // (`import { CartRepository } from "data"`). Same monorepo problem as npm
+  // workspaces, different manifest.
+  const entryByName = new Map<string, string>();
+  for (const [name, dir] of collectOhpmFileDeps(projectRoot)) {
+    if (byName.has(name)) continue;
+    byName.set(name, dir);
+    const entry = readOhpmMain(projectRoot, dir);
+    if (entry) entryByName.set(name, entry);
+  }
+
   if (byName.size === 0) return null;
 
   logDebug('workspace packages loaded', { count: byName.size });
-  return { byName };
+  return { byName, entryByName: entryByName.size > 0 ? entryByName : undefined };
+}
+
+/**
+ * Read an ohpm member's declared entry file: `<dir>/oh-package.json5`'s
+ * `main`, normalized to a projectRoot-relative posix path. Null when the
+ * manifest or field is missing/escaping.
+ */
+function readOhpmMain(projectRoot: string, dirRel: string): string | null {
+  let parsed: unknown;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    parsed = require('jsonc-parser').parse(
+      fs.readFileSync(path.join(projectRoot, dirRel, OHPM_MANIFEST), 'utf-8')
+    );
+  } catch {
+    return null;
+  }
+  const main = (parsed as { main?: unknown } | null)?.main;
+  if (typeof main !== 'string' || !main.trim()) return null;
+  const entryAbs = path.resolve(projectRoot, dirRel, main.trim());
+  const entryRel = path.relative(projectRoot, entryAbs).replace(/\\/g, '/');
+  if (entryRel.startsWith('..')) return null;
+  return entryRel;
+}
+
+/**
+ * Scan the project for `oh-package.json5` manifests and collect their
+ * `file:`-protocol dependencies as workspace members: dep name (what the
+ * source imports) → target directory (projectRoot-relative posix).
+ *
+ * Precision rule: a name declared with DIFFERENT target directories in
+ * different manifests (e.g. every sample in a samples monorepo has its own
+ * "common") is AMBIGUOUS and dropped entirely — a missing edge beats a wrong
+ * cross-module link. Registry dependencies (`@ohos/axios: "^2.0.0"`) don't
+ * use `file:` and are ignored, staying external.
+ *
+ * The walk is bounded (depth + directory budget) and prunes build/dependency
+ * dirs, so non-ArkTS projects pay one readdir at the root and nothing else
+ * (they have no oh-package.json5 anywhere shallow).
+ */
+const OHPM_MANIFEST = 'oh-package.json5';
+const OHPM_WALK_MAX_DEPTH = 6;
+const OHPM_WALK_DIR_BUDGET = 8000;
+const OHPM_SKIP_DIRS = new Set([
+  'node_modules', 'oh_modules', '.git', '.codegraph', '.hvigor', '.preview',
+  'build', 'dist', 'out', 'oh-package-lock.json5',
+]);
+
+function collectOhpmFileDeps(projectRoot: string): Map<string, string> {
+  const byName = new Map<string, string>();
+  const ambiguous = new Set<string>();
+
+  const queue: Array<{ rel: string; depth: number }> = [{ rel: '', depth: 0 }];
+  let visited = 0;
+  while (queue.length > 0) {
+    const { rel, depth } = queue.shift()!;
+    if (++visited > OHPM_WALK_DIR_BUDGET) break;
+    const abs = path.join(projectRoot, rel);
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(abs, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (depth >= OHPM_WALK_MAX_DEPTH) continue;
+        if (e.name.startsWith('.') || OHPM_SKIP_DIRS.has(e.name)) continue;
+        queue.push({ rel: rel ? `${rel}/${e.name}` : e.name, depth: depth + 1 });
+        continue;
+      }
+      if (e.name !== OHPM_MANIFEST) continue;
+
+      const deps = readOhpmFileDeps(path.join(abs, e.name));
+      for (const [name, target] of deps) {
+        const targetAbs = path.resolve(abs, target);
+        const targetRel = path.relative(projectRoot, targetAbs).replace(/\\/g, '/');
+        if (targetRel.startsWith('..')) continue; // escapes the project
+        const existing = byName.get(name);
+        if (existing === undefined) {
+          if (!ambiguous.has(name)) byName.set(name, targetRel);
+        } else if (existing !== targetRel) {
+          byName.delete(name);
+          ambiguous.add(name);
+        }
+      }
+    }
+  }
+
+  return byName;
+}
+
+/** Parse one oh-package.json5's dependencies → [name, file-target] pairs. */
+function readOhpmFileDeps(manifestAbs: string): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  let parsed: unknown;
+  try {
+    // JSON5 tolerates comments and trailing commas; jsonc-parser (already a
+    // dependency, used by the opencode installer target) handles both.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    parsed = require('jsonc-parser').parse(fs.readFileSync(manifestAbs, 'utf-8'));
+  } catch {
+    return out;
+  }
+  const deps = (parsed as { dependencies?: Record<string, unknown> } | null)?.dependencies;
+  if (!deps || typeof deps !== 'object') return out;
+  for (const [name, value] of Object.entries(deps)) {
+    if (typeof value !== 'string' || !value.startsWith('file:')) continue;
+    const target = value.slice('file:'.length).trim();
+    if (target) out.push([name, target]);
+  }
+  return out;
 }
 
 /**
@@ -82,6 +219,13 @@ export function resolveWorkspaceImport(
   if (!bestName) return null;
   const dir = ws.byName.get(bestName)!;
   const subpath = importPath.slice(bestName.length); // '' or '/widgets'
+  // A bare member import resolves straight to the member's declared entry
+  // file when the manifest names one (ohpm `main`) — the caller's exact-path
+  // check hits it without extension/index guessing.
+  if (!subpath) {
+    const entry = ws.entryByName?.get(bestName);
+    if (entry) return entry;
+  }
   return (dir + subpath).replace(/\/{2,}/g, '/');
 }
 

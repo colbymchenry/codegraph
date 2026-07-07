@@ -22,7 +22,9 @@ import * as fs from 'fs';
 import * as net from 'net';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 import { DaemonClientHello, DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
+import { EARLY_PPID } from './early-ppid';
 import { supervisionLostReason } from './ppid-watchdog';
+import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { CodeGraphPackageVersion } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION } from './session';
@@ -178,7 +180,7 @@ function sendClientHello(socket: net.Socket): void {
   const clientHello: DaemonClientHello = {
     codegraph_client: 1,
     pid: process.pid,
-    hostPid: parseHostPpid(process.env[HOST_PPID_ENV]) ?? process.ppid,
+    hostPid: parseHostPpid(process.env[HOST_PPID_ENV]) ?? EARLY_PPID,
   };
   try { socket.write(JSON.stringify(clientHello) + '\n'); } catch { /* best-effort */ }
 }
@@ -328,6 +330,18 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   // busy-spinning the event loop (#799).
   treatStdinFailureAsShutdown(shutdown);
   startPpidWatchdogNoSocket(shutdown);
+  // Backstop for a launch abandoned before any of the above can see it: killed
+  // launcher + held-open pipes + reparent that beat the EARLY_PPID capture
+  // (#1185). A server that never receives a single byte isn't serving anyone.
+  // Armed after the stdin 'data' consumer above so no bytes are emitted while
+  // only the backstop's listener exists.
+  armStartupHandshakeTimeout(() => {
+    process.stderr.write(
+      '[CodeGraph MCP] No MCP traffic since startup; assuming an abandoned launch and shutting down (#1185). ' +
+      'Tune with CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS (0 disables).\n'
+    );
+    shutdown();
+  });
 
   // ---- daemon connection (background) ----
   let socket: net.Socket | null = null;
@@ -396,7 +410,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
 function startPpidWatchdogNoSocket(onDeath: () => void): void {
   const pollMs = parsePollMs(process.env.CODEGRAPH_PPID_POLL_MS);
   if (pollMs <= 0) return;
-  const originalPpid = process.ppid;
+  // Baseline from the CLI entry's earliest capture, not process.ppid here —
+  // a launcher killed during our first ~100ms would otherwise leave the
+  // baseline at 1 and blind the divergence check forever (#1185).
+  const originalPpid = EARLY_PPID;
   const hostPpid = parseHostPpid(process.env[HOST_PPID_ENV]);
   const timer = setInterval(() => {
     const reason = supervisionLostReason({
@@ -524,7 +541,10 @@ function pipeUntilClose(socket: net.Socket): Promise<void> {
 function startPpidWatchdog(socket: net.Socket): void {
   const pollMs = parsePollMs(process.env.CODEGRAPH_PPID_POLL_MS);
   if (pollMs <= 0) return;
-  const originalPpid = process.ppid;
+  // Baseline from the CLI entry's earliest capture, not process.ppid here —
+  // a launcher killed during our first ~100ms would otherwise leave the
+  // baseline at 1 and blind the divergence check forever (#1185).
+  const originalPpid = EARLY_PPID;
   const hostPpid = parseHostPpid(process.env[HOST_PPID_ENV]);
   const timer = setInterval(() => {
     const reason = supervisionLostReason({

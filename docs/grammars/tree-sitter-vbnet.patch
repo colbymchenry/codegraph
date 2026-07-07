@@ -1,0 +1,1293 @@
+diff --git a/grammar.js b/grammar.js
+index 21c8523..00bf2b1 100644
+--- a/grammar.js
++++ b/grammar.js
+@@ -21,10 +21,14 @@ const PRECEDENCE = {
+ 
+ module.exports = grammar({
+   name: "vbnet",
++  word: ($) => $._identifier_token,
++
++  externals: ($) => [$._query_clause_continuation, $.xml_literal],
++
+   extras: $ => [
+     $.comment,
+     $.preprocessor_directive,
+-    /[ \t\v\f]+/,
++    /[ \t\v\f\uFEFF]+/,
+     /\r?\n/,
+     /_[ \t]*\r?\n/,
+   ],
+@@ -38,17 +42,14 @@ module.exports = grammar({
+     $._type,
+   ],
+   conflicts: ($) => [
++    [$.binary_expression, $.assignment_expression, $.inline_assignment_statement],
+     [$.simple_name, $.generic_name],
+     [$.await_expression, $.with_expression],
+     [$._name_reference, $._type],
+     [$.object_creation_expression, $.array_creation_expression, $.array_type],
+-    [$.string_literal, $.character_literal],
+     [$._primary_expression, $.variable_declarator],
+-    [$.lambda_expression, $.with_expression],
+-    [$.lambda_expression],
+     [$.binary_expression, $.assignment_expression],
+     [$._primary_expression, $.select_element],
+-    [$.with_expression, $.select_element],
+     [$.select_clause],
+     [$._primary_expression, $.group_element],
+     [$._terminator, $._block_terminator],
+@@ -66,7 +67,6 @@ module.exports = grammar({
+     [$.aggregate_element, $.into_element],
+     [$.group_by_clause],
+     [$.else_clause],
+-    [$.if_statement],
+     [$.case_else_clause],
+     [$.case_clause],
+     [$.elseif_clause],
+@@ -75,7 +75,6 @@ module.exports = grammar({
+     [$._primary_expression, $.simple_name, $.generic_name],
+     [$._primary_expression, $.variable_declarator, $.labeled_statement],
+     [$._statement, $.with_statement],
+-    [$.dictionary_initializer, $.collection_initializer],
+     [
+       $.class_declaration,
+       $.structure_declaration,
+@@ -89,7 +88,6 @@ module.exports = grammar({
+     ],
+   ],
+ 
+-  word: ($) => $._identifier_token,
+ 
+   rules: {
+     source_file: ($) =>
+@@ -157,13 +155,14 @@ module.exports = grammar({
+       ),
+ 
+     _terminator: ($) =>
+-      choice(seq(optional(":"), choice("\n", "\r\n")), $._eof),
++      prec.right(choice(seq(optional(":"), choice("\n", "\r\n")), prec(-1, ":"), $._eof)),
+ 
+-    _block_terminator: ($) => prec.right(repeat1(choice("\n", "\r\n", $._eof))),
++    _block_terminator: ($) => prec.right(repeat1(choice("\n", "\r\n", ":", $._eof))),
+ 
+     _eof: ($) => token(prec(-10, "$")),
+ 
+-    _identifier_token: ($) => token(prec(-1, /[a-zA-Z_][a-zA-Z0-9_]*/)),
++    _identifier_token: ($) =>
++      token(prec(-1, /[\p{L}\p{Nl}_][\p{L}\p{Nl}\p{Nd}\p{Mn}\p{Pc}]*[%$&!#@]?/u)),
+ 
+     identifier: ($) =>
+       choice(
+@@ -194,7 +193,6 @@ module.exports = grammar({
+             ci("MustInherit"),
+             ci("NotInheritable"),
+             ci("Overrides"),
+-            ci("MustOverride"),
+             ci("NotOverridable"),
+             ci("Overridable"),
+             ci("Overloads"),
+@@ -225,43 +223,6 @@ module.exports = grammar({
+         $._statement  // Fallback to regular statements
+       ),
+ 
+-    _non_statement_identifier: $ => choice(
+-      // Match identifiers that don't start with statement keywords
+-      token(prec(1, seq(
+-        negative_lookahead(seq(
+-          choice(
+-            /[Tt][Rr][Yy]/,
+-            /[Ss][Ee][Ll][Ee][Cc][Tt]/,
+-            /[Ii][Ff]/,
+-            /[Ww][Hh][Ii][Ll][Ee]/,
+-            /[Dd][Oo]/,
+-            /[Ff][Oo][Rr]/,
+-            /[Uu][Ss][Ii][Nn][Gg]/,
+-            /[Ww][Ii][Tt][Hh]/,
+-            /[Tt][Hh][Rr][Oo][Ww]/,
+-            /[Rr][Ee][Tt][Uu][Rr][Nn]/,
+-            /[Ee][Xx][Ii][Tt]/,
+-            /[Cc][Oo][Nn][Tt][Ii][Nn][Uu][Ee]/,
+-            /[Ss][Tt][Oo][Pp]/,
+-            /[Ee][Nn][Dd]/,
+-            /[Gg][Oo][Tt][Oo]/,
+-            /[Rr][Ee][Ss][Uu][Mm][Ee]/,
+-            /[Ee][Rr][Rr][Oo][Rr]/,
+-            /[Oo][Nn]/,
+-            /[Rr][Ee][Dd][Ii][Mm]/,
+-            /[Ee][Rr][Aa][Ss][Ee]/,
+-            /[Ss][Yy][Nn][Cc][Ll][Oo][Cc][Kk]/,
+-            /[Rr][Aa][Ii][Ss][Ee][Ee][Vv][Ee][Nn][Tt]/,
+-            /[Aa][Dd][Dd][Hh][Aa][Nn][Dd][Ll][Ee][Rr]/,
+-            /[Rr][Ee][Mm][Oo][Vv][Ee][Hh][Aa][Nn][Dd][Ll][Ee][Rr]/
+-          ),
+-          choice(/\s/, /\r/, /\n/, /$/)
+-        )),
+-        /[a-zA-Z_][a-zA-Z0-9_]*/
+-      ))),
+-      seq("[", /[^\]]+/, "]") // Bracketed identifier can be anything
+-    ),
+-
+     local_declaration_modifier: ($) =>
+       choice(ci("Dim"), ci("Const"), ci("Static")),
+ 
+@@ -300,6 +261,8 @@ module.exports = grammar({
+     _primary_expression: ($) =>
+       choice(
+         $._literal,
++        $.array_literal,
++        $.tuple_expression,
+         $.identifier,
+         $.parenthesized_expression,
+         $.generic_invocation_expression,  // Add this before regular invocation
+@@ -320,17 +283,26 @@ module.exports = grammar({
+       ),
+ 
+     generic_invocation_expression: ($) =>
+-      prec(
+-        PRECEDENCE.INVOCATION + 1,  
++      prec.right(
++        PRECEDENCE.INVOCATION + 1,
+         seq(
+           field("function", $._expression),
+           field("type_arguments", $.type_argument_list),
+-          field("arguments", $.argument_list)
++          optional(field("arguments", $.argument_list))
+         )
+       ),
+ 
+     parenthesized_expression: ($) => seq("(", $._expression, ")"),
+ 
++    tuple_expression: ($) =>
++      seq(
++        "(",
++        choice($._expression, seq(field("name", $.identifier), ":=", $._expression)),
++        ",",
++        commaSep1(choice($._expression, seq(field("name", $.identifier), ":=", $._expression))),
++        ")"
++      ),
++
+     member_access_expression: ($) =>
+       prec.left(
+         PRECEDENCE.MEMBER_ACCESS,
+@@ -350,20 +322,23 @@ module.exports = grammar({
+         )
+       ),
+ 
+-    argument_list: ($) => seq("(", optional(commaSep1($._argument)), ")"),
++    argument_list: ($) => seq("(", optional($._arguments), ")"),
+ 
+-    _argument: ($) =>
+-      choice($._expression, $.named_argument, $.omitted_argument),
++    // Argument slots may be omitted between commas (`f(a,, b)`, `f(, x)`) —
++    // VB passes Optional parameters positionally by leaving the slot empty.
++    _arguments: ($) =>
++      seq($._argument, repeat(seq(",", optional($._argument)))),
+ 
+-    omitted_argument: ($) => token(prec(1, ",")),
++    _argument: ($) => choice($._expression, $.named_argument),
+ 
+     array_access_expression: ($) =>
+       prec(
+         PRECEDENCE.ARRAY_ACCESS,
+         seq(
+           field("array", $._expression),
++          optional("?"),
+           "(",
+-          field("indices", commaSep1($._expression)),
++          field("indices", $._arguments),
+           ")"
+         )
+       ),
+@@ -471,16 +446,53 @@ module.exports = grammar({
+       ),
+ 
+     lambda_expression: ($) =>
+-      seq(
+-        choice(ci("Function"), ci("Sub")),
+-        field("parameters", $.lambda_parameter_list),
+-        field("body", choice($._expression, $._statement_block))
++      choice(
++        prec.right(
++          seq(
++            optional(choice(ci("Async"), ci("Iterator"))),
++            choice(ci("Function"), ci("Sub")),
++            field("parameters", $.lambda_parameter_list),
++            field(
++              "body",
++              choice(
++                $._expression,
++                alias($.inline_if_statement, $.if_statement),
++                alias($.inline_throw_statement, $.throw_statement)
++              )
++            )
++          )
++        ),
++        seq(
++          optional(choice(ci("Async"), ci("Iterator"))),
++          ci("Function"),
++          field("parameters", $.lambda_parameter_list),
++          optional($.as_clause),
++          $._block_terminator,
++          repeat($._statement),
++          ci("End"), ci("Function")
++        ),
++        seq(
++          optional(choice(ci("Async"), ci("Iterator"))),
++          ci("Sub"),
++          field("parameters", $.lambda_parameter_list),
++          $._block_terminator,
++          repeat($._statement),
++          ci("End"), ci("Sub")
++        )
+       ),
+ 
+     lambda_parameter_list: ($) => seq("(", commaSep($.lambda_parameter), ")"),
+ 
+     lambda_parameter: ($) =>
+-      seq(field("name", $.identifier), optional($.as_clause)),
++      seq(
++        optional(field("modifiers", repeat1(choice(ci("ByVal"), ci("ByRef"))))),
++        field("name", $.identifier),
++        optional(choice(
++          $.array_rank_specifier,
++          seq("(", field("bounds", commaSep1($._expression)), ")")
++        )),
++        optional($.as_clause)
++      ),
+ 
+     typeof_is_expression: ($) =>
+       prec.left(
+@@ -488,7 +500,7 @@ module.exports = grammar({
+         seq(
+           ci("TypeOf"),
+           field("expression", $._expression),
+-          ci("Is"),
++          choice(seq(ci("Is"), ci("Not")), token(prec(12, ci("IsNot"))), ci("Is")),
+           field("type", $._type)
+         )
+       ),
+@@ -504,29 +516,12 @@ module.exports = grammar({
+             "initializer",
+             choice(
+               $.object_initializer, 
+-              $.collection_initializer,
+-              $.dictionary_initializer  // Add this new option
++              $.collection_initializer
+             )
+           )
+         )
+       ),
+ 
+-    dictionary_initializer: ($) =>
+-      seq(
+-        ci("From"), 
+-        "{", 
+-        commaSep($.dictionary_element), 
+-        "}"
+-      ),
+-    
+-    dictionary_element: ($) =>
+-      seq(
+-        "{",
+-        field("key", $._expression),
+-        ",",
+-        field("value", $._expression),
+-        "}"
+-      ),
+ 
+ 
+     object_initializer: ($) =>
+@@ -551,6 +546,8 @@ module.exports = grammar({
+     collection_initializer: ($) =>
+       seq(ci("From"), "{", commaSep($._expression), "}"),
+ 
++    array_literal: ($) => seq("{", commaSep($._expression), "}"),
++
+ 
+     array_creation_expression: ($) =>
+       seq(
+@@ -646,6 +643,9 @@ module.exports = grammar({
+       seq(field("object", $._expression), "!", field("member", $.identifier)),
+     _literal: ($) =>
+       choice(
++        $.xml_literal,
++        $.interpolated_string_literal,
++        $.date_literal,
+         $.string_literal,
+         $.character_literal,
+         $.integer_literal,
+@@ -654,16 +654,49 @@ module.exports = grammar({
+         $.nothing_literal,
+         $.date_literal
+       ),
+-    string_literal: ($) => seq('"', repeat(choice(/[^"\n]+/, '""')), '"'),
+-    character_literal: ($) => seq('"', choice(/[^"\n]/, '""'), '"', "c"),
++    string_literal: ($) => token(seq('"', repeat(choice(/[^"]/, '""')), '"')),
++    interpolated_string_literal: ($) =>
++      seq(
++        '$"',
++        repeat(
++          choice(
++            token.immediate(prec(101, /[^"{}]+/)),
++            token.immediate(prec(101, '""')),
++            token.immediate(prec(101, "{{")),
++            token.immediate(prec(101, "}}")),
++            $.interpolation
++          )
++        ),
++        token.immediate('"')
++      ),
++    interpolation: ($) =>
++      seq(
++        token.immediate(prec(101, "{")),
++        $._expression,
++        optional(seq(",", /-?\d+/)),
++        optional(seq(":", /[^}"\r\n]+/)),
++        "}"
++      ),
++    date_literal: ($) => token(prec(2, /#[ \t]*\d[^#\r\n]*#/)),
++    character_literal: ($) => token(seq('"', choice(/[^"\r\n]/, '""'), '"', /[cC]/)),
+     integer_literal: ($) =>
+-      token(seq(/\d+/, optional(choice("I", "UI", "L", "UL", "S", "US")))),
++      token(
++        seq(
++          choice(
++            /\d+(_+\d+)*/,
++            /&[Hh][0-9A-Fa-f]+(_+[0-9A-Fa-f]+)*/,
++            /&[Oo][0-7]+(_+[0-7]+)*/,
++            /&[Bb][01]+(_+[01]+)*/
++          ),
++          optional(choice(/[Uu][SsIiLl]/, /[SsIiLl]/, "%", "&"))
++        )
++      ),
+     floating_point_literal: ($) =>
+       token(
+         seq(
+           choice(seq(/\d+/, ".", /\d+/), seq(".", /\d+/), /\d+/),
+           optional(/[eE][+-]?\d+/),
+-          optional(choice("F", "D", "R"))
++          optional(/[FfRrDd!#@]/)
+         )
+       ),
+     boolean_literal: ($) => choice(ci("True"), ci("False")),
+@@ -672,7 +705,7 @@ module.exports = grammar({
+ 
+     // Names and types
+     _name_reference: ($) =>
+-      choice($.simple_name, $.qualified_name, $.global_qualified_name),
++      choice($.simple_name, $.generic_name, $.qualified_name, $.global_qualified_name),
+ 
+     simple_name: ($) => $.identifier,
+ 
+@@ -682,7 +715,7 @@ module.exports = grammar({
+         seq(
+           field("qualifier", $._name_reference),
+           ".",
+-          field("name", $.simple_name)
++          field("name", choice($.simple_name, $.generic_name))
+         )
+       ),
+     global_qualified_name: ($) =>
+@@ -694,6 +727,7 @@ module.exports = grammar({
+         $.simple_name,
+         $.qualified_name,
+         $.generic_name,
++        $.global_qualified_name,
+         $.predefined_type,
+         $.array_type,
+         $.tuple_type
+@@ -720,7 +754,8 @@ module.exports = grammar({
+       ),
+ 
+     generic_name: ($) => seq(field("name", $.identifier), $.type_argument_list),
+-    type_argument_list: ($) => seq("(", ci("Of"), commaSep1($._type), ")"),
++    type_argument_list: ($) =>
++      seq("(", ci("Of"), optional($._type), repeat(seq(",", optional($._type))), ")"),
+     array_type: ($) =>
+       seq(field("element_type", $._type), $.array_rank_specifier),
+     array_rank_specifier: ($) => seq("(", repeat(","), ")"),
+@@ -742,10 +777,14 @@ module.exports = grammar({
+         field("type", $._type)
+       ),
+ 
+-    as_clause: ($) => seq(
+-      ci("As"),
+-      field("declared_type", $._type)
+-    ),
++    as_clause: ($) =>
++      seq(
++        ci("As"),
++        choice(
++          $.object_creation_expression,
++          field("declared_type", $._type)
++        )
++      ),
+ 
+     implements_member_clause: ($) =>
+       seq(ci("Implements"), commaSep1($._name_reference)),
+@@ -856,7 +895,7 @@ module.exports = grammar({
+ 
+     enum_member_declaration: ($) =>
+       seq(
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         field("name", $.identifier),
+         optional(seq("=", field("value", $._expression))),
+         $._terminator
+@@ -882,6 +921,10 @@ module.exports = grammar({
+         prec(10, $.inherits_statement),
+         prec(10, $.implements_statement),
+         prec(100, $.constructor_declaration),
++        prec(150, $.external_method_declaration),
++        prec(160, $.custom_event_declaration),
++        prec(170, $.abstract_method_declaration),
++        prec(171, $.abstract_property_declaration),
+         // Explicitly add statements that can appear at class level
+         prec(200, $.try_statement),      // Very high precedence
+         prec(200, $.select_statement),   // Very high precedence
+@@ -936,33 +979,21 @@ module.exports = grammar({
+     variable_declarator: ($) =>
+       seq(
+         field("name", $.identifier),
++        optional("?"),
+         optional(choice(
+           // Array bounds specification
+           seq("(", field("bounds", commaSep1($._expression)), ")"),
+           // Array rank specification
+           $.array_rank_specifier
+         )),
+-        optional(choice(
+-          // Regular type declaration
+-          $.as_clause,
+-          seq(
+-            ci("As"),
+-            ci("New"),
+-            field("type", $._type),
+-            optional(field("arguments", $.argument_list)),
+-            optional(field("initializer", choice(
+-              $.object_initializer,
+-              $.collection_initializer
+-            )))
+-          )
+-        )),
++        optional($.as_clause),
+         optional(seq("=", field("initializer", $._expression)))
+       ),
+ 
+ 
+     field_declaration: ($) =>
+       prec.dynamic(-100, seq(
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         optional(field("modifiers", repeat1($.member_modifier))),
+         commaSep1($.variable_declarator),
+         $._terminator
+@@ -970,7 +1001,8 @@ module.exports = grammar({
+ 
+     field_variable_declarator: ($) =>
+       seq(
+-        field("name", $._non_statement_identifier),
++        field("name", $.identifier),
++        optional("?"),
+         optional($.array_rank_specifier),
+         optional($.as_clause),
+         optional(seq("=", field("initializer", $._expression)))
+@@ -978,12 +1010,13 @@ module.exports = grammar({
+ 
+     property_declaration: ($) =>
+       seq(
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         optional(field("modifiers", repeat1($.member_modifier))), // Changed
+         ci("Property"),
+         field("name", $.identifier),
+         optional(field("parameters", $.parameter_list)),
+-        $.as_clause,
++        optional($.as_clause),
++        optional(seq("=", field("initializer", $._expression))),
+         optional($.implements_member_clause),
+         optional(seq("=", field("initializer", $._expression))),
+         choice(
+@@ -1001,7 +1034,7 @@ module.exports = grammar({
+ 
+     property_getter: ($) =>
+       seq(
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         optional(field("modifiers", repeat1($.member_modifier))),
+         ci("Get"),
+         $._block_terminator,
+@@ -1013,7 +1046,7 @@ module.exports = grammar({
+ 
+     property_setter: ($) =>
+       seq(
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         optional(field("modifiers", repeat1($.member_modifier))),
+         ci("Set"),
+         optional(seq("(", field("parameter", $.parameter), ")")),
+@@ -1028,7 +1061,7 @@ module.exports = grammar({
+       prec(
+         1,
+         seq(
+-          optional(field("attributes", $.attribute_list)),
++          repeat(field("attributes", $.attribute_list)),
+           optional(field("modifiers", repeat1($.member_modifier))),
+           choice(
+             seq(
+@@ -1063,7 +1096,7 @@ module.exports = grammar({
+       prec(
+         100,
+         seq(
+-          optional(field("attributes", $.attribute_list)),
++          repeat(field("attributes", $.attribute_list)),
+           optional(field("modifiers", repeat1($.member_modifier))),
+           $._sub_new,
+           optional(field("parameters", $.parameter_list)),
+@@ -1087,7 +1120,7 @@ module.exports = grammar({
+ 
+     event_declaration: ($) =>
+       seq(
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         optional(field("modifiers", repeat1($.member_modifier))), // Changed
+         ci("Event"),
+         field("name", $.identifier),
+@@ -1098,7 +1131,7 @@ module.exports = grammar({
+ 
+     operator_declaration: ($) =>
+       seq(
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         optional(field("modifiers", repeat1($.member_modifier))), // Changed
+         ci("Operator"),
+         field(
+@@ -1152,7 +1185,7 @@ module.exports = grammar({
+ 
+     interface_method_declaration: ($) =>
+       seq(
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         optional(field("modifiers", repeat1($.member_modifier))), // Changed
+         choice(ci("Sub"), ci("Function")),
+         field("name", $.identifier),
+@@ -1164,7 +1197,7 @@ module.exports = grammar({
+ 
+     interface_property_declaration: ($) =>
+       seq(
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         optional(field("modifiers", repeat1($.member_modifier))), // Changed
+         ci("Property"),
+         field("name", $.identifier),
+@@ -1175,7 +1208,7 @@ module.exports = grammar({
+ 
+     interface_event_declaration: ($) =>
+       seq(
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         optional(field("modifiers", repeat1($.member_modifier))), // Changed
+         ci("Event"),
+         field("name", $.identifier),
+@@ -1209,7 +1242,7 @@ module.exports = grammar({
+ 
+     parameter: ($) =>
+       seq(
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         optional(
+           field(
+             "modifiers",
+@@ -1273,7 +1306,7 @@ module.exports = grammar({
+ 
+     declaration_statement: ($) =>
+       prec(1, seq(  // Add precedence
+-        optional(field("attributes", $.attribute_list)),
++        repeat(field("attributes", $.attribute_list)),
+         field("modifiers", choice(
+           $.local_declaration_modifier,
+           repeat1($.local_declaration_modifier)
+@@ -1282,6 +1315,65 @@ module.exports = grammar({
+         $._terminator
+       )),
+ 
++    _inline_statements: ($) =>
++      prec.right(seq($._inline_statement, repeat(seq(":", $._inline_statement)))),
++
++    _inline_statement: ($) =>
++      choice(
++        alias($.inline_if_statement, $.if_statement),
++        alias($.inline_assignment_statement, $.assignment_statement),
++        alias($.inline_return_statement, $.return_statement),
++        alias($.inline_throw_statement, $.throw_statement),
++        alias($.inline_goto_statement, $.goto_statement),
++        alias($.inline_exit_statement, $.exit_statement),
++        alias($.inline_continue_statement, $.continue_statement),
++        alias($.inline_call_statement, $.call_statement),
++        alias($.inline_raiseevent_statement, $.raiseevent_statement),
++        alias($.inline_expression_statement, $.expression_statement)
++      ),
++
++    inline_assignment_statement: ($) =>
++      prec.right(
++        PRECEDENCE.ASSIGNMENT + 1,
++        seq(
++          field("left", choice(
++            $.identifier,
++            $.member_access_expression,
++            $.array_access_expression
++          )),
++          field(
++            "operator",
++            choice("=", "+=", "-=", "*=", "/=", "\\=", "^=", "&=", "<<=", ">>=")
++          ),
++          field("right", $._expression)
++        )
++      ),
++    inline_return_statement: ($) => prec.right(1, seq(ci("Return"), optional($._expression))),
++    inline_throw_statement: ($) => prec.right(1, seq(ci("Throw"), optional($._expression))),
++    inline_goto_statement: ($) => seq(ci("GoTo"), field("label", $.identifier)),
++    inline_exit_statement: ($) =>
++      seq(
++        ci("Exit"),
++        choice(ci("Do"), ci("For"), ci("While"), ci("Select"), ci("Sub"), ci("Function"), ci("Property"), ci("Try"))
++      ),
++    inline_continue_statement: ($) =>
++      seq(ci("Continue"), choice(ci("Do"), ci("For"), ci("While"))),
++    inline_call_statement: ($) => prec.right(1, seq(ci("Call"), $._expression)),
++    inline_raiseevent_statement: ($) =>
++      prec.right(1, seq(ci("RaiseEvent"), field("event", $.identifier), optional(field("arguments", $.argument_list)))),
++    inline_expression_statement: ($) => prec.right(1, $._expression),
++
++    inline_if_statement: ($) =>
++      prec.right(
++        seq(
++          ci("If"),
++          field("condition", $._expression),
++          ci("Then"),
++          field("then_statement", $._inline_statements),
++          optional(seq(ci("Else"), field("else_statement", $._inline_statements)))
++        )
++      ),
++
+     expression_statement: ($) => seq($._expression, $._terminator),
+ 
+     assignment_statement: ($) =>
+@@ -1301,21 +1393,96 @@ module.exports = grammar({
+           $._terminator
+         )
+       ),
++    custom_event_declaration: ($) =>
++      seq(
++        repeat(field("attributes", $.attribute_list)),
++        optional(field("modifiers", repeat1($.member_modifier))),
++        ci("Custom"),
++        ci("Event"),
++        field("name", $.identifier),
++        $.as_clause,
++        optional($.implements_member_clause),
++        $._block_terminator,
++        repeat($.event_accessor),
++        ci("End"), ci("Event"),
++        $._terminator
++      ),
++
++    event_accessor: ($) =>
++      seq(
++        choice(ci("AddHandler"), ci("RemoveHandler"), ci("RaiseEvent")),
++        optional(field("parameters", $.parameter_list)),
++        $._block_terminator,
++        repeat($._statement),
++        ci("End"),
++        choice(ci("AddHandler"), ci("RemoveHandler"), ci("RaiseEvent")),
++        $._terminator
++      ),
++
++    _mustoverride_token: ($) => token(prec(11, ci("MustOverride"))),
++
++    abstract_method_declaration: ($) =>
++      seq(
++        repeat(field("attributes", $.attribute_list)),
++        optional(field("modifiers", repeat1($.member_modifier))),
++        $._mustoverride_token,
++        optional(field("modifiers", repeat1($.member_modifier))),
++        choice(ci("Sub"), ci("Function")),
++        field("name", $.identifier),
++        optional(field("type_parameters", $.type_parameter_list)),
++        optional(field("parameters", $.parameter_list)),
++        optional($.as_clause),
++        optional($.implements_member_clause),
++        $._terminator
++      ),
++
++    abstract_property_declaration: ($) =>
++      seq(
++        repeat(field("attributes", $.attribute_list)),
++        optional(field("modifiers", repeat1($.member_modifier))),
++        $._mustoverride_token,
++        optional(field("modifiers", repeat1($.member_modifier))),
++        ci("Property"),
++        field("name", $.identifier),
++        optional(field("parameters", $.parameter_list)),
++        optional($.as_clause),
++        optional($.implements_member_clause),
++        $._terminator
++      ),
++
++    external_method_declaration: ($) =>
++      seq(
++        repeat(field("attributes", $.attribute_list)),
++        optional(field("modifiers", repeat1($.member_modifier))),
++        ci("Declare"),
++        optional(choice(ci("Auto"), ci("Ansi"), ci("Unicode"))),
++        choice(ci("Sub"), ci("Function")),
++        field("name", $.identifier),
++        ci("Lib"),
++        field("library", $.string_literal),
++        optional(seq(ci("Alias"), field("alias", $.string_literal))),
++        optional(field("parameters", $.parameter_list)),
++        optional($.as_clause),
++        $._terminator
++      ),
++
+     call_statement: ($) => seq(ci("Call"), $._expression, $._terminator),
+ 
+     if_statement: ($) =>
+       seq(
+         ci("If"),
+         field("condition", $._expression),
+-        ci("Then"),
+         choice(
+-          // Single-line if
++          // Single-line if: inline statements, optional Else, one terminator
+           seq(
+-            field("then_statement", $._statement),
+-            optional(seq(ci("Else"), field("else_statement", $._statement)))
++            ci("Then"),
++            field("then_statement", $._inline_statements),
++            optional(seq(ci("Else"), field("else_statement", $._inline_statements))),
++            $._terminator
+           ),
+           // Multi-line if
+           seq(
++            optional(ci("Then")),
+             $._block_terminator,
+             field("then_branch", repeat($._statement)),
+             repeat($.elseif_clause),
+@@ -1331,7 +1498,7 @@ module.exports = grammar({
+       seq(
+         ci("ElseIf"),
+         field("condition", $._expression),
+-        ci("Then"),
++        optional(ci("Then")),
+         $._block_terminator,
+         field("body", repeat($._statement))
+       ),
+@@ -1445,7 +1612,7 @@ module.exports = grammar({
+     using_statement: ($) =>
+       seq(
+         ci("Using"),
+-        field("resource", choice($.variable_declarator, $._expression)),
++        commaSep1(field("resource", choice($.variable_declarator, $._expression))),
+         $._block_terminator,
+         field("body", repeat($._statement)),
+         ci("End"),
+@@ -1590,14 +1757,25 @@ module.exports = grammar({
+         $._terminator
+       ), // LINQ Query expressions
+     query_expression: ($) =>
+-      seq($.from_clause, repeat($.query_body_clause), $.select_or_group_clause),
+-    from_clause: ($) => seq(ci("From"), commaSep1($.collection_range_variable)),
++      prec.right(
++        choice(
++          seq(
++            $.from_clause,
++            repeat(seq(optional($._query_clause_continuation), $.query_body_clause)),
++            optional(seq(optional($._query_clause_continuation), $.select_or_group_clause))
++          ),
++          $.aggregate_clause
++        )
++      ),
++    from_clause: ($) => prec.right(seq(ci("From"), commaSep1($.collection_range_variable))),
+     collection_range_variable: ($) =>
+-      seq(
+-        field("variable", $.identifier),
+-        optional($.as_clause),
+-        ci("In"),
+-        field("collection", $._expression)
++      prec.right(
++        seq(
++          field("variable", $.identifier),
++          optional($.as_clause),
++          ci("In"),
++          field("collection", $._expression)
++        )
+       ),
+     query_body_clause: ($) =>
+       choice(
+@@ -1606,48 +1784,62 @@ module.exports = grammar({
+         $.where_clause,
+         $.join_clause,
+         $.order_by_clause,
+-        $.aggregate_clause
+-      ),
+-    let_clause: ($) => seq(ci("Let"), commaSep1($.expression_range_variable)),
++        $.aggregate_clause,
++        $.distinct_clause,
++        $.skip_take_clause
++      ),
++    distinct_clause: ($) => ci("Distinct"),
++    skip_take_clause: ($) =>
++      prec.right(seq(choice(ci("Skip"), ci("Take")), optional(ci("While")), $._expression)),
++    let_clause: ($) => prec.right(seq(ci("Let"), commaSep1($.expression_range_variable))),
+     expression_range_variable: ($) =>
+-      seq(
++      prec.right(seq(
+         field("variable", $.identifier),
+         "=",
+         field("expression", $._expression)
+-      ),
+-    where_clause: ($) => seq(ci("Where"), field("condition", $._expression)),
++      )),
++    where_clause: ($) =>
++      prec.right(seq(ci("Where"), field("condition", $._expression))),
+     join_clause: ($) =>
+-      seq(
+-        ci("Join"),
+-        $.collection_range_variable,
+-        ci("On"),
+-        commaSep1($.join_condition)
++      prec.right(
++        seq(
++          ci("Join"),
++          $.collection_range_variable,
++          optional($._query_clause_continuation),
++          ci("On"),
++          commaSep1($.join_condition)
++        )
+       ),
+     join_condition: ($) =>
+-      seq(
++      prec.right(seq(
+         field("left", $._expression),
+         ci("Equals"),
+         field("right", $._expression)
+-      ),
+-    order_by_clause: ($) => seq(ci("Order"), ci("By"), commaSep1($.ordering)),
++      )),
++    order_by_clause: ($) => prec.right(seq(ci("Order"), ci("By"), commaSep1($.ordering))),
+     ordering: ($) =>
+-      seq(
+-        field("expression", $._expression),
+-        optional(choice(ci("Ascending"), ci("Descending")))
++      prec.right(
++        seq(
++          field("expression", $._expression),
++          optional(choice(ci("Ascending"), ci("Descending")))
++        )
+       ),
+     aggregate_clause: ($) =>
+-      seq(
+-        ci("Aggregate"),
+-        $.collection_range_variable,
+-        repeat($.query_body_clause),
+-        ci("Into"),
+-        commaSep1($.aggregate_element)
++      prec.right(
++        seq(
++          ci("Aggregate"),
++          $.collection_range_variable,
++          repeat(seq(optional($._query_clause_continuation), $.query_body_clause)),
++          optional($._query_clause_continuation),
++          ci("Into"),
++          commaSep1($.aggregate_element)
++        )
+       ),
+     aggregate_element: ($) =>
+-      seq(
++      prec.right(seq(
+         optional(seq(field("name", $.identifier), "=")),
+         field("function", $.aggregate_function)
+-      ),
++      )),
+     aggregate_function: ($) =>
+       seq(
+         field(
+@@ -1668,42 +1860,44 @@ module.exports = grammar({
+     select_or_group_clause: ($) => choice($.select_clause, $.group_by_clause),
+     select_clause: ($) => seq(ci("Select"), commaSep1($.select_element)),
+     select_element: ($) =>
+-      choice(
++      prec.right(choice(
+         $._expression,
+         seq(
+           field("name", $.identifier),
+           "=",
+           field("expression", $._expression)
+         )
+-      ),
++      )),
+     group_by_clause: ($) =>
+-      seq(
+-        ci("Group"),
+-        commaSep1($.group_element),
+-        ci("By"),
+-        commaSep1($.by_element),
+-        ci("Into"),
+-        commaSep1($.into_element)
++      prec.right(
++        seq(
++          ci("Group"),
++          commaSep1($.group_element),
++          ci("By"),
++          commaSep1($.by_element),
++          ci("Into"),
++          commaSep1($.into_element)
++        )
+       ),
+     group_element: ($) =>
+-      choice(
++      prec.right(choice(
+         $._expression,
+         seq(
+           field("name", $.identifier),
+           "=",
+           field("expression", $._expression)
+         )
+-      ),
++      )),
+     by_element: ($) =>
+-      choice(
++      prec.right(choice(
+         $._expression,
+         seq(
+           field("name", $.identifier),
+           "=",
+           field("expression", $._expression)
+         )
+-      ),
+-    into_element: ($) => choice($.identifier, $.aggregate_element),
++      )),
++    into_element: ($) => prec.right(choice($.identifier, $.aggregate_element)),
+ 
+     // Comments
+     comment: ($) => token(prec(100, choice(
+@@ -1714,7 +1908,7 @@ module.exports = grammar({
+     ))),
+ 
+     // Preprocessor Directives
+-    preprocessor_directive: ($) => token(seq("#", /[^\r\n]*/)),
++    preprocessor_directive: ($) => token(seq("#", /[ \t]*[A-Za-z][^\r\n]*/)),
+   },
+ });
+ 
+diff --git a/src/scanner.c b/src/scanner.c
+new file mode 100644
+index 0000000..8334fdb
+--- /dev/null
++++ b/src/scanner.c
+@@ -0,0 +1,303 @@
++#include "tree_sitter/parser.h"
++#include <string.h>
++#include <wctype.h>
++
++// External tokens for the two constructs that are not LR(1)-parseable with
++// tree-sitter's newline-as-extra treatment:
++//
++// 1. QUERY_CLAUSE_CONTINUATION — a newline run that CONTINUES a LINQ query
++//    (`From x In xs` ↵ `Where …`). At a clause boundary the parser cannot
++//    know from the newline alone whether the query ends (newline = statement
++//    terminator) or continues (newline = insignificant, next line starts with
++//    a query keyword). The scanner looks past the newline at the next word
++//    and only emits the token when it is a query-clause keyword — so the
++//    terminator/continuation choice is made by the lexer, not the LR table.
++//
++// 2. XML_LITERAL — a whole VB XML literal (`<Tags><Tag/></Tags>`, including
++//    `<%= expr %>` embedded expressions, comments, CDATA) consumed as one
++//    opaque token. Only valid where a literal can begin an expression, so a
++//    relational `<` (which always FOLLOWS an expression) can never collide.
++
++enum TokenType {
++  QUERY_CLAUSE_CONTINUATION,
++  XML_LITERAL,
++};
++
++void *tree_sitter_vbnet_external_scanner_create(void) { return NULL; }
++void tree_sitter_vbnet_external_scanner_destroy(void *payload) { (void)payload; }
++unsigned tree_sitter_vbnet_external_scanner_serialize(void *payload, char *buffer) {
++  (void)payload; (void)buffer;
++  return 0; // stateless
++}
++void tree_sitter_vbnet_external_scanner_deserialize(void *payload, const char *buffer, unsigned length) {
++  (void)payload; (void)buffer; (void)length;
++}
++
++static inline void advance(TSLexer *lexer) { lexer->advance(lexer, false); }
++static inline void skip_ws(TSLexer *lexer) { lexer->advance(lexer, true); }
++
++// Read one alphabetic word (advancing past it), lowercased into buf.
++// Returns its length (0 if the next char is not a letter).
++static int read_word(TSLexer *lexer, char *buf, int cap) {
++  int n = 0;
++  while (iswalpha((wint_t)lexer->lookahead)) {
++    if (n < cap - 1) buf[n] = (char)towlower((wint_t)lexer->lookahead);
++    n++;
++    advance(lexer);
++  }
++  buf[n < cap - 1 ? n : cap - 1] = 0;
++  return n;
++}
++
++static bool is_query_keyword(const char *w) {
++  static const char *kws[] = {
++    "where", "select", "order",    "group", "join", "let",  "skip",
++    "take",  "distinct", "aggregate", "from",  "into", "on",   NULL,
++  };
++  for (int i = 0; kws[i]; i++)
++    if (strcmp(w, kws[i]) == 0) return true;
++  return false;
++}
++
++// [ \t\r]* '\n' [ \t\r\n]*  followed by a query-clause keyword.
++// The token covers only the whitespace/newline run (mark_end before the
++// keyword lookahead), so the clause keyword itself lexes normally after it.
++static bool scan_query_continuation(TSLexer *lexer) {
++  bool saw_newline = false;
++  for (;;) {
++    int32_t c = lexer->lookahead;
++    if (c == ' ' || c == '\t' || c == '\r') {
++      advance(lexer);
++    } else if (c == '\n') {
++      saw_newline = true;
++      advance(lexer);
++    } else {
++      break;
++    }
++  }
++  if (!saw_newline) return false;
++  lexer->mark_end(lexer);
++
++  char w[12];
++  int n = read_word(lexer, w, sizeof w);
++  if (n == 0 || n >= (int)(sizeof w)) return false;
++  if (!is_query_keyword(w)) return false;
++
++  // `Select Case` opens a statement, never a select clause.
++  if (strcmp(w, "select") == 0) {
++    while (lexer->lookahead == ' ' || lexer->lookahead == '\t') advance(lexer);
++    char w2[8];
++    int m = read_word(lexer, w2, sizeof w2);
++    if (m > 0 && m < (int)(sizeof w2) && strcmp(w2, "case") == 0) return false;
++  }
++
++  lexer->result_symbol = QUERY_CLAUSE_CONTINUATION;
++  return true;
++}
++
++// Consume a VB string inside an embedded `<%= … %>` region ("" escapes).
++static void consume_vb_string(TSLexer *lexer) {
++  advance(lexer); // opening quote
++  for (;;) {
++    if (lexer->lookahead == 0) return;
++    if (lexer->lookahead == '"') {
++      advance(lexer);
++      if (lexer->lookahead != '"') return; // closing (not an escaped "")
++      // escaped quote: fall through, keep consuming
++    }
++    advance(lexer);
++  }
++}
++
++// Consume `<%= … %>` starting at the '%' (the '<' is already consumed).
++// Embedded expressions NEST (`<%= From t In ts Select <Tag><%= t.Name %></Tag> %>`,
++// the staxrip WriteTagfile shape), so track <% / %> depth.
++static bool consume_embedded_expression(TSLexer *lexer) {
++  advance(lexer); // '%'
++  int depth = 1;
++  for (;;) {
++    int32_t c = lexer->lookahead;
++    if (c == 0) return false;
++    if (c == '"') { consume_vb_string(lexer); continue; }
++    if (c == '<') {
++      advance(lexer);
++      if (lexer->lookahead == '%') { depth++; advance(lexer); }
++      continue;
++    }
++    if (c == '%') {
++      advance(lexer);
++      if (lexer->lookahead == '>') {
++        advance(lexer);
++        if (--depth == 0) return true;
++      }
++      continue;
++    }
++    advance(lexer);
++  }
++}
++
++// Consume `<!-- … -->` / `<![CDATA[ … ]]>` / `<!DOCTYPE …>` starting at '!'.
++static bool consume_bang_construct(TSLexer *lexer) {
++  advance(lexer); // '!'
++  if (lexer->lookahead == '-') {
++    // comment: to -->
++    int dashes = 0;
++    for (;;) {
++      int32_t c = lexer->lookahead;
++      if (c == 0) return false;
++      if (c == '-') { dashes++; advance(lexer); continue; }
++      if (c == '>' && dashes >= 2) { advance(lexer); return true; }
++      dashes = 0;
++      advance(lexer);
++    }
++  }
++  if (lexer->lookahead == '[') {
++    // CDATA: to ]]>
++    int brackets = 0;
++    for (;;) {
++      int32_t c = lexer->lookahead;
++      if (c == 0) return false;
++      if (c == ']') { brackets++; advance(lexer); continue; }
++      if (c == '>' && brackets >= 2) { advance(lexer); return true; }
++      brackets = 0;
++      advance(lexer);
++    }
++  }
++  // DOCTYPE-ish: to bare >
++  for (;;) {
++    int32_t c = lexer->lookahead;
++    if (c == 0) return false;
++    if (c == '>') { advance(lexer); return true; }
++    advance(lexer);
++  }
++}
++
++// Consume `<? … ?>` starting at the '?'.
++static bool consume_processing_instruction(TSLexer *lexer) {
++  advance(lexer); // '?'
++  for (;;) {
++    int32_t c = lexer->lookahead;
++    if (c == 0) return false;
++    if (c == '?') {
++      advance(lexer);
++      if (lexer->lookahead == '>') { advance(lexer); return true; }
++      continue;
++    }
++    advance(lexer);
++  }
++}
++
++static bool is_name_start(int32_t c) {
++  return iswalpha((wint_t)c) || c == '_';
++}
++
++static bool scan_xml_literal(TSLexer *lexer) {
++  // Only same-line blanks are skipped: a leading newline must stay unconsumed
++  // so it can serve as a statement/block terminator (a successful scan would
++  // otherwise swallow it as trivia). XML on a continuation line still works:
++  // the newline is consumed as an extra first, then the scanner re-runs.
++  while (lexer->lookahead == ' ' || lexer->lookahead == '\t') skip_ws(lexer);
++  if (lexer->lookahead != '<') return false;
++  advance(lexer);
++  // Only element-start markup opens an XML literal here; comments/PIs as the
++  // outermost construct (`Dim d = <?xml …`) are rare enough to leave alone,
++  // and a bare `<` (comparison) never begins an expression.
++  if (!is_name_start(lexer->lookahead)) return false;
++
++  int depth = 0;      // open (unclosed) elements
++  bool in_tag = true; // inside <...> of an element tag
++  bool closing = false;
++  int32_t quote = 0;
++
++  for (;;) {
++    int32_t c = lexer->lookahead;
++    if (c == 0) return false; // unterminated: let the normal parser error
++
++    if (in_tag) {
++      if (quote) {
++        if (c == quote) quote = 0;
++        advance(lexer);
++        continue;
++      }
++      if (c == '"' || c == '\'') { quote = c; advance(lexer); continue; }
++      if (c == '<') {
++        advance(lexer);
++        if (lexer->lookahead == '%') {
++          // attribute value embedded expression: attr=<%= x %>
++          if (!consume_embedded_expression(lexer)) return false;
++          continue;
++        }
++        continue; // stray < in a tag: malformed, keep consuming
++      }
++      if (c == '/') {
++        advance(lexer);
++        if (lexer->lookahead == '>') {
++          // self-closing tag
++          advance(lexer);
++          in_tag = false;
++          if (depth == 0) break; // single self-closed root: done
++          continue;
++        }
++        continue;
++      }
++      if (c == '>') {
++        advance(lexer);
++        if (closing) {
++          depth--;
++          if (depth <= 0) break; // root element closed: done
++        } else {
++          depth++;
++        }
++        in_tag = false;
++        continue;
++      }
++      advance(lexer);
++      continue;
++    }
++
++    // text content between tags
++    if (c == '<') {
++      advance(lexer);
++      int32_t d = lexer->lookahead;
++      if (d == '/') { advance(lexer); closing = true; in_tag = true; continue; }
++      if (d == '%') {
++        if (!consume_embedded_expression(lexer)) return false;
++        continue;
++      }
++      if (d == '!') {
++        if (!consume_bang_construct(lexer)) return false;
++        continue;
++      }
++      if (d == '?') {
++        if (!consume_processing_instruction(lexer)) return false;
++        continue;
++      }
++      closing = false;
++      in_tag = true; // opening tag
++      continue;
++    }
++    advance(lexer);
++  }
++
++  lexer->mark_end(lexer);
++  lexer->result_symbol = XML_LITERAL;
++  return true;
++}
++
++bool tree_sitter_vbnet_external_scanner_scan(void *payload, TSLexer *lexer, const bool *valid_symbols) {
++  (void)payload;
++  int32_t c = lexer->lookahead;
++  bool ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
++
++  // A scan attempt advances the lexer, so exactly ONE attempt runs per
++  // invocation — never chain a second attempt after a failed first (its
++  // reads would start mid-stream). The leading character picks the branch;
++  // a false return discards the attempt entirely.
++  if (valid_symbols[QUERY_CLAUSE_CONTINUATION] && ws) {
++    return scan_query_continuation(lexer);
++  }
++  if (valid_symbols[XML_LITERAL] && (c == '<' || ws)) {
++    return scan_xml_literal(lexer);
++  }
++  return false;
++}

@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -107,6 +107,49 @@ describe('Language Detection', () => {
     expect(isSourceFile('Renderer/Shaders.metal')).toBe(true);
   });
 
+  it('should detect CUDA files as C++ (#387)', () => {
+    expect(detectLanguage('kernels/scan.cu')).toBe('cpp');
+    expect(detectLanguage('include/reduce.cuh')).toBe('cpp');
+    expect(isSourceFile('csrc/flash_attn/softmax.cu')).toBe(true);
+    expect(isSourceFile('include/block_reduce.cuh')).toBe(true);
+  });
+
+  it('should detect Erlang files', () => {
+    expect(detectLanguage('src/my_server.erl')).toBe('erlang');
+    expect(detectLanguage('include/records.hrl')).toBe('erlang');
+    expect(detectLanguage('bin/release_tool.escript')).toBe('erlang');
+    // OTP app resource files route by full suffix — `.src` alone is too generic.
+    expect(detectLanguage('src/myapp.app.src')).toBe('erlang');
+    expect(detectLanguage('ebin/myapp.app')).toBe('erlang');
+    expect(detectLanguage('legacy/module.src')).toBe('unknown');
+    expect(isSourceFile('src/myapp.app.src')).toBe(true);
+    expect(isSourceFile('ebin/myapp.app')).toBe(true);
+    expect(isSourceFile('legacy/module.src')).toBe(false);
+  });
+
+  it('should detect Solidity files', () => {
+    expect(detectLanguage('contracts/Vault.sol')).toBe('solidity');
+  });
+
+  it('should detect Terraform files', () => {
+    expect(detectLanguage('main.tf')).toBe('terraform');
+    expect(detectLanguage('variables.tf')).toBe('terraform');
+    expect(detectLanguage('terraform.tfvars')).toBe('terraform');
+    expect(detectLanguage('versions.tofu')).toBe('terraform');
+  });
+
+  it('should detect ArkTS files', () => {
+    expect(detectLanguage('entry/src/main/ets/pages/Index.ets')).toBe('arkts');
+    // Plain `.ts` in a HarmonyOS project is still TypeScript.
+    expect(detectLanguage('entry/src/main/ets/common/utils.ts')).toBe('typescript');
+  });
+
+  it('should detect Nix files', () => {
+    expect(detectLanguage('default.nix')).toBe('nix');
+    expect(detectLanguage('pkgs/development/tools/misc/codegraph/default.nix')).toBe('nix');
+    expect(isSourceFile('default.nix')).toBe(true);
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -135,6 +178,147 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('solidity');
+    expect(languages).toContain('nix');
+  });
+});
+
+describe('Nix Extraction', () => {
+  it('should distinguish Nix variable and function bindings', () => {
+    const code = `
+let
+  plainValue = 10;
+  simpleFn = arg: arg + 1;
+  destructuredFn = { lib, stdenv }: lib.getName stdenv;
+  curriedFn = a: b: builtins.toString (a + b);
+in
+{
+  exportedValue = plainValue;
+  exportedFn = curriedFn;
+}
+`;
+
+    const result = extractFromSource('default.nix', code);
+
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'plainValue')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'exportedValue')).toBeDefined();
+
+    const simpleFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'simpleFn');
+    const destructuredFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'destructuredFn');
+    const curriedFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'curriedFn');
+
+    expect(simpleFn?.signature).toBe('(arg)');
+    expect(destructuredFn?.signature).toBe('{ lib, stdenv }');
+    expect(curriedFn?.signature).toBe('a : b');
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('lib.getName');
+    expect(calls.filter((name) => name === 'builtins.toString')).toHaveLength(1);
+  });
+
+  it('should extract inherited Nix attributes as variables', () => {
+    const code = `
+let
+  inherit lib;
+  inherit (pkgs) stdenv writeShellScriptBin;
+in
+stdenv.mkDerivation {}
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const variables = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+
+    expect(variables).toContain('lib');
+    expect(variables).toContain('stdenv');
+    expect(variables).toContain('writeShellScriptBin');
+  });
+
+  it('should emit only static project path imports for Nix import calls', () => {
+    const code = `
+let
+  local = import ./x.nix;
+  defaultFile = builtins.import ./dir;
+  packageSet = import <nixpkgs> {};
+  fromSources = import sources.nixpkgs {};
+  dynamic = import selectedPath;
+in
+local
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+
+    expect(imports).toEqual(['./x.nix', './dir']);
+    expect(importRefs).toEqual(['./x.nix', './dir']);
+  });
+
+  it('should emit file imports for NixOS module imports/modules lists (literal paths only)', () => {
+    const code = `
+{ config, lib, ... }:
+{
+  imports = [ ./hardware.nix ../common inputs.foo.nixosModules.bar ];
+  home-manager.users.demo.imports = [ ./home.nix ];
+  flake.modules = [ ./configuration.nix ];
+  notAModuleList = [ ./ignored.nix ];
+}
+`;
+
+    const result = extractFromSource('configuration.nix', code);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+
+    expect(importRefs).toEqual(['./hardware.nix', '../common', './home.nix', './configuration.nix']);
+    // The dynamic entry (inputs.foo.nixosModules.bar) must not create a ref.
+    expect(importRefs).not.toContain('inputs.foo.nixosModules.bar');
+  });
+
+  it('should emit file imports for callPackage with a literal path and skip dynamic ones', () => {
+    const code = `
+{ pkgs, newScope }:
+let
+  hello = pkgs.callPackage ./pkgs/hello { };
+  tools = pkgs.callPackages ../tools/all.nix { };
+  dynamic = pkgs.callPackage pkgPath { };
+in
+{
+  inherit hello tools dynamic;
+}
+`;
+
+    const result = extractFromSource('overlay.nix', code);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+
+    expect(importRefs).toEqual(['./pkgs/hello', '../tools/all.nix']);
+    // The call edge to callPackage itself is still recorded.
+    expect(calls).toContain('pkgs.callPackage');
+  });
+
+  it('should mark returned top-level Nix attrset members exported and keep let or nested attrs private', () => {
+    const code = `
+{ lib, stdenv }:
+let
+  localValue = 10;
+in
+{
+  exported = localValue;
+  package = { name }: stdenv.mkDerivation { inherit name; };
+  nested = {
+    privateNested = true;
+  };
+  inherit (lib) licenses;
+}
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const node = (name: string) => result.nodes.find((n) => n.name === name);
+
+    expect(node('localValue')?.isExported).toBe(false);
+    expect(node('exported')?.isExported).toBe(true);
+    expect(node('package')?.kind).toBe('function');
+    expect(node('package')?.isExported).toBe(true);
+    expect(node('privateNested')?.isExported).toBe(false);
+    expect(node('licenses')?.isExported).toBe(true);
   });
 });
 
@@ -2925,6 +3109,333 @@ kernel void computeBlur(texture2d<float, access::read> inTexture [[texture(0)]],
       ]) {
         expect(blankMetalAttributes(c)).toBe(c);
       }
+    });
+  });
+
+  describe('CUDA extraction (#387)', () => {
+    // CUDA parses with the C++ grammar. Three CUDA-only shapes misparse:
+    // execution-space specifiers (`__global__ void f(…)`) shunt the real return
+    // type into an ERROR node, `__shared__ float tile[256]` mangles the declared
+    // name to `float`, and — the critical one — `k<<<grid, block>>>(args)` lexes
+    // as shift operators around an empty-named template so NO call_expression
+    // (and therefore no host→kernel call edge) exists. blankCudaConstructs
+    // (preParse, `.cu`/`.cuh`-gated) blanks all three so extraction matches
+    // plain C++.
+    const CUDA = `#include <cuda_runtime.h>
+#include "kernels.cuh"
+
+__constant__ float d_scale[16];
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__global__ void scale_kernel(float* out, const float* __restrict__ in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float tile[256];
+    if (i < n) {
+        tile[threadIdx.x] = in[i];
+        __syncthreads();
+        out[i] = warp_reduce_sum(tile[threadIdx.x]) * d_scale[0];
+    }
+}
+
+__global__ void __launch_bounds__(256, 4) bounded_kernel(float* data, int n) {
+    if (blockIdx.x * blockDim.x + threadIdx.x < n) data[0] *= 2.0f;
+}
+
+template <typename T, int BLOCK>
+__global__ void templated_kernel(T* data, int n) {
+    if (blockIdx.x * BLOCK + threadIdx.x < n) data[0] += T(1);
+}
+
+class GpuBuffer {
+public:
+    explicit GpuBuffer(size_t n) { cudaMalloc(&ptr_, n * sizeof(float)); }
+    ~GpuBuffer() { cudaFree(ptr_); }
+private:
+    float* ptr_ = nullptr;
+};
+
+void launch_scale(float* out, const float* in, int n, cudaStream_t stream) {
+    dim3 block(256);
+    dim3 grid((n + block.x - 1) / block.x);
+    scale_kernel<<<grid, block, 0, stream>>>(out, in, n);
+    bounded_kernel<<<grid,
+                     block>>>(out, n);
+    templated_kernel<float, 256><<<grid, block>>>(out, n);
+}
+`;
+
+    it('extracts kernels, device functions, and host→kernel launch calls from a .cu file', () => {
+      const result = extractFromSource('kernels/scan.cu', CUDA);
+      expect(result.errors).toHaveLength(0);
+
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(functions).toEqual(
+        expect.arrayContaining([
+          'warp_reduce_sum',
+          'scale_kernel',
+          'bounded_kernel',
+          'templated_kernel',
+          'launch_scale',
+        ])
+      );
+      expect(result.nodes.filter((n) => n.kind === 'class').map((n) => n.name)).toContain('GpuBuffer');
+      expect(result.nodes.find((n) => n.kind === 'import')?.name).toBe('cuda_runtime.h');
+
+      // No misparse artifacts: pre-blank, `__shared__ float tile[256]` parsed
+      // with `float` as the declared name. (Top-level C++ variables aren't
+      // extracted as nodes — matching plain-C++ behavior is the target.)
+      expect(result.nodes.map((n) => n.name)).not.toContain('float');
+
+      // Blanking is offset-preserving, so positions stay exact.
+      expect(result.nodes.find((n) => n.name === 'scale_kernel')!.startLine).toBe(13);
+
+      // THE point of CUDA support: every `<<<…>>>` launch form — plain,
+      // launch-bounds, multi-line config, and templated — emits a `calls`
+      // reference, so the host→kernel edge exists in the graph. Pre-blank,
+      // the chevrons lexed as shifts and none of these existed.
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      // The templated launch is normalized to the bare kernel name (template
+      // args stripped at extraction, like base-class extends refs — #1043), so
+      // it resolves to the kernel the template was defined as.
+      expect(calls).toEqual(
+        expect.arrayContaining([
+          'scale_kernel',
+          'bounded_kernel',
+          'templated_kernel',
+          'warp_reduce_sum',
+        ])
+      );
+    });
+
+    it('blankCudaConstructs blanks every CUDA form, offset- and newline-preserving', () => {
+      const inp = [
+        '__global__ void __launch_bounds__(256, 4) step(float* p) {',
+        '    __shared__ float tile[32];',
+        '}',
+        '__host__ __device__ int both() { return 0; }',
+        'void run(float* p, int n) {',
+        '    step<<<grid,',
+        '           block, 0, stream>>>(p);',
+        '}',
+      ].join('\n');
+      const out = blankCudaConstructs(inp);
+      expect(out.length).toBe(inp.length); // every byte offset preserved
+      expect(out.split('\n').length).toBe(inp.split('\n').length); // newlines survive the multi-line launch config
+      expect(out).not.toMatch(/__global__|__launch_bounds__|__shared__|__host__|__device__|<<<|>>>/);
+      // Collapsing blank runs gives plain C++ back.
+      expect(out.split('\n').map((l) => l.replace(/ +/g, ' ').trimEnd())).toEqual([
+        ' void step(float* p) {',
+        ' float tile[32];',
+        '}',
+        ' int both() { return 0; }',
+        'void run(float* p, int n) {',
+        ' step',
+        ' (p);',
+        '}',
+      ]);
+    });
+
+    it('blankCudaConstructs never touches non-CUDA chevrons or identifiers', () => {
+      for (const c of [
+        'std::cout << "a" << b << c;', // shift chains — never three consecutive <
+        'auto x = f(a >> 3, b >> 3);', // right shifts
+        'std::vector<std::vector<std::vector<int>>> deep;', // template >>> closer with no <<< opener
+        'printf("<<<unterminated");', // <<< in a string with no >>> anywhere
+        'int __restrict__like = 1;', // dunder-ish identifier not in the specifier list
+        'int z = 1;', // nothing CUDA at all — early-return path
+      ]) {
+        expect(blankCudaConstructs(c)).toBe(c);
+      }
+      // A stray `<<<` (committed merge-conflict marker) must not blank the code
+      // between markers. Two independent guards: statements between markers
+      // carry `;` (excluded from the span)…
+      const conflict = [
+        '<<<<<<< HEAD',
+        'int a = compute(1);',
+        '=======',
+        'int a = compute(2);',
+        '>>>>>>> feature-branch',
+      ].join('\n');
+      expect(blankCudaConstructs(conflict)).toBe(conflict);
+      // …and a `;`-free region still fails the brace-balance check (the `{`s
+      // opened between the markers never close before the `>>>`).
+      const semicolonFree = [
+        '<<<<<<< HEAD',
+        'void foo() {',
+        '=======',
+        'void bar() {',
+        '>>>>>>> feature-branch',
+      ].join('\n');
+      expect(blankCudaConstructs(semicolonFree)).toBe(semicolonFree);
+    });
+
+    it('blanks brace-initialized launch configs (`dim3{…}`), balanced-only', () => {
+      const inp = 'run_it<<<dim3{1, 2, 1}, dim3{256, 1, 1}, 0, stream>>>(data, n);';
+      const out = blankCudaConstructs(inp);
+      expect(out.length).toBe(inp.length);
+      expect(out.replace(/ +/g, ' ')).toBe('run_it (data, n);');
+    });
+
+    it('recovers the real kernel name from a macro-definition idiom, gtest/pybind untouched', () => {
+      const code = `#define DEFINE_MY_FWD_KERNEL(kernelName, ...) \\
+template<typename Traits, __VA_ARGS__> \\
+__global__ void kernelName(const Params params)
+
+DEFINE_MY_FWD_KERNEL(fwd_kernel, bool Is_causal, int kBlockM) {
+    do_work(params);
+}
+
+TEST_F(MyFixture, HandlesEmptyInput) {
+    check(1);
+}
+`;
+      const result = extractFromSource('kernels/impl.cu', code);
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      // The macro invocation's first argument is the defined name.
+      expect(functions).toContain('fwd_kernel');
+      expect(functions).not.toContain('DEFINE_MY_FWD_KERNEL');
+      // gtest's TEST_F(Fixture, Name) has TWO lone identifiers — ambiguous, so
+      // it keeps the macro name rather than guessing.
+      expect(functions).toContain('TEST_F');
+      expect(functions).not.toContain('MyFixture');
+    });
+
+    it('links launches through a local function pointer to the real kernel(s)', () => {
+      // The flash-attention launch-template shape end-to-end: a macro-defined
+      // kernel + `auto kernel = &fn<…>` + branch reassignment + launch through
+      // the local. The call refs must name the real kernels, not `kernel`.
+      const code = `template <typename T, bool Flag>
+__global__ void fwd_kernel(T* data, int n) {
+    if (blockIdx.x * blockDim.x + threadIdx.x < n) data[0] += T(1);
+}
+
+template <typename T>
+__global__ void fwd_splitkv_kernel(T* data, int n) {
+    if (blockIdx.x * blockDim.x + threadIdx.x < n) data[0] += T(2);
+}
+
+template <typename T>
+void run_fwd(T* data, int n, cudaStream_t stream) {
+    auto kernel = &fwd_kernel<T, true>;
+    if (n % 2 == 0) {
+        kernel = &fwd_kernel<T, false>;
+    } else if (n % 3 == 0) {
+        kernel = &fwd_splitkv_kernel<T>;
+    }
+    kernel<<<(n + 255) / 256, 256, 0, stream>>>(data, n);
+}
+`;
+      const result = extractFromSource('kernels/launch.cu', code);
+      expect(result.errors).toHaveLength(0);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      // Every DISTINCT branch target recorded once — the two fwd_kernel<…>
+      // instantiations strip to one target, the splitkv branch adds a second.
+      // The local's name never leaks as a callee.
+      expect(calls.filter((c) => c === 'fwd_kernel')).toHaveLength(1);
+      expect(calls.filter((c) => c === 'fwd_splitkv_kernel')).toHaveLength(1);
+      expect(calls).not.toContain('kernel');
+    });
+
+    it('CUDA blanking is gated by extension or content — plain C++ shift/template chevrons are untouched', () => {
+      const cpp = `#include <vector>
+int shift_it(int a, int b) { return a << b << 1; }
+std::vector<std::vector<std::vector<int>>> matrix() { return {}; }
+`;
+      const result = extractFromSource('math.cpp', cpp);
+      expect(result.errors).toHaveLength(0);
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(functions).toEqual(expect.arrayContaining(['shift_it', 'matrix']));
+    });
+
+    it('CUDA in extension-less headers is caught by content: launch templates in .h connect host→kernel', () => {
+      // Much real CUDA lives in .h: cutlass launches most of its kernels from
+      // headers, flash-attention's launch templates are .h, llm.c keeps device
+      // helpers in C-detected .h. `looksLikeCudaSource` content-gates the same
+      // blank there — no CUDA marker is valid C++ anywhere, so this can't
+      // affect a genuinely-plain C++ header.
+      const header = `#pragma once
+#include <cuda_runtime.h>
+
+template <typename T>
+__global__ void fill_kernel(T* out, T value, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = value;
+}
+
+template <typename T>
+void launch_fill(T* out, T value, int n, cudaStream_t stream) {
+    fill_kernel<T><<<(n + 255) / 256, 256, 0, stream>>>(out, value, n);
+}
+`;
+      const result = extractFromSource('include/fill_launch_template.h', header);
+      expect(result.errors).toHaveLength(0);
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(functions).toEqual(expect.arrayContaining(['fill_kernel', 'launch_fill']));
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('fill_kernel');
+    });
+  });
+
+  describe('C++ namespace qualifiedName prefixing', () => {
+    // C++ namespaces previously left no trace in qualifiedNames, so a
+    // namespace-qualified call (`flash::compute(...)`) could never match its
+    // definition — every `ns::fn()` call site was a permanently dead edge.
+    // The namespace name now prefixes contained symbols' qualifiedNames
+    // (prefix-only: no namespace node is minted — `namespace cutlass {` opens
+    // in thousands of files and a node per block would crowd search, #1093).
+    it('prefixes contained symbols and handles nesting; anonymous stays bare', () => {
+      const code = `namespace flash {
+namespace detail {
+void helper() {}
+}
+void compute_attn(int x) { detail::helper(); }
+class Softmax {
+public:
+    void rescale() {}
+};
+}
+namespace {
+void file_local() {}
+}
+void global_fn() { flash::compute_attn(1); }
+`;
+      const result = extractFromSource('dispatch.cpp', code);
+      expect(result.errors).toHaveLength(0);
+      const byName = new Map(result.nodes.map((n) => [n.name, n]));
+      expect(byName.get('compute_attn')?.qualifiedName).toBe('flash::compute_attn');
+      expect(byName.get('helper')?.qualifiedName).toBe('flash::detail::helper');
+      expect(byName.get('Softmax')?.qualifiedName).toBe('flash::Softmax');
+      // Class scope still stacks under the namespace prefix.
+      expect(byName.get('rescale')?.qualifiedName).toBe('flash::Softmax::rescale');
+      // Anonymous namespace contents and true globals stay bare.
+      expect(byName.get('file_local')?.qualifiedName).toBe('file_local');
+      expect(byName.get('global_fn')?.qualifiedName).toBe('global_fn');
+      // The qualified call refs are emitted as spelled.
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toEqual(expect.arrayContaining(['flash::compute_attn', 'detail::helper']));
+    });
+
+    it('C++17 nested namespace form prefixes as written', () => {
+      const code = `namespace a::b {
+int f() { return 1; }
+}
+`;
+      const result = extractFromSource('nested.cpp', code);
+      expect(result.nodes.find((n) => n.name === 'f')?.qualifiedName).toBe('a::b::f');
     });
   });
 
@@ -7402,6 +7913,211 @@ void helperFunction(int count) {
   });
 });
 
+describe('Solidity Extraction', () => {
+  const code = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+interface IVault {
+    function deposit(uint256 amount) external returns (bool);
+    event Deposited(address indexed user, uint256 amount);
+}
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a + b;
+    }
+}
+
+contract Vault is IVault {
+    using SafeMath for uint256;
+
+    enum Status { Active, Frozen, Closed }
+
+    struct UserInfo {
+        uint256 balance;
+        uint256 lastDeposit;
+    }
+
+    IERC20 public immutable token;
+    mapping(address => UserInfo) public users;
+    address public owner;
+
+    event Withdrawn(address indexed user, uint256 amount);
+    error NotOwner();
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    constructor(address _token) {
+        token = IERC20(_token);
+        owner = msg.sender;
+    }
+
+    function deposit(uint256 amount) external override returns (bool) {
+        users[msg.sender].balance = users[msg.sender].balance.add(amount);
+        emit Deposited(msg.sender, amount);
+        return true;
+    }
+
+    function withdraw(uint256 amount) external onlyOwner {
+        emit Withdrawn(msg.sender, amount);
+    }
+}
+`;
+
+  describe('Language detection', () => {
+    it('should detect Solidity files', () => {
+      expect(detectLanguage('contracts/Vault.sol')).toBe('solidity');
+    });
+
+    it('should report Solidity as supported', () => {
+      expect(isLanguageSupported('solidity')).toBe(true);
+      expect(getSupportedLanguages()).toContain('solidity');
+    });
+  });
+
+  describe('Container extraction', () => {
+    it('should extract contract / interface / library as class-likes', () => {
+      const result = extractFromSource('Vault.sol', code);
+      // interface_declaration → interface
+      const iface = result.nodes.find((n) => n.kind === 'interface' && n.name === 'IVault');
+      expect(iface).toBeDefined();
+      expect(iface?.language).toBe('solidity');
+      // contract and library both map to 'class' (library has no special semantics
+      // a class node doesn't already cover — they share methodTypes/inheritance).
+      expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'Vault')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'SafeMath')).toBeDefined();
+    });
+
+    it('should emit extends references for `is X, Y` inheritance', () => {
+      // `Vault is IVault` — Solidity uses one keyword (`is`) for both class
+      // extension and interface implementation, so the extractor emits `extends`
+      // and the resolver's interface-impl synthesizer reclassifies to
+      // `implements` based on the target node kind.
+      const result = extractFromSource('Vault.sol', code);
+      const extendsRefs = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'extends' && r.referenceName === 'IVault'
+      );
+      expect(extendsRefs).toHaveLength(1);
+      const vaultNode = result.nodes.find((n) => n.kind === 'class' && n.name === 'Vault');
+      expect(extendsRefs[0]?.fromNodeId).toBe(vaultNode?.id);
+    });
+  });
+
+  describe('Method extraction', () => {
+    it('should extract methods, modifiers, and constructor with signatures', () => {
+      const result = extractFromSource('Vault.sol', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const names = methods.map((n) => n.name);
+      expect(names).toContain('deposit');
+      expect(names).toContain('withdraw');
+      expect(names).toContain('add');
+      expect(names).toContain('onlyOwner');     // modifier_definition
+      expect(names).toContain('constructor');   // constructor_definition (synthetic name)
+
+      // Signature should capture parameters + visibility + state mutability + return type.
+      const add = methods.find((m) => m.name === 'add');
+      expect(add?.signature).toContain('uint256 a');
+      expect(add?.signature).toContain('internal');
+      expect(add?.signature).toContain('pure');
+      expect(add?.signature).toContain('returns (uint256)');
+
+      // `external` visibility should map to 'public' (callable from outside the contract).
+      const deposit = methods.find((m) => m.name === 'deposit');
+      expect(deposit?.visibility).toBe('public');
+    });
+  });
+
+  describe('Struct, enum, and field extraction', () => {
+    it('should extract struct, enum, and enum members', () => {
+      const result = extractFromSource('Vault.sol', code);
+      expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'UserInfo')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'Status')).toBeDefined();
+      const enumMembers = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+      expect(enumMembers).toEqual(expect.arrayContaining(['Active', 'Frozen', 'Closed']));
+    });
+
+    it('should extract state variables, struct members, events, errors as fields', () => {
+      const result = extractFromSource('Vault.sol', code);
+      const fieldNames = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      // state variables
+      expect(fieldNames).toEqual(expect.arrayContaining(['token', 'users', 'owner']));
+      // struct members
+      expect(fieldNames).toEqual(expect.arrayContaining(['balance', 'lastDeposit']));
+      // event + error
+      expect(fieldNames).toEqual(expect.arrayContaining(['Deposited', 'Withdrawn', 'NotOwner']));
+    });
+
+    it('should treat `constant_variable_declaration` as a constant, not a variable', () => {
+      const constCode = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+uint256 constant FILE_CONST = 42;
+`;
+      const result = extractFromSource('consts.sol', constCode);
+      const node = result.nodes.find((n) => n.name === 'FILE_CONST');
+      expect(node?.kind).toBe('constant');
+    });
+  });
+
+  describe('Import and call extraction', () => {
+    it('should extract import directives with the source path as the module name', () => {
+      const result = extractFromSource('Vault.sol', code);
+      const imp = result.nodes.find((n) => n.kind === 'import');
+      expect(imp).toBeDefined();
+      expect(imp?.name).toBe('@openzeppelin/contracts/token/ERC20/IERC20.sol');
+    });
+
+    it('should produce calls refs for emit, revert, and library/method calls', () => {
+      const result = extractFromSource('Vault.sol', code);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      // emit Deposited(...)
+      expect(calls).toContain('Deposited');
+      // revert NotOwner()
+      expect(calls).toContain('NotOwner');
+      // library call: balance.add(amount) — receiver-qualified
+      expect(calls.some((c) => c === 'add' || c === 'balance.add')).toBe(true);
+    });
+
+    it('should produce calls refs for modifier invocations and base-constructor invocations', () => {
+      // `withdraw(...) external onlyOwner` — the modifier sits in the function
+      // header, outside the body: field the call walker descends, so it goes
+      // through the decorator-position walk. It must emit `calls` (not
+      // `decorates`) so flow traversal rides the withdraw → onlyOwner →
+      // NotOwner audit path.
+      const result = extractFromSource('Vault.sol', code);
+      const withdrawNode = result.nodes.find((n) => n.kind === 'method' && n.name === 'withdraw');
+      const modifierCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'onlyOwner'
+      );
+      expect(modifierCall).toBeDefined();
+      expect(modifierCall?.fromNodeId).toBe(withdrawNode?.id);
+
+      // Base-constructor invocation parses as the same modifier_invocation
+      // node: `constructor(address o) ERC20("T", "TOK") Ownable(o)` — the
+      // constructor-chain hop.
+      const ctorCode = `pragma solidity ^0.8.20;
+contract MyToken is ERC20, Ownable {
+    constructor(address o) ERC20("Tok", "TOK") Ownable(o) {}
+    function grab(bytes32 r) external onlyRole(ADMIN_ROLE) returns (uint256) { return 1; }
+}
+`;
+      const ctorResult = extractFromSource('MyToken.sol', ctorCode);
+      const ctorCalls = ctorResult.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(ctorCalls).toEqual(expect.arrayContaining(['ERC20', 'Ownable']));
+      // modifier WITH arguments still resolves to the bare modifier name
+      expect(ctorCalls).toContain('onlyRole');
+    });
+  });
+});
+
 describe('Regression: issue-specific extraction fixes', () => {
   it('indexes inner functions of an anonymous AMD/CommonJS module wrapper (#528)', () => {
     const code = `
@@ -8534,5 +9250,1425 @@ DO-WORK.
     const result = extractFromSource('freeprog.cbl', code);
     expect(result.nodes.find((n) => n.kind === 'module')?.name).toBe('FREEPROG');
     expect(result.nodes.find((n) => n.kind === 'function')?.name).toBe('DO-WORK');
+  });
+});
+
+// =============================================================================
+// VB.NET (.vb) — vendored patched govindbanura/tree-sitter-vbnet grammar
+// =============================================================================
+
+describe('VB.NET Extraction', () => {
+  it('should detect .vb as vbnet', () => {
+    expect(detectLanguage('Service.vb')).toBe('vbnet');
+    expect(detectLanguage('app/Forms/MainForm.vb')).toBe('vbnet');
+    expect(isSourceFile('Service.vb')).toBe(true);
+  });
+
+  const SAMPLE = `Imports System
+Imports System.Collections.Generic
+
+Namespace Acme.Billing
+
+    Public Interface IRepository
+        Function GetById(ByVal id As Integer) As Invoice
+    End Interface
+
+    Public Enum InvoiceState
+        Draft = 0
+        Sent
+        Paid
+    End Enum
+
+    Public Structure Money
+        Public Amount As Decimal
+    End Structure
+
+    Public MustInherit Class EntityBase
+        Public Property Id As Integer
+    End Class
+
+    Public Class Invoice
+        Inherits EntityBase
+        Implements IRepository
+
+        Private ReadOnly _lines As New List(Of String)
+        Public Const MaxLines As Integer = 100
+        Public Event Paid(ByVal amount As Decimal)
+
+        Public Property State As InvoiceState
+
+        Public Sub New(ByVal id As Integer)
+            Me.Id = id
+        End Sub
+
+        Public Function GetById(ByVal id As Integer) As Invoice Implements IRepository.GetById
+            Return New Invoice(id)
+        End Function
+
+        Public Sub AddLine(ByVal description As String)
+            _lines.Add(description)
+            Validate(description)
+        End Sub
+
+        Private Sub Validate(ByVal text As String)
+            If text.Length > MaxLines Then Throw New ArgumentException("too long")
+        End Sub
+    End Class
+
+    ' lowercase keywords: VB is case-insensitive
+    public module Helpers
+        public function Twice(byval n as integer) as integer
+            return n * 2
+        end function
+
+        Public Sub Run()
+            Dim inv = New Invoice(1)
+            inv.AddLine("widget")
+            Dim d As New Dictionary(Of String, Integer)
+            Helpers.Twice(21)
+        End Sub
+    end module
+End Namespace
+`;
+
+  it('should extract classes, modules, interfaces, structures, and enums', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const kinds = (kind: string) => result.nodes.filter((n) => n.kind === kind).map((n) => n.name);
+    expect(kinds('class')).toEqual(expect.arrayContaining(['EntityBase', 'Invoice', 'Helpers']));
+    expect(kinds('interface')).toContain('IRepository');
+    expect(kinds('struct')).toContain('Money');
+    expect(kinds('enum')).toContain('InvoiceState');
+    expect(kinds('enum_member')).toEqual(expect.arrayContaining(['Draft', 'Sent', 'Paid']));
+  });
+
+  it('should extract methods, constructors, properties, fields, and events (case-insensitive keywords)', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toEqual(expect.arrayContaining(['GetById', 'AddLine', 'Validate', 'Twice', 'Run']));
+    const props = result.nodes.filter((n) => n.kind === 'property').map((n) => n.name);
+    expect(props).toEqual(expect.arrayContaining(['Id', 'State']));
+    const fields = result.nodes.filter((n) => n.kind === 'field' || n.kind === 'constant').map((n) => n.name);
+    expect(fields).toEqual(expect.arrayContaining(['_lines', 'MaxLines']));
+    // Event declarations index as findable members
+    expect(fields).toContain('Paid');
+  });
+
+  it('should qualify types with their namespace', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const invoice = result.nodes.find((n) => n.kind === 'class' && n.name === 'Invoice');
+    expect(invoice?.qualifiedName).toContain('Acme.Billing');
+  });
+
+  it('should emit Inherits as extends and Implements as implements references', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+    expect(extendsRefs.map((r) => r.referenceName)).toContain('EntityBase');
+    const implementsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+    expect(implementsRefs.map((r) => r.referenceName)).toContain('IRepository');
+  });
+
+  it('should extract calls through both invocation and index-shaped parens', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    // `_lines.Add(description)` parses as array_access (non-empty parens) — still a call site
+    expect(calls).toContain('_lines.Add');
+    // bare call with args
+    expect(calls).toContain('Validate');
+    // qualified module call
+    expect(calls).toContain('Helpers.Twice');
+  });
+
+  it('should emit instantiates for New, with VB generic syntax stripped', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const insts = result.unresolvedReferences.filter((r) => r.referenceKind === 'instantiates').map((r) => r.referenceName);
+    expect(insts).toContain('Invoice');
+    // `As New Dictionary(Of String, Integer)` → bare type name, not `Dictionary(Of ...)`
+    expect(insts.some((n) => n.includes('(') || /\bOf\b/.test(n))).toBe(false);
+  });
+
+  it('should extract Imports as import nodes', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toEqual(expect.arrayContaining(['System', 'System.Collections.Generic']));
+  });
+
+  it('should parse a file without a trailing newline (preParse guard)', () => {
+    const code = 'Class Tail\n    Sub Go()\n        Log("x")\n    End Sub\nEnd Class';
+    const result = extractFromSource('Tail.vb', code);
+    expect(result.nodes.find((n) => n.kind === 'class')?.name).toBe('Tail');
+    expect(result.nodes.find((n) => n.kind === 'method')?.name).toBe('Go');
+  });
+});
+
+describe('VB.NET Extraction — scanner-backed constructs', () => {
+  it('should parse XML literals as opaque literals without breaking siblings', () => {
+    const code = `Class Muxer
+    Function WriteTags() As Object
+        Dim xml = <Tags>
+                      <%= From tag In Tags Select <Tag><Name><%= tag.Name %></Name></Tag> %>
+                  </Tags>
+        Return xml
+    End Function
+
+    Sub After()
+        Log("still extracted")
+    End Sub
+End Class
+`;
+    const result = extractFromSource('Muxer.vb', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toEqual(expect.arrayContaining(['WriteTags', 'After']));
+  });
+
+  it('should parse multi-line LINQ query clauses', () => {
+    const code = `Class T
+    Function Big() As Integer
+        Dim big = From l In _lines
+                  Where l.Length > 3
+                  Select l.Length
+        Return big.Sum()
+    End Function
+End Class
+`;
+    const result = extractFromSource('Linq.vb', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('big.Sum');
+    expect(result.nodes.find((n) => n.kind === 'method')?.name).toBe('Big');
+  });
+
+  it('should extract MustOverride members without derailing following members', () => {
+    const code = `MustInherit Class VideoEncoder
+    MustOverride ReadOnly Property OutputExt As String
+
+    Public MustOverride Sub ShowConfigDialog(Optional param As Object = Nothing)
+
+    MustOverride Function GetError() As String
+
+    Sub New()
+        CanEdit = True
+    End Sub
+End Class
+`;
+    const result = extractFromSource('VideoEncoder.vb', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toEqual(expect.arrayContaining(['ShowConfigDialog', 'GetError', 'New']));
+    const props = result.nodes.filter((n) => n.kind === 'property').map((n) => n.name);
+    expect(props).toContain('OutputExt');
+  });
+
+  it('should parse nullable declarator shorthand (Dim x? = expr)', () => {
+    const code = `Class T
+    Sub M(folderInfo As Object)
+        Dim SteamFolderData? = Parser.GetSteamNameAndID(folderInfo)
+        Use(SteamFolderData)
+    End Sub
+End Class
+`;
+    const result = extractFromSource('Factory.vb', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('Parser.GetSteamNameAndID');
+  });
+});
+
+// =============================================================================
+// Erlang (vendored WhatsApp/tree-sitter-erlang grammar — the ELP grammar)
+// =============================================================================
+
+describe('Erlang Extraction', () => {
+  describe('Language detection', () => {
+    it('should report Erlang as supported', () => {
+      expect(isLanguageSupported('erlang')).toBe(true);
+      expect(getSupportedLanguages()).toContain('erlang');
+      expect(isSourceFile('apps/app/src/foo.erl')).toBe(true);
+      expect(isSourceFile('include/foo.hrl')).toBe(true);
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should merge multi-clause functions into one node spanning all clauses', () => {
+      const code = `-module(m).
+-export([classify/1]).
+
+classify(X) when is_atom(X) ->
+    atom;
+classify(X) when is_binary(X) ->
+    binary;
+classify(_X) ->
+    other.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function' && n.name === 'classify');
+      expect(fns).toHaveLength(1);
+      expect(fns[0]!.startLine).toBe(4);
+      expect(fns[0]!.endLine).toBe(9);
+      expect(fns[0]!.language).toBe('erlang');
+    });
+
+    it('should qualify functions with the module namespace', () => {
+      const code = `-module(my_server).
+-export([start/0]).
+
+start() -> ok.
+helper() -> ok.
+`;
+      const result = extractFromSource('src/my_server.erl', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace');
+      expect(ns?.name).toBe('my_server');
+      const start = result.nodes.find((n) => n.kind === 'function' && n.name === 'start');
+      expect(start?.qualifiedName).toBe('my_server::start');
+    });
+
+    it('should flag exported functions and honor -compile(export_all)', () => {
+      const code = `-module(m).
+-export([api/0]).
+
+api() -> internal().
+internal() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const api = result.nodes.find((n) => n.name === 'api');
+      const internal = result.nodes.find((n) => n.name === 'internal');
+      expect(api?.isExported).toBe(true);
+      expect(internal?.isExported).toBe(false);
+
+      const all = extractFromSource('src/all.erl', `-module(all).
+-compile(export_all).
+
+anything() -> ok.
+`);
+      expect(all.nodes.find((n) => n.name === 'anything')?.isExported).toBe(true);
+    });
+
+    it('should use the preceding -spec as the signature and capture doc comments', () => {
+      const code = `-module(m).
+
+%% Fetches a value by key.
+-spec fetch(binary()) -> {ok, term()} | not_found.
+fetch(Key) ->
+    lookup(Key).
+
+lookup(_K) -> not_found.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const fetch = result.nodes.find((n) => n.name === 'fetch');
+      expect(fetch?.signature).toBe('-spec fetch(binary()) -> {ok, term()} | not_found.');
+      expect(fetch?.docstring).toBe('Fetches a value by key.');
+    });
+
+    it('should fall back to the clause header as the signature', () => {
+      const code = `-module(m).
+
+resize(W, H) when W > 0, H > 0 ->
+    {W, H}.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const resize = result.nodes.find((n) => n.name === 'resize');
+      expect(resize?.signature).toBe('resize(W, H) when W > 0, H > 0');
+    });
+  });
+
+  describe('Record and type extraction', () => {
+    it('should extract records as structs with fields', () => {
+      const code = `-module(m).
+
+-record(state, {
+    store = #{} :: map(),
+    counter = 0 :: non_neg_integer()
+}).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const rec = result.nodes.find((n) => n.kind === 'struct');
+      expect(rec?.name).toBe('state');
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fields).toContain('store');
+      expect(fields).toContain('counter');
+    });
+
+    it('should extract -type and -opaque as type aliases, without bogus type-call refs', () => {
+      const code = `-module(m).
+
+-type key() :: atom() | binary().
+-opaque handle() :: reference().
+-spec noop(key()) -> ok.
+noop(_K) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const aliases = result.nodes.filter((n) => n.kind === 'type_alias').map((n) => n.name);
+      expect(aliases).toContain('key');
+      expect(aliases).toContain('handle');
+      // Type-position expressions parse as `call` nodes — the spec/type subtrees
+      // must not leak `calls` refs to type names like atom()/binary().
+      const bogus = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && ['atom', 'binary', 'reference', 'key'].includes(r.referenceName)
+      );
+      expect(bogus).toHaveLength(0);
+    });
+
+    it('should extract -define macros as constants', () => {
+      const code = `-module(m).
+
+-define(TIMEOUT, 5000).
+-define(WRAP(X), {ok, X}).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const consts = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name);
+      expect(consts).toContain('TIMEOUT');
+      expect(consts).toContain('WRAP');
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should extract -include/-include_lib and -import', () => {
+      const code = `-module(m).
+
+-include("records.hrl").
+-include_lib("kernel/include/logger.hrl").
+-import(lists, [map/2]).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('records.hrl');
+      expect(imports).toContain('kernel/include/logger.hrl');
+      expect(imports).toContain('lists');
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'records.hrl'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should record local calls bare and remote calls module-qualified', () => {
+      const code = `-module(m).
+-export([run/1]).
+
+run(X) ->
+    Y = prepare(X),
+    other_mod:process(Y).
+
+prepare(X) -> X.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('prepare');
+      // `mod:fn(...)` is emitted as `mod::fn` — the same shape the module
+      // namespace gives every function's qualifiedName, so it resolves via
+      // the qualified-name matcher.
+      expect(calls).toContain('other_mod::process');
+    });
+
+    it('should not emit calls for dynamic dispatch (var module / var fun)', () => {
+      const code = `-module(m).
+-export([run/2]).
+
+run(Mod, F) ->
+    Mod:handle(x),
+    F(y).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).not.toContain('handle');
+      expect(calls).not.toContain('Mod::handle');
+      expect(calls).not.toContain('F');
+    });
+
+    it('should connect gen_server self-calls to the module handlers', () => {
+      const code = `-module(kv_store).
+-behaviour(gen_server).
+-export([get/1, put/2, drop/1]).
+-export([init/1, handle_call/3, handle_cast/2]).
+
+-define(SERVER, ?MODULE).
+
+get(Key) ->
+    gen_server:call(?SERVER, {get, Key}).
+
+put(Key, Value) ->
+    gen_server:cast(?MODULE, {put, Key, Value}).
+
+drop(Key) ->
+    gen_server:call(kv_store, {drop, Key}).
+
+init(_) -> {ok, #{}}.
+handle_call({get, K}, _From, S) -> {reply, maps:find(K, S), S};
+handle_call({drop, K}, _From, S) -> {reply, ok, maps:remove(K, S)}.
+handle_cast({put, K, V}, S) -> {noreply, maps:put(K, V, S)}.
+`;
+      const result = extractFromSource('src/kv_store.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      // ?SERVER (defined as ?MODULE), ?MODULE, and the module's own atom all
+      // count as self — public API wrappers connect to their handlers.
+      expect(calls.filter((c) => c === 'kv_store::handle_call')).toHaveLength(2);
+      expect(calls).toContain('kv_store::handle_cast');
+    });
+
+    it('should connect gen_server calls to a registered-name module, directly or via an atom macro', () => {
+      const code = `-module(kv_client).
+-export([fetch/1, evict/1]).
+
+-define(STORE, kv_store).
+
+fetch(Key) ->
+    gen_server:call(kv_store, {get, Key}).
+
+evict(Key) ->
+    gen_server:cast(?STORE, {evict, Key}).
+`;
+      const result = extractFromSource('src/kv_client.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      // OTP's {local, ?MODULE} convention names a server after its module —
+      // a cross-module registered name targets that module's handlers. A name
+      // matching no module simply never resolves downstream.
+      expect(calls).toContain('kv_store::handle_call');
+      expect(calls).toContain('kv_store::handle_cast');
+    });
+
+    it('should not connect gen_server calls with dynamic targets', () => {
+      const code = `-module(m).
+-export([go/2]).
+
+go(Pid, Msg) ->
+    gen_server:call(Pid, Msg),
+    gen_server:cast({global, some_name}, Msg),
+    gen_server:call({some_name, node()}, Msg).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls.filter((c) => c.includes('handle_call') || c.includes('handle_cast'))).toHaveLength(0);
+    });
+
+    it('should lift static MFA arguments of the spawn/apply family into call refs', () => {
+      const code = `-module(m).
+-export([boot/2]).
+
+boot(Req, Env) ->
+    Pid = proc_lib:spawn_link(?MODULE, request_process, [Req, Env]),
+    spawn(?MODULE, monitor_loop, [Pid]),
+    apply(other_mod, handle, [Req]),
+    timer:apply_after(500, other_mod, tick, []),
+    Pid.
+
+request_process(_R, _E) -> ok.
+monitor_loop(_P) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('request_process'); // ?MODULE → bare, same-file resolution
+      expect(calls).toContain('monitor_loop');
+      expect(calls).toContain('other_mod::handle');
+      expect(calls).toContain('other_mod::tick');
+    });
+
+    it('should stay silent on dynamic spawn/apply (var module, fun value, or plain fun)', () => {
+      const code = `-module(m).
+-export([go/3]).
+
+go(M, F, A) ->
+    spawn(M, F, A),
+    spawn(fun() -> helper() end),
+    apply(M, F, A).
+
+helper() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      // The fun body's call is still walked; no phantom MFA targets appear.
+      expect(calls).toContain('helper');
+      expect(calls.filter((c) => c !== 'spawn' && c !== 'apply' && c !== 'helper')).toHaveLength(0);
+    });
+
+    it('should treat ?MODULE:fn calls as local calls', () => {
+      const code = `-module(m).
+-export([kick/0]).
+
+kick() ->
+    ?MODULE:work().
+
+work() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('work');
+    });
+
+    it('should capture fun name/arity values as function references', () => {
+      const code = `-module(m).
+-export([wire/1]).
+
+wire(Pids) ->
+    lists:foreach(fun notify/1, Pids),
+    lists:map(fun m:notify/1, Pids).
+
+notify(_P) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references').map((r) => r.referenceName);
+      expect(refs).toContain('notify');
+      expect(refs).toContain('m::notify');
+    });
+
+    it('should reference records used in bodies and argument patterns', () => {
+      const code = `-module(m).
+-export([mk/1, get_id/1]).
+
+-record(req, {id, payload}).
+
+mk(Id) -> #req{id = Id}.
+get_id(#req{id = Id}) -> Id.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'references' && r.referenceName === 'req'
+      );
+      expect(refs.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('should attribute calls from every clause of a multi-clause function', () => {
+      const code = `-module(m).
+-export([handle/1]).
+
+handle({a, X}) ->
+    first(X);
+handle({b, X}) ->
+    second(X).
+
+first(X) -> X.
+second(X) -> X.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const handle = result.nodes.find((n) => n.kind === 'function' && n.name === 'handle');
+      const calls = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && r.fromNodeId === handle?.id
+      ).map((r) => r.referenceName);
+      expect(calls).toContain('first');
+      expect(calls).toContain('second');
+    });
+  });
+
+  describe('escript and app resource files', () => {
+    it('should extract functions and calls from an escript behind a shebang', () => {
+      const code = `#!/usr/bin/env escript
+%%! -smp enable
+
+main([Path]) ->
+    Result = analyze(Path),
+    io:format("~p~n", [Result]).
+
+analyze(Path) ->
+    {ok, Bin} = file:read_file(Path),
+    byte_size(Bin).
+`;
+      const result = extractFromSource('bin/tool.escript', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toContain('main');
+      expect(fns).toContain('analyze');
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('analyze');
+      expect(calls).toContain('io::format');
+    });
+
+    it('should link an app resource file to its callback module and dependency apps', () => {
+      const code = `{application, sample, [
+    {description, "Sample application"},
+    {vsn, "1.0.0"},
+    {registered, [sample_server]},
+    {mod, {sample_app, []}},
+    {applications, [kernel, stdlib, sample_core]},
+    {included_applications, [sample_extra]},
+    {env, [{limit, 100}]},
+    {modules, []}
+]}.
+`;
+      const result = extractFromSource('src/sample.app.src', code);
+      const refs = result.unresolvedReferences.map((r) => `${r.referenceKind}:${r.referenceName}`);
+      // The application-callback module is the app's entry point.
+      expect(refs).toContain('references:sample_app');
+      // Dependencies resolve to umbrella siblings; kernel/stdlib just drop.
+      expect(refs).toContain('imports:kernel');
+      expect(refs).toContain('imports:sample_core');
+      expect(refs).toContain('imports:sample_extra');
+      // Registered names, env values, and the like carry no graph structure.
+      expect(refs.filter((r) => r.endsWith(':sample_server'))).toHaveLength(0);
+      expect(refs.filter((r) => r.endsWith(':limit'))).toHaveLength(0);
+    });
+  });
+
+  describe('Macro linkage', () => {
+    it('should attribute macro-body calls to the macro and link function-like uses into the chain', () => {
+      const code = `-module(m).
+-export([do_thing/1]).
+
+-define(LOG_AUDIT(Event), audit_logger:log(Event, ?MODULE)).
+
+do_thing(X) ->
+    ?LOG_AUDIT({thing, X}),
+    ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const macro = result.nodes.find((n) => n.kind === 'constant' && n.name === 'LOG_AUDIT');
+      const doThing = result.nodes.find((n) => n.kind === 'function' && n.name === 'do_thing');
+      const refsFrom = (id?: string) =>
+        result.unresolvedReferences.filter((r) => r.fromNodeId === id).map((r) => `${r.referenceKind}:${r.referenceName}`);
+      // The body's remote call belongs to the macro node — true exactly once.
+      expect(refsFrom(macro?.id)).toContain('calls:audit_logger::log');
+      // The use site joins the call chain: do_thing -calls→ LOG_AUDIT.
+      expect(refsFrom(doThing?.id)).toContain('calls:LOG_AUDIT');
+    });
+
+    it('should reference bare macro reads without polluting call chains', () => {
+      const code = `-module(m).
+-export([wait/0]).
+
+-define(TIMEOUT, 5000).
+
+wait() ->
+    receive after ?TIMEOUT -> ok end.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.map((r) => `${r.referenceKind}:${r.referenceName}`);
+      expect(refs).toContain('references:TIMEOUT');
+      expect(refs).not.toContain('calls:TIMEOUT');
+    });
+
+    it('should skip compiler-predefined macros and keep walking macro-use arguments', () => {
+      const code = `-module(m).
+-export([check/0]).
+
+check() ->
+    ?assertEqual(ok, prepare()),
+    {?MODULE, ?LINE, ?FUNCTION_NAME}.
+
+prepare() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      // The nested call inside the macro's arguments still attributes to check/0.
+      expect(refs).toContain('prepare');
+      // ?assertEqual (an OTP header macro) is emitted and simply never resolves…
+      expect(refs).toContain('assertEqual');
+      // …but predefined macros have no definition to link.
+      expect(refs).not.toContain('MODULE');
+      expect(refs).not.toContain('LINE');
+      expect(refs).not.toContain('FUNCTION_NAME');
+    });
+
+    it('should chain macro-to-macro uses', () => {
+      const code = `-module(m).
+
+-define(TARGET, target_fn()).
+-define(ALIAS, ?TARGET).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const target = result.nodes.find((n) => n.kind === 'constant' && n.name === 'TARGET');
+      const alias = result.nodes.find((n) => n.kind === 'constant' && n.name === 'ALIAS');
+      const refsFrom = (id?: string) =>
+        result.unresolvedReferences.filter((r) => r.fromNodeId === id).map((r) => `${r.referenceKind}:${r.referenceName}`);
+      expect(refsFrom(target?.id)).toContain('calls:target_fn');
+      expect(refsFrom(alias?.id)).toContain('references:TARGET');
+    });
+  });
+
+  describe('Behaviour extraction', () => {
+    it('should emit an implements reference for -behaviour', () => {
+      const code = `-module(m).
+-behaviour(gen_server).
+
+init(_) -> {ok, #{}}.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const impl = result.unresolvedReferences.find((r) => r.referenceKind === 'implements');
+      expect(impl?.referenceName).toBe('gen_server');
+    });
+
+    it('should not create symbols from -callback declarations', () => {
+      const code = `-module(b).
+
+-callback handle_thing(term()) -> ok.
+-callback init(list()) -> {ok, term()}.
+`;
+      const result = extractFromSource('src/b.erl', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function');
+      expect(fns).toHaveLength(0);
+    });
+  });
+});
+
+describe('Terraform Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Terraform files', () => {
+      expect(detectLanguage('main.tf')).toBe('terraform');
+      expect(detectLanguage('terraform.tfvars')).toBe('terraform');
+      expect(detectLanguage('versions.tofu')).toBe('terraform');
+    });
+
+    it('should report Terraform as supported', () => {
+      expect(isLanguageSupported('terraform')).toBe(true);
+      expect(getSupportedLanguages()).toContain('terraform');
+    });
+  });
+
+  describe('Block extraction', () => {
+    it('should extract a resource block as a class with qualified type.name', () => {
+      const code = `
+resource "aws_s3_bucket" "my_bucket" {
+  bucket = "example"
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const res = result.nodes.find((n) => n.name === 'aws_s3_bucket.my_bucket');
+      expect(res).toBeDefined();
+      expect(res?.kind).toBe('class');
+      expect(res?.qualifiedName).toBe('aws_s3_bucket.my_bucket');
+      expect(res?.signature).toBe('resource "aws_s3_bucket" "my_bucket"');
+      expect(res?.language).toBe('terraform');
+    });
+
+    it('should extract a data block under the data.* qualified name', () => {
+      const code = `
+data "aws_caller_identity" "current" {}
+`;
+      const result = extractFromSource('main.tf', code);
+      const node = result.nodes.find((n) => n.qualifiedName === 'data.aws_caller_identity.current');
+      expect(node).toBeDefined();
+      expect(node?.kind).toBe('class');
+    });
+
+    it('should extract a variable block as variable with qualified name var.X', () => {
+      const code = `
+variable "region" {
+  type    = string
+  default = "us-east-1"
+}
+`;
+      const result = extractFromSource('variables.tf', code);
+      const v = result.nodes.find((n) => n.qualifiedName === 'var.region');
+      expect(v).toBeDefined();
+      expect(v?.kind).toBe('variable');
+      expect(v?.name).toBe('region');
+    });
+
+    it('should extract an output block as variable with qualified name output.X', () => {
+      const code = `
+output "bucket_arn" {
+  value = aws_s3_bucket.my_bucket.arn
+}
+`;
+      const result = extractFromSource('outputs.tf', code);
+      const out = result.nodes.find((n) => n.qualifiedName === 'output.bucket_arn');
+      expect(out).toBeDefined();
+      expect(out?.kind).toBe('variable');
+    });
+
+    it('should extract a module block as module with qualified name module.X', () => {
+      const code = `
+module "vpc" {
+  source = "./modules/vpc"
+  cidr   = var.vpc_cidr
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const m = result.nodes.find((n) => n.qualifiedName === 'module.vpc');
+      expect(m).toBeDefined();
+      expect(m?.kind).toBe('module');
+    });
+
+    it('should extract a provider block as namespace', () => {
+      const code = `
+provider "aws" {
+  region = "us-east-1"
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const p = result.nodes.find((n) => n.qualifiedName === 'provider.aws');
+      expect(p).toBeDefined();
+      expect(p?.kind).toBe('namespace');
+    });
+
+    it('should extract every locals attribute as its own constant with local.K qualified name', () => {
+      const code = `
+locals {
+  prefix      = "prod"
+  full_name   = "\${local.prefix}-app"
+  max_retries = 3
+}
+`;
+      const result = extractFromSource('locals.tf', code);
+      const names = result.nodes
+        .filter((n) => n.kind === 'constant')
+        .map((n) => n.qualifiedName)
+        .sort();
+      expect(names).toEqual(['local.full_name', 'local.max_retries', 'local.prefix']);
+    });
+
+    it('should ignore a terraform settings block', () => {
+      const code = `
+terraform {
+  required_version = ">= 1.5"
+}
+`;
+      const result = extractFromSource('versions.tf', code);
+      const symbols = result.nodes.filter((n) => n.kind !== 'file');
+      expect(symbols).toHaveLength(0);
+    });
+
+    it('should index .tfvars top-level attributes via the same parser path', () => {
+      // .tfvars files have no blocks — just bare attributes, each of which
+      // SETS the root module variable of that name. No symbols are declared,
+      // but every top-level assignment references its variable so "what sets
+      // var.region" is answerable.
+      const code = `
+region      = "us-east-1"
+environment = "prod"
+`;
+      const result = extractFromSource('terraform.tfvars', code);
+      expect(result.errors.filter((e) => e.severity === 'error')).toHaveLength(0);
+      const symbols = result.nodes.filter((n) => n.kind !== 'file');
+      expect(symbols).toHaveLength(0);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('var.region');
+      expect(refs).toContain('var.environment');
+    });
+  });
+
+  describe('Reference extraction', () => {
+    it('should emit a reference for var.X used inside a resource', () => {
+      const code = `
+variable "region" {}
+resource "aws_s3_bucket" "b" {
+  bucket = var.region
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('var.region');
+    });
+
+    it('should emit a reference for module.M.<output> as module.M', () => {
+      const code = `
+output "vpc_id" {
+  value = module.vpc.vpc_id
+}
+`;
+      const result = extractFromSource('outputs.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('module.vpc');
+    });
+
+    it('should emit a scoped module.M:output.X ref alongside module.M for output chains', () => {
+      const code = `
+output "vpc_id" {
+  value = module.vpc.vpc_id
+}
+`;
+      const result = extractFromSource('outputs.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('module.vpc:output.vpc_id');
+      // A bare module.M use (no output segment) stays a single ref.
+      const bare = extractFromSource('main.tf', 'output "m" {\n  value = module.vpc\n}\n');
+      const bareRefs = bare.unresolvedReferences.map((r) => r.referenceName);
+      expect(bareRefs).toContain('module.vpc');
+      expect(bareRefs.some((r) => r.includes(':output.'))).toBe(false);
+    });
+
+    it('should wire module blocks: scoped input refs, meta-args skipped, local source imported', () => {
+      const code = `
+module "vpc" {
+  source     = "./modules/vpc"
+  version    = "1.0.0"
+  count      = 2
+  depends_on = [aws_iam_role.net]
+  cidr       = var.vpc_cidr
+  name       = "prod"
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      // Input attributes wire to the child module's variables (scoped spelling).
+      expect(refs).toContain('module.vpc:var.cidr');
+      expect(refs).toContain('module.vpc:var.name');
+      // Meta-arguments configure the call, not child variables.
+      expect(refs).not.toContain('module.vpc:var.source');
+      expect(refs).not.toContain('module.vpc:var.version');
+      expect(refs).not.toContain('module.vpc:var.count');
+      expect(refs).not.toContain('module.vpc:var.depends_on');
+      // A local ./ source emits the module→file imports ref.
+      const fileRef = result.unresolvedReferences.find((r) => r.referenceName === 'module.vpc:file');
+      expect(fileRef).toBeDefined();
+      expect(fileRef?.referenceKind).toBe('imports');
+      // Attribute VALUES still reference the parent scope as before.
+      expect(refs).toContain('var.vpc_cidr');
+      expect(refs).toContain('aws_iam_role.net');
+    });
+
+    it('should not emit a module.M:file ref for registry or git sources', () => {
+      const code = `
+module "s3" {
+  source  = "terraform-aws-modules/s3-bucket/aws"
+  version = "4.0.0"
+  bucket  = "x"
+}
+module "net" {
+  source = "git::https://example.com/net.git"
+  cidr   = "10.0.0.0/16"
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs.some((r) => r.endsWith(':file'))).toBe(false);
+      // Input wiring is still emitted — the resolver drops it when the
+      // source turns out to be out-of-repo.
+      expect(refs).toContain('module.s3:var.bucket');
+    });
+
+    it('should emit a remote-output candidate for module.M.outputs.X chains', () => {
+      const code = `
+resource "aws_eks_cluster" "this" {
+  vpc_id = module.vpc.outputs.vpc_id
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('module.vpc');
+      expect(refs).toContain('module.vpc:remote-output.vpc_id');
+      // A plain two-segment chain must NOT produce a remote-output candidate.
+      const plain = extractFromSource('o.tf', 'output "x" {\n  value = module.vpc.vpc_id\n}\n');
+      const plainRefs = plain.unresolvedReferences.map((r) => r.referenceName);
+      expect(plainRefs.some((r) => r.includes(':remote-output.'))).toBe(false);
+    });
+
+    it('should reference resource addresses from moved/import/removed blocks, anchored to the file', () => {
+      const code = `
+resource "aws_instance" "new" {}
+moved {
+  from = aws_instance.old
+  to   = aws_instance.new
+}
+import {
+  to = aws_s3_bucket.b
+  id = "bucket-name"
+}
+removed {
+  from = module.legacy.aws_iam_role.r
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences;
+      const names = refs.map((r) => r.referenceName);
+      expect(names).toContain('aws_instance.old');
+      expect(names).toContain('aws_instance.new');
+      expect(names).toContain('aws_s3_bucket.b');
+      expect(names).toContain('module.legacy');
+      // Scoped module refs are suppressed here: module.legacy.aws_iam_role.r
+      // names a resource inside a module instance, never a module output.
+      expect(names.some((n) => n.includes(':'))).toBe(false);
+      // Anchored to the file node, and no phantom symbols were declared.
+      const fileNode = result.nodes.find((n) => n.kind === 'file');
+      for (const r of refs.filter((x) => x.referenceName === 'aws_instance.old')) {
+        expect(r.fromNodeId).toBe(fileNode?.id);
+      }
+      expect(result.nodes.filter((n) => n.kind !== 'file')).toHaveLength(1); // just aws_instance.new
+    });
+
+    it('should collect check-assert condition references and still index check-scoped data blocks', () => {
+      const code = `
+check "health" {
+  data "http" "ping" {
+    url = var.endpoint
+  }
+  assert {
+    condition     = data.http.ping.status_code == 200 && var.strict
+    error_message = "unhealthy"
+  }
+}
+`;
+      const result = extractFromSource('checks.tf', code);
+      const names = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(names).toContain('data.http.ping');
+      expect(names).toContain('var.strict');
+      expect(names).toContain('var.endpoint');
+      // The scoped data source inside the check is a real symbol.
+      expect(result.nodes.find((n) => n.qualifiedName === 'data.http.ping')).toBeDefined();
+    });
+
+    it('should qualify aliased provider blocks and reference provider selections', () => {
+      const code = `
+provider "aws" {
+  region = "us-east-1"
+}
+provider "aws" {
+  alias  = "east"
+  region = "us-east-2"
+}
+resource "aws_s3_bucket" "b" {
+  provider = aws.east
+  bucket   = "x"
+}
+resource "google_service_account" "sa" {
+  provider = google-beta
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const providers = result.nodes.filter((n) => n.kind === 'namespace').map((n) => n.qualifiedName).sort();
+      expect(providers).toEqual(['provider.aws', 'provider.aws.east']);
+      const names = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(names).toContain('provider.aws.east');
+      expect(names).toContain('provider.google-beta');
+      // The selection must not be misread as a resource reference.
+      expect(names).not.toContain('aws.east');
+    });
+
+    it('should reference the values (not keys) of a module providers map', () => {
+      const code = `
+module "vpc" {
+  source    = "./modules/vpc"
+  providers = {
+    aws = aws.east
+  }
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const names = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(names).toContain('provider.aws.east');
+      expect(names).not.toContain('provider.aws');
+      expect(names).not.toContain('aws.east');
+      // providers is a meta-argument — no input wiring for it.
+      expect(names).not.toContain('module.vpc:var.providers');
+    });
+
+    it('should emit data.T.N references stripped of the trailing attribute', () => {
+      const code = `
+output "account" {
+  value = data.aws_caller_identity.current.account_id
+}
+`;
+      const result = extractFromSource('outputs.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('data.aws_caller_identity.current');
+    });
+
+    it('should emit T.N references for managed-resource attribute access', () => {
+      const code = `
+resource "aws_iam_policy" "p" {
+  policy = aws_s3_bucket.my.arn
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('aws_s3_bucket.my');
+    });
+
+    it('should emit local.K references from locals attribute expressions', () => {
+      const code = `
+locals {
+  prefix = "prod"
+  name   = "\${local.prefix}-app"
+}
+`;
+      const result = extractFromSource('locals.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('local.prefix');
+    });
+
+    it('should skip built-in heads (each, count, self, path, terraform.workspace)', () => {
+      const code = `
+resource "aws_instance" "x" {
+  count       = each.value
+  name        = path.module
+  workspace   = terraform.workspace
+  self_ref    = self.id
+  index_value = count.index
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      // None of the built-ins should produce project references.
+      expect(refs.some((r) => r.startsWith('each.'))).toBe(false);
+      expect(refs.some((r) => r.startsWith('count.'))).toBe(false);
+      expect(refs.some((r) => r.startsWith('self.'))).toBe(false);
+      expect(refs.some((r) => r.startsWith('path.'))).toBe(false);
+      expect(refs.some((r) => r.startsWith('terraform.'))).toBe(false);
+    });
+  });
+});
+
+// =============================================================================
+// ArkTS (HarmonyOS / OpenHarmony declarative UI — `.ets`)
+// =============================================================================
+
+describe('ArkTS Extraction', () => {
+  it('reports ArkTS as supported', () => {
+    expect(isLanguageSupported('arkts')).toBe(true);
+    expect(getSupportedLanguages()).toContain('arkts');
+  });
+
+  describe('@Component struct extraction', () => {
+    const code = `
+import { TodoItem } from '../model/TodoItem';
+
+@Entry
+@Component
+struct Index {
+  @State message: string = 'Hello';
+  @Prop count: number = 0;
+  @StorageLink('theme') theme: string = 'light';
+  private service: TodoService = new TodoService();
+
+  aboutToAppear(): void {
+    this.load();
+  }
+
+  load(): void {
+    this.message = 'loaded';
+  }
+
+  build() {
+    Column() {
+      Text(this.message).fontSize(50)
+    }
+    .height('100%')
+  }
+}
+`;
+
+    it('extracts the struct with its ArkUI decorators', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const comp = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Index');
+      expect(comp).toBeDefined();
+      expect(comp?.language).toBe('arkts');
+      expect(comp?.decorators).toEqual(expect.arrayContaining(['Entry', 'Component']));
+    });
+
+    it('extracts an EXPORTED struct whose decorators sit on the export statement', () => {
+      const result = extractFromSource(
+        'components/Card.ets',
+        `@Component\nexport struct Card {\n  build() {\n    Row() {}\n  }\n}\n`
+      );
+      const card = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Card');
+      expect(card).toBeDefined();
+      expect(card?.isExported).toBe(true);
+      expect(card?.decorators).toContain('Component');
+    });
+
+    it('extracts struct members: build(), lifecycle + regular methods with qualified names', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.find((m) => m.qualifiedName === 'Index::build')).toBeDefined();
+      expect(methods.find((m) => m.qualifiedName === 'Index::aboutToAppear')).toBeDefined();
+      expect(methods.find((m) => m.qualifiedName === 'Index::load')).toBeDefined();
+    });
+
+    it('extracts @State/@Prop/@StorageLink members as properties with their decorators', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const message = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::message');
+      expect(message).toBeDefined();
+      expect(message?.decorators).toContain('State');
+      const count = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::count');
+      expect(count?.decorators).toContain('Prop');
+      // Decorator-with-args: the decorator NAME is captured, not its argument.
+      const theme = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::theme');
+      expect(theme?.decorators).toContain('StorageLink');
+    });
+
+    it('emits intra-struct method call refs (this.load())', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'load'
+      );
+      expect(call).toBeDefined();
+    });
+  });
+
+  describe('build() DSL call surface', () => {
+    const code = `
+@Extend(Text) function titleStyle(size: number) {
+  .fontSize(size)
+}
+
+@Component
+struct Page {
+  count: number = 0;
+
+  handleTap(): void {
+    this.count += 1;
+  }
+
+  @Builder
+  headerBar(title: string) {
+    Row() {
+      Text(title).titleStyle(24)
+      Button('Go').onClick(this.handleTap)
+    }
+  }
+
+  build() {
+    Column({ space: 8 }) {
+      this.headerBar('Home')
+      ChildCard({ label: 'hi' })
+    }
+    .height('100%')
+  }
+}
+`;
+
+    function callRefsFrom(result: ReturnType<typeof extractFromSource>, methodName: string): string[] {
+      const from = result.nodes.find((n) => n.kind === 'method' && n.name === methodName);
+      return result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls' && r.fromNodeId === from?.id)
+        .map((r) => r.referenceName);
+    }
+
+    it('emits a call ref for a custom component instantiation inside build()', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'build')).toContain('ChildCard');
+    });
+
+    it('emits dot-prefixed call refs for chained attributes (@Extend/@Styles-only resolution)', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      // `.titleStyle(24)` chains on the Text component — one node, repeated
+      // property/arguments field pairs, NOT nested call_expressions. The
+      // leading dot routes the ref to the decorator-gated matcher strategy so
+      // framework attributes (`.height` below) can never hit an arbitrary
+      // same-named symbol.
+      expect(callRefsFrom(result, 'headerBar')).toContain('.titleStyle');
+      expect(callRefsFrom(result, 'build')).toContain('.height');
+      expect(callRefsFrom(result, 'build')).not.toContain('height');
+    });
+
+    it('recovers the detached-chain shape (chain on the line after a nested component)', () => {
+      // Inside arkui_children, a chain starting after the closing `}` is
+      // detached by the grammar into sibling leading_dot_expression +
+      // parenthesized_expression statements — the close-button idiom.
+      const detached = `
+@Component
+struct Panel {
+  close(): void {}
+
+  build() {
+    Column() {
+      Row() {
+        Text('x')
+      }
+      .width(10)
+      .onClick(this.close)
+      .id('close_button')
+    }
+  }
+}
+`;
+      const result = extractFromSource('components/Panel.ets', detached);
+      const refs = callRefsFrom(result, 'build');
+      expect(refs).toContain('close');
+      expect(refs).toContain('.width');
+      expect(refs).not.toContain('width');
+    });
+
+    it('dot-prefixes the innermost call of a proper-form detached chain', () => {
+      // `.alignItems(x).layoutWeight(1)` under a leading_dot_expression: the
+      // wrapper consumes the dot, so the innermost call has a bare identifier
+      // function and would otherwise emit as a plain `alignItems(...)` call.
+      const chained = `
+@Component
+struct Card {
+  build() {
+    Column() {
+      List() {
+        Text('x')
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .height('100%')
+    }
+  }
+}
+`;
+      const result = extractFromSource('components/Card.ets', chained);
+      const refs = callRefsFrom(result, 'build');
+      expect(refs).toContain('.alignItems');
+      expect(refs).not.toContain('alignItems');
+      expect(refs).toContain('.layoutWeight');
+      expect(refs).not.toContain('layoutWeight');
+    });
+
+    it('emits a call ref for an .onClick(this.handler) method-reference binding', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'headerBar')).toContain('handleTap');
+    });
+
+    it('emits a call ref for a @Builder method invoked as this.headerBar()', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'build')).toContain('headerBar');
+    });
+
+    it('extracts a global @Extend function with its decorator', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'titleStyle');
+      expect(fn).toBeDefined();
+      expect(fn?.decorators).toContain('Extend');
+    });
+  });
+
+  describe('Global @Builder functions', () => {
+    it('extracts a decorated global @Builder function with signature and decorator', () => {
+      const result = extractFromSource(
+        'common/builders.ets',
+        `@Builder\nfunction EmptyHint(message: string) {\n  Column() {\n    Text(message).fontSize(16)\n  }\n}\n`
+      );
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'EmptyHint');
+      expect(fn).toBeDefined();
+      expect(fn?.signature).toBe('(message: string)');
+      expect(fn?.decorators).toContain('Builder');
+    });
+  });
+
+  describe('Standard TypeScript constructs in .ets', () => {
+    it('extracts classes, interfaces, enums, type aliases and their members', () => {
+      const code = `
+export enum Priority { Low, Medium = 2, High }
+
+export interface Shape {
+  area(): number;
+}
+
+export type Handler = (e: string) => void;
+
+export class Service {
+  private count: number = 0;
+  doWork(x: number): number {
+    return this.helper(x);
+  }
+  helper(n: number): number { return n * 2; }
+}
+`;
+      const result = extractFromSource('common/service.ets', code);
+      expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'Service')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'Priority')).toBeDefined();
+      const members = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.qualifiedName);
+      expect(members).toEqual(expect.arrayContaining(['Priority::Low', 'Priority::Medium', 'Priority::High']));
+      expect(result.nodes.find((n) => n.kind === 'interface' && n.name === 'Shape')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Handler')).toBeDefined();
+      const doWork = result.nodes.find((n) => n.qualifiedName === 'Service::doWork');
+      expect(doWork?.kind).toBe('method');
+      expect(doWork?.signature).toBe('(x: number): number');
+      expect(
+        result.unresolvedReferences.find((r) => r.referenceKind === 'calls' && r.referenceName === 'helper')
+      ).toBeDefined();
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('extracts relative, SDK (@ohos/@kit) and default imports', () => {
+      const code = `
+import router from '@ohos.router';
+import { promptAction } from '@kit.ArkUI';
+import { TodoItem } from '../model/TodoItem';
+import DataStore from '../data/DataStore';
+`;
+      const result = extractFromSource('pages/imports.ets', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('@ohos.router');
+      expect(imports).toContain('@kit.ArkUI');
+      expect(imports).toContain('../model/TodoItem');
+      expect(imports).toContain('../data/DataStore');
+    });
   });
 });

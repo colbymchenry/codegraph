@@ -418,6 +418,269 @@ function flutterBuildEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[
 }
 
 /**
+ * Reactive ArkUI property decorators: assigning a property carrying one of
+ * these re-runs the owning struct's `build()`. Covers both state models —
+ * V1 (`@Component`: State/Prop/Link/Provide/Consume/Storage*) and V2
+ * (`@ComponentV2`: Local/Provider/Consumer; `@Param` is read-only in V2 so
+ * the assignment gate never fires on it, and `@Trace` lives on `@ObservedV2`
+ * data classes, not struct properties).
+ */
+const ARKUI_REACTIVE_DECORATORS = new Set([
+  'State', 'Prop', 'Link', 'Provide', 'Consume', 'StorageLink', 'StorageProp',
+  'LocalStorageLink', 'LocalStorageProp', 'ObjectLink',
+  'Local', 'Provider', 'Consumer',
+]);
+
+/** ArkUI-observed array mutators — `this.todos.push(x)` re-renders like an assignment. */
+const ARKUI_ARRAY_MUTATORS = 'push|pop|shift|unshift|splice|sort|reverse|fill';
+
+/**
+ * Phase 4b-ets: ArkUI state → build (the ArkTS analog of react-render /
+ * flutter-build). Assigning a reactive-decorated property (`@State count`,
+ * `@Link selected`, …) re-runs the `@Component struct`'s `build()`, but that
+ * hop is framework-internal — no static edge — so "onClick → markAllDone →
+ * this.todos = […] → rebuilt list" dead-ends at the assignment. Bridge it:
+ * for each arkts struct with a `build()` method and at least one reactive
+ * property, link every sibling method whose body ASSIGNS (or array-mutates)
+ * one of those properties → `build`. Assignment-gated on the struct's OWN
+ * reactive property names — a method that merely reads state, or a struct
+ * with no reactive properties, gets nothing (this is the precision line the
+ * all-sibling-methods design would erase).
+ */
+function arkuiStateBuildEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const struct of queries.getNodesByKind('struct')) {
+    if (struct.language !== 'arkts') continue;
+    const children = queries.getOutgoingEdges(struct.id, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n);
+    const build = children.find((n) => n.kind === 'method' && n.name === 'build');
+    if (!build) continue;
+    const reactiveProps = children.filter(
+      (n) => n.kind === 'property' && (n.decorators ?? []).some((d) => ARKUI_REACTIVE_DECORATORS.has(d))
+    );
+    if (reactiveProps.length === 0) continue;
+    const propAlternation = reactiveProps
+      .map((p) => p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('|');
+    // `this.count = …` / `+=` / `++` / `--` / `this.todos.push(…)`. The
+    // `=(?!=)` keeps `this.done == x` comparisons out.
+    const mutationRe = new RegExp(
+      `this\\.(?:${propAlternation})\\s*(?:=(?!=)|\\+\\+|--|[+\\-*/%&|^]=|\\.(?:${ARKUI_ARRAY_MUTATORS})\\s*\\()`
+    );
+    let added = 0;
+    for (const m of children) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      if (m.kind !== 'method' || m.id === build.id) continue;
+      const content = ctx.readFile(m.filePath);
+      const src = content && sliceLines(content, m.startLine, m.endLine);
+      if (!src || !mutationRe.test(stripCommentsForRegex(src, 'typescript'))) continue;
+      const key = `${m.id}>${build.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: m.id, target: build.id, kind: 'calls', line: m.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'arkui-state', via: 'state assignment', registeredAt: `${build.filePath}:${build.startLine}` },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
+/** Emit/subscribe call sites of HarmonyOS's `@ohos.events.emitter` bus. */
+const ARKUI_EMITTER_CALL_RE = /\bemitter\s*\.\s*(emit|on|once)\s*\(\s*([A-Za-z_$][\w$.]*|\{[^)]{0,120}?\beventId\s*:\s*[^,}]+[^)]*?\})/g;
+
+/** Cap per event bucket — a generic key with many parties is dynamic routing, not a static pair. */
+const ARKUI_EMITTER_FANOUT_CAP = 8;
+
+/**
+ * Phase 4b-ets2: HarmonyOS `@ohos.events.emitter` bridge. The cross-component
+ * bus — `emitter.emit(eventId)` fires `emitter.on(eventId, cb)` — is
+ * framework-internal, so an order flow riding it (OrangeShopping's
+ * add-to-cart) dead-ends at the emit. Link emit-site enclosing
+ * function/method → on/once-site enclosing function/method when both
+ * reference the SAME statically-recoverable event key.
+ *
+ * Key recovery, per call site (comment-stripped enclosing-file source): the
+ * first argument is an `{ eventId: K }` literal, a `Names.Dotted` constant, or
+ * a local whose same-file declaration is `new EventsId(K)` / `= K` — chase one
+ * level. Precision scoping learned from the samples monorepo (thousands of
+ * unrelated samples, most using eventId 1): NUMERIC keys pair within the same
+ * FILE only; NAMED keys pair within the same workspace module directory (or
+ * the whole project when it declares no modules — the single-app case), both
+ * behind a fan-out cap. Inline `on(id, (e) => {…})` arrows need no special
+ * handling — their bodies' calls already attribute to the registering method,
+ * so targeting that method keeps the chain connected.
+ */
+function arkuiEmitterEdges(ctx: ResolutionContext): Edge[] {
+  interface Site { nodeId: string; file: string; line: number }
+  // bucket key -> emit sites / handler sites
+  const emits = new Map<string, Site[]>();
+  const handlers = new Map<string, Site[]>();
+
+  const moduleDirs = (() => {
+    const ws = ctx.getWorkspacePackages?.();
+    return ws ? [...new Set(ws.byName.values())].sort((a, b) => b.length - a.length) : [];
+  })();
+  const moduleScopeOf = (file: string): string => {
+    for (const dir of moduleDirs) {
+      if (file === dir || file.startsWith(dir + '/')) return dir;
+    }
+    return '';
+  };
+
+  for (const file of ctx.getAllFiles()) {
+    if (!file.endsWith('.ets')) continue;
+    const content = ctx.readFile(file);
+    if (!content || !content.includes('emitter.')) continue;
+    const safe = stripCommentsForRegex(content, 'typescript');
+    const nodes = ctx.getNodesInFile(file)
+      .filter((n) => n.kind === 'method' || n.kind === 'function');
+
+    ARKUI_EMITTER_CALL_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ARKUI_EMITTER_CALL_RE.exec(safe))) {
+      const verb = m[1]!;
+      const arg = m[2]!.trim();
+      const line = safe.slice(0, m.index).split('\n').length;
+      const encl = nodes
+        .filter((n) => n.startLine <= line && n.endLine >= line)
+        .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+      if (!encl) continue;
+
+      // Recover the event key from the first argument.
+      let key: string | null = null;
+      const idLit = arg.startsWith('{') ? arg.match(/\beventId\s*:\s*([\w$.]+)/)?.[1] : undefined;
+      const token = idLit ?? arg;
+      if (token !== undefined) {
+        if (/^\d+$/.test(token)) {
+          key = `num:${file}:${token}`; // numeric: same-file only
+        } else if (token.includes('.')) {
+          key = `name:${moduleScopeOf(file)}:${token}`;
+        } else {
+          // Local variable — chase its same-file declaration one level:
+          // `let x = new EventsId(K)` / `const x = K`.
+          const declRe = new RegExp(
+            `\\b${token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b\\s*(?::[^=\\n]+)?=\\s*(?:new\\s+[\\w$.]+\\(\\s*([^)\\n]+?)\\s*\\)|([\\w$.]+))`
+          );
+          const decl = safe.match(declRe);
+          const inner = (decl?.[1] ?? decl?.[2])?.trim();
+          if (inner && /^\d+$/.test(inner)) key = `num:${file}:${inner}`;
+          else if (inner && /^[\w$.]+$/.test(inner)) key = `name:${moduleScopeOf(file)}:${inner}`;
+        }
+      }
+      if (!key) continue;
+
+      const site: Site = { nodeId: encl.id, file, line };
+      if (verb === 'emit') {
+        (emits.get(key) ?? emits.set(key, []).get(key)!).push(site);
+      } else {
+        (handlers.get(key) ?? handlers.set(key, []).get(key)!).push(site);
+      }
+    }
+  }
+
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const [key, emitSites] of emits) {
+    const handlerSites = handlers.get(key);
+    if (!handlerSites) continue;
+    if (emitSites.length > ARKUI_EMITTER_FANOUT_CAP || handlerSites.length > ARKUI_EMITTER_FANOUT_CAP) continue;
+    const eventLabel = key.slice(key.lastIndexOf(':') + 1);
+    for (const e of emitSites) for (const h of handlerSites) {
+      if (e.nodeId === h.nodeId) continue;
+      const dedupe = `${e.nodeId}>${h.nodeId}`;
+      if (seen.has(dedupe)) continue;
+      seen.add(dedupe);
+      edges.push({
+        source: e.nodeId, target: h.nodeId, kind: 'calls', line: e.line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'arkui-emitter', event: eventLabel, registeredAt: `${h.file}:${h.line}` },
+      });
+    }
+  }
+  return edges;
+}
+
+/** `router.pushUrl({ url: 'pages/Detail' })` / replaceUrl — literal urls only. */
+const ARKUI_ROUTER_RE = /\brouter\s*\.\s*(?:pushUrl|replaceUrl)\s*\(\s*\{[^)]{0,200}?\burl\s*:\s*['"]([\w\-./]+)['"]/g;
+
+/**
+ * Phase 4b-ets3: HarmonyOS page navigation. `router.pushUrl({ url:
+ * 'pages/Detail' })` reaches the `@Entry struct` of
+ * `<module>/src/main/ets/pages/Detail.ets`, but the hop is a string — no
+ * static edge — so "tap → openDetail → ???" ends at the router call. Bridge
+ * literal urls to the page struct: the url resolves against the standard
+ * `src/main/ets/` layout (what main_pages.json entries name); candidates
+ * prefer the caller's own workspace module (routes are module-scoped), and
+ * anything still ambiguous is dropped rather than guessed. Only `@Entry`
+ * structs qualify as targets — the decorator is what makes a file a page.
+ */
+function arkuiRouterEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  const allFiles = ctx.getAllFiles();
+  const moduleDirs = (() => {
+    const ws = ctx.getWorkspacePackages?.();
+    return ws ? [...new Set(ws.byName.values())].sort((a, b) => b.length - a.length) : [];
+  })();
+  const moduleScopeOf = (file: string): string => {
+    for (const dir of moduleDirs) {
+      if (file === dir || file.startsWith(dir + '/')) return dir;
+    }
+    return '';
+  };
+
+  for (const file of allFiles) {
+    if (!file.endsWith('.ets')) continue;
+    const content = ctx.readFile(file);
+    if (!content || !content.includes('router.')) continue;
+    const safe = stripCommentsForRegex(content, 'typescript');
+    const nodes = ctx.getNodesInFile(file)
+      .filter((n) => n.kind === 'method' || n.kind === 'function');
+
+    ARKUI_ROUTER_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ARKUI_ROUTER_RE.exec(safe))) {
+      const url = m[1]!;
+      const line = safe.slice(0, m.index).split('\n').length;
+      const encl = nodes
+        .filter((n) => n.startLine <= line && n.endLine >= line)
+        .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+      if (!encl) continue;
+
+      const suffix = `/src/main/ets/${url}.ets`;
+      let candidates = allFiles.filter((f) => f.endsWith(suffix));
+      if (candidates.length > 1) {
+        const scope = moduleScopeOf(file);
+        const sameModule = candidates.filter((f) => moduleScopeOf(f) === scope);
+        if (sameModule.length > 0) candidates = sameModule;
+      }
+      if (candidates.length !== 1) continue; // ambiguous or unresolved — never guess
+
+      const page = ctx.getNodesInFile(candidates[0]!).find(
+        (n) => n.kind === 'struct' && (n.decorators ?? []).includes('Entry')
+      );
+      if (!page) continue;
+
+      const key = `${encl.id}>${page.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: encl.id, target: page.id, kind: 'calls', line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'arkui-route', event: url, registeredAt: `${candidates[0]}:${page.startLine}` },
+      });
+    }
+  }
+  return edges;
+}
+
+/**
  * Phase 4c: C++ virtual override. A call through a base/interface pointer
  * (`db->Get(...)`, `iter->Next()`) dispatches at runtime to a subclass override,
  * but that hop is a vtable indirection — no static call edge — so a flow stops at
@@ -485,6 +748,7 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
 // or an `object` (Scala) so the loop also iterates those kinds.
 const IFACE_OVERRIDE_LANGS = new Set([
   'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go', 'rust',
+  'arkts',
 ]);
 /**
  * Go implicit interface satisfaction (#584). Go has no `implements` keyword — a
@@ -2520,6 +2784,361 @@ function sidekiqDispatchEdges(ctx: ResolutionContext): Edge[] {
   return edges;
 }
 
+// ── Erlang behaviour-callback dispatch ────────────────────────────────────────
+// An Erlang behaviour is a compile-checked callback contract: the behaviour
+// module declares `-callback init(...) -> ...`, implementers declare
+// `-behaviour(B)` and export the callbacks, and the framework side dispatches
+// through a VARIABLE module — cowboy's `Handler:init(Req, Opts)` and
+// `Middleware:execute(Req, Env)` folds, ejabberd's `Mod:start/2`. Extraction
+// deliberately leaves var-module calls silent (no static target), so the flow
+// breaks at exactly the hop agents ask about (request → handler init). Bridge:
+//
+//   dispatch site `Var:fn(args…)` → every in-repo implementer of the behaviour
+//   declaring `fn` with the SITE's arity — provided exactly ONE in-repo
+//   behaviour declares (fn, arity); a name+arity collision across behaviours
+//   bails (silent beats wrong) — and the implementer defines and exports `fn`.
+//
+// Behaviours are discovered by scanning every Erlang file for `-callback`
+// declarations (not just `implements` targets), so a behaviour with zero
+// implementers still participates in the ambiguity gate. Fan-out control: a
+// mega-behaviour (ejabberd's gen_mod, ~200 mod_* implementers) would mint
+// hundreds of edges per site that READ as complete coverage while being
+// arbitrary — above the cap the site is skipped entirely and the boundary
+// stays visibly dynamic (explore's boundary announcer covers it) instead of
+// silently truncated.
+const ERLANG_EXT = /\.(?:erl|hrl)$/;
+// `Var:fn(` — variable (capitalized) module, lowercase function, immediate
+// open-paren. The leading char class rejects `?MODULE:fn(` (macro), `a:b(`
+// (static remote call, already linked), and mid-word matches.
+const ERLANG_DISPATCH_RE = /(^|[^?\w@'])([A-Z][A-Za-z0-9_@]*):([a-z][A-Za-z0-9_@]*)\(/g;
+const ERLANG_CALLBACK_DECL_RE = /(^|\n)\s*-callback\s+('[^'\n]+'|[a-z][A-Za-z0-9_@]*)\s*\(/g;
+const ERLANG_BEHAVIOUR_FANOUT_CAP = 24;
+
+/**
+ * Argument count of the call/declaration whose `(` sits at `openIdx` —
+ * top-level commas + 1, `()` → 0, unbalanced/oversized → -1. Skips nested
+ * (), [], {}, <<>> content, `"strings"`, `'atoms'`, and `$c` char literals,
+ * so `-callback init(fun((a, b) -> ok), #{k => v}) -> ok.` counts 2.
+ */
+function erlangArityAt(src: string, openIdx: number): number {
+  let depth = 1;
+  let commas = 0;
+  let sawArg = false;
+  const limit = Math.min(src.length, openIdx + 4000);
+  for (let i = openIdx + 1; i < limit; i++) {
+    const ch = src[i]!;
+    if (ch === '"' || ch === "'") {
+      i++;
+      while (i < limit && src[i] !== ch) {
+        if (src[i] === '\\') i++;
+        i++;
+      }
+      sawArg = true;
+      continue;
+    }
+    if (ch === '$') {
+      i++;
+      if (src[i] === '\\') i++;
+      sawArg = true;
+      continue;
+    }
+    if (ch === '(' || ch === '[' || ch === '{') { depth++; sawArg = true; continue; }
+    if (ch === ')' || ch === ']' || ch === '}') {
+      depth--;
+      if (depth === 0) return sawArg ? commas + 1 : 0;
+      continue;
+    }
+    if (ch === ',' && depth === 1) { commas++; continue; }
+    if (!/\s/.test(ch)) sawArg = true;
+  }
+  return -1;
+}
+
+/**
+ * Nix module-system option wiring. A NixOS/home-manager/nix-darwin option is
+ * DECLARED in one module (`options.launchd.user.agents = mkOption { ... }`)
+ * and SET in others (`launchd.user.agents.yabai = { ... }` inside a module's
+ * config) — the connection happens by option-path unification inside the
+ * module-system evaluator, so there is no static call/import edge to follow
+ * and flow questions ("how does services.yabai.enable become a launchd
+ * service?") go dark at the module boundary.
+ *
+ * This pass links each config-write binding to the option declaration whose
+ * path is the longest static-segment prefix of the write path. Precision gates:
+ *  - only STATIC segments participate: plain identifiers, plus quoted segments
+ *    (`"git/config"`, `"com.apple.dock"`) as opaque verbatim tokens that match
+ *    only quote-exactly; an interpolated (`${name}`) segment ends the prefix,
+ *    so dynamic paths never match beyond their static head;
+ *  - matched prefixes must be ≥2 segments: 1-segment paths would wrongly link
+ *    every package's `meta = { ... }` attrset to nixos's `options.meta`;
+ *  - a prefix declared in more than one file is ambiguous → no edge (a wrong
+ *    edge is worse than none);
+ *  - writes physically inside an options block are declaration internals
+ *    (types, defaults, examples), never config writes → excluded.
+ * Both declaration spellings register: flat (`options.a.b = ...`) by name, and
+ * nested (`options = { a.b = ...; }`) by line-span containment.
+ */
+function nixLeadingPlainSegments(name: string): string[] {
+  const segs: string[] = [];
+  let i = 0;
+  const n = name.length;
+  while (i < n) {
+    if (name[i] === '"') {
+      // Quoted segment — an opaque verbatim token (quotes kept, so it can
+      // never collide with a plain identifier). `NSGlobalDomain."com.apple.
+      // mouse.tapBehavior"` must match ITS OWN quoted declaration, not
+      // whichever sibling registered the shared plain prefix first.
+      let j = i + 1;
+      while (j < n && name[j] !== '"') {
+        if (name[j] === '\\') j++;
+        j++;
+      }
+      if (j >= n) return segs; // unterminated — stop at the static head
+      const tok = name.slice(i, j + 1);
+      if (tok.includes('${')) return segs; // interpolated → dynamic → stop
+      segs.push(tok);
+      i = j + 1;
+      if (i >= n) break;
+      if (name[i] !== '.') return segs;
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < n && name[j] !== '.') {
+      if (name[j] === '"' || (name[j] === '$' && name[j + 1] === '{')) return segs;
+      j++;
+    }
+    const seg = name.slice(i, j);
+    if (!/^[A-Za-z_][A-Za-z0-9_'-]*$/.test(seg)) return segs;
+    segs.push(seg);
+    i = j + 1;
+  }
+  return segs;
+}
+
+async function nixOptionPathEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  type Rec = { id: string; filePath: string; startLine: number; endLine: number; segs: string[] };
+
+  // One streaming pass over nix bindings (variables + the odd function-valued
+  // option); memory stays O(bindings-kept), not O(all nodes) (#610).
+  const byFile = new Map<string, Rec[]>();
+  let scanned = 0;
+  for (const kind of ['variable', 'function'] as NodeKind[]) {
+    for (const node of queries.iterateNodesByKind(kind)) {
+      if ((++scanned & 0x3fff) === 0 && onYield) await onYield();
+      if (node.language !== 'nix') continue;
+      const segs = nixLeadingPlainSegments(node.name);
+      if (segs.length === 0) continue;
+      const rec: Rec = {
+        id: node.id,
+        filePath: node.filePath,
+        startLine: node.startLine,
+        endLine: node.endLine,
+        segs,
+      };
+      const arr = byFile.get(node.filePath);
+      if (arr) arr.push(rec);
+      else byFile.set(node.filePath, [rec]);
+    }
+  }
+
+  // Per file: walk bindings outermost-first with a stack of active option
+  // spans, composing nested declaration paths (`options = { services.foo = {
+  // enable = mkOption ...; }; }` registers services.foo AND services.foo.enable).
+  // An `options` binding nested inside another option span is a SUBMODULE's
+  // own namespace (`attrsOf (submodule { options = ...; })`) — its internals
+  // are not globally addressable, so the sentinel blocks registration below it
+  // while still excluding the region from write candidates.
+  const SUBMODULE = ' submodule';
+  const decls = new Map<string, Rec[]>();
+  const writes: Rec[] = [];
+  const register = (path: string[], rec: Rec) => {
+    if (path.length < 2 || path.includes(SUBMODULE)) return;
+    const key = path.join('.');
+    const arr = decls.get(key);
+    if (arr) arr.push(rec);
+    else decls.set(key, [rec]);
+  };
+  for (const recs of byFile.values()) {
+    recs.sort((a, b) => a.startLine - b.startLine || b.endLine - a.endLine);
+    const stack: Array<{ start: number; end: number; prefix: string[] }> = [];
+    for (const rec of recs) {
+      while (stack.length > 0 && stack[stack.length - 1]!.end < rec.startLine) stack.pop();
+      // Strict containment at line granularity: a one-line nested binding is
+      // indistinguishable from its container, so it stays unclassified (rare
+      // in module code, where option blocks are multi-line).
+      const enclosing =
+        stack.length > 0 &&
+        rec.startLine >= stack[stack.length - 1]!.start &&
+        rec.endLine <= stack[stack.length - 1]!.end &&
+        !(rec.startLine === stack[stack.length - 1]!.start && rec.endLine === stack[stack.length - 1]!.end)
+          ? stack[stack.length - 1]!
+          : null;
+
+      if (rec.segs[0] === 'options') {
+        const ownPath = rec.segs.slice(1); // [] for the bare `options = { ... }` spelling
+        const prefix = enclosing ? [SUBMODULE] : ownPath;
+        register(prefix, rec);
+        stack.push({ start: rec.startLine, end: rec.endLine, prefix });
+        continue;
+      }
+      if (enclosing) {
+        const composed = [...enclosing.prefix, ...rec.segs];
+        register(composed, rec);
+        stack.push({ start: rec.startLine, end: rec.endLine, prefix: composed });
+        continue;
+      }
+      if (rec.segs.length >= 2) {
+        writes.push(rec);
+      }
+    }
+  }
+  if (decls.size === 0 || writes.length === 0) return [];
+
+  const edges: Edge[] = [];
+  for (const w of writes) {
+    // `config.services.x = ...` spells the same write with an explicit prefix.
+    const segs = w.segs[0] === 'config' ? w.segs.slice(1) : w.segs;
+    if (segs.length < 2) continue;
+    // Longest prefix wins; an ambiguous longest match does NOT fall back to a
+    // shorter one (that would link `services.nginx.virtualHosts.x` to
+    // `options.services.nginx` when virtualHosts is the contested path).
+    for (let len = Math.min(segs.length, 6); len >= 2; len--) {
+      const candidates = decls.get(segs.slice(0, len).join('.'));
+      if (!candidates || candidates.length === 0) continue;
+      const files = new Set(candidates.map((c) => c.filePath));
+      if (files.size === 1) {
+        const target = candidates[0]!;
+        if (target.id !== w.id) {
+          edges.push({
+            source: w.id,
+            target: target.id,
+            kind: 'references',
+            line: w.startLine,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'nix-option-path',
+              optionPath: segs.slice(0, len).join('.'),
+              registeredAt: `${target.filePath}:${target.startLine}`,
+            },
+          });
+        }
+      }
+      break; // longest hit decides, matched or ambiguous
+    }
+  }
+  return edges;
+}
+
+function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  // Cheap language gate: no Erlang modules → no cost beyond one kind query.
+  const erlangModules = queries.getNodesByKind('namespace').filter((n) => n.language === 'erlang');
+  if (erlangModules.length === 0) return [];
+
+  // Pass 1 — scan every Erlang file with `-callback` decls: behaviour module →
+  // its (name, arity) callback set, and the global `name/arity` → declaring
+  // behaviours map that drives the ambiguity gate.
+  const moduleByFile = new Map<string, Node>();
+  for (const ns of erlangModules) {
+    if (!moduleByFile.has(ns.filePath)) moduleByFile.set(ns.filePath, ns);
+  }
+  const declaringBehaviours = new Map<string, Node[]>(); // `fn/arity` → behaviour namespaces
+  const callbackNames = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!ERLANG_EXT.test(file)) continue;
+    const behaviour = moduleByFile.get(file);
+    if (!behaviour) continue; // a .hrl or module-less file can't be a behaviour
+    const content = ctx.readFile(file);
+    if (!content || !content.includes('-callback')) continue;
+    const safe = stripCommentsForRegex(content, 'erlang');
+    ERLANG_CALLBACK_DECL_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ERLANG_CALLBACK_DECL_RE.exec(safe))) {
+      const name = m[2]!.replace(/^'|'$/g, '');
+      const arity = erlangArityAt(safe, m.index + m[0].length - 1);
+      if (arity < 0) continue;
+      const key = `${name}/${arity}`;
+      const arr = declaringBehaviours.get(key);
+      if (arr) {
+        if (!arr.some((b) => b.id === behaviour.id)) arr.push(behaviour);
+      } else {
+        declaringBehaviours.set(key, [behaviour]);
+      }
+      callbackNames.add(name);
+    }
+  }
+  if (declaringBehaviours.size === 0) return [];
+
+  // Implementer target lookup, lazy per (behaviour, fn): implementers come
+  // from the `implements` edges extraction resolved, and the target is the
+  // implementer module's own exported `fn` function node.
+  const targetCache = new Map<string, Node[]>();
+  const targetsOf = (behaviour: Node, fn: string): Node[] => {
+    const cacheKey = `${behaviour.id}#${fn}`;
+    let targets = targetCache.get(cacheKey);
+    if (targets) return targets;
+    targets = [];
+    for (const e of queries.getIncomingEdges(behaviour.id, ['implements'])) {
+      const impl = queries.getNodeById(e.source);
+      if (!impl || impl.language !== 'erlang' || impl.kind !== 'namespace') continue;
+      const fnNode = ctx
+        .getNodesInFile(impl.filePath)
+        .find((n) => n.kind === 'function' && n.name === fn && n.isExported !== false);
+      if (fnNode) targets.push(fnNode);
+    }
+    targetCache.set(cacheKey, targets);
+    return targets;
+  };
+
+  // Pass 2 — dispatch sites. Only files containing a var-module call shape are
+  // scanned in full.
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const file of ctx.getAllFiles()) {
+    if (!ERLANG_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || !/[A-Z][A-Za-z0-9_@]*:[a-z]/.test(content)) continue;
+    const safe = stripCommentsForRegex(content, 'erlang');
+    const nodesInFile = ctx.getNodesInFile(file);
+    ERLANG_DISPATCH_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ERLANG_DISPATCH_RE.exec(safe))) {
+      const fn = m[3]!;
+      if (!callbackNames.has(fn)) continue;
+      const openIdx = m.index + m[0].length - 1;
+      const arity = erlangArityAt(safe, openIdx);
+      if (arity < 0) continue;
+      const behaviours = declaringBehaviours.get(`${fn}/${arity}`);
+      if (!behaviours || behaviours.length !== 1) continue; // unknown or ambiguous
+      const behaviour = behaviours[0]!;
+      const targets = targetsOf(behaviour, fn);
+      if (targets.length === 0 || targets.length > ERLANG_BEHAVIOUR_FANOUT_CAP) continue;
+      const line = safe.slice(0, m.index).split('\n').length;
+      const disp = enclosingFn(nodesInFile, line);
+      if (!disp) continue;
+      for (const target of targets) {
+        if (target.id === disp.id) continue;
+        const key = `${disp.id}>${target.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: disp.id,
+          target: target.id,
+          kind: 'calls',
+          line,
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'erlang-behaviour',
+            via: `${behaviour.name}:${fn}/${arity}`,
+            registeredAt: `${file}:${line}`,
+          },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
 // ── Laravel events (PHP) ──────────────────────────────────────────────────────
 // Laravel decouples an event dispatch from its listener(s), linked by the EVENT CLASS:
 //   // app/Events/PlaybackStarted.php  +  app/Listeners/UpdateLastfmNowPlaying.php
@@ -2708,6 +3327,9 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   const svelteKitEdges = svelteKitLoadEdges(ctx); await yieldToLoop();
   const pascalEdges = pascalFormEdges(ctx); await yieldToLoop();
   const flutterEdges = flutterBuildEdges(queries, ctx); await yieldToLoop();
+  const arkuiStateEdges = arkuiStateBuildEdges(queries, ctx); await yieldToLoop();
+  const arkuiEmitter = arkuiEmitterEdges(ctx); await yieldToLoop();
+  const arkuiRoutes = arkuiRouterEdges(ctx); await yieldToLoop();
   const cppEdges = cppOverrideEdges(queries); await yieldToLoop();
   const ifaceEdges = interfaceOverrideEdges(queries); await yieldToLoop();
   const kotlinExpectActual = kotlinExpectActualEdges(queries); await yieldToLoop();
@@ -2727,9 +3349,11 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   const springEdges = springEventEdges(ctx); await yieldToLoop();
   const mediatrEdges = mediatrDispatchEdges(ctx); await yieldToLoop();
   const sidekiqEdges = sidekiqDispatchEdges(ctx); await yieldToLoop();
+  const erlangBehaviourEdges = erlangBehaviourDispatchEdges(queries, ctx); await yieldToLoop();
   const laravelEdges = laravelEventEdges(ctx); await yieldToLoop();
   const cFnPtrEdges = cFnPointerDispatchEdges(queries, ctx); await yieldToLoop();
   const goframeEdges = goframeRouteEdges(ctx); await yieldToLoop();
+  const nixOptionEdges = await nixOptionPathEdges(queries, yieldToLoop); await yieldToLoop();
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -2743,6 +3367,9 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
     ...svelteKitEdges,
     ...pascalEdges,
     ...flutterEdges,
+    ...arkuiStateEdges,
+    ...arkuiEmitter,
+    ...arkuiRoutes,
     ...cppEdges,
     ...ifaceEdges,
     ...kotlinExpectActual,
@@ -2762,9 +3389,11 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
     ...springEdges,
     ...mediatrEdges,
     ...sidekiqEdges,
+    ...erlangBehaviourEdges,
     ...laravelEdges,
     ...cFnPtrEdges,
     ...goframeEdges,
+    ...nixOptionEdges,
   ]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
