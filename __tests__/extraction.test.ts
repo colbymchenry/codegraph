@@ -102,6 +102,42 @@ describe('Language Detection', () => {
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
   });
 
+  it('should detect a .h with an export-macro class/struct header as C++ (#1159)', () => {
+    // `class MODULE_API Foo : Base` — the ubiquitous Unreal Engine / library
+    // export-macro form. The macro between `class` and the name previously
+    // defeated the C++ signal, so the header fell back to C and the class was
+    // dropped. Case is stripped of any other C++ tell (no `public:`) so only the
+    // class/struct signal itself is under test.
+    expect(detectLanguage('Foo.h', 'class ENGINE_API Foo : public Bar\n{\n    void Tick();\n};\n')).toBe('cpp');
+    expect(detectLanguage('Foo.h', 'class CORE_API Widget\n{\n    void draw();\n};\n')).toBe('cpp');
+    expect(detectLanguage('Widget.h', 'struct MODULE_API Widget : Base\n{\n    int n;\n};\n')).toBe('cpp');
+    // Regressions guards: the plain forms must keep working, and a plain C
+    // `struct X { … }` (valid C, base-clause absent) must stay C.
+    expect(detectLanguage('Foo.h', 'class Foo : public Bar\n{\n};\n')).toBe('cpp');
+    expect(detectLanguage('Point.h', 'struct Point {\n    int x;\n    int y;\n};\n')).toBe('c');
+  });
+
+  it('recovers the class from an export-macro-only .h header end-to-end (#1159)', () => {
+    // The issue's impact: with detection fixed, the header now reaches the C++
+    // grammar + #1061 macro-blanking, so the class, its member, and its base
+    // edge are all recovered. The header carries NO other C++ tell (no `public:`,
+    // no `#define`) — the macro class is the sole signal, which is exactly the
+    // case that regressed to C before.
+    const header = `class ENGINE_API Foo : public Bar
+{
+    void Tick();
+};
+`;
+    expect(detectLanguage('Foo.h', header)).toBe('cpp');
+    const result = extractFromSource('Foo.h', header);
+    expect(result.nodes.find((n) => n.name === 'Foo')?.kind).toBe('class');
+    expect(
+      result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'extends' && r.referenceName === 'Bar'
+      )
+    ).toBeTruthy();
+  });
+
   it('should detect Metal shader files as C++ (#1121)', () => {
     expect(detectLanguage('Shaders.metal')).toBe('cpp');
     expect(isSourceFile('Renderer/Shaders.metal')).toBe(true);
