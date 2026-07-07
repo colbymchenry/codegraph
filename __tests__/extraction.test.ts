@@ -3285,6 +3285,75 @@ public:
     });
   });
 
+  describe('C++ dense Unreal-Engine header regression (#1160/#1158)', () => {
+    // Regression guard for the three UE blank passes together, on a HEAVILY
+    // reflected class in the shape that broke real engine headers
+    // (`CharacterMovementComponent.h` carries ~240 in-body reflection macros).
+    // On the real headers the accumulated tree-sitter errors collapse the whole
+    // `class_specifier` into an ERROR node and the class itself vanishes; that
+    // full collapse is emergent from real-header content we can't ship here
+    // (Unreal's source is EULA-licensed), so this reproduces the *recoverable*
+    // signal it leaves: with the blank passes reverted, tree-sitter drops every
+    // one of these decorated members and the `UMETA` enum into error recovery,
+    // so the assertions below flip from pass to fail. Verified against the
+    // pre-fix build: `Compute0`, the last member, and `EDenseMode` are all
+    // absent before the fix and present after — reverting any of
+    // blankCppAnnotationMacroCalls / blankCppApiPrefixMacros /
+    // blankCppInlineAnnotationMacros regresses at least one of them.
+    const N = 120; // 120 UPROPERTY + 120 UFUNCTION = ~240 in-body macros
+    function denseReflectedHeader(): string {
+      let members = '';
+      for (let i = 0; i < N; i++) {
+        // line-leading UPROPERTY with nested meta=(...) (blankCppAnnotationMacroCalls)
+        members += `\tUPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Move", meta=(ClampMin="0.0", EditCondition="bOn${i}", AllowedClasses="/Script/Engine.Texture"))\n\tTSubclassOf<AActor> Prop${i};\n`;
+        // line-leading UFUNCTION + member-level ENGINE_API + UPARAM(ref) param
+        // (all three passes) on an inline definition (has a body → is a node)
+        members += `\tUFUNCTION(BlueprintCallable, Category="Move", meta=(DisplayName="Compute ${i}"))\n\tENGINE_API float Compute${i}(UPARAM(ref) float& In) const { return In * ${i}.0f; }\n`;
+      }
+      return `UCLASS(MinimalAPI, Blueprintable)
+class ENGINE_API UDenseMovement : public UPawnMovementComponent, public IRVOAvoidanceInterface, public INetworkPredictionInterface
+{
+\tGENERATED_BODY()
+public:
+\tDECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnMoved, float, Speed, FVector, Loc);
+\tusing FLegacyTick UE_DEPRECATED(5.5, "use TDelegate<void(float)>") = TMulticastDelegate<void(float)>;
+${members}};
+
+UENUM(BlueprintType)
+enum class EDenseMode : uint8
+{
+\tWalking UMETA(DisplayName="Walk (fast), safe"),
+\tFlying  UMETA(DisplayName="Fly"),
+\tCustom  UMETA(Hidden),
+};
+`;
+    }
+
+    it('recovers a ~240-macro reflected class, its base clause, and every decorated member', () => {
+      const result = extractFromSource('DenseMovement.h', denseReflectedHeader());
+      // The class and its whole multiple-inheritance base clause survive.
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'UDenseMovement')).toBe(true);
+      for (const base of ['UPawnMovementComponent', 'IRVOAvoidanceInterface', 'INetworkPredictionInterface']) {
+        expect(
+          result.unresolvedReferences.find((r) => r.referenceKind === 'extends' && r.referenceName === base)
+        ).toBeTruthy();
+      }
+      // The real guard: the decorated inline members parse instead of being lost
+      // to error recovery — the first, a middle, and the LAST (proof the whole
+      // dense body closed, not just the head).
+      expect(result.nodes.some((n) => n.name === 'Compute0')).toBe(true);
+      expect(result.nodes.some((n) => n.name === 'Compute60')).toBe(true);
+      expect(result.nodes.some((n) => n.name === `Compute${N - 1}`)).toBe(true);
+    });
+
+    it('recovers a UENUM whose values carry mid-line UMETA', () => {
+      const result = extractFromSource('DenseMovement.h', denseReflectedHeader());
+      // A mid-line UMETA drops the enum into error recovery pre-fix;
+      // blankCppInlineAnnotationMacros restores it.
+      expect(result.nodes.some((n) => n.kind === 'enum' && n.name === 'EDenseMode')).toBe(true);
+    });
+  });
+
   describe('CUDA extraction (#387)', () => {
     // CUDA parses with the C++ grammar. Three CUDA-only shapes misparse:
     // execution-space specifiers (`__global__ void f(…)`) shunt the real return
