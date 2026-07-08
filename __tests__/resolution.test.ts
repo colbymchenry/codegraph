@@ -567,6 +567,28 @@ describe('Resolution Module', () => {
       expect(result).toBe('src/helpers.ts');
     });
 
+    it('should resolve extensionless Bash imports to Bats scripts', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: (p) => p === 'test/helpers/assertions.bats',
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => ['test/helpers/assertions.bats'],
+      };
+
+      const result = resolveImportPath(
+        './helpers/assertions',
+        'test/integration.bats',
+        'bash',
+        context
+      );
+
+      expect(result).toBe('test/helpers/assertions.bats');
+    });
+
     it('should extract JS/TS import mappings', () => {
       const content = `
 import { foo } from './foo';

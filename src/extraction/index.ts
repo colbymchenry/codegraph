@@ -22,7 +22,7 @@ import {
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, hasBashShebang, isPotentialBashShebangPath } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -119,6 +119,34 @@ export interface SyncResult {
  */
 export function hashContent(content: string): string {
   return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+/** Read only the shebang-sized prefix needed to classify extensionless shell scripts. */
+function fileHasBashShebang(absPath: string): boolean {
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(absPath, 'r');
+    const buf = Buffer.alloc(256);
+    const bytes = fs.readSync(fd, buf, 0, buf.length, 0);
+    return hasBashShebang(buf.subarray(0, bytes).toString('utf-8'));
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+/** Source-file predicate with content-backed Bash shebang support. */
+function isSourceFileAtPath(absPath: string, relativePath: string, overrides?: Record<string, Language>): boolean {
+  if (isSourceFile(relativePath, overrides)) return true;
+  return isPotentialBashShebangPath(relativePath) && fileHasBashShebang(absPath);
+}
+
+function detectLanguageForGrammarLoad(filePath: string, overrides?: Record<string, Language>): Language {
+  const lang = detectLanguage(filePath, undefined, overrides);
+  return lang === 'unknown' && isPotentialBashShebangPath(filePath) ? 'bash' : lang;
 }
 
 /**
@@ -428,7 +456,7 @@ function collectIncludedFiles(
       if (defaults.ignores(rel)) return;
       if (!include.ignores(rel)) return;
       if (exclude && exclude.ignores(rel)) return;
-      if (!isSourceFile(rel, overrides)) return;
+      if (!isSourceFileAtPath(abs, rel, overrides)) return;
       out.add(rel);
     }
   };
@@ -1116,7 +1144,8 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
     }
 
     const filePath = normalizePath(prefix + rel);
-    if (!isSourceFile(filePath, overrides)) continue;
+    const sourceFile = isSourceFileAtPath(path.join(repoDir, rel), filePath, overrides);
+    if (!sourceFile && !(statusCode.includes('D') && isPotentialBashShebangPath(filePath))) continue;
 
     if (statusCode.includes('D')) {
       // Deletions stay unfiltered: getChangedFiles acts on one only when the
@@ -1177,7 +1206,7 @@ export function scanDirectory(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath, overrides)) {
+      if (isSourceFileAtPath(path.join(rootDir, filePath), filePath, overrides)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1206,7 +1235,7 @@ export async function scanDirectoryAsync(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath, overrides)) {
+      if (isSourceFileAtPath(path.join(rootDir, filePath), filePath, overrides)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1310,7 +1339,7 @@ function scanDirectoryWalk(
               walk(fullPath, active);
             }
           } else if (stat.isFile()) {
-            if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath, overrides)) {
+            if (!isIgnored(fullPath, false, active) && isSourceFileAtPath(fullPath, relativePath, overrides)) {
               files.push(relativePath);
               count++;
               onProgress?.(count, relativePath);
@@ -1327,7 +1356,7 @@ function scanDirectoryWalk(
           walk(fullPath, active);
         }
       } else if (entry.isFile()) {
-        if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath, overrides)) {
+        if (!isIgnored(fullPath, false, active) && isSourceFileAtPath(fullPath, relativePath, overrides)) {
           files.push(relativePath);
           count++;
           onProgress?.(count, relativePath);
@@ -1571,8 +1600,11 @@ export class ExtractionOrchestrator {
     });
     await new Promise(resolve => setImmediate(resolve));
 
-    // Detect needed languages and load grammars in the parse worker
-    const neededLanguages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides)))];
+    // Detect needed languages and load grammars in the parse worker. Extensionless
+    // Bash scripts were admitted by a content-backed shebang check during scan,
+    // but content is not available here yet, so include the Bash grammar for
+    // extensionless scanned files whose path alone still reports unknown.
+    const neededLanguages = [...new Set(files.map((f) => detectLanguageForGrammarLoad(f, overrides)))];
     // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded when c is needed
     if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
       neededLanguages.push('cpp');
@@ -2426,7 +2458,7 @@ export class ExtractionOrchestrator {
     // Load only grammars needed for changed files
     if (filesToIndex.length > 0) {
       const overrides = loadExtensionOverrides(this.rootDir);
-      const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f, undefined, overrides)))];
+      const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguageForGrammarLoad(f, overrides)))];
       // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded
       if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
         neededLanguages.push('cpp');

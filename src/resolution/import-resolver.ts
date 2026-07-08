@@ -22,6 +22,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   // rewritten to the member's directory; lowercase variants for safety.
   arkts: ['.ets', '.ts', '.d.ts', '.js', '/Index.ets', '/index.ets', '/index.ts', '/index.js'],
   javascript: ['.js', '.jsx', '.mjs', '.cjs', '/index.js', '/index.jsx'],
+  bash: ['.sh', '.bash', '.bats', '/index.sh'],
   tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js'],
   jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
   // SFC consumers import plain TS/JS, sibling components, and barrels
