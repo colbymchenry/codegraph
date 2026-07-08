@@ -1280,6 +1280,21 @@ function inferLocalReceiverType(
       componentScoped = scope === 'variables' || scope === 'this';
     }
   }
+  // PHP `$this->prop` receiver — the property's declaration lives outside the
+  // calling method (a promoted constructor parameter `private readonly Foo $prop`,
+  // a typed property `private Foo $prop;`, or a classic constructor parameter
+  // `Foo $prop` assigned in __construct). Strip the prefix and widen the scan to
+  // the whole file, the same treatment CFML's component-scoped fields get above:
+  // the existing PHP typed-parameter pattern (`Foo $prop`) matches all three
+  // declaration shapes, and nearest-declaration-backward still prefers a local
+  // that shadows the property.
+  if (ref.language === 'php') {
+    const scoped = receiverName.match(/^this->(.+)$/);
+    if (scoped) {
+      scanReceiver = scoped[1]!;
+      componentScoped = true;
+    }
+  }
 
   const patterns = localReceiverTypePatterns(
     ref.language,
@@ -1363,6 +1378,32 @@ export function matchMethodCall(
   const rDollarMatch = ref.language === 'r'
     ? ref.referenceName.match(/^([\w.]+)\$(\w+)$/)
     : null;
+
+  // PHP property receiver: `$this->prop->method()` reaches the resolver as
+  // `this->prop.method` (the extractor records the receiver's raw text with the
+  // leading `$` stripped). Resolve it EXCLUSIVELY through declared-type
+  // inference + resolveMethodOnType validation — the name-similarity strategies
+  // below must never see this shape, so a property whose type can't be
+  // recovered stays unlinked rather than guessed (a wrong inference produces no
+  // edge rather than a wrong one). Deeper chains (`this->a->b.method`) don't
+  // match the single-property pattern and stay unlinked, same as before.
+  const phpThisPropMatch = ref.language === 'php'
+    ? ref.referenceName.match(/^(this->\w+)\.(\w+)$/)
+    : null;
+  if (phpThisPropMatch) {
+    const [, receiver, phpMethodName] = phpThisPropMatch;
+    const inferredType = inferLocalReceiverType(receiver!, ref, context);
+    if (!inferredType) return null;
+    return resolveMethodOnType(
+      inferredType,
+      phpMethodName!,
+      ref,
+      context,
+      0.9,
+      'instance-method',
+      importedFqnOf(inferredType, ref, context),
+    );
+  }
 
   const match = dotMatch || colonMatch || luaColonMatch || rDollarMatch;
   if (!match) {

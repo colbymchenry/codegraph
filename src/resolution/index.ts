@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
+import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -43,6 +43,9 @@ const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
 
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */
 const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
+
+/** PHP `$this->prop->method()` encoded as `this->prop.method` — no `()`, so CHAIN_SHAPE misses it. */
+const PHP_PROP_SHAPE = /^this->\w+\.\w+$/;
 
 /**
  * Cache size limits. Each per-resolver cache is bounded so memory
@@ -889,6 +892,15 @@ export class ReferenceResolver {
         CHAIN_SHAPE.test(ref.referenceName)
       ) {
         this.deferredChainRefs.push(ref);
+      } else if (
+        // PHP `$this->prop->method()` (encoded `this->prop.method`): its method
+        // may live on the property's declared supertype, resolvable only once
+        // implements/extends edges exist — defer to the same conformance pass.
+        ref.referenceKind === 'calls' &&
+        ref.language === 'php' &&
+        PHP_PROP_SHAPE.test(ref.referenceName)
+      ) {
+        this.deferredChainRefs.push(ref);
       }
       return null;
     }
@@ -1030,9 +1042,13 @@ export class ReferenceResolver {
     const maybeYield = createYielder();
     const resolved: ResolvedRef[] = [];
     for (const ref of deferred) {
-      // `::`-receiver languages (Rust) split on `::` (matchScopedCallChain);
+      // PHP `this->prop.method` resolves via matchMethodCall (declared-type
+      // inference + resolveMethodOnType conformance walk); `::`-receiver
+      // languages (Rust) split on `::` (matchScopedCallChain); other
       // dotted-receiver languages on `.` (matchDottedCallChain).
-      const chainMatch = SCOPED_CHAIN_LANGUAGES.has(ref.language)
+      const chainMatch = (ref.language === 'php' && PHP_PROP_SHAPE.test(ref.referenceName))
+        ? matchMethodCall(ref, this.context)
+        : SCOPED_CHAIN_LANGUAGES.has(ref.language)
         ? matchScopedCallChain(ref, this.context)
         : matchDottedCallChain(ref, this.context);
       const match = this.gateLanguage(chainMatch, ref);

@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- PHP method calls made through a class property — `$this->dep->method()`, the dominant call shape in constructor-injection codebases (Symfony, Laravel) — now resolve to the method on the property's declared type, so `codegraph_callers` and impact analysis see production callers instead of reporting a DI-heavy method as uncalled or test-only. All three declaration shapes count: a promoted constructor parameter (`private readonly Foo $dep`), a typed property (`private Foo $dep;`), and a classic constructor parameter assigned in `__construct`. Interface-typed properties resolve to the interface method, and a method the property's type inherits from a supertype resolves through the existing conformance retry once `extends`/`implements` edges are built. Resolution is deliberately exclusive: a property whose type can't be recovered statically (docblock-only, setter/container injection) stays unlinked rather than guessed, so no name-similarity false edges are introduced. (#1220)
 
 ## [1.3.0] - 2026-07-07
 
