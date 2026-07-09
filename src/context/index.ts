@@ -749,6 +749,12 @@ export class ContextBuilder {
     if (symbolsFromQuery.length > 0) {
       const camelDefinitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'trait',
         'protocol', 'enum', 'type_alias'];
+      // Callable kinds participate too: in service-layer codebases (Express-style,
+      // Express) the camel-infix definers of a queried field are METHODS
+      // (profileInfo → getProfileInfoV2), not classes. Fetched as a separate
+      // LIKE batch so hot single-word terms can't crowd classes out of the
+      // length-ordered 200-row batch. (#1196)
+      const camelCallableKinds: NodeKind[] = ['function', 'method', 'component'];
       const camelSearchedTerms = new Set<string>();
       const searchIdSet = new Set(searchResults.map(r => r.node.id));
       // Track per-node term hits for multi-term boosting
@@ -766,18 +772,33 @@ export class ContextBuilder {
         // have hundreds of substring matches. The LIKE scan cost is the same
         // regardless of LIMIT (SQLite scans all matches to sort), so we fetch
         // generously and let path-relevance scoring pick the best ones.
-        const likeResults = this.queries.findNodesByNameSubstring(titleCased, {
-          limit: 200,
-          kinds: camelDefinitionKinds,
-          excludePrefix: true,
-        });
+        // Two batches (declaration kinds, then callable kinds) so a hot
+        // single-word term can't crowd classes out of the 200-row window.
+        const likeResults = [
+          ...this.queries.findNodesByNameSubstring(titleCased, {
+            limit: 200,
+            kinds: camelDefinitionKinds,
+            excludePrefix: true,
+          }),
+          ...this.queries.findNodesByNameSubstring(titleCased, {
+            limit: 200,
+            kinds: camelCallableKinds,
+            excludePrefix: true,
+          }),
+        ];
 
         // Filter to CamelCase boundaries, score by path relevance, and take top N
         const termCandidates: SearchResult[] = [];
         for (const r of likeResults) {
           const name = r.node.name;
-          const idx = name.indexOf(titleCased);
+          // Case-insensitive: title-casing lowercases interior humps
+          // ("profileInfo" → "Profileinfo"), which a case-sensitive indexOf
+          // can never find inside "getProfileInfoV2". SQL LIKE already matched
+          // case-insensitively; the JS boundary check must not silently
+          // re-tighten that. (#1196)
+          const idx = name.toLowerCase().indexOf(titleCased.toLowerCase());
           if (idx <= 0) continue;
+          if (!/[A-Z]/.test(name.charAt(idx))) continue;
           // Accept CamelCase boundary (lowercase before match) OR
           // acronym boundary (uppercase before match, e.g., RPCProtocol)
           if (!/[a-zA-Z]/.test(name.charAt(idx - 1))) continue;
@@ -841,11 +862,20 @@ export class ContextBuilder {
           const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();
           if (titleCased.length < 3) continue;
 
-          const likeResults = this.queries.findNodesByNameSubstring(titleCased, {
-            limit: 200,
-            kinds: camelDefinitionKinds,
-            excludePrefix: false,
-          });
+          // Callable kinds participate here too: service-layer definers of a
+          // queried field are METHODS, not classes. (#1196)
+          const likeResults = [
+            ...this.queries.findNodesByNameSubstring(titleCased, {
+              limit: 200,
+              kinds: camelDefinitionKinds,
+              excludePrefix: false,
+            }),
+            ...this.queries.findNodesByNameSubstring(titleCased, {
+              limit: 200,
+              kinds: camelCallableKinds,
+              excludePrefix: false,
+            }),
+          ];
 
           for (const r of likeResults) {
             if (searchIdSet.has(r.node.id)) continue;

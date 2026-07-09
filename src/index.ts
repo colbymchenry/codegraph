@@ -1102,6 +1102,20 @@ export class CodeGraph {
   }
 
   /**
+   * Substring search via LIKE (case-insensitive) — recovers camel-infix
+   * matches FTS can't (`Search` inside `TransportSearchAction`, `ProfileInfo`
+   * inside `getProfileInfoV2`). Ordered by name length so the shortest, most
+   * specific match wins. Exposed publicly so explore's named-symbol seeding
+   * can use it as a fallback for field-name tokens (#1196).
+   */
+  findNodesByNameSubstring(
+    substring: string,
+    options: SearchOptions & { excludePrefix?: boolean } = {},
+  ): SearchResult[] {
+    return this.queries.findNodesByNameSubstring(substring, options);
+  }
+
+  /**
    * Search nodes by text
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
