@@ -1214,3 +1214,165 @@ describe('Terraform follow-ups: remote-state bridge, provider alias, moved block
     }
   });
 });
+
+describe('Phoenix end-to-end — route→handler resolution', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('indexes a minimal Phoenix project and resolves route→handler edges', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-phoenix-'));
+
+    // -- mix.exs with Phoenix dependency --
+    fs.writeFileSync(
+      path.join(tmpDir, 'mix.exs'),
+      'defmodule MyApp.MixProject do\n' +
+        '  use Mix.Project\n' +
+        '  def project do\n' +
+        '    [\n' +
+        '      app: :my_app,\n' +
+        '      deps: [\n' +
+        '        {:phoenix, "~> 1.7"},\n' +
+        '        {:phoenix_live_view, "~> 1.0"},\n' +
+        '      ]\n' +
+        '    ]\n' +
+        '  end\n' +
+        'end\n'
+    );
+
+    // -- Directories --
+    fs.mkdirSync(path.join(tmpDir, 'lib/my_app_web/controllers'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'lib/my_app_web/live'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'lib/my_app'), { recursive: true });
+
+    // -- router.ex with scope, get, resources, live --
+    fs.writeFileSync(
+      path.join(tmpDir, 'lib/my_app_web/router.ex'),
+      'defmodule MyAppWeb.Router do\n' +
+        '  use MyAppWeb, :router\n' +
+        '\n' +
+        '  scope "/", MyAppWeb do\n' +
+        '    get "/users", UserController, :index\n' +
+        '    resources "/posts", PostController\n' +
+        '    live "/dashboard", DashboardLive\n' +
+        '  end\n' +
+        'end\n'
+    );
+
+    // -- user_controller.ex --
+    fs.writeFileSync(
+      path.join(tmpDir, 'lib/my_app_web/controllers/user_controller.ex'),
+      'defmodule MyAppWeb.UserController do\n' +
+        '  use MyAppWeb, :controller\n' +
+        '\n' +
+        '  def index(conn, _params) do\n' +
+        '    conn\n' +
+        '  end\n' +
+        'end\n'
+    );
+
+    // -- post_controller.ex with all 7 RESTful actions --
+    fs.writeFileSync(
+      path.join(tmpDir, 'lib/my_app_web/controllers/post_controller.ex'),
+      'defmodule MyAppWeb.PostController do\n' +
+        '  use MyAppWeb, :controller\n' +
+        '\n' +
+        '  def index(conn, _params), do: conn\n' +
+        '  def create(conn, _params), do: conn\n' +
+        '  def new(conn, _params), do: conn\n' +
+        '  def show(conn, %{"id" => _id}), do: conn\n' +
+        '  def edit(conn, %{"id" => _id}), do: conn\n' +
+        '  def update(conn, _params), do: conn\n' +
+        '  def delete(conn, _params), do: conn\n' +
+        'end\n'
+    );
+
+    // -- dashboard_live.ex --
+    fs.writeFileSync(
+      path.join(tmpDir, 'lib/my_app_web/live/dashboard_live.ex'),
+      'defmodule MyAppWeb.DashboardLive do\n' +
+        '  use MyAppWeb, :live_view\n' +
+        '\n' +
+        '  def mount(_params, _session, socket) do\n' +
+        '    {:ok, socket}\n' +
+        '  end\n' +
+        'end\n'
+    );
+
+    // -- greeter.ex (standalone module, no Phoenix dependency) --
+    fs.writeFileSync(
+      path.join(tmpDir, 'lib/my_app/greeter.ex'),
+      'defmodule MyApp.Greeter do\n' +
+        '  def hello, do: :world\n' +
+        'end\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    // -- Verify route nodes from router.ex --
+
+    const routes = cg.getNodesByKind('route');
+    expect(routes.length).toBeGreaterThan(0);
+
+    // Unscoped HTTP route inside scope "/", MyAppWeb
+    const usersRoute = routes.find((n) => n.name === 'GET /users');
+    expect(usersRoute, 'GET /users route node').toBeDefined();
+
+    // Resources routes (7 CRUD actions expanded by the resolver)
+    expect(routes.find((n) => n.name === 'GET /posts'),       'GET /posts').toBeDefined();
+    expect(routes.find((n) => n.name === 'POST /posts'),      'POST /posts').toBeDefined();
+    expect(routes.find((n) => n.name === 'GET /posts/new'),   'GET /posts/new').toBeDefined();
+    expect(routes.find((n) => n.name === 'GET /posts/:id'),   'GET /posts/:id').toBeDefined();
+    expect(routes.find((n) => n.name === 'GET /posts/:id/edit'), 'GET /posts/:id/edit').toBeDefined();
+    expect(routes.find((n) => n.name === 'PATCH /posts/:id'), 'PATCH /posts/:id').toBeDefined();
+    expect(routes.find((n) => n.name === 'DELETE /posts/:id'), 'DELETE /posts/:id').toBeDefined();
+
+    // Live routes produce GET + POST for the same path
+    expect(routes.find((n) => n.name === 'GET /dashboard'),  'GET /dashboard').toBeDefined();
+    expect(routes.find((n) => n.name === 'POST /dashboard'), 'POST /dashboard').toBeDefined();
+
+    // -- Verify route→handler reference edge for UserController.index --
+
+    const userCtrlNodes = cg.getNodesInFile('lib/my_app_web/controllers/user_controller.ex');
+    const indexFn = userCtrlNodes.find((n) => n.kind === 'function' && n.name === 'index');
+    expect(indexFn, 'UserController.index function node').toBeDefined();
+
+    const usersOutEdges = cg.getOutgoingEdges(usersRoute!.id);
+    const toIndex = usersOutEdges.find((e) => e.target === indexFn!.id);
+    expect(toIndex, 'GET /users → UserController.index references edge').toBeDefined();
+    expect(toIndex!.kind, 'edge kind must be references').toBe('references');
+
+    // -- Verify PostController actions all exist and at least the first is reachable --
+
+    const postCtrlNodes = cg.getNodesInFile('lib/my_app_web/controllers/post_controller.ex');
+    // Every action method should be indexed
+    for (const action of ['index', 'create', 'new', 'show', 'edit', 'update', 'delete']) {
+      expect(
+        postCtrlNodes.find((n) => n.kind === 'function' && n.name === action),
+        `PostController.${action} function`,
+      ).toBeDefined();
+    }
+
+    // GET /posts → PostController.index
+    const getPosts = routes.find((n) => n.name === 'GET /posts')!;
+    const postIndexFn = postCtrlNodes.find((n) => n.kind === 'function' && n.name === 'index')!;
+    const toPostIndex = cg.getOutgoingEdges(getPosts.id).find((e) => e.target === postIndexFn.id);
+    expect(toPostIndex, 'GET /posts → PostController.index references edge').toBeDefined();
+
+    // -- Verify MyApp.Greeter module was indexed correctly (standalone module) --
+
+    const modules = cg.getNodesByKind('module');
+    const greeter = modules.find((n) => n.name === 'MyApp.Greeter');
+    expect(greeter, 'MyApp.Greeter module node').toBeDefined();
+
+    // Greeter.hello function exists inside the module
+    const greeterNodes = cg.getNodesInFile('lib/my_app/greeter.ex');
+    const helloFn = greeterNodes.find((n) => n.kind === 'function' && n.name === 'hello');
+    expect(helloFn, 'MyApp.Greeter.hello function').toBeDefined();
+
+    cg.close();
+  });
+});
