@@ -6,9 +6,10 @@
  *     key. The shape is the same one Claude Code / Cursor / Gemini use,
  *     so users can copy-paste configs between octo and other agents.
  *
- *   - No instructions file — octo reads skill / tool guidance from the
- *     MCP server's `initialize` response, so there is no separate
- *     markdown file to maintain.
+ *   - Project instructions are upserted into `~/.octo/octorules.md`
+ *     (global) or `./.octo/octorules.md` (local) using the same
+ *     marker-fenced CodeGraph section that Claude / Codex / Gemini use,
+ *     because octo loads these rules into every session's system prompt.
  *
  *   - No permissions concept — octo gates tool invocations through its
  *     own permission-mode system, not an external allowlist. `autoAllow`
@@ -21,6 +22,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import {
+  CODEGRAPH_INSTRUCTIONS_BLOCK,
+  CODEGRAPH_SECTION_END,
+  CODEGRAPH_SECTION_START,
+} from '../instructions-template';
+import {
   AgentTarget,
   DetectionResult,
   InstallOptions,
@@ -31,6 +37,8 @@ import {
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
+  removeMarkedSection,
+  upsertInstructionsEntry,
   writeJsonFile,
 } from './shared';
 
@@ -42,6 +50,10 @@ function configDir(loc: Location): string {
 
 function mcpJsonPath(loc: Location): string {
   return path.join(configDir(loc), 'mcp.json');
+}
+
+function octorulesPath(loc: Location): string {
+  return path.join(configDir(loc), 'octorules.md');
 }
 
 class OctoTarget implements AgentTarget {
@@ -66,6 +78,7 @@ class OctoTarget implements AgentTarget {
   install(loc: Location, _opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
     files.push(writeMcpEntry(loc));
+    files.push(upsertInstructionsEntry(octorulesPath(loc)));
     return { files };
   }
 
@@ -85,17 +98,25 @@ class OctoTarget implements AgentTarget {
       files.push({ path: file, action: 'not-found' });
     }
 
+    const rulesFile = octorulesPath(loc);
+    const instructionsAction = removeMarkedSection(
+      rulesFile,
+      CODEGRAPH_SECTION_START,
+      CODEGRAPH_SECTION_END,
+    );
+    files.push({ path: rulesFile, action: instructionsAction });
+
     return { files };
   }
 
   printConfig(loc: Location): string {
     const target = mcpJsonPath(loc);
     const snippet = JSON.stringify({ mcpServers: { codegraph: getMcpServerConfig() } }, null, 2);
-    return `# Add to ${target}\n\n${snippet}\n`;
+    return `# Add to ${target}\n\n${snippet}\n\n# Add to ${octorulesPath(loc)}\n\n${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`;
   }
 
   describePaths(loc: Location): string[] {
-    return [mcpJsonPath(loc)];
+    return [mcpJsonPath(loc), octorulesPath(loc)];
   }
 }
 

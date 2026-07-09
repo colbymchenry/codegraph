@@ -14,7 +14,7 @@ The installer will:
 - Ask which agent(s) to configure — auto-detecting installed ones from **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**, and **octo**.
 - Prompt to install `codegraph` on your `PATH` (so agents can launch the MCP server).
 - Ask whether configs apply to all your projects or just this one.
-- Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`). Cursor, Kiro, and octo get the MCP config only. Removed cleanly by `codegraph uninstall`.
+- Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `octorules.md`). Cursor and Kiro get the MCP config only. Removed cleanly by `codegraph uninstall`.
 - Set up auto-allow permissions when Claude Code is one of the targets.
 
 The installer **wires up your agents only — it does not index your code.** After it finishes, build each project's graph yourself with `codegraph init` (step 3 below).
