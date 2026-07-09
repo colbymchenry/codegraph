@@ -1740,4 +1740,359 @@ export class UsersController {
     expect(nodes.map((n) => n.name)).toEqual(['GET /users/real']);
     expect(references.map((r) => r.referenceName)).toEqual(['real']);
   });
+
+  it('phoenix: skips # commented route lines', () => {
+    const src = `# get "/fake", FakeController, :index
+get "/real", RealController, :index
+`;
+    const { nodes, references } = phoenixResolver.extract!('router.ex', src);
+    expect(nodes.map((n) => n.name)).toEqual(['GET /real']);
+    expect(references.map((r) => r.referenceName)).toEqual(['RealController#index']);
+  });
+
+  it('phoenix: skips # commented resources', () => {
+    const src = `# resources "/fake", FakeController
+resources "/real", RealController
+`;
+    const { nodes, references } = phoenixResolver.extract!('router.ex', src);
+    expect(nodes.map((n) => n.name)).toContain('GET /real');
+    expect(references.map((r) => r.referenceName)).toContain('RealController#index');
+  });
+});
+
+import { phoenixResolver } from '../src/resolution/frameworks/phoenix';
+
+describe('phoenixResolver.detect', () => {
+  const baseContext = {
+    getNodesInFile: () => [],
+    getNodesByName: () => [],
+    getNodesByQualifiedName: () => [],
+    getNodesByKind: () => [],
+    fileExists: () => false,
+    readFile: () => null,
+    getProjectRoot: () => '/test',
+    getAllFiles: () => [],
+    getNodesByLowerName: () => [],
+    getImportMappings: () => [],
+  };
+
+  it('detects {:phoenix dependency in mix.exs', () => {
+    const ctx = {
+      ...baseContext,
+      readFile: (p: string) =>
+        p === 'mix.exs' ? 'defp deps do [{:phoenix, "~> 1.7"}] end' : null,
+    };
+    expect(phoenixResolver.detect(ctx as any)).toBe(true);
+  });
+
+  it('detects {:phoenix with comma separator', () => {
+    const ctx = {
+      ...baseContext,
+      readFile: (p: string) =>
+        p === 'mix.exs' ? 'defp deps do [{:phoenix, "~> 1.7"}, {:phoenix_html, "~> 3.3"}] end' : null,
+    };
+    expect(phoenixResolver.detect(ctx as any)).toBe(true);
+  });
+
+  it('detects lib/*_web/router.ex', () => {
+    const ctx = {
+      ...baseContext,
+      readFile: () => null,
+      listDirectories: (rel: string) => (rel === 'lib' ? ['my_app_web'] : []),
+      fileExists: (p: string) => p === 'lib/my_app_web/router.ex',
+    };
+    expect(phoenixResolver.detect(ctx as any)).toBe(true);
+  });
+
+  it('detects lib/*_web/endpoint.ex', () => {
+    const ctx = {
+      ...baseContext,
+      readFile: () => null,
+      listDirectories: (rel: string) => (rel === 'lib' ? ['my_app_web'] : []),
+      fileExists: (p: string) => p === 'lib/my_app_web/endpoint.ex',
+    };
+    expect(phoenixResolver.detect(ctx as any)).toBe(true);
+  });
+
+  it('returns false for a non-Phoenix project', () => {
+    const ctx = {
+      ...baseContext,
+      readFile: (p: string) => (p === 'mix.exs' ? 'defp deps do [{:plug, "~> 1.14"}] end' : null),
+    };
+    expect(phoenixResolver.detect(ctx as any)).toBe(false);
+  });
+});
+
+describe('phoenixResolver.claimsReference', () => {
+  it('claims AppWeb.UserController#index as a route reference', () => {
+    expect(phoenixResolver.claimsReference!('AppWeb.UserController#index')).toBe(true);
+  });
+
+  it('claims simple Controller#action', () => {
+    expect(phoenixResolver.claimsReference!('UserController#show')).toBe(true);
+  });
+
+  it('does not claim plain function names', () => {
+    expect(phoenixResolver.claimsReference!('index')).toBe(false);
+  });
+
+  it('does not claim Rails-style controller#action (lowercase)', () => {
+    expect(phoenixResolver.claimsReference!('users#index')).toBe(false);
+  });
+});
+
+describe('phoenixResolver.resolve', () => {
+  const baseContext = {
+    getNodesInFile: () => [],
+    getNodesByName: () => [],
+    getNodesByQualifiedName: () => [],
+    getNodesByKind: () => [],
+    fileExists: () => false,
+    readFile: () => null,
+    getProjectRoot: () => '/test',
+    getAllFiles: () => [],
+    getNodesByLowerName: () => [],
+    getImportMappings: () => [],
+  };
+
+  it('resolves Controller#action to an action method in controllers/ dir', () => {
+    const indexNode: Node = {
+      id: 'fn:lib/my_app_web/controllers/user_controller.ex:11:index',
+      kind: 'function',
+      name: 'index',
+      qualifiedName: 'lib/my_app_web/controllers/user_controller.ex::index',
+      filePath: 'lib/my_app_web/controllers/user_controller.ex',
+      language: 'elixir',
+      startLine: 11,
+      endLine: 13,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: Date.now(),
+    };
+    const context = {
+      ...baseContext,
+      getAllFiles: () => ['lib/my_app_web/controllers/user_controller.ex'],
+      getNodesInFile: (fp: string) =>
+        fp === 'lib/my_app_web/controllers/user_controller.ex' ? [indexNode] : [],
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'route:router.ex:3:GET:/users',
+      referenceName: 'MyApp.UserController#index',
+      referenceKind: 'references',
+      line: 3,
+      column: 0,
+      filePath: 'router.ex',
+      language: 'elixir',
+    };
+    const result = phoenixResolver.resolve(ref, context as any);
+    expect(result?.targetNodeId).toBe(indexNode.id);
+    expect(result?.resolvedBy).toBe('framework');
+    expect(result?.confidence).toBe(0.85);
+  });
+
+  it('returns null for a ref without the #action suffix', () => {
+    const ref: UnresolvedRef = {
+      fromNodeId: 'x',
+      referenceName: 'UserController',
+      referenceKind: 'references',
+      line: 1,
+      column: 0,
+      filePath: 'a.ex',
+      language: 'elixir',
+    };
+    expect(phoenixResolver.resolve(ref, baseContext as any)).toBeNull();
+  });
+
+  it('returns null when no matching controller file exists', () => {
+    const ref: UnresolvedRef = {
+      fromNodeId: 'route:router.ex:3:GET:/users',
+      referenceName: 'MyApp.Nonexistent#index',
+      referenceKind: 'references',
+      line: 3,
+      column: 0,
+      filePath: 'router.ex',
+      language: 'elixir',
+    };
+    const context = {
+      ...baseContext,
+      getAllFiles: () => ['lib/my_app_web/controllers/user_controller.ex'],
+    };
+    expect(phoenixResolver.resolve(ref, context as any)).toBeNull();
+  });
+});
+
+describe('phoenixResolver.extract', () => {
+  it('extracts route node and reference for get "/path", Controller, :action', () => {
+    const src = `get "/users", UserController, :index\n`;
+    const { nodes, references } = phoenixResolver.extract!('lib/my_app_web/router.ex', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].kind).toBe('route');
+    expect(nodes[0].name).toBe('GET /users');
+    expect(references).toHaveLength(1);
+    expect(references[0].referenceName).toBe('UserController#index');
+    expect(references[0].referenceKind).toBe('references');
+    expect(references[0].fromNodeId).toBe(nodes[0].id);
+  });
+
+  it('extracts all HTTP method routes: post, put, patch, delete, options, head', () => {
+    const verbs = ['post', 'put', 'patch', 'delete', 'options', 'head'] as const;
+    const lines = verbs.map(v => `${v} "/test", TestController, :action`).join('\n');
+    const { nodes, references } = phoenixResolver.extract!('router.ex', lines);
+    expect(nodes.map((n) => n.name)).toEqual(
+      verbs.map((v) => `${v.toUpperCase()} /test`),
+    );
+    expect(references.map((r) => r.referenceName)).toEqual(
+      verbs.map(() => 'TestController#action'),
+    );
+  });
+
+  it('extracts routes with qualified module controller names', () => {
+    const src = `get "/users", MyApp.UserController, :index\n`;
+    const { nodes, references } = phoenixResolver.extract!('router.ex', src);
+    expect(nodes[0].name).toBe('GET /users');
+    expect(references[0].referenceName).toBe('MyApp.UserController#index');
+  });
+
+  it('extracts route from a multi-line router with multiple routes', () => {
+    const src = `defmodule MyApp.Router do
+  use MyApp, :router
+
+  pipeline :api do
+    plug :accepts, ["json"]
+  end
+
+  scope "/api", MyApp do
+    pipe_through :api
+    get "/users", UserController, :index
+    post "/users", UserController, :create
+    get "/users/:id", UserController, :show
+  end
+
+  scope "/", MyApp do
+    get "/", PageController, :index
+  end
+end
+`;
+    const { nodes, references } = phoenixResolver.extract!('lib/my_app_web/router.ex', src);
+    expect(nodes.map((n) => n.name).sort()).toEqual([
+      'GET /',
+      'GET /api/users',
+      'GET /api/users/:id',
+      'POST /api/users',
+    ]);
+    // pipe_through :api also produces :api references attached to the API routes
+    const ctrlRefs = references.filter((r) => r.referenceName.includes('#'));
+    expect(ctrlRefs.map((r) => r.referenceName).sort()).toEqual([
+      'MyApp.PageController#index',
+      'MyApp.UserController#create',
+      'MyApp.UserController#index',
+      'MyApp.UserController#show',
+    ]);
+  });
+
+  it('extracts resources with all 7 default actions', () => {
+    const src = `resources "/posts", PostController\n`;
+    const { nodes, references } = phoenixResolver.extract!('router.ex', src);
+    expect(nodes.map((n) => n.name)).toEqual([
+      'GET /posts',
+      'POST /posts',
+      'GET /posts/new',
+      'GET /posts/:id',
+      'GET /posts/:id/edit',
+      'PATCH /posts/:id',
+      'DELETE /posts/:id',
+    ]);
+    expect(references.map((r) => r.referenceName)).toEqual(
+      ['index', 'create', 'new', 'show', 'edit', 'update', 'delete'].map(
+        (a) => `PostController#${a}`,
+      ),
+    );
+  });
+
+  it('extracts resources with only: filter', () => {
+    const src = `resources "/posts", PostController, only: [:index, :show]\n`;
+    const { nodes, references } = phoenixResolver.extract!('router.ex', src);
+    expect(nodes.map((n) => n.name)).toEqual(['GET /posts', 'GET /posts/:id']);
+    expect(references.map((r) => r.referenceName)).toEqual([
+      'PostController#index',
+      'PostController#show',
+    ]);
+  });
+
+  it('extracts resources with except: filter', () => {
+    const src = `resources "/posts", PostController, except: [:delete, :update]\n`;
+    const { nodes } = phoenixResolver.extract!('router.ex', src);
+    expect(nodes.map((n) => n.name)).not.toContain('DELETE /posts/:id');
+    expect(nodes.map((n) => n.name)).not.toContain('PATCH /posts/:id');
+    expect(nodes.map((n) => n.name)).toContain('GET /posts');
+    expect(nodes.map((n) => n.name)).toContain('POST /posts');
+  });
+
+  it('extracts resource (singular) with 6 default actions', () => {
+    const src = `resource "/profile", ProfileController\n`;
+    const { nodes, references } = phoenixResolver.extract!('router.ex', src);
+    expect(nodes.map((n) => n.name)).toEqual([
+      'POST /profile',
+      'GET /profile/new',
+      'GET /profile/:id',
+      'GET /profile/:id/edit',
+      'PATCH /profile/:id',
+      'DELETE /profile/:id',
+    ]);
+    // Singular resource has no :index
+    expect(references.map((r) => r.referenceName)).toEqual(
+      ['create', 'new', 'show', 'edit', 'update', 'delete'].map(
+        (a) => `ProfileController#${a}`,
+      ),
+    );
+  });
+
+  it('extracts live route with two method nodes (GET + POST)', () => {
+    const src = `live "/posts/:id", PostLive\n`;
+    const { nodes, references } = phoenixResolver.extract!('router.ex', src);
+    expect(nodes.map((n) => n.name)).toEqual(['GET /posts/:id', 'POST /posts/:id']);
+    expect(references.map((r) => r.referenceName)).toEqual([
+      'PostLive',
+      'PostLive',
+    ]);
+  });
+
+  it('extracts live route with explicit :action', () => {
+    const src = `live "/posts/:id", PostLive, :show\n`;
+    const { nodes } = phoenixResolver.extract!('router.ex', src);
+    expect(nodes.map((n) => n.name)).toEqual(['GET /posts/:id', 'POST /posts/:id']);
+    expect(nodes[0].kind).toBe('route');
+  });
+
+  it('extracts pipe_through references attached to the next route', () => {
+    const src = `scope "/api", MyApp do
+  pipe_through [:auth, :api]
+  get "/users", UserController, :index
+end
+`;
+    const { nodes, references } = phoenixResolver.extract!('router.ex', src);
+    const routeNode = nodes.find((n) => n.name === 'GET /api/users');
+    expect(routeNode).toBeDefined();
+    // pipe_through entries become references from the route node
+    const pipeRefs = references.filter((r) => r.fromNodeId === routeNode!.id);
+    expect(pipeRefs.map((r) => r.referenceName)).toContain(':auth');
+    expect(pipeRefs.map((r) => r.referenceName)).toContain(':api');
+  });
+
+  it('extracts routes in nested scopes with combined path and module prefixes', () => {
+    const src = `scope "/api", MyApp do
+  scope "/v1", ApiV1 do
+    get "/users", UserController, :index
+  end
+end
+`;
+    const { nodes, references } = phoenixResolver.extract!('router.ex', src);
+    expect(nodes[0].name).toBe('GET /api/v1/users');
+    expect(references[0].referenceName).toBe('MyApp.ApiV1.UserController#index');
+  });
+
+  it('returns nothing for a non-Elixir file', () => {
+    expect(phoenixResolver.extract!('main.ts', 'get "/x", X, :index').nodes).toHaveLength(0);
+    expect(phoenixResolver.extract!('config.json', 'get "/x", X, :index').nodes).toHaveLength(0);
+  });
 });

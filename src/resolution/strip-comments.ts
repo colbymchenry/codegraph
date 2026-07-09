@@ -36,7 +36,8 @@ export type CommentLang =
   | 'rust'
   | 'c'
   | 'cpp'
-  | 'erlang';
+  | 'erlang'
+  | 'elixir';
 
 export function stripCommentsForRegex(content: string, lang: CommentLang): string {
   switch (lang) {
@@ -48,6 +49,8 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
       return stripRust(content);
     case 'erlang':
       return stripErlang(content);
+    case 'elixir':
+      return stripElixir(content);
     case 'php':
       return stripPhp(content);
     case 'go':
@@ -466,6 +469,71 @@ function stripRust(src: string): string {
         i++;
       }
       if (i < n && src[i] === "'") i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  return out.join('');
+}
+
+// ---------- Elixir ----------
+
+/**
+ * Elixir: `#` line comments, `"""..."""` and `'''...'''` heredocs.
+ * Same as Ruby but without `=begin`/`=end` blocks.
+ */
+function stripElixir(src: string): string {
+  const out = src.split('');
+  let i = 0;
+  const n = src.length;
+
+  while (i < n) {
+    const c = src[i]!;
+    const c2 = src[i + 1] ?? '';
+
+    // Heredoc string: """...""" or '''...'''
+    if ((c === '"' || c === "'") && c2 === c && src[i + 2] === c) {
+      const quote = c;
+      const start = i;
+      i += 3;
+      while (i < n) {
+        if (src[i] === '\\' && i + 1 < n) {
+          i += 2;
+          continue;
+        }
+        if (src[i] === quote && src[i + 1] === quote && src[i + 2] === quote) {
+          i += 3;
+          break;
+        }
+        i++;
+      }
+      blankRange(out, start, i, src);
+      continue;
+    }
+
+    // String literals
+    if (c === '"' || c === "'") {
+      const quote = c;
+      i++;
+      while (i < n && src[i] !== quote) {
+        if (src[i] === '\\' && i + 1 < n) {
+          i += 2;
+          continue;
+        }
+        if (src[i] === '\n') break;
+        i++;
+      }
+      if (i < n && src[i] === quote) i++;
+      continue;
+    }
+
+    // Line comment
+    if (c === '#') {
+      const start = i;
+      while (i < n && src[i] !== '\n') i++;
+      blankRange(out, start, i, src);
       continue;
     }
 
