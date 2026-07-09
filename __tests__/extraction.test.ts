@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
+import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore, getMaxFileSize } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
@@ -10937,5 +10937,34 @@ import DataStore from '../data/DataStore';
       expect(imports).toContain('../model/TodoItem');
       expect(imports).toContain('../data/DataStore');
     });
+  });
+});
+
+describe('CODEGRAPH_MAX_FILE_SIZE env var (#1016)', () => {
+  const originalEnv = process.env.CODEGRAPH_MAX_FILE_SIZE;
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env.CODEGRAPH_MAX_FILE_SIZE;
+    else process.env.CODEGRAPH_MAX_FILE_SIZE = originalEnv;
+  });
+
+  it('returns 1 MB default when env var is not set', () => {
+    delete process.env.CODEGRAPH_MAX_FILE_SIZE;
+    expect(getMaxFileSize()).toBe(1024 * 1024);
+  });
+
+  it('returns custom value when env var is a valid positive integer', () => {
+    process.env.CODEGRAPH_MAX_FILE_SIZE = '5242880';
+    expect(getMaxFileSize()).toBe(5242880);
+  });
+
+  it('falls back to default for invalid values', () => {
+    process.env.CODEGRAPH_MAX_FILE_SIZE = 'notanumber';
+    expect(getMaxFileSize()).toBe(1024 * 1024);
+
+    process.env.CODEGRAPH_MAX_FILE_SIZE = '-1';
+    expect(getMaxFileSize()).toBe(1024 * 1024);
+
+    process.env.CODEGRAPH_MAX_FILE_SIZE = '0';
+    expect(getMaxFileSize()).toBe(1024 * 1024);
   });
 });
