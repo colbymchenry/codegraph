@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph's installer now supports **octo** (octo-agent). Running `codegraph install` can auto-detect and wire the CodeGraph MCP server into octo's MCP config at `~/.octo/mcp.json` (global) or `./.octo/mcp.json` (project-local), using the same `mcpServers.codegraph` shape as Claude Code / Cursor / Gemini. `codegraph uninstall` removes the entry cleanly.
 
 ## [1.3.1] - 2026-07-09
 
@@ -18,8 +21,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Indexing and `codegraph sync` stay responsive through their heaviest internal steps on huge projects: the post-index database maintenance (which on a multi-gigabyte index could stall the process for minutes and get a fully successful index killed by the safety watchdog at the finish line) now runs on a background thread, storing a giant generated file no longer freezes the process mid-extraction, and the reference-resolution bookkeeping between progress updates is broken into small responsive steps. The resulting graph is byte-for-byte identical.
 - Fixed a race that could leave a freshly-attached MCP session permanently silent: when a client's first messages arrived glued together during the daemon's connection handshake (roughly one attach in five on a busy machine), the daemon could drop them and stop reading that connection entirely — every tool call from that session then hung with no reply. The handshake now hands the connection over losslessly, and the fix is validated by hammering the previously-flaky attach test 25× under load.
 - The first tool call after the shared daemon starts no longer waits behind the query workers' cold start (which can take many seconds on a busy machine) — it's served directly until the first worker is warm, so a fresh session answers immediately.
-
-## [1.3.0] - 2026-07-07
 
 ### New Features
 
