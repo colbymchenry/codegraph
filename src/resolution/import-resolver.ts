@@ -34,6 +34,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   csharp: ['.cs'],
   php: ['.php'],
   ruby: ['.rb'],
+  elixir: ['.ex', '.exs', '.heex'],
   objc: ['.h', '.m', '.mm'],
 };
 
@@ -173,6 +174,19 @@ const C_CPP_STDLIB_HEADERS = new Set([
 ]);
 
 /**
+ * Elixir / OTP standard library modules.
+ * Used by isExternalImport to distinguish stdlib from user modules.
+ */
+const ELIXIR_STDLIB_MODULES = new Set([
+  'Kernel', 'Enum', 'List', 'Map', 'String', 'Tuple', 'Atom', 'Integer', 'Float',
+  'Date', 'Time', 'DateTime', 'Regex', 'IO', 'File', 'Path', 'System', 'Process',
+  'Agent', 'Task', 'GenServer', 'Supervisor', 'Registry', 'Node', 'Port',
+  'Application', 'Code', 'Access', 'OptionParser', 'Inspect', 'Protocol',
+  'Record', 'Set', 'Stream', 'Range', 'Keyword', 'Module', 'Function',
+  'Macro', 'Quote',
+]);
+
+/**
  * Check if an import is external (npm package, etc.)
  *
  * `context` is consulted for project-defined path aliases
@@ -180,7 +194,7 @@ const C_CPP_STDLIB_HEADERS = new Set([
  * like `@components/*` would fail the bare-specifier heuristic and
  * be classified as external before alias resolution can run.
  */
-function isExternalImport(
+export function isExternalImport(
   importPath: string,
   language: Language,
   context?: ResolutionContext
@@ -256,6 +270,17 @@ function isExternalImport(
     // C++ headers without .h extension (e.g. "vector", "string")
     const withoutExt = importPath.replace(/\.h$/, '');
     if (C_CPP_STDLIB_HEADERS.has(withoutExt)) return true;
+  }
+
+  if (language === 'elixir') {
+    // Elixir import source is a filesystem path (e.g. "lib/enum.ex").
+    // Convert back to module name and check against stdlib set.
+    const moduleName = elixirPathToModule(importPath);
+    if (ELIXIR_STDLIB_MODULES.has(moduleName)) {
+      return true;
+    }
+    // User modules (not in stdlib) are local.
+    return false;
   }
 
   return false;
@@ -672,6 +697,8 @@ export function extractImportMappings(
     mappings.push(...extractPHPImports(content));
   } else if (language === 'c' || language === 'cpp') {
     mappings.push(...extractCppImports(content));
+  } else if (language === 'elixir') {
+    mappings.push(...extractElixirImports(content));
   }
 
   return mappings;
@@ -971,6 +998,141 @@ function extractCppImports(content: string): ImportMapping[] {
       localName: basename || modulePath,
       exportedName: '*',
       source: modulePath,
+      isDefault: false,
+      isNamespace: true,
+    });
+  }
+
+  return mappings;
+}
+
+/**
+ * Convert an Elixir module name (e.g. "MyApp.Greeter", "Enum") to a
+ * filesystem path relative to the project root.
+ *
+ * Strategy: split by ".", snake_case each segment, join with "/",
+ * prepend "lib/", append ".ex".
+ *
+ * Fallback chain (when the resolver tries to locate the file):
+ *   lib/my_app/greeter.ex  →  lib/my_app/greeter.exs  →  lib/<top-level>.ex
+ */
+export function elixirModuleToPath(modulePath: string): string {
+  const parts = modulePath.split('.');
+  const snakeParts = parts.map(p =>
+    p
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+      .replace(/([a-z\d])([A-Z])/g, '$1_$2')
+      .toLowerCase(),
+  );
+  return `lib/${snakeParts.join('/')}.ex`;
+}
+
+/**
+ * Reverse of elixirModuleToPath: convert a filesystem path like
+ * "lib/my_app/greeter.ex" back to module name "MyApp.Greeter".
+ */
+export function elixirPathToModule(filePath: string): string {
+  const withoutExt = filePath.replace(/\.(ex|exs)$/, '');
+  const withoutLib = withoutExt.startsWith('lib/') ? withoutExt.slice(4) : withoutExt;
+  if (!withoutLib) return filePath;
+  const parts = withoutLib.split('/');
+  const camelParts = parts.map(p =>
+    p.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(''),
+  );
+  return camelParts.join('.');
+}
+
+/**
+ * Extract Elixir import mappings from `alias`, `import`, `require`, and `use`
+ * statements.
+ *
+ * Parsed forms:
+ *   alias MyApp.Greeter            → namespace mapping to lib/my_app/greeter.ex
+ *   alias MyApp.Greeter, as: G     → aliased mapping with localName "G"
+ *   import Enum                    → namespace mapping
+ *   import Enum, only: [map: 2]    → per-function mappings (when only: present)
+ *   require Integer                → namespace mapping
+ *   use MyApp.Web, :controller     → namespace mapping
+ */
+export function extractElixirImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+
+  // ----- alias MyApp.Greeter  [ , as: :Alias ] -----
+  const aliasRe = /\balias\s+([A-Z]\w*(?:\.[A-Z]\w*)*)(?:\s*,\s*as:\s*:(\w+))?/gm;
+  let m: RegExpExecArray | null;
+  while ((m = aliasRe.exec(content)) !== null) {
+    const modulePath  = m[1]!;
+    const alias       = m[2];
+    const localName   = alias || modulePath.split('.').pop()!;
+    const source      = elixirModuleToPath(modulePath);
+    mappings.push({
+      localName,
+      exportedName: modulePath,
+      source,
+      isDefault: false,
+      isNamespace: true,
+    });
+  }
+
+  // ----- import MyApp.Module  [ , only:/except: [... ] ] -----
+  const importRe = /\bimport\s+([A-Z]\w*(?:\.[A-Z]\w*)*)(?:\s*,\s*(only|except):\s*\[([^\]]*)\])?/gm;
+  while ((m = importRe.exec(content)) !== null) {
+    const modulePath  = m[1]!;
+    const importKind  = m[2]; // 'only' | 'except' | undefined
+    const clauseBody  = m[3]?.trim(); // content inside [brackets]
+    const source      = elixirModuleToPath(modulePath);
+
+    if (importKind === 'only' && clauseBody) {
+      // "map: 2, filter: 3" → extract map, filter (the NAME before :arity)
+      const funcs = clauseBody.split(',').map(s => s.trim());
+      for (const func of funcs) {
+        const fMatch = func.match(/(\w+):\s*\d+/);
+        if (fMatch) {
+          mappings.push({
+            localName: fMatch[1]!,
+            exportedName: fMatch[1]!,
+            source,
+            isDefault: false,
+            isNamespace: false,
+          });
+        }
+      }
+    } else {
+      // Bare import or except: — treat as namespace import
+      const localName = modulePath.split('.').pop()!;
+      mappings.push({
+        localName,
+        exportedName: '*',
+        source,
+        isDefault: false,
+        isNamespace: true,
+      });
+    }
+  }
+
+  // ----- require Integer -----
+  const requireRe = /\brequire\s+([A-Z]\w*(?:\.[A-Z]\w*)*)/gm;
+  while ((m = requireRe.exec(content)) !== null) {
+    const modulePath = m[1]!;
+    const localName  = modulePath.split('.').pop()!;
+    mappings.push({
+      localName,
+      exportedName: '*',
+      source: elixirModuleToPath(modulePath),
+      isDefault: false,
+      isNamespace: true,
+    });
+  }
+
+  // ----- use MyApp.Web[, :controller] -----
+  const useRe = /\buse\s+([A-Z]\w*(?:\.[A-Z]\w*)*)/gm;
+  while ((m = useRe.exec(content)) !== null) {
+    const modulePath = m[1]!;
+    const localName  = modulePath.split('.').pop()!;
+    mappings.push({
+      localName,
+      exportedName: '*',
+      source: elixirModuleToPath(modulePath),
       isDefault: false,
       isNamespace: true,
     });

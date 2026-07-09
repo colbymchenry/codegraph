@@ -192,6 +192,28 @@ const CPP_BUILT_INS = new Set([
   'move', 'forward', 'swap',
 ]);
 
+const ELIXIR_STDLIB_MODULES = new Set([
+  'Kernel', 'Enum', 'List', 'Map', 'String', 'Tuple', 'Atom', 'Integer', 'Float',
+  'Date', 'Time', 'DateTime', 'Regex', 'IO', 'File', 'Path', 'System', 'Process',
+  'Agent', 'Task', 'GenServer', 'Supervisor', 'Registry', 'Node', 'Port',
+  'Application', 'Code', 'Access', 'OptionParser', 'Inspect', 'Protocol',
+  'Record', 'Set', 'Stream', 'Range', 'Keyword', 'Module', 'Function',
+  'Macro', 'Quote',
+]);
+
+const ELIXIR_BUILT_INS = new Set([
+  'if', 'unless', 'case', 'cond', 'with', 'try',
+  'raise', 'throw', 'exit',
+  'is_atom', 'is_binary', 'is_boolean', 'is_float', 'is_function',
+  'is_integer', 'is_list', 'is_map', 'is_number', 'is_pid', 'is_port',
+  'is_reference', 'is_tuple',
+  'abs', 'round', 'elem', 'put_elem', 'div', 'rem', 'trunc', 'round',
+  'hd', 'tl', 'length', 'in', 'map_size', 'byte_size', 'bit_size',
+  'self', 'send', 'spawn', 'spawn_link', 'spawn_monitor', 'make_ref',
+  'inspect',
+  'sigil_r', 'sigil_R', 'sigil_w', 'sigil_W', 'sigil_s', 'sigil_S',
+]);
+
 /**
  * Reference Resolver
  *
@@ -1242,6 +1264,20 @@ export class ReferenceResolver {
         return true;
       }
       if (PASCAL_BUILT_INS.has(name)) {
+        return true;
+      }
+    }
+
+    // Elixir standard library modules — `Enum.map`, `String.length`, etc.
+    if (ref.language === 'elixir') {
+      const dotIdx = name.indexOf('.');
+      if (dotIdx > 0) {
+        const mod = name.substring(0, dotIdx);
+        if (ELIXIR_STDLIB_MODULES.has(mod)) {
+          return true;
+        }
+      }
+      if (ELIXIR_BUILT_INS.has(name)) {
         return true;
       }
     }

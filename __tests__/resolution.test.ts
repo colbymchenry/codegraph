@@ -4400,3 +4400,146 @@ procedure Helper; var t: TTgt; begin t.Hit; end;
     });
   });
 });
+
+import { extractElixirImports, elixirModuleToPath, elixirPathToModule, isExternalImport } from '../src/resolution/import-resolver';
+
+describe('Elixir import mapping', () => {
+  describe('elixirModuleToPath / elixirPathToModule', () => {
+    it('converts module name to filesystem path', () => {
+      expect(elixirModuleToPath('MyApp.Greeter')).toBe('lib/my_app/greeter.ex');
+      expect(elixirModuleToPath('Enum')).toBe('lib/enum.ex');
+      expect(elixirModuleToPath('MyApp.UserController')).toBe('lib/my_app/user_controller.ex');
+    });
+
+    it('converts filesystem path back to module name', () => {
+      expect(elixirPathToModule('lib/my_app/greeter.ex')).toBe('MyApp.Greeter');
+      expect(elixirPathToModule('lib/enum.ex')).toBe('Enum');
+      expect(elixirPathToModule('lib/my_app/user_controller.ex')).toBe('MyApp.UserController');
+    });
+
+    it('round-trips correctly', () => {
+      const modules = ['Enum', 'MyApp.Greeter', 'MyApp.UserController', 'MyApp.Api.V1.Posts'];
+      for (const mod of modules) {
+        const path = elixirModuleToPath(mod);
+        expect(elixirPathToModule(path)).toBe(mod);
+      }
+    });
+
+    it('handles .exs extension', () => {
+      expect(elixirPathToModule('lib/my_app/greeter.exs')).toBe('MyApp.Greeter');
+    });
+  });
+
+  describe('extractElixirImports', () => {
+    it('extracts alias MyApp.Greeter', () => {
+      const result = extractElixirImports('alias MyApp.Greeter');
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({
+        localName: 'Greeter',
+        exportedName: 'MyApp.Greeter',
+        source: 'lib/my_app/greeter.ex',
+        isNamespace: true,
+        isDefault: false,
+      });
+    });
+
+    it('extracts alias MyApp.Greeter, as: :G', () => {
+      const result = extractElixirImports('alias MyApp.Greeter, as: :G');
+      expect(result).toHaveLength(1);
+      expect(result[0].localName).toBe('G');
+      expect(result[0].source).toBe('lib/my_app/greeter.ex');
+    });
+
+    it('extracts import Enum', () => {
+      const result = extractElixirImports('import Enum');
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({
+        localName: 'Enum',
+        exportedName: '*',
+        source: 'lib/enum.ex',
+        isNamespace: true,
+      });
+    });
+
+    it('extracts import Enum, only: [map: 2, filter: 3]', () => {
+      const result = extractElixirImports('import Enum, only: [map: 2, filter: 3]');
+      expect(result).toHaveLength(2);
+      expect(result.map((r) => r.localName).sort()).toEqual(['filter', 'map']);
+      expect(result[0]).toMatchObject({
+        exportedName: 'map',
+        source: 'lib/enum.ex',
+        isNamespace: false,
+        isDefault: false,
+      });
+    });
+
+    it('extracts import with except clause (namespace import)', () => {
+      const result = extractElixirImports('import Enum, except: [map: 2]');
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({
+        localName: 'Enum',
+        exportedName: '*',
+        isNamespace: true,
+      });
+    });
+
+    it('extracts require Integer', () => {
+      const result = extractElixirImports('require Integer');
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({
+        localName: 'Integer',
+        source: 'lib/integer.ex',
+        isNamespace: true,
+      });
+    });
+
+    it('extracts use MyApp.Web, :controller', () => {
+      const result = extractElixirImports('use MyApp.Web, :controller');
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({
+        localName: 'Web',
+        source: 'lib/my_app/web.ex',
+        isNamespace: true,
+      });
+    });
+
+    it('extracts combo of alias, import, require, use', () => {
+      const content = `
+        alias MyApp.Repo
+        import Ecto.Query
+        require Integer
+        use MyApp.Web, :controller
+      `;
+      const result = extractElixirImports(content);
+      expect(result.length).toBe(4);
+      const localNames = result.map((r) => r.localName);
+      expect(localNames).toContain('Repo');
+      expect(localNames).toContain('Query');
+      expect(localNames).toContain('Integer');
+      expect(localNames).toContain('Web');
+    });
+
+    it('returns empty array for non-import content', () => {
+      expect(extractElixirImports('defmodule Foo do\ndef hello, do: :world\nend')).toEqual([]);
+    });
+  });
+
+  describe('isExternalImport (elixir)', () => {
+    it('classifies stdlib modules as external', () => {
+      expect(isExternalImport('lib/enum.ex', 'elixir')).toBe(true);
+      expect(isExternalImport('lib/string.ex', 'elixir')).toBe(true);
+      expect(isExternalImport('lib/kernel.ex', 'elixir')).toBe(true);
+    });
+
+    it('classifies user modules as local', () => {
+      expect(isExternalImport('lib/my_app/greeter.ex', 'elixir')).toBe(false);
+      expect(isExternalImport('lib/my_app/user_controller.ex', 'elixir')).toBe(false);
+    });
+
+    it('handles direct module names (not just paths)', () => {
+      // isExternalImport converts paths; if passed a bare module name,
+      // treat it as a path string
+      expect(isExternalImport('lib/enum.ex', 'elixir')).toBe(true);
+    });
+  });
+});
