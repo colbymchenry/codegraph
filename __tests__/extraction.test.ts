@@ -3964,6 +3964,40 @@ class APXCharacter {  // the one real definition
     });
   });
 
+  describe('C macro-attribute + typedef return type misparse (#1211)', () => {
+    const cNames = (code: string) =>
+      extractFromSource('main.c', code).nodes
+        .filter((n) => n.kind === 'function')
+        .map((n) => n.name);
+
+    it('recovers the function name when a macro attribute precedes a typedef return type', () => {
+      const code = `
+#define SEC_ATTR __attribute__((section(".init")))
+typedef unsigned int UINT32;
+#define VOID void
+
+SEC_ATTR VOID   GoodName(VOID)  { }
+SEC_ATTR UINT32 LostName(VOID)  { return 0; }
+`;
+      const names = cNames(code);
+      expect(names).toContain('GoodName');
+      expect(names).toContain('LostName');
+      expect(names).not.toContain('(VOID)');
+    });
+
+    it('handles multiple leading macro tokens before a known return type', () => {
+      const code = `
+LITE_OS_SEC_TEXT_INIT UINT32 LOS_KernelInit(void) { return 0; }
+`;
+      expect(cNames(code)).toContain('LOS_KernelInit');
+    });
+
+    it('does not blank a real mixed-case return type', () => {
+      const code = `int normalFunc(void) { return 0; }`;
+      expect(cNames(code)).toContain('normalFunc');
+    });
+  });
+
   describe('C++ templated base-class inheritance (#1043)', () => {
     // Inheriting from a template (`class D : public Base<int>`) recorded the base
     // ref as the full instantiation `Base<int>`, which never name-matched the

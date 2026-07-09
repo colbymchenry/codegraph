@@ -701,11 +701,35 @@ function preParseCppSource(source: string, filePath?: string): string {
   return blanked;
 }
 
-/** C source pre-processing: C-detected headers in CUDA projects (llm.c keeps
- * `__device__` helpers and kernel prototypes in plain `.h`) get the same
- * content-gated CUDA blank as C++. */
+/**
+ * Blank isolated ALL_CAPS macro tokens sitting before a known C return type at
+ * line start. Handles project-specific attribute/section macros (SEC_ATTR,
+ * LITE_OS_SEC_TEXT_INIT, etc.) that no curated list can cover. tree-sitter-c
+ * can't reconcile an unknown token before a typedef'd return type — the
+ * function name is lost and replaced by the parameter list (#1211).
+ *
+ * Matched tightly: ALL_CAPS tokens only, at line start only, and must be
+ * followed by a known primitive or common typedef return type — so real
+ * declarations like `HRESULT DoIt()` (mixed-case) are never touched.
+ */
+const C_LEADING_MACRO_RE =
+  /^(\s*)((?:[A-Z_][A-Z0-9_]*\s+)+)((?:unsigned\s+|signed\s+|long\s+|short\s+)?(?:void|int|char|short|long|float|double|bool|size_t|ssize_t|ptrdiff_t|u?int(?:8|16|32|64|ptr)_t|VOID|BOOL|BOOLEAN|BYTE|WORD|DWORD|UINT8|UINT16|UINT32|UINT64|INT8|INT16|INT32|INT64|UINTPTR|CHAR|UCHAR|WCHAR|ULONG|LONG|USHORT|SHORT|HANDLE|HRESULT|NTSTATUS|PVOID|LPVOID)\s)/gm;
+function blankCLeadingMacros(source: string): string {
+  return source.replace(
+    C_LEADING_MACRO_RE,
+    (_match, indent: string, macros: string, retType: string) =>
+      indent + ' '.repeat(macros.length) + retType,
+  );
+}
+
+/** C source pre-processing: blank macro tokens that tree-sitter-c can't
+ * reconcile before return types (#1211), plus known inline-specifier macros
+ * shared with C++ (SQLITE_API, WINAPI, etc.), and CUDA constructs in
+ * C-detected headers. */
 function preParseCSource(source: string): string {
-  return looksLikeCudaSource(source) ? blankCudaConstructs(source) : source;
+  let result = blankCLeadingMacros(blankCppInlineMacros(source));
+  if (looksLikeCudaSource(source)) result = blankCudaConstructs(result);
+  return result;
 }
 
 export const cppExtractor: LanguageExtractor = {
