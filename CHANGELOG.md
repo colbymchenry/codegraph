@@ -9,6 +9,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+- `codegraph upgrade` now also refreshes what previous versions installed into your agents — the CodeGraph section in CLAUDE.md / AGENTS.md / GEMINI.md and the MCP entry — so upgrading no longer leaves agents following instructions written for tools that have since been renamed or removed. Refresh-only: agents you never configured are not touched, and your permission and hook choices are preserved. Also available manually as `codegraph install --refresh`, and skippable with `CODEGRAPH_NO_INSTALL_REFRESH=1`.
 
 ## [1.3.1] - 2026-07-09
 

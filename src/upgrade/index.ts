@@ -381,8 +381,41 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
     } catch {
       /* a hook-wiring hiccup must not fail the upgrade */
     }
+    try {
+      selfHealInstalledSurfaces(deps);
+    } catch {
+      /* a refresh hiccup must not fail the upgrade */
+    }
   }
   return code;
+}
+
+/**
+ * Refresh the agent surfaces previous installs wrote — the marker-fenced
+ * instructions sections (CLAUDE.md / AGENTS.md / GEMINI.md), MCP entries,
+ * legacy-hook cleanups — so they match the version that will serve them.
+ * Unlike the prompt hook above, this content is NOT version-agnostic: the
+ * templates are baked into the binary, so the still-running old process
+ * would only rewrite its own stale copy — the exact staleness this heals.
+ * We therefore spawn the freshly-installed binary (`codegraph install
+ * --refresh`), which is refresh-only: agents never configured stay
+ * untouched, and permission / prompt-hook choices are preserved. Gated on
+ * `codegraph` being resolvable on PATH (an npm-local install isn't) and on
+ * the kill-switch; never fatal to the upgrade.
+ */
+function selfHealInstalledSurfaces(deps: UpgradeDeps): void {
+  if (process.env.CODEGRAPH_NO_INSTALL_REFRESH === '1') return;
+  if (!deps.hasCommand('codegraph')) return;
+  deps.log(c.dim('Refreshing agent instruction sections and config written by previous versions…'));
+  // Windows installs expose codegraph through a .cmd launcher. Node cannot
+  // spawn .cmd files directly without a shell, so route the constant command
+  // through cmd.exe there (the same launcher a terminal would resolve).
+  const code = deps.platform === 'win32'
+    ? deps.run('cmd.exe', ['/d', '/s', '/c', 'codegraph install --refresh'])
+    : deps.run('codegraph', ['install', '--refresh']);
+  if (code !== 0) {
+    deps.warn('Could not refresh the installed agent surfaces — run `codegraph install --refresh` manually.');
+  }
 }
 
 /**

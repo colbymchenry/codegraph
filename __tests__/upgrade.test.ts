@@ -366,6 +366,97 @@ describe('runUpgrade', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Post-upgrade self-heal of installed agent surfaces
+// ---------------------------------------------------------------------------
+
+describe('post-upgrade refresh of installed agent surfaces', () => {
+  it('runs `codegraph install --refresh` via the NEW binary after a successful npm upgrade', async () => {
+    const { deps, calls } = makeDeps({
+      method: { kind: 'npm', scope: 'global' },
+      currentVersion: '0.9.8',
+      hasCommand: (cmd) => cmd === 'codegraph',
+    });
+    const code = await runUpgrade({}, deps);
+    expect(code).toBe(0);
+    // The refresh is spawned AFTER the binary swap, so the fresh install
+    // (with the current templates) does the writing — not this process.
+    const last = calls.runs[calls.runs.length - 1];
+    expect(last?.cmd).toBe('codegraph');
+    expect(last?.args).toEqual(['install', '--refresh']);
+  });
+
+  it('runs the Windows .cmd launcher through cmd.exe', async () => {
+    const { deps, calls } = makeDeps({
+      method: { kind: 'npm', scope: 'global' },
+      currentVersion: '0.9.8',
+      platform: 'win32',
+      hasCommand: (cmd) => cmd === 'codegraph',
+    });
+    const code = await runUpgrade({}, deps);
+    expect(code).toBe(0);
+    const last = calls.runs[calls.runs.length - 1];
+    expect(last?.cmd).toBe('cmd.exe');
+    expect(last?.args).toEqual(['/d', '/s', '/c', 'codegraph install --refresh']);
+  });
+
+  it('skips the refresh when `codegraph` is not resolvable on PATH', async () => {
+    const { deps, calls } = makeDeps({
+      method: { kind: 'npm', scope: 'global' },
+      currentVersion: '0.9.8',
+      // default hasCommand resolves only curl
+    });
+    const code = await runUpgrade({}, deps);
+    expect(code).toBe(0);
+    expect(calls.runs.filter((r) => r.cmd === 'codegraph')).toHaveLength(0);
+  });
+
+  it('a failing refresh warns but does not fail the upgrade', async () => {
+    const { deps, calls } = makeDeps({
+      method: { kind: 'npm', scope: 'global' },
+      currentVersion: '0.9.8',
+      hasCommand: (cmd) => cmd === 'codegraph',
+    });
+    deps.run = (cmd, args, env) => {
+      calls.runs.push({ cmd, args, env });
+      return cmd === 'codegraph' ? 1 : 0;
+    };
+    const code = await runUpgrade({}, deps);
+    expect(code).toBe(0);
+    expect(calls.logs.join('\n')).toMatch(/install --refresh/);
+  });
+
+  it('does not run after a failed upgrade', async () => {
+    const { deps, calls } = makeDeps(
+      {
+        method: { kind: 'npm', scope: 'global' },
+        currentVersion: '0.9.8',
+        hasCommand: (cmd) => cmd === 'codegraph',
+      },
+      1
+    );
+    const code = await runUpgrade({}, deps);
+    expect(code).toBe(1);
+    expect(calls.runs.filter((r) => r.cmd === 'codegraph')).toHaveLength(0);
+  });
+
+  it('respects the CODEGRAPH_NO_INSTALL_REFRESH kill-switch', async () => {
+    process.env.CODEGRAPH_NO_INSTALL_REFRESH = '1';
+    try {
+      const { deps, calls } = makeDeps({
+        method: { kind: 'npm', scope: 'global' },
+        currentVersion: '0.9.8',
+        hasCommand: (cmd) => cmd === 'codegraph',
+      });
+      const code = await runUpgrade({}, deps);
+      expect(code).toBe(0);
+      expect(calls.runs.filter((r) => r.cmd === 'codegraph')).toHaveLength(0);
+    } finally {
+      delete process.env.CODEGRAPH_NO_INSTALL_REFRESH;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Re-index staleness — real index, real metadata stamp
 // ---------------------------------------------------------------------------
 

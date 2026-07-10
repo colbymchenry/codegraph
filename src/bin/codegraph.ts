@@ -2187,12 +2187,14 @@ program
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
   .option('--no-permissions', 'Skip writing the auto-allow permissions list (Claude Code only)')
   .option('--print-config <id>', 'Print MCP config snippet for the named agent and exit (no file writes)')
+  .option('--refresh', 'Rewrite what previous installs configured, for already-configured agents only (never adds new ones). Run automatically by `codegraph upgrade`')
   .action(async (opts: {
     target?: string;
     location?: string;
     yes?: boolean;
     permissions?: boolean;
     printConfig?: string;
+    refresh?: boolean;
   }) => {
     if (opts.printConfig) {
       const { getTarget, listTargetIds } = await import('../installer/targets/registry');
@@ -2204,6 +2206,37 @@ program
       }
       const loc = (opts.location === 'local' ? 'local' : 'global') as 'global' | 'local';
       process.stdout.write(target.printConfig(loc));
+      return;
+    }
+
+    // --refresh: non-interactive sweep that re-writes what previous
+    // installs configured (instructions section, MCP entry, legacy-hook
+    // cleanups) for already-configured agents, so those surfaces match
+    // THIS binary's templates. Skips everything else — never a first
+    // install, never touches permissions or the prompt hook. Sweeps both
+    // locations unless --location narrows it.
+    if (opts.refresh) {
+      const { refreshTargets } = await import('../installer');
+      const { ALL_TARGETS } = await import('../installer/targets/registry');
+      if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
+        error(`--location must be "global" or "local" (got "${opts.location}").`);
+        process.exit(1);
+      }
+      const locs: Array<'global' | 'local'> = opts.location
+        ? [opts.location as 'global' | 'local']
+        : ['global', 'local'];
+      let changed = 0;
+      for (const loc of locs) {
+        for (const report of refreshTargets(ALL_TARGETS, loc)) {
+          for (const p of report.changedPaths) {
+            changed += 1;
+            console.log(`  ${report.displayName}: refreshed ${p}`);
+          }
+        }
+      }
+      if (changed === 0) {
+        console.log('All configured agent surfaces are already current.');
+      }
       return;
     }
 
