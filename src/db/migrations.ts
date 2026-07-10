@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 8;
 
 /**
  * Migration definition
@@ -116,6 +116,37 @@ const migrations: Migration[] = [
           name TEXT NOT NULL,
           PRIMARY KEY (segment, name)
         ) WITHOUT ROWID;
+      `);
+    },
+  },
+  {
+    version: 8,
+    description:
+      'Track attempted-but-unresolvable refs as status=failed so sync can retry them when a changed file adds a matching symbol (#1240)',
+    up: (db) => {
+      // DDL only — instant on any size database. No backfill needed: rows are
+      // only ever queried by name_tail once they carry status='failed', and
+      // both fields are written together by markReferencesFailed. Legacy rows
+      // (all 'pending' after this migration) are orphans from interrupted runs
+      // that the #1187 sweep grinds down on the next sync, marking survivors
+      // failed with their tails as it goes. The tail index is partial: on a
+      // healthy index the pending set is empty and the failed set is the only
+      // population worth indexing. Keep the definitions in lockstep with
+      // schema.sql. ALTER TABLE has no IF NOT EXISTS, so guard each column for
+      // idempotency — a database created from current schema.sql already has
+      // both (matters when migrations are re-run from an older recorded
+      // version, as the v6 regression test does).
+      const cols = db.prepare('PRAGMA table_info(unresolved_refs)').all() as Array<{ name: string }>;
+      const hasColumn = (name: string) => cols.some((c) => c.name === name);
+      if (!hasColumn('status')) {
+        db.exec("ALTER TABLE unresolved_refs ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'");
+      }
+      if (!hasColumn('name_tail')) {
+        db.exec("ALTER TABLE unresolved_refs ADD COLUMN name_tail TEXT NOT NULL DEFAULT ''");
+      }
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_unresolved_status ON unresolved_refs(status);
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail ON unresolved_refs(name_tail) WHERE status = 'failed';
       `);
     },
   },

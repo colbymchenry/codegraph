@@ -16,6 +16,8 @@ import {
   ExtractionResult,
   ExtractionError,
   Edge,
+  UnresolvedReference,
+  ReferenceKind,
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
@@ -1361,6 +1363,38 @@ function scanDirectoryWalk(
 }
 
 /**
+ * Resurrect a resolution edge that is about to be dropped (its target symbol
+ * was removed, renamed, or its whole file deleted) as the ORIGINAL unresolved
+ * reference that created it, read from the refName/refKind stamp
+ * `createEdges` writes into edge metadata. Inserted as status='pending', the
+ * ref is consumed by the same sync's resolution sweep: it rebinds to an
+ * alternative definition if one exists, or parks as status='failed' where the
+ * #1240 retry finds it if the symbol later reappears.
+ *
+ * Returns null — drop silently, the pre-#1240 behavior — for edges without a
+ * refName stamp (created before the stamp existed, or synthesized): rebuilding
+ * a ref from the target's plain node name would strip the receiver/qualifier
+ * context the original text carried (`h.greet` → `greet`) and could rebind
+ * somewhere a full re-index never would. Silent beats wrong.
+ */
+function resurrectRefFromDroppedEdge(
+  e: Edge & { sourceFilePath: string; sourceLanguage: Language }
+): UnresolvedReference | null {
+  const refName = e.metadata?.refName;
+  if (typeof refName !== 'string' || refName.length === 0) return null;
+  const refKind = typeof e.metadata?.refKind === 'string' ? (e.metadata.refKind as ReferenceKind) : e.kind;
+  return {
+    fromNodeId: e.source,
+    referenceName: refName,
+    referenceKind: refKind,
+    line: e.line ?? 0,
+    column: e.column ?? 0,
+    filePath: e.sourceFilePath,
+    language: e.sourceLanguage,
+  };
+}
+
+/**
  * Extraction orchestrator
  */
 export class ExtractionOrchestrator {
@@ -2193,24 +2227,40 @@ export class ExtractionOrchestrator {
     // (filePath, kind, name). Node ids include the source line, so any line
     // shift in the callee file (e.g. a docstring-only edit above the symbol)
     // changes every target id and a naive re-insert by old id would drop them
-    // all. `insertEdges` still filters to endpoints that exist, so edges whose
-    // caller (source) was deleted, or whose callee (target) was renamed/removed
-    // during the re-index (no match in `newTargetIds`), are dropped. This
-    // closes the #899 edge-drop on `sync`.
+    // all. `insertEdges` still filters to endpoints that exist. This closes
+    // the #899 edge-drop on `sync`.
+    //
+    // Edges whose callee (target) was renamed/removed during the re-index (no
+    // match in `newNodesByKindName`) are not silently dropped anymore: each is
+    // resurrected as its ORIGINAL unresolved ref (stamped on the edge as
+    // metadata.refName/refKind at creation) so the same sync's resolution
+    // sweep can rebind it to an alternative definition elsewhere, or park it
+    // as status='failed' to be retried when the symbol reappears — the
+    // removal-side counterpart of #1240. Edges without refName (built before
+    // the stamp existed, or synthesized) still drop silently: reconstructing
+    // a ref from the target's plain name would strip receiver/qualifier
+    // context and risk a rebind a full re-index would never make.
     if (crossFileIncomingEdges.length > 0) {
       const newNodesByKindName = new Map<string, string>();
       for (const n of validNodes) {
         newNodesByKindName.set(`${n.kind}\0${n.name}`, n.id);
       }
       const reinserted: Edge[] = [];
+      const resurrected: UnresolvedReference[] = [];
       for (const e of crossFileIncomingEdges) {
         const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
         if (newTargetId) {
           reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
+        } else {
+          const ref = resurrectRefFromDroppedEdge(e);
+          if (ref) resurrected.push(ref);
         }
       }
       if (reinserted.length > 0) {
         this.queries.insertEdges(reinserted);
+      }
+      if (resurrected.length > 0) {
+        this.queries.insertUnresolvedRefsBatch(resurrected);
       }
     }
 
@@ -2300,6 +2350,22 @@ export class ExtractionOrchestrator {
     let reconcileChecks = 0;
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
+        // Before the cascade deletes them, resurrect incoming cross-file
+        // resolution edges as their original refs (#1240 removal case): the
+        // callers live in files this sync will NOT revisit, so this is their
+        // only chance to rebind to an alternative definition — or to park as
+        // failed until the symbol reappears somewhere. (A deleted file whose
+        // CALLERS are also being deleted is fine: their nodes cascade later
+        // in this loop and take the resurrected rows with them.)
+        const incoming = this.queries.getCrossFileIncomingEdgesWithTarget(tracked.path);
+        if (incoming.length > 0) {
+          const resurrected = incoming
+            .map((e) => resurrectRefFromDroppedEdge(e))
+            .filter((r): r is UnresolvedReference => r !== null);
+          if (resurrected.length > 0) {
+            this.queries.insertUnresolvedRefsBatch(resurrected);
+          }
+        }
         this.queries.deleteFile(tracked.path);
         filesRemoved++;
       }

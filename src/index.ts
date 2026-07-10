@@ -664,6 +664,15 @@ export class CodeGraph {
         // (regex over *.module.ts only).
         if (result.filesAdded > 0 || result.filesModified > 0) {
           this.resolver.runPostExtract();
+        } else if (result.filesRemoved > 0) {
+          // A pure-removal sync still resolves refs below — the deletion path
+          // resurrects the removed file's incoming edges as pending refs
+          // (#1240 removal case) and the orphan sweep consumes them. In a
+          // long-lived process (daemon) the resolver's name caches were
+          // warmed against the pre-removal graph; drop them so resolution
+          // sees the post-removal state. (runPostExtract above clears caches
+          // itself, so the changed-files branch is already covered.)
+          this.resolver.clearCaches();
         }
 
         // Resolve references if files were updated
@@ -688,6 +697,34 @@ export class CodeGraph {
                 total,
               });
             });
+
+            // Retry previously-failed refs the changed files may now satisfy
+            // (#1240). Scoped resolution above only re-resolves refs FROM the
+            // changed files — but when a changed file gains an export/symbol,
+            // refs in UNCHANGED files that failed against the old graph can
+            // now resolve, and nothing else ever revisits them (their rows
+            // were parked as status='failed' by an earlier completed pass).
+            // Look them up by the symbol names the changed files now carry
+            // and re-resolve just that set. On a sync where no failed ref
+            // matches, this is one indexed lookup.
+            const tRetry = Date.now();
+            const retryable = this.queries.getRetryableFailedReferences(
+              this.queries.getNodeNamesByFiles(result.changedFilePaths)
+            );
+            if (retryable.length > 0) {
+              options.onProgress?.({
+                phase: 'resolving',
+                current: 0,
+                total: retryable.length,
+              });
+              await this.resolver.resolveAndPersistListYielding(retryable);
+              options.onProgress?.({
+                phase: 'resolving',
+                current: retryable.length,
+                total: retryable.length,
+              });
+            }
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-failed-ref-retry: ${Date.now() - tRetry}ms (${retryable.length} refs)`);
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
@@ -714,9 +751,10 @@ export class CodeGraph {
         // path above never revisits them (it reads only the changed files'
         // rows). Those files' call edges were then missing PERMANENTLY, with
         // nothing to see except a too-small blast radius, until a full
-        // re-index. A completed pass deletes every row it processed (resolved
-        // or not), so any row still present now is such an orphan — or a row
-        // parked by an older engine whose scoped pass kept unresolvable refs.
+        // re-index. A completed pass takes every row it processed out of the
+        // PENDING set (resolved rows are deleted, unresolvable ones parked as
+        // status='failed' for the #1240 retry above), so any pending row now
+        // is such an orphan — or a row from an older engine's scoped pass.
         // Grind them down with the batched resolver; this also makes a bare
         // `codegraph sync` the recovery command for a wedged index. On a
         // healthy index this is one COUNT query.
@@ -968,10 +1006,11 @@ export class CodeGraph {
   }
 
   /**
-   * References extracted but not yet resolved into edges. Zero on a healthy
-   * index — a completed resolution pass consumes every row. Non-zero at rest
-   * means a pass was interrupted mid-run (killed indexer, crash — #1187), so
-   * some files' call edges are missing; the next `sync` sweeps them.
+   * References extracted but never attempted by a resolution pass. Zero on a
+   * healthy index — a completed pass consumes every pending row (resolving it
+   * or parking it as failed, #1240). Non-zero at rest means a pass was
+   * interrupted mid-run (killed indexer, crash — #1187), so some files' call
+   * edges are missing; the next `sync` sweeps them.
    */
   getPendingReferenceCount(): number {
     return this.queries.getUnresolvedReferencesCount();
