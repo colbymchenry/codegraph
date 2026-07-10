@@ -11074,6 +11074,64 @@ end
       expect(names).toContain('Logger');
       expect(names).toContain('GenServer');
     });
+
+    it('should record an `as:` alias under the local name', () => {
+      const code = `
+defmodule M do
+  alias DistributorSSO.JitController, as: JitController
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const imp = result.nodes.find((n) => n.kind === 'import');
+      // Recorded under the LOCAL binding (the alias), matching how a TS/JS
+      // `import { A as C }` records `C` — not the canonical module path.
+      expect(imp?.name).toBe('JitController');
+      expect(imp?.signature).toContain('DistributorSSO.JitController');
+      expect(imp?.signature).toContain('as: JitController');
+    });
+
+    it('resolves a call through an `alias X, as: Y` binding back to X (aliasing)', async () => {
+      const dir = createTempDir();
+      try {
+        fs.mkdirSync(path.join(dir, 'lib', 'distributor_sso'), { recursive: true });
+        fs.writeFileSync(
+          path.join(dir, 'lib', 'distributor_sso', 'jit_controller.ex'),
+          `
+defmodule DistributorSSO.JitController do
+  def foo(conn) do
+    conn
+  end
+end
+`
+        );
+        fs.writeFileSync(
+          path.join(dir, 'lib', 'caller.ex'),
+          `
+defmodule Caller do
+  alias DistributorSSO.JitController, as: JitController
+
+  def handle(conn) do
+    JitController.foo(conn)
+  end
+end
+`
+        );
+        const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ex'], exclude: [] } });
+        await cg.indexAll();
+        cg.resolveReferences();
+
+        const foo = cg
+          .getNodesByName('foo')
+          .find((n) => n.kind === 'function' && n.qualifiedName === 'DistributorSSO.JitController::foo');
+        expect(foo).toBeDefined();
+
+        const callers = cg.getCallers(foo!.id).map((c) => c.node);
+        expect(callers.some((n) => n.kind === 'function' && n.name === 'handle')).toBe(true);
+        cg.destroy();
+      } finally {
+        cleanupTempDir(dir);
+      }
+    });
   });
 
   describe('Structural macros', () => {
@@ -11114,6 +11172,11 @@ end
         (r) => r.referenceKind === 'implements' && r.referenceName === 'Sizeable'
       );
       expect(impl).toBeDefined();
+      // The `for:` target type must be read correctly (not fall back to the
+      // 'Any' default) — the keyword node's text carries a trailing space
+      // ("for: ") that has to be trimmed before comparing against 'for'.
+      const mod = result.nodes.find((n) => n.kind === 'module');
+      expect(mod?.name).toBe('Sizeable.List');
     });
 
     it('should extract defdelegate as a function', () => {

@@ -56,6 +56,28 @@ function doBlock(node: SyntaxNode): SyntaxNode | null {
 }
 
 /**
+ * The `as:` value of `alias X, as: Y` — the arguments node holds
+ * `(alias "X") (keywords (pair key: (keyword "as:") value: (alias "Y")))`.
+ * Returns null when there is no `as:` keyword (the common case, where the
+ * local binding is X's own last segment).
+ */
+function elixirAsAlias(args: SyntaxNode | null, source: string): string | null {
+  const kw = args?.namedChildren.find((c) => c.type === 'keywords');
+  if (!kw) return null;
+  for (let i = 0; i < kw.namedChildCount; i++) {
+    const pair = kw.namedChild(i);
+    if (pair?.type !== 'pair') continue;
+    const key = pair.childForFieldName('key') ?? pair.namedChild(0);
+    const keyText = key ? getNodeText(key, source).trim().replace(/:$/, '') : '';
+    if (keyText === 'as') {
+      const value = pair.childForFieldName('value') ?? pair.namedChild(1);
+      return value ? getNodeText(value, source) : null;
+    }
+  }
+  return null;
+}
+
+/**
  * Extract a definition's simple name from a def-macro's arguments. Handles:
  *   def foo(a)                  → call(target: foo)
  *   def foo(a) when guard       → binary_operator(when){ left: call(target: foo) }
@@ -180,7 +202,7 @@ export const elixirExtractor: LanguageExtractor = {
       // `for:` target type, if present
       const kw = args?.namedChildren.find((c) => c.type === 'keywords');
       const forPair = kw?.namedChildren.find(
-        (p) => p.type === 'pair' && (p.childForFieldName('key')?.text ?? '').replace(/:$/, '') === 'for'
+        (p) => p.type === 'pair' && (p.childForFieldName('key')?.text ?? '').trim().replace(/:$/, '') === 'for'
       );
       const forVal = forPair?.childForFieldName('value');
       const forType = forVal ? getNodeText(forVal, ctx.source) : 'Any';
@@ -241,7 +263,17 @@ export const elixirExtractor: LanguageExtractor = {
       const signature = (getNodeText(node, ctx.source).split('\n')[0] ?? '').trim();
       const first = args?.namedChild(0);
       if (first?.type === 'alias') {
-        ctx.createNode('import', getNodeText(first, ctx.source), node, { signature });
+        const canonical = getNodeText(first, ctx.source);
+        // `alias X, as: Y` — the `as:` keyword renames the local binding: later
+        // code refers to X only as Y (e.g. `Y.some_function()`). Elixir's own
+        // default-alias rule (`alias Foo.Bar` binds the LAST segment, `Bar`,
+        // with no `as:` needed) means an explicit `as:` is the only case where
+        // the local name actually diverges from the canonical module path,
+        // so record the import under the alias name and keep the canonical
+        // path in `signature` for the resolver to recover (import-resolver.ts
+        // resolveElixirAlias reads it back out).
+        const asAlias = elixirAsAlias(args, ctx.source);
+        ctx.createNode('import', asAlias ?? canonical, node, { signature });
       } else if (first?.type === 'dot') {
         // Multi-alias: `alias A.B.{X, Y}` → dot(left: alias "A.B", right: tuple)
         const base = getNodeText(first.childForFieldName('left') ?? first, ctx.source);

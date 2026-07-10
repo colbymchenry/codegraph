@@ -10,6 +10,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
 import { resolveWorkspaceImport } from './workspace-packages';
+import { preferCallSiteFile } from './name-matcher';
 
 /**
  * Extension resolution order by language
@@ -1385,6 +1386,16 @@ export function resolveViaImport(
     if (luaResult) return luaResult;
   }
 
+  // Elixir qualified call through an `alias X, as: Y` binding: `Y.fun()`
+  // extracts to a `calls` ref named `Y.fun`, which shares no substring with
+  // the callee's real qualifiedName (`X::fun`) — plain qualified-name
+  // matching can't bridge the renamed receiver. Rewrite through the calling
+  // file's alias map before falling through to name-matching.
+  if (ref.language === 'elixir' && ref.referenceKind === 'calls') {
+    const elixirResult = resolveElixirAlias(ref, context);
+    if (elixirResult) return elixirResult;
+  }
+
   // Whole-module / namespace imports → link the importing file to the module
   // file. Python `from . import certs` / `import mod`, and TS/JS `import * as ns
   // from './x'` (so a namespace touched only via a value-member read still
@@ -1683,6 +1694,50 @@ function resolvePythonAbsoluteModule(
   if (!ref.referenceName.includes('.')) return null;
   const hit = findPythonModuleFile(ref.referenceName, context, ref.filePath);
   return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;
+}
+
+/**
+ * Resolve an Elixir qualified call made through an `alias X, as: Y` binding —
+ * `Y.some_function()` extracts to a `calls` ref named `Y.some_function`, which
+ * shares no substring with the callee's real qualifiedName
+ * (`X::some_function`), so plain qualified-name matching (which only ever
+ * strips/matches on `.`/`::` boundaries of the SAME path) never connects it.
+ *
+ * The extractor records the alias's `import` node under the LOCAL name (`Y`,
+ * matching how TS/JS `import { A as C }` records `C`) with the full `alias …`
+ * statement text in `signature`, since Elixir's own default-alias rule (a bare
+ * `alias Foo.Bar` binds the last segment, `Bar`, needing no `as:`) means an
+ * explicit `as:` is the only case where the local name actually diverges from
+ * the canonical module path. This walks the calling file's `import` nodes for
+ * one named like the reference's first segment, recovers X from its
+ * `signature`, and rewrites the reference to `X.some_function` before handing
+ * back to the generic qualified-name matcher.
+ */
+function resolveElixirAlias(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const dot = ref.referenceName.indexOf('.');
+  if (dot <= 0) return null;
+  const aliasName = ref.referenceName.slice(0, dot);
+  const rest = ref.referenceName.slice(dot + 1);
+  if (!rest) return null;
+
+  const importNode = context
+    .getNodesInFile(ref.filePath)
+    .find((n) => n.kind === 'import' && n.name === aliasName);
+  if (!importNode?.signature) return null;
+
+  // `signature` holds the full statement, e.g.
+  // "alias DistributorSSO.JitController, as: JitController".
+  const asMatch = importNode.signature.match(/as:\s*([\w.]+)\s*$/);
+  if (!asMatch || asMatch[1] !== aliasName) return null;
+  const canonicalMatch = importNode.signature.match(/alias\s+([\w.]+)\s*,/);
+  const canonical = canonicalMatch?.[1];
+  if (!canonical) return null;
+
+  const qualifiedName = `${canonical}::${rest}`;
+  const candidates = context.getNodesByQualifiedName(qualifiedName);
+  const chosen = preferCallSiteFile(candidates, ref.filePath)[0];
+  if (!chosen) return null;
+  return { original: ref, targetNodeId: chosen.id, confidence: 0.9, resolvedBy: 'import' };
 }
 
 /**
