@@ -7,11 +7,16 @@
  * property's declaration lives OUTSIDE the calling method: a promoted
  * constructor parameter (`private readonly Greeter $greeter`), a classic typed
  * property assigned in `__construct`, or a property typed by an interface. The
- * resolver recovers the property's declared type (widening the local-receiver
- * scan to the whole file, the treatment component-scoped fields already get)
- * and validates it through `resolveMethodOnType`, so a property whose type
- * can't be recovered stays UNLINKED rather than guessed — a wrong inference
- * produces no edge instead of a wrong one.
+ * resolver recovers the property's declared type from PROPERTY-shaped
+ * declarations only — a modifier-prefixed typed declaration, the
+ * `$this->prop = new X()` pseudoconstructor, or (for a classic untyped
+ * property) the typed variable assigned to it inside its own function. Plain
+ * `$prop` locals and parameters live in a different namespace than
+ * `$this->prop` and can never shadow it, so they must never type it — the
+ * interference tests below pin that. The inferred type is validated through
+ * `resolveMethodOnType`, so a property whose type can't be recovered stays
+ * UNLINKED rather than guessed — a wrong inference produces no edge instead
+ * of a wrong one.
  *
  * Method lookup runs EXCLUSIVELY through declared-type inference: the
  * name-similarity fallbacks never see this shape, which is what makes the
@@ -181,6 +186,118 @@ class App {
     const calls = await load();
     expect(hasCall(calls, 'run', 'OtherGreeter::greet')).toBe(true);
     expect(hasCall(calls, 'run', 'Greeter::greet')).toBe(false);
+  });
+
+  it('a same-named local in ANOTHER method never types the property (interference)', async () => {
+    // In PHP `$greeter` (a local) and `$this->greeter` (the property) are
+    // different namespaces — unlike CFML's scopes, no shadowing is possible.
+    // The nearest declaration walking backward from run()'s call is helper()'s
+    // `$greeter = new OtherGreeter()`; the property's promoted type `Greeter`
+    // must still win.
+    write('Greeter.php', greeter);
+    write('OtherGreeter.php', `<?php\nclass OtherGreeter { public function greet() { return 2; } }\n`);
+    write('App.php', `<?php
+class App {
+  public function __construct(private Greeter $greeter) {}
+  public function helper() { $greeter = new OtherGreeter(); return $greeter->greet(); }
+  public function run() { return $this->greeter->greet(); }
+}
+`);
+    const calls = await load();
+    expect(hasCall(calls, 'run', 'Greeter::greet')).toBe(true);
+    expect(hasCall(calls, 'run', 'OtherGreeter::greet')).toBe(false);
+    // helper()'s own local-receiver call still routes to the local's type.
+    expect(hasCall(calls, 'helper', 'OtherGreeter::greet')).toBe(true);
+  });
+
+  it('a same-named local in the SAME method never types the property (interference)', async () => {
+    write('Greeter.php', greeter);
+    write('OtherGreeter.php', `<?php\nclass OtherGreeter { public function greet() { return 2; } }\n`);
+    write('App.php', `<?php
+class App {
+  public function __construct(private Greeter $greeter) {}
+  public function run() {
+    $greeter = new OtherGreeter();
+    $greeter->greet();
+    return $this->greeter->greet();
+  }
+}
+`);
+    const calls = await load();
+    // Both calls resolve, each to its own receiver's type.
+    expect(hasCall(calls, 'run', 'OtherGreeter::greet')).toBe(true);
+    expect(hasCall(calls, 'run', 'Greeter::greet')).toBe(true);
+  });
+
+  it('a same-named parameter of an unrelated method never types the property (interference)', async () => {
+    write('Greeter.php', greeter);
+    write('OtherGreeter.php', `<?php\nclass OtherGreeter { public function greet() { return 2; } }\n`);
+    write('App.php', `<?php
+class App {
+  public function __construct(private Greeter $greeter) {}
+  public function accept(OtherGreeter $greeter) { return $greeter->greet(); }
+  public function run() { return $this->greeter->greet(); }
+}
+`);
+    const calls = await load();
+    expect(hasCall(calls, 'run', 'Greeter::greet')).toBe(true);
+    expect(hasCall(calls, 'run', 'OtherGreeter::greet')).toBe(false);
+    expect(hasCall(calls, 'accept', 'OtherGreeter::greet')).toBe(true);
+  });
+
+  it('resolves a classic UNTYPED property through its constructor assignment (multi-line signature)', async () => {
+    // Pre-7.4 style: the property declaration carries no type; the type lives
+    // on the constructor parameter, here across a multi-line signature. The
+    // resolver follows `$this->greeter = $greeter` to the parameter's type.
+    write('Greeter.php', greeter);
+    write('App.php', `<?php
+class App {
+  private $greeter;
+  public function __construct(
+    Greeter $greeter,
+    $other
+  ) {
+    $this->greeter = $greeter;
+  }
+  public function run() { return $this->greeter->greet(); }
+}
+`);
+    const calls = await load();
+    expect(hasCall(calls, 'run', 'Greeter::greet')).toBe(true);
+  });
+
+  it('resolves a setter-injected untyped property through the setter parameter', async () => {
+    write('Greeter.php', greeter);
+    write('App.php', `<?php
+class App {
+  private $greeter;
+  public function setGreeter(Greeter $greeter) { $this->greeter = $greeter; }
+  public function run() { return $this->greeter->greet(); }
+}
+`);
+    const calls = await load();
+    expect(hasCall(calls, 'run', 'Greeter::greet')).toBe(true);
+  });
+
+  it('the assignment-following fallback stays inside the assigning function (interference)', async () => {
+    // The untyped property is assigned from an UNTYPED constructor parameter,
+    // and a same-named typed variable exists in the method directly above the
+    // constructor. The backward scan from the assignment must stop at the
+    // constructor's own `function` line — no type is recoverable, no edge.
+    write('Greeter.php', greeter);
+    write('OtherGreeter.php', `<?php\nclass OtherGreeter { public function greet() { return 2; } }\n`);
+    write('App.php', `<?php
+class App {
+  private $greeter;
+  public function helper() { $greeter = new OtherGreeter(); return $greeter->greet(); }
+  public function __construct($greeter) {
+    $this->greeter = $greeter;
+  }
+  public function run() { return $this->greeter->greet(); }
+}
+`);
+    const calls = await load();
+    expect(callsMethodNamed(calls, 'run', 'greet')).toBe(false);
   });
 
   // Unit-level check of the confidence the integration DB does not expose:
