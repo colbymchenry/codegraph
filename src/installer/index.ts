@@ -363,7 +363,7 @@ export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsu
 
 /**
  * Per-target outcome of a refresh sweep. `refreshed` means at least one
- * file's content actually changed; `unchanged` means the target was
+ * filesystem entry was created, updated, or removed; `unchanged` means the target was
  * already current (every write reported byte-identical); the other two
  * mirror `UninstallStatus`.
  */
@@ -372,7 +372,7 @@ export interface RefreshReport {
   displayName: string;
   location: Location;
   status: RefreshStatus;
-  /** Absolute paths whose content actually changed. */
+  /** Absolute paths created, updated, or removed by the refresh. */
   changedPaths: string[];
 }
 
