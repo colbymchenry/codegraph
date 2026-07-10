@@ -19,8 +19,8 @@ import {
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
-import { ParseWorkerPool, resolveParsePoolSize } from './parse-pool';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
+import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -53,9 +53,10 @@ const SYNC_RECONCILE_YIELD_INTERVAL = 1000;
 /**
  * Maximum time (ms) to wait for a single file to parse in the worker thread.
  * If tree-sitter hangs or WASM runs out of memory, this prevents the entire
- * indexing run from freezing. The worker is restarted after a timeout.
+ * indexing run from freezing. The worker is restarted after a (hard) timeout.
+ * Env-overridable via CODEGRAPH_PARSE_TIMEOUT_MS for slow storage (#1231).
  */
-const PARSE_TIMEOUT_MS = 10_000;
+const PARSE_TIMEOUT_MS = resolveParseTimeoutMs(process.env.CODEGRAPH_PARSE_TIMEOUT_MS);
 
 /**
  * Number of files to parse before recycling the worker thread.
@@ -1453,7 +1454,12 @@ export class ExtractionOrchestrator {
   async indexAll(
     onProgress?: (progress: IndexProgress) => void,
     signal?: AbortSignal,
-    verbose?: boolean
+    verbose?: boolean,
+    // Writer-side backstop for deferred WAL checkpointing (#1231): returns
+    // null in the normal case, or a promise to await (at this safe,
+    // between-transactions boundary) when the WAL has outrun the off-thread
+    // checkpointer past its hard cap. See db/wal-valve.ts.
+    walBackpressure?: () => Promise<void> | null
   ): Promise<IndexResult> {
     await initGrammars();
     const startTime = Date.now();
@@ -1549,6 +1555,11 @@ export class ExtractionOrchestrator {
       // CODEGRAPH_PARSE_WORKERS: explicit worker count; 1 = the old single-worker
       // behaviour (the conservative rollback). Unset → clamp(cores-1, 1, 8).
       const poolSize = resolveParsePoolSize(process.env.CODEGRAPH_PARSE_WORKERS, os.cpus().length);
+      // Read each needed grammar's WASM ONCE here and hand the bytes to every
+      // worker, so spawns/respawns load grammars from memory instead of
+      // re-reading them from disk (#1231: on an HDD, respawn re-reads amplify
+      // the very I/O contention that caused the respawn).
+      const grammarBuffers = await readGrammarWasmBytes(neededLanguages);
       pool = new ParseWorkerPool({
         languages: neededLanguages,
         size: poolSize,
@@ -1556,6 +1567,7 @@ export class ExtractionOrchestrator {
         recycleInterval: WORKER_RECYCLE_INTERVAL,
         parseTimeoutMs: PARSE_TIMEOUT_MS,
         log,
+        grammarBuffers,
       });
       log(`Parse worker pool: ${poolSize} worker(s)`);
     } else {
@@ -1602,6 +1614,12 @@ export class ExtractionOrchestrator {
 
     const storeResult = async (filePath: string, content: string, stats: fs.Stats, result: ExtractionResult): Promise<void> => {
       processed++;
+
+      // WAL hard-cap backstop: between files (never mid-transaction), pause
+      // the store until the off-thread checkpoint catches up. Resolves to
+      // null in the normal case — a single size check, no cost.
+      const bp = walBackpressure?.();
+      if (bp) await bp;
 
       // Store in database on main thread (SQLite is not thread-safe)
       if (result.nodes.length > 0 || result.errors.length === 0) {
@@ -1815,14 +1833,19 @@ export class ExtractionOrchestrator {
 
     // Retry pass: files that failed due to WASM memory corruption may succeed
     // on a fresh worker with a clean heap. Recycle before each attempt so
-    // every file gets the absolute cleanest WASM state possible.
+    // every file gets the absolute cleanest WASM state possible. Timeouts are
+    // retried too (#1231): most are main-thread-stall artifacts, not slow
+    // parses, and this pass parses one file at a time with the store strictly
+    // after each parse resolves, so the stall window can't recur here.
     const retryableErrors = errors.filter(
       (e) => e.code === 'parse_error' && e.filePath &&
-        (e.message.includes('Worker exited') || e.message.includes('memory access out of bounds'))
+        (e.message.includes('Worker exited') ||
+         e.message.includes('memory access out of bounds') ||
+         e.message.includes('timed out'))
     );
 
     if (retryableErrors.length > 0 && pool) {
-      log(`Retrying ${retryableErrors.length} files that failed due to WASM memory errors...`);
+      log(`Retrying ${retryableErrors.length} files that failed due to WASM memory errors or timeouts...`);
 
       // Fresh WASM heaps for the retry phase. A retry that still crashes its
       // worker makes the pool respawn it, so later retries keep landing on clean

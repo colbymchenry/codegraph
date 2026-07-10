@@ -10,7 +10,23 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixes
-- `codegraph upgrade` now also refreshes what previous versions installed into your agents — the CodeGraph section in CLAUDE.md / AGENTS.md / GEMINI.md and the MCP entry — so upgrading no longer leaves agents following instructions written for tools that have since been renamed or removed. Refresh-only: agents you never configured are not touched, and your permission and hook choices are preserved. Also available manually as `codegraph install --refresh`, and skippable with `CODEGRAPH_NO_INSTALL_REFRESH=1`.
+
+- `codegraph upgrade` now also refreshes what previous versions installed into your agents — the CodeGraph section in CLAUDE.md / AGENTS.md / GEMINI.md and the MCP entry — so upgrading no longer leaves agents following instructions written for tools that have since been renamed or removed. Refresh-only: agents you never configured are not touched, and your permission and hook choices are preserved. Also available manually as `codegraph install --refresh`, and skippable with `CODEGRAPH_NO_INSTALL_REFRESH=1`. (#1238)
+- `codegraph upgrade` on an npm install now upgrades through npm again instead of quietly creating a second copy that never wins the PATH race — previously `codegraph --version` kept reporting the old version forever, no matter how many times you upgraded. (#1238)
+- After every upgrade, CodeGraph now checks that the `codegraph` command your terminal resolves actually serves the freshly installed version — confirming you don't need a new terminal, or telling you exactly which stale install is shadowing the new one. (#1071)
+- The safety watchdog no longer kills a healthy index on severely degraded storage. It used to judge liveness purely by the event loop, so one long database write on a struggling disk looked identical to a hung process and could get a valid, in-progress index terminated. During `codegraph index`/`codegraph init` the watchdog now also checks whether the index files on disk are advancing before it acts: slow-but-progressing work is left alone (bounded by a hard cap), while a genuinely hung process is still killed exactly as fast as before. (#1231)
+
+## [1.4.0] - 2026-07-10
+
+### New Features
+
+- Indexing is dramatically faster on slow storage — mechanical HDDs, network folders, and virtualized disks. The database no longer folds its write journal back into the main file thousands of times during a bulk index (that folding was ~95% of all disk activity); it now streams writes sequentially and folds them back in a few large, coalesced passes that run off the main thread. In a disk-throttled benchmark matching the reported hardware, a mid-size Java project went from over 25 minutes to under a minute, and there is no change on fast disks. Opt out with `CODEGRAPH_NO_WAL_DEFER=1`; tune the fold-back threshold with `CODEGRAPH_WAL_VALVE_MB`. (#1231)
+- New `CODEGRAPH_PARSE_TIMEOUT_MS` environment variable to raise the per-file parse budget on unusually slow storage, the same way `CODEGRAPH_PARSE_WORKERS` already tunes the worker count. (#1231)
+
+### Fixes
+
+- Indexing on slow storage (mechanical HDDs, network folders) no longer collapses into false "parse timeout" failures. When disk writes stalled the coordinating thread, parses that had already finished — including empty files — were being misjudged as hung, their workers killed, and the files silently dropped from the index. A parse result is now judged by the worker's own clock, so a stalled coordinator accepts the finished result instead of killing the worker; only a genuinely hung parse is terminated (after a wider grace window). Files that do hit the timeout are retried at the end of indexing instead of being silently lost. Thanks @KnifeOfLife for the exceptional report. (#1231)
+- Parse workers now receive their grammar files from memory instead of each re-reading them from disk on spawn, eliminating a feedback loop on slow disks where every worker restart added more disk contention — and making worker restarts cheaper everywhere. (#1231)
 
 ## [1.3.1] - 2026-07-09
 
@@ -615,3 +631,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.2.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.2.0
 [1.3.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.3.0
 [1.3.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.3.1
+[1.4.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.4.0

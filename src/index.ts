@@ -24,6 +24,7 @@ import {
   FindRelevantContextOptions,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
+import { WalCheckpointValve } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
 import {
   isInitialized,
@@ -435,6 +436,29 @@ export class CodeGraph {
       } catch {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
+      // Defer WAL auto-checkpointing for the whole bulk run (#1231): the
+      // default 1000-page interval re-writes hot pages into the main DB file
+      // over and over — ~95% of all disk I/O during a bulk index, and a
+      // 19+min → 45s difference on HDD-class storage. The valve bounds WAL
+      // growth by backfilling PASSIVEly on a worker thread (never blocking
+      // the writer or the #850 watchdog heartbeat); runMaintenance below does
+      // the final fold-up before the interval is restored in the finally.
+      // Kill switch: CODEGRAPH_NO_WAL_DEFER=1. Non-WAL journal modes (some
+      // network filesystems) have no WAL to defer — skip.
+      const deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+      let walValve: WalCheckpointValve | null = null;
+      let priorAutocheckpoint = 1000;
+      if (deferWal) {
+        priorAutocheckpoint = this.db.getWalAutocheckpoint();
+        this.db.setWalAutocheckpoint(0);
+        walValve = new WalCheckpointValve(
+          this.db,
+          undefined,
+          undefined,
+          options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
+        );
+        walValve.start();
+      }
       try {
         const before = this.queries.getNodeAndEdgeCount();
         // Mark the index as in-flight BEFORE any writes: a run killed
@@ -446,7 +470,19 @@ export class CodeGraph {
         // path as every file (re-)indexes below — so a full index is also the
         // orphan-cleanup pass for names deleted since the last one.
         try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
-        const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
+        const result = await this.orchestrator.indexAll(
+          options.onProgress,
+          options.signal,
+          options.verbose,
+          walValve ? () => walValve!.backpressure() : undefined
+        );
+
+        // Fold the parse phase's WAL BEFORE the first post-parse reads
+        // (resolver re-init and resolution both read on the main thread):
+        // paging a bulk-write-sized WAL there is what blew the #850
+        // watchdog's 60s window in the #1231 repro. Off-thread + awaited,
+        // so the event loop keeps turning.
+        if (walValve) await walValve.foldNow();
 
         // Re-detect frameworks now that the index is populated. The resolver
         // is constructed with createResolver() before any files exist, so
@@ -501,6 +537,10 @@ export class CodeGraph {
         // successful index. Never load-bearing for correctness.
         if (result.success && result.filesIndexed > 0) {
           const tMaint = Date.now();
+          // Quiesce the valve first so its in-flight checkpoint and the
+          // maintenance checkpoint don't contend for the checkpointer lock
+          // (the loser would silently no-op and leave the WAL unfolded).
+          if (walValve) { walValve.stop(); await walValve.drain(); }
           await this.db.runMaintenance();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] maintenance: ${Date.now() - tMaint}ms`);
         }
@@ -561,6 +601,15 @@ export class CodeGraph {
 
         return result;
       } finally {
+        // Restore the auto-checkpoint interval AFTER the fold-up above so the
+        // next ordinary write doesn't inherit a giant inline checkpoint. On
+        // the error path the WAL may still be large; correctness is unchanged
+        // (SQLite replays the WAL on the next open) and the follow-up write
+        // that folds it is the known cost of a failed run.
+        if (walValve) { walValve.stop(); await walValve.drain(); }
+        if (deferWal) {
+          try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* connection may be closing */ }
+        }
         this.fileLock.release();
       }
     });
