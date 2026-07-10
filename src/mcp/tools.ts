@@ -2619,9 +2619,21 @@ export class ToolHandler {
         // codegraph_node's findSymbolMatches.) Qualified tokens keep findAllSymbols.
         const isQual = /[.\/]|::/.test(t);
         const raw = isQual ? this.findAllSymbols(cg, t).nodes : cg.getNodesByName(t);
-        const cands = raw
-          .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
-          .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
+        const toCands = (ns: Node[]) =>
+          ns
+            .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
+            .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
+        let cands = toCands(raw);
+        // Camel-infix fallback: a token that names a data FIELD or camel
+        // fragment (profileInfo, billingMethod) often has no node of its
+        // own — the definers are the callables whose NAME contains it at a
+        // camel/prefix boundary (getProfileInfoV2, _getCustomerBillingMethods).
+        // Exact-name lookup finds nothing, so without this the query's most
+        // load-bearing tokens contribute zero seeds and weak sub-token FTS
+        // hits take the render budget instead. (#1196)
+        if (!isQual && cands.length === 0 && t.length >= 4) {
+          cands = toCands(this.findCamelInfixCallables(cg, t));
+        }
         // A specific name (<=3 defs) injects all its defs. An overloaded name
         // (`validate` = 10, `request` = 44) would flood the subgraph, so inject
         // only: the overloads whose file/class the query ALSO names (the agent
@@ -4479,6 +4491,46 @@ export class ToolHandler {
     );
     const note = `\n\n> **Note:** Aggregated results across ${ranked.length} symbols named "${symbol}": ${locations.join(', ')}`;
     return { nodes: ranked.map(r => r.node), note };
+  }
+
+  /**
+   * Resolve a query token with NO node of its own (a data field / camel
+   * fragment like `profileInfo`) to the callables whose name contains it at
+   * a prefix or camel-hump boundary (`getProfileInfoV2`,
+   * `_getCustomerBillingMethods`), case-insensitively. Used by explore's
+   * named-symbol seeding so field-name tokens still seed the files that
+   * define them. FTS can't do this: camelCase identifiers are single FTS
+   * tokens, so `"profileinfo"*` never matches an interior hump. (#1196)
+   */
+  private findCamelInfixCallables(cg: CodeGraph, token: string): Node[] {
+    // `constructor` is not a NodeKind — constructors are extracted as `method`
+    // nodes named `constructor`. The CAMEL_INFIX_KINDS list mirrors the
+    // service-layer kinds the issue calls out (Express-style method defs).
+    const CAMEL_INFIX_KINDS: NodeKind[] = ['method', 'function', 'component'];
+    let rows: Array<{ node: Node }> = [];
+    try {
+      rows = cg.findNodesByNameSubstring(token, {
+        limit: 50,
+        kinds: CAMEL_INFIX_KINDS,
+      });
+    } catch {
+      return [];
+    }
+    const tl = token.toLowerCase();
+    const out: Node[] = [];
+    for (const r of rows) {
+      const name = r.node.name;
+      const idx = name.toLowerCase().indexOf(tl);
+      if (idx < 0) continue;
+      if (idx > 0) {
+        // An interior match must start at a camel hump ("…ProfileInfo…") or
+        // right after a separator ("_profile_info"); a mid-word lowercase
+        // run ("reprofileinfo" for "profileinfo") is a false hit. (#1196)
+        if (/[a-zA-Z]/.test(name.charAt(idx - 1)) && !/[A-Z]/.test(name.charAt(idx))) continue;
+      }
+      out.push(r.node);
+    }
+    return out;
   }
 
   /**
