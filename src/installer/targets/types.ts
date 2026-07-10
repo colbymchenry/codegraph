@@ -1,10 +1,10 @@
 /**
  * Agent target abstraction for the installer.
  *
- * Each MCP-capable agent (Claude Code, Cursor, Codex CLI, opencode, ...)
+ * Each supported agent (Claude Code, Cursor, Codex CLI, opencode, Pi, ...)
  * implements this interface so the installer orchestrator can write the
- * right MCP-server config + instructions file + permissions for that
- * agent without baking client-specific paths into core code. Adding a
+ * right integration files (MCP config, native extension, instructions,
+ * permissions) without baking client-specific paths into core code. Adding a
  * new agent = one new file in `targets/` + one entry in `registry.ts`.
  *
  * Closes the Claude-locked installer issue (upstream #137). The
@@ -19,7 +19,7 @@ export type Location = 'global' | 'local';
  * lookup. New targets add a value here when they're added to the
  * registry. Keep these short and lowercase.
  */
-export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro';
+export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro' | 'pi';
 
 /**
  * Result of `target.detect(location)`.
@@ -103,9 +103,10 @@ export interface AgentTarget {
    */
   uninstall(loc: Location): WriteResult;
   /**
-   * Print the MCP-server snippet a user would paste manually for this
-   * target. Used by `codegraph install --print-config <id>` and by
-   * the README. Must NOT touch the filesystem.
+   * Print the manual snippet a user would paste for this target (MCP config,
+   * native extension, instructions, or whichever surface the target uses).
+   * Used by `codegraph install --print-config <id>` and by the README. Must
+   * NOT touch the filesystem.
    */
   printConfig(loc: Location): string;
   /** Filesystem paths this target would write to at this location. */

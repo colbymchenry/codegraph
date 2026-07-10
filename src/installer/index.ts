@@ -1,9 +1,9 @@
 /**
  * CodeGraph Interactive Installer
  *
- * Multi-target: writes MCP server config + instructions for the
- * agents the user picks (Claude Code, Cursor, Codex CLI, opencode,
- * Hermes Agent, Gemini CLI, Antigravity IDE).
+ * Multi-target: writes the needed CodeGraph integration for the agents
+ * the user picks (MCP config for MCP-capable agents, a native extension for
+ * Pi, and instructions where the agent reads them).
  * Defaults to the Claude-only behavior for backwards compatibility
  * when no targets are explicitly chosen and nothing else is detected.
  *
@@ -104,7 +104,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   // matches existing behavior). Skipped when --yes (assume present).
   if (!useDefaults) {
     const shouldInstallGlobally = await clack.confirm({
-      message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
+      message: 'Install the codegraph CLI on your PATH? (Required so agents can launch CodeGraph tools)',
       initialValue: true,
     });
     if (clack.isCancel(shouldInstallGlobally)) {
@@ -124,7 +124,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
         clack.log.warn('Try: sudo npm install -g @colbymchenry/codegraph');
       }
     } else {
-      clack.log.info('Skipped CLI install — agents will not be able to launch the MCP server without it');
+      clack.log.info('Skipped CLI install — agents will not be able to launch CodeGraph without it');
     }
   }
 
@@ -365,8 +365,8 @@ export function uninstallTargets(
  * then sweeps every agent target (or the `--target` subset) and prints
  * one block per agent so the user sees exactly which providers it hit.
  *
- * Removes only what install wrote (MCP server entry, instructions
- * block, permissions) — never the `.codegraph/` index, which `codegraph
+ * Removes only what install wrote (MCP server entry, native extension,
+ * instructions block, permissions) — never the `.codegraph/` index, which `codegraph
  * uninit` owns.
  */
 export async function runUninstaller(opts: RunUninstallerOptions): Promise<void> {
@@ -388,8 +388,8 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro' },
-        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc, ./.gemini, ./.kiro' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.pi/agent' },
+        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc, ./.gemini, ./.kiro, ./.pi' },
       ],
       initialValue: 'global' as const,
     });

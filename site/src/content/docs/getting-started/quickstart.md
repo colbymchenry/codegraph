@@ -25,7 +25,7 @@ Already have Node? `npm i -g @colbymchenry/codegraph` works on any version. Code
 codegraph install
 ```
 
-Auto-detects and configures Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, and Kiro — wiring the CodeGraph MCP server into each. This step connects your agents only; it does **not** index any code. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs the installer in one go.)
+Auto-detects and configures Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and Pi — wiring the CodeGraph MCP server for MCP-capable agents and a native `codegraph_explore` extension for Pi. This step connects your agents only; it does **not** index any code. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs the installer in one go.)
 
 ## 3. Initialize each project
 

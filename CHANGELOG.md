@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Pi users can now choose Pi in `codegraph install`; CodeGraph installs a native Pi tool and the guidance Pi needs to explore indexed projects without scanning files first.
 
 ## [1.3.1] - 2026-07-09
 

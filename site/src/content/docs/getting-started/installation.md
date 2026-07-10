@@ -11,10 +11,10 @@ npx @colbymchenry/codegraph
 
 The installer will:
 
-- Ask which agent(s) to configure — auto-detecting installed ones from **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, and **Kiro**.
-- Prompt to install `codegraph` on your `PATH` (so agents can launch the MCP server).
+- Ask which agent(s) to configure — auto-detecting installed ones from **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**, and **Pi**.
+- Prompt to install `codegraph` on your `PATH` (so agents can launch CodeGraph).
 - Ask whether configs apply to all your projects or just this one.
-- Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`). Cursor and Kiro get the MCP config only. Removed cleanly by `codegraph uninstall`.
+- Write each chosen agent's integration: MCP server config for MCP-capable agents, a native `codegraph_explore` extension for Pi, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`) where that agent reads one. Removed cleanly by `codegraph uninstall`.
 - Set up auto-allow permissions when Claude Code is one of the targets.
 
 The installer **wires up your agents only — it does not index your code.** After it finishes, build each project's graph yourself with `codegraph init` (step 3 below).
@@ -38,7 +38,7 @@ codegraph install --print-config codex               # print snippet, no file wr
 
 ## 2. Restart your agent
 
-Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro) for the MCP server to load.
+Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro / Pi) for the integration to load.
 
 ## 3. Initialize projects
 
@@ -67,4 +67,4 @@ Changed your mind? One command removes CodeGraph from every agent it configured:
 codegraph uninstall
 ```
 
-This reverses the installer — stripping CodeGraph's MCP server config, instructions, and permissions from each configured agent. Your project indexes (`.codegraph/`) are left untouched; remove those per-project with `codegraph uninit`. Use `--target` to remove from specific agents, or `--yes` to run non-interactively.
+This reverses the installer — stripping CodeGraph's MCP server config, native Pi extension, instructions, and permissions from each configured agent. Your project indexes (`.codegraph/`) are left untouched; remove those per-project with `codegraph uninit`. Use `--target` to remove from specific agents, or `--yes` to run non-interactively.

@@ -38,12 +38,14 @@ function setHome(dir: string): { restore: () => void } {
     APPDATA: process.env.APPDATA,
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
     HERMES_HOME: process.env.HERMES_HOME,
+    PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
   };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
   process.env.APPDATA = path.join(dir, '.config');
   process.env.XDG_CONFIG_HOME = path.join(dir, '.config');
   delete process.env.HERMES_HOME;
+  delete process.env.PI_CODING_AGENT_DIR;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
@@ -51,6 +53,7 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.APPDATA === undefined) delete process.env.APPDATA; else process.env.APPDATA = prev.APPDATA;
       if (prev.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prev.XDG_CONFIG_HOME;
       if (prev.HERMES_HOME === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = prev.HERMES_HOME;
+      if (prev.PI_CODING_AGENT_DIR === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = prev.PI_CODING_AGENT_DIR;
     },
   };
 }
@@ -1175,6 +1178,104 @@ describe('Installer targets — partial-state idempotency', () => {
     const stopCmds = (s.hooks?.Stop ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
     expect(stopCmds).toContain('codegraph sync-if-dirty');
   });
+
+  it('pi: global install writes a native extension and AGENTS.md guidance', () => {
+    const pi = getTarget('pi')!;
+    const result = pi.install('global', { autoAllow: true });
+    const extension = path.join(tmpHome, '.pi', 'agent', 'extensions', 'codegraph.ts');
+    const agents = path.join(tmpHome, '.pi', 'agent', 'AGENTS.md');
+
+    expect(result.files.some((f) => f.path === extension && f.action === 'created')).toBe(true);
+    expect(result.files.some((f) => f.path === agents && f.action === 'created')).toBe(true);
+    expect(fs.readFileSync(extension, 'utf-8')).toContain('name: "codegraph_explore"');
+    expect(fs.readFileSync(extension, 'utf-8')).toContain('pi.on("session_start"');
+    expect(fs.readFileSync(extension, 'utf-8')).toContain('pi.getAllTools()');
+    expect(fs.readFileSync(extension, 'utf-8')).toContain('spawn("codegraph"');
+    expect(fs.readFileSync(agents, 'utf-8')).toContain('codegraph explore');
+    expect(pi.detect('global').alreadyConfigured).toBe(true);
+  });
+
+  it('pi: honors PI_CODING_AGENT_DIR for global extension and AGENTS.md', () => {
+    const custom = path.join(tmpHome, 'custom-pi-agent');
+    process.env.PI_CODING_AGENT_DIR = custom;
+    const pi = getTarget('pi')!;
+
+    const result = pi.install('global', { autoAllow: true });
+
+    const extension = path.join(custom, 'extensions', 'codegraph.ts');
+    const agents = path.join(custom, 'AGENTS.md');
+    expect(result.files.map((f) => f.path)).toContain(extension);
+    expect(result.files.map((f) => f.path)).toContain(agents);
+    expect(fs.existsSync(extension)).toBe(true);
+    expect(fs.existsSync(agents)).toBe(true);
+    expect(fs.existsSync(path.join(tmpHome, '.pi', 'agent', 'extensions', 'codegraph.ts'))).toBe(false);
+    expect(pi.detect('global').configPath).toBe(extension);
+  });
+
+  it('pi: local install writes ./.pi/extensions/codegraph.ts and ./AGENTS.md', () => {
+    const pi = getTarget('pi')!;
+    const result = pi.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+
+    expect(paths.some((p) => p.endsWith('/.pi/extensions/codegraph.ts'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+    expect(fs.readFileSync(path.join(process.cwd(), '.pi', 'extensions', 'codegraph.ts'), 'utf-8')).toContain('codegraph_explore');
+    expect(fs.readFileSync(path.join(process.cwd(), 'AGENTS.md'), 'utf-8')).toContain('codegraph explore');
+  });
+
+  it('pi: install is idempotent for both extension and instructions', () => {
+    const pi = getTarget('pi')!;
+    pi.install('global', { autoAllow: true });
+    const extension = path.join(tmpHome, '.pi', 'agent', 'extensions', 'codegraph.ts');
+    const agents = path.join(tmpHome, '.pi', 'agent', 'AGENTS.md');
+    const firstExtension = fs.readFileSync(extension, 'utf-8');
+    const firstAgents = fs.readFileSync(agents, 'utf-8');
+
+    const second = pi.install('global', { autoAllow: true });
+
+    expect(second.files.every((f) => f.action === 'unchanged')).toBe(true);
+    expect(fs.readFileSync(extension, 'utf-8')).toBe(firstExtension);
+    expect(fs.readFileSync(agents, 'utf-8')).toBe(firstAgents);
+  });
+
+  it('pi: uninstall removes only CodeGraph-owned extension and AGENTS.md block', () => {
+    const pi = getTarget('pi')!;
+    const agents = path.join(tmpHome, '.pi', 'agent', 'AGENTS.md');
+    fs.mkdirSync(path.dirname(agents), { recursive: true });
+    fs.writeFileSync(agents, `# My Pi notes\n\nBe direct.\n\n${LEGACY_BLOCK}\n`);
+
+    pi.install('global', { autoAllow: true });
+    const result = pi.uninstall('global');
+
+    const extension = path.join(tmpHome, '.pi', 'agent', 'extensions', 'codegraph.ts');
+    expect(result.files.find((f) => f.path === extension)?.action).toBe('removed');
+    expect(fs.existsSync(extension)).toBe(false);
+    const body = fs.readFileSync(agents, 'utf-8');
+    expect(body).toContain('# My Pi notes');
+    expect(body).toContain('Be direct.');
+    expect(body).not.toContain('CODEGRAPH_START');
+  });
+
+  it('pi: local detection considers an existing CLAUDE.md CodeGraph block', () => {
+    const pi = getTarget('pi')!;
+    fs.writeFileSync(path.join(process.cwd(), 'CLAUDE.md'), `${LEGACY_BLOCK}\n`);
+
+    expect(pi.detect('local').alreadyConfigured).toBe(true);
+  });
+
+  it('pi: printConfig prints a native extension and instructions without writing files', () => {
+    const pi = getTarget('pi')!;
+    const before = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+
+    const out = pi.printConfig('global');
+
+    expect(out).toContain('extensions/codegraph.ts');
+    expect(out).toContain('AGENTS.md');
+    expect(out).toContain('codegraph_explore');
+    expect(out).toContain('codegraph explore');
+    const after = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+    expect(after.sort()).toEqual(before.sort());
+  });
 });
 
 describe('Installer targets — registry', () => {
@@ -1187,6 +1288,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('gemini')?.id).toBe('gemini');
     expect(getTarget('antigravity')?.id).toBe('antigravity');
     expect(getTarget('kiro')?.id).toBe('kiro');
+    expect(getTarget('pi')?.id).toBe('pi');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
@@ -1195,6 +1297,7 @@ describe('Installer targets — registry', () => {
     expect(resolveTargetFlag('all', 'global').length).toBe(ALL_TARGETS.length);
     const csv = resolveTargetFlag('claude,cursor', 'global');
     expect(csv.map((t) => t.id)).toEqual(['claude', 'cursor']);
+    expect(resolveTargetFlag('pi,claude', 'global').map((t) => t.id)).toEqual(['pi', 'claude']);
   });
 
   it('resolveTargetFlag throws on unknown id', () => {

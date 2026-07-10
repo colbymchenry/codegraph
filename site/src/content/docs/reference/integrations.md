@@ -3,7 +3,7 @@ title: Integrations
 description: Supported agents, and manual MCP setup.
 ---
 
-The interactive installer auto-detects and configures each supported agent — wiring the CodeGraph MCP server into each. For the agents that use an instructions file, it also writes a short marker-fenced CodeGraph section (`CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`) so subagents and non-MCP harnesses learn the `codegraph explore` command; `codegraph uninstall` removes it.
+The interactive installer auto-detects and configures each supported agent — wiring the CodeGraph MCP server for MCP-capable agents and a native `codegraph_explore` extension for Pi. For the agents that use an instructions file, it also writes a short marker-fenced CodeGraph section (`CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`) so subagents and non-MCP harnesses learn the `codegraph explore` command; `codegraph uninstall` removes it.
 
 ## Supported agents
 
@@ -15,12 +15,17 @@ The interactive installer auto-detects and configures each supported agent — w
 - **Gemini CLI**
 - **Antigravity IDE**
 - **Kiro**
+- **Pi**
 
 Run `npx @colbymchenry/codegraph` and pick your agent(s); see [Installation](/codegraph/getting-started/installation/) for the non-interactive flags.
 
+:::note
+Pi does not use MCP directly. The installer writes a native Pi extension that registers `codegraph_explore` and calls `codegraph explore` under the hood, plus an `AGENTS.md` hint so Pi knows when to use it.
+:::
+
 ## Manual setup
 
-If you'd rather wire it up yourself, install globally:
+If you'd rather wire it up yourself for an MCP-capable agent, install globally:
 
 ```bash
 npm install -g @colbymchenry/codegraph
