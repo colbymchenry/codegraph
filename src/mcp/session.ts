@@ -260,9 +260,12 @@ export class MCPSession {
       return;
     }
 
+    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} pre-init\n`);
     await this.retryInitIfNeeded();
 
+    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);
     const result = await this.engine.getToolHandler().execute(toolName, toolArgs);
+    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} done\n`);
     this.transport.sendResult(request.id, result);
     // After the reply is on the wire — telemetry must never delay a tool
     // response (in-memory increment only; see src/telemetry).

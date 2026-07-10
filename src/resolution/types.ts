@@ -71,6 +71,15 @@ export interface ResolutionContext {
   getNodesByQualifiedName(qualifiedName: string): Node[];
   /** Get all nodes of a kind */
   getNodesByKind(kind: Node['kind']): Node[];
+  /**
+   * Stream nodes of a kind one at a time instead of materializing (and, unlike
+   * `getNodesByKind`, without populating the resolver's per-kind array cache).
+   * For unbounded kinds (`function`, `method`, `struct`) on a symbol-dense
+   * project the full array is gigabytes — the dynamic-edge synthesizers must
+   * use this so their memory stays O(1) in node count (#610, #1212). Optional
+   * so minimal test contexts compile; callers fall back to getNodesByKind.
+   */
+  iterateNodesByKind?(kind: Node['kind']): IterableIterator<Node>;
   /** Check if a file exists */
   fileExists(filePath: string): boolean;
   /** Read file content */

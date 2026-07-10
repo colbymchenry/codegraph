@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
@@ -229,6 +229,15 @@ export class ReferenceResolver {
   private qualifiedNameCache: LRUCache<string, Node[]>; // qualified_name → nodes cache
   private fileLinesCache: LRUCache<string, string[] | null>; // file → split lines cache
   private methodMatchCache: LRUCache<string, Node[]>; // lang\0Type::method → matching method nodes
+  // Node kinds are a small fixed set (~24), so this is a plain Map, not an LRU.
+  // getNodesByKind returns the FULL node list for a kind; it was previously
+  // uncached — a per-ref `SELECT * FROM nodes WHERE kind=?` + row-mapping. Called
+  // for every dotted call ref by the Spring resolver (constants) and every
+  // `hook_` ref by the Drupal resolver (functions), that scan dominated
+  // resolution on large repos (#1180). The node set is stable within a
+  // resolution pass (same lifetime assumption as nameCache); clearCaches() resets
+  // it between passes. Callers must treat the returned array as read-only.
+  private nodesByKindCache = new Map<Node['kind'], Node[]>();
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
@@ -320,6 +329,30 @@ export class ReferenceResolver {
   }
 
   /**
+   * warmCaches for the async resolution entry points: streams the distinct
+   * name set with periodic yields instead of one synchronous `.all()`. On a
+   * multi-million-node index the DISTINCT scan is a solid multi-second block
+   * (measured up to 28s inside `codegraph sync` on the Linux kernel index),
+   * long enough to matter to the #850 watchdog on slower hardware. Same
+   * result, same memory — only the event loop keeps turning.
+   */
+  async warmCachesYielding(onYield: MaybeYield): Promise<void> {
+    if (this.cachesWarmed) return;
+
+    this.knownFiles = new Set(this.queries.getAllFilePaths());
+
+    const names = new Set<string>();
+    let scanned = 0;
+    for (const name of this.queries.iterateNodeNames()) {
+      names.add(name);
+      if ((++scanned & 8191) === 0) await onYield();
+    }
+    this.knownNames = names;
+
+    this.cachesWarmed = true;
+  }
+
+  /**
    * Clear internal caches
    */
   clearCaches(): void {
@@ -332,6 +365,7 @@ export class ReferenceResolver {
     this.qualifiedNameCache.clear();
     this.fileLinesCache.clear();
     this.methodMatchCache.clear();
+    this.nodesByKindCache.clear();
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
@@ -404,8 +438,18 @@ export class ReferenceResolver {
       },
 
       getNodesByKind: (kind: Node['kind']) => {
-        return this.queries.getNodesByKind(kind);
+        const cached = this.nodesByKindCache.get(kind);
+        if (cached !== undefined) return cached;
+        const result = this.queries.getNodesByKind(kind);
+        this.nodesByKindCache.set(kind, result);
+        return result;
       },
+
+      // Streamed, uncached — synthesizers scan-and-filter whole kinds, and
+      // both the materialized array AND the per-kind cache retention are
+      // O(nodes) memory (#1212). Per-ref resolvers keep the cached array
+      // variant above.
+      iterateNodesByKind: (kind: Node['kind']) => this.queries.iterateNodesByKind(kind),
 
       fileExists: (filePath: string) => {
         // Check pre-built known files set first (O(1))
@@ -543,7 +587,7 @@ export class ReferenceResolver {
         // `.ts` index barrel and silently break the chain (#629). Re-key
         // the parse on the barrel's extension so the chase works no matter
         // what kind of file imports through it.
-        const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?)$/i.test(filePath);
+        const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?|ets)$/i.test(filePath);
         const reExports = extractReExports(content, isJsFamily ? 'typescript' : language);
         this.reExportCache.set(filePath, reExports);
         return reExports;
@@ -744,8 +788,18 @@ export class ReferenceResolver {
     // from './barrel'` where the barrel has `export { signIn as login }
     // from './auth'`) intentionally call a name that has no
     // declaration anywhere — only the renamed upstream symbol does.
+    // ArkTS chained-attribute refs carry a leading dot (`.titleStyle`) that
+    // routes them to the decorator-gated matcher; the symbol itself is
+    // indexed under the bare name, so the existence check strips the dot.
+    // Nix static path imports (`import ./x.nix`) name a FILE, not a symbol —
+    // they bypass the symbol-existence check and resolve via resolveViaImport.
+    const existenceName =
+      ref.language === 'arkts' && ref.referenceName.startsWith('.')
+        ? ref.referenceName.slice(1)
+        : ref.referenceName;
     if (
-      !this.hasAnyPossibleMatch(ref.referenceName) &&
+      !isNixPathImportRef(ref) &&
+      !this.hasAnyPossibleMatch(existenceName) &&
       !this.matchesAnyImport(ref) &&
       !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
     ) {
@@ -815,7 +869,13 @@ export class ReferenceResolver {
     // If that didn't find the file, do NOT fall back to the symbol
     // name-matcher — it would mis-connect e.g. "inc/db.php" to an unrelated
     // db.php elsewhere in the tree (a wrong edge is worse than none, #660).
-    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref)) {
+    // Terraform refs are directory-scoped by language semantics — the
+    // framework resolver IS the whole rulebook (`var.X` can never legally
+    // bind outside its module directory), so the name-matcher's
+    // qualified-name fallback would only ever add wrong cross-module edges.
+    // Nix static path imports are file references for the same reason —
+    // falling through would let "./x.nix" name-match an unrelated node.
+    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || ref.language === 'terraform') {
       return candidates.length > 0
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
@@ -824,7 +884,27 @@ export class ReferenceResolver {
     }
 
     // Strategy 3: Try name matching
-    const nameResult = this.gateLanguage(matchReference(ref, this.context), ref);
+    let nameResult = this.gateLanguage(matchReference(ref, this.context), ref);
+    // Nix has no ambient cross-file namespace — a callee binds lexically
+    // (same file) or through explicit import/callPackage wiring (the import
+    // path above). A cross-file name match is wrong by construction: every
+    // module `inherit (lib) mkOption`s the same nixpkgs helpers, so the
+    // matcher would link each `mkOption` call to whichever file's inherit
+    // binding it happened to pick. Same-file matches only.
+    if (nameResult) {
+      const target = this.queries.getNodeById(nameResult.targetNodeId);
+      if (ref.language === 'nix') {
+        if (!target || target.filePath !== ref.filePath) {
+          nameResult = null;
+        }
+      } else if (target && target.language === 'nix') {
+        // The reverse direction is just as impossible: no other language can
+        // symbolically call into a .nix binding (interop is eval/CLI, never a
+        // linkable symbol) — without this, a Python script's `split()` lands
+        // on some module's `split = ...` binding as a low-confidence match.
+        nameResult = null;
+      }
+    }
     if (nameResult) {
       candidates.push(nameResult);
     }
@@ -928,6 +1008,23 @@ export class ReferenceResolver {
           fromNodeId: r.original.fromNodeId,
           referenceName: r.original.referenceName,
           referenceKind: r.original.referenceKind,
+        }))
+      );
+    }
+
+    // Delete unresolvable refs too — parity with resolveAndPersistBatched.
+    // Keeping them bought nothing: a ref is only ever retried when its file
+    // is re-extracted, which cascade-deletes and re-inserts its rows anyway.
+    // And it broke the #1187 orphan sweep's invariant — after a COMPLETED
+    // pass the table must hold nothing that pass processed, so that any row
+    // still present belongs to an interrupted run and the sweep can key off
+    // a bare row count.
+    if (result.unresolved.length > 0) {
+      this.queries.deleteSpecificResolvedReferences(
+        result.unresolved.map((r) => ({
+          fromNodeId: r.fromNodeId,
+          referenceName: r.referenceName,
+          referenceKind: r.referenceKind,
         }))
       );
     }
@@ -1046,8 +1143,6 @@ export class ReferenceResolver {
     onProgress?: (current: number, total: number) => void,
     batchSize: number = 5000
   ): Promise<ResolutionResult> {
-    this.warmCaches();
-
     // Resolution runs on the indexer's MAIN thread, and the #850 liveness
     // watchdog SIGKILLs a process whose event loop stalls past its window (60s
     // by default). A single dense batch's resolveAll — or the synthesis pass
@@ -1055,6 +1150,8 @@ export class ReferenceResolver {
     // (#1091). A shared yielder lets both give the watchdog heartbeat a regular
     // window to fire; see ./cooperative-yield.
     const maybeYield = createYielder();
+
+    await this.warmCachesYielding(maybeYield);
 
     const total = this.queries.getUnresolvedReferencesCount();
     let processed = 0;
@@ -1074,32 +1171,42 @@ export class ReferenceResolver {
 
       const result = await this.resolveBatchYielding(batch, maybeYield);
 
+      // Persist in bounded sub-transactions with yields between: a whole
+      // batch's edge insert / keyed deletes are otherwise one solid
+      // synchronous span each on a multi-GB index, sitting BETWEEN the
+      // per-ref yields — the last unyielded stretch of the resolution loop.
+      // Crash semantics are unchanged (already several transactions): edges
+      // land before their refs are deleted, so a kill mid-way re-resolves
+      // the remainder idempotently on the next run/sweep (#1187).
+      const PERSIST_CHUNK = 1000;
+
       // Persist edges immediately
       const edges = this.createEdges(result.resolved);
-      if (edges.length > 0) {
-        this.queries.insertEdges(edges);
+      for (let i = 0; i < edges.length; i += PERSIST_CHUNK) {
+        this.queries.insertEdges(edges.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
       }
 
       // Clean up resolved refs so they don't appear in the next batch
-      if (result.resolved.length > 0) {
-        this.queries.deleteSpecificResolvedReferences(
-          result.resolved.map((r) => ({
-            fromNodeId: r.original.fromNodeId,
-            referenceName: r.original.referenceName,
-            referenceKind: r.original.referenceKind,
-          }))
-        );
+      const resolvedKeys = result.resolved.map((r) => ({
+        fromNodeId: r.original.fromNodeId,
+        referenceName: r.original.referenceName,
+        referenceKind: r.original.referenceKind,
+      }));
+      for (let i = 0; i < resolvedKeys.length; i += PERSIST_CHUNK) {
+        this.queries.deleteSpecificResolvedReferences(resolvedKeys.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
       }
 
       // Delete unresolvable refs from this batch to avoid re-processing them
-      if (result.unresolved.length > 0) {
-        this.queries.deleteSpecificResolvedReferences(
-          result.unresolved.map((r) => ({
-            fromNodeId: r.fromNodeId,
-            referenceName: r.referenceName,
-            referenceKind: r.referenceKind,
-          }))
-        );
+      const unresolvedKeys = result.unresolved.map((r) => ({
+        fromNodeId: r.fromNodeId,
+        referenceName: r.referenceName,
+        referenceKind: r.referenceKind,
+      }));
+      for (let i = 0; i < unresolvedKeys.length; i += PERSIST_CHUNK) {
+        this.queries.deleteSpecificResolvedReferences(unresolvedKeys.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
       }
 
       // Aggregate stats
@@ -1116,11 +1223,13 @@ export class ReferenceResolver {
       // Yield so progress UI can render between batches
       await new Promise(resolve => setImmediate(resolve));
 
-      // If nothing was resolved or removed in this batch, we'd loop forever
-      // on the same rows. Break to avoid infinite loop.
-      if (result.resolved.length === 0 && result.unresolved.length === batch.length) {
-        break;
-      }
+      // NOTE: there used to be an extra early break here when a batch resolved
+      // nothing (`result.unresolved.length === batch.length`). That was wrong:
+      // an all-unresolvable batch still DELETES its rows (progress), yet the
+      // break abandoned every batch after it in the same run — on a repo whose
+      // first 5000 refs are all external/stdlib calls, resolution stopped at
+      // batch one and left the rest of the table as permanent orphans (#1187).
+      // The count-based guard below catches the true no-progress case.
 
       // Non-progress guard (defense-in-depth). Because we re-read from offset 0
       // each pass, the unresolved_refs table MUST shrink every iteration — both
@@ -1165,10 +1274,18 @@ export class ReferenceResolver {
   private isBuiltInOrExternal(ref: UnresolvedRef): boolean {
     const name = ref.referenceName;
     const isJsTs = ref.language === 'typescript' || ref.language === 'javascript'
-      || ref.language === 'tsx' || ref.language === 'jsx';
+      || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'arkts';
 
     // JavaScript/TypeScript built-ins
     if (isJsTs && JS_BUILT_INS.has(name)) {
+      return true;
+    }
+
+    // ArkTS resource-reference intrinsics — `$r('app.string.x')` /
+    // `$rawfile('x.png')` are framework-provided and appear dozens of times
+    // per UI file; without this they can resolve to a stray same-named
+    // symbol (e.g. a checked-in hvigor wrapper's `$r`).
+    if (ref.language === 'arkts' && (name === '$r' || name === '$rawfile')) {
       return true;
     }
 

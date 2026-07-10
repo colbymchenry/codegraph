@@ -233,21 +233,22 @@ describe('runMaintenance', () => {
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('runs without throwing on a fresh database', () => {
-    expect(() => db.runMaintenance()).not.toThrow();
+  it('runs without throwing on a fresh database', async () => {
+    await expect(db.runMaintenance()).resolves.toBeUndefined();
   });
 
-  it('runs without throwing after writes', () => {
+  it('runs without throwing after writes', async () => {
     const q = new QueryBuilder(db.getDb());
     q.insertNodes([makeNode('n1'), makeNode('n2')]);
-    expect(() => db.runMaintenance()).not.toThrow();
+    await expect(db.runMaintenance()).resolves.toBeUndefined();
   });
 
-  it('swallows failures rather than propagating (best-effort)', () => {
+  it('swallows failures rather than propagating (best-effort)', async () => {
     // Close the DB so the underlying handle would normally throw on any
-    // exec(). runMaintenance must still not propagate.
+    // exec(). runMaintenance (worker on its own connection, or the in-line
+    // fallback) must still not propagate.
     db.close();
-    expect(() => db.runMaintenance()).not.toThrow();
+    await expect(db.runMaintenance()).resolves.toBeUndefined();
   });
 });
 

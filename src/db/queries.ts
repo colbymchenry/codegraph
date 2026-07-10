@@ -211,6 +211,7 @@ export class QueryBuilder {
     deleteUnresolvedByNode?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
     getNodesByName?: SqliteStatement;
+    getNodesByNamePrefix?: SqliteStatement;
     getNodesByQualifiedNameExact?: SqliteStatement;
     getNodesByLowerName?: SqliteStatement;
     getUnresolvedCount?: SqliteStatement;
@@ -880,6 +881,37 @@ export class QueryBuilder {
   }
 
   /**
+   * Stream nodes of one language whose `decorators` JSON array contains
+   * `decorator`. The LIKE on the JSON text is a cheap index-free pre-filter
+   * (a decorator name can appear as a substring of another), so callers must
+   * still exact-check `node.decorators.includes(decorator)`. Exists so the
+   * kotlin expect/actual synthesizer never materializes the whole node table
+   * the way `getAllNodes().filter(...)` did — that array alone OOM'd Node's
+   * default heap on a 2M-node graph (#1212).
+   */
+  *iterateNodesByLanguageWithDecorator(language: Language, decorator: string): IterableIterator<Node> {
+    // Fresh statement per call — an iterator holds an open cursor (see
+    // iterateNodesByKind).
+    const stmt = this.db.prepare(
+      "SELECT * FROM nodes WHERE language = ? AND decorators LIKE '%' || ? || '%'"
+    );
+    for (const row of stmt.iterate(language, `"${decorator}"`)) {
+      yield rowToNode(row as NodeRow);
+    }
+  }
+
+  /**
+   * Distinct languages present in the files table. One indexed aggregate —
+   * lets the dynamic-edge synthesizers skip passes for languages the project
+   * doesn't contain at all (a Kotlin pass has no work on a pure-C repo), so
+   * their cost is zero rather than a full-graph scan that finds nothing (#1212).
+   */
+  getDistinctFileLanguages(): Set<string> {
+    const rows = this.db.prepare('SELECT DISTINCT language FROM files').all() as Array<{ language: string }>;
+    return new Set(rows.map((r) => r.language));
+  }
+
+  /**
    * Get nodes by exact name match (uses idx_nodes_name index)
    */
   getNodesByName(name: string): Node[] {
@@ -887,6 +919,20 @@ export class QueryBuilder {
       this.stmts.getNodesByName = this.db.prepare('SELECT * FROM nodes WHERE name = ?');
     }
     const rows = this.stmts.getNodesByName.all(name) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
+   * Nodes whose name starts with `prefix`, by index range scan (a LIKE would
+   * skip idx_nodes_name under SQLite's default case-insensitive LIKE).
+   */
+  getNodesByNamePrefix(prefix: string, limit = 20): Node[] {
+    if (!this.stmts.getNodesByNamePrefix) {
+      this.stmts.getNodesByNamePrefix = this.db.prepare(
+        'SELECT * FROM nodes WHERE name >= ? AND name < ? ORDER BY name LIMIT ?'
+      );
+    }
+    const rows = this.stmts.getNodesByNamePrefix.all(prefix, prefix + '￿', limit) as NodeRow[];
     return rows.map(rowToNode);
   }
 
@@ -1836,6 +1882,19 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getAllNodeNames.all() as Array<{ name: string }>;
     return rows.map((r) => r.name);
+  }
+
+  /**
+   * Stream the distinct node names one row at a time — the incremental
+   * counterpart to {@link getAllNodeNames} for callers that need to yield
+   * to the event loop mid-scan (resolver cache warm-up on multi-million-node
+   * indexes). Fresh statement per call: the iterator holds an open cursor.
+   */
+  *iterateNodeNames(): IterableIterator<string> {
+    const stmt = this.db.prepare('SELECT DISTINCT name FROM nodes');
+    for (const row of stmt.iterate()) {
+      yield (row as { name: string }).name;
+    }
   }
 
   /**

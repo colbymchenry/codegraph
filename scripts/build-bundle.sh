@@ -98,6 +98,11 @@ while [ -L "$SELF" ]; do
   esac
 done
 DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+# Thread the MCP host's pid to the server's orphan watchdog (issue #1185).
+# $PPID is our parent — the host itself when it launched this script directly;
+# an already-threaded value (the npm shim sets the true host pid) wins.
+CODEGRAPH_HOST_PPID="${CODEGRAPH_HOST_PPID:-$PPID}"
+export CODEGRAPH_HOST_PPID
 # --liftoff-only: avoid the V8 turboshaft WASM Zone OOM (issues #293/#298).
 exec "$DIR/node" --liftoff-only "$DIR/lib/dist/bin/codegraph.js" "$@"
 LAUNCH
