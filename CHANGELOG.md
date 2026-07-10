@@ -11,6 +11,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- `codegraph upgrade` on an npm install now upgrades through npm again instead of quietly creating a second copy that never wins the PATH race — previously `codegraph --version` kept reporting the old version forever, no matter how many times you upgraded. (#1238)
+- After every upgrade, CodeGraph now checks that the `codegraph` command your terminal resolves actually serves the freshly installed version — confirming you don't need a new terminal, or telling you exactly which stale install is shadowing the new one. (#1071)
 - The safety watchdog no longer kills a healthy index on severely degraded storage. It used to judge liveness purely by the event loop, so one long database write on a struggling disk looked identical to a hung process and could get a valid, in-progress index terminated. During `codegraph index`/`codegraph init` the watchdog now also checks whether the index files on disk are advancing before it acts: slow-but-progressing work is left alone (bounded by a hard cap), while a genuinely hung process is still killed exactly as fast as before. (#1231)
 
 ## [1.4.0] - 2026-07-10

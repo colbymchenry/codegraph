@@ -99,19 +99,20 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   const P = isWin ? path.win32 : path.posix;
   const binDir = P.dirname(input.filename); // <…>/bin
 
-  // Bundle: <root>/lib/dist/bin/codegraph.js → <root> is up 3 from bin/.
-  // A bundle has a vendored node + a launcher script as siblings of lib/.
-  const bundleRoot = P.resolve(binDir, '..', '..', '..');
-  const vendoredNode = P.join(bundleRoot, isWin ? 'node.exe' : 'node');
-  const launcher = P.join(bundleRoot, 'bin', isWin ? 'codegraph.cmd' : 'codegraph');
-  if (exists(vendoredNode) && exists(launcher)) {
-    const os = isWin ? 'windows' : 'unix';
-    return { kind: 'bundle', os, bundleRoot, installDir: deriveInstallDir(bundleRoot, os, exists) };
-  }
-
   const norm = toPosix(input.filename);
 
+  // Path-based checks come FIRST. The npm thin-installer's per-platform
+  // package (@colbymchenry/codegraph-<platform>-<arch>) is itself a complete
+  // bundle — vendored node + bin/ launcher — living inside node_modules, so
+  // the layout sniff below would misread every npm install as a standalone
+  // bundle. `upgrade` would then curl install.sh into ~/.codegraph: a SECOND
+  // install that never wins the PATH race against npm's shim, leaving
+  // `codegraph -v` permanently on the old version (the #1071 shadow,
+  // self-inflicted). A path under node_modules is authoritative about HOW the
+  // user installed, whatever the artifact inside looks like.
+
   // npx cache: <…>/_npx/<hash>/node_modules/@colbymchenry/codegraph/…
+  // (checked before npm — the npx cache path also contains /node_modules/).
   if (norm.includes('/_npx/')) {
     return { kind: 'npx' };
   }
@@ -120,6 +121,16 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   if (norm.includes('/node_modules/')) {
     const underCwd = norm.startsWith(toPosix(P.resolve(input.cwd)) + '/');
     return { kind: 'npm', scope: underCwd ? 'local' : 'global' };
+  }
+
+  // Bundle: <root>/lib/dist/bin/codegraph.js → <root> is up 3 from bin/.
+  // A bundle has a vendored node + a launcher script as siblings of lib/.
+  const bundleRoot = P.resolve(binDir, '..', '..', '..');
+  const vendoredNode = P.join(bundleRoot, isWin ? 'node.exe' : 'node');
+  const launcher = P.join(bundleRoot, 'bin', isWin ? 'codegraph.cmd' : 'codegraph');
+  if (exists(vendoredNode) && exists(launcher)) {
+    const os = isWin ? 'windows' : 'unix';
+    return { kind: 'bundle', os, bundleRoot, installDir: deriveInstallDir(bundleRoot, os, exists) };
   }
 
   // Source checkout: running <repo>/dist/bin/codegraph.js with a sibling .git.
@@ -278,6 +289,8 @@ export interface UpgradeDeps {
   resolveLatest: (pin?: string) => Promise<string>;
   /** Run a command inheriting stdio; returns its exit code (-1 = spawn failed). */
   run: (cmd: string, args: string[], env?: NodeJS.ProcessEnv) => number;
+  /** Run a command capturing stdout (nothing reaches the terminal); null = spawn failed. */
+  capture: (cmd: string, args: string[]) => { code: number; stdout: string } | null;
   hasCommand: (cmd: string) => boolean;
   log: (msg: string) => void;
   warn: (msg: string) => void;
@@ -377,12 +390,70 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
   // fatal to the upgrade.
   if (code === 0) {
     try {
+      reportResolvedVersion(latest, deps);
+    } catch {
+      /* an inconclusive probe must not fail the upgrade */
+    }
+    try {
       await selfHealPromptHook(deps);
     } catch {
       /* a hook-wiring hiccup must not fail the upgrade */
     }
   }
   return code;
+}
+
+type VersionProbe = 'match' | 'mismatch' | 'inconclusive';
+
+/**
+ * Prove the upgrade actually took: spawn the `codegraph` this terminal's PATH
+ * resolves and compare its reported version to the target. Catches the silent
+ * failure mode where ANOTHER install shadows the one we just upgraded (issue
+ * #1071 — e.g. a stale `npm i -g` copy earlier on PATH than the bundle
+ * launcher): the upgrade "succeeds" but `codegraph -v` — in this terminal and
+ * every future one — keeps serving the old version. Exported for unit tests.
+ */
+export function verifyResolvedVersion(latest: string, deps: UpgradeDeps): VersionProbe {
+  if (!deps.hasCommand('codegraph')) return 'inconclusive';
+  // Windows installs expose codegraph through a .cmd launcher; Node can't
+  // spawn .cmd files without a shell, so route through cmd.exe there.
+  const probe = deps.platform === 'win32'
+    ? deps.capture('cmd.exe', ['/d', '/s', '/c', 'codegraph --version'])
+    : deps.capture('codegraph', ['--version']);
+  if (!probe || probe.code !== 0) return 'inconclusive';
+  // `codegraph --version` prints the bare version; take the last non-empty
+  // line so a stray runtime warning above it can't spoil the parse.
+  const reported = probe.stdout.trim().split(/\r?\n/).pop()?.trim() ?? '';
+  if (!parseSemver(reported)) return 'inconclusive';
+  return compareVersions(reported, latest) === 0 ? 'match' : 'mismatch';
+}
+
+/**
+ * Log the outcome of the post-upgrade version probe. On a match the user
+ * knows the current terminal is already serving the new version; on a
+ * mismatch they get told exactly which stale install is hijacking their PATH
+ * instead of discovering it via a mysteriously unchanged `codegraph -v`.
+ * Inconclusive probes fall back to the old soft hint — never a scare on
+ * setups we can't inspect (no `codegraph` on PATH yet, exotic wrappers).
+ */
+function reportResolvedVersion(latest: string, deps: UpgradeDeps): void {
+  const { method } = deps;
+  // A project-local npm install isn't served by PATH's `codegraph` (that
+  // would be some other install) — a probe could only false-alarm.
+  if (method.kind === 'npm' && method.scope === 'local') return;
+  switch (verifyResolvedVersion(latest, deps)) {
+    case 'match':
+      deps.log(c.green(`✓ \`codegraph\` on your PATH now reports ${latest} — this terminal is already using it.`));
+      break;
+    case 'mismatch':
+      deps.warn(`Installed ${latest}, but the \`codegraph\` this terminal resolves still reports an older version.`);
+      deps.log(c.dim('Another CodeGraph install earlier on your PATH is shadowing the one just upgraded.'));
+      deps.log(c.dim('Find every copy with `which -a codegraph` (Windows: `where codegraph`) and remove or upgrade the stale one.'));
+      break;
+    case 'inconclusive':
+      deps.log(c.dim('Open a new terminal if `codegraph --version` looks unchanged (PATH cache).'));
+      break;
+  }
 }
 
 /**
@@ -429,7 +500,9 @@ function upgradeUnixBundle(
     return 1;
   }
   deps.log('');
-  deps.log(c.green('✓ Upgrade complete.') + c.dim(' Open a new terminal if the version looks unchanged (PATH cache).'));
+  // No "open a new terminal" hedge here — after the swap, runUpgrade probes
+  // the PATH-resolved `codegraph --version` and reports the real outcome.
+  deps.log(c.green('✓ Upgrade complete.'));
   deps.log(reindexAdvisory());
   return 0;
 }
@@ -484,7 +557,9 @@ function upgradeWindowsBundle(
     return 1;
   }
   deps.log('');
-  deps.log(c.green('✓ Upgrade complete.') + c.dim(' Open a new terminal to be safe (PATH/version cache).'));
+  // The running node.exe was renamed aside, so the version probe in
+  // runUpgrade already exercises the NEW binary — no terminal hedge needed.
+  deps.log(c.green('✓ Upgrade complete.'));
   deps.log(reindexAdvisory());
   return 0;
 }
@@ -549,4 +624,13 @@ export function defaultRun(cmd: string, args: string[], env?: NodeJS.ProcessEnv)
   const r = spawnSync(cmd, args, { stdio: 'inherit', env: env ?? process.env, windowsHide: true });
   if (r.error) return -1;
   return r.status ?? -1;
+}
+
+export function defaultCapture(cmd: string, args: string[]): { code: number; stdout: string } | null {
+  // stdio is piped (the default with `encoding`), so nothing the probed
+  // command prints reaches the user's terminal. The timeout keeps a wedged
+  // probe from hanging the upgrade's last step.
+  const r = spawnSync(cmd, args, { encoding: 'utf-8', windowsHide: true, timeout: 30_000 });
+  if (r.error) return null;
+  return { code: r.status ?? -1, stdout: r.stdout ?? '' };
 }
