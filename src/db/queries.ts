@@ -222,6 +222,23 @@ export class QueryBuilder {
     getTopRouteFile?: SqliteStatement;
     getRoutingManifest?: SqliteStatement;
     insertNameSegment?: SqliteStatement;
+    isNameSegmentVocabEmpty?: SqliteStatement;
+    getDistinctNodeNames?: SqliteStatement;
+    getNamesForSegment?: SqliteStatement;
+    getAllNodes?: SqliteStatement;
+    getDistinctFileLanguages?: SqliteStatement;
+    getDependentFilePaths?: SqliteStatement;
+    getDependencyFilePaths?: SqliteStatement;
+    getCrossFileIncomingEdgesWithTarget?: SqliteStatement;
+    getLastIndexedAt?: SqliteStatement;
+    getNodeAndEdgeCount?: SqliteStatement;
+    getStatsCounts?: SqliteStatement;
+    getStatsNodesByKind?: SqliteStatement;
+    getStatsEdgesByKind?: SqliteStatement;
+    getStatsFilesByLanguage?: SqliteStatement;
+    getMetadata?: SqliteStatement;
+    setMetadata?: SqliteStatement;
+    getAllMetadata?: SqliteStatement;
   } = {};
 
   // Names whose segments were already written this session — skips re-splitting
@@ -479,7 +496,10 @@ export class QueryBuilder {
   /** True when the vocab has no rows — an index built before the table existed.
    *  `sync` uses this to heal such databases (see rebuildNameSegmentVocabFrom). */
   isNameSegmentVocabEmpty(): boolean {
-    const row = this.db.prepare('SELECT 1 FROM name_segment_vocab LIMIT 1').get();
+    if (!this.stmts.isNameSegmentVocabEmpty) {
+      this.stmts.isNameSegmentVocabEmpty = this.db.prepare('SELECT 1 FROM name_segment_vocab LIMIT 1');
+    }
+    const row = this.stmts.isNameSegmentVocabEmpty.get();
     return row === undefined;
   }
 
@@ -487,9 +507,12 @@ export class QueryBuilder {
    *  (file basenames and import specifiers are excluded from the vocab — see
    *  insertNode). */
   getDistinctNodeNames(limit: number, offset: number): string[] {
-    const rows = this.db
-      .prepare("SELECT DISTINCT name FROM nodes WHERE kind NOT IN ('file', 'import') ORDER BY name LIMIT ? OFFSET ?")
-      .all(limit, offset) as Array<{ name: string }>;
+    if (!this.stmts.getDistinctNodeNames) {
+      this.stmts.getDistinctNodeNames = this.db.prepare(
+        "SELECT DISTINCT name FROM nodes WHERE kind NOT IN ('file', 'import') ORDER BY name LIMIT ? OFFSET ?"
+      );
+    }
+    const rows = this.stmts.getDistinctNodeNames.all(limit, offset) as Array<{ name: string }>;
     return rows.map((r) => r.name);
   }
 
@@ -556,9 +579,12 @@ export class QueryBuilder {
 
   /** Names containing the given segment (rare-single-word tier). */
   getNamesForSegment(segment: string, limit: number): string[] {
-    const rows = this.db
-      .prepare('SELECT name FROM name_segment_vocab WHERE segment = ? ORDER BY length(name) ASC LIMIT ?')
-      .all(segment, limit) as Array<{ name: string }>;
+    if (!this.stmts.getNamesForSegment) {
+      this.stmts.getNamesForSegment = this.db.prepare(
+        'SELECT name FROM name_segment_vocab WHERE segment = ? ORDER BY length(name) ASC LIMIT ?'
+      );
+    }
+    const rows = this.stmts.getNamesForSegment.all(segment, limit) as Array<{ name: string }>;
     return rows.map((r) => r.name);
   }
 
@@ -876,7 +902,10 @@ export class QueryBuilder {
    * Get all nodes in the database
    */
   getAllNodes(): Node[] {
-    const rows = this.db.prepare('SELECT * FROM nodes').all() as NodeRow[];
+    if (!this.stmts.getAllNodes) {
+      this.stmts.getAllNodes = this.db.prepare('SELECT * FROM nodes');
+    }
+    const rows = this.stmts.getAllNodes.all() as NodeRow[];
     return rows.map(rowToNode);
   }
 
@@ -907,7 +936,10 @@ export class QueryBuilder {
    * their cost is zero rather than a full-graph scan that finds nothing (#1212).
    */
   getDistinctFileLanguages(): Set<string> {
-    const rows = this.db.prepare('SELECT DISTINCT language FROM files').all() as Array<{ language: string }>;
+    if (!this.stmts.getDistinctFileLanguages) {
+      this.stmts.getDistinctFileLanguages = this.db.prepare('SELECT DISTINCT language FROM files');
+    }
+    const rows = this.stmts.getDistinctFileLanguages.all() as Array<{ language: string }>;
     return new Set(rows.map((r) => r.language));
   }
 
@@ -1588,14 +1620,18 @@ export class QueryBuilder {
    * it. One indexed query (idx_nodes_file_path + idx_edges_target_kind).
    */
   getDependentFilePaths(filePath: string): string[] {
-    const sql = `SELECT DISTINCT src.file_path AS fp
-      FROM edges e
-      JOIN nodes tgt ON tgt.id = e.target
-      JOIN nodes src ON src.id = e.source
-      WHERE tgt.file_path = ?
-        AND e.kind != 'contains'
-        AND src.file_path != ?`;
-    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<{ fp: string }>;
+    if (!this.stmts.getDependentFilePaths) {
+      this.stmts.getDependentFilePaths = this.db.prepare(`
+        SELECT DISTINCT src.file_path AS fp
+        FROM edges e
+        JOIN nodes tgt ON tgt.id = e.target
+        JOIN nodes src ON src.id = e.source
+        WHERE tgt.file_path = ?
+          AND e.kind != 'contains'
+          AND src.file_path != ?
+      `);
+    }
+    const rows = this.stmts.getDependentFilePaths.all(filePath, filePath) as Array<{ fp: string }>;
     return rows.map((r) => r.fp);
   }
 
@@ -1606,14 +1642,18 @@ export class QueryBuilder {
    * (all kinds except `contains`); same reason imports-only is insufficient.
    */
   getDependencyFilePaths(filePath: string): string[] {
-    const sql = `SELECT DISTINCT tgt.file_path AS fp
-      FROM edges e
-      JOIN nodes src ON src.id = e.source
-      JOIN nodes tgt ON tgt.id = e.target
-      WHERE src.file_path = ?
-        AND e.kind != 'contains'
-        AND tgt.file_path != ?`;
-    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<{ fp: string }>;
+    if (!this.stmts.getDependencyFilePaths) {
+      this.stmts.getDependencyFilePaths = this.db.prepare(`
+        SELECT DISTINCT tgt.file_path AS fp
+        FROM edges e
+        JOIN nodes src ON src.id = e.source
+        JOIN nodes tgt ON tgt.id = e.target
+        WHERE src.file_path = ?
+          AND e.kind != 'contains'
+          AND tgt.file_path != ?
+      `);
+    }
+    const rows = this.stmts.getDependencyFilePaths.all(filePath, filePath) as Array<{ fp: string }>;
     return rows.map((r) => r.fp);
   }
 
@@ -1628,14 +1668,18 @@ export class QueryBuilder {
    * {@link getDependentFilePaths}: all kinds except `contains`.
    */
   getCrossFileIncomingEdgesWithTarget(filePath: string): Array<Edge & { targetName: string; targetKind: NodeKind }> {
-    const sql = `SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind
-      FROM edges e
-      JOIN nodes tgt ON tgt.id = e.target
-      JOIN nodes src ON src.id = e.source
-      WHERE tgt.file_path = ?
-        AND e.kind != 'contains'
-        AND src.file_path != ?`;
-    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<EdgeRow & { target_name: string; target_kind: NodeKind }>;
+    if (!this.stmts.getCrossFileIncomingEdgesWithTarget) {
+      this.stmts.getCrossFileIncomingEdgesWithTarget = this.db.prepare(`
+        SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind
+        FROM edges e
+        JOIN nodes tgt ON tgt.id = e.target
+        JOIN nodes src ON src.id = e.source
+        WHERE tgt.file_path = ?
+          AND e.kind != 'contains'
+          AND src.file_path != ?
+      `);
+    }
+    const rows = this.stmts.getCrossFileIncomingEdgesWithTarget.all(filePath, filePath) as Array<EdgeRow & { target_name: string; target_kind: NodeKind }>;
     return rows.map(row => ({
       ...rowToEdge(row),
       targetName: row.target_name,
@@ -1718,9 +1762,10 @@ export class QueryBuilder {
    * null when nothing is indexed yet. One indexed aggregate, no per-row scan. (#329)
    */
   getLastIndexedAt(): number | null {
-    const row = this.db
-      .prepare('SELECT MAX(indexed_at) AS last FROM files')
-      .get() as { last: number | null } | undefined;
+    if (!this.stmts.getLastIndexedAt) {
+      this.stmts.getLastIndexedAt = this.db.prepare('SELECT MAX(indexed_at) AS last FROM files');
+    }
+    const row = this.stmts.getLastIndexedAt.get() as { last: number | null } | undefined;
     return row?.last ?? null;
   }
 
@@ -1983,9 +2028,12 @@ export class QueryBuilder {
    * the edge count (resolution + synthesizer edges were invisible).
    */
   getNodeAndEdgeCount(): { nodes: number; edges: number } {
-    return this.db
-      .prepare('SELECT (SELECT COUNT(*) FROM nodes) AS nodes, (SELECT COUNT(*) FROM edges) AS edges')
-      .get() as { nodes: number; edges: number };
+    if (!this.stmts.getNodeAndEdgeCount) {
+      this.stmts.getNodeAndEdgeCount = this.db.prepare(
+        'SELECT (SELECT COUNT(*) FROM nodes) AS nodes, (SELECT COUNT(*) FROM edges) AS edges'
+      );
+    }
+    return this.stmts.getNodeAndEdgeCount.get() as { nodes: number; edges: number };
   }
 
   /**
@@ -1993,33 +2041,39 @@ export class QueryBuilder {
    */
   getStats(): GraphStats {
     // Single query for all three aggregate counts
-    const counts = this.db.prepare(`
-      SELECT
-        (SELECT COUNT(*) FROM nodes) AS node_count,
-        (SELECT COUNT(*) FROM edges) AS edge_count,
-        (SELECT COUNT(*) FROM files) AS file_count
-    `).get() as { node_count: number; edge_count: number; file_count: number };
+    if (!this.stmts.getStatsCounts) {
+      this.stmts.getStatsCounts = this.db.prepare(`
+        SELECT
+          (SELECT COUNT(*) FROM nodes) AS node_count,
+          (SELECT COUNT(*) FROM edges) AS edge_count,
+          (SELECT COUNT(*) FROM files) AS file_count
+      `);
+    }
+    const counts = this.stmts.getStatsCounts.get() as { node_count: number; edge_count: number; file_count: number };
 
     const nodesByKind = {} as Record<NodeKind, number>;
-    const nodeKindRows = this.db
-      .prepare('SELECT kind, COUNT(*) as count FROM nodes GROUP BY kind')
-      .all() as Array<{ kind: string; count: number }>;
+    if (!this.stmts.getStatsNodesByKind) {
+      this.stmts.getStatsNodesByKind = this.db.prepare('SELECT kind, COUNT(*) as count FROM nodes GROUP BY kind');
+    }
+    const nodeKindRows = this.stmts.getStatsNodesByKind.all() as Array<{ kind: string; count: number }>;
     for (const row of nodeKindRows) {
       nodesByKind[row.kind as NodeKind] = row.count;
     }
 
     const edgesByKind = {} as Record<EdgeKind, number>;
-    const edgeKindRows = this.db
-      .prepare('SELECT kind, COUNT(*) as count FROM edges GROUP BY kind')
-      .all() as Array<{ kind: string; count: number }>;
+    if (!this.stmts.getStatsEdgesByKind) {
+      this.stmts.getStatsEdgesByKind = this.db.prepare('SELECT kind, COUNT(*) as count FROM edges GROUP BY kind');
+    }
+    const edgeKindRows = this.stmts.getStatsEdgesByKind.all() as Array<{ kind: string; count: number }>;
     for (const row of edgeKindRows) {
       edgesByKind[row.kind as EdgeKind] = row.count;
     }
 
     const filesByLanguage = {} as Record<Language, number>;
-    const languageRows = this.db
-      .prepare('SELECT language, COUNT(*) as count FROM files GROUP BY language')
-      .all() as Array<{ language: string; count: number }>;
+    if (!this.stmts.getStatsFilesByLanguage) {
+      this.stmts.getStatsFilesByLanguage = this.db.prepare('SELECT language, COUNT(*) as count FROM files GROUP BY language');
+    }
+    const languageRows = this.stmts.getStatsFilesByLanguage.all() as Array<{ language: string; count: number }>;
     for (const row of languageRows) {
       filesByLanguage[row.language as Language] = row.count;
     }
@@ -2044,7 +2098,10 @@ export class QueryBuilder {
    * Get a metadata value by key
    */
   getMetadata(key: string): string | null {
-    const row = this.db.prepare('SELECT value FROM project_metadata WHERE key = ?').get(key) as { value: string } | undefined;
+    if (!this.stmts.getMetadata) {
+      this.stmts.getMetadata = this.db.prepare('SELECT value FROM project_metadata WHERE key = ?');
+    }
+    const row = this.stmts.getMetadata.get(key) as { value: string } | undefined;
     return row?.value ?? null;
   }
 
@@ -2052,16 +2109,22 @@ export class QueryBuilder {
    * Set a metadata key-value pair (upsert)
    */
   setMetadata(key: string, value: string): void {
-    this.db.prepare(
-      'INSERT INTO project_metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
-    ).run(key, value, Date.now());
+    if (!this.stmts.setMetadata) {
+      this.stmts.setMetadata = this.db.prepare(
+        'INSERT INTO project_metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
+      );
+    }
+    this.stmts.setMetadata.run(key, value, Date.now());
   }
 
   /**
    * Get all metadata as a key-value record
    */
   getAllMetadata(): Record<string, string> {
-    const rows = this.db.prepare('SELECT key, value FROM project_metadata').all() as { key: string; value: string }[];
+    if (!this.stmts.getAllMetadata) {
+      this.stmts.getAllMetadata = this.db.prepare('SELECT key, value FROM project_metadata');
+    }
+    const rows = this.stmts.getAllMetadata.all() as { key: string; value: string }[];
     const result: Record<string, string> = {};
     for (const row of rows) {
       result[row.key] = row.value;
