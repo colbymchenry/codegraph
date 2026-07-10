@@ -359,6 +359,66 @@ export function uninstallTargets(
   });
 }
 
+export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported';
+
+/**
+ * Per-target outcome of a refresh sweep. `refreshed` means at least one
+ * filesystem entry was created, updated, or removed; `unchanged` means the target was
+ * already current (every write reported byte-identical); the other two
+ * mirror `UninstallStatus`.
+ */
+export interface RefreshReport {
+  id: TargetId;
+  displayName: string;
+  location: Location;
+  status: RefreshStatus;
+  /** Absolute paths created, updated, or removed by the refresh. */
+  changedPaths: string[];
+}
+
+/**
+ * Pure refresh sweep — re-runs `install()` for every target that is
+ * ALREADY configured at `location`, so the surfaces a previous version
+ * wrote (the marker-fenced instructions section, the MCP server entry,
+ * the legacy-hook cleanups) match the binary that will serve them.
+ * Without this, those files keep the wording — and the tool names — of
+ * whatever version first wrote them, no matter how many upgrades later.
+ *
+ * Strictly a refresh, never a first install:
+ *   - targets that aren't `alreadyConfigured` are skipped untouched;
+ *   - permissions are not written (`autoAllow: false`) and the prompt
+ *     hook is left as-is (`promptHook: undefined`), so choices the user
+ *     made at install time — or by hand since — are preserved.
+ *
+ * Every write underneath is the targets' own idempotent upsert, so a
+ * re-run on an already-current machine reports `unchanged` everywhere.
+ * Exposed (and unit-tested) separately from the CLI wiring, same as
+ * `uninstallTargets`.
+ */
+export function refreshTargets(
+  targets: readonly AgentTarget[],
+  location: Location,
+): RefreshReport[] {
+  return targets.map((target) => {
+    const base = { id: target.id, displayName: target.displayName, location };
+    if (!target.supportsLocation(location)) {
+      return { ...base, status: 'unsupported' as const, changedPaths: [] };
+    }
+    if (!target.detect(location).alreadyConfigured) {
+      return { ...base, status: 'not-configured' as const, changedPaths: [] };
+    }
+    const result = target.install(location, { autoAllow: false, promptHook: undefined });
+    const changedPaths = result.files
+      .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
+      .map((f) => f.path);
+    return {
+      ...base,
+      status: changedPaths.length > 0 ? ('refreshed' as const) : ('unchanged' as const),
+      changedPaths,
+    };
+  });
+}
+
 /**
  * Interactive uninstaller — the inverse of `runInstallerWithOptions`.
  * Asks global-vs-local first (unless `--location`/`--yes` is given),

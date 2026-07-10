@@ -590,7 +590,7 @@ program
         return;
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
+      const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
       const cg = await CodeGraph.init(projectPath, { index: false });
       clack.log.success(`Initialized in ${projectPath}`);
 
@@ -598,10 +598,13 @@ program
       // accepted (so existing muscle memory and scripts don't break) but is a
       // no-op — initializing always builds the initial index.
       // Supervise the index: self-terminate if orphaned or wedged (#999).
+      // The DB + WAL paths let the liveness watchdog tell a slow store on
+      // degraded storage from a true wedge (#1231).
       // A closure so we can re-run the exact same supervised, progress-rendered
       // index if the user opts gitignored child repos in below (#1156).
+      const dbPath = getDatabasePath(projectPath);
       const runIndex = async (): Promise<IndexResult> => {
-        const supervision = installCommandSupervision('init');
+        const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
         try {
           if (options.verbose) {
             return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
@@ -727,7 +730,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
+      const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
       // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
       // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
       // than opening the old graph and DELETE-ing every row. The clear-then-index
@@ -741,7 +744,10 @@ program
 
       // Supervise the indexer: self-terminate if orphaned (parent shim killed)
       // or if the main thread wedges — neither was guarded on this path (#999).
-      const supervision = installCommandSupervision('index');
+      // The DB + WAL paths let the liveness watchdog tell a slow store on
+      // degraded storage from a true wedge (#1231).
+      const dbPath = getDatabasePath(projectPath);
+      const supervision = installCommandSupervision('index', { progressPaths: [dbPath, `${dbPath}-wal`] });
       try {
         if (options.quiet) {
           // Quiet mode: no UI, just run against the freshly-recreated graph.
@@ -2187,12 +2193,14 @@ program
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
   .option('--no-permissions', 'Skip writing the auto-allow permissions list (Claude Code only)')
   .option('--print-config <id>', 'Print MCP config snippet for the named agent and exit (no file writes)')
+  .option('--refresh', 'Rewrite what previous installs configured, for already-configured agents only (never adds new ones). Run automatically by `codegraph upgrade`')
   .action(async (opts: {
     target?: string;
     location?: string;
     yes?: boolean;
     permissions?: boolean;
     printConfig?: string;
+    refresh?: boolean;
   }) => {
     if (opts.printConfig) {
       const { getTarget, listTargetIds } = await import('../installer/targets/registry');
@@ -2204,6 +2212,37 @@ program
       }
       const loc = (opts.location === 'local' ? 'local' : 'global') as 'global' | 'local';
       process.stdout.write(target.printConfig(loc));
+      return;
+    }
+
+    // --refresh: non-interactive sweep that re-writes what previous
+    // installs configured (instructions section, MCP entry, legacy-hook
+    // cleanups) for already-configured agents, so those surfaces match
+    // THIS binary's templates. Skips everything else — never a first
+    // install, never touches permissions or the prompt hook. Sweeps both
+    // locations unless --location narrows it.
+    if (opts.refresh) {
+      const { refreshTargets } = await import('../installer');
+      const { ALL_TARGETS } = await import('../installer/targets/registry');
+      if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
+        error(`--location must be "global" or "local" (got "${opts.location}").`);
+        process.exit(1);
+      }
+      const locs: Array<'global' | 'local'> = opts.location
+        ? [opts.location as 'global' | 'local']
+        : ['global', 'local'];
+      let changed = 0;
+      for (const loc of locs) {
+        for (const report of refreshTargets(ALL_TARGETS, loc)) {
+          for (const p of report.changedPaths) {
+            changed += 1;
+            console.log(`  ${report.displayName}: refreshed ${p}`);
+          }
+        }
+      }
+      if (changed === 0) {
+        console.log('All configured agent surfaces are already current.');
+      }
       return;
     }
 
@@ -2345,6 +2384,7 @@ program
         method,
         resolveLatest: () => up.resolveLatestVersion(),
         run: up.defaultRun,
+        capture: up.defaultCapture,
         hasCommand: up.hasCommand,
         log: (m: string) => console.log(m),
         warn: (m: string) => warn(m),

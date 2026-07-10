@@ -190,6 +190,98 @@ export class DatabaseConnection {
   }
 
   /**
+   * Size of the `-wal` sidecar file in bytes. 0 when it doesn't exist (non-WAL
+   * journal mode, in-memory DB, or no write since the last checkpoint+reset).
+   */
+  getWalSizeBytes(): number {
+    if (!this.dbPath || this.dbPath === ':memory:') return 0;
+    try {
+      return fs.statSync(`${this.dbPath}-wal`).size;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Current `wal_autocheckpoint` interval in pages (0 = disabled). */
+  getWalAutocheckpoint(): number {
+    const v = this.db.pragma('wal_autocheckpoint', { simple: true });
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  /**
+   * Set the connection's `wal_autocheckpoint` interval (pages; 0 disables).
+   * Bulk indexing defers checkpoints entirely (#1231): the default 1000-page
+   * auto-checkpoint re-writes hot B-tree/FTS pages into the main DB file over
+   * and over — measured at ~95% of ALL disk I/O during a bulk index, and the
+   * difference between 45s and 19+ minutes on HDD-class storage. During
+   * deferral a {@link WalCheckpointValve} bounds WAL growth off-thread.
+   */
+  setWalAutocheckpoint(pages: number): void {
+    this.db.pragma(`wal_autocheckpoint = ${Math.max(0, Math.floor(pages))}`);
+  }
+
+  /**
+   * `PRAGMA wal_checkpoint(PASSIVE)` on a worker thread with its own
+   * connection. PASSIVE never blocks the writer, and running it off-thread
+   * means the main thread — and the #850 watchdog heartbeat — keep turning
+   * even when the backfill is minutes of I/O on slow storage (a synchronous
+   * checkpoint that exceeds the watchdog's 60s window gets a healthy index
+   * SIGKILLed — observed in the #1231 repro).
+   *
+   * Returns SQLite's checkpoint result row — `log === checkpointed` with
+   * `busy === 0` means the ENTIRE WAL was backfilled, so the writer's next
+   * commit restarts the WAL from the top and the file stops growing. The
+   * WAL valve needs that signal because a WAL file's SIZE never shrinks:
+   * after the first wrap, raw file size says nothing about the un-backfilled
+   * backlog. Best-effort: returns null on any failure (including worker
+   * threads being unavailable — a potentially minutes-long checkpoint must
+   * never run inline on the main thread).
+   */
+  async checkpointWalPassive(): Promise<{ busy: number; log: number; checkpointed: number } | null> {
+    if (!this.dbPath || this.dbPath === ':memory:') {
+      try {
+        const row = this.db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get() as Record<string, number> | undefined;
+        return row ? { busy: Number(row.busy), log: Number(row.log), checkpointed: Number(row.checkpointed) } : null;
+      } catch {
+        return null;
+      }
+    }
+    try {
+      const { Worker } = await import('node:worker_threads');
+      const workerSource = `
+        const { workerData, parentPort } = require('node:worker_threads');
+        let row = null;
+        try {
+          const { DatabaseSync } = require('node:sqlite');
+          const db = new DatabaseSync(workerData.dbPath);
+          try { row = db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get(); } catch {}
+          try { db.close(); } catch {}
+        } catch {}
+        parentPort.postMessage({ row });
+      `;
+      return await new Promise((resolve) => {
+        let settled = false;
+        const finish = (row?: Record<string, number> | null): void => {
+          if (settled) return;
+          settled = true;
+          resolve(row ? { busy: Number(row.busy), log: Number(row.log), checkpointed: Number(row.checkpointed) } : null);
+        };
+        try {
+          const worker = new Worker(workerSource, { eval: true, workerData: { dbPath: this.dbPath } });
+          worker.once('message', (m: { row?: Record<string, number> | null }) => { void worker.terminate(); finish(m?.row ?? null); });
+          worker.once('error', () => { void worker.terminate(); finish(null); });
+          worker.once('exit', () => finish(null));
+        } catch {
+          finish(null);
+        }
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Optimize database (vacuum and analyze)
    */
   optimize(): void {
@@ -198,8 +290,8 @@ export class DatabaseConnection {
   }
 
   /**
-   * Lightweight, non-blocking maintenance to run after bulk writes
-   * (indexAll, sync). Two operations:
+   * Lightweight maintenance to run after bulk writes (indexAll, sync).
+   * Two operations:
    *
    *   - `PRAGMA optimize` — incremental ANALYZE; SQLite only re-analyzes
    *     tables whose row counts changed materially since the last
@@ -211,19 +303,74 @@ export class DatabaseConnection {
    *     unboundedly between automatic checkpoints (auto-fires at 1000
    *     pages by default; large indexAll runs blow past that).
    *
-   * Both operations are silently swallowed on failure — they're a
-   * best-effort optimization, never load-bearing for correctness.
+   * Runs on a WORKER THREAD with its own connection: on a multi-GB index
+   * these pragmas are minutes of synchronous IO (a 95k-file kernel index
+   * left a 593MB WAL whose checkpoint alone blew the #850 watchdog's 60s
+   * window and got a COMPLETED index SIGKILLed at the finish line). WAL
+   * checkpointing from a second connection is standard SQLite; `PRAGMA
+   * optimize` persists its statistics in sqlite_stat tables, so the main
+   * connection benefits the same. The main thread just awaits a message,
+   * so the event loop — and the watchdog heartbeat — keep turning.
+   *
+   * Everything is silently swallowed on failure — best-effort
+   * optimization, never load-bearing for correctness. If worker threads
+   * are unavailable, falls back to a bounded in-line `PRAGMA optimize`
+   * and SKIPS the checkpoint (the final close() checkpoints after the
+   * CLI has already disarmed its watchdog).
    */
-  runMaintenance(): void {
-    try {
-      this.db.exec('PRAGMA optimize');
-    } catch {
-      // ignore
+  async runMaintenance(): Promise<void> {
+    // In-memory / test databases: nothing worth a worker round-trip.
+    if (!this.dbPath || this.dbPath === ':memory:') {
+      try { this.db.exec('PRAGMA optimize'); } catch { /* ignore */ }
+      try { this.db.exec('PRAGMA wal_checkpoint(PASSIVE)'); } catch { /* ignore */ }
+      return;
     }
+    await this.runPragmasOffThread(
+      ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'PRAGMA wal_checkpoint(PASSIVE)'],
+      // Worker threads unavailable — bounded in-line fallback, no checkpoint.
+      ['PRAGMA analysis_limit=1000', 'PRAGMA optimize']
+    );
+  }
+
+  /**
+   * Run pragmas on a worker thread against its own connection to this DB
+   * (shared machinery for {@link runMaintenance} and
+   * {@link checkpointWalPassive}). Each pragma is individually best-effort;
+   * the whole call is best-effort. `inlineFallback` (if any) runs on THIS
+   * connection only when worker threads are unavailable — keep it to pragmas
+   * that are safe to run synchronously on the main thread.
+   */
+  private async runPragmasOffThread(pragmas: string[], inlineFallback: string[] = []): Promise<void> {
     try {
-      this.db.exec('PRAGMA wal_checkpoint(PASSIVE)');
+      const { Worker } = await import('node:worker_threads');
+      const workerSource = `
+        const { workerData, parentPort } = require('node:worker_threads');
+        try {
+          const { DatabaseSync } = require('node:sqlite');
+          const db = new DatabaseSync(workerData.dbPath);
+          for (const p of workerData.pragmas) { try { db.exec(p); } catch {} }
+          try { db.close(); } catch {}
+        } catch {}
+        parentPort.postMessage('done');
+      `;
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = (): void => {
+          if (!settled) { settled = true; resolve(); }
+        };
+        try {
+          const worker = new Worker(workerSource, { eval: true, workerData: { dbPath: this.dbPath, pragmas } });
+          worker.once('message', () => { void worker.terminate(); finish(); });
+          worker.once('error', () => { void worker.terminate(); finish(); });
+          worker.once('exit', finish);
+        } catch {
+          finish();
+        }
+      });
     } catch {
-      // ignore (e.g., not in WAL mode)
+      for (const p of inlineFallback) {
+        try { this.db.exec(p); } catch { /* ignore */ }
+      }
     }
   }
 

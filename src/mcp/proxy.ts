@@ -279,10 +279,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   const routeToDaemon = (line: string): void => {
     if (daemonStatus === 'ready' && daemonSocket) {
       trackInflight(line);
+      if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] proxy->daemon ${line.slice(0, 80)}\n`);
       try { daemonSocket.write(line.endsWith('\n') ? line : line + '\n'); } catch { /* close path */ }
     } else if (daemonStatus === 'failed') {
       void handleLocally(line);
     } else {
+      if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] proxy-buffer(${daemonStatus}) ${line.slice(0, 80)}\n`);
       pending.push(line);
     }
   };
@@ -364,6 +366,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         if (!line.trim()) continue;
         let resp: JsonRpc | null = null;
         try { resp = JSON.parse(line) as JsonRpc; } catch { /* not JSON — relay verbatim */ }
+        if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] daemon->proxy ${line.slice(0, 80)}\n`);
         if (resp && resp.id !== undefined && ('result' in resp || 'error' in resp)) {
           inflight.delete(resp.id); // answered — no longer in flight
           // Suppress the daemon's reply to the initialize we forwarded to prime it
@@ -392,7 +395,11 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     };
     socket.on('close', onDaemonLost);
     socket.on('error', onDaemonLost);
-    for (const line of pending) { trackInflight(line); try { socket.write(line + '\n'); } catch { /* ignore */ } }
+    for (const line of pending) {
+      trackInflight(line);
+      if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] proxy-flush ${line.slice(0, 80)}\n`);
+      try { socket.write(line + '\n'); } catch { /* ignore */ }
+    }
     pending.length = 0;
   } else if (!shuttingDown) {
     daemonStatus = 'failed';

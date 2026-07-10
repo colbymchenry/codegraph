@@ -67,7 +67,15 @@ CREATE TABLE IF NOT EXISTS files (
     errors TEXT -- JSON array
 );
 
--- Unresolved References: References that need resolution after full indexing
+-- Unresolved References: References that need resolution after full indexing.
+-- status lifecycle: rows are inserted 'pending' by extraction; a completed
+-- resolution pass either deletes a row (resolved) or marks it 'failed'
+-- (attempted, no match — kept so a later sync can retry it when a changed
+-- file introduces a symbol that could satisfy it, #1240). name_tail is the
+-- last segment of reference_name ('util.greet' → 'greet'), written when a
+-- row is marked failed, so the retry lookup matches new node names against
+-- dotted refs too. Rows follow their from_node via ON DELETE CASCADE, so
+-- re-extracting or deleting a file clears its stale rows in any status.
 CREATE TABLE IF NOT EXISTS unresolved_refs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     from_node_id TEXT NOT NULL,
@@ -78,6 +86,8 @@ CREATE TABLE IF NOT EXISTS unresolved_refs (
     candidates TEXT, -- JSON array
     file_path TEXT NOT NULL DEFAULT '',
     language TEXT NOT NULL DEFAULT 'unknown',
+    status TEXT NOT NULL DEFAULT 'pending',
+    name_tail TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
@@ -172,6 +182,8 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_from_node ON unresolved_refs(from_node
 CREATE INDEX IF NOT EXISTS idx_unresolved_name ON unresolved_refs(reference_name);
 CREATE INDEX IF NOT EXISTS idx_unresolved_file_path ON unresolved_refs(file_path);
 CREATE INDEX IF NOT EXISTS idx_unresolved_from_name ON unresolved_refs(from_node_id, reference_name);
+CREATE INDEX IF NOT EXISTS idx_unresolved_status ON unresolved_refs(status);
+CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail ON unresolved_refs(name_tail) WHERE status = 'failed';
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
 
 -- Project metadata for version/provenance tracking

@@ -1399,15 +1399,20 @@ export class ToolHandler {
       }
 
       // Read tools: off-load the CPU-heavy dispatch to the worker pool when one
-      // is attached and healthy (daemon mode), so the daemon's single event loop
-      // stays free for the MCP transport under concurrent load — otherwise N
-      // concurrent explores serialize AND starve the transport until the whole
-      // batch drains (clients then time out). With no pool (direct mode) or a
-      // degraded one, dispatch runs in-process exactly as before. Either way the
-      // result flows through the cross-cutting notices — worktree-index mismatch
-      // (#155) and per-file staleness (#403) — which need the watched MAIN
-      // instance and so are always applied here, never in the worker.
-      const result = (this.queryPool && this.queryPool.healthy)
+      // is attached, healthy, AND has finished its first cold start (daemon
+      // mode), so the daemon's single event loop stays free for the MCP
+      // transport under concurrent load — otherwise N concurrent explores
+      // serialize AND starve the transport until the whole batch drains
+      // (clients then time out). Before the first worker is warm, calls run
+      // in-process: a call queued behind a cold start sat invisible until the
+      // 45s busy backstop — the daemon's first tool call stalling for however
+      // long a worker spawn takes on a loaded machine (the #662 flake). With
+      // no pool (direct mode) or a degraded one, dispatch runs in-process
+      // exactly as before. Either way the result flows through the
+      // cross-cutting notices — worktree-index mismatch (#155) and per-file
+      // staleness (#403) — which need the watched MAIN instance and so are
+      // always applied here, never in the worker.
+      const result = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
         ? await this.queryPool.run(toolName, args)
         : await this.executeReadTool(toolName, args);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);

@@ -52,6 +52,8 @@ import * as path from 'node:path';
 import type { Edge, Node } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
+import type { MaybeYield } from './cooperative-yield';
+import { LRUCache } from './lru-cache';
 import { stripCommentsForRegex } from './strip-comments';
 
 const C_CPP_EXT = /\.(c|h|cc|cpp|cxx|hpp|hh|hxx|cppm|ipp|inl|tcc)$/i;
@@ -306,22 +308,31 @@ const INCLUDE_RE = /#[ \t]*include[ \t]+"([^"\n]+)"/g;
 /** Included files worth scanning for registration tables (e.g. a generated `.def`). */
 const INCLUDABLE_EXT = /\.(def|inc|h|hh|hpp|hxx|c|cc|cpp|cxx|ipp|tcc|tbl)$/i;
 
-export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   const files = ctx.getAllFiles().filter((f) => C_CPP_EXT.test(f));
   if (files.length === 0) return [];
 
-  // Cache raw + stripped source per file (read once, reused across passes).
-  // Raw is needed for `#include "…"` directives — strip blanks string contents.
-  const rawCache = new Map<string, string | null>();
+  // Cache raw + stripped source per file, LRU-BOUNDED. The old unbounded Maps
+  // retained every C/C++ file's raw AND stripped text for the whole pass —
+  // multiple GB on the Linux kernel, one of the two OOM culprits in #1212.
+  // Every sweep below iterates in `files` order, and node-kind scans return
+  // rows in file-commit order, so access is near-sequential and a small LRU
+  // hits; a miss just re-reads + re-strips.
+  const rawCache = new LRUCache<string, string | null>(128);
   const raw = (file: string): string | null => {
     if (rawCache.has(file)) return rawCache.get(file)!;
     const r = ctx.readFile(file);
     rawCache.set(file, r);
     return r;
   };
-  const srcCache = new Map<string, string>();
+  const srcCache = new LRUCache<string, string>(128);
   const src = (file: string): string | null => {
-    if (srcCache.has(file)) return srcCache.get(file)!;
+    // A cached '' (empty or unreadable file) returns '' where the miss path
+    // returns null for unreadable — every caller falsy-checks, so the two are
+    // interchangeable.
+    const hit = srcCache.get(file);
+    if (hit !== undefined) return hit;
     const r = raw(file);
     const s = r == null ? '' : stripCommentsForRegex(r, 'c');
     srcCache.set(file, s);
@@ -347,6 +358,7 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
   const fnPtrTypedefs = new Set<string>();
   const fnTypeTypedefs = new Set<string>();
   for (const file of files) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     const s = src(file);
     if (!s || !s.includes('typedef')) continue;
     FNPTR_TYPEDEF_RE.lastIndex = 0;
@@ -426,9 +438,10 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
     if (fields.some((f) => f.isFnPtr)) structLayout.set(name, fields);
   };
 
-  for (const st of ctx.getNodesByKind('struct')) {
+  for (const st of (ctx.iterateNodesByKind?.('struct') ?? ctx.getNodesByKind('struct'))) {
+    if ((++scannedFiles & 255) === 0) await onYield();
     if (!C_CPP_EXT.test(st.filePath)) continue;
-    const s = srcCache.get(st.filePath) ?? src(st.filePath);
+    const s = src(st.filePath);
     if (!s) continue;
     const body = sliceLines(s, st.startLine, st.endLine);
     const open = body.indexOf('{');
@@ -444,11 +457,9 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
   const fnPtrFieldOf = (struct: string, field: string): boolean =>
     !!structLayout.get(struct)?.some((f) => f.name === field && f.isFnPtr);
 
-  // C/C++ function + method nodes, materialized once (bounded by C/C++ files).
-  const cFns: Node[] = [];
-  for (const fn of iterateFns(queries)) {
-    if (C_CPP_EXT.test(fn.filePath)) cFns.push(fn);
-  }
+  // C/C++ function + method nodes are STREAMED per sweep (see passes D/E) —
+  // the old materialized `cFns` array held every function node on the repo
+  // (O(nodes) memory, part of the #1212 kernel OOM).
 
   // ---- function-name → node resolution (prefer a function in the same file) ----
   const resolveFn = (name: string, preferFile?: string): Node | null => {
@@ -463,13 +474,13 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
   };
 
   // ---- Pass C: registrations — Map<"struct.field", Set<funcNodeId>> ----
+  // Ids only — retaining the full Node per registration (the old `idToNode`)
+  // was write-only dead weight at O(registrations) memory.
   const reg = new Map<string, Set<string>>();
-  const idToNode = new Map<string, Node>();
   const addReg = (struct: string, field: string, fn: Node): void => {
     const key = `${struct}.${field}`;
     if (!reg.has(key)) reg.set(key, new Set());
     reg.get(key)!.add(fn.id);
-    idToNode.set(fn.id, fn);
   };
 
   // Bare arrays-of-fn-pointers (no struct): array VARIABLE name → per-file sets
@@ -483,7 +494,6 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
     let e = entries.find((x) => x.file === file);
     if (!e) { e = { file, ids: new Set() }; entries.push(e); }
     e.ids.add(fn.id);
-    idToNode.set(fn.id, fn);
   };
 
   // A struct value `{ … }` (one element) — register its function entries to the
@@ -560,25 +570,26 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
   };
 
   // Per-file macro + include parsing (any file, indexed or not), cached.
-  const fnMacroCache = new Map<string, Map<string, MacroDef>>();
+  // Derived per-file caches, LRU-bounded like the content caches (#1212).
+  const fnMacroCache = new LRUCache<string, Map<string, MacroDef>>(256);
   const fileFnMacros = (file: string): Map<string, MacroDef> => {
     let m = fnMacroCache.get(file);
     if (!m) { m = parseFunctionMacros(src(file) ?? ''); fnMacroCache.set(file, m); }
     return m;
   };
-  const objMacroCache = new Map<string, Map<string, string>>();
+  const objMacroCache = new LRUCache<string, Map<string, string>>(256);
   const fileObjMacros = (file: string): Map<string, string> => {
     let m = objMacroCache.get(file);
     if (!m) { m = parseObjectMacros(src(file) ?? ''); objMacroCache.set(file, m); }
     return m;
   };
-  const definedCache = new Map<string, Set<string>>();
+  const definedCache = new LRUCache<string, Set<string>>(256);
   const fileDefinedNames = (file: string): Set<string> => {
     let d = definedCache.get(file);
     if (!d) { d = parseDefinedNames(src(file) ?? ''); definedCache.set(file, d); }
     return d;
   };
-  const includeCache = new Map<string, string[]>();
+  const includeCache = new LRUCache<string, string[]>(1024);
   const localIncludesOf = (file: string): string[] => {
     let out = includeCache.get(file);
     if (out) return out;
@@ -635,39 +646,7 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
     objEnv: Map<string, string>;
   }
   const indexedSet = new Set(files);
-  const units: Unit[] = [];
   const seenInclude = new Set<string>();
-  for (const file of files) {
-    const env = new Map<string, MacroDef>();
-    const objEnv = new Map<string, string>();
-    const defined = new Set<string>();
-    buildEnv(file, 2, new Set(), env, objEnv, defined);
-    const s = src(file);
-    if (s) units.push({ text: s, file, env, objEnv });
-    for (const target of localIncludesOf(file)) {
-      if (seenInclude.has(`${file}>${target}`)) continue;
-      const incSrc = src(target);
-      if (!incSrc) continue;
-      if (indexedSet.has(target)) {
-        // Re-scan an indexed header only when this includer unlocks guarded code.
-        const ownDef = fileDefinedNames(target);
-        const adds = [...defined].some((n) => !ownDef.has(n));
-        if (!adds || !/#\s*if/.test(incSrc)) continue;
-      }
-      seenInclude.add(`${file}>${target}`);
-      // The include is pasted into the includer — evaluate its conditionals in
-      // the includer's defined set (a no-op when it has none). Re-parse the
-      // included file's OWN macros from that resolved text so a macro it defines
-      // conditionally (vim's `EXCMD`, whose plain last-wins parse picks the enum
-      // arm) overrides with the ARM THAT IS ACTUALLY ACTIVE here.
-      const text = evalConditionals(incSrc, defined);
-      const incEnv = new Map(env);
-      for (const [k, v] of parseFunctionMacros(text)) incEnv.set(k, v);
-      const incObjEnv = new Map(objEnv);
-      for (const [k, v] of parseObjectMacros(text)) incObjEnv.set(k, v);
-      units.push({ text, file: target, env: incEnv, objEnv: incObjEnv });
-    }
-  }
 
   // Global variable → struct type, for resolving a dispatch through a file-scope
   // table by subscript (`cmdnames[i].cmd_func(…)`).
@@ -716,9 +695,12 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
   // (below) is what separates this from a plain data/struct array.
   const ARRAY_TABLE_RE =
     /(?:^|[;{}])\s*(?:(?:static|const|extern|register|volatile)\s+)*(\w+)\s+(\*\s*)?(\w+)\s*\[[^\]]*\]\s*=\s*\{/g;
-  for (const unit of units) {
+  // Process ONE unit's text and discard it. The old shape built every unit up
+  // front (`const units: Unit[]`) — the full text of every C file plus its
+  // expanded includes held simultaneously, gigabytes on the kernel (#1212).
+  const processUnit = (unit: Unit): void => {
     const s = unit.text;
-    if (!s || !s.includes('{')) continue;
+    if (!s || !s.includes('{')) return;
 
     INLINE_STRUCT_RE.lastIndex = 0;
     let im: RegExpExecArray | null;
@@ -745,7 +727,7 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
       }
     }
 
-    if (!s.includes('=')) continue;
+    if (!s.includes('=')) return;
     INIT_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = INIT_RE.exec(s))) {
@@ -776,6 +758,41 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
       if (close < 0) continue;
       registerArrayValue(am[3]!, s.slice(open + 1, close), unit.file, unit.env);
       ARRAY_TABLE_RE.lastIndex = close;
+    }
+  };
+
+  // ---- Pass C: registrations — stream each file (and its qualifying local
+  // includes) through processUnit, one at a time.
+  for (const file of files) {
+    if ((++scannedFiles & 15) === 0) await onYield();
+    const env = new Map<string, MacroDef>();
+    const objEnv = new Map<string, string>();
+    const defined = new Set<string>();
+    buildEnv(file, 2, new Set(), env, objEnv, defined);
+    const s = src(file);
+    if (s) processUnit({ text: s, file, env, objEnv });
+    for (const target of localIncludesOf(file)) {
+      if (seenInclude.has(`${file}>${target}`)) continue;
+      const incSrc = src(target);
+      if (!incSrc) continue;
+      if (indexedSet.has(target)) {
+        // Re-scan an indexed header only when this includer unlocks guarded code.
+        const ownDef = fileDefinedNames(target);
+        const adds = [...defined].some((n) => !ownDef.has(n));
+        if (!adds || !/#\s*if/.test(incSrc)) continue;
+      }
+      seenInclude.add(`${file}>${target}`);
+      // The include is pasted into the includer — evaluate its conditionals in
+      // the includer's defined set (a no-op when it has none). Re-parse the
+      // included file's OWN macros from that resolved text so a macro it defines
+      // conditionally (vim's `EXCMD`, whose plain last-wins parse picks the enum
+      // arm) overrides with the ARM THAT IS ACTUALLY ACTIVE here.
+      const text = evalConditionals(incSrc, defined);
+      const incEnv = new Map(env);
+      for (const [k, v] of parseFunctionMacros(text)) incEnv.set(k, v);
+      const incObjEnv = new Map(objEnv);
+      for (const [k, v] of parseObjectMacros(text)) incObjEnv.set(k, v);
+      processUnit({ text, file: target, env: incEnv, objEnv: incObjEnv });
     }
   }
 
@@ -828,19 +845,23 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
   // a fixpoint so a hook slot inherits a registry field's handlers.
   const FIELD_ASSIGN_RE = /(\w+)\s*(?:->|\.)\s*(\w+)\s*=\s*(\w+)\s*(?:->|\.)\s*(\w+)/g;
   const propagations: { to: string; from: string }[] = [];
-  for (const fn of cFns) {
-    const s = srcCache.get(fn.filePath);
-    if (!s) continue;
-    const body = sliceLines(s, fn.startLine, fn.endLine);
-    if (!body.includes('=')) continue;
-    FIELD_ASSIGN_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = FIELD_ASSIGN_RE.exec(body))) {
-      const [, lrecv, lfield, rrecv, rfield] = m;
-      const lt = recvTypeIn(body, lrecv!);
-      const rt = recvTypeIn(body, rrecv!);
-      if (lt && rt && fnPtrFieldOf(lt, lfield!) && fnPtrFieldOf(rt, rfield!)) {
-        propagations.push({ to: `${lt}.${lfield}`, from: `${rt}.${rfield}` });
+  for (const file of files) {
+    if ((++scannedFiles & 15) === 0) await onYield();
+    const s = src(file);
+    if (!s || !s.includes('=')) continue;
+    for (const fn of ctx.getNodesInFile(file)) {
+      if (!FN_KINDS.has(fn.kind)) continue;
+      const body = sliceLines(s, fn.startLine, fn.endLine);
+      if (!body.includes('=')) continue;
+      FIELD_ASSIGN_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = FIELD_ASSIGN_RE.exec(body))) {
+        const [, lrecv, lfield, rrecv, rfield] = m;
+        const lt = recvTypeIn(body, lrecv!);
+        const rt = recvTypeIn(body, rrecv!);
+        if (lt && rt && fnPtrFieldOf(lt, lfield!) && fnPtrFieldOf(rt, rfield!)) {
+          propagations.push({ to: `${lt}.${lfield}`, from: `${rt}.${rfield}` });
+        }
       }
     }
   }
@@ -875,9 +896,12 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
   const ARRAY_DISPATCH_RE = /(?:\(\s*\*\s*)?\b(\w+)\s*\[[^\][]*\]\s*\)?\s*\(/g;
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  for (const fn of cFns) {
-    const s = srcCache.get(fn.filePath);
+  for (const file of files) {
+    if ((++scannedFiles & 15) === 0) await onYield();
+    const s = src(file);
     if (!s) continue;
+    for (const fn of ctx.getNodesInFile(file)) {
+    if (!FN_KINDS.has(fn.kind)) continue;
     const body = sliceLines(s, fn.startLine, fn.endLine);
     DISPATCH_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
@@ -956,12 +980,7 @@ export function cFnPointerDispatchEdges(queries: QueryBuilder, ctx: ResolutionCo
         }
       }
     }
+    }
   }
   return edges;
-}
-
-/** C/C++ function + method nodes, streamed (memory-safe on symbol-dense repos). */
-function* iterateFns(queries: QueryBuilder): IterableIterator<Node> {
-  yield* queries.iterateNodesByKind('function');
-  yield* queries.iterateNodesByKind('method');
 }

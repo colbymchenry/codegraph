@@ -120,6 +120,7 @@ function waitFor<T>(
   predicate: () => T | undefined | null | false,
   timeoutMs: number,
   pollMs = 25,
+  label = '',
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     const started = Date.now();
@@ -127,7 +128,12 @@ function waitFor<T>(
       let v: T | undefined | null | false;
       try { v = predicate(); } catch (e) { return reject(e); }
       if (v) return resolve(v as T);
-      if (Date.now() - started > timeoutMs) return reject(new Error(`Timed out after ${timeoutMs}ms`));
+      if (Date.now() - started > timeoutMs) {
+        // Name the wait: an async stack loses the await site, so an unlabeled
+        // timeout can't tell WHICH step flaked (the #662 test's recurring
+        // timeout was undiagnosable for exactly this reason).
+        return reject(new Error(`Timed out after ${timeoutMs}ms${label ? ` waiting for: ${label}` : ''}`));
+      }
       setTimeout(tick, pollMs);
     };
     tick();
@@ -419,14 +425,25 @@ describe('Shared MCP daemon (issue #411)', () => {
     const server = spawnServer(tempDir, env);
     servers.push(server);
     sendInitialize(server.child, `file://${tempDir}`, 1);
-    await waitFor(() => findResponse(server.stdout, 1), 10000);
-    await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
-    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
+    await waitFor(() => findResponse(server.stdout, 1), 20000, 25, 'initialize response');
+    await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 8000, 25, 'daemon attach log');
+    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000, 25, 'daemon pidfile');
     const daemonPid = readLockPid(realRoot)!;
 
     // A warm call goes through the daemon.
     sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
-    await waitFor(() => findResponse(server.stdout, 2), 10000);
+    try {
+      await waitFor(() => findResponse(server.stdout, 2), 30000, 25, 'warm tools/call via daemon');
+    } catch (e) {
+      // This is the wait that historically flaked — surface WHERE the request
+      // died: proxy side (stderr) or daemon side (daemon.log).
+      let daemonLog = '<no daemon.log>';
+      try { daemonLog = fs.readFileSync(path.join(realRoot, '.codegraph', 'daemon.log'), 'utf8').split('\n').slice(-25).join('\n'); } catch { /* absent */ }
+      throw new Error(
+        `${(e as Error).message}\ndaemonAlive=${isAlive(daemonPid)} proxyAlive=${isAlive(server.child.pid!)}\n` +
+        `--- proxy stderr tail ---\n${server.stderr.slice(-15).join('')}\n--- daemon.log tail ---\n${daemonLog}`
+      );
+    }
 
     // Kill the daemon out from under the live proxy.
     process.kill(daemonPid, 'SIGTERM');
@@ -434,7 +451,7 @@ describe('Shared MCP daemon (issue #411)', () => {
 
     // The proxy must still be alive and still answer — served in-process now.
     expect(isAlive(server.child.pid!)).toBe(true);
-    await waitFor(() => server.stderr.some((l) => l.includes('serving this session in-process')), 8000);
+    await waitFor(() => server.stderr.some((l) => l.includes('serving this session in-process')), 8000, 25, 'in-process failover log');
     sendMessage(server.child, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
     const resp = await waitFor(() => findResponse(server.stdout, 3), 15000);
     expect(resp.result !== undefined || resp.error !== undefined).toBe(true);

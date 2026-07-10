@@ -803,10 +803,24 @@ function readClientHello(
     ) => {
       if (settled) return;
       settled = true;
+      // PAUSE before detaching: removing the last 'data' listener does NOT
+      // stop a flowing stream, so bytes arriving (or unshifted) in the gap
+      // between this handler and the session transport attaching were emitted
+      // to zero listeners and silently DISCARDED — and the listener swap left
+      // the socket's flow state wedged, never delivering to the new listener.
+      // A proxy whose client-hello arrived glued to the initialize hit this
+      // ~1-in-5 under load: the daemon answered nothing for the whole session
+      // (the #662 test flake, and real dead sessions behind it). Paused, the
+      // unshifted tail and any new bytes buffer; SocketTransport.start()
+      // resumes explicitly.
+      try { socket.pause(); } catch { /* stream already gone */ }
       socket.removeListener('data', onData);
       socket.removeListener('error', onEnd);
       socket.removeListener('close', onEnd);
       clearTimeout(timer);
+      if (process.env.CODEGRAPH_MCP_DEBUG) {
+        process.stderr.write(`[mcp-debug] clientHello finish pid=${String(peers.pid)} putBack=${putBack ? putBack.length : 0} flowing=${String(socket.readableFlowing)}\n`);
+      }
       if (putBack && putBack.length > 0 && !socket.destroyed) {
         try { socket.unshift(putBack); } catch { /* stream already gone */ }
       }
@@ -836,7 +850,12 @@ function readClientHello(
       }
     };
     const onEnd = () => finish({ pid: null, hostPid: null });
-    const timer = setTimeout(() => finish({ pid: null, hostPid: null }), CLIENT_HELLO_TIMEOUT_MS);
+    // On timeout, hand back whatever partial bytes accumulated — discarding
+    // them would tear the first message the transport parses.
+    const timer = setTimeout(() => {
+      const partial = chunks.length === 0 ? undefined : (chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, total));
+      finish({ pid: null, hostPid: null }, partial);
+    }, CLIENT_HELLO_TIMEOUT_MS);
     timer.unref?.();
     socket.on('data', onData);
     socket.on('error', onEnd);

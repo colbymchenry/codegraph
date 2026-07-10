@@ -11,7 +11,7 @@
  * parallelism safe.
  */
 import { describe, it, expect } from 'vitest';
-import { ParseWorkerPool, resolveParsePoolSize, type ParsePoolWorker, type ParseTask } from '../src/extraction/parse-pool';
+import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs, type ParsePoolWorker, type ParseTask } from '../src/extraction/parse-pool';
 import type { Language, ExtractionResult } from '../src/types';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -79,6 +79,20 @@ function makePool(
   });
   return { pool, counts: () => ({ spawned, terminated }) };
 }
+
+describe('resolveParseTimeoutMs', () => {
+  it('honors a positive numeric override (CODEGRAPH_PARSE_TIMEOUT_MS)', () => {
+    expect(resolveParseTimeoutMs('30000')).toBe(30000);
+    expect(resolveParseTimeoutMs('1500.9')).toBe(1500);
+  });
+  it('falls back to the 10s default when unset/blank/non-numeric/non-positive', () => {
+    expect(resolveParseTimeoutMs(undefined)).toBe(10_000);
+    expect(resolveParseTimeoutMs('')).toBe(10_000);
+    expect(resolveParseTimeoutMs('abc')).toBe(10_000);
+    expect(resolveParseTimeoutMs('0')).toBe(10_000);
+    expect(resolveParseTimeoutMs('-5')).toBe(10_000);
+  });
+});
 
 describe('resolveParsePoolSize', () => {
   it('treats explicit 0 and 1 as a single worker (the rollback path)', () => {
@@ -150,11 +164,58 @@ describe('ParseWorkerPool', () => {
     await pool.destroy();
   });
 
-  it('times out a hung parse and stays usable', async () => {
+  it('times out a hung parse (at the hard-kill backstop) and stays usable', async () => {
     const { pool } = makePool(1, (m) => (m.filePath === 'hang.ts' ? { hang: true } : { result: result(9) }), { parseTimeoutMs: 30 });
-    await expect(pool.requestParse(task('hang.ts'))).rejects.toThrow(/timed out/i);
+    const t0 = Date.now();
+    // The base timer (30ms) only marks the job late; the kill happens at the
+    // 3× backstop (90ms), and the message carries the full window.
+    await expect(pool.requestParse(task('hang.ts'))).rejects.toThrow(/timed out after 90ms/i);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(80);
     const ok = await pool.requestParse(task('ok.ts'));
     expect(ok.durationMs).toBe(9);
+    await pool.destroy();
+  });
+
+  it('accepts a result that arrives after the base timeout instead of killing the worker (#1231 false-timeout fix)', async () => {
+    // Simulates the HDD stall: the parse "finished" but its result is only
+    // delivered after the base timer fired. Old behaviour killed the worker and
+    // rejected; now the late result is accepted and the worker keeps serving.
+    const { pool, counts } = makePool(
+      1,
+      (m) => (m.filePath === 'late.ts' ? { wait: sleep(80).then(() => result(11)) } : { result: result(9) }),
+      { parseTimeoutMs: 50 }
+    );
+    const res = await pool.requestParse(task('late.ts')); // base timer 50ms < delivery 80ms < backstop 150ms
+    expect(res.durationMs).toBe(11);
+    expect(counts().terminated).toBe(0); // no kill…
+    expect(counts().spawned).toBe(1);    // …and no respawn churn
+    const ok = await pool.requestParse(task('next.ts'));
+    expect(ok.durationMs).toBe(9); // same worker still serving
+    await pool.destroy();
+  });
+
+  it('forwards pre-read grammar WASM bytes to every spawned worker (#1231 respawn I/O fix)', async () => {
+    const grammarBuffers = { typescript: new Uint8Array([1, 2, 3]) };
+    const loadMsgs: Array<{ grammarBuffers?: Record<string, Uint8Array> }> = [];
+    let worker!: FakeWorker;
+    const pool = new ParseWorkerPool({
+      languages: ['typescript'] as Language[],
+      size: 1,
+      grammarBuffers,
+      createWorker: () => {
+        worker = new FakeWorker(() => ({ result: result() }));
+        const orig = worker.postMessage.bind(worker);
+        worker.postMessage = (msg: unknown) => {
+          const m = msg as { type: string; grammarBuffers?: Record<string, Uint8Array> };
+          if (m.type === 'load-grammars') loadMsgs.push(m);
+          orig(msg);
+        };
+        return worker;
+      },
+    });
+    await pool.requestParse(task('a.ts'));
+    expect(loadMsgs).toHaveLength(1);
+    expect(loadMsgs[0].grammarBuffers).toBe(grammarBuffers);
     await pool.destroy();
   });
 
