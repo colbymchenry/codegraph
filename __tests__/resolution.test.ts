@@ -173,6 +173,75 @@ describe('Resolution Module', () => {
       expect(matchReference(appRef('my_behaviour'), context)?.targetNodeId).toBe(behaviourModule.id);
     });
 
+    it('should resolve Elixir bare calls same-file only, and implements refs to namespaces only', () => {
+      const mkNode = (partial: Partial<Node> & Pick<Node, 'id' | 'kind' | 'name' | 'qualifiedName' | 'filePath'>): Node => ({
+        language: 'elixir',
+        startLine: 1,
+        endLine: 1,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+        ...partial,
+      });
+      // A cross-file `config/1` function that Mix's `config :app, …` DSL calls
+      // must NOT link to, and a same-file `helper/1` that a bare call must.
+      const crossFileConfig = mkNode({
+        id: 'function:lib/consumer.ex:config:5',
+        kind: 'function',
+        name: 'config',
+        qualifiedName: 'MyApp.Consumer::config',
+        filePath: 'lib/consumer.ex',
+      });
+      const sameFileHelper = mkNode({
+        id: 'function:lib/worker.ex:helper:20',
+        kind: 'function',
+        name: 'helper',
+        qualifiedName: 'MyApp.Worker::helper',
+        filePath: 'lib/worker.ex',
+      });
+      const behaviourModule = mkNode({
+        id: 'namespace:lib/my_behaviour.ex:MyBehaviour:1',
+        kind: 'namespace',
+        name: 'MyBehaviour',
+        qualifiedName: 'MyBehaviour',
+        filePath: 'lib/my_behaviour.ex',
+      });
+      const nodes = [crossFileConfig, sameFileHelper, behaviourModule];
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => nodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      const mkRef = (name: string, kind: 'calls' | 'references' | 'implements') => ({
+        fromNodeId: 'function:lib/worker.ex:run:3',
+        referenceName: name,
+        referenceKind: kind,
+        line: 4,
+        column: 0,
+        filePath: 'lib/worker.ex',
+        language: 'elixir' as const,
+      });
+
+      // Bare call to a function that only exists in ANOTHER file: silence.
+      expect(matchReference(mkRef('config', 'calls'), context)).toBeNull();
+      // Bare call to a same-file function resolves.
+      expect(matchReference(mkRef('helper', 'calls'), context)?.targetNodeId).toBe(sameFileHelper.id);
+      // Bare capture reference follows the same rule.
+      expect(matchReference(mkRef('helper', 'references'), context)?.targetNodeId).toBe(sameFileHelper.id);
+      expect(matchReference(mkRef('config', 'references'), context)).toBeNull();
+      // `@behaviour`/`use` implements refs resolve only to module namespaces;
+      // an out-of-repo behaviour stays unresolved.
+      expect(matchReference(mkRef('MyBehaviour', 'implements'), context)?.targetNodeId).toBe(behaviourModule.id);
+      expect(matchReference(mkRef('GenServer', 'implements'), context)).toBeNull();
+    });
+
     it('should prefer same-module candidates over cross-module matches', () => {
       // Simulates a Python monorepo where multiple apps define navigate()
       const candidateA: Node = {
