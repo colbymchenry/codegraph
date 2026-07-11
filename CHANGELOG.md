@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Elixir is now a supported language (`.ex`/`.exs`). CodeGraph indexes modules as namespaces — including nested `defmodule`s, which get their full dotted name — and their `def`/`defp`/`defmacro`/`defguard` definitions, grouping a function's multiple clauses (pattern matching, guards, default args) into one node with the right visibility. It reads `@spec` as the signature and `@doc`/`@moduledoc` as docstrings, `defstruct` fields, and `defprotocol`/`defimpl` blocks. Cross-module call edges resolve `Module.fun(...)` through the file's `alias` declarations (including `alias Foo.{A, B}` and `alias …, as: X`), link `__MODULE__.fun` within the same module, and record `&Mod.fun/arity` captures and `%Struct{}` literals as references; `@behaviour`/`use` become `implements` links and `import`/`require`/`alias` become import edges. Following the project's "a wrong edge is worse than no edge" rule, dynamic dispatch that has no static target — a call through a variable receiver, `apply/3`, or `GenServer.call(pid, …)` — is deliberately left unlinked rather than guessed. Known limitations: user-macro expansion, Phoenix/Ecto DSLs, GenServer/process dispatch, `.heex` templates, and import-based resolution of bare calls are out of scope for this first version.
 
 ## [1.6.2] - 2026-10-03
 
