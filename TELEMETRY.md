@@ -28,6 +28,11 @@ a one-line notice is printed to stderr before the first time anything is sent.
 Off means off: when disabled, CodeGraph records nothing, opens no connection to the
 telemetry endpoint, and sends no "opted out" ping.
 
+Separately from telemetry, the MCP server checks GitHub for a newer release in the
+background (at most once a day) so it can tell you an update exists — it fetches a
+version number and sends nothing about you or your machine. `DO_NOT_TRACK=1` disables
+this check too; to turn off only the update check, use `CODEGRAPH_NO_UPDATE_CHECK=1`.
+
 ## What is collected
 
 Every payload carries this envelope:

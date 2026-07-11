@@ -122,11 +122,13 @@ Auto-sync is enabled by default. CodeGraph watches the project and updates the g
 
 ### Uninstall
 
-Changed your mind? One command removes CodeGraph from every agent it configured:
+Changed your mind? One command removes CodeGraph from every agent it configured **and** the CLI itself — every install it finds (standalone bundle, npm global package, launcher link), shown to you before anything is deleted:
 
 ```bash
 codegraph uninstall
 ```
+
+Pass `--keep-cli` to remove only the agent configurations and keep the CLI installed.
 
 <sub>Reverses the installer — strips CodeGraph's MCP server config, instructions, and permissions from each configured agent. Your project indexes (`.codegraph/`) are left untouched; remove those per-project with `codegraph uninit`. Use `--target` to remove from specific agents, or `--yes` to run non-interactively.</sub>
 
@@ -540,7 +542,7 @@ The exact text is `src/mcp/server-instructions.ts` — the single source of trut
 ```bash
 codegraph                         # Run interactive installer
 codegraph install                 # Run installer (explicit)
-codegraph uninstall               # Remove CodeGraph from your agents (inverse of install)
+codegraph uninstall               # Remove CodeGraph from your agents AND the CLI (--keep-cli for configs only)
 codegraph init [path]             # Initialize a project + build its graph (one step)
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
 codegraph index [path]            # Full index (--force to re-index, --quiet for less output)

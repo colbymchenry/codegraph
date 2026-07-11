@@ -66,6 +66,15 @@ const CC_DISPATCH_RE = /(\w+)\.forEach\s*\{\s*(?:\$0|it)\s*\(/g;
 const CC_APPEND_WRITE_RE = /(\w+)\.write\s*\{\s*\$0(?:\.(\w+))?\.(?:append|add|push|insert)\s*\(/g;
 const CC_APPEND_DIRECT_RE = /(\w+)\.(?:append|add|push|insert)\s*\(/g;
 const CC_FANOUT_CAP = 8; // skip a field name with more dispatchers/registrars than this (too generic to pair confidently)
+// The dispatcher gate — `{ $0( ` / `{ it( ` element-invocation — is Swift/Kotlin
+// trailing-closure syntax, so ONLY those languages can ever contribute a
+// dispatcher, and a cross-language registrar pairing (a JS `.push(` against a
+// Swift dispatcher's field name) would be a wrong edge, not a missed one.
+// Gating both sides here isn't just precision: `.push(`/`.add(` is everywhere
+// in JS/PHP, so an ungated scan slices + regexes nearly every function on repos
+// where the pass cannot emit a single edge — on a 12k-file PHP/JS app that was
+// 20+ minutes of the "Resolving refs" tail and a #850 watchdog kill (#1235).
+const CC_LANGUAGES = new Set(['swift', 'kotlin']);
 
 function kebabToPascal(s: string): string {
   return s.split('-').map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join('');
@@ -98,6 +107,33 @@ function nuxtComponentName(filePath: string): string | null {
 function sliceLines(content: string, startLine?: number, endLine?: number): string | null {
   if (!startLine || !endLine) return null;
   return content.split('\n').slice(startLine - 1, endLine).join('\n');
+}
+
+/**
+ * Per-match line resolver over `src`, 1-based at `baseLine`. The inline
+ * `src.slice(0, idx).split('\n').length` idiom is O(source-length) PER MATCH,
+ * which goes quadratic on a match-dense source (a generated function full of
+ * `.push(` calls re-scanned tens of thousands of times was most of the #1235
+ * indexing wedge). Builds the newline index once — lazily, since most sources
+ * never produce a match — then answers each call with a binary search.
+ */
+function makeLineAt(src: string, baseLine: number): (idx: number) => number {
+  let nl: number[] | null = null;
+  return (idx: number) => {
+    if (!nl) {
+      nl = [];
+      for (let i = src.indexOf('\n'); i !== -1; i = src.indexOf('\n', i + 1)) nl.push(i);
+    }
+    // Count newlines strictly before idx.
+    let lo = 0;
+    let hi = nl.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (nl[mid]! < idx) lo = mid + 1;
+      else hi = mid;
+    }
+    return baseLine + lo;
+  };
 }
 
 function registrarField(src: string): string | null {
@@ -224,24 +260,29 @@ async function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionCont
     registrars.set(field, arr);
   };
 
-  // Slices EVERY method/function's source (no cheap name-gate), so on a repo
-  // with a huge file this is the heaviest synthesis pass — yield mid-scan so it
-  // can't wedge the #850 watchdog on its own (#1091).
+  // Slices EVERY Swift/Kotlin method/function's source (no cheap name-gate), so
+  // on a repo with a huge file this is the heaviest synthesis pass — yield
+  // mid-scan (and mid-match-loop below: a single generated function dense with
+  // matches must not starve the watchdog either) so it can't wedge the #850
+  // watchdog on its own (#1091, #1235).
   let scanned = 0;
+  let matchTick = 0;
   for (const m of methodAndFunctionNodes(queries)) {
     if ((++scanned & 127) === 0) await onYield();
+    if (!CC_LANGUAGES.has(m.language)) continue;
     const content = ctx.readFile(m.filePath);
     const src = content && sliceLines(content, m.startLine, m.endLine);
     if (!src) continue;
     const hasForEach = src.includes('.forEach');
     const hasAppend = src.includes('.append(') || src.includes('.add(') || src.includes('.push(') || src.includes('.insert(');
     if (!hasForEach && !hasAppend) continue;
-    const lineAt = (idx: number) => (m.startLine ?? 1) + src.slice(0, idx).split('\n').length - 1;
+    const lineAt = makeLineAt(src, m.startLine ?? 1);
 
     if (hasForEach) {
       CC_DISPATCH_RE.lastIndex = 0;
       let d: RegExpExecArray | null;
       while ((d = CC_DISPATCH_RE.exec(src))) {
+        if ((++matchTick & 255) === 0) await onYield();
         const arr = dispatchers.get(d[1]!) ?? [];
         if (!arr.some((n) => n.node.id === m.id)) arr.push({ node: m, line: lineAt(d.index) });
         dispatchers.set(d[1]!, arr);
@@ -250,10 +291,16 @@ async function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionCont
     if (hasAppend) {
       CC_APPEND_WRITE_RE.lastIndex = 0;
       let w: RegExpExecArray | null;
-      while ((w = CC_APPEND_WRITE_RE.exec(src))) addReg(w[2] || w[1], m, lineAt(w.index)); // nested `$0.streams` else the `.write` receiver
+      while ((w = CC_APPEND_WRITE_RE.exec(src))) {
+        if ((++matchTick & 255) === 0) await onYield();
+        addReg(w[2] || w[1], m, lineAt(w.index)); // nested `$0.streams` else the `.write` receiver
+      }
       CC_APPEND_DIRECT_RE.lastIndex = 0;
       let a: RegExpExecArray | null;
-      while ((a = CC_APPEND_DIRECT_RE.exec(src))) addReg(a[1], m, lineAt(a.index));
+      while ((a = CC_APPEND_DIRECT_RE.exec(src))) {
+        if ((++matchTick & 255) === 0) await onYield();
+        addReg(a[1], m, lineAt(a.index));
+      }
     }
   }
 
@@ -294,7 +341,7 @@ async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     const hasOn = content.includes('.on(') || content.includes('.once(') || content.includes('.addListener(');
     if (!hasEmit && !hasOn) continue;
     const nodesInFile = ctx.getNodesInFile(file);
-    const lineOf = (idx: number) => content.slice(0, idx).split('\n').length;
+    const lineOf = makeLineAt(content, 1);
 
     if (hasEmit) {
       EMIT_RE.lastIndex = 0;
@@ -1368,7 +1415,7 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
     if (!content) continue;
 
     const nodesInFile = ctx.getNodesInFile(file);
-    const lineOf = (idx: number) => content.slice(0, idx).split('\n').length;
+    const lineOf = makeLineAt(content, 1);
     const addDispatcher = (event: string, line: number) => {
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) return;

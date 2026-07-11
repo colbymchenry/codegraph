@@ -28,7 +28,7 @@
  * work — is exactly what cooperative yielding buys: a genuinely stuck span never
  * reaches its next yield, so it still trips the timeout.
  */
-import { installMainThreadWatchdog } from '../mcp/liveness-watchdog';
+import { installMainThreadWatchdog, WatchdogOptions } from '../mcp/liveness-watchdog';
 import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from '../mcp/ppid-watchdog';
 import { isProcessAlive } from '../mcp/daemon-registry';
 import { EARLY_PPID } from '../mcp/early-ppid';
@@ -44,12 +44,18 @@ export interface CommandSupervision {
  * `label` is used in the shutdown notice (e.g. `"index"`). Returns a handle
  * whose `stop()` must be called when the command completes so neither watchdog
  * outlives it.
+ *
+ * Pass `watchdog.progressPaths` (the project's SQLite DB + `-wal`) so the
+ * liveness watchdog can tell a slow-but-progressing store on degraded storage
+ * (files advancing) from a true wedge (they aren't) — one long synchronous
+ * SQLite statement on a 150-IOPS disk otherwise gets a healthy index
+ * SIGKILLed (#1231).
  */
-export function installCommandSupervision(label: string): CommandSupervision {
+export function installCommandSupervision(label: string, watchdog: WatchdogOptions = {}): CommandSupervision {
   // Liveness watchdog: a separate process that SIGKILLs us if our event loop
   // stops turning for too long (a wedged synchronous loop). Self-disables on
   // CODEGRAPH_NO_WATCHDOG.
-  const liveness = installMainThreadWatchdog();
+  const liveness = installMainThreadWatchdog(watchdog);
 
   // PPID watchdog: detect that the parent (or the host threaded past the
   // relaunch shim) died and we've been orphaned, then exit instead of leaking.

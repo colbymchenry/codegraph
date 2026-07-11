@@ -50,6 +50,7 @@ import {
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import { getDaemonSocketCandidates } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
+import { checkForUpdateInBackground } from '../upgrade/update-check';
 import { EARLY_PPID } from './early-ppid';
 import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from './ppid-watchdog';
 import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
@@ -227,6 +228,14 @@ export class MCPServer {
     // telemetry opportunistically. Fire-and-forget + unref'd — adds nothing
     // to the handshake path and never keeps the process alive.
     getTelemetry().startInterval();
+
+    // #1243: the MCP config launches the local binary, so a server left
+    // running drifts behind releases with no signal. Refresh the shared
+    // update-check cache in the background and log ONE stderr notice when a
+    // newer version exists (stderr only — stdout is the protocol channel).
+    // The notice also reaches the agent via the initialize instructions and
+    // codegraph_status. Fire-and-forget: adds nothing to the handshake path.
+    checkForUpdateInBackground();
 
     // The detached daemon process itself. Checked before the opt-out so the
     // daemon honors the same env it was spawned with (it never sets NO_DAEMON).

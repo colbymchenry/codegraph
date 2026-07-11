@@ -7,6 +7,7 @@
  */
 
 import * as path from 'path';
+import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
@@ -249,30 +250,100 @@ export async function initGrammars(): Promise<void> {
 }
 
 /**
+ * Grammars that ship their own vendored WASMs under `dist/extraction/wasm/`
+ * (not in tree-sitter-wasms, or the tree-sitter-wasms build is too old).
+ * Lua: tree-sitter-wasms ships an ABI-13 build that corrupts the shared WASM
+ * heap under web-tree-sitter 0.25 (drops nested calls/imports on every file
+ * after the first); we vendor the upstream ABI-15 wasm instead. C#: the
+ * tree-sitter-wasms build (ABI 13) has no primary-constructor support and
+ * parses `class Foo(...)` as an ERROR that swallows the whole class (#237); we
+ * vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
+ * primary constructors natively. Terraform: tree-sitter-wasms does not ship
+ * HCL/Terraform at all, so we vendor the prebuilt tree-sitter-terraform.wasm
+ * from @tree-sitter-grammars/tree-sitter-hcl 1.2.0 (Apache-2.0) —
+ * byte-identical to the npm package's artifact. ArkTS: tree-sitter-wasms
+ * doesn't ship it either; we vendor the prebuilt tree-sitter-arkts.wasm from
+ * the tree-sitter-arkts 0.2.0 npm package (harmony-contrib/tree-sitter-arkts,
+ * MIT) — byte-identical to the npm tarball's artifact. It extends the
+ * tree-sitter-javascript grammar the same way tree-sitter-typescript does,
+ * adding `struct_declaration` and the `arkui_component_expression` build()
+ * DSL. Nix: tree-sitter-wasms doesn't ship it; we vendor a wasm built from
+ * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
+ * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
+ * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
+ */
+const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
+  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+]);
+
+/** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
+function resolveWasmPath(lang: GrammarLanguage): string {
+  const wasmFile = WASM_GRAMMAR_FILES[lang];
+  return VENDORED_WASM_LANGS.has(lang)
+    ? path.join(__dirname, 'wasm', wasmFile)
+    : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
+}
+
+/**
+ * Expand an index set's languages to the grammars actually needed to parse it.
+ * SFC languages (svelte/vue/astro) have no grammar of their own — their
+ * extractors delegate <script>/frontmatter content to the TS/JS extractor, so
+ * those grammars must be loaded even when no plain .ts/.js file is in the index
+ * set (e.g. a pure-.astro content site). CFML (.cfc/.cfm) likewise delegates
+ * bare-script content, <cfscript> tag bodies, and <cfquery> SQL bodies to the
+ * cfscript/cfquery grammars (see injections.scm in tree-sitter-cfml).
+ */
+function expandGrammarLanguages(languages: Language[]): Language[] {
+  if (languages.some((l) => l === 'svelte' || l === 'vue' || l === 'astro')) {
+    languages = [...languages, 'typescript', 'javascript'];
+  }
+  if (languages.some((l) => l === 'cfml')) {
+    languages = [...languages, 'cfscript', 'cfquery'];
+  }
+  return languages;
+}
+
+/**
+ * Pre-read the grammar WASM bytes for an index set, keyed by language. The
+ * orchestrator reads each grammar ONCE and hands the bytes to every parse
+ * worker via its `load-grammars` message, so worker spawns/respawns load
+ * grammars from memory instead of re-reading them from disk — on slow storage
+ * (HDD, issue #1231) each respawn's grammar re-read otherwise amplifies the
+ * I/O contention that caused the respawn. Best-effort: a language whose WASM
+ * can't be read here is simply omitted, and the worker falls back to its own
+ * disk load (which surfaces the real error/warning path).
+ */
+export async function readGrammarWasmBytes(languages: Language[]): Promise<Record<string, Uint8Array>> {
+  const out: Record<string, Uint8Array> = {};
+  const toRead = [...new Set(expandGrammarLanguages(languages))].filter(
+    (lang): lang is GrammarLanguage => lang in WASM_GRAMMAR_FILES
+  );
+  for (const lang of toRead) {
+    try {
+      out[lang] = await fsp.readFile(resolveWasmPath(lang));
+    } catch {
+      // fall through — the worker's own load reports the failure
+    }
+  }
+  return out;
+}
+
+/**
  * Load grammar WASM files for specific languages only.
  * Skips languages that are already loaded or have no WASM grammar.
  * Must be called after initGrammars().
+ *
+ * `wasmBytes` (optional) holds pre-read grammar bytes keyed by language (from
+ * {@link readGrammarWasmBytes}, forwarded through the parse pool); when a
+ * language's bytes are present they're loaded from memory instead of disk.
  */
-export async function loadGrammarsForLanguages(languages: Language[]): Promise<void> {
+export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?: Record<string, Uint8Array>): Promise<void> {
   if (!parserInitialized) {
     await initGrammars();
   }
 
-  // SFC languages (svelte/vue/astro) have no grammar of their own — their
-  // extractors delegate <script>/frontmatter content to the TS/JS extractor,
-  // so those grammars must be loaded even when no plain .ts/.js file is in
-  // the index set (e.g. a pure-.astro content site).
-  if (languages.some((l) => l === 'svelte' || l === 'vue' || l === 'astro')) {
-    languages = [...languages, 'typescript', 'javascript'];
-  }
-
-  // CFML (.cfc/.cfm) delegates bare-script content, <cfscript> tag bodies, and
-  // <cfquery> SQL bodies to the cfscript/cfquery grammars (see injections.scm in
-  // tree-sitter-cfml) — load both even when no standalone .cfs file is in the
-  // index set.
-  if (languages.some((l) => l === 'cfml')) {
-    languages = [...languages, 'cfscript', 'cfquery'];
-  }
+  languages = expandGrammarLanguages(languages);
 
   // Deduplicate and filter to languages that have WASM grammars and aren't already loaded
   const toLoad = [...new Set(languages)].filter(
@@ -285,35 +356,9 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
   // Load grammars sequentially to avoid web-tree-sitter WASM race condition on Node 20+
   // See: https://github.com/tree-sitter/tree-sitter/issues/2338
   for (const lang of toLoad) {
-    const wasmFile = WASM_GRAMMAR_FILES[lang];
     try {
-      // Some grammars ship their own WASMs (not in tree-sitter-wasms, or the
-      // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
-      // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
-      // 0.25 (drops nested calls/imports on every file after the first); we
-      // vendor the upstream ABI-15 wasm instead. C#: the tree-sitter-wasms
-      // build (ABI 13) has no primary-constructor support and parses
-      // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
-      // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
-      // primary constructors natively. Terraform: tree-sitter-wasms does not
-      // ship HCL/Terraform at all, so we vendor the prebuilt
-      // tree-sitter-terraform.wasm from @tree-sitter-grammars/tree-sitter-hcl
-      // 1.2.0 (Apache-2.0) — byte-identical to the npm package's artifact.
-      // ArkTS: tree-sitter-wasms doesn't ship it either; we vendor the prebuilt
-      // tree-sitter-arkts.wasm from the tree-sitter-arkts 0.2.0 npm package
-      // (harmony-contrib/tree-sitter-arkts, MIT) — byte-identical to the npm
-      // tarball's artifact. It extends the tree-sitter-javascript grammar the
-      // same way tree-sitter-typescript does, adding `struct_declaration` and
-      // the `arkui_component_expression` build() DSL.
-      // Nix: tree-sitter-wasms doesn't ship it; we vendor a wasm built from
-      // nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli
-      // 0.25.10 (`generate` + `build --wasm`, ABI 15 — upstream's checked-in
-      // parser.c is still ABI 13; all 54 upstream corpus tests pass on the
-      // regenerated parser).
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol' || lang === 'vbnet' || lang === 'erlang' || lang === 'terraform' || lang === 'arkts' || lang === 'nix')
-        ? path.join(__dirname, 'wasm', wasmFile)
-        : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
-      const language = await WasmLanguage.load(wasmPath);
+      const bytes = wasmBytes?.[lang];
+      const language = await WasmLanguage.load(bytes ?? resolveWasmPath(lang));
       languageCache.set(lang, language);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

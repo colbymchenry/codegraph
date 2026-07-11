@@ -20,6 +20,7 @@ import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server
 import { CodeGraphPackageVersion } from './version';
 import { findNearestCodeGraphRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
+import { getUpdateNotice } from '../upgrade/update-check';
 
 /**
  * MCP Server Info — kept on the session because some clients log it. The
@@ -31,6 +32,27 @@ export const SERVER_INFO = {
   name: 'codegraph',
   version: CodeGraphPackageVersion,
 };
+
+/**
+ * Instructions for the `initialize` response, with the update-availability
+ * notice appended when one is known (#1243). Exported so the proxy's local
+ * handshake sends the IDENTICAL payload — same convention as SERVER_INFO.
+ * `getUpdateNotice` is a memoized synchronous cache read, so the #172
+ * respond-fast contract holds; when no notice exists the instructions are
+ * byte-identical to the bare constants.
+ *
+ * Test-authoring note: on a machine whose real `~/.codegraph` cache knows a
+ * newer release, spawned servers append the notice — a test asserting exact
+ * instructions equality must set `CODEGRAPH_NO_UPDATE_CHECK=1` in the spawn
+ * env or it will fail only in the weeks after a release ships.
+ */
+export function initializeInstructions(base: string, notice: string | null = getUpdateNotice()): string {
+  if (!notice) return base;
+  return (
+    `${base}\n\n---\n${notice} This server keeps running the old version until ` +
+    `the user upgrades — mention it when convenient; do not run the upgrade yourself.`
+  );
+}
 
 /** MCP Protocol Version (latest the server claims). */
 export const PROTOCOL_VERSION = '2024-11-05';
@@ -207,7 +229,7 @@ export class MCPSession {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
-      instructions: indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX,
+      instructions: initializeInstructions(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX),
     });
 
     if (explicitPath) {

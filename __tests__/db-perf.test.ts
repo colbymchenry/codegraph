@@ -344,7 +344,7 @@ describe('migration v6: dedup edges + add identity index on upgrade (#1034)', ()
     runMigrations(raw, 5);
 
     expect(count()).toBe(2); // duplicate collapsed, the distinct `calls` edge kept
-    expect(getCurrentVersion(raw)).toBe(7);
+    expect(getCurrentVersion(raw)).toBe(8);
     const idx = raw
       .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_edges_identity'")
       .get();

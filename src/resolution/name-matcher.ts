@@ -1280,11 +1280,30 @@ function inferLocalReceiverType(
       componentScoped = scope === 'variables' || scope === 'this';
     }
   }
+  // PHP `$this->prop` receiver — the property's declaration lives outside the
+  // calling method (a promoted constructor parameter `private readonly Foo $prop`,
+  // a typed property `private Foo $prop;`, or a classic constructor parameter
+  // `Foo $prop` assigned in __construct). Strip the prefix and widen the scan to
+  // the whole file (the constructor may sit below the calling method), but —
+  // unlike CFML's scopes above — switch to PROPERTY-shaped patterns: a plain
+  // `$prop` local or parameter lives in a different namespace than `$this->prop`
+  // and can never shadow it, so the generic local patterns would type the
+  // property from unrelated same-named variables in other methods (a wrong
+  // 0.9-confidence edge, not a missing one).
+  let phpProperty = false;
+  if (ref.language === 'php') {
+    const scoped = receiverName.match(/^this->(.+)$/);
+    if (scoped) {
+      scanReceiver = scoped[1]!;
+      componentScoped = true;
+      phpProperty = true;
+    }
+  }
 
-  const patterns = localReceiverTypePatterns(
-    ref.language,
-    scanReceiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-  );
+  const escapedReceiver = scanReceiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const patterns = phpProperty
+    ? phpPropertyTypePatterns(escapedReceiver)
+    : localReceiverTypePatterns(ref.language, escapedReceiver);
   if (patterns.length === 0) return null;
 
   // Split through the context's per-file lines cache when available: this runs
@@ -1332,6 +1351,95 @@ function inferLocalReceiverType(
       if (type) return type;
     }
   }
+  // A PHP property with no statically-typed declaration (classic pre-7.4
+  // style) may still be typed by what gets ASSIGNED to it — follow the
+  // `$this->prop = $var` assignment to the assigned variable's own typed
+  // declaration (a classic or multi-line constructor parameter, or a typed
+  // setter's parameter).
+  if (phpProperty) {
+    return inferPhpAssignedPropertyType(escapedReceiver, lines, callIdx);
+  }
+  return null;
+}
+
+/**
+ * Patterns that recover a PHP class property's declared type for a
+ * `$this->prop` receiver. Deliberately NOT localReceiverTypePatterns: only
+ * property-shaped declarations qualify —
+ *   1. a modifier-prefixed typed declaration, which covers both a typed
+ *      property (`private ?Foo $prop;`) and a promoted constructor parameter
+ *      (`private readonly Foo $prop`), and
+ *   2. the pseudoconstructor assignment (`$this->prop = new Foo(...)`).
+ * A bare `X $prop` parameter or `$prop = new X()` local elsewhere in the
+ * file must NOT match: those variables can never alias `$this->prop`.
+ * Union-typed properties (`Foo|Bar $prop`) yield no match and thus no edge —
+ * silent beats wrong. The classic untyped-property-assigned-in-constructor
+ * shape is handled by inferPhpAssignedPropertyType instead.
+ */
+function phpPropertyTypePatterns(r: string): RegExp[] {
+  return [
+    new RegExp(
+      `\\b(?:(?:private|protected|public|readonly|static|final)(?:\\(set\\))?\\s+)+\\??([A-Za-z_\\\\][\\w\\\\]*)\\s+&?\\$${r}\\b`,
+    ), // private readonly ?Foo $prop  (typed property / promoted param)
+    new RegExp(`\\$this->${r}\\b\\s*=\\s*new\\s+([A-Za-z_\\\\][\\w\\\\]*)`), // $this->prop = new Foo()
+  ];
+}
+
+/**
+ * Second-chance typing for a PHP `$this->prop` receiver whose property
+ * declaration carries no static type (classic pre-7.4 style): find the
+ * `$this->prop = $var` assignment, then recover `$var`'s type from its own
+ * declaration WITHIN the assignment's function — the constructor's (possibly
+ * multi-line) parameter list, a typed setter's parameter, or a `= new X()`
+ * local. The backward scan stops at the enclosing `function` line (checked
+ * for a match first — a single-line `__construct(Foo $var) { ... }` carries
+ * the typed parameter itself), so a same-named variable in another method
+ * can never type the property.
+ */
+function inferPhpAssignedPropertyType(
+  escapedProp: string,
+  lines: string[],
+  callIdx: number,
+): string | null {
+  const assignRe = new RegExp(`\\$this->${escapedProp}\\b\\s*=\\s*\\$(\\w+)\\b`);
+  const assignAt = (i: number): RegExpMatchArray | null => {
+    const line = lines[i];
+    if (!line || line.length > 10_000) return null;
+    return line.match(assignRe);
+  };
+  // The assignment is position-independent relative to the call — nearest-
+  // backward first, then sweep forward, same order as the componentScoped scan.
+  let assignIdx = -1;
+  let varName: string | null = null;
+  for (let i = callIdx; i >= 0; i--) {
+    const m = assignAt(i);
+    if (m) { assignIdx = i; varName = m[1]!; break; }
+  }
+  if (varName === null) {
+    for (let i = callIdx + 1; i < lines.length; i++) {
+      const m = assignAt(i);
+      if (m) { assignIdx = i; varName = m[1]!; break; }
+    }
+  }
+  if (varName === null) return null;
+
+  const varPatterns = localReceiverTypePatterns(
+    'php',
+    varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+  );
+  for (let i = assignIdx; i >= 0; i--) {
+    const line = lines[i];
+    if (line && line.length <= 10_000) {
+      for (const re of varPatterns) {
+        const m = line.match(re);
+        if (m && m[1]) {
+          const type = normalizeInferredTypeName(m[1]);
+          if (type) return type;
+        }
+      }
+    }
+    if (line && /\bfunction\b/.test(line)) break;
+  }
   return null;
 }
 
@@ -1363,6 +1471,32 @@ export function matchMethodCall(
   const rDollarMatch = ref.language === 'r'
     ? ref.referenceName.match(/^([\w.]+)\$(\w+)$/)
     : null;
+
+  // PHP property receiver: `$this->prop->method()` reaches the resolver as
+  // `this->prop.method` (the extractor records the receiver's raw text with the
+  // leading `$` stripped). Resolve it EXCLUSIVELY through declared-type
+  // inference + resolveMethodOnType validation — the name-similarity strategies
+  // below must never see this shape, so a property whose type can't be
+  // recovered stays unlinked rather than guessed (a wrong inference produces no
+  // edge rather than a wrong one). Deeper chains (`this->a->b.method`) don't
+  // match the single-property pattern and stay unlinked, same as before.
+  const phpThisPropMatch = ref.language === 'php'
+    ? ref.referenceName.match(/^(this->\w+)\.(\w+)$/)
+    : null;
+  if (phpThisPropMatch) {
+    const [, receiver, phpMethodName] = phpThisPropMatch;
+    const inferredType = inferLocalReceiverType(receiver!, ref, context);
+    if (!inferredType) return null;
+    return resolveMethodOnType(
+      inferredType,
+      phpMethodName!,
+      ref,
+      context,
+      0.9,
+      'instance-method',
+      importedFqnOf(inferredType, ref, context),
+    );
+  }
 
   const match = dotMatch || colonMatch || luaColonMatch || rDollarMatch;
   if (!match) {

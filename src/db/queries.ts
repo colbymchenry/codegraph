@@ -109,6 +109,20 @@ interface UnresolvedRefRow {
   candidates: string | null;
   file_path: string;
   language: string;
+  status: string;
+  name_tail: string;
+}
+
+/**
+ * Last segment of a (possibly dotted/qualified) reference name — the part a
+ * new symbol's plain node name could match: 'util.greet' → 'greet',
+ * 'mod::fn' → 'fn', 'greet' → 'greet'. Written to unresolved_refs.name_tail
+ * when a ref is marked failed, so the #1240 retry lookup can match dotted
+ * refs against newly-added node names.
+ */
+function referenceNameTail(referenceName: string): string {
+  const idx = Math.max(referenceName.lastIndexOf('.'), referenceName.lastIndexOf(':'));
+  return idx >= 0 ? referenceName.slice(idx + 1) : referenceName;
 }
 
 /**
@@ -1627,19 +1641,26 @@ export class QueryBuilder {
    * re-index (issue #899). Same edge-kind rules as
    * {@link getDependentFilePaths}: all kinds except `contains`.
    */
-  getCrossFileIncomingEdgesWithTarget(filePath: string): Array<Edge & { targetName: string; targetKind: NodeKind }> {
-    const sql = `SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind
+  getCrossFileIncomingEdgesWithTarget(
+    filePath: string
+  ): Array<Edge & { targetName: string; targetKind: NodeKind; sourceFilePath: string; sourceLanguage: Language }> {
+    const sql = `SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind,
+        src.file_path AS source_file_path, src.language AS source_language
       FROM edges e
       JOIN nodes tgt ON tgt.id = e.target
       JOIN nodes src ON src.id = e.source
       WHERE tgt.file_path = ?
         AND e.kind != 'contains'
         AND src.file_path != ?`;
-    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<EdgeRow & { target_name: string; target_kind: NodeKind }>;
+    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<
+      EdgeRow & { target_name: string; target_kind: NodeKind; source_file_path: string; source_language: Language }
+    >;
     return rows.map(row => ({
       ...rowToEdge(row),
       targetName: row.target_name,
       targetKind: row.target_kind,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
     }));
   }
 
@@ -1827,12 +1848,16 @@ export class QueryBuilder {
   }
 
   /**
-   * Get the count of unresolved references without loading them into memory
+   * Get the count of PENDING (never-attempted) references without loading
+   * them into memory. Rows marked status='failed' — attempted by a completed
+   * pass, no match — are excluded: they are not outstanding work, only retry
+   * candidates for the #1240 sweep, so they must not trip the #1187 orphan
+   * sweep or the `status` pending-refs warning.
    */
   getUnresolvedReferencesCount(): number {
     if (!this.stmts.getUnresolvedCount) {
       this.stmts.getUnresolvedCount = this.db.prepare(
-        'SELECT COUNT(*) as count FROM unresolved_refs'
+        "SELECT COUNT(*) as count FROM unresolved_refs WHERE status = 'pending'"
       );
     }
     const row = this.stmts.getUnresolvedCount.get() as { count: number };
@@ -1840,13 +1865,15 @@ export class QueryBuilder {
   }
 
   /**
-   * Get a batch of unresolved references using LIMIT/OFFSET pagination.
-   * Used to process references in bounded memory chunks.
+   * Get a batch of PENDING unresolved references using LIMIT/OFFSET
+   * pagination. Used to process references in bounded memory chunks; failed
+   * rows are excluded so the batched drain loop terminates once every row
+   * has been attempted.
    */
   getUnresolvedReferencesBatch(offset: number, limit: number): UnresolvedReference[] {
     if (!this.stmts.getUnresolvedBatch) {
       this.stmts.getUnresolvedBatch = this.db.prepare(
-        'SELECT * FROM unresolved_refs LIMIT ? OFFSET ?'
+        "SELECT * FROM unresolved_refs WHERE status = 'pending' LIMIT ? OFFSET ?"
       );
     }
     const rows = this.stmts.getUnresolvedBatch.all(limit, offset) as UnresolvedRefRow[];
@@ -1913,7 +1940,7 @@ export class QueryBuilder {
       const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const chunkRows = this.db
-        .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
+        .prepare(`SELECT * FROM unresolved_refs WHERE status = 'pending' AND file_path IN (${placeholders})`)
         .all(...chunk) as UnresolvedRefRow[];
       rows.push(...chunkRows);
     }
@@ -1969,6 +1996,97 @@ export class QueryBuilder {
       }
     });
     deleteMany(refs);
+  }
+
+  /**
+   * Mark refs a completed resolution pass could not resolve as status='failed'
+   * instead of deleting them (#1240). Failed rows are invisible to the pending
+   * count/batch readers (so drain loops and the #1187 orphan sweep still
+   * terminate) but stay queryable by name_tail so a later sync can retry them
+   * when a changed file introduces a symbol that could satisfy them. name_tail
+   * is (re)written here so rows inserted before the v8 migration get their
+   * tail the first time they're attempted.
+   */
+  markReferencesFailed(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>): void {
+    if (refs.length === 0) return;
+    const stmt = this.db.prepare(
+      "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?"
+    );
+    const markMany = this.db.transaction((items: typeof refs) => {
+      for (const ref of items) {
+        stmt.run(referenceNameTail(ref.referenceName), ref.fromNodeId, ref.referenceName, ref.referenceKind);
+      }
+    });
+    markMany(refs);
+  }
+
+  /**
+   * Failed refs whose name tail matches one of the given symbol names — the
+   * candidates a sync should retry after files carrying those names changed
+   * (#1240). Names matching more than `perNameCeiling` failed refs are
+   * skipped entirely: at that population a name is external/builtin noise
+   * (`get`, `map`, …) that one new definition won't resolve — the same
+   * rationale as resolution's AMBIGUOUS_NAME_CEILING (#999) — and retrying an
+   * arbitrary subset would be both wasted work and incoherent coverage.
+   */
+  getRetryableFailedReferences(names: string[], perNameCeiling: number = 500): UnresolvedReference[] {
+    if (names.length === 0) return [];
+
+    // Pass 1: per-tail counts, chunked under the SQLite parameter limit.
+    const retryNames: string[] = [];
+    for (let i = 0; i < names.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = names.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const counts = this.db
+        .prepare(
+          `SELECT name_tail, COUNT(*) as count FROM unresolved_refs WHERE status = 'failed' AND name_tail IN (${placeholders}) GROUP BY name_tail`
+        )
+        .all(...chunk) as Array<{ name_tail: string; count: number }>;
+      for (const row of counts) {
+        if (row.count <= perNameCeiling) retryNames.push(row.name_tail);
+      }
+    }
+    if (retryNames.length === 0) return [];
+
+    // Pass 2: load the surviving rows.
+    const rows: UnresolvedRefRow[] = [];
+    for (let i = 0; i < retryNames.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = retryNames.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const chunkRows = this.db
+        .prepare(`SELECT * FROM unresolved_refs WHERE status = 'failed' AND name_tail IN (${placeholders})`)
+        .all(...chunk) as UnresolvedRefRow[];
+      rows.push(...chunkRows);
+    }
+
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+    }));
+  }
+
+  /**
+   * Distinct node names present in the given files — the symbol names a sync
+   * pass uses to look up retryable failed refs after those files changed.
+   */
+  getNodeNamesByFiles(filePaths: string[]): string[] {
+    if (filePaths.length === 0) return [];
+    const names = new Set<string>();
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT DISTINCT name FROM nodes WHERE file_path IN (${placeholders})`)
+        .all(...chunk) as Array<{ name: string }>;
+      for (const row of rows) names.add(row.name);
+    }
+    return [...names];
   }
 
   // ===========================================================================

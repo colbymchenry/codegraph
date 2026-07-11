@@ -30,6 +30,7 @@ import {
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { scanDynamicDispatch } from './dynamic-boundaries';
+import { getUpdateNotice } from '../upgrade/update-check';
 
 /**
  * An expected, recoverable "codegraph can't serve this" condition — most
@@ -2611,6 +2612,36 @@ export class ToolHandler {
           const lc = ct.toLowerCase();
           return n.filePath.toLowerCase().includes(lc) || n.qualifiedName.toLowerCase().includes(lc);
         });
+      // NL-stopword guard: this seeding treats every token as "a symbol the
+      // agent named", but explore also takes natural-language questions, whose
+      // ordinary English words collide with real callables — "…check the latest
+      // version…" exact-matched a lone `check()` method, which then earned the
+      // named-FIRST sort tier and displaced the corroborated answer files from
+      // the whole render budget (the agent fell back to Read). A shape-precise
+      // token (camelCase, PascalCase, snake_case, qualified) is an unambiguous
+      // symbol reference and seeds unconditionally; a BARE lowercase word seeds
+      // only where the query corroborates the file — another query token is
+      // itself a symbol defined in that same file (the "check drain fire"
+      // sibling-bag case), which an incidental English-word collision never is.
+      const lcTokens = new Set(tokens.map((x) => x.toLowerCase()));
+      const isPreciseToken = (x: string) =>
+        /[._$]|::|\//.test(x) || /[a-z][A-Z]/.test(x) || /^[A-Z]/.test(x);
+      const fileNameSets = new Map<string, Set<string>>();
+      const coNamedInFile = (t: string, fp: string): boolean => {
+        let names = fileNameSets.get(fp);
+        if (!names) {
+          names = new Set<string>();
+          try {
+            for (const n of cg.getNodesInFile(fp)) names.add(n.name.toLowerCase());
+          } catch { /* unreadable file entry — treat as uncorroborated */ }
+          fileNameSets.set(fp, names);
+        }
+        const self = t.toLowerCase();
+        for (const o of lcTokens) {
+          if (o !== self && names.has(o)) return true;
+        }
+        return false;
+      };
       for (const t of tokens) {
         // Enumerate ALL defs of a bare token via the direct index, not FTS — a
         // 50+-overload name (tokio `poll`) ranks the wanted def (`Harness::poll`)
@@ -2619,9 +2650,17 @@ export class ToolHandler {
         // codegraph_node's findSymbolMatches.) Qualified tokens keep findAllSymbols.
         const isQual = /[.\/]|::/.test(t);
         const raw = isQual ? this.findAllSymbols(cg, t).nodes : cg.getNodesByName(t);
-        const cands = raw
+        let cands = raw
           .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
           .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
+        // Bare lowercase words only seed defs their query-siblings corroborate
+        // (see the NL-stopword guard above). Filtering CANDS (not picks) applies
+        // the guard uniformly to both branches below, including the >3-def
+        // single-pick fallback — an uncorroborated bare `run` must not tier its
+        // most-substantive namesake any more than a 1-def `check` may.
+        if (!isPreciseToken(t)) {
+          cands = cands.filter((n) => coNamedInFile(t, n.filePath));
+        }
         // A specific name (<=3 defs) injects all its defs. An overloaded name
         // (`validate` = 10, `request` = 44) would flood the subgraph, so inject
         // only: the overloads whose file/class the query ALSO names (the agent
@@ -4041,6 +4080,14 @@ export class ToolHandler {
         `**Journal mode:** ⚠ ${journalMode || 'unknown'} — WAL not active, so reads ` +
         `can block on a concurrent write (WAL appears unsupported on this filesystem)`
       );
+    }
+
+    // A newer release exists (#1243) — status is where users and agents look
+    // when something seems off, so surface the drift here too. Cheap memoized
+    // cache read; absent entirely when up to date or opted out.
+    const updateNotice = getUpdateNotice();
+    if (updateNotice) {
+      lines.push(`**Update available:** ${updateNotice}`);
     }
 
     // Non-zero at rest means a resolution pass was interrupted mid-run, so
