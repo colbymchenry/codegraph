@@ -1037,7 +1037,7 @@ program
       if (reindexRecommended) {
         const builtWith = buildInfo.version ? `v${buildInfo.version.replace(/^v/, '')}` : 'an earlier version';
         warn(`Index was built by ${builtWith}; re-index to pick up this engine's improvements.`);
-        info('Run "codegraph index" (full rebuild) or "codegraph sync"');
+        info('Run "codegraph index" (full rebuild required)');
         console.log();
       }
 

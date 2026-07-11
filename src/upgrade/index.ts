@@ -310,9 +310,8 @@ const c = {
 export function reindexAdvisory(): string {
   return [
     c.dim('Your existing project indexes keep working, but were built by the previous version.'),
-    c.dim('To pick up this version’s extraction improvements, refresh each project:'),
-    `  ${c.cyan('codegraph sync')}        ${c.dim('# incremental, fast')}`,
-    `  ${c.cyan('codegraph index -f')}    ${c.dim('# full rebuild')}`,
+    c.dim('To pick up this version’s extraction improvements, fully rebuild each project index:'),
+    `  ${c.cyan('codegraph index')}    ${c.dim('# full rebuild required')}`,
     c.dim('(`codegraph status` flags any index that predates the engine you’re running.)'),
   ].join('\n');
 }
