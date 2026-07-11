@@ -30,6 +30,7 @@ import {
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { scanDynamicDispatch } from './dynamic-boundaries';
+import { getUpdateNotice } from '../upgrade/update-check';
 
 /**
  * An expected, recoverable "codegraph can't serve this" condition — most
@@ -1399,15 +1400,20 @@ export class ToolHandler {
       }
 
       // Read tools: off-load the CPU-heavy dispatch to the worker pool when one
-      // is attached and healthy (daemon mode), so the daemon's single event loop
-      // stays free for the MCP transport under concurrent load — otherwise N
-      // concurrent explores serialize AND starve the transport until the whole
-      // batch drains (clients then time out). With no pool (direct mode) or a
-      // degraded one, dispatch runs in-process exactly as before. Either way the
-      // result flows through the cross-cutting notices — worktree-index mismatch
-      // (#155) and per-file staleness (#403) — which need the watched MAIN
-      // instance and so are always applied here, never in the worker.
-      const result = (this.queryPool && this.queryPool.healthy)
+      // is attached, healthy, AND has finished its first cold start (daemon
+      // mode), so the daemon's single event loop stays free for the MCP
+      // transport under concurrent load — otherwise N concurrent explores
+      // serialize AND starve the transport until the whole batch drains
+      // (clients then time out). Before the first worker is warm, calls run
+      // in-process: a call queued behind a cold start sat invisible until the
+      // 45s busy backstop — the daemon's first tool call stalling for however
+      // long a worker spawn takes on a loaded machine (the #662 flake). With
+      // no pool (direct mode) or a degraded one, dispatch runs in-process
+      // exactly as before. Either way the result flows through the
+      // cross-cutting notices — worktree-index mismatch (#155) and per-file
+      // staleness (#403) — which need the watched MAIN instance and so are
+      // always applied here, never in the worker.
+      const result = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
         ? await this.queryPool.run(toolName, args)
         : await this.executeReadTool(toolName, args);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
@@ -1944,11 +1950,18 @@ export class ToolHandler {
         }
         // Same token, non-callable synth endpoints (capped, precision-gated on an
         // actual heuristic edge so plain config constants never qualify).
+        // Per-token sub-cap so one token's many endpoints (10 nix option writes
+        // of `programs.git.enable` across test configs) can't fill the pool
+        // before later tokens (`home.file`) get a slot.
         if (dynNamed.size < 12) {
+          let tokenDyn = 0;
           for (const n of hits) {
             if (CALLABLE.has(n.kind) || !DYN_KINDS.has(n.kind) || dynNamed.has(n.id)) continue;
-            if (hasHeuristicEdge(n.id)) dynNamed.set(n.id, n);
-            if (dynNamed.size >= 12) break;
+            if (hasHeuristicEdge(n.id)) {
+              dynNamed.set(n.id, n);
+              tokenDyn++;
+            }
+            if (dynNamed.size >= 12 || tokenDyn >= 4) break;
           }
         }
         if (named.size > 40) break;
@@ -2599,6 +2612,36 @@ export class ToolHandler {
           const lc = ct.toLowerCase();
           return n.filePath.toLowerCase().includes(lc) || n.qualifiedName.toLowerCase().includes(lc);
         });
+      // NL-stopword guard: this seeding treats every token as "a symbol the
+      // agent named", but explore also takes natural-language questions, whose
+      // ordinary English words collide with real callables — "…check the latest
+      // version…" exact-matched a lone `check()` method, which then earned the
+      // named-FIRST sort tier and displaced the corroborated answer files from
+      // the whole render budget (the agent fell back to Read). A shape-precise
+      // token (camelCase, PascalCase, snake_case, qualified) is an unambiguous
+      // symbol reference and seeds unconditionally; a BARE lowercase word seeds
+      // only where the query corroborates the file — another query token is
+      // itself a symbol defined in that same file (the "check drain fire"
+      // sibling-bag case), which an incidental English-word collision never is.
+      const lcTokens = new Set(tokens.map((x) => x.toLowerCase()));
+      const isPreciseToken = (x: string) =>
+        /[._$]|::|\//.test(x) || /[a-z][A-Z]/.test(x) || /^[A-Z]/.test(x);
+      const fileNameSets = new Map<string, Set<string>>();
+      const coNamedInFile = (t: string, fp: string): boolean => {
+        let names = fileNameSets.get(fp);
+        if (!names) {
+          names = new Set<string>();
+          try {
+            for (const n of cg.getNodesInFile(fp)) names.add(n.name.toLowerCase());
+          } catch { /* unreadable file entry — treat as uncorroborated */ }
+          fileNameSets.set(fp, names);
+        }
+        const self = t.toLowerCase();
+        for (const o of lcTokens) {
+          if (o !== self && names.has(o)) return true;
+        }
+        return false;
+      };
       for (const t of tokens) {
         // Enumerate ALL defs of a bare token via the direct index, not FTS — a
         // 50+-overload name (tokio `poll`) ranks the wanted def (`Harness::poll`)
@@ -2607,9 +2650,17 @@ export class ToolHandler {
         // codegraph_node's findSymbolMatches.) Qualified tokens keep findAllSymbols.
         const isQual = /[.\/]|::/.test(t);
         const raw = isQual ? this.findAllSymbols(cg, t).nodes : cg.getNodesByName(t);
-        const cands = raw
+        let cands = raw
           .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
           .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
+        // Bare lowercase words only seed defs their query-siblings corroborate
+        // (see the NL-stopword guard above). Filtering CANDS (not picks) applies
+        // the guard uniformly to both branches below, including the >3-def
+        // single-pick fallback — an uncorroborated bare `run` must not tier its
+        // most-substantive namesake any more than a 1-def `check` may.
+        if (!isPreciseToken(t)) {
+          cands = cands.filter((n) => coNamedInFile(t, n.filePath));
+        }
         // A specific name (<=3 defs) injects all its defs. An overloaded name
         // (`validate` = 10, `request` = 44) would flood the subgraph, so inject
         // only: the overloads whose file/class the query ALSO names (the agent
@@ -4031,6 +4082,27 @@ export class ToolHandler {
       );
     }
 
+    // A newer release exists (#1243) — status is where users and agents look
+    // when something seems off, so surface the drift here too. Cheap memoized
+    // cache read; absent entirely when up to date or opted out.
+    const updateNotice = getUpdateNotice();
+    if (updateNotice) {
+      lines.push(`**Update available:** ${updateNotice}`);
+    }
+
+    // Non-zero at rest means a resolution pass was interrupted mid-run, so
+    // some files' call/impact edges are missing until the next sync sweeps
+    // the leftovers (#1187). Surface it — an agent trusting an incomplete
+    // blast radius is worse than one that knows to re-sync.
+    const pendingRefs = cg.getPendingReferenceCount();
+    if (pendingRefs > 0) {
+      lines.push(
+        `**Pending resolution:** ⚠ ${pendingRefs} references from an interrupted ` +
+        `index run — some caller/impact edges are missing until the next sync ` +
+        `(any file change triggers it, or run \`codegraph sync\`)`
+      );
+    }
+
     lines.push('', '**Nodes by Kind:**');
 
     for (const [kind, count] of Object.entries(stats.nodesByKind)) {
@@ -4399,6 +4471,26 @@ export class ToolHandler {
    * results across all matching symbols (e.g., multiple classes with an `execute` method).
    */
   private findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
+    // Nix option paths: the declaration is stored as `options.<path>` and
+    // config writes carry longer/quoted tails (`<path>."git/config".text`),
+    // so a dotted option token (`xdg.configFile`, `launchd.user.agents`) has
+    // no exact-name node and would degrade to bare-tail FTS soup — burying
+    // the declaration hub the nix-option-path edges hang off. Resolve the
+    // convention directly: declaration first, then the exact write, then a
+    // capped prefix scan of write sites. Three index hits; non-nix graphs
+    // fall straight through.
+    if (/^[a-z][\w'-]*(?:\.[\w'-]+)+$/.test(symbol)) {
+      const optionHits = [
+        ...cg.getNodesByName(`options.${symbol}`),
+        ...cg.getNodesByName(symbol),
+        ...cg.getNodesByNamePrefix(`${symbol}.`, 12),
+      ].filter((n) => n.language === 'nix');
+      if (optionHits.length > 0) {
+        const seen = new Set<string>();
+        const nodes = optionHits.filter((n) => !seen.has(n.id) && !!seen.add(n.id)).slice(0, 10);
+        return { nodes, note: '' };
+      }
+    }
     let results = cg.searchNodes(symbol, { limit: 50 });
 
     // Mirror the fallback in `findSymbol` for qualified queries — FTS

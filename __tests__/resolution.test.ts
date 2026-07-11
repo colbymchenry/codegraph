@@ -4399,4 +4399,199 @@ procedure Helper; var t: TTgt; begin t.Hit; end;
       expect(callerNamesOf('TTgt::Hit')).toEqual(['DoStuff', 'Helper']);
     });
   });
+
+  describe('Nix path import resolution', () => {
+    function fileNode(filePath: string) {
+      return cg.getNodesByKind('file').find((n) => n.filePath === filePath);
+    }
+
+    function importedFilePaths(fromFile: string): string[] {
+      const source = fileNode(fromFile);
+      expect(source, `${fromFile} file node`).toBeDefined();
+      return cg
+        .getOutgoingEdges(source!.id)
+        .filter((edge) => edge.kind === 'imports')
+        .map((edge) => cg.getNodesByKind('file').find((n) => n.id === edge.target)?.filePath)
+        .filter((filePath): filePath is string => Boolean(filePath))
+        .sort();
+    }
+
+    it('resolves relative Nix imports to indexed file nodes', async () => {
+      fs.mkdirSync(path.join(tempDir, 'core'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'data'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'core', 'ports.nix'), '{ http = 80; https = 443; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'data', 'postgresql.nix'),
+        `let
+  ports = import ../core/ports.nix;
+in
+{
+  port = ports.https;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('data/postgresql.nix')).toEqual(['core/ports.nix']);
+    });
+
+    it('resolves Nix directory imports through default.nix and deduplicates called imports', async () => {
+      fs.mkdirSync(path.join(tempDir, 'dir'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'dir', 'default.nix'), '{ value = 1; }');
+      fs.writeFileSync(path.join(tempDir, 'x.nix'), '{ value = 2; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'main.nix'),
+        `let
+  dir = import ./dir;
+  x = import ./x.nix {};
+in
+{
+  inherit dir x;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('main.nix')).toEqual(['dir/default.nix', 'x.nix']);
+    });
+
+    it('resolves NixOS module imports lists and callPackage paths to file nodes', async () => {
+      fs.mkdirSync(path.join(tempDir, 'modules'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'common'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'pkgs', 'hello'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'modules', 'users.nix'), '{ users.users.demo.isNormalUser = true; }');
+      fs.writeFileSync(path.join(tempDir, 'common', 'default.nix'), '{ time.timeZone = "UTC"; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'pkgs', 'hello', 'default.nix'),
+        '{ stdenv }: stdenv.mkDerivation { pname = "hello"; }'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'configuration.nix'),
+        `{ config, pkgs, ... }:
+{
+  imports = [ ./modules/users.nix ./common ];
+  environment.systemPackages = [ (pkgs.callPackage ./pkgs/hello { }) ];
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('configuration.nix')).toEqual([
+        'common/default.nix',
+        'modules/users.nix',
+        'pkgs/hello/default.nix',
+      ]);
+    });
+
+    it('never resolves another language\'s calls into nix bindings', async () => {
+      // Nix bindings are not linkable symbols from any other language —
+      // interop is eval/CLI. Without the target-side gate, a Python script's
+      // bare `resolve(...)` exact-matches a module's `resolve = ...` binding.
+      fs.writeFileSync(
+        path.join(tempDir, 'helpers.nix'),
+        `let
+  resolve = x: x;
+in
+{
+  inherit resolve;
+}
+`
+      );
+      fs.writeFileSync(path.join(tempDir, 'tool.py'), 'def main():\n    return resolve("target")\n');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const nixNodeIds = new Set(
+        cg.getNodesByKind('variable').filter((n) => n.language === 'nix').map((n) => n.id)
+      );
+      const pyFns = cg.getNodesByKind('function').filter((n) => n.language === 'python');
+      expect(pyFns.length).toBeGreaterThan(0);
+      const crossEdges = pyFns.flatMap((f) => cg.getOutgoingEdges(f.id)).filter((e) => nixNodeIds.has(e.target));
+      expect(crossEdges).toEqual([]);
+    });
+
+    it('never cross-links Nix calls by bare name across files (lexical scope only)', async () => {
+      // Both modules `inherit (lib) mkOption` — the nixpkgs idiom. A call to
+      // mkOption in one file must NOT resolve to the other file's inherit
+      // binding: Nix has no ambient cross-file namespace, so any such edge is
+      // wrong by construction. Same-file bindings still resolve.
+      fs.writeFileSync(
+        path.join(tempDir, 'alpha.nix'),
+        `{ lib, ... }:
+let
+  inherit (lib) mkOption;
+  mkPort = default: mkOption { inherit default; };
+in
+{
+  options.alpha.port = mkPort 8080;
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'beta.nix'),
+        `{ lib, ... }:
+let
+  inherit (lib) mkOption;
+in
+{
+  options.beta.enable = mkOption { default = false; };
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const crossFileCalls = cg
+        .getNodesByKind('file')
+        .flatMap((f) => cg.getOutgoingEdges(f.id))
+        .concat(
+          cg.getNodesByKind('function').flatMap((f) => cg.getOutgoingEdges(f.id)),
+          cg.getNodesByKind('variable').flatMap((v) => cg.getOutgoingEdges(v.id))
+        )
+        .filter((e) => e.kind === 'calls')
+        .map((e) => {
+          const src = cg.getNode(e.source);
+          const tgt = cg.getNode(e.target);
+          return { from: src?.filePath, to: tgt?.filePath, name: tgt?.name };
+        });
+
+      // No calls edge may cross files by bare-name matching.
+      expect(crossFileCalls.filter((e) => e.from !== e.to)).toEqual([]);
+      // The same-file chain still resolves: mkPort's mkOption call hits
+      // alpha.nix's own inherit binding.
+      const sameFile = crossFileCalls.filter((e) => e.from === e.to && e.name === 'mkOption');
+      expect(sameFile.length).toBeGreaterThan(0);
+      expect(sameFile.every((e) => e.from === 'alpha.nix' || e.from === 'beta.nix')).toBe(true);
+    });
+
+    it('does not resolve Nix angle-bracket, attribute, or variable imports as project file edges', async () => {
+      fs.writeFileSync(path.join(tempDir, 'nixpkgs.nix'), '{ bogus = true; }');
+      fs.writeFileSync(path.join(tempDir, 'selectedPath.nix'), '{ bogus = true; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'main.nix'),
+        `let
+  pkgs = import <nixpkgs> {};
+  fromSources = import sources.nixpkgs {};
+  dynamic = import selectedPath;
+in
+{
+  inherit pkgs fromSources dynamic;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('main.nix')).toEqual([]);
+    });
+  });
 });

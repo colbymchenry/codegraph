@@ -120,6 +120,7 @@ function waitFor<T>(
   predicate: () => T | undefined | null | false,
   timeoutMs: number,
   pollMs = 25,
+  label = '',
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     const started = Date.now();
@@ -127,7 +128,12 @@ function waitFor<T>(
       let v: T | undefined | null | false;
       try { v = predicate(); } catch (e) { return reject(e); }
       if (v) return resolve(v as T);
-      if (Date.now() - started > timeoutMs) return reject(new Error(`Timed out after ${timeoutMs}ms`));
+      if (Date.now() - started > timeoutMs) {
+        // Name the wait: an async stack loses the await site, so an unlabeled
+        // timeout can't tell WHICH step flaked (the #662 test's recurring
+        // timeout was undiagnosable for exactly this reason).
+        return reject(new Error(`Timed out after ${timeoutMs}ms${label ? ` waiting for: ${label}` : ''}`));
+      }
       setTimeout(tick, pollMs);
     };
     tick();
@@ -362,15 +368,21 @@ describe('Shared MCP daemon (issue #411)', () => {
     }
   }, 30000);
 
-  // The over-the-wire client-hello → record → sweep path is covered by the
-  // deterministic `Daemon.reapDeadClients` unit test in daemon-client-liveness
-  // (a raw-socket variant here was flaky under heavy parallel load), plus the
-  // client-hello round-trip exercised by every test above (the real proxy now
-  // sends it). What stays here is the lifecycle behavior that needs real procs.
-  it('exits on the inactivity backstop even while a client stays connected (#692)', async () => {
+  // The over-the-wire client-hello → record → sweep path, and the inactivity
+  // backstop's liveness gate, are covered by the deterministic unit tests in
+  // daemon-client-liveness (`reapDeadClients`, `backstopShouldExit`) — a
+  // raw-socket variant here was flaky under heavy parallel load. What stays
+  // here is the lifecycle behavior that needs real procs: a live-but-quiet
+  // client must SURVIVE the inactivity backstop. Reaping it used to silently
+  // degrade the session (and any others sharing the daemon) to an in-process
+  // engine; on a real machine the backstop fired on live sessions far more
+  // often than on the phantoms it exists for. The phantom case it still covers
+  // (an unknown-pid connection) is the `backstopShouldExit` unit test.
+  it('does NOT reap a live-but-quiet client on the inactivity backstop (#692)', async () => {
     // Backstop short, idle timeout long: with a client connected the idle timer
-    // never arms, so only the inactivity backstop can take the daemon down.
-    const env = { CODEGRAPH_DAEMON_MAX_IDLE_MS: '1500', CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '60000' };
+    // never arms, so the inactivity backstop is the only thing that could take
+    // the daemon down — and it must not, because the client's peer is alive.
+    const env = { CODEGRAPH_DAEMON_MAX_IDLE_MS: '1200', CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '60000' };
     const server = spawnServer(tempDir, env);
     servers.push(server);
     sendInitialize(server.child, `file://${tempDir}`, 1);
@@ -379,11 +391,13 @@ describe('Shared MCP daemon (issue #411)', () => {
     const daemonPid = readLockPid(realRoot)!;
     expect(isAlive(daemonPid)).toBe(true);
 
-    // Send nothing further — the client stays connected but idle. The backstop
-    // should fire and the daemon should exit and clean up its lockfile.
-    expect(await waitProcessExit(daemonPid, 12000)).toBe(true);
-    expect(readDaemonLog(realRoot)).toContain('inactivity backstop');
-    expect(fs.existsSync(path.join(realRoot, '.codegraph', 'daemon.pid'))).toBe(false);
+    // Stay silent well past several backstop windows. The live session's peer is
+    // provably alive, so the daemon must keep running (and never log a backstop
+    // shutdown), with its lockfile intact.
+    await new Promise((r) => setTimeout(r, 4000)); // > 3× maxIdle
+    expect(isAlive(daemonPid)).toBe(true);
+    expect(readDaemonLog(realRoot)).not.toContain('inactivity backstop');
+    expect(readLockPid(realRoot)).toBe(daemonPid);
   }, 30000);
 
   it('daemon idle-times-out after the last client disconnects', async () => {
@@ -411,14 +425,25 @@ describe('Shared MCP daemon (issue #411)', () => {
     const server = spawnServer(tempDir, env);
     servers.push(server);
     sendInitialize(server.child, `file://${tempDir}`, 1);
-    await waitFor(() => findResponse(server.stdout, 1), 10000);
-    await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
-    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
+    await waitFor(() => findResponse(server.stdout, 1), 20000, 25, 'initialize response');
+    await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 8000, 25, 'daemon attach log');
+    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000, 25, 'daemon pidfile');
     const daemonPid = readLockPid(realRoot)!;
 
     // A warm call goes through the daemon.
     sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
-    await waitFor(() => findResponse(server.stdout, 2), 10000);
+    try {
+      await waitFor(() => findResponse(server.stdout, 2), 30000, 25, 'warm tools/call via daemon');
+    } catch (e) {
+      // This is the wait that historically flaked — surface WHERE the request
+      // died: proxy side (stderr) or daemon side (daemon.log).
+      let daemonLog = '<no daemon.log>';
+      try { daemonLog = fs.readFileSync(path.join(realRoot, '.codegraph', 'daemon.log'), 'utf8').split('\n').slice(-25).join('\n'); } catch { /* absent */ }
+      throw new Error(
+        `${(e as Error).message}\ndaemonAlive=${isAlive(daemonPid)} proxyAlive=${isAlive(server.child.pid!)}\n` +
+        `--- proxy stderr tail ---\n${server.stderr.slice(-15).join('')}\n--- daemon.log tail ---\n${daemonLog}`
+      );
+    }
 
     // Kill the daemon out from under the live proxy.
     process.kill(daemonPid, 'SIGTERM');
@@ -426,7 +451,7 @@ describe('Shared MCP daemon (issue #411)', () => {
 
     // The proxy must still be alive and still answer — served in-process now.
     expect(isAlive(server.child.pid!)).toBe(true);
-    await waitFor(() => server.stderr.some((l) => l.includes('serving this session in-process')), 8000);
+    await waitFor(() => server.stderr.some((l) => l.includes('serving this session in-process')), 8000, 25, 'in-process failover log');
     sendMessage(server.child, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
     const resp = await waitFor(() => findResponse(server.stdout, 3), 15000);
     expect(resp.result !== undefined || resp.error !== undefined).toBe(true);

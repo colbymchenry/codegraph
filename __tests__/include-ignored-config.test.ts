@@ -14,7 +14,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { loadIncludeIgnoredPatterns, loadExtensionOverrides, clearProjectConfigCache } from '../src/project-config';
+import { loadIncludeIgnoredPatterns, loadExtensionOverrides, clearProjectConfigCache, addIncludeIgnoredPatterns } from '../src/project-config';
 
 describe('includeIgnored loader (codegraph.json)', () => {
   let dir: string;
@@ -85,5 +85,60 @@ describe('includeIgnored loader (codegraph.json)', () => {
 
     fs.rmSync(path.join(dir, 'codegraph.json'));
     expect(loadIncludeIgnoredPatterns(dir)).toEqual([]);
+  });
+});
+
+describe('addIncludeIgnoredPatterns (codegraph.json writer, #1156)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-addincludeignored-'));
+    clearProjectConfigCache();
+  });
+  afterEach(() => {
+    clearProjectConfigCache();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const readConfig = () => JSON.parse(fs.readFileSync(path.join(dir, 'codegraph.json'), 'utf-8'));
+
+  it('creates codegraph.json when none exists', () => {
+    expect(addIncludeIgnoredPatterns(dir, ['mtc-a/', 'mtc-b/'])).toBe(2);
+    expect(loadIncludeIgnoredPatterns(dir)).toEqual(['mtc-a/', 'mtc-b/']);
+  });
+
+  it('merges into an existing list, preserving other keys and de-duping', () => {
+    fs.writeFileSync(
+      path.join(dir, 'codegraph.json'),
+      JSON.stringify({ extensions: { '.foo': 'typescript' }, includeIgnored: ['mtc-a/'] }),
+    );
+    expect(addIncludeIgnoredPatterns(dir, ['mtc-a/', 'mtc-b/'])).toBe(1); // only mtc-b/ is new
+    const parsed = readConfig();
+    expect(parsed.includeIgnored).toEqual(['mtc-a/', 'mtc-b/']);
+    expect(parsed.extensions).toEqual({ '.foo': 'typescript' }); // untouched
+  });
+
+  it('is idempotent — re-adding the same patterns adds nothing', () => {
+    addIncludeIgnoredPatterns(dir, ['mtc-a/']);
+    expect(addIncludeIgnoredPatterns(dir, ['mtc-a/'])).toBe(0);
+    expect(loadIncludeIgnoredPatterns(dir)).toEqual(['mtc-a/']);
+  });
+
+  it('replaces a non-array includeIgnored value rather than crashing', () => {
+    fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ includeIgnored: 'oops' }));
+    expect(addIncludeIgnoredPatterns(dir, ['mtc-a/'])).toBe(1);
+    expect(loadIncludeIgnoredPatterns(dir)).toEqual(['mtc-a/']);
+  });
+
+  it('refuses to clobber a malformed existing codegraph.json (throws, leaves file intact)', () => {
+    const bad = '{ not: valid json ';
+    fs.writeFileSync(path.join(dir, 'codegraph.json'), bad);
+    expect(() => addIncludeIgnoredPatterns(dir, ['mtc-a/'])).toThrow();
+    expect(fs.readFileSync(path.join(dir, 'codegraph.json'), 'utf-8')).toBe(bad);
+  });
+
+  it('writes pretty-printed, newline-terminated JSON', () => {
+    addIncludeIgnoredPatterns(dir, ['mtc-a/']);
+    const raw = fs.readFileSync(path.join(dir, 'codegraph.json'), 'utf-8');
+    expect(raw.endsWith('\n')).toBe(true);
+    expect(raw).toContain('\n  "includeIgnored"'); // 2-space indent
   });
 });

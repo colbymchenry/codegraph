@@ -561,5 +561,51 @@
       "files": "~1800",
       "question": "In the eks/cluster component, how does the cluster IAM role get created and reach the EKS cluster resource, and which outputs expose cluster identity to other components?"
     }
+  ],
+  "ArkTS": [
+    {
+      "name": "HarmoneyOpenEye",
+      "repo": "https://github.com/WinWang/HarmoneyOpenEye",
+      "size": "Small",
+      "files": "~82",
+      "question": "How does the home page get its feed data from the network layer, and how does that data end up rendered as the list on screen? Trace the flow from the HTTP request through the view model into the home page UI."
+    },
+    {
+      "name": "CoolMallArkTS",
+      "repo": "https://github.com/Joker-x-dev/CoolMallArkTS",
+      "size": "Medium",
+      "files": "~528",
+      "question": "When the user adds a product to the cart from the goods detail page, how does the item travel from the UI action to persistent storage? Trace the flow across the feature and core modules."
+    },
+    {
+      "name": "applications_app_samples",
+      "repo": "https://github.com/openharmony/applications_app_samples",
+      "size": "Large",
+      "files": "~9500",
+      "question": "In the OrangeShopping sample app, how does the product detail page's bottom bar (add to cart / buy) lead to the order placement flow? Trace from the bottom navigation component to where the order is created."
+    }
+  ],
+  "Nix": [
+    {
+      "name": "agenix",
+      "repo": "https://github.com/ryantm/agenix",
+      "size": "Small",
+      "files": "~13",
+      "question": "When a NixOS system activates, how does a secret declared under age.secrets get decrypted and installed at its runtime path? Trace the flow from the age.secrets option definition to the activation machinery that performs the decryption."
+    },
+    {
+      "name": "nix-darwin",
+      "repo": "https://github.com/nix-darwin/nix-darwin",
+      "size": "Medium",
+      "files": "~207",
+      "question": "How does setting services.yabai.enable = true become a running launchd service? Trace the flow from the yabai module's options to the launchd daemon definition that generates the plist."
+    },
+    {
+      "name": "home-manager",
+      "repo": "https://github.com/nix-community/home-manager",
+      "size": "Large",
+      "files": "~3390",
+      "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
+    }
   ]
 }

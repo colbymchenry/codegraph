@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -138,6 +138,43 @@ describe('Language Detection', () => {
     expect(detectLanguage('versions.tofu')).toBe('terraform');
   });
 
+  it('should detect ArkTS files', () => {
+    expect(detectLanguage('entry/src/main/ets/pages/Index.ets')).toBe('arkts');
+    // Plain `.ts` in a HarmonyOS project is still TypeScript.
+    expect(detectLanguage('entry/src/main/ets/common/utils.ts')).toBe('typescript');
+  });
+
+  it('should detect Nix files', () => {
+    expect(detectLanguage('default.nix')).toBe('nix');
+    expect(detectLanguage('pkgs/development/tools/misc/codegraph/default.nix')).toBe('nix');
+    expect(isSourceFile('default.nix')).toBe(true);
+  });
+
+  it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
+    // Lean Unreal-Engine style header: the class is annotated with an export
+    // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
+    // so the macro-blind `class\s+\w+\s*[:{]` branch alone can't see it. It must
+    // still detect as C++ — otherwise the C extractor (classTypes: []) drops the
+    // class definition entirely. (#1093 follow-up)
+    const macroClassHeader = `#pragma once
+#include "CoreMinimal.h"
+
+UCLASS()
+class ENGINE_API UNetConnectionRepControl : public UObject
+{
+\tGENERATED_BODY()
+\tbool IsRepControlEnable() const;
+};
+`;
+    expect(detectLanguage('NetConnectionRepControl.h', macroClassHeader)).toBe('cpp');
+    // Macro class with no base clause, brace on the next line, still C++.
+    expect(detectLanguage('Foo.h', 'MYMODULE_API_DECL\nclass MYMODULE_API FFoo\n{\n\tint X;\n};\n')).toBe('cpp');
+    // Export-macro struct with inheritance is likewise C++-only.
+    expect(detectLanguage('Bar.h', 'struct ENGINE_API FBar : public FBase {};\n')).toBe('cpp');
+    // Guard: a genuine C header must NOT be dragged to C++ by the new branch.
+    expect(detectLanguage('cfoo.h', '#ifndef CFOO_H\nstruct Point { int x; int y; };\nvoid f(struct Point p);\n#endif\n')).toBe('c');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -167,6 +204,146 @@ describe('Language Support', () => {
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
+    expect(languages).toContain('nix');
+  });
+});
+
+describe('Nix Extraction', () => {
+  it('should distinguish Nix variable and function bindings', () => {
+    const code = `
+let
+  plainValue = 10;
+  simpleFn = arg: arg + 1;
+  destructuredFn = { lib, stdenv }: lib.getName stdenv;
+  curriedFn = a: b: builtins.toString (a + b);
+in
+{
+  exportedValue = plainValue;
+  exportedFn = curriedFn;
+}
+`;
+
+    const result = extractFromSource('default.nix', code);
+
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'plainValue')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'exportedValue')).toBeDefined();
+
+    const simpleFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'simpleFn');
+    const destructuredFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'destructuredFn');
+    const curriedFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'curriedFn');
+
+    expect(simpleFn?.signature).toBe('(arg)');
+    expect(destructuredFn?.signature).toBe('{ lib, stdenv }');
+    expect(curriedFn?.signature).toBe('a : b');
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('lib.getName');
+    expect(calls.filter((name) => name === 'builtins.toString')).toHaveLength(1);
+  });
+
+  it('should extract inherited Nix attributes as variables', () => {
+    const code = `
+let
+  inherit lib;
+  inherit (pkgs) stdenv writeShellScriptBin;
+in
+stdenv.mkDerivation {}
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const variables = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+
+    expect(variables).toContain('lib');
+    expect(variables).toContain('stdenv');
+    expect(variables).toContain('writeShellScriptBin');
+  });
+
+  it('should emit only static project path imports for Nix import calls', () => {
+    const code = `
+let
+  local = import ./x.nix;
+  defaultFile = builtins.import ./dir;
+  packageSet = import <nixpkgs> {};
+  fromSources = import sources.nixpkgs {};
+  dynamic = import selectedPath;
+in
+local
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+
+    expect(imports).toEqual(['./x.nix', './dir']);
+    expect(importRefs).toEqual(['./x.nix', './dir']);
+  });
+
+  it('should emit file imports for NixOS module imports/modules lists (literal paths only)', () => {
+    const code = `
+{ config, lib, ... }:
+{
+  imports = [ ./hardware.nix ../common inputs.foo.nixosModules.bar ];
+  home-manager.users.demo.imports = [ ./home.nix ];
+  flake.modules = [ ./configuration.nix ];
+  notAModuleList = [ ./ignored.nix ];
+}
+`;
+
+    const result = extractFromSource('configuration.nix', code);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+
+    expect(importRefs).toEqual(['./hardware.nix', '../common', './home.nix', './configuration.nix']);
+    // The dynamic entry (inputs.foo.nixosModules.bar) must not create a ref.
+    expect(importRefs).not.toContain('inputs.foo.nixosModules.bar');
+  });
+
+  it('should emit file imports for callPackage with a literal path and skip dynamic ones', () => {
+    const code = `
+{ pkgs, newScope }:
+let
+  hello = pkgs.callPackage ./pkgs/hello { };
+  tools = pkgs.callPackages ../tools/all.nix { };
+  dynamic = pkgs.callPackage pkgPath { };
+in
+{
+  inherit hello tools dynamic;
+}
+`;
+
+    const result = extractFromSource('overlay.nix', code);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+
+    expect(importRefs).toEqual(['./pkgs/hello', '../tools/all.nix']);
+    // The call edge to callPackage itself is still recorded.
+    expect(calls).toContain('pkgs.callPackage');
+  });
+
+  it('should mark returned top-level Nix attrset members exported and keep let or nested attrs private', () => {
+    const code = `
+{ lib, stdenv }:
+let
+  localValue = 10;
+in
+{
+  exported = localValue;
+  package = { name }: stdenv.mkDerivation { inherit name; };
+  nested = {
+    privateNested = true;
+  };
+  inherit (lib) licenses;
+}
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const node = (name: string) => result.nodes.find((n) => n.name === name);
+
+    expect(node('localValue')?.isExported).toBe(false);
+    expect(node('exported')?.isExported).toBe(true);
+    expect(node('package')?.kind).toBe('function');
+    expect(node('package')?.isExported).toBe(true);
+    expect(node('privateNested')?.isExported).toBe(false);
+    expect(node('licenses')?.isExported).toBe(true);
   });
 });
 
@@ -2957,6 +3134,248 @@ kernel void computeBlur(texture2d<float, access::read> inTexture [[texture(0)]],
       ]) {
         expect(blankMetalAttributes(c)).toBe(c);
       }
+    });
+  });
+
+  describe('C++ in-body reflection-macro annotations do not collapse the class (UE)', () => {
+    // Unreal reflection markup — `UPROPERTY(...)`, `UFUNCTION(...)`,
+    // `GENERATED_BODY()`, `UE_DEPRECATED_*(...)`, `DECLARE_DELEGATE_*(...)` — are
+    // no-semicolon macro CALLS decorating members. tree-sitter doesn't know they
+    // are macros, so each drops into error recovery; in a heavily-reflected class
+    // the errors accumulate until the enclosing class_specifier can't close and
+    // the whole class (its base clause and members) collapses into an ERROR node
+    // and disappears from the graph. blankCppAnnotationMacroCalls strips them,
+    // offset-preserving, so the class parses normally.
+    it('recovers a heavily-reflected class with multiple inheritance + members', () => {
+      const code = `UCLASS(MinimalAPI)
+class UMyMovement : public UPawnMovementComponent, public IRVOAvoidanceInterface, public INetworkPredictionInterface
+{
+\tGENERATED_BODY()
+public:
+\tUE_DEPRECATED_FORGAME(5.0, "Deprecated; note the commas, and (parens) inside the string")
+\tUPROPERTY(Category="Move", EditAnywhere, BlueprintReadWrite, meta=(ClampMin="0", UIMin="0"))
+\tfloat MaxWalkSpeed;
+
+\tUFUNCTION(BlueprintCallable, Category="Move")
+\tfloat ComputeSpeed() const { return MaxWalkSpeed * 2.0f; }
+};
+`;
+      const result = extractFromSource('movement.cpp', code);
+      const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'UMyMovement');
+      expect(cls).toBeTruthy();
+      // The class body parses, so its inline method definition is extracted too —
+      // proof the class_specifier closed instead of collapsing into an ERROR node.
+      expect(result.nodes.some((n) => n.name === 'ComputeSpeed')).toBe(true);
+      // The base clause survives (inheritance queries keep working).
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'UPawnMovementComponent'
+        )
+      ).toBeTruthy();
+    });
+
+    it('strips line-leading no-semicolon ALL-CAPS calls, offset-preserving', () => {
+      const inp = `\tUPROPERTY(EditAnywhere, meta=(ClampMin="0"))\n\tfloat X;\n`;
+      const out = blankCppAnnotationMacroCalls(inp);
+      expect(out.length).toBe(inp.length); // every byte offset preserved
+      expect(out).not.toContain('UPROPERTY');
+      expect(out).toContain('float X;');
+      // A macro whose args carry commas/parens inside a string still balances.
+      const inp2 = `UE_DEPRECATED_FORGAME(5.0, "a, b (c)")\nUPROPERTY(Foo)\nfloat Y;\n`;
+      const out2 = blankCppAnnotationMacroCalls(inp2);
+      expect(out2.length).toBe(inp2.length);
+      expect(out2).not.toContain('UE_DEPRECATED_FORGAME');
+      expect(out2).not.toContain('UPROPERTY');
+      expect(out2).toContain('float Y;');
+    });
+
+    it('does NOT blank expression / condition / statement / init-list macro uses', () => {
+      for (const c of [
+        'void f() {\n\tif (CHECK_FLAG(x)) { g(); }\n}',   // condition — not line-leading
+        'void f() {\n\tLOG_MESSAGE("hi");\n}',             // statement call — trailing ;
+        'C::C()\n\t: MEMBER_A(1)\n\t, MEMBER_B(2)\n{}',    // init-list — comma / not line-leading
+        'C::C() :\n\tMEMBER_A(1),\n\tMEMBER_B(2)\n{}',     // init-list wrapped — trailing , / {
+        'auto y =\n\tMAKE_THING(a) + 1;',                  // line-leading but an expression fragment
+      ]) {
+        expect(blankCppAnnotationMacroCalls(c)).toBe(c);
+      }
+    });
+  });
+
+  describe('C++ member/method-level export macros do not orphan declarations (UE)', () => {
+    // The `*_API` visibility macro doesn't only prefix the class header — it
+    // prefixes almost every exported member/method of a big UE class
+    // (`ENGINE_API virtual void Tick(…)`, `static ENGINE_API void Foo(…)`).
+    // blankCppExportMacros only recovers the class-HEADER form; without blanking
+    // the member form, tree-sitter reads `MACRO <ret> <name>(` as an extra type
+    // token and each declaration drops into error recovery.
+    it('recovers a class + base + members when members are *_API-prefixed', () => {
+      const code = `class ENGINE_API AActor : public UObject
+{
+\tGENERATED_BODY()
+public:
+\tENGINE_API virtual void Tick(float DeltaSeconds);
+\tstatic ENGINE_API void AddReferencedObjects(int32 Count);
+\tENGINE_API float GetLifeSpan() const { return LifeSpan; }
+};
+`;
+      const result = extractFromSource('actor.cpp', code);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'AActor')).toBe(true);
+      // The inline definition (its body prefixed by ENGINE_API) is extracted —
+      // proof the class_specifier closed instead of collapsing into an ERROR.
+      expect(result.nodes.some((n) => n.name === 'GetLifeSpan')).toBe(true);
+      // The base clause survives (inheritance queries keep working).
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'UObject'
+        )
+      ).toBeTruthy();
+    });
+
+    it('blanks only the suffix macro before a declaration, offset-preserving', () => {
+      const inp = `ENGINE_API void Tick();\nstatic MYMOD_EXPORT int32 X;\nLLVM_ABI bool Y();\n`;
+      const out = blankCppApiPrefixMacros(inp);
+      expect(out.length).toBe(inp.length); // every byte offset preserved
+      expect(out).not.toContain('ENGINE_API');
+      expect(out).not.toContain('MYMOD_EXPORT');
+      expect(out).not.toContain('LLVM_ABI');
+      expect(out).toContain('void Tick();');
+      expect(out).toContain('int32 X;');
+      expect(out).toContain('bool Y();');
+      expect(out).toMatch(/static\s+int32 X;/); // `static` kept, only the macro blanked
+    });
+
+    it('does NOT blank an *_API token used as a value or in non-declaration position', () => {
+      for (const c of [
+        'int x = SOME_API;',              // rvalue — trailing ;
+        'if (mode == FOO_API) { g(); }',  // comparison — trailing )
+        'return DEFAULT_API, other;',     // comma operand
+        'auto v = NS_API::Make();',       // qualified name — trailing ::
+        'x = A_API + B_API;',             // operands of + / trailing ;
+      ]) {
+        expect(blankCppApiPrefixMacros(c)).toBe(c);
+      }
+    });
+
+    it('leaves a genuine _API-suffixed word alone when it is itself the name', () => {
+      // A longer word merely CONTAINING _API (not ending in it) must not match.
+      const inp = 'FOO_APIENTRY handler;';
+      expect(blankCppApiPrefixMacros(inp)).toBe(inp);
+    });
+  });
+
+  describe('C++ mid-line UE annotation macros do not collapse the enum/class (UE)', () => {
+    // UMETA / UPARAM / UE_DEPRECATED can sit MID-LINE (not line-leading), where
+    // blankCppAnnotationMacroCalls structurally can't reach them: an enum value's
+    // `UMETA(...)`, or a deprecation tag wedged into a class-scope `using`
+    // (`using X UE_DEPRECATED(5.5, "…") = …;`) — which alone collapsed UWorld in
+    // World.h. blankCppInlineAnnotationMacros strips them, offset-preserving.
+    it('recovers a class whose in-body using-alias carries a mid-line UE_DEPRECATED', () => {
+      const code = `class ENGINE_API UWorld : public UObject
+{
+\tGENERATED_BODY()
+public:
+\tusing FOnNetTickEvent UE_DEPRECATED(5.5, "use TMulticastDelegate<void(float)>") = TMulticastDelegate<void(float)>;
+\tENGINE_API float GetTimeSeconds() const { return TimeSeconds; }
+};
+`;
+      const result = extractFromSource('world.cpp', code);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'UWorld')).toBe(true);
+      // The member after the poison using-alias is reached — the class closed.
+      expect(result.nodes.some((n) => n.name === 'GetTimeSeconds')).toBe(true);
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'UObject'
+        )
+      ).toBeTruthy();
+    });
+
+    it('blanks mid-line UMETA/UPARAM/UE_DEPRECATED with balanced parens, offset-preserving', () => {
+      const inp = `enum class EMode : uint8 {\n\tWalk UMETA(DisplayName="Walk (fast), safe"),\n\tRun\n};\n`;
+      const out = blankCppInlineAnnotationMacros(inp);
+      expect(out.length).toBe(inp.length);
+      expect(out).not.toContain('UMETA');
+      expect(out).toContain('Walk');
+      expect(out).toContain('Run');
+      const inp2 = `void F(UPARAM(ref) int& x) {}\n`;
+      const out2 = blankCppInlineAnnotationMacros(inp2);
+      expect(out2.length).toBe(inp2.length);
+      expect(out2).not.toContain('UPARAM');
+      expect(out2).toContain('int& x');
+    });
+
+    it('does NOT touch source without those UE-only macro names', () => {
+      const c = 'enum class E { A, B };\nvoid metadata(int meta) { return; }\n';
+      expect(blankCppInlineAnnotationMacros(c)).toBe(c);
+    });
+  });
+
+  describe('C++ dense Unreal-Engine header regression (#1160/#1158)', () => {
+    // Regression guard for the three UE blank passes together, on a HEAVILY
+    // reflected class in the shape that broke real engine headers
+    // (`CharacterMovementComponent.h` carries ~240 in-body reflection macros).
+    // On the real headers the accumulated tree-sitter errors collapse the whole
+    // `class_specifier` into an ERROR node and the class itself vanishes; that
+    // full collapse is emergent from real-header content we can't ship here
+    // (Unreal's source is EULA-licensed), so this reproduces the *recoverable*
+    // signal it leaves: with the blank passes reverted, tree-sitter drops every
+    // one of these decorated members and the `UMETA` enum into error recovery,
+    // so the assertions below flip from pass to fail. Verified against the
+    // pre-fix build: `Compute0`, the last member, and `EDenseMode` are all
+    // absent before the fix and present after — reverting any of
+    // blankCppAnnotationMacroCalls / blankCppApiPrefixMacros /
+    // blankCppInlineAnnotationMacros regresses at least one of them.
+    const N = 120; // 120 UPROPERTY + 120 UFUNCTION = ~240 in-body macros
+    function denseReflectedHeader(): string {
+      let members = '';
+      for (let i = 0; i < N; i++) {
+        // line-leading UPROPERTY with nested meta=(...) (blankCppAnnotationMacroCalls)
+        members += `\tUPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Move", meta=(ClampMin="0.0", EditCondition="bOn${i}", AllowedClasses="/Script/Engine.Texture"))\n\tTSubclassOf<AActor> Prop${i};\n`;
+        // line-leading UFUNCTION + member-level ENGINE_API + UPARAM(ref) param
+        // (all three passes) on an inline definition (has a body → is a node)
+        members += `\tUFUNCTION(BlueprintCallable, Category="Move", meta=(DisplayName="Compute ${i}"))\n\tENGINE_API float Compute${i}(UPARAM(ref) float& In) const { return In * ${i}.0f; }\n`;
+      }
+      return `UCLASS(MinimalAPI, Blueprintable)
+class ENGINE_API UDenseMovement : public UPawnMovementComponent, public IRVOAvoidanceInterface, public INetworkPredictionInterface
+{
+\tGENERATED_BODY()
+public:
+\tDECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnMoved, float, Speed, FVector, Loc);
+\tusing FLegacyTick UE_DEPRECATED(5.5, "use TDelegate<void(float)>") = TMulticastDelegate<void(float)>;
+${members}};
+
+UENUM(BlueprintType)
+enum class EDenseMode : uint8
+{
+\tWalking UMETA(DisplayName="Walk (fast), safe"),
+\tFlying  UMETA(DisplayName="Fly"),
+\tCustom  UMETA(Hidden),
+};
+`;
+    }
+
+    it('recovers a ~240-macro reflected class, its base clause, and every decorated member', () => {
+      const result = extractFromSource('DenseMovement.h', denseReflectedHeader());
+      // The class and its whole multiple-inheritance base clause survive.
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'UDenseMovement')).toBe(true);
+      for (const base of ['UPawnMovementComponent', 'IRVOAvoidanceInterface', 'INetworkPredictionInterface']) {
+        expect(
+          result.unresolvedReferences.find((r) => r.referenceKind === 'extends' && r.referenceName === base)
+        ).toBeTruthy();
+      }
+      // The real guard: the decorated inline members parse instead of being lost
+      // to error recovery — the first, a middle, and the LAST (proof the whole
+      // dense body closed, not just the head).
+      expect(result.nodes.some((n) => n.name === 'Compute0')).toBe(true);
+      expect(result.nodes.some((n) => n.name === 'Compute60')).toBe(true);
+      expect(result.nodes.some((n) => n.name === `Compute${N - 1}`)).toBe(true);
+    });
+
+    it('recovers a UENUM whose values carry mid-line UMETA', () => {
+      const result = extractFromSource('DenseMovement.h', denseReflectedHeader());
+      // A mid-line UMETA drops the enum into error recovery pre-fix;
+      // blankCppInlineAnnotationMacros restores it.
+      expect(result.nodes.some((n) => n.kind === 'enum' && n.name === 'EDenseMode')).toBe(true);
     });
   });
 
@@ -10235,6 +10654,288 @@ resource "aws_instance" "x" {
       expect(refs.some((r) => r.startsWith('self.'))).toBe(false);
       expect(refs.some((r) => r.startsWith('path.'))).toBe(false);
       expect(refs.some((r) => r.startsWith('terraform.'))).toBe(false);
+    });
+  });
+});
+
+// =============================================================================
+// ArkTS (HarmonyOS / OpenHarmony declarative UI — `.ets`)
+// =============================================================================
+
+describe('ArkTS Extraction', () => {
+  it('reports ArkTS as supported', () => {
+    expect(isLanguageSupported('arkts')).toBe(true);
+    expect(getSupportedLanguages()).toContain('arkts');
+  });
+
+  describe('@Component struct extraction', () => {
+    const code = `
+import { TodoItem } from '../model/TodoItem';
+
+@Entry
+@Component
+struct Index {
+  @State message: string = 'Hello';
+  @Prop count: number = 0;
+  @StorageLink('theme') theme: string = 'light';
+  private service: TodoService = new TodoService();
+
+  aboutToAppear(): void {
+    this.load();
+  }
+
+  load(): void {
+    this.message = 'loaded';
+  }
+
+  build() {
+    Column() {
+      Text(this.message).fontSize(50)
+    }
+    .height('100%')
+  }
+}
+`;
+
+    it('extracts the struct with its ArkUI decorators', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const comp = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Index');
+      expect(comp).toBeDefined();
+      expect(comp?.language).toBe('arkts');
+      expect(comp?.decorators).toEqual(expect.arrayContaining(['Entry', 'Component']));
+    });
+
+    it('extracts an EXPORTED struct whose decorators sit on the export statement', () => {
+      const result = extractFromSource(
+        'components/Card.ets',
+        `@Component\nexport struct Card {\n  build() {\n    Row() {}\n  }\n}\n`
+      );
+      const card = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Card');
+      expect(card).toBeDefined();
+      expect(card?.isExported).toBe(true);
+      expect(card?.decorators).toContain('Component');
+    });
+
+    it('extracts struct members: build(), lifecycle + regular methods with qualified names', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.find((m) => m.qualifiedName === 'Index::build')).toBeDefined();
+      expect(methods.find((m) => m.qualifiedName === 'Index::aboutToAppear')).toBeDefined();
+      expect(methods.find((m) => m.qualifiedName === 'Index::load')).toBeDefined();
+    });
+
+    it('extracts @State/@Prop/@StorageLink members as properties with their decorators', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const message = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::message');
+      expect(message).toBeDefined();
+      expect(message?.decorators).toContain('State');
+      const count = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::count');
+      expect(count?.decorators).toContain('Prop');
+      // Decorator-with-args: the decorator NAME is captured, not its argument.
+      const theme = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::theme');
+      expect(theme?.decorators).toContain('StorageLink');
+    });
+
+    it('emits intra-struct method call refs (this.load())', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'load'
+      );
+      expect(call).toBeDefined();
+    });
+  });
+
+  describe('build() DSL call surface', () => {
+    const code = `
+@Extend(Text) function titleStyle(size: number) {
+  .fontSize(size)
+}
+
+@Component
+struct Page {
+  count: number = 0;
+
+  handleTap(): void {
+    this.count += 1;
+  }
+
+  @Builder
+  headerBar(title: string) {
+    Row() {
+      Text(title).titleStyle(24)
+      Button('Go').onClick(this.handleTap)
+    }
+  }
+
+  build() {
+    Column({ space: 8 }) {
+      this.headerBar('Home')
+      ChildCard({ label: 'hi' })
+    }
+    .height('100%')
+  }
+}
+`;
+
+    function callRefsFrom(result: ReturnType<typeof extractFromSource>, methodName: string): string[] {
+      const from = result.nodes.find((n) => n.kind === 'method' && n.name === methodName);
+      return result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls' && r.fromNodeId === from?.id)
+        .map((r) => r.referenceName);
+    }
+
+    it('emits a call ref for a custom component instantiation inside build()', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'build')).toContain('ChildCard');
+    });
+
+    it('emits dot-prefixed call refs for chained attributes (@Extend/@Styles-only resolution)', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      // `.titleStyle(24)` chains on the Text component — one node, repeated
+      // property/arguments field pairs, NOT nested call_expressions. The
+      // leading dot routes the ref to the decorator-gated matcher strategy so
+      // framework attributes (`.height` below) can never hit an arbitrary
+      // same-named symbol.
+      expect(callRefsFrom(result, 'headerBar')).toContain('.titleStyle');
+      expect(callRefsFrom(result, 'build')).toContain('.height');
+      expect(callRefsFrom(result, 'build')).not.toContain('height');
+    });
+
+    it('recovers the detached-chain shape (chain on the line after a nested component)', () => {
+      // Inside arkui_children, a chain starting after the closing `}` is
+      // detached by the grammar into sibling leading_dot_expression +
+      // parenthesized_expression statements — the close-button idiom.
+      const detached = `
+@Component
+struct Panel {
+  close(): void {}
+
+  build() {
+    Column() {
+      Row() {
+        Text('x')
+      }
+      .width(10)
+      .onClick(this.close)
+      .id('close_button')
+    }
+  }
+}
+`;
+      const result = extractFromSource('components/Panel.ets', detached);
+      const refs = callRefsFrom(result, 'build');
+      expect(refs).toContain('close');
+      expect(refs).toContain('.width');
+      expect(refs).not.toContain('width');
+    });
+
+    it('dot-prefixes the innermost call of a proper-form detached chain', () => {
+      // `.alignItems(x).layoutWeight(1)` under a leading_dot_expression: the
+      // wrapper consumes the dot, so the innermost call has a bare identifier
+      // function and would otherwise emit as a plain `alignItems(...)` call.
+      const chained = `
+@Component
+struct Card {
+  build() {
+    Column() {
+      List() {
+        Text('x')
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .height('100%')
+    }
+  }
+}
+`;
+      const result = extractFromSource('components/Card.ets', chained);
+      const refs = callRefsFrom(result, 'build');
+      expect(refs).toContain('.alignItems');
+      expect(refs).not.toContain('alignItems');
+      expect(refs).toContain('.layoutWeight');
+      expect(refs).not.toContain('layoutWeight');
+    });
+
+    it('emits a call ref for an .onClick(this.handler) method-reference binding', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'headerBar')).toContain('handleTap');
+    });
+
+    it('emits a call ref for a @Builder method invoked as this.headerBar()', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'build')).toContain('headerBar');
+    });
+
+    it('extracts a global @Extend function with its decorator', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'titleStyle');
+      expect(fn).toBeDefined();
+      expect(fn?.decorators).toContain('Extend');
+    });
+  });
+
+  describe('Global @Builder functions', () => {
+    it('extracts a decorated global @Builder function with signature and decorator', () => {
+      const result = extractFromSource(
+        'common/builders.ets',
+        `@Builder\nfunction EmptyHint(message: string) {\n  Column() {\n    Text(message).fontSize(16)\n  }\n}\n`
+      );
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'EmptyHint');
+      expect(fn).toBeDefined();
+      expect(fn?.signature).toBe('(message: string)');
+      expect(fn?.decorators).toContain('Builder');
+    });
+  });
+
+  describe('Standard TypeScript constructs in .ets', () => {
+    it('extracts classes, interfaces, enums, type aliases and their members', () => {
+      const code = `
+export enum Priority { Low, Medium = 2, High }
+
+export interface Shape {
+  area(): number;
+}
+
+export type Handler = (e: string) => void;
+
+export class Service {
+  private count: number = 0;
+  doWork(x: number): number {
+    return this.helper(x);
+  }
+  helper(n: number): number { return n * 2; }
+}
+`;
+      const result = extractFromSource('common/service.ets', code);
+      expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'Service')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'Priority')).toBeDefined();
+      const members = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.qualifiedName);
+      expect(members).toEqual(expect.arrayContaining(['Priority::Low', 'Priority::Medium', 'Priority::High']));
+      expect(result.nodes.find((n) => n.kind === 'interface' && n.name === 'Shape')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Handler')).toBeDefined();
+      const doWork = result.nodes.find((n) => n.qualifiedName === 'Service::doWork');
+      expect(doWork?.kind).toBe('method');
+      expect(doWork?.signature).toBe('(x: number): number');
+      expect(
+        result.unresolvedReferences.find((r) => r.referenceKind === 'calls' && r.referenceName === 'helper')
+      ).toBeDefined();
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('extracts relative, SDK (@ohos/@kit) and default imports', () => {
+      const code = `
+import router from '@ohos.router';
+import { promptAction } from '@kit.ArkUI';
+import { TodoItem } from '../model/TodoItem';
+import DataStore from '../data/DataStore';
+`;
+      const result = extractFromSource('pages/imports.ets', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('@ohos.router');
+      expect(imports).toContain('@kit.ArkUI');
+      expect(imports).toContain('../model/TodoItem');
+      expect(imports).toContain('../data/DataStore');
     });
   });
 });

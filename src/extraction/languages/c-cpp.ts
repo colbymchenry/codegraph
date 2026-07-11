@@ -434,6 +434,172 @@ export function blankMetalAttributes(source: string): string {
 }
 
 /**
+ * Blank annotation-style macro invocations that decorate a declaration but carry
+ * NO terminating semicolon — the pervasive Unreal-Engine reflection markup
+ * (`UPROPERTY(...)`, `UFUNCTION(...)`, `UCLASS(...)`, `GENERATED_BODY()`,
+ * `UE_DEPRECATED_FORGAME(...)`, `DECLARE_DELEGATE_*(...)`, …) that sits on its
+ * own line right before a member/type. tree-sitter's C++ grammar doesn't know
+ * these are macros, so each one drops into error recovery; in a big reflected
+ * class (`CharacterMovementComponent.h` has ~240 of them) the errors accumulate
+ * until the enclosing `class_specifier` can't close and collapses into an ERROR
+ * node — the whole class definition, its members, and its `extends` edges vanish
+ * from the graph. Neither `blankCppExportMacros` (class-header export macros) nor
+ * `blankCppInlineMacros` (return-type inline specifiers) touches these in-body
+ * markup macros. Replacing each with equal-length spaces preserves every byte
+ * offset (so line/column stay exact) and the class then parses normally.
+ *
+ * Deliberately name-list-FREE — UE alone has hundreds of such macros and projects
+ * add their own — so it keys on structure, not a curated list, matched tightly to
+ * avoid touching legitimate C++:
+ *  - the macro must be the FIRST non-whitespace token on its line (`^[ \t]*`),
+ *    which is where declaration markup lives — so a macro used inside an
+ *    expression or condition (`if (CHECK(x))`, `x = MACRO(a) + b`) is never
+ *    matched (it isn't line-leading);
+ *  - the name must be ALL-CAPS (`[A-Z][A-Z0-9_]{2,}`), since ordinary
+ *    function/type names called at line start are lower/mixed case;
+ *  - the char after the balanced `(...)` must START A DECLARATION — a letter,
+ *    `_`, `~` (destructor), or `#` (a following directive). Declaration markup is
+ *    always followed by the thing it decorates (`UPROPERTY(...)\n float X;`,
+ *    `UE_DEPRECATED(...) UPROPERTY(...)`), whereas a statement call is followed by
+ *    `;` (`FOO(x);`), an init-list item by `,`/`{`, and an expression fragment by
+ *    an operator (`MAKE(a) + 1`) — all rejected. String/char literals inside the
+ *    args are skipped so an embedded `)` can't mis-close the balance.
+ *
+ * C++-only (wired into cppExtractor). A blanked macro inside a block comment is
+ * harmless (comments don't parse), and the rare line-leading no-semicolon
+ * ALL-CAPS call that isn't markup only loses that one annotation, never a whole
+ * class.
+ */
+export function blankCppAnnotationMacroCalls(source: string): string {
+  if (!/^[ \t]*[A-Z][A-Z0-9_]{2,}\s*\(/m.test(source)) return source;
+  const chars = source.split('');
+  const re = /^([ \t]*)([A-Z][A-Z0-9_]{2,})(\s*)\(/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const macroStart = m.index + (m[1] ?? '').length; // skip leading indent
+    let i = m.index + m[0].length - 1; // index of the opening '('
+    let depth = 0;
+    let end = -1;
+    for (; i < source.length; i++) {
+      const c = source[i];
+      if (c === '"' || c === "'") {
+        const quote = c;
+        i++;
+        while (i < source.length && source[i] !== quote) {
+          if (source[i] === '\\') i++;
+          i++;
+        }
+        continue;
+      }
+      if (c === '(') depth++;
+      else if (c === ')') {
+        depth--;
+        if (depth === 0) { end = i + 1; break; }
+      }
+    }
+    if (end < 0) continue;
+    let j = end;
+    while (j < source.length && /\s/.test(source[j] as string)) j++;
+    const after = source[j];
+    // Only markup is followed by the declaration it decorates; a statement call
+    // (`;`), init-list item (`,`/`{`), or expression fragment (operator) is not.
+    if (!after || !/[A-Za-z_~#]/.test(after)) continue;
+    for (let k = macroStart; k < end; k++) {
+      if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
+    }
+    re.lastIndex = end;
+  }
+  return chars.join('');
+}
+
+/**
+ * Blank an export/visibility macro sitting in front of a *member* or *method*
+ * declaration inside a class/namespace (`ENGINE_API virtual void Tick(…)`,
+ * `static ENGINE_API void AddReferencedObjects(…)`, `UE_API FVector GetVel()
+ * const`), before parsing. `blankCppExportMacros` only recovers the macro in a
+ * `class MACRO Name` *header*; the very same macro also prefixes almost every
+ * exported member of a big Unreal-Engine class, and tree-sitter — not knowing
+ * it's a macro — reads `MACRO <return-type> <name>(` as an extra type token and
+ * drops each such declaration into error recovery. In a heavily-exported header
+ * (`Actor.h`, `World.h`, …) hundreds of these accumulate: the return types pile
+ * up as orphan ERROR tokens and, combined with other markup, can still tip the
+ * enclosing class into collapse. Replacing the macro with equal-length spaces
+ * preserves every byte offset (line/column stay exact) and each member parses
+ * as an ordinary declaration.
+ *
+ * Matched tightly so it can't touch the same token used as a value
+ * (`int x = SOME_API;`, `if (mode == FOO_API)`): the token must be ALL-CAPS AND
+ * end in the conventional visibility-macro suffix `_API` / `_EXPORT` / `_ABI`
+ * (Unreal `*_API`, Qt/Boost `*_EXPORT`, LLVM `*_ABI`) — ordinary identifiers
+ * effectively never carry these suffixes — and must be immediately followed by
+ * whitespace then a declaration token (`\s+[A-Za-z_]`: a type, `virtual`,
+ * `static`, or the name). A value use is instead followed by `;`, `)`, `,`,
+ * `=`, `::`, or an operator, all of which fail the look-ahead. C++-only (wired
+ * into cppExtractor).
+ */
+const CPP_API_PREFIX_RE = /\b[A-Z][A-Z0-9_]*(?:_API|_EXPORT|_ABI)\b(?=\s+[A-Za-z_])/g;
+export function blankCppApiPrefixMacros(source: string): string {
+  if (!/_(?:API|EXPORT|ABI)\b/.test(source)) return source;
+  return source.replace(CPP_API_PREFIX_RE, (m) => ' '.repeat(m.length));
+}
+
+/**
+ * Blank an Unreal-Engine annotation macro that appears MID-LINE (not
+ * line-leading, so `blankCppAnnotationMacroCalls` never sees it) inside a
+ * declaration: an enum value's `UMETA(DisplayName="…")`, a parameter's
+ * `UPARAM(ref)`, or a deprecation tag wedged into a `using`/member declaration
+ * (`using FOnNetTick UE_DEPRECATED(5.5, "…") = TMulticastDelegate<void(float)>;`
+ * in `World.h`, which otherwise collapses `UWorld`). tree-sitter can't reconcile
+ * these embedded macro calls and drops into error recovery, and a mid-line one
+ * inside a big enum or a class-scope `using` can cascade into the whole enum /
+ * class being lost. Replacing the entire `MACRO(...)` (balanced parens, string
+ * literals skipped so an embedded `)` can't mis-close) with equal-length spaces
+ * preserves every byte offset and the declaration parses normally.
+ *
+ * Keyed on an explicit UE-only name list (`UMETA`, `UPARAM`, and the
+ * `UE_DEPRECATED*` family) — these identifiers are exclusive to Unreal's
+ * reflection layer and appear in no standard-C++ or other-library code, so
+ * blanking them is zero-risk to non-UE sources. (The line-LEADING forms of
+ * `UE_DEPRECATED(...)` are already handled by `blankCppAnnotationMacroCalls`;
+ * this covers the mid-line forms it structurally can't.) C++-only.
+ */
+const CPP_INLINE_ANNOTATION_RE = /\b(?:UMETA|UPARAM|UE_DEPRECATED\w*)\s*\(/g;
+export function blankCppInlineAnnotationMacros(source: string): string {
+  if (!/\b(?:UMETA|UPARAM|UE_DEPRECATED)/.test(source)) return source;
+  const chars = source.split('');
+  const re = new RegExp(CPP_INLINE_ANNOTATION_RE.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    let i = m.index + m[0].length - 1; // index of the opening '('
+    let depth = 0;
+    let end = -1;
+    for (; i < source.length; i++) {
+      const c = source[i];
+      if (c === '"' || c === "'") {
+        const quote = c;
+        i++;
+        while (i < source.length && source[i] !== quote) {
+          if (source[i] === '\\') i++;
+          i++;
+        }
+        continue;
+      }
+      if (c === '(') depth++;
+      else if (c === ')') {
+        depth--;
+        if (depth === 0) { end = i + 1; break; }
+      }
+    }
+    if (end < 0) continue;
+    for (let k = m.index; k < end; k++) {
+      if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
+    }
+    re.lastIndex = end;
+  }
+  return chars.join('');
+}
+
+/**
  * Blank CUDA-specific constructs before parsing `.cu`/`.cuh` files (parsed with
  * the C++ grammar). Three shapes tree-sitter-cpp can't reconcile, each replaced
  * with equal-length whitespace so every byte offset survives (#387):
@@ -515,13 +681,18 @@ function looksLikeCudaSource(source: string): boolean {
   );
 }
 
-/** C/C++ source pre-processing before tree-sitter: recover both macro-annotated
- * class definitions and macro-prefixed function definitions — plus the non-C++
+/** C/C++ source pre-processing before tree-sitter: recover macro-annotated class
+ * definitions, macro-prefixed function definitions, macro-prefixed members, and
+ * macro-decorated members (Unreal-Engine reflection markup) — plus the non-C++
  * surface of the dialects parsed with the C++ grammar: `.metal` MSL attribute
  * annotations, and CUDA specifiers + launch syntax (by `.cu`/`.cuh` extension
  * or by content, for CUDA living in `.h`/`.hpp` headers). Offset-preserving. */
 function preParseCppSource(source: string, filePath?: string): string {
-  const blanked = blankCppInlineMacros(blankCppExportMacros(source));
+  const blanked = blankCppAnnotationMacroCalls(
+    blankCppInlineAnnotationMacros(
+      blankCppApiPrefixMacros(blankCppInlineMacros(blankCppExportMacros(source)))
+    )
+  );
   const lower = filePath ? filePath.toLowerCase() : '';
   if (lower.endsWith('.metal')) return blankMetalAttributes(blanked);
   if (lower.endsWith('.cu') || lower.endsWith('.cuh') || looksLikeCudaSource(source)) {

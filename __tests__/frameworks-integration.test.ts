@@ -464,6 +464,70 @@ describe('Java end-to-end — field-injected bean trace (issue #389)', () => {
     cg.close();
   });
 
+  it('covers legacy iBatis <sqlMap> statements and keeps same-line vendor-split pairs (#1182)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ibatis-'));
+    const xmlDir = path.join(tmpDir, 'src/main/resources/sqlmaps');
+    fs.mkdirSync(xmlDir, { recursive: true });
+
+    // iBatis 2 sqlMap with an explicit namespace.
+    fs.writeFileSync(
+      path.join(xmlDir, 'Account.xml'),
+      '<?xml version="1.0" encoding="UTF-8"?>\n' +
+        '<!DOCTYPE sqlMap PUBLIC "-//iBATIS.com//DTD SQL Map 2.0//EN" "http://ibatis.apache.org/dtd/sql-map-2.dtd">\n' +
+        "<sqlMap namespace='Account'>\n" +
+        "  <sql id='cols'>id, name, email</sql>\n" +
+        "  <select id='getById' resultClass='Account'>SELECT <include refid='cols'/> FROM account WHERE id = #id#</select>\n" +
+        "  <insert id='insert' parameterClass='Account'>INSERT INTO account (id) VALUES (#id#)</insert>\n" +
+        '  <!-- <select id="disabled">SELECT 0</select> -->\n' +
+        '</sqlMap>\n'
+    );
+    // Namespace-less sqlMap whose ids carry the qualifier as `Map.statement`.
+    fs.writeFileSync(
+      path.join(xmlDir, 'LegacyDao.xml'),
+      '<sqlMap>\n' +
+        '  <select id="LegacyDao.findAll" resultClass="Row">SELECT * FROM t</select>\n' +
+        '</sqlMap>\n'
+    );
+    // MyBatis mapper with a vendor-split databaseId pair written on ONE line —
+    // same qualifiedName + same start line. Before the id-hash fold both nodes
+    // hashed identically and INSERT OR REPLACE dropped one.
+    fs.writeFileSync(
+      path.join(xmlDir, 'VendorMapper.xml'),
+      '<mapper namespace="com.example.VendorMapper">\n' +
+        '<select id="findUser" databaseId="oracle">SELECT 1 FROM dual</select><select id="findUser" databaseId="mysql">SELECT 1</select>\n' +
+        '</mapper>\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const xmlMethods = cg.getNodesByKind('method').filter((n) => n.language === 'xml');
+    const qnames = xmlMethods.map((n) => n.qualifiedName);
+
+    // iBatis statements now land in the graph (was zero coverage before #1182).
+    expect(qnames).toContain('Account::getById');
+    expect(qnames).toContain('Account::insert');
+    expect(qnames).toContain('Account::cols');
+    expect(qnames).toContain('LegacyDao::findAll');
+    // The commented-out statement produced no node.
+    expect(qnames).not.toContain('Account::disabled');
+
+    // <include refid='cols'/> resolves to the <sql> fragment in the same map.
+    const getById = xmlMethods.find((n) => n.qualifiedName === 'Account::getById');
+    const cols = xmlMethods.find((n) => n.qualifiedName === 'Account::cols');
+    expect(getById).toBeDefined();
+    expect(cols).toBeDefined();
+    const incEdge = cg.getOutgoingEdges(getById!.id).find((e) => e.target === cols!.id);
+    expect(incEdge, "iBatis <include refid='cols'/> should reach the <sql> fragment").toBeDefined();
+
+    // Both vendor-split statements survive the DB write (the collision fix).
+    const findUser = xmlMethods.filter((n) => n.name === 'findUser');
+    expect(findUser, 'both databaseId variants of findUser should survive').toHaveLength(2);
+    expect(new Set(findUser.map((n) => n.id)).size).toBe(2);
+
+    cg.close();
+  });
+
   it('binds @Value / @ConfigurationProperties to YAML + .properties keys (incl. relaxed binding)', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-spring-config-'));
     const javaDir = path.join(tmpDir, 'src/main/java/com/example');
@@ -556,6 +620,64 @@ describe('Java end-to-end — field-injected bean trace (issue #389)', () => {
     expect(cpAppCache).toBeDefined();
     const cpEdges = cg.getOutgoingEdges(cpAppCache!.id);
     expect(cpEdges.length).toBeGreaterThan(0);
+
+    cg.close();
+  });
+
+  it('binds a config key only for `references` refs, never a same-named method call (#1180)', async () => {
+    // `service.process` is BOTH a yaml key and a `service.process()` method call.
+    // canonicalConfigKey collapses them to the same token, so before #1180 the
+    // method call (kind `calls`) fell into the Spring config-key branch and
+    // mis-resolved to the YAML constant at 0.9 confidence — a wrong edge, and the
+    // uncached constant scan that made large Java/Kotlin indexes take ~1h. The
+    // branch is now gated to `references` (only @Value/@ConfigurationProperties).
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-spring-kindgate-'));
+    const javaDir = path.join(tmpDir, 'src/main/java/com/example');
+    const resDir = path.join(tmpDir, 'src/main/resources');
+    fs.mkdirSync(javaDir, { recursive: true });
+    fs.mkdirSync(resDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'pom.xml'),
+      '<project><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter</artifactId></dependency></dependencies></project>\n'
+    );
+    fs.writeFileSync(path.join(resDir, 'application.yml'), 'service:\n  process: "enabled"\n');
+    fs.writeFileSync(
+      path.join(javaDir, 'Worker.java'),
+      'package com.example;\n' +
+        'import org.springframework.beans.factory.annotation.Value;\n' +
+        'class Processor { void process() {} }\n' +
+        'public class Worker {\n' +
+        '  private Processor service;\n' +
+        '  @Value("${service.process}") private String sp;\n' +
+        '  void run() { service.process(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const yamlKey = cg
+      .getNodesByKind('constant')
+      .find((n) => n.language === 'yaml' && n.qualifiedName === 'service.process');
+    expect(yamlKey, 'yaml key service.process should be indexed').toBeDefined();
+
+    // `references` ref (@Value) DOES bind to the config key.
+    const valueBind = cg
+      .getNodesByKind('constant')
+      .find((n) => n.id.startsWith('spring-value:') && n.name === 'service.process');
+    expect(valueBind).toBeDefined();
+    expect(
+      cg.getOutgoingEdges(valueBind!.id).some((e) => e.target === yamlKey!.id),
+      '@Value should still bind to the yaml key',
+    ).toBe(true);
+
+    // `calls` ref (service.process()) must NOT bind to the config key.
+    const run = cg.getNodesByKind('method').find((n) => n.name === 'run');
+    expect(run).toBeDefined();
+    expect(
+      cg.getOutgoingEdges(run!.id).some((e) => e.target === yamlKey!.id),
+      'a method call must never resolve to a config-key constant',
+    ).toBe(false);
 
     cg.close();
   });
