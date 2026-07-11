@@ -86,6 +86,27 @@ const ERLANG_MFA_CALLS = new Set([
 ]);
 
 /**
+ * Elixir declaration macros — intercepted by the elixir visitNode hook, so they
+ * should never reach extractCall as a bare local call. Used only as a defensive
+ * guard against a shape the hook might not have consumed.
+ */
+const ELIXIR_DECL_MACROS = new Set([
+  'defmodule', 'defprotocol', 'defimpl', 'def', 'defp', 'defmacro', 'defmacrop',
+  'defguard', 'defguardp', 'defdelegate', 'defstruct', 'defexception',
+  'use', 'import', 'require', 'alias',
+]);
+
+/**
+ * Elixir special forms that parse as a bare `call` but are never a
+ * user-defined function — emitting a `calls` ref for them is pure noise (they
+ * resolve to nothing, and the identifiers are reserved so they can't collide
+ * with a real function either).
+ */
+const ELIXIR_SPECIAL_FORMS = new Set([
+  'quote', 'unquote', 'unquote_splicing', 'super', 'receive',
+]);
+
+/**
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
@@ -3694,6 +3715,99 @@ export class TreeSitterExtractor {
   private erlangSelfMacros = new Set<string>();
   private erlangAtomMacros = new Map<string, string>();
 
+  // Elixir per-module alias table (`alias Foo.Bar` → Bar ⇒ Foo.Bar), memoized
+  // by the enclosing module node so `Bar.fun(x)` expands to `Foo.Bar::fun`.
+  // Single-entry: extraction is sequential and a module's calls are contiguous.
+  private elixirAliasModuleKey = '';
+  private elixirAliasMap = new Map<string, string>();
+
+  /**
+   * Expand an Elixir module reference (`Bar`, `Bar.Deep`, `Foo.Sub.Mod`) to its
+   * full dotted name using the enclosing module's `alias` declarations. Only the
+   * FIRST segment is an alias key; the rest is appended verbatim. A reference
+   * whose head isn't aliased is already fully qualified and returned as-is.
+   */
+  private resolveElixirModule(callNode: SyntaxNode, modText: string): string {
+    // Find the enclosing module (defmodule/defprotocol/defimpl) call.
+    let module: SyntaxNode | null = callNode.parent;
+    while (module) {
+      if (module.type === 'call') {
+        const t = getChildByField(module, 'target');
+        if (t?.type === 'identifier') {
+          const name = getNodeText(t, this.source);
+          if (name === 'defmodule' || name === 'defprotocol' || name === 'defimpl') break;
+        }
+      }
+      module = module.parent;
+    }
+    const key = module ? `${this.filePath}:${module.startIndex}` : this.filePath;
+    if (this.elixirAliasModuleKey !== key) {
+      this.elixirAliasModuleKey = key;
+      this.elixirAliasMap = new Map<string, string>();
+      const doBlock = module
+        ? module.namedChildren.find((c) => c.type === 'do_block')
+        : null;
+      if (doBlock) {
+        for (const stmt of doBlock.namedChildren) {
+          if (stmt.type !== 'call') continue;
+          const t = getChildByField(stmt, 'target');
+          if (t?.type !== 'identifier' || getNodeText(t, this.source) !== 'alias') continue;
+          // `arguments` is a child node TYPE in tree-sitter-elixir, not a field.
+          const args = stmt.namedChildren.find((c) => c.type === 'arguments');
+          if (!args) continue;
+          const aliasNode = args.namedChildren.find((c) => c.type === 'alias');
+          const asValue = this.elixirKeywordValue(args, 'as');
+          if (aliasNode) {
+            const full = getNodeText(aliasNode, this.source);
+            if (asValue?.type === 'alias') {
+              this.elixirAliasMap.set(getNodeText(asValue, this.source), full);
+            } else {
+              const last = full.split('.').pop()!;
+              this.elixirAliasMap.set(last, full);
+            }
+          }
+          // grouped: alias Foo.{Alpha, Beta}
+          const dot = args.namedChildren.find((c) => c.type === 'dot');
+          if (dot) {
+            const left = getChildByField(dot, 'left');
+            const right = getChildByField(dot, 'right');
+            const prefix = left?.type === 'alias' ? getNodeText(left, this.source) : '';
+            if (right?.type === 'tuple' && prefix) {
+              for (const member of right.namedChildren) {
+                if (member.type === 'alias') {
+                  const seg = getNodeText(member, this.source);
+                  this.elixirAliasMap.set(seg, `${prefix}.${seg}`);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    const segments = modText.split('.');
+    const head = segments[0]!;
+    const mapped = this.elixirAliasMap.get(head);
+    if (mapped) {
+      return segments.length > 1 ? `${mapped}.${segments.slice(1).join('.')}` : mapped;
+    }
+    return modText;
+  }
+
+  /** Look up a keyword value inside an Elixir `arguments` node (`as:` → value). */
+  private elixirKeywordValue(argsNode: SyntaxNode, key: string): SyntaxNode | null {
+    for (const child of argsNode.namedChildren) {
+      if (child.type !== 'keywords') continue;
+      for (const pair of child.namedChildren) {
+        if (pair.type !== 'pair') continue;
+        const k = getChildByField(pair, 'key');
+        if (k && getNodeText(k, this.source).trim().replace(/:$/, '') === key) {
+          return getChildByField(pair, 'value');
+        }
+      }
+    }
+    return null;
+  }
+
   private resolveErlangGenServerTarget(target: SyntaxNode): string | null {
     const ownModule = (this.filePath.split('/').pop() ?? '').replace(/\.erl$/, '');
     if (target.type === 'atom') {
@@ -3974,6 +4088,130 @@ export class TreeSitterExtractor {
           line,
           column,
         });
+      }
+      return;
+    }
+
+    // Elixir: every construct is a `call`, but the DECLARATION macros
+    // (defmodule/def/use/…) are intercepted by the elixir visitNode hook and
+    // never reach here — so a `call` that arrives is a real invocation. Shapes:
+    //   - remote `Mod.Sub.fun(x)` → call(target: dot{left: alias, right: id}).
+    //     Emitted as `Full.Module::fun` (alias-expanded), byte-identical to the
+    //     qualifiedName the module's functions carry, so it resolves via
+    //     matchByQualifiedName — the erlang design. A dot whose `left` is an
+    //     identifier is `__MODULE__.fun` (same-file bare name) or a variable
+    //     receiver (`mod.fun` / `apply/3`) which has no static target → silence.
+    //   - local `fun(x)` → call(target: identifier) → bare name (same-file pref).
+    //   - `&Mod.fun/2` / `&local/1` capture → unary_operator → `references`.
+    //   - `%Foo.Bar{…}` struct literal → map > struct > alias → `references`.
+    if (this.language === 'elixir') {
+      const line = node.startPosition.row + 1;
+      const column = node.startPosition.column;
+      if (node.type === 'call') {
+        // Skip a call that is the function part of an `&Mod.fun/arity` capture
+        // (`unary_operator & → binary_operator / → left: call`): the capture is a
+        // `references` edge emitted by the unary_operator branch, not a `calls`.
+        const cap = node.parent;
+        if (
+          cap?.type === 'binary_operator' &&
+          cap.parent?.type === 'unary_operator' &&
+          getNodeText(cap.parent, this.source).startsWith('&')
+        ) {
+          return;
+        }
+        const target = getChildByField(node, 'target');
+        if (!target) return;
+        if (target.type === 'dot') {
+          const left = getChildByField(target, 'left');
+          const right = getChildByField(target, 'right');
+          if (right?.type !== 'identifier') return;
+          const fn = getNodeText(right, this.source);
+          if (left?.type === 'alias') {
+            const fullMod = this.resolveElixirModule(node, getNodeText(left, this.source));
+            this.unresolvedReferences.push({
+              fromNodeId: callerId,
+              referenceName: `${fullMod}::${fn}`,
+              referenceKind: 'calls',
+              line,
+              column,
+            });
+          } else if (left?.type === 'identifier' && getNodeText(left, this.source) === '__MODULE__') {
+            // `__MODULE__.fun(...)` targets THIS module — bare name, same-file
+            // preference resolves it (like `?MODULE:fn` in erlang).
+            this.unresolvedReferences.push({
+              fromNodeId: callerId,
+              referenceName: fn,
+              referenceKind: 'calls',
+              line,
+              column,
+            });
+          }
+          // else: variable receiver (`mod.fun`, `apply/3`) → no static target.
+          return;
+        }
+        if (target.type === 'identifier') {
+          // Bare local call `fun(x)`. Declaration macros are consumed by the
+          // hook, but guard defensively in case one slips through.
+          const name = getNodeText(target, this.source);
+          if (ELIXIR_DECL_MACROS.has(name) || ELIXIR_SPECIAL_FORMS.has(name)) return;
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: name,
+            referenceKind: 'calls',
+            line,
+            column,
+          });
+        }
+        return;
+      }
+      if (node.type === 'unary_operator') {
+        // `&Mod.fun/arity` / `&local/arity` capture. operand is `/`
+        // binary_operator; `&1`-style arg captures (operand: integer) are NOT.
+        const operand = getChildByField(node, 'operand');
+        if (operand?.type !== 'binary_operator') return;
+        const capLeft = getChildByField(operand, 'left');
+        if (capLeft?.type === 'call') {
+          const t = getChildByField(capLeft, 'target');
+          if (t?.type === 'dot') {
+            const l = getChildByField(t, 'left');
+            const r = getChildByField(t, 'right');
+            if (l?.type === 'alias' && r?.type === 'identifier') {
+              const fullMod = this.resolveElixirModule(node, getNodeText(l, this.source));
+              this.unresolvedReferences.push({
+                fromNodeId: callerId,
+                referenceName: `${fullMod}::${getNodeText(r, this.source)}`,
+                referenceKind: 'references',
+                line,
+                column,
+              });
+            }
+          }
+        } else if (capLeft?.type === 'identifier') {
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: getNodeText(capLeft, this.source),
+            referenceKind: 'references',
+            line,
+            column,
+          });
+        }
+        return;
+      }
+      if (node.type === 'map') {
+        // `%Foo.Bar{…}` struct literal: map > struct > alias.
+        const structChild = node.namedChildren.find((c) => c.type === 'struct');
+        const aliasNode = structChild?.namedChildren.find((c) => c.type === 'alias');
+        if (aliasNode) {
+          const fullMod = this.resolveElixirModule(node, getNodeText(aliasNode, this.source));
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: fullMod,
+            referenceKind: 'references',
+            line,
+            column,
+          });
+        }
+        return;
       }
       return;
     }

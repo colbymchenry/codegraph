@@ -2531,13 +2531,53 @@ export function matchReference(
   // ref an `.app`/`.app.src` resource file emits — its `{mod, …}` callback and
   // `{applications, …}` dependency names can only mean modules, and on emqx
   // the `ssl` OTP app otherwise resolved to a test helper FUNCTION named ssl.
+  // Elixir bare (unqualified, lowercase-initial) call/reference names — local
+  // calls, `__MODULE__.fun`, `&local/arity` captures. In Elixir a bare call can
+  // only legitimately target the same module — which lives in the same file —
+  // or an `import`ed function (deliberately unexpanded in v1: a wrong edge is
+  // worse than none). Letting these fall through to bare-name matching grabbed
+  // arbitrary same-named functions across the repo: on a Phoenix app, every
+  // Mix `config :app, …` DSL call resolved to some module's `config/0`, and
+  // every ConnTest `get(conn, path)` to an unrelated HTTP client's `get`.
+  // Resolve same-file only; no same-file match → stay unresolved. Function
+  // names in Elixir always start with a lowercase letter or underscore, so
+  // module references (`Foo`, `Foo.Bar` — capitalized) are unaffected.
   if (
-    ref.language === 'erlang' &&
-    (ref.referenceKind === 'implements' || /\.app(?:\.src)?$/i.test(ref.filePath))
+    ref.language === 'elixir' &&
+    (ref.referenceKind === 'calls' || ref.referenceKind === 'references') &&
+    !ref.referenceName.includes('::') &&
+    /^[a-z_]/.test(ref.referenceName)
+  ) {
+    const sameFile = context
+      .getNodesByName(ref.referenceName)
+      .filter(
+        (n) =>
+          n.language === 'elixir' &&
+          n.kind === 'function' &&
+          n.filePath === ref.filePath
+      );
+    const chosen = sameFile[0];
+    if (!chosen) return null;
+    return {
+      original: ref,
+      targetNodeId: chosen.id,
+      confidence: 0.9,
+      resolvedBy: 'exact-match',
+    };
+  }
+
+  // Elixir `@behaviour Mod` / `use Mod` implements refs also target a MODULE
+  // (namespace). Same rationale as erlang: bare-name matching would grab any
+  // same-named symbol, and an out-of-repo behaviour (GenServer, …) must stay
+  // unresolved rather than guessed.
+  if (
+    (ref.language === 'erlang' &&
+      (ref.referenceKind === 'implements' || /\.app(?:\.src)?$/i.test(ref.filePath))) ||
+    (ref.language === 'elixir' && ref.referenceKind === 'implements')
   ) {
     const modules = context
       .getNodesByName(ref.referenceName)
-      .filter((n) => n.language === 'erlang' && n.kind === 'namespace');
+      .filter((n) => n.language === ref.language && n.kind === 'namespace');
     const chosen = preferCallSiteFile(modules, ref.filePath)[0];
     if (!chosen) return null;
     return {

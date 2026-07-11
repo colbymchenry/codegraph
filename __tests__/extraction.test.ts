@@ -10939,6 +10939,287 @@ init(_) -> {ok, #{}}.
   });
 });
 
+// =============================================================================
+// Elixir (prebuilt elixir-lang/tree-sitter-elixir grammar from tree-sitter-wasms)
+// Every construct is a `call`/`@`-attribute macro, driven from the visitNode
+// hook; remote calls emit `Module::fun` to ride the qualified-name matcher.
+// =============================================================================
+
+describe('Elixir Extraction', () => {
+  const calls = (r: ReturnType<typeof extractFromSource>): string[] =>
+    r.unresolvedReferences.filter((u) => u.referenceKind === 'calls').map((u) => u.referenceName);
+  const refsOf = (r: ReturnType<typeof extractFromSource>, kind: string): string[] =>
+    r.unresolvedReferences.filter((u) => u.referenceKind === kind).map((u) => u.referenceName);
+
+  describe('Language detection', () => {
+    it('should detect Elixir files', () => {
+      expect(detectLanguage('lib/foo.ex')).toBe('elixir');
+      expect(detectLanguage('test/foo_test.exs')).toBe('elixir');
+      expect(detectLanguage('mix.exs')).toBe('elixir');
+      expect(isLanguageSupported('elixir')).toBe(true);
+      expect(getSupportedLanguages()).toContain('elixir');
+      expect(isSourceFile('lib/app/worker.ex')).toBe(true);
+    });
+  });
+
+  describe('Module and function extraction', () => {
+    it('should extract a module as a namespace and qualify its functions', () => {
+      const code = `defmodule Foo.Bar do
+  def greet(name), do: "hi " <> name
+  defp helper(x), do: x + 1
+end
+`;
+      const result = extractFromSource('lib/foo_bar.ex', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace');
+      expect(ns?.name).toBe('Foo.Bar');
+      const greet = result.nodes.find((n) => n.kind === 'function' && n.name === 'greet');
+      expect(greet?.qualifiedName).toBe('Foo.Bar::greet');
+      expect(greet?.language).toBe('elixir');
+      expect(greet?.visibility).toBe('public');
+      expect(greet?.isExported).toBe(true);
+      const helper = result.nodes.find((n) => n.kind === 'function' && n.name === 'helper');
+      expect(helper?.visibility).toBe('private');
+      expect(helper?.isExported).toBe(false);
+    });
+
+    it('should merge multi-clause functions (incl. default args) into one node', () => {
+      const code = `defmodule M do
+  def greet(nil), do: "hello"
+  def greet(name) when is_binary(name) do
+    "hello " <> name
+  end
+  def greet(name, greeting \\\\ "hi") do
+    greeting <> " " <> name
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const greets = result.nodes.filter((n) => n.kind === 'function' && n.name === 'greet');
+      expect(greets).toHaveLength(1);
+      expect(greets[0]!.startLine).toBe(2);
+      expect(greets[0]!.endLine).toBe(8);
+    });
+
+    it('should not merge same-named functions across different modules', () => {
+      const code = `defmodule A do
+  def run(x), do: x
+end
+defmodule B do
+  def run(x), do: x
+end
+`;
+      const result = extractFromSource('lib/ab.ex', code);
+      const runs = result.nodes.filter((n) => n.kind === 'function' && n.name === 'run');
+      expect(runs).toHaveLength(2);
+      expect(runs.map((n) => n.qualifiedName).sort()).toEqual(['A::run', 'B::run']);
+    });
+
+    it('should use @spec as signature and @doc as docstring', () => {
+      const code = `defmodule M do
+  @doc "Greets a person."
+  @spec greet(String.t()) :: String.t()
+  def greet(name), do: name
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const greet = result.nodes.find((n) => n.name === 'greet');
+      expect(greet?.signature).toBe('@spec greet(String.t()) :: String.t()');
+      expect(greet?.docstring).toBe('Greets a person.');
+      // @spec type expressions parse as calls — they must not leak call refs.
+      expect(calls(result)).not.toContain('String.t');
+      expect(calls(result)).not.toContain('greet');
+    });
+
+    it('should treat defmacro/defguard as functions and capture @moduledoc', () => {
+      const code = `defmodule M do
+  @moduledoc "A module."
+  defmacro mac(x), do: x
+  defguard is_even(n) when rem(n, 2) == 0
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace');
+      expect(ns?.docstring).toBe('A module.');
+      expect(result.nodes.find((n) => n.name === 'mac')?.kind).toBe('function');
+      expect(result.nodes.find((n) => n.name === 'is_even')?.kind).toBe('function');
+    });
+
+    it('should qualify nested modules with the full dotted name', () => {
+      const code = `defmodule Foo.Bar do
+  defmodule Nested do
+    def inner(y), do: y * 2
+  end
+end
+`;
+      const result = extractFromSource('lib/foo_bar.ex', code);
+      const nested = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'Foo.Bar.Nested');
+      expect(nested).toBeDefined();
+      const inner = result.nodes.find((n) => n.name === 'inner');
+      expect(inner?.qualifiedName).toBe('Foo.Bar.Nested::inner');
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should emit remote calls as Module::fun, resolving aliases', () => {
+      const code = `defmodule M do
+  alias Foo.Baz
+  alias Foo.Qux, as: Q
+  alias Foo.{Alpha, Beta}
+
+  def run(x) do
+    Foo.Sub.Mod.compute(x)
+    Baz.process(x)
+    Q.handle(x)
+    Alpha.a(x)
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const c = calls(result);
+      expect(c).toContain('Foo.Sub.Mod::compute');
+      expect(c).toContain('Foo.Baz::process');
+      expect(c).toContain('Foo.Qux::handle');
+      expect(c).toContain('Foo.Alpha::a');
+    });
+
+    it('should emit bare local calls and treat __MODULE__.fun as same-module', () => {
+      const code = `defmodule M do
+  def run(x) do
+    helper(x)
+    __MODULE__.greet("self")
+  end
+  def helper(x), do: x
+  def greet(s), do: s
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const c = calls(result);
+      expect(c).toContain('helper');
+      expect(c).toContain('greet'); // __MODULE__.greet → bare name
+      expect(c).not.toContain('__MODULE__::greet');
+    });
+
+    it('should link a piped remote call and record captures as references', () => {
+      const code = `defmodule M do
+  def run do
+    [1, 2, 3]
+    |> Enum.map(&private_helper/1)
+    |> MyMod.transform()
+  end
+  defp private_helper(x), do: x
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const c = calls(result);
+      expect(c).toContain('Enum::map');
+      expect(c).toContain('MyMod::transform');
+      expect(refsOf(result, 'references')).toContain('private_helper');
+    });
+
+    it('should record a remote capture once, as a reference (no duplicate call edge)', () => {
+      const code = `defmodule M do
+  alias Foo.Baz
+  def run do
+    &Baz.process/2
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      expect(refsOf(result, 'references')).toContain('Foo.Baz::process');
+      expect(calls(result)).not.toContain('Foo.Baz::process');
+    });
+
+    it('should stay silent on dynamic dispatch (variable receiver, apply, gen_server pid)', () => {
+      const code = `defmodule M do
+  alias Foo.Baz
+  def run(x) do
+    GenServer.call(x, :msg)
+    apply(Baz, :process, [x])
+    mod = Baz
+    mod.process(x)
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const c = calls(result);
+      // A variable receiver has no static target — no edge to process at all.
+      expect(c).not.toContain('Foo.Baz::process');
+      expect(c).not.toContain('process');
+      // GenServer.call routes to a pid, not a local module handler.
+      expect(c.filter((n) => n.endsWith('::process'))).toHaveLength(0);
+    });
+  });
+
+  describe('Structural edges', () => {
+    it('should model @behaviour and use as implements, and alias/import/require as imports', () => {
+      const code = `defmodule M do
+  @behaviour GenServer
+  use GenServer
+  import Enum, only: [map: 2]
+  alias Foo.Baz
+  require Logger
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const impls = refsOf(result, 'implements');
+      expect(impls.filter((n) => n === 'GenServer')).toHaveLength(2); // @behaviour + use
+      const imports = refsOf(result, 'imports');
+      expect(imports).toContain('Enum');
+      expect(imports).toContain('Foo.Baz');
+      expect(imports).toContain('Logger');
+    });
+
+    it('should extract defstruct fields on the module and %Struct{} as a reference', () => {
+      const code = `defmodule Foo.Bar do
+  defstruct name: nil, count: 0
+  def make, do: %Foo.Bar{name: "n", count: 1}
+end
+`;
+      const result = extractFromSource('lib/foo_bar.ex', code);
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fields).toContain('name');
+      expect(fields).toContain('count');
+      expect(refsOf(result, 'references')).toContain('Foo.Bar');
+    });
+  });
+
+  describe('Protocols', () => {
+    it('should extract defprotocol and defimpl as namespaces with implements', () => {
+      const code = `defprotocol Sizeable do
+  @doc "Returns size."
+  def size(data)
+end
+
+defimpl Sizeable, for: List do
+  def size(data), do: length(data)
+end
+`;
+      const result = extractFromSource('lib/sizeable.ex', code);
+      const proto = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'Sizeable');
+      expect(proto).toBeDefined();
+      const impl = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'Sizeable.List');
+      expect(impl).toBeDefined();
+      expect(refsOf(result, 'implements')).toContain('Sizeable');
+      const implSize = result.nodes.find((n) => n.qualifiedName === 'Sizeable.List::size');
+      expect(implSize).toBeDefined();
+      // one-liner do: body still contributes calls
+      expect(calls(result)).toContain('length');
+    });
+  });
+
+  describe('Scripts', () => {
+    it('should index .exs script modules', () => {
+      const code = `defmodule Mix.Tasks.Hello do
+  def run(_), do: IO.puts("hi")
+end
+`;
+      const result = extractFromSource('mix.exs', code);
+      expect(result.nodes.find((n) => n.kind === 'namespace')?.name).toBe('Mix.Tasks.Hello');
+      expect(calls(result)).toContain('IO::puts');
+    });
+  });
+});
+
 describe('Terraform Extraction', () => {
   describe('Language detection', () => {
     it('should detect Terraform files', () => {
