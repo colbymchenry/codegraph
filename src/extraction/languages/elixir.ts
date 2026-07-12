@@ -31,6 +31,47 @@ import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 
 const PUBLIC_DEFS = new Set(['def', 'defmacro', 'defguard', 'defdelegate']);
 const PRIVATE_DEFS = new Set(['defp', 'defmacrop', 'defguardp']);
+
+/**
+ * Reserved/built-in module attributes whose VALUES are type positions, docs, or
+ * compiler metadata — NOT runtime code. Their subtree is consumed (not walked)
+ * because a type expression like `String.t()` in `@spec` parses as a `call` and
+ * would otherwise mint a bogus `calls` edge (D3). List sourced from the official
+ * Module docs (https://hexdocs.pm/elixir/Module.html, verified 2026-07-12) plus
+ * the American spelling `behavior` and the Mix `@shortdoc` convention.
+ * Every attribute OUTSIDE this set is a custom attribute: its value is real
+ * compile-time code, so we descend into it to emit normal `calls` edges.
+ */
+const META_ATTRIBUTES = new Set([
+  'spec',
+  'doc',
+  'moduledoc',
+  'typedoc',
+  'shortdoc',
+  'behaviour',
+  'behavior',
+  'type',
+  'typep',
+  'opaque',
+  'callback',
+  'macrocallback',
+  'optional_callbacks',
+  'impl',
+  'derive',
+  'enforce_keys',
+  'deprecated',
+  'dialyzer',
+  'external_resource',
+  'compile',
+  'before_compile',
+  'after_compile',
+  'after_verify',
+  'on_definition',
+  'on_load',
+  'nifs',
+  'vsn',
+  'file',
+]);
 /** Every macro that introduces a named function. */
 const DEF_MACROS = new Set([...PUBLIC_DEFS, ...PRIVATE_DEFS]);
 
@@ -436,10 +477,15 @@ function handleModuleDirective(node: SyntaxNode, ctx: ExtractorContext, macro: s
   return true;
 }
 
-/** `@behaviour Mod` → implements ref; every other `@attr` is consumed silently. */
+/**
+ * `@behaviour Mod` → implements ref; other META attributes (@spec/@doc/…) are
+ * consumed silently; CUSTOM attributes have their VALUE walked so a compile-time
+ * call in the value (`@id Product.get_product_name(:x)`) emits a normal `calls`
+ * edge attributed to the enclosing module (the current scope).
+ */
 function handleAttribute(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const call = attributeCall(node);
-  if (!call) return true; // `@x 5` custom attribute — consume, don't descend
+  if (!call) return true; // no inner call (e.g. bare `@x`) — nothing to walk
   const name = attributeName(call, ctx.source);
   if (name === 'behaviour' || name === 'behavior') {
     const parentId = ctx.nodeStack[ctx.nodeStack.length - 1];
@@ -453,10 +499,24 @@ function handleAttribute(node: SyntaxNode, ctx: ExtractorContext): boolean {
         column: node.startPosition.column,
       });
     }
+    return true;
   }
-  // @doc/@spec are consumed here (picked up by precedingAttrs on the next def);
-  // @moduledoc by moduledocOf. Consuming prevents type-position exprs in @spec
-  // (`String.t()` parses as a call) from minting bogus call refs (D3).
+  if (META_ATTRIBUTES.has(name)) {
+    // @doc/@spec are consumed here (picked up by precedingAttrs on the next def);
+    // @moduledoc by moduledocOf. Consuming prevents type-position exprs in @spec
+    // (`String.t()` parses as a call) from minting bogus call refs (D3).
+    return true;
+  }
+  // Custom attribute: its value is real compile-time code. Walk the value
+  // subtree (the inner call's arguments) — NOT the inner call's target, which is
+  // just the attribute NAME (`x` in `@x value`) and must never become a `calls`
+  // edge. Descending lets `Mod.fun(...)` in the value resolve normally; the
+  // enclosing module namespace is the current scope, so the edge originates
+  // there (attributes live at module level, not inside any function).
+  const args = argsOf(call);
+  if (args) {
+    for (const child of args.namedChildren) ctx.visitNode(child);
+  }
   return true;
 }
 
