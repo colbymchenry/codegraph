@@ -94,6 +94,56 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
   return extractor.recoverMangledName ? extractor.recoverMangledName(name) : name;
 }
 
+/**
+ * Recover the callee name for a C/C++ explicit operator-overload call —
+ * `a.operator+(b)`, `a.operator[](i)`, `a.operator==(b)`, … — from the ERROR
+ * node tree-sitter-cpp wraps the `.operator<sym>` member access in (see the
+ * guard in `extractCall`). Returns `operator+` for an unresolvable receiver
+ * (a simple-identifier-unique name still resolves via matchByExactName), or
+ * `recv.operator+` when the receiver is a plain identifier so the resolver can
+ * route it to the right class via receiver-type inference. Returns undefined
+ * when the call_expression carries no `operator_name`, so every other call shape
+ * falls through to the generic path unchanged.
+ *
+ * Safe by construction: it only acts when an `operator_name` actually exists in
+ * a child (ERROR or otherwise), and only ever emits `operator`-prefixed names —
+ * a name no ordinary call site produces — so it can't collide with real refs.
+ */
+function readCppOperatorCallCallee(node: SyntaxNode, source: string): string | undefined {
+  let operatorName: string | undefined;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    // The `operator_name` is nested under an ERROR node tree-sitter-cpp emits
+    // around the `.operator<sym>` it can't parse; walk the subtree to find it.
+    const visit = (n: SyntaxNode | null): void => {
+      if (!n || operatorName) return;
+      if (n.type === 'operator_name') {
+        operatorName = getNodeText(n, source).trim();
+        return;
+      }
+      for (let j = 0; j < n.namedChildCount; j++) visit(n.namedChild(j));
+    };
+    visit(child);
+    if (operatorName) break;
+  }
+  if (!operatorName) return undefined;
+
+  // Qualify with a plain-identifier receiver when present, so the resolver can
+  // infer the receiver's type and pick the right `operator<sym>` overload.
+  // A non-identifier receiver (call result, pointer deref, …) has no static name
+  // to route through inference; emit the bare `operator<sym>` and let
+  // matchByExactName link it when the overload name is unique in scope.
+  const first = node.namedChild(0);
+  if (first && (first.type === 'identifier' || first.type === 'field_identifier')) {
+    const recv = getNodeText(first, source);
+    if (recv && !/^(self|this|super)$/.test(recv)) {
+      return `${recv}.${operatorName}`;
+    }
+  }
+  return operatorName;
+}
+
 function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
   const hookName = extractor.resolveName?.(node, source);
   if (hookName) return hookName;
@@ -3624,6 +3674,39 @@ export class TreeSitterExtractor {
 
     const callerId = this.nodeStack[this.nodeStack.length - 1];
     if (!callerId) return;
+
+    // C/C++ explicit operator-overload call: `a.operator+(b)`, `a.operator[](i)`,
+    // `a.operator==(b)` … tree-sitter-cpp can't parse the `.operator<sym>` member
+    // access and lands it in an ERROR node wrapping an `operator_name`, with the
+    // receiver as the call_expression's first named child and NO `function` field:
+    //   call_expression
+    //     identifier [a]                 ← namedChild(0) = receiver
+    //     ERROR [.operator+]             ← wraps operator_name
+    //       operator_name [operator+]
+    //     argument_list [(b)]
+    // The generic path below would take `namedChild(0)` (the receiver `a`) as the
+    // callee, emitting a useless `calls:"a"` ref and never linking the `operator+`
+    // method (#1247 case 1). Recover here: read the `operator_name` and qualify it
+    // with a simple-identifier receiver so the resolver routes it to the right
+    // class via receiver-type inference (same path as any other `recv.method()`).
+    // Gated to C/C++ — only their grammars produce this ERROR-wrapped shape, and
+    // the method-segment pattern in name-matcher is C/C++-only too. This covers
+    // ONLY the explicit form; infix `a + b` and subscript `a[i]` parse as
+    // binary_expression / subscript_expression (not call_expression) and need
+    // receiver type inference from an expression — tracked separately in #1258.
+    if ((this.language === 'cpp' || this.language === 'c') && node.type === 'call_expression') {
+      const opCallee = readCppOperatorCallCallee(node, this.source);
+      if (opCallee) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: opCallee,
+          referenceKind: 'calls',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+        return;
+      }
+    }
 
     // VB.NET: `foo(args)` is syntactically ambiguous between a call and an
     // index read, so the grammar parses non-empty parens as

@@ -1459,8 +1459,23 @@ export function matchMethodCall(
   // (with its existing single-candidate / receiver-overlap guards). Without this
   // a multi-dot extension-method call (C# DI `builder.Services.AddCoreServices()`,
   // `Guard.Against.X()`) matched no pattern and never resolved.
-  const dotMatch = ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/);
-  const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);
+  // The method segment is `\w+` with an optional ObjC selector tail (`:`s).
+  // C/C++ operator-overload call sites arrive as `recv.operator+` /
+  // `recv.operator[]` etc. (the explicit `a.operator+(b)` form, #1247 case 1);
+  // `+`/`[`/`(` aren't in `\w`, so a single `\w+` gate dropped them and the call
+  // edge to the `operator+` method node never resolved. Allow the method segment
+  // to also be `operator` + an overload-symbol tail for C/C++ only — the symbol
+  // set is the C++ overloadable operators; an unbounded `[^.]+` would over-match.
+  const cppOperatorMethod =
+    '(?:operator(?:[\\[\\]()+\\-*/%^&|~!<>=,]+|new|delete|new\\[\\]|delete\\[\\]))';
+  const methodSegment =
+    ref.language === 'cpp' || ref.language === 'c'
+      ? `(?:\\w+:?(?:\\w+:)*|${cppOperatorMethod})`
+      : '\\w+:?(?:\\w+:)*';
+  const dotMatch = ref.referenceName.match(new RegExp(`^([\\w.]+)\\.(${methodSegment})$`));
+  const colonMatch = ref.referenceName.match(
+    new RegExp(`^(\\w+)::(${methodSegment})$`)
+  );
   // Lua/Luau method calls use a single colon (`lg:log`); R uses `$` (`lg$log`).
   // Recognize these receiver/method separators so local-variable receiver-type
   // inference (#1108) applies to them too — extraction already emits the ref in

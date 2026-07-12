@@ -1637,6 +1637,40 @@ func main() {
       expect(callTargets('useB')).toContain(logB.id);
     });
 
+    it('resolves an explicit a.operator+(b) call to the operator+ method (#1247 case 1)', async () => {
+      // The repro from #1247: a call to an operator-overload method in its
+      // explicit `a.operator+(b)` form never recorded a call edge. The `operator+`
+      // method node IS indexed (definition side is fine), but the resolver's
+      // method-call pattern `recv.method` used `\w` for the method segment, which
+      // excludes `+` — so `a.operator+` matched no pattern and `matchByExactName`
+      // couldn't bridge `a.operator+` to a node named `operator+`. With a receiver
+      // whose type is locally declared (`Vec a;`), the inference chain already
+      // works; only the pattern gate stopped it. This is the explicit-form case
+      // only — infix `a + b` and subscript `a[i]` parse as binary_expression /
+      // subscript_expression (not call_expression) and are tracked separately in
+      // #1258 (they need receiver type inference from an expression, not a name).
+      fs.writeFileSync(
+        path.join(tempDir, 'vec.cpp'),
+        'class Vec { public: Vec operator+(const Vec& o) const { return o; } };\n'
+          + 'Vec add(Vec a, Vec b) { return a.operator+(b); }\n',
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const opPlus = cg.getNodesByKind('method').find((n) => n.name === 'operator+');
+      const add = cg.getNodesByKind('function').find((n) => n.name === 'add');
+      expect(opPlus).toBeDefined();
+      expect(add).toBeDefined();
+
+      const callTargets = cg
+        .getOutgoingEdges(add!.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => e.target);
+      // `add` is reported as a caller of the `operator+` method — the missing edge.
+      expect(callTargets).toContain(opPlus!.id);
+    });
+
     it('preferCallSiteFile puts same-file candidates first and is otherwise a no-op', () => {
       const a = methodNode('m:a', 'a/svc.cpp');
       const b = methodNode('m:b', 'b/svc.cpp');
