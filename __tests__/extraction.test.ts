@@ -11129,6 +11129,53 @@ end
       expect(calls(result)).not.toContain('Foo.Baz::process');
     });
 
+    it('should emit calls in custom module-attribute values, attributed to the module', () => {
+      const code = `defmodule M do
+  @product_id Product.get_product_name("calltracker", :calltracker_api)
+  @nested Foo.bar(Baz.qux(1))
+  def run, do: @product_id
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const c = calls(result);
+      // Compile-time remote call in a custom attribute value → normal calls edge.
+      expect(c).toContain('Product::get_product_name');
+      // Nested calls inside the value are walked too.
+      expect(c).toContain('Foo::bar');
+      expect(c).toContain('Baz::qux');
+      // The attribute NAME itself is never a call target.
+      expect(c).not.toContain('product_id');
+      expect(c).not.toContain('nested');
+      // The call originates from the module namespace (attributes live at
+      // module level), not from any function.
+      const ns = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'M');
+      const call = result.unresolvedReferences.find(
+        (u) => u.referenceKind === 'calls' && u.referenceName === 'Product::get_product_name'
+      );
+      expect(call?.fromNodeId).toBe(ns?.id);
+    });
+
+    it('should NOT emit calls from @spec/@type type positions or @enforce_keys', () => {
+      const code = `defmodule M do
+  @enforce_keys [:a, :b]
+  defstruct [:a, :b]
+  @type t :: String.t()
+  @spec build(String.t()) :: t()
+  def build(s), do: s
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const c = calls(result);
+      // Type-position expressions in @spec/@type must not leak call refs (D3).
+      expect(c).not.toContain('String.t');
+      expect(c).not.toContain('String::t');
+      expect(c).not.toContain('t');
+      expect(c).not.toContain('build');
+      // @enforce_keys value (an atom list) produces no call and no noise.
+      expect(c).not.toContain('enforce_keys');
+      expect(c).toHaveLength(0);
+    });
+
     it('should stay silent on dynamic dispatch (variable receiver, apply, gen_server pid)', () => {
       const code = `defmodule M do
   alias Foo.Baz
