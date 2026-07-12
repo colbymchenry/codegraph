@@ -133,6 +133,47 @@ function firstAlias(node: SyntaxNode | null): SyntaxNode | null {
   return null;
 }
 
+/**
+ * Statically recover a module name from `Module.concat(A, B)` /
+ * `Module.concat([A, B])` when every argument is a literal `alias`. Returns the
+ * dotted join (`A.B`) or null for any other shape (variable args, non-literal
+ * segments, nesting) — those stay genuinely dynamic. The `defmodule` argument is
+ * the head `call` whose target is a `dot` (left alias "Module", right identifier
+ * "concat"); its own `arguments` hold the aliases, either directly or wrapped in
+ * a single `list`.
+ */
+function recoverModuleConcat(head: SyntaxNode, source: string): string | null {
+  if (head.type !== 'call') return null;
+  const target = getChildByField(head, 'target');
+  if (!target || target.type !== 'dot') return null;
+  const left = getChildByField(target, 'left');
+  const right = getChildByField(target, 'right');
+  if (
+    !left ||
+    left.type !== 'alias' ||
+    getNodeText(left, source) !== 'Module' ||
+    !right ||
+    right.type !== 'identifier' ||
+    getNodeText(right, source) !== 'concat'
+  ) {
+    return null;
+  }
+  const args = argsOf(head);
+  if (!args) return null;
+  let segNodes = args.namedChildren;
+  // List form: a single `list` child holding the aliases.
+  if (segNodes.length === 1 && segNodes[0]!.type === 'list') {
+    segNodes = segNodes[0]!.namedChildren;
+  }
+  if (segNodes.length === 0) return null;
+  const parts: string[] = [];
+  for (const seg of segNodes) {
+    if (seg.type !== 'alias') return null; // any non-literal segment → dynamic
+    parts.push(getNodeText(seg, source));
+  }
+  return parts.join('.');
+}
+
 /** Look up a keyword value (`for:` → its value node) inside an arguments node. */
 function keywordValue(argsNode: SyntaxNode | null, key: string, source: string): SyntaxNode | null {
   if (!argsNode) return null;
@@ -262,6 +303,27 @@ function moduledocOf(doBlock: SyntaxNode | null, source: string): string | undef
   return undefined;
 }
 
+/**
+ * Visit a module's body regardless of form: the `do_block` child (block form) or
+ * the `do:` keyword value (one-liner `defmodule M, do: def ...`). The one-liner
+ * value is a `block` wrapping the statements; visit its children individually so
+ * each inner `def` reaches the visitNode hook.
+ */
+function visitModuleBody(node: SyntaxNode, ctx: ExtractorContext): void {
+  const doBlock = doBlockOf(node);
+  if (doBlock) {
+    for (const child of doBlock.namedChildren) ctx.visitNode(child);
+    return;
+  }
+  const doValue = keywordValue(argsOf(node), 'do', ctx.source);
+  if (!doValue) return;
+  if (doValue.type === 'block') {
+    for (const child of doValue.namedChildren) ctx.visitNode(child);
+  } else {
+    ctx.visitNode(doValue);
+  }
+}
+
 function handleModule(node: SyntaxNode, ctx: ExtractorContext, localName: string): boolean {
   const prefix = currentModulePrefix();
   const fullName = prefix ? `${prefix}.${localName}` : localName;
@@ -273,9 +335,7 @@ function handleModule(node: SyntaxNode, ctx: ExtractorContext, localName: string
   if (!ns) return true;
   ctx.pushScope(ns.id);
   moduleNameStack.push(fullName);
-  if (doBlock) {
-    for (const child of doBlock.namedChildren) ctx.visitNode(child);
-  }
+  visitModuleBody(node, ctx);
   moduleNameStack.pop();
   ctx.popScope();
   return true;
@@ -297,7 +357,6 @@ function handleDefImpl(node: SyntaxNode, ctx: ExtractorContext): boolean {
   // implements ref, then treat the block like a normal module named Proto.Type.
   const prefix = currentModulePrefix();
   const fullName = prefix ? `${prefix}.${localName}` : localName;
-  const doBlock = doBlockOf(node);
   const ns = ctx.createNode('namespace', fullName, node, { qualifiedName: fullName });
   if (!ns) return true;
   if (proto) {
@@ -311,9 +370,7 @@ function handleDefImpl(node: SyntaxNode, ctx: ExtractorContext): boolean {
   }
   ctx.pushScope(ns.id);
   moduleNameStack.push(fullName);
-  if (doBlock) {
-    for (const child of doBlock.namedChildren) ctx.visitNode(child);
-  }
+  visitModuleBody(node, ctx);
   moduleNameStack.pop();
   ctx.popScope();
   return true;
@@ -369,8 +426,13 @@ function handleDef(node: SyntaxNode, ctx: ExtractorContext, macro: string): bool
 
 /**
  * Walk a def's body/bodies for calls WITHOUT walking the head (which would emit
- * a spurious self-call to the function's own name): the do_block child and, for
- * the one-liner form, the `do:` keyword value.
+ * a spurious self-call to the function's own name): the guard expression (the
+ * RIGHT side of a `when` binary_operator in arguments[0] — the LEFT is the head),
+ * the do_block child and, for the one-liner form, the `do:` keyword value.
+ *
+ * The guard walk covers two shapes both invisible before: `defguard`/`defguardp`
+ * (whose ONLY body is the guard — no do_block, no `do:`) and a `def f(x) when
+ * guard, do: body` whose guard calls were previously dropped.
  */
 function visitDefBodies(
   node: SyntaxNode,
@@ -378,6 +440,12 @@ function visitDefBodies(
   fnId: string,
   ctx: ExtractorContext
 ): void {
+  const first = argsOf(node)?.namedChildren[0] ?? null;
+  if (first?.type === 'binary_operator') {
+    // Guard clause: arguments[0] is `head when guard`; walk the guard (right).
+    const right = getChildByField(first, 'right');
+    if (right) ctx.visitFunctionBody(right, fnId);
+  }
   const doBlock = doBlockOf(node);
   if (doBlock) ctx.visitFunctionBody(doBlock, fnId);
   const doValue = keywordValue(argsOf(node), 'do', ctx.source);
@@ -397,12 +465,20 @@ function handleDefstruct(node: SyntaxNode, ctx: ExtractorContext): boolean {
       qualifiedName: fullMod ? `${fullMod}::${fieldName}` : fieldName,
     });
   };
+  // Field default VALUES are real compile-time code (`ts: DateTime.utc_now()`),
+  // so their calls must be emitted — attributed to the enclosing module (the
+  // current scope). The field NAME (the keyword key) must never become an edge.
+  const walkValue = (pair: SyntaxNode): void => {
+    const value = getChildByField(pair, 'value');
+    if (value) ctx.visitNode(value);
+  };
   for (const child of args.namedChildren) {
     if (child.type === 'keywords') {
       for (const pair of child.namedChildren) {
         if (pair.type !== 'pair') continue;
         const key = getChildByField(pair, 'key');
         if (key) addField(keywordKey(key, ctx.source), pair);
+        walkValue(pair);
       }
     } else if (child.type === 'list') {
       for (const item of child.namedChildren) {
@@ -413,6 +489,7 @@ function handleDefstruct(node: SyntaxNode, ctx: ExtractorContext): boolean {
             if (pair.type !== 'pair') continue;
             const key = getChildByField(pair, 'key');
             if (key) addField(keywordKey(key, ctx.source), pair);
+            walkValue(pair);
           }
         }
       }
@@ -556,8 +633,16 @@ export const elixirExtractor: LanguageExtractor = {
     const macro = getNodeText(target, ctx.source);
     if (macro === 'defmodule' || macro === 'defprotocol') {
       const aliasNode = firstAlias(argsOf(node));
-      if (!aliasNode) return true;
-      return handleModule(node, ctx, getNodeText(aliasNode, ctx.source));
+      if (aliasNode) return handleModule(node, ctx, getNodeText(aliasNode, ctx.source));
+      // Dynamic module name (no literal alias). Try to recover a static name from
+      // `Module.concat(A, B)` / `Module.concat([A, B])`; otherwise (genuinely
+      // dynamic) DON'T silently swallow the body — visit it so inner defs are
+      // indexed like top-level defs, with no fabricated namespace (F6).
+      const head = argsOf(node)?.namedChildren[0] ?? null;
+      const recovered = head ? recoverModuleConcat(head, ctx.source) : null;
+      if (recovered) return handleModule(node, ctx, recovered);
+      visitModuleBody(node, ctx);
+      return true;
     }
     if (macro === 'defimpl') return handleDefImpl(node, ctx);
     if (DEF_MACROS.has(macro)) return handleDef(node, ctx, macro);
