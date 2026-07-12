@@ -93,17 +93,28 @@ const ERLANG_MFA_CALLS = new Set([
 const ELIXIR_DECL_MACROS = new Set([
   'defmodule', 'defprotocol', 'defimpl', 'def', 'defp', 'defmacro', 'defmacrop',
   'defguard', 'defguardp', 'defdelegate', 'defstruct', 'defexception',
+  'defoverridable',
   'use', 'import', 'require', 'alias',
 ]);
 
 /**
- * Elixir special forms that parse as a bare `call` but are never a
- * user-defined function — emitting a `calls` ref for them is pure noise (they
- * resolve to nothing, and the identifiers are reserved so they can't collide
- * with a real function either).
+ * Elixir Kernel special forms / macros / process primitives that parse as a bare
+ * `call` but are never a user-defined function — emitting a `calls` ref for them
+ * is pure noise (they resolve to nothing; the same-file-only rule keeps them from
+ * ever colliding with a real function, so this only suppresses dead edges).
+ *
+ * Includes the everyday control-flow macros (`if`/`case`/`with`/…) — in Elixir
+ * these are macros, not keywords, so unlike erlang they parse as calls and leak.
+ * `send`/`spawn`/`self`/`throw`/`exit` are Kernel process/flow primitives that in
+ * practice never target repo code; suppressing them is a conscious trade-off
+ * (a hypothetical local `def send` called bare would no longer link). `apply` is
+ * deliberately NOT here: dynamic dispatch is handled elsewhere and its silence is
+ * already covered by the variable-receiver path.
  */
 const ELIXIR_SPECIAL_FORMS = new Set([
   'quote', 'unquote', 'unquote_splicing', 'super', 'receive',
+  'if', 'unless', 'case', 'cond', 'with', 'for', 'raise', 'try',
+  'send', 'spawn', 'self', 'throw', 'exit',
 ]);
 
 /**
@@ -3716,10 +3727,11 @@ export class TreeSitterExtractor {
   private erlangAtomMacros = new Map<string, string>();
 
   // Elixir per-module alias table (`alias Foo.Bar` → Bar ⇒ Foo.Bar), memoized
-  // by the enclosing module node so `Bar.fun(x)` expands to `Foo.Bar::fun`.
-  // Single-entry: extraction is sequential and a module's calls are contiguous.
-  private elixirAliasModuleKey = '';
-  private elixirAliasMap = new Map<string, string>();
+  // per enclosing module node so `Bar.fun(x)` expands to `Foo.Bar::fun`. Keyed by
+  // `(file, module.startIndex)` — a Map, not a single entry, so interleaved
+  // nested-module resolution (outer→inner→outer) does not thrash the cache by
+  // rebuilding the outer module's table on every return from a nested one.
+  private elixirAliasMemo = new Map<string, Map<string, string>>();
 
   /**
    * Expand an Elixir module reference (`Bar`, `Bar.Deep`, `Foo.Sub.Mod`) to its
@@ -3741,56 +3753,101 @@ export class TreeSitterExtractor {
       module = module.parent;
     }
     const key = module ? `${this.filePath}:${module.startIndex}` : this.filePath;
-    if (this.elixirAliasModuleKey !== key) {
-      this.elixirAliasModuleKey = key;
-      this.elixirAliasMap = new Map<string, string>();
-      const doBlock = module
-        ? module.namedChildren.find((c) => c.type === 'do_block')
-        : null;
-      if (doBlock) {
-        for (const stmt of doBlock.namedChildren) {
-          if (stmt.type !== 'call') continue;
-          const t = getChildByField(stmt, 'target');
-          if (t?.type !== 'identifier' || getNodeText(t, this.source) !== 'alias') continue;
-          // `arguments` is a child node TYPE in tree-sitter-elixir, not a field.
-          const args = stmt.namedChildren.find((c) => c.type === 'arguments');
-          if (!args) continue;
-          const aliasNode = args.namedChildren.find((c) => c.type === 'alias');
-          const asValue = this.elixirKeywordValue(args, 'as');
-          if (aliasNode) {
-            const full = getNodeText(aliasNode, this.source);
-            if (asValue?.type === 'alias') {
-              this.elixirAliasMap.set(getNodeText(asValue, this.source), full);
-            } else {
-              const last = full.split('.').pop()!;
-              this.elixirAliasMap.set(last, full);
-            }
+    let aliasMap = this.elixirAliasMemo.get(key);
+    if (!aliasMap) {
+      aliasMap = new Map<string, string>();
+      this.elixirAliasMemo.set(key, aliasMap);
+      const addAlias = (stmt: SyntaxNode): void => {
+        // `arguments` is a child node TYPE in tree-sitter-elixir, not a field.
+        const args = stmt.namedChildren.find((c) => c.type === 'arguments');
+        if (!args) return;
+        const aliasNode = args.namedChildren.find((c) => c.type === 'alias');
+        const asValue = this.elixirKeywordValue(args, 'as');
+        if (aliasNode) {
+          const full = getNodeText(aliasNode, this.source);
+          if (asValue?.type === 'alias') {
+            aliasMap!.set(getNodeText(asValue, this.source), full);
+          } else {
+            const last = full.split('.').pop()!;
+            aliasMap!.set(last, full);
           }
-          // grouped: alias Foo.{Alpha, Beta}
-          const dot = args.namedChildren.find((c) => c.type === 'dot');
-          if (dot) {
-            const left = getChildByField(dot, 'left');
-            const right = getChildByField(dot, 'right');
-            const prefix = left?.type === 'alias' ? getNodeText(left, this.source) : '';
-            if (right?.type === 'tuple' && prefix) {
-              for (const member of right.namedChildren) {
-                if (member.type === 'alias') {
-                  const seg = getNodeText(member, this.source);
-                  this.elixirAliasMap.set(seg, `${prefix}.${seg}`);
-                }
+        }
+        // grouped: alias Foo.{Alpha, Beta}
+        const dot = args.namedChildren.find((c) => c.type === 'dot');
+        if (dot) {
+          const left = getChildByField(dot, 'left');
+          const right = getChildByField(dot, 'right');
+          const prefix = left?.type === 'alias' ? getNodeText(left, this.source) : '';
+          if (right?.type === 'tuple' && prefix) {
+            for (const member of right.namedChildren) {
+              if (member.type === 'alias') {
+                const seg = getNodeText(member, this.source);
+                aliasMap!.set(seg, `${prefix}.${seg}`);
               }
             }
           }
         }
-      }
+      };
+      // Collect `alias` directives from the ENTIRE module subtree, not just the
+      // module body's direct children — an alias declared inside a function body
+      // (`def run do alias Foo.Bar; Bar.work() end`) must resolve too. Recursion
+      // stops at nested module boundaries so an inner module's aliases don't bleed
+      // outward. Scoping an alias to the one function it sits in is a deliberate
+      // non-goal (module-wide is the pragmatic, near-always-correct choice).
+      const doBlock = module
+        ? module.namedChildren.find((c) => c.type === 'do_block')
+        : null;
+      const collect = (n: SyntaxNode): void => {
+        for (const child of n.namedChildren) {
+          if (child.type === 'call') {
+            const t = getChildByField(child, 'target');
+            const tn = t?.type === 'identifier' ? getNodeText(t, this.source) : '';
+            if (tn === 'alias') {
+              addAlias(child);
+              continue;
+            }
+            if (tn === 'defmodule' || tn === 'defprotocol' || tn === 'defimpl') {
+              continue; // nested module — its aliases belong to a different scope
+            }
+          }
+          collect(child);
+        }
+      };
+      if (doBlock) collect(doBlock);
     }
     const segments = modText.split('.');
     const head = segments[0]!;
-    const mapped = this.elixirAliasMap.get(head);
+    const mapped = aliasMap.get(head);
     if (mapped) {
       return segments.length > 1 ? `${mapped}.${segments.slice(1).join('.')}` : mapped;
     }
     return modText;
+  }
+
+  /**
+   * Full dotted name of the module enclosing `node`, matching the qualifiedName
+   * its namespace node carries (outer→inner alias names joined with `.`). Used to
+   * resolve `__MODULE__` self-references (`%__MODULE__{}`) to the current module.
+   * Empty string when there is no enclosing `defmodule`/`defprotocol`.
+   */
+  private currentElixirModuleName(node: SyntaxNode): string {
+    const parts: string[] = [];
+    let n: SyntaxNode | null = node.parent;
+    while (n) {
+      if (n.type === 'call') {
+        const t = getChildByField(n, 'target');
+        if (t?.type === 'identifier') {
+          const name = getNodeText(t, this.source);
+          if (name === 'defmodule' || name === 'defprotocol') {
+            const args = n.namedChildren.find((c) => c.type === 'arguments');
+            const alias = args?.namedChildren.find((c) => c.type === 'alias');
+            if (alias) parts.unshift(getNodeText(alias, this.source));
+          }
+        }
+      }
+      n = n.parent;
+    }
+    return parts.join('.');
   }
 
   /** Look up a keyword value inside an Elixir `arguments` node (`as:` → value). */
@@ -4184,6 +4241,20 @@ export class TreeSitterExtractor {
                 line,
                 column,
               });
+            } else if (
+              l?.type === 'identifier' &&
+              getNodeText(l, this.source) === '__MODULE__' &&
+              r?.type === 'identifier'
+            ) {
+              // `&__MODULE__.fun/arity` → bare name, same-file preference resolves
+              // it to the local function (mirrors the `__MODULE__.fun()` call form).
+              this.unresolvedReferences.push({
+                fromNodeId: callerId,
+                referenceName: getNodeText(r, this.source),
+                referenceKind: 'references',
+                line,
+                column,
+              });
             }
           }
         } else if (capLeft?.type === 'identifier') {
@@ -4198,7 +4269,10 @@ export class TreeSitterExtractor {
         return;
       }
       if (node.type === 'map') {
-        // `%Foo.Bar{…}` struct literal: map > struct > alias.
+        // `%Foo.Bar{…}` struct literal: map > struct > alias. A `%__MODULE__{…}`
+        // literal parses as map > struct > identifier "__MODULE__" instead — the
+        // struct analog of the `__MODULE__.fun()` call: resolve it to the
+        // enclosing module by name so the self-build reference is not lost.
         const structChild = node.namedChildren.find((c) => c.type === 'struct');
         const aliasNode = structChild?.namedChildren.find((c) => c.type === 'alias');
         if (aliasNode) {
@@ -4210,6 +4284,22 @@ export class TreeSitterExtractor {
             line,
             column,
           });
+        } else {
+          const idNode = structChild?.namedChildren.find(
+            (c) => c.type === 'identifier' && getNodeText(c, this.source) === '__MODULE__'
+          );
+          if (idNode) {
+            const selfMod = this.currentElixirModuleName(node);
+            if (selfMod) {
+              this.unresolvedReferences.push({
+                fromNodeId: callerId,
+                referenceName: selfMod,
+                referenceKind: 'references',
+                line,
+                column,
+              });
+            }
+          }
         }
         return;
       }

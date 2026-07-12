@@ -11057,6 +11057,49 @@ end
       const inner = result.nodes.find((n) => n.name === 'inner');
       expect(inner?.qualifiedName).toBe('Foo.Bar.Nested::inner');
     });
+
+    it('should still index defs inside a dynamically-named defmodule (no fake namespace)', () => {
+      const code = `defmodule unquote(name) do
+  def handle(e), do: Helper.work(e)
+end
+`;
+      const result = extractFromSource('lib/dyn.ex', code);
+      // No static module name is inventable, so the def is indexed like a
+      // top-level def (bare qualifiedName) — NOT dropped, NOT under a fabricated
+      // namespace (F6).
+      const handle = result.nodes.find((n) => n.kind === 'function' && n.name === 'handle');
+      expect(handle).toBeDefined();
+      expect(handle?.qualifiedName).toBe('handle');
+      // The body call inside the def is still emitted, attributed to the def.
+      expect(calls(result)).toContain('Helper::work');
+      // No bogus namespace node minted for the un-recoverable dynamic name.
+      expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
+    });
+
+    it('should statically recover Module.concat(A, B) as a normal A.B module', () => {
+      const code = `defmodule Module.concat(Foo, Bar) do
+  def handle(e), do: Helper.work(e)
+end
+`;
+      const result = extractFromSource('lib/concat.ex', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace');
+      expect(ns?.name).toBe('Foo.Bar');
+      const handle = result.nodes.find((n) => n.kind === 'function' && n.name === 'handle');
+      expect(handle?.qualifiedName).toBe('Foo.Bar::handle');
+      expect(calls(result)).toContain('Helper::work');
+    });
+
+    it('should statically recover Module.concat([A, B]) (list form) as A.B', () => {
+      const code = `defmodule Module.concat([Foo, Bar]) do
+  def handle(e), do: Helper.work(e)
+end
+`;
+      const result = extractFromSource('lib/concat_list.ex', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace');
+      expect(ns?.name).toBe('Foo.Bar');
+      const handle = result.nodes.find((n) => n.kind === 'function' && n.name === 'handle');
+      expect(handle?.qualifiedName).toBe('Foo.Bar::handle');
+    });
   });
 
   describe('Call extraction', () => {
@@ -11263,6 +11306,149 @@ end
       const result = extractFromSource('mix.exs', code);
       expect(result.nodes.find((n) => n.kind === 'namespace')?.name).toBe('Mix.Tasks.Hello');
       expect(calls(result)).toContain('IO::puts');
+    });
+  });
+
+  // Gaps found in code review (GLM + Cursor), fixed together.
+  describe('Review-found extraction gaps', () => {
+    it('should emit calls inside guard expressions (defguard body and def ... when)', () => {
+      const code = `defmodule M do
+  defguard ok(x) when local_guard(x)
+  def run(x) when allowed?(x), do: work(x)
+  def check(x) when MyValidator.valid?(x), do: x
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const c = calls(result);
+      // defguard body is a \`when\` binary_operator in arguments, not a do_block.
+      expect(c).toContain('local_guard');
+      // \`def ... when guard, do: body\` — both the guard and the body have calls.
+      expect(c).toContain('allowed?');
+      expect(c).toContain('work');
+      // Remote call in a guard resolves as Module::fun.
+      expect(c).toContain('MyValidator::valid?');
+      // The def head names must never leak as self-calls.
+      expect(c).not.toContain('ok');
+      expect(c).not.toContain('run');
+      expect(c).not.toContain('check');
+    });
+
+    it('should emit %__MODULE__{} as a reference to the enclosing module', () => {
+      const code = `defmodule Foo.Bar do
+  def new(attrs), do: %__MODULE__{a: attrs}
+end
+`;
+      const result = extractFromSource('lib/foo_bar.ex', code);
+      // Struct analog of __MODULE__.fun(): reference the current module by name.
+      expect(refsOf(result, 'references')).toContain('Foo.Bar');
+    });
+
+    it('should resolve %__MODULE__{} inside a nested module to the nested name', () => {
+      const code = `defmodule Foo.Bar do
+  defmodule Nested do
+    def new, do: %__MODULE__{a: 1}
+  end
+end
+`;
+      const result = extractFromSource('lib/foo_bar.ex', code);
+      expect(refsOf(result, 'references')).toContain('Foo.Bar.Nested');
+    });
+
+    it('should emit &__MODULE__.fun/arity captures as a same-module reference', () => {
+      const code = `defmodule M do
+  def cap, do: &__MODULE__.normalize/1
+  def normalize(x), do: x
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      // __MODULE__.normalize → bare name, same-file preference (like the call form).
+      expect(refsOf(result, 'references')).toContain('normalize');
+      expect(refsOf(result, 'references')).not.toContain('__MODULE__::normalize');
+    });
+
+    it('should not leak defoverridable as a call ref', () => {
+      const code = `defmodule M do
+  def run(x), do: x
+  defoverridable run: 1
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      expect(calls(result)).not.toContain('defoverridable');
+    });
+
+    it('should not leak Kernel control-flow / process macros as call refs', () => {
+      const code = `defmodule M do
+  def run(x) do
+    if x, do: raise("no")
+    unless x, do: throw(:stop)
+    case x do
+      _ -> exit(:normal)
+    end
+    cond do
+      true -> send(self(), :ok)
+    end
+    with :ok <- x, do: spawn(fn -> real_helper(x) end)
+    for _ <- [], do: :ok
+    try do
+      real_helper(x)
+    rescue
+      _ -> :err
+    end
+  end
+  def real_helper(x), do: x
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const c = calls(result);
+      for (const m of ['if', 'unless', 'case', 'cond', 'with', 'for', 'raise', 'try',
+        'send', 'spawn', 'self', 'throw', 'exit']) {
+        expect(c).not.toContain(m);
+      }
+      // A genuine local call in the same body is still emitted.
+      expect(c).toContain('real_helper');
+    });
+
+    it('should emit calls in defstruct default values without minting field-name edges', () => {
+      const code = `defmodule M do
+  defstruct ts: DateTime.utc_now(), id: generate_id(), items: []
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const c = calls(result);
+      // Default-value calls are real compile-time code.
+      expect(c).toContain('DateTime::utc_now');
+      expect(c).toContain('generate_id');
+      // Field names must never become call edges.
+      expect(c).not.toContain('ts');
+      expect(c).not.toContain('id');
+      // Fields are still recorded on the module.
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fields).toContain('ts');
+      expect(fields).toContain('id');
+      expect(fields).toContain('items');
+    });
+
+    it('should index a one-liner module body (defmodule M, do: ...)', () => {
+      const code = `defmodule M, do: (def run, do: Helper.work())
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const run = result.nodes.find((n) => n.kind === 'function' && n.name === 'run');
+      expect(run?.qualifiedName).toBe('M::run');
+      expect(calls(result)).toContain('Helper::work');
+    });
+
+    it('should resolve an alias declared inside a function body (module-wide)', () => {
+      const code = `defmodule M do
+  def run do
+    alias Foo.Bar
+    Bar.work()
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const c = calls(result);
+      expect(c).toContain('Foo.Bar::work');
+      expect(c).not.toContain('Bar::work');
     });
   });
 });
