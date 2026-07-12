@@ -916,6 +916,7 @@ Impact and blast-radius queries are only as good as the dependency graph behind 
 | C# | jbogard/MediatR | 85.2% |
 | PHP | guzzle/guzzle | 100% |
 | Ruby | sidekiq/sidekiq | 100% |
+| Elixir | elixir-ecto/ecto | 92.9% |
 | C | redis/redis | 92.2% |
 | C++ | google/leveldb | 94.8% |
 | Objective-C | SDWebImage | 91.6% |
