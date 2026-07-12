@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Batched reference resolution no longer silently drops call and reference edges when one caller reaches the same target from more call sites than fit in a single resolution batch. Each call site is its own edge (identity includes line and column), but the per-batch cleanup deleted resolved refs keyed only on caller + name + kind, so the first batch's delete wiped the whole group — including the call sites a later batch hadn't read yet. Those edges never got built, while the index reported a clean, fully-resolved state, so callers and impact analysis quietly under-reported heavy call sites. The cleanup now keys on the full call-site identity, so a group that straddles a batch boundary keeps every edge. (#1265)
+
 
 ## [1.4.1] - 2026-07-10
 

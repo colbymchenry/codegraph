@@ -1985,14 +1985,23 @@ export class QueryBuilder {
    * Delete specific resolved references by (fromNodeId, referenceName, referenceKind) tuples.
    * More precise than deleteResolvedReferences — only removes refs that were actually resolved.
    */
-  deleteSpecificResolvedReferences(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>): void {
+  deleteSpecificResolvedReferences(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string; line: number; col: number }>): void {
     if (refs.length === 0) return;
+    // Key on the FULL call-site identity (line/col included), not just the
+    // (from_node_id, reference_name, reference_kind) 3-tuple. Edge identity is
+    // (source, target, kind, line, col) (idx_edges_identity), so one caller
+    // invoking the same target from many call sites is many distinct rows AND
+    // many distinct edges. The batched resolver reads pending refs in
+    // offset-0 pages and deletes each batch's resolved rows; a 3-tuple delete
+    // would wipe the whole same-key group, including tail rows a later batch
+    // hasn't read yet — silently dropping their edges (batch-boundary loss).
+    // line/col are NOT NULL in unresolved_refs, so a plain equality suffices.
     const stmt = this.db.prepare(
-      'DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?'
+      'DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ? AND line = ? AND col = ?'
     );
     const deleteMany = this.db.transaction((items: typeof refs) => {
       for (const ref of items) {
-        stmt.run(ref.fromNodeId, ref.referenceName, ref.referenceKind);
+        stmt.run(ref.fromNodeId, ref.referenceName, ref.referenceKind, ref.line, ref.col);
       }
     });
     deleteMany(refs);
@@ -2007,14 +2016,20 @@ export class QueryBuilder {
    * is (re)written here so rows inserted before the v8 migration get their
    * tail the first time they're attempted.
    */
-  markReferencesFailed(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>): void {
+  markReferencesFailed(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string; line: number; col: number }>): void {
     if (refs.length === 0) return;
+    // Key on the full call-site identity (line/col included) for symmetry with
+    // deleteSpecificResolvedReferences: a 3-tuple UPDATE would flag the whole
+    // same-key group 'failed', including tail rows a later batch hasn't read.
+    // Benign today (a same-key group resolves uniformly, so a straddling tail
+    // would fail anyway), but leaving the second 3-tuple mine in place invites
+    // the batch-boundary hazard back. line/col are NOT NULL in unresolved_refs.
     const stmt = this.db.prepare(
-      "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?"
+      "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ? AND line = ? AND col = ?"
     );
     const markMany = this.db.transaction((items: typeof refs) => {
       for (const ref of items) {
-        stmt.run(referenceNameTail(ref.referenceName), ref.fromNodeId, ref.referenceName, ref.referenceKind);
+        stmt.run(referenceNameTail(ref.referenceName), ref.fromNodeId, ref.referenceName, ref.referenceKind, ref.line, ref.col);
       }
     });
     markMany(refs);

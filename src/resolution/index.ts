@@ -1032,6 +1032,8 @@ export class ReferenceResolver {
           fromNodeId: r.original.fromNodeId,
           referenceName: r.original.referenceName,
           referenceKind: r.original.referenceKind,
+          line: r.original.line,
+          col: r.original.column,
         }))
       );
     }
@@ -1051,6 +1053,8 @@ export class ReferenceResolver {
           fromNodeId: r.fromNodeId,
           referenceName: r.referenceName,
           referenceKind: r.referenceKind,
+          line: r.line,
+          col: r.column,
         }))
       );
     }
@@ -1082,6 +1086,8 @@ export class ReferenceResolver {
       fromNodeId: r.original.fromNodeId,
       referenceName: r.original.referenceName,
       referenceKind: r.original.referenceKind,
+      line: r.original.line,
+      col: r.original.column,
     }));
     for (let i = 0; i < resolvedKeys.length; i += PERSIST_CHUNK) {
       this.queries.deleteSpecificResolvedReferences(resolvedKeys.slice(i, i + PERSIST_CHUNK));
@@ -1092,6 +1098,8 @@ export class ReferenceResolver {
       fromNodeId: r.fromNodeId,
       referenceName: r.referenceName,
       referenceKind: r.referenceKind,
+      line: r.line,
+      col: r.column,
     }));
     for (let i = 0; i < unresolvedKeys.length; i += PERSIST_CHUNK) {
       this.queries.markReferencesFailed(unresolvedKeys.slice(i, i + PERSIST_CHUNK));
@@ -1267,6 +1275,8 @@ export class ReferenceResolver {
         fromNodeId: r.original.fromNodeId,
         referenceName: r.original.referenceName,
         referenceKind: r.original.referenceKind,
+        line: r.original.line,
+        col: r.original.column,
       }));
       for (let i = 0; i < resolvedKeys.length; i += PERSIST_CHUNK) {
         this.queries.deleteSpecificResolvedReferences(resolvedKeys.slice(i, i + PERSIST_CHUNK));
@@ -1281,6 +1291,8 @@ export class ReferenceResolver {
         fromNodeId: r.fromNodeId,
         referenceName: r.referenceName,
         referenceKind: r.referenceKind,
+        line: r.line,
+        col: r.column,
       }));
       for (let i = 0; i < unresolvedKeys.length; i += PERSIST_CHUNK) {
         this.queries.markReferencesFailed(unresolvedKeys.slice(i, i + PERSIST_CHUNK));
