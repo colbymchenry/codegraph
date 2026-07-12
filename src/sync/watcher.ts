@@ -549,6 +549,14 @@ export class FileWatcher {
    */
   private handleChange(rel: string): void {
     if (!rel || rel === '.' || rel.startsWith('..')) return;
+    // Windows fs.watch recursive can deliver events from outside the project
+    // root via ReadDirectoryChangesW (e.g., %ProgramData% paths from system
+    // services). After normalizePath these arrive as absolute-looking paths
+    // like "/ProgramData/Autodesk/CER", which would crash the ignore matcher
+    // with "path should be a `path.relative()`d string" RangeError.
+    // Reject any absolute path here — a legitimate project-relative change
+    // is never absolute.
+    if (path.isAbsolute(rel)) return;
     if (this.isAlwaysIgnored(rel)) return;
     if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
     if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) return;
