@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph install` gained a `codev` target for agents that read opencode-style config from renamed paths (`~/.config/codev/codev.jsonc` globally, `./codev.jsonc` per project) — those paths were invisible to the opencode target. Auto-detected, or select it explicitly with `--target=codev`.
+
 ### Fixes
 
 - Callers and impact analysis no longer silently under-count a function that calls the same callee many times. When one caller contained several call sites to the same callee and an internal resolution batch boundary happened to split them, cleanup after the first batch removed the later sites' pending rows before they were ever attempted — their edges were never created, deterministically, and which edges went missing shifted with unrelated changes to the project's total reference count. Post-pass cleanup now targets the exact database row each processed reference came from. Found while validating the operator-call fix on nlohmann/json, where `write_cbor`'s 11 calls to `to_char_type` indexed as 10. (#1269)

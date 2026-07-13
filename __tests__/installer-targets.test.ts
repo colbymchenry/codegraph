@@ -131,8 +131,9 @@ describe('Installer targets — contract', () => {
             // Seed pre-existing config.
             fs.mkdirSync(path.dirname(jsonPath), { recursive: true });
             const seed: Record<string, any> = { mcpServers: { other: { command: 'x' } } };
-            // opencode uses `mcp` not `mcpServers`. Match its shape too.
-            if (target.id === 'opencode') {
+            // opencode-family targets use `mcp` not `mcpServers`.
+            // Match that shape too.
+            if (target.id === 'opencode' || target.id === 'codev') {
               delete seed.mcpServers;
               seed.mcp = { other: { type: 'local', command: ['x'], enabled: true } };
             }
@@ -141,7 +142,7 @@ describe('Installer targets — contract', () => {
             target.install(location, { autoAllow: true });
 
             const after = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
-            if (target.id === 'opencode') {
+            if (target.id === 'opencode' || target.id === 'codev') {
               expect(after.mcp.other).toBeDefined();
               expect(after.mcp.codegraph).toBeDefined();
             } else {
@@ -343,6 +344,120 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(paths.some((p) => p.endsWith('/opencode.jsonc'))).toBe(true);
     expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
     expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(true);
+  });
+
+  // codev is an opencode fork with renamed paths (~/.config/codev/
+  // codev.jsonc) but the identical config shape. The shared contract
+  // suite covers install/idempotency/uninstall; these pin the paths and
+  // the fork's independence from opencode's files.
+
+  it('codev: global install writes ~/.config/codev/codev.jsonc and its AGENTS.md block', () => {
+    const codev = getTarget('codev')!;
+    const result = codev.install('global', { autoAllow: true });
+    const dir = path.join(tmpHome, '.config', 'codev');
+    expect(result.files.some((f) => f.path === path.join(dir, 'codev.jsonc'))).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(path.join(dir, 'codev.jsonc'), 'utf-8'));
+    expect(cfg.mcp.codegraph).toEqual({ type: 'local', command: ['codegraph', 'serve', '--mcp'], enabled: true });
+    const agentsMd = path.join(dir, 'AGENTS.md');
+    expect(fs.existsSync(agentsMd)).toBe(true);
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toContain('codegraph explore');
+  });
+
+  it('codev: prefers .jsonc when both codev.json and codev.jsonc exist', () => {
+    const codev = getTarget('codev')!;
+    const dir = path.join(tmpHome, '.config', 'codev');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'codev.json'), '{\n  "$schema": "https://opencode.ai/config.json"\n}\n');
+    fs.writeFileSync(path.join(dir, 'codev.jsonc'), '{\n  "$schema": "https://opencode.ai/config.json"\n}\n');
+
+    const result = codev.install('global', { autoAllow: true });
+    const written = result.files.find((f) => /codev\.jsonc?$/.test(f.path))!;
+    expect(written.path).toMatch(/codev\.jsonc$/);
+    const jsonText = fs.readFileSync(path.join(dir, 'codev.json'), 'utf-8');
+    expect(jsonText).not.toContain('codegraph');
+  });
+
+  it('codev: uses codev.json when only .json exists (no .jsonc)', () => {
+    const codev = getTarget('codev')!;
+    const dir = path.join(tmpHome, '.config', 'codev');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'codev.json'), '{\n  "$schema": "https://opencode.ai/config.json"\n}\n');
+
+    const result = codev.install('global', { autoAllow: true });
+    expect(result.files[0].path).toMatch(/codev\.json$/);
+    expect(fs.existsSync(path.join(dir, 'codev.jsonc'))).toBe(false);
+  });
+
+  it('codev: local install writes ./codev.jsonc and the ./AGENTS.md block', () => {
+    const codev = getTarget('codev')!;
+    const result = codev.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    // macOS realpath shenanigans (/var vs /private/var) — suffix match.
+    expect(paths.some((p) => p.endsWith('/codev.jsonc'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(true);
+  });
+
+  it('codev: never writes opencode paths, and vice versa (fork independence)', () => {
+    const codev = getTarget('codev')!;
+    const opencode = getTarget('opencode')!;
+
+    codev.install('global', { autoAllow: true });
+    expect(fs.existsSync(path.join(tmpHome, '.config', 'opencode'))).toBe(false);
+
+    opencode.install('global', { autoAllow: true });
+    const opencodeCfg = JSON.parse(
+      fs.readFileSync(path.join(tmpHome, '.config', 'opencode', 'opencode.jsonc'), 'utf-8'),
+    );
+    expect(opencodeCfg.mcp.codegraph).toBeDefined();
+
+    // Uninstalling one leaves the other's config wired.
+    codev.uninstall('global');
+    expect(opencode.detect('global').alreadyConfigured).toBe(true);
+    expect(codev.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('codev: detect reports installed only when ~/.config/codev exists, ignoring %APPDATA% (no #535 history)', () => {
+    const codev = getTarget('codev')!;
+    expect(codev.detect('global').installed).toBe(false);
+
+    // A legacy %APPDATA%/codev dir must NOT count — the pre-#535
+    // misplacement is opencode history that the fork never had.
+    // (setHome points APPDATA at <home>/.config, so plant the dir via a
+    // distinct APPDATA to prove it's ignored.)
+    const appData = mkTmpDir('appdata');
+    const prevAppData = process.env.APPDATA;
+    process.env.APPDATA = appData;
+    try {
+      fs.mkdirSync(path.join(appData, 'codev'), { recursive: true });
+      expect(codev.detect('global').installed).toBe(false);
+
+      fs.mkdirSync(path.join(tmpHome, '.config', 'codev'), { recursive: true });
+      expect(codev.detect('global').installed).toBe(true);
+    } finally {
+      process.env.APPDATA = prevAppData;
+      fs.rmSync(appData, { recursive: true, force: true });
+    }
+  });
+
+  it('codev: global install never touches a legacy %APPDATA%/codev dir', () => {
+    const appData = mkTmpDir('appdata');
+    const prevAppData = process.env.APPDATA;
+    process.env.APPDATA = appData;
+    try {
+      const planted = path.join(appData, 'codev', 'codev.jsonc');
+      fs.mkdirSync(path.dirname(planted), { recursive: true });
+      const plantedBody = JSON.stringify({ mcp: { codegraph: { type: 'local', command: ['stale'], enabled: true } } }, null, 2);
+      fs.writeFileSync(planted, plantedBody);
+
+      const codev = getTarget('codev')!;
+      const result = codev.install('global', { autoAllow: true });
+      expect(result.files.some((f) => f.path.startsWith(appData))).toBe(false);
+      expect(fs.readFileSync(planted, 'utf-8')).toBe(plantedBody);
+    } finally {
+      process.env.APPDATA = prevAppData;
+      fs.rmSync(appData, { recursive: true, force: true });
+    }
   });
 
   it('gemini: install writes settings.json (mcpServers.codegraph) and the GEMINI.md block (#704)', () => {
@@ -1183,6 +1298,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('cursor')?.id).toBe('cursor');
     expect(getTarget('codex')?.id).toBe('codex');
     expect(getTarget('opencode')?.id).toBe('opencode');
+    expect(getTarget('codev')?.id).toBe('codev');
     expect(getTarget('hermes')?.id).toBe('hermes');
     expect(getTarget('gemini')?.id).toBe('gemini');
     expect(getTarget('antigravity')?.id).toBe('antigravity');
