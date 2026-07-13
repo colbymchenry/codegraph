@@ -30,6 +30,24 @@ export const CODEGRAPH_SECTION_START = '<!-- CODEGRAPH_START -->';
 export const CODEGRAPH_SECTION_END = '<!-- CODEGRAPH_END -->';
 
 /**
+ * The body of the codegraph guidance, without the marker fence.
+ *
+ * Module-internal — only used to compose `CODEGRAPH_INSTRUCTIONS_BLOCK`
+ * below. Targets that own their entire instruction file outright (e.g.
+ * Qoder's `.qoder/rules/codegraph.md`) define their own rule body
+ * tailored to that agent's constraints, so they don't consume this
+ * constant.
+ */
+const CODEGRAPH_INSTRUCTIONS_BODY = `## CodeGraph
+
+In repositories indexed by CodeGraph (a \`.codegraph/\` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
+
+- **MCP tool** (when available): \`codegraph_explore\` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
+- **Shell** (always works): \`codegraph explore "<symbol names or question>"\` prints the same output.
+
+If there is no \`.codegraph/\` directory, skip CodeGraph entirely — indexing is the user's decision.`;
+
+/**
  * The full block, markers included, exactly as written to disk.
  *
  * The wording is deliberately CONDITIONAL ("in repositories indexed by…"):
@@ -40,12 +58,5 @@ export const CODEGRAPH_SECTION_END = '<!-- CODEGRAPH_END -->';
  * noise the unindexed-session policy exists to prevent).
  */
 export const CODEGRAPH_INSTRUCTIONS_BLOCK = `${CODEGRAPH_SECTION_START}
-## CodeGraph
-
-In repositories indexed by CodeGraph (a \`.codegraph/\` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
-
-- **MCP tool** (when available): \`codegraph_explore\` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
-- **Shell** (always works): \`codegraph explore "<symbol names or question>"\` prints the same output.
-
-If there is no \`.codegraph/\` directory, skip CodeGraph entirely — indexing is the user's decision.
+${CODEGRAPH_INSTRUCTIONS_BODY}
 ${CODEGRAPH_SECTION_END}`;
