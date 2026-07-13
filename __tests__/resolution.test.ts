@@ -3180,6 +3180,76 @@ void wrong() { WidgetFactory::create().onlyOther(); }
     });
   });
 
+  describe('C++ explicit operator-call resolution (#1247)', () => {
+    // `a.operator+(b)` produced no calls edge: the operator_name lands in an
+    // ERROR node (never a field_expression callee), so the extractor emitted a
+    // ref named just `a`. With the ERROR-node recovery it emits `a.operator+`,
+    // and matchMethodCall (dot pattern extended to admit operator method parts)
+    // resolves it through receiver-type inference. Infix `a + b` / `a[i]` need
+    // real type inference and are out of scope here (#1258).
+    async function indexCpp(files: Record<string, string>): Promise<void> {
+      for (const [name, content] of Object.entries(files)) {
+        fs.writeFileSync(path.join(tempDir, name), content);
+      }
+      cg = await CodeGraph.init(tempDir, { index: true });
+    }
+
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves explicit operator calls to the receiver type, never a same-named decoy', async () => {
+      // Aaa sorts first and declares the same operators — only receiver-type
+      // inference (const V& a → V) can pick V, so a name-only tie can't win.
+      await indexCpp({
+        'optest.cpp': `struct Aaa {
+  Aaa operator+(const Aaa& o) const { return o; }
+  Aaa operator[](int i) const { return *this; }
+};
+struct V {
+  int x;
+  V operator+(const V& o) const { return V{x + o.x}; }
+  V operator[](int i) const { return V{x + i}; }
+  int get() const { return x; }
+};
+int plainCaller(const V& a) { return a.get(); }
+V explicitCaller(const V& a, const V& b) { return a.operator+(b); }
+V subscriptCaller(const V& a) { return a.operator[](3); }
+V pointerCaller(const V* p, const V& b) { return p->operator+(b); }
+`,
+      });
+
+      expect(callerNamesOf('V::operator+')).toEqual(['explicitCaller', 'pointerCaller']);
+      expect(callerNamesOf('V::operator[]')).toEqual(['subscriptCaller']);
+      expect(callerNamesOf('V::get')).toEqual(['plainCaller']); // control: plain calls unaffected
+      expect(callerNamesOf('Aaa::operator+')).toEqual([]);
+      expect(callerNamesOf('Aaa::operator[]')).toEqual([]);
+    });
+
+    it('resolves an out-of-line operator definition (declaration in header)', async () => {
+      await indexCpp({
+        'v.hpp': `#pragma once
+struct V { int x; V operator+(const V& o) const; };
+`,
+        'v.cpp': `#include "v.hpp"
+V V::operator+(const V& o) const { return V{x + o.x}; }
+`,
+        'app.cpp': `#include "v.hpp"
+V add(const V& a, const V& b) { return a.operator+(b); }
+`,
+      });
+
+      expect(callerNamesOf('V::operator+')).toEqual(['add']);
+    });
+  });
+
   describe('PHP chained static-factory call resolution (#608)', () => {
     function callerNamesOf(qualifiedName: string): string[] {
       const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);

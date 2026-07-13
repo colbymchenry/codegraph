@@ -1459,7 +1459,18 @@ export function matchMethodCall(
   // (with its existing single-candidate / receiver-overlap guards). Without this
   // a multi-dot extension-method call (C# DI `builder.Services.AddCoreServices()`,
   // `Guard.Against.X()`) matched no pattern and never resolved.
-  const dotMatch = ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/);
+  // C++ explicit operator call `a.operator+(b)` reaches the resolver as
+  // `a.operator+` (#1247) — the operator's symbol chars (`+`, `==`, `[]`, `()`)
+  // fail the \w method part of the plain pattern, so admit them explicitly.
+  // Names like `operatorTable` stay on the plain pattern (tried first); the
+  // operator form requires at least one non-word char after `operator`, and
+  // every downstream strategy compares the method part by exact string
+  // equality, so a stray match can't invent an edge.
+  const dotMatch =
+    ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/) ??
+    (ref.language === 'cpp'
+      ? ref.referenceName.match(/^([\w.]+)\.(operator[^\w\s.]+)$/)
+      : null);
   const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);
   // Lua/Luau method calls use a single colon (`lg:log`); R uses `$` (`lg$log`).
   // Recognize these receiver/method separators so local-variable receiver-type

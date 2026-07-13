@@ -3823,6 +3823,52 @@ class APXCharacter {  // the one real definition
     });
   });
 
+  describe('C++ explicit operator-call refs (#1247)', () => {
+    // tree-sitter-cpp can't parse an operator_name in field position:
+    // `a.operator+(b)` yields `call_expression(function: identifier «a»,
+    // ERROR(operator_name), argument_list)` instead of a field_expression
+    // callee, so the emitted ref was just the receiver (`a`) and the call never
+    // resolved. The extractor recovers the operator_name from the ERROR child
+    // and emits `<receiver>.operator+` like any other member call.
+    const HEADER = 'struct V {\n  V operator+(const V& o) const;\n  V operator[](int i) const;\n  V operator()(int i) const;\n  bool operator==(const V& o) const;\n  int get() const;\n};\n';
+    const callRefsOf = (body: string) =>
+      extractFromSource('op.cpp', HEADER + body)
+        .unresolvedReferences.filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+
+    it('recovers receiver.operator+ from the explicit call form', () => {
+      expect(callRefsOf('V f(const V& a, const V& b) { return a.operator+(b); }\n')).toContain('a.operator+');
+    });
+
+    it('recovers pointer receivers (p->operator+ → p.operator+)', () => {
+      expect(callRefsOf('V f(const V* p, const V& b) { return p->operator+(b); }\n')).toContain('p.operator+');
+    });
+
+    it('recovers subscript, call, and comparison operator forms', () => {
+      const refs = callRefsOf(
+        'V f1(const V& a) { return a.operator[](3); }\n' +
+        'V f2(V& a) { return a.operator()(1); }\n' +
+        'bool f3(const V& a, const V& b) { return a.operator==(b); }\n'
+      );
+      expect(refs).toContain('a.operator[]');
+      expect(refs).toContain('a.operator()');
+      expect(refs).toContain('a.operator==');
+    });
+
+    it('emits the bare operator name for a this-> receiver', () => {
+      const refs = extractFromSource(
+        'op.cpp',
+        'struct V {\n  V operator+(const V& o) const;\n  V twice() const { return this->operator+(*this); }\n};\n'
+      ).unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(refs).toContain('operator+');
+      expect(refs.some((r) => r.includes('this'))).toBe(false);
+    });
+
+    it('leaves plain member calls unchanged (control)', () => {
+      expect(callRefsOf('int f(const V& a) { return a.get(); }\n')).toContain('a.get');
+    });
+  });
+
   describe('C++ macro-prefixed function names (#1093 follow-up)', () => {
     // An unknown inline-specifier macro before the return type
     // (`FORCEINLINE FString GetName(…)`) threw tree-sitter into error recovery:

@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- C++ explicit operator calls — `a.operator+(b)`, `p->operator+(b)`, `a.operator[](3)`, and the other symbolic forms — now produce a `calls` edge to the operator method, so an operator invoked only through the explicit syntax no longer looks uncalled in callers and impact analysis. tree-sitter parses these call sites with the operator name stranded in an error node (never as a normal member access), so the call's target was silently read as just the receiver variable; the operator name is now recovered from the error node and resolved through receiver-type inference like any other member call — a same-named operator on an unrelated class can never capture the edge. Infix uses (`a + b`, `a[i]`) need real type inference and are tracked separately. (#1247)
 
 ## [1.4.1] - 2026-07-10
 

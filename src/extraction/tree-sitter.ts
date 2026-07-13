@@ -4250,6 +4250,43 @@ export class TreeSitterExtractor {
     } else {
       const func = getChildByField(node, 'function') || node.namedChild(0);
 
+      // C++ explicit operator call `a.operator+(b)` / `p->operator+(b)` (#1247):
+      // tree-sitter-cpp can't parse an operator_name in field position, so the
+      // callee is NOT a field_expression — the call_expression carries
+      // `function: <receiver>` plus an ERROR child wrapping the operator_name.
+      // Reading the function field alone yields just the receiver (`a`), an
+      // unresolvable ref. Recover `<receiver>.operator+` so it resolves like any
+      // other member call (matchMethodCall admits the operator method part).
+      // The infix forms `a + b` / `a[i]` need receiver type inference and are
+      // tracked separately (#1258).
+      if (this.language === 'cpp' && func) {
+        let operatorName = '';
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child?.type !== 'ERROR') continue;
+          const op = child.namedChildren.find((c: SyntaxNode) => c.type === 'operator_name');
+          if (op) { operatorName = getNodeText(op, this.source); break; }
+        }
+        if (operatorName) {
+          // `->` receivers resolve identically to `.` ones; a receiver that
+          // isn't a simple identifier/member chain (or is `this`) can't aid
+          // resolution — keep the bare operator name, like other such calls.
+          const receiver = getNodeText(func, this.source).replace(/->/g, '.').replace(/\s+/g, '');
+          const calleeName =
+            receiver !== 'this' && /^[A-Za-z_][\w.]*$/.test(receiver)
+              ? `${receiver}.${operatorName}`
+              : operatorName;
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: calleeName,
+            referenceKind: 'calls',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+          return;
+        }
+      }
+
       if (func) {
         if (func.type === 'member_expression' || func.type === 'attribute' || func.type === 'selector_expression' || func.type === 'navigation_expression' || func.type === 'field_expression') {
           // Method call: obj.method() or obj.field.method()
