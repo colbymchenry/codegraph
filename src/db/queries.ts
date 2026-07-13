@@ -1827,6 +1827,7 @@ export class QueryBuilder {
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
       filePath: row.file_path,
       language: row.language as Language,
+      rowId: row.id,
     }));
   }
 
@@ -1844,6 +1845,7 @@ export class QueryBuilder {
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
       filePath: row.file_path,
       language: row.language as Language,
+      rowId: row.id,
     }));
   }
 
@@ -1886,6 +1888,7 @@ export class QueryBuilder {
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
       filePath: row.file_path,
       language: row.language as Language,
+      rowId: row.id,
     }));
   }
 
@@ -1954,6 +1957,7 @@ export class QueryBuilder {
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
       filePath: row.file_path,
       language: row.language as Language,
+      rowId: row.id,
     }));
   }
 
@@ -1999,6 +2003,23 @@ export class QueryBuilder {
   }
 
   /**
+   * Delete unresolved-ref rows by row id — the precise cleanup for refs a
+   * resolution pass actually processed. The key-tuple variant above also
+   * deletes SIBLING rows (same caller calling the same callee at other lines)
+   * that a later batch hasn't attempted yet, so when a batch boundary split a
+   * caller's same-named call sites, the later sites' edges were silently never
+   * created (#1269).
+   */
+  deleteReferencesByRowIds(rowIds: number[]): void {
+    if (rowIds.length === 0) return;
+    for (let i = 0; i < rowIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = rowIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      this.db.prepare(`DELETE FROM unresolved_refs WHERE id IN (${placeholders})`).run(...chunk);
+    }
+  }
+
+  /**
    * Mark refs a completed resolution pass could not resolve as status='failed'
    * instead of deleting them (#1240). Failed rows are invisible to the pending
    * count/batch readers (so drain loops and the #1187 orphan sweep still
@@ -2015,6 +2036,27 @@ export class QueryBuilder {
     const markMany = this.db.transaction((items: typeof refs) => {
       for (const ref of items) {
         stmt.run(referenceNameTail(ref.referenceName), ref.fromNodeId, ref.referenceName, ref.referenceKind);
+      }
+    });
+    markMany(refs);
+  }
+
+  /**
+   * Park refs as status='failed' by row id — the precise counterpart of
+   * markReferencesFailed, for the same reason as deleteReferencesByRowIds:
+   * the key-tuple variant also flips same-key sibling rows in later batches
+   * to 'failed' before they were ever attempted (#1269). Resolution outcome
+   * can differ per call site (receiver-type inference reads the ref's line),
+   * so a sibling must not inherit this row's failure.
+   */
+  markReferencesFailedByRowIds(refs: Array<{ rowId: number; referenceName: string }>): void {
+    if (refs.length === 0) return;
+    const stmt = this.db.prepare(
+      "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE id = ?"
+    );
+    const markMany = this.db.transaction((items: typeof refs) => {
+      for (const ref of items) {
+        stmt.run(referenceNameTail(ref.referenceName), ref.rowId);
       }
     });
     markMany(refs);
@@ -2068,6 +2110,7 @@ export class QueryBuilder {
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
       filePath: row.file_path,
       language: row.language as Language,
+      rowId: row.id,
     }));
   }
 

@@ -625,6 +625,7 @@ export class ReferenceResolver {
       column: ref.column,
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
+      rowId: ref.rowId,
     }));
 
     const total = refs.length;
@@ -1009,6 +1010,56 @@ export class ReferenceResolver {
   }
 
   /**
+   * Split resolved refs into rows deletable by id and hand-built refs that
+   * must fall back to the key-tuple delete. Rows loaded from the database
+   * carry their row id and are deleted by exactly that id; the key tuple
+   * omits line/col, so it also removes SIBLING rows — the same caller calling
+   * the same callee at other lines — that a later batch hadn't attempted yet:
+   * when a batch boundary split a caller's same-named call sites, the later
+   * sites' edges were silently never created (#1269).
+   */
+  private static partitionResolvedCleanup(resolved: ResolvedRef[]): {
+    rowIds: number[];
+    legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>;
+  } {
+    const rowIds: number[] = [];
+    const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }> = [];
+    for (const r of resolved) {
+      if (r.original.rowId != null) rowIds.push(r.original.rowId);
+      else legacyKeys.push({
+        fromNodeId: r.original.fromNodeId,
+        referenceName: r.original.referenceName,
+        referenceKind: r.original.referenceKind,
+      });
+    }
+    return { rowIds, legacyKeys };
+  }
+
+  /**
+   * Same row-id precision for parking unresolvable refs as status='failed'
+   * (#1240): the key-tuple fallback would flip same-key sibling rows in later
+   * batches to 'failed' before they were ever attempted, and resolution
+   * outcome can differ per call site (receiver-type inference reads the
+   * ref's line), so a sibling must not inherit this row's failure (#1269).
+   */
+  private static partitionFailedCleanup(unresolved: UnresolvedRef[]): {
+    byRowId: Array<{ rowId: number; referenceName: string }>;
+    legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>;
+  } {
+    const byRowId: Array<{ rowId: number; referenceName: string }> = [];
+    const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }> = [];
+    for (const r of unresolved) {
+      if (r.rowId != null) byRowId.push({ rowId: r.rowId, referenceName: r.referenceName });
+      else legacyKeys.push({
+        fromNodeId: r.fromNodeId,
+        referenceName: r.referenceName,
+        referenceKind: r.referenceKind,
+      });
+    }
+    return { byRowId, legacyKeys };
+  }
+
+  /**
    * Resolve and persist edges to database
    */
   resolveAndPersist(
@@ -1027,13 +1078,9 @@ export class ReferenceResolver {
 
     // Clean up resolved refs from unresolved_refs table so metrics are accurate
     if (result.resolved.length > 0) {
-      this.queries.deleteSpecificResolvedReferences(
-        result.resolved.map((r) => ({
-          fromNodeId: r.original.fromNodeId,
-          referenceName: r.original.referenceName,
-          referenceKind: r.original.referenceKind,
-        }))
-      );
+      const { rowIds, legacyKeys } = ReferenceResolver.partitionResolvedCleanup(result.resolved);
+      this.queries.deleteReferencesByRowIds(rowIds);
+      this.queries.deleteSpecificResolvedReferences(legacyKeys);
     }
 
     // Park unresolvable refs as status='failed' — parity with
@@ -1046,13 +1093,9 @@ export class ReferenceResolver {
     // is still 'pending', so any pending row at rest belongs to an
     // interrupted run and the sweep can key off the pending count.
     if (result.unresolved.length > 0) {
-      this.queries.markReferencesFailed(
-        result.unresolved.map((r) => ({
-          fromNodeId: r.fromNodeId,
-          referenceName: r.referenceName,
-          referenceKind: r.referenceKind,
-        }))
-      );
+      const { byRowId, legacyKeys } = ReferenceResolver.partitionFailedCleanup(result.unresolved);
+      this.queries.markReferencesFailedByRowIds(byRowId);
+      this.queries.markReferencesFailed(legacyKeys);
     }
 
     return result;
@@ -1078,23 +1121,23 @@ export class ReferenceResolver {
       await maybeYield();
     }
 
-    const resolvedKeys = result.resolved.map((r) => ({
-      fromNodeId: r.original.fromNodeId,
-      referenceName: r.original.referenceName,
-      referenceKind: r.original.referenceKind,
-    }));
-    for (let i = 0; i < resolvedKeys.length; i += PERSIST_CHUNK) {
-      this.queries.deleteSpecificResolvedReferences(resolvedKeys.slice(i, i + PERSIST_CHUNK));
+    const resolvedCleanup = ReferenceResolver.partitionResolvedCleanup(result.resolved);
+    for (let i = 0; i < resolvedCleanup.rowIds.length; i += PERSIST_CHUNK) {
+      this.queries.deleteReferencesByRowIds(resolvedCleanup.rowIds.slice(i, i + PERSIST_CHUNK));
+      await maybeYield();
+    }
+    for (let i = 0; i < resolvedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
+      this.queries.deleteSpecificResolvedReferences(resolvedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
       await maybeYield();
     }
 
-    const unresolvedKeys = result.unresolved.map((r) => ({
-      fromNodeId: r.fromNodeId,
-      referenceName: r.referenceName,
-      referenceKind: r.referenceKind,
-    }));
-    for (let i = 0; i < unresolvedKeys.length; i += PERSIST_CHUNK) {
-      this.queries.markReferencesFailed(unresolvedKeys.slice(i, i + PERSIST_CHUNK));
+    const failedCleanup = ReferenceResolver.partitionFailedCleanup(result.unresolved);
+    for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
+      this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
+      await maybeYield();
+    }
+    for (let i = 0; i < failedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
+      this.queries.markReferencesFailed(failedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
       await maybeYield();
     }
 
@@ -1184,6 +1227,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        rowId: raw.rowId,
       };
       const result = this.resolveOne(ref);
       if (result) {
@@ -1262,14 +1306,17 @@ export class ReferenceResolver {
         await maybeYield();
       }
 
-      // Clean up resolved refs so they don't appear in the next batch
-      const resolvedKeys = result.resolved.map((r) => ({
-        fromNodeId: r.original.fromNodeId,
-        referenceName: r.original.referenceName,
-        referenceKind: r.original.referenceKind,
-      }));
-      for (let i = 0; i < resolvedKeys.length; i += PERSIST_CHUNK) {
-        this.queries.deleteSpecificResolvedReferences(resolvedKeys.slice(i, i + PERSIST_CHUNK));
+      // Clean up resolved refs so they don't appear in the next batch —
+      // by row id, so a same-key sibling ref in a LATER batch (same caller
+      // calling the same callee at another line) is left pending for its own
+      // attempt instead of being swept out with this batch's rows (#1269).
+      const resolvedCleanup = ReferenceResolver.partitionResolvedCleanup(result.resolved);
+      for (let i = 0; i < resolvedCleanup.rowIds.length; i += PERSIST_CHUNK) {
+        this.queries.deleteReferencesByRowIds(resolvedCleanup.rowIds.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
+      }
+      for (let i = 0; i < resolvedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
+        this.queries.deleteSpecificResolvedReferences(resolvedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
         await maybeYield();
       }
 
@@ -1277,13 +1324,13 @@ export class ReferenceResolver {
       // leave the pending set (the batch reader and non-progress guard below
       // only see pending rows) but stay retryable when a later sync adds a
       // symbol that could satisfy them (#1240).
-      const unresolvedKeys = result.unresolved.map((r) => ({
-        fromNodeId: r.fromNodeId,
-        referenceName: r.referenceName,
-        referenceKind: r.referenceKind,
-      }));
-      for (let i = 0; i < unresolvedKeys.length; i += PERSIST_CHUNK) {
-        this.queries.markReferencesFailed(unresolvedKeys.slice(i, i + PERSIST_CHUNK));
+      const failedCleanup = ReferenceResolver.partitionFailedCleanup(result.unresolved);
+      for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
+        this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
+      }
+      for (let i = 0; i < failedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
+        this.queries.markReferencesFailed(failedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
         await maybeYield();
       }
 

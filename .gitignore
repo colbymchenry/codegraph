@@ -70,3 +70,6 @@ assets/__pycache__/
 assets/generate-waitlist.py
 
 .kommandr/
+
+# Local scratch tests (never commit)
+__tests__/zz-scratch*

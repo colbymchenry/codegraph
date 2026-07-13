@@ -918,10 +918,11 @@ export function matchDottedCallChain(
       // CRITICAL: resolve the TARGET via a synthetic bare-name ref, but return the
       // match tied to the ORIGINAL `ref` (referenceName `inner().method`). The
       // batched resolver (resolveAndPersistBatched) reads unresolved rows from
-      // offset 0 every pass and relies on deleteSpecificResolvedReferences —
-      // keyed on referenceName — to clear each resolved row so the batch empties.
-      // If we propagated the synthetic ref's bare `method` as `.original`, the
-      // delete would never match the stored `inner().method` row, the batch would
+      // offset 0 every pass and relies on the post-batch cleanup (row-id delete
+      // for DB-loaded refs, referenceName-keyed delete otherwise, #1269) to
+      // clear each resolved row so the batch empties. If we propagated the
+      // synthetic ref's bare `method` as `.original`, a key-based delete
+      // would never match the stored `inner().method` row, the batch would
       // never drain, and the loop would re-resolve + re-insert forever (a runaway
       // that grew gin's graph to 5M edges / 1.4 GB before this fix).
       const bareRef = { ...ref, referenceName: method };

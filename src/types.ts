@@ -323,6 +323,17 @@ export interface UnresolvedReference {
 
   /** Possible qualified names it might resolve to */
   candidates?: string[];
+
+  /**
+   * `unresolved_refs.id` when this ref was loaded from the database. Post-pass
+   * cleanup (delete-on-resolve / park-as-failed) targets exactly this row.
+   * Without it, cleanup falls back to deleting by (fromNodeId, referenceName,
+   * referenceKind) — which also removes SIBLING rows (same caller calling the
+   * same callee at other lines) that a later batch hasn't attempted yet, so
+   * their edges were silently never created when a batch boundary split the
+   * call sites (#1269).
+   */
+  rowId?: number;
 }
 
 // =============================================================================

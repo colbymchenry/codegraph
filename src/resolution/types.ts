@@ -26,6 +26,9 @@ export interface UnresolvedRef {
   language: Language;
   /** Possible qualified names it might resolve to */
   candidates?: string[];
+  /** `unresolved_refs.id` when loaded from the database — post-pass cleanup
+   * targets exactly this row instead of every same-key sibling (#1269). */
+  rowId?: number;
 }
 
 /**
