@@ -33,6 +33,8 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
+import { isTestFile as isDefaultTestFile } from '../search/query-utils';
+import picomatch from 'picomatch';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -2090,31 +2092,11 @@ program
       const cg = await CodeGraph.open(projectPath);
       const maxDepth = parseInt(options.depth || '5', 10);
 
-      // Common test file patterns
-      const defaultTestPatterns = [
-        /\.spec\./,
-        /\.test\./,
-        /\/__tests__\//,
-        /\/tests?\//,
-        /\/e2e\//,
-        /\/spec\//,
-      ];
+      const customFilter = options.filter ? picomatch(options.filter) : null;
 
-      // Custom filter pattern
-      let customFilter: RegExp | null = null;
-      if (options.filter) {
-        // Convert glob to regex: ** → .+, * → [^/]*, . → \.
-        const regex = options.filter
-          .replace(/[+[\]{}()^$|\\]/g, '\\$&')
-          .replace(/\./g, '\\.')
-          .replace(/\*\*/g, '.+')
-          .replace(/\*/g, '[^/]*');
-        customFilter = new RegExp(regex);
-      }
-
-      function isTestFile(filePath: string): boolean {
-        if (customFilter) return customFilter.test(filePath);
-        return defaultTestPatterns.some(p => p.test(filePath));
+      function matchesTestFile(filePath: string): boolean {
+        if (customFilter) return customFilter(filePath);
+        return isDefaultTestFile(filePath);
       }
 
       // BFS to find all transitive dependents of changed files, filtered to test files
@@ -2123,7 +2105,7 @@ program
 
       for (const file of changedFiles) {
         // If the changed file is itself a test file, include it
-        if (isTestFile(file)) {
+        if (matchesTestFile(file)) {
           affectedTests.add(file);
           continue;
         }
@@ -2143,7 +2125,7 @@ program
             visited.add(dep);
             allDependents.add(dep);
 
-            if (isTestFile(dep)) {
+            if (matchesTestFile(dep)) {
               affectedTests.add(dep);
             } else {
               queue.push({ file: dep, depth: current.depth + 1 });
