@@ -4268,14 +4268,25 @@ export class TreeSitterExtractor {
           if (op) { operatorName = getNodeText(op, this.source); break; }
         }
         if (operatorName) {
-          // `->` receivers resolve identically to `.` ones; a receiver that
-          // isn't a simple identifier/member chain (or is `this`) can't aid
-          // resolution — keep the bare operator name, like other such calls.
+          // Call sites may space the symbolic name (nlohmann/json's
+          // `it.operator * ()`, `other.operator < (*this)`) while definitions
+          // index compact (`operator*`) — normalize so they match. The word
+          // forms (`operator new`) keep their space.
+          const sym = operatorName.slice('operator'.length).trim();
+          if (/^[^\w\s]/.test(sym)) operatorName = `operator${sym.replace(/\s+/g, '')}`;
+          // `->` receivers resolve identically to `.` ones. A receiver that
+          // isn't a simple identifier/member chain (`(*it)`, a call result, …)
+          // can't aid type inference, and a bare operator name would fall
+          // through to exact-name matching — which GUESSES among the many
+          // same-named operators (on nlohmann/json it linked a std::map
+          // `object->operator[]` call to an unrelated in-repo operator[]).
+          // Drop the ref: a silent miss, never a wrong edge. `this->` keeps
+          // the bare name, matching how `this.method()` calls are emitted —
+          // the target is on the enclosing class, where exact-name's same-file
+          // preference is reliable.
           const receiver = getNodeText(func, this.source).replace(/->/g, '.').replace(/\s+/g, '');
-          const calleeName =
-            receiver !== 'this' && /^[A-Za-z_][\w.]*$/.test(receiver)
-              ? `${receiver}.${operatorName}`
-              : operatorName;
+          if (receiver !== 'this' && !/^[A-Za-z_][\w.]*$/.test(receiver)) return;
+          const calleeName = receiver === 'this' ? operatorName : `${receiver}.${operatorName}`;
           this.unresolvedReferences.push({
             fromNodeId: callerId,
             referenceName: calleeName,

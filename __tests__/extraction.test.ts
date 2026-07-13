@@ -3855,6 +3855,29 @@ class APXCharacter {  // the one real definition
       expect(refs).toContain('a.operator==');
     });
 
+    it('normalizes spaced call-site operator names to the compact definition form', () => {
+      // nlohmann/json calls `it.operator * ()` / `other.operator < (*this)`
+      // while defining `operator*` / `operator<` compact.
+      const refs = callRefsOf(
+        'bool f(const V& a, const V& b) { return a.operator == (b); }\n' +
+        'V g(const V& a) { return a.operator [] (3); }\n'
+      );
+      expect(refs).toContain('a.operator==');
+      expect(refs).toContain('a.operator[]');
+    });
+
+    it('drops the ref for a complex receiver instead of guessing (no wrong edge)', () => {
+      // `object->operator[](val)` through a member chain ending in a call —
+      // the receiver type isn't inferable and a bare `operator[]` ref would
+      // let exact-name matching guess among unrelated operators.
+      const refs = callRefsOf(
+        'struct W { V* obj(); };\n' +
+        'V f(W& w, const V& b) { return w.obj()->operator+(b); }\n'
+      );
+      expect(refs.some((r) => r.includes('operator+'))).toBe(false);
+      expect(refs).toContain('w.obj'); // the inner call itself still refs normally
+    });
+
     it('emits the bare operator name for a this-> receiver', () => {
       const refs = extractFromSource(
         'op.cpp',
