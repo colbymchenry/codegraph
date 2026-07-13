@@ -11,6 +11,7 @@ The interactive installer auto-detects and configures each supported agent — w
 - **Cursor**
 - **Codex CLI**
 - **opencode**
+- **CoDev Code**
 - **Hermes Agent**
 - **Gemini CLI**
 - **Antigravity IDE**

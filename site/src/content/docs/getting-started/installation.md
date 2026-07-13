@@ -11,7 +11,7 @@ npx @colbymchenry/codegraph
 
 The installer will:
 
-- Ask which agent(s) to configure — auto-detecting installed ones from **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, and **Kiro**.
+- Ask which agent(s) to configure — auto-detecting installed ones from **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **CoDev Code**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, and **Kiro**.
 - Prompt to install `codegraph` on your `PATH` (so agents can launch the MCP server).
 - Ask whether configs apply to all your projects or just this one.
 - Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`). Cursor and Kiro get the MCP config only. Removed cleanly by `codegraph uninstall`.
@@ -38,7 +38,7 @@ codegraph install --print-config codex               # print snippet, no file wr
 
 ## 2. Restart your agent
 
-Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro) for the MCP server to load.
+Restart your agent (Claude Code / Cursor / Codex CLI / opencode / CoDev Code / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro) for the MCP server to load.
 
 ## 3. Initialize projects
 
