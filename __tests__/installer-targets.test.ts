@@ -699,6 +699,56 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(cliAfter.mcpServers.codegraph).toBeDefined();
   });
 
+  it('qoder: install writes SharedClientCache/mcp.json under the platform config dir', () => {
+    const qoder = getTarget('qoder')!;
+    const result = qoder.install('global', { autoAllow: true });
+    const file = result.files[0]!.path;
+    // Path lives under the platform-appropriate Qoder config dir.
+    expect(file.endsWith(path.join('Qoder', 'SharedClientCache', 'mcp.json'))).toBe(true);
+    expect(fs.existsSync(file)).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+    expect(cfg.mcpServers.codegraph.type).toBe('stdio');
+    expect(cfg.mcpServers.codegraph.args).toEqual(['serve', '--mcp']);
+  });
+
+  it('qoder: entry never carries --path or ${workspaceFolder} (Qoder does not substitute vars)', () => {
+    // Regression guard: Qoder passes MCP args to the child verbatim, so a
+    // literal `${workspaceFolder}` reaches codegraph as a bogus path and
+    // (pre-#964 codegraph) yields an empty tools/list. We install with no
+    // --path at all and rely on the MCP roots/list handshake instead.
+    const qoder = getTarget('qoder')!;
+    qoder.install('global', { autoAllow: true });
+    const cfg = JSON.parse(fs.readFileSync(qoder.describePaths('global')[0]!, 'utf-8'));
+    const args: string[] = cfg.mcpServers.codegraph.args;
+    expect(args).not.toContain('--path');
+    expect(args.some((a: string) => a.includes('${workspaceFolder}'))).toBe(false);
+  });
+
+  it('qoder: uninstall strips codegraph but leaves sibling MCP servers intact', () => {
+    const qoder = getTarget('qoder')!;
+    const file = qoder.describePaths('global')[0]!;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      mcpServers: { 'forge-gateway': { url: 'http://example.test/mcp' } },
+    }, null, 2) + '\n');
+
+    qoder.install('global', { autoAllow: true });
+    qoder.uninstall('global');
+
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.mcpServers['forge-gateway']).toBeDefined();
+    expect(cfg.mcpServers.codegraph).toBeUndefined();
+  });
+
+  it('qoder: rejects --location=local with a clear note (global-only IDE)', () => {
+    const qoder = getTarget('qoder')!;
+    expect(qoder.supportsLocation('local')).toBe(false);
+    const result = qoder.install('local', { autoAllow: true });
+    expect(result.files).toEqual([]);
+    expect(result.notes?.join(' ')).toMatch(/no project-local/);
+  });
+
   it('hermes: install adds codegraph MCP server and cli toolset, preserving existing yaml', () => {
     const hermes = getTarget('hermes')!;
     const config = path.join(tmpHome, '.hermes', 'config.yaml');

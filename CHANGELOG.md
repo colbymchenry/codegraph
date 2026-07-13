@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph install` now detects and configures **Qoder**. The MCP entry lands in Qoder's shared `mcp.json` under `~/Library/Application Support/Qoder/SharedClientCache/` on macOS (the platform-appropriate config dir on Linux and Windows), sibling MCP servers are left intact, and re-runs are idempotent. Two Qoder-specific quirks are handled at install time: (a) Qoder does not expand `${workspaceFolder}` in MCP args, so codegraph is installed without a `--path` argument and resolves the workspace via the MCP `roots/list` handshake; (b) Qoder launches from Dock/launchd on macOS with a stripped PATH, so the `command` is resolved to the absolute `codegraph` path from your login shell — the same trick already used for Antigravity IDE. Uninstall reverses every change and leaves sibling servers untouched.
+
 ### Fixes
 
 - Callers and impact analysis no longer silently under-count a function that calls the same callee many times. When one caller contained several call sites to the same callee and an internal resolution batch boundary happened to split them, cleanup after the first batch removed the later sites' pending rows before they were ever attempted — their edges were never created, deterministically, and which edges went missing shifted with unrelated changes to the project's total reference count. Post-pass cleanup now targets the exact database row each processed reference came from. Found while validating the operator-call fix on nlohmann/json, where `write_cbor`'s 11 calls to `to_char_type` indexed as 10. (#1269)

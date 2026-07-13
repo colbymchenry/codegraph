@@ -73,3 +73,4 @@ assets/generate-waitlist.py
 
 # Local scratch tests (never commit)
 __tests__/zz-scratch*
+.history/
