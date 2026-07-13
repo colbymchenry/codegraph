@@ -19,6 +19,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
+import { createOpencodeFamilyTarget } from '../src/installer/targets/opencode-family';
 import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
@@ -1823,5 +1824,131 @@ describe('Installer targets — opencode XDG config path (#535)', () => {
     expect(opencode.detect('global').installed).toBe(true);
     // But configuration state is read from the REAL path only.
     expect(opencode.detect('global').alreadyConfigured).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// opencode-family factory — direct contract tests
+//
+// The registered opencode and codev targets exercise the shared
+// implementation end-to-end above; these pin the FACTORY's spec
+// semantics with a synthetic spec that belongs to neither, so the
+// parameterization contract holds for the next fork target anyone adds:
+// every path derives from `appName`, and `%APPDATA%` handling follows
+// `sweepLegacyWindowsAppData` — not the app name.
+// ---------------------------------------------------------------------------
+describe('Installer targets — opencode-family factory contract', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+  let appDataDir: string; // distinct from ~/.config, like real Windows
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+    appDataDir = path.join(tmpHome, 'AppData', 'Roaming');
+    process.env.APPDATA = appDataDir; // realistic split: APPDATA ≠ ~/.config
+    delete process.env.XDG_CONFIG_HOME; // default resolution: ~/.config
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  // `id` reuses a real TargetId union member (specs of unregistered
+  // targets still have to type-check), but nothing about 'sampleapp'
+  // exists in the registry — every asserted path can only come from
+  // the spec.
+  const makeSample = (sweep: boolean) => createOpencodeFamilyTarget({
+    id: 'opencode',
+    displayName: 'Sample App',
+    docsUrl: 'https://example.com/docs',
+    appName: 'sampleapp',
+    sweepLegacyWindowsAppData: sweep,
+  });
+
+  const sampleConfigFile = () => path.join(tmpHome, '.config', 'sampleapp', 'sampleapp.jsonc');
+  const legacyDir = () => path.join(appDataDir, 'sampleapp');
+  const plantLegacyEntry = () => {
+    fs.mkdirSync(legacyDir(), { recursive: true });
+    const file = path.join(legacyDir(), 'sampleapp.json');
+    const body = '{\n  "mcp": {\n    "codegraph": { "type": "local", "command": ["codegraph", "serve", "--mcp"], "enabled": true }\n  }\n}\n';
+    fs.writeFileSync(file, body);
+    return { file, body };
+  };
+
+  it('exposes the spec identity verbatim (id, displayName, docsUrl)', () => {
+    const sample = makeSample(false);
+    expect(sample.id).toBe('opencode');
+    expect(sample.displayName).toBe('Sample App');
+    expect(sample.docsUrl).toBe('https://example.com/docs');
+  });
+
+  it('derives every path from appName: global <app>/<app>.jsonc + AGENTS.md, local ./<app>.jsonc', () => {
+    const sample = makeSample(false);
+
+    const result = sample.install('global', { autoAllow: true });
+    expect(result.files.some((f) => path.resolve(f.path) === path.resolve(sampleConfigFile()))).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(sampleConfigFile(), 'utf-8'));
+    expect(cfg.mcp.codegraph).toEqual({ type: 'local', command: ['codegraph', 'serve', '--mcp'], enabled: true });
+    expect(fs.existsSync(path.join(tmpHome, '.config', 'sampleapp', 'AGENTS.md'))).toBe(true);
+
+    const localPaths = sample.describePaths('local').map((p) => p.replace(/\\/g, '/'));
+    expect(localPaths.some((p) => p.endsWith('/sampleapp.jsonc'))).toBe(true);
+    expect(sample.printConfig('global')).toContain('sampleapp.jsonc');
+  });
+
+  it('prefers an existing <app>.json over creating <app>.jsonc', () => {
+    const dir = path.join(tmpHome, '.config', 'sampleapp');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'sampleapp.json'), '{\n  "$schema": "https://opencode.ai/config.json"\n}\n');
+
+    const sample = makeSample(false);
+    const result = sample.install('global', { autoAllow: true });
+    expect(result.files[0].path).toMatch(/sampleapp\.json$/);
+    expect(fs.existsSync(sampleConfigFile())).toBe(false);
+  });
+
+  it('honors XDG_CONFIG_HOME with the spec appName', () => {
+    const custom = path.join(tmpHome, 'xdg-custom');
+    process.env.XDG_CONFIG_HOME = custom;
+    const sample = makeSample(false);
+    const result = sample.install('global', { autoAllow: true });
+    expect(path.resolve(result.files[0]!.path))
+      .toBe(path.resolve(path.join(custom, 'sampleapp', 'sampleapp.jsonc')));
+  });
+
+  it('sweep disabled: %APPDATA%/<app> is invisible to detect/install/uninstall', () => {
+    const planted = plantLegacyEntry();
+    const sample = makeSample(false);
+
+    // Legacy-only presence does NOT count as installed…
+    expect(sample.detect('global').installed).toBe(false);
+
+    // …and neither install nor uninstall reads or writes under %APPDATA%.
+    const installed = sample.install('global', { autoAllow: true });
+    const removed = sample.uninstall('global');
+    for (const f of [...installed.files, ...removed.files]) {
+      expect(path.resolve(f.path).startsWith(path.resolve(appDataDir) + path.sep)).toBe(false);
+    }
+    expect(fs.readFileSync(planted.file, 'utf-8')).toBe(planted.body);
+  });
+
+  it('sweep enabled: the same legacy state is detected and healed on install', () => {
+    const planted = plantLegacyEntry();
+    const sample = makeSample(true);
+
+    expect(sample.detect('global').installed).toBe(true);
+
+    const result = sample.install('global', { autoAllow: true });
+    expect(result.files.some((f) => f.action === 'removed' && path.resolve(f.path) === path.resolve(planted.file))).toBe(true);
+    expect(fs.readFileSync(planted.file, 'utf-8')).not.toContain('codegraph');
   });
 });
