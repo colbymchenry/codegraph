@@ -363,3 +363,85 @@ describe('migration v6: dedup edges + add identity index on upgrade (#1034)', ()
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('unresolved-ref readers do not overflow the argument stack (large result sets)', () => {
+  let dir: string;
+  let db: DatabaseConnection;
+  let q: QueryBuilder;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-perf-refspread-'));
+    db = DatabaseConnection.initialize(path.join(dir, 'test.db'));
+    q = new QueryBuilder(db.getDb());
+  });
+
+  afterEach(() => {
+    db.close();
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('getUnresolvedReferencesByFiles: one file with more pending refs than the spread limit', () => {
+    // Regression: the method chunks the file-PATH list under SQLite's parameter
+    // limit, then collected the matched rows with `rows.push(...chunkRows)` —
+    // spreading every matched row as a separate call argument. On a large
+    // `codegraph sync` a single chunk of files matches hundreds of thousands of
+    // pending refs, which blew V8's argument-stack limit with "Maximum call
+    // stack size exceeded" (the arg-spread ceiling is ~125k). All refs here
+    // share ONE file_path so a single chunk returns the whole set; from_node_id
+    // has a FK to nodes, so a backing node must exist first.
+    const COUNT = 130_000; // just past the arg-spread ceiling
+    q.insertNode(makeNode('n1'));
+    q.insertUnresolvedRefsBatch(
+      Array.from({ length: COUNT }, (_, i) => ({
+        fromNodeId: 'n1',
+        referenceName: `ref${i}`,
+        referenceKind: 'calls' as const,
+        line: i + 1,
+        column: 0,
+        filePath: 'big.ts',
+        language: 'typescript' as const,
+      }))
+    );
+
+    let refs: ReturnType<typeof q.getUnresolvedReferencesByFiles> = [];
+    expect(() => {
+      refs = q.getUnresolvedReferencesByFiles(['big.ts']);
+    }).not.toThrow();
+    expect(refs.length).toBe(COUNT);
+  });
+
+  it('getRetryableFailedReferences: one name-chunk matching more failed refs than the spread limit', () => {
+    // Same regression, second reader (#1240 retry path). Pass 2 chunks the NAME
+    // list under the parameter limit, then did `rows.push(...chunkRows)`. Each
+    // name stays under perNameCeiling, but a single chunk of names collectively
+    // matches far more failed rows than the arg-spread ceiling, so the spread
+    // overflowed the stack. Here 400 distinct name tails × 400 failed refs each
+    // (each under the 500 ceiling) all fall in one name-chunk → 160k rows.
+    const TAILS = 400;
+    const PER_TAIL = 400; // < perNameCeiling(500) so every tail survives pass 1
+    q.insertNode(makeNode('n1'));
+
+    const refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: 'calls'; line: number; column: number }> = [];
+    for (let t = 0; t < TAILS; t++) {
+      for (let j = 0; j < PER_TAIL; j++) {
+        // A plain name (no '.'/'::') is its own name_tail, so referenceName === tail.
+        refs.push({ fromNodeId: 'n1', referenceName: `tail${t}`, referenceKind: 'calls', line: j + 1, column: 0 });
+      }
+    }
+    q.insertUnresolvedRefsBatch(refs);
+
+    // Park them all as status='failed' with their name_tail, so the retry reader
+    // (which only sees failed rows) returns them. One mark per distinct tuple
+    // flips all same-tuple rows.
+    q.markReferencesFailed(
+      Array.from({ length: TAILS }, (_, t) => ({ fromNodeId: 'n1', referenceName: `tail${t}`, referenceKind: 'calls' }))
+    );
+
+    const names = Array.from({ length: TAILS }, (_, t) => `tail${t}`);
+    let retry: ReturnType<typeof q.getRetryableFailedReferences> = [];
+    expect(() => {
+      retry = q.getRetryableFailedReferences(names);
+    }).not.toThrow();
+    expect(retry.length).toBe(TAILS * PER_TAIL);
+  });
+});
