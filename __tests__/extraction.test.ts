@@ -4074,6 +4074,35 @@ class Both : public Base<char>, public Plain {};
     });
   });
 
+  describe('C++ out-of-line template method qualifier (#1286)', () => {
+    // An out-of-line template method definition
+    // (`template<typename T> T Box<T>::get()`) recorded its class qualifier as the
+    // full instantiation `Box<T>`, so the method's qualifiedName was `Box<T>::get`.
+    // That never name-matched the class node indexed as `Box`, and long/multi-line
+    // template params could push the qualifiedName past the 255-byte filename
+    // limit. The `<…>` args are stripped so the qualifier is the bare `Box`,
+    // exactly like #1043 did for templated base classes. Inline method bodies were
+    // already unaffected.
+    it('strips template args from an out-of-line template method qualifier', () => {
+      const code = `
+template <typename T>
+class Box { public: T get() const; void set(T v); private: T value; };
+
+template <typename T> T Box<T>::get() const { return value; }
+template <typename T> void Box<T>::set(T v) { value = v; }
+`;
+      const nodes = extractFromSource('box.cpp', code).nodes;
+      const get = nodes.find((n) => n.name === 'get');
+      const set = nodes.find((n) => n.name === 'set');
+
+      // Qualifier is the bare class, not the `Box<T>` instantiation.
+      expect(get?.qualifiedName).toBe('Box::get');
+      expect(set?.qualifiedName).toBe('Box::set');
+      // No node still carries angle brackets in its qualified name.
+      expect(nodes.find((n) => n.qualifiedName?.includes('<'))).toBeUndefined();
+    });
+  });
+
   describe('C++ stack-allocation construction (#1035)', () => {
     // `Calculator calc(0)` (direct-init) and `Widget w{1, 2}` (brace-init) carry
     // the constructor args directly on the declarator — no call/new node — so

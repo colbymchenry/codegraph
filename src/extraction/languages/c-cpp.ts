@@ -88,7 +88,14 @@ function extractCppReceiverType(node: SyntaxNode, source: string): string | unde
   if (!declarator) return undefined;
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
-  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
+  // Strip template arguments before splitting on `::` so an out-of-line template
+  // method definition (`template<typename T> T Box<T>::get()`) yields the bare
+  // class `Box`, not `Box<T>` — matching the class node indexed as `Box`, the
+  // same reason #1043 stripped them from templated base-class references. Doing it
+  // before the split also tolerates `::` inside the args (`Box<std::string>::get`).
+  const parts = stripCppTemplateArgs(getNodeText(qid, source).trim())
+    .split('::')
+    .filter(Boolean);
   return parts.length > 1 ? parts.slice(0, -1).join('::') : undefined;
 }
 
