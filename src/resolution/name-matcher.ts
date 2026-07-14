@@ -2480,6 +2480,22 @@ export function dumpNameMatcherProfile(label: string): void {
   }
 }
 
+/**
+ * The Elixir module a node belongs to, or `null` when it can't be determined.
+ * Function/method nodes carry a `Full.Module::fun` qualifiedName, so the module
+ * is everything before the last `::`. A `namespace` node IS a module, so its
+ * whole qualifiedName is the module name (calls in module-attribute values
+ * report the namespace node as their from-node — c4c0eec). A top-level function
+ * with no enclosing module (no `::`) yields `null`, so its bare calls stay
+ * unresolved rather than guess a module.
+ */
+function elixirModuleOf(node: Node | null | undefined): string | null {
+  if (!node) return null;
+  if (node.kind === 'namespace') return node.qualifiedName || null;
+  const sep = node.qualifiedName.lastIndexOf('::');
+  return sep > 0 ? node.qualifiedName.slice(0, sep) : null;
+}
+
 export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -2548,15 +2564,27 @@ export function matchReference(
     !ref.referenceName.includes('::') &&
     /^[a-z_]/.test(ref.referenceName)
   ) {
-    const sameFile = context
+    // Same-file is necessary but NOT sufficient: one file can hold two+ modules,
+    // and a bare call may only legitimately target a function of the CALLER's own
+    // module. Without qualifying by module, a bare `helper()` in module B would
+    // grab module A's same-named `helper` (whichever getNodesByName returns
+    // first) — a wrong cross-module edge, worse than none. Derive the caller's
+    // module from its node (`Mod.Sub::fun` → `Mod.Sub`; a namespace caller, for
+    // calls in module-attribute values (c4c0eec), IS the module) and keep only
+    // candidates in that module. Caller module indeterminable, or no same-module
+    // candidate → stay unresolved.
+    const callerModule = elixirModuleOf(context.getNodeById?.(ref.fromNodeId));
+    if (!callerModule) return null;
+    const sameModule = context
       .getNodesByName(ref.referenceName)
       .filter(
         (n) =>
           n.language === 'elixir' &&
           n.kind === 'function' &&
-          n.filePath === ref.filePath
+          n.filePath === ref.filePath &&
+          elixirModuleOf(n) === callerModule
       );
-    const chosen = sameFile[0];
+    const chosen = sameModule[0];
     if (!chosen) return null;
     return {
       original: ref,
