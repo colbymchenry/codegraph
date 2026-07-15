@@ -1376,7 +1376,10 @@ program
       const args: Record<string, unknown> = {};
       if (options.file) {
         args.file = options.file;
-        if (name && name !== options.file) args.symbol = name;
+        if (name && name !== options.file) {
+          args.symbol = name;
+          args.includeCode = true;
+        }
       } else if (name && (name.includes('/') || name.includes('\\'))) {
         args.file = name.replace(/\\/g, '/');
       } else if (name) {

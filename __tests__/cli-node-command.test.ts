@@ -39,6 +39,7 @@ describe('codegraph node — argument handling (#1044)', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-node-cmd-'));
     fs.mkdirSync(path.join(tempDir, 'src'));
     fs.writeFileSync(path.join(tempDir, 'src/util.ts'), 'export function util(x: number){ return x + 1; }\n');
+    fs.writeFileSync(path.join(tempDir, 'src/other.ts'), 'export function util(x: number){ return x - 1; }\n');
     const cg = CodeGraph.initSync(tempDir);
     await cg.indexAll();
     cg.close();
@@ -69,6 +70,14 @@ describe('codegraph node — argument handling (#1044)', () => {
     expect(code).toBe(0);
     expect(stdout).toContain('util');
     expect(stdout).toContain('Location:');
+  });
+
+  it('a symbol pinned with -f includes the selected definition body (#1284)', () => {
+    const { stdout, code } = runNode(tempDir, ['util', '-f', 'src/util.ts']);
+    expect(code).toBe(0);
+    expect(stdout).toContain('src/util.ts');
+    expect(stdout).toContain('return x + 1');
+    expect(stdout).not.toContain('return x - 1');
   });
 
   it('neither symbol nor file gives a usage error, not commander\'s cryptic one', () => {
