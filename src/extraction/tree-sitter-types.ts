@@ -168,6 +168,10 @@ export interface LanguageExtractor {
    * implementations across source sets.
    */
   extractModifiers?: (node: SyntaxNode) => string[] | undefined;
+  /** Extract decorators with access to source and file path (shader stage/layout metadata). */
+  extractDecorators?: (node: SyntaxNode, source: string, filePath: string) => string[] | undefined;
+  /** Return true for compiler intrinsics/type constructors that should not emit call refs. */
+  isBuiltinCall?: (name: string, node: SyntaxNode, source: string) => boolean;
 
   // --- New config properties ---
 

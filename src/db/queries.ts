@@ -1742,7 +1742,11 @@ export class QueryBuilder {
     const row = this.db
       .prepare('SELECT MAX(indexed_at) AS last FROM files')
       .get() as { last: number | null } | undefined;
-    return row?.last ?? null;
+    const fileLast = row?.last ?? null;
+    const operationRaw = this.getMetadata('last_indexed_at');
+    const operationLast = operationRaw == null ? NaN : Number(operationRaw);
+    if (!Number.isFinite(operationLast) || operationLast <= 0) return fileLast;
+    return fileLast == null ? operationLast : Math.max(fileLast, operationLast);
   }
 
   /**
@@ -1864,6 +1868,28 @@ export class QueryBuilder {
     }
     const row = this.stmts.getUnresolvedCount.get() as { count: number };
     return row.count;
+  }
+
+  /** Attempted references that could not be resolved, summarized for status. */
+  getFailedReferenceStats(): {
+    total: number;
+    byLanguage: Record<string, number>;
+    byKind: Record<string, number>;
+  } {
+    const total = (this.db.prepare(
+      "SELECT COUNT(*) AS count FROM unresolved_refs WHERE status = 'failed'"
+    ).get() as { count: number }).count;
+    const languageRows = this.db.prepare(
+      "SELECT language, COUNT(*) AS count FROM unresolved_refs WHERE status = 'failed' GROUP BY language ORDER BY count DESC"
+    ).all() as Array<{ language: string; count: number }>;
+    const kindRows = this.db.prepare(
+      "SELECT reference_kind AS kind, COUNT(*) AS count FROM unresolved_refs WHERE status = 'failed' GROUP BY reference_kind ORDER BY count DESC"
+    ).all() as Array<{ kind: string; count: number }>;
+    return {
+      total,
+      byLanguage: Object.fromEntries(languageRows.map((row) => [row.language, row.count])),
+      byKind: Object.fromEntries(kindRows.map((row) => [row.kind, row.count])),
+    };
   }
 
   /**

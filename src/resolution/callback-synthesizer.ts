@@ -28,6 +28,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
+import { shaderIntegrationEdges } from './shader-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
@@ -3540,6 +3541,7 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   const cFnPtrEdges = has('c', 'cpp') ? await cFnPointerDispatchEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('cFnPtrEdges');
   const goframeEdges = has('go') ? await goframeRouteEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('goframeEdges');
   const nixOptionEdges = has('nix') ? await nixOptionPathEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('nixOptionEdges');
+  const shaderEdges = has('glsl', 'hlsl') ? await shaderIntegrationEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('shaderEdges');
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -3580,6 +3582,7 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
     ...cFnPtrEdges,
     ...goframeEdges,
     ...nixOptionEdges,
+    ...shaderEdges,
   ]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;

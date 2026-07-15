@@ -69,6 +69,22 @@ describe('Language Detection', () => {
     expect(detectLanguage('class.hpp')).toBe('cpp');
   });
 
+  it('should detect GLSL, Vulkan shader stages, GLSLFX, and HLSL files', () => {
+    for (const file of ['shader.glsl', 'shader.vert', 'shader.frag', 'shader.comp', 'shader.geom',
+      'shader.tesc', 'shader.tese', 'shader.rgen', 'shader.rmiss', 'shader.rchit',
+      'shader.rahit', 'shader.rint', 'shader.rcall', 'shader.mesh', 'shader.task', 'shader.glslfx']) {
+      expect(detectLanguage(file)).toBe('glsl');
+      expect(isSourceFile(file)).toBe(true);
+    }
+    for (const file of ['shader.hlsl', 'shader.hlsli', 'shader.fx', 'shader.fxh']) {
+      expect(detectLanguage(file)).toBe('hlsl');
+      expect(isSourceFile(file)).toBe(true);
+    }
+    expect(isLanguageSupported('glsl')).toBe(true);
+    expect(isLanguageSupported('hlsl')).toBe(true);
+    expect(getSupportedLanguages()).toEqual(expect.arrayContaining(['glsl', 'hlsl']));
+  });
+
   it('should detect C# files', () => {
     expect(detectLanguage('Program.cs')).toBe('csharp');
   });

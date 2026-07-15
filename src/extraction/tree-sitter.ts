@@ -30,6 +30,8 @@ import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
+import { GlslfxExtractor } from './glslfx-extractor';
+import { extractCmake, extractPowershell } from './build-script-extractors';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -1053,6 +1055,13 @@ export class TreeSitterExtractor {
       this.scanFnRefSubtree(node, 0);
       skipChildren = true;
     }
+    // C++ named lambdas are local variables syntactically, but callable symbols
+    // semantically: `auto parse = [](auto x) { ... };`. Handle them before the
+    // top-level-variable gate so lambdas inside both free functions and methods
+    // become scoped function nodes without indexing ordinary local variables.
+    else if (this.language === 'cpp' && nodeType === 'declaration' && this.extractCppLambdaDeclarations(node)) {
+      skipChildren = true;
+    }
     // Check for variable declarations (const, let, var, etc.)
     // Only extract top-level variables (not inside functions/methods) — plus
     // class/module-scope CONSTANTS, which Ruby (and other const-in-class
@@ -1320,6 +1329,10 @@ export class TreeSitterExtractor {
     if (mods && mods.length > 0) {
       newNode.decorators = [...(newNode.decorators ?? []), ...mods];
     }
+    const decorators = this.extractor?.extractDecorators?.(node, this.source, this.filePath);
+    if (decorators && decorators.length > 0) {
+      newNode.decorators = [...new Set([...(newNode.decorators ?? []), ...decorators])];
+    }
 
     this.nodes.push(newNode);
 
@@ -1452,7 +1465,11 @@ export class TreeSitterExtractor {
   /**
    * Extract a function
    */
-  private extractFunction(node: SyntaxNode, nameOverride?: string): void {
+  private extractFunction(
+    node: SyntaxNode,
+    nameOverride?: string,
+    extraProps?: Partial<Node>
+  ): void {
     if (!this.extractor) return;
 
     // If the language provides getReceiverType and this function has a receiver
@@ -1516,6 +1533,9 @@ export class TreeSitterExtractor {
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
     const returnType = this.extractor.getReturnType?.(node, this.source);
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    const correctedBody = body ? this.correctMalformedCppBodyRange(body) : null;
 
     const funcNode = this.createNode('function', name, node, {
       docstring,
@@ -1525,6 +1545,11 @@ export class TreeSitterExtractor {
       isAsync,
       isStatic,
       returnType,
+      ...(correctedBody ? {
+        endLine: correctedBody.endLine,
+        endColumn: correctedBody.endColumn,
+      } : {}),
+      ...extraProps,
     });
     if (!funcNode) return;
 
@@ -1538,12 +1563,13 @@ export class TreeSitterExtractor {
 
     // Push to stack and visit body
     this.nodeStack.push(funcNode.id);
-    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
-      ?? getChildByField(node, this.extractor.bodyField);
     if (body) {
-      this.visitFunctionBody(body, funcNode.id);
+      this.visitFunctionBody(body, funcNode.id, correctedBody?.endIndex);
     }
     this.nodeStack.pop();
+    if (body && correctedBody) {
+      this.recoverCppFunctionsAfterMalformedBody(body, correctedBody.endIndex);
+    }
   }
 
   /**
@@ -1717,6 +1743,9 @@ export class TreeSitterExtractor {
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
     const returnType = this.extractor.getReturnType?.(node, this.source);
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    const correctedBody = body ? this.correctMalformedCppBodyRange(body) : null;
     const extraProps: Partial<Node> = {
       docstring,
       signature,
@@ -1724,6 +1753,10 @@ export class TreeSitterExtractor {
       isAsync,
       isStatic,
       returnType,
+      ...(correctedBody ? {
+        endLine: correctedBody.endLine,
+        endColumn: correctedBody.endColumn,
+      } : {}),
     };
     if (receiverType) {
       extraProps.qualifiedName = `${receiverType}::${name}`;
@@ -1758,12 +1791,13 @@ export class TreeSitterExtractor {
 
     // Push to stack and visit body
     this.nodeStack.push(methodNode.id);
-    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
-      ?? getChildByField(node, this.extractor.bodyField);
     if (body) {
-      this.visitFunctionBody(body, methodNode.id);
+      this.visitFunctionBody(body, methodNode.id, correctedBody?.endIndex);
     }
     this.nodeStack.pop();
+    if (body && correctedBody) {
+      this.recoverCppFunctionsAfterMalformedBody(body, correctedBody.endIndex);
+    }
   }
 
   /**
@@ -2473,6 +2507,38 @@ export class TreeSitterExtractor {
    * Extracts top-level and module-level variable declarations.
    * Captures the variable name and first 100 chars of initializer in signature for searchability.
    */
+  private extractCppLambdaDeclarations(node: SyntaxNode): boolean {
+    let extracted = false;
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const declarator = node.namedChild(i);
+      if (declarator?.type !== 'init_declarator') continue;
+      const value = getChildByField(declarator, 'value');
+      if (value?.type !== 'lambda_expression') continue;
+      const nameNode = cDeclaratorIdentifier(getChildByField(declarator, 'declarator'));
+      if (!nameNode) continue;
+      const name = getNodeText(nameNode, this.source);
+      if (!name) continue;
+      const ownerId = this.nodeStack[this.nodeStack.length - 1];
+      const owner = ownerId ? this.nodes.find((candidate) => candidate.id === ownerId) : undefined;
+      let ownerQualifiedName = owner && owner.kind !== 'file' ? owner.qualifiedName : '';
+      const namespace = this.namespacePrefix.join('::');
+      if (
+        namespace &&
+        ownerQualifiedName &&
+        ownerQualifiedName !== namespace &&
+        !ownerQualifiedName.startsWith(`${namespace}::`)
+      ) {
+        ownerQualifiedName = `${namespace}::${ownerQualifiedName}`;
+      }
+      this.extractFunction(value, name, {
+        ...(ownerQualifiedName ? { qualifiedName: `${ownerQualifiedName}::${name}` } : {}),
+        decorators: ['cpp:lambda'],
+      });
+      extracted = true;
+    }
+    return extracted;
+  }
+
   private extractVariable(node: SyntaxNode): void {
     if (!this.extractor) return;
 
@@ -3619,6 +3685,48 @@ export class TreeSitterExtractor {
     return this.erlangAtomMacros.get(macroName) ?? null;
   }
 
+  private isPlausibleShaderType(name: string): boolean {
+    return /^(?:(?:bool|int|uint|dword|half|float|double|min16float|min10float|min16int|min12int|min16uint)(?:[1-4](?:x[1-4])?)?|[A-Z][A-Za-z0-9_]*|(?:RTXDI|RAB)_[A-Za-z0-9_]+)$/.test(name);
+  }
+
+  private inferShaderArgumentType(argument: SyntaxNode, call: SyntaxNode): string | null {
+    let arg = argument;
+    while (arg.type === 'parenthesized_expression' && arg.namedChildCount === 1) {
+      const child = arg.namedChild(0);
+      if (!child) break;
+      arg = child;
+    }
+    if (arg.type === 'true' || arg.type === 'false') return 'bool';
+    if (/^(?:float|double)_literal$/.test(arg.type)) return 'float';
+    if (arg.type === 'call_expression') {
+      const fn = getChildByField(arg, 'function');
+      if (fn?.type === 'identifier') {
+        const name = getNodeText(fn, this.source);
+        if (this.isPlausibleShaderType(name)) return name;
+      }
+    }
+    if (arg.type !== 'identifier') return null;
+    const identifier = getNodeText(arg, this.source);
+    if (!identifier) return null;
+    let scope: SyntaxNode | null = call;
+    while (scope.parent && !this.extractor?.functionTypes.includes(scope.type) && !this.extractor?.methodTypes.includes(scope.type)) {
+      scope = scope.parent;
+    }
+    const before = this.source.slice(scope?.startIndex ?? 0, call.startIndex);
+    const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const declaration = new RegExp(
+      `(?:^|[({;,])\\s*(?:(?:const|static|uniform|groupshared|inout|out|in)\\s+)*([A-Za-z_]\\w*)\\s+${escaped}\\b`,
+      'gm',
+    );
+    let inferred: string | null = null;
+    let match: RegExpExecArray | null;
+    while ((match = declaration.exec(before))) {
+      const type = match[1]!;
+      if (this.isPlausibleShaderType(type)) inferred = type;
+    }
+    return inferred;
+  }
+
   private extractCall(node: SyntaxNode): void {
     if (this.nodeStack.length === 0) return;
 
@@ -4482,13 +4590,37 @@ export class TreeSitterExtractor {
       }
     }
 
+    if (
+      calleeName &&
+      this.extractor?.isBuiltinCall?.(calleeName, node, this.source) &&
+      !this.nodes.some((n) =>
+        (n.kind === 'function' || n.kind === 'method') &&
+        (n.name === calleeName || n.name === calleeName.slice(calleeName.lastIndexOf('.') + 1))
+      )
+    ) {
+      return;
+    }
+
     if (calleeName) {
+      const shaderArgs = (this.language === 'glsl' || this.language === 'hlsl')
+        ? getChildByField(node, 'arguments')
+        : null;
+      const shaderCandidates = shaderArgs ? [`arity:${shaderArgs.namedChildCount}`] : undefined;
+      if (shaderArgs && shaderCandidates) {
+        for (let index = 0; index < shaderArgs.namedChildCount; index++) {
+          const argument = shaderArgs.namedChild(index);
+          if (!argument) continue;
+          const type = this.inferShaderArgumentType(argument, node);
+          if (type) shaderCandidates.push(`argtype:${index}:${type}`);
+        }
+      }
       this.unresolvedReferences.push({
         fromNodeId: callerId,
         referenceName: calleeName,
         referenceKind: 'calls',
         line: node.startPosition.row + 1,
         column: node.startPosition.column,
+        candidates: shaderCandidates,
       });
     }
   }
@@ -5039,10 +5171,126 @@ export class TreeSitterExtractor {
     targets.add(target);
   }
 
-  private visitFunctionBody(body: SyntaxNode, _functionId: string): void {
+  /**
+   * tree-sitter-cpp can pair a nested conditional directive with a distant
+   * `#endif`, causing one function body to consume the rest of a file. When the
+   * body is erroneous, prefer the first lexically balanced closing brace. The
+   * scanner ignores comments and every C++ string form so braces in text do not
+   * truncate a valid body.
+   */
+  private correctMalformedCppBodyRange(
+    body: SyntaxNode
+  ): { endIndex: number; endLine: number; endColumn: number } | null {
+    if (this.language !== 'cpp' || !body.hasError) return null;
+
+    const openIndex = this.source.indexOf('{', body.startIndex);
+    if (openIndex < 0 || openIndex >= body.endIndex) return null;
+    const closeIndex = this.findMatchingCppBrace(openIndex);
+    if (closeIndex < 0 || closeIndex + 1 >= body.endIndex) return null;
+
+    const throughClose = this.source.slice(body.startIndex, closeIndex + 1);
+    const newlineCount = (throughClose.match(/\n/g) ?? []).length;
+    const lastNewline = throughClose.lastIndexOf('\n');
+    const endColumn = lastNewline >= 0
+      ? throughClose.length - lastNewline - 1
+      : body.startPosition.column + throughClose.length;
+    return {
+      endIndex: closeIndex + 1,
+      endLine: body.startPosition.row + newlineCount + 1,
+      endColumn,
+    };
+  }
+
+  private findMatchingCppBrace(openIndex: number): number {
+    let depth = 0;
+    let i = openIndex;
+    while (i < this.source.length) {
+      const rawPrefix = ['u8R"', 'uR"', 'UR"', 'LR"', 'R"']
+        .find((prefix) => this.source.startsWith(prefix, i));
+      if (rawPrefix) {
+        const delimiterStart = i + rawPrefix.length;
+        const paren = this.source.indexOf('(', delimiterStart);
+        if (paren >= 0 && paren - delimiterStart <= 16) {
+          const delimiter = this.source.slice(delimiterStart, paren);
+          const rawEnd = this.source.indexOf(`)${delimiter}"`, paren + 1);
+          if (rawEnd >= 0) {
+            i = rawEnd + delimiter.length + 2;
+            continue;
+          }
+        }
+      }
+
+      const char = this.source[i];
+      const next = this.source[i + 1];
+      if (char === '/' && next === '/') {
+        const newline = this.source.indexOf('\n', i + 2);
+        i = newline < 0 ? this.source.length : newline + 1;
+        continue;
+      }
+      if (char === '/' && next === '*') {
+        const commentEnd = this.source.indexOf('*/', i + 2);
+        i = commentEnd < 0 ? this.source.length : commentEnd + 2;
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        const quote = char;
+        i++;
+        while (i < this.source.length) {
+          if (this.source[i] === '\\') {
+            i += 2;
+            continue;
+          }
+          if (this.source[i] === quote) {
+            i++;
+            break;
+          }
+          i++;
+        }
+        continue;
+      }
+      if (char === '{') depth++;
+      if (char === '}' && --depth === 0) return i;
+      i++;
+    }
+    return -1;
+  }
+
+  /**
+   * Later top-level definitions are descendants of the corrupted body in the
+   * AST, so the normal root walk never sees them. Revisit only the outermost
+   * function definitions after the recovered close at the original file scope.
+   */
+  private recoverCppFunctionsAfterMalformedBody(body: SyntaxNode, cutoff: number): void {
+    const visit = (node: SyntaxNode): void => {
+      if (node.endIndex <= cutoff) return;
+      if (
+        node.startIndex >= cutoff &&
+        this.extractor?.functionTypes.includes(node.type)
+      ) {
+        this.visitNode(node);
+        return;
+      }
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child) visit(child);
+      }
+    };
+
+    for (let i = 0; i < body.namedChildCount; i++) {
+      const child = body.namedChild(i);
+      if (child) visit(child);
+    }
+  }
+
+  private visitFunctionBody(
+    body: SyntaxNode,
+    _functionId: string,
+    maxEndIndex?: number
+  ): void {
     if (!this.extractor) return;
 
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
+      if (maxEndIndex !== undefined && node.startIndex >= maxEndIndex) return;
       const nodeType = node.type;
 
       // Function-as-value capture (#756) — function bodies are walked here,
@@ -5082,6 +5330,24 @@ export class TreeSitterExtractor {
               column: node.startPosition.column,
             });
           }
+        }
+      }
+
+      if (
+        (this.language === 'glsl' || this.language === 'hlsl') &&
+        nodeType === 'identifier' &&
+        this.nodeStack.length > 0
+      ) {
+        const macroName = getNodeText(node, this.source);
+        if (/^[A-Z][A-Z0-9_]{2,}$/.test(macroName)) {
+          const ownerId = this.nodeStack[this.nodeStack.length - 1];
+          if (ownerId) this.unresolvedReferences.push({
+            fromNodeId: ownerId,
+            referenceName: macroName,
+            referenceKind: 'references',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
         }
       }
 
@@ -5155,6 +5421,10 @@ export class TreeSitterExtractor {
       // recursion below, keeping their inner calls attributed to the enclosing
       // function: this bounds the new nodes to NAMED functions only (no explosion,
       // no lost edges). extractFunction walks the nested body itself, so we return.
+      if (this.language === 'cpp' && nodeType === 'declaration' && this.extractCppLambdaDeclarations(node)) {
+        return;
+      }
+
       if (this.extractor!.functionTypes.includes(nodeType)) {
         const nestedName = extractName(node, this.source, this.extractor!);
         if (nestedName && nestedName !== '<anonymous>') {
@@ -6611,6 +6881,13 @@ export function extractFromSource(
     // CFML never spells one in source) stays `<anonymous>`.
     const extractor = new CfmlExtractor(filePath, source, detectedLanguage);
     result = extractor.extract();
+  } else if (detectedLanguage === 'glsl' && fileExtension === '.glslfx') {
+    const extractor = new GlslfxExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'cmake') {
+    result = extractCmake(filePath, source);
+  } else if (detectedLanguage === 'powershell') {
+    result = extractPowershell(filePath, source);
   } else if (isFileLevelOnlyLanguage(detectedLanguage)) {
     // No symbol extraction at this stage — files are tracked at the file-record
     // level only. Framework extractors (Drupal routing yml, Spring `@Value`

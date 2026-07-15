@@ -374,6 +374,47 @@ export function matchByExactName(
     };
   }
 
+  // A named local C++ lambda is indexed as a function nested under its
+  // enclosing function/method (`recordGraph::bufferResource`). Prefer that
+  // lexical child over same-named project methods before path proximity can
+  // select an unrelated API symbol. Multiple children remain unresolved.
+  if (ref.language === 'cpp' && ref.referenceKind === 'calls' && context.getNodeById) {
+    const caller = context.getNodeById(ref.fromNodeId);
+    if (caller && (caller.kind === 'function' || caller.kind === 'method')) {
+      const prefix = `${caller.qualifiedName}::`;
+      const nameScope = `::${caller.name}::`;
+      const local = candidates.filter((candidate) =>
+        candidate.kind === 'function' &&
+        candidate.filePath === ref.filePath &&
+        (candidate.qualifiedName.startsWith(prefix) ||
+          candidate.qualifiedName.startsWith(`${caller.name}::`) ||
+          candidate.qualifiedName.includes(nameScope))
+      );
+      if (local.length === 1) {
+        return {
+          original: ref,
+          targetNodeId: local[0]!.id,
+          confidence: 0.98,
+          resolvedBy: 'exact-match',
+        };
+      }
+    }
+  }
+
+  // A bare C/C++ method call such as `std::string::empty()` may arrive as
+  // just `empty` when the extractor cannot retain the receiver chain. Never
+  // guess among unrelated method declarations in that case; a false edge is
+  // worse than an unresolved standard-library call. Same-file methods remain
+  // eligible because the enclosing type is a strong local signal.
+  if (
+    (ref.language === 'cpp' || ref.language === 'c') &&
+    ref.referenceKind === 'calls' &&
+    candidates.every((candidate) => candidate.kind === 'method') &&
+    !candidates.some((candidate) => candidate.filePath === ref.filePath)
+  ) {
+    return null;
+  }
+
   // Ubiquitous-name ceiling (#999): above it, picking one target among K
   // same-named defs by directory proximity is unreliable AND O(K) per ref — the
   // quadratic behind the "Resolving refs" wedge on theme/SDK-vendoring repos.
@@ -1551,6 +1592,11 @@ export function matchMethodCall(
       if (typedMatch) {
         return typedMatch;
       }
+      // C++ receiver typing is strong evidence. If the inferred type's method
+      // is not indexed (most commonly `std::string::empty()`), do not discard
+      // that evidence and fall through to a unique same-named project method.
+      // Missing is safer than manufacturing a cross-type call edge.
+      if (ref.language === 'cpp') return null;
     }
   }
 
@@ -1648,6 +1694,12 @@ export function matchMethodCall(
       }
     }
   }
+
+  // `empty()` is ubiquitous on standard-library containers and strings, whose
+  // declarations are intentionally outside the project index. An untyped C++
+  // receiver must not capture the only project method named `empty`; precise
+  // class-name and inferred-type strategies already had their chance above.
+  if (ref.language === 'cpp' && dotMatch && methodName === 'empty') return null;
 
   // Strategy 3: Find methods by name across the codebase, match by receiver
   // name similarity with the containing class. Handles abbreviated variable

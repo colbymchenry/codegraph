@@ -11,7 +11,7 @@ import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'cmake' | 'powershell' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -50,6 +50,8 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  glsl: 'tree-sitter-glsl.wasm',
+  hlsl: 'tree-sitter-hlsl.wasm',
 };
 
 /**
@@ -170,6 +172,32 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  // OpenGL/Vulkan shading languages, including Vulkan ray tracing and mesh stages.
+  '.glsl': 'glsl',
+  '.vert': 'glsl',
+  '.frag': 'glsl',
+  '.comp': 'glsl',
+  '.geom': 'glsl',
+  '.tesc': 'glsl',
+  '.tese': 'glsl',
+  '.rgen': 'glsl',
+  '.rmiss': 'glsl',
+  '.rchit': 'glsl',
+  '.rahit': 'glsl',
+  '.rint': 'glsl',
+  '.rcall': 'glsl',
+  '.mesh': 'glsl',
+  '.task': 'glsl',
+  // OpenUSD GLSLFX is a container around named GLSL sections.
+  '.glslfx': 'glsl',
+  '.hlsl': 'hlsl',
+  '.hlsli': 'hlsl',
+  '.fx': 'hlsl',
+  '.fxh': 'hlsl',
+  '.cmake': 'cmake',
+  '.ps1': 'powershell',
+  '.psm1': 'powershell',
+  '.psd1': 'powershell',
 };
 
 /**
@@ -182,6 +210,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
  * to the built-ins. Omitting it is byte-identical to the zero-config behavior.
  */
 export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
+  if (/(^|[\\/])CMakeLists\.txt$/i.test(filePath)) return true;
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
   if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
   if (isErlangAppFile(filePath)) return true; // OTP `.app`/`.app.src` resource files
@@ -274,7 +303,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix', 'glsl', 'hlsl',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
@@ -412,6 +441,7 @@ export function getParser(language: Language): Parser | null {
  * `EXTENSION_MAP`. Omitting it is byte-identical to the zero-config behavior.
  */
 export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>): Language {
+  if (/(^|[\\/])CMakeLists\.txt$/i.test(filePath)) return 'cmake';
   // Play `conf/routes` has no grammar — route through the no-symbol path; the
   // Play framework resolver extracts route nodes from it.
   if (isPlayRoutesFile(filePath)) return 'yaml';
@@ -481,7 +511,7 @@ export function isLanguageSupported(language: Language): boolean {
  * Check if a grammar has been loaded and is ready for parsing.
  */
 export function isGrammarLoaded(language: Language): boolean {
-  if (language === 'svelte' || language === 'vue' || language === 'astro' || language === 'liquid' || language === 'razor') return true;
+  if (language === 'svelte' || language === 'vue' || language === 'astro' || language === 'liquid' || language === 'razor' || language === 'cmake' || language === 'powershell') return true;
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
   if (language === 'xml' || language === 'properties') return true; // no WASM grammar needed
   return languageCache.has(language);
@@ -504,7 +534,7 @@ export function isFileLevelOnlyLanguage(language: Language): boolean {
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'astro', 'liquid'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'astro', 'liquid', 'cmake', 'powershell'];
 }
 
 /**
@@ -592,6 +622,10 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    glsl: 'GLSL / Vulkan GLSL',
+    hlsl: 'HLSL',
+    cmake: 'CMake',
+    powershell: 'PowerShell',
     unknown: 'Unknown',
   };
   return names[language] || language;

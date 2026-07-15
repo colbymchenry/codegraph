@@ -126,6 +126,27 @@ export function normalizeQuerySpelling(query: string): string {
     );
 }
 
+interface SourceLocationHint {
+  file: string;
+  line: number;
+}
+
+function sourceLocationHints(query: string): SourceLocationHint[] {
+  const pattern = /(?:^|\s)([A-Za-z0-9_./\\-]+\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl|glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|hlsli|fx|fxh))(?::(\d+)|\s+(?:at\s+)?line\s+(\d+)|\s*\(\s*line\s+(\d+)\s*\))/gi;
+  const hints: SourceLocationHint[] = [];
+  const seen = new Set<string>();
+  for (const match of query.matchAll(pattern)) {
+    const file = match[1]!.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+    const line = Number(match[2] ?? match[3] ?? match[4]);
+    if (!Number.isFinite(line) || line <= 0) continue;
+    const key = `${file}:${line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    hints.push({ file, line });
+  }
+  return hints;
+}
+
 /**
  * Calculate the recommended number of codegraph_explore calls based on project size.
  * Larger codebases need more exploration calls to cover their surface area,
@@ -574,6 +595,10 @@ export const tools: ToolDefinition[] = [
           type: 'string',
           description: 'Narrow to the definition in this file (path or suffix) when several same-named symbols exist (e.g. one UserService per app in a monorepo)',
         },
+        line: {
+          type: 'number',
+          description: 'Narrow to the definition starting at, or containing, this 1-based line (use with file for repeated local lambdas)',
+        },
         limit: {
           type: 'number',
           description: 'Maximum number of callers to return (default: 20)',
@@ -599,6 +624,10 @@ export const tools: ToolDefinition[] = [
           type: 'string',
           description: 'Narrow to the definition in this file (path or suffix) when several same-named symbols exist',
         },
+        line: {
+          type: 'number',
+          description: 'Narrow to the definition starting at, or containing, this 1-based line (use with file for repeated local lambdas)',
+        },
         limit: {
           type: 'number',
           description: 'Maximum number of callees to return (default: 20)',
@@ -623,6 +652,10 @@ export const tools: ToolDefinition[] = [
         file: {
           type: 'string',
           description: 'Narrow to the definition in this file (path or suffix) when several same-named symbols exist',
+        },
+        line: {
+          type: 'number',
+          description: 'Narrow to the definition starting at, or containing, this 1-based line (use with file for repeated local lambdas)',
         },
         depth: {
           type: 'number',
@@ -1530,11 +1563,12 @@ export class ToolHandler {
    * (filePath, qualifiedName), so same-file overloads stay together while
    * unrelated same-named classes across a monorepo's apps (#764: one
    * `UserService` per NestJS app) are kept apart. Optionally narrowed by a
-   * `file` path/suffix first.
+   * `file` path/suffix and then a precise source `line` when supplied.
    */
   private groupDefinitions(
     nodes: Node[],
-    fileFilter: string | undefined
+    fileFilter: string | undefined,
+    lineFilter: number | undefined
   ): { groups: Node[][]; filteredOut: boolean } {
     let pool = nodes;
     let filteredOut = false;
@@ -1547,11 +1581,32 @@ export class ToolHandler {
         pool = narrowed;
       } else {
         filteredOut = true;
+        // Preserve the historical fallback for ordinary application symbols,
+        // but never fall back for shader names: a non-matching shader file hint
+        // must not resurrect an unrelated `main`/`luminance` definition. A line
+        // is also an exact location request, so never fall back past it.
+        if (lineFilter || pool.some((n) => n.language === 'glsl' || n.language === 'hlsl')) pool = [];
+      }
+    }
+    if (lineFilter && pool.length > 0) {
+      const exact = pool.filter((n) => n.startLine === lineFilter);
+      const containing = exact.length > 0
+        ? exact
+        : pool.filter((n) => n.startLine <= lineFilter && n.endLine >= lineFilter);
+      if (containing.length > 0) pool = containing;
+      else {
+        pool = [];
+        filteredOut = true;
       }
     }
     const byDef = new Map<string, Node[]>();
     for (const n of pool) {
-      const key = `${n.filePath}|${n.qualifiedName}`;
+      // Repeated local C++ lambdas can share both file and qualified name (two
+      // block-local `bufferResource` declarations in one method). Their source
+      // line is part of their identity; overloads and conditional variants keep
+      // the historical grouping behavior.
+      const lineIdentity = n.decorators?.includes('cpp:lambda') ? `|${n.startLine}` : '';
+      const key = `${n.filePath}|${n.qualifiedName}${lineIdentity}`;
       const group = byDef.get(key);
       if (group) group.push(n);
       else byDef.set(key, [n]);
@@ -1576,13 +1631,22 @@ export class ToolHandler {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
+    const lineFilter = typeof args.line === 'number' && Number.isFinite(args.line) && args.line >= 1
+      ? Math.floor(args.line)
+      : undefined;
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
       return this.textResult(`Symbol "${symbol}" not found in the codebase`);
     }
 
-    const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
+    const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter, lineFilter);
+    if (filteredOut && groups.length === 0) {
+      const location = fileFilter
+        ? `file "${fileFilter}"${lineFilter ? ` at line ${lineFilter}` : ''}`
+        : `line ${lineFilter}`;
+      return this.textResult(`Symbol "${symbol}" not found at ${location}`);
+    }
     const filterNote = filteredOut
       ? `\n\n> **Note:** no definition of "${symbol}" matches file "${fileFilter}" — showing all definitions instead.`
       : '';
@@ -1612,7 +1676,7 @@ export class ToolHandler {
       }
       // A successful `file` narrowing makes the multi-symbol aggregation note
       // stale — suppress it.
-      const note = fileFilter && !filteredOut ? '' : allMatches.note;
+      const note = (fileFilter || lineFilter) && !filteredOut ? '' : allMatches.note;
       const formatted = this.formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels) + note + filterNote;
       return this.textResult(this.truncateOutput(formatted));
     }
@@ -1621,7 +1685,7 @@ export class ToolHandler {
     // agent never mistakes one app's callers for another's. Narrow with
     // `file` to focus a single definition.
     const lines: string[] = [
-      `**Callers of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)**`,
+      `**Callers of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\` + \`line\`)**`,
     ];
     for (const group of groups) {
       const { callers, labels } = collect(group);
@@ -1649,13 +1713,22 @@ export class ToolHandler {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
+    const lineFilter = typeof args.line === 'number' && Number.isFinite(args.line) && args.line >= 1
+      ? Math.floor(args.line)
+      : undefined;
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
       return this.textResult(`Symbol "${symbol}" not found in the codebase`);
     }
 
-    const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
+    const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter, lineFilter);
+    if (filteredOut && groups.length === 0) {
+      const location = fileFilter
+        ? `file "${fileFilter}"${lineFilter ? ` at line ${lineFilter}` : ''}`
+        : `line ${lineFilter}`;
+      return this.textResult(`Symbol "${symbol}" not found at ${location}`);
+    }
     const filterNote = filteredOut
       ? `\n\n> **Note:** no definition of "${symbol}" matches file "${fileFilter}" — showing all definitions instead.`
       : '';
@@ -1684,14 +1757,14 @@ export class ToolHandler {
       }
       // A successful `file` narrowing makes the multi-symbol aggregation note
       // stale — suppress it.
-      const note = fileFilter && !filteredOut ? '' : allMatches.note;
+      const note = (fileFilter || lineFilter) && !filteredOut ? '' : allMatches.note;
       const formatted = this.formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels) + note + filterNote;
       return this.textResult(this.truncateOutput(formatted));
     }
 
     // Multiple DISTINCT definitions (#764): per-definition sections.
     const lines: string[] = [
-      `**Callees of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)**`,
+      `**Callees of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\` + \`line\`)**`,
     ];
     for (const group of groups) {
       const { callees, labels } = collect(group);
@@ -1719,13 +1792,22 @@ export class ToolHandler {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const depth = clamp((args.depth as number) || 2, 1, 10);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
+    const lineFilter = typeof args.line === 'number' && Number.isFinite(args.line) && args.line >= 1
+      ? Math.floor(args.line)
+      : undefined;
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
       return this.textResult(`Symbol "${symbol}" not found in the codebase`);
     }
 
-    const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
+    const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter, lineFilter);
+    if (filteredOut && groups.length === 0) {
+      const location = fileFilter
+        ? `file "${fileFilter}"${lineFilter ? ` at line ${lineFilter}` : ''}`
+        : `line ${lineFilter}`;
+      return this.textResult(`Symbol "${symbol}" not found at ${location}`);
+    }
     const filterNote = filteredOut
       ? `\n\n> **Note:** no definition of "${symbol}" matches file "${fileFilter}" — showing all definitions instead.`
       : '';
@@ -1752,7 +1834,7 @@ export class ToolHandler {
 
     // Single definition (or same-file overloads): the familiar merged report.
     if (groups.length === 1) {
-      const formatted = this.formatImpact(symbol, impactOf(groups[0]!)) + (fileFilter && !filteredOut ? "" : allMatches.note) + filterNote;
+      const formatted = this.formatImpact(symbol, impactOf(groups[0]!)) + ((fileFilter || lineFilter) && !filteredOut ? "" : allMatches.note) + filterNote;
       return this.textResult(this.truncateOutput(formatted));
     }
 
@@ -1760,7 +1842,7 @@ export class ToolHandler {
     // merging unrelated same-named classes (one UserService per monorepo app)
     // overstated impact and confused agents. Narrow with `file`.
     const sections: string[] = [
-      `**Impact of ${symbol} — ${groups.length} distinct definitions (each with its own blast radius; narrow with \`file\`)**`,
+      `**Impact of ${symbol} — ${groups.length} distinct definitions (each with its own blast radius; narrow with \`file\` + \`line\`)**`,
     ];
     for (const group of groups) {
       const head = group[0]!;
@@ -1879,6 +1961,100 @@ export class ToolHandler {
    * whose qualifiedName contains another named token (`PmsProductServiceImpl::list`),
    * dropping unrelated `OmsOrderService::list`.
    */
+  private sourceLocationCallPaths(cg: CodeGraph, query: string): Array<{ source: Node; target: Node; edge: Edge }> {
+    const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
+    const paths: Array<{ source: Node; target: Node; edge: Edge }> = [];
+    const seen = new Set<string>();
+    const files = cg.getFiles().map((file) => file.path);
+    for (const hint of sourceLocationHints(query)) {
+      const matchingFiles = files.filter((filePath) => {
+        const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+        return normalized === hint.file || normalized.endsWith(`/${hint.file}`) ||
+          (!hint.file.includes('/') && normalized.endsWith(`/${hint.file}`));
+      });
+      if (matchingFiles.length !== 1) continue;
+      let candidates: Node[] = [];
+      try {
+        candidates = cg.getNodesInFile(matchingFiles[0]!).filter((node) =>
+          CALLABLE.has(node.kind) && node.startLine <= hint.line && (node.endLine ?? node.startLine) >= hint.line
+        );
+      } catch { continue; }
+      if (candidates.length === 0) continue;
+      const source = [...candidates].sort((a, b) =>
+        ((a.endLine ?? a.startLine) - a.startLine) - ((b.endLine ?? b.startLine) - b.startLine) ||
+        Math.abs(a.startLine - hint.line) - Math.abs(b.startLine - hint.line)
+      )[0]!;
+      for (const callee of cg.getCallees(source.id)) {
+        if (callee.edge.kind !== 'calls' || callee.edge.line !== hint.line) continue;
+        const key = `${source.id}>${callee.node.id}@${hint.line}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        paths.push({ source, target: callee.node, edge: callee.edge });
+      }
+    }
+    return paths;
+  }
+
+  /**
+   * Resolve direct calls between symbol names explicitly present in the query.
+   * This lets a proven edge disambiguate a large family such as shader `main`
+   * without relaxing the normal natural-language stopword safeguards.
+   */
+  private queryDirectCallPaths(cg: CodeGraph, query: string): Array<{ source: Node; target: Node; edge: Edge }> {
+    const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
+    const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl|glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|hlsli|fx|fxh)$/i;
+    const fileHints = [...query.matchAll(/(?:^|\s)([A-Za-z0-9_./\\-]+\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl|glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|hlsli|fx|fxh))\b/gi)]
+      .map((match) => match[1]!.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase());
+    const matchesHint = (filePath: string): boolean => {
+      const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+      return fileHints.some((hint) =>
+        normalized === hint || normalized.endsWith(`/${hint}`) ||
+        (!hint.includes('/') && normalized.endsWith(`/${hint}`))
+      );
+    };
+    const tokens = [...new Set(
+      query.split(/(?:->|[\s,()[\]\u2192]+)/)
+        .map((token) => token.replace(/^[`'"{]+|[`'"}:;?!]+$/g, '').trim())
+        .filter((token) => token.length >= 3 && !FILE_EXT.test(token) && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(token))
+    )].slice(0, 16);
+    const families = tokens.map((token) => {
+      const qualified = /::|\./.test(token);
+      const nodes = (qualified ? this.findAllSymbols(cg, token).nodes : cg.getNodesByName(token))
+        .filter((node) => CALLABLE.has(node.kind));
+      return { token, nodes };
+    }).filter((family) => family.nodes.length > 0);
+    if (families.length < 2) return [];
+
+    const paths = new Map<string, { source: Node; target: Node; edge: Edge }>();
+    const addPath = (source: Node, target: Node, edge: Edge) => {
+      if (edge.kind !== 'calls') return;
+      if (fileHints.length > 0 && !matchesHint(source.filePath) && !matchesHint(target.filePath)) return;
+      paths.set(`${source.id}\0${target.id}`, { source, target, edge });
+    };
+    for (let left = 0; left < families.length; left++) {
+      for (let right = left + 1; right < families.length; right++) {
+        const a = families[left]!;
+        const b = families[right]!;
+        // One endpoint must be narrow enough to inspect without turning a generic
+        // natural-language query into an all-to-all overload scan.
+        if (a.nodes.length > 6 && b.nodes.length > 6) continue;
+        const inspected = a.nodes.length <= b.nodes.length ? a : b;
+        const other = inspected === a ? b : a;
+        const otherIds = new Set(other.nodes.map((node) => node.id));
+        for (const node of inspected.nodes) {
+          for (const callee of cg.getCallees(node.id)) {
+            if (otherIds.has(callee.node.id)) addPath(node, callee.node, callee.edge);
+          }
+          for (const caller of cg.getCallers(node.id)) {
+            if (otherIds.has(caller.node.id)) addPath(caller.node, node, caller.edge);
+          }
+          if (paths.size > 12) return [];
+        }
+      }
+    }
+    return [...paths.values()];
+  }
+
   private buildFlowFromNamedSymbols(cg: CodeGraph, query: string): { text: string; pathNodeIds: Set<string>; namedNodeIds: Set<string>; uniqueNamedNodeIds: Set<string>; spineCallSites: Map<string, number> } {
     // spineCallSites: for each spine node, the line where it CALLS the next hop —
     // lets the source assembler window an oversize spine method (e.g. n8n's 962-line
@@ -1890,13 +2066,44 @@ export class ToolHandler {
       // names (Class.method / Class::method) — the agent's most precise input,
       // resolved exactly by findAllSymbols. (The old strip mangled Class.method
       // into Class, throwing the method away.)
-      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
+      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl|glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|hlsli|fx|fxh)$/i;
+      const fileHints = [...query.matchAll(/(?:^|\s)([A-Za-z0-9_./\\-]+\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl|glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|hlsli|fx|fxh))\b/gi)].map((m) => m[1]!.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase());
+      const sourceCallPaths = this.sourceLocationCallPaths(cg, query);
+      const namedDirectCallPaths = this.queryDirectCallPaths(cg, query).filter((path) =>
+        !sourceCallPaths.some((sourcePath) => sourcePath.source.id === path.source.id && sourcePath.target.id === path.target.id)
+      );
+      const pinnedCallPaths = [...sourceCallPaths, ...namedDirectCallPaths];
+      const matchesHint = (filePath: string): boolean => {
+        const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+        return fileHints.some((hint) =>
+          normalized === hint || normalized.endsWith(`/${hint}`) ||
+          (!hint.includes('/') && normalized.endsWith(`/${hint}`))
+        );
+      };
+      const shaderContextFiles = new Set<string>();
+      const shaderRoots = cg.getFiles().filter((file) =>
+        (file.language === 'glsl' || file.language === 'hlsl') && matchesHint(file.path)
+      ).map((file) => file.path);
+      const shaderQueue = [...shaderRoots];
+      for (let index = 0; index < shaderQueue.length && index < 4096; index++) {
+        const filePath = shaderQueue[index]!;
+        if (shaderContextFiles.has(filePath)) continue;
+        shaderContextFiles.add(filePath);
+        const fileNode = cg.getNodesInFile(filePath).find((node) => node.kind === 'file');
+        if (!fileNode) continue;
+        for (const edge of cg.getOutgoingEdges(fileNode.id).filter((candidate) => candidate.kind === 'imports')) {
+          const target = cg.getNode(edge.target);
+          if (target?.kind === 'file' && (target.language === 'glsl' || target.language === 'hlsl') && !shaderContextFiles.has(target.filePath)) {
+            shaderQueue.push(target.filePath);
+          }
+        }
+      }
       const tokens = [...new Set(
         query.split(/[\s,()[\]]+/)
           .map((t) => t.replace(FILE_EXT, '').trim())
           .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
       )].slice(0, 16);
-      if (tokens.length < 2) return EMPTY;
+      if (tokens.length < 2 && pinnedCallPaths.length === 0) return EMPTY;
       // Pool of name SEGMENTS (Class + method from every token) used to
       // disambiguate an ambiguous SIMPLE name: keep a candidate only if its
       // CONTAINER class is itself named in the query.
@@ -1926,11 +2133,25 @@ export class ToolHandler {
       // fed only to the dynamic-dispatch-links scan below.
       const dynNamed = new Map<string, Node>();
       const DYN_KINDS = new Set(['constant', 'variable', 'field', 'property']);
+      for (const path of pinnedCallPaths) {
+        named.set(path.source.id, path.source);
+        named.set(path.target.id, path.target);
+        uniqueNamedNodeIds.add(path.source.id);
+        uniqueNamedNodeIds.add(path.target.id);
+      }
       const hasHeuristicEdge = (id: string): boolean =>
         [...cg.getCallers(id), ...cg.getCallees(id)].some(({ edge }) => edge.provenance === 'heuristic');
       for (const t of tokens) {
         const hits = this.findAllSymbols(cg, t).nodes;
-        const cands = hits.filter((n) => CALLABLE.has(n.kind));
+        const allCands = hits.filter((n) => CALLABLE.has(n.kind));
+        const hintedCands = fileHints.length ? allCands.filter((n) => matchesHint(n.filePath)) : [];
+        const shaderCands = allCands.filter((n) => n.language === 'glsl' || n.language === 'hlsl');
+        const contextualCands = shaderContextFiles.size > 0
+          ? shaderCands.filter((n) => shaderContextFiles.has(n.filePath))
+          : [];
+        const cands = shaderContextFiles.size > 0 && shaderCands.length > 0
+          ? contextualCands
+          : (hintedCands.length > 0 ? hintedCands : allCands);
         tokenFamily.set(t, cands);
         // A qualified or otherwise-specific name (<=3 hits) keeps all; an
         // ambiguous simple name keeps only candidates whose container is named.
@@ -1966,6 +2187,15 @@ export class ToolHandler {
         }
         if (named.size > 40) break;
       }
+      const sourcePinnedPaths: Array<Array<{ node: Node; edge: Edge | null }>> = sourceCallPaths.map((path) => [
+        { node: path.source, edge: null },
+        { node: path.target, edge: path.edge },
+      ]);
+      const namedPinnedPaths: Array<Array<{ node: Node; edge: Edge | null }>> = namedDirectCallPaths.map((path) => [
+        { node: path.source, edge: null },
+        { node: path.target, edge: path.edge },
+      ]);
+      const pinnedPaths = [...sourcePinnedPaths, ...namedPinnedPaths];
       // Surface synthesized (heuristic) edges incident to a named symbol — INCLUDING
       // the non-callable CONSTANT endpoints in `dynNamed`. `skipInChain` drops a hop
       // already shown in the rendered main chain (a 2-node chain renders nothing, so a
@@ -2039,8 +2269,11 @@ export class ToolHandler {
         chain.reverse();
         if (!best || chain.length > best.length) best = chain;
       }
-      const hasMain = !!best && best.length >= 3;
-      const pathIds = new Set((best ?? []).map((s) => s.node.id));
+      const hasMainChain = !!best && best.length >= 3;
+      const hasPinnedFlow = pinnedPaths.length > 0;
+      const hasMain = hasMainChain || hasPinnedFlow;
+      const pathIds = new Set((hasMainChain ? best ?? [] : []).map((s) => s.node.id));
+      for (const path of pinnedPaths) for (const step of path) pathIds.add(step.node.id);
       // Where each spine node calls the NEXT hop (best[i+1].edge is the edge from
       // best[i] → best[i+1]; its line is the call site inside best[i]'s body). Lets
       // the assembler window an oversize spine method to the call instead of dumping it.
@@ -2048,6 +2281,10 @@ export class ToolHandler {
       if (best) for (let i = 0; i < best.length - 1; i++) {
         const ln = best[i + 1]?.edge?.line;
         if (ln && ln > 0 && !spineCallSites.has(best[i]!.node.id)) spineCallSites.set(best[i]!.node.id, ln);
+      }
+      for (const path of pinnedPaths) {
+        const line = path[1]?.edge?.line;
+        if (line && !spineCallSites.has(path[0]!.node.id)) spineCallSites.set(path[0]!.node.id, line);
       }
 
       // Dynamic-boundary scan (#687) — fires ONLY when the flow the agent
@@ -2073,7 +2310,7 @@ export class ToolHandler {
         }
         if (uncovered.length > 0) {
           const scanList: Node[] = [];
-          if (hasMain) scanList.push(best![best!.length - 1]!.node);
+          if (hasMainChain) scanList.push(best![best!.length - 1]!.node);
           scanList.push(...uncovered.sort((a, b) =>
             (uniqueNamedNodeIds.has(b.id) ? 1 : 0) - (uniqueNamedNodeIds.has(a.id) ? 1 : 0)));
           boundaryText = this.buildDynamicBoundaries(cg, scanList, named);
@@ -2115,7 +2352,29 @@ export class ToolHandler {
 
       if (!hasMain && synthLines.length === 0 && !boundaryText && !polyText) return EMPTY;
       const out: string[] = [];
-      if (hasMain) {
+      if (sourcePinnedPaths.length > 0) {
+        out.push('**Flow (call paths at the source locations you queried)**', '');
+        for (const path of sourcePinnedPaths) {
+          for (let i = 0; i < path.length; i++) {
+            const step = path[i]!;
+            if (step.edge) out.push(`   â†“ ${step.edge.kind} @${path[0]!.node.filePath}:${step.edge.line}`);
+            out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
+          }
+          out.push('');
+        }
+      }
+      if (namedPinnedPaths.length > 0) {
+        out.push('**Flow (direct call paths among the symbols you queried)**', '');
+        for (const path of namedPinnedPaths) {
+          for (let i = 0; i < path.length; i++) {
+            const step = path[i]!;
+            if (step.edge) out.push(`   ↓ ${step.edge.kind} @${path[0]!.node.filePath}:${step.edge.line}`);
+            out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
+          }
+          out.push('');
+        }
+      }
+      if (hasMainChain) {
         out.push('**Flow (call path among the symbols you queried)**', '');
         for (let i = 0; i < best!.length; i++) {
           const step = best![i]!;
@@ -2535,6 +2794,98 @@ export class ToolHandler {
       return this.textResult(`No relevant code found for "${query}"`);
     }
 
+    // An explicit source filename is a hard disambiguator. Keep the initial
+    // context anchored to that file before relevance ranking can let a common
+    // symbol such as shader `main` pull in unrelated entry points. When the
+    // query also asks for includes/dependencies, retain the transitive shader
+    // include closure so explore can answer the multi-file question directly.
+    const explicitShaderRootFiles = new Set<string>();
+    const explicitShaderContextFiles = new Set<string>();
+    const requestedShaderIncludeFiles = new Set<string>();
+    const explicitFileHints = [...query.matchAll(/(?:^|\s)([A-Za-z0-9_./\\-]+\.(?:glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|hlsli|fx|fxh))\b/gi)]
+      .map((m) => m[1]!.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase());
+    if (explicitFileHints.length > 0) {
+      const expandIncludes = /\b(?:include|included|imports?|dependencies|dependency|closure|transitive|glsl files?|hlsl files?|shader files?)\b/i.test(query);
+      const isShaderPath = (filePath: string) => /\.(?:glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|hlsli|fx|fxh)$/i.test(filePath);
+      const matchesHint = (filePath: string) => {
+        const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+        return explicitFileHints.some((hint) =>
+          normalized === hint ||
+          normalized.endsWith(`/${hint}`) ||
+          (!hint.includes('/') && normalized.endsWith(`/${hint}`))
+        );
+      };
+      const hintedPaths = cg.getFiles().map((f) => f.path).filter(matchesHint);
+      for (const filePath of hintedPaths) explicitShaderRootFiles.add(filePath);
+      const hintedNodes = hintedPaths.flatMap((filePath) => {
+        try { return cg.getNodesInFile(filePath); } catch { return []; }
+      });
+      const contextQueue = hintedNodes.filter((node) => node.kind === 'file');
+      for (let index = 0; index < contextQueue.length && index < 4096; index++) {
+        const current = contextQueue[index]!;
+        if (explicitShaderContextFiles.has(current.filePath)) continue;
+        explicitShaderContextFiles.add(current.filePath);
+        let outgoing: Edge[] = [];
+        try { outgoing = cg.getOutgoingEdges(current.id); } catch { continue; }
+        for (const edge of outgoing) {
+          if (edge.kind !== 'imports') continue;
+          const target = cg.getNode(edge.target);
+          if (!target || target.kind !== 'file' || !isShaderPath(target.filePath) || explicitShaderContextFiles.has(target.filePath)) continue;
+          contextQueue.push(target);
+        }
+      }
+      const keptById = new Map<string, Node>();
+      for (const n of [...subgraph.nodes.values()].filter((n) => matchesHint(n.filePath))) keptById.set(n.id, n);
+      for (const n of hintedNodes) keptById.set(n.id, n);
+      const includeRootIds = new Set<string>();
+      if (expandIncludes) {
+        const queue = hintedNodes.filter((node) => node.kind === 'file');
+        const visited = new Set(queue.map((node) => node.id));
+        const includeFileCap = Math.min(20, Math.max(maxFiles, 8));
+        while (queue.length > 0 && visited.size < includeFileCap) {
+          const current = queue.shift()!;
+          let outgoing: Edge[] = [];
+          try { outgoing = cg.getOutgoingEdges(current.id); } catch { continue; }
+          for (const edge of outgoing) {
+            if (edge.kind !== 'imports' || visited.size >= includeFileCap) continue;
+            const target = cg.getNode(edge.target);
+            if (!target || target.kind !== 'file' || !isShaderPath(target.filePath)) continue;
+            if (visited.has(target.id)) continue;
+            visited.add(target.id);
+            includeRootIds.add(target.id);
+            requestedShaderIncludeFiles.add(target.filePath);
+            queue.push(target);
+            let importedNodes: Node[] = [];
+            try { importedNodes = cg.getNodesInFile(target.filePath); } catch { /* stale file row */ }
+            for (const node of importedNodes) keptById.set(node.id, node);
+          }
+        }
+      }
+      const kept = [...keptById.values()];
+      if (kept.length > 0) {
+        const keepIds = new Set(kept.map((n) => n.id));
+        subgraph.nodes = new Map(kept.map((n) => [n.id, n]));
+        const edgeByKey = new Map<string, Edge>();
+        const retainEdge = (edge: Edge) => {
+          if (!keepIds.has(edge.source) || !keepIds.has(edge.target)) return;
+          edgeByKey.set(`${edge.source}\0${edge.target}\0${edge.kind}`, edge);
+        };
+        for (const edge of subgraph.edges) retainEdge(edge);
+        if (expandIncludes) {
+          for (const node of kept) {
+            let outgoing: Edge[] = [];
+            try { outgoing = cg.getOutgoingEdges(node.id); } catch { continue; }
+            for (const edge of outgoing) retainEdge(edge);
+          }
+        }
+        subgraph.edges = [...edgeByKey.values()];
+        subgraph.roots = [...new Set([
+          ...subgraph.roots.filter((id) => keepIds.has(id)),
+          ...includeRootIds,
+        ])];
+      }
+    }
+
     // Graph-aware glue: findRelevantContext builds the subgraph from name/text
     // search, so a method that BRIDGES named symbols — e.g. App.tsx's
     // triggerRender, which calls the named triggerUpdate — is never a search hit
@@ -2585,7 +2936,16 @@ export class ToolHandler {
     // overloads (the query also named the type) all earn it. (#1064)
     const tierSeedIds = new Set<string>();
     {
-      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
+      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl|glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|hlsli|fx|fxh)$/i;
+      const fileHints = [...query.matchAll(/(?:^|\s)([A-Za-z0-9_./\\-]+\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl|glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|hlsli|fx|fxh))\b/gi)].map((m) => m[1]!.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase());
+      const matchesHint = (filePath: string): boolean => {
+        const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+        return fileHints.some((hint) =>
+          normalized === hint ||
+          normalized.endsWith(`/${hint}`) ||
+          (!hint.includes('/') && normalized.endsWith(`/${hint}`))
+        );
+      };
       const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
       const isTestPath = (p: string) => /(^|\/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)\//i.test(p) || /\.(test|spec)\.[a-z]+$/i.test(p);
       const bodyLines = (n: Node) => Math.max(0, (n.endLine ?? n.startLine) - n.startLine);
@@ -2651,15 +3011,21 @@ export class ToolHandler {
         const isQual = /[.\/]|::/.test(t);
         const raw = isQual ? this.findAllSymbols(cg, t).nodes : cg.getNodesByName(t);
         let cands = raw
-          .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
+          .filter((n) => CALLABLE.has(n.kind) && (!isTestPath(n.filePath) || matchesHint(n.filePath) || explicitShaderContextFiles.has(n.filePath)))
           .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
+        const shaderCands = cands.filter((n) => n.language === 'glsl' || n.language === 'hlsl');
+        if (explicitShaderContextFiles.size > 0 && shaderCands.length > 0) {
+          cands = shaderCands.filter((n) => explicitShaderContextFiles.has(n.filePath));
+        }
+        const hintedCands = fileHints.length ? cands.filter((n) => matchesHint(n.filePath)) : [];
+        if (hintedCands.length > 0) cands = hintedCands;
         // Bare lowercase words only seed defs their query-siblings corroborate
         // (see the NL-stopword guard above). Filtering CANDS (not picks) applies
         // the guard uniformly to both branches below, including the >3-def
         // single-pick fallback — an uncorroborated bare `run` must not tier its
         // most-substantive namesake any more than a 1-def `check` may.
         if (!isPreciseToken(t)) {
-          cands = cands.filter((n) => coNamedInFile(t, n.filePath));
+          cands = cands.filter((n) => matchesHint(n.filePath) || coNamedInFile(t, n.filePath));
         }
         // A specific name (<=3 defs) injects all its defs. An overloaded name
         // (`validate` = 10, `request` = 44) would flood the subgraph, so inject
@@ -2698,7 +3064,102 @@ export class ToolHandler {
       }
     }
 
+    // Exact source locations are stronger than fuzzy relevance. Reattach the
+    // proven full-graph call at that line before Relationships and file ranking
+    // run, so natural queries such as `shader.rgen line 228` surface the same
+    // edge that callers already knows about.
+    const explicitSourceCallPaths = this.sourceLocationCallPaths(cg, query);
+    const explicitNamedCallPaths = this.queryDirectCallPaths(cg, query).filter((path) =>
+      !explicitSourceCallPaths.some((sourcePath) => sourcePath.source.id === path.source.id && sourcePath.target.id === path.target.id)
+    );
+    const priorityCalls = new Map<string, Edge>();
+    for (const path of [...explicitSourceCallPaths, ...explicitNamedCallPaths]) {
+      subgraph.nodes.set(path.source.id, path.source);
+      subgraph.nodes.set(path.target.id, path.target);
+      namedSeedIds.add(path.source.id);
+      namedSeedIds.add(path.target.id);
+      tierSeedIds.add(path.source.id);
+      tierSeedIds.add(path.target.id);
+      subgraph.roots.push(path.source.id);
+      priorityCalls.set(`${path.edge.source}\0${path.edge.target}\0${path.edge.kind}`, path.edge);
+    }
+    // A direct edge between symbols the query named is itself part of the
+    // requested answer. Fuzzy context gathering may omit that edge even after
+    // finding both endpoints; restore only exact named-to-named calls.
+    for (const sourceId of namedSeedIds) {
+      let outgoing: Edge[] = [];
+      try { outgoing = cg.getOutgoingEdges(sourceId); } catch { continue; }
+      for (const edge of outgoing) {
+        if (edge.kind !== 'calls' || !namedSeedIds.has(edge.target)) continue;
+        const key = `${edge.source}\0${edge.target}\0${edge.kind}`;
+        if (!priorityCalls.has(key)) priorityCalls.set(key, edge);
+      }
+    }
+    if (priorityCalls.size > 0) {
+      subgraph.edges = [
+        ...priorityCalls.values(),
+        ...subgraph.edges.filter((edge) =>
+          !priorityCalls.has(`${edge.source}\0${edge.target}\0${edge.kind}`)
+        ),
+      ];
+      subgraph.roots = [...new Set(subgraph.roots)];
+    }
+
     // Step 2: Group nodes by file, score by relevance
+    // Include closures can contain large utility libraries with hundreds of
+    // declarations. Render the symbols that actually connect files, plus two
+    // intra-file hops from that cross-file spine, instead of letting one dense
+    // include consume the whole explore response.
+    const shaderIncludeRelevantNodeIds = new Set<string>();
+    const shaderClosureLineHints = new Map<string, number[]>();
+    const addShaderLineHint = (filePath: string, line: number | undefined) => {
+      if (!line || line <= 0) return;
+      const lines = shaderClosureLineHints.get(filePath) ?? [];
+      if (!lines.includes(line)) lines.push(line);
+      shaderClosureLineHints.set(filePath, lines);
+    };
+    for (const location of sourceLocationHints(query)) {
+      for (const filePath of explicitShaderRootFiles) {
+        const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+        if (normalized === location.file || normalized.endsWith(`/${location.file}`) ||
+            (!location.file.includes('/') && normalized.endsWith(`/${location.file}`))) {
+          addShaderLineHint(filePath, location.line);
+        }
+      }
+    }
+    if (requestedShaderIncludeFiles.size > 0) {
+      for (const edge of subgraph.edges) {
+        if (edge.kind === 'contains') continue;
+        const source = subgraph.nodes.get(edge.source);
+        const target = subgraph.nodes.get(edge.target);
+        if (!source || !target || source.filePath === target.filePath) continue;
+        if (requestedShaderIncludeFiles.has(source.filePath)) {
+          shaderIncludeRelevantNodeIds.add(source.id);
+          addShaderLineHint(source.filePath, edge.line ?? source.startLine);
+        }
+        if (requestedShaderIncludeFiles.has(target.filePath)) {
+          shaderIncludeRelevantNodeIds.add(target.id);
+          addShaderLineHint(target.filePath, target.startLine);
+        }
+        if (explicitShaderRootFiles.has(source.filePath)) addShaderLineHint(source.filePath, edge.line ?? source.startLine);
+      }
+      for (let depth = 0; depth < 2; depth++) {
+        const add = new Set<string>();
+        for (const edge of subgraph.edges) {
+          if (edge.kind !== 'calls' && edge.kind !== 'references') continue;
+          const source = subgraph.nodes.get(edge.source);
+          const target = subgraph.nodes.get(edge.target);
+          if (!source || !target || source.filePath !== target.filePath || !requestedShaderIncludeFiles.has(source.filePath)) continue;
+          if (shaderIncludeRelevantNodeIds.has(source.id)) add.add(target.id);
+          if (shaderIncludeRelevantNodeIds.has(target.id)) add.add(source.id);
+        }
+        for (const id of add) shaderIncludeRelevantNodeIds.add(id);
+      }
+      for (const id of shaderIncludeRelevantNodeIds) {
+        const node = subgraph.nodes.get(id);
+        if (node) addShaderLineHint(node.filePath, node.startLine);
+      }
+    }
     const fileGroups = new Map<string, { nodes: Node[]; score: number }>();
     const entryNodeIds = new Set([...subgraph.roots, ...namedSeedIds]);
 
@@ -2744,6 +3205,9 @@ export class ToolHandler {
     for (const node of subgraph.nodes.values()) {
       // Skip import/export nodes — they add noise without information
       if (node.kind === 'import' || node.kind === 'export') continue;
+      if (requestedShaderIncludeFiles.has(node.filePath)
+          && node.kind !== 'file'
+          && !shaderIncludeRelevantNodeIds.has(node.id)) continue;
       // SECURITY (#383): never render the on-disk source of a config-leaf
       // (Spring application.{yml,properties} key) — its line is `key = <secret>`,
       // so whole-file/cluster rendering here would push secrets into context
@@ -2772,6 +3236,10 @@ export class ToolHandler {
 
     // Only include files that have entry points or nodes directly connected to entry points
     let relevantFiles = [...fileGroups.entries()].filter(([, group]) => group.score >= 3);
+    for (const filePath of new Set([...requestedShaderIncludeFiles, ...explicitShaderRootFiles])) {
+      const group = fileGroups.get(filePath);
+      if (group && !relevantFiles.some(([candidate]) => candidate === filePath)) relevantFiles.push([filePath, group]);
+    }
 
     // Extract query terms for relevance checking
     const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
@@ -2870,6 +3338,8 @@ export class ToolHandler {
       const n = subgraph.nodes.get(id);
       if (n) entryFiles.add(n.filePath);
     }
+    for (const filePath of requestedShaderIncludeFiles) entryFiles.add(filePath);
+    for (const filePath of explicitShaderRootFiles) entryFiles.add(filePath);
     // Buried-rescue pass (#1064): surface a named method's signature type ONLY
     // when its file is genuinely buried — near-zero graph mass AND not lexically
     // matched. That is the invisible case (grpc's `DialOption` → `dialoptions.go`,
@@ -2935,6 +3405,7 @@ export class ToolHandler {
     // buried-rescue pass) is the lexically-dissimilar answer; give it the named
     // tier so it isn't buried under files that merely share surface words (#1064).
     for (const fp of changeSurfaceFiles) namedSeedFiles.add(fp);
+    for (const fp of explicitShaderRootFiles) namedSeedFiles.add(fp);
 
     // Multi-term corroboration tier: a file that is BOTH (a) an entry/central file
     // (a search root, named seed, or graph-central hub — i.e. structurally part of
@@ -3133,7 +3604,8 @@ export class ToolHandler {
       // after the build + validators-exec files and never reached the ranked-in
       // validate-logic file (Alamofire's Validation.swift).
       const fileNecessary = group.nodes.some(n =>
-        entryNodeIds.has(n.id) || flow.pathNodeIds.has(n.id) || flow.uniqueNamedNodeIds.has(n.id));
+        entryNodeIds.has(n.id) || flow.pathNodeIds.has(n.id) || flow.uniqueNamedNodeIds.has(n.id))
+        || requestedShaderIncludeFiles.has(filePath);
       if (!fileNecessary && totalChars > budget.maxOutputChars * 0.9) continue;
 
       const absPath = validatePathWithinRoot(projectRoot, filePath);
@@ -3351,7 +3823,7 @@ export class ToolHandler {
         const n = cg.getNode(id);
         if (n && n.filePath === filePath && n.startLine > 0 && n.endLine > 0) rangeNodes.set(id, n);
       }
-      const ranges: Array<{ start: number; end: number; name: string; kind: string; importance: number; spine: boolean; spineCallLine?: number }> = [...rangeNodes.values()]
+      const ranges: Array<{ start: number; end: number; name: string; kind: string; importance: number; spine: boolean; spineStartLine?: number; spineCallLine?: number }> = [...rangeNodes.values()]
         // Drop whole-file envelope nodes (containers covering >50% of the file).
         .filter(n => !(ENVELOPE_KINDS.has(n.kind) && (n.endLine - n.startLine + 1) > fileLines.length * 0.5))
         .map(n => {
@@ -3365,7 +3837,8 @@ export class ToolHandler {
           // processRunExecutionData, the named flow ENTRY at L1562, is a large
           // low-density method that lost the budget to denser blocks and got cut, so
           // the agent Read it back — the very thing explore exists to prevent).
-          return { start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance, spine: flow.pathNodeIds.has(n.id), spineCallLine: flow.spineCallSites.get(n.id) };
+          const spine = flow.pathNodeIds.has(n.id);
+          return { start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance, spine, spineStartLine: spine ? n.startLine : undefined, spineCallLine: flow.spineCallSites.get(n.id) };
         });
 
       // Add edge source locations in this file — captures template references
@@ -3391,8 +3864,10 @@ export class ToolHandler {
 
       if (ranges.length === 0) continue;
 
-      const gapThreshold = budget.gapThreshold;
-      const clusters: Array<{ start: number; end: number; symbols: string[]; score: number; maxImportance: number; hasSpine: boolean; spineCallLine?: number }> = [];
+      const shaderClosureView = (requestedShaderIncludeFiles.size > 0 || shaderClosureLineHints.has(filePath))
+        && (explicitShaderRootFiles.has(filePath) || requestedShaderIncludeFiles.has(filePath));
+      const gapThreshold = shaderClosureView ? 1 : budget.gapThreshold;
+      const clusters: Array<{ start: number; end: number; symbols: string[]; score: number; maxImportance: number; hasSpine: boolean; spineStartLine?: number; spineCallLine?: number }> = [];
       let current = {
         start: ranges[0]!.start,
         end: ranges[0]!.end,
@@ -3400,6 +3875,7 @@ export class ToolHandler {
         score: ranges[0]!.importance,
         maxImportance: ranges[0]!.importance,
         hasSpine: ranges[0]!.spine,
+        spineStartLine: ranges[0]!.spineStartLine,
         spineCallLine: ranges[0]!.spineCallLine,
       };
 
@@ -3411,6 +3887,7 @@ export class ToolHandler {
           current.score += r.importance;
           current.maxImportance = Math.max(current.maxImportance, r.importance);
           current.hasSpine = current.hasSpine || r.spine;
+          current.spineStartLine = current.spineStartLine ?? r.spineStartLine;
           current.spineCallLine = current.spineCallLine ?? r.spineCallLine;
         } else {
           clusters.push(current);
@@ -3421,6 +3898,7 @@ export class ToolHandler {
             score: r.importance,
             maxImportance: r.importance,
             hasSpine: r.spine,
+            spineStartLine: r.spineStartLine,
             spineCallLine: r.spineCallLine,
           };
         }
@@ -3447,7 +3925,29 @@ export class ToolHandler {
       // the spine's call still appears in context.
       const OVERSIZE_SPINE_LINES = 200;
       const SPINE_WINDOW = 28; // lines each side of the next-hop call site
-      const buildSection = (c: { start: number; end: number; hasSpine?: boolean; spineCallLine?: number }): string => {
+      const buildSection = (c: { start: number; end: number; hasSpine?: boolean; spineStartLine?: number; spineCallLine?: number }): string => {
+        if (shaderClosureView && (c.end - c.start + 1) > 160) {
+          const hints = (shaderClosureLineHints.get(filePath) ?? [])
+            .filter((line) => line >= c.start && line <= c.end)
+            .sort((a, b) => a - b)
+            .filter((line, index, all) => index === 0 || line - all[index - 1]! >= 20)
+            .slice(0, 4);
+          if (hints.length > 0) {
+            anyFileTrimmed = true;
+            const parts: string[] = [];
+            const headEnd = Math.min(c.end, c.start + 4);
+            const head = fileLines.slice(c.start - 1, headEnd).join('\n');
+            parts.push(withLineNumbers ? numberSourceLines(head, c.start) : head);
+            for (const line of hints) {
+              const winStart = Math.max(c.start, line - 10);
+              const winEnd = Math.min(c.end, line + 10);
+              if (winStart <= headEnd + 1) continue;
+              const win = fileLines.slice(winStart - 1, winEnd).join('\n');
+              parts.push(withLineNumbers ? numberSourceLines(win, winStart) : win);
+            }
+            return parts.join(GAP_MARKER);
+          }
+        }
         if (c.hasSpine && c.spineCallLine && (c.end - c.start + 1) > OVERSIZE_SPINE_LINES) {
           const call = c.spineCallLine;
           const winStart = Math.max(c.start, call - SPINE_WINDOW);
@@ -3463,6 +3963,15 @@ export class ToolHandler {
           const win = fileLines.slice(winStart - 1, winEnd).join('\n');
           parts.push(withLineNumbers ? numberSourceLines(win, winStart) : win);
           return parts.join(GAP_MARKER);
+        }
+        if (c.hasSpine && c.spineStartLine && (c.end - c.start + 1) > OVERSIZE_SPINE_LINES) {
+          // A terminal path endpoint has no next-hop call site. Window around its
+          // definition instead of letting one enormous callee consume the entire
+          // response and displace the caller source from the same proven path.
+          const winStart = Math.max(c.start, c.spineStartLine - 3);
+          const winEnd = Math.min(c.end, c.spineStartLine + SPINE_WINDOW * 2);
+          const win = fileLines.slice(winStart - 1, winEnd).join('\n');
+          return withLineNumbers ? numberSourceLines(win, winStart) : win;
         }
         const startIdx = Math.max(0, c.start - 1 - contextPadding);
         const endIdx = Math.min(fileLines.length, c.end + contextPadding);
@@ -4491,7 +5000,11 @@ export class ToolHandler {
         return { nodes, note: '' };
       }
     }
-    let results = cg.searchNodes(symbol, { limit: 50 });
+    // Bare names need the uncapped exact index: shader entry points commonly
+    // all share `main`, and the FTS limit would hide the file the query named.
+    let results = /^[A-Za-z_$][\w$]*$/.test(symbol)
+      ? cg.getNodesByName(symbol).map((node) => ({ node }))
+      : cg.searchNodes(symbol, { limit: 50 });
 
     // Mirror the fallback in `findSymbol` for qualified queries — FTS
     // strips colons, so a module-qualified lookup needs a second pass
@@ -4610,7 +5123,10 @@ export class ToolHandler {
     for (const [file, nodes] of byFile) {
       lines.push(`**${file}:**`);
       // Compact: inline list
-      const nodeList = nodes.map(n => `${n.name}:${n.startLine}`).join(', ');
+      const nodeList = nodes.map((n) => {
+        const conditions = n.decorators?.filter((d) => d.startsWith('pp:'));
+        return `${n.name}:${n.startLine}${conditions?.length ? ` [${conditions.join(' && ')}]` : ''}`;
+      }).join(', ');
       lines.push(nodeList);
       lines.push('');
     }

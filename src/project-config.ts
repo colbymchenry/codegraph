@@ -67,6 +67,10 @@ export interface ProjectConfig {
    * wins. Absent/empty (the default) forces nothing in.
    */
   include?: string[];
+  /** Project-relative include roots used by GLSL/HLSL preprocessors. */
+  shaderIncludePaths?: string[];
+  /** Shader include prefix aliases, e.g. "$TOOLS": "pxr/imaging". */
+  shaderIncludeAliases?: Record<string, string>;
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -75,6 +79,8 @@ interface ParsedConfig {
   includeIgnored: string[];
   exclude: string[];
   include: string[];
+  shaderIncludePaths: string[];
+  shaderIncludeAliases: Record<string, string>;
 }
 
 interface CacheEntry {
@@ -97,6 +103,8 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   includeIgnored: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
+  shaderIncludePaths: Object.freeze([]) as unknown as string[],
+  shaderIncludeAliases: Object.freeze({}) as Record<string, string>,
 });
 
 /**
@@ -149,15 +157,19 @@ function parseConfig(file: string): ParsedConfig {
   const includeIgnored = extractIncludeIgnored(parsed, file);
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
+  const shaderIncludePaths = extractShaderIncludePaths(parsed, file);
+  const shaderIncludeAliases = extractShaderIncludeAliases(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
-    include.length === 0
+    include.length === 0 &&
+    shaderIncludePaths.length === 0 &&
+    Object.keys(shaderIncludeAliases).length === 0
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include };
+  return { extensions, includeIgnored, exclude, include, shaderIncludePaths, shaderIncludeAliases };
 }
 
 /**
@@ -264,6 +276,42 @@ function extractInclude(parsed: object, file: string): string[] {
   return out;
 }
 
+function extractShaderIncludePaths(parsed: object, file: string): string[] {
+  const raw = (parsed as ProjectConfig).shaderIncludePaths;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    logWarn(`Ignoring "shaderIncludePaths" in ${PROJECT_CONFIG_FILENAME}: must be an array of project-relative paths`, { file });
+    return [];
+  }
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      logWarn(`Ignoring a "shaderIncludePaths" entry in ${PROJECT_CONFIG_FILENAME}: every path must be a non-empty string`, { file });
+      continue;
+    }
+    out.push(entry.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/$/, ''));
+  }
+  return [...new Set(out)];
+}
+
+function extractShaderIncludeAliases(parsed: object, file: string): Record<string, string> {
+  const raw = (parsed as ProjectConfig).shaderIncludeAliases;
+  if (raw === undefined) return {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    logWarn(`Ignoring "shaderIncludeAliases" in ${PROJECT_CONFIG_FILENAME}: must be an object of prefix-to-path mappings`, { file });
+    return {};
+  }
+  const out: Record<string, string> = {};
+  for (const [prefix, target] of Object.entries(raw)) {
+    if (!prefix.trim() || typeof target !== 'string' || !target.trim()) {
+      logWarn(`Ignoring shader include alias "${prefix}" in ${PROJECT_CONFIG_FILENAME}: aliases require non-empty string targets`, { file });
+      continue;
+    }
+    out[prefix.trim()] = target.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/$/, '');
+  }
+  return out;
+}
+
 /**
  * Load the parsed `codegraph.json` for a project, mtime-cached. A missing or
  * malformed file yields the zero-config default. One `stat` (and at most one
@@ -336,6 +384,14 @@ export function loadExcludePatterns(rootDir: string): string[] {
  */
 export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
+}
+
+export function loadShaderIncludePaths(rootDir: string): string[] {
+  return loadParsedConfig(rootDir).shaderIncludePaths;
+}
+
+export function loadShaderIncludeAliases(rootDir: string): Record<string, string> {
+  return loadParsedConfig(rootDir).shaderIncludeAliases;
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */
