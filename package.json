@@ -41,7 +41,7 @@
     "picomatch": "^4.0.3",
     "sisteransi": "^1.0.5",
     "tree-sitter-wasms": "^0.1.11",
-    "tree-sitter-xpp": "file:../../VSCodeProjects/tree-sitter-xpp",
+    "tree-sitter-xpp": "github:Quorrel/tree-sitter-xpp#81805ce1a1d3423ff0e45bc8db0800174767fcd8",
     "web-tree-sitter": "^0.25.3"
   },
   "devDependencies": {
@@ -56,6 +56,7 @@
   },
   "allowScripts": {
     "file:../../../VSCodeProjects/tree-sitter-xpp": true,
-    "esbuild@0.21.5": true
+    "esbuild@0.21.5": true,
+    "github:Quorrel/tree-sitter-xpp#81805ce1a1d3423ff0e45bc8db0800174767fcd8": true
   }
 }
