@@ -76,6 +76,8 @@ LANGS = [
     ("objective-c", "Objective-C", ("devicon", "objectivec", "plain")),
     ("metal",       "Metal",       ("si", "apple")),
     ("cuda",        "CUDA",        ("si", "nvidia")),
+    ("glsl",        "GLSL",        ("custom", "glsl")),
+    ("hlsl",        "HLSL",        ("custom", "hlsl")),
     ("swift",       "Swift",       ("si", "swift")),
     ("kotlin",      "Kotlin",      ("si", "kotlin")),
     ("scala",       "Scala",       ("si", "scala")),
@@ -174,6 +176,12 @@ def custom_glyph(key, out):
         baseline = round(cy + out.cap_height(size, wt) / 2, 2)
         d = out.centered("<cf>", size, wt, cx, baseline, track=0.4)
         return f'<path fill="#1b5ea6" d="{d}"/>'
+    if key in ("glsl", "hlsl"):
+        size, wt = 18.0, 750
+        baseline = round(cy + out.cap_height(size, wt) / 2, 2)
+        d = out.centered("GL" if key == "glsl" else "HL", size, wt, cx, baseline, track=0.5)
+        color = "#5586A4" if key == "glsl" else "#2B579A"
+        return f'<path fill="{color}" d="{d}"/>'
     if key == "cobol":
         # A punched card: manila stock, clipped corner, punched rows.
         w, h = GLYPH_BOX, 28

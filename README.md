@@ -154,6 +154,8 @@ Every language below gets the same treatment — full structural extraction and 
   <img src="https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/languages/objective-c.svg?v=1" width="104" height="104" alt="Objective-C" />
   <img src="https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/languages/metal.svg?v=1" width="104" height="104" alt="Metal" />
   <img src="https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/languages/cuda.svg?v=1" width="104" height="104" alt="CUDA" />
+  <img src="https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/languages/glsl.svg?v=1" width="104" height="104" alt="GLSL" />
+  <img src="https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/languages/hlsl.svg?v=1" width="104" height="104" alt="HLSL" />
   <img src="https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/languages/swift.svg?v=1" width="104" height="104" alt="Swift" />
   <img src="https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/languages/kotlin.svg?v=1" width="104" height="104" alt="Kotlin" />
   <img src="https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/languages/scala.svg?v=1" width="104" height="104" alt="Scala" />
@@ -314,7 +316,7 @@ The reliable, universal payoff is **surgical context and speed**: CodeGraph coll
 | **Full-Text Search** | Find code by name instantly across your entire codebase, powered by FTS5 |
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
-| **20+ Languages** | TypeScript, JavaScript, ArkTS, Python, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Nix, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
+| **30+ Languages** | TypeScript, JavaScript, ArkTS, Python, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, GLSL, HLSL, CMake, PowerShell, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Nix, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
 | **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 17 frameworks |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
@@ -553,9 +555,9 @@ codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
 codegraph node <symbol|file>      # One symbol's source + callers, or read a file with line numbers (same output as codegraph_node)
 codegraph files [path]            # Show file structure (--format, --filter, --max-depth, --json)
-codegraph callers <symbol>        # Find what calls a function/method (--limit, --json)
-codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)
-codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
+codegraph callers <symbol>        # Find what calls a function/method (--file, --line, --limit, --json)
+codegraph callees <symbol>        # Find what a function/method calls (--file, --line, --limit, --json)
+codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--file, --line, --depth, --json)
 codegraph affected [files...]     # Find test files affected by changes (see below)
 codegraph daemon                  # Manage background daemons — pick one to stop (alias: daemons)
 codegraph telemetry [on|off]      # Show or change anonymous usage telemetry
@@ -563,6 +565,8 @@ codegraph upgrade [version]       # Update to the latest release (--check, --for
 codegraph version                 # Print the installed version (also -v, --version)
 codegraph help [command]          # Show help, optionally for one command
 ```
+
+`codegraph status --json` separates tracked files from graph-producing files and reports unresolved attempted references by language and kind, making semantic gaps visible even when the index is current.
 
 ### `codegraph affected`
 
@@ -581,6 +585,8 @@ codegraph affected src/auth.ts --filter "e2e/*"     # Custom test file pattern
 | `-f, --filter <glob>` | Custom glob to identify test files | auto-detect |
 | `-j, --json` | Output as JSON | `false` |
 | `-q, --quiet` | Output file paths only | `false` |
+
+Automatic test discovery excludes common vendored roots for project-owned changes; pass `--filter` to include matching dependency tests explicitly.
 
 **CI/hook example:**
 
@@ -726,6 +732,24 @@ language or a malformed file is warned about and skipped — it never breaks
 indexing — and a project with no `codegraph.json` behaves exactly as before.
 Re-index (`codegraph index`) after adding or changing mappings.
 
+### Shader include roots
+
+GLSL and HLSL quoted includes resolve relative to the including file, then
+through project include roots, then from the project root. Configure compiler
+include roots and aliases in the same `codegraph.json` when your build uses them:
+
+```json
+{
+  "shaderIncludePaths": ["shaders/include", "third_party/NRD/Shaders/Include"],
+  "shaderIncludeAliases": {
+    "$TOOLS": "pxr/imaging"
+  }
+}
+```
+
+Paths must remain inside the project. Ambiguous include or symbol matches stay
+unlinked rather than guessing.
+
 ## Telemetry
 
 CodeGraph collects **anonymous usage statistics** — which tools and commands get
@@ -790,6 +814,10 @@ is written):
 | Objective-C | `.m`, `.mm`, `.h` | Partial support (classes, protocols, methods, `@property`, `#import`, message sends; `.mm` ObjC++ may parse incompletely) |
 | Metal | `.metal` | Full support (vertex/fragment/kernel functions, structs, type aliases, call edges — MSL parses as C++, with `[[attribute]]` annotations handled) |
 | CUDA | `.cu`, `.cuh` | Full support (kernels and device/host functions, structs, classes, host→kernel call edges through `<<<grid, block>>>` launch syntax — templated launches, function-pointer launches (`auto kernel = &fn<...>`), `dim3{...}` configs, and macro-defined kernels included; `__global__`/`__device__`/`__launch_bounds__` specifiers handled; CUDA in plain `.h`/`.hpp` headers recognized by content) |
+| GLSL / Vulkan GLSL | `.glsl`, `.vert`, `.frag`, `.comp`, `.geom`, `.tesc`, `.tese`, `.rgen`, `.rmiss`, `.rchit`, `.rahit`, `.rint`, `.rcall`, `.mesh`, `.task`, `.glslfx` | Full support (functions, structs, macros, transitive includes, call edges, descriptor layouts, uniform/storage/push-constant blocks, specialization constants, ray payloads, mesh/ray stages, and OpenUSD GLSLFX sections/techniques) |
+| HLSL | `.hlsl`, `.hlsli`, `.fx`, `.fxh` | Full support (functions and shader entry points, structs/classes, macros/includes, `cbuffer`/`tbuffer`, semantics and thread-group attributes, register/space and Vulkan attributes, texture/buffer/sampler/ray-tracing resources, including NVIDIA NRD-style declaration macros) |
+| CMake | `CMakeLists.txt`, `.cmake` | Build-script support (functions/macros, variables, include and subdirectory wiring, shader and SPIR-V references) |
+| PowerShell | `.ps1`, `.psm1`, `.psd1` | Build-script support (functions, `Import-Module` dependencies, cross-module and script/function call edges, script-scope variables, tool invocations, shader and SPIR-V references) |
 | Swift | `.swift` | Full support |
 | Kotlin | `.kt`, `.kts` | Full support |
 | Scala | `.scala`, `.sc` | Full support (classes, traits, methods, type aliases, Scala 3 enums) |

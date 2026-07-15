@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="104" height="104" viewBox="0 0 104 104" role="img" aria-label="GLSL">
+  <title>GLSL</title>
+  <rect x="0.5" y="0.5" width="103" height="103" rx="8" fill="#f7f6f2" stroke="#d6d3c8"/>
+  <path fill="#5586A4" d="M30 20h44v40H30z"/>
+  <text x="52" y="48" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#fff">GL</text>
+  <text x="52" y="83" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" font-weight="700" fill="#16150f">GLSL</text>
+</svg>

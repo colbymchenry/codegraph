@@ -21,6 +21,12 @@ codegraph affected src/auth.ts --filter "e2e/*"      # custom test-file pattern
 | `-j, --json` | Output as JSON | `false` |
 | `-q, --quiet` | Output file paths only | `false` |
 
+For project-owned changes, automatic test discovery excludes common vendored roots such as `External`, `vendor`, `third_party`, and `deps`. Changes inside those roots still return their own tests, and an explicit `--filter` includes any matching path.
+
+Test-directory matching is case-insensitive and includes shader entry files, so paths such as `Support/Tests/.../CompileTest.hlsl` can be returned when an included shader library changes.
+
+For shader changes, CodeGraph follows reverse include relationships to concrete compilation roots before looking for tests. This keeps application bridges isolated and classifies only entry shaders as tests; supporting `.hlsli` and `.fxh` headers are not returned merely because they live under a test directory.
+
 ## CI / hook example
 
 ```bash

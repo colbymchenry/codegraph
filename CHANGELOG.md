@@ -9,8 +9,31 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes GLSL, Vulkan ray-tracing and mesh shaders, HLSL, and OpenUSD GLSLFX files, including shader includes, macros, entry points, descriptor/register metadata, uniform and storage resources, push and specialization constants, and conservative C/C++ links to the shaders and bindings they configure.
+- CodeGraph now indexes CMake and PowerShell build scripts, so shader targets, generated SPIR-V names, and build-time variables appear in project search and dependency analysis.
+
 ### Fixes
 
+- GLSL extraction now recovers preprocessor-heavy and malformed-but-valid function declarations, while shader call resolution follows equivalent definitions through include closures instead of silently dropping real callers.
+- Shader impact queries can be scoped to a file, common variant definitions are presented without duplicate blast-radius entries, unrelated C++ methods are no longer guessed as matches, and deletion-only syncs preserve a fresh index timestamp.
+- Common shader names such as `main` now require an explicit file when a project contains many definitions, explicit shader filenames anchor `codegraph_explore` to that file, and conditional shader variants remain visible as separate impact roots.
+- Shared shader helpers and constants injected by the build system now resolve when their equivalent declarations have matching contracts, and recovered GLSL signatures retain their return type and parameters.
+- PowerShell indexing now records calls between script functions and from script scope, reports exact declaration and call-site lines, and avoids flooding search with repeated or function-local assignment nodes.
+- Ambiguous CLI queries now report the complete definition count instead of the first 50 matches, and shader impact output identifies the preprocessor conditions attached to each indexed variant.
+- PowerShell `Import-Module` statements now link scripts to local `.psm1` modules, and calls to exported module functions participate in callers, callees, impact, and file dependency analysis.
+- Shader exploration now expands an explicitly requested file through its transitive include closure, while PowerShell exports no longer appear as callers and executable launches are no longer misclassified as module imports.
+- PowerShell dot-sourced scripts now create file dependencies and expose their shared functions to callers, callees, impact, and exploration without enabling unrelated project-wide name matches.
+- Named local C++ lambdas now appear as scoped functions with accurate callers and callees, preventing their invocations from being linked to unrelated same-named methods elsewhere in the project.
+- Malformed C++ preprocessor parse ranges no longer let one method consume the rest of a file, while local lambdas retain their namespace and class ownership and can be isolated by source line in callers, callees, and impact queries.
+- HLSL compiler-root includes now resolve through unique project suffixes, overloads use include context and call arity, and shared RTXDI-style library calls connect to each application bridge implementation instead of collapsing onto one sample.
+- `codegraph status` now distinguishes metadata-only files and reports unresolved attempted references by language and kind, so a current index no longer hides semantic coverage gaps.
+- `codegraph affected` now excludes vendored dependency tests for project-owned changes while retaining them for dependency changes or explicit filters.
+- Shader exploration and impact now stay inside the explicitly selected compilation target, HLSL overloads use proven argument types when arity alone is ambiguous, and shader compile-test entry files participate in affected-test results.
+- Shared shader-header impact now surfaces every proven compilation entry even at shallow depth, while `codegraph affected` follows shader include roots without crossing between application bridges or treating helper headers as tests.
+- GLSL overload callers now resolve by their real parameter counts, and C/C++ shader filename checks or documentation strings remain file dependencies instead of being reported as calls to a shader entry point.
+- Calls to shader helpers that switch between a function and a function-like macro now remain connected across every preprocessor variant, and `codegraph_explore` keeps both endpoint sources while showing proven direct calls in Flow and Relationships when a query uses `file:line`, `file line N`, or directly names both endpoints.
 - Callers and impact analysis no longer silently under-count a function that calls the same callee many times. When one caller contained several call sites to the same callee and an internal resolution batch boundary happened to split them, cleanup after the first batch removed the later sites' pending rows before they were ever attempted — their edges were never created, deterministically, and which edges went missing shifted with unrelated changes to the project's total reference count. Post-pass cleanup now targets the exact database row each processed reference came from. Found while validating the operator-call fix on nlohmann/json, where `write_cbor`'s 11 calls to `to_char_type` indexed as 10. (#1269)
 - C++ explicit operator calls — `a.operator+(b)`, `p->operator+(b)`, `a.operator[](3)`, and the other symbolic forms — now produce a `calls` edge to the operator method, so an operator invoked only through the explicit syntax no longer looks uncalled in callers and impact analysis. tree-sitter parses these call sites with the operator name stranded in an error node (never as a normal member access), so the call's target was silently read as just the receiver variable; the operator name is now recovered from the error node and resolved through receiver-type inference like any other member call — a same-named operator on an unrelated class can never capture the edge. Infix uses (`a + b`, `a[i]`) need real type inference and are tracked separately. (#1247)
 

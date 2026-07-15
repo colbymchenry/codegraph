@@ -17,9 +17,9 @@ codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
 codegraph node <symbol|file>      # One symbol's source + callers, or read a file with line numbers (same output as codegraph_node)
 codegraph files [path]            # Show file structure (--format, --filter, --pattern, --max-depth, --json)
-codegraph callers <symbol>        # Find what calls a function/method (--limit, --json)
-codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)
-codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
+codegraph callers <symbol>        # Find what calls a function/method (--file, --line, --limit, --json)
+codegraph callees <symbol>        # Find what a function/method calls (--file, --line, --limit, --json)
+codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--file, --line, --depth, --json)
 codegraph affected [files...]     # Find test files affected by changes (see below)
 codegraph daemon                  # Manage background daemons — pick one to stop (alias: daemons)
 codegraph telemetry [on|off]      # Show or change anonymous usage telemetry
@@ -29,6 +29,10 @@ codegraph help [command]          # Show help, optionally for one command
 ```
 
 The MCP server (`codegraph serve --mcp`) is launched automatically by your agent — you don't run it by hand. See [MCP Server](/codegraph/reference/mcp-server/).
+
+## status
+
+`codegraph status --json` distinguishes tracked files from graph-producing files with `fileCount`, `graphFileNodeCount`, and `filesWithoutNodes`. It also reports attempted references that could not be resolved under `index.failedRefs`, grouped by language and reference kind, so a current index does not hide incomplete semantic coverage.
 
 ## init, index, and sync
 
@@ -42,7 +46,10 @@ The MCP server (`codegraph serve --mcp`) is launched automatically by your agent
 codegraph query UserService --kind class --limit 10
 codegraph callers handleRequest --json
 codegraph impact AuthMiddleware --depth 3
+codegraph impact bufferResource --file src/renderer.cpp --line 8311
 ```
+
+Use `--file` and `--line` together when one file contains repeated local functions or lambdas with the same name.
 
 `explore` and `node` are the CLI faces of the `codegraph_explore` and `codegraph_node` MCP tools — same output — so subagents and non-MCP harnesses can reach the graph from a shell.
 
