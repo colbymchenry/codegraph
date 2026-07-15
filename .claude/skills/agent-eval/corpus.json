@@ -1,0 +1,611 @@
+{
+  "_comment": "Test corpus for /agent-eval. Add entries freely. size: Small (<~150 files), Medium (~150-1500), Large (>~1500). 'question' is a representative architectural question that exercises cross-file understanding.",
+  "TypeScript": [
+    {
+      "name": "ky",
+      "repo": "https://github.com/sindresorhus/ky",
+      "size": "Small",
+      "files": "~25",
+      "question": "How does ky implement request retries and timeouts?"
+    },
+    {
+      "name": "excalidraw",
+      "repo": "https://github.com/excalidraw/excalidraw",
+      "size": "Medium",
+      "files": "~600",
+      "question": "How does Excalidraw render and update canvas elements?"
+    },
+    {
+      "name": "vscode",
+      "repo": "https://github.com/microsoft/vscode",
+      "size": "Large",
+      "files": "~10000",
+      "question": "How does the extension host communicate with the main process?"
+    }
+  ],
+  "JavaScript": [
+    {
+      "name": "express",
+      "repo": "https://github.com/expressjs/express",
+      "size": "Small",
+      "files": "~50",
+      "question": "How does Express route a request through its middleware stack?"
+    }
+  ],
+  "Go": [
+    {
+      "name": "cobra",
+      "repo": "https://github.com/spf13/cobra",
+      "size": "Small",
+      "files": "~50",
+      "question": "How does cobra parse commands and flags?"
+    },
+    {
+      "name": "gin",
+      "repo": "https://github.com/gin-gonic/gin",
+      "size": "Medium",
+      "files": "~150",
+      "question": "How does gin route requests through its middleware chain?"
+    },
+    {
+      "name": "terraform",
+      "repo": "https://github.com/hashicorp/terraform",
+      "size": "Large",
+      "files": "~4000",
+      "question": "How does Terraform build and walk the resource dependency graph?"
+    },
+    {
+      "name": "cosmos-sdk",
+      "repo": "https://github.com/cosmos/cosmos-sdk",
+      "size": "Large",
+      "files": "~5000",
+      "question": "How does a bank module MsgSend message reach the account balance update? Trace the cross-module call path from the bank keeper's Send handler through to the account/balance store update."
+    }
+  ],
+  "Python": [
+    {
+      "name": "click",
+      "repo": "https://github.com/pallets/click",
+      "size": "Small",
+      "files": "~60",
+      "question": "How does click parse command-line arguments into commands?"
+    },
+    {
+      "name": "flask",
+      "repo": "https://github.com/pallets/flask",
+      "size": "Medium",
+      "files": "~90",
+      "question": "How does Flask dispatch a request to a view function?"
+    },
+    {
+      "name": "django",
+      "repo": "https://github.com/django/django",
+      "size": "Large",
+      "files": "~2700",
+      "question": "How does Django's ORM build and execute a query from a QuerySet?"
+    }
+  ],
+  "Rust": [
+    {
+      "name": "clap",
+      "repo": "https://github.com/clap-rs/clap",
+      "size": "Medium",
+      "files": "~200",
+      "question": "How does clap parse arguments against a derived command definition?"
+    },
+    {
+      "name": "tokio",
+      "repo": "https://github.com/tokio-rs/tokio",
+      "size": "Large",
+      "files": "~700",
+      "question": "How does tokio schedule and run async tasks on its runtime?"
+    },
+    {
+      "name": "deno",
+      "repo": "https://github.com/denoland/deno",
+      "size": "Large",
+      "files": "~1500",
+      "question": "How does Deno load and execute a TypeScript module?"
+    }
+  ],
+  "Java": [
+    {
+      "name": "gson",
+      "repo": "https://github.com/google/gson",
+      "size": "Medium",
+      "files": "~200",
+      "question": "How does Gson serialize an object to JSON?"
+    },
+    {
+      "name": "okhttp",
+      "repo": "https://github.com/square/okhttp",
+      "size": "Medium",
+      "files": "~640",
+      "question": "How does OkHttp process a request through its interceptor chain?"
+    },
+    {
+      "name": "guava",
+      "repo": "https://github.com/google/guava",
+      "size": "Large",
+      "files": "~3000",
+      "question": "How does Guava's CacheBuilder build and configure a cache?"
+    }
+  ],
+  "Kotlin": [
+    {
+      "name": "koin",
+      "repo": "https://github.com/InsertKoinIO/koin",
+      "size": "Medium",
+      "files": "~300",
+      "question": "How does Koin resolve and inject dependencies?"
+    },
+    {
+      "name": "leakcanary",
+      "repo": "https://github.com/square/leakcanary",
+      "size": "Medium",
+      "files": "~250",
+      "question": "How does LeakCanary detect and analyze a memory leak?"
+    }
+  ],
+  "Swift": [
+    {
+      "name": "alamofire",
+      "repo": "https://github.com/Alamofire/Alamofire",
+      "size": "Small",
+      "files": "~100",
+      "question": "How does Alamofire build, send, and validate a request?"
+    }
+  ],
+  "C#": [
+    {
+      "name": "serilog",
+      "repo": "https://github.com/serilog/serilog",
+      "size": "Medium",
+      "files": "~250",
+      "question": "How does Serilog route a log event to its sinks?"
+    },
+    {
+      "name": "jellyfin",
+      "repo": "https://github.com/jellyfin/jellyfin",
+      "size": "Large",
+      "files": "~2500",
+      "question": "How does Jellyfin scan and identify items in a media library?"
+    }
+  ],
+  "Ruby": [
+    {
+      "name": "sinatra",
+      "repo": "https://github.com/sinatra/sinatra",
+      "size": "Small",
+      "files": "~60",
+      "question": "How does Sinatra match a request to a route handler?"
+    },
+    {
+      "name": "discourse",
+      "repo": "https://github.com/discourse/discourse",
+      "size": "Large",
+      "files": "~3000",
+      "question": "How does Discourse create and render a new post?"
+    }
+  ],
+  "PHP": [
+    {
+      "name": "slim",
+      "repo": "https://github.com/slimphp/Slim",
+      "size": "Small",
+      "files": "~80",
+      "question": "How does Slim handle a request through its middleware?"
+    },
+    {
+      "name": "laravel",
+      "repo": "https://github.com/laravel/framework",
+      "size": "Large",
+      "files": "~3000",
+      "question": "How does Laravel resolve and dispatch a route to a controller?"
+    }
+  ],
+  "C": [
+    {
+      "name": "redis",
+      "repo": "https://github.com/redis/redis",
+      "size": "Large",
+      "files": "~600",
+      "question": "How does Redis parse and dispatch a client command?"
+    }
+  ],
+  "C++": [
+    {
+      "name": "json",
+      "repo": "https://github.com/nlohmann/json",
+      "size": "Small",
+      "files": "~100",
+      "question": "How does nlohmann::json parse a JSON string into a value?"
+    },
+    {
+      "name": "grpc",
+      "repo": "https://github.com/grpc/grpc",
+      "size": "Large",
+      "files": "~3000",
+      "question": "How does gRPC dispatch an incoming RPC to its handler?"
+    }
+  ],
+  "Dart": [
+    {
+      "name": "flutter",
+      "repo": "https://github.com/flutter/flutter",
+      "size": "Large",
+      "files": "~6000",
+      "question": "How does Flutter build and lay out a widget tree?"
+    }
+  ],
+  "Svelte": [
+    {
+      "name": "shadcn-svelte",
+      "repo": "https://github.com/huntabyte/shadcn-svelte",
+      "size": "Medium",
+      "files": "~600",
+      "question": "How do shadcn-svelte components compose and apply their styling?"
+    }
+  ],
+  "Lua": [
+    {
+      "name": "lualine.nvim",
+      "repo": "https://github.com/nvim-lualine/lualine.nvim",
+      "size": "Small",
+      "files": "~120",
+      "question": "How does lualine assemble and render its statusline sections and components?"
+    },
+    {
+      "name": "telescope.nvim",
+      "repo": "https://github.com/nvim-telescope/telescope.nvim",
+      "size": "Medium",
+      "files": "~80",
+      "question": "How does Telescope wire a picker to its finder, sorter, and previewer?"
+    },
+    {
+      "name": "kong",
+      "repo": "https://github.com/Kong/kong",
+      "size": "Large",
+      "files": "~1330",
+      "question": "How does Kong execute plugins across a request's lifecycle phases?"
+    }
+  ],
+  "Luau": [
+    {
+      "name": "Knit",
+      "repo": "https://github.com/Sleitnick/Knit",
+      "size": "Small",
+      "files": "~10",
+      "question": "How does Knit register services and expose them to clients?"
+    },
+    {
+      "name": "vide",
+      "repo": "https://github.com/centau/vide",
+      "size": "Small",
+      "files": "~40",
+      "question": "How does vide track reactive sources and re-run effects when state changes?"
+    },
+    {
+      "name": "Fusion",
+      "repo": "https://github.com/dphfox/Fusion",
+      "size": "Medium",
+      "files": "~115",
+      "question": "How does Fusion build and update its reactive UI graph from state objects?"
+    }
+  ],
+  "Objective-C": [
+    {
+      "name": "Masonry",
+      "repo": "https://github.com/SnapKit/Masonry",
+      "size": "Small",
+      "files": "~50",
+      "question": "How does Masonry build and activate Auto Layout constraints from its block DSL?"
+    },
+    {
+      "name": "FMDB",
+      "repo": "https://github.com/ccgus/fmdb",
+      "size": "Medium",
+      "files": "~80",
+      "question": "How does FMDB execute a prepared SQL statement and bind parameters?"
+    },
+    {
+      "name": "SDWebImage",
+      "repo": "https://github.com/SDWebImage/SDWebImage",
+      "size": "Large",
+      "files": "~400",
+      "question": "How does SDWebImage download, cache, and decode an image for a UIImageView?"
+    }
+  ],
+  "Mixed iOS (Swift+ObjC)": [
+    {
+      "name": "Charts",
+      "repo": "https://github.com/danielgindi/Charts",
+      "size": "Small",
+      "files": "~270",
+      "question": "How does the ChartsDemo ObjC demo controller drive the Swift Charts library to animate and notify a data update?"
+    },
+    {
+      "name": "realm-swift",
+      "repo": "https://github.com/realm/realm-swift",
+      "size": "Medium",
+      "files": "~370",
+      "question": "How does a Swift `Realm.write { realm.add(obj) }` reach the Objective-C persistence layer?"
+    },
+    {
+      "name": "wikipedia-ios",
+      "repo": "https://github.com/wikimedia/wikipedia-ios",
+      "size": "Large",
+      "files": "~1700",
+      "question": "How does tapping a search result reach the article-fetch network call across the Swift / ObjC boundary?"
+    }
+  ],
+  "React Native (legacy bridge + TurboModule)": [
+    {
+      "name": "@react-native-async-storage",
+      "repo": "https://github.com/react-native-async-storage/async-storage",
+      "size": "Small",
+      "files": "~60",
+      "question": "How does `setItem` in JS reach the native `legacy_multiSet` implementation?"
+    },
+    {
+      "name": "react-native-svg",
+      "repo": "https://github.com/software-mansion/react-native-svg",
+      "size": "Medium",
+      "files": "~700",
+      "question": "How does a JS `Svg.getTotalLength(...)` reach the iOS / Android native implementation via TurboModule?"
+    },
+    {
+      "name": "react-native-firebase",
+      "repo": "https://github.com/invertase/react-native-firebase",
+      "size": "Large",
+      "files": "~1100",
+      "question": "How does a native iOS push notification reach the JS `messaging().onMessage(...)` listener?"
+    }
+  ],
+  "Expo Modules": [
+    {
+      "name": "expo-haptics",
+      "repo": "https://github.com/expo/expo/tree/main/packages/expo-haptics",
+      "size": "Small",
+      "files": "~15",
+      "question": "How does `Haptics.notificationAsync(...)` in JS reach `UINotificationFeedbackGenerator` in the Swift Module?"
+    },
+    {
+      "name": "expo-camera",
+      "repo": "https://github.com/expo/expo/tree/main/packages/expo-camera",
+      "size": "Medium",
+      "files": "~70",
+      "question": "How does a JS `CameraView.takePictureAsync(options)` reach the native AVCaptureSession / CameraDevice call?"
+    }
+  ],
+  "React Native Fabric (view components)": [
+    {
+      "name": "react-native-segmented-control",
+      "repo": "https://github.com/react-native-segmented-control/segmented-control",
+      "size": "Small",
+      "files": "~25",
+      "question": "How does JSX `<SegmentedControl onChange={cb}/>` reach the native onChange handler on iOS/Android?"
+    },
+    {
+      "name": "react-native-screens",
+      "repo": "https://github.com/software-mansion/react-native-screens",
+      "size": "Medium",
+      "files": "~1200",
+      "question": "How does JSX `<ScreenStack>` reach the native RNSScreenStackView component?"
+    },
+    {
+      "name": "react-native-skia",
+      "repo": "https://github.com/Shopify/react-native-skia",
+      "size": "Large",
+      "files": "~1000",
+      "question": "How does a `<SkiaPictureView/>` JSX usage reach the iOS / Android native renderer?"
+    }
+  ],
+  "R": [
+    {
+      "name": "AnomalyDetection",
+      "repo": "https://github.com/twitter/AnomalyDetection",
+      "size": "Small",
+      "files": "~24",
+      "question": "How does AnomalyDetectionTs go from the exported entry function to the underlying S-H-ESD statistical test? Name the functions on the path in order."
+    },
+    {
+      "name": "dplyr",
+      "repo": "https://github.com/tidyverse/dplyr",
+      "size": "Medium",
+      "files": "~450",
+      "question": "When mutate() is called on a grouped data frame, which functions handle the grouping and expression evaluation, in order, from mutate() down?"
+    },
+    {
+      "name": "ggplot2",
+      "repo": "https://github.com/tidyverse/ggplot2",
+      "size": "Large",
+      "files": "~1150",
+      "question": "When a ggplot object is printed, how does the plot actually get built and drawn — trace the path from print/plot to where geoms render. Name the key functions in order."
+    }
+  ],
+  "COBOL": [
+    {
+      "name": "cics-genapp",
+      "repo": "https://github.com/cicsdev/cics-genapp",
+      "size": "Small",
+      "files": "~60",
+      "question": "When a new insurance policy is added through the LGTESTP1 CICS test harness, which programs handle the request on the way to the DB2 insert? Trace the path and name the programs in order."
+    },
+    {
+      "name": "carddemo",
+      "repo": "https://github.com/aws-samples/aws-mainframe-modernization-carddemo",
+      "size": "Medium",
+      "files": "~75",
+      "question": "How does the online bill-payment flow work — from the COBIL00C screen program to the transaction record being written? Name the paragraphs performed in order and the copybooks that define the records involved."
+    },
+    {
+      "name": "CobolCraft",
+      "repo": "https://github.com/meyfa/CobolCraft",
+      "size": "Medium",
+      "files": "~270",
+      "question": "How does an incoming player chat message travel from packet handling to being broadcast to the other connected players? Name the programs on the path in order."
+    }
+  ],
+  "VB.NET": [
+    {
+      "name": "policyplus",
+      "repo": "https://github.com/Fleex255/PolicyPlus",
+      "size": "Small",
+      "files": "~94",
+      "question": "When the user toggles a policy to Enabled in the policy-setting editor and clicks OK, how does the new state end up written into the loaded policy source (POL file or registry)? Trace the path from the EditSetting dialog to the concrete write."
+    },
+    {
+      "name": "scrawler",
+      "repo": "https://github.com/AAndyProgram/SCrawler",
+      "size": "Medium",
+      "files": "~320",
+      "question": "When a user download is started for a Reddit user, how does the request flow from the user-level download entry point through the shared downloader base into the Reddit site plugin, and where do downloaded media items get appended to the user's content list?"
+    },
+    {
+      "name": "staxrip",
+      "repo": "https://github.com/staxrip/staxrip",
+      "size": "Medium",
+      "files": "~145",
+      "question": "When a job finishes video encoding, how does staxrip decide which muxer runs and how does the muxer command line get built and executed? Trace from job processing to the mkvmerge invocation."
+    }
+  ],
+  "Erlang": [
+    {
+      "name": "cowboy",
+      "repo": "https://github.com/ninenines/cowboy",
+      "size": "Small",
+      "files": "~190",
+      "question": "How does an incoming HTTP request travel from cowboy's connection process to a user-defined handler's init/2 callback? Trace the path through the stream handler and middleware chain."
+    },
+    {
+      "name": "ejabberd",
+      "repo": "https://github.com/processone/ejabberd",
+      "size": "Medium",
+      "files": "~410",
+      "question": "When a client sends a chat message, how does the stanza get from the receiving C2S process to the recipient's session on the same node? Trace the path through the router and session manager."
+    },
+    {
+      "name": "emqx",
+      "repo": "https://github.com/emqx/emqx",
+      "size": "Large",
+      "files": "~2450",
+      "question": "How does a PUBLISH packet from an MQTT client reach the sessions of matching subscribers? Trace the flow from the connection/channel layer through the broker's routing to session delivery."
+    }
+  ],
+  "Solidity": [
+    {
+      "name": "solmate",
+      "repo": "https://github.com/transmissions11/solmate",
+      "size": "Small",
+      "files": "~60",
+      "question": "How does solmate's ERC20 transferFrom enforce allowance and update balances? Trace the flow including the permit() signature path."
+    },
+    {
+      "name": "solady",
+      "repo": "https://github.com/Vectorized/solady",
+      "size": "Medium",
+      "files": "~270",
+      "question": "How does solady's ERC20 implementation handle a permit() call — from signature recovery through nonce update to allowance write?"
+    },
+    {
+      "name": "openzeppelin-contracts",
+      "repo": "https://github.com/OpenZeppelin/openzeppelin-contracts",
+      "size": "Large",
+      "files": "~400",
+      "question": "How does an OpenZeppelin AccessControl-protected function check the caller's role? Trace from the onlyRole modifier through hasRole to the role storage."
+    }
+  ],
+  "CUDA": [
+    {
+      "name": "llm.c",
+      "repo": "https://github.com/karpathy/llm.c",
+      "size": "Small",
+      "files": "~76",
+      "question": "How does the attention forward pass reach the GPU in the CUDA training path? Trace from attention_forward to the kernels it launches, and explain where softmax happens."
+    },
+    {
+      "name": "flash-attention",
+      "repo": "https://github.com/Dao-AILab/flash-attention",
+      "size": "Medium",
+      "files": "~900",
+      "question": "How does a Python call to flash_attn_func reach the CUDA kernel that computes forward attention? Trace the dispatch path from the Python API through the C++ binding to the kernel launch."
+    },
+    {
+      "name": "cutlass",
+      "repo": "https://github.com/NVIDIA/cutlass",
+      "size": "Large",
+      "files": "~2700",
+      "question": "When a cutlass device-level GEMM (cutlass::gemm::device::Gemm) is invoked, how does it reach the GPU kernel? Trace from the operator() call to the kernel entry point and its launch site."
+    }
+  ],
+  "Terraform": [
+    {
+      "name": "terraform-aws-vpc",
+      "repo": "https://github.com/terraform-aws-modules/terraform-aws-vpc",
+      "size": "Small",
+      "files": "~77",
+      "question": "How does the private_subnets variable shape the NAT gateway setup? Trace from the variable through the subnet and NAT gateway resources to the outputs that expose the private subnets."
+    },
+    {
+      "name": "cloud-foundation-fabric",
+      "repo": "https://github.com/GoogleCloudPlatform/cloud-foundation-fabric",
+      "size": "Medium",
+      "files": "~990",
+      "question": "In the project module (modules/project), how does the iam variable turn into actual IAM bindings on the project, and what depends on the module's project_id output elsewhere in the repo?"
+    },
+    {
+      "name": "terraform-aws-components",
+      "repo": "https://github.com/cloudposse/terraform-aws-components",
+      "size": "Large",
+      "files": "~1800",
+      "question": "In the eks/cluster component, how does the cluster IAM role get created and reach the EKS cluster resource, and which outputs expose cluster identity to other components?"
+    }
+  ],
+  "ArkTS": [
+    {
+      "name": "HarmoneyOpenEye",
+      "repo": "https://github.com/WinWang/HarmoneyOpenEye",
+      "size": "Small",
+      "files": "~82",
+      "question": "How does the home page get its feed data from the network layer, and how does that data end up rendered as the list on screen? Trace the flow from the HTTP request through the view model into the home page UI."
+    },
+    {
+      "name": "CoolMallArkTS",
+      "repo": "https://github.com/Joker-x-dev/CoolMallArkTS",
+      "size": "Medium",
+      "files": "~528",
+      "question": "When the user adds a product to the cart from the goods detail page, how does the item travel from the UI action to persistent storage? Trace the flow across the feature and core modules."
+    },
+    {
+      "name": "applications_app_samples",
+      "repo": "https://github.com/openharmony/applications_app_samples",
+      "size": "Large",
+      "files": "~9500",
+      "question": "In the OrangeShopping sample app, how does the product detail page's bottom bar (add to cart / buy) lead to the order placement flow? Trace from the bottom navigation component to where the order is created."
+    }
+  ],
+  "Nix": [
+    {
+      "name": "agenix",
+      "repo": "https://github.com/ryantm/agenix",
+      "size": "Small",
+      "files": "~13",
+      "question": "When a NixOS system activates, how does a secret declared under age.secrets get decrypted and installed at its runtime path? Trace the flow from the age.secrets option definition to the activation machinery that performs the decryption."
+    },
+    {
+      "name": "nix-darwin",
+      "repo": "https://github.com/nix-darwin/nix-darwin",
+      "size": "Medium",
+      "files": "~207",
+      "question": "How does setting services.yabai.enable = true become a running launchd service? Trace the flow from the yabai module's options to the launchd daemon definition that generates the plist."
+    },
+    {
+      "name": "home-manager",
+      "repo": "https://github.com/nix-community/home-manager",
+      "size": "Large",
+      "files": "~3390",
+      "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
+    }
+  ]
+}

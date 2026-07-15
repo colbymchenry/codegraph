@@ -116,24 +116,11 @@ export class GraphQueryManager {
    * @returns Array of file paths this file depends on
    */
   getFileDependencies(filePath: string): string[] {
-    const nodes = this.queries.getNodesByFile(filePath);
-    const fileNode = nodes.find((n) => n.kind === 'file');
-
-    if (!fileNode) {
-      return [];
-    }
-
-    const dependencies = new Set<string>();
-    const importEdges = this.queries.getOutgoingEdges(fileNode.id, ['imports']);
-
-    for (const edge of importEdges) {
-      const targetNode = this.queries.getNodeById(edge.target);
-      if (targetNode && targetNode.filePath !== filePath) {
-        dependencies.add(targetNode.filePath);
-      }
-    }
-
-    return Array.from(dependencies);
+    // Follow the symbol-level cross-file edge graph, not just `imports`:
+    // an `imports` edge here points from a file to its own local import
+    // declarations (same-file), so the actual cross-file dependencies live in
+    // the resolved calls/references/instantiates/extends/... edges.
+    return this.queries.getDependencyFilePaths(filePath);
   }
 
   /**
@@ -145,35 +132,14 @@ export class GraphQueryManager {
    * @returns Array of file paths that depend on this file
    */
   getFileDependents(filePath: string): string[] {
-    const nodes = this.queries.getNodesByFile(filePath);
-    const dependents = new Set<string>();
-
-    // Check file-level incoming import edges (file:X imports file:Y)
-    const fileNode = nodes.find((n) => n.kind === 'file');
-    if (fileNode) {
-      const incomingFileEdges = this.queries.getIncomingEdges(fileNode.id, ['imports']);
-      for (const edge of incomingFileEdges) {
-        const sourceNode = this.queries.getNodeById(edge.source);
-        if (sourceNode && sourceNode.filePath !== filePath) {
-          dependents.add(sourceNode.filePath);
-        }
-      }
-    }
-
-    // Also check node-level imports of exported symbols
-    for (const node of nodes) {
-      if (node.isExported) {
-        const incomingEdges = this.queries.getIncomingEdges(node.id, ['imports']);
-        for (const edge of incomingEdges) {
-          const sourceNode = this.queries.getNodeById(edge.source);
-          if (sourceNode && sourceNode.filePath !== filePath) {
-            dependents.add(sourceNode.filePath);
-          }
-        }
-      }
-    }
-
-    return Array.from(dependents);
+    // Previously this only followed `imports` edges into the file node or its
+    // exported symbols and returned 0 dependents for *every* file — because an
+    // `imports` edge here connects a file to its own local import declarations
+    // (always same-file), never to the providing file. The real cross-file
+    // dependency signal is the resolved symbol graph (calls/references/
+    // instantiates/extends/implements/...), which is what blast-radius /
+    // `affected` need. Delegate to the indexed projection of that graph.
+    return this.queries.getDependentFilePaths(filePath);
   }
 
   /**

@@ -1,0 +1,226 @@
+/* =====================================================================
+   codegraph — flat / paper editorial theme
+   Monochrome ink-on-paper, hairline rules, square corners. Shared by the
+   custom landing page (src/pages/index.astro) and the Starlight docs.
+   ===================================================================== */
+
+/* ---- Fonts ---- */
+:root {
+	--sl-font: 'Archivo Variable', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
+	--sl-font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+/* ---- Starlight colour mapping: light / paper (default) ---- */
+:root,
+:root[data-theme='light'] {
+	--sl-color-accent-low: #e2dfd5;
+	--sl-color-accent: #16150f;
+	--sl-color-accent-high: #16150f;
+	--sl-color-white: #16150f;
+	--sl-color-gray-1: #2a281f;
+	--sl-color-gray-2: #56544a;
+	--sl-color-gray-3: #6f6c61;
+	--sl-color-gray-4: #87847a;
+	--sl-color-gray-5: #b4b1a5;
+	--sl-color-gray-6: #d6d3c8;
+	--sl-color-gray-7: #e8e6dd;
+	--sl-color-black: #f7f6f2;
+
+	--sl-color-bg: #f7f6f2;
+	--sl-color-bg-nav: #f7f6f2;
+	--sl-color-bg-sidebar: #f7f6f2;
+	--sl-color-bg-inline-code: #e8e6dd;
+	--sl-color-bg-accent: #16150f;
+
+	--sl-color-text: #16150f;
+	--sl-color-text-accent: #16150f;
+	--sl-color-text-invert: #f7f6f2;
+
+	--sl-color-hairline: #16150f;
+	--sl-color-hairline-light: #d6d3c8;
+	--sl-color-hairline-shade: #d6d3c8;
+
+	/* shared tokens */
+	--cg-paper: #f7f6f2;
+	--cg-paper-2: #f1efe8;
+	--cg-paper-press: #e8e6dd;
+	--cg-ink: #16150f;
+	--cg-ink-2: #56544a;
+	--cg-ink-3: #87847a;
+	--cg-rule: #16150f;
+	--cg-rule-soft: #d6d3c8;
+}
+
+/* ---- Starlight colour mapping: dark / ink ---- */
+:root[data-theme='dark'] {
+	--sl-color-accent-low: #34322a;
+	--sl-color-accent: #f3f1ea;
+	--sl-color-accent-high: #f3f1ea;
+	--sl-color-white: #f3f1ea;
+	--sl-color-gray-1: #e7e5dc;
+	--sl-color-gray-2: #c9c6ba;
+	--sl-color-gray-3: #a7a499;
+	--sl-color-gray-4: #7c7a70;
+	--sl-color-gray-5: #57554c;
+	--sl-color-gray-6: #2c2a23;
+	--sl-color-gray-7: #1e1c16;
+	--sl-color-black: #16150f;
+
+	--sl-color-bg: #16150f;
+	--sl-color-bg-nav: #16150f;
+	--sl-color-bg-sidebar: #16150f;
+	--sl-color-bg-inline-code: #23211a;
+	--sl-color-bg-accent: #f3f1ea;
+
+	--sl-color-text: #f3f1ea;
+	--sl-color-text-accent: #f3f1ea;
+	--sl-color-text-invert: #16150f;
+
+	--sl-color-hairline: #f3f1ea;
+	--sl-color-hairline-light: #34322a;
+	--sl-color-hairline-shade: #34322a;
+
+	--cg-paper: #16150f;
+	--cg-paper-2: #1e1c16;
+	--cg-paper-press: #23211a;
+	--cg-ink: #f3f1ea;
+	--cg-ink-2: #b8b5a8;
+	--cg-ink-3: #87847a;
+	--cg-rule: #f3f1ea;
+	--cg-rule-soft: #34322a;
+}
+
+/* ---- Global flat resets ---- */
+*,
+*::before,
+*::after {
+	border-radius: 0 !important; /* this design has no rounded corners, anywhere */
+}
+
+:root {
+	--sl-shadow-sm: none;
+	--sl-shadow-md: none;
+	--sl-shadow-lg: none;
+}
+
+body {
+	background: var(--cg-paper);
+	color: var(--cg-ink);
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+}
+
+:where(h1, h2, h3, h4, h5) {
+	letter-spacing: -0.02em;
+}
+
+/* ---- Docs chrome ---- */
+
+/* Header: one crisp bottom rule. Starlight nests <div class="header"> inside
+   <header class="header">, so a bare `.header { border-bottom }` draws two
+   lines — put the rule on the outer <header> only and clear the inner div. */
+.header {
+	background: var(--cg-paper);
+	-webkit-backdrop-filter: none;
+	backdrop-filter: none;
+}
+header.header {
+	border-bottom: 1px solid var(--cg-rule);
+}
+.header .header {
+	border-bottom: 0;
+}
+
+/* Sidebar: crisp right rule */
+#starlight__sidebar,
+.sidebar-pane {
+	border-inline-end: 1px solid var(--cg-rule);
+	background: var(--cg-paper);
+}
+
+/* Sidebar group labels — small caps, committed editorial direction */
+.sidebar-content details > summary,
+.sidebar-content > ul > li > span,
+.sidebar-content .large {
+	font-weight: 700;
+	letter-spacing: 0.07em;
+	text-transform: uppercase;
+	font-size: 0.72rem;
+	color: var(--cg-ink-2);
+}
+
+/* Sidebar links */
+.sidebar-content a {
+	color: var(--cg-ink-2);
+}
+.sidebar-content a:hover {
+	background: var(--cg-paper-press);
+	color: var(--cg-ink);
+}
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover {
+	background: transparent;
+	color: var(--cg-ink);
+	font-weight: 700;
+	border-inline-start: 2px solid var(--cg-ink);
+}
+
+/* Right "On this page" rail */
+starlight-toc a {
+	color: var(--cg-ink-3);
+}
+starlight-toc a[aria-current='true'] {
+	color: var(--cg-ink);
+	font-weight: 600;
+}
+
+/* Prev / next pagination: flat bordered boxes */
+.pagination-links a {
+	border: 1px solid var(--cg-rule);
+	box-shadow: none;
+	background: var(--cg-paper);
+}
+.pagination-links a:hover {
+	background: var(--cg-paper-press);
+}
+
+/* Inline code */
+.sl-markdown-content :not(pre) > code {
+	border: 1px solid var(--cg-rule-soft);
+	background: var(--cg-paper-2);
+	font-size: 0.875em;
+}
+
+/* Cards / asides: square, hairline */
+.card,
+.starlight-aside {
+	border: 1px solid var(--cg-rule);
+	box-shadow: none;
+}
+
+/* Search trigger */
+button[data-open-modal] {
+	border: 1px solid var(--cg-rule);
+	background: var(--cg-paper);
+}
+
+/* Content horizontal rules */
+.sl-markdown-content hr {
+	border: 0;
+	border-top: 1px solid var(--cg-rule);
+}
+
+/* Links in prose */
+.sl-markdown-content a {
+	color: var(--cg-ink);
+	text-underline-offset: 3px;
+}
+
+/* On wide screens Starlight right-aligns the content against the TOC
+   (margin-inline: auto 0), piling all the empty space on the left. Center the
+   content within its pane so it sits balanced between the sidebar and the TOC. */
+@media (min-width: 72rem) {
+	.main-pane {
+		--sl-content-margin-inline: auto;
+	}
+}

@@ -46,14 +46,11 @@ import {
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
-  removeMarkedSection,
-  replaceOrAppendMarkedSection,
   writeJsonFile,
 } from './shared';
 import {
   CODEGRAPH_SECTION_END,
   CODEGRAPH_SECTION_START,
-  INSTRUCTIONS_TEMPLATE,
 } from '../instructions-template';
 
 function mcpJsonPath(loc: Location): string {
@@ -113,8 +110,13 @@ class CursorTarget implements AgentTarget {
 
     files.push(writeMcpEntry(loc));
 
+    // We no longer write `.cursor/rules/codegraph.mdc` — the codegraph
+    // usage guidance ships in the MCP server's `initialize` response,
+    // the single source of truth (issue #529). Strip a rules file a
+    // previous install created so an upgrade self-heals.
     if (loc === 'local') {
-      files.push(writeRulesEntry());
+      const rulesCleanup = removeRulesEntry();
+      if (rulesCleanup.action === 'removed') files.push(rulesCleanup);
     }
 
     return {
@@ -140,9 +142,7 @@ class CursorTarget implements AgentTarget {
     }
 
     if (loc === 'local') {
-      const rules = rulesPath();
-      const action = removeMarkedSection(rules, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
-      files.push({ path: rules, action });
+      files.push(removeRulesEntry());
     }
 
     return { files };
@@ -158,16 +158,6 @@ class CursorTarget implements AgentTarget {
     return loc === 'local'
       ? [mcpJsonPath(loc), rulesPath()]
       : [mcpJsonPath(loc)];
-  }
-
-  /**
-   * Write the project-local `.cursor/rules/codegraph.mdc` file. Used
-   * by `codegraph init` to bootstrap projects that have only the
-   * global `~/.cursor/mcp.json` — without the rules file, the Cursor
-   * agent has no signal to prefer codegraph over native grep.
-   */
-  wireProjectSurfaces(): WriteResult {
-    return { files: [writeRulesEntry()] };
   }
 }
 
@@ -200,41 +190,58 @@ function writeMcpEntry(loc: Location): WriteResult['files'][number] {
   return { path: file, action };
 }
 
-function writeRulesEntry(): WriteResult['files'][number] {
+/**
+ * Remove the Cursor rules file on uninstall (and as a self-heal on
+ * install — see issue #529).
+ *
+ * Unlike the shared CLAUDE.md / AGENTS.md files (where codegraph owns
+ * only a marker-delimited section), `.cursor/rules/codegraph.mdc` is a
+ * file we create OUTRIGHT — the frontmatter is ours too. So a plain
+ * `removeMarkedSection` is wrong here: it would strip our instruction
+ * block but leave the orphaned `description: CodeGraph ...` frontmatter
+ * behind, so the file lingers and still "mentions" codegraph.
+ *
+ * Instead: strip our block, and if nothing but our own frontmatter
+ * remains, delete the whole file. Only when the user has added their
+ * own content outside our markers do we keep the file (minus our block).
+ */
+function removeRulesEntry(): WriteResult['files'][number] {
   const file = rulesPath();
-  const dir = path.dirname(file);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
 
-  // Body is frontmatter + the shared instructions block. The
-  // marker-based replacement targets only the marker block, so the
-  // frontmatter is preserved across re-runs.
-  const body = MDC_FRONTMATTER + INSTRUCTIONS_TEMPLATE;
-
-  if (!fs.existsSync(file)) {
-    atomicWriteFileSync(file, body + '\n');
-    return { path: file, action: 'created' };
+  let content: string;
+  try {
+    content = fs.readFileSync(file, 'utf-8');
+  } catch {
+    return { path: file, action: 'not-found' };
   }
 
-  // For .mdc files we own outright, do byte-equality first.
-  const existing = fs.readFileSync(file, 'utf-8');
-  const wantWithNL = body + '\n';
-  if (existing === wantWithNL) {
-    return { path: file, action: 'unchanged' };
+  const ourFrontmatter = MDC_FRONTMATTER.trim();
+  const startIdx = content.indexOf(CODEGRAPH_SECTION_START);
+  const endIdx = content.indexOf(CODEGRAPH_SECTION_END);
+
+  // Our marked block is present — strip it, then decide what's left.
+  if (startIdx !== -1 && endIdx > startIdx) {
+    const before = content.substring(0, startIdx).trimEnd();
+    const after = content.substring(endIdx + CODEGRAPH_SECTION_END.length).trimStart();
+    const remainder = (before + (before && after ? '\n\n' : '') + after).trim();
+    if (remainder === '' || remainder === ourFrontmatter) {
+      try { fs.unlinkSync(file); } catch { /* ignore */ }
+    } else {
+      atomicWriteFileSync(file, remainder + '\n');
+    }
+    return { path: file, action: 'removed' };
   }
 
-  // Otherwise, marker-based section swap (preserves any user-added
-  // content outside the markers).
-  const action = replaceOrAppendMarkedSection(
-    file,
-    INSTRUCTIONS_TEMPLATE,
-    CODEGRAPH_SECTION_START,
-    CODEGRAPH_SECTION_END,
-  );
-  const mapped: 'created' | 'updated' | 'unchanged' =
-    action === 'created' ? 'created'
-      : action === 'unchanged' ? 'unchanged'
-        : 'updated';
-  return { path: file, action: mapped };
+  // No block, but the file is still our pristine frontmatter-only file
+  // — it's ours, so remove it.
+  if (content.trim() === ourFrontmatter) {
+    try { fs.unlinkSync(file); } catch { /* ignore */ }
+    return { path: file, action: 'removed' };
+  }
+
+  // Foreign content we don't recognize — leave it alone.
+  return { path: file, action: 'not-found' };
 }
 
 export const cursorTarget: AgentTarget = new CursorTarget();

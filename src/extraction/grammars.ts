@@ -7,10 +7,11 @@
  */
 
 import * as path from 'path';
+import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -35,6 +36,20 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   dart: 'tree-sitter-dart.wasm',
   pascal: 'tree-sitter-pascal.wasm',
   scala: 'tree-sitter-scala.wasm',
+  lua: 'tree-sitter-lua.wasm',
+  r: 'tree-sitter-r.wasm',
+  luau: 'tree-sitter-luau.wasm',
+  objc: 'tree-sitter-objc.wasm',
+  cfml: 'tree-sitter-cfml.wasm',
+  cfscript: 'tree-sitter-cfscript.wasm',
+  cfquery: 'tree-sitter-cfquery.wasm',
+  cobol: 'tree-sitter-cobol.wasm',
+  vbnet: 'tree-sitter-vbnet.wasm',
+  erlang: 'tree-sitter-erlang.wasm',
+  solidity: 'tree-sitter-solidity.wasm',
+  terraform: 'tree-sitter-terraform.wasm',
+  arkts: 'tree-sitter-arkts.wasm',
+  nix: 'tree-sitter-nix.wasm',
 };
 
 /**
@@ -43,9 +58,19 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
 export const EXTENSION_MAP: Record<string, Language> = {
   '.ts': 'typescript',
   '.tsx': 'tsx',
+  // ESM/CJS TypeScript module extensions — parsed as TS (no JSX). (#366)
+  '.mts': 'typescript',
+  '.cts': 'typescript',
+  // ArkTS (HarmonyOS / OpenHarmony) — a TypeScript superset with declarative
+  // UI (`@Component struct` + `build()`). Own grammar (a tree-sitter-typescript
+  // -style fork); plain `.ts` in an ArkTS project stays TypeScript. (#648)
+  '.ets': 'arkts',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
+  // SAP HANA XS Classic server-side JavaScript. (#556)
+  '.xsjs': 'javascript',
+  '.xsjslib': 'javascript',
   '.jsx': 'jsx',
   '.py': 'python',
   '.pyw': 'python',
@@ -60,7 +85,21 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.hpp': 'cpp',
   '.hxx': 'cpp',
   '.cs': 'csharp',
+  // ASP.NET Razor / Blazor markup — custom RazorExtractor (links @model/@inject/
+  // component tags to their C# types; markup isn't a tree-sitter grammar).
+  '.cshtml': 'razor',
+  '.razor': 'razor',
   '.php': 'php',
+  // Drupal-specific PHP file extensions
+  '.module': 'php',
+  '.install': 'php',
+  '.theme': 'php',
+  '.inc': 'php',
+  // YAML (used for Drupal routing files; no symbol extraction, file-level tracking only)
+  '.yml': 'yaml',
+  '.yaml': 'yaml',
+  // Twig templates (file-level tracking only, no symbol extraction)
+  '.twig': 'twig',
   '.rb': 'ruby',
   '.rake': 'ruby',
   '.swift': 'swift',
@@ -70,6 +109,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.liquid': 'liquid',
   '.svelte': 'svelte',
   '.vue': 'vue',
+  '.astro': 'astro',
+  '.r': 'r',
   '.pas': 'pascal',
   '.dpr': 'pascal',
   '.dpk': 'pascal',
@@ -78,7 +119,113 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.fmx': 'pascal',
   '.scala': 'scala',
   '.sc': 'scala',
+  '.lua': 'lua',
+  '.luau': 'luau',
+  '.m': 'objc',
+  '.mm': 'objc',
+  '.sol': 'solidity',
+  // CFML: .cfc/.cfm parse with the tag-aware `cfml` grammar (custom CfmlExtractor
+  // dialect-switches to cfscript for bare-script content); .cfs is pure CFScript.
+  '.cfc': 'cfml',
+  '.cfm': 'cfml',
+  '.cfs': 'cfscript',
+  // Metal Shading Language ≈ C++14: the C++ grammar extracts its functions,
+  // structs, and calls. MSL-specific `[[attribute]]` annotations are blanked
+  // pre-parse for `.metal` files (see blankMetalAttributes in c-cpp.ts). (#1121)
+  '.metal': 'cpp',
+  // CUDA ≈ C++ plus execution-space specifiers (`__global__` …) and
+  // `<<<grid, block>>>` kernel-launch syntax: the C++ grammar extracts its
+  // functions/structs/classes/calls once blankCudaConstructs (pre-parse; gated
+  // by these extensions OR by content for CUDA living in `.h`/`.hpp` headers —
+  // see c-cpp.ts) blanks the CUDA-only tokens. (#387)
+  '.cu': 'cpp',
+  '.cuh': 'cpp',
+  '.nix': 'nix',
+  // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
+  // shape and emits SQL-statement nodes (other XML returns empty).
+  '.xml': 'xml',
+  // COBOL: programs (.cbl/.cob) and copybooks (.cpy). Vendored grammar
+  // (patched yutaro-sakamoto/tree-sitter-cobol) handles fixed-format column
+  // rules, EXEC CICS/SQL blocks, and standalone copybook fragments.
+  '.cbl': 'cobol',
+  '.cob': 'cobol',
+  '.cobol': 'cobol',
+  '.cpy': 'cobol',
+  // VB.NET: vendored grammar (patched govindbanura/tree-sitter-vbnet) — classes,
+  // modules, interfaces, structures, properties, events, Handles clauses, LINQ.
+  '.vb': 'vbnet',
+  // Erlang: modules (.erl) and header files (.hrl). Vendored WhatsApp/
+  // tree-sitter-erlang grammar (the ELP grammar).
+  '.erl': 'erlang',
+  '.hrl': 'erlang',
+  // escripts parse natively — the grammar has a first-class `shebang` node.
+  // (`.app`/`.app.src` resource files route via isErlangAppFile below: their
+  // last-dot extension is too generic for this map.)
+  '.escript': 'erlang',
+  // Spring config: `application.properties` / `application-*.properties`. Same
+  // shape as the `.yml` variants — the YAML/properties extractor emits one node
+  // per leaf key, and the Spring resolver links `@Value("${k}")` references.
+  '.properties': 'properties',
+  // Terraform / OpenTofu / HCL config — tree-sitter-terraform dialect of HCL.
+  '.tf': 'terraform',
+  '.tfvars': 'terraform',
+  '.tofu': 'terraform',
 };
+
+/**
+ * Whether a file is one CodeGraph can parse, based purely on its extension.
+ * This is the single source of truth for "should we index this file" — derived
+ * from EXTENSION_MAP so parser support and indexing selection never drift.
+ *
+ * `overrides` is the project's validated custom extension → language map (from
+ * `codegraph.json`); when present its extensions count as indexable in addition
+ * to the built-ins. Omitting it is byte-identical to the zero-config behavior.
+ */
+export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
+  if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
+  if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
+  if (isErlangAppFile(filePath)) return true; // OTP `.app`/`.app.src` resource files
+  const dot = filePath.lastIndexOf('.');
+  if (dot < 0) return false;
+  const ext = filePath.slice(dot).toLowerCase();
+  return ext in EXTENSION_MAP || (!!overrides && ext in overrides);
+}
+
+/**
+ * Shopify OS 2.0 JSON template (`templates/*.json`) or section group
+ * (`sections/*.json`) — these reference sections by `"type"`, so the Liquid
+ * extractor links them. (config/ + locales/ JSON have no section refs.)
+ */
+export function isShopifyLiquidJson(filePath: string): boolean {
+  // Allow nested template dirs (`templates/customers/login.json`), not just
+  // top-level (`templates/product.json`).
+  return /(^|\/)(templates|sections)\/.+\.json$/i.test(filePath);
+}
+
+/**
+ * OTP application resource file: `<app>.app.src` (checked into every rebar3/
+ * erlang.mk app) or its compiled `<app>.app`. Erlang TERMS, not forms — the
+ * grammar parses them as top-level expressions, and the Erlang extractor's
+ * application-tuple handler turns `{mod, {Mod, _}}` and `{applications, […]}`
+ * into entry-module and dependency edges. Routed by full suffix because the
+ * last-dot extension (`.src`) is far too generic for EXTENSION_MAP.
+ */
+export function isErlangAppFile(filePath: string): boolean {
+  return /\.app(?:\.src)?$/i.test(filePath);
+}
+
+/**
+ * Play Framework routes file: the extensionless `conf/routes` (and included
+ * `conf/*.routes`). No grammar — route extraction is done by the Play framework
+ * resolver, so it's processed through the no-grammar (`yaml`-style) path.
+ */
+export function isPlayRoutesFile(filePath: string): boolean {
+  return (
+    filePath === 'conf/routes' ||
+    filePath.endsWith('/conf/routes') ||
+    filePath.endsWith('.routes')
+  );
+}
 
 /**
  * Caches for loaded grammars and parsers
@@ -103,14 +250,100 @@ export async function initGrammars(): Promise<void> {
 }
 
 /**
+ * Grammars that ship their own vendored WASMs under `dist/extraction/wasm/`
+ * (not in tree-sitter-wasms, or the tree-sitter-wasms build is too old).
+ * Lua: tree-sitter-wasms ships an ABI-13 build that corrupts the shared WASM
+ * heap under web-tree-sitter 0.25 (drops nested calls/imports on every file
+ * after the first); we vendor the upstream ABI-15 wasm instead. C#: the
+ * tree-sitter-wasms build (ABI 13) has no primary-constructor support and
+ * parses `class Foo(...)` as an ERROR that swallows the whole class (#237); we
+ * vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
+ * primary constructors natively. Terraform: tree-sitter-wasms does not ship
+ * HCL/Terraform at all, so we vendor the prebuilt tree-sitter-terraform.wasm
+ * from @tree-sitter-grammars/tree-sitter-hcl 1.2.0 (Apache-2.0) —
+ * byte-identical to the npm package's artifact. ArkTS: tree-sitter-wasms
+ * doesn't ship it either; we vendor the prebuilt tree-sitter-arkts.wasm from
+ * the tree-sitter-arkts 0.2.0 npm package (harmony-contrib/tree-sitter-arkts,
+ * MIT) — byte-identical to the npm tarball's artifact. It extends the
+ * tree-sitter-javascript grammar the same way tree-sitter-typescript does,
+ * adding `struct_declaration` and the `arkui_component_expression` build()
+ * DSL. Nix: tree-sitter-wasms doesn't ship it; we vendor a wasm built from
+ * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
+ * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
+ * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
+ */
+const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
+  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+]);
+
+/** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
+function resolveWasmPath(lang: GrammarLanguage): string {
+  const wasmFile = WASM_GRAMMAR_FILES[lang];
+  return VENDORED_WASM_LANGS.has(lang)
+    ? path.join(__dirname, 'wasm', wasmFile)
+    : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
+}
+
+/**
+ * Expand an index set's languages to the grammars actually needed to parse it.
+ * SFC languages (svelte/vue/astro) have no grammar of their own — their
+ * extractors delegate <script>/frontmatter content to the TS/JS extractor, so
+ * those grammars must be loaded even when no plain .ts/.js file is in the index
+ * set (e.g. a pure-.astro content site). CFML (.cfc/.cfm) likewise delegates
+ * bare-script content, <cfscript> tag bodies, and <cfquery> SQL bodies to the
+ * cfscript/cfquery grammars (see injections.scm in tree-sitter-cfml).
+ */
+function expandGrammarLanguages(languages: Language[]): Language[] {
+  if (languages.some((l) => l === 'svelte' || l === 'vue' || l === 'astro')) {
+    languages = [...languages, 'typescript', 'javascript'];
+  }
+  if (languages.some((l) => l === 'cfml')) {
+    languages = [...languages, 'cfscript', 'cfquery'];
+  }
+  return languages;
+}
+
+/**
+ * Pre-read the grammar WASM bytes for an index set, keyed by language. The
+ * orchestrator reads each grammar ONCE and hands the bytes to every parse
+ * worker via its `load-grammars` message, so worker spawns/respawns load
+ * grammars from memory instead of re-reading them from disk — on slow storage
+ * (HDD, issue #1231) each respawn's grammar re-read otherwise amplifies the
+ * I/O contention that caused the respawn. Best-effort: a language whose WASM
+ * can't be read here is simply omitted, and the worker falls back to its own
+ * disk load (which surfaces the real error/warning path).
+ */
+export async function readGrammarWasmBytes(languages: Language[]): Promise<Record<string, Uint8Array>> {
+  const out: Record<string, Uint8Array> = {};
+  const toRead = [...new Set(expandGrammarLanguages(languages))].filter(
+    (lang): lang is GrammarLanguage => lang in WASM_GRAMMAR_FILES
+  );
+  for (const lang of toRead) {
+    try {
+      out[lang] = await fsp.readFile(resolveWasmPath(lang));
+    } catch {
+      // fall through — the worker's own load reports the failure
+    }
+  }
+  return out;
+}
+
+/**
  * Load grammar WASM files for specific languages only.
  * Skips languages that are already loaded or have no WASM grammar.
  * Must be called after initGrammars().
+ *
+ * `wasmBytes` (optional) holds pre-read grammar bytes keyed by language (from
+ * {@link readGrammarWasmBytes}, forwarded through the parse pool); when a
+ * language's bytes are present they're loaded from memory instead of disk.
  */
-export async function loadGrammarsForLanguages(languages: Language[]): Promise<void> {
+export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?: Record<string, Uint8Array>): Promise<void> {
   if (!parserInitialized) {
     await initGrammars();
   }
+
+  languages = expandGrammarLanguages(languages);
 
   // Deduplicate and filter to languages that have WASM grammars and aren't already loaded
   const toLoad = [...new Set(languages)].filter(
@@ -123,13 +356,9 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
   // Load grammars sequentially to avoid web-tree-sitter WASM race condition on Node 20+
   // See: https://github.com/tree-sitter/tree-sitter/issues/2338
   for (const lang of toLoad) {
-    const wasmFile = WASM_GRAMMAR_FILES[lang];
     try {
-      // Pascal and Scala ship their own WASMs (not in tree-sitter-wasms)
-      const wasmPath = (lang === 'pascal' || lang === 'scala')
-        ? path.join(__dirname, 'wasm', wasmFile)
-        : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
-      const language = await WasmLanguage.load(wasmPath);
+      const bytes = wasmBytes?.[lang];
+      const language = await WasmLanguage.load(bytes ?? resolveWasmPath(lang));
       languageCache.set(lang, language);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -176,15 +405,29 @@ export function getParser(language: Language): Parser | null {
 }
 
 /**
- * Detect language from file extension
+ * Detect language from file extension.
+ *
+ * `overrides` is the project's validated custom extension → language map (from
+ * `codegraph.json`); when present its mappings take precedence over the built-in
+ * `EXTENSION_MAP`. Omitting it is byte-identical to the zero-config behavior.
  */
-export function detectLanguage(filePath: string, source?: string): Language {
+export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>): Language {
+  // Play `conf/routes` has no grammar — route through the no-symbol path; the
+  // Play framework resolver extracts route nodes from it.
+  if (isPlayRoutesFile(filePath)) return 'yaml';
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
-  const lang = EXTENSION_MAP[ext] || 'unknown';
+  // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
+  // links each section `"type"` to its `sections/<type>.liquid`).
+  if (isShopifyLiquidJson(filePath)) return 'liquid';
+  // OTP `.app`/`.app.src` resource files — Erlang terms the grammar parses as
+  // top-level expressions (last-dot ext `.src` is too generic for the map).
+  if (isErlangAppFile(filePath)) return 'erlang';
+  const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
-  // .h files could be C or C++ — check source content for C++ features
+  // .h files could be C, C++, or Objective-C — check source content
   if (lang === 'c' && ext === '.h' && source) {
     if (looksLikeCpp(source)) return 'cpp';
+    if (looksLikeObjc(source)) return 'objc';
   }
 
   return lang;
@@ -196,7 +439,24 @@ export function detectLanguage(filePath: string, source?: string): Language {
  */
 function looksLikeCpp(source: string): boolean {
   const sample = source.substring(0, 8192);
-  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
+  // The `class MACRO Name : Base` / `class MACRO Name { … }` branch mirrors what
+  // `blankCppExportMacros` recovers: an ALL-CAPS export/visibility macro
+  // (`ENGINE_API`, `MYMODULE_API`, `*_EXPORT`, …) sitting between `class`/`struct`
+  // and the type name. Without it, a header whose ONLY C++ signal is such a
+  // macro-annotated class — common for lean Unreal-Engine types that carry just
+  // `GENERATED_BODY()` and no explicit `public:`/`virtual` — is misdetected as C,
+  // routed through the C extractor (which extracts no classes), and its class
+  // definition silently vanishes. The two-token shape (`<KW> <MACRO> <Name>`
+  // before a `[:{]`) never occurs in valid C, so this can't misclassify C headers.
+  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\b(?:class|struct)\s+[A-Z][A-Z0-9_]+\s+\w+\s*(?:final\s*)?[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
+}
+
+/**
+ * Heuristic: does a .h file contain Objective-C constructs?
+ */
+function looksLikeObjc(source: string): boolean {
+  const sample = source.substring(0, 8192);
+  return /@(?:interface|implementation|protocol|synthesize)\b/.test(sample);
 }
 
 /**
@@ -206,7 +466,13 @@ function looksLikeCpp(source: string): boolean {
 export function isLanguageSupported(language: Language): boolean {
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'vue') return true; // custom extractor (script block delegation)
+  if (language === 'astro') return true; // custom extractor (frontmatter/script block delegation)
   if (language === 'liquid') return true; // custom regex extractor
+  if (language === 'razor') return true; // custom RazorExtractor (.cshtml/.razor markup)
+  if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver
+  if (language === 'twig') return true; // file-level tracking only
+  if (language === 'xml') return true; // MyBatis mapper extractor
+  if (language === 'properties') return true; // Spring config keys
   if (language === 'unknown') return false;
   return language in WASM_GRAMMAR_FILES;
 }
@@ -215,15 +481,30 @@ export function isLanguageSupported(language: Language): boolean {
  * Check if a grammar has been loaded and is ready for parsing.
  */
 export function isGrammarLoaded(language: Language): boolean {
-  if (language === 'svelte' || language === 'vue' || language === 'liquid') return true;
+  if (language === 'svelte' || language === 'vue' || language === 'astro' || language === 'liquid' || language === 'razor') return true;
+  if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
+  if (language === 'xml' || language === 'properties') return true; // no WASM grammar needed
   return languageCache.has(language);
+}
+
+/**
+ * Languages tracked at the file-record level only: parsing emits zero symbol
+ * nodes, but the file is still stored (and framework resolvers may add per-file
+ * references later, e.g. Drupal routing yml, Spring `@Value` against
+ * application.properties). This is the canonical set behind the no-symbol
+ * branch in `tree-sitter.ts`; `xml` is intentionally excluded because its
+ * MyBatis extractor emits a file node. Callers use this to count such files as
+ * indexed rather than skipped, so it must stay in sync with that branch.
+ */
+export function isFileLevelOnlyLanguage(language: Language): boolean {
+  return language === 'yaml' || language === 'twig' || language === 'properties';
 }
 
 /**
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'liquid'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'astro', 'liquid'];
 }
 
 /**
@@ -277,10 +558,12 @@ export function getLanguageDisplayName(language: Language): string {
     python: 'Python',
     go: 'Go',
     rust: 'Rust',
+    r: 'R',
     java: 'Java',
     c: 'C',
     cpp: 'C++',
     csharp: 'C#',
+    razor: 'Razor/Blazor',
     php: 'PHP',
     ruby: 'Ruby',
     swift: 'Swift',
@@ -288,9 +571,27 @@ export function getLanguageDisplayName(language: Language): string {
     dart: 'Dart',
     svelte: 'Svelte',
     vue: 'Vue',
+    astro: 'Astro',
     liquid: 'Liquid',
     pascal: 'Pascal / Delphi',
     scala: 'Scala',
+    lua: 'Lua',
+    luau: 'Luau',
+    objc: 'Objective-C',
+    solidity: 'Solidity',
+    nix: 'Nix',
+    yaml: 'YAML',
+    twig: 'Twig',
+    xml: 'XML',
+    properties: 'Java properties',
+    cfml: 'CFML',
+    cfscript: 'CFScript',
+    cfquery: 'CFQuery (SQL)',
+    cobol: 'COBOL',
+    vbnet: 'Visual Basic .NET',
+    erlang: 'Erlang',
+    terraform: 'Terraform',
+    arkts: 'ArkTS',
     unknown: 'Unknown',
   };
   return names[language] || language;

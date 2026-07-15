@@ -68,6 +68,7 @@ export const LANGUAGES = [
   'javascript',
   'tsx',
   'jsx',
+  'arkts',
   'python',
   'go',
   'rust',
@@ -75,6 +76,7 @@ export const LANGUAGES = [
   'c',
   'cpp',
   'csharp',
+  'razor',
   'php',
   'ruby',
   'swift',
@@ -82,9 +84,27 @@ export const LANGUAGES = [
   'dart',
   'svelte',
   'vue',
+  'astro',
   'liquid',
   'pascal',
   'scala',
+  'lua',
+  'luau',
+  'objc',
+  'r',
+  'solidity',
+  'nix',
+  'yaml',
+  'twig',
+  'xml',
+  'properties',
+  'cfml',
+  'cfscript',
+  'cfquery',
+  'cobol',
+  'vbnet',
+  'erlang',
+  'terraform',
   'unknown',
 ] as const;
 
@@ -154,6 +174,15 @@ export interface Node {
 
   /** Generic type parameters */
   typeParameters?: string[];
+
+  /**
+   * Normalized return/result type name for a function/method (the bare class
+   * name, smart-pointer pointee unwrapped). Captured for C/C++ so resolution
+   * can infer a chained receiver's type from what the inner call returns —
+   * `Foo::instance().bar()` resolves `bar` on `Foo` (issue #645). Undefined for
+   * languages/symbols where it isn't captured.
+   */
+  returnType?: string;
 
   /** When the node was last updated */
   updatedAt: number;
@@ -262,6 +291,14 @@ export interface ExtractionError {
 }
 
 /**
+ * Kinds an unresolved reference can carry. `function_ref` is internal-only —
+ * a function name used as a VALUE (callback registration, #756). It never
+ * becomes an edge kind: resolution maps it to a `references` edge targeting
+ * function/method nodes only (see `matchFunctionRef`).
+ */
+export type ReferenceKind = EdgeKind | 'function_ref';
+
+/**
  * A reference that couldn't be resolved during extraction
  */
 export interface UnresolvedReference {
@@ -272,7 +309,7 @@ export interface UnresolvedReference {
   referenceName: string;
 
   /** Type of reference (call, type, import, etc.) */
-  referenceKind: EdgeKind;
+  referenceKind: ReferenceKind;
 
   /** Location of the reference */
   line: number;
@@ -286,6 +323,17 @@ export interface UnresolvedReference {
 
   /** Possible qualified names it might resolve to */
   candidates?: string[];
+
+  /**
+   * `unresolved_refs.id` when this ref was loaded from the database. Post-pass
+   * cleanup (delete-on-resolve / park-as-failed) targets exactly this row.
+   * Without it, cleanup falls back to deleting by (fromNodeId, referenceName,
+   * referenceKind) — which also removes SIBLING rows (same caller calling the
+   * same callee at other lines) that a later batch hasn't attempted yet, so
+   * their edges were silently never created when a batch boundary split the
+   * call sites (#1269).
+   */
+  rowId?: number;
 }
 
 // =============================================================================
@@ -304,6 +352,15 @@ export interface Subgraph {
 
   /** Root node IDs (entry points) */
   roots: string[];
+
+  /**
+   * Retrieval confidence for context-style queries. `'low'` means the query
+   * resolved only to isolated common-word matches (no entry point corroborated
+   * by 2+ distinct query terms) — callers should surface an honest handoff to
+   * explore/trace rather than present the results as comprehensive. Undefined
+   * for graph traversals that don't run the search-ranking path.
+   */
+  confidence?: 'high' | 'low';
 }
 
 /**
@@ -362,11 +419,35 @@ export interface SearchResult {
   /** Matching node */
   node: Node;
 
-  /** Relevance score (0-1) */
+  /**
+   * Relevance score for relative ranking only — higher is more relevant.
+   * NOT normalized and NOT a 0-1 fraction: the FTS path returns an unbounded
+   * BM25 magnitude (often in the tens or hundreds), while the fuzzy/exact
+   * paths return ~0-1. Use it to order results, not as an absolute percentage.
+   */
   score: number;
 
   /** Matched text snippets for highlighting */
   highlights?: string[];
+}
+
+/**
+ * A symbol whose name-segments match prose words from a prompt — the
+ * graph-derived signal behind the front-load hook's medium tier
+ * (CodeGraph.getSegmentMatches). Always verified to exist in `nodes` at the
+ * time it is returned.
+ */
+export interface SegmentMatch {
+  /** Symbol name as indexed (e.g. `OrderStateMachine`). */
+  name: string;
+  /** Kind of the representative definition. */
+  kind: NodeKind;
+  /** File of the representative definition. */
+  filePath: string;
+  /** 1-based start line of the representative definition. */
+  startLine: number;
+  /** The prompt words (normalized) that matched this name's segments. */
+  matchedWords: string[];
 }
 
 // =============================================================================
@@ -421,279 +502,6 @@ export interface CodeBlock {
   /** Associated node if extracted */
   node?: Node;
 }
-
-// =============================================================================
-// Configuration Types
-// =============================================================================
-
-/**
- * Framework-specific hints for better extraction
- */
-export interface FrameworkHint {
-  /** Framework name (react, express, django, etc.) */
-  name: string;
-
-  /** Version constraint if relevant */
-  version?: string;
-
-  /** Custom patterns for this framework */
-  patterns?: {
-    /** Component detection patterns */
-    components?: string[];
-    /** Route detection patterns */
-    routes?: string[];
-    /** Model detection patterns */
-    models?: string[];
-  };
-}
-
-/**
- * Configuration for a CodeGraph project
- */
-export interface CodeGraphConfig {
-  /** Schema version for migrations */
-  version: number;
-
-  /** Root directory of the project */
-  rootDir: string;
-
-  /** Glob patterns for files to include */
-  include: string[];
-
-  /** Glob patterns for files to exclude */
-  exclude: string[];
-
-  /** Languages to process (auto-detected if empty) */
-  languages: Language[];
-
-  /** Framework hints for better extraction */
-  frameworks: FrameworkHint[];
-
-  /** Maximum file size to process (in bytes) */
-  maxFileSize: number;
-
-  /** Whether to extract docstrings */
-  extractDocstrings: boolean;
-
-  /** Whether to track call sites */
-  trackCallSites: boolean;
-
-  /** Custom symbol patterns to extract */
-  customPatterns?: {
-    /** Name for this pattern group */
-    name: string;
-    /** Regex pattern to match */
-    pattern: string;
-    /** Node kind to assign */
-    kind: NodeKind;
-  }[];
-}
-
-/**
- * Default configuration values
- */
-export const DEFAULT_CONFIG: CodeGraphConfig = {
-  version: 1,
-  rootDir: '.',
-  include: [
-    // TypeScript/JavaScript
-    '**/*.ts',
-    '**/*.tsx',
-    '**/*.js',
-    '**/*.jsx',
-    // Python
-    '**/*.py',
-    // Go
-    '**/*.go',
-    // Rust
-    '**/*.rs',
-    // Java
-    '**/*.java',
-    // C/C++
-    '**/*.c',
-    '**/*.h',
-    '**/*.cpp',
-    '**/*.hpp',
-    '**/*.cc',
-    '**/*.cxx',
-    // C#
-    '**/*.cs',
-    // PHP
-    '**/*.php',
-    // Ruby
-    '**/*.rb',
-    // Swift
-    '**/*.swift',
-    // Kotlin
-    '**/*.kt',
-    '**/*.kts',
-    // Dart
-    '**/*.dart',
-    // Svelte
-    '**/*.svelte',
-    // Vue
-    '**/*.vue',
-    // Liquid (Shopify themes)
-    '**/*.liquid',
-    // Pascal / Delphi
-    '**/*.pas',
-    '**/*.dpr',
-    '**/*.dpk',
-    '**/*.lpr',
-    '**/*.dfm',
-    '**/*.fmx',
-    // Scala
-    '**/*.scala',
-    '**/*.sc',
-  ],
-  exclude: [
-    // Version control
-    '**/.git/**',
-
-    // Dependencies
-    '**/node_modules/**',
-    '**/vendor/**',
-    '**/Pods/**',
-
-    // Generic build outputs
-    '**/dist/**',
-    '**/build/**',
-    '**/out/**',
-    '**/bin/**',
-    '**/obj/**',
-    '**/target/**',
-
-    // JavaScript/TypeScript
-    '**/*.min.js',
-    '**/*.bundle.js',
-    '**/.next/**',
-    '**/.nuxt/**',
-    '**/.svelte-kit/**',
-    '**/.output/**',
-    '**/.turbo/**',
-    '**/.cache/**',
-    '**/.parcel-cache/**',
-    '**/.vite/**',
-    '**/.astro/**',
-    '**/.docusaurus/**',
-    '**/.gatsby/**',
-    '**/.webpack/**',
-    '**/.nx/**',
-    '**/.yarn/cache/**',
-    '**/.pnpm-store/**',
-    '**/storybook-static/**',
-
-    // React Native / Expo
-    '**/.expo/**',
-    '**/web-build/**',
-    '**/ios/Pods/**',
-    '**/ios/build/**',
-    '**/android/build/**',
-    '**/android/.gradle/**',
-
-    // Python
-    '**/__pycache__/**',
-    '**/.venv/**',
-    '**/venv/**',
-    '**/site-packages/**',
-    '**/dist-packages/**',
-    '**/.pytest_cache/**',
-    '**/.mypy_cache/**',
-    '**/.ruff_cache/**',
-    '**/.tox/**',
-    '**/.nox/**',
-    '**/*.egg-info/**',
-    '**/.eggs/**',
-
-    // Go
-    '**/go/pkg/mod/**',
-
-    // Rust
-    '**/target/debug/**',
-    '**/target/release/**',
-
-    // Java/Kotlin/Gradle
-    '**/.gradle/**',
-    '**/.m2/**',
-    '**/generated-sources/**',
-    '**/.kotlin/**',
-
-    // Dart/Flutter
-    '**/.dart_tool/**',
-
-    // C#/.NET
-    '**/.vs/**',
-    '**/.nuget/**',
-    '**/artifacts/**',
-    '**/publish/**',
-
-    // C/C++
-    '**/cmake-build-*/**',
-    '**/CMakeFiles/**',
-    '**/bazel-*/**',
-    '**/vcpkg_installed/**',
-    '**/.conan/**',
-    '**/Debug/**',
-    '**/Release/**',
-    '**/x64/**',
-    '**/.pio/**',  // Platform.io (IoT/embedded build artifacts and library deps)
-
-    // Electron
-    '**/release/**',
-    '**/*.app/**',
-    '**/*.asar',
-
-    // Swift/iOS/Xcode
-    '**/DerivedData/**',
-    '**/.build/**',
-    '**/.swiftpm/**',
-    '**/xcuserdata/**',
-    '**/Carthage/Build/**',
-    '**/SourcePackages/**',
-
-    // Delphi/Pascal
-    '**/__history/**',
-    '**/__recovery/**',
-    '**/*.dcu',
-
-    // PHP
-    '**/.composer/**',
-    '**/storage/framework/**',
-    '**/bootstrap/cache/**',
-
-    // Ruby
-    '**/.bundle/**',
-    '**/tmp/cache/**',
-    '**/public/assets/**',
-    '**/public/packs/**',
-    '**/.yardoc/**',
-
-    // Testing/Coverage
-    '**/coverage/**',
-    '**/htmlcov/**',
-    '**/.nyc_output/**',
-    '**/test-results/**',
-    '**/.coverage/**',
-
-    // IDE/Editor
-    '**/.idea/**',
-
-    // Logs and temp
-    '**/logs/**',
-    '**/tmp/**',
-    '**/temp/**',
-
-    // Documentation build output
-    '**/_build/**',
-    '**/docs/_build/**',
-    '**/site/**',
-  ],
-  languages: [],
-  frameworks: [],
-  maxFileSize: 1024 * 1024, // 1MB
-  extractDocstrings: true,
-  trackCallSites: true,
-};
 
 // =============================================================================
 // Database Types

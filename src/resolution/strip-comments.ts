@@ -33,7 +33,10 @@ export type CommentLang =
   | 'csharp'
   | 'swift'
   | 'go'
-  | 'rust';
+  | 'rust'
+  | 'c'
+  | 'cpp'
+  | 'erlang';
 
 export function stripCommentsForRegex(content: string, lang: CommentLang): string {
   switch (lang) {
@@ -43,6 +46,8 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
       return stripRuby(content);
     case 'rust':
       return stripRust(content);
+    case 'erlang':
+      return stripErlang(content);
     case 'php':
       return stripPhp(content);
     case 'go':
@@ -52,6 +57,8 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
     case 'java':
     case 'csharp':
     case 'swift':
+    case 'c':
+    case 'cpp':
       return stripCStyle(content, /* allowSingleQuoteStrings */ lang === 'javascript' || lang === 'typescript');
     default:
       return content;
@@ -459,6 +466,58 @@ function stripRust(src: string): string {
         i++;
       }
       if (i < n && src[i] === "'") i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  return out.join('');
+}
+
+// ---------- Erlang ----------
+
+/**
+ * Erlang: `%` starts a line comment unless it sits inside a `"string"`, a
+ * `'quoted atom'`, or is the character literal `$%`. Strings and quoted atoms
+ * are left intact (a behaviour callback name can be a quoted atom); only the
+ * comment text is blanked.
+ */
+function stripErlang(src: string): string {
+  const out = src.split('');
+  let i = 0;
+  const n = src.length;
+
+  while (i < n) {
+    const c = src[i];
+
+    if (c === '"' || c === "'") {
+      const quote = c;
+      i++;
+      while (i < n && src[i] !== quote) {
+        if (src[i] === '\\' && i + 1 < n) {
+          i += 2;
+          continue;
+        }
+        i++;
+      }
+      if (i < n) i++;
+      continue;
+    }
+
+    // Character literal: `$x`, `$\n`, `$%` — the next char (or escape) is data.
+    if (c === '$') {
+      i++;
+      if (i < n && src[i] === '\\') i++;
+      i++;
+      continue;
+    }
+
+    if (c === '%') {
+      let end = i;
+      while (end < n && src[end] !== '\n') end++;
+      blankRange(out, i, end, src);
+      i = end;
       continue;
     }
 

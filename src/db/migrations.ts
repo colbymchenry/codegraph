@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 8;
 
 /**
  * Migration definition
@@ -62,6 +62,91 @@ const migrations: Migration[] = [
       db.exec(`
         DROP INDEX IF EXISTS idx_edges_source;
         DROP INDEX IF EXISTS idx_edges_target;
+      `);
+    },
+  },
+  {
+    version: 5,
+    description:
+      'Add nodes.return_type — normalized return/result type for receiver-type inference (C++ singletons/factories, #645)',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE nodes ADD COLUMN return_type TEXT;
+      `);
+    },
+  },
+  {
+    version: 6,
+    description:
+      'Dedup duplicate edge rows and add a UNIQUE identity index so INSERT OR IGNORE actually dedups (#1034)',
+    up: (db) => {
+      // `insertEdge` has always used `INSERT OR IGNORE`, but the edges table had
+      // no UNIQUE constraint, so nothing conflicted and byte-identical rows
+      // accumulated whenever two passes emitted the same edge. Collapse each
+      // identity group to its lowest id, then add the constraint that makes
+      // `OR IGNORE` keep its promise. IFNULL folds nullable line/col so
+      // coordinate-less edges dedup too (SQLite treats each NULL as distinct) —
+      // and it MUST match the GROUP BY exactly, or the index creation would
+      // fail on a pair the DELETE left behind. Idempotent: the index is
+      // `IF NOT EXISTS` and the DELETE is a no-op once the table is unique.
+      db.exec(`
+        DELETE FROM edges
+        WHERE id NOT IN (
+          SELECT MIN(id) FROM edges
+          GROUP BY source, target, kind, IFNULL(line, -1), IFNULL(col, -1)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
+          ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
+      `);
+    },
+  },
+  {
+    version: 7,
+    description:
+      'Add name_segment_vocab — prose-word → symbol-name lookup for the prompt hook’s graph-derived gate',
+    up: (db) => {
+      // DDL only — instant on any size database (the row-churn hazards of #1067
+      // don't apply). The table starts EMPTY on migrated databases; `sync`
+      // detects that over a populated graph and backfills batched+yielding
+      // (CodeGraph.rebuildNameSegmentVocab), and any full index rebuilds it
+      // from scratch. Keep the definition in lockstep with schema.sql.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS name_segment_vocab (
+          segment TEXT NOT NULL,
+          name TEXT NOT NULL,
+          PRIMARY KEY (segment, name)
+        ) WITHOUT ROWID;
+      `);
+    },
+  },
+  {
+    version: 8,
+    description:
+      'Track attempted-but-unresolvable refs as status=failed so sync can retry them when a changed file adds a matching symbol (#1240)',
+    up: (db) => {
+      // DDL only — instant on any size database. No backfill needed: rows are
+      // only ever queried by name_tail once they carry status='failed', and
+      // both fields are written together by markReferencesFailed. Legacy rows
+      // (all 'pending' after this migration) are orphans from interrupted runs
+      // that the #1187 sweep grinds down on the next sync, marking survivors
+      // failed with their tails as it goes. The tail index is partial: on a
+      // healthy index the pending set is empty and the failed set is the only
+      // population worth indexing. Keep the definitions in lockstep with
+      // schema.sql. ALTER TABLE has no IF NOT EXISTS, so guard each column for
+      // idempotency — a database created from current schema.sql already has
+      // both (matters when migrations are re-run from an older recorded
+      // version, as the v6 regression test does).
+      const cols = db.prepare('PRAGMA table_info(unresolved_refs)').all() as Array<{ name: string }>;
+      const hasColumn = (name: string) => cols.some((c) => c.name === name);
+      if (!hasColumn('status')) {
+        db.exec("ALTER TABLE unresolved_refs ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'");
+      }
+      if (!hasColumn('name_tail')) {
+        db.exec("ALTER TABLE unresolved_refs ADD COLUMN name_tail TEXT NOT NULL DEFAULT ''");
+      }
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_unresolved_status ON unresolved_refs(status);
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail ON unresolved_refs(name_tail) WHERE status = 'failed';
       `);
     },
   },

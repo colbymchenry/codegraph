@@ -12,12 +12,10 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock } from '../src/utils';
+import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
-import { shouldIncludeFile, scanDirectory } from '../src/extraction';
-import { shouldIncludeFile as configShouldInclude } from '../src/config';
-import { CodeGraphConfig, DEFAULT_CONFIG } from '../src/types';
+import { scanDirectory, isSourceFile } from '../src/extraction';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
 
@@ -178,6 +176,158 @@ describe('Path Traversal Prevention', () => {
   });
 });
 
+describe('Symlink escape prevention (#527)', () => {
+  // An in-repo symlink whose logical path is inside the project root but whose
+  // REAL target escapes the root must never be served. validatePathWithinRoot
+  // is the chokepoint both content-serving read sinks go through (codegraph_node
+  // includeCode + codegraph_explore source rendering), so it must resolve
+  // symlinks, not just compare strings. realpathSync the roots so the test's own
+  // expectations don't trip over /tmp -> /private/tmp on macOS.
+  let root: string;
+  let outside: string;
+
+  beforeEach(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-root-')));
+    outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-outside-')));
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.writeFileSync(path.join(root, 'src', 'in.ts'), 'export const x = 1;\n');
+    fs.mkdirSync(path.join(outside, 'pkg'));
+    fs.writeFileSync(path.join(outside, 'pkg', 'secret.txt'), 'TOP-SECRET\n');
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  });
+
+  // Symlink creation needs privileges on Windows; skip gracefully if it fails.
+  const link = (linkPath: string, target: string): boolean => {
+    try { fs.symlinkSync(target, linkPath); return true; } catch { return false; }
+  };
+
+  it('allows a real file inside the root (and realpaths consistently)', () => {
+    expect(validatePathWithinRoot(root, 'src/in.ts')).not.toBeNull();
+  });
+
+  it('allows a not-yet-existing path inside the root (ENOENT — files about to be written)', () => {
+    expect(validatePathWithinRoot(root, 'src/will-write.ts')).not.toBeNull();
+  });
+
+  it('rejects a lexical ../ traversal out of the root', () => {
+    expect(validatePathWithinRoot(root, `../${path.basename(outside)}/pkg/secret.txt`)).toBeNull();
+  });
+
+  it('rejects an in-repo symlink to an out-of-root FILE', () => {
+    if (!link(path.join(root, 'escape'), path.join(outside, 'pkg', 'secret.txt'))) return;
+    expect(validatePathWithinRoot(root, 'escape')).toBeNull();
+  });
+
+  it('rejects a path that escapes through an in-repo symlink to an out-of-root DIR', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+    expect(validatePathWithinRoot(root, 'escapedir/secret.txt')).toBeNull();
+  });
+
+  it('still allows an in-repo symlink that stays WITHIN the root (no over-blocking)', () => {
+    if (!link(path.join(root, 'src', 'inlink.ts'), path.join(root, 'src', 'in.ts'))) return;
+    expect(validatePathWithinRoot(root, 'src/inlink.ts')).not.toBeNull();
+  });
+
+  // The INDEXING read path opts into following in-root symlinks the directory
+  // walk already descended into — discovery and the reader must agree, or files
+  // reached via an in-root symlink-to-outside fail to index (#935). The lexical
+  // `../` guard is NOT waived, and content-serving sinks never pass the flag.
+  it('allowSymlinkEscape follows an in-repo symlink to an out-of-root FILE (indexing read)', () => {
+    if (!link(path.join(root, 'escape'), path.join(outside, 'pkg', 'secret.txt'))) return;
+    expect(validatePathWithinRoot(root, 'escape', { allowSymlinkEscape: true })).not.toBeNull();
+  });
+
+  it('allowSymlinkEscape follows a path through an in-repo out-of-root DIR symlink (indexing read)', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+    expect(validatePathWithinRoot(root, 'escapedir/secret.txt', { allowSymlinkEscape: true })).not.toBeNull();
+  });
+
+  it('allowSymlinkEscape STILL rejects a lexical ../ traversal (guard not waived)', () => {
+    expect(
+      validatePathWithinRoot(root, `../${path.basename(outside)}/pkg/secret.txt`, { allowSymlinkEscape: true })
+    ).toBeNull();
+  });
+
+  it('end-to-end: getCode never serves an out-of-root file reached via a dir symlink', async () => {
+    fs.writeFileSync(path.join(outside, 'pkg', 'leak.ts'),
+      'export function leaked() { return "LEAKED-ZZZ-9"; }\n');
+    if (!link(path.join(root, 'vendored'), path.join(outside, 'pkg'))) return;
+
+    const cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
+    try {
+      await cg.indexAll();
+      // Whether or not extraction followed the dir symlink, NO node may ever
+      // yield the out-of-root content through getCode.
+      for (const n of cg.getNodesByKind('function')) {
+        const code = await cg.getCode(n.id);
+        expect(code ?? '').not.toContain('LEAKED-ZZZ-9');
+      }
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('end-to-end (#935): indexes source reached through an in-root dir symlink to outside', async () => {
+    // The Dota custom-game layout symlinks `game/` and `content/` into an SDK
+    // tree outside the repo. Before #935 the batch reader's strict symlink-escape
+    // guard blocked every file under them, so nothing indexed — even though the
+    // directory walk deliberately followed the symlink to enumerate them. The
+    // reader now agrees with discovery: the file indexes.
+    fs.writeFileSync(path.join(outside, 'pkg', 'vendored.ts'),
+      'export function vendoredHelper() { return "LEAKED-ZZZ-9"; }\n');
+    if (!link(path.join(root, 'game'), path.join(outside, 'pkg'))) return;
+
+    const cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
+    try {
+      await cg.indexAll();
+      // The symlinked-in file is now part of the graph...
+      const names = cg.getNodesByKind('function').map((n) => n.name);
+      expect(names).toContain('vendoredHelper');
+      // ...but its out-of-root contents are STILL never served (the #527 sink
+      // stays strict — indexing relaxes only the read path, not getCode).
+      for (const n of cg.getNodesByKind('function')) {
+        expect((await cg.getCode(n.id)) ?? '').not.toContain('LEAKED-ZZZ-9');
+      }
+    } finally {
+      cg.close();
+    }
+  });
+});
+
+describe('validateProjectPath — sensitive directory blocking', () => {
+  // POSIX-only: on Windows '/etc' resolves to C:\etc (non-existent), not a
+  // sensitive dir — the Windows case is covered by the win32-gated test below.
+  it.runIf(process.platform !== 'win32')('blocks POSIX system directories (exact match)', () => {
+    expect(validateProjectPath('/')).toMatch(/sensitive system directory/i);
+    expect(validateProjectPath('/etc')).toMatch(/sensitive system directory/i);
+  });
+
+  it('allows a normal, existing directory', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-validate-'));
+    try {
+      expect(validateProjectPath(dir)).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // SENSITIVE_PATHS stores the Windows entries lowercase and validateProjectPath
+  // matches via resolved.toLowerCase(), so 'C:\\Windows' and 'c:\\windows' are
+  // both blocked. path.resolve is platform-specific, so this only runs on Windows.
+  it.runIf(process.platform === 'win32')(
+    'blocks Windows system directories regardless of case',
+    () => {
+      expect(validateProjectPath('C:\\Windows')).toMatch(/sensitive system directory/i);
+      expect(validateProjectPath('c:\\windows')).toMatch(/sensitive system directory/i);
+      expect(validateProjectPath('C:\\WINDOWS\\System32')).toMatch(/sensitive system directory/i);
+    }
+  );
+});
+
 describe('MCP Input Validation', () => {
   let testDir: string;
   let cg: CodeGraph;
@@ -235,10 +385,36 @@ describe('MCP Input Validation', () => {
     expect(result.content[0].text).toContain('non-empty string');
   });
 
-  it('should reject non-string task in codegraph_context', async () => {
-    const result = await handler.execute('codegraph_context', { task: undefined });
+  it('should reject non-string query in codegraph_explore', async () => {
+    const result = await handler.execute('codegraph_explore', { query: undefined });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('non-empty string');
+  });
+
+  it('should truncate oversized tool output', async () => {
+    // Force a huge result set through codegraph_search; the response must be
+    // truncated with the sentinel rather than flooding the agent's context.
+    const many = Array.from({ length: 3000 }, (_, i) => ({
+      node: {
+        id: `n${i}`,
+        name: `symbol_${i}_${'x'.repeat(40)}`,
+        kind: 'function',
+        filePath: `src/very/deep/path/file_${i}.ts`,
+        startLine: 1,
+        endLine: 2,
+        language: 'typescript',
+      },
+      score: 1,
+    }));
+    const fakeCg = {
+      searchNodes: () => many,
+    };
+    const fakeHandler = new ToolHandler(fakeCg as unknown as CodeGraph);
+
+    const result = await fakeHandler.execute('codegraph_search', { query: 'x' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('... (output truncated)');
   });
 
   it('should reject non-string symbol in codegraph_impact', async () => {
@@ -265,6 +441,34 @@ describe('MCP Input Validation', () => {
     const result = await handler.execute('codegraph_search', { query: 'example', limit: -5 });
     expect(result.isError).toBeFalsy();
   });
+
+  // #230: getCodeGraph must reject a sensitive system directory passed as
+  // projectPath before opening it. The error surfaces through execute()'s
+  // catch as an isError result. /etc is sensitive on POSIX; C:\Windows on
+  // Windows (path.resolve is platform-specific, so each case is gated).
+  it.runIf(process.platform !== 'win32')(
+    'rejects a sensitive POSIX projectPath (/etc) via the MCP handler',
+    async () => {
+      const result = await handler.execute('codegraph_search', {
+        query: 'example',
+        projectPath: '/etc',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/sensitive system directory/i);
+    }
+  );
+
+  it.runIf(process.platform === 'win32')(
+    'rejects a sensitive Windows projectPath (C:\\Windows) via the MCP handler',
+    async () => {
+      const result = await handler.execute('codegraph_search', {
+        query: 'example',
+        projectPath: 'C:\\Windows',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/sensitive system directory/i);
+    }
+  );
 });
 
 describe('Atomic Writes', () => {
@@ -298,58 +502,24 @@ describe('Atomic Writes', () => {
   });
 });
 
-describe('Glob Matching (picomatch)', () => {
-  const makeConfig = (include: string[], exclude: string[]): CodeGraphConfig => ({
-    ...DEFAULT_CONFIG,
-    rootDir: '/test',
-    include,
-    exclude,
+describe('Source file detection (isSourceFile)', () => {
+  it('selects files by supported extension', () => {
+    expect(isSourceFile('src/index.ts')).toBe(true);
+    expect(isSourceFile('src/deep/nested/file.ts')).toBe(true);
+    expect(isSourceFile('src/component.tsx')).toBe(true);
+    expect(isSourceFile('lib/util.js')).toBe(true);
+    expect(isSourceFile('src/main.py')).toBe(true);
   });
 
-  it('should match standard glob patterns in extraction', () => {
-    const config = makeConfig(['**/*.ts'], ['node_modules/**']);
-
-    expect(shouldIncludeFile('src/index.ts', config)).toBe(true);
-    expect(shouldIncludeFile('src/deep/nested/file.ts', config)).toBe(true);
-    expect(shouldIncludeFile('src/index.js', config)).toBe(false);
-    expect(shouldIncludeFile('node_modules/lib/index.ts', config)).toBe(false);
+  it('rejects unsupported extensions and extensionless files', () => {
+    expect(isSourceFile('src/component.css')).toBe(false);
+    expect(isSourceFile('README.md')).toBe(false);
+    expect(isSourceFile('Makefile')).toBe(false);
+    expect(isSourceFile('.gitignore')).toBe(false);
   });
 
-  it('should match standard glob patterns in config', () => {
-    const config = makeConfig(['**/*.py'], ['__pycache__/**']);
-
-    expect(configShouldInclude('src/main.py', config)).toBe(true);
-    expect(configShouldInclude('src/main.ts', config)).toBe(false);
-    expect(configShouldInclude('__pycache__/module.py', config)).toBe(false);
-  });
-
-  it('should handle complex glob patterns correctly', () => {
-    const config = makeConfig(['src/**/*.{ts,tsx}', 'lib/**/*.js'], []);
-
-    expect(shouldIncludeFile('src/component.ts', config)).toBe(true);
-    expect(shouldIncludeFile('src/component.tsx', config)).toBe(true);
-    expect(shouldIncludeFile('lib/util.js', config)).toBe(true);
-    expect(shouldIncludeFile('src/component.css', config)).toBe(false);
-  });
-
-  it('should handle patterns that previously caused ReDoS', () => {
-    // This pattern would cause catastrophic backtracking with hand-rolled regex
-    const evilPattern = '**/**/**/**/**/**/**/**/**/**/**/**/**/**/a';
-    const config = makeConfig([evilPattern], []);
-
-    const start = Date.now();
-    // This should return quickly, not hang
-    shouldIncludeFile('x/x/x/x/x/x/x/x/x/x/x/x/x/x/b', config);
-    const elapsed = Date.now() - start;
-
-    // Should complete in under 100ms, not seconds
-    expect(elapsed).toBeLessThan(100);
-  });
-
-  it('should handle dot files correctly', () => {
-    const config = makeConfig(['**/*.ts'], []);
-
-    expect(shouldIncludeFile('.hidden/index.ts', config)).toBe(true);
+  it('matches regardless of leading dot directories', () => {
+    expect(isSourceFile('.hidden/index.ts')).toBe(true);
   });
 });
 
@@ -464,15 +634,9 @@ describe('Symlink Cycle Detection', () => {
       return;
     }
 
-    const config: CodeGraphConfig = {
-      ...DEFAULT_CONFIG,
-      rootDir: tempDir,
-      include: ['**/*.ts'],
-      exclude: [],
-    };
 
     // This should complete without hanging
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     // Should find the real file but not loop infinitely
     expect(files).toContain('src/index.ts');
@@ -496,14 +660,8 @@ describe('Symlink Cycle Detection', () => {
       return;
     }
 
-    const config: CodeGraphConfig = {
-      ...DEFAULT_CONFIG,
-      rootDir: tempDir,
-      include: ['**/*.ts'],
-      exclude: [],
-    };
 
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
 
     // Should find files from both the real dir and via the symlink
     // But deduplicate since they resolve to the same real path
@@ -521,15 +679,9 @@ describe('Symlink Cycle Detection', () => {
       return;
     }
 
-    const config: CodeGraphConfig = {
-      ...DEFAULT_CONFIG,
-      rootDir: tempDir,
-      include: ['**/*.ts'],
-      exclude: [],
-    };
 
     // Should not throw
-    const files = scanDirectory(tempDir, config);
+    const files = scanDirectory(tempDir);
     expect(files).toContain('src/valid.ts');
   });
 });

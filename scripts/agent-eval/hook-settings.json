@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/colby/Development/Personal/codegraph/scripts/agent-eval/block-read-hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

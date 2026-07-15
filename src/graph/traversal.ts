@@ -56,6 +56,19 @@ export class GraphTraverser {
     const nodes = new Map<string, Node>();
     const edges: Edge[] = [];
     const visited = new Set<string>();
+    // Enqueue-once guard, tracked separately from `visited` (which is only set
+    // on dequeue). Guarding the enqueue on `visited` alone let a target
+    // reachable via two edges get queued twice; the second dequeue then hit
+    // `visited.has → continue` and its edge was never recorded, so parallel
+    // edges (A calls AND references B, or two `calls` on different lines — edges
+    // are unique on source+target+kind+line+col) went missing from the result
+    // (#1090). `enqueued` makes each node queued exactly once.
+    const enqueued = new Set<string>([startNode.id]);
+    // Edge-identity dedup so a `direction:'both'` scan — which encounters A→B
+    // from both endpoints — records each edge once.
+    const seenEdges = new Set<string>();
+    const edgeKey = (e: Edge) =>
+      `${e.source}|${e.target}|${e.kind}|${e.line ?? -1}|${e.column ?? -1}`;
     const queue: TraversalStep[] = [{ node: startNode, edge: null, depth: 0 }];
 
     if (opts.includeStart) {
@@ -64,17 +77,12 @@ export class GraphTraverser {
 
     while (queue.length > 0 && nodes.size < opts.limit) {
       const step = queue.shift()!;
-      const { node, edge, depth } = step;
+      const { node, depth } = step;
 
       if (visited.has(node.id)) {
         continue;
       }
       visited.add(node.id);
-
-      // Add edge to result
-      if (edge) {
-        edges.push(edge);
-      }
 
       // Check depth limit
       if (depth >= opts.maxDepth) {
@@ -90,30 +98,42 @@ export class GraphTraverser {
         return priority(a) - priority(b);
       });
 
+      // Batch-fetch neighbors we might newly enqueue in one query (was N+1 per
+      // BFS step). Already-queued/visited neighbors are already in `nodes`, so
+      // they don't need re-fetching to record an edge back to them.
+      const wantIds = adjacentEdges
+        .map((e) => (e.source === node.id ? e.target : e.source))
+        .filter((id) => !visited.has(id) && !enqueued.has(id));
+      const neighborNodes = wantIds.length > 0 ? this.queries.getNodesByIds(wantIds) : new Map();
+
       for (const adjEdge of adjacentEdges) {
-        // Determine next node: for 'both' direction, edges can be either
-        // incoming or outgoing, so pick whichever end is not the current node
         const nextNodeId = adjEdge.source === node.id ? adjEdge.target : adjEdge.source;
+        const nextNode = neighborNodes.get(nextNodeId) ?? nodes.get(nextNodeId);
+        if (!nextNode) continue;
 
-        if (visited.has(nextNodeId)) {
-          continue;
-        }
-
-        const nextNode = this.queries.getNodeById(nextNodeId);
-        if (!nextNode) {
-          continue;
-        }
-
-        // Apply node kind filter
         if (opts.nodeKinds && opts.nodeKinds.length > 0 && !opts.nodeKinds.includes(nextNode.kind)) {
           continue;
         }
 
-        // Add node to result
-        nodes.set(nextNode.id, nextNode);
+        // Enqueue each neighbor exactly once, and only while under the node
+        // budget — the cap is checked per-add here, not just on the outer
+        // `while`, so one high-degree node can't overshoot `opts.limit` (#1087).
+        if (!visited.has(nextNodeId) && !enqueued.has(nextNodeId)) {
+          if (nodes.size >= opts.limit) continue;
+          enqueued.add(nextNodeId);
+          nodes.set(nextNode.id, nextNode);
+          queue.push({ node: nextNode, edge: adjEdge, depth: depth + 1 });
+        }
 
-        // Queue for further traversal
-        queue.push({ node: nextNode, edge: adjEdge, depth: depth + 1 });
+        // Record every distinct edge among kept nodes. Collecting on the
+        // adjacency scan (rather than once per dequeue) is what preserves
+        // parallel edges to the same target (#1090); `nextNode` is guaranteed
+        // to be in `nodes` at this point (just added, or already in-set).
+        const ek = edgeKey(adjEdge);
+        if (!seenEdges.has(ek)) {
+          seenEdges.add(ek);
+          edges.push(adjEdge);
+        }
       }
     }
 
@@ -176,19 +196,24 @@ export class GraphTraverser {
     // Get adjacent edges
     const adjacentEdges = this.getAdjacentEdges(node.id, opts.direction, opts.edgeKinds);
 
+    // Batch-fetch unvisited neighbors (was N+1 per DFS step).
+    const wantIds = adjacentEdges
+      .map((e) => (e.source === node.id ? e.target : e.source))
+      .filter((id) => !visited.has(id));
+    const neighborNodes = wantIds.length > 0 ? this.queries.getNodesByIds(wantIds) : new Map();
+
     for (const edge of adjacentEdges) {
-      // Determine next node: for 'both' direction, edges can be either
-      // incoming or outgoing, so pick whichever end is not the current node
+      // Cap per-add, not just at the top of each frame: the top-of-function
+      // guard only stops the next recursion, so without this every sibling of
+      // the first over-budget child still got inserted, overshooting
+      // `opts.limit` by a node's full fan-out (#1088).
+      if (nodes.size >= opts.limit) break;
+
       const nextNodeId = edge.source === node.id ? edge.target : edge.source;
+      if (visited.has(nextNodeId)) continue;
 
-      if (visited.has(nextNodeId)) {
-        continue;
-      }
-
-      const nextNode = this.queries.getNodeById(nextNodeId);
-      if (!nextNode) {
-        continue;
-      }
+      const nextNode = neighborNodes.get(nextNodeId);
+      if (!nextNode) continue;
 
       // Apply node kind filter
       if (opts.nodeKinds && opts.nodeKinds.length > 0 && !opts.nodeKinds.includes(nextNode.kind)) {
@@ -249,15 +274,34 @@ export class GraphTraverser {
     result: Array<{ node: Node; edge: Edge }>,
     visited: Set<string>
   ): void {
-    if (currentDepth >= maxDepth || visited.has(nodeId)) {
+    // Mark visited BEFORE the depth check, not after. Folding both into one
+    // guard meant that when `currentDepth >= maxDepth` fired we returned without
+    // marking the node — so a caller reachable from the same parent via two
+    // edges (two call sites, or calls + references) was pushed once per edge,
+    // duplicating it in `result` at the default `maxDepth=1` (#1086).
+    if (visited.has(nodeId)) {
       return;
     }
     visited.add(nodeId);
+    if (currentDepth >= maxDepth) {
+      return;
+    }
 
-    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports']);
+    // `instantiates` counts as a caller: constructing a class (`Foo(...)` /
+    // `new Foo()`) is calling its constructor, so the instantiation site is a
+    // caller of the class. Without it, `callers <Class>` surfaced only the
+    // importing file (via `imports`) and missed every construction site —
+    // the opposite of "what breaks if I change this class?" (#774).
+    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates']);
+    if (incomingEdges.length === 0) return;
+
+    // Batch-fetch all caller nodes in one round-trip instead of one
+    // getNodeById per edge (was N+1 — meaningful on functions with many callers).
+    const sourceIds = incomingEdges.map((e) => e.source);
+    const callerNodes = this.queries.getNodesByIds(sourceIds);
 
     for (const edge of incomingEdges) {
-      const callerNode = this.queries.getNodeById(edge.source);
+      const callerNode = callerNodes.get(edge.source);
       if (callerNode && !visited.has(callerNode.id)) {
         result.push({ node: callerNode, edge });
         this.getCallersRecursive(callerNode.id, maxDepth, currentDepth + 1, result, visited);
@@ -288,15 +332,30 @@ export class GraphTraverser {
     result: Array<{ node: Node; edge: Edge }>,
     visited: Set<string>
   ): void {
-    if (currentDepth >= maxDepth || visited.has(nodeId)) {
+    // Mark visited before the depth check — see getCallersRecursive: the merged
+    // guard dropped the `visited.add` at the depth boundary, duplicating a
+    // callee reached from the same node via two edges at `maxDepth=1` (#1086).
+    if (visited.has(nodeId)) {
       return;
     }
     visited.add(nodeId);
+    if (currentDepth >= maxDepth) {
+      return;
+    }
 
-    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports']);
+    // Symmetric with getCallers: a function that constructs a class
+    // (`Foo(...)` / `new Foo()`) has that class as a callee, so callers and
+    // callees stay inverses of each other and `trace` can cross the
+    // instantiation boundary (function → class → its methods) (#774).
+    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates']);
+    if (outgoingEdges.length === 0) return;
+
+    // Batch-fetch callee nodes (was N+1 — see getCallersRecursive note).
+    const targetIds = outgoingEdges.map((e) => e.target);
+    const calleeNodes = this.queries.getNodesByIds(targetIds);
 
     for (const edge of outgoingEdges) {
-      const calleeNode = this.queries.getNodeById(edge.target);
+      const calleeNode = calleeNodes.get(edge.target);
       if (calleeNode && !visited.has(calleeNode.id)) {
         result.push({ node: calleeNode, edge });
         this.getCalleesRecursive(calleeNode.id, maxDepth, currentDepth + 1, result, visited);
@@ -388,9 +447,11 @@ export class GraphTraverser {
     visited.add(nodeId);
 
     const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['extends', 'implements']);
+    if (outgoingEdges.length === 0) return;
+    const parents = this.queries.getNodesByIds(outgoingEdges.map((e) => e.target));
 
     for (const edge of outgoingEdges) {
-      const parentNode = this.queries.getNodeById(edge.target);
+      const parentNode = parents.get(edge.target);
       if (parentNode && !nodes.has(parentNode.id)) {
         nodes.set(parentNode.id, parentNode);
         edges.push(edge);
@@ -411,9 +472,11 @@ export class GraphTraverser {
     visited.add(nodeId);
 
     const incomingEdges = this.queries.getIncomingEdges(nodeId, ['extends', 'implements']);
+    if (incomingEdges.length === 0) return;
+    const children = this.queries.getNodesByIds(incomingEdges.map((e) => e.source));
 
     for (const edge of incomingEdges) {
-      const childNode = this.queries.getNodeById(edge.source);
+      const childNode = children.get(edge.source);
       if (childNode && !nodes.has(childNode.id)) {
         nodes.set(childNode.id, childNode);
         edges.push(edge);
@@ -433,12 +496,13 @@ export class GraphTraverser {
 
     // Get all incoming edges (references, calls, type_of, etc.)
     const incomingEdges = this.queries.getIncomingEdges(nodeId);
+    if (incomingEdges.length === 0) return result;
 
+    // Batch-fetch source nodes (was N+1).
+    const sources = this.queries.getNodesByIds(incomingEdges.map((e) => e.source));
     for (const edge of incomingEdges) {
-      const sourceNode = this.queries.getNodeById(edge.source);
-      if (sourceNode) {
-        result.push({ node: sourceNode, edge });
-      }
+      const sourceNode = sources.get(edge.source);
+      if (sourceNode) result.push({ node: sourceNode, edge });
     }
 
     return result;
@@ -484,10 +548,17 @@ export class GraphTraverser {
     edges: Edge[],
     visited: Set<string>
   ): void {
-    if (currentDepth >= maxDepth || visited.has(nodeId)) {
+    // Mark visited before the depth check so a node collected at the depth
+    // boundary still lands in `visited`. Otherwise it could sit in `nodes` but
+    // not `visited`, and the two loops below — which used different sets to
+    // gate re-processing — would disagree about it (#1089).
+    if (visited.has(nodeId)) {
       return;
     }
     visited.add(nodeId);
+    if (currentDepth >= maxDepth) {
+      return;
+    }
 
     // For container nodes (classes, interfaces, structs, etc.), also traverse
     // into their children so that callers of contained methods appear in impact
@@ -496,26 +567,40 @@ export class GraphTraverser {
       const containerKinds = new Set(['class', 'interface', 'struct', 'trait', 'protocol', 'module', 'enum']);
       if (containerKinds.has(focalNode.kind)) {
         const containsEdges = this.queries.getOutgoingEdges(nodeId, ['contains']);
-        for (const edge of containsEdges) {
-          const childNode = this.queries.getNodeById(edge.target);
-          if (childNode && !visited.has(childNode.id)) {
-            nodes.set(childNode.id, childNode);
-            edges.push(edge);
-            // Recurse into children at the same depth (they're part of the same symbol)
-            this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited);
+        if (containsEdges.length > 0) {
+          const children = this.queries.getNodesByIds(containsEdges.map((e) => e.target));
+          for (const edge of containsEdges) {
+            const childNode = children.get(edge.target);
+            if (childNode && !visited.has(childNode.id)) {
+              nodes.set(childNode.id, childNode);
+              edges.push(edge);
+              // Recurse into children at the same depth (they're part of the same symbol)
+              this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited);
+            }
           }
         }
       }
     }
 
-    // Get all incoming edges (things that depend on this node)
-    const incomingEdges = this.queries.getIncomingEdges(nodeId);
+    // Get all incoming edges (things that depend on this node). Exclude
+    // `contains`: a container "contains" its members but does not *depend* on
+    // them, so following it upward would climb to the parent class and then
+    // re-expand every sibling member — exploding impact for a leaf symbol. (#536)
+    const incomingEdges = this.queries.getIncomingEdges(nodeId).filter((e) => e.kind !== 'contains');
+    if (incomingEdges.length === 0) return;
+    const sources = this.queries.getNodesByIds(incomingEdges.map((e) => e.source));
 
     for (const edge of incomingEdges) {
-      const sourceNode = this.queries.getNodeById(edge.source);
-      if (sourceNode && !nodes.has(sourceNode.id)) {
+      const sourceNode = sources.get(edge.source);
+      if (!sourceNode) continue;
+      // Record the dependency edge unconditionally. The gate used to also gate
+      // edge collection (`!nodes.has(...)`), so a second incoming edge into a
+      // node already collected via another path was silently dropped from
+      // `edges` even though it's a real dependency (#1089). Each node's incoming
+      // edges are fetched once (nodes are expanded once), so no edge repeats.
+      edges.push(edge);
+      if (!visited.has(sourceNode.id)) {
         nodes.set(sourceNode.id, sourceNode);
-        edges.push(edge);
         this.getImpactRecursive(sourceNode.id, maxDepth, currentDepth + 1, nodes, edges, visited);
       }
     }
@@ -564,10 +649,17 @@ export class GraphTraverser {
         nodeId,
         edgeKinds.length > 0 ? edgeKinds : undefined
       );
+      if (outgoingEdges.length === 0) continue;
+
+      // Batch-fetch only the unvisited targets (was N+1 per BFS frontier).
+      const wantIds = outgoingEdges
+        .map((e) => e.target)
+        .filter((id) => !visited.has(id));
+      const nextNodes = wantIds.length > 0 ? this.queries.getNodesByIds(wantIds) : new Map();
 
       for (const edge of outgoingEdges) {
         if (!visited.has(edge.target)) {
-          const nextNode = this.queries.getNodeById(edge.target);
+          const nextNode = nextNodes.get(edge.target);
           if (nextNode) {
             queue.push({
               nodeId: edge.target,
@@ -627,15 +719,15 @@ export class GraphTraverser {
    */
   getChildren(nodeId: string): Node[] {
     const containsEdges = this.queries.getOutgoingEdges(nodeId, ['contains']);
+    if (containsEdges.length === 0) return [];
+
+    // Batch-fetch (was N+1).
+    const childNodes = this.queries.getNodesByIds(containsEdges.map((e) => e.target));
     const children: Node[] = [];
-
     for (const edge of containsEdges) {
-      const childNode = this.queries.getNodeById(edge.target);
-      if (childNode) {
-        children.push(childNode);
-      }
+      const childNode = childNodes.get(edge.target);
+      if (childNode) children.push(childNode);
     }
-
     return children;
   }
 }
