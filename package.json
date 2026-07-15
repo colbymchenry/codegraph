@@ -41,6 +41,7 @@
     "picomatch": "^4.0.3",
     "sisteransi": "^1.0.5",
     "tree-sitter-wasms": "^0.1.11",
+    "tree-sitter-xpp": "file:../../VSCodeProjects/tree-sitter-xpp",
     "web-tree-sitter": "^0.25.3"
   },
   "devDependencies": {
@@ -52,5 +53,9 @@
   },
   "engines": {
     "node": ">=20.0.0 <25.0.0"
+  },
+  "allowScripts": {
+    "file:../../../VSCodeProjects/tree-sitter-xpp": true,
+    "esbuild@0.21.5": true
   }
 }

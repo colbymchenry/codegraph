@@ -13,6 +13,12 @@ import { Language } from '../types';
 
 export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
+// tree-sitter-xpp's own D365 AOT XML detection (path-based: `AxClass/Foo.xml`,
+// `AxTable/Bar.xml`, ...) — used by detectLanguage below to route D365
+// metadata XML to the 'xpp' language instead of the generic 'xml' one, and by
+// XppXmlExtractor to know which .xml files actually carry X++ source.
+const { isD365MetadataFile } = require('tree-sitter-xpp/lib/d365-xml');
+
 /**
  * WASM filename map — maps each language to its .wasm grammar file
  * in the tree-sitter-wasms package.
@@ -50,6 +56,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  xpp: 'tree-sitter-xpp.wasm',
 };
 
 /**
@@ -274,7 +281,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix', 'xpp',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
@@ -422,6 +429,12 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   // OTP `.app`/`.app.src` resource files — Erlang terms the grammar parses as
   // top-level expressions (last-dot ext `.src` is too generic for the map).
   if (isErlangAppFile(filePath)) return 'erlang';
+  // D365 F&O AOT metadata XML (`AxClass/Foo.xml`, `AxTable/Bar.xml`, ...) wraps
+  // real X++ source in XML text nodes — route to 'xpp' (XppXmlExtractor
+  // stitches the fragments and parses them with tree-sitter-xpp) instead of
+  // the generic 'xml' MyBatis-mapper path. Every other .xml file (pom.xml,
+  // Spring beans, MyBatis mappers, ...) is unaffected.
+  if (isD365MetadataFile(filePath)) return 'xpp';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content
@@ -592,6 +605,7 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    xpp: 'X++ (D365 F&O)',
     unknown: 'Unknown',
   };
   return names[language] || language;

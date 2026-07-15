@@ -30,6 +30,7 @@ import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
+import { XppXmlExtractor } from './xpp-xml-extractor';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -6595,6 +6596,12 @@ export function extractFromSource(
   } else if (detectedLanguage === 'razor') {
     // Use custom extractor for ASP.NET Razor (.cshtml) / Blazor (.razor) markup
     const extractor = new RazorExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'xpp') {
+    // D365 F&O AOT metadata XML (AxClass/AxTable/AxForm/... — see
+    // detectLanguage's isD365MetadataFile check) wraps real X++ source in XML
+    // text nodes. Stitches the fragments and parses them with tree-sitter-xpp.
+    const extractor = new XppXmlExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'xml') {
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
