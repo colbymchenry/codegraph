@@ -78,3 +78,42 @@ describe('codegraph node — argument handling (#1044)', () => {
     expect(stderr).not.toMatch(/missing required argument/);
   });
 });
+
+describe('codegraph node — symbol pinned to a file includes the body (#1284)', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-node-pin-'));
+    fs.mkdirSync(path.join(tempDir, 'a'));
+    fs.mkdirSync(path.join(tempDir, 'b'));
+    // Two same-named definitions, so `-f` is genuinely disambiguating.
+    fs.writeFileSync(
+      path.join(tempDir, 'a', 'state.ts'),
+      'export function setState(x: number): void {\n  console.log("A", x);\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'b', 'state.ts'),
+      'export function setState(y: string): void {\n  console.log("B", y);\n}\n'
+    );
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('`node <symbol> -f <file>` prints the pinned definition WITH its source body', () => {
+    // The exact #1284 shape: `-f` narrowed the overload correctly but printed
+    // only Location + trail — no code fence — so the user had nothing to read.
+    const { stdout, code } = runNode(tempDir, ['setState', '-f', 'a/state.ts']);
+    expect(code).toBe(0);
+    expect(stdout).toContain('a/state.ts');
+    // The body is present (line-numbered fence), and it's the pinned overload.
+    expect(stdout).toMatch(/1\s+export function setState\(x: number\)/);
+    expect(stdout).toContain('console.log("A", x)');
+    // The other file's overload is not what was pinned.
+    expect(stdout).not.toContain('console.log("B", y)');
+  });
+});

@@ -1414,7 +1414,14 @@ program
       const args: Record<string, unknown> = {};
       if (options.file) {
         args.file = options.file;
-        if (name && name !== options.file) args.symbol = name;
+        if (name && name !== options.file) {
+          args.symbol = name;
+          // Symbol mode pinned to a file is still symbol mode — the CLI
+          // always wants the body, exactly like the bare-symbol branch
+          // below. Omitting this printed location + trail with no source
+          // (#1284).
+          args.includeCode = true;
+        }
       } else if (name && (name.includes('/') || name.includes('\\'))) {
         args.file = name.replace(/\\/g, '/');
       } else if (name) {
