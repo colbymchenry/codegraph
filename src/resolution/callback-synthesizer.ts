@@ -3446,7 +3446,20 @@ async function laravelEventEdges(ctx: ResolutionContext, onYield: MaybeYield): P
  * Sidekiq Worker.perform_async → #perform + Laravel event(new X) → listener handle).
  * Returns the count added. Never throws into indexing — callers wrap in try/catch.
  */
-export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): Promise<number> {
+
+/**
+ * Number of progress steps synthesizeCallbackEdges reports: one per `__mark()`
+ * call (every synthesis pass, plus the dedupe-merge and edge-insert steps).
+ * Cosmetic only — drift just makes the progress bar end early or jump — and a
+ * test pins it to the actual `__mark(` call count so adding a pass without
+ * bumping this fails loudly instead of silently skewing the bar.
+ */
+export const SYNTH_PROGRESS_STEPS = 40;
+export async function synthesizeCallbackEdges(
+  queries: QueryBuilder,
+  ctx: ResolutionContext,
+  onProgress?: (done: number, total: number) => void
+): Promise<number> {
   // Each sub-pass below is a whole-graph scan, and there are ~30 of them, all
   // running synchronously on the indexer's main thread. Their AGGREGATE can run
   // for well over a minute on a large repo — long enough for the #850 liveness
@@ -3455,6 +3468,14 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   // that itself hangs (a real wedge) never reaches the next yield, so the
   // watchdog still catches that. See ./cooperative-yield.
   const yieldToLoop = createYielder();
+
+  // Synthesis runs AFTER the resolution progress bar reaches 100%, so without
+  // its own progress the UI freezes at "Resolving refs 100%" for the whole
+  // tail — long enough on big repos that users conclude the index hung and
+  // kill it. Report each completed pass; the caller surfaces it as its own
+  // progress phase. Emit 0/total up front so the phase flips immediately.
+  let passesDone = 0;
+  onProgress?.(0, SYNTH_PROGRESS_STEPS);
 
   // Per-pass wall-clock timing to stderr, opt-in via CODEGRAPH_SYNTH_TIMINGS
   // (=1: passes over 250ms; =all: every pass). This is the diagnostic that
@@ -3467,6 +3488,8 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
     if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
       console.error(`[synth-timing] ${label}: ${dt}ms`);
     }
+    passesDone++;
+    onProgress?.(Math.min(passesDone, SYNTH_PROGRESS_STEPS), SYNTH_PROGRESS_STEPS);
   };
 
   // Language gating: one indexed DISTINCT over the files table lets a pass

@@ -81,7 +81,7 @@ rm -f "$STAGE/lib/package-lock.json"
 # runs are covered too; passing it here avoids that extra spawn.)
 if [ "$OSFAM" = "win32" ]; then
   cp "$NODE_BIN" "$STAGE/node.exe"
-  printf '@"%%~dp0..\\node.exe" --liftoff-only "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
+  printf '@"%%~dp0..\\node.exe" --liftoff-only --disable-warning=ExperimentalWarning "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
     > "$STAGE/bin/codegraph.cmd"
 else
   cp "$NODE_BIN" "$STAGE/node"
@@ -104,7 +104,9 @@ DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 CODEGRAPH_HOST_PPID="${CODEGRAPH_HOST_PPID:-$PPID}"
 export CODEGRAPH_HOST_PPID
 # --liftoff-only: avoid the V8 turboshaft WASM Zone OOM (issues #293/#298).
-exec "$DIR/node" --liftoff-only "$DIR/lib/dist/bin/codegraph.js" "$@"
+# --disable-warning=ExperimentalWarning: mute node:sqlite's per-thread
+# "experimental feature" warning that otherwise interleaves with the progress UI.
+exec "$DIR/node" --liftoff-only --disable-warning=ExperimentalWarning "$DIR/lib/dist/bin/codegraph.js" "$@"
 LAUNCH
   chmod +x "$STAGE/bin/codegraph"
 fi

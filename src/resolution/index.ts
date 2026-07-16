@@ -1258,7 +1258,8 @@ export class ReferenceResolver {
    */
   async resolveAndPersistBatched(
     onProgress?: (current: number, total: number) => void,
-    batchSize: number = 5000
+    batchSize: number = 5000,
+    onSynthesisProgress?: (done: number, total: number) => void
   ): Promise<ResolutionResult> {
     // Resolution runs on the indexer's MAIN thread, and the #850 liveness
     // watchdog SIGKILLs a process whose event loop stalls past its window (60s
@@ -1375,7 +1376,11 @@ export class ReferenceResolver {
     // callbacks) that static parsing leaves out. Best-effort — never fail the
     // index on it. See docs/design/callback-edge-synthesis.md.
     try {
-      aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(this.queries, this.context);
+      aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(
+        this.queries,
+        this.context,
+        onSynthesisProgress
+      );
     } catch {
       // synthesis is additive and optional; ignore failures
     }
