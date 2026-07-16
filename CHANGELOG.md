@@ -11,6 +11,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- `codegraph install` and `codegraph upgrade` now offer CodeGraph Pro beta access after finishing — answer yes, type your email, and you join the same waitlist as the getcodegraph.com homepage form. Strictly opt-in and asked at most once per machine total: nothing is sent unless you say yes and enter an email, either answer is remembered so no later install or upgrade ever re-asks, and non-interactive runs (`--yes`, scripts, CI) never see the question.
 - Every release is now cryptographically verifiable: npm packages publish with npm provenance (the "Provenance" badge on npmjs.com, proving each version was built by this repository's release workflow from a specific commit), and the GitHub Release bundles carry signed build attestations you can check with `gh attestation verify <file> -R colbymchenry/codegraph`.
 
 ### Fixes

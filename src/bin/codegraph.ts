@@ -2394,6 +2394,10 @@ program
         warn: (m: string) => warn(m),
         error: (m: string) => error(m),
         platform: process.platform,
+        offerBetaSignup: async () => {
+          const { maybeOfferBetaSignup } = await import('../installer/beta-signup');
+          await maybeOfferBetaSignup({ source: 'cli-upgrade' });
+        },
       }
     );
     process.exit(code);

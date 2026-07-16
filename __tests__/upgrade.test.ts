@@ -411,6 +411,69 @@ describe('runUpgrade', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Beta signup offer — fires ONLY after a real, successful binary update.
+// (The hook itself gates on TTY + the once-per-machine stored choice; see
+// __tests__/beta-signup.test.ts. Here we pin WHEN the upgrade path invokes it.)
+// ---------------------------------------------------------------------------
+
+describe('runUpgrade beta signup offer', () => {
+  function withSpy(deps: UpgradeDeps): { deps: UpgradeDeps; offered: () => number } {
+    let n = 0;
+    deps.offerBetaSignup = async () => { n += 1; };
+    return { deps, offered: () => n };
+  }
+
+  it('offers after a successful npm upgrade', async () => {
+    const { deps } = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8' });
+    const { offered } = withSpy(deps);
+    expect(await runUpgrade({}, deps)).toBe(0);
+    expect(offered()).toBe(1);
+  });
+
+  it('does not offer on --check', async () => {
+    const { deps } = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8' });
+    const { offered } = withSpy(deps);
+    expect(await runUpgrade({ check: true }, deps)).toBe(0);
+    expect(offered()).toBe(0);
+  });
+
+  it('does not offer when already up to date', async () => {
+    const { deps } = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.9' });
+    const { offered } = withSpy(deps);
+    expect(await runUpgrade({}, deps)).toBe(0);
+    expect(offered()).toBe(0);
+  });
+
+  it('does not offer when the upgrade fails', async () => {
+    const { deps } = makeDeps(
+      { method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8' },
+      1 // npm exits non-zero
+    );
+    const { offered } = withSpy(deps);
+    expect(await runUpgrade({}, deps)).toBe(1);
+    expect(offered()).toBe(0);
+  });
+
+  it('does not offer on npx / source no-op paths', async () => {
+    for (const method of [
+      { kind: 'npx' } as const,
+      { kind: 'source', root: '/dev/codegraph' } as const,
+    ]) {
+      const { deps } = makeDeps({ method, currentVersion: '0.9.8' });
+      const { offered } = withSpy(deps);
+      expect(await runUpgrade({}, deps)).toBe(0);
+      expect(offered()).toBe(0);
+    }
+  });
+
+  it('a throwing offer never fails the upgrade', async () => {
+    const { deps } = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8' });
+    deps.offerBetaSignup = async () => { throw new Error('boom'); };
+    expect(await runUpgrade({}, deps)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Post-upgrade self-heal of installed agent surfaces
 // ---------------------------------------------------------------------------
 
