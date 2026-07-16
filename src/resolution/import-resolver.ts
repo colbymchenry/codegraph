@@ -10,6 +10,11 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
 import { resolveWorkspaceImport } from './workspace-packages';
+import {
+  resolveMethodOnType,
+  localReceiverTypePatterns,
+  normalizeInferredTypeName,
+} from './name-matcher';
 
 /**
  * Extension resolution order by language
@@ -1512,6 +1517,18 @@ export function resolveViaImport(
                 resolvedBy: 'import',
               };
             }
+            // An imported VALUE (singleton constant / shared instance) called
+            // through a member: `reproStore.notifyJoinGuildStatus()` after
+            // `import { reproStore } from './store'`. findExportedSymbol
+            // resolved the CONSTANT itself; linking the CALL there hides the
+            // real callee — callers of the method miss every cross-file use
+            // and the method can look unused (#1292). Infer the value's type
+            // from its own declaration in the exporting file and resolve the
+            // member on that type. resolveMethodOnType VALIDATES the type
+            // declares the method, so a mis-inference falls through to the
+            // constant edge below rather than fabricating a wrong one.
+            const instanceMember = resolveImportedInstanceMember(targetNode, ref, imp.localName, context);
+            if (instanceMember) return instanceMember;
           }
 
           return {
@@ -2158,6 +2175,48 @@ const STATIC_MEMBER_CONTAINERS = new Set<Node['kind']>([
  * languages whose members aren't `::`-qualified, and genuine class references,
  * are unaffected. See #825.
  */
+/**
+ * Resolve a CALL through an imported value to the method on the value's own
+ * type: `reproStore.notifyJoinGuildStatus()` where `reproStore` is
+ * `export const reproStore = new ReproStore()` in the imported file (#1292).
+ * The same-file form of this call already resolves via local-variable
+ * receiver inference (#1108); this is the cross-file/import half. The type is
+ * recovered from the VALUE'S OWN declaration lines in the exporting file
+ * (initializer `= new T(...)` or a type annotation, per the shared #1108
+ * pattern table), then the member is resolved AND VALIDATED on that type by
+ * resolveMethodOnType — a failed inference or validation returns null so the
+ * caller keeps its existing constant-edge behavior.
+ */
+function resolveImportedInstanceMember(
+  value: Node,
+  ref: UnresolvedRef,
+  localName: string,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
+  if (value.kind !== 'constant' && value.kind !== 'variable') return null;
+  const member = ref.referenceName.slice(localName.length + 1).split('.')[0];
+  if (!member) return null;
+
+  const source = context.readFile(value.filePath);
+  if (!source) return null;
+  // Only the value's own declaration lines — never the whole file, so a
+  // same-named identifier elsewhere can't donate a type.
+  const lines = source.split('\n');
+  const declSlice = lines.slice(Math.max(0, value.startLine - 1), value.endLine).join('\n');
+
+  const receiver = value.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const pattern of localReceiverTypePatterns(value.language as Language, receiver)) {
+    const m = declSlice.match(pattern);
+    if (!m || !m[1]) continue;
+    const typeName = normalizeInferredTypeName(m[1]);
+    if (!typeName) continue;
+    const resolved = resolveMethodOnType(typeName, member, ref, context, 0.85, 'instance-method');
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
 function resolveStaticMember(
   container: Node,
   ref: UnresolvedRef,

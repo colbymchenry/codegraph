@@ -1075,7 +1075,7 @@ const NON_TYPE_RECEIVER_TOKENS = new Set([
  * args and pointer/ref markers, take the last `.`/`::`-qualified segment, and
  * reject obvious non-types.
  */
-function normalizeInferredTypeName(raw: string): string | null {
+export function normalizeInferredTypeName(raw: string): string | null {
   const cleaned = raw.replace(/<[^>]*>/g, '').replace(/[&*]/g, '').trim();
   const seg = cleaned.split(/[.:]+/).filter(Boolean).pop();
   if (!seg) return null;
@@ -1090,7 +1090,7 @@ function normalizeInferredTypeName(raw: string): string | null {
  * PascalCase is required in the capture where the language convention allows,
  * as a cheap false-positive guard on top of resolveMethodOnType's validation.
  */
-function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
+export function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
   switch (language) {
     case 'typescript':
     case 'javascript':

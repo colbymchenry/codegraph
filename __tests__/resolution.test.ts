@@ -2541,6 +2541,61 @@ func main() {
     });
   });
 
+  describe('Imported singleton instance-method calls (#1292)', () => {
+    // `reproStore.notifyJoinGuildStatus()` after `import { reproStore }` used
+    // to emit its calls edge to the CONSTANT (resolvedBy:'import'), while the
+    // identical call in the defining file resolved to the method — so callers
+    // of the method missed every cross-file use. The import path now infers
+    // the value's type from its own declaration and resolves the member on it.
+    it('cross-file call through an imported singleton resolves to the class method', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1292-'));
+      try {
+        fs.mkdirSync(path.join(tmpDir, 'src'));
+        fs.writeFileSync(
+          path.join(tmpDir, 'src', 'store.ts'),
+          `export class ReproStore {
+  notifyJoinGuildStatus(): void {
+    console.log('notified');
+  }
+}
+
+export const reproStore = new ReproStore();
+
+export function callInDefinitionFile(): void {
+  reproStore.notifyJoinGuildStatus();
+}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'src', 'caller.ts'),
+          `import { reproStore } from './store';
+
+export function callFromImportedFile(): void {
+  reproStore.notifyJoinGuildStatus();
+}
+`
+        );
+
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        const method = (await cg.searchNodes('notifyJoinGuildStatus', { limit: 5 })).find(
+          (r) => r.node.kind === 'method'
+        );
+        expect(method).toBeDefined();
+
+        // BOTH functions call the method — the cross-file one included.
+        const callers = await cg.getCallers(method!.node.id);
+        const callerNames = callers.map((c) => c.node.name).sort();
+        expect(callerNames).toContain('callInDefinitionFile');
+        expect(callerNames).toContain('callFromImportedFile');
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+  });
+
   describe('C++ namespace-qualified static method calls to out-of-line definitions (#1291)', () => {
     // The issue's exact shape: nested types + out-of-line static method
     // definition inside `namespace simulator { }` in the .cpp, called via the
