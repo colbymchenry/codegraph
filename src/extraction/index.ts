@@ -839,6 +839,10 @@ export function findUnindexedIgnoredRepos(rootDir: string): string[] {
     if (defaults.ignores(dir)) continue; // node_modules etc. — never project code
     if (includeIgnored?.ignores(normalizePath(dir))) continue; // already opted in — nothing to nag about
     for (const repo of findNestedGitRepos(path.join(rootDir, dir), dir)) {
+      // Per-repo opt-in check, mirroring findIgnoredEmbeddedRepos: a child
+      // pattern (`repos/a/`) doesn't match the parent dir above but DOES
+      // cover this repo — it's indexed, so don't nag about it (#1295).
+      if (includeIgnored?.ignores(normalizePath(repo))) continue;
       repos.push(repo);
       if (repos.length >= UNINDEXED_IGNORED_REPO_HINT_CAP) return repos;
     }
@@ -867,8 +871,21 @@ function findIgnoredEmbeddedRepos(repoDir: string, includeIgnored: Ignore | null
   const repos: string[] = [];
   for (const dir of listIgnoredDirs(repoDir)) {
     if (defaults.ignores(dir)) continue;
-    if (!includeIgnored.ignores(normalizePath(prefix + dir))) continue;
-    repos.push(...findNestedGitRepos(path.join(repoDir, dir), dir));
+    const nested = findNestedGitRepos(path.join(repoDir, dir), dir);
+    if (includeIgnored.ignores(normalizePath(prefix + dir))) {
+      // The whole ignored dir is opted in — every nested repo under it counts.
+      repos.push(...nested);
+    } else {
+      // A single gitignore rule often covers the PARENT of the opted-in
+      // repos: `.gitignore: /repos/` lists `repos/` as ONE ignored entry,
+      // while `includeIgnored: ["repos/a/"]` (the CLI hint's own suggested
+      // spelling) names the child — which never matches the parent path, so
+      // the opt-in silently did nothing (#1295). Match each nested repo
+      // root individually so both spellings work. The walk is bounded
+      // (depth/entry caps in findNestedGitRepos) and only runs when
+      // includeIgnored is configured at all.
+      repos.push(...nested.filter((r) => includeIgnored.ignores(normalizePath(prefix + r))));
+    }
   }
   return repos;
 }
