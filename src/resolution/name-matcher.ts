@@ -4,8 +4,134 @@
  * Handles symbol name matching for reference resolution.
  */
 
-import { Language, Node } from '../types';
+import { Language, Node, NodeKind } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+
+/**
+ * Kinds whose nodes can contain other nodes (and therefore introduce
+ * lexical scoping that blocks a nested local from being reachable from
+ * an outside caller). Used as a containment filter when picking the
+ * tightest enclosing scope for a candidate or caller.
+ */
+const SCOPING_CONTAINER_KINDS: ReadonlySet<NodeKind> = new Set([
+  'function', 'method', 'class', 'struct', 'interface', 'trait', 'protocol', 'namespace', 'module', 'enum',
+]);
+
+/**
+ * Given a candidate and a caller (both Nodes), decide whether the
+ * candidate is lexically reachable from the caller.
+ *
+ * Rule: walk the candidate's enclosing scope and the caller's
+ * enclosing scope. The candidate is reachable iff the caller's
+ * container is the candidate's container OR the candidate's container
+ * is a STRICT ancestor of the caller (i.e. the caller is nested
+ * inside the candidate's container). Otherwise the candidate is a
+ * nested local captured by a sibling function and the caller has no
+ * lexical path to it (#1230 — `report_missing` cannot call a `join`
+ * nested inside `format_fields`).
+ *
+ * Cross-file candidates are always considered reachable — the
+ * import graph (not lexical scope) is what makes them callable, and
+ * the rest of the matcher (proximity, imports) handles them.
+ */
+function isReachableFromCaller(
+  candidate: Node,
+  caller: Node | null,
+  inFile: Node[],
+): boolean {
+  if (!caller) return true;
+  if (candidate.filePath !== caller.filePath) return true;
+
+  const candidateParent = findStrictContainer(candidate, inFile);
+  if (!candidateParent) return true; // module-level — always reachable
+
+  if (candidateParent.id === caller.id) return true;
+  // Caller is nested inside candidateParent (caller is the outer
+  // function, candidate is module-level, etc.) — reachable.
+  if (isStrictAncestorOf(candidateParent, caller, inFile)) return true;
+
+  return false;
+}
+
+/**
+ * Find the tightest node that contains `node` lexically. Uses two
+ * tiers:
+ *
+ *  1. **Strict**: the container extends at least one line beyond
+ *     `node` in either direction — unambiguous even on one-liners
+ *     because multi-line siblings clearly span beyond the node.
+ *
+ *  2. **Loose** (fallback): the container has the same line range.
+ *     On multi-line code this is rare and usually correct. On
+ *     one-liners (e.g. C++ `class Calculator { Calculator(int){} };`
+ *     where the class and its constructor share one line), the
+ *     extractor's `qualifiedName` hierarchy breaks the tie: if the
+ *     candidate's qn is a prefix of the potential container's qn
+ *     (separated by `::`), the "container" is actually a CHILD — a
+ *     constructor `Calculator::Calculator` is inside the class
+ *     `Calculator`, not the other way around. Skipping the false
+ *     child prevents #1230/#1035 scope-filter regressions.
+ */
+function findStrictContainer(node: Node, inFile: Node[]): Node | null {
+  const nodeStart = node.startLine;
+  const nodeEnd = node.endLine ?? node.startLine;
+  let strictBest: Node | null = null;
+  let looseBest: Node | null = null;
+  for (const n of inFile) {
+    if (n.id === node.id) continue;
+    if (!SCOPING_CONTAINER_KINDS.has(n.kind)) continue;
+    const start = n.startLine;
+    const end = n.endLine ?? n.startLine;
+    const contains = start <= nodeStart && end >= nodeEnd;
+    if (!contains) continue;
+    const strict = start < nodeStart || end > nodeEnd;
+    if (strict) {
+      if (!strictBest || start > strictBest.startLine) strictBest = n;
+    } else {
+      // Loose match: same line range. On one-liners the extractor's
+      // qualifiedName encodes the true hierarchy — a child's qn starts
+      // with the parent's qn + "::". Skip false "containers" that are
+      // actually nested inside the candidate (e.g. a constructor method
+      // whose qn is `Calculator::Calculator` is inside class `Calculator`).
+      if (isChildOfCandidate(n, node)) continue;
+      if (!looseBest || start > looseBest.startLine) looseBest = n;
+    }
+  }
+  return strictBest ?? looseBest;
+}
+
+/**
+ * True when `node` is lexically nested inside `candidate` according
+ * to the extractor's qualifiedName hierarchy: `node.qualifiedName`
+ * starts with `candidate.qualifiedName + "::"`. Used by
+ * {@link findStrictContainer} to reject one-liner false positives
+ * where a constructor method and its enclosing class share a line —
+ * the constructor's qn `Calculator::Calculator` starts with the
+ * class's qn `Calculator::`, so the constructor is a CHILD, not a
+ * parent container.
+ */
+function isChildOfCandidate(node: Node, candidate: Node): boolean {
+  const candidateQN = candidate.qualifiedName;
+  const nodeQN = node.qualifiedName;
+  if (nodeQN.length <= candidateQN.length) return false;
+  return nodeQN.startsWith(candidateQN + '::');
+}
+
+/** True if `ancestor` STRICTLY lexically contains `descendant`. */
+function isStrictAncestorOf(ancestor: Node, descendant: Node, _inFile: Node[]): boolean {
+  if (ancestor.filePath !== descendant.filePath) return false;
+  const dStart = descendant.startLine;
+  const dEnd = descendant.endLine ?? descendant.startLine;
+  const aStart = ancestor.startLine;
+  const aEnd = ancestor.endLine ?? ancestor.startLine;
+  if (aStart > dStart) return false;
+  if (aEnd < dEnd) return false;
+  // Strict: at least one of ancestor's boundaries is strictly outside
+  // descendant's, so a same-line sibling isn't reported as an
+  // ancestor of itself.
+  if (aStart === dStart && aEnd === dEnd) return false;
+  return true;
+}
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -356,8 +482,20 @@ export function matchByExactName(
   // unresolved import refs each scored K same-named import candidates through
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
+  const rawCandidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
     .filter((n) => n.kind !== 'import');
+
+  // Lexical-scope filter (#1230): drop candidates that are nested locals
+  // in a sibling function of the caller — a `join` nested inside
+  // `format_fields` is not reachable from `report_missing` even though
+  // they share a file. Same-file proximity can otherwise promote a
+  // nested local over a missing name, fabricating call edges on
+  // service-layer codebases (Python/Ruby/JS/TS). Cross-file candidates
+  // pass through (their reachability is governed by imports, not
+  // lexical scope).
+  const inFile = ref.filePath ? context.getNodesInFile(ref.filePath) : [];
+  const caller = inFile.find((n) => n.id === ref.fromNodeId) ?? null;
+  const candidates = rawCandidates.filter((c) => isReachableFromCaller(c, caller, inFile));
 
   if (candidates.length === 0) {
     return null;
@@ -1885,9 +2023,17 @@ export function matchFuzzy(
   const callableKinds = new Set(['function', 'method', 'class']);
   const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
 
+  // Lexical-scope filter (#1230) — drop nested locals whose container is
+  // a sibling function of the caller's container. Same rule as
+  // matchByExactName: a `join` nested inside `format_fields` is not
+  // reachable from `report_missing` even though they share a file.
+  const inFile = ref.filePath ? context.getNodesInFile(ref.filePath) : [];
+  const caller = inFile.find((n) => n.id === ref.fromNodeId) ?? null;
+  const scopedCandidates = callableCandidates.filter((c) => isReachableFromCaller(c, caller, inFile));
+
   // Prefer same-language matches
-  const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
-  const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
+  const sameLanguageCandidates = scopedCandidates.filter(n => n.language === ref.language);
+  const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : scopedCandidates;
 
   if (finalCandidates.length === 1) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
