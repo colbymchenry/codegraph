@@ -4074,6 +4074,66 @@ class Both : public Base<char>, public Plain {};
     });
   });
 
+  describe('C++ out-of-line template method receivers (#1286)', () => {
+    // `template<typename T> T Box<T>::get()` used to store qualified_name
+    // `Box<T>::get` — the `<T>` qualifier never matched the class node indexed
+    // as `Box`, and long multi-line parameter lists could push qualified_name
+    // past NAME_MAX. Inline definitions of the same method produce `Box::get`,
+    // so the out-of-line form must normalize to the identical name.
+    it('strips the template parameter list from the receiver qualifier', () => {
+      const code = `template <typename T>
+class Box {
+public:
+    T get() const;
+    void set(T v);
+private:
+    T value;
+};
+
+template <typename T> T Box<T>::get() const { return value; }
+template <typename T> void Box<T>::set(T v) { value = v; }
+`;
+      const result = extractFromSource('box.cpp', code);
+      expect(result.errors).toHaveLength(0);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const qns = methods.map((n) => n.qualifiedName).sort();
+      // Out-of-line definitions carry the SAME qualifier as the class node.
+      expect(qns).toContain('Box::get');
+      expect(qns).toContain('Box::set');
+      expect(qns.find((q) => q?.includes('<'))).toBeUndefined();
+      // Names themselves stay clean.
+      expect(methods.map((n) => n.name).sort()).toEqual(expect.arrayContaining(['get', 'set']));
+    });
+
+    it('multi-line template parameter lists cannot leak into qualified_name (NAME_MAX overflow shape)', () => {
+      // The ICU capi_helper.h shape: enormous multi-line parameter names made
+      // qualified_name 272 bytes (> NAME_MAX 255) including embedded newlines.
+      const code = `template <typename CType,
+          typename CPPType,
+          int32_t kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>
+class ApiHelper {
+public:
+    CPPType* validate();
+};
+
+template <typename CType,
+          typename CPPType,
+          int32_t kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>
+CPPType* ApiHelper<CType,
+                   CPPType,
+                   kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>::validate() {
+    return nullptr;
+}
+`;
+      const result = extractFromSource('capi_helper.h', code);
+      const validate = result.nodes.find((n) => n.kind === 'method' && n.name === 'validate' && n.qualifiedName?.includes('::'));
+      expect(validate).toBeDefined();
+      expect(validate!.qualifiedName).toBe('ApiHelper::validate');
+      expect(validate!.qualifiedName!.length).toBeLessThan(255);
+      expect(validate!.qualifiedName).not.toMatch(/[<>\n]/);
+    });
+  });
+
   describe('C++ stack-allocation construction (#1035)', () => {
     // `Calculator calc(0)` (direct-init) and `Widget w{1, 2}` (brace-init) carry
     // the constructor args directly on the declarator — no call/new node — so

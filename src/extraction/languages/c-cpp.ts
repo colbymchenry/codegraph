@@ -89,7 +89,15 @@ function extractCppReceiverType(node: SyntaxNode, source: string): string | unde
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
   const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
-  return parts.length > 1 ? parts.slice(0, -1).join('::') : undefined;
+  if (parts.length <= 1) return undefined;
+  // An out-of-line template method definition carries the class's template
+  // parameter list in the qualifier (`template<typename T> T Box<T>::get()`),
+  // but the class node is indexed as bare `Box` — strip `<…>` so the receiver
+  // matches it, the same normalization #1043 applies to base-class refs.
+  // Multi-line parameter lists otherwise leak whole `<…>` blocks (newlines
+  // included) into qualified_name, which can exceed NAME_MAX (#1286).
+  const receiver = stripCppTemplateArgs(parts.slice(0, -1).join('::'));
+  return receiver || undefined;
 }
 
 /**
