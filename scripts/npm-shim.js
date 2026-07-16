@@ -65,8 +65,8 @@ async function main() {
 function resolveInstalledBundle() {
   try {
     if (isWindows) {
-      // Modern Node refuses to spawn the bundle's .cmd directly (EINVAL, the
-      // CVE-2024-27980 hardening on Node 24), so invoke the bundled node.exe
+      // Modern Node refuses to spawn the bundle's .cmd directly (EINVAL after
+      // CVE-2024-27980 hardening), so invoke the bundled node.exe
       // against the app entry point and pass --liftoff-only here.
       var nodeExe = require.resolve(pkg + '/node.exe');
       var entry = require.resolve(pkg + '/lib/dist/bin/codegraph.js');
