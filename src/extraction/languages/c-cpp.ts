@@ -709,11 +709,47 @@ function preParseCppSource(source: string, filePath?: string): string {
   return blanked;
 }
 
-/** C source pre-processing: C-detected headers in CUDA projects (llm.c keeps
- * `__device__` helpers and kernel prototypes in plain `.h`) get the same
- * content-gated CUDA blank as C++. */
+/**
+ * Blank an unknown attribute macro sitting in front of a C function
+ * definition's return type: `SEC_ATTR UINT32 LostName(VOID) { … }` (macro
+ * wrapping `__attribute__((…))`, common in embedded/kernel C). tree-sitter's
+ * C grammar reads the macro as the declaration's type, the real return type
+ * as the declarator, and stores the PARAMETER LIST as the function name —
+ * `LostName` indexes as `"(VOID)"` and is unfindable (#1211). The C++ grammar
+ * recovers this shape differently (glued name, salvaged post-hoc by
+ * `recoverMangledCppName`), but in C the real name never reaches the mangled
+ * string, so only a pre-parse blank can recover it.
+ *
+ * Attribute macros are project-specific (`SEC_ATTR`, `INIT_TEXT`, …), so this
+ * keys on structure, not a curated list, matched tightly:
+ *  - line-leading (`^[ \t]*`) — declaration position, never an expression use;
+ *  - ALL-CAPS token of ≥3 chars (`[A-Z][A-Z0-9_]{2,}`) — ordinary C types in
+ *    definitions are rarely spelled this way, and when they are (`UINT32 f()`)
+ *    they're followed by ONE identifier + `(`, which the lookahead rejects;
+ *  - followed by TWO identifier tokens (return type, then name — `*` allowed
+ *    for pointer returns) and then `(` — i.e. exactly the
+ *    `MACRO Ret name(` definition shape. `MACRO name(` calls, `#define`
+ *    lines (start with `#`), and multi-word builtin returns
+ *    (`MACRO unsigned int f(` — where the C grammar already keeps the name)
+ *    are all left untouched.
+ * Equal-length spaces preserve every byte offset, like the C++ blanks above.
+ */
+const C_LEADING_ATTR_MACRO_RE =
+  /^([ \t]*)([A-Z][A-Z0-9_]{2,})(?=\s+[A-Za-z_]\w*[\s*]+[A-Za-z_]\w*\s*\()/gm;
+export function blankCLeadingAttrMacros(source: string): string {
+  return source.replace(
+    C_LEADING_ATTR_MACRO_RE,
+    (_m, ws: string, macro: string) => ws + ' '.repeat(macro.length)
+  );
+}
+
+/** C source pre-processing: recover functions hidden behind a leading
+ * attribute macro (#1211), then — for C-detected headers in CUDA projects
+ * (llm.c keeps `__device__` helpers and kernel prototypes in plain `.h`) —
+ * the same content-gated CUDA blank as C++. Offset-preserving. */
 function preParseCSource(source: string): string {
-  return looksLikeCudaSource(source) ? blankCudaConstructs(source) : source;
+  const blanked = blankCLeadingAttrMacros(source);
+  return looksLikeCudaSource(blanked) ? blankCudaConstructs(blanked) : blanked;
 }
 
 export const cppExtractor: LanguageExtractor = {

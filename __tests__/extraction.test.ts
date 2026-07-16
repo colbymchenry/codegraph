@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -4112,6 +4112,59 @@ class Both : public Base<char>, public Plain {};
       expect(stripCppTemplateArgs('Outer<int>::Inner')).toBe('Outer::Inner'); // mid-name
       expect(stripCppTemplateArgs('Base')).toBe('Base'); // no-op
       expect(stripCppTemplateArgs('ns::Plain')).toBe('ns::Plain'); // no-op qualified
+    });
+  });
+
+  describe('C leading attribute macro before typedef return type (#1211)', () => {
+    // `SEC_ATTR UINT32 LostName(VOID)` — tree-sitter's C grammar reads the
+    // unknown macro as the type, the typedef'd return as the declarator, and
+    // stores the PARAMETER LIST as the function name ("(VOID)"). The
+    // structural pre-parse blank recovers the definition; the issue's whole
+    // isolation table is pinned here.
+    it("recovers the issue's full isolation table under their real names", () => {
+      const code = `#define SEC_ATTR __attribute__((section(".init")))
+typedef unsigned int UINT32;
+#define VOID void
+
+SEC_ATTR VOID   GoodName(VOID)  { }
+SEC_ATTR UINT32 LostName(VOID)  { return 0; }
+UINT32 NoAttr(void) { return 0; }
+SEC_ATTR int BuiltinRet(void) { return 0; }
+__attribute__((section(".init"))) UINT32 RawAttr(void) { return 0; }
+SEC_ATTR UINT32 OneNamedArg(UINT32 x) { return x; }
+SEC_ATTR UINT32* PtrRet(VOID) { return 0; }
+`;
+      const result = extractFromSource('attrs.c', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toEqual(
+        expect.arrayContaining([
+          'GoodName', 'LostName', 'NoAttr', 'BuiltinRet', 'RawAttr', 'OneNamedArg', 'PtrRet',
+        ])
+      );
+      // The bug shape: a parameter list stored as a name.
+      expect(fns.find((n) => n.includes('('))).toBeUndefined();
+    });
+
+    it('blankCLeadingAttrMacros only touches the MACRO-ret-name-( definition shape', () => {
+      // Blanked: the definition shape (offset-preserving).
+      expect(blankCLeadingAttrMacros('SEC_ATTR UINT32 f(void) {}')).toBe(
+        '         UINT32 f(void) {}'
+      );
+      // Untouched: a plain typedef'd return with ONE identifier before `(`.
+      expect(blankCLeadingAttrMacros('UINT32 helper(void) {}')).toBe('UINT32 helper(void) {}');
+      // Untouched: an ALL-CAPS function CALL at line start.
+      expect(blankCLeadingAttrMacros('MY_ASSERT(x);')).toBe('MY_ASSERT(x);');
+      // Untouched: #define lines (start with #, not line-leading CAPS).
+      const def = '#define SEC_ATTR __attribute__((section(".init")))';
+      expect(blankCLeadingAttrMacros(def)).toBe(def);
+      // Untouched: multi-word builtin returns (the grammar keeps the name there).
+      expect(blankCLeadingAttrMacros('SEC_ATTR unsigned int f(void) {}')).toBe(
+        'SEC_ATTR unsigned int f(void) {}'
+      );
+      // Untouched: mid-line uses.
+      expect(blankCLeadingAttrMacros('x = SEC_ATTR UINT32 y(z);')).toBe(
+        'x = SEC_ATTR UINT32 y(z);'
+      );
     });
   });
 
