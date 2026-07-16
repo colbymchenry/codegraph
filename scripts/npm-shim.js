@@ -7,7 +7,7 @@
 // optionalDependency: @colbymchenry/codegraph-<platform>-<arch>. npm installs
 // only the one matching the host, via each package's `os`/`cpu` fields (the
 // esbuild pattern). This shim — run by the user's OWN Node — locates that bundle
-// and execs its launcher, so the real work always runs on the bundled Node 24
+// and execs its launcher, so the real work always runs on the pinned bundled Node
 // (with node:sqlite), regardless of the user's Node version. The user's Node is
 // only ever a launcher; even an ancient version can run this file.
 //
