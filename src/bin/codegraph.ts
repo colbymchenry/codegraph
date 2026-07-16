@@ -36,6 +36,7 @@ import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
+import { colorEnabled } from '../ui/colors';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { installFatalHandlers } from './fatal-handler';
@@ -143,18 +144,40 @@ if (firstArg === '-v' || firstArg === '-version') {
 // ANSI Color Helpers (avoid chalk ESM issues)
 // =============================================================================
 
-const colors = {
-  reset: '\x1b[0m',
-  bold: '\x1b[1m',
-  dim: '\x1b[2m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  blue: '\x1b[34m',
-  cyan: '\x1b[36m',
-  white: '\x1b[37m',
-  gray: '\x1b[90m',
-};
+// Decide color once, then strip `--no-color` before commander parses: it's a
+// global affordance that must also work after a subcommand
+// (`codegraph query … --no-color`), where commander would reject it as an
+// unknown option. Same pre-parse intercept pattern as `-v` above. (#1281)
+const useColor = colorEnabled();
+process.argv = process.argv.filter((arg) => arg !== '--no-color');
+
+// With color disabled every code is an empty string, so both the `colors.X`
+// interpolations and the `chalk.X()` helpers below become plain-text no-ops.
+const colors = useColor
+  ? {
+      reset: '\x1b[0m',
+      bold: '\x1b[1m',
+      dim: '\x1b[2m',
+      red: '\x1b[31m',
+      green: '\x1b[32m',
+      yellow: '\x1b[33m',
+      blue: '\x1b[34m',
+      cyan: '\x1b[36m',
+      white: '\x1b[37m',
+      gray: '\x1b[90m',
+    }
+  : {
+      reset: '',
+      bold: '',
+      dim: '',
+      red: '',
+      green: '',
+      yellow: '',
+      blue: '',
+      cyan: '',
+      white: '',
+      gray: '',
+    };
 
 const chalk = {
   bold: (s: string) => `${colors.bold}${s}${colors.reset}`,
@@ -171,7 +194,10 @@ const chalk = {
 program
   .name('codegraph')
   .description('Code intelligence and knowledge graph for any codebase')
-  .version(packageJson.version);
+  .version(packageJson.version)
+  // Parsed by the pre-parse intercept above (and stripped from argv, so it
+  // works after subcommands too); registered here so it shows in --help.
+  .option('--no-color', 'disable ANSI colors (also honors NO_COLOR; color is off by default when stdout is not a TTY)');
 
 // Anonymous usage telemetry (see TELEMETRY.md): record the invoked subcommand
 // NAME only — never arguments or paths. Counts buffer locally; network sends

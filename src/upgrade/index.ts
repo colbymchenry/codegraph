@@ -28,6 +28,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import { spawnSync } from 'child_process';
+import { colorEnabled } from '../ui/colors';
 
 export const REPO = 'colbymchenry/codegraph';
 export const NPM_PACKAGE = '@colbymchenry/codegraph';
@@ -305,12 +306,17 @@ export interface UpgradeDeps {
   offerBetaSignup?: () => Promise<void>;
 }
 
+// Evaluated per call so the NO_COLOR / non-TTY gate (#1281) applies at the
+// moment of printing, and unit tests (piped stdout) stay escape-free.
+const paint = (code: string) => (s: string) =>
+  colorEnabled() ? `\x1b[${code}m${s}\x1b[0m` : s;
+
 const c = {
-  bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
-  dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
-  green: (s: string) => `\x1b[32m${s}\x1b[0m`,
-  yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
-  cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,
+  bold: paint('1'),
+  dim: paint('2'),
+  green: paint('32'),
+  yellow: paint('33'),
+  cyan: paint('36'),
 };
 
 /** The honest, additive re-index reminder shown after a successful upgrade. */
