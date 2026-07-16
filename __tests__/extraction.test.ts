@@ -47,6 +47,14 @@ describe('Language Detection', () => {
     expect(detectLanguage('main.py')).toBe('python');
   });
 
+  it('should detect Bash and shell scripts', () => {
+    expect(detectLanguage('scripts/deploy.sh')).toBe('bash');
+    expect(detectLanguage('scripts/deploy.bash')).toBe('bash');
+    expect(detectLanguage('test/integration.bats')).toBe('bash');
+    expect(detectLanguage('bin/deploy', '#!/usr/bin/env bash\nset -euo pipefail\n')).toBe('bash');
+    expect(detectLanguage('bin/run', '#!/bin/sh\necho ok\n')).toBe('bash');
+  });
+
   it('should detect Go files', () => {
     expect(detectLanguage('main.go')).toBe('go');
   });
@@ -184,6 +192,7 @@ class ENGINE_API UNetConnectionRepControl : public UObject
 describe('Language Support', () => {
   it('should report supported languages', () => {
     expect(isLanguageSupported('typescript')).toBe(true);
+    expect(isLanguageSupported('bash')).toBe(true);
     expect(isLanguageSupported('python')).toBe(true);
     expect(isLanguageSupported('go')).toBe(true);
     expect(isLanguageSupported('unknown')).toBe(false);
@@ -193,6 +202,7 @@ describe('Language Support', () => {
     const languages = getSupportedLanguages();
     expect(languages).toContain('typescript');
     expect(languages).toContain('javascript');
+    expect(languages).toContain('bash');
     expect(languages).toContain('python');
     expect(languages).toContain('go');
     expect(languages).toContain('rust');
@@ -205,6 +215,71 @@ describe('Language Support', () => {
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
     expect(languages).toContain('nix');
+  });
+});
+
+describe('Bash Extraction', () => {
+  it('should extract shell functions, variables, command calls, and sourced scripts', () => {
+    const code = `#!/usr/bin/env bash
+set -euo pipefail
+
+readonly ROOT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+export IMAGE_TAG="latest"
+
+source ./env.sh
+
+log() {
+  printf '%s\n' "$1"
+}
+
+deploy() {
+  local target="\${1:-dev}"
+  ./scripts/build.sh "$target"
+  bash ./scripts/migrate.sh
+  kubectl apply -f k8s/
+  log "deployed"
+}
+
+deploy "$@"
+`;
+
+    const result = extractFromSource('scripts/deploy.sh', code);
+
+    expect(result.nodes.find((n) => n.kind === 'function' && n.name === 'log')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'function' && n.name === 'deploy')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'ROOT_DIR')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'IMAGE_TAG')?.isExported).toBe(true);
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'target')).toBeDefined();
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('./scripts/build.sh');
+    expect(calls).toContain('bash');
+    expect(calls).toContain('kubectl');
+    expect(calls).toContain('log');
+    expect(calls).toContain('deploy');
+
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toEqual(['./env.sh', './scripts/build.sh', './scripts/migrate.sh']);
+
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+    expect(importRefs).toEqual(['./env.sh', './scripts/build.sh', './scripts/migrate.sh']);
+  });
+
+  it('should include extensionless Bash shebang scripts in directory scans', () => {
+    const tempDir = createTempDir();
+    try {
+      const binDir = path.join(tempDir, 'bin');
+      fs.mkdirSync(binDir, { recursive: true });
+      fs.writeFileSync(path.join(binDir, 'deploy'), '#!/usr/bin/env bash\ndeploy() { echo ok; }\n');
+      fs.writeFileSync(path.join(binDir, 'notes'), 'plain text\n');
+
+      const files = scanDirectory(tempDir);
+
+      expect(files).toContain('bin/deploy');
+      expect(files).not.toContain('bin/notes');
+    } finally {
+      cleanupTempDir(tempDir);
+    }
   });
 });
 

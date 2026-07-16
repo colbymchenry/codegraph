@@ -22,6 +22,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   tsx: 'tree-sitter-tsx.wasm',
   javascript: 'tree-sitter-javascript.wasm',
   jsx: 'tree-sitter-javascript.wasm',
+  bash: 'tree-sitter-bash.wasm',
   python: 'tree-sitter-python.wasm',
   go: 'tree-sitter-go.wasm',
   rust: 'tree-sitter-rust.wasm',
@@ -72,6 +73,9 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.xsjs': 'javascript',
   '.xsjslib': 'javascript',
   '.jsx': 'jsx',
+  '.sh': 'bash',
+  '.bash': 'bash',
+  '.bats': 'bash',
   '.py': 'python',
   '.pyw': 'python',
   '.go': 'go',
@@ -212,6 +216,24 @@ export function isShopifyLiquidJson(filePath: string): boolean {
  */
 export function isErlangAppFile(filePath: string): boolean {
   return /\.app(?:\.src)?$/i.test(filePath);
+}
+
+/**
+ * Extensionless executable scripts can still be Bash. Keep this deliberately
+ * narrow so arbitrary extensionless docs/binaries are not treated as source by
+ * path alone; callers that have content available should pair it with
+ * `hasBashShebang`.
+ */
+export function isPotentialBashShebangPath(filePath: string): boolean {
+  const base = path.basename(filePath);
+  return base.length > 0 && !base.includes('.');
+}
+
+/** True when the first line names bash or POSIX sh as the interpreter. */
+export function hasBashShebang(source: string): boolean {
+  const firstNewline = source.indexOf('\n');
+  const firstLine = (firstNewline >= 0 ? source.slice(0, firstNewline) : source).trim();
+  return /^#!.*(?:^|[\/\s])(?:bash|sh)(?:\s|$)/.test(firstLine);
 }
 
 /**
@@ -422,6 +444,7 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   // OTP `.app`/`.app.src` resource files — Erlang terms the grammar parses as
   // top-level expressions (last-dot ext `.src` is too generic for the map).
   if (isErlangAppFile(filePath)) return 'erlang';
+  if (source && isPotentialBashShebangPath(filePath) && hasBashShebang(source)) return 'bash';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content
@@ -555,6 +578,7 @@ export function getLanguageDisplayName(language: Language): string {
     javascript: 'JavaScript',
     tsx: 'TypeScript (TSX)',
     jsx: 'JavaScript (JSX)',
+    bash: 'Bash / shell',
     python: 'Python',
     go: 'Go',
     rust: 'Rust',
