@@ -181,6 +181,41 @@ describe('value-reference edges', () => {
     expect(valueRefReaders(cg, 'DefaultLabels')).toEqual(expect.arrayContaining(['labels']));
   });
 
+  it('edges Go readers to an imported package value without crossing a local shadow', async () => {
+    fs.mkdirSync(path.join(dir, 'internal', 'realtime'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'p2p'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/app\n\ngo 1.24\n');
+    fs.writeFileSync(
+      path.join(dir, 'internal', 'realtime', 'store.go'),
+      [
+        'package realtime',
+        '',
+        'type Store struct{}',
+        'var DefaultSessionStore = &Store{}',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'p2p', 'service.go'),
+      [
+        'package p2p',
+        '',
+        'import "example.com/app/internal/realtime"',
+        '',
+        'type holder struct { DefaultSessionStore *realtime.Store }',
+        'func usesDefault() *realtime.Store { return realtime.DefaultSessionStore }',
+        'func shadowed(realtime holder) *realtime.Store { return realtime.DefaultSessionStore }',
+        'func shadowedLocal() *realtime.Store { realtime := holder{}; return realtime.DefaultSessionStore }',
+      ].join('\n'),
+    );
+    cg = index();
+    await cg.indexAll();
+
+    const readers = valueRefReaders(cg, 'DefaultSessionStore');
+    expect(readers).toContain('usesDefault');
+    expect(readers).not.toContain('shadowed');
+    expect(readers).not.toContain('shadowedLocal');
+  });
+
   it('does NOT edge a Go package const shadowed by a local := of the same name', async () => {
     // `Timeout` is a package const AND a local `:=` (short_var_declaration) in
     // shadows(). The local read resolves to the inner binding, so a file-scope
@@ -626,6 +661,73 @@ describe('value-reference edges', () => {
     expect(valueRefReaders(cg, 'TOP_LEVEL_MAX')).toEqual(expect.arrayContaining(['withinLimit']));
     // An instance field is per-object state, never a value-ref target.
     expect(valueRefReaders(cg, 'instanceField')).toEqual([]);
+  });
+
+  it('edges Dart readers to a uniquely imported top-level final without crossing a parameter shadow', async () => {
+    fs.mkdirSync(path.join(dir, 'lib', 'providers'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'lib', 'pages'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'lib', 'providers', 'presence.dart'),
+      'final agentBridgePresenceProvider = Object();\n',
+    );
+    fs.writeFileSync(
+      path.join(dir, 'lib', 'pages', 'settings.dart'),
+      [
+        "import '../providers/presence.dart';",
+        '',
+        'void usesProvider() { print(agentBridgePresenceProvider); }',
+        'void shadowed(Object agentBridgePresenceProvider) { print(agentBridgePresenceProvider); }',
+        'void shadowedLocal() { final agentBridgePresenceProvider = Object(); print(agentBridgePresenceProvider); }',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'lib', 'pages', 'prefixed.dart'),
+      [
+        "import '../providers/presence.dart' as presence;",
+        'void usesPrefixed() { print(presence.agentBridgePresenceProvider); }',
+      ].join('\n'),
+    );
+    cg = index();
+    await cg.indexAll();
+
+    const readers = valueRefReaders(cg, 'agentBridgePresenceProvider');
+    expect(readers).toContain('usesProvider');
+    expect(readers).toContain('usesPrefixed');
+    expect(readers).not.toContain('shadowed');
+    expect(readers).not.toContain('shadowedLocal');
+  });
+
+  it('resolves Dart value readers through this package URI but not another package', async () => {
+    fs.mkdirSync(path.join(dir, 'lib', 'providers'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'test'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'pubspec.yaml'), 'name: example_app\n');
+    fs.writeFileSync(
+      path.join(dir, 'lib', 'providers', 'presence.dart'),
+      'final agentBridgePresenceProvider = Object();\n',
+    );
+    fs.writeFileSync(
+      path.join(dir, 'test', 'presence_test.dart'),
+      [
+        "import 'package:example_app/providers/presence.dart';",
+        'void readsOwnPackage() { print(agentBridgePresenceProvider); }',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'test', 'external_test.dart'),
+      [
+        '/*',
+        "import 'package:example_app/providers/presence.dart';",
+        '*/',
+        "import 'package:another_app/providers/presence.dart';",
+        'void readsExternalPackage() { print(agentBridgePresenceProvider); }',
+      ].join('\n'),
+    );
+    cg = index();
+    await cg.indexAll();
+
+    const readers = valueRefReaders(cg, 'agentBridgePresenceProvider');
+    expect(readers).toContain('readsOwnPackage');
+    expect(readers).not.toContain('readsExternalPackage');
   });
 
   it('does NOT edge a Dart const shadowed by a method-local const of the same name', async () => {

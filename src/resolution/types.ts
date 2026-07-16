@@ -149,6 +149,12 @@ export interface ResolutionContext {
    */
   getGoModule?(): import('./go-module').GoModule | null;
   /**
+   * Package name declared by the root `pubspec.yaml`, or `null` outside a Dart
+   * package. Used to distinguish this project's `package:<name>/...` imports
+   * from third-party packages.
+   */
+  getDartPackageName?(): string | null;
+  /**
    * Monorepo workspace member packages, keyed by declared package name.
    * Returns `null` for single-package repos (no `workspaces` field).
    * Lets the resolver treat `@scope/ui/sub` as a local import into the

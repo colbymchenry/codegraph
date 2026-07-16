@@ -250,6 +250,9 @@ export class ReferenceResolver {
   private projectAliases: AliasMap | null | undefined = undefined;
   // go.mod module path. Same lazy/immutable convention as projectAliases.
   private goModule: GoModule | null | undefined = undefined;
+  // Root pubspec package name. Cleared between resolution/sync passes because
+  // pubspec.yaml can change while the resolver instance stays alive.
+  private dartPackageName: string | null | undefined = undefined;
   // Monorepo workspace member packages. Same lazy/immutable convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
 
@@ -372,6 +375,7 @@ export class ReferenceResolver {
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
+    this.dartPackageName = undefined;
   }
 
   /** `readFile` through the LRU content cache (null = read failed, also cached). */
@@ -566,6 +570,16 @@ export class ReferenceResolver {
           this.goModule = loadGoModule(this.projectRoot);
         }
         return this.goModule;
+      },
+
+      getDartPackageName: () => {
+        if (this.dartPackageName === undefined) {
+          const pubspec = this.readFileCached('pubspec.yaml');
+          this.dartPackageName = pubspec?.match(
+            /^\s*name\s*:\s*['"]?([A-Za-z_][\w-]*)['"]?\s*(?:#.*)?$/m
+          )?.[1] ?? null;
+        }
+        return this.dartPackageName;
       },
 
       getWorkspacePackages: () => {
@@ -810,6 +824,18 @@ export class ReferenceResolver {
       return null;
     }
 
+    // Imported value refs get a dedicated, strictly-gated path. They resolve
+    // only through an explicit language import/package mapping and may target
+    // only top-level constants/variables — never fuzzy name matching.
+    if (ref.referenceKind === 'value_ref') {
+      const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
+      if (!viaImport) return null;
+      const target = this.queries.getNodeById(viaImport.targetNodeId);
+      return target && (target.kind === 'constant' || target.kind === 'variable')
+        ? viaImport
+        : null;
+    }
+
     // Function-as-value refs (#756) get a dedicated, strictly-gated path:
     // import-based resolution first (an imported callback resolves through its
     // import, the most precise cross-file signal), then matchFunctionRef
@@ -947,13 +973,12 @@ export class ReferenceResolver {
    */
   createEdges(resolved: ResolvedRef[]): Edge[] {
     return resolved.map((ref) => {
-      // `function_ref` (#756) is internal-only: it persists as a `references`
-      // edge (the registration site depends on the callback), distinguishable
-      // by metadata.resolvedBy === 'function-ref'. callers/impact already
-      // traverse `references`, so registration sites surface with no
-      // graph-layer changes.
+      // Internal reference kinds persist as `references` edges. callers/impact
+      // already traverse `references`, so no graph-layer changes are needed.
       let kind: Edge['kind'] =
-        ref.original.referenceKind === 'function_ref' ? 'references' : ref.original.referenceKind;
+        ref.original.referenceKind === 'function_ref' || ref.original.referenceKind === 'value_ref'
+          ? 'references'
+          : ref.original.referenceKind;
 
       // Promote "extends" to "implements" when a class/struct targets an interface
       if (kind === 'extends') {
@@ -989,7 +1014,7 @@ export class ReferenceResolver {
           resolvedBy: ref.resolvedBy,
           // The ORIGINAL reference text (and kind, when edge-kind promotion
           // rewrote it — calls→instantiates, extends→implements,
-          // function_ref→references). If this edge's target is later removed
+          // function_ref/value_ref→references). If this edge's target is later removed
           // by a re-index, the edge is resurrected as exactly this ref and
           // re-resolved (#1240 removal case) — a faithful resurrection, so
           // re-resolution can never bind anywhere a full re-index wouldn't.
@@ -1004,6 +1029,7 @@ export class ReferenceResolver {
           // tooling label "callback registration" and lets validation diff
           // exactly the edges this feature added.
           ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),
+          ...(ref.original.referenceKind === 'value_ref' ? { valueRef: true } : {}),
         },
       };
     });
@@ -1846,7 +1872,10 @@ export class ReferenceResolver {
     if (!result) return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (!tgt || !ref.language) return result;
-    if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !sameLanguageFamily(tgt, ref.language)) return null;
+    if (
+      (ref.referenceKind === 'references' || ref.referenceKind === 'function_ref' || ref.referenceKind === 'value_ref') &&
+      !sameLanguageFamily(tgt, ref.language)
+    ) return null;
     if (ref.referenceKind === 'imports' && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
   }

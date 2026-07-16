@@ -69,6 +69,16 @@ export function resolveImportPath(
     return resolveCobolCopybook(importPath, fromFile, context);
   }
 
+  // Dart's own package URI is a precise project-local mapping:
+  // `package:<pubspec name>/x.dart` -> `lib/x.dart`. Other packages and
+  // `dart:` SDK libraries remain external.
+  if (language === 'dart') {
+    if (importPath.startsWith('dart:')) return null;
+    if (importPath.startsWith('package:')) {
+      return resolveDartPackageImport(importPath, context);
+    }
+  }
+
   // Skip external/npm packages — but pass the context so the
   // bare-specifier heuristic can consult the project's tsconfig
   // alias map first (custom prefixes like `@components/*` would
@@ -97,6 +107,25 @@ export function resolveImportPath(
   }
 
   return null;
+}
+
+function resolveDartPackageImport(
+  importPath: string,
+  context: ResolutionContext
+): string | null {
+  const match = /^package:([^/]+)\/(.+)$/.exec(importPath);
+  if (!match) return null;
+
+  let packageName = context.getDartPackageName?.();
+  if (packageName === undefined) {
+    const pubspec = context.readFile('pubspec.yaml');
+    packageName = pubspec?.match(/^\s*name\s*:\s*['"]?([A-Za-z_][\w-]*)['"]?\s*(?:#.*)?$/m)?.[1] ?? null;
+  }
+  if (!packageName || match[1] !== packageName) return null;
+
+  const candidate = path.posix.normalize(`lib/${match[2]}`);
+  if (!candidate.startsWith('lib/')) return null;
+  return context.fileExists(candidate) ? candidate : null;
 }
 
 /**
@@ -681,6 +710,8 @@ export function extractImportMappings(
     mappings.push(...extractPythonImports(content));
   } else if (language === 'go') {
     mappings.push(...extractGoImports(content));
+  } else if (language === 'dart') {
+    mappings.push(...extractDartImports(content));
   } else if (language === 'java' || language === 'kotlin') {
     mappings.push(...extractJavaImports(content));
   } else if (language === 'php') {
@@ -889,6 +920,36 @@ function extractGoImports(content: string): ImportMapping[] {
         isNamespace: true,
       });
     }
+  }
+
+  return mappings;
+}
+
+/**
+ * Extract local Dart library imports. An unprefixed import exposes its public
+ * top-level names directly, represented by `localName: '*'`; `as prefix`
+ * imports use that prefix as a namespace. Conditional and show/hide imports
+ * are skipped for now because resolving them without their visibility/platform
+ * rules would trade missing edges for incorrect ones.
+ */
+function extractDartImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+  const cleaned = stripJsComments(content);
+  const importRegex = /^\s*import\s+['"]([^'"]+)['"]([^;]*);/gm;
+  let match: RegExpExecArray | null;
+
+  while ((match = importRegex.exec(cleaned)) !== null) {
+    const source = match[1]!;
+    const suffix = match[2] ?? '';
+    if (/\b(?:show|hide)\b/.test(suffix) || /\bif\s*\(/.test(suffix)) continue;
+    const prefix = suffix.match(/\bas\s+([A-Za-z_]\w*)\b/)?.[1];
+    mappings.push({
+      localName: prefix ?? '*',
+      exportedName: '*',
+      source,
+      isDefault: false,
+      isNamespace: true,
+    });
   }
 
   return mappings;
@@ -1339,6 +1400,11 @@ export function resolveViaImport(
   if (ref.language === 'go') {
     const goResult = resolveGoCrossPackageReference(ref, imports, context);
     if (goResult) return goResult;
+  }
+
+  if (ref.language === 'dart' && ref.referenceKind === 'value_ref') {
+    const dartResult = resolveDartImportedValue(ref, imports, context);
+    if (dartResult) return dartResult;
   }
 
   // Java / Kotlin: imports are FQNs (`import com.example.Foo;`) — no
@@ -1928,7 +1994,17 @@ function resolveGoCrossPackageReference(
     const candidates = context.getNodesByName(memberName);
     for (const node of candidates) {
       if (node.language !== 'go') continue;
-      if (!node.isExported) continue;
+      if (ref.referenceKind === 'value_ref') {
+        // Go exports package values by identifier case. The generic extractor
+        // does not currently stamp isExported on const/var nodes, so use the
+        // language rule directly and keep value refs restricted to top-level
+        // value nodes.
+        if (!/^[A-Z]/.test(memberName)) continue;
+        if (node.kind !== 'constant' && node.kind !== 'variable') continue;
+        if (node.qualifiedName !== node.name) continue;
+      } else if (!node.isExported) {
+        continue;
+      }
       const fp = node.filePath.replace(/\\/g, '/');
       const lastSlash = fp.lastIndexOf('/');
       const fileDir = lastSlash >= 0 ? fp.substring(0, lastSlash) : '';
@@ -1943,6 +2019,50 @@ function resolveGoCrossPackageReference(
     }
   }
   return null;
+}
+
+/**
+ * Resolve a Dart imported top-level value through an explicit local library
+ * import. Multiple imported libraries defining the same unprefixed name are
+ * treated as ambiguous and dropped. Private and class-static values are never
+ * importable as bare library members, so they are excluded.
+ */
+function resolveDartImportedValue(
+  ref: UnresolvedRef,
+  imports: ImportMapping[],
+  context: ResolutionContext
+): ResolvedRef | null {
+  const matches = new Map<string, Node>();
+
+  for (const imp of imports) {
+    let memberName: string | null = null;
+    if (imp.localName === '*') {
+      if (!ref.referenceName.includes('.')) memberName = ref.referenceName;
+    } else if (ref.referenceName.startsWith(imp.localName + '.')) {
+      memberName = ref.referenceName.slice(imp.localName.length + 1);
+    }
+    if (!memberName || memberName.startsWith('_')) continue;
+
+    const resolvedPath = resolveImportPath(imp.source, ref.filePath, 'dart', context);
+    if (!resolvedPath) continue;
+    const target = context.getNodesInFile(resolvedPath).find(
+      (node) =>
+        node.language === 'dart' &&
+        node.name === memberName &&
+        node.qualifiedName === node.name &&
+        (node.kind === 'constant' || node.kind === 'variable')
+    );
+    if (target) matches.set(target.id, target);
+  }
+
+  if (matches.size !== 1) return null;
+  const target = matches.values().next().value as Node;
+  return {
+    original: ref,
+    targetNodeId: target.id,
+    confidence: 0.95,
+    resolvedBy: 'import',
+  };
 }
 
 /** Recursive depth cap for re-export chain following. Real codebases

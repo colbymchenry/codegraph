@@ -756,4 +756,61 @@ describe('Sync Module', () => {
       expect(callerCount('callee_two')).toBe(1);
     });
   });
+
+  describe('Import-aware value references survive target sync', () => {
+    let testDir: string;
+    let cg: CodeGraph;
+
+    const readers = (): string[] => {
+      const target = cg.searchNodes('sharedProvider')
+        .map((result) => result.node)
+        .find((node) => node.name === 'sharedProvider');
+      if (!target) return [];
+      return cg.getIncomingEdges(target.id)
+        .filter((edge) => edge.kind === 'references' && edge.metadata?.valueRef === true)
+        .map((edge) => cg.getNode(edge.source)?.name)
+        .filter((name): name is string => !!name);
+    };
+
+    beforeEach(async () => {
+      testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-value-ref-sync-'));
+      fs.mkdirSync(path.join(testDir, 'lib', 'providers'), { recursive: true });
+      fs.mkdirSync(path.join(testDir, 'lib', 'pages'), { recursive: true });
+      fs.writeFileSync(
+        path.join(testDir, 'lib', 'providers', 'shared.dart'),
+        'final sharedProvider = Object();\n'
+      );
+      fs.writeFileSync(
+        path.join(testDir, 'lib', 'pages', 'consumer.dart'),
+        "import '../providers/shared.dart';\nvoid usesShared() { print(sharedProvider); }\n"
+      );
+      cg = CodeGraph.initSync(testDir, {
+        config: { include: ['**/*.dart'], exclude: [] },
+      });
+      await cg.indexAll();
+    });
+
+    afterEach(() => {
+      cg?.destroy();
+      if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+    });
+
+    it('drops and restores the edge when the imported value disappears and returns', async () => {
+      expect(readers()).toContain('usesShared');
+
+      fs.writeFileSync(
+        path.join(testDir, 'lib', 'providers', 'shared.dart'),
+        'final renamedProvider = Object();\n'
+      );
+      await cg.sync();
+      expect(readers()).toEqual([]);
+
+      fs.writeFileSync(
+        path.join(testDir, 'lib', 'providers', 'shared.dart'),
+        'final sharedProvider = Object();\n'
+      );
+      await cg.sync();
+      expect(readers()).toContain('usesShared');
+    });
+  });
 });

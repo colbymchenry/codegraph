@@ -746,7 +746,8 @@ export class TreeSitterExtractor {
     this.fileScopeValues = new Map();
     this.fileScopeValueCounts = new Map();
     if (!this.valueRefsEnabled || !TreeSitterExtractor.VALUE_REF_LANGS.has(this.language)) return;
-    if (targets.size === 0 || scopes.length === 0 || isGeneratedFile(this.filePath)) return;
+    const crossFileEnabled = this.language === 'go' || this.language === 'dart';
+    if ((targets.size === 0 && !crossFileEnabled) || scopes.length === 0 || isGeneratedFile(this.filePath)) return;
 
     // Prune SHADOWED targets. A target re-bound in an INNER scope (a
     // bundled/Emscripten `const Module` re-declared as a nested `var Module`; a
@@ -838,11 +839,16 @@ export class TreeSitterExtractor {
         }
       }
       for (const [nm, c] of declCounts) if (c > (fileScopeCounts.get(nm) ?? 1)) targets.delete(nm);
-      if (targets.size === 0) return;
+      if (targets.size === 0 && !crossFileEnabled) return;
     }
 
     for (const scope of scopes) {
       const seen = new Set<string>();
+      const localBindings = new Set<string>([scope.name]);
+      const crossFileCandidates = new Map<
+        string,
+        { referenceName: string; shadowName: string; line: number; column: number }
+      >();
       const stack: SyntaxNode[] = [scope.node];
       // Dart and Pascal attach a function/method BODY as a *next sibling* of the
       // signature node that is stored as the reader scope (Dart `method_signature`
@@ -858,6 +864,85 @@ export class TreeSitterExtractor {
       while (stack.length > 0 && visited < TreeSitterExtractor.MAX_VALUE_REF_NODES) {
         const n = stack.pop()!;
         visited++;
+
+        if (this.language === 'go') {
+          // A package-qualified value read is precise only while the receiver
+          // still names the imported package. Any local declaration with the
+          // same name shadows that import for the reader scope, so remember it
+          // and conservatively drop the candidate after the walk.
+          if (n.type === 'parameter_declaration' || n.type === 'var_spec') {
+            for (const child of n.namedChildren) {
+              if (child.type === 'identifier') localBindings.add(getNodeText(child, this.source));
+            }
+          } else if (n.type === 'short_var_declaration' || n.type === 'range_clause') {
+            const left = getChildByField(n, 'left') ?? n.namedChild(0);
+            if (left?.type === 'identifier') localBindings.add(getNodeText(left, this.source));
+            else if (left) {
+              for (const child of left.namedChildren) {
+                if (child.type === 'identifier') localBindings.add(getNodeText(child, this.source));
+              }
+            }
+          } else if (n.type === 'selector_expression') {
+            const operand = getChildByField(n, 'operand');
+            const field = getChildByField(n, 'field');
+            if (operand?.type === 'identifier' && field?.type === 'field_identifier') {
+              const receiver = getNodeText(operand, this.source);
+              const member = getNodeText(field, this.source);
+              // Exported package values start uppercase. Calls are extracted by
+              // the normal call path and must not be duplicated as value refs.
+              const isCallTarget = n.parent?.type === 'call_expression' &&
+                getChildByField(n.parent, 'function')?.id === n.id;
+              if (/^[A-Z]/.test(member) && !isCallTarget) {
+                const referenceName = `${receiver}.${member}`;
+                crossFileCandidates.set(referenceName, {
+                  referenceName,
+                  shadowName: receiver,
+                  line: field.startPosition.row + 1,
+                  column: field.startPosition.column,
+                });
+              }
+            }
+          }
+        } else if (this.language === 'dart') {
+          if (
+            n.type === 'formal_parameter' ||
+            n.type === 'initialized_identifier' ||
+            n.type === 'initialized_variable_definition'
+          ) {
+            const id = getChildByField(n, 'name') ??
+              n.namedChildren.find((child) => child.type === 'identifier');
+            if (id) localBindings.add(getNodeText(id, this.source));
+          }
+          if (n.type === 'identifier') {
+            let referenceName = getNodeText(n, this.source);
+            let shadowName = referenceName;
+            const accessor = n.parent;
+            const selector = accessor?.parent;
+            const receiver = selector?.previousNamedSibling;
+            if (
+              (accessor?.type === 'unconditional_assignable_selector' ||
+                accessor?.type === 'conditional_assignable_selector') &&
+              selector?.type === 'selector' &&
+              receiver?.type === 'identifier'
+            ) {
+              shadowName = getNodeText(receiver, this.source);
+              referenceName = `${shadowName}.${referenceName}`;
+            }
+            if (
+              referenceName.length >= 3 &&
+              /[A-Z_]/.test(referenceName) &&
+              !targets.has(referenceName)
+            ) {
+              crossFileCandidates.set(referenceName, {
+                referenceName,
+                shadowName,
+                line: n.startPosition.row + 1,
+                column: n.startPosition.column,
+              });
+            }
+          }
+        }
+
         // `constant` covers Ruby, where both a constant's definition and its
         // references are `constant`-typed nodes, not `identifier`. `name` covers
         // PHP, where a constant reference — bare `MAX_ITEMS` or the const half of
@@ -890,6 +975,17 @@ export class TreeSitterExtractor {
           const c = n.namedChild(i);
           if (c) stack.push(c);
         }
+      }
+
+      for (const candidate of crossFileCandidates.values()) {
+        if (localBindings.has(candidate.shadowName)) continue;
+        this.unresolvedReferences.push({
+          fromNodeId: scope.id,
+          referenceName: candidate.referenceName,
+          referenceKind: 'value_ref',
+          line: candidate.line,
+          column: candidate.column,
+        });
       }
     }
   }
