@@ -705,6 +705,31 @@ export class CodeGraph {
       } catch {
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
       }
+      // Defer WAL auto-checkpointing for the whole incremental run, exactly
+      // as indexAll does for the bulk path (#1231): sync's store loop and its
+      // resolution passes churn the same FTS + secondary-index hot pages, and
+      // at the default 1000-page cadence the inline checkpoints re-write them
+      // over and over — on HDD-class storage a 7-file sync took 2 minutes at
+      // 0-2% CPU (#1248). The cost scales with the EXISTING database size,
+      // not the change size, so small syncs on big indexes hurt most. The
+      // valve bounds WAL growth off-thread; runMaintenance at the end does
+      // the final fold-up before the interval is restored in the finally.
+      // Same kill switch as indexAll: CODEGRAPH_NO_WAL_DEFER=1. Idle valve
+      // cost is one timer, so watcher-frequency syncs stay cheap.
+      const deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+      let walValve: WalCheckpointValve | null = null;
+      let priorAutocheckpoint = 1000;
+      if (deferWal) {
+        priorAutocheckpoint = this.db.getWalAutocheckpoint();
+        this.db.setWalAutocheckpoint(0);
+        walValve = new WalCheckpointValve(
+          this.db,
+          undefined,
+          undefined,
+          options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
+        );
+        walValve.start();
+      }
       try {
         // Captured BEFORE the sync runs: the sync's own incremental writes
         // populate vocab rows for the files it touches, so an end-of-sync
@@ -715,6 +740,11 @@ export class CodeGraph {
         })();
 
         const result = await this.orchestrator.sync(options.onProgress);
+
+        // Fold the store phase's WAL BEFORE the post-store reads below
+        // (resolution reads on the main thread) — same rationale as
+        // indexAll's fold between store and resolution.
+        if (walValve) await walValve.foldNow();
 
         // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
         // every sync that touched files so edits to `app.module.ts` propagate
@@ -881,6 +911,14 @@ export class CodeGraph {
 
         return result;
       } finally {
+        // Mirror indexAll's teardown: stop the valve, then restore the
+        // auto-checkpoint interval (runMaintenance above already folded the
+        // WAL on the success path; on the error path SQLite replays it on
+        // the next open).
+        if (walValve) { walValve.stop(); await walValve.drain(); }
+        if (deferWal) {
+          try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* connection may be closing */ }
+        }
         this.fileLock.release();
       }
     });

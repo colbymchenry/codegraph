@@ -177,17 +177,18 @@ describe('WalCheckpointValve', () => {
   });
 });
 
-describe('indexAll WAL deferral end-to-end', () => {
-  function writeFixtureProject(): void {
-    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
-    for (let i = 0; i < 8; i++) {
-      fs.writeFileSync(
-        path.join(tmpDir, 'src', `mod${i}.ts`),
-        `export function fn${i}(x: number): number { return helper${i}(x) + ${i}; }\n` +
-        `function helper${i}(x: number): number { return x * ${i}; }\n`
-      );
-    }
+function writeFixtureProject(): void {
+  fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+  for (let i = 0; i < 8; i++) {
+    fs.writeFileSync(
+      path.join(tmpDir, 'src', `mod${i}.ts`),
+      `export function fn${i}(x: number): number { return helper${i}(x) + ${i}; }\n` +
+      `function helper${i}(x: number): number { return x * ${i}; }\n`
+    );
   }
+}
+
+describe('indexAll WAL deferral end-to-end', () => {
 
   it('produces the same graph with and without deferral, and restores the interval', async () => {
     writeFixtureProject();
@@ -209,6 +210,84 @@ describe('indexAll WAL deferral end-to-end', () => {
       const r2 = await cg2.indexAll();
       expect(r2.success).toBe(true);
       expect({ nodes: r2.nodesCreated, edges: r2.edgesCreated }).toEqual(counts1);
+      await cg2.close();
+    } finally {
+      delete process.env.CODEGRAPH_NO_WAL_DEFER;
+    }
+  });
+});
+
+describe('sync WAL deferral end-to-end (#1248)', () => {
+  // The #1242 fix originally landed only on indexAll; sync stayed at the
+  // default 1000-page autocheckpoint and reproduced the #1231 HDD thrash on
+  // every incremental run (2 minutes for a 7-file sync). These pin that sync
+  // defers during the run, restores after — success AND no-change paths —
+  // and that a deferred sync produces the same graph as an undeferred one.
+  it('defers the autocheckpoint interval DURING sync and restores it after', async () => {
+    writeFixtureProject();
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    const conn = (cg as unknown as { db: DatabaseConnection }).db;
+
+    fs.writeFileSync(
+      path.join(tmpDir, 'src', 'mod0.ts'),
+      `export function fn0(x: number): number { return helper0(x) + 100; }\n` +
+      `function helper0(x: number): number { return x * 100; }\n`
+    );
+
+    // Sample the interval mid-run from inside the progress callback — the
+    // store loop is exactly where the #1248 thrash happened.
+    const midRunIntervals: number[] = [];
+    const result = await cg.sync({
+      onProgress: () => {
+        try { midRunIntervals.push(conn.getWalAutocheckpoint()); } catch { /* ignore */ }
+      },
+    });
+    expect(result.filesModified).toBe(1);
+    expect(midRunIntervals.length).toBeGreaterThan(0);
+    expect(midRunIntervals.every((v) => v === 0)).toBe(true);
+    // Scoped to the run: back on the default afterwards.
+    expect(conn.getWalAutocheckpoint()).toBe(1000);
+    await cg.close();
+  });
+
+  it('restores the interval on a no-change sync too', async () => {
+    writeFixtureProject();
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    const conn = (cg as unknown as { db: DatabaseConnection }).db;
+    const result = await cg.sync();
+    expect(result.filesAdded + result.filesModified + result.filesRemoved).toBe(0);
+    expect(conn.getWalAutocheckpoint()).toBe(1000);
+    await cg.close();
+  });
+
+  it('produces the same sync result with and without deferral', async () => {
+    writeFixtureProject();
+    const cg1 = CodeGraph.initSync(tmpDir);
+    await cg1.indexAll();
+    fs.writeFileSync(
+      path.join(tmpDir, 'src', 'mod1.ts'),
+      `export function fn1(x: number): number { return helper1(x) + 111; }\n` +
+      `function helper1(x: number): number { return x * 111; }\n`
+    );
+    const r1 = await cg1.sync();
+    const counts1 = { modified: r1.filesModified, nodes: r1.nodesUpdated };
+    await cg1.close();
+
+    fs.rmSync(path.join(tmpDir, '.codegraph'), { recursive: true, force: true });
+
+    process.env.CODEGRAPH_NO_WAL_DEFER = '1';
+    try {
+      const cg2 = CodeGraph.initSync(tmpDir);
+      await cg2.indexAll();
+      fs.writeFileSync(
+        path.join(tmpDir, 'src', 'mod1.ts'),
+        `export function fn1(x: number): number { return helper1(x) + 222; }\n` +
+        `function helper1(x: number): number { return x * 222; }\n`
+      );
+      const r2 = await cg2.sync();
+      expect({ modified: r2.filesModified, nodes: r2.nodesUpdated }).toEqual(counts1);
       await cg2.close();
     } finally {
       delete process.env.CODEGRAPH_NO_WAL_DEFER;
