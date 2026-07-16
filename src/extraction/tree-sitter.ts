@@ -1380,6 +1380,32 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Qualified name for a method defined out-of-line via a receiver qualifier
+   * (`Type::method() {}`). The declarator spells the receiver RELATIVE to the
+   * enclosing namespace, so the active C++ namespace prefix must be composed
+   * in — `namespace sim { Output ManifestStartup::Apply() {} }` previously
+   * indexed as `ManifestStartup::Apply` while the class node carried
+   * `sim::ManifestStartup`, so qualified call sites
+   * (`sim::ManifestStartup::Apply(...)`) never resolved (#1291).
+   *
+   * The source may also re-spell part or all of the namespace path
+   * (`namespace sim { void sim::M::f() {} }` is legal), so the receiver is
+   * anchored at the first prefix segment it names: everything before that
+   * anchor is taken from the prefix, the receiver supplies the rest. A
+   * receiver naming no prefix segment gets the whole prefix prepended.
+   * `namespacePrefix` is only ever non-empty for C++, so every other
+   * receiver language (Go, Rust, Kotlin, Lua) passes through unchanged.
+   */
+  private composeReceiverQualifiedName(receiverType: string, name: string): string {
+    const base = `${receiverType}::${name}`;
+    if (this.namespacePrefix.length === 0) return base;
+    const receiverHead = receiverType.split('::')[0];
+    const anchor = this.namespacePrefix.indexOf(receiverHead!);
+    const prefix = anchor === -1 ? this.namespacePrefix : this.namespacePrefix.slice(0, anchor);
+    return prefix.length > 0 ? `${prefix.join('::')}::${base}` : base;
+  }
+
+  /**
    * Build qualified name from node stack
    */
   private buildQualifiedName(name: string): string {
@@ -1726,7 +1752,7 @@ export class TreeSitterExtractor {
       returnType,
     };
     if (receiverType) {
-      extraProps.qualifiedName = `${receiverType}::${name}`;
+      extraProps.qualifiedName = this.composeReceiverQualifiedName(receiverType, name);
     }
 
     const methodNode = this.createNode('method', name, node, extraProps);

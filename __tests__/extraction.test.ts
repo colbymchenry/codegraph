@@ -3704,6 +3704,47 @@ int f() { return 1; }
       const result = extractFromSource('nested.cpp', code);
       expect(result.nodes.find((n) => n.name === 'f')?.qualifiedName).toBe('a::b::f');
     });
+
+    // Out-of-line member definitions take their qualifiedName from the
+    // declarator's receiver (`ManifestStartup::Apply`), which is spelled
+    // RELATIVE to the enclosing namespace — the namespace prefix must compose
+    // in, or the method's qualifiedName diverges from its own class node's
+    // and `ns::Class::Method(...)` call sites never resolve (#1291).
+    it('out-of-line method definitions inside a namespace carry the namespace prefix', () => {
+      const code = `namespace simulator {
+class ManifestStartup {
+public:
+    struct Input { int x; };
+    struct Output { int y; };
+    static Output Apply(const Input& input);
+};
+ManifestStartup::Output ManifestStartup::Apply(const Input& input) { return {}; }
+}
+`;
+      const result = extractFromSource('manifest_startup.cpp', code);
+      const apply = result.nodes.filter((n) => n.name === 'Apply');
+      // The out-of-line definition's QN matches the class node's prefix.
+      expect(apply.map((n) => n.qualifiedName)).toContain('simulator::ManifestStartup::Apply');
+      expect(result.nodes.find((n) => n.kind === 'class')?.qualifiedName).toBe(
+        'simulator::ManifestStartup'
+      );
+    });
+
+    it('a receiver that re-spells the namespace path is not double-prefixed', () => {
+      const code = `namespace sim {
+class M { public: static void f(); static void g(); };
+void sim::M::f() {}
+void M::g() {}
+}
+void sim::M::f2() {}
+`;
+      const result = extractFromSource('m.cpp', code);
+      const qns = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+      expect(qns).toContain('sim::M::f'); // fully re-spelled inside the namespace
+      expect(qns).toContain('sim::M::g'); // relative form
+      expect(qns).toContain('sim::M::f2'); // global scope, spelled absolute
+      expect(qns.find((q) => q?.includes('sim::sim'))).toBeUndefined();
+    });
   });
 
   describe('C++ forward declarations do not mint phantom class nodes (#1093)', () => {
