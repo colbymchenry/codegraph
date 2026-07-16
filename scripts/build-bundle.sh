@@ -31,6 +31,15 @@ trap 'rm -rf "$WORK"' EXIT
 ARCH="${TARGET##*-}"   # x64 | arm64
 OSFAM="${TARGET%-*}"   # darwin | linux | win32
 
+if [ "$OSFAM" = "win32" ]; then
+  for tool in unzip zip; do
+    command -v "$tool" >/dev/null 2>&1 || {
+      echo "[bundle] error: $tool is required for Windows bundles" >&2
+      exit 1
+    }
+  done
+fi
+
 echo "[bundle] target=${TARGET} node=${NODE_VERSION}"
 
 # 1. Download + extract the official Node runtime for the target platform.
@@ -39,11 +48,7 @@ if [ "$OSFAM" = "win32" ]; then
   NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${NODE_DIST}.zip"
   echo "[bundle] downloading ${NODE_URL}"
   curl -fsSL "$NODE_URL" -o "$WORK/node.zip"
-  if command -v unzip >/dev/null 2>&1; then
-    unzip -q "$WORK/node.zip" -d "$WORK"
-  else
-    tar -xf "$WORK/node.zip" -C "$WORK"   # bsdtar can read zip
-  fi
+  unzip -q "$WORK/node.zip" -d "$WORK"
   NODE_BIN="$WORK/${NODE_DIST}/node.exe"
 else
   NODE_DIST="node-${NODE_VERSION}-${TARGET}"
