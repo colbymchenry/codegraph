@@ -316,14 +316,15 @@ describe('validateProjectPath — sensitive directory blocking', () => {
     }
   });
 
-  it('allows a verified linked worktree under .config without allowing ordinary config directories', () => {
-    const mainRepo = createTempDir();
+  it('allows a verified linked worktree under .config without allowing ordinary config repositories', () => {
     const configRoot = path.join(os.homedir(), '.config');
     fs.mkdirSync(configRoot, { recursive: true });
     const configSandbox = fs.mkdtempSync(path.join(configRoot, 'codegraph-worktree-test-'));
+    const mainRepo = path.join(configSandbox, 'main-repo');
     const worktree = path.join(configSandbox, 'superpowers', 'worktrees', 'project');
-    const ordinaryConfigDir = path.join(configSandbox, 'ordinary-project');
-    fs.mkdirSync(ordinaryConfigDir, { recursive: true });
+    const ordinaryConfigRepo = path.join(configSandbox, 'ordinary-project');
+    fs.mkdirSync(mainRepo, { recursive: true });
+    fs.mkdirSync(ordinaryConfigRepo, { recursive: true });
 
     try {
       execFileSync('git', ['init', '-q'], { cwd: mainRepo, stdio: 'ignore' });
@@ -339,9 +340,10 @@ describe('validateProjectPath — sensitive directory blocking', () => {
         cwd: mainRepo,
         stdio: 'ignore',
       });
+      execFileSync('git', ['init', '-q'], { cwd: ordinaryConfigRepo, stdio: 'ignore' });
 
       expect(validateProjectPath(worktree)).toBeNull();
-      expect(validateProjectPath(ordinaryConfigDir)).toMatch(/sensitive directory/i);
+      expect(validateProjectPath(ordinaryConfigRepo)).toMatch(/sensitive directory/i);
     } finally {
       try {
         execFileSync('git', ['worktree', 'remove', '--force', worktree], {
@@ -351,7 +353,6 @@ describe('validateProjectPath — sensitive directory blocking', () => {
       } catch {
         // best-effort cleanup
       }
-      cleanupTempDir(mainRepo);
       cleanupTempDir(configSandbox);
     }
   });

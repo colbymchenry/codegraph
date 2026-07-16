@@ -86,13 +86,12 @@ function isWithinDir(child: string, parent: string): boolean {
 /**
  * Allow the narrow linked-worktree case used by agent harnesses that place
  * task worktrees below ~/.config while keeping ordinary config directories
- * blocked. The linked tree must point to a standard non-sensitive main
- * checkout through Git's shared .git directory.
+ * blocked. The linked tree must point to a different checkout through Git's
+ * shared .git directory.
  */
 function isVerifiedLinkedWorktreeUnderConfig(
   resolved: string,
   configPath: string,
-  homeDir: string,
 ): boolean {
   const worktreeRoot = gitWorktreeRoot(resolved);
   const commonDir = gitCommonDir(resolved);
@@ -107,12 +106,7 @@ function isVerifiedLinkedWorktreeUnderConfig(
     return false;
   }
 
-  const mainCheckout = path.dirname(commonDir);
-  if (mainCheckout === worktreeRoot) return false;
-  for (const dir of SENSITIVE_HOME_DIRS) {
-    if (isWithinDir(mainCheckout, path.join(homeDir, dir))) return false;
-  }
-  return true;
+  return path.dirname(commonDir) !== worktreeRoot;
 }
 
 /**
@@ -205,7 +199,7 @@ export function validateProjectPath(dirPath: string): string | null {
     if (resolved === sensitivePath || resolved.startsWith(sensitivePath + path.sep)) {
       if (
         dir === '.config'
-        && isVerifiedLinkedWorktreeUnderConfig(resolved, sensitivePath, homeDir)
+        && isVerifiedLinkedWorktreeUnderConfig(resolved, sensitivePath)
       ) {
         continue;
       }
