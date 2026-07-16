@@ -1554,6 +1554,21 @@ export function matchMethodCall(
     }
   }
 
+  // Go 2-hop field chain `base.field.Method` (#1276): the base's type comes
+  // from the enclosing scope (typed parameter / method receiver / local var),
+  // the field's declared type from that struct's own declaration lines, and
+  // the method is VALIDATED on the field's type by resolveMethodOnType. This
+  // branch is EXCLUSIVE for chained Go receivers: when the hop can't be
+  // inferred or the field's type is external (`conn *sql.DB` — no project
+  // node), the ref stays unresolved rather than falling through to the
+  // bare-name strategies below, which is exactly how `target.conn.Exec(...)`
+  // fabricated a dependency on an unrelated local interface's same-named
+  // method. Chained Go receivers were never emitted before #1276, so there
+  // is no prior recall to preserve on the fallback path.
+  if (ref.language === 'go' && dotMatch && objectOrClass!.includes('.')) {
+    return matchGoFieldChainCall(objectOrClass!, methodName!, ref, context);
+  }
+
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
   // Java naming convention (`userbo` → class `UserBO`, abbreviated). Look up
   // the field in the enclosing class to get its declared type, then resolve
@@ -1714,6 +1729,92 @@ export function matchMethodCall(
     }
   }
 
+  return null;
+}
+
+/** Go builtin/primitive field types that can never carry a project method. */
+const GO_BUILTIN_FIELD_TYPES = new Set([
+  'string', 'bool', 'byte', 'rune', 'error', 'any',
+  'int', 'int8', 'int16', 'int32', 'int64',
+  'uint', 'uint8', 'uint16', 'uint32', 'uint64', 'uintptr',
+  'float32', 'float64', 'complex64', 'complex128',
+  'chan', 'map', 'func', 'struct', 'interface',
+]);
+
+/**
+ * Resolve a Go 2-hop field-chain call `base.field.Method(...)` (#1276):
+ * `target.conn.Exec("insert")` where `func (target *Target) Write()` and
+ * `type Target struct { conn *sql.DB }`. Two inference hops, both read from
+ * source the same way #1108 does:
+ *   1. `base`'s type from the enclosing scope (method receiver, typed
+ *      parameter, or local declaration) via inferLocalReceiverType;
+ *   2. `field`'s declared type from the struct's own declaration lines.
+ * The method is then resolved AND VALIDATED on the field's type. A field
+ * whose type has no project node (`sql.DB`, any external dependency) yields
+ * null — the caller treats this branch as exclusive for chained Go
+ * receivers, so the ref stays unresolved instead of name-guessing.
+ */
+function matchGoFieldChainCall(
+  receiverChain: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const segs = receiverChain.split('.');
+  if (segs.length !== 2 || !segs[0] || !segs[1]) return null;
+  const [base, field] = segs;
+
+  const baseType = inferLocalReceiverType(base!, ref, context);
+  if (!baseType) return null;
+
+  const fieldEsc = field!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const fieldTypeRe = new RegExp(`\\b${fieldEsc}\\s+\\*?\\[?\\]?([A-Za-z_][\\w.]*)`);
+
+  const structs = preferCallSiteFile(context.getNodesByName(baseType), ref.filePath).filter(
+    (n) => (n.kind === 'struct' || n.kind === 'class') && n.language === 'go'
+  );
+  for (const s of structs) {
+    const source = context.readFile(s.filePath);
+    if (!source) continue;
+    // Only the struct's own declaration lines — a same-named identifier
+    // elsewhere in the file can't donate a type. Matched LINE BY LINE with
+    // comments stripped: chi's `Mux` has a doc comment reading "the tree
+    // router" right above `tree *node`, and a whole-block match captured
+    // `router` from the prose instead of `node` from the field.
+    const declLines = source.split('\n').slice(Math.max(0, s.startLine - 1), s.endLine);
+    for (const rawLine of declLines) {
+      const line = rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
+      const m = line.match(fieldTypeRe);
+      if (!m || !m[1]) continue;
+      const rawType = m[1];
+      // A package-qualified field type (`http.Handler`, `sql.DB`) is only
+      // followed when the package is IN-MODULE: stripping the qualifier and
+      // matching the bare name would conflate a stdlib/third-party type with
+      // any same-named project type — on chi, `handler http.Handler` bound
+      // to an example app's unrelated local `Handler`. That is the exact
+      // fabrication this matcher exists to prevent (#1276).
+      if (rawType.includes('.')) {
+        const pkg = rawType.split('.')[0]!;
+        const mod = context.getGoModule?.();
+        const imp = context
+          .getImportMappings(s.filePath, 'go')
+          .find((i) => i.localName === pkg);
+        const inModule =
+          !!mod &&
+          !!imp &&
+          (imp.source === mod.modulePath || imp.source.startsWith(mod.modulePath + '/'));
+        if (!inModule) continue;
+      }
+      // Unexported (lowercase) types are idiomatic Go and stay eligible —
+      // chi's `mx.tree.FindRoute()` chains through `tree *node`. A
+      // mis-capture is harmless: resolveMethodOnType only returns a
+      // validated `<type>::<method>` match.
+      const fieldType = rawType.split('.').pop();
+      if (!fieldType || !/^[A-Za-z_]/.test(fieldType) || GO_BUILTIN_FIELD_TYPES.has(fieldType)) continue;
+      const resolved = resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method');
+      if (resolved) return resolved;
+    }
+  }
   return null;
 }
 
