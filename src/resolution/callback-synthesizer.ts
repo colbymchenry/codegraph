@@ -3474,8 +3474,24 @@ export async function synthesizeCallbackEdges(
   // tail — long enough on big repos that users conclude the index hung and
   // kill it. Report each completed pass; the caller surfaces it as its own
   // progress phase. Emit 0/total up front so the phase flips immediately.
+  // Emissions are throttled to whole-percent movement (each consumes a UI
+  // message); values may be fractional steps from within-pass reporting.
   let passesDone = 0;
-  onProgress?.(0, SYNTH_PROGRESS_STEPS);
+  let lastPct = -1;
+  const emit = (value: number): void => {
+    if (!onProgress) return;
+    const v = Math.min(value, SYNTH_PROGRESS_STEPS);
+    const pct = Math.floor((v / SYNTH_PROGRESS_STEPS) * 100);
+    if (pct === lastPct) return;
+    lastPct = pct;
+    onProgress(v, SYNTH_PROGRESS_STEPS);
+  };
+  // A single long pass otherwise parks the bar between steps; a pass that
+  // takes this callback reports a 0..1 fraction of its own work, surfaced
+  // here as fractional progress within its step.
+  const subProgress = (fraction: number): void =>
+    emit(passesDone + Math.max(0, Math.min(fraction, 1)));
+  emit(0);
 
   // Per-pass wall-clock timing to stderr, opt-in via CODEGRAPH_SYNTH_TIMINGS
   // (=1: passes over 250ms; =all: every pass). This is the diagnostic that
@@ -3489,7 +3505,7 @@ export async function synthesizeCallbackEdges(
       console.error(`[synth-timing] ${label}: ${dt}ms`);
     }
     passesDone++;
-    onProgress?.(Math.min(passesDone, SYNTH_PROGRESS_STEPS), SYNTH_PROGRESS_STEPS);
+    emit(passesDone);
   };
 
   // Language gating: one indexed DISTINCT over the files table lets a pass
@@ -3560,7 +3576,7 @@ export async function synthesizeCallbackEdges(
   const sidekiqEdges = has('ruby') ? await sidekiqDispatchEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('sidekiqEdges');
   const erlangBehaviourEdges = has('erlang') ? await erlangBehaviourDispatchEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('erlangBehaviourEdges');
   const laravelEdges = has('php') ? await laravelEventEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('laravelEdges');
-  const cFnPtrEdges = has('c', 'cpp') ? await cFnPointerDispatchEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('cFnPtrEdges');
+  const cFnPtrEdges = has('c', 'cpp') ? await cFnPointerDispatchEdges(queries, ctx, yieldToLoop, subProgress) : NONE; await yieldToLoop(); __mark('cFnPtrEdges');
   const goframeEdges = has('go') ? await goframeRouteEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('goframeEdges');
   const nixOptionEdges = has('nix') ? await nixOptionPathEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('nixOptionEdges');
 
