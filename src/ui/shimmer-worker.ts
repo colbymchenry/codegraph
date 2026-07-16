@@ -21,10 +21,16 @@ const SPINNER_GLYPHS = G.spinner;
 const ANIM_INTERVAL = 150;
 const FRAMES_PER_GLYPH = 3;
 
-const RST = '\x1b[0m';
-const DM = '\x1b[2m';
-const GRN = '\x1b[32m';
-const BOLD = '\x1b[1m';
+// colors:false (NO_COLOR / --no-color on an interactive TTY, #1281) keeps the
+// animation but drops every color/style code. `\r\x1b[K` line rewrites stay —
+// they're cursor control, not color, and the parent only spawns this worker
+// when stdout is a real TTY.
+const COLORS: boolean = workerData.colors !== false;
+
+const RST = COLORS ? '\x1b[0m' : '';
+const DM = COLORS ? '\x1b[2m' : '';
+const GRN = COLORS ? '\x1b[32m' : '';
+const BOLD = COLORS ? '\x1b[1m' : '';
 
 const startTime: number = workerData.startTime;
 
@@ -37,6 +43,7 @@ function lerp(a: number, b: number, t: number): number {
 }
 
 function shimmerColor(frame: number): string {
+  if (!COLORS) return '';
   const t = (Math.sin(frame * 2 * Math.PI / 13) + 1) / 2;
   const r = lerp(160, 251, t);
   const g = lerp(100, 191, t);
@@ -55,6 +62,10 @@ function renderBar(frame: number, filled: number, empty: number): string {
   const shimmerWidth = 3;
   let bar = '';
   for (let i = 0; i < filled; i++) {
+    if (!COLORS) {
+      bar += G.barFilled;
+      continue;
+    }
     const dist = Math.abs(i - shimmerPos);
     const t = Math.max(0, 1 - dist / shimmerWidth);
     const r = lerp(160, 251, t);

@@ -45,6 +45,7 @@ import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
+import { ansiColorsEnabled } from '../ui/color';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { installFatalHandlers } from './fatal-handler';
@@ -53,13 +54,18 @@ import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 
+// Decided once, before `--color`/`--no-color` are stripped from argv below
+// (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
+const COLORS_ENABLED = ansiColorsEnabled();
+
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
   try {
     return await import('../index');
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`\x1b[31m${getGlyphs().err}\x1b[0m Failed to load CodeGraph modules.`);
+    const [red, reset] = COLORS_ENABLED ? ['\x1b[31m', '\x1b[0m'] : ['', ''];
+    console.error(`${red}${getGlyphs().err}${reset} Failed to load CodeGraph modules.`);
     console.error(`\n  Node: ${process.version}  Platform: ${process.platform} ${process.arch}`);
     console.error(`\n  Error: ${msg}`);
     console.error('\n  Try reinstalling with: npm install -g @colbymchenry/codegraph\n');
@@ -152,18 +158,36 @@ if (firstArg === '-v' || firstArg === '-version') {
 // ANSI Color Helpers (avoid chalk ESM issues)
 // =============================================================================
 
-const colors = {
-  reset: '\x1b[0m',
-  bold: '\x1b[1m',
-  dim: '\x1b[2m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  blue: '\x1b[34m',
-  cyan: '\x1b[36m',
-  white: '\x1b[37m',
-  gray: '\x1b[90m',
-};
+// `--color` / `--no-color` are global and position-independent — they were
+// already read by ansiColorsEnabled() at module load, so strip them before
+// commander parses (a subcommand would otherwise reject the unknown flag).
+process.argv = process.argv.filter((a) => a !== '--color' && a !== '--no-color');
+
+const colors = COLORS_ENABLED
+  ? {
+      reset: '\x1b[0m',
+      bold: '\x1b[1m',
+      dim: '\x1b[2m',
+      red: '\x1b[31m',
+      green: '\x1b[32m',
+      yellow: '\x1b[33m',
+      blue: '\x1b[34m',
+      cyan: '\x1b[36m',
+      white: '\x1b[37m',
+      gray: '\x1b[90m',
+    }
+  : {
+      reset: '',
+      bold: '',
+      dim: '',
+      red: '',
+      green: '',
+      yellow: '',
+      blue: '',
+      cyan: '',
+      white: '',
+      gray: '',
+    };
 
 const chalk = {
   bold: (s: string) => `${colors.bold}${s}${colors.reset}`,
@@ -180,7 +204,12 @@ const chalk = {
 program
   .name('codegraph')
   .description('Code intelligence and knowledge graph for any codebase')
-  .version(packageJson.version);
+  .version(packageJson.version)
+  // Parsed manually before commander runs (any argv position works); declared
+  // here so they show up in --help. NO_COLOR / FORCE_COLOR env vars are also
+  // honored, and piped output defaults to no color (#1281).
+  .option('--color', 'force ANSI colors even when stdout is not a TTY')
+  .option('--no-color', 'disable ANSI colors (NO_COLOR env is also honored)');
 
 // Anonymous usage telemetry (see TELEMETRY.md): record the invoked subcommand
 // NAME only — never arguments or paths. Counts buffer locally; network sends

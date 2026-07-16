@@ -1,5 +1,6 @@
 import { Worker } from 'worker_threads';
 import * as path from 'path';
+import { ansiColorsEnabled } from './color';
 
 const PHASE_NAMES: Record<string, string> = {
   scanning: 'Scanning files',
@@ -21,11 +22,19 @@ export interface ShimmerProgress {
 }
 
 export function createShimmerProgress(): ShimmerProgress {
+  // Piped/redirected stdout: `\r`-rewriting animation frames are garbage in a
+  // log file — emit one plain line per phase instead (#1281).
+  if (process.stdout.isTTY !== true) {
+    return createPlainProgress();
+  }
+
   let lastPhase = '';
 
   const workerPath = path.join(__dirname, 'shimmer-worker.js');
   const worker = new Worker(workerPath, {
-    workerData: { startTime: Date.now() },
+    // colors:false keeps the animation (still an interactive TTY) but drops
+    // the ANSI color codes, honoring NO_COLOR / --no-color (#1281).
+    workerData: { startTime: Date.now(), colors: ansiColorsEnabled() },
   });
 
   return {
@@ -69,6 +78,28 @@ export function createShimmerProgress(): ShimmerProgress {
 
         worker.postMessage({ type: 'stop' });
       });
+    },
+  };
+}
+
+/**
+ * Non-TTY fallback: one plain line per phase, no rewrites, no ANSI.
+ * Completion details (counts, timings) are printed by the caller's result
+ * summary, so phase starts are all that's worth logging here.
+ */
+function createPlainProgress(): ShimmerProgress {
+  let lastPhase = '';
+
+  return {
+    onProgress(progress: IndexProgress) {
+      if (progress.phase === lastPhase) return;
+      lastPhase = progress.phase;
+      const phaseName = PHASE_NAMES[progress.phase] || progress.phase;
+      process.stdout.write(`${phaseName}...\n`);
+    },
+
+    stop() {
+      return Promise.resolve();
     },
   };
 }
