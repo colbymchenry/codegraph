@@ -2,6 +2,10 @@
   "name": "@colbymchenry/codegraph",
   "version": "1.4.1",
   "description": "Supercharge AI coding agents with semantic code intelligence — surgical context, fewer tool calls, faster answers. 100% local.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/colbymchenry/codegraph.git"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {

@@ -18,7 +18,9 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # create the GitHub Release + tag, push the CHANGELOG promote
+  contents: write      # create the GitHub Release + tag, push the CHANGELOG promote
+  id-token: write      # OIDC token for npm --provenance and Sigstore signing
+  attestations: write  # store the GitHub artifact attestations for the bundles
 
 jobs:
   release:
@@ -127,6 +129,18 @@ jobs:
           ( cd release && sha256sum codegraph-* > SHA256SUMS )
           cat release/SHA256SUMS
 
+      - name: Attest build provenance for release bundles
+        # Signed, publicly-verifiable proof that each bundle (and SHA256SUMS)
+        # was built by this workflow from this repo — SHA256SUMS alone only
+        # proves integrity, not origin, since it ships next to the bundles.
+        # Verify any downloaded artifact with:
+        #   gh attestation verify <file> -R colbymchenry/codegraph
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            release/codegraph-*
+            release/SHA256SUMS
+
       - name: Release notes from CHANGELOG.md
         # The [<version>] block was guaranteed-populated by the
         # "Promote" step above, so the [Unreleased] fallback should
@@ -167,7 +181,10 @@ jobs:
               echo "skip $name@$V (already published)"
             else
               echo "publishing $name@$V"
-              ( cd "$dir" && npm publish --access public )
+              # --provenance: publish with an npm provenance attestation
+              # (needs the id-token: write permission above and the
+              # repository field pack-npm.sh writes into each package.json).
+              ( cd "$dir" && npm publish --access public --provenance )
             fi
           done
 

@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Every release is now cryptographically verifiable: npm packages publish with npm provenance (the "Provenance" badge on npmjs.com, proving each version was built by this repository's release workflow from a specific commit), and the GitHub Release bundles carry signed build attestations you can check with `gh attestation verify <file> -R colbymchenry/codegraph`.
+
 ### Fixes
 
 - Callers and impact analysis no longer silently under-count a function that calls the same callee many times. When one caller contained several call sites to the same callee and an internal resolution batch boundary happened to split them, cleanup after the first batch removed the later sites' pending rows before they were ever attempted — their edges were never created, deterministically, and which edges went missing shifted with unrelated changes to the project's total reference count. Post-pass cleanup now targets the exact database row each processed reference came from. Found while validating the operator-call fix on nlohmann/json, where `write_cbor`'s 11 calls to `to_char_type` indexed as 10. (#1269)
