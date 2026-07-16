@@ -17,6 +17,8 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 [![npm version](https://img.shields.io/npm/v/@colbymchenry/codegraph.svg)](https://www.npmjs.com/package/@colbymchenry/codegraph)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Self-contained](https://img.shields.io/badge/Node.js-bundled%20%C2%B7%20none%20required-brightgreen.svg)](https://nodejs.org/)
+[![npm provenance](https://img.shields.io/badge/npm-provenance-brightgreen.svg)](#verified-releases)
+[![Attested builds](https://img.shields.io/badge/releases-signed%20%26%20attested-brightgreen.svg)](#verified-releases)
 
 [![Windows](https://img.shields.io/badge/Windows-supported-blue.svg)](#supported-platforms)
 [![macOS](https://img.shields.io/badge/macOS-supported-blue.svg)](#supported-platforms)
@@ -56,6 +58,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 - [Library Usage](#library-usage)
 - [Configuration](#configuration)
 - [Telemetry](#telemetry)
+- [Verified releases](#verified-releases)
 - [Supported Platforms](#supported-platforms)
 - [Supported Agents](#supported-agents)
 - [Supported Languages](#supported-languages)
@@ -742,6 +745,33 @@ codegraph telemetry off    # or: CODEGRAPH_TELEMETRY=0, or DO_NOT_TRACK=1
 
 [`TELEMETRY.md`](TELEMETRY.md) lists every field, with the off-switches and the
 full data-handling story.
+
+## Verified releases
+
+Every artifact is built and published by the public
+[Release workflow](.github/workflows/release.yml) — never from a laptop — and
+carries cryptographic proof of it:
+
+- **npm packages** are published via [trusted publishing](https://docs.npmjs.com/trusted-publishers)
+  (OIDC — no long-lived npm tokens exist that could be stolen) with
+  [provenance attestations](https://docs.npmjs.com/generating-provenance-statements)
+  linking every version to the exact commit and workflow run that built it.
+  Verify what's installed:
+
+  ```bash
+  npm audit signatures
+  ```
+
+- **GitHub Release bundles** (and `SHA256SUMS`) carry signed
+  [build attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
+  (SLSA v1.0 Build Level 2). Verify any downloaded bundle:
+
+  ```bash
+  gh attestation verify codegraph-darwin-arm64.tar.gz -R colbymchenry/codegraph
+  ```
+
+Releases published before July 2026 predate this pipeline and don't carry
+attestations.
 
 ## Supported Platforms
 

@@ -13,7 +13,13 @@ name: Release
 #   5. publishes the npm thin-installer (shim + per-platform packages).
 #
 # Before triggering: bump package.json. CHANGELOG.md entries can live under
-# `## [Unreleased]` — step 2 takes care of moving them. Set the NPM_TOKEN secret.
+# `## [Unreleased]` — step 2 takes care of moving them.
+#
+# npm auth is OIDC trusted publishing (no NPM_TOKEN): every published package
+# (@colbymchenry/codegraph + the per-platform bundles) has this repo +
+# release.yml configured as its trusted publisher on npmjs.com. Adding a new
+# platform package means configuring its trusted publisher there before the
+# first release that includes it.
 on:
   workflow_dispatch: {}
 
@@ -47,7 +53,13 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
+          # No registry-url here: it writes an .npmrc that requires a
+          # NODE_AUTH_TOKEN env var to exist, and we publish via OIDC
+          # trusted publishing instead of a token.
+
+      - name: Upgrade npm for OIDC trusted publishing
+        # Trusted publishing needs npm >= 11.5; Node 22 bundles npm 10.
+        run: npm install -g npm@11 && npm --version
 
       - name: Sync package-lock.json if version drifted
         # When the maintainer bumps the version on package.json only — for
@@ -168,8 +180,11 @@ jobs:
           fi
 
       - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # Auth is OIDC trusted publishing (id-token: write above) — npm mints
+        # a short-lived credential from the workflow's identity; there is no
+        # NPM_TOKEN. Provenance is generated automatically on this path; the
+        # explicit --provenance keeps the intent visible and fails loudly if
+        # OIDC is ever unavailable.
         run: |
           V="${{ steps.ver.outputs.version }}"
           bash scripts/pack-npm.sh "$V"
