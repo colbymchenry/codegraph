@@ -341,6 +341,42 @@ export function matchFunctionRef(
 }
 
 /**
+ * A function nested inside another FUNCTION is only callable from within its
+ * container — Python, JS/TS, and every closure language scope it lexically.
+ * Resolving a bare name from elsewhere to a nested local fabricates an edge
+ * scope already rules out: `join(...)` in one function must never bind to a
+ * `join` defined inside a DIFFERENT function (#1230). A candidate whose
+ * qualifiedName parent is a same-file function/method is kept only when the
+ * ref originates inside that parent's line range. Class members are
+ * unaffected (their parent resolves to a class-like node), as are top-level
+ * symbols and C++ namespace-prefixed names (the prefix has no node).
+ */
+function isLexicallyReachable(
+  candidate: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  if (candidate.kind !== 'function') return true;
+  const qn = candidate.qualifiedName;
+  if (!qn || !qn.includes('::')) return true;
+  const parentQn = qn.slice(0, qn.lastIndexOf('::'));
+  const containers = context
+    .getNodesByQualifiedName(parentQn)
+    .filter(
+      (p) =>
+        p.filePath === candidate.filePath &&
+        (p.kind === 'function' || p.kind === 'method') &&
+        p.startLine <= candidate.startLine &&
+        p.endLine >= candidate.endLine
+    );
+  if (containers.length === 0) return true;
+  return (
+    ref.filePath === candidate.filePath &&
+    containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine)
+  );
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
@@ -357,7 +393,9 @@ export function matchByExactName(
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
   const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
-    .filter((n) => n.kind !== 'import');
+    .filter((n) => n.kind !== 'import')
+    // Nested locals are only reachable from inside their container (#1230).
+    .filter((n) => isLexicallyReachable(n, ref, context));
 
   if (candidates.length === 0) {
     return null;

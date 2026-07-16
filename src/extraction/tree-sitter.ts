@@ -362,6 +362,30 @@ const INSTANTIATION_KINDS: ReadonlySet<string> = new Set([
 /**
  * TreeSitterExtractor - Main extraction class
  */
+/**
+ * tree-sitter node types (across grammars) for literal expressions in method-
+ * call RECEIVER position. A literal's methods are the language's builtins —
+ * `", ".join`, `"x".toUpperCase()`, `5.times`, `[].concat` — never project
+ * symbols, so a member call on one must not emit a `calls` ref that bare-name
+ * matching could bind to an unrelated same-named project function (#1230).
+ */
+const LITERAL_RECEIVER_TYPES = new Set([
+  // strings
+  'string', 'string_literal', 'interpreted_string_literal', 'raw_string_literal',
+  'template_string', 'concatenated_string', 'formatted_string', 'f_string',
+  'line_string_literal', 'string_content', 'heredoc_body',
+  // numbers
+  'number', 'number_literal', 'integer', 'integer_literal', 'float',
+  'float_literal', 'int_literal', 'decimal_integer_literal', 'real_literal',
+  // chars / runes / regex / booleans / null-likes
+  'char_literal', 'character_literal', 'rune_literal', 'regex', 'regex_literal',
+  'true', 'false', 'boolean_literal', 'bool_literal', 'none', 'null', 'nil',
+  'null_literal', 'undefined',
+  // collection literals
+  'list', 'list_literal', 'array', 'array_literal', 'array_creation_expression',
+  'dictionary', 'dict_literal', 'object', 'tuple', 'set',
+]);
+
 export class TreeSitterExtractor {
   private filePath: string;
   private language: Language;
@@ -4351,6 +4375,16 @@ export class TreeSitterExtractor {
               getChildByField(func, 'operand') ||
               getChildByField(func, 'argument') ||
               func.namedChild(0);
+            // A LITERAL receiver — `", ".join(...)`, `"x".toUpperCase()`,
+            // `5.times`, `[].concat(...)` — calls a builtin of the literal's
+            // type, never a project symbol. The bare-name fallback below let
+            // these exact-match an unrelated same-named project function
+            // (`", ".join` bound to a local `join` defined inside a DIFFERENT
+            // function, #1230). Emit nothing: a silent miss, never a wrong
+            // edge. Nested calls in the arguments are visited independently.
+            if (receiver && LITERAL_RECEIVER_TYPES.has(receiver.type)) {
+              return;
+            }
             const SKIP_RECEIVERS = new Set(['self', 'this', 'cls', 'super']);
             if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier' || receiver.type === 'field_identifier')) {
               const receiverName = getNodeText(receiver, this.source);

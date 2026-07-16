@@ -2541,6 +2541,57 @@ func main() {
     });
   });
 
+  describe('Literal receivers and nested-local scope (#1230)', () => {
+    // Two stacked fabrications: `", ".join(...)` (a builtin on a string
+    // literal) exact-matched a project function named `join` — one that was
+    // moreover nested inside a DIFFERENT function and thus lexically
+    // unreachable. Literal receivers now emit no call ref at all, and
+    // exact-match refuses candidates nested in a function the ref isn't in.
+    it("str-literal builtin calls don't bind to project symbols; nested locals only resolve from inside their container", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1230-'));
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'repro.py'),
+          `def format_fields(values):
+    def join(vals):
+        return "-".join(sorted(vals))
+
+    return join(values)
+
+
+def report_missing(unresolved):
+    missing_list = ", ".join(sorted(unresolved))
+    return f"Could not resolve: {missing_list}"
+`
+        );
+
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        const join = (await cg.searchNodes('join', { limit: 5 })).find(
+          (r) => r.node.kind === 'function' && r.node.name === 'join'
+        );
+        expect(join).toBeDefined();
+
+        // Exactly one caller: the enclosing format_fields. Neither
+        // report_missing (literal receiver) nor join itself (its own literal
+        // "-".join) may appear.
+        const callers = await cg.getCallers(join!.node.id);
+        expect(callers.map((c) => c.node.name)).toEqual(['format_fields']);
+
+        // report_missing has zero project callees.
+        const reportMissing = (await cg.searchNodes('report_missing', { limit: 5 })).find(
+          (r) => r.node.kind === 'function'
+        );
+        const callees = await cg.getCallees(reportMissing!.node.id);
+        expect(callees.filter((c) => c.node.name === 'join')).toHaveLength(0);
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+  });
+
   describe('Go field-chain receiver calls (#1276)', () => {
     // `target.conn.Exec(...)` where `conn *sql.DB` used to emit a BARE `Exec`
     // ref, which exact-matched the only local `Exec` — an unrelated
