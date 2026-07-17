@@ -7,7 +7,7 @@
 // optionalDependency: @colbymchenry/codegraph-<platform>-<arch>. npm installs
 // only the one matching the host, via each package's `os`/`cpu` fields (the
 // esbuild pattern). This shim — run by the user's OWN Node — locates that bundle
-// and execs its launcher, so the real work always runs on the pinned bundled Node
+// and execs its launcher, so the real work always runs on the bundled Node 24
 // (with node:sqlite), regardless of the user's Node version. The user's Node is
 // only ever a launcher; even an ancient version can run this file.
 //
@@ -65,8 +65,8 @@ async function main() {
 function resolveInstalledBundle() {
   try {
     if (isWindows) {
-      // Modern Node refuses to spawn the bundle's .cmd directly (EINVAL after
-      // CVE-2024-27980 hardening), so invoke the bundled node.exe
+      // Modern Node refuses to spawn the bundle's .cmd directly (EINVAL, the
+      // CVE-2024-27980 hardening on Node 24), so invoke the bundled node.exe
       // against the app entry point and pass --liftoff-only here.
       var nodeExe = require.resolve(pkg + '/node.exe');
       var entry = require.resolve(pkg + '/lib/dist/bin/codegraph.js');
