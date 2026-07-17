@@ -50,7 +50,7 @@ linux/amd64`).
    bundles ship as per-platform `optionalDependencies`
    (`@colbymchenry/codegraph-<target>` with `os`/`cpu`), so npm installs only the
    matching one. The shim — run by the user's Node — execs the bundle, so the
-   real work runs on the pinned bundled Node runtime. Works even on old Node. On Windows it
+   real work runs on the bundled Node 24. Works even on old Node. On Windows it
    invokes the bundled `node.exe` against the app entry directly (not the `.cmd`
    launcher) — modern Node throws `EINVAL` when asked to spawn a `.cmd`/`.bat`.
 3. **Windows** ([`install.ps1`](install.ps1)) — `irm … | iex`; same flow as
@@ -69,6 +69,6 @@ Still TODO:
   Developer ID + notarization; Windows needs Authenticode. Homebrew softens the
   macOS case (handles quarantine).
 - Retire the now-vestigial Node-version gate in `src/bin/codegraph.ts` — the
-  bundle always runs the pinned runtime, and the npm shim does no tree-sitter work.
+  bundle always runs Node 24, and the npm shim does no tree-sitter work.
 - Re-wire `npm uninstall` cleanup (the agent-config `preuninstall`) through the
   shim — the generated main package doesn't carry it.
