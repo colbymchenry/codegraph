@@ -2,7 +2,7 @@
 //
 // Programmatic / embedded SDK entry for @colbymchenry/codegraph (issue #354).
 //
-// The CLI/MCP `bin` (npm-shim.js) execs the per-platform bundle's OWN Node so
+// The CLI/MCP `bin` (npm-shim.js) execs the per-platform bundle's OWN Node 24 so
 // the tool never depends on the user's runtime. Embedded library consumers are
 // the opposite case: they already run their own Node and just want the compiled
 // API — `require("@colbymchenry/codegraph")` returning the CodeGraph class et al.
