@@ -1,0 +1,35 @@
+[package]
+name = "codegraph-kernel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Native extraction kernel for CodeGraph — tree-sitter parse+extract with one JS boundary crossing per file"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+tree-sitter = "0.25"
+sha2 = "0.10"
+regex = "1"
+
+# Grammars — MUST stay revision-matched with the wasm grammars the fallback
+# path loads (tree-sitter-wasms npm package / src/extraction/wasm/). The
+# kernel-grammar-parity test asserts node-kind-table equality at test time;
+# bump these together with the wasm side or that gate fails.
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"

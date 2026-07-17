@@ -30,6 +30,7 @@ import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
+import { tryKernelExtract } from './kernel';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -362,6 +363,30 @@ const INSTANTIATION_KINDS: ReadonlySet<string> = new Set([
 /**
  * TreeSitterExtractor - Main extraction class
  */
+/**
+ * tree-sitter node types (across grammars) for literal expressions in method-
+ * call RECEIVER position. A literal's methods are the language's builtins —
+ * `", ".join`, `"x".toUpperCase()`, `5.times`, `[].concat` — never project
+ * symbols, so a member call on one must not emit a `calls` ref that bare-name
+ * matching could bind to an unrelated same-named project function (#1230).
+ */
+const LITERAL_RECEIVER_TYPES = new Set([
+  // strings
+  'string', 'string_literal', 'interpreted_string_literal', 'raw_string_literal',
+  'template_string', 'concatenated_string', 'formatted_string', 'f_string',
+  'line_string_literal', 'string_content', 'heredoc_body',
+  // numbers
+  'number', 'number_literal', 'integer', 'integer_literal', 'float',
+  'float_literal', 'int_literal', 'decimal_integer_literal', 'real_literal',
+  // chars / runes / regex / booleans / null-likes
+  'char_literal', 'character_literal', 'rune_literal', 'regex', 'regex_literal',
+  'true', 'false', 'boolean_literal', 'bool_literal', 'none', 'null', 'nil',
+  'null_literal', 'undefined',
+  // collection literals
+  'list', 'list_literal', 'array', 'array_literal', 'array_creation_expression',
+  'dictionary', 'dict_literal', 'object', 'tuple', 'set',
+]);
+
 export class TreeSitterExtractor {
   private filePath: string;
   private language: Language;
@@ -1380,6 +1405,32 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Qualified name for a method defined out-of-line via a receiver qualifier
+   * (`Type::method() {}`). The declarator spells the receiver RELATIVE to the
+   * enclosing namespace, so the active C++ namespace prefix must be composed
+   * in — `namespace sim { Output ManifestStartup::Apply() {} }` previously
+   * indexed as `ManifestStartup::Apply` while the class node carried
+   * `sim::ManifestStartup`, so qualified call sites
+   * (`sim::ManifestStartup::Apply(...)`) never resolved (#1291).
+   *
+   * The source may also re-spell part or all of the namespace path
+   * (`namespace sim { void sim::M::f() {} }` is legal), so the receiver is
+   * anchored at the first prefix segment it names: everything before that
+   * anchor is taken from the prefix, the receiver supplies the rest. A
+   * receiver naming no prefix segment gets the whole prefix prepended.
+   * `namespacePrefix` is only ever non-empty for C++, so every other
+   * receiver language (Go, Rust, Kotlin, Lua) passes through unchanged.
+   */
+  private composeReceiverQualifiedName(receiverType: string, name: string): string {
+    const base = `${receiverType}::${name}`;
+    if (this.namespacePrefix.length === 0) return base;
+    const receiverHead = receiverType.split('::')[0];
+    const anchor = this.namespacePrefix.indexOf(receiverHead!);
+    const prefix = anchor === -1 ? this.namespacePrefix : this.namespacePrefix.slice(0, anchor);
+    return prefix.length > 0 ? `${prefix.join('::')}::${base}` : base;
+  }
+
+  /**
    * Build qualified name from node stack
    */
   private buildQualifiedName(name: string): string {
@@ -1726,7 +1777,7 @@ export class TreeSitterExtractor {
       returnType,
     };
     if (receiverType) {
-      extraProps.qualifiedName = `${receiverType}::${name}`;
+      extraProps.qualifiedName = this.composeReceiverQualifiedName(receiverType, name);
     }
 
     const methodNode = this.createNode('method', name, node, extraProps);
@@ -4325,6 +4376,16 @@ export class TreeSitterExtractor {
               getChildByField(func, 'operand') ||
               getChildByField(func, 'argument') ||
               func.namedChild(0);
+            // A LITERAL receiver — `", ".join(...)`, `"x".toUpperCase()`,
+            // `5.times`, `[].concat(...)` — calls a builtin of the literal's
+            // type, never a project symbol. The bare-name fallback below let
+            // these exact-match an unrelated same-named project function
+            // (`", ".join` bound to a local `join` defined inside a DIFFERENT
+            // function, #1230). Emit nothing: a silent miss, never a wrong
+            // edge. Nested calls in the arguments are visited independently.
+            if (receiver && LITERAL_RECEIVER_TYPES.has(receiver.type)) {
+              return;
+            }
             const SKIP_RECEIVERS = new Set(['self', 'this', 'cls', 'super']);
             if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier' || receiver.type === 'field_identifier')) {
               const receiverName = getNodeText(receiver, this.source);
@@ -4405,6 +4466,21 @@ export class TreeSitterExtractor {
               // scope keywords: such calls previously emitted a bare method
               // name, which either failed to resolve or resolved ambiguously.
               calleeName = `${getNodeText(receiver, this.source)}.${methodName}`;
+            } else if (
+              this.language === 'go' &&
+              receiver &&
+              receiver.type === 'selector_expression' &&
+              /^[A-Za-z_]\w*\.[A-Za-z_]\w*$/.test(getNodeText(receiver, this.source).replace(/\s+/g, ''))
+            ) {
+              // Go 2-hop field chain `target.conn.Exec(...)`: keep the
+              // receiver chain so resolution can infer `conn`'s declared type
+              // from the Target struct. Previously this emitted the bare
+              // method name, and when the field's type is EXTERNAL (sql.DB)
+              // the bare name exact-matched an unrelated same-named local
+              // method — a fabricated internal dependency (#1276). Chained
+              // Go receivers resolve strictly via validated field-hop
+              // inference (see matchGoFieldChainCall) or stay unresolved.
+              calleeName = `${getNodeText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
             } else {
               calleeName = methodName;
             }
@@ -6625,8 +6701,16 @@ export function extractFromSource(
     const extractor = new DfmExtractor(filePath, source);
     result = extractor.extract();
   } else {
-    const extractor = new TreeSitterExtractor(filePath, source, detectedLanguage);
-    result = extractor.extract();
+    // Native-kernel route (docs/design/rust-kernel-migration-plan.md): gated
+    // per language, null when not routed/available or on a kernel error —
+    // the wasm TreeSitterExtractor below stays the fallback either way.
+    const kernelResult = tryKernelExtract(filePath, source, detectedLanguage);
+    if (kernelResult) {
+      result = kernelResult;
+    } else {
+      const extractor = new TreeSitterExtractor(filePath, source, detectedLanguage);
+      result = extractor.extract();
+    }
   }
 
   // Framework-specific extraction (routes, middleware, etc.)

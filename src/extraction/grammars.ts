@@ -271,10 +271,27 @@ export async function initGrammars(): Promise<void> {
  * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
  * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
  * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
+ *
+ * TypeScript/TSX/JavaScript (+jsx, which shares the javascript grammar): the
+ * tree-sitter-wasms builds are 2023-era (^0.20.x); we vendor wasm built from
+ * the SAME grammar revisions the native extraction kernel compiles
+ * (codegraph-kernel/Cargo.toml), so the kernel path and the wasm fallback
+ * parse identically and per-language routing stays graph-neutral:
+ *   - tree-sitter/tree-sitter-typescript v0.23.2 (f975a62) → typescript + tsx
+ *   - tree-sitter/tree-sitter-javascript v0.25.0 (44c892e) → javascript + jsx
+ *   - tree-sitter/tree-sitter-java v0.23.5 (94703d5) → java
+ *   - tree-sitter/tree-sitter-python v0.23.6 (bffb65a) → python
+ *   - tree-sitter/tree-sitter-go v0.23.4 (3c3775f) → go
+ * Built from each repo's CHECKED-IN parser.c (no `generate`) with
+ * tree-sitter-cli 0.25.10 `build --wasm` — the same tables crates.io compiles
+ * (parser.c sha-matched against the crates.io tarball).
+ * The kernel-grammar-parity test asserts this alignment; bump the crate and
+ * the vendored wasm together.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */

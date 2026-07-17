@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -3704,6 +3704,47 @@ int f() { return 1; }
       const result = extractFromSource('nested.cpp', code);
       expect(result.nodes.find((n) => n.name === 'f')?.qualifiedName).toBe('a::b::f');
     });
+
+    // Out-of-line member definitions take their qualifiedName from the
+    // declarator's receiver (`ManifestStartup::Apply`), which is spelled
+    // RELATIVE to the enclosing namespace — the namespace prefix must compose
+    // in, or the method's qualifiedName diverges from its own class node's
+    // and `ns::Class::Method(...)` call sites never resolve (#1291).
+    it('out-of-line method definitions inside a namespace carry the namespace prefix', () => {
+      const code = `namespace simulator {
+class ManifestStartup {
+public:
+    struct Input { int x; };
+    struct Output { int y; };
+    static Output Apply(const Input& input);
+};
+ManifestStartup::Output ManifestStartup::Apply(const Input& input) { return {}; }
+}
+`;
+      const result = extractFromSource('manifest_startup.cpp', code);
+      const apply = result.nodes.filter((n) => n.name === 'Apply');
+      // The out-of-line definition's QN matches the class node's prefix.
+      expect(apply.map((n) => n.qualifiedName)).toContain('simulator::ManifestStartup::Apply');
+      expect(result.nodes.find((n) => n.kind === 'class')?.qualifiedName).toBe(
+        'simulator::ManifestStartup'
+      );
+    });
+
+    it('a receiver that re-spells the namespace path is not double-prefixed', () => {
+      const code = `namespace sim {
+class M { public: static void f(); static void g(); };
+void sim::M::f() {}
+void M::g() {}
+}
+void sim::M::f2() {}
+`;
+      const result = extractFromSource('m.cpp', code);
+      const qns = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+      expect(qns).toContain('sim::M::f'); // fully re-spelled inside the namespace
+      expect(qns).toContain('sim::M::g'); // relative form
+      expect(qns).toContain('sim::M::f2'); // global scope, spelled absolute
+      expect(qns.find((q) => q?.includes('sim::sim'))).toBeUndefined();
+    });
   });
 
   describe('C++ forward declarations do not mint phantom class nodes (#1093)', () => {
@@ -4071,6 +4112,119 @@ class Both : public Base<char>, public Plain {};
       expect(stripCppTemplateArgs('Outer<int>::Inner')).toBe('Outer::Inner'); // mid-name
       expect(stripCppTemplateArgs('Base')).toBe('Base'); // no-op
       expect(stripCppTemplateArgs('ns::Plain')).toBe('ns::Plain'); // no-op qualified
+    });
+  });
+
+  describe('C leading attribute macro before typedef return type (#1211)', () => {
+    // `SEC_ATTR UINT32 LostName(VOID)` — tree-sitter's C grammar reads the
+    // unknown macro as the type, the typedef'd return as the declarator, and
+    // stores the PARAMETER LIST as the function name ("(VOID)"). The
+    // structural pre-parse blank recovers the definition; the issue's whole
+    // isolation table is pinned here.
+    it("recovers the issue's full isolation table under their real names", () => {
+      const code = `#define SEC_ATTR __attribute__((section(".init")))
+typedef unsigned int UINT32;
+#define VOID void
+
+SEC_ATTR VOID   GoodName(VOID)  { }
+SEC_ATTR UINT32 LostName(VOID)  { return 0; }
+UINT32 NoAttr(void) { return 0; }
+SEC_ATTR int BuiltinRet(void) { return 0; }
+__attribute__((section(".init"))) UINT32 RawAttr(void) { return 0; }
+SEC_ATTR UINT32 OneNamedArg(UINT32 x) { return x; }
+SEC_ATTR UINT32* PtrRet(VOID) { return 0; }
+`;
+      const result = extractFromSource('attrs.c', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toEqual(
+        expect.arrayContaining([
+          'GoodName', 'LostName', 'NoAttr', 'BuiltinRet', 'RawAttr', 'OneNamedArg', 'PtrRet',
+        ])
+      );
+      // The bug shape: a parameter list stored as a name.
+      expect(fns.find((n) => n.includes('('))).toBeUndefined();
+    });
+
+    it('blankCLeadingAttrMacros only touches the MACRO-ret-name-( definition shape', () => {
+      // Blanked: the definition shape (offset-preserving).
+      expect(blankCLeadingAttrMacros('SEC_ATTR UINT32 f(void) {}')).toBe(
+        '         UINT32 f(void) {}'
+      );
+      // Untouched: a plain typedef'd return with ONE identifier before `(`.
+      expect(blankCLeadingAttrMacros('UINT32 helper(void) {}')).toBe('UINT32 helper(void) {}');
+      // Untouched: an ALL-CAPS function CALL at line start.
+      expect(blankCLeadingAttrMacros('MY_ASSERT(x);')).toBe('MY_ASSERT(x);');
+      // Untouched: #define lines (start with #, not line-leading CAPS).
+      const def = '#define SEC_ATTR __attribute__((section(".init")))';
+      expect(blankCLeadingAttrMacros(def)).toBe(def);
+      // Untouched: multi-word builtin returns (the grammar keeps the name there).
+      expect(blankCLeadingAttrMacros('SEC_ATTR unsigned int f(void) {}')).toBe(
+        'SEC_ATTR unsigned int f(void) {}'
+      );
+      // Untouched: mid-line uses.
+      expect(blankCLeadingAttrMacros('x = SEC_ATTR UINT32 y(z);')).toBe(
+        'x = SEC_ATTR UINT32 y(z);'
+      );
+    });
+  });
+
+  describe('C++ out-of-line template method receivers (#1286)', () => {
+    // `template<typename T> T Box<T>::get()` used to store qualified_name
+    // `Box<T>::get` — the `<T>` qualifier never matched the class node indexed
+    // as `Box`, and long multi-line parameter lists could push qualified_name
+    // past NAME_MAX. Inline definitions of the same method produce `Box::get`,
+    // so the out-of-line form must normalize to the identical name.
+    it('strips the template parameter list from the receiver qualifier', () => {
+      const code = `template <typename T>
+class Box {
+public:
+    T get() const;
+    void set(T v);
+private:
+    T value;
+};
+
+template <typename T> T Box<T>::get() const { return value; }
+template <typename T> void Box<T>::set(T v) { value = v; }
+`;
+      const result = extractFromSource('box.cpp', code);
+      expect(result.errors).toHaveLength(0);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const qns = methods.map((n) => n.qualifiedName).sort();
+      // Out-of-line definitions carry the SAME qualifier as the class node.
+      expect(qns).toContain('Box::get');
+      expect(qns).toContain('Box::set');
+      expect(qns.find((q) => q?.includes('<'))).toBeUndefined();
+      // Names themselves stay clean.
+      expect(methods.map((n) => n.name).sort()).toEqual(expect.arrayContaining(['get', 'set']));
+    });
+
+    it('multi-line template parameter lists cannot leak into qualified_name (NAME_MAX overflow shape)', () => {
+      // The ICU capi_helper.h shape: enormous multi-line parameter names made
+      // qualified_name 272 bytes (> NAME_MAX 255) including embedded newlines.
+      const code = `template <typename CType,
+          typename CPPType,
+          int32_t kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>
+class ApiHelper {
+public:
+    CPPType* validate();
+};
+
+template <typename CType,
+          typename CPPType,
+          int32_t kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>
+CPPType* ApiHelper<CType,
+                   CPPType,
+                   kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>::validate() {
+    return nullptr;
+}
+`;
+      const result = extractFromSource('capi_helper.h', code);
+      const validate = result.nodes.find((n) => n.kind === 'method' && n.name === 'validate' && n.qualifiedName?.includes('::'));
+      expect(validate).toBeDefined();
+      expect(validate!.qualifiedName).toBe('ApiHelper::validate');
+      expect(validate!.qualifiedName!.length).toBeLessThan(255);
+      expect(validate!.qualifiedName).not.toMatch(/[<>\n]/);
     });
   });
 

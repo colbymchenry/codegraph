@@ -1,0 +1,3 @@
+target/
+prebuilds/
+*.node

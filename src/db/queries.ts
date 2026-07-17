@@ -230,6 +230,7 @@ export class QueryBuilder {
     getNodesByLowerName?: SqliteStatement;
     getUnresolvedCount?: SqliteStatement;
     getUnresolvedBatch?: SqliteStatement;
+    deleteRefsByRowIdsFull?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
     getDominantFile?: SqliteStatement;
@@ -244,6 +245,46 @@ export class QueryBuilder {
   // correctness backstop. Bounded so a pathological repo can't grow it forever.
   private segmentedNames: Set<string> = new Set();
   private static readonly MAX_SEGMENTED_NAMES = 65536;
+
+  // Multi-row INSERT statements, cached per (statement kind × row count). The
+  // bulk write path decomposes N rows into a few fixed batch sizes so each
+  // size's statement is prepared once and reused — one .run() binds a whole
+  // chunk instead of one row, which is where the per-call overhead lives.
+  // Row order within and across chunks is the input order, so rowid assignment
+  // (and therefore resolution's insertion-order disambiguation) is identical
+  // to the one-row-per-run path.
+  private batchStmts: Map<string, SqliteStatement> = new Map();
+  private static readonly BATCH_SIZES: readonly number[] = [128, 32, 8, 1];
+
+  /**
+   * Run `rows` through a multi-row `INSERT` built as `head + (tuple,)*n`,
+   * decomposed greedily into the cached batch sizes. Preserves row order.
+   */
+  private runBatched(kind: string, head: string, tuple: string, rows: unknown[][]): void {
+    if (rows.length === 0) return;
+    let i = 0;
+    for (const size of QueryBuilder.BATCH_SIZES) {
+      while (rows.length - i >= size) {
+        const key = `${kind}:${size}`;
+        let stmt = this.batchStmts.get(key);
+        if (!stmt) {
+          stmt = this.db.prepare(head + new Array(size).fill(tuple).join(','));
+          this.batchStmts.set(key, stmt);
+        }
+        if (size === 1) {
+          stmt.run(...rows[i]!);
+        } else {
+          const params: unknown[] = [];
+          for (let r = 0; r < size; r++) {
+            const row = rows[i + r]!;
+            for (let c = 0; c < row.length; c++) params.push(row[c]);
+          }
+          stmt.run(...params);
+        }
+        i += size;
+      }
+    }
+  }
 
   constructor(db: SqliteDatabase) {
     this.db = db;
@@ -351,17 +392,14 @@ export class QueryBuilder {
 
   /** Write `name`'s segments into name_segment_vocab (idempotent). */
   private insertNameSegments(name: string): void {
-    if (this.segmentedNames.has(name)) return;
-    if (this.segmentedNames.size >= QueryBuilder.MAX_SEGMENTED_NAMES) this.segmentedNames.clear();
-    this.segmentedNames.add(name);
-    if (!this.stmts.insertNameSegment) {
-      this.stmts.insertNameSegment = this.db.prepare(
-        'INSERT OR IGNORE INTO name_segment_vocab (segment, name) VALUES (?, ?)',
-      );
-    }
-    for (const segment of splitIdentifierSegments(name)) {
-      this.stmts.insertNameSegment.run(segment, name);
-    }
+    const rows: unknown[][] = [];
+    this.collectNameSegmentRows(name, rows);
+    this.runBatched(
+      'insertNameSegments',
+      'INSERT OR IGNORE INTO name_segment_vocab (segment, name) VALUES ',
+      '(?,?)',
+      rows
+    );
   }
 
   /**
@@ -369,10 +407,122 @@ export class QueryBuilder {
    */
   insertNodes(nodes: Node[]): void {
     this.db.transaction(() => {
+      // Bulk path: same semantics as insertNode() per row (validation, cache
+      // invalidation, segment vocab), but bound as multi-row INSERTs — the
+      // per-.run() call overhead dominates the store phase on full indexes.
+      const rows: unknown[][] = [];
+      const segmentRows: unknown[][] = [];
       for (const node of nodes) {
-        this.insertNode(node);
+        if (!node.id || !node.kind || !node.name || !node.filePath || !node.language) {
+          console.error('[CodeGraph] Skipping node with missing required fields:', {
+            id: node.id,
+            kind: node.kind,
+            name: node.name,
+            filePath: node.filePath,
+            language: node.language,
+          });
+          continue;
+        }
+        this.nodeCache.delete(node.id);
+        rows.push([
+          node.id,
+          node.kind,
+          node.name,
+          node.qualifiedName ?? node.name,
+          node.filePath,
+          node.language,
+          node.startLine ?? 0,
+          node.endLine ?? 0,
+          node.startColumn ?? 0,
+          node.endColumn ?? 0,
+          node.docstring ?? null,
+          node.signature ?? null,
+          node.visibility ?? null,
+          node.isExported ? 1 : 0,
+          node.isAsync ? 1 : 0,
+          node.isStatic ? 1 : 0,
+          node.isAbstract ? 1 : 0,
+          node.decorators ? JSON.stringify(node.decorators) : null,
+          node.typeParameters ? JSON.stringify(node.typeParameters) : null,
+          node.returnType ?? null,
+          node.updatedAt ?? Date.now(),
+        ]);
+        if (this.isSegmentableKind(node.kind)) this.collectNameSegmentRows(node.name, segmentRows);
       }
+      this.runBatched(
+        'insertNodes',
+        `INSERT OR REPLACE INTO nodes (
+          id, kind, name, qualified_name, file_path, language,
+          start_line, end_line, start_column, end_column,
+          docstring, signature, visibility,
+          is_exported, is_async, is_static, is_abstract,
+          decorators, type_parameters, return_type, updated_at
+        ) VALUES `,
+        '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        rows
+      );
+      this.runBatched(
+        'insertNameSegments',
+        'INSERT OR IGNORE INTO name_segment_vocab (segment, name) VALUES ',
+        '(?,?)',
+        segmentRows
+      );
     })();
+  }
+
+  /**
+   * Store one file's whole extraction bundle — nodes, edges, unresolved refs,
+   * and the file record — in a SINGLE transaction. The bulk-index path calls
+   * this once per file instead of opening one transaction per table (#1015
+   * file-order commit discipline is unchanged: callers still invoke it in file
+   * order, and row order within is input order).
+   *
+   * Edges MUST already be endpoint-filtered by the caller (the store path
+   * filters to the file's own inserted node ids), so the per-file existence
+   * SELECT that insertEdges() pays is skipped here.
+   */
+  storeFileBundle(bundle: {
+    nodes: Node[];
+    edges: Edge[];
+    refs: UnresolvedReference[];
+    file: FileRecord;
+  }): void {
+    this.db.transaction(() => {
+      this.insertNodes(bundle.nodes);
+      if (bundle.edges.length > 0) {
+        const rows: unknown[][] = [];
+        for (const edge of bundle.edges) {
+          rows.push([
+            edge.source,
+            edge.target,
+            edge.kind,
+            edge.metadata ? JSON.stringify(edge.metadata) : null,
+            edge.line ?? null,
+            edge.column ?? null,
+            edge.provenance ?? null,
+          ]);
+        }
+        this.runBatched(
+          'insertEdges',
+          'INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance) VALUES ',
+          '(?,?,?,?,?,?,?)',
+          rows
+        );
+      }
+      if (bundle.refs.length > 0) this.insertUnresolvedRefsBatch(bundle.refs);
+      this.upsertFile(bundle.file);
+    })();
+  }
+
+  /**
+   * Collect (segment, name) rows for a name, honouring the same session-dedupe
+   * semantics as insertNameSegments(). Shared by the bulk write paths.
+   */
+  private collectNameSegmentRows(name: string, out: unknown[][]): void {
+    if (this.segmentedNames.has(name)) return;
+    if (this.segmentedNames.size >= QueryBuilder.MAX_SEGMENTED_NAMES) this.segmentedNames.clear();
+    this.segmentedNames.add(name);
+    for (const segment of splitIdentifierSegments(name)) out.push([segment, name]);
   }
 
   /**
@@ -510,7 +660,14 @@ export class QueryBuilder {
   /** Insert segments for a batch of names in one transaction (vocab heal path). */
   insertNameSegmentsBatch(names: string[]): void {
     this.db.transaction(() => {
-      for (const name of names) this.insertNameSegments(name);
+      const rows: unknown[][] = [];
+      for (const name of names) this.collectNameSegmentRows(name, rows);
+      this.runBatched(
+        'insertNameSegments',
+        'INSERT OR IGNORE INTO name_segment_vocab (segment, name) VALUES ',
+        '(?,?)',
+        rows
+      );
     })();
   }
 
@@ -1500,12 +1657,27 @@ export class QueryBuilder {
       }
       const existingNodeIds = this.getExistingNodeIds([...endpointIds]);
 
+      const rows: unknown[][] = [];
       for (const edge of edges) {
         if (!existingNodeIds.has(edge.source) || !existingNodeIds.has(edge.target)) {
           continue;
         }
-        this.insertEdge(edge);
+        rows.push([
+          edge.source,
+          edge.target,
+          edge.kind,
+          edge.metadata ? JSON.stringify(edge.metadata) : null,
+          edge.line ?? null,
+          edge.column ?? null,
+          edge.provenance ?? null,
+        ]);
       }
+      this.runBatched(
+        'insertEdges',
+        'INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance) VALUES ',
+        '(?,?,?,?,?,?,?)',
+        rows
+      );
     })();
   }
 
@@ -1789,9 +1961,25 @@ export class QueryBuilder {
   insertUnresolvedRefsBatch(refs: UnresolvedReference[]): void {
     if (refs.length === 0) return;
     const insert = this.db.transaction(() => {
+      const rows: unknown[][] = [];
       for (const ref of refs) {
-        this.insertUnresolvedRef(ref);
+        rows.push([
+          ref.fromNodeId,
+          ref.referenceName,
+          ref.referenceKind,
+          ref.line,
+          ref.column,
+          ref.candidates ? JSON.stringify(ref.candidates) : null,
+          ref.filePath ?? '',
+          ref.language ?? 'unknown',
+        ]);
       }
+      this.runBatched(
+        'insertUnresolvedRefs',
+        'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ',
+        '(?,?,?,?,?,?,?,?)',
+        rows
+      );
     });
     insert();
   }
@@ -1874,8 +2062,13 @@ export class QueryBuilder {
    */
   getUnresolvedReferencesBatch(offset: number, limit: number): UnresolvedReference[] {
     if (!this.stmts.getUnresolvedBatch) {
+      // ORDER BY rowid is load-bearing for the pipelined resolution loop: it
+      // prefetches batch k+1 at OFFSET batch_k.length while batch k's rows are
+      // still pending, which is only exact under a stable enumeration. (A plain
+      // scan and the status index both return rowid order anyway — this pins
+      // it.)
       this.stmts.getUnresolvedBatch = this.db.prepare(
-        "SELECT * FROM unresolved_refs WHERE status = 'pending' LIMIT ? OFFSET ?"
+        "SELECT * FROM unresolved_refs WHERE status = 'pending' ORDER BY rowid LIMIT ? OFFSET ?"
       );
     }
     const rows = this.stmts.getUnresolvedBatch.all(limit, offset) as UnresolvedRefRow[];
@@ -2012,11 +2205,28 @@ export class QueryBuilder {
    */
   deleteReferencesByRowIds(rowIds: number[]): void {
     if (rowIds.length === 0) return;
-    for (let i = 0; i < rowIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
-      const chunk = rowIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
-      const placeholders = chunk.map(() => '?').join(',');
-      this.db.prepare(`DELETE FROM unresolved_refs WHERE id IN (${placeholders})`).run(...chunk);
-    }
+    // One transaction for all chunks (each chunk was previously its own
+    // implicit transaction = its own WAL commit — measurable on 100k+-ref
+    // resolution persists), and the full-size chunk statement is cached so
+    // repeat calls skip the re-prepare; only the final partial chunk (if any)
+    // prepares ad hoc.
+    this.db.transaction(() => {
+      for (let i = 0; i < rowIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+        const chunk = rowIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+        if (chunk.length === SQLITE_PARAM_CHUNK_SIZE) {
+          if (!this.stmts.deleteRefsByRowIdsFull) {
+            const placeholders = new Array(SQLITE_PARAM_CHUNK_SIZE).fill('?').join(',');
+            this.stmts.deleteRefsByRowIdsFull = this.db.prepare(
+              `DELETE FROM unresolved_refs WHERE id IN (${placeholders})`
+            );
+          }
+          this.stmts.deleteRefsByRowIdsFull.run(...chunk);
+        } else {
+          const placeholders = chunk.map(() => '?').join(',');
+          this.db.prepare(`DELETE FROM unresolved_refs WHERE id IN (${placeholders})`).run(...chunk);
+        }
+      }
+    })();
   }
 
   /**

@@ -308,10 +308,28 @@ const INCLUDE_RE = /#[ \t]*include[ \t]+"([^"\n]+)"/g;
 /** Included files worth scanning for registration tables (e.g. a generated `.def`). */
 const INCLUDABLE_EXT = /\.(def|inc|h|hh|hpp|hxx|c|cc|cpp|cxx|ipp|tcc|tbl)$/i;
 
-export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+export async function cFnPointerDispatchEdges(
+  _queries: QueryBuilder,
+  ctx: ResolutionContext,
+  onYield: MaybeYield,
+  onFraction?: (fraction: number) => void
+): Promise<Edge[]> {
   let scannedFiles = 0;
   const files = ctx.getAllFiles().filter((f) => C_CPP_EXT.test(f));
   if (files.length === 0) return [];
+
+  // Within-pass progress: this is the pass that parks the "Linking dynamic
+  // dispatch" bar on C-heavy repos, so it reports a real fraction of its
+  // dominant work. `files` is swept once per file loop below (passes A, C, D,
+  // E — pass B is node-bound and comparatively brief), reported at the same
+  // per-16-files cadence as the cooperative yield.
+  const FILE_SWEEPS = 4;
+  const tick = async (): Promise<void> => {
+    if ((++scannedFiles & 15) === 0) {
+      onFraction?.(scannedFiles / (files.length * FILE_SWEEPS));
+      await onYield();
+    }
+  };
 
   // Cache raw + stripped source per file, LRU-BOUNDED. The old unbounded Maps
   // retained every C/C++ file's raw AND stripped text for the whole pass —
@@ -358,7 +376,7 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
   const fnPtrTypedefs = new Set<string>();
   const fnTypeTypedefs = new Set<string>();
   for (const file of files) {
-    if ((++scannedFiles & 15) === 0) await onYield();
+    await tick();
     const s = src(file);
     if (!s || !s.includes('typedef')) continue;
     FNPTR_TYPEDEF_RE.lastIndex = 0;
@@ -764,7 +782,7 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
   // ---- Pass C: registrations — stream each file (and its qualifying local
   // includes) through processUnit, one at a time.
   for (const file of files) {
-    if ((++scannedFiles & 15) === 0) await onYield();
+    await tick();
     const env = new Map<string, MacroDef>();
     const objEnv = new Map<string, string>();
     const defined = new Set<string>();
@@ -846,7 +864,7 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
   const FIELD_ASSIGN_RE = /(\w+)\s*(?:->|\.)\s*(\w+)\s*=\s*(\w+)\s*(?:->|\.)\s*(\w+)/g;
   const propagations: { to: string; from: string }[] = [];
   for (const file of files) {
-    if ((++scannedFiles & 15) === 0) await onYield();
+    await tick();
     const s = src(file);
     if (!s || !s.includes('=')) continue;
     for (const fn of ctx.getNodesInFile(file)) {
@@ -897,7 +915,7 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const file of files) {
-    if ((++scannedFiles & 15) === 0) await onYield();
+    await tick();
     const s = src(file);
     if (!s) continue;
     for (const fn of ctx.getNodesInFile(file)) {

@@ -28,6 +28,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import { spawnSync } from 'child_process';
+import { ansiColorsEnabled } from '../ui/color';
 
 export const REPO = 'colbymchenry/codegraph';
 export const NPM_PACKAGE = '@colbymchenry/codegraph';
@@ -296,14 +297,23 @@ export interface UpgradeDeps {
   warn: (msg: string) => void;
   error: (msg: string) => void;
   platform: NodeJS.Platform;
+  /**
+   * Offer the one-time CodeGraph Pro beta opt-in after a successful update
+   * (see installer/beta-signup — self-gating: TTY only, and silent forever
+   * once any install/upgrade ask was answered). Optional so unit tests and
+   * embedded callers stay prompt-free; never fatal to the upgrade.
+   */
+  offerBetaSignup?: () => Promise<void>;
 }
 
+// Colors off when piped / NO_COLOR / --no-color (#1281).
+const useColor = ansiColorsEnabled();
 const c = {
-  bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
-  dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
-  green: (s: string) => `\x1b[32m${s}\x1b[0m`,
-  yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
-  cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,
+  bold: (s: string) => (useColor ? `\x1b[1m${s}\x1b[0m` : s),
+  dim: (s: string) => (useColor ? `\x1b[2m${s}\x1b[0m` : s),
+  green: (s: string) => (useColor ? `\x1b[32m${s}\x1b[0m` : s),
+  yellow: (s: string) => (useColor ? `\x1b[33m${s}\x1b[0m` : s),
+  cyan: (s: string) => (useColor ? `\x1b[36m${s}\x1b[0m` : s),
 };
 
 /** The honest, additive re-index reminder shown after a successful upgrade. */
@@ -412,6 +422,15 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
       }
     } else {
       deps.log(c.dim('Skipped refreshing agent instructions/config — run `codegraph install --refresh` once the PATH is fixed.'));
+    }
+    // Reached only after a real binary update (check/up-to-date/npx/source
+    // all returned earlier) — the one place the upgrade path may offer the
+    // beta opt-in. The hook self-gates on TTY + the stored once-per-machine
+    // choice, so an already-answered user never sees it again.
+    try {
+      await deps.offerBetaSignup?.();
+    } catch {
+      /* a marketing question must never fail the upgrade */
     }
   }
   return code;
