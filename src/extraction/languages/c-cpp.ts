@@ -89,7 +89,15 @@ function extractCppReceiverType(node: SyntaxNode, source: string): string | unde
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
   const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
-  return parts.length > 1 ? parts.slice(0, -1).join('::') : undefined;
+  if (parts.length <= 1) return undefined;
+  // An out-of-line template method definition carries the class's template
+  // parameter list in the qualifier (`template<typename T> T Box<T>::get()`),
+  // but the class node is indexed as bare `Box` — strip `<…>` so the receiver
+  // matches it, the same normalization #1043 applies to base-class refs.
+  // Multi-line parameter lists otherwise leak whole `<…>` blocks (newlines
+  // included) into qualified_name, which can exceed NAME_MAX (#1286).
+  const receiver = stripCppTemplateArgs(parts.slice(0, -1).join('::'));
+  return receiver || undefined;
 }
 
 /**
@@ -513,6 +521,63 @@ export function blankCppAnnotationMacroCalls(source: string): string {
 }
 
 /**
+ * Blank a macro that is the ONLY token on its line — no parens, no semicolon:
+ * namespace-management macros (`FMT_BEGIN_NAMESPACE`, `FMT_END_EXPORT`,
+ * `JEMALLOC_DIAGNOSTIC_DISABLE_SPURIOUS`), Qt's `Q_OBJECT`, and friends. A
+ * bare identifier is not a statement or declaration in C or C++, so
+ * tree-sitter drops into error recovery at every one — and since the kernel
+ * path defers ANY erroring file to wasm, this single idiom deferred 13/73 fmt
+ * files and a comparable share of jemalloc, forfeiting the native-parse win
+ * on exactly the header-heavy trees it targets (the wasm path also mis-nests
+ * scopes around them today). Replacing the token with equal-length spaces
+ * preserves every byte offset and the surrounding declarations parse clean.
+ *
+ * Matched tightly so a real identifier can never be touched — ALL of:
+ *  - the line consists of ONE ALL-CAPS token (≥4 chars, with `_`), optionally
+ *    followed by a same-line comment — a lone lowercase identifier or any
+ *    second token disqualifies;
+ *  - the PREVIOUS non-blank line does not end in a continuation character
+ *    (`=`, an operator, `,`, `(`, `?`, `:`, or a `\` macro-definition
+ *    continuation) — so an ALL-CAPS operand split onto its own line inside a
+ *    multi-line expression (`int x =\n  SOME_CONST\n  | OTHER;`) is left
+ *    alone; and
+ *  - the NEXT non-blank line starts like a declaration/scope token
+ *    (letter, `_`, `#`, `{`, `}`, or `~`) or the file ends — an operator,
+ *    string literal, or `;` continuation rejects the match.
+ * Shared by C and C++ (the idiom is identical in both).
+ */
+const LONE_MACRO_LINE_RE = /^[ \t]*([A-Z][A-Z0-9_]{3,})[ \t]*(?:\/\/[^\n\r]*|\/\*[^\n\r]*\*\/[ \t]*)?\r?$/;
+const LONE_MACRO_CONTINUATION_END_RE = /[=+\-*/%&|^<>?:,(\\]$/;
+export function blankLoneMacroLines(source: string): string {
+  if (!/^[ \t]*[A-Z][A-Z0-9_]{3,}[ \t]*\r?$/m.test(source)) return source;
+  const lines = source.split('\n');
+  const content = (l: string): string => l.replace(/\r$/, '').trim();
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const m = LONE_MACRO_LINE_RE.exec(line);
+    if (!m) continue;
+    // Underscore requirement rides the macro convention (FMT_BEGIN_NAMESPACE,
+    // Q_OBJECT); a solid all-caps word (`NDEBUG`-style) alone is too risky.
+    if (!(m[1] as string).includes('_')) continue;
+    let prev = i - 1;
+    while (prev >= 0 && content(lines[prev] as string) === '') prev--;
+    if (prev >= 0 && LONE_MACRO_CONTINUATION_END_RE.test(content(lines[prev] as string))) continue;
+    let next = i + 1;
+    while (next < lines.length && content(lines[next] as string) === '') next++;
+    if (next < lines.length) {
+      const first = content(lines[next] as string)[0];
+      if (!first || !/[A-Za-z_#{}~]/.test(first)) continue;
+    }
+    const start = line.indexOf(m[1] as string);
+    lines[i] =
+      line.slice(0, start) + ' '.repeat((m[1] as string).length) + line.slice(start + (m[1] as string).length);
+    changed = true;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
+/**
  * Blank an export/visibility macro sitting in front of a *member* or *method*
  * declaration inside a class/namespace (`ENGINE_API virtual void Tick(…)`,
  * `static ENGINE_API void AddReferencedObjects(…)`, `UE_API FVector GetVel()
@@ -681,31 +746,353 @@ function looksLikeCudaSource(source: string): boolean {
   );
 }
 
+/**
+ * Restore preprocessor-directive lines to their original bytes after the
+ * blanking passes ran. The token-level blanks match on shape, not context, so
+ * a macro name that happens to sit inside a DIRECTIVE gets blanked too — and
+ * blanking the name position of `#define FMT_API FMT_VISIBILITY("default")`
+ * leaves a nameless `#  define        FMT_VISIBILITY(…)`, which is a parse
+ * ERROR (fmt's base.h carries several). Inside a directive the blanks were
+ * never useful anyway: tree-sitter stores `#define` bodies as raw
+ * preproc_arg text it doesn't parse, so blanking there can only ever break
+ * the directive itself. Copying the original directive lines back (including
+ * `\`-continuation lines of multi-line defines) is offset-preserving by
+ * construction and strictly reduces parse errors on both extraction arms.
+ */
+function restoreDirectiveLines(original: string, blanked: string): string {
+  if (blanked === original || original.indexOf('#') === -1) return blanked;
+  const o = original.split('\n');
+  const b = blanked.split('\n');
+  let changed = false;
+  let continuation: boolean = false;
+  for (let i = 0; i < o.length && i < b.length; i++) {
+    const line = o[i] as string;
+    const isDirective: boolean = continuation || /^[ \t]*#/.test(line);
+    if (isDirective && b[i] !== line) {
+      b[i] = line;
+      changed = true;
+    }
+    continuation = isDirective && /\\\s*$/.test(line.replace(/\r$/, ''));
+  }
+  return changed ? b.join('\n') : blanked;
+}
+
 /** C/C++ source pre-processing before tree-sitter: recover macro-annotated class
  * definitions, macro-prefixed function definitions, macro-prefixed members, and
  * macro-decorated members (Unreal-Engine reflection markup) — plus the non-C++
  * surface of the dialects parsed with the C++ grammar: `.metal` MSL attribute
  * annotations, and CUDA specifiers + launch syntax (by `.cu`/`.cuh` extension
- * or by content, for CUDA living in `.h`/`.hpp` headers). Offset-preserving. */
+ * or by content, for CUDA living in `.h`/`.hpp` headers). Offset-preserving;
+ * directive lines are restored at the end (see restoreDirectiveLines). */
 function preParseCppSource(source: string, filePath?: string): string {
-  const blanked = blankCppAnnotationMacroCalls(
-    blankCppInlineAnnotationMacros(
-      blankCppApiPrefixMacros(blankCppInlineMacros(blankCppExportMacros(source)))
+  // blankCLeadingAttrMacros runs AFTER the api-prefix blank so a stacked
+  // `FMT_NORETURN FMT_API void f(…)` reduces to the `MACRO Ret name(` shape
+  // it matches (the _API token is already spaces by then).
+  let blanked = blankLoneMacroLines(
+    blankCLeadingAttrMacros(
+      blankCppAnnotationMacroCalls(
+        blankCppInlineAnnotationMacros(
+          blankCppApiPrefixMacros(blankCppInlineMacros(blankCppExportMacros(source)))
+        )
+      )
     )
   );
   const lower = filePath ? filePath.toLowerCase() : '';
-  if (lower.endsWith('.metal')) return blankMetalAttributes(blanked);
-  if (lower.endsWith('.cu') || lower.endsWith('.cuh') || looksLikeCudaSource(source)) {
-    return blankCudaConstructs(blanked);
+  if (lower.endsWith('.metal')) {
+    blanked = blankMetalAttributes(blanked);
+  } else if (lower.endsWith('.cu') || lower.endsWith('.cuh') || looksLikeCudaSource(source)) {
+    blanked = blankCudaConstructs(blanked);
   }
-  return blanked;
+  return restoreDirectiveLines(source, blanked);
 }
 
-/** C source pre-processing: C-detected headers in CUDA projects (llm.c keeps
- * `__device__` helpers and kernel prototypes in plain `.h`) get the same
- * content-gated CUDA blank as C++. */
+/**
+ * Blank an unknown attribute macro sitting in front of a C function
+ * definition's return type: `SEC_ATTR UINT32 LostName(VOID) { … }` (macro
+ * wrapping `__attribute__((…))`, common in embedded/kernel C). tree-sitter's
+ * C grammar reads the macro as the declaration's type, the real return type
+ * as the declarator, and stores the PARAMETER LIST as the function name —
+ * `LostName` indexes as `"(VOID)"` and is unfindable (#1211). The C++ grammar
+ * recovers this shape differently (glued name, salvaged post-hoc by
+ * `recoverMangledCppName`), but in C the real name never reaches the mangled
+ * string, so only a pre-parse blank can recover it.
+ *
+ * Attribute macros are project-specific (`SEC_ATTR`, `INIT_TEXT`, …), so this
+ * keys on structure, not a curated list, matched tightly:
+ *  - line-leading (`^[ \t]*`) — declaration position, never an expression use;
+ *  - ALL-CAPS token of ≥3 chars (`[A-Z][A-Z0-9_]{2,}`) — ordinary C types in
+ *    definitions are rarely spelled this way, and when they are (`UINT32 f()`)
+ *    they're followed by ONE identifier + `(`, which the lookahead rejects;
+ *  - followed by TWO identifier tokens (return type, then name — `*` allowed
+ *    for pointer returns) and then `(` — i.e. exactly the
+ *    `MACRO Ret name(` definition shape. `MACRO name(` calls, `#define`
+ *    lines (start with `#`), and multi-word builtin returns
+ *    (`MACRO unsigned int f(` — where the C grammar already keeps the name)
+ *    are all left untouched.
+ * Equal-length spaces preserve every byte offset, like the C++ blanks above.
+ */
+const C_LEADING_ATTR_MACRO_RE =
+  /^([ \t]*)([A-Z][A-Z0-9_]{2,})(?=\s+[A-Za-z_]\w*[\s*]+[A-Za-z_]\w*\s*\()/gm;
+export function blankCLeadingAttrMacros(source: string): string {
+  return source.replace(
+    C_LEADING_ATTR_MACRO_RE,
+    (_m, ws: string, macro: string) => ws + ' '.repeat(macro.length)
+  );
+}
+
+/**
+ * Blank the body of `#ifdef __cplusplus … #endif` guard regions in C sources.
+ * The ubiquitous C-header compatibility idiom
+ *
+ *   #ifdef __cplusplus
+ *   extern "C" {
+ *   #endif
+ *
+ * is NOT valid C — `extern "C" {` (and any other C++-only line under the
+ * guard) drops tree-sitter-c into error recovery, so effectively every public
+ * C header carries parse errors. The wasm path shrugs (recovery keeps the
+ * rest); the kernel path defers EVERY erroring file to wasm by policy — so
+ * this one idiom pushed C-header deferral to ~32% on redis (vs the <10%
+ * gate) and forfeited the native-parse win exactly where C repos have the
+ * most files. A C compiler never sees the guarded lines (`__cplusplus` is
+ * only defined for C++), so blanking the region BODY mirrors the
+ * preprocessor's own view of the file.
+ *
+ * Matched conservatively, line-based and offset-preserving:
+ *  - the opener must be `#ifdef __cplusplus` / `#if defined(__cplusplus)`;
+ *  - the body may contain NO other preprocessor directive (a nested `#if`,
+ *    `#else`, or `#define` bails the whole region — those need real
+ *    preprocessing, so the file keeps its current behavior);
+ *  - the region must close with `#endif` within a few lines (guards are
+ *    tiny; a giant region is something else).
+ * The `#ifdef`/`#endif` directive lines themselves are kept — an empty
+ * preproc_ifdef parses clean — and every blanked byte becomes a space with
+ * `\r` preserved, so offsets, lines, and columns survive on CRLF checkouts.
+ */
+const C_CPLUSPLUS_GUARD_OPEN_RE =
+  /^[ \t]*#[ \t]*(?:ifdef[ \t]+__cplusplus\b|if[ \t]+defined[ \t]*\(?[ \t]*__cplusplus[ \t]*\)?)/;
+const C_PREPROC_DIRECTIVE_RE = /^[ \t]*#/;
+const C_PREPROC_ENDIF_RE = /^[ \t]*#[ \t]*endif\b/;
+const C_CPLUSPLUS_GUARD_MAX_BODY_LINES = 40;
+export function blankCCplusplusGuardBodies(source: string): string {
+  if (source.indexOf('__cplusplus') === -1) return source;
+  const lines = source.split('\n');
+  const stripCr = (l: string): string => (l.endsWith('\r') ? l.slice(0, -1) : l);
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (!C_CPLUSPLUS_GUARD_OPEN_RE.test(stripCr(lines[i] as string))) continue;
+    let end = -1;
+    for (let j = i + 1; j < lines.length && j - i - 1 <= C_CPLUSPLUS_GUARD_MAX_BODY_LINES; j++) {
+      const line = stripCr(lines[j] as string);
+      if (C_PREPROC_ENDIF_RE.test(line)) {
+        end = j;
+        break;
+      }
+      if (C_PREPROC_DIRECTIVE_RE.test(line)) break; // nested directive — bail
+    }
+    if (end < 0) continue;
+    for (let k = i + 1; k < end; k++) {
+      lines[k] = (lines[k] as string).replace(/[^\r]/g, ' ');
+    }
+    changed = true;
+    i = end;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
+/**
+ * Blank a C iterator-macro call in STATEMENT position — `ql_foreach(iter,
+ * &arena->tcache_ql, link) { … }` (jemalloc), `for_each_string_list_item(item,
+ * &list) { … }` (git), `list_for_each_entry(pos, head, member) { … }` (the
+ * Linux kernel's core iteration idiom). A call followed by a brace block is
+ * not a C statement, so tree-sitter-c drops into error recovery at every use —
+ * these macros are the single largest source of parse errors in macro-heavy C
+ * trees (git: ~39% of files error; the kernel path defers each one to wasm).
+ * Blanking JUST the macro call leaves the brace block as a bare compound
+ * statement — valid C — so the body's calls/locals extract normally on both
+ * arms instead of riding error recovery.
+ *
+ * C-ONLY, and matched tightly:
+ *  - the call must be INDENTED (statement position; file-scope definitions
+ *    start at column 0, and an unbraced file-scope `name(args) { }` is a
+ *    valid implicit-int function definition that must not be touched);
+ *  - lowercase-led identifier (iterator macros are lowercase by convention;
+ *    this also excludes constructors if the file is really C++) that is not a
+ *    control keyword;
+ *  - the parens balance ON the line (string literals skipped), and after
+ *    them only `{` or end-of-line may follow — a `;` (a real call statement),
+ *    an operator, or any other token disqualifies;
+ *  - when the line ends at `)`, the NEXT non-blank line must begin with `{`.
+ * C++ deliberately does NOT get this pass: an indented snake_case
+ * constructor (`basic_string_view(const Char* s) : … {`) is exactly this
+ * shape, and blanking it would corrupt every STL-style class.
+ */
+const C_STMT_MACRO_KEYWORDS = new Set([
+  'if', 'while', 'for', 'switch', 'return', 'do', 'else', 'sizeof',
+]);
+export function blankCStatementMacroCalls(source: string): string {
+  const lines = source.split('\n');
+  let changed = false;
+  const content = (l: string): string => l.replace(/\r$/, '').trim();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const m = /^[ \t]+([a-z_][a-z0-9_]*)[ \t]*\(/.exec(line);
+    if (!m || C_STMT_MACRO_KEYWORDS.has(m[1] as string)) continue;
+    const open = line.indexOf('(', m[0].length - 1);
+    let depth = 0;
+    let close = -1;
+    for (let k = open; k < line.length; k++) {
+      const ch = line[k];
+      if (ch === '"' || ch === "'") {
+        const quote = ch;
+        k++;
+        while (k < line.length && line[k] !== quote) {
+          if (line[k] === '\\') k++;
+          k++;
+        }
+        continue;
+      }
+      if (ch === '(') depth++;
+      else if (ch === ')') {
+        depth--;
+        if (depth === 0) {
+          close = k;
+          break;
+        }
+      }
+    }
+    if (close < 0) continue; // parens don't balance on the line
+    const after = line.slice(close + 1).replace(/\r$/, '').trim();
+    if (after === '') {
+      // Brace on the next line (`ql_foreach(…)\n{`) or a brace-less
+      // single-statement body (`for_each_subsys(ss, i)\n\tstmt;` — blanking
+      // leaves the bare statement, valid C). A next line starting with an
+      // operator/string/`;` is an expression continuation — bail.
+      let next = i + 1;
+      while (next < lines.length && content(lines[next] as string) === '') next++;
+      if (next >= lines.length) continue;
+      const first = content(lines[next] as string)[0];
+      if (!first || !/[A-Za-z_{]/.test(first)) continue;
+    } else if (after !== '{') {
+      continue;
+    }
+    const identStart = line.indexOf(m[1] as string);
+    lines[i] =
+      line.slice(0, identStart) +
+      ' '.repeat(close + 1 - identStart) +
+      line.slice(close + 1);
+    changed = true;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
+/**
+ * Blank a trailing parameter-attribute macro — `int argc UNUSED,` /
+ * `struct repository *repo UNUSED)` — git's house style for
+ * `__attribute__((unused))` on nearly every callback parameter (and the same
+ * shape as `MAYBE_UNUSED`/`G_GNUC_UNUSED` elsewhere). tree-sitter-c can't
+ * parse a second identifier after the parameter name, so every such
+ * SIGNATURE drops into error recovery — the single largest deferral bucket
+ * on git (~150 files). Blanking the macro leaves an ordinary parameter.
+ *
+ * Matched tightly: an identifier, whitespace, then an ALL-CAPS ≥3-char token
+ * immediately before `,` or `)`. Two juxtaposed identifiers in that position
+ * have no other valid-C reading — in a CALL the would-be macro is preceded
+ * by `,`/`(`, an operator, or a literal, never by a bare identifier. C-only:
+ * C++ grammars accept more juxtapositions (user-defined suffixes, macro'd
+ * `final`/`override`), so cpp keeps its existing recovery there.
+ */
+const C_TRAILING_PARAM_ATTR_RE = /\b([A-Za-z_]\w*)([ \t]+)([A-Z][A-Z0-9_]{2,})(?=[ \t]*[,)])/g;
+export function blankCTrailingParamAttrMacros(source: string): string {
+  if (!C_TRAILING_PARAM_ATTR_RE.test(source)) {
+    C_TRAILING_PARAM_ATTR_RE.lastIndex = 0;
+    return source;
+  }
+  C_TRAILING_PARAM_ATTR_RE.lastIndex = 0;
+  return source.replace(
+    C_TRAILING_PARAM_ATTR_RE,
+    (_m, name: string, ws: string, macro: string) => name + ws + ' '.repeat(macro.length)
+  );
+}
+
+/**
+ * Blank the Linux-kernel/sparse declaration-annotation macros — `static int
+ * __init audit_init(void)`, `void __user *buf`, `__bpf_kfunc void f(…)`,
+ * `int x __ro_after_init;`. These lowercase double-underscore annotations sit
+ * between storage/type tokens and the declarator, a position tree-sitter-c
+ * can't reconcile, and they blanket the Linux tree: measured on the kernel's
+ * own `kernel/` + `mm/` subtrees, they are the largest single deferral cause
+ * (the `__init` family alone heads ~37% of erroring files).
+ *
+ * A structural match is IMPOSSIBLE here: `__u32 count` (a real typedef) and
+ * `__init foo` (an annotation) are byte-shape identical — so unlike the
+ * shape-keyed blanks above, this is a CURATED list (the CPP_INLINE_MACROS
+ * precedent) of well-known sparse/section/compiler annotations that are
+ * reserved-namespace macros in every codebase that spells them. Whole-word,
+ * equal-length spaces, C-only (the C++ grammar's kernel exposure is
+ * negligible and cpp keeps its narrower blank set).
+ */
+const C_KERNEL_ANNOTATIONS = [
+  '__init', '__exit', '__initdata', '__initconst', '__exitdata',
+  '__devinit', '__devexit', '__cpuinit', '__meminit', '__meminitdata',
+  '__net_init', '__net_exit', '__init_or_module',
+  '__user', '__kernel', '__iomem', '__percpu', '__rcu', '__force', '__nocast',
+  '__must_check', '__maybe_unused', '__always_unused', '__used', '__cold',
+  '__hot', '__weak', '__pure', '__sched', '__malloc', '__visible',
+  '__deprecated', '__ro_after_init', '__read_mostly', '__refdata',
+  '__latent_entropy', '__randomize_layout', '__no_randomize_layout',
+  '__bpf_kfunc', '__function_aligned', '__always_inline', '__noreturn',
+] as const;
+// `(?!\s*\()` keeps the parameterized annotations (`__printf(1, 2)`,
+// `__aligned(8)`, `__section("x")`) intact — blanking just their name would
+// strand the argument list as a floating parenthesis and CREATE an error.
+const C_KERNEL_ANNOTATION_RE = new RegExp(
+  `\\b(${[...C_KERNEL_ANNOTATIONS].sort((a, b) => b.length - a.length).join('|')})\\b(?!\\s*\\()`,
+  'g'
+);
+export function blankCKernelAnnotations(source: string): string {
+  if (source.indexOf('__') === -1) return source;
+  C_KERNEL_ANNOTATION_RE.lastIndex = 0;
+  if (!C_KERNEL_ANNOTATION_RE.test(source)) return source;
+  let out = source.replace(C_KERNEL_ANNOTATION_RE, (m) => ' '.repeat(m.length));
+  // `container_of(ptr, struct T, member)` — the type-keyword argument is the
+  // one call shape tree-sitter-c cannot read (a macro taking a TYPE), and it
+  // is pervasive across the Linux tree. Blanking just the `struct`/`union`
+  // keyword leaves `container_of(ptr,        T, member)` — a plain
+  // identifier argument the grammar parses natively. Keyed to the macro name
+  // so no other `struct` keyword anywhere is ever touched.
+  if (out.indexOf('container_of') !== -1) {
+    out = out.replace(
+      /(\bcontainer_of\s*\([^;()]*?,\s*)(struct|union)(\s+)/g,
+      (_m, head: string, kw: string, ws: string) => head + ' '.repeat(kw.length) + ws
+    );
+  }
+  return out;
+}
+
+/** C source pre-processing: neutralize `#ifdef __cplusplus` compat-guard
+ * bodies (invisible to a C compiler; `extern "C" {` otherwise errors every
+ * public header), blank declaration-markup macro calls and lone macro lines
+ * (`REDIS_NO_SANITIZE("bounds")` before a definition, jemalloc's diagnostic
+ * toggles — the same structural shapes the C++ side already blanks), recover
+ * functions hidden behind a leading attribute macro (#1211), then — for
+ * C-detected headers in CUDA projects (llm.c keeps `__device__` helpers and
+ * kernel prototypes in plain `.h`) — the same content-gated CUDA blank as
+ * C++. Offset-preserving. */
 function preParseCSource(source: string): string {
-  return looksLikeCudaSource(source) ? blankCudaConstructs(source) : source;
+  let blanked = blankCLeadingAttrMacros(
+    blankLoneMacroLines(
+      blankCStatementMacroCalls(
+        blankCTrailingParamAttrMacros(
+          blankCppAnnotationMacroCalls(
+            blankCKernelAnnotations(blankCCplusplusGuardBodies(source))
+          )
+        )
+      )
+    )
+  );
+  if (looksLikeCudaSource(blanked)) blanked = blankCudaConstructs(blanked);
+  return restoreDirectiveLines(source, blanked);
 }
 
 export const cppExtractor: LanguageExtractor = {

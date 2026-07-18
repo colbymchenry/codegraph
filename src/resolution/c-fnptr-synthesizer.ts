@@ -53,6 +53,7 @@ import type { Edge, Node } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
+import { memoryBudgetBytes } from './memory-budget';
 import { LRUCache } from './lru-cache';
 import { stripCommentsForRegex } from './strip-comments';
 
@@ -70,9 +71,13 @@ interface FieldInfo {
   type: string;
 }
 
-function sliceLines(content: string, startLine?: number, endLine?: number): string {
+/** Slice a node's body from a pre-split line array — the per-file sweeps (B/D/E)
+ *  call this once per NODE, and splitting the whole file per node was an
+ *  O(nodes × file-size) term (~1.6M full-file splits on the Linux tree,
+ *  §7a.3 cFnPtr round). Split once per file, slice many times. */
+function sliceLinesPre(lines: string[], startLine?: number, endLine?: number): string {
   if (!startLine) return '';
-  return content.split('\n').slice(startLine - 1, endLine ?? startLine).join('\n');
+  return lines.slice(startLine - 1, endLine ?? startLine).join('\n');
 }
 
 /** Index of the `}` matching the `{` at `open` (which must point at a `{`). -1 if unbalanced. */
@@ -308,10 +313,35 @@ const INCLUDE_RE = /#[ \t]*include[ \t]+"([^"\n]+)"/g;
 /** Included files worth scanning for registration tables (e.g. a generated `.def`). */
 const INCLUDABLE_EXT = /\.(def|inc|h|hh|hpp|hxx|c|cc|cpp|cxx|ipp|tcc|tbl)$/i;
 
-export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+export async function cFnPointerDispatchEdges(
+  _queries: QueryBuilder,
+  ctx: ResolutionContext,
+  onYield: MaybeYield,
+  onFraction?: (fraction: number) => void
+): Promise<Edge[]> {
   let scannedFiles = 0;
   const files = ctx.getAllFiles().filter((f) => C_CPP_EXT.test(f));
   if (files.length === 0) return [];
+
+  // CODEGRAPH_SYNTH_TIMINGS sub-attribution: this pass is 86% of kernel-scale
+  // synthesis (306s, §7a.2/§7a.3) — per-sweep walls + read/strip accounting
+  // name which sweep and which cost class owns it.
+  const prof = process.env.CODEGRAPH_SYNTH_TIMINGS
+    ? { A: 0, B: 0, C: 0, D: 0, E: 0, readMs: 0, readN: 0, stripMs: 0, stripN: 0, nodesMs: 0, nodesN: 0 }
+    : null;
+
+  // Within-pass progress: this is the pass that parks the "Linking dynamic
+  // dispatch" bar on C-heavy repos, so it reports a real fraction of its
+  // dominant work. `files` is swept once per file loop below (passes A, C, D,
+  // E — pass B is node-bound and comparatively brief), reported at the same
+  // per-16-files cadence as the cooperative yield.
+  const FILE_SWEEPS = 4;
+  const tick = async (): Promise<void> => {
+    if ((++scannedFiles & 15) === 0) {
+      onFraction?.(scannedFiles / (files.length * FILE_SWEEPS));
+      await onYield();
+    }
+  };
 
   // Cache raw + stripped source per file, LRU-BOUNDED. The old unbounded Maps
   // retained every C/C++ file's raw AND stripped text for the whole pass —
@@ -319,14 +349,30 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
   // Every sweep below iterates in `files` order, and node-kind scans return
   // rows in file-commit order, so access is near-sequential and a small LRU
   // hits; a miss just re-reads + re-strips.
-  const rawCache = new LRUCache<string, string | null>(128);
+  // Cache sizing is memory-budget-aware AND all-or-nothing (§7a.3 cFnPtr
+  // round): the flat 128 caused 4.4 strips/file across the pass's four file
+  // sweeps — 71.8s of the kernel-scale wall — and a partial LRU is WORSE than
+  // useless for cyclic sweeps (a first attempt sized ~61k against 63.8k files
+  // and thrashed to a ~0% cross-sweep hit rate). Hold every stripped file
+  // (~24KB each measured on the Linux tree) only when 40% of the live memory
+  // budget covers it; otherwise keep the old within-sweep-locality 128. The
+  // cache is pass-scoped — freed on return.
+  // Slack over files.length: non-indexed includes (.def/.inc, generated
+  // headers) join the working set mid-pass, and even a handful of keys past
+  // the cap re-triggers cyclic eviction (measured: cap==files.length still
+  // stripped 2.25×/file). Pass-scoped transient, freed on return.
+  const fullCacheCap = Math.ceil(files.length * 1.05) + 512;
+  const cacheCap = memoryBudgetBytes() * 0.5 >= fullCacheCap * 24_576 ? fullCacheCap : 128;
+  const rawCache = new LRUCache<string, string | null>(Math.min(cacheCap, 4096));
   const raw = (file: string): string | null => {
     if (rawCache.has(file)) return rawCache.get(file)!;
+    const t0 = prof ? Date.now() : 0;
     const r = ctx.readFile(file);
+    if (prof) { prof.readMs += Date.now() - t0; prof.readN++; }
     rawCache.set(file, r);
     return r;
   };
-  const srcCache = new LRUCache<string, string>(128);
+  const srcCache = new LRUCache<string, string>(cacheCap);
   const src = (file: string): string | null => {
     // A cached '' (empty or unreadable file) returns '' where the miss path
     // returns null for unreadable — every caller falsy-checks, so the two are
@@ -334,7 +380,9 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
     const hit = srcCache.get(file);
     if (hit !== undefined) return hit;
     const r = raw(file);
+    const t0 = prof ? Date.now() : 0;
     const s = r == null ? '' : stripCommentsForRegex(r, 'c');
+    if (prof) { prof.stripMs += Date.now() - t0; prof.stripN++; }
     srcCache.set(file, s);
     return r == null ? null : s;
   };
@@ -357,8 +405,9 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
   // declared as `redisCommandProc *proc;`. Without this, `proc` reads as data.
   const fnPtrTypedefs = new Set<string>();
   const fnTypeTypedefs = new Set<string>();
+  let tPass = Date.now();
   for (const file of files) {
-    if ((++scannedFiles & 15) === 0) await onYield();
+    await tick();
     const s = src(file);
     if (!s || !s.includes('typedef')) continue;
     FNPTR_TYPEDEF_RE.lastIndex = 0;
@@ -372,6 +421,7 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
       if (fm && !C_TYPE_KEYWORDS.has(fm[1]!)) fnTypeTypedefs.add(fm[1]!);
     }
   }
+  if (prof) { prof.A = Date.now() - tPass; tPass = Date.now(); }
 
   // ---- Pass B: struct field layouts ----
   // structLayout: struct name → ordered fields, for structs with ≥1 fn-pointer
@@ -438,17 +488,21 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
     if (fields.some((f) => f.isFnPtr)) structLayout.set(name, fields);
   };
 
+  let linesFile = '';
+  let linesArr: string[] = [];
   for (const st of (ctx.iterateNodesByKind?.('struct') ?? ctx.getNodesByKind('struct'))) {
     if ((++scannedFiles & 255) === 0) await onYield();
     if (!C_CPP_EXT.test(st.filePath)) continue;
     const s = src(st.filePath);
     if (!s) continue;
-    const body = sliceLines(s, st.startLine, st.endLine);
+    if (linesFile !== st.filePath) { linesFile = st.filePath; linesArr = s.split('\n'); }
+    const body = sliceLinesPre(linesArr, st.startLine, st.endLine);
     const open = body.indexOf('{');
     const close = open >= 0 ? matchBrace(body, open) : -1;
     if (open < 0 || close < 0) continue;
     registerStructLayout(st.name, parseStructFields(body.slice(open + 1, close)));
   }
+  if (prof) { prof.B = Date.now() - tPass; tPass = Date.now(); }
   // NB: no early return on an empty structLayout here — an inline `struct TAG
   // { … } var[]` table whose struct never became a node (vim's `cmdname`, broken
   // up by `#ifdef`) is discovered later during the unit scan. The `reg.size === 0`
@@ -764,7 +818,7 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
   // ---- Pass C: registrations — stream each file (and its qualifying local
   // includes) through processUnit, one at a time.
   for (const file of files) {
-    if ((++scannedFiles & 15) === 0) await onYield();
+    await tick();
     const env = new Map<string, MacroDef>();
     const objEnv = new Map<string, string>();
     const defined = new Set<string>();
@@ -795,12 +849,19 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
       processUnit({ text, file: target, env: incEnv, objEnv: incObjEnv });
     }
   }
+  if (prof) { prof.C = Date.now() - tPass; tPass = Date.now(); }
 
   // ---- receiver-type resolution within a function's source ----
   // `(?:struct )?TYPE [*]recv` declared in the params or body → TYPE (if a known
   //  fn-pointer-bearing struct).
+  const recvReCache = new Map<string, RegExp>();
   const recvTypeIn = (fnSrc: string, recv: string): string | null => {
-    const re = new RegExp(`(?:struct\\s+)?(\\w+)\\s*\\*?\\s*\\b${recv}\\b\\s*(?:[,)=;]|\\[)`, 'g');
+    let re = recvReCache.get(recv);
+    if (!re) {
+      re = new RegExp(`(?:struct\\s+)?(\\w+)\\s*\\*?\\s*\\b${recv}\\b\\s*(?:[,)=;]|\\[)`, 'g');
+      recvReCache.set(recv, re);
+    }
+    re.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = re.exec(fnSrc))) {
       if (structLayout.has(m[1]!)) return m[1]!;
@@ -812,8 +873,14 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
   // structs (the base of a chained receiver needn't carry a fn pointer itself).
   // Falls back to a file-scope table variable (`cmdnames` in `cmdnames[i].fn()`).
   const escapeRe = (x: string): string => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const varReCache = new Map<string, RegExp>();
   const varTypeIn = (fnSrc: string, v: string): string | null => {
-    const re = new RegExp(`(?:struct\\s+)?(\\w+)\\s*\\*?\\s*\\b${escapeRe(v)}\\b\\s*(?:[,)=;]|\\[)`, 'g');
+    let re = varReCache.get(v);
+    if (!re) {
+      re = new RegExp(`(?:struct\\s+)?(\\w+)\\s*\\*?\\s*\\b${escapeRe(v)}\\b\\s*(?:[,)=;]|\\[)`, 'g');
+      varReCache.set(v, re);
+    }
+    re.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = re.exec(fnSrc))) {
       if (!C_TYPE_KEYWORDS.has(m[1]!)) return m[1]!;
@@ -846,17 +913,26 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
   const FIELD_ASSIGN_RE = /(\w+)\s*(?:->|\.)\s*(\w+)\s*=\s*(\w+)\s*(?:->|\.)\s*(\w+)/g;
   const propagations: { to: string; from: string }[] = [];
   for (const file of files) {
-    if ((++scannedFiles & 15) === 0) await onYield();
+    await tick();
     const s = src(file);
     if (!s || !s.includes('=')) continue;
-    for (const fn of ctx.getNodesInFile(file)) {
+    const tN = prof ? Date.now() : 0;
+    const fnsD = ctx.getNodesInFile(file);
+    if (prof) { prof.nodesMs += Date.now() - tN; prof.nodesN++; }
+    const dLines = s.split('\n');
+    for (const fn of fnsD) {
       if (!FN_KINDS.has(fn.kind)) continue;
-      const body = sliceLines(s, fn.startLine, fn.endLine);
+      const body = sliceLinesPre(dLines, fn.startLine, fn.endLine);
       if (!body.includes('=')) continue;
       FIELD_ASSIGN_RE.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = FIELD_ASSIGN_RE.exec(body))) {
         const [, lrecv, lfield, rrecv, rfield] = m;
+        // Pre-gate on field NAMES: `a->f = b->g` matches every struct-field
+        // assignment in the tree (millions on the kernel), but only fields
+        // that are fn-pointer fields of SOME struct can pass fnPtrFieldOf —
+        // skip the two regex type resolutions for the ~99% that can't.
+        if (!fieldToStructs.has(lfield!) || !fieldToStructs.has(rfield!)) continue;
         const lt = recvTypeIn(body, lrecv!);
         const rt = recvTypeIn(body, rrecv!);
         if (lt && rt && fnPtrFieldOf(lt, lfield!) && fnPtrFieldOf(rt, rfield!)) {
@@ -881,6 +957,7 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
     }
     if (!changed) break;
   }
+  if (prof) { prof.D = Date.now() - tPass; tPass = Date.now(); }
   if (reg.size === 0 && arrayReg.size === 0) return [];
 
   // ---- Pass E: dispatch sites → edges ----
@@ -897,15 +974,29 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const file of files) {
-    if ((++scannedFiles & 15) === 0) await onYield();
+    await tick();
     const s = src(file);
     if (!s) continue;
-    for (const fn of ctx.getNodesInFile(file)) {
+    const tN = prof ? Date.now() : 0;
+    const fnsE = ctx.getNodesInFile(file);
+    if (prof) { prof.nodesMs += Date.now() - tN; prof.nodesN++; }
+    const eLines = s.split('\n');
+    for (const fn of fnsE) {
     if (!FN_KINDS.has(fn.kind)) continue;
-    const body = sliceLines(s, fn.startLine, fn.endLine);
+    const body = sliceLinesPre(eLines, fn.startLine, fn.endLine);
     DISPATCH_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     let added = 0;
+    // Incremental line counting: matches arrive in ascending index order, so
+    // count newlines since the previous match instead of re-splitting the
+    // whole body prefix per match (O(body) each — real time on god-files).
+    let lcIdx = 0;
+    let lcLine = fn.startLine;
+    const lineAt = (idx: number): number => {
+      for (let i = lcIdx; i < idx; i++) if (body.charCodeAt(i) === 10) lcLine++;
+      lcIdx = idx;
+      return lcLine;
+    };
     while ((m = DISPATCH_RE.exec(body)) && added < FANOUT_CAP) {
       const baseChain = m[1]!.replace(/\s*(?:->|\.)\s*$/, '').trim(); // receiver, minus the trailing arrow
       const field = m[2]!;
@@ -924,7 +1015,7 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
       if (!struct) continue;
       const targets = reg.get(`${struct}.${field}`);
       if (!targets) continue;
-      const line = fn.startLine + body.slice(0, m.index).split('\n').length - 1;
+      const line = lineAt(m.index);
       for (const tid of targets) {
         if (tid === fn.id) continue;
         const key = `${fn.id}>${tid}`;
@@ -948,6 +1039,9 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
 
     // ---- bare array-of-fn-pointers dispatch (`tbl[i](…)`) ----
     if (arrayReg.size && added < FANOUT_CAP) {
+      // Fresh scan from the body's start — rewind the line-count cursor too.
+      lcIdx = 0;
+      lcLine = fn.startLine;
       ARRAY_DISPATCH_RE.lastIndex = 0;
       while ((m = ARRAY_DISPATCH_RE.exec(body)) && added < FANOUT_CAP) {
         const entries = arrayReg.get(m[1]!);
@@ -958,7 +1052,7 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
           ? entries[0]!.ids
           : (entries.find((e) => e.file === fn.filePath)?.ids ?? null);
         if (!ids) continue;
-        const line = fn.startLine + body.slice(0, m.index).split('\n').length - 1;
+        const line = lineAt(m.index);
         for (const tid of ids) {
           if (tid === fn.id) continue;
           const key = `${fn.id}>${tid}`;
@@ -981,6 +1075,12 @@ export async function cFnPointerDispatchEdges(_queries: QueryBuilder, ctx: Resol
       }
     }
     }
+  }
+  if (prof) {
+    prof.E = Date.now() - tPass;
+    console.error(
+      `[synth-timing] cFnPtr sub: A=${prof.A}ms B=${prof.B}ms C=${prof.C}ms D=${prof.D}ms E=${prof.E}ms | read n=${prof.readN} ${prof.readMs}ms strip n=${prof.stripN} ${prof.stripMs}ms nodesInFile n=${prof.nodesN} ${prof.nodesMs}ms`
+    );
   }
   return edges;
 }

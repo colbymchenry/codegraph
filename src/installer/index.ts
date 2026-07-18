@@ -29,6 +29,7 @@ import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
 import { getCodeGraphDir, codeGraphDirName } from '../directory';
 import { getTelemetry, TELEMETRY_DOCS } from '../telemetry';
+import { maybeOfferBetaSignup } from './beta-signup';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -264,6 +265,17 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       scope: location,
       kind: sawCreated ? 'fresh' : sawUpdated ? 'upgrade' : 'reinstall',
     });
+  }
+
+  // Step 5½: CodeGraph Pro beta opt-in — the same waitlist as the
+  // getcodegraph.com homepage form, offered once per machine at the end of a
+  // successful install (and after `codegraph upgrade` — the shared gate in
+  // maybeOfferBetaSignup means whichever asks first is the ONLY ask ever).
+  // Strictly opt-in (user answers yes AND types an email), never shown under
+  // --yes, and any yes/no answer is stored so nothing re-asks. Cancel or a
+  // failed submit stores nothing, so a later install/upgrade may offer again.
+  if (!useDefaults && installedIds.length > 0) {
+    await maybeOfferBetaSignup({ source: 'cli-install' });
   }
 
   // Step 6: install wires up agents only — it deliberately does NOT index.

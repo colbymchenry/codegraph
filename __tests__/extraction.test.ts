@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -3720,6 +3720,47 @@ int f() { return 1; }
       const result = extractFromSource('nested.cpp', code);
       expect(result.nodes.find((n) => n.name === 'f')?.qualifiedName).toBe('a::b::f');
     });
+
+    // Out-of-line member definitions take their qualifiedName from the
+    // declarator's receiver (`ManifestStartup::Apply`), which is spelled
+    // RELATIVE to the enclosing namespace — the namespace prefix must compose
+    // in, or the method's qualifiedName diverges from its own class node's
+    // and `ns::Class::Method(...)` call sites never resolve (#1291).
+    it('out-of-line method definitions inside a namespace carry the namespace prefix', () => {
+      const code = `namespace simulator {
+class ManifestStartup {
+public:
+    struct Input { int x; };
+    struct Output { int y; };
+    static Output Apply(const Input& input);
+};
+ManifestStartup::Output ManifestStartup::Apply(const Input& input) { return {}; }
+}
+`;
+      const result = extractFromSource('manifest_startup.cpp', code);
+      const apply = result.nodes.filter((n) => n.name === 'Apply');
+      // The out-of-line definition's QN matches the class node's prefix.
+      expect(apply.map((n) => n.qualifiedName)).toContain('simulator::ManifestStartup::Apply');
+      expect(result.nodes.find((n) => n.kind === 'class')?.qualifiedName).toBe(
+        'simulator::ManifestStartup'
+      );
+    });
+
+    it('a receiver that re-spells the namespace path is not double-prefixed', () => {
+      const code = `namespace sim {
+class M { public: static void f(); static void g(); };
+void sim::M::f() {}
+void M::g() {}
+}
+void sim::M::f2() {}
+`;
+      const result = extractFromSource('m.cpp', code);
+      const qns = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+      expect(qns).toContain('sim::M::f'); // fully re-spelled inside the namespace
+      expect(qns).toContain('sim::M::g'); // relative form
+      expect(qns).toContain('sim::M::f2'); // global scope, spelled absolute
+      expect(qns.find((q) => q?.includes('sim::sim'))).toBeUndefined();
+    });
   });
 
   describe('C++ forward declarations do not mint phantom class nodes (#1093)', () => {
@@ -4087,6 +4128,119 @@ class Both : public Base<char>, public Plain {};
       expect(stripCppTemplateArgs('Outer<int>::Inner')).toBe('Outer::Inner'); // mid-name
       expect(stripCppTemplateArgs('Base')).toBe('Base'); // no-op
       expect(stripCppTemplateArgs('ns::Plain')).toBe('ns::Plain'); // no-op qualified
+    });
+  });
+
+  describe('C leading attribute macro before typedef return type (#1211)', () => {
+    // `SEC_ATTR UINT32 LostName(VOID)` — tree-sitter's C grammar reads the
+    // unknown macro as the type, the typedef'd return as the declarator, and
+    // stores the PARAMETER LIST as the function name ("(VOID)"). The
+    // structural pre-parse blank recovers the definition; the issue's whole
+    // isolation table is pinned here.
+    it("recovers the issue's full isolation table under their real names", () => {
+      const code = `#define SEC_ATTR __attribute__((section(".init")))
+typedef unsigned int UINT32;
+#define VOID void
+
+SEC_ATTR VOID   GoodName(VOID)  { }
+SEC_ATTR UINT32 LostName(VOID)  { return 0; }
+UINT32 NoAttr(void) { return 0; }
+SEC_ATTR int BuiltinRet(void) { return 0; }
+__attribute__((section(".init"))) UINT32 RawAttr(void) { return 0; }
+SEC_ATTR UINT32 OneNamedArg(UINT32 x) { return x; }
+SEC_ATTR UINT32* PtrRet(VOID) { return 0; }
+`;
+      const result = extractFromSource('attrs.c', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toEqual(
+        expect.arrayContaining([
+          'GoodName', 'LostName', 'NoAttr', 'BuiltinRet', 'RawAttr', 'OneNamedArg', 'PtrRet',
+        ])
+      );
+      // The bug shape: a parameter list stored as a name.
+      expect(fns.find((n) => n.includes('('))).toBeUndefined();
+    });
+
+    it('blankCLeadingAttrMacros only touches the MACRO-ret-name-( definition shape', () => {
+      // Blanked: the definition shape (offset-preserving).
+      expect(blankCLeadingAttrMacros('SEC_ATTR UINT32 f(void) {}')).toBe(
+        '         UINT32 f(void) {}'
+      );
+      // Untouched: a plain typedef'd return with ONE identifier before `(`.
+      expect(blankCLeadingAttrMacros('UINT32 helper(void) {}')).toBe('UINT32 helper(void) {}');
+      // Untouched: an ALL-CAPS function CALL at line start.
+      expect(blankCLeadingAttrMacros('MY_ASSERT(x);')).toBe('MY_ASSERT(x);');
+      // Untouched: #define lines (start with #, not line-leading CAPS).
+      const def = '#define SEC_ATTR __attribute__((section(".init")))';
+      expect(blankCLeadingAttrMacros(def)).toBe(def);
+      // Untouched: multi-word builtin returns (the grammar keeps the name there).
+      expect(blankCLeadingAttrMacros('SEC_ATTR unsigned int f(void) {}')).toBe(
+        'SEC_ATTR unsigned int f(void) {}'
+      );
+      // Untouched: mid-line uses.
+      expect(blankCLeadingAttrMacros('x = SEC_ATTR UINT32 y(z);')).toBe(
+        'x = SEC_ATTR UINT32 y(z);'
+      );
+    });
+  });
+
+  describe('C++ out-of-line template method receivers (#1286)', () => {
+    // `template<typename T> T Box<T>::get()` used to store qualified_name
+    // `Box<T>::get` — the `<T>` qualifier never matched the class node indexed
+    // as `Box`, and long multi-line parameter lists could push qualified_name
+    // past NAME_MAX. Inline definitions of the same method produce `Box::get`,
+    // so the out-of-line form must normalize to the identical name.
+    it('strips the template parameter list from the receiver qualifier', () => {
+      const code = `template <typename T>
+class Box {
+public:
+    T get() const;
+    void set(T v);
+private:
+    T value;
+};
+
+template <typename T> T Box<T>::get() const { return value; }
+template <typename T> void Box<T>::set(T v) { value = v; }
+`;
+      const result = extractFromSource('box.cpp', code);
+      expect(result.errors).toHaveLength(0);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const qns = methods.map((n) => n.qualifiedName).sort();
+      // Out-of-line definitions carry the SAME qualifier as the class node.
+      expect(qns).toContain('Box::get');
+      expect(qns).toContain('Box::set');
+      expect(qns.find((q) => q?.includes('<'))).toBeUndefined();
+      // Names themselves stay clean.
+      expect(methods.map((n) => n.name).sort()).toEqual(expect.arrayContaining(['get', 'set']));
+    });
+
+    it('multi-line template parameter lists cannot leak into qualified_name (NAME_MAX overflow shape)', () => {
+      // The ICU capi_helper.h shape: enormous multi-line parameter names made
+      // qualified_name 272 bytes (> NAME_MAX 255) including embedded newlines.
+      const code = `template <typename CType,
+          typename CPPType,
+          int32_t kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>
+class ApiHelper {
+public:
+    CPPType* validate();
+};
+
+template <typename CType,
+          typename CPPType,
+          int32_t kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>
+CPPType* ApiHelper<CType,
+                   CPPType,
+                   kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>::validate() {
+    return nullptr;
+}
+`;
+      const result = extractFromSource('capi_helper.h', code);
+      const validate = result.nodes.find((n) => n.kind === 'method' && n.name === 'validate' && n.qualifiedName?.includes('::'));
+      expect(validate).toBeDefined();
+      expect(validate!.qualifiedName).toBe('ApiHelper::validate');
+      expect(validate!.qualifiedName!.length).toBeLessThan(255);
+      expect(validate!.qualifiedName).not.toMatch(/[<>\n]/);
     });
   });
 
@@ -11022,5 +11176,141 @@ import DataStore from '../data/DataStore';
       expect(imports).toContain('../model/TodoItem');
       expect(imports).toContain('../data/DataStore');
     });
+  });
+});
+
+// R7a preParse additions — the blanking passes added so macro-heavy C/C++
+// parses clean enough for the kernel route (each also improves the wasm
+// path's own graphs). Offset preservation is load-bearing everywhere.
+describe('C/C++ kernel-port preParse blanks (R7a)', () => {
+  it('blankCCplusplusGuardBodies blanks extern-C guard bodies, keeps directives', async () => {
+    const { blankCCplusplusGuardBodies } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      '#ifdef __cplusplus',
+      'extern "C" {',
+      '#endif',
+      'int real_decl(void);',
+      '#ifdef __cplusplus',
+      '}',
+      '#endif',
+      '',
+    ].join('\n');
+    const out = blankCCplusplusGuardBodies(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('extern "C"');
+    expect(out).toContain('#ifdef __cplusplus'); // directives stay
+    expect(out).toContain('int real_decl(void);');
+    // A guard with a nested directive bails (needs real preprocessing).
+    const nested = [
+      '#ifdef __cplusplus',
+      '#define EXTERNC extern "C"',
+      '#endif',
+      '',
+    ].join('\n');
+    expect(blankCCplusplusGuardBodies(nested)).toBe(nested);
+    // The `#ifndef` inverse guard is C-visible and must be untouched.
+    const inverse = ['#ifndef __cplusplus', 'int c_only(void);', '#endif', ''].join('\n');
+    expect(blankCCplusplusGuardBodies(inverse)).toBe(inverse);
+  });
+
+  it('blankLoneMacroLines blanks namespace-management macros, spares expression operands', async () => {
+    const { blankLoneMacroLines } = await import('../src/extraction/languages/c-cpp');
+    const src = ['FMT_BEGIN_NAMESPACE', 'struct S { int x; };', 'FMT_END_NAMESPACE', ''].join('\n');
+    const out = blankLoneMacroLines(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('FMT_BEGIN_NAMESPACE');
+    expect(out).toContain('struct S { int x; };');
+    // An ALL-CAPS operand alone on a line inside a multi-line expression is
+    // NOT a lone macro — the next line starts with an operator.
+    const expr = ['int x = 0', '  | FLAG_ONE', '  | FLAG_TWO;', ''].join('\n');
+    expect(blankLoneMacroLines(expr)).toBe(expr);
+    const cont = ['int y =', 'SOME_FLAG', '| OTHER;', ''].join('\n');
+    expect(blankLoneMacroLines(cont)).toBe(cont);
+    // Underscore-free solid words are too risky and stay.
+    const bare = ['NDEBUG', 'int z;', ''].join('\n');
+    expect(blankLoneMacroLines(bare)).toBe(bare);
+  });
+
+  it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
+    const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static void walk(struct list *head) {',
+      '\tlist_for_each_entry(pos, head, member) {',
+      '\t\tuse(pos);',
+      '\t}',
+      '}',
+      '',
+    ].join('\n');
+    const out = blankCStatementMacroCalls(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('list_for_each_entry');
+    expect(out).toContain('use(pos);');
+    // A real call statement ends with `;` — untouched.
+    expect(out).toContain('use(pos);');
+    const call = ['void f(void) {', '\tdo_thing(a, b);', '}', ''].join('\n');
+    expect(blankCStatementMacroCalls(call)).toBe(call);
+    // Column-0 `name(args) {` is an implicit-int function definition — untouched.
+    const kandr = ['main(argc, argv)', '{', '\treturn 0;', '}', ''].join('\n');
+    expect(blankCStatementMacroCalls(kandr)).toBe(kandr);
+    // Control-flow keywords are never macros.
+    const ctrl = ['void g(int x) {', '\twhile (x) {', '\t\tx--;', '\t}', '}', ''].join('\n');
+    expect(blankCStatementMacroCalls(ctrl)).toBe(ctrl);
+  });
+
+  it('blankCTrailingParamAttrMacros blanks `name UNUSED` params, spares call args', async () => {
+    const { blankCTrailingParamAttrMacros } = await import('../src/extraction/languages/c-cpp');
+    const src = 'static int run(int argc UNUSED, const char **argv UNUSED)\n{\n\treturn 0;\n}\n';
+    const out = blankCTrailingParamAttrMacros(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('UNUSED');
+    expect(out).toContain('int argc ');
+    // A macro CONSTANT as a call argument is preceded by `,`/`(`, never by a
+    // bare identifier — untouched.
+    const call = 'void f(void) {\n\tconnect(sock, DEFAULT_TIMEOUT);\n}\n';
+    expect(blankCTrailingParamAttrMacros(call)).toBe(call);
+  });
+
+  it('blankCKernelAnnotations blanks sparse/section dunders, spares parameterized ones and real types', async () => {
+    const { blankCKernelAnnotations } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static int __init audit_init(void) { return 0; }',
+      'void copy(void __user *dst, const char *src);',
+      '__bpf_kfunc void bpf_iter_destroy(struct bpf_iter_num *it);',
+      '__printf(1, 2) void log_fmt(const char *fmt, ...);',
+      'struct e *entry = container_of(r, struct audit_entry, rule);',
+      '__u32 count = 0;',
+      '',
+    ].join('\n');
+    const out = blankCKernelAnnotations(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('__init');
+    expect(out).not.toContain('__user');
+    expect(out).not.toContain('__bpf_kfunc');
+    // Parameterized annotations keep their name — blanking it would strand
+    // the argument list as a floating parenthesis.
+    expect(out).toContain('__printf(1, 2)');
+    // container_of's type-keyword argument blanks; other `struct` keywords stay.
+    expect(out).toContain('container_of(r,        audit_entry, rule)');
+    expect(out).toContain('struct e *entry');
+    // Real dunder TYPES are not annotations.
+    expect(out).toContain('__u32 count');
+  });
+
+  it('restoreDirectiveLines keeps #define lines out of the blanking blast radius', async () => {
+    const { extractFromSource } = await import('../src/extraction');
+    // FMT_API matches the _API-suffix member blank; without the directive
+    // restore the #define loses its NAME and the file gains a parse error.
+    const src = [
+      '#define FMT_API FMT_VISIBILITY("default")',
+      'class Widget {',
+      ' public:',
+      '  int size() const { return 1; }',
+      '};',
+      '',
+    ].join('\n');
+    const result = extractFromSource('lib.hpp', src, 'cpp');
+    expect(result.errors).toEqual([]);
+    expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
   });
 });

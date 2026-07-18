@@ -551,7 +551,10 @@ export class FileWatcher {
     if (!rel || rel === '.' || rel.startsWith('..')) return;
     if (this.isAlwaysIgnored(rel)) return;
     if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
-    if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) return;
+    if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) {
+      this.maybeScheduleForRemovedDir(rel);
+      return;
+    }
 
     logDebug('File change detected', { file: rel });
     if (this.ready) {
@@ -562,6 +565,35 @@ export class FileWatcher {
         lastSeenMs: now,
       });
     }
+    this.scheduleSync();
+  }
+
+  /**
+   * A deleted DIRECTORY arrives as one event on the directory's own path —
+   * no source extension, so the source-file filter drops it, and the files
+   * underneath may never get events of their own (Windows's recursive
+   * watcher reports only the top-most removed entry; macOS FSEvents can
+   * coalesce a tree deletion the same way). The index then kept every child
+   * record until some unrelated edit happened to trigger a sync (#1285).
+   *
+   * If a non-source path no longer exists on disk, treat it as a potential
+   * subtree removal and schedule the debounced sync — its scan-diff removes
+   * whatever is gone, which is the ground truth for what was underneath.
+   * pendingFiles is left alone (we can't know the children from the event).
+   * An event for an EXISTING non-source file stays fully ignored, so build
+   * churn on live files never schedules work; a deleted non-source file
+   * costs at most one no-op scan-diff, absorbed by the debounce.
+   */
+  private maybeScheduleForRemovedDir(rel: string): void {
+    try {
+      fs.statSync(path.join(this.projectRoot, rel));
+      return; // still on disk — an ordinary non-source change, ignore
+    } catch {
+      /* gone — fall through */
+    }
+    logDebug('Non-source path removed; scheduling sync for possible directory removal', {
+      path: rel,
+    });
     this.scheduleSync();
   }
 

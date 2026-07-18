@@ -103,21 +103,26 @@ describe('WalCheckpointValve', () => {
     db.close();
   });
 
-  it('advances its baseline on a full backfill — a wrapped WAL does not retrigger it', async () => {
+  it('advances its baseline on a full backfill — no infinite retrigger (at most one truncate park)', async () => {
+    // Pre-§7a.1 contract was "a wrapped WAL never retriggers"; the file-size
+    // trigger deliberately weakens that to "retriggers AT MOST once more, to
+    // truncate the file, then goes quiet" — the pre-fix bug this test pinned
+    // (firing on raw size forever, serializing every store) stays dead: a
+    // successful truncate zeroes the file, so the trigger cannot loop. At
+    // this test's pathological 10-BYTE soft cap, byte-level residue can trip
+    // the 4×-soft file cap once; product-scale caps are 256MB/1GB.
     const db = openDb();
     db.setWalAutocheckpoint(0);
     writeRows(db, 500);
     const valve = new WalCheckpointValve(db, 0.00001);
     valve.check();
-    await valve.drain(); // full backfill on an idle DB → baseline = current file size
-    // The WAL file keeps its high-water size, but growth is now 0: neither
-    // the timer path nor backpressure may fire again (the pre-fix bug fired
-    // on raw size forever and serialized every store behind a checkpoint).
-    expect(valve.backpressure()).toBeNull();
+    await valve.drain(); // full backfill (and possibly a timer truncate)
+    const first = valve.backpressure();
+    if (first) await first; // one truncate park allowed — file must be 0 after
+    expect(db.getWalSizeBytes()).toBe(0);
+    expect(valve.backpressure()).toBeNull(); // and now: quiet
     valve.check();
-    await valve.drain(); // no-op drain: nothing in flight
-    // New commits recycle wrapped frames — file size is flat, still no trigger.
-    writeRows(db, 5);
+    await valve.drain();
     expect(valve.backpressure()).toBeNull();
     db.close();
   });
@@ -177,17 +182,18 @@ describe('WalCheckpointValve', () => {
   });
 });
 
-describe('indexAll WAL deferral end-to-end', () => {
-  function writeFixtureProject(): void {
-    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
-    for (let i = 0; i < 8; i++) {
-      fs.writeFileSync(
-        path.join(tmpDir, 'src', `mod${i}.ts`),
-        `export function fn${i}(x: number): number { return helper${i}(x) + ${i}; }\n` +
-        `function helper${i}(x: number): number { return x * ${i}; }\n`
-      );
-    }
+function writeFixtureProject(): void {
+  fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+  for (let i = 0; i < 8; i++) {
+    fs.writeFileSync(
+      path.join(tmpDir, 'src', `mod${i}.ts`),
+      `export function fn${i}(x: number): number { return helper${i}(x) + ${i}; }\n` +
+      `function helper${i}(x: number): number { return x * ${i}; }\n`
+    );
   }
+}
+
+describe('indexAll WAL deferral end-to-end', () => {
 
   it('produces the same graph with and without deferral, and restores the interval', async () => {
     writeFixtureProject();
@@ -213,5 +219,211 @@ describe('indexAll WAL deferral end-to-end', () => {
     } finally {
       delete process.env.CODEGRAPH_NO_WAL_DEFER;
     }
+  });
+});
+
+describe('sync WAL deferral end-to-end (#1248)', () => {
+  // The #1242 fix originally landed only on indexAll; sync stayed at the
+  // default 1000-page autocheckpoint and reproduced the #1231 HDD thrash on
+  // every incremental run (2 minutes for a 7-file sync). These pin that sync
+  // defers during the run, restores after — success AND no-change paths —
+  // and that a deferred sync produces the same graph as an undeferred one.
+  it('defers the autocheckpoint interval DURING sync and restores it after', async () => {
+    writeFixtureProject();
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    const conn = (cg as unknown as { db: DatabaseConnection }).db;
+
+    fs.writeFileSync(
+      path.join(tmpDir, 'src', 'mod0.ts'),
+      `export function fn0(x: number): number { return helper0(x) + 100; }\n` +
+      `function helper0(x: number): number { return x * 100; }\n`
+    );
+
+    // Sample the interval mid-run from inside the progress callback — the
+    // store loop is exactly where the #1248 thrash happened.
+    const midRunIntervals: number[] = [];
+    const result = await cg.sync({
+      onProgress: () => {
+        try { midRunIntervals.push(conn.getWalAutocheckpoint()); } catch { /* ignore */ }
+      },
+    });
+    expect(result.filesModified).toBe(1);
+    expect(midRunIntervals.length).toBeGreaterThan(0);
+    expect(midRunIntervals.every((v) => v === 0)).toBe(true);
+    // Scoped to the run: back on the default afterwards.
+    expect(conn.getWalAutocheckpoint()).toBe(1000);
+    await cg.close();
+  });
+
+  it('restores the interval on a no-change sync too', async () => {
+    writeFixtureProject();
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    const conn = (cg as unknown as { db: DatabaseConnection }).db;
+    const result = await cg.sync();
+    expect(result.filesAdded + result.filesModified + result.filesRemoved).toBe(0);
+    expect(conn.getWalAutocheckpoint()).toBe(1000);
+    await cg.close();
+  });
+
+  it('produces the same sync result with and without deferral', async () => {
+    writeFixtureProject();
+    const cg1 = CodeGraph.initSync(tmpDir);
+    await cg1.indexAll();
+    fs.writeFileSync(
+      path.join(tmpDir, 'src', 'mod1.ts'),
+      `export function fn1(x: number): number { return helper1(x) + 111; }\n` +
+      `function helper1(x: number): number { return x * 111; }\n`
+    );
+    const r1 = await cg1.sync();
+    const counts1 = { modified: r1.filesModified, nodes: r1.nodesUpdated };
+    await cg1.close();
+
+    fs.rmSync(path.join(tmpDir, '.codegraph'), { recursive: true, force: true });
+
+    process.env.CODEGRAPH_NO_WAL_DEFER = '1';
+    try {
+      const cg2 = CodeGraph.initSync(tmpDir);
+      await cg2.indexAll();
+      fs.writeFileSync(
+        path.join(tmpDir, 'src', 'mod1.ts'),
+        `export function fn1(x: number): number { return helper1(x) + 222; }\n` +
+        `function helper1(x: number): number { return x * 222; }\n`
+      );
+      const r2 = await cg2.sync();
+      expect({ modified: r2.filesModified, nodes: r2.nodesUpdated }).toEqual(counts1);
+      await cg2.close();
+    } finally {
+      delete process.env.CODEGRAPH_NO_WAL_DEFER;
+    }
+  });
+});
+
+describe('resolution-phase WAL backpressure plumbing (§7a.1)', () => {
+  // The valve's timer-driven passive checkpoints stay perpetually partial
+  // against the resolver pool's continuous reads, so during resolution the
+  // writer-side backpressure() hook is the ONLY mechanism that can complete
+  // a backfill and let the WAL wrap — a kernel-scale run without it grew a
+  // 22GB WAL on a 4.6GB DB. These pin that the batch loop (a) calls the hook
+  // at the pool-idle boundary and (b) actually parks on a returned promise.
+
+  async function seedPendingRefs(cg: CodeGraph): Promise<void> {
+    const raw = (cg as unknown as { db: DatabaseConnection }).db.getDb();
+    const node = raw.prepare("SELECT id, file_path FROM nodes WHERE kind = 'function' LIMIT 1").get() as
+      | { id: string; file_path: string }
+      | undefined;
+    expect(node).toBeDefined();
+    const ins = raw.prepare(
+      "INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, file_path, language, status) VALUES (?, ?, 'calls', 1, 0, ?, 'typescript', 'pending')"
+    );
+    ins.run(node!.id, 'helper0', node!.file_path);
+    ins.run(node!.id, 'helper1', node!.file_path);
+  }
+
+  it('calls the backpressure hook once per settled batch', async () => {
+    writeFixtureProject();
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    await seedPendingRefs(cg);
+
+    let calls = 0;
+    const result = await cg.resolveReferencesBatched(undefined, undefined, () => {
+      calls++;
+      return null; // under the hard cap — loop must proceed without waiting
+    });
+    expect(result.stats.total).toBeGreaterThan(0);
+    expect(calls).toBeGreaterThanOrEqual(1);
+    await cg.close();
+  });
+
+  it('parks the batch loop on a backpressure promise until it resolves', async () => {
+    writeFixtureProject();
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    await seedPendingRefs(cg);
+
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let hookHit = false;
+    const done = cg
+      .resolveReferencesBatched(undefined, undefined, () => {
+        if (hookHit) return null; // park only on the first boundary
+        hookHit = true;
+        return gate;
+      })
+      .then(() => true);
+
+    // Give the loop ample turns: it must reach the hook and then be parked.
+    for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r));
+    expect(hookHit).toBe(true);
+    const settledEarly = await Promise.race([done, Promise.resolve(false)]);
+    expect(settledEarly).toBe(false); // still parked on the gate
+
+    release();
+    expect(await done).toBe(true);
+    await cg.close();
+  });
+});
+
+describe('checkpointWalTruncate (§7a.1 file containment)', () => {
+  it('chops a fully-backfilled WAL file to zero', async () => {
+    const db = openDb();
+    db.setWalAutocheckpoint(0);
+    writeRows(db, 400);
+    expect(db.getWalSizeBytes()).toBeGreaterThan(1024 * 1024);
+    const res = await db.checkpointWalTruncate();
+    expect(res).not.toBeNull();
+    expect(res!.busy).toBe(0);
+    expect(db.getWalSizeBytes()).toBe(0); // the file itself, not just the backlog
+    db.close();
+  });
+});
+
+describe('valve file-size trigger (§7a.1: backfilled WAL still grows the file)', () => {
+  it('backpressure trips on file size alone once past the file cap, even with zero backlog', async () => {
+    const db = openDb();
+    db.setWalAutocheckpoint(0);
+    // Grow the file well past a 0.5MB soft cap (file cap = 4× = 2MB), then
+    // fold the backlog completely so growth-vs-baseline is ~zero.
+    writeRows(db, 800);
+    const valve = new WalCheckpointValve(db, 0.5);
+    await valve.foldNow(); // baseline := file size; backlog now 0; file unchanged
+    expect(db.getWalSizeBytes()).toBe(0); // foldNow's success path truncates at the barrier
+    db.close();
+  });
+
+  it('a fully-backfilled but oversized file is chopped at the barrier', async () => {
+    const db = openDb();
+    db.setWalAutocheckpoint(0);
+    writeRows(db, 800);
+    const before = db.getWalSizeBytes();
+    expect(before).toBeGreaterThan(2 * 1024 * 1024);
+    const valve = new WalCheckpointValve(db, 0.5);
+    const bp = valve.backpressure(); // growth past hard cap → parks
+    expect(bp).not.toBeNull();
+    await bp;
+    expect(db.getWalSizeBytes()).toBe(0); // truncated at the parked barrier
+    // And the file-size trigger alone re-arms it after regrowth:
+    writeRows(db, 800);
+    await valve.foldNow();
+    writeRows(db, 100); // small backlog, file grows again but under hard cap
+    const sizeTrigger = valve.backpressure();
+    // 100 rows ≈ <1MB backlog (under 1MB hard cap) but file is past the 2MB cap
+    expect(sizeTrigger).not.toBeNull();
+    await sizeTrigger;
+    expect(db.getWalSizeBytes()).toBe(0);
+    db.close();
+  });
+});
+
+describe('resolveWalValveMb DB-size scaling (§7a.2 fold-tax reduction)', () => {
+  it('scales soft cap ~dbSize/4 within [256, 2048]MB; env always wins', () => {
+    const GB = 1024 * 1024 * 1024;
+    expect(resolveWalValveMb(undefined, 100 * 1024 * 1024)).toBe(256); // floor
+    expect(resolveWalValveMb(undefined, 4.6 * GB)).toBe(1177); // ~dbSize/4
+    expect(resolveWalValveMb(undefined, 40 * GB)).toBe(2048); // ceiling
+    expect(resolveWalValveMb('64', 40 * GB)).toBe(64); // env override wins
+    expect(resolveWalValveMb(undefined, 0)).toBe(256); // unknown size → default
   });
 });

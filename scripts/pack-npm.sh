@@ -64,7 +64,10 @@ for archive in "${archives[@]}"; do
         description: `CodeGraph self-contained bundle for ${process.env.TARGET}`,
         os: [process.env.OSV], cpu: [process.env.ARCHV],
         files: [process.env.NODEFILE, "lib", "bin"],
-        license: "MIT"
+        license: "MIT",
+        // npm --provenance refuses to publish unless this matches the repo
+        // the release workflow runs in.
+        repository: { type: "git", url: "git+https://github.com/colbymchenry/codegraph.git" }
       }, null, 2) + "\n");
     ' "$pkgdir/package.json"
   targets+=("$target")
@@ -111,7 +114,8 @@ VERSION="$VERSION" SCOPE="$SCOPE" TARGETS="${targets[*]}" \
       },
       optionalDependencies: opt,
       files: ["npm-shim.js","npm-sdk.js","dist","README.md"],
-      license: "MIT"
+      license: "MIT",
+      repository: { type: "git", url: "git+https://github.com/colbymchenry/codegraph.git" }
     }, null, 2) + "\n");
   ' "$NPM/main/package.json"
 

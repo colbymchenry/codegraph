@@ -96,17 +96,29 @@ export const goResolver: FrameworkResolver = {
     let match: RegExpExecArray | null;
     while ((match = routeRegex.exec(safe)) !== null) {
       const [, rawMethod, routePath, handlerExpr] = match;
+
+      // The first argument must be URL-shaped, or this is just a method that
+      // happens to share a verb name — `cache.Put("key", val)`, `store.Get(...)`,
+      // `bus.Handle("user.created", h)` all polluted the route index (#1259).
+      // Real registrations use "/path" (every router), or net/http's Go 1.22
+      // "METHOD /path" patterns on Handle/HandleFunc.
+      const methodPrefix = matchGo122MethodPattern(routePath!, rawMethod!);
+      if (!routePath!.startsWith('/') && !methodPrefix) continue;
+
       const line = safe.slice(0, match.index).split('\n').length;
-      const method =
-        rawMethod === 'Handle' || rawMethod === 'HandleFunc'
+      // "GET /users/{id}" -> method GET, path /users/{id}
+      const path = methodPrefix ? routePath!.slice(methodPrefix.length).trimStart() : routePath!;
+      const method = methodPrefix
+        ? methodPrefix
+        : rawMethod === 'Handle' || rawMethod === 'HandleFunc'
           ? 'ANY'
           : rawMethod!.toUpperCase();
 
       const routeNode: Node = {
-        id: `route:${filePath}:${line}:${method}:${routePath}`,
+        id: `route:${filePath}:${line}:${method}:${path}`,
         kind: 'route',
-        name: `${method} ${routePath}`,
-        qualifiedName: `${filePath}::route:${routePath}`,
+        name: `${method} ${path}`,
+        qualifiedName: `${filePath}::route:${path}`,
         filePath,
         startLine: line,
         endLine: line,
@@ -134,6 +146,17 @@ export const goResolver: FrameworkResolver = {
     return { nodes, references };
   },
 };
+
+/**
+ * Go 1.22 net/http mux patterns: `mux.HandleFunc("GET /users/{id}", h)`.
+ * Returns the HTTP method when the pattern starts with one, null otherwise.
+ * Only Handle/HandleFunc take these — Gin/Chi verb methods take a bare path.
+ */
+function matchGo122MethodPattern(routePath: string, rawMethod: string): string | null {
+  if (rawMethod !== 'Handle' && rawMethod !== 'HandleFunc') return null;
+  const m = routePath.match(/^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|CONNECT|TRACE)\s+\S/);
+  return m ? m[1]! : null;
+}
 
 /** Extract the last identifier from an expression like `pkg.Sub.handler` or `handler`. */
 function extractGoTailIdent(expr: string): string | null {

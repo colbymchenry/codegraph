@@ -208,6 +208,21 @@ export class ParseWorkerPool {
     this.spawnOne(); // one eager warm worker, ready for the first parse
   }
 
+  /**
+   * Spawn the whole pool up front. The default demand-driven growth avoids
+   * paying worker boot for small jobs, but a bulk index KNOWS every core will
+   * be needed — on a fast repo the one-by-one ramp-up otherwise consumes most
+   * of the parse phase (each worker boot is a fresh Node isolate + grammar
+   * load, ~hundreds of ms, and growth only triggers as queue pressure builds).
+   */
+  prewarm(): void {
+    while (this.workers.size < this.maxSize) {
+      const before = this.workers.size;
+      this.spawnOne();
+      if (this.workers.size === before) break; // spawn failed / breaker tripped
+    }
+  }
+
   /** Pool size cap (for logging). */
   get size(): number { return this.maxSize; }
 

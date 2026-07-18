@@ -3447,7 +3447,120 @@ async function laravelEventEdges(ctx: ResolutionContext, onYield: MaybeYield): P
  * Sidekiq Worker.perform_async → #perform + Laravel event(new X) → listener handle).
  * Returns the count added. Never throws into indexing — callers wrap in try/catch.
  */
-export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): Promise<number> {
+
+/**
+ * Number of progress steps synthesizeCallbackEdges reports: one per `__mark()`
+ * call (every synthesis pass, plus the dedupe-merge and edge-insert steps).
+ * Cosmetic only — drift just makes the progress bar end early or jump — and a
+ * test pins it to the actual step count (registry passes + the fixed
+ * pre/post marks) so adding a pass without bumping this fails loudly instead
+ * of silently skewing the bar.
+ */
+const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
+
+/** `has(...)` shape passed to pass gates — true when the project contains any of the languages. */
+type HasLang = (...ls: string[]) => boolean;
+
+/**
+ * One independent synthesis pass. Every pass scans the COMMITTED graph (plus
+ * source via ctx) and returns an edge list; nothing it produces is persisted
+ * until the ordered merge in synthesizeCallbackEdges — which is what makes
+ * execution order free and the passes safe to fan out across the resolver
+ * pool's read-only workers. `gate` short-circuits a pass whose language never
+ * appears in the project (its result is provably empty — see #1212).
+ */
+export interface SynthPassDef {
+  name: string;
+  gate: (has: HasLang) => boolean;
+  run: (
+    queries: QueryBuilder,
+    ctx: ResolutionContext,
+    yieldToLoop: MaybeYield,
+    subProgress?: (fraction: number) => void
+  ) => Promise<Edge[]>;
+}
+
+const ALWAYS = (): boolean => true;
+
+/**
+ * The independent passes, in MERGE ORDER — the first-seen dedup in
+ * synthesizeCallbackEdges follows this array, so reordering entries changes
+ * which duplicate edge wins. The two Go pre-passes (cross-file method
+ * `contains`, implicit `implements`) are NOT here: they persist before these
+ * run because interfaceOverrideEdges reads their edges from the DB.
+ */
+export const SYNTH_PASSES: SynthPassDef[] = [
+  { name: 'fieldEdges', gate: ALWAYS, run: (q, c, y) => fieldChannelEdges(q, c, y) },
+  { name: 'closureCollEdges', gate: ALWAYS, run: (q, c, y) => closureCollectionEdges(q, c, y) },
+  { name: 'emitterEdges', gate: ALWAYS, run: (_q, c, y) => eventEmitterEdges(c, y) },
+  { name: 'renderEdges', gate: ALWAYS, run: (q, c, y) => reactRenderEdges(q, c, y) },
+  { name: 'jsxEdges', gate: ALWAYS, run: (_q, c, y) => reactJsxChildEdges(c, y) },
+  { name: 'vueEdges', gate: (has) => has('vue'), run: (_q, c, y) => vueTemplateEdges(c, y) },
+  { name: 'svelteKitEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLoadEdges(c, y) },
+  { name: 'pascalEdges', gate: ALWAYS, run: (_q, c, y) => pascalFormEdges(c, y) },
+  { name: 'flutterEdges', gate: (has) => has('dart'), run: (q, c, y) => flutterBuildEdges(q, c, y) },
+  { name: 'arkuiStateEdges', gate: (has) => has('arkts'), run: (q, c, y) => arkuiStateBuildEdges(q, c, y) },
+  { name: 'arkuiEmitter', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiEmitterEdges(c, y) },
+  { name: 'arkuiRoutes', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiRouterEdges(c, y) },
+  { name: 'cppEdges', gate: (has) => has('cpp'), run: (q, _c, y) => cppOverrideEdges(q, y) },
+  {
+    name: 'ifaceEdges',
+    gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
+    run: (q, _c, y) => interfaceOverrideEdges(q, y),
+  },
+  { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },
+  { name: 'goGrpcEdges', gate: (has) => has('go'), run: (q, _c, y) => goGrpcStubImplEdges(q, y) },
+  { name: 'rnEventEdgesList', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => rnEventEdges(c, y) },
+  { name: 'fabricNativeEdges', gate: ALWAYS, run: (_q, c, y) => fabricNativeImplEdges(c, y) },
+  { name: 'expoXPlatEdges', gate: ALWAYS, run: (q, _c, y) => expoCrossPlatformEdges(q, y) },
+  { name: 'rnXPlatEdges', gate: ALWAYS, run: (q, _c, y) => rnCrossPlatformEdges(q, y) },
+  {
+    name: 'mybatisEdges',
+    gate: (has) => has('java', 'kotlin') && has('xml'),
+    run: (q, _c, y) => mybatisJavaXmlEdges(q, y),
+  },
+  { name: 'ginEdges', gate: (has) => has('go'), run: (q, c, y) => ginMiddlewareChainEdges(q, c, y) },
+  { name: 'thunkEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => reduxThunkEdges(q, c, y) },
+  { name: 'registryEdges', gate: ALWAYS, run: (_q, c, y) => objectRegistryEdges(c, y) },
+  { name: 'rtkEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => rtkQueryEdges(q, c, y) },
+  { name: 'piniaEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => piniaStoreEdges(c, y) },
+  { name: 'vuexEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => vuexDispatchEdges(c, y) },
+  { name: 'celeryEdges', gate: (has) => has('python'), run: (_q, c, y) => celeryDispatchEdges(c, y) },
+  { name: 'springEdges', gate: (has) => has('java'), run: (_q, c, y) => springEventEdges(c, y) },
+  { name: 'mediatrEdges', gate: (has) => has('csharp'), run: (_q, c, y) => mediatrDispatchEdges(c, y) },
+  { name: 'sidekiqEdges', gate: (has) => has('ruby'), run: (_q, c, y) => sidekiqDispatchEdges(c, y) },
+  {
+    name: 'erlangBehaviourEdges',
+    gate: (has) => has('erlang'),
+    run: (q, c, y) => erlangBehaviourDispatchEdges(q, c, y),
+  },
+  { name: 'laravelEdges', gate: (has) => has('php'), run: (_q, c, y) => laravelEventEdges(c, y) },
+  {
+    name: 'cFnPtrEdges',
+    gate: (has) => has('c', 'cpp'),
+    run: (q, c, y, sub) => cFnPointerDispatchEdges(q, c, y, sub),
+  },
+  { name: 'goframeEdges', gate: (has) => has('go'), run: (_q, c, y) => goframeRouteEdges(c, y) },
+  { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
+  { name: 'shaderEdges', gate: (has) => has('glsl', 'hlsl'), run: (q, c, y) => shaderIntegrationEdges(q, c, y) },
+];
+
+/** Fixed non-registry steps: goMethodContains, goImplements, dedupe-merge, insertMergedEdges. */
+const FIXED_SYNTH_STEPS = 4;
+export const SYNTH_PROGRESS_STEPS = SYNTH_PASSES.length + FIXED_SYNTH_STEPS;
+export async function synthesizeCallbackEdges(
+  queries: QueryBuilder,
+  ctx: ResolutionContext,
+  onProgress?: (done: number, total: number) => void,
+  // A live resolver pool to fan the independent passes across (structural type
+  // so this file never imports the pool — resolver-worker imports THIS file).
+  // Null/omitted → the sequential path, byte-identical to the pool path.
+  pool?: { runSynthPass(name: string): Promise<{ edges: Edge[]; ms: number }> } | null,
+  // WAL-valve writer backstop (WalCheckpointValve.backpressure), called at
+  // pool-idle points in the edge-insert loops below — the passes themselves
+  // only read; every write in this function happens with the pool idle.
+  backpressure?: () => Promise<void> | null
+): Promise<number> {
   // Each sub-pass below is a whole-graph scan, and there are ~30 of them, all
   // running synchronously on the indexer's main thread. Their AGGREGATE can run
   // for well over a minute on a large repo — long enough for the #850 liveness
@@ -3456,6 +3569,30 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   // that itself hangs (a real wedge) never reaches the next yield, so the
   // watchdog still catches that. See ./cooperative-yield.
   const yieldToLoop = createYielder();
+
+  // Synthesis runs AFTER the resolution progress bar reaches 100%, so without
+  // its own progress the UI freezes at "Resolving refs 100%" for the whole
+  // tail — long enough on big repos that users conclude the index hung and
+  // kill it. Report each completed pass; the caller surfaces it as its own
+  // progress phase. Emit 0/total up front so the phase flips immediately.
+  // Emissions are throttled to whole-percent movement (each consumes a UI
+  // message); values may be fractional steps from within-pass reporting.
+  let passesDone = 0;
+  let lastPct = -1;
+  const emit = (value: number): void => {
+    if (!onProgress) return;
+    const v = Math.min(value, SYNTH_PROGRESS_STEPS);
+    const pct = Math.floor((v / SYNTH_PROGRESS_STEPS) * 100);
+    if (pct === lastPct) return;
+    lastPct = pct;
+    onProgress(v, SYNTH_PROGRESS_STEPS);
+  };
+  // A single long pass otherwise parks the bar between steps; a pass that
+  // takes this callback reports a 0..1 fraction of its own work, surfaced
+  // here as fractional progress within its step.
+  const subProgress = (fraction: number): void =>
+    emit(passesDone + Math.max(0, Math.min(fraction, 1)));
+  emit(0);
 
   // Per-pass wall-clock timing to stderr, opt-in via CODEGRAPH_SYNTH_TIMINGS
   // (=1: passes over 250ms; =all: every pass). This is the diagnostic that
@@ -3468,6 +3605,8 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
     if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
       console.error(`[synth-timing] ${label}: ${dt}ms`);
     }
+    passesDone++;
+    emit(passesDone);
   };
 
   // Language gating: one indexed DISTINCT over the files table lets a pass
@@ -3478,7 +3617,6 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   // Passes without an explicit language filter always run.
   const langs = queries.getDistinctFileLanguages();
   const has = (...ls: string[]): boolean => ls.some((l) => langs.has(l));
-  const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
   const NONE: Edge[] = [];
 
   // Cross-file Go method→type `contains` edges must be synthesized AND persisted
@@ -3486,10 +3624,18 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   // otherwise orphaned from the struct, and goImplementsEdges (next) derives a
   // struct's method set from its `contains` edges — so without this it would
   // under-count the interfaces a cross-file struct satisfies. (#583)
+  // Writer-side WAL backstop for the insert loops here (see the param doc):
+  // one fstat when under the valve's hard cap, a parked full backfill past it.
+  const foldIfOver = async (): Promise<void> => {
+    const bp = backpressure?.();
+    if (bp) await bp;
+  };
+
   const goMethodContains = has('go') ? await goCrossFileMethodContainsEdges(queries, yieldToLoop) : NONE;
   for (let i = 0; i < goMethodContains.length; i += 2000) {
     queries.insertEdges(goMethodContains.slice(i, i + 2000));
     await yieldToLoop();
+    await foldIfOver();
   }
   await yieldToLoop(); __mark('goMethodContains');
 
@@ -3501,89 +3647,82 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   for (let i = 0; i < goImpl.length; i += 2000) {
     queries.insertEdges(goImpl.slice(i, i + 2000));
     await yieldToLoop();
+    await foldIfOver();
   }
   await yieldToLoop(); __mark('goImplements');
 
-  const fieldEdges = await fieldChannelEdges(queries, ctx, yieldToLoop); await yieldToLoop(); __mark('fieldEdges');
-  const closureCollEdges = await closureCollectionEdges(queries, ctx, yieldToLoop); await yieldToLoop(); __mark('closureCollEdges');
-  const emitterEdges = await eventEmitterEdges(ctx, yieldToLoop); await yieldToLoop(); __mark('emitterEdges');
-  const renderEdges = await reactRenderEdges(queries, ctx, yieldToLoop); await yieldToLoop(); __mark('renderEdges');
-  const jsxEdges = await reactJsxChildEdges(ctx, yieldToLoop); await yieldToLoop(); __mark('jsxEdges');
-  const vueEdges = has('vue') ? await vueTemplateEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('vueEdges');
-  const svelteKitEdges = has('svelte') ? await svelteKitLoadEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('svelteKitEdges');
-  const pascalEdges = await pascalFormEdges(ctx, yieldToLoop); await yieldToLoop(); __mark('pascalEdges');
-  const flutterEdges = has('dart') ? await flutterBuildEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('flutterEdges');
-  const arkuiStateEdges = has('arkts') ? await arkuiStateBuildEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('arkuiStateEdges');
-  const arkuiEmitter = has('arkts') ? await arkuiEmitterEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('arkuiEmitter');
-  const arkuiRoutes = has('arkts') ? await arkuiRouterEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('arkuiRoutes');
-  const cppEdges = has('cpp') ? await cppOverrideEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('cppEdges');
-  const ifaceEdges = has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY)
-    ? await interfaceOverrideEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('ifaceEdges');
-  const kotlinExpectActual = has('kotlin') ? await kotlinExpectActualEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('kotlinExpectActual');
-  const goGrpcEdges = has('go') ? await goGrpcStubImplEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('goGrpcEdges');
-  const rnEventEdgesList = has(...JS_FAMILY) ? await rnEventEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('rnEventEdgesList');
-  const fabricNativeEdges = await fabricNativeImplEdges(ctx, yieldToLoop); await yieldToLoop(); __mark('fabricNativeEdges');
-  const expoXPlatEdges = await expoCrossPlatformEdges(queries, yieldToLoop); await yieldToLoop(); __mark('expoXPlatEdges');
-  const rnXPlatEdges = await rnCrossPlatformEdges(queries, yieldToLoop); await yieldToLoop(); __mark('rnXPlatEdges');
-  const mybatisEdges = has('java', 'kotlin') && has('xml') ? await mybatisJavaXmlEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('mybatisEdges');
-  const ginEdges = has('go') ? await ginMiddlewareChainEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('ginEdges');
-  const thunkEdges = has(...JS_FAMILY) ? await reduxThunkEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('thunkEdges');
-  const registryEdges = await objectRegistryEdges(ctx, yieldToLoop); await yieldToLoop(); __mark('registryEdges');
-  const rtkEdges = has(...JS_FAMILY) ? await rtkQueryEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('rtkEdges');
-  const piniaEdges = has('vue', ...JS_FAMILY) ? await piniaStoreEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('piniaEdges');
-  const vuexEdges = has('vue', ...JS_FAMILY) ? await vuexDispatchEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('vuexEdges');
-  const celeryEdges = has('python') ? await celeryDispatchEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('celeryEdges');
-  const springEdges = has('java') ? await springEventEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('springEdges');
-  const mediatrEdges = has('csharp') ? await mediatrDispatchEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('mediatrEdges');
-  const sidekiqEdges = has('ruby') ? await sidekiqDispatchEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('sidekiqEdges');
-  const erlangBehaviourEdges = has('erlang') ? await erlangBehaviourDispatchEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('erlangBehaviourEdges');
-  const laravelEdges = has('php') ? await laravelEventEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('laravelEdges');
-  const cFnPtrEdges = has('c', 'cpp') ? await cFnPointerDispatchEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('cFnPtrEdges');
-  const goframeEdges = has('go') ? await goframeRouteEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('goframeEdges');
-  const nixOptionEdges = has('nix') ? await nixOptionPathEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('nixOptionEdges');
-  const shaderEdges = has('glsl', 'hlsl') ? await shaderIntegrationEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('shaderEdges');
+  // Run the independent passes (see SYNTH_PASSES). Their results are merged in
+  // REGISTRY ORDER below regardless of execution order, and none of their edges
+  // persist until that merge — so every pass sees the same committed
+  // post-resolution DB state whether it runs sequentially here or on a resolver
+  // pool worker. With a live pool (already booted on ≥150k-ref repos), passes
+  // fan out across its read-only workers and the per-pass wall-clock comes from
+  // the worker; a pass that fails on a worker falls back to running on the main
+  // thread, so a worker crash isolates to a retry instead of failing synthesis.
+  const passEdges: Edge[][] = new Array<Edge[]>(SYNTH_PASSES.length).fill(NONE);
+  const markPass = (label: string, dt: number): void => {
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
+      console.error(`[synth-timing] ${label}: ${dt}ms`);
+    }
+    passesDone++;
+    emit(passesDone);
+  };
+  const runPassOnMain = async (i: number): Promise<void> => {
+    const pass = SYNTH_PASSES[i]!;
+    const t0 = Date.now();
+    passEdges[i] = await pass.run(queries, ctx, yieldToLoop, subProgress);
+    await yieldToLoop();
+    markPass(pass.name, Date.now() - t0);
+  };
+
+  const gatedIn: number[] = [];
+  for (let i = 0; i < SYNTH_PASSES.length; i++) {
+    if (SYNTH_PASSES[i]!.gate(has)) gatedIn.push(i);
+    else markPass(SYNTH_PASSES[i]!.name, 0);
+  }
+
+  // Above this node count, a pass that OOM-killed its worker must NOT be
+  // retried on the main thread — the retry would OOM the whole process and
+  // take the index with it (the #1212 failure class). Below it, a worker
+  // failure is more likely a transient crash than a memory ceiling, and the
+  // main-thread retry keeps coverage. Skipping loses only that pass's
+  // synthesized edges; the index still completes.
+  const MAIN_RETRY_MAX_NODES = 1_500_000;
+  const graphNodes = queries.getNodeAndEdgeCount().nodes;
+
+  if (pool && gatedIn.length > 1) {
+    await Promise.all(
+      gatedIn.map(async (i) => {
+        const pass = SYNTH_PASSES[i]!;
+        try {
+          const out = await pool.runSynthPass(pass.name);
+          passEdges[i] = out.edges;
+          markPass(pass.name, out.ms);
+        } catch (err) {
+          if (graphNodes > MAIN_RETRY_MAX_NODES) {
+            // Worker died at a scale where the main-thread retry is a process
+            // OOM risk: skip the pass, keep the index alive, and say so.
+            console.error(
+              `[synthesis] pass '${pass.name}' failed on a worker at ${graphNodes} nodes — skipped (edges from this pass are absent): ${err instanceof Error ? err.message : String(err)}`
+            );
+            markPass(`${pass.name} (skipped at scale)`, 0);
+            return;
+          }
+          // Worker-side failure (crash, OOM, unknown pass after a version
+          // mismatch): retry this one pass on the main thread.
+          await runPassOnMain(i);
+        }
+      })
+    );
+  } else {
+    for (const i of gatedIn) {
+      await runPassOnMain(i);
+    }
+  }
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
-  for (const e of [
-    ...fieldEdges,
-    ...closureCollEdges,
-    ...emitterEdges,
-    ...renderEdges,
-    ...jsxEdges,
-    ...vueEdges,
-    ...svelteKitEdges,
-    ...pascalEdges,
-    ...flutterEdges,
-    ...arkuiStateEdges,
-    ...arkuiEmitter,
-    ...arkuiRoutes,
-    ...cppEdges,
-    ...ifaceEdges,
-    ...kotlinExpectActual,
-    ...goGrpcEdges,
-    ...rnEventEdgesList,
-    ...fabricNativeEdges,
-    ...expoXPlatEdges,
-    ...rnXPlatEdges,
-    ...mybatisEdges,
-    ...ginEdges,
-    ...thunkEdges,
-    ...registryEdges,
-    ...rtkEdges,
-    ...piniaEdges,
-    ...vuexEdges,
-    ...celeryEdges,
-    ...springEdges,
-    ...mediatrEdges,
-    ...sidekiqEdges,
-    ...erlangBehaviourEdges,
-    ...laravelEdges,
-    ...cFnPtrEdges,
-    ...goframeEdges,
-    ...nixOptionEdges,
-    ...shaderEdges,
-  ]) {
+  for (const e of passEdges.flat()) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -3596,6 +3735,7 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   for (let i = 0; i < merged.length; i += 2000) {
     queries.insertEdges(merged.slice(i, i + 2000));
     await yieldToLoop();
+    await foldIfOver();
   }
   __mark('insertMergedEdges');
   return merged.length + goImpl.length + goMethodContains.length;
