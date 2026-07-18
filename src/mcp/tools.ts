@@ -2027,7 +2027,9 @@ export class ToolHandler {
 
     const paths = new Map<string, { source: Node; target: Node; edge: Edge }>();
     const addPath = (source: Node, target: Node, edge: Edge) => {
-      if (edge.kind !== 'calls') return;
+      // Heuristic calls describe dynamic dispatch and need their synthesized
+      // label + wiring site; never flatten them into a proven static call path.
+      if (edge.kind !== 'calls' || edge.provenance === 'heuristic') return;
       if (fileHints.length > 0 && !matchesHint(source.filePath) && !matchesHint(target.filePath)) return;
       paths.set(`${source.id}\0${target.id}`, { source, target, edge });
     };
