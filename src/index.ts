@@ -8,6 +8,7 @@
 import * as path from 'path';
 import {
   Node,
+  NodeKind,
   Edge,
   FileRecord,
   ExtractionResult,
@@ -24,6 +25,7 @@ import {
   FindRelevantContextOptions,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
+import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
 import {
   isInitialized,
@@ -54,6 +56,7 @@ import { deriveProjectNameTokens } from './search/query-utils';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
+import { minRefsForPool } from './resolution/resolver-pool';
 
 // Re-export types for consumers
 export * from './types';
@@ -435,6 +438,46 @@ export class CodeGraph {
       } catch {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
+      // Defer WAL auto-checkpointing for the whole bulk run (#1231): the
+      // default 1000-page interval re-writes hot pages into the main DB file
+      // over and over — ~95% of all disk I/O during a bulk index, and a
+      // 19+min → 45s difference on HDD-class storage. The valve bounds WAL
+      // growth by backfilling PASSIVEly on a worker thread (never blocking
+      // the writer or the #850 watchdog heartbeat); runMaintenance below does
+      // the final fold-up before the interval is restored in the finally.
+      // Kill switch: CODEGRAPH_NO_WAL_DEFER=1. Non-WAL journal modes (some
+      // network filesystems) have no WAL to defer — skip.
+      // Fast-init: on a COMPLETELY fresh DB, trade crash-durability for speed
+      // during the bulk build (journal in memory, no fsync). Safe because the
+      // DB is disposable until the index completes — index_state stays
+      // 'indexing' and a crashed init is re-run from scratch; existing DBs
+      // (re-index/sync) never take this path. Kill switch:
+      // CODEGRAPH_NO_FAST_INIT=1 (same pattern as CODEGRAPH_NO_WAL_DEFER).
+      const freshDb = this.queries.getNodeAndEdgeCount().nodes === 0;
+      const fastInit = process.env.CODEGRAPH_NO_FAST_INIT !== '1' && freshDb;
+      if (fastInit) {
+        try {
+          this.db.getDb().pragma('journal_mode = MEMORY');
+          this.db.getDb().pragma('synchronous = OFF');
+        } catch { /* keep WAL */ }
+      }
+      const deferWal = !fastInit && process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+      let walValve: WalCheckpointValve | null = null;
+      let priorAutocheckpoint = 1000;
+      // Set when the fastInit+pool path below defers autocheckpointing, so the
+      // finally knows to restore the interval on that path too.
+      let restoreAutocheckpoint = false;
+      if (deferWal) {
+        priorAutocheckpoint = this.db.getWalAutocheckpoint();
+        this.db.setWalAutocheckpoint(0);
+        walValve = new WalCheckpointValve(
+          this.db,
+          resolveWalValveMb(process.env.CODEGRAPH_WAL_VALVE_MB, this.db.getDbFileSizeBytes()),
+          undefined,
+          options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
+        );
+        walValve.start();
+      }
       try {
         const before = this.queries.getNodeAndEdgeCount();
         // Mark the index as in-flight BEFORE any writes: a run killed
@@ -446,7 +489,34 @@ export class CodeGraph {
         // path as every file (re-)indexes below — so a full index is also the
         // orphan-cleanup pass for names deleted since the last one.
         try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
-        const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
+        // Bulk FTS mode for the mass-insert phase: drop the per-row FTS sync
+        // triggers, rebuild nodes_fts once from the nodes table afterwards.
+        // Crash inside the window is healed on the next DatabaseConnection.open.
+        this.db.beginBulkNodeLoad();
+        let result: IndexResult;
+        try {
+          result = await this.orchestrator.indexAll(
+            options.onProgress,
+            options.signal,
+            options.verbose,
+            walValve ? () => walValve!.backpressure() : undefined,
+            // Store-writer offload is fresh-DB-only: with any pre-existing
+            // data the store path must read (existing-file checks, cross-file
+            // edge snapshots) and delete, which belongs on one thread.
+            freshDb ? { dbPath: this.db.getPath(), fastInit } : null
+          );
+        } finally {
+          const tFts = Date.now();
+          this.db.endBulkNodeLoad();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] fts-rebuild: ${Date.now() - tFts}ms`);
+        }
+
+        // Fold the parse phase's WAL BEFORE the first post-parse reads
+        // (resolver re-init and resolution both read on the main thread):
+        // paging a bulk-write-sized WAL there is what blew the #850
+        // watchdog's 60s window in the #1231 repro. Off-thread + awaited,
+        // so the event loop keeps turning.
+        if (walValve) await walValve.foldNow();
 
         // Re-detect frameworks now that the index is populated. The resolver
         // is constructed with createResolver() before any files exist, so
@@ -456,10 +526,12 @@ export class CodeGraph {
         // and silently drop themselves. Re-initializing here gives them a
         // chance to see the actual project before resolution runs.
         if (result.success && result.filesIndexed > 0) {
+          const tReinit = Date.now();
           this.resolver.initialize();
           // Cross-file finalization (e.g. NestJS RouterModule prefixes). Runs
           // before resolution so updated names show up in subsequent reads.
           this.resolver.runPostExtract();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolver-reinit: ${Date.now() - tReinit}ms`);
         }
 
         // Resolve references to create call/import/extends edges
@@ -467,41 +539,98 @@ export class CodeGraph {
           // Get count without loading all refs into memory
           const unresolvedCount = this.queries.getUnresolvedReferencesCount();
 
+          // Fast-init leaves the DB in memory-journal (rollback) mode, where
+          // the parallel resolver pool's read connections would contend with
+          // the main writer's exclusive commits. When the pool will actually
+          // run (enough pending refs), restore WAL BEFORE resolution so
+          // readers never block the writer; otherwise stay in the fast mode
+          // until the finally — sequential resolution has no readers.
+          if (fastInit && unresolvedCount >= minRefsForPool()) {
+            try {
+              this.db.getDb().pragma('synchronous = NORMAL');
+              this.db.getDb().pragma('journal_mode = WAL');
+              // Defer auto-checkpointing for the resolution phase, same
+              // rationale as the deferWal path above: at the default 1000-page
+              // interval, the persist loop's edge inserts + ref deletes make
+              // SQLite re-write hot B-tree pages into the main DB file inline
+              // on the writer over and over (#1231's pathology — measured as
+              // ~58% of the resolution phase on a 255k-ref repo). The valve
+              // bounds WAL growth off-thread; runMaintenance does the final
+              // fold and the finally restores the interval.
+              priorAutocheckpoint = this.db.getWalAutocheckpoint();
+              this.db.setWalAutocheckpoint(0);
+              restoreAutocheckpoint = true;
+              walValve = new WalCheckpointValve(
+                this.db,
+                undefined,
+                undefined,
+                options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
+              );
+              walValve.start();
+            } catch { /* keep current mode; resolution still works sequentially */ }
+          }
+
           options.onProgress?.({
             phase: 'resolving',
             current: 0,
             total: unresolvedCount,
           });
 
-          await this.resolveReferencesBatched((current, total) => {
-            options.onProgress?.({
-              phase: 'resolving',
-              current,
-              total,
-            });
-          });
+          const tResolve = Date.now();
+          await this.resolveReferencesBatched(
+            (current, total) => {
+              options.onProgress?.({
+                phase: 'resolving',
+                current,
+                total,
+              });
+            },
+            (done, totalPasses) => {
+              options.onProgress?.({
+                phase: 'linking',
+                current: done,
+                total: totalPasses,
+              });
+            },
+            walValve ? () => walValve!.backpressure() : undefined
+          );
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolution: ${Date.now() - tResolve}ms`);
 
           // Second pass: chained calls whose method lives on a supertype the
           // receiver conforms to (protocol-extension / inherited / default-
           // interface). Needs the implements/extends edges the main pass just
           // built, so it runs after resolution (#750).
+          const tChained = Date.now();
           await this.resolver.resolveChainedCallsViaConformance();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] chainedConformance: ${Date.now() - tChained}ms`);
           // Same lifecycle for `this.<member>` callback registrations whose
           // member is inherited from a supertype (#808).
+          const tDeferred = Date.now();
           await this.resolver.resolveDeferredThisMemberRefs();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] deferredThisMember: ${Date.now() - tDeferred}ms`);
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
-        // Cheap and non-blocking; never load-bearing for correctness.
+        // Off-thread (worker connection): on a multi-GB index this is minutes
+        // of IO, and inline it starved the #850 watchdog AFTER a fully
+        // successful index. Never load-bearing for correctness.
         if (result.success && result.filesIndexed > 0) {
-          this.db.runMaintenance();
+          const tMaint = Date.now();
+          // Quiesce the valve first so its in-flight checkpoint and the
+          // maintenance checkpoint don't contend for the checkpointer lock
+          // (the loser would silently no-op and leave the WAL unfolded).
+          if (walValve) { walValve.stop(); await walValve.drain(); }
+          await this.db.runMaintenance();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] maintenance: ${Date.now() - tMaint}ms`);
         }
 
         // The orchestrator only sees extraction-phase counts; resolution and
         // synthesizer edges (often >50% of the graph on JVM repos) come later.
         // Recompute against the DB so the CLI summary reports the true totals.
         if (result.success && result.filesIndexed > 0) {
+          const tCount = Date.now();
           const after = this.queries.getNodeAndEdgeCount();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] count-recompute: ${Date.now() - tCount}ms`);
           result.nodesCreated = after.nodes - before.nodes;
           result.edgesCreated = after.edges - before.edges;
         }
@@ -551,6 +680,23 @@ export class CodeGraph {
 
         return result;
       } finally {
+        // Restore the auto-checkpoint interval AFTER the fold-up above so the
+        // next ordinary write doesn't inherit a giant inline checkpoint. On
+        // the error path the WAL may still be large; correctness is unchanged
+        // (SQLite replays the WAL on the next open) and the follow-up write
+        // that folds it is the known cost of a failed run.
+        if (walValve) { walValve.stop(); await walValve.drain(); }
+        if (deferWal || restoreAutocheckpoint) {
+          try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* connection may be closing */ }
+        }
+        if (fastInit) {
+          // Back to the durable defaults; journal_mode=WAL folds the MEMORY
+          // journal state into a normal WAL-mode database file.
+          try {
+            this.db.getDb().pragma('synchronous = NORMAL');
+            this.db.getDb().pragma('journal_mode = WAL');
+          } catch { /* connection may be closing */ }
+        }
         this.fileLock.release();
       }
     });
@@ -588,6 +734,31 @@ export class CodeGraph {
       } catch {
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
       }
+      // Defer WAL auto-checkpointing for the whole incremental run, exactly
+      // as indexAll does for the bulk path (#1231): sync's store loop and its
+      // resolution passes churn the same FTS + secondary-index hot pages, and
+      // at the default 1000-page cadence the inline checkpoints re-write them
+      // over and over — on HDD-class storage a 7-file sync took 2 minutes at
+      // 0-2% CPU (#1248). The cost scales with the EXISTING database size,
+      // not the change size, so small syncs on big indexes hurt most. The
+      // valve bounds WAL growth off-thread; runMaintenance at the end does
+      // the final fold-up before the interval is restored in the finally.
+      // Same kill switch as indexAll: CODEGRAPH_NO_WAL_DEFER=1. Idle valve
+      // cost is one timer, so watcher-frequency syncs stay cheap.
+      const deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+      let walValve: WalCheckpointValve | null = null;
+      let priorAutocheckpoint = 1000;
+      if (deferWal) {
+        priorAutocheckpoint = this.db.getWalAutocheckpoint();
+        this.db.setWalAutocheckpoint(0);
+        walValve = new WalCheckpointValve(
+          this.db,
+          resolveWalValveMb(process.env.CODEGRAPH_WAL_VALVE_MB, this.db.getDbFileSizeBytes()),
+          undefined,
+          options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
+        );
+        walValve.start();
+      }
       try {
         // Captured BEFORE the sync runs: the sync's own incremental writes
         // populate vocab rows for the files it touches, so an end-of-sync
@@ -599,19 +770,36 @@ export class CodeGraph {
 
         const result = await this.orchestrator.sync(options.onProgress);
 
+        // Fold the store phase's WAL BEFORE the post-store reads below
+        // (resolution reads on the main thread) — same rationale as
+        // indexAll's fold between store and resolution.
+        if (walValve) await walValve.foldNow();
+
         // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
         // every sync that touched files so edits to `app.module.ts` propagate
         // to controllers in unchanged files. The pass is idempotent and cheap
         // (regex over *.module.ts only).
         if (result.filesAdded > 0 || result.filesModified > 0) {
           this.resolver.runPostExtract();
+        } else if (result.filesRemoved > 0) {
+          // A pure-removal sync still resolves refs below — the deletion path
+          // resurrects the removed file's incoming edges as pending refs
+          // (#1240 removal case) and the orphan sweep consumes them. In a
+          // long-lived process (daemon) the resolver's name caches were
+          // warmed against the pre-removal graph; drop them so resolution
+          // sees the post-removal state. (runPostExtract above clears caches
+          // itself, so the changed-files branch is already covered.)
+          this.resolver.clearCaches();
         }
 
         // Resolve references if files were updated
-        if (result.filesAdded > 0 || result.filesModified > 0) {
+        const filesChanged = result.filesAdded > 0 || result.filesModified > 0;
+        if (filesChanged) {
           if (result.changedFilePaths) {
             // Scope resolution to changed files (git fast path — bounded set)
+            const tRefLoad = Date.now();
             const unresolvedRefs = this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths);
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-ref-load: ${Date.now() - tRefLoad}ms (${unresolvedRefs.length} refs)`);
 
             options.onProgress?.({
               phase: 'resolving',
@@ -626,6 +814,34 @@ export class CodeGraph {
                 total,
               });
             });
+
+            // Retry previously-failed refs the changed files may now satisfy
+            // (#1240). Scoped resolution above only re-resolves refs FROM the
+            // changed files — but when a changed file gains an export/symbol,
+            // refs in UNCHANGED files that failed against the old graph can
+            // now resolve, and nothing else ever revisits them (their rows
+            // were parked as status='failed' by an earlier completed pass).
+            // Look them up by the symbol names the changed files now carry
+            // and re-resolve just that set. On a sync where no failed ref
+            // matches, this is one indexed lookup.
+            const tRetry = Date.now();
+            const retryable = this.queries.getRetryableFailedReferences(
+              this.queries.getNodeNamesByFiles(result.changedFilePaths)
+            );
+            if (retryable.length > 0) {
+              options.onProgress?.({
+                phase: 'resolving',
+                current: 0,
+                total: retryable.length,
+              });
+              await this.resolver.resolveAndPersistListYielding(retryable);
+              options.onProgress?.({
+                phase: 'resolving',
+                current: retryable.length,
+                total: retryable.length,
+              });
+            }
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-failed-ref-retry: ${Date.now() - tRetry}ms (${retryable.length} refs)`);
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
@@ -636,15 +852,65 @@ export class CodeGraph {
               total: unresolvedCount,
             });
 
-            await this.resolveReferencesBatched((current, total) => {
+            await this.resolveReferencesBatched(
+              (current, total) => {
+                options.onProgress?.({
+                  phase: 'resolving',
+                  current,
+                  total,
+                });
+              },
+              (done, totalPasses) => {
+                options.onProgress?.({
+                  phase: 'linking',
+                  current: done,
+                  total: totalPasses,
+                });
+              }
+            );
+          }
+        }
+
+        // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
+        // daemon liveness watchdog's SIGKILL (#1122), Ctrl-C, a crash — leaves
+        // the refs it never reached in unresolved_refs, and the git-scoped fast
+        // path above never revisits them (it reads only the changed files'
+        // rows). Those files' call edges were then missing PERMANENTLY, with
+        // nothing to see except a too-small blast radius, until a full
+        // re-index. A completed pass takes every row it processed out of the
+        // PENDING set (resolved rows are deleted, unresolvable ones parked as
+        // status='failed' for the #1240 retry above), so any pending row now
+        // is such an orphan — or a row from an older engine's scoped pass.
+        // Grind them down with the batched resolver; this also makes a bare
+        // `codegraph sync` the recovery command for a wedged index. On a
+        // healthy index this is one COUNT query.
+        const orphanCount = this.queries.getUnresolvedReferencesCount();
+        if (orphanCount > 0) {
+          options.onProgress?.({
+            phase: 'resolving',
+            current: 0,
+            total: orphanCount,
+          });
+
+          await this.resolveReferencesBatched(
+            (current, total) => {
               options.onProgress?.({
                 phase: 'resolving',
                 current,
                 total,
               });
-            });
-          }
+            },
+            (done, totalPasses) => {
+              options.onProgress?.({
+                phase: 'linking',
+                current: done,
+                total: totalPasses,
+              });
+            }
+          );
+        }
 
+        if (filesChanged || orphanCount > 0) {
           // Second pass: chained calls whose method lives on a supertype the
           // receiver conforms to (protocol-extension / inherited). Needs the
           // implements/extends edges built above (#750).
@@ -655,8 +921,9 @@ export class CodeGraph {
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
-        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
-          this.db.runMaintenance();
+        // Off-thread — see indexAll's call site.
+        if (filesChanged || result.filesRemoved > 0 || orphanCount > 0) {
+          await this.db.runMaintenance();
         }
 
         // Heal the segment vocabulary on indexes built before the table
@@ -673,6 +940,14 @@ export class CodeGraph {
 
         return result;
       } finally {
+        // Mirror indexAll's teardown: stop the valve, then restore the
+        // auto-checkpoint interval (runMaintenance above already folded the
+        // WAL on the success path; on the error path SQLite replays it on
+        // the next open).
+        if (walValve) { walValve.stop(); await walValve.drain(); }
+        if (deferWal) {
+          try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* connection may be closing */ }
+        }
         this.fileLock.release();
       }
     });
@@ -869,8 +1144,40 @@ export class CodeGraph {
    * Resolve references in batches to keep memory bounded on large codebases.
    * Processes chunks of unresolved refs, persisting results after each batch.
    */
-  async resolveReferencesBatched(onProgress?: (current: number, total: number) => void): Promise<ResolutionResult> {
-    return this.resolver.resolveAndPersistBatched(onProgress);
+  async resolveReferencesBatched(
+    onProgress?: (current: number, total: number) => void,
+    onSynthesisProgress?: (done: number, total: number) => void,
+    // The WAL valve's writer-side backstop, threaded into the batch loop's
+    // pool-idle boundaries. Without it the valve's only lever during
+    // resolution is timer-driven passive checkpoints, which the pool's
+    // continuous reads keep perpetually partial — the WAL then accretes the
+    // whole phase's write volume (22GB on a 4.6GB DB at kernel scale).
+    backpressure?: () => Promise<void> | null
+  ): Promise<ResolutionResult> {
+    return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress, {
+      dbPath: this.db.getPath(),
+      // Bulk-edge-load hooks: on big runs the resolver drops the non-unique
+      // edge indexes for the batch loop and recreates them before synthesis
+      // (which reads kind-keyed). Concurrent readers (a daemon serving this
+      // project mid-index) stay CORRECT during the window — target/kind reads
+      // just degrade to scans until the recreate.
+      bulkEdgeLoad: {
+        begin: () => this.db.beginBulkEdgeLoad(),
+        end: () => this.db.endBulkEdgeLoad(),
+      },
+      backpressure,
+    });
+  }
+
+  /**
+   * References extracted but never attempted by a resolution pass. Zero on a
+   * healthy index — a completed pass consumes every pending row (resolving it
+   * or parking it as failed, #1240). Non-zero at rest means a pass was
+   * interrupted mid-run (killed indexer, crash — #1187), so some files' call
+   * edges are missing; the next `sync` sweeps them.
+   */
+  getPendingReferenceCount(): number {
+    return this.queries.getUnresolvedReferencesCount();
   }
 
   /**
@@ -951,6 +1258,25 @@ export class CodeGraph {
    */
   getNodesByName(name: string): Node[] {
     return this.queries.getNodesByName(name);
+  }
+
+  /** Nodes whose name starts with `prefix` (index range scan, capped). */
+  getNodesByNamePrefix(prefix: string, limit = 20): Node[] {
+    return this.queries.getNodesByNamePrefix(prefix, limit);
+  }
+
+  /**
+   * Nodes whose name CONTAINS `substring` (LIKE scan, ASCII-case-insensitive,
+   * shortest-first). The camel-infix lookup FTS can't do — `profileInfo`
+   * inside `getProfileInfoV2` is one FTS token (#1196).
+   */
+  getNodesByNameSubstring(
+    substring: string,
+    options: { kinds?: NodeKind[]; limit?: number; excludePrefix?: boolean } = {}
+  ): Node[] {
+    return this.queries
+      .findNodesByNameSubstring(substring, options)
+      .map((r) => r.node);
   }
 
   /**

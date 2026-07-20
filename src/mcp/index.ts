@@ -50,8 +50,11 @@ import {
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import { getDaemonSocketCandidates } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
+import { checkForUpdateInBackground } from '../upgrade/update-check';
+import { EARLY_PPID } from './early-ppid';
 import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from './ppid-watchdog';
 import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
+import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
@@ -148,6 +151,11 @@ function spawnDetachedDaemon(root: string): void {
     stdio = 'ignore'; // no log file — discard daemon output rather than fail
   }
   try {
+    // The daemon has no host: scrub the threaded host pid so it can't leak
+    // into the daemon's env (and from there into anything the daemon spawns),
+    // where a long-dead session's host pid would trigger spurious shutdowns.
+    const env: NodeJS.ProcessEnv = { ...process.env, [DAEMON_INTERNAL_ENV]: '1' };
+    delete env[HOST_PPID_ENV];
     const child = spawn(
       process.execPath,
       [...process.execArgv, scriptPath, 'serve', '--mcp', '--path', root],
@@ -155,7 +163,7 @@ function spawnDetachedDaemon(root: string): void {
         detached: true,
         stdio,
         windowsHide: true,
-        env: { ...process.env, [DAEMON_INTERNAL_ENV]: '1' },
+        env,
       },
     );
     child.unref();
@@ -189,9 +197,10 @@ export class MCPServer {
   // Worker-thread liveness watchdog (#850). Long-lived modes only; SIGKILLs the
   // process if the main thread wedges in a non-yielding sync loop.
   private livenessWatchdog: WatchdogHandle | null = null;
-  // PPID watchdog baseline — captured at construction so we always have a
-  // baseline, even if start() runs after a fork-style reparent.
-  private originalPpid: number = process.ppid;
+  // PPID watchdog baseline — from the CLI entry's earliest-possible capture
+  // (early-ppid.ts). Capturing here (construction) already lost the race when
+  // the launcher was killed during module loading (#1185).
+  private originalPpid: number = EARLY_PPID;
   private hostPpid: number | null = parseHostPpid(process.env[HOST_PPID_ENV]);
   // Idempotency guard for stop().
   private stopped = false;
@@ -219,6 +228,14 @@ export class MCPServer {
     // telemetry opportunistically. Fire-and-forget + unref'd — adds nothing
     // to the handshake path and never keeps the process alive.
     getTelemetry().startInterval();
+
+    // #1243: the MCP config launches the local binary, so a server left
+    // running drifts behind releases with no signal. Refresh the shared
+    // update-check cache in the background and log ONE stderr notice when a
+    // newer version exists (stderr only — stdout is the protocol channel).
+    // The notice also reaches the agent via the initialize instructions and
+    // codegraph_status. Fire-and-forget: adds nothing to the handshake path.
+    checkForUpdateInBackground();
 
     // The detached daemon process itself. Checked before the opt-out so the
     // daemon honors the same env it was spawned with (it never sets NO_DAEMON).
@@ -314,6 +331,17 @@ export class MCPServer {
     // ECONNRESET/hangup instead of a clean close) as shutdown, and destroy the
     // stream so a hung fd can't busy-spin the event loop (#799).
     treatStdinFailureAsShutdown(() => this.stop());
+    // Backstop for a launch abandoned during startup (#1185): launcher killed
+    // before EARLY_PPID could see it + host holding our pipes open. A server
+    // that never receives a byte of MCP traffic isn't serving anyone. Armed
+    // after session.start() attached the real stdin consumer.
+    armStartupHandshakeTimeout(() => {
+      process.stderr.write(
+        '[CodeGraph MCP] No MCP traffic since startup; assuming an abandoned launch and shutting down (#1185). ' +
+        'Tune with CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS (0 disables).\n'
+      );
+      this.stop();
+    });
 
     this.mode = 'direct';
     this.installSignalHandlers();

@@ -341,6 +341,42 @@ export function matchFunctionRef(
 }
 
 /**
+ * A function nested inside another FUNCTION is only callable from within its
+ * container — Python, JS/TS, and every closure language scope it lexically.
+ * Resolving a bare name from elsewhere to a nested local fabricates an edge
+ * scope already rules out: `join(...)` in one function must never bind to a
+ * `join` defined inside a DIFFERENT function (#1230). A candidate whose
+ * qualifiedName parent is a same-file function/method is kept only when the
+ * ref originates inside that parent's line range. Class members are
+ * unaffected (their parent resolves to a class-like node), as are top-level
+ * symbols and C++ namespace-prefixed names (the prefix has no node).
+ */
+function isLexicallyReachable(
+  candidate: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  if (candidate.kind !== 'function') return true;
+  const qn = candidate.qualifiedName;
+  if (!qn || !qn.includes('::')) return true;
+  const parentQn = qn.slice(0, qn.lastIndexOf('::'));
+  const containers = context
+    .getNodesByQualifiedName(parentQn)
+    .filter(
+      (p) =>
+        p.filePath === candidate.filePath &&
+        (p.kind === 'function' || p.kind === 'method') &&
+        p.startLine <= candidate.startLine &&
+        p.endLine >= candidate.endLine
+    );
+  if (containers.length === 0) return true;
+  return (
+    ref.filePath === candidate.filePath &&
+    containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine)
+  );
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
@@ -357,7 +393,9 @@ export function matchByExactName(
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
   const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
-    .filter((n) => n.kind !== 'import');
+    .filter((n) => n.kind !== 'import')
+    // Nested locals are only reachable from inside their container (#1230).
+    .filter((n) => isLexicallyReachable(n, ref, context));
 
   if (candidates.length === 0) {
     return null;
@@ -412,7 +450,21 @@ export function matchByQualifiedName(
     return null;
   }
 
-  const candidates = context.getNodesByQualifiedName(ref.referenceName);
+  // A method call `receiver.method()` can share an exact qualified name with a
+  // config-file key: `service.process()` (a `calls` ref named `service.process`)
+  // vs the yaml key `service.process`. Config keys are bound to their code refs
+  // upstream by the framework resolvers (`@Value` → `references`); a `calls` ref
+  // must never resolve to a yaml/properties config node — that's a wrong edge
+  // AND it hides the real callee. Drop those from both the exact and the partial
+  // candidate sets so resolution falls through to method resolution below (#1180).
+  const keepForRef = (nodes: Node[]): Node[] =>
+    ref.referenceKind === 'calls'
+      ? nodes.filter(
+          (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
+        )
+      : nodes;
+
+  const candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
 
   if (candidates.length === 1) {
     return {
@@ -444,8 +496,7 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
-    const partialCandidates = context
-      .getNodesByName(lastName)
+    const partialCandidates = keepForRef(context.getNodesByName(lastName))
       .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName));
     const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
     if (chosen) {
@@ -905,10 +956,11 @@ export function matchDottedCallChain(
       // CRITICAL: resolve the TARGET via a synthetic bare-name ref, but return the
       // match tied to the ORIGINAL `ref` (referenceName `inner().method`). The
       // batched resolver (resolveAndPersistBatched) reads unresolved rows from
-      // offset 0 every pass and relies on deleteSpecificResolvedReferences —
-      // keyed on referenceName — to clear each resolved row so the batch empties.
-      // If we propagated the synthetic ref's bare `method` as `.original`, the
-      // delete would never match the stored `inner().method` row, the batch would
+      // offset 0 every pass and relies on the post-batch cleanup (row-id delete
+      // for DB-loaded refs, referenceName-keyed delete otherwise, #1269) to
+      // clear each resolved row so the batch empties. If we propagated the
+      // synthetic ref's bare `method` as `.original`, a key-based delete
+      // would never match the stored `inner().method` row, the batch would
       // never drain, and the loop would re-resolve + re-insert forever (a runaway
       // that grew gin's graph to 5M edges / 1.4 GB before this fix).
       const bareRef = { ...ref, referenceName: method };
@@ -1061,7 +1113,7 @@ const NON_TYPE_RECEIVER_TOKENS = new Set([
  * args and pointer/ref markers, take the last `.`/`::`-qualified segment, and
  * reject obvious non-types.
  */
-function normalizeInferredTypeName(raw: string): string | null {
+export function normalizeInferredTypeName(raw: string): string | null {
   const cleaned = raw.replace(/<[^>]*>/g, '').replace(/[&*]/g, '').trim();
   const seg = cleaned.split(/[.:]+/).filter(Boolean).pop();
   if (!seg) return null;
@@ -1076,7 +1128,7 @@ function normalizeInferredTypeName(raw: string): string | null {
  * PascalCase is required in the capture where the language convention allows,
  * as a cheap false-positive guard on top of resolveMethodOnType's validation.
  */
-function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
+export function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
   switch (language) {
     case 'typescript':
     case 'javascript':
@@ -1267,11 +1319,30 @@ function inferLocalReceiverType(
       componentScoped = scope === 'variables' || scope === 'this';
     }
   }
+  // PHP `$this->prop` receiver — the property's declaration lives outside the
+  // calling method (a promoted constructor parameter `private readonly Foo $prop`,
+  // a typed property `private Foo $prop;`, or a classic constructor parameter
+  // `Foo $prop` assigned in __construct). Strip the prefix and widen the scan to
+  // the whole file (the constructor may sit below the calling method), but —
+  // unlike CFML's scopes above — switch to PROPERTY-shaped patterns: a plain
+  // `$prop` local or parameter lives in a different namespace than `$this->prop`
+  // and can never shadow it, so the generic local patterns would type the
+  // property from unrelated same-named variables in other methods (a wrong
+  // 0.9-confidence edge, not a missing one).
+  let phpProperty = false;
+  if (ref.language === 'php') {
+    const scoped = receiverName.match(/^this->(.+)$/);
+    if (scoped) {
+      scanReceiver = scoped[1]!;
+      componentScoped = true;
+      phpProperty = true;
+    }
+  }
 
-  const patterns = localReceiverTypePatterns(
-    ref.language,
-    scanReceiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-  );
+  const escapedReceiver = scanReceiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const patterns = phpProperty
+    ? phpPropertyTypePatterns(escapedReceiver)
+    : localReceiverTypePatterns(ref.language, escapedReceiver);
   if (patterns.length === 0) return null;
 
   // Split through the context's per-file lines cache when available: this runs
@@ -1319,6 +1390,95 @@ function inferLocalReceiverType(
       if (type) return type;
     }
   }
+  // A PHP property with no statically-typed declaration (classic pre-7.4
+  // style) may still be typed by what gets ASSIGNED to it — follow the
+  // `$this->prop = $var` assignment to the assigned variable's own typed
+  // declaration (a classic or multi-line constructor parameter, or a typed
+  // setter's parameter).
+  if (phpProperty) {
+    return inferPhpAssignedPropertyType(escapedReceiver, lines, callIdx);
+  }
+  return null;
+}
+
+/**
+ * Patterns that recover a PHP class property's declared type for a
+ * `$this->prop` receiver. Deliberately NOT localReceiverTypePatterns: only
+ * property-shaped declarations qualify —
+ *   1. a modifier-prefixed typed declaration, which covers both a typed
+ *      property (`private ?Foo $prop;`) and a promoted constructor parameter
+ *      (`private readonly Foo $prop`), and
+ *   2. the pseudoconstructor assignment (`$this->prop = new Foo(...)`).
+ * A bare `X $prop` parameter or `$prop = new X()` local elsewhere in the
+ * file must NOT match: those variables can never alias `$this->prop`.
+ * Union-typed properties (`Foo|Bar $prop`) yield no match and thus no edge —
+ * silent beats wrong. The classic untyped-property-assigned-in-constructor
+ * shape is handled by inferPhpAssignedPropertyType instead.
+ */
+function phpPropertyTypePatterns(r: string): RegExp[] {
+  return [
+    new RegExp(
+      `\\b(?:(?:private|protected|public|readonly|static|final)(?:\\(set\\))?\\s+)+\\??([A-Za-z_\\\\][\\w\\\\]*)\\s+&?\\$${r}\\b`,
+    ), // private readonly ?Foo $prop  (typed property / promoted param)
+    new RegExp(`\\$this->${r}\\b\\s*=\\s*new\\s+([A-Za-z_\\\\][\\w\\\\]*)`), // $this->prop = new Foo()
+  ];
+}
+
+/**
+ * Second-chance typing for a PHP `$this->prop` receiver whose property
+ * declaration carries no static type (classic pre-7.4 style): find the
+ * `$this->prop = $var` assignment, then recover `$var`'s type from its own
+ * declaration WITHIN the assignment's function — the constructor's (possibly
+ * multi-line) parameter list, a typed setter's parameter, or a `= new X()`
+ * local. The backward scan stops at the enclosing `function` line (checked
+ * for a match first — a single-line `__construct(Foo $var) { ... }` carries
+ * the typed parameter itself), so a same-named variable in another method
+ * can never type the property.
+ */
+function inferPhpAssignedPropertyType(
+  escapedProp: string,
+  lines: string[],
+  callIdx: number,
+): string | null {
+  const assignRe = new RegExp(`\\$this->${escapedProp}\\b\\s*=\\s*\\$(\\w+)\\b`);
+  const assignAt = (i: number): RegExpMatchArray | null => {
+    const line = lines[i];
+    if (!line || line.length > 10_000) return null;
+    return line.match(assignRe);
+  };
+  // The assignment is position-independent relative to the call — nearest-
+  // backward first, then sweep forward, same order as the componentScoped scan.
+  let assignIdx = -1;
+  let varName: string | null = null;
+  for (let i = callIdx; i >= 0; i--) {
+    const m = assignAt(i);
+    if (m) { assignIdx = i; varName = m[1]!; break; }
+  }
+  if (varName === null) {
+    for (let i = callIdx + 1; i < lines.length; i++) {
+      const m = assignAt(i);
+      if (m) { assignIdx = i; varName = m[1]!; break; }
+    }
+  }
+  if (varName === null) return null;
+
+  const varPatterns = localReceiverTypePatterns(
+    'php',
+    varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+  );
+  for (let i = assignIdx; i >= 0; i--) {
+    const line = lines[i];
+    if (line && line.length <= 10_000) {
+      for (const re of varPatterns) {
+        const m = line.match(re);
+        if (m && m[1]) {
+          const type = normalizeInferredTypeName(m[1]);
+          if (type) return type;
+        }
+      }
+    }
+    if (line && /\bfunction\b/.test(line)) break;
+  }
   return null;
 }
 
@@ -1338,7 +1498,18 @@ export function matchMethodCall(
   // (with its existing single-candidate / receiver-overlap guards). Without this
   // a multi-dot extension-method call (C# DI `builder.Services.AddCoreServices()`,
   // `Guard.Against.X()`) matched no pattern and never resolved.
-  const dotMatch = ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/);
+  // C++ explicit operator call `a.operator+(b)` reaches the resolver as
+  // `a.operator+` (#1247) — the operator's symbol chars (`+`, `==`, `[]`, `()`)
+  // fail the \w method part of the plain pattern, so admit them explicitly.
+  // Names like `operatorTable` stay on the plain pattern (tried first); the
+  // operator form requires at least one non-word char after `operator`, and
+  // every downstream strategy compares the method part by exact string
+  // equality, so a stray match can't invent an edge.
+  const dotMatch =
+    ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/) ??
+    (ref.language === 'cpp'
+      ? ref.referenceName.match(/^([\w.]+)\.(operator[^\w\s.]+)$/)
+      : null);
   const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);
   // Lua/Luau method calls use a single colon (`lg:log`); R uses `$` (`lg$log`).
   // Recognize these receiver/method separators so local-variable receiver-type
@@ -1350,6 +1521,32 @@ export function matchMethodCall(
   const rDollarMatch = ref.language === 'r'
     ? ref.referenceName.match(/^([\w.]+)\$(\w+)$/)
     : null;
+
+  // PHP property receiver: `$this->prop->method()` reaches the resolver as
+  // `this->prop.method` (the extractor records the receiver's raw text with the
+  // leading `$` stripped). Resolve it EXCLUSIVELY through declared-type
+  // inference + resolveMethodOnType validation — the name-similarity strategies
+  // below must never see this shape, so a property whose type can't be
+  // recovered stays unlinked rather than guessed (a wrong inference produces no
+  // edge rather than a wrong one). Deeper chains (`this->a->b.method`) don't
+  // match the single-property pattern and stay unlinked, same as before.
+  const phpThisPropMatch = ref.language === 'php'
+    ? ref.referenceName.match(/^(this->\w+)\.(\w+)$/)
+    : null;
+  if (phpThisPropMatch) {
+    const [, receiver, phpMethodName] = phpThisPropMatch;
+    const inferredType = inferLocalReceiverType(receiver!, ref, context);
+    if (!inferredType) return null;
+    return resolveMethodOnType(
+      inferredType,
+      phpMethodName!,
+      ref,
+      context,
+      0.9,
+      'instance-method',
+      importedFqnOf(inferredType, ref, context),
+    );
+  }
 
   const match = dotMatch || colonMatch || luaColonMatch || rDollarMatch;
   if (!match) {
@@ -1393,6 +1590,21 @@ export function matchMethodCall(
         return typedMatch;
       }
     }
+  }
+
+  // Go 2-hop field chain `base.field.Method` (#1276): the base's type comes
+  // from the enclosing scope (typed parameter / method receiver / local var),
+  // the field's declared type from that struct's own declaration lines, and
+  // the method is VALIDATED on the field's type by resolveMethodOnType. This
+  // branch is EXCLUSIVE for chained Go receivers: when the hop can't be
+  // inferred or the field's type is external (`conn *sql.DB` — no project
+  // node), the ref stays unresolved rather than falling through to the
+  // bare-name strategies below, which is exactly how `target.conn.Exec(...)`
+  // fabricated a dependency on an unrelated local interface's same-named
+  // method. Chained Go receivers were never emitted before #1276, so there
+  // is no prior recall to preserve on the fallback path.
+  if (ref.language === 'go' && dotMatch && objectOrClass!.includes('.')) {
+    return matchGoFieldChainCall(objectOrClass!, methodName!, ref, context);
   }
 
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
@@ -1555,6 +1767,92 @@ export function matchMethodCall(
     }
   }
 
+  return null;
+}
+
+/** Go builtin/primitive field types that can never carry a project method. */
+const GO_BUILTIN_FIELD_TYPES = new Set([
+  'string', 'bool', 'byte', 'rune', 'error', 'any',
+  'int', 'int8', 'int16', 'int32', 'int64',
+  'uint', 'uint8', 'uint16', 'uint32', 'uint64', 'uintptr',
+  'float32', 'float64', 'complex64', 'complex128',
+  'chan', 'map', 'func', 'struct', 'interface',
+]);
+
+/**
+ * Resolve a Go 2-hop field-chain call `base.field.Method(...)` (#1276):
+ * `target.conn.Exec("insert")` where `func (target *Target) Write()` and
+ * `type Target struct { conn *sql.DB }`. Two inference hops, both read from
+ * source the same way #1108 does:
+ *   1. `base`'s type from the enclosing scope (method receiver, typed
+ *      parameter, or local declaration) via inferLocalReceiverType;
+ *   2. `field`'s declared type from the struct's own declaration lines.
+ * The method is then resolved AND VALIDATED on the field's type. A field
+ * whose type has no project node (`sql.DB`, any external dependency) yields
+ * null — the caller treats this branch as exclusive for chained Go
+ * receivers, so the ref stays unresolved instead of name-guessing.
+ */
+function matchGoFieldChainCall(
+  receiverChain: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const segs = receiverChain.split('.');
+  if (segs.length !== 2 || !segs[0] || !segs[1]) return null;
+  const [base, field] = segs;
+
+  const baseType = inferLocalReceiverType(base!, ref, context);
+  if (!baseType) return null;
+
+  const fieldEsc = field!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const fieldTypeRe = new RegExp(`\\b${fieldEsc}\\s+\\*?\\[?\\]?([A-Za-z_][\\w.]*)`);
+
+  const structs = preferCallSiteFile(context.getNodesByName(baseType), ref.filePath).filter(
+    (n) => (n.kind === 'struct' || n.kind === 'class') && n.language === 'go'
+  );
+  for (const s of structs) {
+    const source = context.readFile(s.filePath);
+    if (!source) continue;
+    // Only the struct's own declaration lines — a same-named identifier
+    // elsewhere in the file can't donate a type. Matched LINE BY LINE with
+    // comments stripped: chi's `Mux` has a doc comment reading "the tree
+    // router" right above `tree *node`, and a whole-block match captured
+    // `router` from the prose instead of `node` from the field.
+    const declLines = source.split('\n').slice(Math.max(0, s.startLine - 1), s.endLine);
+    for (const rawLine of declLines) {
+      const line = rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
+      const m = line.match(fieldTypeRe);
+      if (!m || !m[1]) continue;
+      const rawType = m[1];
+      // A package-qualified field type (`http.Handler`, `sql.DB`) is only
+      // followed when the package is IN-MODULE: stripping the qualifier and
+      // matching the bare name would conflate a stdlib/third-party type with
+      // any same-named project type — on chi, `handler http.Handler` bound
+      // to an example app's unrelated local `Handler`. That is the exact
+      // fabrication this matcher exists to prevent (#1276).
+      if (rawType.includes('.')) {
+        const pkg = rawType.split('.')[0]!;
+        const mod = context.getGoModule?.();
+        const imp = context
+          .getImportMappings(s.filePath, 'go')
+          .find((i) => i.localName === pkg);
+        const inModule =
+          !!mod &&
+          !!imp &&
+          (imp.source === mod.modulePath || imp.source.startsWith(mod.modulePath + '/'));
+        if (!inModule) continue;
+      }
+      // Unexported (lowercase) types are idiomatic Go and stay eligible —
+      // chi's `mx.tree.FindRoute()` chains through `tree *node`. A
+      // mis-capture is harmless: resolveMethodOnType only returns a
+      // validated `<type>::<method>` match.
+      const fieldType = rawType.split('.').pop();
+      if (!fieldType || !/^[A-Za-z_]/.test(fieldType) || GO_BUILTIN_FIELD_TYPES.has(fieldType)) continue;
+      const resolved = resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method');
+      if (resolved) return resolved;
+    }
+  }
   return null;
 }
 

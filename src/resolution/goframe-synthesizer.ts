@@ -25,6 +25,7 @@
 
 import type { Edge, Node } from '../types';
 import type { ResolutionContext } from './types';
+import type { MaybeYield } from './cooperative-yield';
 import { GOFRAME_ROUTE_MARKER } from './frameworks/goframe';
 
 const FANOUT_CAP = 2000; // backstop only; real apps are 1 route → 1 method.
@@ -73,13 +74,15 @@ function selectHandler(candidates: Node[], routeFile: string): Node | null {
   return sameModule.length === 1 ? sameModule[0]! : null;
 }
 
-export function goframeRouteEdges(ctx: ResolutionContext): Edge[] {
+export async function goframeRouteEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   // Route nodes the goframe extractor created, keyed by their package-qualified
   // request type (`cash.ListReq`). `wanted` holds every key a handler signature
   // could match — the qualified form plus its bare type fallback.
   const routesByReqType = new Map<string, Node[]>();
   const wanted = new Set<string>();
-  for (const route of ctx.getNodesByKind('route')) {
+  for (const route of (ctx.iterateNodesByKind?.('route') ?? ctx.getNodesByKind('route'))) {
+    if ((++scanned255 & 63) === 0) await onYield();
     if (route.language !== 'go') continue;
     const marker = route.qualifiedName.indexOf(GOFRAME_ROUTE_MARKER);
     if (marker < 0) continue;
@@ -98,7 +101,8 @@ export function goframeRouteEdges(ctx: ResolutionContext): Edge[] {
   // pointer, indexed by every matching (qualified + bare) form so a route can
   // match precisely on `pkg.Type` and fall back to the bare `Type`.
   const handlersByKey = new Map<string, Node[]>();
-  for (const method of ctx.getNodesByKind('method')) {
+  for (const method of (ctx.iterateNodesByKind?.('method') ?? ctx.getNodesByKind('method'))) {
+    if ((++scanned255 & 63) === 0) await onYield();
     if (method.language !== 'go' || !method.signature) continue;
     for (const t of pointerParamTypes(method.signature)) {
       if (!wanted.has(t)) continue;

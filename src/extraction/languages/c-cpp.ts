@@ -89,7 +89,15 @@ function extractCppReceiverType(node: SyntaxNode, source: string): string | unde
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
   const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
-  return parts.length > 1 ? parts.slice(0, -1).join('::') : undefined;
+  if (parts.length <= 1) return undefined;
+  // An out-of-line template method definition carries the class's template
+  // parameter list in the qualifier (`template<typename T> T Box<T>::get()`),
+  // but the class node is indexed as bare `Box` — strip `<…>` so the receiver
+  // matches it, the same normalization #1043 applies to base-class refs.
+  // Multi-line parameter lists otherwise leak whole `<…>` blocks (newlines
+  // included) into qualified_name, which can exceed NAME_MAX (#1286).
+  const receiver = stripCppTemplateArgs(parts.slice(0, -1).join('::'));
+  return receiver || undefined;
 }
 
 /**
@@ -434,6 +442,229 @@ export function blankMetalAttributes(source: string): string {
 }
 
 /**
+ * Blank annotation-style macro invocations that decorate a declaration but carry
+ * NO terminating semicolon — the pervasive Unreal-Engine reflection markup
+ * (`UPROPERTY(...)`, `UFUNCTION(...)`, `UCLASS(...)`, `GENERATED_BODY()`,
+ * `UE_DEPRECATED_FORGAME(...)`, `DECLARE_DELEGATE_*(...)`, …) that sits on its
+ * own line right before a member/type. tree-sitter's C++ grammar doesn't know
+ * these are macros, so each one drops into error recovery; in a big reflected
+ * class (`CharacterMovementComponent.h` has ~240 of them) the errors accumulate
+ * until the enclosing `class_specifier` can't close and collapses into an ERROR
+ * node — the whole class definition, its members, and its `extends` edges vanish
+ * from the graph. Neither `blankCppExportMacros` (class-header export macros) nor
+ * `blankCppInlineMacros` (return-type inline specifiers) touches these in-body
+ * markup macros. Replacing each with equal-length spaces preserves every byte
+ * offset (so line/column stay exact) and the class then parses normally.
+ *
+ * Deliberately name-list-FREE — UE alone has hundreds of such macros and projects
+ * add their own — so it keys on structure, not a curated list, matched tightly to
+ * avoid touching legitimate C++:
+ *  - the macro must be the FIRST non-whitespace token on its line (`^[ \t]*`),
+ *    which is where declaration markup lives — so a macro used inside an
+ *    expression or condition (`if (CHECK(x))`, `x = MACRO(a) + b`) is never
+ *    matched (it isn't line-leading);
+ *  - the name must be ALL-CAPS (`[A-Z][A-Z0-9_]{2,}`), since ordinary
+ *    function/type names called at line start are lower/mixed case;
+ *  - the char after the balanced `(...)` must START A DECLARATION — a letter,
+ *    `_`, `~` (destructor), or `#` (a following directive). Declaration markup is
+ *    always followed by the thing it decorates (`UPROPERTY(...)\n float X;`,
+ *    `UE_DEPRECATED(...) UPROPERTY(...)`), whereas a statement call is followed by
+ *    `;` (`FOO(x);`), an init-list item by `,`/`{`, and an expression fragment by
+ *    an operator (`MAKE(a) + 1`) — all rejected. String/char literals inside the
+ *    args are skipped so an embedded `)` can't mis-close the balance.
+ *
+ * C++-only (wired into cppExtractor). A blanked macro inside a block comment is
+ * harmless (comments don't parse), and the rare line-leading no-semicolon
+ * ALL-CAPS call that isn't markup only loses that one annotation, never a whole
+ * class.
+ */
+export function blankCppAnnotationMacroCalls(source: string): string {
+  if (!/^[ \t]*[A-Z][A-Z0-9_]{2,}\s*\(/m.test(source)) return source;
+  const chars = source.split('');
+  const re = /^([ \t]*)([A-Z][A-Z0-9_]{2,})(\s*)\(/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const macroStart = m.index + (m[1] ?? '').length; // skip leading indent
+    let i = m.index + m[0].length - 1; // index of the opening '('
+    let depth = 0;
+    let end = -1;
+    for (; i < source.length; i++) {
+      const c = source[i];
+      if (c === '"' || c === "'") {
+        const quote = c;
+        i++;
+        while (i < source.length && source[i] !== quote) {
+          if (source[i] === '\\') i++;
+          i++;
+        }
+        continue;
+      }
+      if (c === '(') depth++;
+      else if (c === ')') {
+        depth--;
+        if (depth === 0) { end = i + 1; break; }
+      }
+    }
+    if (end < 0) continue;
+    let j = end;
+    while (j < source.length && /\s/.test(source[j] as string)) j++;
+    const after = source[j];
+    // Only markup is followed by the declaration it decorates; a statement call
+    // (`;`), init-list item (`,`/`{`), or expression fragment (operator) is not.
+    if (!after || !/[A-Za-z_~#]/.test(after)) continue;
+    for (let k = macroStart; k < end; k++) {
+      if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
+    }
+    re.lastIndex = end;
+  }
+  return chars.join('');
+}
+
+/**
+ * Blank a macro that is the ONLY token on its line — no parens, no semicolon:
+ * namespace-management macros (`FMT_BEGIN_NAMESPACE`, `FMT_END_EXPORT`,
+ * `JEMALLOC_DIAGNOSTIC_DISABLE_SPURIOUS`), Qt's `Q_OBJECT`, and friends. A
+ * bare identifier is not a statement or declaration in C or C++, so
+ * tree-sitter drops into error recovery at every one — and since the kernel
+ * path defers ANY erroring file to wasm, this single idiom deferred 13/73 fmt
+ * files and a comparable share of jemalloc, forfeiting the native-parse win
+ * on exactly the header-heavy trees it targets (the wasm path also mis-nests
+ * scopes around them today). Replacing the token with equal-length spaces
+ * preserves every byte offset and the surrounding declarations parse clean.
+ *
+ * Matched tightly so a real identifier can never be touched — ALL of:
+ *  - the line consists of ONE ALL-CAPS token (≥4 chars, with `_`), optionally
+ *    followed by a same-line comment — a lone lowercase identifier or any
+ *    second token disqualifies;
+ *  - the PREVIOUS non-blank line does not end in a continuation character
+ *    (`=`, an operator, `,`, `(`, `?`, `:`, or a `\` macro-definition
+ *    continuation) — so an ALL-CAPS operand split onto its own line inside a
+ *    multi-line expression (`int x =\n  SOME_CONST\n  | OTHER;`) is left
+ *    alone; and
+ *  - the NEXT non-blank line starts like a declaration/scope token
+ *    (letter, `_`, `#`, `{`, `}`, or `~`) or the file ends — an operator,
+ *    string literal, or `;` continuation rejects the match.
+ * Shared by C and C++ (the idiom is identical in both).
+ */
+const LONE_MACRO_LINE_RE = /^[ \t]*([A-Z][A-Z0-9_]{3,})[ \t]*(?:\/\/[^\n\r]*|\/\*[^\n\r]*\*\/[ \t]*)?\r?$/;
+const LONE_MACRO_CONTINUATION_END_RE = /[=+\-*/%&|^<>?:,(\\]$/;
+export function blankLoneMacroLines(source: string): string {
+  if (!/^[ \t]*[A-Z][A-Z0-9_]{3,}[ \t]*\r?$/m.test(source)) return source;
+  const lines = source.split('\n');
+  const content = (l: string): string => l.replace(/\r$/, '').trim();
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const m = LONE_MACRO_LINE_RE.exec(line);
+    if (!m) continue;
+    // Underscore requirement rides the macro convention (FMT_BEGIN_NAMESPACE,
+    // Q_OBJECT); a solid all-caps word (`NDEBUG`-style) alone is too risky.
+    if (!(m[1] as string).includes('_')) continue;
+    let prev = i - 1;
+    while (prev >= 0 && content(lines[prev] as string) === '') prev--;
+    if (prev >= 0 && LONE_MACRO_CONTINUATION_END_RE.test(content(lines[prev] as string))) continue;
+    let next = i + 1;
+    while (next < lines.length && content(lines[next] as string) === '') next++;
+    if (next < lines.length) {
+      const first = content(lines[next] as string)[0];
+      if (!first || !/[A-Za-z_#{}~]/.test(first)) continue;
+    }
+    const start = line.indexOf(m[1] as string);
+    lines[i] =
+      line.slice(0, start) + ' '.repeat((m[1] as string).length) + line.slice(start + (m[1] as string).length);
+    changed = true;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
+/**
+ * Blank an export/visibility macro sitting in front of a *member* or *method*
+ * declaration inside a class/namespace (`ENGINE_API virtual void Tick(…)`,
+ * `static ENGINE_API void AddReferencedObjects(…)`, `UE_API FVector GetVel()
+ * const`), before parsing. `blankCppExportMacros` only recovers the macro in a
+ * `class MACRO Name` *header*; the very same macro also prefixes almost every
+ * exported member of a big Unreal-Engine class, and tree-sitter — not knowing
+ * it's a macro — reads `MACRO <return-type> <name>(` as an extra type token and
+ * drops each such declaration into error recovery. In a heavily-exported header
+ * (`Actor.h`, `World.h`, …) hundreds of these accumulate: the return types pile
+ * up as orphan ERROR tokens and, combined with other markup, can still tip the
+ * enclosing class into collapse. Replacing the macro with equal-length spaces
+ * preserves every byte offset (line/column stay exact) and each member parses
+ * as an ordinary declaration.
+ *
+ * Matched tightly so it can't touch the same token used as a value
+ * (`int x = SOME_API;`, `if (mode == FOO_API)`): the token must be ALL-CAPS AND
+ * end in the conventional visibility-macro suffix `_API` / `_EXPORT` / `_ABI`
+ * (Unreal `*_API`, Qt/Boost `*_EXPORT`, LLVM `*_ABI`) — ordinary identifiers
+ * effectively never carry these suffixes — and must be immediately followed by
+ * whitespace then a declaration token (`\s+[A-Za-z_]`: a type, `virtual`,
+ * `static`, or the name). A value use is instead followed by `;`, `)`, `,`,
+ * `=`, `::`, or an operator, all of which fail the look-ahead. C++-only (wired
+ * into cppExtractor).
+ */
+const CPP_API_PREFIX_RE = /\b[A-Z][A-Z0-9_]*(?:_API|_EXPORT|_ABI)\b(?=\s+[A-Za-z_])/g;
+export function blankCppApiPrefixMacros(source: string): string {
+  if (!/_(?:API|EXPORT|ABI)\b/.test(source)) return source;
+  return source.replace(CPP_API_PREFIX_RE, (m) => ' '.repeat(m.length));
+}
+
+/**
+ * Blank an Unreal-Engine annotation macro that appears MID-LINE (not
+ * line-leading, so `blankCppAnnotationMacroCalls` never sees it) inside a
+ * declaration: an enum value's `UMETA(DisplayName="…")`, a parameter's
+ * `UPARAM(ref)`, or a deprecation tag wedged into a `using`/member declaration
+ * (`using FOnNetTick UE_DEPRECATED(5.5, "…") = TMulticastDelegate<void(float)>;`
+ * in `World.h`, which otherwise collapses `UWorld`). tree-sitter can't reconcile
+ * these embedded macro calls and drops into error recovery, and a mid-line one
+ * inside a big enum or a class-scope `using` can cascade into the whole enum /
+ * class being lost. Replacing the entire `MACRO(...)` (balanced parens, string
+ * literals skipped so an embedded `)` can't mis-close) with equal-length spaces
+ * preserves every byte offset and the declaration parses normally.
+ *
+ * Keyed on an explicit UE-only name list (`UMETA`, `UPARAM`, and the
+ * `UE_DEPRECATED*` family) — these identifiers are exclusive to Unreal's
+ * reflection layer and appear in no standard-C++ or other-library code, so
+ * blanking them is zero-risk to non-UE sources. (The line-LEADING forms of
+ * `UE_DEPRECATED(...)` are already handled by `blankCppAnnotationMacroCalls`;
+ * this covers the mid-line forms it structurally can't.) C++-only.
+ */
+const CPP_INLINE_ANNOTATION_RE = /\b(?:UMETA|UPARAM|UE_DEPRECATED\w*)\s*\(/g;
+export function blankCppInlineAnnotationMacros(source: string): string {
+  if (!/\b(?:UMETA|UPARAM|UE_DEPRECATED)/.test(source)) return source;
+  const chars = source.split('');
+  const re = new RegExp(CPP_INLINE_ANNOTATION_RE.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    let i = m.index + m[0].length - 1; // index of the opening '('
+    let depth = 0;
+    let end = -1;
+    for (; i < source.length; i++) {
+      const c = source[i];
+      if (c === '"' || c === "'") {
+        const quote = c;
+        i++;
+        while (i < source.length && source[i] !== quote) {
+          if (source[i] === '\\') i++;
+          i++;
+        }
+        continue;
+      }
+      if (c === '(') depth++;
+      else if (c === ')') {
+        depth--;
+        if (depth === 0) { end = i + 1; break; }
+      }
+    }
+    if (end < 0) continue;
+    for (let k = m.index; k < end; k++) {
+      if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
+    }
+    re.lastIndex = end;
+  }
+  return chars.join('');
+}
+
+/**
  * Blank CUDA-specific constructs before parsing `.cu`/`.cuh` files (parsed with
  * the C++ grammar). Three shapes tree-sitter-cpp can't reconcile, each replaced
  * with equal-length whitespace so every byte offset survives (#387):
@@ -515,26 +746,792 @@ function looksLikeCudaSource(source: string): boolean {
   );
 }
 
-/** C/C++ source pre-processing before tree-sitter: recover both macro-annotated
- * class definitions and macro-prefixed function definitions — plus the non-C++
- * surface of the dialects parsed with the C++ grammar: `.metal` MSL attribute
- * annotations, and CUDA specifiers + launch syntax (by `.cu`/`.cuh` extension
- * or by content, for CUDA living in `.h`/`.hpp` headers). Offset-preserving. */
-function preParseCppSource(source: string, filePath?: string): string {
-  const blanked = blankCppInlineMacros(blankCppExportMacros(source));
-  const lower = filePath ? filePath.toLowerCase() : '';
-  if (lower.endsWith('.metal')) return blankMetalAttributes(blanked);
-  if (lower.endsWith('.cu') || lower.endsWith('.cuh') || looksLikeCudaSource(source)) {
-    return blankCudaConstructs(blanked);
+/**
+ * Restore preprocessor-directive lines to their original bytes after the
+ * blanking passes ran. The token-level blanks match on shape, not context, so
+ * a macro name that happens to sit inside a DIRECTIVE gets blanked too — and
+ * blanking the name position of `#define FMT_API FMT_VISIBILITY("default")`
+ * leaves a nameless `#  define        FMT_VISIBILITY(…)`, which is a parse
+ * ERROR (fmt's base.h carries several). Inside a directive the blanks were
+ * never useful anyway: tree-sitter stores `#define` bodies as raw
+ * preproc_arg text it doesn't parse, so blanking there can only ever break
+ * the directive itself. Copying the original directive lines back (including
+ * `\`-continuation lines of multi-line defines) is offset-preserving by
+ * construction and strictly reduces parse errors on both extraction arms.
+ */
+function restoreDirectiveLines(original: string, blanked: string): string {
+  if (blanked === original || original.indexOf('#') === -1) return blanked;
+  const o = original.split('\n');
+  const b = blanked.split('\n');
+  let changed = false;
+  let continuation: boolean = false;
+  for (let i = 0; i < o.length && i < b.length; i++) {
+    const line = o[i] as string;
+    const isDirective: boolean = continuation || /^[ \t]*#/.test(line);
+    if (isDirective && b[i] !== line) {
+      b[i] = line;
+      changed = true;
+    }
+    continuation = isDirective && /\\\s*$/.test(line.replace(/\r$/, ''));
   }
-  return blanked;
+  return changed ? b.join('\n') : blanked;
 }
 
-/** C source pre-processing: C-detected headers in CUDA projects (llm.c keeps
- * `__device__` helpers and kernel prototypes in plain `.h`) get the same
- * content-gated CUDA blank as C++. */
+/** C/C++ source pre-processing before tree-sitter: recover macro-annotated class
+ * definitions, macro-prefixed function definitions, macro-prefixed members, and
+ * macro-decorated members (Unreal-Engine reflection markup) — plus the non-C++
+ * surface of the dialects parsed with the C++ grammar: `.metal` MSL attribute
+ * annotations, and CUDA specifiers + launch syntax (by `.cu`/`.cuh` extension
+ * or by content, for CUDA living in `.h`/`.hpp` headers). Offset-preserving;
+ * directive lines are restored at the end (see restoreDirectiveLines). */
+function preParseCppSource(source: string, filePath?: string): string {
+  // blankCLeadingAttrMacros runs AFTER the api-prefix blank so a stacked
+  // `FMT_NORETURN FMT_API void f(…)` reduces to the `MACRO Ret name(` shape
+  // it matches (the _API token is already spaces by then).
+  let blanked = blankLoneMacroLines(
+    blankCLeadingAttrMacros(
+      blankCppAnnotationMacroCalls(
+        blankCppInlineAnnotationMacros(
+          blankCppApiPrefixMacros(blankCppInlineMacros(blankCppExportMacros(source)))
+        )
+      )
+    )
+  );
+  const lower = filePath ? filePath.toLowerCase() : '';
+  if (lower.endsWith('.metal')) {
+    blanked = blankMetalAttributes(blanked);
+  } else if (lower.endsWith('.cu') || lower.endsWith('.cuh') || looksLikeCudaSource(source)) {
+    blanked = blankCudaConstructs(blanked);
+  }
+  return restoreDirectiveLines(source, blanked);
+}
+
+/**
+ * Blank an unknown attribute macro sitting in front of a C function
+ * definition's return type: `SEC_ATTR UINT32 LostName(VOID) { … }` (macro
+ * wrapping `__attribute__((…))`, common in embedded/kernel C). tree-sitter's
+ * C grammar reads the macro as the declaration's type, the real return type
+ * as the declarator, and stores the PARAMETER LIST as the function name —
+ * `LostName` indexes as `"(VOID)"` and is unfindable (#1211). The C++ grammar
+ * recovers this shape differently (glued name, salvaged post-hoc by
+ * `recoverMangledCppName`), but in C the real name never reaches the mangled
+ * string, so only a pre-parse blank can recover it.
+ *
+ * Attribute macros are project-specific (`SEC_ATTR`, `INIT_TEXT`, …), so this
+ * keys on structure, not a curated list, matched tightly:
+ *  - line-leading (`^[ \t]*`) — declaration position, never an expression use;
+ *  - ALL-CAPS token of ≥3 chars (`[A-Z][A-Z0-9_]{2,}`) — ordinary C types in
+ *    definitions are rarely spelled this way, and when they are (`UINT32 f()`)
+ *    they're followed by ONE identifier + `(`, which the lookahead rejects;
+ *  - followed by TWO identifier tokens (return type, then name — `*` allowed
+ *    for pointer returns) and then `(` — i.e. exactly the
+ *    `MACRO Ret name(` definition shape. `MACRO name(` calls, `#define`
+ *    lines (start with `#`), and multi-word builtin returns
+ *    (`MACRO unsigned int f(` — where the C grammar already keeps the name)
+ *    are all left untouched.
+ * Equal-length spaces preserve every byte offset, like the C++ blanks above.
+ */
+const C_LEADING_ATTR_MACRO_RE =
+  /^([ \t]*)([A-Z][A-Z0-9_]{2,})(?=\s+[A-Za-z_]\w*[\s*]+[A-Za-z_]\w*\s*\()/gm;
+export function blankCLeadingAttrMacros(source: string): string {
+  return source.replace(
+    C_LEADING_ATTR_MACRO_RE,
+    (_m, ws: string, macro: string) => ws + ' '.repeat(macro.length)
+  );
+}
+
+/**
+ * Blank the body of `#ifdef __cplusplus … #endif` guard regions in C sources.
+ * The ubiquitous C-header compatibility idiom
+ *
+ *   #ifdef __cplusplus
+ *   extern "C" {
+ *   #endif
+ *
+ * is NOT valid C — `extern "C" {` (and any other C++-only line under the
+ * guard) drops tree-sitter-c into error recovery, so effectively every public
+ * C header carries parse errors. The wasm path shrugs (recovery keeps the
+ * rest); the kernel path defers EVERY erroring file to wasm by policy — so
+ * this one idiom pushed C-header deferral to ~32% on redis (vs the <10%
+ * gate) and forfeited the native-parse win exactly where C repos have the
+ * most files. A C compiler never sees the guarded lines (`__cplusplus` is
+ * only defined for C++), so blanking the region BODY mirrors the
+ * preprocessor's own view of the file.
+ *
+ * Matched conservatively, line-based and offset-preserving:
+ *  - the opener must be `#ifdef __cplusplus` / `#if defined(__cplusplus)`;
+ *  - the body may contain NO other preprocessor directive (a nested `#if`,
+ *    `#else`, or `#define` bails the whole region — those need real
+ *    preprocessing, so the file keeps its current behavior);
+ *  - the region must close with `#endif` within a few lines (guards are
+ *    tiny; a giant region is something else).
+ * The `#ifdef`/`#endif` directive lines themselves are kept — an empty
+ * preproc_ifdef parses clean — and every blanked byte becomes a space with
+ * `\r` preserved, so offsets, lines, and columns survive on CRLF checkouts.
+ */
+const C_CPLUSPLUS_GUARD_OPEN_RE =
+  /^[ \t]*#[ \t]*(?:ifdef[ \t]+__cplusplus\b|if[ \t]+defined[ \t]*\(?[ \t]*__cplusplus[ \t]*\)?)/;
+const C_PREPROC_DIRECTIVE_RE = /^[ \t]*#/;
+const C_PREPROC_ENDIF_RE = /^[ \t]*#[ \t]*endif\b/;
+const C_CPLUSPLUS_GUARD_MAX_BODY_LINES = 40;
+export function blankCCplusplusGuardBodies(source: string): string {
+  if (source.indexOf('__cplusplus') === -1) return source;
+  const lines = source.split('\n');
+  const stripCr = (l: string): string => (l.endsWith('\r') ? l.slice(0, -1) : l);
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (!C_CPLUSPLUS_GUARD_OPEN_RE.test(stripCr(lines[i] as string))) continue;
+    let end = -1;
+    for (let j = i + 1; j < lines.length && j - i - 1 <= C_CPLUSPLUS_GUARD_MAX_BODY_LINES; j++) {
+      const line = stripCr(lines[j] as string);
+      if (C_PREPROC_ENDIF_RE.test(line)) {
+        end = j;
+        break;
+      }
+      if (C_PREPROC_DIRECTIVE_RE.test(line)) break; // nested directive — bail
+    }
+    if (end < 0) continue;
+    for (let k = i + 1; k < end; k++) {
+      lines[k] = (lines[k] as string).replace(/[^\r]/g, ' ');
+    }
+    changed = true;
+    i = end;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
+/**
+ * Blank a C iterator-macro call in STATEMENT position — `ql_foreach(iter,
+ * &arena->tcache_ql, link) { … }` (jemalloc), `for_each_string_list_item(item,
+ * &list) { … }` (git), `list_for_each_entry(pos, head, member) { … }` (the
+ * Linux kernel's core iteration idiom). A call followed by a brace block is
+ * not a C statement, so tree-sitter-c drops into error recovery at every use —
+ * these macros are the single largest source of parse errors in macro-heavy C
+ * trees (git: ~39% of files error; the kernel path defers each one to wasm).
+ * Blanking JUST the macro call leaves the brace block as a bare compound
+ * statement — valid C — so the body's calls/locals extract normally on both
+ * arms instead of riding error recovery.
+ *
+ * C-ONLY, and matched tightly:
+ *  - the call must be INDENTED (statement position; file-scope definitions
+ *    start at column 0, and an unbraced file-scope `name(args) { }` is a
+ *    valid implicit-int function definition that must not be touched);
+ *  - lowercase-led identifier (iterator macros are lowercase by convention;
+ *    this also excludes constructors if the file is really C++) that is not a
+ *    control keyword;
+ *  - the parens balance ON the line (string literals skipped), and after
+ *    them only `{` or end-of-line may follow — a `;` (a real call statement),
+ *    an operator, or any other token disqualifies;
+ *  - when the line ends at `)`, the NEXT non-blank line must begin with `{`.
+ * C++ deliberately does NOT get this pass: an indented snake_case
+ * constructor (`basic_string_view(const Char* s) : … {`) is exactly this
+ * shape, and blanking it would corrupt every STL-style class.
+ */
+const C_STMT_MACRO_KEYWORDS = new Set([
+  'if', 'while', 'for', 'switch', 'return', 'do', 'else', 'sizeof',
+]);
+export function blankCStatementMacroCalls(source: string): string {
+  const lines = source.split('\n');
+  let changed = false;
+  const content = (l: string): string => l.replace(/\r$/, '').trim();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const m = /^[ \t]+([a-z_][a-z0-9_]*)[ \t]*\(/.exec(line);
+    if (!m || C_STMT_MACRO_KEYWORDS.has(m[1] as string)) continue;
+    const open = line.indexOf('(', m[0].length - 1);
+    let depth = 0;
+    let close = -1;
+    for (let k = open; k < line.length; k++) {
+      const ch = line[k];
+      if (ch === '"' || ch === "'") {
+        const quote = ch;
+        k++;
+        while (k < line.length && line[k] !== quote) {
+          if (line[k] === '\\') k++;
+          k++;
+        }
+        continue;
+      }
+      if (ch === '(') depth++;
+      else if (ch === ')') {
+        depth--;
+        if (depth === 0) {
+          close = k;
+          break;
+        }
+      }
+    }
+    let endLine = i;
+    if (close < 0) {
+      // Parens don't balance on the head line — the kernel wraps iterator
+      // macros (`hlist_for_each_entry_rcu(p, head, hlist,\n\t\t
+      // lockdep_is_held(&kprobe_mutex)) {`). Continue the same
+      // string-skipping paren scan over a few continuation lines. A `;` or
+      // a brace anywhere in the span means a real statement or compound
+      // literal — bail (missing a blank is safe; corrupting one is not).
+      if (line.indexOf(';') !== -1) continue;
+      for (let j = i + 1; j <= i + 5 && j < lines.length && close < 0; j++) {
+        const cont = lines[j] as string;
+        let bail = false;
+        for (let k = 0; k < cont.length; k++) {
+          const ch = cont[k];
+          if (ch === '"' || ch === "'") {
+            const quote = ch;
+            k++;
+            while (k < cont.length && cont[k] !== quote) {
+              if (cont[k] === '\\') k++;
+              k++;
+            }
+            continue;
+          }
+          if (ch === ';' || ch === '{' || ch === '}') {
+            bail = true;
+            break;
+          }
+          if (ch === '(') depth++;
+          else if (ch === ')') {
+            depth--;
+            if (depth === 0) {
+              close = k;
+              endLine = j;
+              break;
+            }
+          }
+        }
+        if (bail) break;
+      }
+      if (close < 0) continue;
+    }
+    const endLineStr = lines[endLine] as string;
+    const after = endLineStr.slice(close + 1).replace(/\r$/, '').trim();
+    if (after === '') {
+      // Brace on the next line (`ql_foreach(…)\n{`) or a brace-less
+      // single-statement body (`for_each_subsys(ss, i)\n\tstmt;` — blanking
+      // leaves the bare statement, valid C). A next line starting with an
+      // operator/string/`;` is an expression continuation — bail.
+      let next = endLine + 1;
+      while (next < lines.length && content(lines[next] as string) === '') next++;
+      if (next >= lines.length) continue;
+      const first = content(lines[next] as string)[0];
+      if (!first || !/[A-Za-z_{]/.test(first)) continue;
+    } else if (after !== '{') {
+      continue;
+    }
+    const identStart = line.indexOf(m[1] as string);
+    if (endLine === i) {
+      lines[i] =
+        line.slice(0, identStart) +
+        ' '.repeat(close + 1 - identStart) +
+        line.slice(close + 1);
+    } else {
+      lines[i] = line.slice(0, identStart) + line.slice(identStart).replace(/[^\r]/g, ' ');
+      for (let j = i + 1; j < endLine; j++) {
+        lines[j] = (lines[j] as string).replace(/[^\r]/g, ' ');
+      }
+      lines[endLine] =
+        endLineStr.slice(0, close + 1).replace(/[^\r]/g, ' ') + endLineStr.slice(close + 1);
+      i = endLine; // the blanked span can't host another head
+    }
+    changed = true;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
+/**
+ * Blank a lowercase compiler-annotation word SANDWICHED between a storage
+ * class and the rest of a declaration — `static notrace void tick(…)`,
+ * `static nokprobe_inline void arm(…)` (kernel compiler.h markers). The
+ * dunder word-list can't carry these bare-word forms: `notrace` is a
+ * plausible identifier. The sandwich IS the guard — the token counts only
+ * when directly preceded by `static`/`extern`/`inline` AND followed by
+ * another word, a position where it cannot be a variable name (an archaic
+ * implicit-int `static notrace = 1;` fails the following-word requirement).
+ * C-only.
+ */
+const C_SANDWICHED_ANNOTATIONS = [
+  'noinline_for_stack', 'nokprobe_inline', 'noinline', 'notrace', 'noinstr',
+] as const;
+const C_SANDWICH_RE = new RegExp(
+  `\\b(static|extern|inline)([ \\t]+)(${C_SANDWICHED_ANNOTATIONS.join('|')})\\b(?=[ \\t]+[A-Za-z_])`,
+  'g'
+);
+export function blankCSandwichedAnnotations(source: string): string {
+  C_SANDWICH_RE.lastIndex = 0;
+  if (!C_SANDWICH_RE.test(source)) return source;
+  C_SANDWICH_RE.lastIndex = 0;
+  return source.replace(
+    C_SANDWICH_RE,
+    (_m, storage: string, ws: string, ann: string) => storage + ws + ' '.repeat(ann.length)
+  );
+}
+
+/**
+ * Blank a C23 `auto` type-inference keyword — `auto hb = hbr.hb;` (the
+ * futex code; tree-sitter-c predates C23 auto and errors the enclosing
+ * function). The old storage-class reading (`auto int x = 1;`) has a TYPE
+ * between `auto` and the `=` and is untouched — the match requires
+ * `auto IDENT =` directly, which only the C23 form exhibits. Blanking
+ * leaves a plain assignment statement. C-only.
+ */
+const C_AUTO_INFER_RE = /\bauto(?=[ \t]+[A-Za-z_]\w*[ \t]*=)/g;
+export function blankCAutoInference(source: string): string {
+  C_AUTO_INFER_RE.lastIndex = 0;
+  if (!C_AUTO_INFER_RE.test(source)) return source;
+  C_AUTO_INFER_RE.lastIndex = 0;
+  return source.replace(C_AUTO_INFER_RE, () => '    ');
+}
+
+/**
+ * Blank a trailing parameter-attribute macro — `int argc UNUSED,` /
+ * `struct repository *repo UNUSED)` — git's house style for
+ * `__attribute__((unused))` on nearly every callback parameter (and the same
+ * shape as `MAYBE_UNUSED`/`G_GNUC_UNUSED` elsewhere). tree-sitter-c can't
+ * parse a second identifier after the parameter name, so every such
+ * SIGNATURE drops into error recovery — the single largest deferral bucket
+ * on git (~150 files). Blanking the macro leaves an ordinary parameter.
+ *
+ * Matched tightly: an identifier, whitespace, then an ALL-CAPS ≥3-char token
+ * immediately before `,` or `)`. Two juxtaposed identifiers in that position
+ * have no other valid-C reading — in a CALL the would-be macro is preceded
+ * by `,`/`(`, an operator, or a literal, never by a bare identifier. C-only:
+ * C++ grammars accept more juxtapositions (user-defined suffixes, macro'd
+ * `final`/`override`), so cpp keeps its existing recovery there.
+ */
+const C_TRAILING_PARAM_ATTR_RE = /\b([A-Za-z_]\w*)([ \t]+)([A-Z][A-Z0-9_]{2,})(?=[ \t]*[,)])/g;
+export function blankCTrailingParamAttrMacros(source: string): string {
+  if (!C_TRAILING_PARAM_ATTR_RE.test(source)) {
+    C_TRAILING_PARAM_ATTR_RE.lastIndex = 0;
+    return source;
+  }
+  C_TRAILING_PARAM_ATTR_RE.lastIndex = 0;
+  return source.replace(
+    C_TRAILING_PARAM_ATTR_RE,
+    (_m, name: string, ws: string, macro: string) => name + ws + ' '.repeat(macro.length)
+  );
+}
+
+/**
+ * Blank the Linux-kernel/sparse declaration-annotation macros — `static int
+ * __init audit_init(void)`, `void __user *buf`, `__bpf_kfunc void f(…)`,
+ * `int x __ro_after_init;`. These lowercase double-underscore annotations sit
+ * between storage/type tokens and the declarator, a position tree-sitter-c
+ * can't reconcile, and they blanket the Linux tree: measured on the kernel's
+ * own `kernel/` + `mm/` subtrees, they are the largest single deferral cause
+ * (the `__init` family alone heads ~37% of erroring files).
+ *
+ * A structural match is IMPOSSIBLE here: `__u32 count` (a real typedef) and
+ * `__init foo` (an annotation) are byte-shape identical — so unlike the
+ * shape-keyed blanks above, this is a CURATED list (the CPP_INLINE_MACROS
+ * precedent) of well-known sparse/section/compiler annotations that are
+ * reserved-namespace macros in every codebase that spells them. Whole-word,
+ * equal-length spaces, C-only (the C++ grammar's kernel exposure is
+ * negligible and cpp keeps its narrower blank set).
+ */
+const C_KERNEL_ANNOTATIONS = [
+  '__init', '__exit', '__initdata', '__initconst', '__exitdata',
+  '__devinit', '__devexit', '__cpuinit', '__meminit', '__meminitdata',
+  '__net_init', '__net_exit', '__net_initdata', '__init_or_module',
+  '__user', '__kernel', '__iomem', '__percpu', '__rcu', '__force', '__nocast',
+  '__must_check', '__maybe_unused', '__always_unused', '__used', '__cold',
+  '__hot', '__weak', '__pure', '__sched', '__malloc', '__visible',
+  '__deprecated', '__ro_after_init', '__read_mostly', '__refdata',
+  '__latent_entropy', '__randomize_layout', '__no_randomize_layout',
+  '__bpf_kfunc', '__function_aligned', '__always_inline', '__noreturn',
+  // Round-2 additions, each measured heading first-error lines on the
+  // v7.2-rc2 kernel/+mm/ census (2026-07-17): cacheline placement, sparse
+  // lock/section markers, and bpf/typecheck annotations. Real dunder TYPES
+  // (`__u32`, `__s64`) and operators (`__alignof__`) are deliberately absent.
+  '__cacheline_aligned_in_smp', '__cacheline_aligned',
+  '__cacheline_internodealigned_in_smp', '____cacheline_aligned_in_smp',
+  '____cacheline_aligned', '____cacheline_internodealigned_in_smp',
+  '__noclone', '__lockfunc', '__ref', '__private', '__bitwise',
+  '__nosavedata', '__no_kcsan', '__cpuidle', '__ksym',
+  '__initdata_memblock', '__initdata_or_meminfo',
+] as const;
+// `(?!\s*\()` keeps the parameterized annotations (`__printf(1, 2)`,
+// `__aligned(8)`, `__section("x")`) intact — blanking just their name would
+// strand the argument list as a floating parenthesis and CREATE an error.
+const C_KERNEL_ANNOTATION_RE = new RegExp(
+  `\\b(${[...C_KERNEL_ANNOTATIONS].sort((a, b) => b.length - a.length).join('|')})\\b(?!\\s*\\()`,
+  'g'
+);
+export function blankCKernelAnnotations(source: string): string {
+  if (source.indexOf('__') === -1) return source;
+  C_KERNEL_ANNOTATION_RE.lastIndex = 0;
+  if (!C_KERNEL_ANNOTATION_RE.test(source)) return source;
+  let out = source.replace(C_KERNEL_ANNOTATION_RE, (m) => ' '.repeat(m.length));
+  // `container_of(ptr, struct T, member)` — the type-keyword argument is the
+  // one call shape tree-sitter-c cannot read (a macro taking a TYPE), and it
+  // is pervasive across the Linux tree. Blanking just the `struct`/`union`
+  // keyword leaves `container_of(ptr,        T, member)` — a plain
+  // identifier argument the grammar parses natively. Keyed to the macro name
+  // so no other `struct` keyword anywhere is ever touched.
+  if (out.indexOf('container_of') !== -1) {
+    out = out.replace(
+      /(\bcontainer_of\s*\([^;()]*?,\s*)(struct|union)(\s+)/g,
+      (_m, head: string, kw: string, ws: string) => head + ' '.repeat(kw.length) + ws
+    );
+  }
+  return out;
+}
+
+/**
+ * Blank the PARAMETERIZED sparse/compiler annotations whole — name AND
+ * argument list — `struct file *f __free(fput) = NULL;`, `static void
+ * __printf(4, 0) log_it(…)`, `} owners[] __counted_by(count);`,
+ * `__bpf_md_ptr(struct bpf_iter_meta *, meta);`. The word-list blank above
+ * deliberately skips these via `(?!\s*\()` because blanking just the NAME
+ * strands `(args)` as a floating parenthesis — so every such file kept
+ * deferring (the v7.2-rc2 kernel/+mm/ census puts `__free`/`__printf`/
+ * `__counted_by`/`__aligned` at the head of 39 first-error lines). Blanking
+ * the whole `__name(args)` span leaves an ordinary declaration.
+ *
+ * CURATED for the same reason as the word list: `__aligned(8)` (annotation)
+ * and `__hash(key)` (a real static helper call) are byte-shape identical, so
+ * only reserved-namespace names that are annotations in every codebase that
+ * spells them are listed. One nesting level of parens is allowed
+ * (`__aligned(sizeof(struct x))`); newlines inside the span survive so byte
+ * offsets are preserved. C-only.
+ */
+const C_PARAMETERIZED_ANNOTATIONS = [
+  '__free', '__printf', '__scanf', '__counted_by', '__counted_by_le',
+  '__counted_by_be', '__guarded_by', '__pt_guarded_by', '__acquires',
+  '__releases', '__must_hold', '__cleanup', '__aligned', '__section',
+  '__bpf_md_ptr', '__assume_aligned',
+] as const;
+const C_PARAM_ANNOTATION_RE = new RegExp(
+  `\\b(${[...C_PARAMETERIZED_ANNOTATIONS].sort((a, b) => b.length - a.length).join('|')})[ \\t]*\\((?:[^()]|\\([^()]*\\))*\\)`,
+  'g'
+);
+export function blankCParameterizedAnnotationMacros(source: string): string {
+  if (source.indexOf('__') === -1) return source;
+  C_PARAM_ANNOTATION_RE.lastIndex = 0;
+  if (!C_PARAM_ANNOTATION_RE.test(source)) return source;
+  C_PARAM_ANNOTATION_RE.lastIndex = 0;
+  let result = '';
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = C_PARAM_ANNOTATION_RE.exec(source)) !== null) {
+    const start = m.index;
+    let end = start + (m[0] as string).length;
+    // Field-position form — `__bpf_md_ptr(struct bpf_iter_meta *, meta);` as
+    // the whole line: a lone `;` field is ITSELF a parse error (measured;
+    // an empty struct body is fine), so the semicolon blanks with it. A
+    // mid-line match (`… __free(fput) = NULL;`) keeps its statement tail.
+    const lineStart = source.lastIndexOf('\n', start - 1) + 1;
+    if (/^[ \t]*$/.test(source.slice(lineStart, start))) {
+      const after = /^[ \t]*;/.exec(source.slice(end));
+      if (after) end += after[0].length;
+    }
+    result += source.slice(last, start) + source.slice(start, end).replace(/[^\n\r]/g, ' ');
+    last = end;
+  }
+  return result + source.slice(last);
+}
+
+/**
+ * Blank a bare `struct`/`union`/`enum` TYPE-keyword argument inside a macro
+ * call — `kzalloc_obj(struct bpf_mount_opts)`, `alloc_percpu(struct irqstat)`,
+ * `list_first_entry(&pending,\n\t\tstruct async_entry, domain_list)` — the
+ * `container_of` disease generalized (that blank stays as the keyed
+ * precedent). A bare type is never a valid C expression argument, so
+ * tree-sitter drops into error recovery at every such call; removing just the
+ * keyword leaves a plain identifier argument the grammar parses natively.
+ * This single shape heads ~35 first-error lines on the kernel/+mm/ census
+ * (kzalloc_obj/list_entry/alloc_percpu + multi-line continuations).
+ *
+ * Guarded three ways, because `f(struct T)` has VALID look-alikes:
+ *  - head exclusions: `sizeof(struct T)` / `offsetof(struct T, m)` /
+ *    `_Generic(x, struct T *: …)` all parse natively (probed) and must keep
+ *    their keyword; `va_arg` gets its own dedicated blank below.
+ *  - call-vs-declaration: in `int wf(struct a, struct b);` (a wrapped
+ *    prototype — valid C) the head is preceded by a TYPE, so any identifier
+ *    or `*` before the head rejects the match — except the word `return`,
+ *    which precedes real calls. Newline/`=`/`,`/`(`/`;`/`{`/`>` etc. accept.
+ *  - the keyword must OPEN a top-level argument and the argument must be
+ *    exactly `struct T` (optionally `struct T *`, whose stars blank too —
+ *    `DEFINE_PER_CPU(struct task_struct *, ksoftirqd)` leaves two plain
+ *    identifier arguments): a cast (`f((struct T *)p)`) opens a nested
+ *    group, and a declaration argument (`TP_PROTO(struct foo *bar)`) trails
+ *    an extra identifier — neither matches.
+ * A hand-rolled bounded scanner rather than a nested-alternation regex:
+ * preceding args may themselves contain calls
+ * (`hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(&d->h)),\n
+ * struct bpf_dtab_netdev, index_hlist)`), and lazy nested regex groups over
+ * untrusted repo text invite catastrophic backtracking. C-only.
+ */
+const C_TYPE_ARG_HEAD_EXCLUSIONS = new Set([
+  'sizeof', 'alignof', '_Alignof', 'typeof', '__typeof__', '__typeof',
+  'offsetof', '_Generic', 'va_arg', 'if', 'while', 'for', 'switch', 'case',
+]);
+const C_TYPE_ARG_HEAD_RE = /\b([A-Za-z_]\w*)[ \t]*\(/g;
+const C_TYPE_ARG_OPENER_RE = /^(struct|union|enum)([ \t\r\n]+)([A-Za-z_]\w*)([ \t\r\n]*\*+)?(?=[ \t\r\n]*[,)])/;
+const C_TYPE_ARG_SCAN_CAP = 600;
+export function blankCTypeKeywordArgs(source: string): string {
+  if (!/\b(?:struct|union|enum)[ \t\r\n]/.test(source)) return source;
+  let chars: string[] | null = null;
+  C_TYPE_ARG_HEAD_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = C_TYPE_ARG_HEAD_RE.exec(source)) !== null) {
+    const head = m[1] as string;
+    if (C_TYPE_ARG_HEAD_EXCLUSIONS.has(head)) continue;
+    // Reject declaration shapes: an identifier or `*` (a return/field type)
+    // immediately before the head — unless that word is `return`.
+    let j = m.index - 1;
+    while (j >= 0 && (source[j] === ' ' || source[j] === '\t')) j--;
+    const prev = j >= 0 ? (source[j] as string) : '';
+    if (/[\w*]/.test(prev)) {
+      let w = j;
+      while (w >= 0 && /\w/.test(source[w] as string)) w--;
+      if (source.slice(w + 1, j + 1) !== 'return') continue;
+    }
+    const open = m.index + (m[0] as string).length - 1;
+    let depth = 1;
+    let atArgStart = true;
+    for (let k = open + 1; k < source.length && k - open <= C_TYPE_ARG_SCAN_CAP; k++) {
+      const ch = source[k] as string;
+      if (ch === '"' || ch === "'") {
+        const quote = ch;
+        k++;
+        while (k < source.length && source[k] !== quote) {
+          if (source[k] === '\\') k++;
+          k++;
+        }
+        atArgStart = false;
+        continue;
+      }
+      if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') continue;
+      if (ch === '(') {
+        depth++;
+        atArgStart = false;
+        continue;
+      }
+      if (ch === ')') {
+        depth--;
+        if (depth === 0) break;
+        atArgStart = false;
+        continue;
+      }
+      if (ch === ';' || ch === '{' || ch === '}') break; // not an argument list
+      if (ch === ',') {
+        if (depth === 1) atArgStart = true;
+        continue;
+      }
+      if (depth === 1 && atArgStart) {
+        const opener = C_TYPE_ARG_OPENER_RE.exec(source.slice(k, k + 160));
+        if (opener) {
+          chars ??= [...source];
+          const kw = opener[1] as string;
+          for (let b = k; b < k + kw.length; b++) chars[b] = ' ';
+          if (opener[4]) {
+            const tail = opener[4] as string;
+            const stars = (/\*+$/.exec(tail) as RegExpExecArray)[0].length;
+            const starsStart =
+              k + kw.length + (opener[2] as string).length + (opener[3] as string).length + (tail.length - stars);
+            for (let b = starsStart; b < starsStart + stars; b++) chars[b] = ' ';
+          }
+          k += (opener[0] as string).length - 1;
+        }
+      }
+      atArgStart = false;
+    }
+  }
+  return chars ? chars.join('') : source;
+}
+
+/**
+ * Blank a file-scope `static`/`extern`-prefixed ALL-CAPS declaration macro —
+ * `static DEFINE_PER_CPU(struct llist_head, rstat_backlog_list);`,
+ * `static DECLARE_WORK(init_free_wq, do_free_init);`,
+ * `static DEFINE_RATELIMIT_STATE(ratelimit, 5 * HZ, 5);` — the single
+ * largest deferral family on the kernel/+mm/ census (~45 first-error lines
+ * across the DEFINE_/DECLARE_ variants). A storage-class specifier followed
+ * by a call expression is never valid C, so every one errors; the whole line
+ * blanks to spaces (the macro-declared variable was invisible to extraction
+ * anyway, and the file's remaining symbols recover).
+ *
+ * The UNPREFIXED form (`EXPORT_SYMBOL(x);`, `DEFINE_MUTEX(lock);` at column
+ * 0) parses natively as a K&R implicit-int declaration (probed) — extraction
+ * ignores declarations, so those lines are left alone; the type-keyword-arg
+ * blank above already recovers the `DEFINE_PER_CPU(struct T, x);` bare form.
+ * Matched tightly: `static`/`extern` first on the line (indentation allowed —
+ * `static DEFINE_RATELIMIT_STATE(…)` appears at BLOCK scope too, and the
+ * storage-class-plus-call shape is invalid at every scope), CAPS macro name,
+ * parens balancing ON the line (string literals skipped), then exactly `;`
+ * to end of line. Initializer forms (`… ) = { …`) are deliberately not
+ * matched — blanking the head would strand the brace block. C-only.
+ */
+const C_PREFIXED_DECL_MACRO_RE = /^[ \t]*(?:static|extern)[ \t]+[A-Z][A-Z0-9_]{2,}[ \t]*\(/;
+export function blankCFileScopePrefixedDeclMacros(source: string): string {
+  if (!/^[ \t]*(?:static|extern)[ \t]+[A-Z]/m.test(source)) return source;
+  const lines = source.split('\n');
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const m = C_PREFIXED_DECL_MACRO_RE.exec(line);
+    if (!m) continue;
+    const open = line.indexOf('(', m[0].length - 1);
+    let depth = 0;
+    let close = -1;
+    for (let k = open; k < line.length; k++) {
+      const ch = line[k];
+      if (ch === '"' || ch === "'") {
+        const quote = ch;
+        k++;
+        while (k < line.length && line[k] !== quote) {
+          if (line[k] === '\\') k++;
+          k++;
+        }
+        continue;
+      }
+      if (ch === '(') depth++;
+      else if (ch === ')') {
+        depth--;
+        if (depth === 0) {
+          close = k;
+          break;
+        }
+      }
+    }
+    if (close < 0) continue; // spans lines — leave for a future round
+    if (line.slice(close + 1).replace(/\r$/, '').trim() !== ';') continue;
+    lines[i] = line.replace(/[^\n\r]/g, ' ');
+    changed = true;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
+/**
+ * REWRITE (the one non-blank pass in this family — it moves a token) a
+ * 2-argument `static CAPS_MACRO(type, name) = {`-style initialized
+ * declaration macro into the declaration it expands to — `static
+ * DEFINE_PER_CPU(struct cpuhp_cpu_state, cpuhp_state) = {` becomes `static
+ * struct cpuhp_cpu_state       cpuhp_state) …` → `static struct
+ * cpuhp_cpu_state` + padding + `cpuhp_state` + padding + `= {`. The blank
+ * family can't help here: blanking the head strands the brace block, and
+ * dropping the whole span would discard the initializer's function
+ * references (`.startup.single = bringup_cpu` — real cFnPtr wiring). The
+ * NAME keeps its exact original column and the `= {` tail keeps its exact
+ * offsets (`d`-flag group indices); only the TYPE token sits left of where
+ * the macro name was, and type tokens contribute strings, not positions.
+ * Only the two-argument `(<type-ish>, <ident>)` form with an `=` tail
+ * matches; three-argument macros and `;`-terminated forms (the blank above)
+ * never do. C-only.
+ */
+const C_PREFIXED_DECL_MACRO_INIT_RE = /^([ \t]*)static[ \t]+[A-Z][A-Z0-9_]{2,}[ \t]*\(([^();'"]*?),[ \t]*([A-Za-z_]\w*)[ \t]*\)([ \t]*=[ \t]*\{?[ \t]*\r?)$/d;
+export function rewriteCPrefixedDeclMacroInitializers(source: string): string {
+  if (!/^[ \t]*static[ \t]+[A-Z]/m.test(source)) return source;
+  const lines = source.split('\n');
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const m = C_PREFIXED_DECL_MACRO_INIT_RE.exec(line);
+    if (!m) continue;
+    const indices = (m as RegExpExecArray & { indices: Array<[number, number]> }).indices;
+    const arg1 = (m[2] as string).trim().replace(/[ \t]+/g, ' ');
+    if (!/^[A-Za-z_][\w \t*]*$/.test(arg1)) continue; // a type-token run only
+    const name = m[3] as string;
+    const nameStart = (indices[3] as [number, number])[0];
+    const tailStart = (indices[4] as [number, number])[0];
+    const prefix = (m[1] as string) + 'static ' + arg1;
+    if (prefix.length + 1 > nameStart) continue; // rewrite must fit left of the name
+    lines[i] =
+      prefix +
+      ' '.repeat(nameStart - prefix.length) +
+      name +
+      ' '.repeat(tailStart - nameStart - name.length) +
+      line.slice(tailStart);
+    changed = true;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
+/**
+ * Blank a QUALIFIED/POINTER type argument of `va_arg` — `va_arg(ap, const
+ * char *)`, `va_arg(args, unsigned long)`. tree-sitter-c parses the
+ * single-token forms (`va_arg(ap, int)`, `va_arg(ap, foo_t)`) natively
+ * (probed), but multi-token type descriptors error the whole enclosing
+ * function. Blanking the comma and the entire second argument leaves
+ * `va_arg(ap              )` — a one-argument call the grammar accepts.
+ * Function-pointer types (`va_arg(ap, void (*)(int))`) contain parens and
+ * are deliberately unmatched. C-only.
+ */
+const C_VA_ARG_RE = /\bva_arg[ \t]*\(([^(),]+)(,[^()]*)\)/g;
+export function blankCVaArgQualifiedTypeArgs(source: string): string {
+  if (source.indexOf('va_arg') === -1) return source;
+  C_VA_ARG_RE.lastIndex = 0;
+  return source.replace(C_VA_ARG_RE, (m, arg1: string, rest: string) => {
+    if (/^,[ \t]*[A-Za-z_]\w*[ \t]*$/.test(rest)) return m; // single token — parses natively
+    return `va_arg(${arg1}${rest.replace(/[^\n\r]/g, ' ')})`;
+  });
+}
+
+/**
+ * Blank the DOTS of a GNU NAMED-variadic function-like `#define` parameter —
+ * `#define verbose(env, fmt, args...) …` → `#define verbose(env, fmt,
+ * args   ) …`. The `ident...` parameter form (unlike standard `...`) errors
+ * the DIRECTIVE itself (measured — and so does trailing whitespace after a
+ * bare `#define NAME`, which is why the tail is NOT blanked wholesale); with
+ * just the dots blanked the params parse as ordinary identifiers and the
+ * body (`##args` included — the preproc body is opaque to the grammar) is
+ * untouched. `restoreDirectiveLines` exists to keep directives out of the
+ * other blanks' blast radius, so this pass runs AFTER the restore and edits
+ * the directive deliberately. Multi-line bodies are fine — the params always
+ * sit on the `#define` line. C-only (the census hits are the kernel's bpf
+ * verifier headers).
+ */
+const C_NAMED_VARIADIC_DEFINE_RE = /^([ \t]*#[ \t]*define[ \t]+[A-Za-z_]\w*\([^()\n]*?\b\w+)\.\.\./;
+export function blankCNamedVariadicDefineDots(source: string): string {
+  if (source.indexOf('...') === -1) return source;
+  const lines = source.split('\n');
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const m = C_NAMED_VARIADIC_DEFINE_RE.exec(line);
+    if (!m) continue;
+    const keep = m[1] as string;
+    lines[i] = keep + '   ' + line.slice(keep.length + 3);
+    changed = true;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
+/** C source pre-processing: neutralize `#ifdef __cplusplus` compat-guard
+ * bodies (invisible to a C compiler; `extern "C" {` otherwise errors every
+ * public header), blank declaration-markup macro calls and lone macro lines
+ * (`REDIS_NO_SANITIZE("bounds")` before a definition, jemalloc's diagnostic
+ * toggles — the same structural shapes the C++ side already blanks), recover
+ * functions hidden behind a leading attribute macro (#1211), then — for
+ * C-detected headers in CUDA projects (llm.c keeps `__device__` helpers and
+ * kernel prototypes in plain `.h`) — the same content-gated CUDA blank as
+ * C++. Offset-preserving. */
 function preParseCSource(source: string): string {
-  return looksLikeCudaSource(source) ? blankCudaConstructs(source) : source;
+  const inner = blankCKernelAnnotations(blankCCplusplusGuardBodies(source));
+  let blanked = blankCLeadingAttrMacros(
+    blankLoneMacroLines(
+      blankCStatementMacroCalls(
+        blankCTrailingParamAttrMacros(
+          blankCppAnnotationMacroCalls(
+            rewriteCPrefixedDeclMacroInitializers(
+              blankCFileScopePrefixedDeclMacros(
+                blankCVaArgQualifiedTypeArgs(
+                  blankCTypeKeywordArgs(
+                    blankCParameterizedAnnotationMacros(
+                      blankCAutoInference(blankCSandwichedAnnotations(inner))
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  );
+  if (looksLikeCudaSource(blanked)) blanked = blankCudaConstructs(blanked);
+  // The named-variadic `#define` pass runs AFTER the directive restore — it
+  // deliberately edits directive lines (see its doc comment).
+  return blankCNamedVariadicDefineDots(restoreDirectiveLines(source, blanked));
 }
 
 export const cppExtractor: LanguageExtractor = {

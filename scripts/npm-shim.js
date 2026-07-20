@@ -45,7 +45,14 @@ async function main() {
   // Happy path: the npm-installed optional dependency. Fall back to a download
   // when the registry didn't deliver it.
   var resolved = resolveInstalledBundle() || (await selfHealBundle());
-  var res = childProcess.spawnSync(resolved.command, resolved.args, { stdio: 'inherit', windowsHide: true });
+  // Thread the MCP host's pid (our parent) down to the bundled server so its
+  // orphan watchdog can poll the host directly. Without this, the server can
+  // only watch THIS shim — and a shim killed during the server's first ~100ms
+  // of startup used to leave the server orphaned forever (issue #1185). An
+  // already-set value (an outer launcher) wins.
+  var env = Object.assign({}, process.env);
+  if (!env.CODEGRAPH_HOST_PPID) env.CODEGRAPH_HOST_PPID = String(process.ppid);
+  var res = childProcess.spawnSync(resolved.command, resolved.args, { stdio: 'inherit', windowsHide: true, env: env });
   if (res.error) {
     process.stderr.write('codegraph: ' + res.error.message + '\n');
     process.exit(1);
@@ -91,8 +98,12 @@ function launcherIn(dir) {
 // --liftoff-only keeps tree-sitter's WASM grammars off V8's turboshaft tier to
 // avoid the Zone OOM on Node >= 22 (issues #293/#298). The unix bin/codegraph
 // launcher already passes it; on Windows we invoke node.exe directly so add it.
+// --disable-warning=ExperimentalWarning mutes node:sqlite's per-thread
+// "experimental feature" warning, which otherwise prints once per parse worker
+// mid-index, shredding the progress UI. The bundled node.exe is always new
+// enough for both flags.
 function liftoff(entry) {
-  return ['--liftoff-only', entry].concat(process.argv.slice(2));
+  return ['--liftoff-only', '--disable-warning=ExperimentalWarning', entry].concat(process.argv.slice(2));
 }
 
 // Download + cache the platform bundle from GitHub Releases. Returns

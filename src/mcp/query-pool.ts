@@ -183,6 +183,23 @@ export class QueryPool {
     return !this.destroyed && this.totalCrashes < CRASH_BUDGET;
   }
 
+  /**
+   * True once at least one worker has completed its cold start (posted the
+   * 'ready' handshake). Until then the ToolHandler serves calls IN-PROCESS:
+   * a worker cold start is a full module load + DB open — seconds normally,
+   * tens of seconds on a loaded machine — and a call queued behind it gets
+   * nothing until the 45s busy backstop. The daemon's very first tool call
+   * hitting that window was the recurring #662 test flake (and a real
+   * first-call stall for agents). The pool exists for CONCURRENT load, which
+   * by definition arrives after warm-up; the pre-pool in-process path is
+   * strictly better while nothing is warm. Stays true for the pool's
+   * lifetime — later crash-respawn gaps are covered by retry + backstop.
+   */
+  get ready(): boolean {
+    return this.everReady && !this.destroyed;
+  }
+  private everReady = false;
+
   private spawnOne(): void {
     if (this.destroyed || this.workers.size >= this.maxSize) return;
     let w: PoolWorker;
@@ -204,6 +221,7 @@ export class QueryPool {
     if (m.type === 'ready') {
       this.pendingWorkers.delete(w);
       if (m.ok === false) this.totalCrashes++; // hard open failure
+      else this.everReady = true;
       this.idle.push(w);
       this.drain();
       return;

@@ -108,3 +108,74 @@ describe('Daemon.reapDeadClients', () => {
     expect(d.clients.has(s)).toBe(false);
   });
 });
+
+// The inactivity backstop (#692) must reap a phantom daemon but NEVER a
+// live-but-quiet session — reaping the latter silently degraded that session
+// (and any others sharing the daemon) to an in-process engine, and on a real
+// machine it fired far more often on live sessions than on actual phantoms.
+describe('Daemon.backstopShouldExit', () => {
+  // maxIdleMs small; idleTimeoutMs:0 so a sweep that empties the set doesn't arm
+  // a real timer. Force the inactivity window open by backdating lastActivityAt.
+  const makeDaemon = () => {
+    const d = new Daemon('/tmp/codegraph-backstop-unit-test', { idleTimeoutMs: 0, maxIdleMs: 1000 }) as any;
+    d.lastActivityAt = Date.now() - 60_000; // long past the 1000ms window
+    return d;
+  };
+  const fakeSession = () => ({ stopped: false, stop() { this.stopped = true; } });
+
+  it('does NOT reap while a provably-alive client stays connected (the fix)', () => {
+    const d = makeDaemon();
+    const live = fakeSession();
+    d.clients.add(live); d.clientPeers.set(live, { pid: 222, hostPid: null });
+
+    expect(d.backstopShouldExit(() => true)).toBe(false); // 222 alive → keep the daemon
+    expect(d.clients.has(live)).toBe(true);
+  });
+
+  it('reaps when only an unknown-pid client remains (the phantom the sweep cannot catch)', () => {
+    const d = makeDaemon();
+    const phantom = fakeSession();
+    d.clients.add(phantom); d.clientPeers.set(phantom, { pid: null, hostPid: null });
+
+    // Unknown pid → the sweep leaves it, and after the window it's a probable phantom.
+    expect(d.backstopShouldExit(() => false)).toBe(true);
+  });
+
+  it('protects a live session even when a phantom is also connected', () => {
+    const d = makeDaemon();
+    const live = fakeSession();
+    const phantom = fakeSession();
+    d.clients.add(live); d.clientPeers.set(live, { pid: 222, hostPid: null });
+    d.clients.add(phantom); d.clientPeers.set(phantom, { pid: null, hostPid: null });
+
+    // 222 alive, phantom unknown → ANY alive keeps the daemon; the live one wins.
+    expect(d.backstopShouldExit((pid: number) => pid === 222)).toBe(false);
+    expect(d.clients.has(live)).toBe(true);
+  });
+
+  it('sweeps a dead-peer client first; if that empties the set it does not exit', () => {
+    const d = makeDaemon();
+    const dead = fakeSession();
+    d.clients.add(dead); d.clientPeers.set(dead, { pid: 111, hostPid: null });
+
+    // 111 dead → swept by backstopShouldExit; empty set → idle timer owns it, no backstop exit.
+    expect(d.backstopShouldExit(() => false)).toBe(false);
+    expect(d.clients.has(dead)).toBe(false);
+    expect(dead.stopped).toBe(true);
+  });
+
+  it('does not exit before the inactivity window elapses', () => {
+    const d = makeDaemon();
+    d.lastActivityAt = Date.now(); // fresh — inside the 1000ms window
+    const phantom = fakeSession();
+    d.clients.add(phantom); d.clientPeers.set(phantom, { pid: null, hostPid: null });
+
+    expect(d.backstopShouldExit(() => false)).toBe(false);
+    expect(d.clients.has(phantom)).toBe(true); // not even swept yet
+  });
+
+  it('does not exit with zero clients (the idle timer owns that case)', () => {
+    const d = makeDaemon();
+    expect(d.backstopShouldExit(() => false)).toBe(false);
+  });
+});

@@ -66,6 +66,15 @@ const CC_DISPATCH_RE = /(\w+)\.forEach\s*\{\s*(?:\$0|it)\s*\(/g;
 const CC_APPEND_WRITE_RE = /(\w+)\.write\s*\{\s*\$0(?:\.(\w+))?\.(?:append|add|push|insert)\s*\(/g;
 const CC_APPEND_DIRECT_RE = /(\w+)\.(?:append|add|push|insert)\s*\(/g;
 const CC_FANOUT_CAP = 8; // skip a field name with more dispatchers/registrars than this (too generic to pair confidently)
+// The dispatcher gate — `{ $0( ` / `{ it( ` element-invocation — is Swift/Kotlin
+// trailing-closure syntax, so ONLY those languages can ever contribute a
+// dispatcher, and a cross-language registrar pairing (a JS `.push(` against a
+// Swift dispatcher's field name) would be a wrong edge, not a missed one.
+// Gating both sides here isn't just precision: `.push(`/`.add(` is everywhere
+// in JS/PHP, so an ungated scan slices + regexes nearly every function on repos
+// where the pass cannot emit a single edge — on a 12k-file PHP/JS app that was
+// 20+ minutes of the "Resolving refs" tail and a #850 watchdog kill (#1235).
+const CC_LANGUAGES = new Set(['swift', 'kotlin']);
 
 function kebabToPascal(s: string): string {
   return s.split('-').map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join('');
@@ -98,6 +107,33 @@ function nuxtComponentName(filePath: string): string | null {
 function sliceLines(content: string, startLine?: number, endLine?: number): string | null {
   if (!startLine || !endLine) return null;
   return content.split('\n').slice(startLine - 1, endLine).join('\n');
+}
+
+/**
+ * Per-match line resolver over `src`, 1-based at `baseLine`. The inline
+ * `src.slice(0, idx).split('\n').length` idiom is O(source-length) PER MATCH,
+ * which goes quadratic on a match-dense source (a generated function full of
+ * `.push(` calls re-scanned tens of thousands of times was most of the #1235
+ * indexing wedge). Builds the newline index once — lazily, since most sources
+ * never produce a match — then answers each call with a binary search.
+ */
+function makeLineAt(src: string, baseLine: number): (idx: number) => number {
+  let nl: number[] | null = null;
+  return (idx: number) => {
+    if (!nl) {
+      nl = [];
+      for (let i = src.indexOf('\n'); i !== -1; i = src.indexOf('\n', i + 1)) nl.push(i);
+    }
+    // Count newlines strictly before idx.
+    let lo = 0;
+    let hi = nl.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (nl[mid]! < idx) lo = mid + 1;
+      else hi = mid;
+    }
+    return baseLine + lo;
+  };
 }
 
 function registrarField(src: string): string | null {
@@ -224,24 +260,29 @@ async function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionCont
     registrars.set(field, arr);
   };
 
-  // Slices EVERY method/function's source (no cheap name-gate), so on a repo
-  // with a huge file this is the heaviest synthesis pass — yield mid-scan so it
-  // can't wedge the #850 watchdog on its own (#1091).
+  // Slices EVERY Swift/Kotlin method/function's source (no cheap name-gate), so
+  // on a repo with a huge file this is the heaviest synthesis pass — yield
+  // mid-scan (and mid-match-loop below: a single generated function dense with
+  // matches must not starve the watchdog either) so it can't wedge the #850
+  // watchdog on its own (#1091, #1235).
   let scanned = 0;
+  let matchTick = 0;
   for (const m of methodAndFunctionNodes(queries)) {
     if ((++scanned & 127) === 0) await onYield();
+    if (!CC_LANGUAGES.has(m.language)) continue;
     const content = ctx.readFile(m.filePath);
     const src = content && sliceLines(content, m.startLine, m.endLine);
     if (!src) continue;
     const hasForEach = src.includes('.forEach');
     const hasAppend = src.includes('.append(') || src.includes('.add(') || src.includes('.push(') || src.includes('.insert(');
     if (!hasForEach && !hasAppend) continue;
-    const lineAt = (idx: number) => (m.startLine ?? 1) + src.slice(0, idx).split('\n').length - 1;
+    const lineAt = makeLineAt(src, m.startLine ?? 1);
 
     if (hasForEach) {
       CC_DISPATCH_RE.lastIndex = 0;
       let d: RegExpExecArray | null;
       while ((d = CC_DISPATCH_RE.exec(src))) {
+        if ((++matchTick & 255) === 0) await onYield();
         const arr = dispatchers.get(d[1]!) ?? [];
         if (!arr.some((n) => n.node.id === m.id)) arr.push({ node: m, line: lineAt(d.index) });
         dispatchers.set(d[1]!, arr);
@@ -250,10 +291,16 @@ async function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionCont
     if (hasAppend) {
       CC_APPEND_WRITE_RE.lastIndex = 0;
       let w: RegExpExecArray | null;
-      while ((w = CC_APPEND_WRITE_RE.exec(src))) addReg(w[2] || w[1], m, lineAt(w.index)); // nested `$0.streams` else the `.write` receiver
+      while ((w = CC_APPEND_WRITE_RE.exec(src))) {
+        if ((++matchTick & 255) === 0) await onYield();
+        addReg(w[2] || w[1], m, lineAt(w.index)); // nested `$0.streams` else the `.write` receiver
+      }
       CC_APPEND_DIRECT_RE.lastIndex = 0;
       let a: RegExpExecArray | null;
-      while ((a = CC_APPEND_DIRECT_RE.exec(src))) addReg(a[1], m, lineAt(a.index));
+      while ((a = CC_APPEND_DIRECT_RE.exec(src))) {
+        if ((++matchTick & 255) === 0) await onYield();
+        addReg(a[1], m, lineAt(a.index));
+      }
     }
   }
 
@@ -280,11 +327,13 @@ async function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionCont
 
 /** Phase 2: string-keyed EventEmitter channels (on('e', fn) ↔ emit('e')). */
 async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   const emitsByEvent = new Map<string, Set<string>>();          // event → dispatcher node ids
   const handlersByEvent = new Map<string, Map<string, string>>(); // event → handler id → registration site (file:line)
 
   let scanned = 0;
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     const content = ctx.readFile(file);
     if (!content) continue;
@@ -292,7 +341,7 @@ async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     const hasOn = content.includes('.on(') || content.includes('.once(') || content.includes('.addListener(');
     if (!hasEmit && !hasOn) continue;
     const nodesInFile = ctx.getNodesInFile(file);
-    const lineOf = (idx: number) => content.slice(0, idx).split('\n').length;
+    const lineOf = makeLineAt(content, 1);
 
     if (hasEmit) {
       EMIT_RE.lastIndex = 0;
@@ -348,10 +397,12 @@ async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
  * `this.setState`). Over-approximation (all setState methods reach render) is
  * accepted — it's reachability-correct, like the callback channels.
  */
-function reactRenderEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+async function reactRenderEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  for (const cls of queries.getNodesByKind('class')) {
+  for (const cls of queries.iterateNodesByKind('class')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     const children = queries.getOutgoingEdges(cls.id, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
@@ -387,10 +438,12 @@ function reactRenderEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[]
  * body calls `setState(` → `build`. The setState gate + `.dart` file keep this to
  * Flutter State classes. Over-approximation accepted (reachability-correct).
  */
-function flutterBuildEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+async function flutterBuildEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  for (const cls of queries.getNodesByKind('class')) {
+  for (const cls of queries.iterateNodesByKind('class')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     const children = queries.getOutgoingEdges(cls.id, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
@@ -447,10 +500,12 @@ const ARKUI_ARRAY_MUTATORS = 'push|pop|shift|unshift|splice|sort|reverse|fill';
  * with no reactive properties, gets nothing (this is the precision line the
  * all-sibling-methods design would erase).
  */
-function arkuiStateBuildEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+async function arkuiStateBuildEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  for (const struct of queries.getNodesByKind('struct')) {
+  for (const struct of queries.iterateNodesByKind('struct')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     if (struct.language !== 'arkts') continue;
     const children = queries.getOutgoingEdges(struct.id, ['contains'])
       .map((e) => queries.getNodeById(e.target))
@@ -515,7 +570,8 @@ const ARKUI_EMITTER_FANOUT_CAP = 8;
  * handling — their bodies' calls already attribute to the registering method,
  * so targeting that method keeps the chain connected.
  */
-function arkuiEmitterEdges(ctx: ResolutionContext): Edge[] {
+async function arkuiEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   interface Site { nodeId: string; file: string; line: number }
   // bucket key -> emit sites / handler sites
   const emits = new Map<string, Site[]>();
@@ -533,6 +589,7 @@ function arkuiEmitterEdges(ctx: ResolutionContext): Edge[] {
   };
 
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!file.endsWith('.ets')) continue;
     const content = ctx.readFile(file);
     if (!content || !content.includes('emitter.')) continue;
@@ -619,7 +676,7 @@ const ARKUI_ROUTER_RE = /\brouter\s*\.\s*(?:pushUrl|replaceUrl)\s*\(\s*\{[^)]{0,
  * anything still ambiguous is dropped rather than guessed. Only `@Entry`
  * structs qualify as targets — the decorator is what makes a file a page.
  */
-function arkuiRouterEdges(ctx: ResolutionContext): Edge[] {
+async function arkuiRouterEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const edges: Edge[] = [];
   const seen = new Set<string>();
 
@@ -635,7 +692,9 @@ function arkuiRouterEdges(ctx: ResolutionContext): Edge[] {
     return '';
   };
 
+  let scannedFiles = 0;
   for (const file of allFiles) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!file.endsWith('.ets')) continue;
     const content = ctx.readFile(file);
     if (!content || !content.includes('router.')) continue;
@@ -690,7 +749,8 @@ function arkuiRouterEdges(ctx: ResolutionContext): Edge[] {
  * implementation(s). Over-approximation accepted (reachability-correct); capped
  * per class and gated to C++ to avoid touching other languages' dispatch.
  */
-function cppOverrideEdges(queries: QueryBuilder): Edge[] {
+async function cppOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const methodsOf = (classId: string): Node[] =>
@@ -698,7 +758,8 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
       .getOutgoingEdges(classId, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
-  for (const cls of queries.getNodesByKind('class')) {
+  for (const cls of queries.iterateNodesByKind('class')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     const subMethods = methodsOf(cls.id).filter((n) => n.language === 'cpp');
     if (subMethods.length === 0) continue;
     for (const ext of queries.getOutgoingEdges(cls.id, ['extends'])) {
@@ -762,7 +823,8 @@ const IFACE_OVERRIDE_LANGS = new Set([
  * with the other dispatch synthesizers; capped per interface. Empty interfaces
  * (`any`) are skipped so they don't match every struct.
  */
-function goImplementsEdges(queries: QueryBuilder): Edge[] {
+async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
 
@@ -775,11 +837,21 @@ function goImplementsEdges(queries: QueryBuilder): Edge[] {
         .map((n) => n.name),
     );
 
-  const goStructs = queries.getNodesByKind('struct').filter((s) => s.language === 'go');
+  // Materializes GO structs only (the pass is language-gated by the caller),
+  // never the whole struct kind — that array is O(nodes) on struct-heavy
+  // repos like the Linux kernel (#1212).
+  const goStructs: Node[] = [];
+  for (const s of queries.iterateNodesByKind('struct')) {
+    if ((++scanned255 & 63) === 0) await onYield();
+    if (s.language === 'go') goStructs.push(s);
+  }
   const structMethods = new Map<string, Set<string>>();
   for (const s of goStructs) structMethods.set(s.id, methodNameSet(s.id));
 
-  for (const iface of queries.getNodesByKind('interface')) {
+  for (const iface of queries.iterateNodesByKind('interface')) {
+    if ((++scanned255 & 63) === 0) await onYield();
+
+    if ((++scanned255 & 63) === 0) await onYield();
     if (iface.language !== 'go') continue;
     const want = methodNameSet(iface.id);
     if (want.size === 0) continue; // empty interface (`any`) — would match everything
@@ -831,7 +903,8 @@ function goImplementsEdges(queries: QueryBuilder): Edge[] {
  * matching the same-file edges extraction already emits). Skips methods that
  * already have a type parent (the same-file case). (#583, cross-file half)
  */
-function goCrossFileMethodContainsEdges(queries: QueryBuilder): Edge[] {
+async function goCrossFileMethodContainsEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const TYPE_KINDS = new Set<NodeKind>(['struct', 'class', 'interface', 'enum', 'type_alias']);
@@ -840,7 +913,10 @@ function goCrossFileMethodContainsEdges(queries: QueryBuilder): Edge[] {
     return i >= 0 ? p.slice(0, i) : '';
   };
 
-  for (const method of queries.getNodesByKind('method')) {
+  for (const method of queries.iterateNodesByKind('method')) {
+    if ((++scanned255 & 63) === 0) await onYield();
+
+    if ((++scanned255 & 63) === 0) await onYield();
     if (method.language !== 'go') continue;
     // The receiver type is encoded in the method's qualifiedName as `Recv::name`
     // (extraction sets `${receiverType}::${name}` for receiver methods).
@@ -908,13 +984,18 @@ function kmpKindsCompatible(a: string, b: string): boolean {
   return a === b || (KMP_TYPE_KINDS.has(a) && KMP_TYPE_KINDS.has(b));
 }
 
-function kotlinExpectActualEdges(queries: QueryBuilder): Edge[] {
+async function kotlinExpectActualEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  const actuals = queries
-    .getAllNodes()
-    .filter((n) => n.language === 'kotlin' && !!n.decorators?.includes('actual'));
-  for (const act of actuals) {
+  // SQL-side language+decorator pre-filter, streamed. The old
+  // `getAllNodes().filter(...)` hydrated the ENTIRE node table into one array
+  // just to find kotlin `actual` declarations — on a 2M-node graph that alone
+  // exceeded Node's default heap and killed the index (#1212). The LIKE
+  // pre-filter can over-match (substring), so the exact decorator check stays.
+  for (const act of queries.iterateNodesByLanguageWithDecorator('kotlin', 'actual')) {
+    if ((++scanned255 & 63) === 0) await onYield();
+    if (!act.decorators?.includes('actual')) continue;
     let added = 0;
     for (const cand of queries.getNodesByQualifiedNameExact(act.qualifiedName)) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
@@ -944,7 +1025,8 @@ function kotlinExpectActualEdges(queries: QueryBuilder): Edge[] {
   return edges;
 }
 
-function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
+async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const methodsOf = (classId: string): Node[] =>
@@ -957,7 +1039,8 @@ function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
   // types that conform to protocols. Iterate both.
   const concreteKinds = ['class', 'struct'] as const;
   for (const kind of concreteKinds) {
-  for (const cls of queries.getNodesByKind(kind)) {
+  for (const cls of queries.iterateNodesByKind(kind)) {
+    if ((++scanned255 & 63) === 0) await onYield();
     const implMethods = methodsOf(cls.id).filter((n) => IFACE_OVERRIDE_LANGS.has(n.language));
     if (implMethods.length === 0) continue;
     for (const sup of queries.getOutgoingEdges(cls.id, ['implements', 'extends'])) {
@@ -1023,7 +1106,8 @@ function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
  * Provenance: `heuristic`, `synthesizedBy: 'go-grpc-stub-impl'`. The
  * stub's source line is the wiring site shown in the trace trail.
  */
-function goGrpcStubImplEdges(queries: QueryBuilder): Edge[] {
+async function goGrpcStubImplEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
 
@@ -1037,7 +1121,8 @@ function goGrpcStubImplEdges(queries: QueryBuilder): Edge[] {
   const methodNamesByStruct = new Map<string, Set<string>>();
   const methodNodesByStruct = new Map<string, Node[]>();
   const goStructs: Node[] = [];
-  for (const s of queries.getNodesByKind('struct')) {
+  for (const s of queries.iterateNodesByKind('struct')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     if (s.language !== 'go') continue;
     goStructs.push(s);
     const ms = queries
@@ -1117,11 +1202,13 @@ function goGrpcStubImplEdges(queries: QueryBuilder): Edge[] {
  * (or nothing) and are dropped.
  */
 async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const PARENT_KINDS = new Set(['method', 'function', 'component']);
   let scanned = 0;
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     const content = ctx.readFile(file);
     if (!content || (!content.includes('</') && !content.includes('/>'))) continue; // JSX-file gate
@@ -1167,7 +1254,9 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
  * component, handler→function/method) keeps precision; inline arrows / `$emit`
  * skipped.
  */
-function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
+async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const COMPONENT_KINDS = new Set(['component', 'function', 'class']);
@@ -1181,11 +1270,13 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
   // misses it (flat components match by basename and don't need this). Map each
   // nested component's Nuxt name → node so those template usages resolve.
   const nuxtComponents = new Map<string, Node>();
-  for (const c of ctx.getNodesByKind('component')) {
+  for (const c of (ctx.iterateNodesByKind?.('component') ?? ctx.getNodesByKind('component'))) {
+    if ((++scanned255 & 63) === 0) await onYield();
     const nn = nuxtComponentName(c.filePath);
     if (nn && !nuxtComponents.has(nn)) nuxtComponents.set(nn, c);
   }
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!file.endsWith('.vue')) continue;
     const content = ctx.readFile(file);
     const tpl = content && content.match(/<template[^>]*>([\s\S]*)<\/template>/i)?.[1];
@@ -1310,7 +1401,8 @@ const RN_JVM_EMIT_RE = /\.emit\s*\(\s*"([^"]+)"\s*,/g;
 // is followed by `… ) {`) never matches. Multi-line tolerant. (java/kotlin/swift)
 const RN_NATIVE_SENDEVENT_RE = /\bsendEvent\s*\([^;{}]*?"([^"]+)"/g;
 
-function rnEventEdges(ctx: ResolutionContext): Edge[] {
+async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   // Native dispatchers (source = the native method whose body sends the
   // event) and JS handlers (target = the function/method registered as
   // the listener) keyed by event name.
@@ -1318,11 +1410,12 @@ function rnEventEdges(ctx: ResolutionContext): Edge[] {
   const jsHandlersByEvent = new Map<string, Map<string, string>>();
 
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     const content = ctx.readFile(file);
     if (!content) continue;
 
     const nodesInFile = ctx.getNodesInFile(file);
-    const lineOf = (idx: number) => content.slice(0, idx).split('\n').length;
+    const lineOf = makeLineAt(content, 1);
     const addDispatcher = (event: string, line: number) => {
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) return;
@@ -1500,11 +1593,13 @@ const FABRIC_NATIVE_SUFFIXES = ['', 'View', 'ViewManager', 'ComponentView', 'Man
  * caller. The Expo method nodes are id-prefixed `expo-module:` and qualified
  * `<file>::<module>.<method>` by the framework extractor.
  */
-function expoCrossPlatformEdges(queries: QueryBuilder): Edge[] {
+async function expoCrossPlatformEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const byKey = new Map<string, Node[]>();
-  for (const m of queries.getNodesByKind('method')) {
+  for (const m of queries.iterateNodesByKind('method')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     if (!m.id.startsWith('expo-module:')) continue;
     const key = m.qualifiedName.split('::').pop(); // `<module>.<method>`
     if (!key) continue;
@@ -1547,7 +1642,8 @@ function expoCrossPlatformEdges(queries: QueryBuilder): Edge[] {
  * `getFreeDiskStorage`) — that's the JS-visible name, and how the iOS selector
  * lines up with the bare Android method name.
  */
-function rnCrossPlatformEdges(queries: QueryBuilder): Edge[] {
+async function rnCrossPlatformEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const NATIVE = new Set(['java', 'kotlin', 'objc', 'cpp']);
@@ -1570,6 +1666,7 @@ function rnCrossPlatformEdges(queries: QueryBuilder): Edge[] {
   // below only runs for genuine cross-platform candidates.
   const byName = new Map<string, Node[]>();
   for (const m of queries.iterateNodesByKind('method')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     if (!NATIVE.has(m.language)) continue;
     const key = norm(m.name);
     const arr = byName.get(key);
@@ -1613,18 +1710,25 @@ function rnCrossPlatformEdges(queries: QueryBuilder): Edge[] {
   return edges;
 }
 
-function fabricNativeImplEdges(ctx: ResolutionContext): Edge[] {
+async function fabricNativeImplEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
 
   // The Fabric extractor IDs are prefixed `fabric-component:` so we can
-  // filter to just those without iterating all `component` nodes.
-  const components = ctx.getNodesByKind('component').filter((n) => n.id.startsWith('fabric-component:'));
+  // filter to just those while streaming — never materializing the whole
+  // `component` kind (#1212).
+  const components: Node[] = [];
+  for (const n of (ctx.iterateNodesByKind?.('component') ?? ctx.getNodesByKind('component'))) {
+    if ((++scanned255 & 63) === 0) await onYield();
+    if (n.id.startsWith('fabric-component:')) components.push(n);
+  }
   if (components.length === 0) return edges;
 
   // Pre-index native classes by name for O(1) lookup.
   const nativeClassesByName = new Map<string, Node[]>();
-  for (const n of ctx.getNodesByKind('class')) {
+  for (const n of (ctx.iterateNodesByKind?.('class') ?? ctx.getNodesByKind('class'))) {
+    if ((++scanned255 & 63) === 0) await onYield();
     if (n.language !== 'objc' && n.language !== 'kotlin' && n.language !== 'java' && n.language !== 'cpp') continue;
     const arr = nativeClassesByName.get(n.name);
     if (arr) arr.push(n);
@@ -1675,12 +1779,14 @@ function fabricNativeImplEdges(ctx: ResolutionContext): Edge[] {
  * same simple name) are dropped. We need-not bridge by package because Java
  * mapper interfaces are typically uniquely named within a project.
  */
-function mybatisJavaXmlEdges(queries: QueryBuilder): Edge[] {
+async function mybatisJavaXmlEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   // Index Java methods by `<ClassName>::<methodName>` for O(1) lookup.
   const javaIndex = new Map<string, Node[]>();
   for (const m of queries.iterateNodesByKind('method')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     if (m.language !== 'java' && m.language !== 'kotlin') continue;
     const parts = m.qualifiedName.split('::');
     const last = parts[parts.length - 1];
@@ -1692,6 +1798,7 @@ function mybatisJavaXmlEdges(queries: QueryBuilder): Edge[] {
   }
 
   for (const xml of queries.iterateNodesByKind('method')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     if (xml.language !== 'xml') continue;
     // Qualified name: `<namespace>::<id>`. Extract the simple class name.
     const colonIdx = xml.qualifiedName.lastIndexOf('::');
@@ -1785,10 +1892,13 @@ function goHandlerIdent(expr: string): string | null {
   return m ? m[1]! : null;
 }
 
-function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+async function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
+  let scannedFiles = 0;
   // 1. Find the chain dispatcher(s): a Go method that invokes a `handlers` slice by index.
   const dispatchers: Node[] = [];
   for (const n of queries.iterateNodesByKind('method')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     if (n.language !== 'go') continue;
     const content = ctx.readFile(n.filePath);
     const src = content && sliceLines(content, n.startLine, n.endLine);
@@ -1801,6 +1911,7 @@ function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext):
   //    closures are dropped by goHandlerIdent; the rest are HandlerFuncs.
   const registered = new Map<string, string>();                         // name → registeredAt (file:line)
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!file.endsWith('.go')) continue;
     const content = ctx.readFile(file);
     if (!content || (!content.includes('.Use(') && !/\.(?:GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any|Handle)\(/.test(content))) continue;
@@ -1852,10 +1963,12 @@ function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext):
  * clause. Link the unit → its form so a `.dfm`/`.fmx` used only as a form
  * definition isn't orphaned, and editing the form surfaces its code-behind unit.
  */
-function pascalFormEdges(ctx: ResolutionContext): Edge[] {
+async function pascalFormEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   const edges: Edge[] = [];
   const allFiles = new Set(ctx.getAllFiles());
   for (const file of allFiles) {
+    if ((++scannedFiles & 255) === 0) await onYield();
     if (!/\.(dfm|fmx)$/i.test(file)) continue;
     const pasFile = file.replace(/\.(dfm|fmx)$/i, '.pas');
     if (!allFiles.has(pasFile)) continue;
@@ -1889,12 +2002,14 @@ function pascalFormEdges(ctx: ResolutionContext): Edge[] {
  * a loader's data shows the page it feeds) and the page's dependencies include
  * its loader.
  */
-function svelteKitLoadEdges(ctx: ResolutionContext): Edge[] {
+async function svelteKitLoadEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   const edges: Edge[] = [];
   const allFiles = new Set(ctx.getAllFiles());
   const HOOKS = new Set(['load', 'actions']);
   const HOOK_KINDS = new Set(['function', 'method', 'constant', 'variable']);
   for (const file of allFiles) {
+    if ((++scannedFiles & 255) === 0) await onYield();
     const m = file.match(/(.*\/)(\+(?:page|layout))\.svelte$/);
     if (!m) continue;
     const dir = m[1]!;
@@ -1941,10 +2056,12 @@ const THUNK_DECL_RE = /create(?:Async)?Thunk/;
 const THUNK_DISPATCH_RE = /\bdispatch\s*\(\s*([A-Za-z_]\w*)\s*[(),]/g;
 const THUNK_FANOUT_CAP = 24;
 
-function reduxThunkEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+async function reduxThunkEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const node of queries.iterateNodesByKind('constant')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     // Cheap gate: the initializer (captured in `signature`) must be a create(Async)Thunk call —
     // avoids reading every constant's body on a large repo.
     if (!node.signature || !THUNK_DECL_RE.test(node.signature)) continue;
@@ -2069,10 +2186,12 @@ function resolveRegistryHandler(ctx: ResolutionContext, name: string, chained: s
 }
 
 async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   let scanned = 0;
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     if (!REGISTRY_JS_EXT.test(file)) continue;
     const content = ctx.readFile(file);
@@ -2174,10 +2293,12 @@ function rtkEndpointNameFromHook(hook: string): string | null {
   return mid.charAt(0).toLowerCase() + mid.slice(1);
 }
 
-function rtkQueryEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+async function rtkQueryEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const hook of queries.iterateNodesByKind('function')) {
+    if ((++scanned255 & 63) === 0) await onYield();
     // Only our extracted generated-hook bindings (sentinel) — not a real hook fn.
     if (hook.signature !== RTK_GENERATED_HOOK_SIGNATURE) continue;
     const endpointName = rtkEndpointNameFromHook(hook.name);
@@ -2219,10 +2340,12 @@ const PINIA_BIND_RE = /\bconst\s+(\w+)\s*=\s*(?:await\s+)?(\w+)\s*\(/g;
 const PINIA_CALL_RE = /(\w+)\s*\.\s*(\w+)\s*\(/g;
 const PINIA_FANOUT_CAP = 80;
 
-function piniaStoreEdges(ctx: ResolutionContext): Edge[] {
+async function piniaStoreEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   // 1. Map each `const useXStore = defineStore(...)` factory → its store file.
   const factoryFile = new Map<string, string>();
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!PINIA_CONSUMER_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content || !content.includes('defineStore')) continue;
@@ -2235,6 +2358,7 @@ function piniaStoreEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!PINIA_CONSUMER_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content || !content.includes('Store')) continue;
@@ -2304,7 +2428,8 @@ function pathHasSegment(filePath: string, seg: string): boolean {
   return new RegExp('[\\\\/]' + seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[\\\\/.]').test(filePath);
 }
 
-function vuexDispatchEdges(ctx: ResolutionContext): Edge[] {
+async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   const storeFileCache = new Map<string, boolean>();
   const isStoreFile = (file: string): boolean => {
     let v = storeFileCache.get(file);
@@ -2339,6 +2464,7 @@ function vuexDispatchEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!PINIA_CONSUMER_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content || (!content.includes('dispatch(') && !content.includes('commit('))) continue;
@@ -2395,7 +2521,8 @@ const CELERY_PY_EXT = /\.py$/;
 const CELERY_FANOUT_CAP = 80;
 const CELERY_DECORATOR_LOOKBACK = 12; // max lines above a `def` to scan for its decorators
 
-function celeryDispatchEdges(ctx: ResolutionContext): Edge[] {
+async function celeryDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   // Memoize the decorator check per task-candidate node: it reads the file and scans a few
   // lines above the def. Only called on names that are actually `.delay`/`.apply_async`
   // receivers, so the candidate set stays small.
@@ -2434,6 +2561,7 @@ function celeryDispatchEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!CELERY_PY_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content || (!content.includes('.delay(') && !content.includes('.apply_async('))) continue;
@@ -2506,13 +2634,20 @@ function springFirstParamType(sig: string | undefined): string | null {
   return /^[A-Z][A-Za-z0-9_]*$/.test(type) ? type : null;
 }
 
-function springEventEdges(ctx: ResolutionContext): Edge[] {
+async function springEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   // Pass 1 — event-type → listener methods, scanning only event-relevant files.
+  // This is the ONLY full read sweep: publisher files are recorded here so
+  // pass 2 re-reads just those instead of every .java file again (#1212 —
+  // the double full-repo read was one of the tail's longest unyielded spans).
   const listeners = new Map<string, Node[]>();
+  const publisherFiles: string[] = [];
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!SPRING_JAVA_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content) continue;
+    if (content.includes('.publishEvent(')) publisherFiles.push(file);
     const hasAnno = content.includes('@EventListener') || content.includes('@TransactionalEventListener');
     const hasAppListener = SPRING_APP_LISTENER_RE.test(content);
     if (!hasAnno && !hasAppListener) continue;
@@ -2543,11 +2678,12 @@ function springEventEdges(ctx: ResolutionContext): Edge[] {
   }
   if (!listeners.size) return [];
 
-  // Pass 2 — link each publishEvent(new XEvent(...)) site → every listener of XEvent.
+  // Pass 2 — link each publishEvent(new XEvent(...)) site → every listener of
+  // XEvent. Only the publisher files recorded in pass 1 are (re-)read.
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  for (const file of ctx.getAllFiles()) {
-    if (!SPRING_JAVA_EXT.test(file)) continue;
+  for (const file of publisherFiles) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     const content = ctx.readFile(file);
     if (!content || !content.includes('.publishEvent(')) continue;
     const safe = stripCommentsForRegex(content, 'java');
@@ -2626,10 +2762,12 @@ function resolveMediatrArgType(arg: string, lines: string[], methodStart: number
   return declType;
 }
 
-function mediatrDispatchEdges(ctx: ResolutionContext): Edge[] {
+async function mediatrDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   // Pass 1 — request/notification type → the Handle method of each handler class.
   const handlers = new Map<string, Node[]>();
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!MEDIATR_CS_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content || (!content.includes('IRequestHandler<') && !content.includes('INotificationHandler<'))) continue;
@@ -2657,6 +2795,7 @@ function mediatrDispatchEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!MEDIATR_CS_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content || (!content.includes('.Send(') && !content.includes('.Publish('))) continue;
@@ -2714,7 +2853,8 @@ const SIDEKIQ_WORKER_RE = /\binclude\s+Sidekiq::(?:Job|Worker)\b/;
 const SIDEKIQ_RB_EXT = /\.rb$/;
 const SIDEKIQ_FANOUT_CAP = 80;
 
-function sidekiqDispatchEdges(ctx: ResolutionContext): Edge[] {
+async function sidekiqDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   // class node id → its instance `perform` method (null if the class isn't a Sidekiq worker),
   // memoized. Reads the class body for the mixin; only consulted for actual dispatch receivers.
   const performCache = new Map<string, Node | null>();
@@ -2753,6 +2893,7 @@ function sidekiqDispatchEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!SIDEKIQ_RB_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content || !/\.perform_(?:async|in|at)\b/.test(content)) continue;
@@ -2854,9 +2995,194 @@ function erlangArityAt(src: string, openIdx: number): number {
   return -1;
 }
 
-function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
-  // Cheap language gate: no Erlang modules → no cost beyond one kind query.
-  const erlangModules = queries.getNodesByKind('namespace').filter((n) => n.language === 'erlang');
+/**
+ * Nix module-system option wiring. A NixOS/home-manager/nix-darwin option is
+ * DECLARED in one module (`options.launchd.user.agents = mkOption { ... }`)
+ * and SET in others (`launchd.user.agents.yabai = { ... }` inside a module's
+ * config) — the connection happens by option-path unification inside the
+ * module-system evaluator, so there is no static call/import edge to follow
+ * and flow questions ("how does services.yabai.enable become a launchd
+ * service?") go dark at the module boundary.
+ *
+ * This pass links each config-write binding to the option declaration whose
+ * path is the longest static-segment prefix of the write path. Precision gates:
+ *  - only STATIC segments participate: plain identifiers, plus quoted segments
+ *    (`"git/config"`, `"com.apple.dock"`) as opaque verbatim tokens that match
+ *    only quote-exactly; an interpolated (`${name}`) segment ends the prefix,
+ *    so dynamic paths never match beyond their static head;
+ *  - matched prefixes must be ≥2 segments: 1-segment paths would wrongly link
+ *    every package's `meta = { ... }` attrset to nixos's `options.meta`;
+ *  - a prefix declared in more than one file is ambiguous → no edge (a wrong
+ *    edge is worse than none);
+ *  - writes physically inside an options block are declaration internals
+ *    (types, defaults, examples), never config writes → excluded.
+ * Both declaration spellings register: flat (`options.a.b = ...`) by name, and
+ * nested (`options = { a.b = ...; }`) by line-span containment.
+ */
+function nixLeadingPlainSegments(name: string): string[] {
+  const segs: string[] = [];
+  let i = 0;
+  const n = name.length;
+  while (i < n) {
+    if (name[i] === '"') {
+      // Quoted segment — an opaque verbatim token (quotes kept, so it can
+      // never collide with a plain identifier). `NSGlobalDomain."com.apple.
+      // mouse.tapBehavior"` must match ITS OWN quoted declaration, not
+      // whichever sibling registered the shared plain prefix first.
+      let j = i + 1;
+      while (j < n && name[j] !== '"') {
+        if (name[j] === '\\') j++;
+        j++;
+      }
+      if (j >= n) return segs; // unterminated — stop at the static head
+      const tok = name.slice(i, j + 1);
+      if (tok.includes('${')) return segs; // interpolated → dynamic → stop
+      segs.push(tok);
+      i = j + 1;
+      if (i >= n) break;
+      if (name[i] !== '.') return segs;
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < n && name[j] !== '.') {
+      if (name[j] === '"' || (name[j] === '$' && name[j + 1] === '{')) return segs;
+      j++;
+    }
+    const seg = name.slice(i, j);
+    if (!/^[A-Za-z_][A-Za-z0-9_'-]*$/.test(seg)) return segs;
+    segs.push(seg);
+    i = j + 1;
+  }
+  return segs;
+}
+
+async function nixOptionPathEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned255 = 0;
+  type Rec = { id: string; filePath: string; startLine: number; endLine: number; segs: string[] };
+
+  // One streaming pass over nix bindings (variables + the odd function-valued
+  // option); memory stays O(bindings-kept), not O(all nodes) (#610).
+  const byFile = new Map<string, Rec[]>();
+  let scanned = 0;
+  for (const kind of ['variable', 'function'] as NodeKind[]) {
+    for (const node of queries.iterateNodesByKind(kind)) {
+      if ((++scanned255 & 63) === 0) await onYield();
+      if ((++scanned & 0x3fff) === 0 && onYield) await onYield();
+      if (node.language !== 'nix') continue;
+      const segs = nixLeadingPlainSegments(node.name);
+      if (segs.length === 0) continue;
+      const rec: Rec = {
+        id: node.id,
+        filePath: node.filePath,
+        startLine: node.startLine,
+        endLine: node.endLine,
+        segs,
+      };
+      const arr = byFile.get(node.filePath);
+      if (arr) arr.push(rec);
+      else byFile.set(node.filePath, [rec]);
+    }
+  }
+
+  // Per file: walk bindings outermost-first with a stack of active option
+  // spans, composing nested declaration paths (`options = { services.foo = {
+  // enable = mkOption ...; }; }` registers services.foo AND services.foo.enable).
+  // An `options` binding nested inside another option span is a SUBMODULE's
+  // own namespace (`attrsOf (submodule { options = ...; })`) — its internals
+  // are not globally addressable, so the sentinel blocks registration below it
+  // while still excluding the region from write candidates.
+  const SUBMODULE = ' submodule';
+  const decls = new Map<string, Rec[]>();
+  const writes: Rec[] = [];
+  const register = (path: string[], rec: Rec) => {
+    if (path.length < 2 || path.includes(SUBMODULE)) return;
+    const key = path.join('.');
+    const arr = decls.get(key);
+    if (arr) arr.push(rec);
+    else decls.set(key, [rec]);
+  };
+  for (const recs of byFile.values()) {
+    recs.sort((a, b) => a.startLine - b.startLine || b.endLine - a.endLine);
+    const stack: Array<{ start: number; end: number; prefix: string[] }> = [];
+    for (const rec of recs) {
+      while (stack.length > 0 && stack[stack.length - 1]!.end < rec.startLine) stack.pop();
+      // Strict containment at line granularity: a one-line nested binding is
+      // indistinguishable from its container, so it stays unclassified (rare
+      // in module code, where option blocks are multi-line).
+      const enclosing =
+        stack.length > 0 &&
+        rec.startLine >= stack[stack.length - 1]!.start &&
+        rec.endLine <= stack[stack.length - 1]!.end &&
+        !(rec.startLine === stack[stack.length - 1]!.start && rec.endLine === stack[stack.length - 1]!.end)
+          ? stack[stack.length - 1]!
+          : null;
+
+      if (rec.segs[0] === 'options') {
+        const ownPath = rec.segs.slice(1); // [] for the bare `options = { ... }` spelling
+        const prefix = enclosing ? [SUBMODULE] : ownPath;
+        register(prefix, rec);
+        stack.push({ start: rec.startLine, end: rec.endLine, prefix });
+        continue;
+      }
+      if (enclosing) {
+        const composed = [...enclosing.prefix, ...rec.segs];
+        register(composed, rec);
+        stack.push({ start: rec.startLine, end: rec.endLine, prefix: composed });
+        continue;
+      }
+      if (rec.segs.length >= 2) {
+        writes.push(rec);
+      }
+    }
+  }
+  if (decls.size === 0 || writes.length === 0) return [];
+
+  const edges: Edge[] = [];
+  for (const w of writes) {
+    // `config.services.x = ...` spells the same write with an explicit prefix.
+    const segs = w.segs[0] === 'config' ? w.segs.slice(1) : w.segs;
+    if (segs.length < 2) continue;
+    // Longest prefix wins; an ambiguous longest match does NOT fall back to a
+    // shorter one (that would link `services.nginx.virtualHosts.x` to
+    // `options.services.nginx` when virtualHosts is the contested path).
+    for (let len = Math.min(segs.length, 6); len >= 2; len--) {
+      const candidates = decls.get(segs.slice(0, len).join('.'));
+      if (!candidates || candidates.length === 0) continue;
+      const files = new Set(candidates.map((c) => c.filePath));
+      if (files.size === 1) {
+        const target = candidates[0]!;
+        if (target.id !== w.id) {
+          edges.push({
+            source: w.id,
+            target: target.id,
+            kind: 'references',
+            line: w.startLine,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'nix-option-path',
+              optionPath: segs.slice(0, len).join('.'),
+              registeredAt: `${target.filePath}:${target.startLine}`,
+            },
+          });
+        }
+      }
+      break; // longest hit decides, matched or ambiguous
+    }
+  }
+  return edges;
+}
+
+async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
+  let scanned255 = 0;
+  // Cheap language gate: no Erlang modules → no cost beyond one streamed
+  // kind scan (never a materialized array of every namespace — #1212).
+  const erlangModules: Node[] = [];
+  for (const n of queries.iterateNodesByKind('namespace')) {
+    if ((++scanned255 & 63) === 0) await onYield();
+    if (n.language === 'erlang') erlangModules.push(n);
+  }
   if (erlangModules.length === 0) return [];
 
   // Pass 1 — scan every Erlang file with `-callback` decls: behaviour module →
@@ -2869,6 +3195,7 @@ function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: ResolutionCont
   const declaringBehaviours = new Map<string, Node[]>(); // `fn/arity` → behaviour namespaces
   const callbackNames = new Set<string>();
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!ERLANG_EXT.test(file)) continue;
     const behaviour = moduleByFile.get(file);
     if (!behaviour) continue; // a .hrl or module-less file can't be a behaviour
@@ -2919,6 +3246,7 @@ function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: ResolutionCont
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!ERLANG_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content || !/[A-Z][A-Za-z0-9_@]*:[a-z]/.test(content)) continue;
@@ -3010,7 +3338,8 @@ function phpArrayBody(src: string, openIdx: number): string | null {
   return null;
 }
 
-function laravelEventEdges(ctx: ResolutionContext): Edge[] {
+async function laravelEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  let scannedFiles = 0;
   // event short name → its listener `handle` methods (deduped by node id).
   const listeners = new Map<string, Map<string, Node>>();
   const add = (event: string, handle: Node) => {
@@ -3028,6 +3357,7 @@ function laravelEventEdges(ctx: ResolutionContext): Edge[] {
 
   // Pass 1 — build the event→handle map from both registration mechanisms.
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!LARAVEL_PHP_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content) continue;
@@ -3070,6 +3400,7 @@ function laravelEventEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
     if (!LARAVEL_PHP_EXT.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content || !content.includes('event(')) continue;
@@ -3115,7 +3446,119 @@ function laravelEventEdges(ctx: ResolutionContext): Edge[] {
  * Sidekiq Worker.perform_async → #perform + Laravel event(new X) → listener handle).
  * Returns the count added. Never throws into indexing — callers wrap in try/catch.
  */
-export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): Promise<number> {
+
+/**
+ * Number of progress steps synthesizeCallbackEdges reports: one per `__mark()`
+ * call (every synthesis pass, plus the dedupe-merge and edge-insert steps).
+ * Cosmetic only — drift just makes the progress bar end early or jump — and a
+ * test pins it to the actual step count (registry passes + the fixed
+ * pre/post marks) so adding a pass without bumping this fails loudly instead
+ * of silently skewing the bar.
+ */
+const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
+
+/** `has(...)` shape passed to pass gates — true when the project contains any of the languages. */
+type HasLang = (...ls: string[]) => boolean;
+
+/**
+ * One independent synthesis pass. Every pass scans the COMMITTED graph (plus
+ * source via ctx) and returns an edge list; nothing it produces is persisted
+ * until the ordered merge in synthesizeCallbackEdges — which is what makes
+ * execution order free and the passes safe to fan out across the resolver
+ * pool's read-only workers. `gate` short-circuits a pass whose language never
+ * appears in the project (its result is provably empty — see #1212).
+ */
+export interface SynthPassDef {
+  name: string;
+  gate: (has: HasLang) => boolean;
+  run: (
+    queries: QueryBuilder,
+    ctx: ResolutionContext,
+    yieldToLoop: MaybeYield,
+    subProgress?: (fraction: number) => void
+  ) => Promise<Edge[]>;
+}
+
+const ALWAYS = (): boolean => true;
+
+/**
+ * The independent passes, in MERGE ORDER — the first-seen dedup in
+ * synthesizeCallbackEdges follows this array, so reordering entries changes
+ * which duplicate edge wins. The two Go pre-passes (cross-file method
+ * `contains`, implicit `implements`) are NOT here: they persist before these
+ * run because interfaceOverrideEdges reads their edges from the DB.
+ */
+export const SYNTH_PASSES: SynthPassDef[] = [
+  { name: 'fieldEdges', gate: ALWAYS, run: (q, c, y) => fieldChannelEdges(q, c, y) },
+  { name: 'closureCollEdges', gate: ALWAYS, run: (q, c, y) => closureCollectionEdges(q, c, y) },
+  { name: 'emitterEdges', gate: ALWAYS, run: (_q, c, y) => eventEmitterEdges(c, y) },
+  { name: 'renderEdges', gate: ALWAYS, run: (q, c, y) => reactRenderEdges(q, c, y) },
+  { name: 'jsxEdges', gate: ALWAYS, run: (_q, c, y) => reactJsxChildEdges(c, y) },
+  { name: 'vueEdges', gate: (has) => has('vue'), run: (_q, c, y) => vueTemplateEdges(c, y) },
+  { name: 'svelteKitEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLoadEdges(c, y) },
+  { name: 'pascalEdges', gate: ALWAYS, run: (_q, c, y) => pascalFormEdges(c, y) },
+  { name: 'flutterEdges', gate: (has) => has('dart'), run: (q, c, y) => flutterBuildEdges(q, c, y) },
+  { name: 'arkuiStateEdges', gate: (has) => has('arkts'), run: (q, c, y) => arkuiStateBuildEdges(q, c, y) },
+  { name: 'arkuiEmitter', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiEmitterEdges(c, y) },
+  { name: 'arkuiRoutes', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiRouterEdges(c, y) },
+  { name: 'cppEdges', gate: (has) => has('cpp'), run: (q, _c, y) => cppOverrideEdges(q, y) },
+  {
+    name: 'ifaceEdges',
+    gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
+    run: (q, _c, y) => interfaceOverrideEdges(q, y),
+  },
+  { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },
+  { name: 'goGrpcEdges', gate: (has) => has('go'), run: (q, _c, y) => goGrpcStubImplEdges(q, y) },
+  { name: 'rnEventEdgesList', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => rnEventEdges(c, y) },
+  { name: 'fabricNativeEdges', gate: ALWAYS, run: (_q, c, y) => fabricNativeImplEdges(c, y) },
+  { name: 'expoXPlatEdges', gate: ALWAYS, run: (q, _c, y) => expoCrossPlatformEdges(q, y) },
+  { name: 'rnXPlatEdges', gate: ALWAYS, run: (q, _c, y) => rnCrossPlatformEdges(q, y) },
+  {
+    name: 'mybatisEdges',
+    gate: (has) => has('java', 'kotlin') && has('xml'),
+    run: (q, _c, y) => mybatisJavaXmlEdges(q, y),
+  },
+  { name: 'ginEdges', gate: (has) => has('go'), run: (q, c, y) => ginMiddlewareChainEdges(q, c, y) },
+  { name: 'thunkEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => reduxThunkEdges(q, c, y) },
+  { name: 'registryEdges', gate: ALWAYS, run: (_q, c, y) => objectRegistryEdges(c, y) },
+  { name: 'rtkEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => rtkQueryEdges(q, c, y) },
+  { name: 'piniaEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => piniaStoreEdges(c, y) },
+  { name: 'vuexEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => vuexDispatchEdges(c, y) },
+  { name: 'celeryEdges', gate: (has) => has('python'), run: (_q, c, y) => celeryDispatchEdges(c, y) },
+  { name: 'springEdges', gate: (has) => has('java'), run: (_q, c, y) => springEventEdges(c, y) },
+  { name: 'mediatrEdges', gate: (has) => has('csharp'), run: (_q, c, y) => mediatrDispatchEdges(c, y) },
+  { name: 'sidekiqEdges', gate: (has) => has('ruby'), run: (_q, c, y) => sidekiqDispatchEdges(c, y) },
+  {
+    name: 'erlangBehaviourEdges',
+    gate: (has) => has('erlang'),
+    run: (q, c, y) => erlangBehaviourDispatchEdges(q, c, y),
+  },
+  { name: 'laravelEdges', gate: (has) => has('php'), run: (_q, c, y) => laravelEventEdges(c, y) },
+  {
+    name: 'cFnPtrEdges',
+    gate: (has) => has('c', 'cpp'),
+    run: (q, c, y, sub) => cFnPointerDispatchEdges(q, c, y, sub),
+  },
+  { name: 'goframeEdges', gate: (has) => has('go'), run: (_q, c, y) => goframeRouteEdges(c, y) },
+  { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
+];
+
+/** Fixed non-registry steps: goMethodContains, goImplements, dedupe-merge, insertMergedEdges. */
+const FIXED_SYNTH_STEPS = 4;
+export const SYNTH_PROGRESS_STEPS = SYNTH_PASSES.length + FIXED_SYNTH_STEPS;
+export async function synthesizeCallbackEdges(
+  queries: QueryBuilder,
+  ctx: ResolutionContext,
+  onProgress?: (done: number, total: number) => void,
+  // A live resolver pool to fan the independent passes across (structural type
+  // so this file never imports the pool — resolver-worker imports THIS file).
+  // Null/omitted → the sequential path, byte-identical to the pool path.
+  pool?: { runSynthPass(name: string): Promise<{ edges: Edge[]; ms: number }> } | null,
+  // WAL-valve writer backstop (WalCheckpointValve.backpressure), called at
+  // pool-idle points in the edge-insert loops below — the passes themselves
+  // only read; every write in this function happens with the pool idle.
+  backpressure?: () => Promise<void> | null
+): Promise<number> {
   // Each sub-pass below is a whole-graph scan, and there are ~30 of them, all
   // running synchronously on the indexer's main thread. Their AGGREGATE can run
   // for well over a minute on a large repo — long enough for the #850 liveness
@@ -3125,103 +3568,173 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   // watchdog still catches that. See ./cooperative-yield.
   const yieldToLoop = createYielder();
 
+  // Synthesis runs AFTER the resolution progress bar reaches 100%, so without
+  // its own progress the UI freezes at "Resolving refs 100%" for the whole
+  // tail — long enough on big repos that users conclude the index hung and
+  // kill it. Report each completed pass; the caller surfaces it as its own
+  // progress phase. Emit 0/total up front so the phase flips immediately.
+  // Emissions are throttled to whole-percent movement (each consumes a UI
+  // message); values may be fractional steps from within-pass reporting.
+  let passesDone = 0;
+  let lastPct = -1;
+  const emit = (value: number): void => {
+    if (!onProgress) return;
+    const v = Math.min(value, SYNTH_PROGRESS_STEPS);
+    const pct = Math.floor((v / SYNTH_PROGRESS_STEPS) * 100);
+    if (pct === lastPct) return;
+    lastPct = pct;
+    onProgress(v, SYNTH_PROGRESS_STEPS);
+  };
+  // A single long pass otherwise parks the bar between steps; a pass that
+  // takes this callback reports a 0..1 fraction of its own work, surfaced
+  // here as fractional progress within its step.
+  const subProgress = (fraction: number): void =>
+    emit(passesDone + Math.max(0, Math.min(fraction, 1)));
+  emit(0);
+
+  // Per-pass wall-clock timing to stderr, opt-in via CODEGRAPH_SYNTH_TIMINGS
+  // (=1: passes over 250ms; =all: every pass). This is the diagnostic that
+  // located both the #1091/#1122 watchdog stalls and the #1212 OOM — keep it.
+  const markT = { t: Date.now() };
+  const __mark = (label: string): void => {
+    const now = Date.now();
+    const dt = now - markT.t;
+    markT.t = now;
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
+      console.error(`[synth-timing] ${label}: ${dt}ms`);
+    }
+    passesDone++;
+    emit(passesDone);
+  };
+
+  // Language gating: one indexed DISTINCT over the files table lets a pass
+  // whose own filters reference a specific language/extension be skipped
+  // outright when the project has no such files — its result is provably
+  // empty, so skipping is behavior-identical and the cost drops to zero
+  // (the Kotlin pass was the OOM culprit on the pure-C Linux kernel, #1212).
+  // Passes without an explicit language filter always run.
+  const langs = queries.getDistinctFileLanguages();
+  const has = (...ls: string[]): boolean => ls.some((l) => langs.has(l));
+  const NONE: Edge[] = [];
+
   // Cross-file Go method→type `contains` edges must be synthesized AND persisted
   // FIRST: a method declared in a different file from its receiver type is
   // otherwise orphaned from the struct, and goImplementsEdges (next) derives a
   // struct's method set from its `contains` edges — so without this it would
   // under-count the interfaces a cross-file struct satisfies. (#583)
-  const goMethodContains = goCrossFileMethodContainsEdges(queries);
-  if (goMethodContains.length > 0) queries.insertEdges(goMethodContains);
-  await yieldToLoop();
+  // Writer-side WAL backstop for the insert loops here (see the param doc):
+  // one fstat when under the valve's hard cap, a parked full backfill past it.
+  const foldIfOver = async (): Promise<void> => {
+    const bp = backpressure?.();
+    if (bp) await bp;
+  };
+
+  const goMethodContains = has('go') ? await goCrossFileMethodContainsEdges(queries, yieldToLoop) : NONE;
+  for (let i = 0; i < goMethodContains.length; i += 2000) {
+    queries.insertEdges(goMethodContains.slice(i, i + 2000));
+    await yieldToLoop();
+    await foldIfOver();
+  }
+  await yieldToLoop(); __mark('goMethodContains');
 
   // Go implicit `implements` edges must be synthesized AND persisted next: the
   // interface-dispatch bridge below reads `implements` edges from the DB, and
   // Go has none statically. (Other languages already have static implements
   // edges from extraction, so they don't need this pre-pass.)
-  const goImpl = goImplementsEdges(queries);
-  if (goImpl.length > 0) queries.insertEdges(goImpl);
-  await yieldToLoop();
+  const goImpl = has('go') ? await goImplementsEdges(queries, yieldToLoop) : NONE;
+  for (let i = 0; i < goImpl.length; i += 2000) {
+    queries.insertEdges(goImpl.slice(i, i + 2000));
+    await yieldToLoop();
+    await foldIfOver();
+  }
+  await yieldToLoop(); __mark('goImplements');
 
-  const fieldEdges = await fieldChannelEdges(queries, ctx, yieldToLoop); await yieldToLoop();
-  const closureCollEdges = await closureCollectionEdges(queries, ctx, yieldToLoop); await yieldToLoop();
-  const emitterEdges = await eventEmitterEdges(ctx, yieldToLoop); await yieldToLoop();
-  const renderEdges = reactRenderEdges(queries, ctx); await yieldToLoop();
-  const jsxEdges = await reactJsxChildEdges(ctx, yieldToLoop); await yieldToLoop();
-  const vueEdges = vueTemplateEdges(ctx); await yieldToLoop();
-  const svelteKitEdges = svelteKitLoadEdges(ctx); await yieldToLoop();
-  const pascalEdges = pascalFormEdges(ctx); await yieldToLoop();
-  const flutterEdges = flutterBuildEdges(queries, ctx); await yieldToLoop();
-  const arkuiStateEdges = arkuiStateBuildEdges(queries, ctx); await yieldToLoop();
-  const arkuiEmitter = arkuiEmitterEdges(ctx); await yieldToLoop();
-  const arkuiRoutes = arkuiRouterEdges(ctx); await yieldToLoop();
-  const cppEdges = cppOverrideEdges(queries); await yieldToLoop();
-  const ifaceEdges = interfaceOverrideEdges(queries); await yieldToLoop();
-  const kotlinExpectActual = kotlinExpectActualEdges(queries); await yieldToLoop();
-  const goGrpcEdges = goGrpcStubImplEdges(queries); await yieldToLoop();
-  const rnEventEdgesList = rnEventEdges(ctx); await yieldToLoop();
-  const fabricNativeEdges = fabricNativeImplEdges(ctx); await yieldToLoop();
-  const expoXPlatEdges = expoCrossPlatformEdges(queries); await yieldToLoop();
-  const rnXPlatEdges = rnCrossPlatformEdges(queries); await yieldToLoop();
-  const mybatisEdges = mybatisJavaXmlEdges(queries); await yieldToLoop();
-  const ginEdges = ginMiddlewareChainEdges(queries, ctx); await yieldToLoop();
-  const thunkEdges = reduxThunkEdges(queries, ctx); await yieldToLoop();
-  const registryEdges = await objectRegistryEdges(ctx, yieldToLoop); await yieldToLoop();
-  const rtkEdges = rtkQueryEdges(queries, ctx); await yieldToLoop();
-  const piniaEdges = piniaStoreEdges(ctx); await yieldToLoop();
-  const vuexEdges = vuexDispatchEdges(ctx); await yieldToLoop();
-  const celeryEdges = celeryDispatchEdges(ctx); await yieldToLoop();
-  const springEdges = springEventEdges(ctx); await yieldToLoop();
-  const mediatrEdges = mediatrDispatchEdges(ctx); await yieldToLoop();
-  const sidekiqEdges = sidekiqDispatchEdges(ctx); await yieldToLoop();
-  const erlangBehaviourEdges = erlangBehaviourDispatchEdges(queries, ctx); await yieldToLoop();
-  const laravelEdges = laravelEventEdges(ctx); await yieldToLoop();
-  const cFnPtrEdges = cFnPointerDispatchEdges(queries, ctx); await yieldToLoop();
-  const goframeEdges = goframeRouteEdges(ctx); await yieldToLoop();
+  // Run the independent passes (see SYNTH_PASSES). Their results are merged in
+  // REGISTRY ORDER below regardless of execution order, and none of their edges
+  // persist until that merge — so every pass sees the same committed
+  // post-resolution DB state whether it runs sequentially here or on a resolver
+  // pool worker. With a live pool (already booted on ≥150k-ref repos), passes
+  // fan out across its read-only workers and the per-pass wall-clock comes from
+  // the worker; a pass that fails on a worker falls back to running on the main
+  // thread, so a worker crash isolates to a retry instead of failing synthesis.
+  const passEdges: Edge[][] = new Array<Edge[]>(SYNTH_PASSES.length).fill(NONE);
+  const markPass = (label: string, dt: number): void => {
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
+      console.error(`[synth-timing] ${label}: ${dt}ms`);
+    }
+    passesDone++;
+    emit(passesDone);
+  };
+  const runPassOnMain = async (i: number): Promise<void> => {
+    const pass = SYNTH_PASSES[i]!;
+    const t0 = Date.now();
+    passEdges[i] = await pass.run(queries, ctx, yieldToLoop, subProgress);
+    await yieldToLoop();
+    markPass(pass.name, Date.now() - t0);
+  };
+
+  const gatedIn: number[] = [];
+  for (let i = 0; i < SYNTH_PASSES.length; i++) {
+    if (SYNTH_PASSES[i]!.gate(has)) gatedIn.push(i);
+    else markPass(SYNTH_PASSES[i]!.name, 0);
+  }
+
+  // Above this node count, a pass that OOM-killed its worker must NOT be
+  // retried on the main thread — the retry would OOM the whole process and
+  // take the index with it (the #1212 failure class). Below it, a worker
+  // failure is more likely a transient crash than a memory ceiling, and the
+  // main-thread retry keeps coverage. Skipping loses only that pass's
+  // synthesized edges; the index still completes.
+  const MAIN_RETRY_MAX_NODES = 1_500_000;
+  const graphNodes = queries.getNodeAndEdgeCount().nodes;
+
+  if (pool && gatedIn.length > 1) {
+    await Promise.all(
+      gatedIn.map(async (i) => {
+        const pass = SYNTH_PASSES[i]!;
+        try {
+          const out = await pool.runSynthPass(pass.name);
+          passEdges[i] = out.edges;
+          markPass(pass.name, out.ms);
+        } catch (err) {
+          if (graphNodes > MAIN_RETRY_MAX_NODES) {
+            // Worker died at a scale where the main-thread retry is a process
+            // OOM risk: skip the pass, keep the index alive, and say so.
+            console.error(
+              `[synthesis] pass '${pass.name}' failed on a worker at ${graphNodes} nodes — skipped (edges from this pass are absent): ${err instanceof Error ? err.message : String(err)}`
+            );
+            markPass(`${pass.name} (skipped at scale)`, 0);
+            return;
+          }
+          // Worker-side failure (crash, OOM, unknown pass after a version
+          // mismatch): retry this one pass on the main thread.
+          await runPassOnMain(i);
+        }
+      })
+    );
+  } else {
+    for (const i of gatedIn) {
+      await runPassOnMain(i);
+    }
+  }
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
-  for (const e of [
-    ...fieldEdges,
-    ...closureCollEdges,
-    ...emitterEdges,
-    ...renderEdges,
-    ...jsxEdges,
-    ...vueEdges,
-    ...svelteKitEdges,
-    ...pascalEdges,
-    ...flutterEdges,
-    ...arkuiStateEdges,
-    ...arkuiEmitter,
-    ...arkuiRoutes,
-    ...cppEdges,
-    ...ifaceEdges,
-    ...kotlinExpectActual,
-    ...goGrpcEdges,
-    ...rnEventEdgesList,
-    ...fabricNativeEdges,
-    ...expoXPlatEdges,
-    ...rnXPlatEdges,
-    ...mybatisEdges,
-    ...ginEdges,
-    ...thunkEdges,
-    ...registryEdges,
-    ...rtkEdges,
-    ...piniaEdges,
-    ...vuexEdges,
-    ...celeryEdges,
-    ...springEdges,
-    ...mediatrEdges,
-    ...sidekiqEdges,
-    ...erlangBehaviourEdges,
-    ...laravelEdges,
-    ...cFnPtrEdges,
-    ...goframeEdges,
-  ]) {
+  for (const e of passEdges.flat()) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(e);
   }
-  if (merged.length > 0) queries.insertEdges(merged);
+  __mark('dedupe-merge');
+  // Chunked insert with yields: on the Linux kernel the merged synthesized
+  // edge set is ~275k rows, and one transaction for all of them was a 20s
+  // unyielded main-thread span (#1212 follow-up) — the last one in the tail.
+  for (let i = 0; i < merged.length; i += 2000) {
+    queries.insertEdges(merged.slice(i, i + 2000));
+    await yieldToLoop();
+    await foldIfOver();
+  }
+  __mark('insertMergedEdges');
   return merged.length + goImpl.length + goMethodContains.length;
 }

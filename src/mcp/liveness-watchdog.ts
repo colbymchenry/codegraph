@@ -29,10 +29,26 @@
  * orphan).
  *
  * **Won't fire on real work.** Heavy parsing runs in the parse worker
- * (off-thread) and indexing shells out to a child process, so the daemon's main
- * thread only ever does fast, bounded work. The default timeout is ~300× the
- * 5h #850 wedge shorter, yet far longer than any legitimate main-thread block.
- * Opt out with `CODEGRAPH_NO_WATCHDOG=1`; tune with `CODEGRAPH_WATCHDOG_TIMEOUT_MS`.
+ * (off-thread) and the daemon's indexing shells out to a child process, so the
+ * daemon's main thread only ever does fast, bounded work. The default timeout
+ * is ~300× the 5h #850 wedge shorter, yet far longer than any legitimate
+ * main-thread block. Opt out with `CODEGRAPH_NO_WATCHDOG=1`; tune with
+ * `CODEGRAPH_WATCHDOG_TIMEOUT_MS`.
+ *
+ * **Disk-progress deferral (`progressPaths`).** The CLI `index`/`init` path is
+ * different: it runs the SQLite store on this thread, and one long synchronous
+ * statement on severely degraded storage can block the loop past the timeout
+ * with the process perfectly healthy (#1231: killed a valid index on a
+ * 150-IOPS disk). Heartbeat silence alone cannot tell that apart from a wedge —
+ * but the disk can: a wedged CPU loop makes no forward progress on the DB
+ * files, while a slow store advances them. When the caller supplies
+ * `progressPaths` (the SQLite DB + `-wal`), the child checks them at each
+ * silent timeout: size/mtime advanced ⇒ defer the kill and keep watching;
+ * unchanged ⇒ kill as before. Deferral is bounded by a hard cap
+ * (`PROGRESS_CAP_MULTIPLIER` × timeout) of continuous silence, so a wedge
+ * coinciding with unrelated file activity — or I/O hung beyond all reason —
+ * still dies. A true wedge with no disk progress dies at the base timeout,
+ * exactly as before.
  */
 import * as fs from 'fs';
 import * as os from 'os';
@@ -40,6 +56,14 @@ import { spawn, ChildProcess } from 'child_process';
 
 /** Default: 60s — ~300× shorter than the 5h #850 wedge, far longer than any real main-thread block. */
 export const DEFAULT_WATCHDOG_TIMEOUT_MS = 60_000;
+
+/**
+ * Hard cap on disk-progress deferral: after this many timeouts' worth of
+ * CONTINUOUS heartbeat silence the process is killed even if the watched files
+ * keep advancing (a wedge coinciding with unrelated file writes, or I/O hung
+ * beyond any legitimate statement). 10× the 60s default ⇒ 10 minutes.
+ */
+export const PROGRESS_CAP_MULTIPLIER = 10;
 
 /** `true` for `1/true/yes/on` (case-insensitive); `false` otherwise. */
 function isEnvTruthy(raw: string | undefined): boolean {
@@ -85,19 +109,65 @@ const CHILD_SOURCE = `
 const fs = require('fs');
 const parentPid = Number(process.argv[1]);
 const timeoutMs = Number(process.argv[2]);
+const capMs = Number(process.argv[3]);
+const progressPaths = process.argv.slice(4);
 const secs = Math.round(timeoutMs / 1000);
-const MSG = Buffer.from('[CodeGraph] Main thread unresponsive for ~' + secs + 's — killing the wedged process so a fresh one can start (#850). Disable with CODEGRAPH_NO_WATCHDOG=1.\\n');
-function kill() {
-  try { fs.writeSync(2, MSG); } catch (e) {}
+function kill(extra) {
+  try { fs.writeSync(2, Buffer.from('[CodeGraph] Main thread unresponsive for ~' + secs + 's' + (extra || '') + ' — killing the wedged process so a fresh one can start (#850). Disable with CODEGRAPH_NO_WATCHDOG=1.\\n')); } catch (e) {}
   try { process.kill(parentPid, 'SIGKILL'); } catch (e) {}
   process.exit(0);
 }
-let timer = setTimeout(kill, timeoutMs);
-process.stdin.on('data', () => { clearTimeout(timer); timer = setTimeout(kill, timeoutMs); });
+// Fingerprint of the watched files (size + mtime). A change between checks is
+// forward disk progress — a slow synchronous SQLite statement, not a wedge.
+function snap() {
+  let s = '';
+  for (const p of progressPaths) {
+    try { const st = fs.statSync(p); s += st.size + ':' + st.mtimeMs + ';'; } catch (e) { s += 'x;'; }
+  }
+  return s;
+}
+let lastSnap = progressPaths.length ? snap() : '';
+let lastSnapAt = Date.now();
+let silentSince = null; // start of the current continuous-silence episode
+function onTimeout() {
+  if (!progressPaths.length) return kill('');
+  const now = Date.now();
+  if (silentSince === null) silentSince = now - timeoutMs; // silence began ~one timeout ago
+  const cur = snap();
+  if (cur !== lastSnap && now - silentSince < capMs) {
+    // The event loop is blocked but the DB files are advancing: a legitimate
+    // long store on slow storage. Defer, re-baseline, keep watching.
+    lastSnap = cur;
+    timer = setTimeout(onTimeout, timeoutMs);
+    return;
+  }
+  kill(cur !== lastSnap ? ' despite ongoing disk activity (hard cap ' + Math.round(capMs / 1000) + 's reached)' : '');
+}
+let timer = setTimeout(onTimeout, timeoutMs);
+process.stdin.on('data', () => {
+  silentSince = null;
+  // Keep the baseline fresh while healthy (throttled — a stat per second).
+  if (progressPaths.length) {
+    const t = Date.now();
+    if (t - lastSnapAt >= 1000) { lastSnap = snap(); lastSnapAt = t; }
+  }
+  clearTimeout(timer); timer = setTimeout(onTimeout, timeoutMs);
+});
 process.stdin.on('end', () => process.exit(0));   // parent closed the pipe (exited) -> no orphan
 process.stdin.on('error', () => process.exit(0)); // pipe broke -> parent gone
 process.stdin.resume();
 `;
+
+export interface WatchdogOptions {
+  /**
+   * Files whose size/mtime advancing counts as forward progress (the SQLite
+   * DB + `-wal` for an in-process indexer). With paths supplied, a silent
+   * timeout only kills when the files did NOT advance — see the header. Omit
+   * for pure heartbeat behavior (the daemon, whose main thread never runs
+   * long synchronous work).
+   */
+  progressPaths?: string[];
+}
 
 /**
  * Install the main-thread liveness watchdog for a long-lived process. Returns a
@@ -105,11 +175,13 @@ process.stdin.resume();
  * (degraded, never throws — a missing watchdog must never keep a process from
  * starting).
  */
-export function installMainThreadWatchdog(): WatchdogHandle | null {
+export function installMainThreadWatchdog(options: WatchdogOptions = {}): WatchdogHandle | null {
   if (isEnvTruthy(process.env.CODEGRAPH_NO_WATCHDOG)) return null;
 
   const timeoutMs = parseWatchdogTimeoutMs(process.env.CODEGRAPH_WATCHDOG_TIMEOUT_MS);
   const checkMs = deriveCheckIntervalMs(timeoutMs);
+  const capMs = timeoutMs * PROGRESS_CAP_MULTIPLIER;
+  const progressPaths = options.progressPaths ?? [];
 
   let child: ChildProcess;
   try {
@@ -118,7 +190,7 @@ export function installMainThreadWatchdog(): WatchdogHandle | null {
     // fd 2 so the kill notice lands wherever the parent logs (daemon.log).
     child = spawn(
       process.execPath,
-      ['-e', CHILD_SOURCE, String(process.pid), String(timeoutMs)],
+      ['-e', CHILD_SOURCE, String(process.pid), String(timeoutMs), String(capMs), ...progressPaths],
       {
         stdio: ['pipe', 'ignore', 'inherit'],
         windowsHide: true,
@@ -155,7 +227,7 @@ export function installMainThreadWatchdog(): WatchdogHandle | null {
   child.unref();
   try { (stdin as unknown as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
 
-  debug(`armed (child pid ${child.pid ?? '?'}): timeoutMs=${timeoutMs} checkMs=${checkMs}`);
+  debug(`armed (child pid ${child.pid ?? '?'}): timeoutMs=${timeoutMs} checkMs=${checkMs} progressPaths=${progressPaths.length}`);
 
   let stopped = false;
   return {

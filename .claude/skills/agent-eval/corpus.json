@@ -584,5 +584,28 @@
       "files": "~9500",
       "question": "In the OrangeShopping sample app, how does the product detail page's bottom bar (add to cart / buy) lead to the order placement flow? Trace from the bottom navigation component to where the order is created."
     }
+  ],
+  "Nix": [
+    {
+      "name": "agenix",
+      "repo": "https://github.com/ryantm/agenix",
+      "size": "Small",
+      "files": "~13",
+      "question": "When a NixOS system activates, how does a secret declared under age.secrets get decrypted and installed at its runtime path? Trace the flow from the age.secrets option definition to the activation machinery that performs the decryption."
+    },
+    {
+      "name": "nix-darwin",
+      "repo": "https://github.com/nix-darwin/nix-darwin",
+      "size": "Medium",
+      "files": "~207",
+      "question": "How does setting services.yabai.enable = true become a running launchd service? Trace the flow from the yabai module's options to the launchd daemon definition that generates the plist."
+    },
+    {
+      "name": "home-manager",
+      "repo": "https://github.com/nix-community/home-manager",
+      "size": "Large",
+      "files": "~3390",
+      "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
+    }
   ]
 }

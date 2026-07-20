@@ -29,6 +29,7 @@ import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
 import { getCodeGraphDir, codeGraphDirName } from '../directory';
 import { getTelemetry, TELEMETRY_DOCS } from '../telemetry';
+import { maybeOfferBetaSignup } from './beta-signup';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -266,6 +267,17 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     });
   }
 
+  // Step 5½: CodeGraph Pro beta opt-in — the same waitlist as the
+  // getcodegraph.com homepage form, offered once per machine at the end of a
+  // successful install (and after `codegraph upgrade` — the shared gate in
+  // maybeOfferBetaSignup means whichever asks first is the ONLY ask ever).
+  // Strictly opt-in (user answers yes AND types an email), never shown under
+  // --yes, and any yes/no answer is stored so nothing re-asks. Cancel or a
+  // failed submit stores nothing, so a later install/upgrade may offer again.
+  if (!useDefaults && installedIds.length > 0) {
+    await maybeOfferBetaSignup({ source: 'cli-install' });
+  }
+
   // Step 6: install wires up agents only — it deliberately does NOT index.
   // Building the per-project graph is the user's explicit `codegraph init`
   // (or `index`), so they choose what gets indexed and when, and we never
@@ -300,6 +312,13 @@ export interface RunUninstallerOptions {
   location?: Location;
   /** Non-interactive: location=global, target=all, no prompts. */
   yes?: boolean;
+  /** Remove agent configs only — leave the CLI binary installed. */
+  keepCli?: boolean;
+  /**
+   * `__filename` of the CLI entry (dist/bin/codegraph.js) — install-method
+   * detection is keyed off the running binary's real location.
+   */
+  cliFilename?: string;
 }
 
 export type UninstallStatus = 'removed' | 'not-configured' | 'unsupported';
@@ -355,6 +374,66 @@ export function uninstallTargets(
       status: removedPaths.length > 0 ? ('removed' as const) : ('not-configured' as const),
       removedPaths,
       notes: result.notes ?? [],
+    };
+  });
+}
+
+export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported';
+
+/**
+ * Per-target outcome of a refresh sweep. `refreshed` means at least one
+ * filesystem entry was created, updated, or removed; `unchanged` means the target was
+ * already current (every write reported byte-identical); the other two
+ * mirror `UninstallStatus`.
+ */
+export interface RefreshReport {
+  id: TargetId;
+  displayName: string;
+  location: Location;
+  status: RefreshStatus;
+  /** Absolute paths created, updated, or removed by the refresh. */
+  changedPaths: string[];
+}
+
+/**
+ * Pure refresh sweep — re-runs `install()` for every target that is
+ * ALREADY configured at `location`, so the surfaces a previous version
+ * wrote (the marker-fenced instructions section, the MCP server entry,
+ * the legacy-hook cleanups) match the binary that will serve them.
+ * Without this, those files keep the wording — and the tool names — of
+ * whatever version first wrote them, no matter how many upgrades later.
+ *
+ * Strictly a refresh, never a first install:
+ *   - targets that aren't `alreadyConfigured` are skipped untouched;
+ *   - permissions are not written (`autoAllow: false`) and the prompt
+ *     hook is left as-is (`promptHook: undefined`), so choices the user
+ *     made at install time — or by hand since — are preserved.
+ *
+ * Every write underneath is the targets' own idempotent upsert, so a
+ * re-run on an already-current machine reports `unchanged` everywhere.
+ * Exposed (and unit-tested) separately from the CLI wiring, same as
+ * `uninstallTargets`.
+ */
+export function refreshTargets(
+  targets: readonly AgentTarget[],
+  location: Location,
+): RefreshReport[] {
+  return targets.map((target) => {
+    const base = { id: target.id, displayName: target.displayName, location };
+    if (!target.supportsLocation(location)) {
+      return { ...base, status: 'unsupported' as const, changedPaths: [] };
+    }
+    if (!target.detect(location).alreadyConfigured) {
+      return { ...base, status: 'not-configured' as const, changedPaths: [] };
+    }
+    const result = target.install(location, { autoAllow: false, promptHook: undefined });
+    const changedPaths = result.files
+      .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
+      .map((f) => f.path);
+    return {
+      ...base,
+      status: changedPaths.length > 0 ? ('refreshed' as const) : ('unchanged' as const),
+      changedPaths,
     };
   });
 }
@@ -437,6 +516,55 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     clack.log.info(`The ${codeGraphDirName()}/ index for this project is still here. Run \`codegraph uninit\` to delete it.`);
   }
 
+  // Step 4b: the CLI binary itself (global uninstall only — a project-scoped
+  // uninstall must not touch the machine-wide install). Before this step,
+  // `codegraph uninstall` removed agent configs but left every installed
+  // binary — bundle AND npm global — so `codegraph` still resolved afterward
+  // (the #1071 shadow, uninstall edition). Plan every install present on the
+  // machine, confirm, then remove them all. Skippable with --keep-cli.
+  let cliRemoved = false;
+  if (location === 'global' && opts.keepCli !== true && opts.cliFilename) {
+    const { planBinaryRemoval, executeBinaryRemoval, defaultProbes } =
+      await import('../upgrade/remove-binary');
+    const plan = planBinaryRemoval(defaultProbes(opts.cliFilename));
+
+    if (plan.sourceRoot) {
+      clack.log.info(`Running from a source checkout (${tildify(plan.sourceRoot)}) — leaving it untouched.`);
+    }
+    if (plan.summary.length > 0) {
+      let removeBinaries = useDefaults;
+      if (!useDefaults) {
+        const sel = await clack.confirm({
+          message: `Also remove the CodeGraph CLI from this machine?\n${plan.summary.map((s) => `     - ${s}`).join('\n')}`,
+          initialValue: true,
+        });
+        if (clack.isCancel(sel)) {
+          clack.cancel('Uninstall cancelled.');
+          process.exit(0);
+        }
+        removeBinaries = sel;
+      }
+      if (removeBinaries) {
+        const result = executeBinaryRemoval(plan);
+        for (const p of result.removed) clack.log.success(`Removed ${tildify(p)}`);
+        if (result.npm === 'removed') {
+          clack.log.success('Removed the npm global package (npm uninstall -g).');
+        } else if (result.npm === 'failed') {
+          clack.log.warn('npm uninstall failed — run `npm uninstall -g @colbymchenry/codegraph` yourself (EACCES usually means it needs sudo).');
+        }
+        for (const p of result.leftovers) {
+          clack.log.warn(`Could not remove ${tildify(p)} — delete it manually${process.platform === 'win32' ? ' after this window closes' : ''}.`);
+        }
+        cliRemoved = result.removed.length > 0 || result.npm === 'removed';
+        if (cliRemoved && process.platform === 'win32') {
+          clack.log.info('If your PATH still lists a codegraph bin directory, remove that entry from your user PATH.');
+        }
+      } else {
+        clack.log.info('Kept the CLI. Remove it later with `codegraph uninstall` or `npm uninstall -g @colbymchenry/codegraph`.');
+      }
+    }
+  }
+
   // Telemetry churn signal (agent IDs only) — flush now, since after an
   // uninstall there is usually no "next run" to deliver it.
   if (removed.length > 0) {
@@ -445,12 +573,15 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   }
 
   // Step 5: summary.
+  const cliNote = cliRemoved ? ' The CLI is removed too — this was its last run.' : '';
   if (removed.length > 0) {
     const names = removed.map((r) => r.displayName).join(', ');
     clack.outro(
       `Removed CodeGraph from ${removed.length} agent${removed.length > 1 ? 's' : ''}: ${names}. ` +
-      `Restart ${removed.length > 1 ? 'them' : 'it'} to apply.`,
+      `Restart ${removed.length > 1 ? 'them' : 'it'} to apply.` + cliNote,
     );
+  } else if (cliRemoved) {
+    clack.outro(`No ${location} agent had CodeGraph configured.` + cliNote);
   } else {
     clack.outro(`CodeGraph was not configured in any ${location} agent — nothing to remove.`);
   }

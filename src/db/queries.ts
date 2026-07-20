@@ -109,6 +109,20 @@ interface UnresolvedRefRow {
   candidates: string | null;
   file_path: string;
   language: string;
+  status: string;
+  name_tail: string;
+}
+
+/**
+ * Last segment of a (possibly dotted/qualified) reference name — the part a
+ * new symbol's plain node name could match: 'util.greet' → 'greet',
+ * 'mod::fn' → 'fn', 'greet' → 'greet'. Written to unresolved_refs.name_tail
+ * when a ref is marked failed, so the #1240 retry lookup can match dotted
+ * refs against newly-added node names.
+ */
+function referenceNameTail(referenceName: string): string {
+  const idx = Math.max(referenceName.lastIndexOf('.'), referenceName.lastIndexOf(':'));
+  return idx >= 0 ? referenceName.slice(idx + 1) : referenceName;
 }
 
 /**
@@ -211,10 +225,13 @@ export class QueryBuilder {
     deleteUnresolvedByNode?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
     getNodesByName?: SqliteStatement;
+    getNodesByNamePrefix?: SqliteStatement;
     getNodesByQualifiedNameExact?: SqliteStatement;
     getNodesByLowerName?: SqliteStatement;
     getUnresolvedCount?: SqliteStatement;
     getUnresolvedBatch?: SqliteStatement;
+    getUnresolvedBatchAfter?: SqliteStatement;
+    deleteRefsByRowIdsFull?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
     getDominantFile?: SqliteStatement;
@@ -230,8 +247,66 @@ export class QueryBuilder {
   private segmentedNames: Set<string> = new Set();
   private static readonly MAX_SEGMENTED_NAMES = 65536;
 
+  // Multi-row INSERT statements, cached per (statement kind × row count). The
+  // bulk write path decomposes N rows into a few fixed batch sizes so each
+  // size's statement is prepared once and reused — one .run() binds a whole
+  // chunk instead of one row, which is where the per-call overhead lives.
+  // Row order within and across chunks is the input order, so rowid assignment
+  // (and therefore resolution's insertion-order disambiguation) is identical
+  // to the one-row-per-run path.
+  private batchStmts: Map<string, SqliteStatement> = new Map();
+  private static readonly BATCH_SIZES: readonly number[] = [128, 32, 8, 1];
+
+  /**
+   * Run `rows` through a multi-row `INSERT` built as `head + (tuple,)*n`,
+   * decomposed greedily into the cached batch sizes. Preserves row order.
+   */
+  private runBatched(kind: string, head: string, tuple: string, rows: unknown[][]): void {
+    if (rows.length === 0) return;
+    let i = 0;
+    for (const size of QueryBuilder.BATCH_SIZES) {
+      while (rows.length - i >= size) {
+        const key = `${kind}:${size}`;
+        let stmt = this.batchStmts.get(key);
+        if (!stmt) {
+          stmt = this.db.prepare(head + new Array(size).fill(tuple).join(','));
+          this.batchStmts.set(key, stmt);
+        }
+        if (size === 1) {
+          stmt.run(...rows[i]!);
+        } else {
+          const params: unknown[] = [];
+          for (let r = 0; r < size; r++) {
+            const row = rows[i + r]!;
+            for (let c = 0; c < row.length; c++) params.push(row[c]);
+          }
+          stmt.run(...params);
+        }
+        i += size;
+      }
+    }
+  }
+
   constructor(db: SqliteDatabase) {
     this.db = db;
+  }
+
+  /**
+   * Swap the underlying connection in place. Used by pool workers'
+   * connection recycling (plan §7a.6, writes-under-readers): a long-lived
+   * read connection pins WAL checkpoint progress, and the deep WAL that
+   * accumulates behind it taxes every main-thread B-tree page operation
+   * (deletes measured 42.6s → 118.8s from 0 to 4 attached readers on
+   * identical hardware). Workers therefore close and reopen their read-only
+   * connection at the pool-idle boundary; everything above the connection —
+   * this QueryBuilder, the resolver and its warm caches — survives, and only
+   * connection-derived state (prepared statements) resets, re-preparing
+   * lazily on next use.
+   */
+  rebind(db: SqliteDatabase): void {
+    this.db = db;
+    this.stmts = {};
+    this.batchStmts.clear();
   }
 
   /** Set the normalized project-name tokens used to down-weight non-discriminative
@@ -336,17 +411,14 @@ export class QueryBuilder {
 
   /** Write `name`'s segments into name_segment_vocab (idempotent). */
   private insertNameSegments(name: string): void {
-    if (this.segmentedNames.has(name)) return;
-    if (this.segmentedNames.size >= QueryBuilder.MAX_SEGMENTED_NAMES) this.segmentedNames.clear();
-    this.segmentedNames.add(name);
-    if (!this.stmts.insertNameSegment) {
-      this.stmts.insertNameSegment = this.db.prepare(
-        'INSERT OR IGNORE INTO name_segment_vocab (segment, name) VALUES (?, ?)',
-      );
-    }
-    for (const segment of splitIdentifierSegments(name)) {
-      this.stmts.insertNameSegment.run(segment, name);
-    }
+    const rows: unknown[][] = [];
+    this.collectNameSegmentRows(name, rows);
+    this.runBatched(
+      'insertNameSegments',
+      'INSERT OR IGNORE INTO name_segment_vocab (segment, name) VALUES ',
+      '(?,?)',
+      rows
+    );
   }
 
   /**
@@ -354,10 +426,122 @@ export class QueryBuilder {
    */
   insertNodes(nodes: Node[]): void {
     this.db.transaction(() => {
+      // Bulk path: same semantics as insertNode() per row (validation, cache
+      // invalidation, segment vocab), but bound as multi-row INSERTs — the
+      // per-.run() call overhead dominates the store phase on full indexes.
+      const rows: unknown[][] = [];
+      const segmentRows: unknown[][] = [];
       for (const node of nodes) {
-        this.insertNode(node);
+        if (!node.id || !node.kind || !node.name || !node.filePath || !node.language) {
+          console.error('[CodeGraph] Skipping node with missing required fields:', {
+            id: node.id,
+            kind: node.kind,
+            name: node.name,
+            filePath: node.filePath,
+            language: node.language,
+          });
+          continue;
+        }
+        this.nodeCache.delete(node.id);
+        rows.push([
+          node.id,
+          node.kind,
+          node.name,
+          node.qualifiedName ?? node.name,
+          node.filePath,
+          node.language,
+          node.startLine ?? 0,
+          node.endLine ?? 0,
+          node.startColumn ?? 0,
+          node.endColumn ?? 0,
+          node.docstring ?? null,
+          node.signature ?? null,
+          node.visibility ?? null,
+          node.isExported ? 1 : 0,
+          node.isAsync ? 1 : 0,
+          node.isStatic ? 1 : 0,
+          node.isAbstract ? 1 : 0,
+          node.decorators ? JSON.stringify(node.decorators) : null,
+          node.typeParameters ? JSON.stringify(node.typeParameters) : null,
+          node.returnType ?? null,
+          node.updatedAt ?? Date.now(),
+        ]);
+        if (this.isSegmentableKind(node.kind)) this.collectNameSegmentRows(node.name, segmentRows);
       }
+      this.runBatched(
+        'insertNodes',
+        `INSERT OR REPLACE INTO nodes (
+          id, kind, name, qualified_name, file_path, language,
+          start_line, end_line, start_column, end_column,
+          docstring, signature, visibility,
+          is_exported, is_async, is_static, is_abstract,
+          decorators, type_parameters, return_type, updated_at
+        ) VALUES `,
+        '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        rows
+      );
+      this.runBatched(
+        'insertNameSegments',
+        'INSERT OR IGNORE INTO name_segment_vocab (segment, name) VALUES ',
+        '(?,?)',
+        segmentRows
+      );
     })();
+  }
+
+  /**
+   * Store one file's whole extraction bundle — nodes, edges, unresolved refs,
+   * and the file record — in a SINGLE transaction. The bulk-index path calls
+   * this once per file instead of opening one transaction per table (#1015
+   * file-order commit discipline is unchanged: callers still invoke it in file
+   * order, and row order within is input order).
+   *
+   * Edges MUST already be endpoint-filtered by the caller (the store path
+   * filters to the file's own inserted node ids), so the per-file existence
+   * SELECT that insertEdges() pays is skipped here.
+   */
+  storeFileBundle(bundle: {
+    nodes: Node[];
+    edges: Edge[];
+    refs: UnresolvedReference[];
+    file: FileRecord;
+  }): void {
+    this.db.transaction(() => {
+      this.insertNodes(bundle.nodes);
+      if (bundle.edges.length > 0) {
+        const rows: unknown[][] = [];
+        for (const edge of bundle.edges) {
+          rows.push([
+            edge.source,
+            edge.target,
+            edge.kind,
+            edge.metadata ? JSON.stringify(edge.metadata) : null,
+            edge.line ?? null,
+            edge.column ?? null,
+            edge.provenance ?? null,
+          ]);
+        }
+        this.runBatched(
+          'insertEdges',
+          'INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance) VALUES ',
+          '(?,?,?,?,?,?,?)',
+          rows
+        );
+      }
+      if (bundle.refs.length > 0) this.insertUnresolvedRefsBatch(bundle.refs);
+      this.upsertFile(bundle.file);
+    })();
+  }
+
+  /**
+   * Collect (segment, name) rows for a name, honouring the same session-dedupe
+   * semantics as insertNameSegments(). Shared by the bulk write paths.
+   */
+  private collectNameSegmentRows(name: string, out: unknown[][]): void {
+    if (this.segmentedNames.has(name)) return;
+    if (this.segmentedNames.size >= QueryBuilder.MAX_SEGMENTED_NAMES) this.segmentedNames.clear();
+    this.segmentedNames.add(name);
+    for (const segment of splitIdentifierSegments(name)) out.push([segment, name]);
   }
 
   /**
@@ -495,7 +679,14 @@ export class QueryBuilder {
   /** Insert segments for a batch of names in one transaction (vocab heal path). */
   insertNameSegmentsBatch(names: string[]): void {
     this.db.transaction(() => {
-      for (const name of names) this.insertNameSegments(name);
+      const rows: unknown[][] = [];
+      for (const name of names) this.collectNameSegmentRows(name, rows);
+      this.runBatched(
+        'insertNameSegments',
+        'INSERT OR IGNORE INTO name_segment_vocab (segment, name) VALUES ',
+        '(?,?)',
+        rows
+      );
     })();
   }
 
@@ -880,6 +1071,37 @@ export class QueryBuilder {
   }
 
   /**
+   * Stream nodes of one language whose `decorators` JSON array contains
+   * `decorator`. The LIKE on the JSON text is a cheap index-free pre-filter
+   * (a decorator name can appear as a substring of another), so callers must
+   * still exact-check `node.decorators.includes(decorator)`. Exists so the
+   * kotlin expect/actual synthesizer never materializes the whole node table
+   * the way `getAllNodes().filter(...)` did — that array alone OOM'd Node's
+   * default heap on a 2M-node graph (#1212).
+   */
+  *iterateNodesByLanguageWithDecorator(language: Language, decorator: string): IterableIterator<Node> {
+    // Fresh statement per call — an iterator holds an open cursor (see
+    // iterateNodesByKind).
+    const stmt = this.db.prepare(
+      "SELECT * FROM nodes WHERE language = ? AND decorators LIKE '%' || ? || '%'"
+    );
+    for (const row of stmt.iterate(language, `"${decorator}"`)) {
+      yield rowToNode(row as NodeRow);
+    }
+  }
+
+  /**
+   * Distinct languages present in the files table. One indexed aggregate —
+   * lets the dynamic-edge synthesizers skip passes for languages the project
+   * doesn't contain at all (a Kotlin pass has no work on a pure-C repo), so
+   * their cost is zero rather than a full-graph scan that finds nothing (#1212).
+   */
+  getDistinctFileLanguages(): Set<string> {
+    const rows = this.db.prepare('SELECT DISTINCT language FROM files').all() as Array<{ language: string }>;
+    return new Set(rows.map((r) => r.language));
+  }
+
+  /**
    * Get nodes by exact name match (uses idx_nodes_name index)
    */
   getNodesByName(name: string): Node[] {
@@ -887,6 +1109,20 @@ export class QueryBuilder {
       this.stmts.getNodesByName = this.db.prepare('SELECT * FROM nodes WHERE name = ?');
     }
     const rows = this.stmts.getNodesByName.all(name) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
+   * Nodes whose name starts with `prefix`, by index range scan (a LIKE would
+   * skip idx_nodes_name under SQLite's default case-insensitive LIKE).
+   */
+  getNodesByNamePrefix(prefix: string, limit = 20): Node[] {
+    if (!this.stmts.getNodesByNamePrefix) {
+      this.stmts.getNodesByNamePrefix = this.db.prepare(
+        'SELECT * FROM nodes WHERE name >= ? AND name < ? ORDER BY name LIMIT ?'
+      );
+    }
+    const rows = this.stmts.getNodesByNamePrefix.all(prefix, prefix + '￿', limit) as NodeRow[];
     return rows.map(rowToNode);
   }
 
@@ -1440,12 +1676,27 @@ export class QueryBuilder {
       }
       const existingNodeIds = this.getExistingNodeIds([...endpointIds]);
 
+      const rows: unknown[][] = [];
       for (const edge of edges) {
         if (!existingNodeIds.has(edge.source) || !existingNodeIds.has(edge.target)) {
           continue;
         }
-        this.insertEdge(edge);
+        rows.push([
+          edge.source,
+          edge.target,
+          edge.kind,
+          edge.metadata ? JSON.stringify(edge.metadata) : null,
+          edge.line ?? null,
+          edge.column ?? null,
+          edge.provenance ?? null,
+        ]);
       }
+      this.runBatched(
+        'insertEdges',
+        'INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance) VALUES ',
+        '(?,?,?,?,?,?,?)',
+        rows
+      );
     })();
   }
 
@@ -1581,19 +1832,26 @@ export class QueryBuilder {
    * re-index (issue #899). Same edge-kind rules as
    * {@link getDependentFilePaths}: all kinds except `contains`.
    */
-  getCrossFileIncomingEdgesWithTarget(filePath: string): Array<Edge & { targetName: string; targetKind: NodeKind }> {
-    const sql = `SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind
+  getCrossFileIncomingEdgesWithTarget(
+    filePath: string
+  ): Array<Edge & { targetName: string; targetKind: NodeKind; sourceFilePath: string; sourceLanguage: Language }> {
+    const sql = `SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind,
+        src.file_path AS source_file_path, src.language AS source_language
       FROM edges e
       JOIN nodes tgt ON tgt.id = e.target
       JOIN nodes src ON src.id = e.source
       WHERE tgt.file_path = ?
         AND e.kind != 'contains'
         AND src.file_path != ?`;
-    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<EdgeRow & { target_name: string; target_kind: NodeKind }>;
+    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<
+      EdgeRow & { target_name: string; target_kind: NodeKind; source_file_path: string; source_language: Language }
+    >;
     return rows.map(row => ({
       ...rowToEdge(row),
       targetName: row.target_name,
       targetKind: row.target_kind,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
     }));
   }
 
@@ -1722,9 +1980,25 @@ export class QueryBuilder {
   insertUnresolvedRefsBatch(refs: UnresolvedReference[]): void {
     if (refs.length === 0) return;
     const insert = this.db.transaction(() => {
+      const rows: unknown[][] = [];
       for (const ref of refs) {
-        this.insertUnresolvedRef(ref);
+        rows.push([
+          ref.fromNodeId,
+          ref.referenceName,
+          ref.referenceKind,
+          ref.line,
+          ref.column,
+          ref.candidates ? JSON.stringify(ref.candidates) : null,
+          ref.filePath ?? '',
+          ref.language ?? 'unknown',
+        ]);
       }
+      this.runBatched(
+        'insertUnresolvedRefs',
+        'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ',
+        '(?,?,?,?,?,?,?,?)',
+        rows
+      );
     });
     insert();
   }
@@ -1760,6 +2034,7 @@ export class QueryBuilder {
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
       filePath: row.file_path,
       language: row.language as Language,
+      rowId: row.id,
     }));
   }
 
@@ -1777,16 +2052,21 @@ export class QueryBuilder {
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
       filePath: row.file_path,
       language: row.language as Language,
+      rowId: row.id,
     }));
   }
 
   /**
-   * Get the count of unresolved references without loading them into memory
+   * Get the count of PENDING (never-attempted) references without loading
+   * them into memory. Rows marked status='failed' — attempted by a completed
+   * pass, no match — are excluded: they are not outstanding work, only retry
+   * candidates for the #1240 sweep, so they must not trip the #1187 orphan
+   * sweep or the `status` pending-refs warning.
    */
   getUnresolvedReferencesCount(): number {
     if (!this.stmts.getUnresolvedCount) {
       this.stmts.getUnresolvedCount = this.db.prepare(
-        'SELECT COUNT(*) as count FROM unresolved_refs'
+        "SELECT COUNT(*) as count FROM unresolved_refs WHERE status = 'pending'"
       );
     }
     const row = this.stmts.getUnresolvedCount.get() as { count: number };
@@ -1794,13 +2074,20 @@ export class QueryBuilder {
   }
 
   /**
-   * Get a batch of unresolved references using LIMIT/OFFSET pagination.
-   * Used to process references in bounded memory chunks.
+   * Get a batch of PENDING unresolved references using LIMIT/OFFSET
+   * pagination. Used to process references in bounded memory chunks; failed
+   * rows are excluded so the batched drain loop terminates once every row
+   * has been attempted.
    */
   getUnresolvedReferencesBatch(offset: number, limit: number): UnresolvedReference[] {
     if (!this.stmts.getUnresolvedBatch) {
+      // ORDER BY rowid is load-bearing for the pipelined resolution loop: it
+      // prefetches batch k+1 at OFFSET batch_k.length while batch k's rows are
+      // still pending, which is only exact under a stable enumeration. (A plain
+      // scan and the status index both return rowid order anyway — this pins
+      // it.)
       this.stmts.getUnresolvedBatch = this.db.prepare(
-        'SELECT * FROM unresolved_refs LIMIT ? OFFSET ?'
+        "SELECT * FROM unresolved_refs WHERE status = 'pending' ORDER BY rowid LIMIT ? OFFSET ?"
       );
     }
     const rows = this.stmts.getUnresolvedBatch.all(limit, offset) as UnresolvedRefRow[];
@@ -1813,6 +2100,35 @@ export class QueryBuilder {
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
       filePath: row.file_path,
       language: row.language as Language,
+      rowId: row.id,
+    }));
+  }
+
+  /**
+   * Keyset variant of {@link getUnresolvedReferencesBatch} for the batched
+   * resolution loop: seek past the last-seen row id instead of OFFSET-walking.
+   * OFFSET reads re-scan the accumulated failed-row prefix on every batch —
+   * O(failed rows) per read, measured at 54.6s of the kernel-scale batch loop
+   * (§7a.2) — while the seek is O(batch) forever. `id` is the rowid alias, so
+   * the enumeration order is identical to the OFFSET reader's.
+   */
+  getUnresolvedReferencesBatchAfter(afterRowId: number, limit: number): UnresolvedReference[] {
+    if (!this.stmts.getUnresolvedBatchAfter) {
+      this.stmts.getUnresolvedBatchAfter = this.db.prepare(
+        "SELECT * FROM unresolved_refs WHERE status = 'pending' AND id > ? ORDER BY id LIMIT ?"
+      );
+    }
+    const rows = this.stmts.getUnresolvedBatchAfter.all(afterRowId, limit) as UnresolvedRefRow[];
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+      rowId: row.id,
     }));
   }
 
@@ -1839,6 +2155,19 @@ export class QueryBuilder {
   }
 
   /**
+   * Stream the distinct node names one row at a time — the incremental
+   * counterpart to {@link getAllNodeNames} for callers that need to yield
+   * to the event loop mid-scan (resolver cache warm-up on multi-million-node
+   * indexes). Fresh statement per call: the iterator holds an open cursor.
+   */
+  *iterateNodeNames(): IterableIterator<string> {
+    const stmt = this.db.prepare('SELECT DISTINCT name FROM nodes');
+    for (const row of stmt.iterate()) {
+      yield (row as { name: string }).name;
+    }
+  }
+
+  /**
    * Get unresolved references scoped to specific file paths.
    * Uses the idx_unresolved_file_path index for efficient lookup.
    */
@@ -1854,7 +2183,7 @@ export class QueryBuilder {
       const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const chunkRows = this.db
-        .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
+        .prepare(`SELECT * FROM unresolved_refs WHERE status = 'pending' AND file_path IN (${placeholders})`)
         .all(...chunk) as UnresolvedRefRow[];
       rows.push(...chunkRows);
     }
@@ -1868,6 +2197,7 @@ export class QueryBuilder {
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
       filePath: row.file_path,
       language: row.language as Language,
+      rowId: row.id,
     }));
   }
 
@@ -1899,17 +2229,176 @@ export class QueryBuilder {
    * Delete specific resolved references by (fromNodeId, referenceName, referenceKind) tuples.
    * More precise than deleteResolvedReferences — only removes refs that were actually resolved.
    */
-  deleteSpecificResolvedReferences(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>): void {
-    if (refs.length === 0) return;
+  deleteSpecificResolvedReferences(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>): number {
+    if (refs.length === 0) return 0;
     const stmt = this.db.prepare(
       'DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?'
     );
+    // Returns rows actually removed (SQLite `changes`, summed): the batched
+    // resolution loop's non-progress guard keys on this — zero removals from
+    // a batch that claimed work is the direct runaway signal (§7a.2).
+    let changed = 0;
     const deleteMany = this.db.transaction((items: typeof refs) => {
       for (const ref of items) {
-        stmt.run(ref.fromNodeId, ref.referenceName, ref.referenceKind);
+        changed += stmt.run(ref.fromNodeId, ref.referenceName, ref.referenceKind).changes;
       }
     });
     deleteMany(refs);
+    return changed;
+  }
+
+  /**
+   * Delete unresolved-ref rows by row id — the precise cleanup for refs a
+   * resolution pass actually processed. The key-tuple variant above also
+   * deletes SIBLING rows (same caller calling the same callee at other lines)
+   * that a later batch hasn't attempted yet, so when a batch boundary split a
+   * caller's same-named call sites, the later sites' edges were silently never
+   * created (#1269).
+   */
+  deleteReferencesByRowIds(rowIds: number[]): number {
+    if (rowIds.length === 0) return 0;
+    // One transaction for all chunks (each chunk was previously its own
+    // implicit transaction = its own WAL commit — measurable on 100k+-ref
+    // resolution persists), and the full-size chunk statement is cached so
+    // repeat calls skip the re-prepare; only the final partial chunk (if any)
+    // prepares ad hoc. Returns rows actually removed (summed `changes`) for
+    // the batched loop's non-progress guard (§7a.2).
+    let changed = 0;
+    this.db.transaction(() => {
+      for (let i = 0; i < rowIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+        const chunk = rowIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+        if (chunk.length === SQLITE_PARAM_CHUNK_SIZE) {
+          if (!this.stmts.deleteRefsByRowIdsFull) {
+            const placeholders = new Array(SQLITE_PARAM_CHUNK_SIZE).fill('?').join(',');
+            this.stmts.deleteRefsByRowIdsFull = this.db.prepare(
+              `DELETE FROM unresolved_refs WHERE id IN (${placeholders})`
+            );
+          }
+          changed += this.stmts.deleteRefsByRowIdsFull.run(...chunk).changes;
+        } else {
+          const placeholders = chunk.map(() => '?').join(',');
+          changed += this.db.prepare(`DELETE FROM unresolved_refs WHERE id IN (${placeholders})`).run(...chunk).changes;
+        }
+      }
+    })();
+    return changed;
+  }
+
+  /**
+   * Mark refs a completed resolution pass could not resolve as status='failed'
+   * instead of deleting them (#1240). Failed rows are invisible to the pending
+   * count/batch readers (so drain loops and the #1187 orphan sweep still
+   * terminate) but stay queryable by name_tail so a later sync can retry them
+   * when a changed file introduces a symbol that could satisfy them. name_tail
+   * is (re)written here so rows inserted before the v8 migration get their
+   * tail the first time they're attempted.
+   */
+  markReferencesFailed(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>): number {
+    if (refs.length === 0) return 0;
+    const stmt = this.db.prepare(
+      "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?"
+    );
+    let changed = 0;
+    const markMany = this.db.transaction((items: typeof refs) => {
+      for (const ref of items) {
+        changed += stmt.run(referenceNameTail(ref.referenceName), ref.fromNodeId, ref.referenceName, ref.referenceKind).changes;
+      }
+    });
+    markMany(refs);
+    return changed;
+  }
+
+  /**
+   * Park refs as status='failed' by row id — the precise counterpart of
+   * markReferencesFailed, for the same reason as deleteReferencesByRowIds:
+   * the key-tuple variant also flips same-key sibling rows in later batches
+   * to 'failed' before they were ever attempted (#1269). Resolution outcome
+   * can differ per call site (receiver-type inference reads the ref's line),
+   * so a sibling must not inherit this row's failure.
+   */
+  markReferencesFailedByRowIds(refs: Array<{ rowId: number; referenceName: string }>): number {
+    if (refs.length === 0) return 0;
+    const stmt = this.db.prepare(
+      "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE id = ?"
+    );
+    let changed = 0;
+    const markMany = this.db.transaction((items: typeof refs) => {
+      for (const ref of items) {
+        changed += stmt.run(referenceNameTail(ref.referenceName), ref.rowId).changes;
+      }
+    });
+    markMany(refs);
+    return changed;
+  }
+
+  /**
+   * Failed refs whose name tail matches one of the given symbol names — the
+   * candidates a sync should retry after files carrying those names changed
+   * (#1240). Names matching more than `perNameCeiling` failed refs are
+   * skipped entirely: at that population a name is external/builtin noise
+   * (`get`, `map`, …) that one new definition won't resolve — the same
+   * rationale as resolution's AMBIGUOUS_NAME_CEILING (#999) — and retrying an
+   * arbitrary subset would be both wasted work and incoherent coverage.
+   */
+  getRetryableFailedReferences(names: string[], perNameCeiling: number = 500): UnresolvedReference[] {
+    if (names.length === 0) return [];
+
+    // Pass 1: per-tail counts, chunked under the SQLite parameter limit.
+    const retryNames: string[] = [];
+    for (let i = 0; i < names.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = names.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const counts = this.db
+        .prepare(
+          `SELECT name_tail, COUNT(*) as count FROM unresolved_refs WHERE status = 'failed' AND name_tail IN (${placeholders}) GROUP BY name_tail`
+        )
+        .all(...chunk) as Array<{ name_tail: string; count: number }>;
+      for (const row of counts) {
+        if (row.count <= perNameCeiling) retryNames.push(row.name_tail);
+      }
+    }
+    if (retryNames.length === 0) return [];
+
+    // Pass 2: load the surviving rows.
+    const rows: UnresolvedRefRow[] = [];
+    for (let i = 0; i < retryNames.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = retryNames.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const chunkRows = this.db
+        .prepare(`SELECT * FROM unresolved_refs WHERE status = 'failed' AND name_tail IN (${placeholders})`)
+        .all(...chunk) as UnresolvedRefRow[];
+      rows.push(...chunkRows);
+    }
+
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+      rowId: row.id,
+    }));
+  }
+
+  /**
+   * Distinct node names present in the given files — the symbol names a sync
+   * pass uses to look up retryable failed refs after those files changed.
+   */
+  getNodeNamesByFiles(filePaths: string[]): string[] {
+    if (filePaths.length === 0) return [];
+    const names = new Set<string>();
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT DISTINCT name FROM nodes WHERE file_path IN (${placeholders})`)
+        .all(...chunk) as Array<{ name: string }>;
+      for (const row of rows) names.add(row.name);
+    }
+    return [...names];
   }
 
   // ===========================================================================

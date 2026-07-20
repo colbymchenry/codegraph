@@ -62,6 +62,18 @@ const DEFAULT_RECYCLE_INTERVAL = 250;
 /** Base per-parse timeout; scaled up for large files by the caller's formula. */
 const DEFAULT_PARSE_TIMEOUT_MS = 10_000;
 /**
+ * A worker is only killed once a parse has gone this many × its budget with no
+ * result. The base timer firing is NOT proof the parse is still running: after
+ * a long synchronous main-thread stretch (the SQLite store on slow disks,
+ * issue #1231) Node runs the timers phase before the poll phase, so the
+ * expired timer fires BEFORE an already-delivered `parse-result` is processed.
+ * Killing at the base timeout therefore produced false timeouts on parses that
+ * finished instantly (even 0-byte files). Instead the base timer only marks
+ * the job late; a result that arrives before this backstop is accepted, and
+ * only a worker that stays silent the whole window is treated as hung.
+ */
+const HARD_KILL_MULTIPLIER = 3;
+/**
  * Max workers cold-starting at once. A worker's cold start is heavy (module load
  * + grammar WASM compile); starting the whole pool simultaneously thrashes CPU.
  * Warming a couple at a time keeps each start fast while the pool still reaches
@@ -84,6 +96,19 @@ const CRASH_BUDGET = 100;
  *   - unset / blank / non-numeric → `clamp(cores - 1, 1, 8)` (leave a core for
  *     the main thread + UI; never zero — parsing always needs a worker).
  */
+/**
+ * Resolve the base per-parse timeout from the `CODEGRAPH_PARSE_TIMEOUT_MS`
+ * override. Slow storage (HDD, network folders) can need a larger budget; a
+ * non-numeric / non-positive value falls back to the default (10s).
+ */
+export function resolveParseTimeoutMs(envVal: string | undefined): number {
+  if (envVal !== undefined && envVal !== '') {
+    const n = Number(envVal);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  }
+  return DEFAULT_PARSE_TIMEOUT_MS;
+}
+
 export function resolveParsePoolSize(envVal: string | undefined, cpuCount: number): number {
   if (envVal !== undefined && envVal !== '') {
     const n = Number(envVal);
@@ -102,6 +127,11 @@ interface ParseJob {
   reject: (e: Error) => void;
   settled: boolean;
   timer?: ReturnType<typeof setTimeout>;
+  /** Full budget for this parse (base timeout + size scaling), for late-result logging. */
+  budgetMs?: number;
+  /** The base timer fired with no result yet — accept a late result, kill at the backstop. */
+  timerExpired?: boolean;
+  hardKillTimer?: ReturnType<typeof setTimeout>;
 }
 
 /** Shape of a message a worker posts back (grammar-load ack or a parse result). */
@@ -109,6 +139,8 @@ interface ParseWorkerMessage {
   type?: string;
   id?: number;
   result?: ExtractionResult;
+  /** Worker-side parse duration — the worker's own clock, immune to main-thread stalls. */
+  parseMs?: number;
 }
 
 export interface ParseWorkerPoolOptions {
@@ -126,6 +158,15 @@ export interface ParseWorkerPoolOptions {
   createWorker?: () => ParsePoolWorker;
   /** Optional verbose logger (the orchestrator's `[worker] …` logger). */
   log?: (msg: string) => void;
+  /**
+   * Pre-read grammar WASM bytes keyed by language, forwarded to every worker's
+   * `load-grammars` message so a spawn/respawn loads grammars from memory
+   * instead of re-reading them from disk — on slow storage each respawn's
+   * grammar re-read otherwise amplifies the very I/O contention that caused
+   * the respawn (issue #1231). Best-effort: a missing language falls back to
+   * the worker's own disk read.
+   */
+  grammarBuffers?: Record<string, Uint8Array>;
 }
 
 export class ParseWorkerPool {
@@ -147,9 +188,11 @@ export class ParseWorkerPool {
   private readonly parseTimeoutMs: number;
   private readonly createWorker: () => ParsePoolWorker;
   private readonly log: (msg: string) => void;
+  private readonly grammarBuffers?: Record<string, Uint8Array>;
 
   constructor(opts: ParseWorkerPoolOptions) {
     this.languages = opts.languages;
+    this.grammarBuffers = opts.grammarBuffers;
     this.maxSize = Math.max(1, Math.min(opts.size, MAX_PARSE_POOL_SIZE));
     this.recycleInterval = opts.recycleInterval ?? DEFAULT_RECYCLE_INTERVAL;
     this.parseTimeoutMs = opts.parseTimeoutMs ?? DEFAULT_PARSE_TIMEOUT_MS;
@@ -163,6 +206,21 @@ export class ParseWorkerPool {
       throw new Error('ParseWorkerPool requires workerScriptPath or createWorker');
     }
     this.spawnOne(); // one eager warm worker, ready for the first parse
+  }
+
+  /**
+   * Spawn the whole pool up front. The default demand-driven growth avoids
+   * paying worker boot for small jobs, but a bulk index KNOWS every core will
+   * be needed — on a fast repo the one-by-one ramp-up otherwise consumes most
+   * of the parse phase (each worker boot is a fresh Node isolate + grammar
+   * load, ~hundreds of ms, and growth only triggers as queue pressure builds).
+   */
+  prewarm(): void {
+    while (this.workers.size < this.maxSize) {
+      const before = this.workers.size;
+      this.spawnOne();
+      if (this.workers.size === before) break; // spawn failed / breaker tripped
+    }
   }
 
   /** Pool size cap (for logging). */
@@ -179,7 +237,7 @@ export class ParseWorkerPool {
   /**
    * Parse one file on the pool. Resolves with the extraction result, or REJECTS
    * if the parse times out or its worker crashes — the caller records the error
-   * and (for worker-exit/OOM rejections) re-attempts in its retry pass.
+   * and (for worker-exit/OOM/timeout rejections) re-attempts in its retry pass.
    */
   requestParse(task: ParseTask): Promise<ExtractionResult> {
     if (this.destroyed) return Promise.reject(new Error('Parse pool destroyed'));
@@ -205,7 +263,9 @@ export class ParseWorkerPool {
     w.on('error', (e) => this.onWorkerGone(w, `Worker error: ${e?.message ?? 'unknown'}`));
     w.on('exit', (code) => { if (code !== 0) this.onWorkerGone(w, `Worker exited with code ${code}`); });
     // Load grammars; the worker replies 'grammars-loaded' and only then is idle.
-    w.postMessage({ type: 'load-grammars', languages: this.languages });
+    // Pre-read WASM bytes (when the orchestrator provided them) make this a
+    // memory load instead of a per-spawn disk read.
+    w.postMessage({ type: 'load-grammars', languages: this.languages, grammarBuffers: this.grammarBuffers });
   }
 
   private onMessage(w: ParsePoolWorker, m: ParseWorkerMessage): void {
@@ -220,6 +280,22 @@ export class ParseWorkerPool {
       const job = this.inflight.get(w);
       if (!job || (m.id !== undefined && m.id !== job.id)) return; // stale (post-recycle)
       this.inflight.delete(w);
+      if (job.timerExpired) {
+        // The base timer fired before this result was processed. That almost
+        // always means the MAIN THREAD was stalled (sync SQLite store on slow
+        // disks) while the parse itself finished long ago — the worker's own
+        // clock (parseMs) tells the two apart. Either way the result is here
+        // and valid: accept it instead of the old behaviour (kill worker +
+        // reject), which turned every main-thread stall into false timeouts
+        // and dropped files (issue #1231).
+        const parseMs = typeof m.parseMs === 'number' ? Math.round(m.parseMs) : undefined;
+        const detail = parseMs === undefined
+          ? ''
+          : parseMs < (job.budgetMs ?? this.parseTimeoutMs)
+            ? ` (parse took ${parseMs}ms in-worker — the main thread was stalled, not the parse)`
+            : ` (parse genuinely took ${parseMs}ms)`;
+        this.log(`Late parse-result accepted: ${job.task.filePath}${detail}`);
+      }
       // Recycle the worker once it's done enough parses to have grown its WASM
       // heap; otherwise return it to the idle set for the next job.
       if ((this.parseCounts.get(w) ?? 0) >= this.recycleInterval) {
@@ -269,6 +345,7 @@ export class ParseWorkerPool {
     // Scale the timeout for large files: base + 10s per 100KB (matches the
     // original single-worker formula so pathological-file behaviour is unchanged).
     const timeoutMs = this.parseTimeoutMs + Math.floor(job.task.content.length / 100_000) * 10_000;
+    job.budgetMs = timeoutMs;
     job.timer = setTimeout(() => this.onTimeout(w, job, timeoutMs), timeoutMs);
     job.timer.unref?.();
     w.postMessage({
@@ -281,16 +358,35 @@ export class ParseWorkerPool {
     });
   }
 
+  /**
+   * The base timer fired with no result processed yet. Do NOT kill or settle:
+   * the timer firing doesn't prove the parse is still running — after a long
+   * synchronous main-thread stretch Node services the timers phase before the
+   * poll phase, so an already-delivered `parse-result` is still queued behind
+   * this callback. Mark the job late (onMessage accepts a result that shows up)
+   * and arm the hard-kill backstop for workers that are genuinely hung.
+   */
   private onTimeout(w: ParsePoolWorker, job: ParseJob, ms: number): void {
     if (job.settled || !this.workers.has(w)) return;
-    this.log(`TIMEOUT: ${job.task.filePath} exceeded ${ms}ms — killing worker`);
-    // Kill the (possibly WASM-wedged) worker and reject this parse. A timeout
-    // isn't a crash — don't charge the budget — but the worker is gone, so spawn
-    // a replacement to keep capacity.
+    const graceMs = ms * (HARD_KILL_MULTIPLIER - 1);
+    this.log(`TIMEOUT: ${job.task.filePath} exceeded ${ms}ms with no result — waiting up to ${graceMs}ms more for a late result before killing the worker`);
+    job.timerExpired = true;
+    job.hardKillTimer = setTimeout(() => this.onHardTimeout(w, job, ms * HARD_KILL_MULTIPLIER), graceMs);
+    job.hardKillTimer.unref?.();
+  }
+
+  /** No result after the full hard-kill window — the worker really is hung. */
+  private onHardTimeout(w: ParsePoolWorker, job: ParseJob, totalMs: number): void {
+    if (job.settled || !this.workers.has(w)) return;
+    this.log(`TIMEOUT: ${job.task.filePath} got no result after ${totalMs}ms — killing worker`);
+    // Kill the (WASM-wedged) worker and reject this parse. A timeout isn't a
+    // crash — don't charge the budget — but the worker is gone, so spawn a
+    // replacement to keep capacity. The rejection message contains "timed out"
+    // so the orchestrator's retry pass re-attempts the file.
     this.removeWorker(w);
     this.inflight.delete(w);
     try { void w.terminate(); } catch { /* already gone */ }
-    this.settle(job, undefined, new Error(`Parse timed out after ${ms}ms`));
+    this.settle(job, undefined, new Error(`Parse timed out after ${totalMs}ms`));
     if (this.healthy) this.spawnOne();
     this.drain();
   }
@@ -329,6 +425,7 @@ export class ParseWorkerPool {
     if (job.settled) return;
     job.settled = true;
     if (job.timer) clearTimeout(job.timer);
+    if (job.hardKillTimer) clearTimeout(job.hardKillTimer);
     if (err) job.reject(err);
     else job.resolve(result!);
   }

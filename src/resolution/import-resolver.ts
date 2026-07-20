@@ -10,6 +10,11 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
 import { resolveWorkspaceImport } from './workspace-packages';
+import {
+  resolveMethodOnType,
+  localReceiverTypePatterns,
+  normalizeInferredTypeName,
+} from './name-matcher';
 
 /**
  * Extension resolution order by language
@@ -40,12 +45,89 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   php: ['.php'],
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
+  nix: ['.nix', '/default.nix'],
 };
+
+export function isNixPathImportRef(ref: UnresolvedRef): boolean {
+  return (
+    ref.language === 'nix' &&
+    ref.referenceKind === 'imports' &&
+    (ref.referenceName.startsWith('./') || ref.referenceName.startsWith('../')) &&
+    !/[\s{}()[\];"'<>$]/.test(ref.referenceName)
+  );
+}
 
 /**
  * Resolve an import path to an actual file
  */
+// Per-context memos for the two hottest pure lookups on the resolution path:
+// import-specifier → file resolution and exported-symbol lookup. Both are pure
+// given a stable file set + node table, which is exactly the window between
+// ReferenceResolver.clearCaches() calls — clearImportResolverMemos() is invoked
+// there, so the staleness discipline matches the resolver's own caches.
+const importPathMemos = new WeakMap<ResolutionContext, Map<string, string | null>>();
+const exportedSymbolMemos = new WeakMap<ResolutionContext, Map<string, Node | undefined>>();
+
+/**
+ * Per-file index of exported symbols, replacing repeated linear `.find`s over
+ * `getNodesInFile` arrays (a barrel-heavy repo scans its biggest files once
+ * per referencing symbol otherwise). First-wins insertion preserves exactly
+ * the array-order semantics of the `.find` calls it replaces.
+ */
+interface FileExportIndex {
+  byName: Map<string, Node>;
+  defaultComponent: Node | undefined;
+  defaultFnClass: Node | undefined;
+}
+const fileExportIndexes = new WeakMap<ResolutionContext, Map<string, FileExportIndex>>();
+
+function getFileExportIndex(filePath: string, context: ResolutionContext): FileExportIndex {
+  let perFile = fileExportIndexes.get(context);
+  if (!perFile) {
+    perFile = new Map();
+    fileExportIndexes.set(context, perFile);
+  }
+  let idx = perFile.get(filePath);
+  if (!idx) {
+    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };
+    for (const n of context.getNodesInFile(filePath)) {
+      if (!n.isExported) continue;
+      if (!idx.byName.has(n.name)) idx.byName.set(n.name, n);
+      if (idx.defaultComponent === undefined && n.kind === 'component') idx.defaultComponent = n;
+      if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class')) idx.defaultFnClass = n;
+    }
+    perFile.set(filePath, idx);
+  }
+  return idx;
+}
+
+/** Drop the per-context memo tables (see ReferenceResolver.clearCaches). */
+export function clearImportResolverMemos(context: ResolutionContext): void {
+  importPathMemos.delete(context);
+  exportedSymbolMemos.delete(context);
+  fileExportIndexes.delete(context);
+}
+
 export function resolveImportPath(
+  importPath: string,
+  fromFile: string,
+  language: Language,
+  context: ResolutionContext
+): string | null {
+  let memo = importPathMemos.get(context);
+  if (!memo) {
+    memo = new Map();
+    importPathMemos.set(context, memo);
+  }
+  const key = `${language}\0${fromFile}\0${importPath}`;
+  const hit = memo.get(key);
+  if (hit !== undefined || memo.has(key)) return hit ?? null;
+  const resolved = resolveImportPathUncached(importPath, fromFile, language, context);
+  memo.set(key, resolved);
+  return resolved;
+}
+
+function resolveImportPathUncached(
   importPath: string,
   fromFile: string,
   language: Language,
@@ -1292,6 +1374,30 @@ export function resolveViaImport(
     return null;
   }
 
+  // Nix static project-path imports (`import ./x.nix`, `builtins.import ./dir`,
+  // `import ./x.nix {}`) resolve to file nodes only. Do not resolve
+  // angle-bracket channels, attribute expressions, variables, or other dynamic
+  // expressions as project files.
+  if (isNixPathImportRef(ref)) {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
+    return null;
+  }
+
   // Use cached import mappings (avoids re-reading and re-parsing per ref)
   const imports = context.getImportMappings(ref.filePath, ref.language);
   if (imports.length === 0 && !context.readFile(ref.filePath)) {
@@ -1411,6 +1517,18 @@ export function resolveViaImport(
                 resolvedBy: 'import',
               };
             }
+            // An imported VALUE (singleton constant / shared instance) called
+            // through a member: `reproStore.notifyJoinGuildStatus()` after
+            // `import { reproStore } from './store'`. findExportedSymbol
+            // resolved the CONSTANT itself; linking the CALL there hides the
+            // real callee — callers of the method miss every cross-file use
+            // and the method can look unused (#1292). Infer the value's type
+            // from its own declaration in the exporting file and resolve the
+            // member on that type. resolveMethodOnType VALIDATES the type
+            // declares the method, so a mis-inference falls through to the
+            // constant edge below rather than fabricating a wrong one.
+            const instanceMember = resolveImportedInstanceMember(targetNode, ref, imp.localName, context);
+            if (instanceMember) return instanceMember;
           }
 
           return {
@@ -1939,11 +2057,44 @@ function findExportedSymbol(
   visited: Set<string>,
   depth = 0
 ): Node | undefined {
+  // Memoize fresh (top-level) lookups only: recursive re-export steps carry a
+  // populated `visited` set, whose contents change the reachable answer.
+  // Every ref to the same imported symbol repeats this exact walk, so the
+  // top-level memo removes the re-export chase + per-file linear scans from
+  // all but the first occurrence.
+  if (depth === 0 && visited.size === 0) {
+    let memo = exportedSymbolMemos.get(context);
+    if (!memo) {
+      memo = new Map();
+      exportedSymbolMemos.set(context, memo);
+    }
+    const key = `${filePath}\0${want.isDefault ? 1 : 0}${want.isNamespace ? 1 : 0}\0${want.exportedName}\0${want.memberName ?? ''}\0${language}`;
+    if (memo.has(key)) return memo.get(key);
+    const result = findExportedSymbolWalk(filePath, want, language, context, visited, depth);
+    memo.set(key, result);
+    return result;
+  }
+  return findExportedSymbolWalk(filePath, want, language, context, visited, depth);
+}
+
+function findExportedSymbolWalk(
+  filePath: string,
+  want: {
+    isDefault: boolean;
+    isNamespace: boolean;
+    exportedName: string;
+    memberName: string | null;
+  },
+  language: Language,
+  context: ResolutionContext,
+  visited: Set<string>,
+  depth: number
+): Node | undefined {
   if (depth > REEXPORT_MAX_DEPTH) return undefined;
   if (visited.has(filePath)) return undefined;
   visited.add(filePath);
 
-  const nodesInFile = context.getNodesInFile(filePath);
+  const exportIndex = getFileExportIndex(filePath, context);
 
   // 1. Direct hit: the symbol is declared in this file.
   if (want.isDefault) {
@@ -1953,21 +2104,13 @@ function findExportedSymbol(
     // `.ts`/`.tsx` `export default fn`/`class` case. Without the component
     // branch, an `export { default as X } from './X.svelte'` barrel never
     // resolves and the component shows a false 0 callers (#629).
-    const direct =
-      nodesInFile.find((n) => n.isExported && n.kind === 'component') ??
-      nodesInFile.find(
-        (n) => n.isExported && (n.kind === 'function' || n.kind === 'class')
-      );
+    const direct = exportIndex.defaultComponent ?? exportIndex.defaultFnClass;
     if (direct) return direct;
   } else if (want.isNamespace && want.memberName) {
-    const direct = nodesInFile.find(
-      (n) => n.name === want.memberName && n.isExported
-    );
+    const direct = exportIndex.byName.get(want.memberName);
     if (direct) return direct;
   } else {
-    const direct = nodesInFile.find(
-      (n) => n.name === want.exportedName && n.isExported
-    );
+    const direct = exportIndex.byName.get(want.exportedName);
     if (direct) return direct;
   }
 
@@ -2032,6 +2175,48 @@ const STATIC_MEMBER_CONTAINERS = new Set<Node['kind']>([
  * languages whose members aren't `::`-qualified, and genuine class references,
  * are unaffected. See #825.
  */
+/**
+ * Resolve a CALL through an imported value to the method on the value's own
+ * type: `reproStore.notifyJoinGuildStatus()` where `reproStore` is
+ * `export const reproStore = new ReproStore()` in the imported file (#1292).
+ * The same-file form of this call already resolves via local-variable
+ * receiver inference (#1108); this is the cross-file/import half. The type is
+ * recovered from the VALUE'S OWN declaration lines in the exporting file
+ * (initializer `= new T(...)` or a type annotation, per the shared #1108
+ * pattern table), then the member is resolved AND VALIDATED on that type by
+ * resolveMethodOnType — a failed inference or validation returns null so the
+ * caller keeps its existing constant-edge behavior.
+ */
+function resolveImportedInstanceMember(
+  value: Node,
+  ref: UnresolvedRef,
+  localName: string,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
+  if (value.kind !== 'constant' && value.kind !== 'variable') return null;
+  const member = ref.referenceName.slice(localName.length + 1).split('.')[0];
+  if (!member) return null;
+
+  const source = context.readFile(value.filePath);
+  if (!source) return null;
+  // Only the value's own declaration lines — never the whole file, so a
+  // same-named identifier elsewhere can't donate a type.
+  const lines = source.split('\n');
+  const declSlice = lines.slice(Math.max(0, value.startLine - 1), value.endLine).join('\n');
+
+  const receiver = value.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const pattern of localReceiverTypePatterns(value.language as Language, receiver)) {
+    const m = declSlice.match(pattern);
+    if (!m || !m[1]) continue;
+    const typeName = normalizeInferredTypeName(m[1]);
+    if (!typeName) continue;
+    const resolved = resolveMethodOnType(typeName, member, ref, context, 0.85, 'instance-method');
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
 function resolveStaticMember(
   container: Node,
   ref: UnresolvedRef,

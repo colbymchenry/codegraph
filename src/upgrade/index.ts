@@ -28,6 +28,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import { spawnSync } from 'child_process';
+import { ansiColorsEnabled } from '../ui/color';
 
 export const REPO = 'colbymchenry/codegraph';
 export const NPM_PACKAGE = '@colbymchenry/codegraph';
@@ -99,19 +100,20 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   const P = isWin ? path.win32 : path.posix;
   const binDir = P.dirname(input.filename); // <…>/bin
 
-  // Bundle: <root>/lib/dist/bin/codegraph.js → <root> is up 3 from bin/.
-  // A bundle has a vendored node + a launcher script as siblings of lib/.
-  const bundleRoot = P.resolve(binDir, '..', '..', '..');
-  const vendoredNode = P.join(bundleRoot, isWin ? 'node.exe' : 'node');
-  const launcher = P.join(bundleRoot, 'bin', isWin ? 'codegraph.cmd' : 'codegraph');
-  if (exists(vendoredNode) && exists(launcher)) {
-    const os = isWin ? 'windows' : 'unix';
-    return { kind: 'bundle', os, bundleRoot, installDir: deriveInstallDir(bundleRoot, os, exists) };
-  }
-
   const norm = toPosix(input.filename);
 
+  // Path-based checks come FIRST. The npm thin-installer's per-platform
+  // package (@colbymchenry/codegraph-<platform>-<arch>) is itself a complete
+  // bundle — vendored node + bin/ launcher — living inside node_modules, so
+  // the layout sniff below would misread every npm install as a standalone
+  // bundle. `upgrade` would then curl install.sh into ~/.codegraph: a SECOND
+  // install that never wins the PATH race against npm's shim, leaving
+  // `codegraph -v` permanently on the old version (the #1071 shadow,
+  // self-inflicted). A path under node_modules is authoritative about HOW the
+  // user installed, whatever the artifact inside looks like.
+
   // npx cache: <…>/_npx/<hash>/node_modules/@colbymchenry/codegraph/…
+  // (checked before npm — the npx cache path also contains /node_modules/).
   if (norm.includes('/_npx/')) {
     return { kind: 'npx' };
   }
@@ -120,6 +122,16 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   if (norm.includes('/node_modules/')) {
     const underCwd = norm.startsWith(toPosix(P.resolve(input.cwd)) + '/');
     return { kind: 'npm', scope: underCwd ? 'local' : 'global' };
+  }
+
+  // Bundle: <root>/lib/dist/bin/codegraph.js → <root> is up 3 from bin/.
+  // A bundle has a vendored node + a launcher script as siblings of lib/.
+  const bundleRoot = P.resolve(binDir, '..', '..', '..');
+  const vendoredNode = P.join(bundleRoot, isWin ? 'node.exe' : 'node');
+  const launcher = P.join(bundleRoot, 'bin', isWin ? 'codegraph.cmd' : 'codegraph');
+  if (exists(vendoredNode) && exists(launcher)) {
+    const os = isWin ? 'windows' : 'unix';
+    return { kind: 'bundle', os, bundleRoot, installDir: deriveInstallDir(bundleRoot, os, exists) };
   }
 
   // Source checkout: running <repo>/dist/bin/codegraph.js with a sibling .git.
@@ -278,19 +290,30 @@ export interface UpgradeDeps {
   resolveLatest: (pin?: string) => Promise<string>;
   /** Run a command inheriting stdio; returns its exit code (-1 = spawn failed). */
   run: (cmd: string, args: string[], env?: NodeJS.ProcessEnv) => number;
+  /** Run a command capturing stdout (nothing reaches the terminal); null = spawn failed. */
+  capture: (cmd: string, args: string[]) => { code: number; stdout: string } | null;
   hasCommand: (cmd: string) => boolean;
   log: (msg: string) => void;
   warn: (msg: string) => void;
   error: (msg: string) => void;
   platform: NodeJS.Platform;
+  /**
+   * Offer the one-time CodeGraph Pro beta opt-in after a successful update
+   * (see installer/beta-signup — self-gating: TTY only, and silent forever
+   * once any install/upgrade ask was answered). Optional so unit tests and
+   * embedded callers stay prompt-free; never fatal to the upgrade.
+   */
+  offerBetaSignup?: () => Promise<void>;
 }
 
+// Colors off when piped / NO_COLOR / --no-color (#1281).
+const useColor = ansiColorsEnabled();
 const c = {
-  bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
-  dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
-  green: (s: string) => `\x1b[32m${s}\x1b[0m`,
-  yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
-  cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,
+  bold: (s: string) => (useColor ? `\x1b[1m${s}\x1b[0m` : s),
+  dim: (s: string) => (useColor ? `\x1b[2m${s}\x1b[0m` : s),
+  green: (s: string) => (useColor ? `\x1b[32m${s}\x1b[0m` : s),
+  yellow: (s: string) => (useColor ? `\x1b[33m${s}\x1b[0m` : s),
+  cyan: (s: string) => (useColor ? `\x1b[36m${s}\x1b[0m` : s),
 };
 
 /** The honest, additive re-index reminder shown after a successful upgrade. */
@@ -376,13 +399,126 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
   // an existing Claude config, and skipped entirely by the kill-switch. Never
   // fatal to the upgrade.
   if (code === 0) {
+    let probe: VersionProbe = 'inconclusive';
+    try {
+      probe = reportResolvedVersion(latest, deps);
+    } catch {
+      /* an inconclusive probe must not fail the upgrade */
+    }
     try {
       await selfHealPromptHook(deps);
     } catch {
       /* a hook-wiring hiccup must not fail the upgrade */
     }
+    // The refresh executes whatever `codegraph` PATH resolves. If the probe
+    // just proved that's a stale shadowed install, spawning it would rewrite
+    // the agent surfaces with the very templates the refresh exists to heal —
+    // skip, and point at the manual command for after the PATH is fixed.
+    if (probe !== 'mismatch') {
+      try {
+        selfHealInstalledSurfaces(deps);
+      } catch {
+        /* a refresh hiccup must not fail the upgrade */
+      }
+    } else {
+      deps.log(c.dim('Skipped refreshing agent instructions/config — run `codegraph install --refresh` once the PATH is fixed.'));
+    }
+    // Reached only after a real binary update (check/up-to-date/npx/source
+    // all returned earlier) — the one place the upgrade path may offer the
+    // beta opt-in. The hook self-gates on TTY + the stored once-per-machine
+    // choice, so an already-answered user never sees it again.
+    try {
+      await deps.offerBetaSignup?.();
+    } catch {
+      /* a marketing question must never fail the upgrade */
+    }
   }
   return code;
+}
+
+type VersionProbe = 'match' | 'mismatch' | 'inconclusive';
+
+/**
+ * Prove the upgrade actually took: spawn the `codegraph` this terminal's PATH
+ * resolves and compare its reported version to the target. Catches the silent
+ * failure mode where ANOTHER install shadows the one we just upgraded (issue
+ * #1071 — e.g. a stale `npm i -g` copy earlier on PATH than the bundle
+ * launcher): the upgrade "succeeds" but `codegraph -v` — in this terminal and
+ * every future one — keeps serving the old version. Exported for unit tests.
+ */
+export function verifyResolvedVersion(latest: string, deps: UpgradeDeps): VersionProbe {
+  if (!deps.hasCommand('codegraph')) return 'inconclusive';
+  // Windows installs expose codegraph through a .cmd launcher; Node can't
+  // spawn .cmd files without a shell, so route through cmd.exe there.
+  const probe = deps.platform === 'win32'
+    ? deps.capture('cmd.exe', ['/d', '/s', '/c', 'codegraph --version'])
+    : deps.capture('codegraph', ['--version']);
+  if (!probe || probe.code !== 0) return 'inconclusive';
+  // `codegraph --version` prints the bare version; take the last non-empty
+  // line so a stray runtime warning above it can't spoil the parse.
+  const reported = probe.stdout.trim().split(/\r?\n/).pop()?.trim() ?? '';
+  if (!parseSemver(reported)) return 'inconclusive';
+  return compareVersions(reported, latest) === 0 ? 'match' : 'mismatch';
+}
+
+/**
+ * Log the outcome of the post-upgrade version probe. On a match the user
+ * knows the current terminal is already serving the new version; on a
+ * mismatch they get told exactly which stale install is hijacking their PATH
+ * instead of discovering it via a mysteriously unchanged `codegraph -v`.
+ * Inconclusive probes fall back to the old soft hint — never a scare on
+ * setups we can't inspect (no `codegraph` on PATH yet, exotic wrappers).
+ * Returns the probe result so the caller can gate the post-upgrade refresh
+ * (which spawns the PATH-resolved binary) on it.
+ */
+function reportResolvedVersion(latest: string, deps: UpgradeDeps): VersionProbe {
+  const { method } = deps;
+  // A project-local npm install isn't served by PATH's `codegraph` (that
+  // would be some other install) — a probe could only false-alarm.
+  if (method.kind === 'npm' && method.scope === 'local') return 'inconclusive';
+  const probe = verifyResolvedVersion(latest, deps);
+  switch (probe) {
+    case 'match':
+      deps.log(c.green(`✓ \`codegraph\` on your PATH now reports ${latest} — this terminal is already using it.`));
+      break;
+    case 'mismatch':
+      deps.warn(`Installed ${latest}, but the \`codegraph\` this terminal resolves still reports an older version.`);
+      deps.log(c.dim('Another CodeGraph install earlier on your PATH is shadowing the one just upgraded.'));
+      deps.log(c.dim('Find every copy with `which -a codegraph` (Windows: `where codegraph`) and remove or upgrade the stale one.'));
+      break;
+    case 'inconclusive':
+      deps.log(c.dim('Open a new terminal if `codegraph --version` looks unchanged (PATH cache).'));
+      break;
+  }
+  return probe;
+}
+
+/**
+ * Refresh the agent surfaces previous installs wrote — the marker-fenced
+ * instructions sections (CLAUDE.md / AGENTS.md / GEMINI.md), MCP entries,
+ * legacy-hook cleanups — so they match the version that will serve them.
+ * Unlike the prompt hook above, this content is NOT version-agnostic: the
+ * templates are baked into the binary, so the still-running old process
+ * would only rewrite its own stale copy — the exact staleness this heals.
+ * We therefore spawn the freshly-installed binary (`codegraph install
+ * --refresh`), which is refresh-only: agents never configured stay
+ * untouched, and permission / prompt-hook choices are preserved. Gated on
+ * `codegraph` being resolvable on PATH (an npm-local install isn't) and on
+ * the kill-switch; never fatal to the upgrade.
+ */
+function selfHealInstalledSurfaces(deps: UpgradeDeps): void {
+  if (process.env.CODEGRAPH_NO_INSTALL_REFRESH === '1') return;
+  if (!deps.hasCommand('codegraph')) return;
+  deps.log(c.dim('Refreshing agent instruction sections and config written by previous versions…'));
+  // Windows installs expose codegraph through a .cmd launcher. Node cannot
+  // spawn .cmd files directly without a shell, so route the constant command
+  // through cmd.exe there (the same launcher a terminal would resolve).
+  const code = deps.platform === 'win32'
+    ? deps.run('cmd.exe', ['/d', '/s', '/c', 'codegraph install --refresh'])
+    : deps.run('codegraph', ['install', '--refresh']);
+  if (code !== 0) {
+    deps.warn('Could not refresh the installed agent surfaces — run `codegraph install --refresh` manually.');
+  }
 }
 
 /**
@@ -429,7 +565,9 @@ function upgradeUnixBundle(
     return 1;
   }
   deps.log('');
-  deps.log(c.green('✓ Upgrade complete.') + c.dim(' Open a new terminal if the version looks unchanged (PATH cache).'));
+  // No "open a new terminal" hedge here — after the swap, runUpgrade probes
+  // the PATH-resolved `codegraph --version` and reports the real outcome.
+  deps.log(c.green('✓ Upgrade complete.'));
   deps.log(reindexAdvisory());
   return 0;
 }
@@ -484,9 +622,26 @@ function upgradeWindowsBundle(
     return 1;
   }
   deps.log('');
-  deps.log(c.green('✓ Upgrade complete.') + c.dim(' Open a new terminal to be safe (PATH/version cache).'));
+  // The running node.exe was renamed aside, so the version probe in
+  // runUpgrade already exercises the NEW binary — no terminal hedge needed.
+  deps.log(c.green('✓ Upgrade complete.'));
   deps.log(reindexAdvisory());
   return 0;
+}
+
+/**
+ * How to invoke npm. On Windows npm is a .cmd batch file, which Node refuses
+ * to spawn without a shell (EINVAL since the CVE-2024-27980 hardening) — a
+ * direct `npm.cmd` spawn fails on every current Node, so route it through
+ * cmd.exe, the same way the surface-refresh step invokes the .cmd launcher.
+ * (Verified live on the Windows VM: `spawnSync('npm.cmd')` → EINVAL;
+ * `cmd.exe /d /s /c npm …` → works.)
+ */
+export function npmInvocation(platform: NodeJS.Platform, npmArgs: string[]): { cmd: string; args: string[] } {
+  if (platform === 'win32') {
+    return { cmd: 'cmd.exe', args: ['/d', '/s', '/c', ['npm', ...npmArgs].join(' ')] };
+  }
+  return { cmd: 'npm', args: npmArgs };
 }
 
 function upgradeNpm(
@@ -494,12 +649,12 @@ function upgradeNpm(
   versionSpec: string,
   deps: UpgradeDeps
 ): number {
-  const npm = deps.platform === 'win32' ? 'npm.cmd' : 'npm';
   const args = method.scope === 'global'
     ? ['install', '-g', `${NPM_PACKAGE}@${versionSpec}`]
     : ['install', `${NPM_PACKAGE}@${versionSpec}`];
-  deps.log(c.dim(`Running: ${npm} ${args.join(' ')}`));
-  const code = deps.run(npm, args, process.env);
+  deps.log(c.dim(`Running: npm ${args.join(' ')}`));
+  const inv = npmInvocation(deps.platform, args);
+  const code = deps.run(inv.cmd, inv.args, process.env);
   if (code !== 0) {
     deps.error(`npm exited with code ${code}.`);
     if (method.scope === 'global') {
@@ -549,4 +704,13 @@ export function defaultRun(cmd: string, args: string[], env?: NodeJS.ProcessEnv)
   const r = spawnSync(cmd, args, { stdio: 'inherit', env: env ?? process.env, windowsHide: true });
   if (r.error) return -1;
   return r.status ?? -1;
+}
+
+export function defaultCapture(cmd: string, args: string[]): { code: number; stdout: string } | null {
+  // stdio is piped (the default with `encoding`), so nothing the probed
+  // command prints reaches the user's terminal. The timeout keeps a wedged
+  // probe from hanging the upgrade's last step.
+  const r = spawnSync(cmd, args, { encoding: 'utf-8', windowsHide: true, timeout: 30_000 });
+  if (r.error) return null;
+  return { code: r.status ?? -1, stdout: r.stdout ?? '' };
 }

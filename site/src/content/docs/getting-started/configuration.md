@@ -1,9 +1,9 @@
 ---
 title: Configuration
-description: CodeGraph is zero-config by default, with one optional codegraph.json for custom extensions, excluding tracked directories, and indexing nested git repositories.
+description: CodeGraph is zero-config by default, with one optional codegraph.json for custom extensions, excluding tracked directories, indexing gitignored source, and indexing nested git repositories.
 ---
 
-Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions), [excluding tracked directories](#excluding-a-tracked-directory), and [indexing nested git repositories](#indexing-nested-git-repositories).
+Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions), [excluding tracked directories](#excluding-a-tracked-directory), [indexing gitignored source](#indexing-gitignored-source-a-second-vcs), and [indexing nested git repositories](#indexing-nested-git-repositories).
 
 ## What it skips out of the box
 
@@ -30,6 +30,28 @@ The defaults apply uniformly, so committing a dependency or build directory does
 Each entry is a gitignore-style pattern, matched against project-root-relative paths, and honored everywhere CodeGraph looks at files — the full index, incremental `sync`, and file-watching. It applies even to tracked files (that's the whole point) and takes precedence over everything else, so it's the right tool for a large committed dependency that bloats the graph but isn't really your code. (This is the opposite of [`includeIgnored`](#indexing-nested-git-repositories), which pulls gitignored directories back *in*.)
 
 Re-index (`codegraph index`) after adding or changing `exclude`.
+
+## Indexing gitignored source (a second VCS)
+
+`.gitignore` keeps files out of the index — which is usually what you want, but not when the gitignored files are real first-party source. The case this exists for: a project tracked by **SVN, Perforce, or another VCS alongside Git**, where some source is committed to that VCS and deliberately listed in `.gitignore` so it never lands in Git. That source is still yours and you want it in the graph, but git never lists it, so CodeGraph never sees it. (`includeIgnored` doesn't help — it only revives *embedded git repositories* inside a gitignored directory, not plain source.)
+
+List those paths under `include` in `codegraph.json` to force them in:
+
+```json
+{
+  "include": ["Tools/", "Local/typescript/"]
+}
+```
+
+Each entry is a gitignore-style pattern, matched against project-root-relative paths (a directory like `"Tools/"`, a recursive `"Tools/**"` glob, or a single file all work). CodeGraph discovers the matching files directly off disk — overriding `.gitignore` — and indexes them everywhere it looks at files: the full index, incremental `sync`, and file-watching.
+
+A few things to know:
+
+- An explicit [`exclude`](#excluding-a-tracked-directory) still wins — listing the same path in both keeps it out.
+- Built-in skips like `node_modules`, `dist`, and `.git` are never re-included, even when an `include` pattern would match inside them.
+- This is the opposite of `exclude` (which keeps tracked files *out*); it's for source git itself never tracks.
+
+Re-index (`codegraph index`) after adding or changing `include`.
 
 ## Custom file extensions
 
