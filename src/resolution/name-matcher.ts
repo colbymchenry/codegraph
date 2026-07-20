@@ -47,10 +47,11 @@ export function matchByFilePath(
   const [pathWithoutAnchor, symbolName] = splitFileSymbol(pathAndSymbol);
   // Path-like (`a/b.liquid`) OR a bare filename ending in a short extension
   // (`Foo.h` — an Objective-C `#import "Foo.h"`, resolved to the header by
-  // basename). A bare ref WITHOUT an extension is a symbol name, not a file, so
-  // leave it to the symbol-matching strategies. The anchor/symbol suffix is
-  // already split off above, so `docs/guide.md#section` is judged on the path.
-  if (!pathWithoutAnchor.includes('/') && !/\.[A-Za-z][A-Za-z0-9]{0,3}$/.test(pathWithoutAnchor)) {
+  // basename) or `.markdown`. A bare ref WITHOUT an extension is a symbol name,
+  // not a file, so leave it to the symbol-matching strategies. The anchor/symbol
+  // suffix is already split off above, so `docs/guide.md#section` is judged on
+  // the path.
+  if (!pathWithoutAnchor.includes('/') && !/(?:\.[A-Za-z][A-Za-z0-9]{0,3}|\.markdown)$/i.test(pathWithoutAnchor)) {
     return null;
   }
 

@@ -305,6 +305,29 @@ node scripts/release.mjs
     );
   });
 
+  it('should keep structured blocks after fences containing a different fence marker', () => {
+    const markdown = `# Runbook
+
+\`\`\`text
+~~~~
+\`\`\`
+
+- POST-FENCE references \`src/auth.ts::login\`.
+
+| Key | Target |
+| --- | --- |
+| POST-TABLE | \`src/auth.ts::login\` |
+`;
+
+    const result = extractFromSource('docs/runbook.md', markdown);
+    const constants = result.nodes.filter((n) => n.kind === 'constant');
+
+    expect(constants).toEqual(expect.arrayContaining([
+      expect.objectContaining({ docstring: 'POST-FENCE references src/auth.ts::login.' }),
+      expect.objectContaining({ name: 'POST-TABLE' }),
+    ]));
+  });
+
   it('indexes Setext (underline) headings and skips frontmatter / code fences', () => {
     const markdown = `---
 title: Config Doc

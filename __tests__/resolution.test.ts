@@ -400,6 +400,32 @@ describe('Resolution Module', () => {
           endColumn: 9,
           updatedAt: Date.now(),
         },
+        {
+          id: 'file:GUIDE.markdown',
+          kind: 'file',
+          name: 'GUIDE.markdown',
+          qualifiedName: 'GUIDE.markdown',
+          filePath: 'GUIDE.markdown',
+          language: 'markdown',
+          startLine: 1,
+          endLine: 10,
+          startColumn: 0,
+          endColumn: 0,
+          updatedAt: Date.now(),
+        },
+        {
+          id: 'module:GUIDE.markdown:install:1',
+          kind: 'module',
+          name: 'Install',
+          qualifiedName: 'GUIDE.markdown#install',
+          filePath: 'GUIDE.markdown',
+          language: 'markdown',
+          startLine: 1,
+          endLine: 10,
+          startColumn: 0,
+          endColumn: 9,
+          updatedAt: Date.now(),
+        },
       ];
 
       const context: ResolutionContext = {
@@ -410,7 +436,7 @@ describe('Resolution Module', () => {
         fileExists: () => true,
         readFile: () => null,
         getProjectRoot: () => '/test',
-        getAllFiles: () => ['README.md', 'docs/setup.md'],
+        getAllFiles: () => ['README.md', 'docs/setup.md', 'GUIDE.markdown'],
         getNodesByLowerName: () => [],
         getImportMappings: () => [],
       };
@@ -429,9 +455,15 @@ describe('Resolution Module', () => {
         referenceName: 'docs/setup.md#install',
         filePath: 'README.md',
       };
+      const markdownRef = {
+        ...readmeRef,
+        referenceName: 'GUIDE.markdown#install',
+        filePath: 'README.md',
+      };
 
       expect(matchReference(readmeRef, context)?.targetNodeId).toBe('file:README.md');
       expect(matchReference(setupRef, context)?.targetNodeId).toBe('module:docs/setup.md:install:1');
+      expect(matchReference(markdownRef, context)?.targetNodeId).toBe('module:GUIDE.markdown:install:1');
     });
 
     it('should resolve Markdown file-symbol references to symbols in the referenced file', () => {

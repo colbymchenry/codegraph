@@ -252,8 +252,16 @@ export class MarkdownExtractor {
       const line = this.lines[i]!;
       const fenceMatch = /^(\s*)(`{3,}|~{3,})/.exec(line);
       if (fenceMatch) {
-        const marker = fenceMatch[2]![0]!.repeat(fenceMatch[2]!.length);
-        inFence = inFence === marker ? null : marker;
+        const marker = fenceMatch[2]!;
+        if (inFence === null) {
+          inFence = marker;
+        } else if (
+          marker[0] === inFence[0] &&
+          marker.length >= inFence.length &&
+          line.slice(fenceMatch[0].length).trim() === ''
+        ) {
+          inFence = null;
+        }
         continue;
       }
       if (inFence) continue;
@@ -286,8 +294,16 @@ export class MarkdownExtractor {
       const line = this.lines[i]!;
       const fenceMatch = /^(\s*)(`{3,}|~{3,})/.exec(line);
       if (fenceMatch) {
-        const marker = fenceMatch[2]![0]!.repeat(fenceMatch[2]!.length);
-        inFence = inFence === marker ? null : marker;
+        const marker = fenceMatch[2]!;
+        if (inFence === null) {
+          inFence = marker;
+        } else if (
+          marker[0] === inFence[0] &&
+          marker.length >= inFence.length &&
+          line.slice(fenceMatch[0].length).trim() === ''
+        ) {
+          inFence = null;
+        }
         continue;
       }
       if (inFence) continue;
