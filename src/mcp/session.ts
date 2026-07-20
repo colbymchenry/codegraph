@@ -16,10 +16,11 @@ import * as path from 'path';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
 import { tools } from './tools';
-import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_UNINDEXED } from './server-instructions';
+import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server-instructions';
 import { CodeGraphPackageVersion } from './version';
 import { findNearestCodeGraphRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
+import { getUpdateNotice } from '../upgrade/update-check';
 
 /**
  * MCP Server Info — kept on the session because some clients log it. The
@@ -31,6 +32,27 @@ export const SERVER_INFO = {
   name: 'codegraph',
   version: CodeGraphPackageVersion,
 };
+
+/**
+ * Instructions for the `initialize` response, with the update-availability
+ * notice appended when one is known (#1243). Exported so the proxy's local
+ * handshake sends the IDENTICAL payload — same convention as SERVER_INFO.
+ * `getUpdateNotice` is a memoized synchronous cache read, so the #172
+ * respond-fast contract holds; when no notice exists the instructions are
+ * byte-identical to the bare constants.
+ *
+ * Test-authoring note: on a machine whose real `~/.codegraph` cache knows a
+ * newer release, spawned servers append the notice — a test asserting exact
+ * instructions equality must set `CODEGRAPH_NO_UPDATE_CHECK=1` in the spawn
+ * env or it will fail only in the weeks after a release ships.
+ */
+export function initializeInstructions(base: string, notice: string | null = getUpdateNotice()): string {
+  if (!notice) return base;
+  return (
+    `${base}\n\n---\n${notice} This server keeps running the old version until ` +
+    `the user upgrades — mention it when convenient; do not run the upgrade yourself.`
+  );
+}
 
 /** MCP Protocol Version (latest the server claims). */
 export const PROTOCOL_VERSION = '2024-11-05';
@@ -189,16 +211,17 @@ export class MCPSession {
       explicitPath = this.explicitProjectPath;
     }
 
-    // Pick the instructions variant by the workspace's index state — a cheap
+    // Pick the instructions variant by the root's index state — a cheap
     // synchronous walk-up (existsSync loop only, no DB open, so the #172
-    // respond-fast contract holds). An unindexed workspace gets the short
-    // "inactive this session" note instead of the full playbook: the playbook
-    // tells the agent to lean on tools that would all fail, and early failures
-    // teach the agent to abandon codegraph entirely. `tools/list` is gated the
-    // same way (empty list when unindexed). When no explicit path is known yet
-    // (roots/list dance pending), cwd is the best predictor of where the
-    // default project will resolve — and on a mismatch the worst case is the
-    // optimistic full playbook backstopped by the empty tool list.
+    // respond-fast contract holds). When the root IS indexed, send the full
+    // single-project playbook. When it ISN'T, send the per-project variant
+    // (tools are still exposed — see handleToolsList): it tells the agent there
+    // is no default project and to pass `projectPath` to any project that has a
+    // `.codegraph/`. Gating tool AVAILABILITY on whether `./` is indexed was the
+    // #964 bug — it broke monorepos (only sub-projects indexed) and never
+    // surfaced the tools after a mid-session `codegraph init`. When no explicit
+    // path is known yet (roots/list dance pending), cwd is the best predictor of
+    // where the default project will resolve.
     const indexed = findNearestCodeGraphRoot(explicitPath ?? process.cwd()) !== null;
 
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.
@@ -206,7 +229,7 @@ export class MCPSession {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
-      instructions: indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_UNINDEXED,
+      instructions: initializeInstructions(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX),
     });
 
     if (explicitPath) {
@@ -219,15 +242,19 @@ export class MCPSession {
 
   private async handleToolsList(request: JsonRpcRequest): Promise<void> {
     await this.retryInitIfNeeded();
-    // An unindexed workspace serves an EMPTY tool list: absence is the one
-    // signal an agent can't misread. Listing 8 tools that all fail wastes the
-    // agent's calls and teaches it codegraph is broken (observed: one or two
-    // early isError responses and the agent stops calling codegraph for the
-    // whole session). A `codegraph init` run after the server started is
-    // picked up on the next tools/list — retryInitIfNeeded re-walks — though
-    // most hosts only request the list once per connection.
+    // Always expose the tools — even when the server root has no index. Gating
+    // availability on whether `./` is indexed (the old behavior) breaks the
+    // monorepo case where only sub-projects carry a `.codegraph/` (the agent
+    // saw zero tools and couldn't even reach an indexed sub-project by
+    // `projectPath`), and it hides the tools from a session that started before
+    // the user ran `codegraph init` (most hosts request the list once, so the
+    // freshly-built index never surfaces). #964. The not-indexed case is still
+    // safe: a call against an un-indexed path returns SUCCESS-shaped guidance
+    // ("pass projectPath / run codegraph init"), never `isError`, so it can't
+    // teach the agent to abandon codegraph. `getTools()` returns the default
+    // surface even before a project is open.
     this.transport.sendResult(request.id, {
-      tools: this.engine.hasDefaultCodeGraph() ? this.engine.getToolHandler().getTools() : [],
+      tools: this.engine.getToolHandler().getTools(),
     });
   }
 
@@ -255,9 +282,12 @@ export class MCPSession {
       return;
     }
 
+    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} pre-init\n`);
     await this.retryInitIfNeeded();
 
+    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);
     const result = await this.engine.getToolHandler().execute(toolName, toolArgs);
+    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} done\n`);
     this.transport.sendResult(request.id, result);
     // After the reply is on the wire — telemetry must never delay a tool
     // response (in-memory increment only; see src/telemetry).

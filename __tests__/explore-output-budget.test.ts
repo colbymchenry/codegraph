@@ -10,7 +10,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { getExploreOutputBudget, getExploreBudget, ToolHandler } from '../src/mcp/tools';
+import { getExploreOutputBudget, getExploreBudget, normalizeQuerySpelling, ToolHandler } from '../src/mcp/tools';
 import CodeGraph from '../src/index';
 
 describe('getExploreOutputBudget', () => {
@@ -206,8 +206,8 @@ describe('codegraph_explore output respects the adaptive budget', () => {
     const text = result.content?.[0]?.text ?? '';
     // Either there are relationships, or no edges were significant — both are fine.
     // We just want to confirm we did not accidentally gate it off.
-    const hasRelationships = text.includes('### Relationships');
-    const sourceFollowsHeader = text.indexOf('### Source Code') > 0;
+    const hasRelationships = text.includes('**Relationships');
+    const sourceFollowsHeader = text.indexOf('**Source Code') > 0;
     expect(hasRelationships || sourceFollowsHeader).toBe(true);
   });
 
@@ -252,5 +252,29 @@ describe('codegraph_explore output respects the adaptive budget', () => {
     // the `export class Session {` opener.
     const hasMethodBody = /method\d+\(arg: string\)/.test(text);
     expect(hasMethodBody).toBe(true);
+  });
+});
+
+describe('normalizeQuerySpelling (Erlang mod:fn/arity)', () => {
+  it('rewrites Erlang-native symbol spellings to pipeline shapes', () => {
+    expect(normalizeQuerySpelling('cowboy_stream_h:request_process/3'))
+      .toBe('cowboy_stream_h.request_process');
+    expect(normalizeQuerySpelling('ejabberd_router:route/1 do_route/1 session'))
+      .toBe('ejabberd_router.route do_route session');
+    expect(normalizeQuerySpelling('init/2 handle_call/3')).toBe('init handle_call');
+  });
+
+  it('leaves query-language field prefixes and other spellings alone', () => {
+    expect(normalizeQuerySpelling('kind:function lang:erlang route'))
+      .toBe('kind:function lang:erlang route');
+    expect(normalizeQuerySpelling('path:src/api name:auth')).toBe('path:src/api name:auth');
+    expect(normalizeQuerySpelling('Foo::bar baz')).toBe('Foo::bar baz');
+    expect(normalizeQuerySpelling('https://example.com/docs')).toBe('https://example.com/docs');
+    expect(normalizeQuerySpelling('meeting at 12:30')).toBe('meeting at 12:30');
+    expect(normalizeQuerySpelling('src/2fa/handler.ts')).toBe('src/2fa/handler.ts');
+  });
+
+  it('maps Lua colon-method spelling onto the qualified form', () => {
+    expect(normalizeQuerySpelling('logger:log message')).toBe('logger.log message');
   });
 });

@@ -324,6 +324,71 @@ describe('FileWatcher', () => {
     });
   });
 
+  describe('persistent sync-failure degradation (#1127)', () => {
+    it('disables auto-sync after a persistent non-lock sync failure, with bounded retries', async () => {
+      // A deterministic pipeline failure (broken extractor on a file, DB
+      // corruption, SQLITE_FULL, OOM) recurs every cycle. Unbounded it retried
+      // forever at the debounce cadence; it must now back off and degrade.
+      const syncFn = vi.fn().mockRejectedValue(new Error('extractor crashed on src/bad.ts'));
+      const onSyncComplete = vi.fn();
+      const onSyncError = vi.fn();
+      const onDegraded = vi.fn();
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const watcher = newWatcher(syncFn, {
+        debounceMs: 25,
+        onSyncComplete,
+        onSyncError,
+        onDegraded,
+      });
+      watcher.start();
+      await watcher.waitUntilReady();
+      __emitWatchEventForTests(testDir, 'src/persistent-fail.ts');
+
+      // 5 backoff retries (25·1,2,4,8,16 ms), then degrade on the 6th attempt.
+      await waitFor(() => !watcher.isActive(), 8000, 20);
+
+      expect(syncFn.mock.calls.length).toBeGreaterThanOrEqual(6); // MAX_SYNC_FAILURE_RETRIES + 1
+      expect(watcher.isDegraded()).toBe(true);
+      expect(onDegraded).toHaveBeenCalledTimes(1);
+      expect(onDegraded).toHaveBeenCalledWith(expect.stringContaining('auto-sync disabled'));
+      // The degrade reason carries the underlying error so the user can act.
+      expect(onDegraded).toHaveBeenCalledWith(expect.stringContaining('extractor crashed'));
+      // Unlike a held lock, a generic failure IS surfaced per-attempt.
+      expect(onSyncError.mock.calls.length).toBeGreaterThanOrEqual(6);
+      expect(onSyncComplete).not.toHaveBeenCalled();
+      // Degrade stops the watcher, which clears pending state.
+      expect(watcher.getPendingFiles()).toEqual([]);
+      const disableWarnings = warnSpy.mock.calls.filter(
+        (c) => typeof c[0] === 'string' && c[0].includes('File watcher disabled')
+      );
+      expect(disableWarnings).toHaveLength(1);
+    });
+
+    it('does NOT degrade on a transient sync failure — backoff resets after a clean sync', async () => {
+      const syncFn = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('transient blip'))
+        .mockRejectedValueOnce(new Error('transient blip'))
+        .mockRejectedValueOnce(new Error('transient blip'))
+        .mockResolvedValue({ filesChanged: 1, durationMs: 5 });
+      const onDegraded = vi.fn();
+      const onSyncComplete = vi.fn();
+      const watcher = newWatcher(syncFn, { debounceMs: 25, onDegraded, onSyncComplete });
+      watcher.start();
+      await watcher.waitUntilReady();
+      __emitWatchEventForTests(testDir, 'src/transient-fail.ts');
+
+      await waitFor(() => onSyncComplete.mock.calls.length > 0, 4000, 20);
+
+      expect(onDegraded).not.toHaveBeenCalled();
+      expect(watcher.isDegraded()).toBe(false);
+      expect(watcher.isActive()).toBe(true);
+      expect(watcher.getPendingFiles().some((p) => p.path === 'src/transient-fail.ts')).toBe(false);
+
+      watcher.stop();
+    });
+  });
+
   describe('debounced sync', () => {
     it('should trigger sync after file change', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
@@ -373,8 +438,11 @@ describe('FileWatcher', () => {
       watcher.start();
       await watcher.waitUntilReady();
 
-      // A non-source-file event — FileWatcher's `isSourceFile` gate must drop
-      // it before scheduling sync.
+      // An EXISTING non-source file changing — FileWatcher's `isSourceFile`
+      // gate must drop it before scheduling sync. (It must exist on disk:
+      // a VANISHED non-source path is the deleted-directory shape, which
+      // deliberately schedules a sync — #1285.)
+      fs.writeFileSync(path.join(testDir, 'src', 'styles.css'), 'body {}\n');
       __emitWatchEventForTests(testDir, 'src/styles.css');
 
       // Wait a bit longer than debounce — sync should NOT trigger.
@@ -382,6 +450,64 @@ describe('FileWatcher', () => {
       expect(syncFn).not.toHaveBeenCalled();
 
       watcher.stop();
+    });
+
+    it('a deleted directory schedules a sync so child records get removed (#1285)', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      // A directory deletion arrives as ONE event on the directory path —
+      // no extension, nothing on disk anymore. Must schedule a sync (the
+      // sync's scan-diff removes the children), not be dropped as
+      // "non-source".
+      const sub = path.join(testDir, 'docs');
+      fs.mkdirSync(path.join(sub, 'nested'), { recursive: true });
+      fs.writeFileSync(path.join(sub, 'nested', 'mod.ts'), 'export const q = 1;');
+      fs.rmSync(sub, { recursive: true, force: true });
+      __emitWatchEventForTests(testDir, 'docs');
+
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      expect(syncFn).toHaveBeenCalled();
+
+      watcher.stop();
+    });
+
+    it('end-to-end: deleting a subdirectory removes its files from the index via watch sync (#1285)', async () => {
+      // Real CodeGraph as the sync target; the watcher is inert and driven
+      // by the synthetic event seam for determinism.
+      fs.writeFileSync(path.join(testDir, 'root.ts'), 'export const r = 1;');
+      const deep = path.join(testDir, 'docs', 'a', 'b');
+      fs.mkdirSync(deep, { recursive: true });
+      fs.writeFileSync(path.join(deep, 'inner.ts'), 'export const i = 2;');
+
+      const cg = CodeGraph.initSync(testDir);
+      await cg.indexAll();
+      const before = cg.getFiles().map((f) => f.path);
+      expect(before).toContain('docs/a/b/inner.ts');
+
+      const syncFn = vi.fn(async () => {
+        const r = await cg.sync();
+        return { filesChanged: r.filesAdded + r.filesModified + r.filesRemoved, durationMs: r.durationMs };
+      });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      fs.rmSync(path.join(testDir, 'docs'), { recursive: true, force: true });
+      __emitWatchEventForTests(testDir, 'docs');
+
+      await waitFor(() => syncFn.mock.calls.length > 0, 5000);
+      // The sync body is async — poll the DB until the removal commits.
+      await waitFor(() => !cg.getFiles().some((f) => f.path.startsWith('docs/')), 5000);
+
+      const after = cg.getFiles().map((f) => f.path);
+      expect(after).toContain('root.ts');
+      expect(after.some((p) => p.startsWith('docs/'))).toBe(false);
+
+      watcher.stop();
+      cg.close();
     });
 
     it('should ignore .codegraph directory changes', async () => {

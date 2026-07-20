@@ -67,6 +67,10 @@ const nonNegInt =
  * without the other is a bug. Anything not listed here does not exist as far
  * as this endpoint is concerned.
  */
+// `sqlite_backend` (`native`/`wasm`) below is a LEGACY field: pre-schema-v2 clients
+// (≤ June 2026) sent it, but node:sqlite is now the only backend so current clients
+// omit it. Kept here so old clients' events still validate; safe to drop once their
+// share is negligible. Never `required`.
 const EVENTS: Record<string, { required: readonly string[]; props: Record<string, Sanitize> }> = {
   install: {
     required: ['scope', 'kind'],

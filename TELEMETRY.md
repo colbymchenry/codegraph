@@ -28,6 +28,11 @@ a one-line notice is printed to stderr before the first time anything is sent.
 Off means off: when disabled, CodeGraph records nothing, opens no connection to the
 telemetry endpoint, and sends no "opted out" ping.
 
+Separately from telemetry, the MCP server checks GitHub for a newer release in the
+background (at most once a day) so it can tell you an update exists — it fetches a
+version number and sends nothing about you or your machine. `DO_NOT_TRACK=1` disables
+this check too; to turn off only the update check, use `CODEGRAPH_NO_UPDATE_CHECK=1`.
+
 ## What is collected
 
 Every payload carries this envelope:
@@ -39,7 +44,7 @@ Every payload carries this envelope:
 | `os` / `arch` | `darwin` / `arm64` | platform identifiers only |
 | `node_major` | `22` | major version only |
 | `ci` | `false` | whether the `CI` env var was set |
-| `schema_version` | `1` | bumped when this page changes |
+| `schema_version` | `2` | bumped when this page changes (v2 dropped the `index` event's `sqlite_backend` field) |
 
 And one of four events:
 
@@ -48,12 +53,13 @@ And one of four events:
   an upgrade, or a re-run.
 - **`index`** — when a full index completes: the **language names** present (e.g.
   `["typescript","go"]`), the file count as a **coarse bucket** (`<100`, `100-1k`,
-  `1k-10k`, `10k+`), the duration as a bucket (`<10s`, `10-60s`, `1-5m`, `5m+`), and the
-  SQLite backend (`native`/`wasm`).
+  `1k-10k`, `10k+`), and the duration as a bucket (`<10s`, `10-60s`, `1-5m`, `5m+`).
 - **`usage_rollup`** — one line per day per tool: the tool or CLI command **name** (e.g.
   `codegraph_explore`, `init`), how many times it ran, how many errored, and — for MCP
   tools — the connecting agent's name and version from the MCP handshake (e.g.
-  `Claude Code 2.1`).
+  `Claude Code 2.1`). The Claude Code prompt hook also counts its **gate decision**
+  (fired fully, fired as a hint, or did nothing — fixed counter names like
+  `prompt-hook-gate-medium-segment`); the prompt itself is never read, stored, or sent.
 - **`uninstall`** — when `codegraph uninstall`/`uninit` runs: which agents were removed.
 
 Usage is **aggregated locally into daily totals** before anything is sent — there is no

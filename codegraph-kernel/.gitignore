@@ -1,0 +1,5 @@
+target/
+# Cross-compile scratch dirs (e.g. target-linux for the cg1212 envelope runs)
+target-*/
+prebuilds/
+*.node

@@ -84,14 +84,22 @@ export const springResolver: FrameworkResolver = {
       // (the bindings come from `@Value`). Skip non-Spring refs that happen to
       // have dots in them.
     }
+    // Spring config-key resolution: `@Value("${a.b.c}")` and
+    // `@ConfigurationProperties`. Gate on the `references` kind — those bindings
+    // are emitted as `references` by extractSpringValueBindings, whereas the far
+    // more numerous method-call refs (`list.add()`, `builder.build()`, every
+    // `receiver.method()`) are `calls`. A config key is NEVER a `calls` ref, so
+    // this loses no resolution. Without the gate, every dotted `calls` ref fell
+    // into the uncached getNodesByKind('constant') scan below — an
+    // O(dotted-calls × constant-nodes) cost that dominated resolution and made a
+    // full index take ~1h on large Java/Kotlin (Spring) monorepos (#1180). The
+    // old `split('.').length >= 2` heuristic couldn't separate keys from calls;
+    // the kind check does it exactly.
     if (
+      ref.referenceKind === 'references' &&
       (ref.language === 'java' || ref.language === 'kotlin') &&
       ref.referenceName.includes('.') &&
-      !ref.referenceName.includes('::') &&
-      // Exclude method-call style (single-dot, both sides lower-camel). Spring
-      // config keys are typically 3+ segments and contain kebabs/dashes; we
-      // can't filter perfectly but skipping single-dot keeps the lookup tight.
-      ref.referenceName.split('.').length >= 2
+      !ref.referenceName.includes('::')
     ) {
       const canonRef = canonicalConfigKey(ref.referenceName);
       const candidates = context.getNodesByKind('constant').filter(

@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
-import { matchReference } from '../src/resolution/name-matcher';
+import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile, matchMethodCall } from '../src/resolution/name-matcher';
 import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
@@ -81,6 +81,96 @@ describe('Resolution Module', () => {
       expect(result).not.toBeNull();
       expect(result?.targetNodeId).toBe('func:test.ts:myFunction:10');
       expect(result?.resolvedBy).toBe('exact-match');
+    });
+
+    it('should resolve Erlang -behaviour refs only to module namespaces', () => {
+      // On emqx, `-behaviour(supervisor)` (OTP behaviour, not in the repo)
+      // fell through to bare-name matching and resolved to a
+      // `-define(supervisor, ...)` macro constant in an unrelated app.
+      const macroConstant: Node = {
+        id: 'constant:apps/bridge/src/impl.erl:supervisor:61',
+        kind: 'constant',
+        name: 'supervisor',
+        qualifiedName: 'impl::supervisor',
+        filePath: 'apps/bridge/src/impl.erl',
+        language: 'erlang',
+        startLine: 61,
+        endLine: 61,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      };
+      const behaviourModule: Node = {
+        id: 'namespace:src/my_behaviour.erl:my_behaviour:1',
+        kind: 'namespace',
+        name: 'my_behaviour',
+        qualifiedName: 'my_behaviour',
+        filePath: 'src/my_behaviour.erl',
+        language: 'erlang',
+        startLine: 1,
+        endLine: 1,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      };
+      const nodes = [macroConstant, behaviourModule];
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => nodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      const mkRef = (name: string) => ({
+        fromNodeId: 'namespace:src/worker.erl:worker:1',
+        referenceName: name,
+        referenceKind: 'implements' as const,
+        line: 2,
+        column: 0,
+        filePath: 'src/worker.erl',
+        language: 'erlang' as const,
+      });
+
+      // Out-of-repo behaviour whose name collides with a macro constant:
+      // stays unresolved instead of linking the constant.
+      expect(matchReference(mkRef('supervisor'), context)).toBeNull();
+      // In-repo behaviour module resolves to its namespace.
+      const resolved = matchReference(mkRef('my_behaviour'), context);
+      expect(resolved?.targetNodeId).toBe(behaviourModule.id);
+
+      // The same module-only rule covers refs emitted by .app/.app.src
+      // resource files: on emqx, the `ssl` OTP app dependency resolved to a
+      // test helper FUNCTION named ssl. A colliding non-module name stays
+      // unresolved; a real umbrella-sibling module resolves.
+      nodes.push({
+        id: 'function:test/ldap_SUITE.erl:ssl:12',
+        kind: 'function',
+        name: 'ssl',
+        qualifiedName: 'ldap_SUITE::ssl',
+        filePath: 'test/ldap_SUITE.erl',
+        language: 'erlang',
+        startLine: 12,
+        endLine: 14,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      });
+      const appRef = (name: string) => ({
+        fromNodeId: 'file:src/myapp.app.src',
+        referenceName: name,
+        referenceKind: 'imports' as const,
+        line: 6,
+        column: 0,
+        filePath: 'src/myapp.app.src',
+        language: 'erlang' as const,
+      });
+      expect(matchReference(appRef('ssl'), context)).toBeNull();
+      expect(matchReference(appRef('my_behaviour'), context)?.targetNodeId).toBe(behaviourModule.id);
     });
 
     it('should prefer same-module candidates over cross-module matches', () => {
@@ -398,6 +488,168 @@ describe('Resolution Module', () => {
       };
 
       expect(matchReference(ref, context)?.targetNodeId).toBe('function:scripts/csv_search.py:run_p4:40');
+    });
+  });
+
+  describe('Ubiquitous-name ceiling (#999)', () => {
+    // A vendored theme/SDK re-declares the same method name across thousands of
+    // files (Metronic's `init`/`update`/… on every widget). The fuzzy strategies
+    // used to score every same-named candidate per ref — O(K) per ref, O(K²)
+    // total — which pinned a core for 15-28 min at "Resolving refs … 94%". Above
+    // the ceiling they must DECLINE instead, since no proximity/word-overlap
+    // score can pick the one true target among thousands anyway.
+    const CEILING = 500;
+
+    // A spy context: counts how many nodes the strategy actually inspects, so we
+    // can assert the cap short-circuits BEFORE the O(K) scoring (not just that it
+    // returns null).
+    const makeManyMethods = (n: number, name: string): Node[] =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `method:widget${i}.js:Widget${i}.${name}:1`,
+        kind: 'method' as const,
+        name,
+        qualifiedName: `widget${i}.js::Widget${i}::${name}`,
+        filePath: `static/theme/widget${i}.js`,
+        language: 'javascript' as const,
+        startLine: 1,
+        endLine: 5,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      }));
+
+    const spyContext = (nodes: Node[]): { ctx: ResolutionContext; lookups: () => number } => {
+      let scanned = 0;
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => {
+          const hit = nodes.filter((n) => n.name === name);
+          scanned += hit.length;
+          return hit;
+        },
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      return { ctx, lookups: () => scanned };
+    };
+
+    it('declines a method call (`obj.init`) above the ceiling instead of scoring K candidates', () => {
+      const { ctx } = spyContext(makeManyMethods(CEILING + 1, 'init'));
+      const ref = {
+        fromNodeId: 'method:caller.js:caller:1',
+        referenceName: 'widget.init',
+        referenceKind: 'calls' as const,
+        line: 2,
+        column: 4,
+        filePath: 'static/theme/caller.js',
+        language: 'javascript' as const,
+      };
+      expect(matchReference(ref, ctx)).toBeNull();
+    });
+
+    it('declines a bare exact-name ref above the ceiling', () => {
+      const { ctx } = spyContext(makeManyMethods(CEILING + 1, 'render'));
+      const ref = {
+        fromNodeId: 'method:caller.js:caller:1',
+        referenceName: 'render',
+        referenceKind: 'calls' as const,
+        line: 2,
+        column: 4,
+        filePath: 'static/theme/caller.js',
+        language: 'javascript' as const,
+      };
+      expect(matchReference(ref, ctx)).toBeNull();
+    });
+
+    it('still resolves a SAME-FILE definition when one exists (precise path unaffected)', () => {
+      // Strategy 1 (class-name) and same-file matching are precise — a ubiquitous
+      // name with an unambiguous local target still resolves.
+      const nodes = makeManyMethods(CEILING + 1, 'init');
+      const local: Node = {
+        id: 'class:static/theme/caller.js:Widgetly:1',
+        kind: 'class',
+        name: 'Widgetly',
+        qualifiedName: 'static/theme/caller.js::Widgetly',
+        filePath: 'static/theme/caller.js',
+        language: 'javascript',
+        startLine: 1, endLine: 9, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const localMethod: Node = {
+        id: 'method:static/theme/caller.js:Widgetly.init:2',
+        kind: 'method',
+        name: 'init',
+        qualifiedName: 'static/theme/caller.js::Widgetly::init',
+        filePath: 'static/theme/caller.js',
+        language: 'javascript',
+        startLine: 2, endLine: 4, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const all = [...nodes, local, localMethod];
+      const ctx: ResolutionContext = {
+        getNodesInFile: (fp) => all.filter((n) => n.filePath === fp),
+        getNodesByName: (name) => all.filter((n) => n.name === name),
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      // `Widgetly.init` names the class explicitly → Strategy 1 resolves it.
+      const ref = {
+        fromNodeId: 'method:static/theme/caller.js:caller:6',
+        referenceName: 'Widgetly.init',
+        referenceKind: 'calls' as const,
+        line: 6,
+        column: 4,
+        filePath: 'static/theme/caller.js',
+        language: 'javascript' as const,
+      };
+      const result = matchReference(ref, ctx);
+      expect(result?.targetNodeId).toBe('method:static/theme/caller.js:Widgetly.init:2');
+    });
+
+    it('still scores normally JUST below the ceiling (no behavior change for normal repos)', () => {
+      // Real repos top out near ~40 same-named methods; this proves a sub-ceiling
+      // collision still resolves via proximity, so the cap is invisible to them.
+      const nodes = makeManyMethods(CEILING - 1, 'update');
+      // Make ONE candidate share the caller's directory so proximity picks it.
+      nodes[0] = {
+        ...nodes[0]!,
+        id: 'method:static/theme/app/Widget0.update:1',
+        qualifiedName: 'static/theme/app/widget.js::Widget0::update',
+        filePath: 'static/theme/app/widget.js',
+      };
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => nodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => true,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      const ref = {
+        fromNodeId: 'method:static/theme/app/caller.js:caller:1',
+        referenceName: 'update',
+        referenceKind: 'calls' as const,
+        line: 2,
+        column: 4,
+        filePath: 'static/theme/app/caller.js',
+        language: 'javascript' as const,
+      };
+      // Below the ceiling the fuzzy path runs and resolves SOMETHING (not capped).
+      expect(matchReference(ref, ctx)).not.toBeNull();
     });
   });
 
@@ -899,6 +1151,43 @@ def bootstrap():
       expect(callsToUserService).toHaveLength(0);
     });
 
+    it('records instantiates for C++ stack/brace construction, targeting the class (#1035)', async () => {
+      // `Calculator calc(0)` (direct-init) and `Widget w{1, 2}` (brace-init)
+      // carry the constructor args directly on the declarator — there's no
+      // call/new node — so they recorded no `instantiates` edge, while heap
+      // `new Calculator(0)` did. Both stack forms now do.
+      fs.writeFileSync(
+        path.join(tempDir, 'm.cpp'),
+        `class Calculator { public: Calculator(int seed) {} int add(int a, int b){ return a+b; } };
+class Widget { public: Widget(int a, int b) {} };
+
+int runStack(int a, int b) { Calculator calc(0); return calc.add(a, b); }
+int runBrace() { Widget w{1, 2}; return 0; }
+int runHeap(int a, int b) { Calculator* c = new Calculator(0); return c->add(a, b); }
+void noise() { int x(5); int y{6}; Calculator deferred; }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const fn = (name: string) => cg.getNodesByKind('function').find((n) => n.name === name)!;
+      const instTargets = (name: string) =>
+        cg
+          .getOutgoingEdges(fn(name).id)
+          .filter((e) => e.kind === 'instantiates')
+          .map((e) => cg.getNode(e.target)!);
+
+      // Direct-init (the issue) and brace-init both instantiate, targeting the
+      // CLASS node — not the same-named constructor method.
+      const stack = instTargets('runStack');
+      expect(stack.map((n) => `${n.kind}:${n.name}`)).toContain('class:Calculator');
+      expect(instTargets('runBrace').map((n) => `${n.kind}:${n.name}`)).toContain('class:Widget');
+      // Heap still works (regression guard).
+      expect(instTargets('runHeap').map((n) => `${n.kind}:${n.name}`)).toContain('class:Calculator');
+      // Primitives (`int x(0)`/`int y{6}`) and bare default construction
+      // (`Calculator deferred;`) must NOT mint an instantiates edge.
+      expect(instTargets('noise')).toHaveLength(0);
+    });
+
     it('resolves a cross-file static method call to the method, not the class (#825)', async () => {
       // `Foo.bar()` where `Foo` is an imported class must link to the static
       // method `Foo::bar`, NOT to the class `Foo`. Previously the import
@@ -1375,6 +1664,601 @@ func main() {
     });
   });
 
+  describe('Same-name method disambiguation (#1079)', () => {
+    // resolveMethodOnType picks among several methods that share a
+    // `Type::method` qualifiedName. The precedence is:
+    //   1. preferredFqn (Java/Kotlin import — target is intentionally in
+    //      ANOTHER file, #314),
+    //   2. the call site's OWN file (language-agnostic, #1079),
+    //   3. matches[0] (first-indexed) as a last resort.
+    const methodNode = (
+      id: string,
+      filePath: string,
+      language: Node['language'] = 'cpp',
+      qualifiedName = 'Logger::log',
+      name = 'log',
+    ): Node => ({
+      id, kind: 'method', name, qualifiedName, filePath, language,
+      startLine: 1, endLine: 1, startColumn: 0, endColumn: 0, updatedAt: 0,
+    });
+    const callRef = (filePath: string, language: Node['language'] = 'cpp'): UnresolvedRef => ({
+      fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
+      line: 2, column: 0, filePath, language,
+    });
+    const ctxFor = (candidates: Node[]): ResolutionContext => ({
+      getNodesInFile: () => [],
+      getNodesByName: (name) => candidates.filter((c) => c.name === name),
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      fileExists: () => false,
+      readFile: () => null,
+      getProjectRoot: () => '',
+      getAllFiles: () => [],
+    });
+
+    it('prefers the definition in the call site\'s own file (#1079)', () => {
+      // matches[0] is the a/ definition; the call comes from b/, so it must
+      // resolve to b/ — not collapse onto the first-indexed match.
+      const logA = methodNode('m:a', 'a/svc.cpp');
+      const logB = methodNode('m:b', 'b/svc.cpp');
+      const result = resolveMethodOnType(
+        'Logger', 'log', callRef('b/svc.cpp'), ctxFor([logA, logB]), 0.9, 'instance-method',
+      );
+      expect(result?.targetNodeId).toBe('m:b');
+    });
+
+    it('lets an import FQN pin a cross-file target over the same-file preference (#314)', () => {
+      // Java: two `Bar::doIt` in different packages. The import FQN pins the
+      // alpha package; even though the call site lives in beta's file, the FQN
+      // must win — the same-file preference runs only AFTER preferredFqn.
+      const alpha = methodNode('m:alpha', 'com/example/alpha/Bar.java', 'java', 'Bar::doIt', 'doIt');
+      const beta = methodNode('m:beta', 'com/example/beta/Bar.java', 'java', 'Bar::doIt', 'doIt');
+      const result = resolveMethodOnType(
+        'Bar', 'doIt', callRef('com/example/beta/Bar.java', 'java'),
+        ctxFor([alpha, beta]), 0.9, 'instance-method', 'com.example.alpha.Bar',
+      );
+      expect(result?.targetNodeId).toBe('m:alpha');
+    });
+
+    it('falls back to the first match when nothing disambiguates', () => {
+      // Call site is a third file: no FQN, no same-file candidate → matches[0].
+      const logA = methodNode('m:a', 'a/svc.cpp');
+      const logB = methodNode('m:b', 'b/svc.cpp');
+      const result = resolveMethodOnType(
+        'Logger', 'log', callRef('c/other.cpp'), ctxFor([logA, logB]), 0.9, 'instance-method',
+      );
+      expect(result?.targetNodeId).toBe('m:a');
+    });
+
+    it('resolves C++ calls end-to-end to same-named classes in different files (#1079)', async () => {
+      // The exact repro from the issue: two files, each with its own
+      // `Logger::log`. Before the fix both callers pointed at the first def.
+      fs.mkdirSync(path.join(tempDir, 'a'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'b'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'a', 'svc.cpp'),
+        `class Logger { public: void log() { int a = 1; } };\nvoid useA() { Logger lg; lg.log(); }\n`,
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'b', 'svc.cpp'),
+        `class Logger { public: void log() { int b = 2; } };\nvoid useB() { Logger lg; lg.log(); }\n`,
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const logInDir = (dir: string) =>
+        cg.getNodesByKind('method').find(
+          (n) => n.name === 'log' && n.filePath.replace(/\\/g, '/').endsWith(`${dir}/svc.cpp`),
+        )!;
+      const callTargets = (fnName: string) =>
+        cg
+          .getOutgoingEdges(cg.getNodesByKind('function').find((n) => n.name === fnName)!.id)
+          .filter((e) => e.kind === 'calls')
+          .map((e) => e.target);
+
+      const logA = logInDir('a');
+      const logB = logInDir('b');
+      expect(logA).toBeDefined();
+      expect(logB).toBeDefined();
+      expect(logA.id).not.toBe(logB.id);
+
+      // Each caller resolves to the Logger::log in its OWN file.
+      expect(callTargets('useA')).toContain(logA.id);
+      expect(callTargets('useB')).toContain(logB.id);
+    });
+
+    it('preferCallSiteFile puts same-file candidates first and is otherwise a no-op', () => {
+      const a = methodNode('m:a', 'a/svc.cpp');
+      const b = methodNode('m:b', 'b/svc.cpp');
+      // Same-file first; the rest keep their original order (stable).
+      expect(preferCallSiteFile([a, b], 'b/svc.cpp').map((n) => n.id)).toEqual(['m:b', 'm:a']);
+      expect(preferCallSiteFile([a, b], 'a/svc.cpp').map((n) => n.id)).toEqual(['m:a', 'm:b']);
+      // No same-file match → unchanged; <2 candidates → returned as-is.
+      expect(preferCallSiteFile([a, b], 'c/other.cpp').map((n) => n.id)).toEqual(['m:a', 'm:b']);
+      expect(preferCallSiteFile([a], 'z/none.cpp')).toHaveLength(1);
+    });
+
+    it('matchByQualifiedName prefers the same-file target when a qualified name is ambiguous (#1079)', () => {
+      // Two `Logger::log` definitions; an explicit `Logger::log()` call from b/
+      // must resolve to b/'s definition, not the first-indexed one.
+      const a = methodNode('m:a', 'a/svc.cpp');
+      const b = methodNode('m:b', 'b/svc.cpp');
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => [a, b].filter((n) => n.name === name),
+        getNodesByQualifiedName: (q) => (q === 'Logger::log' ? [a, b] : []),
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      };
+      const ref: UnresolvedRef = {
+        fromNodeId: 'caller', referenceName: 'Logger::log', referenceKind: 'calls',
+        line: 2, column: 0, filePath: 'b/svc.cpp', language: 'cpp',
+      };
+      expect(matchByQualifiedName(ref, ctx)?.targetNodeId).toBe('m:b');
+    });
+
+    it('resolves a static/class-receiver call to the class in the caller\'s file (#1079)', async () => {
+      // `Logger.log()` — the receiver is the class NAME, so this routes through
+      // the class-name-receiver strategy (not the C++ instance path). It was
+      // file-blind across languages; verified here on TypeScript.
+      fs.mkdirSync(path.join(tempDir, 'a'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'b'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'a', 'svc.ts'),
+        `class Logger { static log() { return 1; } }\nexport function useA() { return Logger.log(); }\n`,
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'b', 'svc.ts'),
+        `class Logger { static log() { return 2; } }\nexport function useB() { return Logger.log(); }\n`,
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const logInDir = (dir: string) =>
+        cg.getNodesByKind('method').find(
+          (n) => n.name === 'log' && n.filePath.replace(/\\/g, '/').endsWith(`${dir}/svc.ts`),
+        )!;
+      const callTargets = (fnName: string) =>
+        cg
+          .getOutgoingEdges(cg.getNodesByKind('function').find((n) => n.name === fnName)!.id)
+          .filter((e) => e.kind === 'calls')
+          .map((e) => e.target);
+
+      const logA = logInDir('a');
+      const logB = logInDir('b');
+      expect(logA?.id).not.toBe(logB?.id);
+      expect(callTargets('useA')).toContain(logA.id);
+      expect(callTargets('useB')).toContain(logB.id);
+    });
+
+    it('resolves an explicitly-qualified call to the definition in the caller\'s file (#1079)', async () => {
+      // `Logger::log()` with two `Logger::log` definitions routes through the
+      // qualified-name strategy, whose partial match previously picked the first.
+      fs.mkdirSync(path.join(tempDir, 'a'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'b'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'a', 'svc.cpp'),
+        `class Logger { public: static void log() { int a = 1; } };\nvoid useA() { Logger::log(); }\n`,
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'b', 'svc.cpp'),
+        `class Logger { public: static void log() { int b = 2; } };\nvoid useB() { Logger::log(); }\n`,
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const logInDir = (dir: string) =>
+        cg.getNodesByKind('method').find(
+          (n) => n.name === 'log' && n.filePath.replace(/\\/g, '/').endsWith(`${dir}/svc.cpp`),
+        )!;
+      const callTargets = (fnName: string) =>
+        cg
+          .getOutgoingEdges(cg.getNodesByKind('function').find((n) => n.name === fnName)!.id)
+          .filter((e) => e.kind === 'calls')
+          .map((e) => e.target);
+
+      const logA = logInDir('a');
+      const logB = logInDir('b');
+      expect(logA?.id).not.toBe(logB?.id);
+      expect(callTargets('useA')).toContain(logA.id);
+      expect(callTargets('useB')).toContain(logB.id);
+    });
+  });
+
+  describe('Watchdog-safe resolution on collision-heavy repos (#1122)', () => {
+    // On a large Java-style repo, per-ref resolution cost is unbounded in the
+    // worst case (a colliding method name whose candidate set misses the LRU
+    // re-fetches tens of thousands of rows, and receiver inference re-splits
+    // the whole source file). v1.2.0 yielded only every 500 refs, so a dense
+    // pocket multiplied that cost past the #850 watchdog window and a VALID
+    // `init` was SIGKILLed at "Resolving refs". These pin the three guards:
+    // per-ref yield checkpoints, the (type, method) match memo, and the
+    // per-file lines cache with its generated/minified-line skip.
+    const methodNode = (
+      id: string,
+      filePath: string,
+      qualifiedName: string,
+      name: string,
+      language: Node['language'] = 'typescript',
+      kind: Node['kind'] = 'method',
+    ): Node => ({
+      id, kind, name, qualifiedName, filePath, language,
+      startLine: 1, endLine: 1, startColumn: 0, endColumn: 0, updatedAt: 0,
+    });
+
+    it('resolveMethodOnType consults the method-match memo and still disambiguates per call site', () => {
+      const logA = methodNode('m:a', 'a/svc.ts', 'Logger::log', 'log');
+      const logB = methodNode('m:b', 'b/svc.ts', 'Logger::log', 'log');
+      const shared = [logA, logB]; // one cached array served to every caller
+      let memoCalls = 0;
+      let rawNameLookups = 0;
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => { rawNameLookups++; return shared; },
+        getMethodMatches: () => { memoCalls++; return shared; },
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      };
+      const refFrom = (filePath: string): UnresolvedRef => ({
+        fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
+        line: 2, column: 0, filePath, language: 'typescript',
+      });
+
+      // Both call sites read the SAME memoized array, yet each still resolves
+      // to its own file — per-ref disambiguation runs after the memo (#1079).
+      const fromA = resolveMethodOnType('Logger', 'log', refFrom('a/svc.ts'), ctx, 0.9, 'instance-method');
+      const fromB = resolveMethodOnType('Logger', 'log', refFrom('b/svc.ts'), ctx, 0.9, 'instance-method');
+      expect(fromA?.targetNodeId).toBe('m:a');
+      expect(fromB?.targetNodeId).toBe('m:b');
+      expect(memoCalls).toBe(2);
+      expect(rawNameLookups).toBe(0); // memo bypasses the unbounded name fetch
+    });
+
+    it('the production resolver context memoizes method matches per (language, type, method)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'svc.ts'),
+        `class Logger { log() { return 1; } }\nexport function use() { const lg = new Logger(); return lg.log(); }\n`,
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const resolver = (cg as unknown as { resolver: ReferenceResolver }).resolver;
+      const ctx = (resolver as unknown as { context: ResolutionContext }).context;
+
+      const first = ctx.getMethodMatches!('Logger', 'log', 'typescript');
+      const second = ctx.getMethodMatches!('Logger', 'log', 'typescript');
+      expect(first.map((n) => n.qualifiedName)).toEqual(['Logger::log']);
+      // Same array instance = served from the memo, not recomputed.
+      expect(second).toBe(first);
+
+      resolver.clearCaches();
+      const afterClear = ctx.getMethodMatches!('Logger', 'log', 'typescript');
+      expect(afterClear).not.toBe(first);
+      expect(afterClear.map((n) => n.qualifiedName)).toEqual(['Logger::log']);
+    });
+
+    it('resolveBatchYielding offers a yield checkpoint for every ref', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'a.ts'),
+        `export function fnA() { return 1; }\nexport function fnB() { return fnA(); }\nexport function fnC() { return fnB(); }\n`,
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'b.ts'),
+        `import { fnA } from './a';\nexport function fnD() { return fnA(); }\n`,
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const resolver = (cg as unknown as { resolver: ReferenceResolver }).resolver;
+
+      // `init({ index: true })` already ran resolution, so feed the batch
+      // directly — resolveBatchYielding takes it as an argument; whether each
+      // ref resolves is irrelevant to the checkpoint contract.
+      const refs: UnresolvedReference[] = ['fnA', 'fnB', 'nosuchFn', 'fnA', 'alsoMissing'].map((name, i) => ({
+        fromNodeId: `caller-${i}`,
+        referenceName: name,
+        referenceKind: 'calls',
+        line: i + 1,
+        column: 0,
+        filePath: 'a.ts',
+        language: 'typescript',
+      }));
+
+      let checkpoints = 0;
+      const countingYield = async () => { checkpoints++; };
+      const result = await (resolver as unknown as {
+        resolveBatchYielding(batch: UnresolvedReference[], maybeYield: () => Promise<void>): Promise<{ stats: { total: number } }>;
+      }).resolveBatchYielding(refs, countingYield);
+
+      // One checkpoint per ref: a pocket of pathologically slow refs can never
+      // run more than ONE ref past the yield budget before the heartbeat gets
+      // a window — the #1122 kill required 500.
+      expect(checkpoints).toBe(refs.length);
+      expect(result.stats.total).toBe(refs.length);
+    });
+
+    it('receiver inference reads lines through getFileLines when the context provides it', () => {
+      const loggerClass = methodNode('c:logger', 'svc.ts', 'Logger', 'Logger', 'typescript', 'class');
+      const logMethod = methodNode('m:log', 'svc.ts', 'Logger::log', 'log');
+      const otherLog = methodNode('m:other', 'other.ts', 'Other::log', 'log');
+      const byName: Record<string, Node[]> = {
+        Logger: [loggerClass],
+        log: [logMethod, otherLog], // ambiguous bare name → only inference can resolve
+      };
+      const lines = ['const lg = new Logger();', 'lg.log();'];
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => byName[name] ?? [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        // Reading the raw source must not be needed when lines are provided.
+        readFile: () => { throw new Error('readFile must not be called when getFileLines exists'); },
+        getFileLines: () => lines,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      };
+      const ref: UnresolvedRef = {
+        fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
+        line: 2, column: 0, filePath: 'svc.ts', language: 'typescript',
+      };
+      expect(matchMethodCall(ref, ctx)?.targetNodeId).toBe('m:log');
+    });
+
+    it('receiver inference skips generated/minified lines instead of regex-scanning them', () => {
+      const loggerClass = methodNode('c:logger', 'svc.ts', 'Logger', 'Logger', 'typescript', 'class');
+      const logMethod = methodNode('m:log', 'svc.ts', 'Logger::log', 'log');
+      const otherLog = methodNode('m:other', 'other.ts', 'Other::log', 'log');
+      const byName: Record<string, Node[]> = {
+        Logger: [loggerClass],
+        log: [logMethod, otherLog],
+      };
+      const ctxWithLines = (lines: string[]): ResolutionContext => ({
+        getNodesInFile: () => [],
+        getNodesByName: (name) => byName[name] ?? [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getFileLines: () => lines,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      });
+      const ref: UnresolvedRef = {
+        fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
+        line: 1, column: 0, filePath: 'svc.ts', language: 'typescript',
+      };
+
+      // Control: the declaration on a normal-length line resolves.
+      const normal = matchMethodCall(ref, ctxWithLines(['const lg = new Logger(); lg.log();']));
+      expect(normal?.targetNodeId).toBe('m:log');
+
+      // The same declaration buried in a >10K-char generated/minified line is
+      // skipped — no resolution, and no per-ref regex pass over the huge line.
+      const minified = 'var pad="' + 'x'.repeat(10_000) + '";const lg = new Logger(); lg.log();';
+      expect(matchMethodCall(ref, ctxWithLines([minified]))).toBeNull();
+    });
+  });
+
+  describe('Local-variable receiver-type inference (#1108)', () => {
+    // `lg.log()` where `lg` is a local whose type is inferred from its
+    // declaration/initializer. Before this, only C++ resolved these; every
+    // other language produced no method edge. Each case is one file with a
+    // single Logger + a caller using a local-variable receiver — a correct
+    // resolution makes the caller a caller of `log`.
+    const cases: Array<{ lang: string; file: string; src: string }> = [
+      { lang: 'TypeScript (= new T)', file: 'svc.ts',
+        src: `class Logger { log() { return 1; } }\nexport function use() { const lg = new Logger(); return lg.log(); }\n` },
+      { lang: 'JavaScript (= new T)', file: 'svc.js',
+        src: `class Logger { log() { return 1; } }\nexport function use() { const lg = new Logger(); return lg.log(); }\n` },
+      { lang: 'Python (= T())', file: 'svc.py',
+        src: `class Logger:\n    def log(self):\n        return 1\ndef use():\n    lg = Logger()\n    return lg.log()\n` },
+      { lang: 'Java (T x = new T)', file: 'Svc.java',
+        src: `class Logger { void log() { int a = 1; } }\nclass Use { void run() { Logger lg = new Logger(); lg.log(); } }\n` },
+      { lang: 'C# (var x = new T)', file: 'Svc.cs',
+        src: `class Logger { void Log() { int a = 1; } }\nclass Use { void Run() { var lg = new Logger(); lg.Log(); } }\n` },
+      { lang: 'Kotlin (val x = T())', file: 'Svc.kt',
+        src: `class Logger { fun log(): Int { return 1 } }\nfun use(): Int { val lg = Logger(); return lg.log() }\n` },
+      { lang: 'Swift (let x = T())', file: 'svc.swift',
+        src: `class Logger { func log() -> Int { return 1 } }\nfunc use() -> Int { let lg = Logger(); return lg.log() }\n` },
+      { lang: 'Go (x := T{})', file: 'svc.go',
+        src: `package a\ntype Logger struct{}\nfunc (l Logger) Log() int { return 1 }\nfunc Use() int { lg := Logger{}; return lg.Log() }\n` },
+      { lang: 'Rust (let x = T{})', file: 'svc.rs',
+        src: `pub struct Logger { n: i32 }\nimpl Logger { pub fn log(&self) -> i32 { self.n } }\npub fn use_it() -> i32 { let lg = Logger { n: 1 }; lg.log() }\n` },
+      { lang: 'Dart (var x = T())', file: 'svc.dart',
+        src: `class Logger { int log() { return 1; } }\nint use() { var lg = Logger(); return lg.log(); }\n` },
+      { lang: 'PHP ($x = new T)', file: 'svc.php',
+        src: `<?php\nclass Logger { function log() { return 1; } }\nfunction useIt() { $lg = new Logger(); return $lg->log(); }\n` },
+      { lang: 'Scala (val x = new T)', file: 'Svc.scala',
+        src: `class Logger { def log(): Int = 1 }\nobject A { def use(): Int = { val lg = new Logger(); lg.log() } }\n` },
+      { lang: 'Ruby (x = T.new)', file: 'svc.rb',
+        src: `class Logger\n  def log\n    1\n  end\nend\ndef use\n  lg = Logger.new\n  lg.log\nend\n` },
+      { lang: 'Lua (x = T.new(); x:log())', file: 'svc.lua',
+        src: `local Logger = {}\nLogger.__index = Logger\nfunction Logger.new() return setmetatable({}, Logger) end\nfunction Logger:log() return 1 end\nlocal function use() local lg = Logger.new(); return lg:log() end\nreturn use\n` },
+      { lang: 'Luau (x = T.new(); x:log())', file: 'svc.luau',
+        src: `local Logger = {}\nLogger.__index = Logger\nfunction Logger.new() return setmetatable({}, Logger) end\nfunction Logger:log(): number return 1 end\nlocal function use(): number local lg = Logger.new(); return lg:log() end\nreturn use\n` },
+      { lang: 'R (x <- T$new(); x$log())', file: 'svc.R',
+        src: `Logger <- R6::R6Class("Logger", public = list(log = function() 1))\nuse <- function() { lg <- Logger$new(); lg$log() }\n` },
+      { lang: 'Pascal (var x: T; x.Method)', file: 'svc.pas',
+        src: `unit A;\ninterface\ntype TLogger = class function Log: Integer; end;\nimplementation\nfunction TLogger.Log: Integer; begin Result := 1; end;\nprocedure Use;\nvar lg: TLogger;\nbegin\n  lg := TLogger.Create;\n  lg.Log;\nend;\nend.\n` },
+    ];
+
+    for (const c of cases) {
+      it(`resolves a local-variable method call — ${c.lang}`, async () => {
+        fs.writeFileSync(path.join(tempDir, c.file), c.src);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        cg.resolveReferences();
+
+        const logMethod = cg
+          .getNodesByKind('method')
+          .find((n) => n.name.toLowerCase() === 'log');
+        expect(logMethod, `${c.lang}: log method should be indexed`).toBeDefined();
+
+        // The enclosing caller resolves through the local variable to `log`.
+        const callers = cg.getCallers(logMethod!.id).map((x) => x.node.name);
+        expect(
+          callers.length,
+          `${c.lang}: log should have a caller (got [${callers.join(', ')}])`,
+        ).toBeGreaterThan(0);
+      });
+    }
+
+    it('Ruby: builds receiver.method and keeps Foo.new as an instantiation', async () => {
+      // The Ruby extractor previously took the receiver as the callee and
+      // dropped the method name (`lg.log()` -> a call to `lg`). Now it builds
+      // `lg.log`, while `Logger.new` must still record an instantiation.
+      fs.writeFileSync(
+        path.join(tempDir, 'svc.rb'),
+        `class Logger\n  def log\n    1\n  end\nend\ndef run\n  lg = Logger.new\n  lg.log\nend\n`,
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const run = cg.getNodesByKind('function').find((n) => n.name === 'run')!;
+      const logMethod = cg.getNodesByKind('method').find((n) => n.name === 'log')!;
+      const logger = cg.getNodesByKind('class').find((n) => n.name === 'Logger')!;
+      const out = cg.getOutgoingEdges(run.id);
+
+      // lg.log resolved to the method (the receiver-type inference kicked in).
+      expect(out.some((e) => e.kind === 'calls' && e.target === logMethod.id)).toBe(true);
+      // Logger.new is still an instantiation of the class.
+      expect(out.some((e) => e.kind === 'instantiates' && e.target === logger.id)).toBe(true);
+    });
+
+    it('TypeScript: infers a typed-parameter receiver, disambiguating same-named methods (#1125)', async () => {
+      // A typed function parameter used as a receiver — `function use(lg: Logger)`
+      // — never matched the old TS/JS pattern (it required a const|let|var
+      // prefix), so `lg.log()` fell through to no edge once a second class shared
+      // the method name. Two ambiguous classes are load-bearing here: a
+      // single-class version resolves via a same-name fallback even without
+      // inference, so only the collision proves type inference actually fired.
+      fs.writeFileSync(
+        path.join(tempDir, 'svc.ts'),
+        `class Logger { log() { return 1; } }\n` +
+          `class Other { log() { return 2; } }\n` +
+          `export function use(lg: Logger) { return lg.log(); }\n` +
+          `export function useOther(o: Other) { return o.log(); }\n`,
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const classes = cg.getNodesByKind('class');
+      const logger = classes.find((n) => n.name === 'Logger')!;
+      const other = classes.find((n) => n.name === 'Other')!;
+      const logs = cg.getNodesByKind('method').filter((n) => n.name === 'log');
+      expect(logs.length, 'both log methods should be indexed').toBe(2);
+
+      // Associate each same-named `log` with its class by line containment.
+      const inClass = (m: (typeof logs)[number], c: typeof logger) =>
+        m.startLine >= c.startLine && m.startLine <= (c.endLine ?? c.startLine);
+      const loggerLog = logs.find((m) => inClass(m, logger))!;
+      const otherLog = logs.find((m) => inClass(m, other))!;
+      expect(loggerLog, "Logger's log").toBeDefined();
+      expect(otherLog, "Other's log").toBeDefined();
+
+      const loggerCallers = cg.getCallers(loggerLog.id).map((x) => x.node.name);
+      const otherCallers = cg.getCallers(otherLog.id).map((x) => x.node.name);
+
+      // Each typed-param call routes to its OWN class's method, not the other's.
+      expect(loggerCallers).toContain('use');
+      expect(loggerCallers).not.toContain('useOther');
+      expect(otherCallers).toContain('useOther');
+      expect(otherCallers).not.toContain('use');
+    });
+
+    // The same typed-parameter gap existed in every language whose pattern set
+    // only matched keyword-anchored locals (let/var/:=/= new), not the bare
+    // parameter form — Rust, Go, Dart, PHP (#1125). Each case: two classes
+    // sharing a method name + two functions taking one as a typed param; a
+    // correct fix routes each call to its OWN type's method (the collision is
+    // load-bearing — a single class resolves via the same-name fallback either
+    // way). Method↔type association is by qualifiedName, robust where the method
+    // lives outside the type's line range (Rust `impl`, Go method decl).
+    const typedParamCases: Array<{
+      lang: string; file: string; method: string; callerA: string; callerB: string; src: string;
+    }> = [
+      { lang: 'Rust (fn f(x: &T))', file: 'svc.rs', method: 'log', callerA: 'use_it', callerB: 'use_other',
+        src: `pub struct Logger { n: i32 }\nimpl Logger { pub fn log(&self) -> i32 { self.n } }\npub struct Other { n: i32 }\nimpl Other { pub fn log(&self) -> i32 { self.n } }\npub fn use_it(lg: &Logger) -> i32 { lg.log() }\npub fn use_other(o: &Other) -> i32 { o.log() }\n` },
+      { lang: 'Go (func f(x T))', file: 'svc.go', method: 'Log', callerA: 'UseIt', callerB: 'UseOther',
+        src: `package a\ntype Logger struct{}\nfunc (l Logger) Log() int { return 1 }\ntype Other struct{}\nfunc (o Other) Log() int { return 2 }\nfunc UseIt(lg Logger) int { return lg.Log() }\nfunc UseOther(o Other) int { return o.Log() }\n` },
+      { lang: 'Dart (T f(U x))', file: 'svc.dart', method: 'log', callerA: 'useIt', callerB: 'useOther',
+        src: `class Logger { int log() { return 1; } }\nclass Other { int log() { return 2; } }\nint useIt(Logger lg) { return lg.log(); }\nint useOther(Other o) { return o.log(); }\n` },
+      { lang: 'PHP (f(T $x))', file: 'svc.php', method: 'log', callerA: 'useIt', callerB: 'useOther',
+        src: `<?php\nclass Logger { function log() { return 1; } }\nclass Other { function log() { return 2; } }\nfunction useIt(Logger $lg) { return $lg->log(); }\nfunction useOther(Other $o) { return $o->log(); }\n` },
+    ];
+
+    for (const c of typedParamCases) {
+      it(`infers a typed-parameter receiver, disambiguating same-named methods — ${c.lang} (#1125)`, async () => {
+        fs.writeFileSync(path.join(tempDir, c.file), c.src);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        cg.resolveReferences();
+
+        const methods = cg.getNodesByKind('method').filter((n) => n.name === c.method);
+        expect(methods.length, `${c.lang}: both ${c.method} methods indexed`).toBe(2);
+
+        const loggerLog = methods.find((m) => /Logger/.test(m.qualifiedName ?? ''));
+        const otherLog = methods.find((m) => /Other/.test(m.qualifiedName ?? ''));
+        expect(loggerLog, `${c.lang}: Logger's ${c.method}`).toBeDefined();
+        expect(otherLog, `${c.lang}: Other's ${c.method}`).toBeDefined();
+
+        const loggerCallers = cg.getCallers(loggerLog!.id).map((x) => x.node.name);
+        const otherCallers = cg.getCallers(otherLog!.id).map((x) => x.node.name);
+
+        expect(loggerCallers, `${c.lang}: Logger callers`).toContain(c.callerA);
+        expect(loggerCallers, `${c.lang}: Logger callers`).not.toContain(c.callerB);
+        expect(otherCallers, `${c.lang}: Other callers`).toContain(c.callerB);
+        expect(otherCallers, `${c.lang}: Other callers`).not.toContain(c.callerA);
+      });
+    }
+
+    // Lua/Luau: a PascalCase method call (`lg:Log()`, the Roblox convention)
+    // is the identical `receiver:Name` shape as a Luau type annotation, so it
+    // self-matched the annotation pattern on the call's own line and inferred
+    // "type = Log" (#1124). Two things are load-bearing in these fixtures:
+    // the declaration sits on an EARLIER line than the call (on one line,
+    // pattern order resolves it — the `.new` pattern wins first), and TWO
+    // classes share the method name (a single class resolves via the
+    // same-name fallback even when inference misfires). Luau's `useLogger`
+    // takes a typed param instead of calling `.new()`, pinning that the
+    // gated pattern still matches a genuine annotation.
+    const pascalMethodCases: Array<{ lang: string; file: string; src: string }> = [
+      { lang: 'Lua', file: 'svc.lua',
+        src: `local Logger = {}\nLogger.__index = Logger\nfunction Logger.new() return setmetatable({}, Logger) end\nfunction Logger:Log() return 1 end\n\nlocal Other = {}\nOther.__index = Other\nfunction Other.new() return setmetatable({}, Other) end\nfunction Other:Log() return 2 end\n\nlocal function useLogger()\n\tlocal lg = Logger.new()\n\treturn lg:Log()\nend\n\nlocal function useOther()\n\tlocal o = Other.new()\n\treturn o:Log()\nend\n\nreturn useLogger, useOther\n` },
+      { lang: 'Luau', file: 'svc.luau',
+        src: `local Logger = {}\nLogger.__index = Logger\nfunction Logger.new() return setmetatable({}, Logger) end\nfunction Logger:Log(): number return 1 end\n\nlocal Other = {}\nOther.__index = Other\nfunction Other.new() return setmetatable({}, Other) end\nfunction Other:Log(): number return 2 end\n\nlocal function useLogger(lg: Logger): number\n\treturn lg:Log()\nend\n\nlocal function useOther(): number\n\tlocal o = Other.new()\n\treturn o:Log()\nend\n\nreturn useLogger, useOther\n` },
+    ];
+
+    for (const c of pascalMethodCases) {
+      it(`resolves a PascalCase method call without self-matching the annotation pattern — ${c.lang} (#1124)`, async () => {
+        fs.writeFileSync(path.join(tempDir, c.file), c.src);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        cg.resolveReferences();
+
+        const methods = cg.getNodesByKind('method').filter((n) => n.name === 'Log');
+        expect(methods.length, `${c.lang}: both Log methods indexed`).toBe(2);
+
+        const loggerLog = methods.find((m) => /Logger/.test(m.qualifiedName ?? ''));
+        const otherLog = methods.find((m) => /Other/.test(m.qualifiedName ?? ''));
+        expect(loggerLog, `${c.lang}: Logger's Log`).toBeDefined();
+        expect(otherLog, `${c.lang}: Other's Log`).toBeDefined();
+
+        const loggerCallers = cg.getCallers(loggerLog!.id).map((x) => x.node.name);
+        const otherCallers = cg.getCallers(otherLog!.id).map((x) => x.node.name);
+
+        expect(loggerCallers, `${c.lang}: Logger callers`).toContain('useLogger');
+        expect(loggerCallers, `${c.lang}: Logger callers`).not.toContain('useOther');
+        expect(otherCallers, `${c.lang}: Other callers`).toContain('useOther');
+        expect(otherCallers, `${c.lang}: Other callers`).not.toContain('useLogger');
+      });
+    }
+  });
+
   describe('Name Matcher: kind bias for new ref kinds', () => {
     const baseContext = (candidates: Node[]): ResolutionContext => ({
       getNodesInFile: () => [],
@@ -1788,6 +2672,320 @@ func main() {
     });
   });
 
+  describe('Literal receivers and nested-local scope (#1230)', () => {
+    // Two stacked fabrications: `", ".join(...)` (a builtin on a string
+    // literal) exact-matched a project function named `join` — one that was
+    // moreover nested inside a DIFFERENT function and thus lexically
+    // unreachable. Literal receivers now emit no call ref at all, and
+    // exact-match refuses candidates nested in a function the ref isn't in.
+    it("str-literal builtin calls don't bind to project symbols; nested locals only resolve from inside their container", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1230-'));
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'repro.py'),
+          `def format_fields(values):
+    def join(vals):
+        return "-".join(sorted(vals))
+
+    return join(values)
+
+
+def report_missing(unresolved):
+    missing_list = ", ".join(sorted(unresolved))
+    return f"Could not resolve: {missing_list}"
+`
+        );
+
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        const join = (await cg.searchNodes('join', { limit: 5 })).find(
+          (r) => r.node.kind === 'function' && r.node.name === 'join'
+        );
+        expect(join).toBeDefined();
+
+        // Exactly one caller: the enclosing format_fields. Neither
+        // report_missing (literal receiver) nor join itself (its own literal
+        // "-".join) may appear.
+        const callers = await cg.getCallers(join!.node.id);
+        expect(callers.map((c) => c.node.name)).toEqual(['format_fields']);
+
+        // report_missing has zero project callees.
+        const reportMissing = (await cg.searchNodes('report_missing', { limit: 5 })).find(
+          (r) => r.node.kind === 'function'
+        );
+        const callees = await cg.getCallees(reportMissing!.node.id);
+        expect(callees.filter((c) => c.node.name === 'join')).toHaveLength(0);
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+  });
+
+  describe('Go field-chain receiver calls (#1276)', () => {
+    // `target.conn.Exec(...)` where `conn *sql.DB` used to emit a BARE `Exec`
+    // ref, which exact-matched the only local `Exec` — an unrelated
+    // interface's method — fabricating an internal dependency. Chained Go
+    // receivers now resolve exclusively via validated field-hop inference:
+    // external field types produce NO edge; in-project ones produce the
+    // correct edge (new recall).
+    it('external receiver types produce no edge; in-project field chains resolve correctly', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1276-'));
+      try {
+        fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module example.com/app\n\ngo 1.22\n');
+        fs.mkdirSync(path.join(tmpDir, 'flow'));
+        fs.writeFileSync(
+          path.join(tmpDir, 'flow', 'flow.go'),
+          `package flow
+
+import "database/sql"
+
+type InternalStore interface {
+	Exec(string, ...any) (sql.Result, error)
+	QueryRow(string, ...any) *sql.Row
+}
+
+type Target struct{ conn *sql.DB }
+
+func (target *Target) Write() error {
+	_, err := target.conn.Exec("insert")
+	return err
+}
+
+func (target *Target) Read() *sql.Row {
+	return target.conn.QueryRow("select")
+}
+
+type Store struct{}
+
+func (s *Store) Put(key string) {}
+
+type Repo struct{ db *Store }
+
+func (r *Repo) Save() {
+	r.db.Put("k")
+}
+`
+        );
+
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        // The unrelated local interface's methods have NO callers — the
+        // external sql.DB calls must not bind to them.
+        const execDecl = (await cg.searchNodes('Exec', { limit: 10 })).find(
+          (r) => r.node.kind === 'method'
+        );
+        if (execDecl) {
+          const execCallers = await cg.getCallers(execDecl.node.id);
+          expect(execCallers.map((c) => c.node.name)).not.toContain('Write');
+        }
+        const qrDecl = (await cg.searchNodes('QueryRow', { limit: 10 })).find(
+          (r) => r.node.kind === 'method'
+        );
+        if (qrDecl) {
+          const qrCallers = await cg.getCallers(qrDecl.node.id);
+          expect(qrCallers.map((c) => c.node.name)).not.toContain('Read');
+        }
+
+        // The in-project field chain resolves (validated), gaining an edge the
+        // bare-name era never produced.
+        const put = (await cg.searchNodes('Put', { limit: 10 })).find(
+          (r) => r.node.kind === 'method' && r.node.qualifiedName?.includes('Store')
+        );
+        expect(put).toBeDefined();
+        const putCallers = await cg.getCallers(put!.node.id);
+        expect(putCallers.map((c) => c.node.name)).toContain('Save');
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('unexported field types resolve; stdlib-qualified types never bind a same-named local decoy', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1276b-'));
+      try {
+        fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module example.com/b\n\ngo 1.22\n');
+        fs.writeFileSync(
+          path.join(tmpDir, 'm.go'),
+          `package m
+
+import "net/http"
+
+type node struct{}
+
+func (n *node) InsertRoute(path string) {}
+
+// A local type sharing the stdlib interface's name — the decoy the
+// package-qualifier gate exists for.
+type Handler func()
+
+func (h Handler) ServeHTTP() {}
+
+type Mux struct {
+	// the tree router lives below this comment (the comment must not
+	// donate a field type)
+	handler http.Handler
+	tree    *node
+}
+
+func (mx *Mux) handle(path string) {
+	mx.tree.InsertRoute(path)
+}
+
+func (mx *Mux) dispatch() {
+	mx.handler.ServeHTTP(nil, nil)
+}
+`
+        );
+
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        // Unexported in-package field type: chain resolves (chi's mx.tree shape),
+        // and the doc comment above the field donates nothing.
+        const insert = (await cg.searchNodes('InsertRoute', { limit: 5 })).find(
+          (r) => r.node.kind === 'method'
+        );
+        expect(insert).toBeDefined();
+        const insertCallers = await cg.getCallers(insert!.node.id);
+        expect(insertCallers.map((c) => c.node.name)).toContain('handle');
+
+        // `handler http.Handler` is stdlib — the call must NOT bind to the
+        // local decoy `Handler.ServeHTTP`.
+        const serve = (await cg.searchNodes('ServeHTTP', { limit: 5 })).find(
+          (r) => r.node.kind === 'method'
+        );
+        if (serve) {
+          const serveCallers = await cg.getCallers(serve.node.id);
+          expect(serveCallers.map((c) => c.node.name)).not.toContain('dispatch');
+        }
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+  });
+
+  describe('Imported singleton instance-method calls (#1292)', () => {
+    // `reproStore.notifyJoinGuildStatus()` after `import { reproStore }` used
+    // to emit its calls edge to the CONSTANT (resolvedBy:'import'), while the
+    // identical call in the defining file resolved to the method — so callers
+    // of the method missed every cross-file use. The import path now infers
+    // the value's type from its own declaration and resolves the member on it.
+    it('cross-file call through an imported singleton resolves to the class method', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1292-'));
+      try {
+        fs.mkdirSync(path.join(tmpDir, 'src'));
+        fs.writeFileSync(
+          path.join(tmpDir, 'src', 'store.ts'),
+          `export class ReproStore {
+  notifyJoinGuildStatus(): void {
+    console.log('notified');
+  }
+}
+
+export const reproStore = new ReproStore();
+
+export function callInDefinitionFile(): void {
+  reproStore.notifyJoinGuildStatus();
+}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'src', 'caller.ts'),
+          `import { reproStore } from './store';
+
+export function callFromImportedFile(): void {
+  reproStore.notifyJoinGuildStatus();
+}
+`
+        );
+
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        const method = (await cg.searchNodes('notifyJoinGuildStatus', { limit: 5 })).find(
+          (r) => r.node.kind === 'method'
+        );
+        expect(method).toBeDefined();
+
+        // BOTH functions call the method — the cross-file one included.
+        const callers = await cg.getCallers(method!.node.id);
+        const callerNames = callers.map((c) => c.node.name).sort();
+        expect(callerNames).toContain('callInDefinitionFile');
+        expect(callerNames).toContain('callFromImportedFile');
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+  });
+
+  describe('C++ namespace-qualified static method calls to out-of-line definitions (#1291)', () => {
+    // The issue's exact shape: nested types + out-of-line static method
+    // definition inside `namespace simulator { }` in the .cpp, called via the
+    // fully-qualified path from a different file. The definition's
+    // qualifiedName previously dropped the namespace (`ManifestStartup::Apply`
+    // vs the class's `simulator::ManifestStartup`), so `callers` came up empty.
+    it('resolves simulator::ManifestStartup::Apply(...) from another file', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1291-'));
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'manifest_startup.h'),
+          `#pragma once
+namespace simulator {
+class ManifestStartup {
+public:
+    struct Input { int a; };
+    struct Output { int b; };
+    static Output Apply(const Input& input);
+};
+}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'manifest_startup.cpp'),
+          `#include "manifest_startup.h"
+namespace simulator {
+ManifestStartup::Output ManifestStartup::Apply(const Input& input) {
+    return Output{input.a};
+}
+}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'main.cpp'),
+          `#include "manifest_startup.h"
+int run() {
+    const auto manifest_result = simulator::ManifestStartup::Apply({1});
+    return manifest_result.b;
+}
+`
+        );
+
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        const applyDefs = (await cg.searchNodes('Apply', { limit: 20 })).filter(
+          (r) => r.node.name === 'Apply' && r.node.kind === 'method'
+        );
+        expect(applyDefs.length).toBeGreaterThan(0);
+        const def = applyDefs.find((r) => r.node.filePath.endsWith('manifest_startup.cpp'));
+        expect(def).toBeDefined();
+        expect(def!.node.qualifiedName).toBe('simulator::ManifestStartup::Apply');
+
+        // The qualified cross-file call resolves: run() is a caller of Apply.
+        const callers = await cg.getCallers(def!.node.id);
+        expect(callers.map((c) => c.node.name)).toContain('run');
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+  });
+
   describe('C/C++ Import Resolution', () => {
     afterEach(() => {
       clearCppIncludeDirCache();
@@ -2142,6 +3340,51 @@ func main() {
     });
   });
 
+  describe('C++ templated base-class inheritance (#1043)', () => {
+    // A class deriving from a TEMPLATE — `class D : public Base<int>` (or a CRTP
+    // `class W : public CRTPBase<W>`, or a qualified `class Q : public ns::Tpl<int>`)
+    // recorded its base as the full instantiation text (`Base<int>`), which never
+    // name-matched the template, indexed as the bare node `Base`. The `<…>` args
+    // are now stripped so the `extends` edge resolves end-to-end.
+    it('resolves an extends edge to a templated base (plain, CRTP, struct, multi-base)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'lib.hpp'),
+        `#pragma once
+template<typename T> class Base { public: void foo(); };
+template<typename Derived> class CRTPBase {};
+class Plain {};
+
+class Widget : public Base<int> {};            // plain template base
+class App : public CRTPBase<App> {};           // CRTP (curiously-recurring)
+struct Node : public Base<double> {};          // struct inheriting a template
+class Both : public Base<char>, public Plain {}; // templated + plain in one clause
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const edges = db
+        .getDb()
+        .prepare(
+          `select src.name as fromName, dst.name as toName
+             from edges e
+             join nodes src on e.source = src.id
+             join nodes dst on e.target = dst.id
+            where e.kind = 'extends'`
+        )
+        .all() as Array<{ fromName: string; toName: string }>;
+      const has = (from: string, to: string) =>
+        edges.some((r) => r.fromName === from && r.toName === to);
+
+      // Every templated base now resolves to the bare template node.
+      expect(has('Widget', 'Base'), 'Widget : Base<int>').toBe(true);
+      expect(has('App', 'CRTPBase'), 'App : CRTPBase<App> (CRTP)').toBe(true);
+      expect(has('Node', 'Base'), 'struct Node : Base<double>').toBe(true);
+      // A mixed clause resolves BOTH the templated and the plain base.
+      expect(has('Both', 'Base'), 'Both : Base<char>').toBe(true);
+      expect(has('Both', 'Plain'), 'Both : Plain (non-templated, regression guard)').toBe(true);
+    });
+  });
+
   describe('PHP Include Resolution', () => {
     it('isPhpIncludePathRef distinguishes include paths from namespace use (#660)', () => {
       const mk = (name: string, over: Partial<UnresolvedRef> = {}): UnresolvedRef => ({
@@ -2379,6 +3622,76 @@ void wrong() { WidgetFactory::create().onlyOther(); }
       });
 
       expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
+  describe('C++ explicit operator-call resolution (#1247)', () => {
+    // `a.operator+(b)` produced no calls edge: the operator_name lands in an
+    // ERROR node (never a field_expression callee), so the extractor emitted a
+    // ref named just `a`. With the ERROR-node recovery it emits `a.operator+`,
+    // and matchMethodCall (dot pattern extended to admit operator method parts)
+    // resolves it through receiver-type inference. Infix `a + b` / `a[i]` need
+    // real type inference and are out of scope here (#1258).
+    async function indexCpp(files: Record<string, string>): Promise<void> {
+      for (const [name, content] of Object.entries(files)) {
+        fs.writeFileSync(path.join(tempDir, name), content);
+      }
+      cg = await CodeGraph.init(tempDir, { index: true });
+    }
+
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves explicit operator calls to the receiver type, never a same-named decoy', async () => {
+      // Aaa sorts first and declares the same operators — only receiver-type
+      // inference (const V& a → V) can pick V, so a name-only tie can't win.
+      await indexCpp({
+        'optest.cpp': `struct Aaa {
+  Aaa operator+(const Aaa& o) const { return o; }
+  Aaa operator[](int i) const { return *this; }
+};
+struct V {
+  int x;
+  V operator+(const V& o) const { return V{x + o.x}; }
+  V operator[](int i) const { return V{x + i}; }
+  int get() const { return x; }
+};
+int plainCaller(const V& a) { return a.get(); }
+V explicitCaller(const V& a, const V& b) { return a.operator+(b); }
+V subscriptCaller(const V& a) { return a.operator[](3); }
+V pointerCaller(const V* p, const V& b) { return p->operator+(b); }
+`,
+      });
+
+      expect(callerNamesOf('V::operator+')).toEqual(['explicitCaller', 'pointerCaller']);
+      expect(callerNamesOf('V::operator[]')).toEqual(['subscriptCaller']);
+      expect(callerNamesOf('V::get')).toEqual(['plainCaller']); // control: plain calls unaffected
+      expect(callerNamesOf('Aaa::operator+')).toEqual([]);
+      expect(callerNamesOf('Aaa::operator[]')).toEqual([]);
+    });
+
+    it('resolves an out-of-line operator definition (declaration in header)', async () => {
+      await indexCpp({
+        'v.hpp': `#pragma once
+struct V { int x; V operator+(const V& o) const; };
+`,
+        'v.cpp': `#include "v.hpp"
+V V::operator+(const V& o) const { return V{x + o.x}; }
+`,
+        'app.cpp': `#include "v.hpp"
+V add(const V& a, const V& b) { return a.operator+(b); }
+`,
+      });
+
+      expect(callerNamesOf('V::operator+')).toEqual(['add']);
     });
   });
 
@@ -3599,6 +4912,201 @@ procedure Helper; var t: TTgt; begin t.Hit; end;
       // body's call must attribute to `Helper`, not the file/module — alongside the
       // method `DoStuff`.
       expect(callerNamesOf('TTgt::Hit')).toEqual(['DoStuff', 'Helper']);
+    });
+  });
+
+  describe('Nix path import resolution', () => {
+    function fileNode(filePath: string) {
+      return cg.getNodesByKind('file').find((n) => n.filePath === filePath);
+    }
+
+    function importedFilePaths(fromFile: string): string[] {
+      const source = fileNode(fromFile);
+      expect(source, `${fromFile} file node`).toBeDefined();
+      return cg
+        .getOutgoingEdges(source!.id)
+        .filter((edge) => edge.kind === 'imports')
+        .map((edge) => cg.getNodesByKind('file').find((n) => n.id === edge.target)?.filePath)
+        .filter((filePath): filePath is string => Boolean(filePath))
+        .sort();
+    }
+
+    it('resolves relative Nix imports to indexed file nodes', async () => {
+      fs.mkdirSync(path.join(tempDir, 'core'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'data'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'core', 'ports.nix'), '{ http = 80; https = 443; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'data', 'postgresql.nix'),
+        `let
+  ports = import ../core/ports.nix;
+in
+{
+  port = ports.https;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('data/postgresql.nix')).toEqual(['core/ports.nix']);
+    });
+
+    it('resolves Nix directory imports through default.nix and deduplicates called imports', async () => {
+      fs.mkdirSync(path.join(tempDir, 'dir'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'dir', 'default.nix'), '{ value = 1; }');
+      fs.writeFileSync(path.join(tempDir, 'x.nix'), '{ value = 2; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'main.nix'),
+        `let
+  dir = import ./dir;
+  x = import ./x.nix {};
+in
+{
+  inherit dir x;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('main.nix')).toEqual(['dir/default.nix', 'x.nix']);
+    });
+
+    it('resolves NixOS module imports lists and callPackage paths to file nodes', async () => {
+      fs.mkdirSync(path.join(tempDir, 'modules'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'common'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'pkgs', 'hello'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'modules', 'users.nix'), '{ users.users.demo.isNormalUser = true; }');
+      fs.writeFileSync(path.join(tempDir, 'common', 'default.nix'), '{ time.timeZone = "UTC"; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'pkgs', 'hello', 'default.nix'),
+        '{ stdenv }: stdenv.mkDerivation { pname = "hello"; }'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'configuration.nix'),
+        `{ config, pkgs, ... }:
+{
+  imports = [ ./modules/users.nix ./common ];
+  environment.systemPackages = [ (pkgs.callPackage ./pkgs/hello { }) ];
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('configuration.nix')).toEqual([
+        'common/default.nix',
+        'modules/users.nix',
+        'pkgs/hello/default.nix',
+      ]);
+    });
+
+    it('never resolves another language\'s calls into nix bindings', async () => {
+      // Nix bindings are not linkable symbols from any other language —
+      // interop is eval/CLI. Without the target-side gate, a Python script's
+      // bare `resolve(...)` exact-matches a module's `resolve = ...` binding.
+      fs.writeFileSync(
+        path.join(tempDir, 'helpers.nix'),
+        `let
+  resolve = x: x;
+in
+{
+  inherit resolve;
+}
+`
+      );
+      fs.writeFileSync(path.join(tempDir, 'tool.py'), 'def main():\n    return resolve("target")\n');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const nixNodeIds = new Set(
+        cg.getNodesByKind('variable').filter((n) => n.language === 'nix').map((n) => n.id)
+      );
+      const pyFns = cg.getNodesByKind('function').filter((n) => n.language === 'python');
+      expect(pyFns.length).toBeGreaterThan(0);
+      const crossEdges = pyFns.flatMap((f) => cg.getOutgoingEdges(f.id)).filter((e) => nixNodeIds.has(e.target));
+      expect(crossEdges).toEqual([]);
+    });
+
+    it('never cross-links Nix calls by bare name across files (lexical scope only)', async () => {
+      // Both modules `inherit (lib) mkOption` — the nixpkgs idiom. A call to
+      // mkOption in one file must NOT resolve to the other file's inherit
+      // binding: Nix has no ambient cross-file namespace, so any such edge is
+      // wrong by construction. Same-file bindings still resolve.
+      fs.writeFileSync(
+        path.join(tempDir, 'alpha.nix'),
+        `{ lib, ... }:
+let
+  inherit (lib) mkOption;
+  mkPort = default: mkOption { inherit default; };
+in
+{
+  options.alpha.port = mkPort 8080;
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'beta.nix'),
+        `{ lib, ... }:
+let
+  inherit (lib) mkOption;
+in
+{
+  options.beta.enable = mkOption { default = false; };
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const crossFileCalls = cg
+        .getNodesByKind('file')
+        .flatMap((f) => cg.getOutgoingEdges(f.id))
+        .concat(
+          cg.getNodesByKind('function').flatMap((f) => cg.getOutgoingEdges(f.id)),
+          cg.getNodesByKind('variable').flatMap((v) => cg.getOutgoingEdges(v.id))
+        )
+        .filter((e) => e.kind === 'calls')
+        .map((e) => {
+          const src = cg.getNode(e.source);
+          const tgt = cg.getNode(e.target);
+          return { from: src?.filePath, to: tgt?.filePath, name: tgt?.name };
+        });
+
+      // No calls edge may cross files by bare-name matching.
+      expect(crossFileCalls.filter((e) => e.from !== e.to)).toEqual([]);
+      // The same-file chain still resolves: mkPort's mkOption call hits
+      // alpha.nix's own inherit binding.
+      const sameFile = crossFileCalls.filter((e) => e.from === e.to && e.name === 'mkOption');
+      expect(sameFile.length).toBeGreaterThan(0);
+      expect(sameFile.every((e) => e.from === 'alpha.nix' || e.from === 'beta.nix')).toBe(true);
+    });
+
+    it('does not resolve Nix angle-bracket, attribute, or variable imports as project file edges', async () => {
+      fs.writeFileSync(path.join(tempDir, 'nixpkgs.nix'), '{ bogus = true; }');
+      fs.writeFileSync(path.join(tempDir, 'selectedPath.nix'), '{ bogus = true; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'main.nix'),
+        `let
+  pkgs = import <nixpkgs> {};
+  fromSources = import sources.nixpkgs {};
+  dynamic = import selectedPath;
+in
+{
+  inherit pkgs fromSources dynamic;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('main.nix')).toEqual([]);
     });
   });
 });
