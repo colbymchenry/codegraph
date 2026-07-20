@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- `codegraph_explore` now finds files by their exact Chinese names, so querying `示例模块` surfaces the indexed `示例模块.lua` without also treating partial Chinese terms as broader filename matches. (#1372)
 
 ## [1.5.0] - 2026-07-21
 
