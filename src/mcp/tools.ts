@@ -1008,7 +1008,7 @@ export class ToolHandler {
         if (tool.name === 'codegraph_explore') {
           return {
             ...tool,
-            description: `${tool.description} Budget: make at most ${budget} calls for this project (${stats.fileCount.toLocaleString()} files indexed).`,
+            description: `${tool.description} Tip: ~${budget} calls usually orient you on a project this size (${stats.fileCount.toLocaleString()} files indexed); there is NO call limit — call again whenever a result doesn't fully cover your question.`,
           };
         }
         return tool;
@@ -3673,7 +3673,7 @@ export class ToolHandler {
         const stats = cg.getStats();
         const callBudget = getExploreBudget(stats.fileCount);
         lines.push('');
-        lines.push(`> **Explore budget: ${callBudget} calls for this project (${stats.fileCount.toLocaleString()} files indexed).** Each call covers ~6 files; if your question spans more, spend your remaining calls on the uncovered area BEFORE falling back to Read — another explore is cheaper and more complete than reading those files. Synthesize once you've used ${callBudget}.`);
+        lines.push(`> **Orientation tip: ~${callBudget} calls typically cover a project this size (${stats.fileCount.toLocaleString()} files).** There is NO call limit — if this result didn't cover your question, call again targeting the uncovered area; another explore is cheaper and more complete than Read.`);
       } catch {
         // Stats unavailable — skip budget note
       }
