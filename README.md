@@ -890,6 +890,86 @@ Framework routing is validated the same way, on a canonical app per framework: E
 
 **Sharing one checkout between Windows and WSL** — Don't point both at the same `.codegraph/`: the background-server lock and the SQLite index are tied to the OS that wrote them, and SQLite locking across the WSL2/Windows filesystem boundary is unreliable. Give each side its own index in the same tree by setting `CODEGRAPH_DIR` to a distinct name on one of them — e.g. `CODEGRAPH_DIR=.codegraph-win` on Windows, leaving WSL on the default `.codegraph`. CodeGraph skips any sibling `.codegraph-*` directory when indexing and watching, so the two never trip over each other.
 
+## Contributing
+
+### Prerequisites
+
+- Node.js 18–24 (via [nvm](https://github.com/nvm-sh/nvm) recommended)
+- npm
+
+### Fork and clone
+
+```bash
+# 1. Fork https://github.com/colbymchenry/codegraph on GitHub, then:
+git clone https://github.com/<your-username>/codegraph.git
+cd codegraph
+
+# 2. Add the upstream remote so you can pull in future changes
+git remote add upstream https://github.com/colbymchenry/codegraph.git
+```
+
+### Install dependencies and build
+
+```bash
+npm install
+npm run build
+```
+
+`npm run build` compiles TypeScript, copies `schema.sql` and the tree-sitter WASM grammar files into `dist/`, and marks the CLI entry point executable.
+
+### Point the `codegraph` command at your local build
+
+If you already have CodeGraph installed globally, replace its symlink with one pointing at your local source so every `codegraph` invocation runs your build:
+
+```bash
+npm link
+```
+
+To restore the published version later:
+
+```bash
+npm unlink -g @colbymchenry/codegraph
+npm i -g @colbymchenry/codegraph
+```
+
+Alternatively, skip the global symlink entirely and invoke the local build directly:
+
+```bash
+npm run cli -- <subcommand>   # e.g. npm run cli -- init -i
+```
+
+### Development workflow
+
+```bash
+npm run dev          # TypeScript watch mode — recompiles on every save
+npm test             # run the full test suite
+npm run test:watch   # vitest in watch mode
+```
+
+### FTS5 not available
+
+If you see `Failed to sync: no such module: fts5` after running `codegraph init` or `codegraph sync`, your Node build was compiled without the FTS5 full-text search module. This affects the official Node 22 and 23 macOS binaries. Switch to Node 24, which ships with FTS5 enabled:
+
+```bash
+nvm install 24
+nvm use 24
+npm install    # reinstall against the new Node
+npm run build
+npm link       # re-point the global symlink
+```
+
+You can verify FTS5 is available before running the indexer:
+
+```bash
+node -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(':memory:');db.exec('CREATE VIRTUAL TABLE t USING fts5(x)');console.log('FTS5 OK')"
+```
+
+### Before opening a PR
+
+- Run `npm test` — all tests must pass (or pre-existing failures must match `main`)
+- Keep changes scoped to the feature or fix
+- Don't bump `package.json` versions or update `package-lock.json` unless your change added or removed a dependency
+
 ## Star History
 
 <a href="https://www.star-history.com/?repos=colbymchenry%2Fcodegraph&type=date&legend=top-left">
