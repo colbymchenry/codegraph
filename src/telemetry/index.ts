@@ -30,7 +30,10 @@ import { randomUUID } from 'crypto';
 export const TELEMETRY_ENDPOINT = 'https://telemetry.getcodegraph.com/v1/events';
 export const TELEMETRY_DOCS = 'https://github.com/colbymchenry/codegraph/blob/main/TELEMETRY.md';
 
-const SCHEMA_VERSION = 1;
+// v2: dropped the `sqlite_backend` field from the `index` event — node:sqlite is
+// now the only backend (the better-sqlite3-native / wasm-fallback split is gone),
+// so the value was a constant carrying no signal. See TELEMETRY.md.
+const SCHEMA_VERSION = 2;
 const MAX_BUFFER_BYTES = 256 * 1024;
 const MAX_EVENTS_PER_REQUEST = 100;
 const DEFAULT_FLUSH_TIMEOUT_MS = 1500;
@@ -55,18 +58,13 @@ export function bucketDuration(ms: number): '<10s' | '10-60s' | '1-5m' | '5m+' {
   return '5m+';
 }
 
-/** Collapse a backend identifier (e.g. `node-sqlite`) to the schema's enum. */
-export function backendKind(backend: string): 'native' | 'wasm' {
-  return backend.toLowerCase().includes('wasm') ? 'wasm' : 'native';
-}
-
 /**
  * Shared "a full index completed" event (CLI init/index + installer local
  * init): language names and coarse buckets only — never paths, file names,
  * or exact counts. Structurally typed so callers don't need engine imports.
  */
 export function recordIndexEvent(
-  cg: { getStats(): { filesByLanguage: Record<string, number> }; getBackend(): string },
+  cg: { getStats(): { filesByLanguage: Record<string, number> } },
   result: { filesIndexed: number; durationMs: number },
 ): void {
   try {
@@ -77,7 +75,6 @@ export function recordIndexEvent(
       languages,
       file_count_bucket: bucketFileCount(result.filesIndexed),
       duration_bucket: bucketDuration(result.durationMs),
-      sqlite_backend: backendKind(cg.getBackend()),
     });
   } catch {
     /* telemetry must never break indexing */

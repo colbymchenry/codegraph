@@ -91,25 +91,47 @@ function isWithinDir(child: string, parent: string): boolean {
  * (codegraph_node `includeCode`, codegraph_explore source) go through here, so
  * this is the chokepoint that keeps out-of-root file contents from leaking.
  *
+ * `allowSymlinkEscape` waives **only** the realpath-escape rejection (the
+ * lexical `../` guard still applies) for the INDEXING read path. The directory
+ * walk deliberately descends into in-root symlinks whose targets live outside
+ * the root (e.g. a `game/` symlink in a Dota custom-game tree, #935); discovery
+ * and the reader must agree, or every file the walk enumerated fails to index.
+ * Indexing only reads paths it just discovered, into a local index — it never
+ * serves them to an agent, so this does not widen the #527 leak surface. The
+ * content-serving sinks must never pass this flag.
+ *
  * @param projectRoot - The project root directory
  * @param filePath - The (relative or absolute) file path to validate
+ * @param options.allowSymlinkEscape - Follow in-root symlinks out of the root
+ *   (indexing read path only); defaults to the strict, leak-safe behavior.
  * @returns The resolved absolute path (realpath when it exists), or null if it
  *   escapes the root
  */
-export function validatePathWithinRoot(projectRoot: string, filePath: string): string | null {
+export function validatePathWithinRoot(
+  projectRoot: string,
+  filePath: string,
+  options?: { allowSymlinkEscape?: boolean }
+): string | null {
   const resolved = path.resolve(projectRoot, filePath);
   const normalizedRoot = path.resolve(projectRoot);
 
-  // 1. Lexical containment — cheap, catches `../` traversal.
+  // 1. Lexical containment — cheap, catches `../` traversal. Applies even on
+  //    the indexing read path: a crafted `../` escape is still rejected.
   if (!isWithinDir(resolved, normalizedRoot)) {
     return null;
   }
 
   // 2. Symlink-aware containment — resolve symlinks on both sides and re-check,
   //    so an in-repo symlink whose real target escapes the root is rejected.
+  //    The indexing read path (allowSymlinkEscape) skips only this rejection so
+  //    it stays consistent with the directory walk, which already followed the
+  //    in-root symlink to enumerate these files (#935).
   try {
     const realRoot = fs.realpathSync(normalizedRoot);
     const realResolved = fs.realpathSync(resolved);
+    if (options?.allowSymlinkEscape) {
+      return realResolved;
+    }
     return isWithinDir(realResolved, realRoot) ? realResolved : null;
   } catch (err) {
     // ENOENT: the path doesn't exist yet (a file about to be written, or an

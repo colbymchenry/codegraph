@@ -16,6 +16,8 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   WASM_RUNTIME_FLAGS,
+  NODE_RUNTIME_FLAGS,
+  nodeRuntimeFlagsFor,
   processHasWasmRuntimeFlags,
   buildRelaunchArgv,
 } from '../src/extraction/wasm-runtime-flags';
@@ -42,6 +44,36 @@ describe('WASM_RUNTIME_FLAGS', () => {
   });
 });
 
+describe('NODE_RUNTIME_FLAGS', () => {
+  it('suppresses the node:sqlite ExperimentalWarning on this runtime', () => {
+    // The warning is emitted once per THREAD (main + every parse worker), so
+    // during indexing it repeatedly interleaves with the progress UI. Prove
+    // the flag both launches node and actually silences the warning.
+    expect(NODE_RUNTIME_FLAGS).toContain('--disable-warning=ExperimentalWarning');
+    const res = spawnSync(
+      process.execPath,
+      [...NODE_RUNTIME_FLAGS, '-e', "require('node:sqlite'); process.exit(0)"],
+      { encoding: 'utf8' }
+    );
+    expect(res.status, res.stderr).toBe(0);
+    expect(res.stderr).not.toMatch(/ExperimentalWarning/);
+  });
+
+  it('is empty on nodes too old for --disable-warning (fatal "bad option" there)', () => {
+    expect(nodeRuntimeFlagsFor('20.10.0')).toEqual([]);
+    expect(nodeRuntimeFlagsFor('21.2.0')).toEqual([]);
+    expect(nodeRuntimeFlagsFor('20.11.0')).toContain('--disable-warning=ExperimentalWarning');
+    expect(nodeRuntimeFlagsFor('21.3.0')).toContain('--disable-warning=ExperimentalWarning');
+    expect(nodeRuntimeFlagsFor('22.5.0')).toContain('--disable-warning=ExperimentalWarning');
+  });
+
+  it('is NOT required by the re-exec gate (old-launcher compat)', () => {
+    // An installed bundle launcher that passes only the WASM flags must not
+    // trigger a pointless re-exec over a cosmetic warning flag.
+    expect(processHasWasmRuntimeFlags(['--liftoff-only'])).toBe(true);
+  });
+});
+
 describe('processHasWasmRuntimeFlags', () => {
   it('is true only when every required flag is present', () => {
     expect(processHasWasmRuntimeFlags(['--liftoff-only'])).toBe(true);
@@ -55,8 +87,9 @@ describe('processHasWasmRuntimeFlags', () => {
 });
 
 describe('buildRelaunchArgv', () => {
-  it('places the wasm flags first, then the script and its args', () => {
+  it('places our flags first, then the script and its args', () => {
     expect(buildRelaunchArgv('/x/codegraph.js', ['index', '/repo'], [])).toEqual([
+      ...NODE_RUNTIME_FLAGS,
       '--liftoff-only',
       '/x/codegraph.js',
       'index',
@@ -66,8 +99,18 @@ describe('buildRelaunchArgv', () => {
 
   it('preserves other existing node flags without duplicating ours', () => {
     expect(
-      buildRelaunchArgv('/x/codegraph.js', ['status'], ['--liftoff-only', '--enable-source-maps'])
-    ).toEqual(['--liftoff-only', '--enable-source-maps', '/x/codegraph.js', 'status']);
+      buildRelaunchArgv('/x/codegraph.js', ['status'], [
+        '--liftoff-only',
+        ...NODE_RUNTIME_FLAGS,
+        '--enable-source-maps',
+      ])
+    ).toEqual([
+      ...NODE_RUNTIME_FLAGS,
+      '--liftoff-only',
+      '--enable-source-maps',
+      '/x/codegraph.js',
+      'status',
+    ]);
   });
 
   it('produces an argv that actually launches node WITH the flag applied', () => {

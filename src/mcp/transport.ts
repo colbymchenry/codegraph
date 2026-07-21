@@ -193,7 +193,15 @@ abstract class LineBasedJsonRpcTransport implements JsonRpcTransport {
 
     if (this.messageHandler) {
       try {
+        if (process.env.CODEGRAPH_MCP_DEBUG) {
+          const m = parsed as { method?: string; id?: unknown };
+          process.stderr.write(`[mcp-debug] recv method=${m.method} id=${String(m.id)}\n`);
+        }
         await this.messageHandler(parsed as JsonRpcRequest | JsonRpcNotification);
+        if (process.env.CODEGRAPH_MCP_DEBUG) {
+          const m = parsed as { method?: string; id?: unknown };
+          process.stderr.write(`[mcp-debug] handled method=${m.method} id=${String(m.id)}\n`);
+        }
       } catch (err) {
         const message = parsed as JsonRpcRequest;
         if ('id' in message) {
@@ -353,7 +361,11 @@ export class SocketTransport extends LineBasedJsonRpcTransport {
     this.messageHandler = handler;
 
     this.socket.setEncoding('utf8');
+    if (process.env.CODEGRAPH_MCP_DEBUG) {
+      process.stderr.write(`[mcp-debug] transport attached flowing=${String(this.socket.readableFlowing)} buffered=${this.socket.readableLength}\n`);
+    }
     this.socket.on('data', (chunk: string) => {
+      if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] transport data ${chunk.length}b\n`);
       this.buffer += chunk;
       let idx;
       // Drain every complete line; tail-fragment stays in the buffer for the
@@ -374,6 +386,11 @@ export class SocketTransport extends LineBasedJsonRpcTransport {
       process.stderr.write(`[CodeGraph daemon] socket error: ${err.message}\n`);
       this.handleSocketClose();
     });
+    // The daemon's hello reader hands the socket over PAUSED (so the unshifted
+    // tail can't be emitted to zero listeners and lost — the #662 wedge).
+    // Attaching 'data' does not resume an explicitly-paused stream; do it here.
+    // Harmless when the socket was never paused.
+    this.socket.resume();
   }
 
   stop(): void {

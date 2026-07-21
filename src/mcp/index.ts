@@ -48,19 +48,15 @@ import {
   tryAcquireDaemonLock,
 } from './daemon';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
-import { getDaemonSocketPath } from './daemon-paths';
+import { getDaemonSocketCandidates } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
-import { supervisionLostReason } from './ppid-watchdog';
+import { checkForUpdateInBackground } from '../upgrade/update-check';
+import { EARLY_PPID } from './early-ppid';
+import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from './ppid-watchdog';
 import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
+import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
-
-/**
- * How often to poll `process.ppid` to detect parent process death (see #277).
- * 5s is a deliberate trade-off: the failure mode being guarded against is rare
- * (parent SIGKILL'd), and longer poll = less wakeup overhead while idle.
- */
-const DEFAULT_PPID_POLL_MS = 5000;
 
 /**
  * Env var that marks a process as the *detached daemon* itself (set by
@@ -93,34 +89,6 @@ const TAKEOVER_RETRY_DELAY_MS = 100;
 // path, this narrows the "No such tool available" race window.
 const DAEMON_CONNECT_MAX_RETRIES = 240;
 const DAEMON_CONNECT_RETRY_DELAY_MS = 25;
-
-/**
- * Resolve the PPID watchdog poll interval from an env override. A value of
- * `0` disables the watchdog entirely (escape hatch for embedded scenarios
- * where the parent legitimately re-parents the server on purpose). Anything
- * non-numeric or negative falls back to the default.
- */
-function parsePpidPollMs(raw: string | undefined): number {
-  if (raw === undefined || raw === '') return DEFAULT_PPID_POLL_MS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return DEFAULT_PPID_POLL_MS;
-  if (parsed < 0) return DEFAULT_PPID_POLL_MS;
-  return Math.floor(parsed);
-}
-
-/**
- * Parse the host PID propagated across the `--liftoff-only` re-exec
- * ({@link HOST_PPID_ENV}). Returns a positive integer PID, or null when
- * unset/invalid — the direct-launch path, where the watchdog falls back to
- * `process.ppid` divergence. PIDs of 0/1 are rejected (0 = unknown, 1 = init,
- * i.e. already orphaned), so the watchdog doesn't latch onto init.
- */
-function parseHostPpid(raw: string | undefined): number | null {
-  if (raw === undefined || raw === '') return null;
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 1) return null;
-  return parsed;
-}
 
 /** Whether `CODEGRAPH_NO_DAEMON` was set to a truthy value. */
 function daemonOptOutSet(): boolean {
@@ -183,6 +151,11 @@ function spawnDetachedDaemon(root: string): void {
     stdio = 'ignore'; // no log file — discard daemon output rather than fail
   }
   try {
+    // The daemon has no host: scrub the threaded host pid so it can't leak
+    // into the daemon's env (and from there into anything the daemon spawns),
+    // where a long-dead session's host pid would trigger spurious shutdowns.
+    const env: NodeJS.ProcessEnv = { ...process.env, [DAEMON_INTERNAL_ENV]: '1' };
+    delete env[HOST_PPID_ENV];
     const child = spawn(
       process.execPath,
       [...process.execArgv, scriptPath, 'serve', '--mcp', '--path', root],
@@ -190,7 +163,7 @@ function spawnDetachedDaemon(root: string): void {
         detached: true,
         stdio,
         windowsHide: true,
-        env: { ...process.env, [DAEMON_INTERNAL_ENV]: '1' },
+        env,
       },
     );
     child.unref();
@@ -224,9 +197,10 @@ export class MCPServer {
   // Worker-thread liveness watchdog (#850). Long-lived modes only; SIGKILLs the
   // process if the main thread wedges in a non-yielding sync loop.
   private livenessWatchdog: WatchdogHandle | null = null;
-  // PPID watchdog baseline — captured at construction so we always have a
-  // baseline, even if start() runs after a fork-style reparent.
-  private originalPpid: number = process.ppid;
+  // PPID watchdog baseline — from the CLI entry's earliest-possible capture
+  // (early-ppid.ts). Capturing here (construction) already lost the race when
+  // the launcher was killed during module loading (#1185).
+  private originalPpid: number = EARLY_PPID;
   private hostPpid: number | null = parseHostPpid(process.env[HOST_PPID_ENV]);
   // Idempotency guard for stop().
   private stopped = false;
@@ -254,6 +228,14 @@ export class MCPServer {
     // telemetry opportunistically. Fire-and-forget + unref'd — adds nothing
     // to the handshake path and never keeps the process alive.
     getTelemetry().startInterval();
+
+    // #1243: the MCP config launches the local binary, so a server left
+    // running drifts behind releases with no signal. Refresh the shared
+    // update-check cache in the background and log ONE stderr notice when a
+    // newer version exists (stderr only — stdout is the protocol channel).
+    // The notice also reaches the agent via the initialize instructions and
+    // codegraph_status. Fire-and-forget: adds nothing to the handshake path.
+    checkForUpdateInBackground();
 
     // The detached daemon process itself. Checked before the opt-out so the
     // daemon honors the same env it was spawned with (it never sets NO_DAEMON).
@@ -349,6 +331,17 @@ export class MCPServer {
     // ECONNRESET/hangup instead of a clean close) as shutdown, and destroy the
     // stream so a hung fd can't busy-spin the event loop (#799).
     treatStdinFailureAsShutdown(() => this.stop());
+    // Backstop for a launch abandoned during startup (#1185): launcher killed
+    // before EARLY_PPID could see it + host holding our pipes open. A server
+    // that never receives a byte of MCP traffic isn't serving anyone. Armed
+    // after session.start() attached the real stdin consumer.
+    armStartupHandshakeTimeout(() => {
+      process.stderr.write(
+        '[CodeGraph MCP] No MCP traffic since startup; assuming an abandoned launch and shutting down (#1185). ' +
+        'Tune with CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS (0 disables).\n'
+      );
+      this.stop();
+    });
 
     this.mode = 'direct';
     this.installSignalHandlers();
@@ -411,17 +404,34 @@ export class MCPServer {
    * never wedges a session.
    */
   private async runProxyWithLocalHandshake(root: string): Promise<void> {
-    const socketPath = getDaemonSocketPath(root);
+    // The daemon may relocate its socket past an in-project filesystem that can't
+    // host one (ExFAT/FAT volumes, WSL2 DrvFs; #997) to the deterministic tmpdir
+    // fallback. We don't read the bound path from the lockfile — both sides walk
+    // the SAME ordered candidate list, so we converge on whichever the daemon
+    // bound with zero coordination. The in-project candidate is tried first, so a
+    // normal repo pays nothing extra (it connects on the very first probe).
+    const candidates = getDaemonSocketCandidates(root);
+    const connectAnyCandidate = async (): Promise<Awaited<ReturnType<typeof connectWithHello>>> => {
+      for (const candidate of candidates) {
+        const s = await connectWithHello(candidate);
+        // A wrong-version daemon IS up — definitive; propagate so the caller
+        // serves in-process instead of spawning + polling for 6s. Don't keep
+        // probing fallbacks past it.
+        if (s === 'version-mismatch') return s;
+        if (s) return s;
+      }
+      return null;
+    };
     const getDaemonSocket = async () => {
-      // Fast path: a daemon may already be listening.
-      const probe = await connectWithHello(socketPath);
+      // Fast path: a daemon may already be listening (on either candidate).
+      const probe = await connectAnyCandidate();
       if (probe === 'version-mismatch') return null; // definitive — serve in-process, don't poll for 6s
       if (probe) return probe;
       // None reachable — spawn one (detached) and poll for its bind.
       spawnDetachedDaemon(root);
       for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
         await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
-        const s = await connectWithHello(socketPath);
+        const s = await connectAnyCandidate();
         if (s === 'version-mismatch') return null;
         if (s) return s;
       }

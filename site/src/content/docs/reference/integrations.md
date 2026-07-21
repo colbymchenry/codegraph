@@ -3,7 +3,7 @@ title: Integrations
 description: Supported agents, and manual MCP setup.
 ---
 
-The interactive installer auto-detects and configures each supported agent — wiring up the MCP server and writing its instructions file.
+The interactive installer auto-detects and configures each supported agent — wiring the CodeGraph MCP server into each. For the agents that use an instructions file, it also writes a short marker-fenced CodeGraph section (`CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`) so subagents and non-MCP harnesses learn the `codegraph explore` command; `codegraph uninstall` removes it.
 
 ## Supported agents
 
@@ -40,23 +40,19 @@ Add the MCP server to `~/.claude.json`:
 }
 ```
 
-Optionally auto-allow the read-only tools in `~/.claude/settings.json`:
+Optionally auto-allow CodeGraph's tools in `~/.claude/settings.json`:
 
 ```json
 {
   "permissions": {
     "allow": [
-      "mcp__codegraph__codegraph_search",
-      "mcp__codegraph__codegraph_callers",
-      "mcp__codegraph__codegraph_callees",
-      "mcp__codegraph__codegraph_impact",
-      "mcp__codegraph__codegraph_node",
-      "mcp__codegraph__codegraph_status",
-      "mcp__codegraph__codegraph_files"
+      "mcp__codegraph__*"
     ]
   }
 }
 ```
+
+One wildcard auto-approves every CodeGraph tool. The server lists a single tool by default — `codegraph_explore` — but if you re-enable others via the `CODEGRAPH_MCP_TOOLS` environment variable, they're already permitted with no prompt.
 
 :::tip
 Cursor launches MCP subprocesses with the wrong working directory. The installer handles this for you by injecting a `--path` argument; if you wire Cursor up by hand, pass the project path explicitly.

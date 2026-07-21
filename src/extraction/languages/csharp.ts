@@ -121,6 +121,22 @@ export const csharpExtractor: LanguageExtractor = {
     }
     return false;
   },
+  // `const` and `static readonly` fields are C# constants (`MaxItems`, lookup
+  // tables, shared config). Drives `constant` kind so value-reference edges
+  // target them; instance `readonly` / plain `static` fields stay `field`s.
+  isConst: (node) => {
+    let hasStatic = false;
+    let hasReadonly = false;
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (child?.type !== 'modifier') continue;
+      const t = child.text;
+      if (t === 'const') return true;
+      if (t === 'static') hasStatic = true;
+      else if (t === 'readonly') hasReadonly = true;
+    }
+    return hasStatic && hasReadonly;
+  },
   isAsync: (node) => {
     for (let i = 0; i < node.childCount; i++) {
       const child = node.child(i);

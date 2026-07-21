@@ -19,6 +19,12 @@ OUT="${AGENT_EVAL_OUT:-/tmp/agent-eval}"
 HARNESS="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$OUT"
 
+# Neutralize any ambient CodeGraph prompt-hook (~/.claude) in BOTH arms:
+# the hook injects codegraph context into every prompt, which contaminates
+# the without-arm (free structural context) and double-counts the with-arm.
+# The A/B's only variable must be the MCP server wired below.
+export CODEGRAPH_NO_PROMPT_HOOK=1
+
 [ -n "$CG_BIN" ] || { echo "no codegraph binary on PATH (set CG_BIN)"; exit 1; }
 [ -d "$REPO/.codegraph" ] || { echo "no .codegraph index at $REPO — index it first"; exit 1; }
 case "$MODE" in headless|tmux|all) ;; *) echo "mode must be headless|tmux|all (got '$MODE')"; exit 1;; esac
