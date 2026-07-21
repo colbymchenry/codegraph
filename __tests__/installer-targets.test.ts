@@ -227,6 +227,36 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(mdEntry?.action).toBe('updated');
   });
 
+  it('grok: writes and removes only its MCP table while preserving sibling tables', () => {
+    const grok = getTarget('grok')!;
+    const config = path.join(tmpHome, '.grok', 'config.toml');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    fs.writeFileSync(config, [
+      '[mcp_servers.other]',
+      'command = "other-server"',
+      '',
+      '[ui]',
+      'theme = "dark"',
+      '',
+    ].join('\n'));
+
+    grok.install('global', { autoAllow: false });
+
+    const installed = fs.readFileSync(config, 'utf-8');
+    expect(installed).toContain('[mcp_servers.other]');
+    expect(installed).toContain('[ui]');
+    expect(installed).toContain('[mcp_servers.codegraph]');
+    expect(installed).toContain('command = "codegraph"');
+    expect(installed).toContain('args = ["serve", "--mcp"]');
+
+    grok.uninstall('global');
+
+    const removed = fs.readFileSync(config, 'utf-8');
+    expect(removed).toContain('[mcp_servers.other]');
+    expect(removed).toContain('[ui]');
+    expect(removed).not.toContain('[mcp_servers.codegraph]');
+  });
+
   it('opencode: prefers .jsonc when both .json and .jsonc exist', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
