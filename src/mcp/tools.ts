@@ -2653,6 +2653,31 @@ export class ToolHandler {
         let cands = raw
           .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
           .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
+        // Field-name seeding fallback (#1196): a camelCase token that names NO
+        // definition of its own is usually an object-literal key / API field
+        // (`profileInfo`) — no node exists, so it contributed zero seeds and
+        // the files that DEFINE it (`getProfileInfoV2` in profileController)
+        // never surfaced. Seed its camel-infix definers instead: callables
+        // whose name contains the token at a hump boundary or as a prefix.
+        // Exact-empty + camel-shaped only (bare words keep the NL-stopword
+        // guard below), shortest-first, capped so a hot infix can't flood.
+        if (cands.length === 0 && !isQual && /[a-z][A-Z]/.test(t)) {
+          const lcToken = t.toLowerCase();
+          cands = cg
+            .getNodesByNameSubstring(t, {
+              kinds: ['function', 'method', 'component'],
+              limit: 60,
+            })
+            .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
+            .filter((n) => {
+              const idx = n.name.toLowerCase().indexOf(lcToken);
+              if (idx < 0) return false;
+              if (idx === 0) return n.name.length > t.length; // prefix definer
+              return /[A-Z]/.test(n.name.charAt(idx)); // camel-hump boundary
+            })
+            .sort((a, b) => a.name.length - b.name.length)
+            .slice(0, 3);
+        }
         // Bare lowercase words only seed defs their query-siblings corroborate
         // (see the NL-stopword guard above). Filtering CANDS (not picks) applies
         // the guard uniformly to both branches below, including the >3-def

@@ -112,7 +112,244 @@ export class DatabaseConnection {
       runMigrations(db, currentVersion);
     }
 
+    // Self-heal a bulk-load window that never closed (crash between
+    // beginBulkNodeLoad and endBulkNodeLoad): the FTS triggers are missing and
+    // nodes_fts is stale. Rebuild + recreate so search stays in sync.
+    conn.healBulkNodeLoad();
+
     return conn;
+  }
+
+  /**
+   * FTS maintenance triggers dropped/recreated around a bulk load.
+   * Names must match schema.sql.
+   */
+  private static readonly FTS_TRIGGER_NAMES = ['nodes_ai', 'nodes_ad', 'nodes_au'] as const;
+
+  /**
+   * Enter bulk-load mode: drop the per-row FTS sync triggers so mass node
+   * inserts skip per-row tokenization. MUST be paired with endBulkNodeLoad()
+   * (use try/finally); a crash inside the window is healed on the next open().
+   * The window is DB-wide (triggers are schema objects), which is safe because
+   * endBulkNodeLoad() rebuilds nodes_fts from the nodes table wholesale — any
+   * row written by anyone during the window is captured by the rebuild.
+   */
+  beginBulkNodeLoad(): void {
+    for (const t of DatabaseConnection.FTS_TRIGGER_NAMES) {
+      this.db.exec(`DROP TRIGGER IF EXISTS ${t}`);
+    }
+  }
+
+  /**
+   * Leave bulk-load mode: rebuild the whole FTS index from the nodes table in
+   * one pass (far cheaper than per-row trigger firings), then recreate the
+   * triggers by re-running schema.sql (idempotent — everything in it is
+   * IF NOT EXISTS).
+   */
+  endBulkNodeLoad(): void {
+    this.db.exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`);
+    this.recreateFtsTriggers();
+  }
+
+  /**
+   * NON-UNIQUE secondary indexes maintained per-row during the parse phase's
+   * bulk inserts — the store-architecture arc's first lever (plan §4d: dubbo's
+   * parse-loop wall is 94% store-writer busy, and the #1320 post-mortem showed
+   * statement batching and sorted inserts are ~zero on this path because
+   * B-TREE MAINTENANCE is the floor). A fresh init writes every row of
+   * nodes/unresolved_refs/files exactly once and reads none of them until
+   * resolution, so the parse window can drop all of these and rebuild each in
+   * one table scan afterwards — the same measured trade as the resolution
+   * phase's edge-index window (2.8s → 1.1s inserting, ~0.3s recreating).
+   * Primary keys and UNIQUE constraints stay (upserts and OR-IGNORE dedup
+   * conflict on them).
+   */
+  private static readonly BULK_PARSE_INDEX_NAMES = [
+    'idx_nodes_kind',
+    'idx_nodes_name',
+    'idx_nodes_qualified_name',
+    'idx_nodes_file_path',
+    'idx_nodes_language',
+    'idx_nodes_file_line',
+    'idx_nodes_lower_name',
+    'idx_unresolved_from_node',
+    'idx_unresolved_name',
+    'idx_unresolved_file_path',
+    'idx_unresolved_from_name',
+    'idx_unresolved_status',
+    'idx_unresolved_failed_tail',
+    'idx_files_language',
+    'idx_files_modified_at',
+  ] as const;
+
+  /**
+   * Enter bulk-parse-load mode (FRESH-INIT ONLY — the caller gates on a fresh
+   * DB, because an incremental index deletes per-file rows mid-phase and needs
+   * the file_path indexes): drop every parse-lane secondary index, including
+   * the four non-unique edge indexes (parse inserts contains-edges too; the
+   * UNIQUE identity index stays for INSERT OR IGNORE dedup, and its `source`
+   * prefix keeps source-keyed reads indexed, as in the edge window). MUST be
+   * paired with endBulkParseLoad(); a crash inside the window is healed on the
+   * next DatabaseConnection open (schema.sql re-applies CREATE INDEX IF NOT
+   * EXISTS).
+   */
+  beginBulkParseLoad(): void {
+    for (const idx of DatabaseConnection.BULK_PARSE_INDEX_NAMES) {
+      this.db.exec(`DROP INDEX IF EXISTS ${idx}`);
+    }
+    this.beginBulkEdgeLoad();
+  }
+
+  /**
+   * Leave bulk-parse-load mode: recreate everything the window dropped, one
+   * table scan per index, with a yield between statements (same
+   * liveness-watchdog rationale as endBulkEdgeLoad — at kernel scale each
+   * build is a long synchronous scan). The edge indexes are rebuilt here too,
+   * so paths that never enter the resolution phase's own bulk-edge window
+   * (small runs) are left with a complete schema; the batched resolver's
+   * beginBulkEdgeLoad simply re-drops them (DROP IF EXISTS — idempotent).
+   */
+  async endBulkParseLoad(): Promise<void> {
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    for (const idx of DatabaseConnection.BULK_PARSE_INDEX_NAMES) {
+      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
+      if (!m) throw new Error(`schema.sql: parse index ${idx} not found for bulk-load recreation`);
+      this.db.exec(m[0]);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    await this.endBulkEdgeLoad();
+  }
+
+  /**
+   * unresolved_refs secondary indexes NOT read by the batched resolution
+   * loop. The loop pages pending refs by keyset (`status='pending' AND id>?`
+   * — the status index + PK), deletes resolved rows by id, and parks failures
+   * with a status UPDATE; every other ref index serves SYNC-time paths
+   * (per-file re-index deletes, name-keyed retry, failed-tail heal). Each
+   * per-batch DELETE maintains all of them — the biggest single main-thread
+   * stage on the dubbo profile (deletes 1.2s of a 5.4s resolution phase) —
+   * so the batched loop drops them and rebuilds at the end, where the table
+   * holds only the surviving FAILED refs (resolved rows are gone), making
+   * the recreate near-free.
+   */
+  private static readonly BULK_REF_INDEX_NAMES = [
+    'idx_unresolved_from_node',
+    'idx_unresolved_name',
+    'idx_unresolved_file_path',
+    'idx_unresolved_from_name',
+    'idx_unresolved_failed_tail',
+  ] as const;
+
+  /**
+   * Enter bulk-ref mode for the batched resolution loop — see
+   * BULK_REF_INDEX_NAMES. MUST be paired with endBulkRefLoad(); a crash
+   * inside the window heals on the next open (schema.sql re-applies
+   * CREATE INDEX IF NOT EXISTS).
+   */
+  beginBulkRefLoad(): void {
+    for (const idx of DatabaseConnection.BULK_REF_INDEX_NAMES) {
+      this.db.exec(`DROP INDEX IF EXISTS ${idx}`);
+    }
+  }
+
+  /** Leave bulk-ref mode: recreate each index in one scan (yield between). */
+  async endBulkRefLoad(): Promise<void> {
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    for (const idx of DatabaseConnection.BULK_REF_INDEX_NAMES) {
+      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
+      if (!m) throw new Error(`schema.sql: ref index ${idx} not found for bulk-load recreation`);
+      this.db.exec(m[0]);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /**
+   * Names of the NON-UNIQUE edge indexes dropped for a bulk edge load.
+   * idx_edges_identity deliberately stays: INSERT OR IGNORE's dedup conflicts
+   * on it (#1034), and its leftmost column is `source`, so the source-keyed
+   * reads resolution makes mid-window (supertype walks over
+   * `implements`/`extends`) keep an index via its prefix — verified with
+   * EXPLAIN QUERY PLAN. Target-keyed and kind-keyed reads (traversal,
+   * synthesis) happen only after endBulkEdgeLoad().
+   */
+  private static readonly BULK_EDGE_INDEX_NAMES = [
+    'idx_edges_kind',
+    'idx_edges_source_kind',
+    'idx_edges_target_kind',
+    'idx_edges_provenance',
+  ] as const;
+
+  /**
+   * Enter bulk-edge-load mode: drop the non-unique edge indexes so the mass
+   * INSERT OR IGNORE stream pays one B-tree (the identity index) instead of
+   * five — measured 2.8s → 1.1s inserting a 224k-edge resolution set, with
+   * recreation costing ~0.3s. MUST be paired with endBulkEdgeLoad(); a crash
+   * inside the window is healed on the next DatabaseConnection open (schema.sql
+   * re-applies CREATE INDEX IF NOT EXISTS).
+   */
+  beginBulkEdgeLoad(): void {
+    for (const idx of DatabaseConnection.BULK_EDGE_INDEX_NAMES) {
+      this.db.exec(`DROP INDEX IF EXISTS ${idx}`);
+    }
+  }
+
+  /**
+   * Leave bulk-edge-load mode: recreate the dropped indexes in one pass each
+   * over the (now fully loaded) edges table — far cheaper than maintaining
+   * them per-insert. DDL is extracted from schema.sql so it cannot drift.
+   *
+   * Async with a yield BETWEEN the four CREATE INDEX statements: each build is
+   * a synchronous scan of the whole edges table (~20s apiece at Linux-kernel
+   * scale, 79s total measured), and running them back-to-back is a single
+   * event-loop stall longer than the #850 liveness watchdog's 60s window — a
+   * daemon-triggered re-index would be SIGKILLed right after doing the work.
+   * One yield per statement keeps every stall to a single index build, which
+   * stays inside the window.
+   */
+  async endBulkEdgeLoad(): Promise<void> {
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    for (const idx of DatabaseConnection.BULK_EDGE_INDEX_NAMES) {
+      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
+      if (!m) throw new Error(`schema.sql: edge index ${idx} not found for bulk-load recreation`);
+      this.db.exec(m[0]);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /** Recreate the FTS triggers + rebuild if a bulk-load window never closed. */
+  private healBulkNodeLoad(): void {
+    const row = this.db
+      .prepare(
+        `SELECT count(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name IN ('nodes_ai','nodes_ad','nodes_au')`
+      )
+      .get() as { c: number } | undefined;
+    if ((row?.c ?? 0) >= DatabaseConnection.FTS_TRIGGER_NAMES.length) return;
+    this.endBulkNodeLoad();
+  }
+
+  /**
+   * Recreate the FTS sync triggers from schema.sql — extracted from the file
+   * rather than duplicated here so the DDL cannot drift from the schema.
+   * (Re-execing the whole schema is not an option: it contains data INSERTs
+   * that are not idempotent, e.g. schema_versions.)
+   */
+  private recreateFtsTriggers(): void {
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    const triggerDdls = schema.match(
+      /CREATE TRIGGER IF NOT EXISTS nodes_a[idu]\b[\s\S]*?END;/g
+    );
+    if (!triggerDdls || triggerDdls.length !== DatabaseConnection.FTS_TRIGGER_NAMES.length) {
+      throw new Error(
+        `schema.sql: expected ${DatabaseConnection.FTS_TRIGGER_NAMES.length} nodes FTS triggers, found ${triggerDdls?.length ?? 0}`
+      );
+    }
+    for (const ddl of triggerDdls) {
+      this.db.exec(ddl);
+    }
   }
 
   /**
@@ -202,6 +439,17 @@ export class DatabaseConnection {
     }
   }
 
+  /** Size of the main DB file in bytes (0 for in-memory/unknown) — the WAL
+   * valve scales its fold caps with it (resolveWalValveMb). */
+  getDbFileSizeBytes(): number {
+    if (!this.dbPath || this.dbPath === ':memory:') return 0;
+    try {
+      return fs.statSync(this.dbPath).size;
+    } catch {
+      return 0;
+    }
+  }
+
   /** Current `wal_autocheckpoint` interval in pages (0 = disabled). */
   getWalAutocheckpoint(): number {
     const v = this.db.pragma('wal_autocheckpoint', { simple: true });
@@ -239,9 +487,29 @@ export class DatabaseConnection {
    * never run inline on the main thread).
    */
   async checkpointWalPassive(): Promise<{ busy: number; log: number; checkpointed: number } | null> {
+    return this.checkpointWal('PASSIVE');
+  }
+
+  /**
+   * `PRAGMA wal_checkpoint(TRUNCATE)` — same off-thread pattern as PASSIVE,
+   * but on success the WAL FILE is chopped to zero. A completed passive
+   * backfill bounds the un-checkpointed backlog, yet the FILE only stops
+   * growing when a commit finds ZERO readers holding WAL marks — rare while
+   * pool workers cycle, so at kernel scale a fully-backfilled WAL still
+   * accreted the phase's whole write volume on disk (§7a.1: 22GB). The valve
+   * calls this exactly at a parked barrier (writer parked, pool drained,
+   * backfill complete) where the no-reader condition is guaranteed rather
+   * than lucky. The worker sets a short busy_timeout so a racing reader
+   * degrades this to a no-op (busy=1) instead of a stall.
+   */
+  async checkpointWalTruncate(): Promise<{ busy: number; log: number; checkpointed: number } | null> {
+    return this.checkpointWal('TRUNCATE');
+  }
+
+  private async checkpointWal(mode: 'PASSIVE' | 'TRUNCATE'): Promise<{ busy: number; log: number; checkpointed: number } | null> {
     if (!this.dbPath || this.dbPath === ':memory:') {
       try {
-        const row = this.db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get() as Record<string, number> | undefined;
+        const row = this.db.prepare(`PRAGMA wal_checkpoint(${mode})`).get() as Record<string, number> | undefined;
         return row ? { busy: Number(row.busy), log: Number(row.log), checkpointed: Number(row.checkpointed) } : null;
       } catch {
         return null;
@@ -252,13 +520,18 @@ export class DatabaseConnection {
       const workerSource = `
         const { workerData, parentPort } = require('node:worker_threads');
         let row = null;
+        let err = null;
         try {
           const { DatabaseSync } = require('node:sqlite');
           const db = new DatabaseSync(workerData.dbPath);
-          try { row = db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get(); } catch {}
+          const mode = workerData.mode === 'TRUNCATE' ? 'TRUNCATE' : 'PASSIVE';
+          try {
+            if (mode === 'TRUNCATE') db.exec('PRAGMA busy_timeout = 2000');
+            row = db.prepare('PRAGMA wal_checkpoint(' + mode + ')').get();
+          } catch (e) { err = String(e && e.message || e); }
           try { db.close(); } catch {}
-        } catch {}
-        parentPort.postMessage({ row });
+        } catch (e) { err = err || String(e && e.message || e); }
+        parentPort.postMessage({ row, err });
       `;
       return await new Promise((resolve) => {
         let settled = false;
@@ -268,8 +541,14 @@ export class DatabaseConnection {
           resolve(row ? { busy: Number(row.busy), log: Number(row.log), checkpointed: Number(row.checkpointed) } : null);
         };
         try {
-          const worker = new Worker(workerSource, { eval: true, workerData: { dbPath: this.dbPath } });
-          worker.once('message', (m: { row?: Record<string, number> | null }) => { void worker.terminate(); finish(m?.row ?? null); });
+          const worker = new Worker(workerSource, { eval: true, workerData: { dbPath: this.dbPath, mode } });
+          worker.once('message', (m: { row?: Record<string, number> | null; err?: string | null }) => {
+            if (m?.err && process.env.CODEGRAPH_WAL_VALVE_DEBUG) {
+              console.error(`[wal-valve] checkpoint worker (${mode}): ${m.err}`);
+            }
+            void worker.terminate();
+            finish(m?.row ?? null);
+          });
           worker.once('error', () => { void worker.terminate(); finish(null); });
           worker.once('exit', () => finish(null));
         } catch {

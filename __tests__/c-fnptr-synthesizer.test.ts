@@ -366,4 +366,32 @@ void setup(int *L) {
     const edges = await load();
     expect(edges.length).toBe(0);
   });
+
+  // This is the pass that parks the "Linking dynamic dispatch" bar on C-heavy
+  // repos, so it reports a within-pass fraction of its file sweeps. Pin that
+  // the fractions arrive, stay in (0, 1], and never go backwards.
+  it('reports a monotonic within-pass progress fraction over its file sweeps', async () => {
+    // Enough files to cross the per-16-files reporting cadence several times
+    // across the four file sweeps.
+    for (let i = 0; i < 33; i++) write(`f${i}.c`, `void fn${i}(void) { }\n`);
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const { cFnPointerDispatchEdges } = await import('../src/resolution/c-fnptr-synthesizer');
+    const fractions: number[] = [];
+    await cFnPointerDispatchEdges(
+      (cg as any).queries,
+      (cg as any).resolver.context,
+      async () => {},
+      (f: number) => fractions.push(f)
+    );
+    cg.close?.();
+    expect(fractions.length).toBeGreaterThanOrEqual(4);
+    for (const f of fractions) {
+      expect(f).toBeGreaterThan(0);
+      expect(f).toBeLessThanOrEqual(1);
+    }
+    for (let i = 1; i < fractions.length; i++) {
+      expect(fractions[i]!).toBeGreaterThanOrEqual(fractions[i - 1]!);
+    }
+  });
 });
