@@ -48,7 +48,7 @@
     "@types/node": "^20.19.30",
     "@types/picomatch": "^4.0.2",
     "typescript": "^5.0.0",
-    "vitest": "^2.1.9"
+    "vitest": "^4.1.10"
   },
   "engines": {
     "node": ">=20.0.0 <25.0.0"
