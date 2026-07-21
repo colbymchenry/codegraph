@@ -143,6 +143,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Trails are plain JSON, one file per trail, under `.codegraph/ui/trails/` — already ignored by git, so they stay yours by default. **Export** hands you the file if you'd rather commit one for the team. This is the only thing the viewer writes: it still never indexes, never changes your graph, and never touches a line of your code. Start it with `codegraph ui --read-only` and it won't write even that — saved trails can still be opened, just not saved or deleted.
 
+- CodeGraph now indexes **Magik** (`.magik`) — the SmallWorld/GE Smallworld language used in GIS and asset management platforms. Exemplar definitions (`define_slotted_exemplar`, `define_mixin`, and related forms) are extracted as class nodes, `_method` declarations as methods with their exemplar as the receiver type, named `_proc` blocks as functions, `_package` declarations as namespaces, and inline `##` docstrings are preserved. Call edges are tracked across methods and procedures.
+
 ### Fixes
 
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
@@ -750,7 +752,6 @@ Full details in the entries below.
 - New `codegraph daemon` command (alias `daemons`) — an interactive manager for the background daemons. It shows what's running (your current project's daemon first, pre-selected), and you arrow-key to one and press enter to stop it, or pick "Stop all". Previously the only way to shut a daemon down was to hunt for its pid and `kill` it by hand. (#845)
 - Checking your installed version is now easy to reach however you guess at it: `codegraph version`, `codegraph -v`, and `codegraph -version` all print it, alongside the existing `codegraph --version`. (#864)
 - The CodeGraph MCP server now self-heals if its main thread ever locks up. A lightweight watchdog notices when the process has stopped responding and stops it so a fresh one starts on your next request — it can no longer sit pinned at 100% CPU with no way to recover. Tune the detection window with `CODEGRAPH_WATCHDOG_TIMEOUT_MS`, or turn it off entirely with `CODEGRAPH_NO_WATCHDOG=1`. (#850)
-- CodeGraph now indexes **Magik** (`.magik`) — the SmallWorld/GE Smallworld language used in GIS and asset management platforms. Exemplar definitions (`define_slotted_exemplar`, `define_mixin`, and related forms) are extracted as class nodes, `_method` declarations as methods with their exemplar as the receiver type, named `_proc` blocks as functions, `_package` declarations as namespaces, and inline `##` docstrings are preserved. Call edges are tracked across methods and procedures.
 
 ### Fixes
 
