@@ -164,6 +164,21 @@ function enclosingFn(nodesInFile: Node[], line: number): Node | null {
   return best;
 }
 
+const CLASS_LIKE_KINDS = new Set(['class', 'module', 'struct', 'interface', 'trait']);
+
+/** Innermost class/module-like node whose line range contains `line`. */
+function enclosingClass(nodesInFile: Node[], line: number): Node | null {
+  let best: Node | null = null;
+  for (const n of nodesInFile) {
+    if (!CLASS_LIKE_KINDS.has(n.kind)) continue;
+    const end = n.endLine ?? n.startLine;
+    if (n.startLine <= line && end >= line) {
+      if (!best || n.startLine >= best.startLine) best = n;
+    }
+  }
+  return best;
+}
+
 /**
  * Stream method + function nodes lazily. The synthesizers only scan-and-filter
  * down to a tiny matched subset, so materializing every function/method (which
@@ -2965,6 +2980,212 @@ async function sidekiqDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield)
   return edges;
 }
 
+// ── Prism dispatcher fan-out (ruby-lsp-style visitor registration, Ruby) ──────
+// A `Prism::Dispatcher` fans a single AST walk out to every listener's
+// `on_<node_type>_node_enter/leave` method by NAME CONVENTION — the listener
+// registers itself with `dispatcher.register(self, :on_x, :on_y, ...)` (a
+// symbol list, often 20-50 long, spanning many lines), and later
+// `dispatcher.dispatch(tree)` walks the AST, invoking every registered method
+// on every registered listener. There is no static call from `dispatch` to
+// `on_x` — the callback fan-out happens inside the external `prism` gem. This
+// is the ONLY dynamic hop in the "request → listener callback" flow (the
+// caller of `dispatch` is normally reached by ordinary static dispatch), so
+// bridging it closes the flow end-to-end:
+//
+//   dispatcher = Prism::Dispatcher.new
+//   hover = Requests::Hover.new(response_builder, ..., dispatcher, ...)  # registers on_call_node_enter, ...
+//   dispatcher.dispatch(document.ast)                                   # → hover.on_call_node_enter(node), ...
+//
+// Bridge: for each `dispatcher_var.dispatch(...)` call site, look at listener
+// classes constructed via `SomeListener.new(...)` in the SAME enclosing
+// method that also pass `dispatcher_var` as a constructor argument — a
+// textual pairing (like the Sidekiq/Mediatr channels above), not a full
+// variable-dataflow trace, but sufficient here since construction and dispatch
+// are conventionally colocated in one request-handling method (ruby-lsp:
+// `run_combined_requests`). For each such listener, link the enclosing method
+// → every `on_*` method it actually registers (cross-checked against real
+// method nodes in that class, so a typo'd or since-renamed symbol never mints
+// a dangling edge). Precision backstop: a `.dispatch(` call elsewhere (Redux
+// `store.dispatch`, ActionCable, ad-hoc event buses) simply resolves to no
+// listener-shaped class and contributes nothing.
+const PRISM_REGISTER_RE = /register\s*\(\s*self\s*,([\s\S]{0,4000}?)\)/g;
+const PRISM_ON_SYMBOL_RE = /:(on_\w+)\b/g;
+// `.dispatch(tree)` (bulk AST walk) and `.dispatch_once(node)` (ruby-lsp's
+// Hover-style single-node walk, used by requests that only care about the
+// node under the cursor) are the two dispatch entry points this gem exposes.
+// Captures the optional `@` separately: a bare local (`dispatcher.dispatch`)
+// is constructed and dispatched in the SAME method (`run_combined_requests`),
+// but an instance variable (`@dispatcher.dispatch_once`) is commonly threaded
+// through — assigned from a same-named constructor parameter in `initialize`,
+// read in a sibling `perform` (ruby-lsp's `Requests::Hover`) — so only the
+// `@`-prefixed form widens the listener search to the whole enclosing class;
+// a bare local stays scoped to its own method to avoid a same-named local in
+// an unrelated sibling method cross-linking (`text_document_document_highlight`
+// has its own unrelated `dispatcher` local in the same class as
+// `run_combined_requests`).
+const PRISM_DISPATCH_RE = /(@)?\b([A-Za-z_]\w*)\s*\.\s*dispatch(?:_once)?\s*\(/g;
+const PRISM_NEW_RE = /([A-Z][\w:]*)\s*\.\s*new\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)/g;
+const PRISM_RB_EXT = /\.rb$/;
+// A `Request` facade commonly wraps the actual registering `Listener` one
+// level down (ruby-lsp: `Requests::Hover#initialize` constructs
+// `Listeners::Hover.new(..., dispatcher)`, threading the SAME dispatcher
+// variable through unchanged) — so a class with no direct `register` call is
+// followed into its own body for further `.new(...dispatcher...)` calls.
+// Capped shallow: this bridges one real architectural indirection, not an
+// open-ended call chain.
+const PRISM_MAX_INDIRECTION = 2;
+// Bounds one dispatch site's total fan-out (typically a handful of listeners
+// × 20-50 `on_*` methods each — a fixed, legitimate cost per listener, not an
+// open-ended ambiguity like the Erlang mega-behaviour case). Sized as a
+// backstop against a genuinely pathological repo, not routine truncation.
+const PRISM_FANOUT_CAP = 400;
+
+async function prismDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  // listener class node id → the `on_*` method nodes it actually registers
+  // (directly, or via PRISM_MAX_INDIRECTION hops through a wrapper) AND
+  // actually declares, memoized per (class, dispatcher-var-name) pair since
+  // the indirection search is keyed on that variable's spelling.
+  const listenerCache = new Map<string, Node[]>();
+
+  const directRegisteredMethods = (cls: Node): Node[] => {
+    const content = ctx.readFile(cls.filePath);
+    if (!content) return [];
+    const end = cls.endLine ?? cls.startLine;
+    const body = content.split('\n').slice(cls.startLine - 1, end).join('\n');
+    const safeBody = stripCommentsForRegex(body, 'ruby');
+    const names = new Set<string>();
+    PRISM_REGISTER_RE.lastIndex = 0;
+    let rm: RegExpExecArray | null;
+    while ((rm = PRISM_REGISTER_RE.exec(safeBody))) {
+      PRISM_ON_SYMBOL_RE.lastIndex = 0;
+      let sm: RegExpExecArray | null;
+      while ((sm = PRISM_ON_SYMBOL_RE.exec(rm[1]!))) names.add(sm[1]!);
+    }
+    if (names.size === 0) return [];
+    const result: Node[] = [];
+    for (const n of ctx.getNodesInFile(cls.filePath)) {
+      if (n.kind === 'method' && names.has(n.name) && n.startLine >= cls.startLine && n.startLine <= end) {
+        result.push(n);
+      }
+    }
+    return result;
+  };
+
+  // Resolve a (possibly namespaced) class reference. Ruby elides enclosing
+  // modules lexically — `server.rb`'s `module RubyLsp; class Server; ...;
+  // Requests::FoldingRanges.new(...)` refers to
+  // `RubyLsp::Requests::FoldingRanges` with the `RubyLsp::` prefix dropped —
+  // so beyond sidekiqDispatchEdges.resolve's exact-qualified-name /
+  // unambiguous-simple-name tiers, a third tier accepts a class whose
+  // qualifiedName ends with `::${ref}` (the reference is a lexical-scope
+  // suffix of the real path), still requiring exactly one match.
+  const resolveClass = (ref: string): Node | null => {
+    if (ref.includes('::')) {
+      const q = ctx.getNodesByQualifiedName(ref).find((n) => n.kind === 'class');
+      if (q) return q;
+    }
+    const classes = ctx.getNodesByName(ref.split('::').pop()!).filter((n) => n.kind === 'class');
+    if (classes.length === 1) return classes[0]!;
+    if (ref.includes('::') && classes.length > 1) {
+      const bySuffix = classes.filter((n) => n.qualifiedName === ref || n.qualifiedName?.endsWith(`::${ref}`));
+      if (bySuffix.length === 1) return bySuffix[0]!;
+    }
+    return null;
+  };
+
+  const registeredMethodsOf = (ref: string, dispatcherVar: string, depth: number): Node[] => {
+    const cacheKey = `${ref}\0${dispatcherVar}`;
+    const cached = listenerCache.get(cacheKey);
+    if (cached) return cached;
+    const cls = resolveClass(ref);
+    let result: Node[] = cls ? directRegisteredMethods(cls) : [];
+    if (result.length === 0 && cls && depth < PRISM_MAX_INDIRECTION) {
+      const content = ctx.readFile(cls.filePath);
+      const end = cls.endLine ?? cls.startLine;
+      const body = content ? content.split('\n').slice(cls.startLine - 1, end).join('\n') : '';
+      const safeBody = stripCommentsForRegex(body, 'ruby');
+      const dispatcherRefRe = new RegExp(`\\b${dispatcherVar}\\b`);
+      const nested: Node[] = [];
+      const seenNested = new Set<string>();
+      PRISM_NEW_RE.lastIndex = 0;
+      let nm: RegExpExecArray | null;
+      while ((nm = PRISM_NEW_RE.exec(safeBody))) {
+        const nestedClassName = nm[1]!;
+        if (nestedClassName === ref || seenNested.has(nestedClassName) || !dispatcherRefRe.test(nm[2]!)) continue;
+        seenNested.add(nestedClassName);
+        nested.push(...registeredMethodsOf(nestedClassName, dispatcherVar, depth + 1));
+      }
+      result = nested;
+    }
+    listenerCache.set(cacheKey, result);
+    return result;
+  };
+
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  let scannedFiles = 0;
+  for (const file of ctx.getAllFiles()) {
+    if ((++scannedFiles & 15) === 0) await onYield();
+    if (!PRISM_RB_EXT.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || !/\.dispatch(?:_once)?\(/.test(content)) continue;
+    const safe = stripCommentsForRegex(content, 'ruby');
+    const nodesInFile = ctx.getNodesInFile(file);
+
+    PRISM_DISPATCH_RE.lastIndex = 0;
+    let dm: RegExpExecArray | null;
+    while ((dm = PRISM_DISPATCH_RE.exec(safe))) {
+      const isInstanceVar = dm[1] === '@';
+      const dispatcherVar = dm[2]!;
+      const line = safe.slice(0, dm.index).split('\n').length;
+      const disp = enclosingFn(nodesInFile, line);
+      if (!disp) continue;
+
+      // An instance-variable dispatcher (`@dispatcher.dispatch_once`) widens
+      // the listener search to the whole enclosing class — ruby-lsp threads
+      // it from a same-named constructor parameter in `initialize` to a
+      // sibling `perform`. A bare local stays scoped to `disp`'s own method
+      // body so an unrelated same-named local in a sibling method (both
+      // methods separately doing `dispatcher = Prism::Dispatcher.new`) can't
+      // cross-link. `disp` itself stays the edge source either way (the
+      // method an agent actually lands on tracing from the RPC entry point).
+      const scopeNode = isInstanceVar ? (enclosingClass(nodesInFile, line) ?? disp) : disp;
+      const scopeEnd = scopeNode.endLine ?? scopeNode.startLine;
+      const methodBody = safe.split('\n').slice(scopeNode.startLine - 1, scopeEnd).join('\n');
+      const dispatcherRefRe = new RegExp(`\\b${dispatcherVar}\\b`);
+
+      let added = 0;
+      const linkedListeners = new Set<string>();
+      PRISM_NEW_RE.lastIndex = 0;
+      let nm: RegExpExecArray | null;
+      while ((nm = PRISM_NEW_RE.exec(methodBody)) && added < PRISM_FANOUT_CAP) {
+        const className = nm[1]!;
+        const args = nm[2]!;
+        if (linkedListeners.has(className) || !dispatcherRefRe.test(args)) continue;
+        linkedListeners.add(className);
+        const targets = registeredMethodsOf(className, dispatcherVar, 0);
+        if (targets.length === 0) continue;
+        for (const target of targets) {
+          if (added >= PRISM_FANOUT_CAP) break;
+          const key = `${disp.id}>${target.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: disp.id,
+            target: target.id,
+            kind: 'calls',
+            line,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'prism-dispatch', via: className, registeredAt: `${file}:${line}` },
+          });
+          added++;
+        }
+      }
+    }
+  }
+  return edges;
+}
+
 // ── Erlang behaviour-callback dispatch ────────────────────────────────────────
 // An Erlang behaviour is a compile-checked callback contract: the behaviour
 // module declares `-callback init(...) -> ...`, implementers declare
@@ -3575,6 +3796,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'springEdges', gate: (has) => has('java'), run: (_q, c, y) => springEventEdges(c, y) },
   { name: 'mediatrEdges', gate: (has) => has('csharp'), run: (_q, c, y) => mediatrDispatchEdges(c, y) },
   { name: 'sidekiqEdges', gate: (has) => has('ruby'), run: (_q, c, y) => sidekiqDispatchEdges(c, y) },
+  { name: 'prismEdges', gate: (has) => has('ruby'), run: (_q, c, y) => prismDispatchEdges(c, y) },
   {
     name: 'erlangBehaviourEdges',
     gate: (has) => has('erlang'),

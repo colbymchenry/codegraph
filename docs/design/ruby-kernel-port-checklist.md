@@ -740,3 +740,27 @@ config/routes.rb.
    framework extract() merge over a kernel-extracted file — route nodes +
    `controller#action` refs land on top of walker output identically in both
    arms (can live in the existing frameworks-integration suite if simpler).
+
+## Post-port behavior changes (superseding rows above)
+
+Three gaps this survey catalogued as permanent quirks have since been
+deliberately fixed, in both `languages/ruby.ts` and `ruby.rs` (kernel parity
+maintained — `torture.rb` already exercised all three shapes, so
+`kernel-ruby-parity.test.ts` caught any TS/Rust divergence for free):
+
+- **isStatic (lines 282, 284, 333)**: `def self.x` (class-level or top-level)
+  and methods inside `class << self` now set `isStatic: true`. `class << self`
+  methods are still `contains`-parented to the outer class (that part was
+  already correct) — only the boolean field was missing.
+- **attr_accessor/attr_reader/attr_writer (lines 266, 698)**: no longer
+  produce nothing. Synthesized as `method` nodes (getter/setter) via the
+  `synthesizeMembers` hook, for both `class` bodies and module bodies
+  (Rails-Concern-style `attr_accessor` inside a `module`). An explicit
+  hand-written method of the same name is never overridden. The rest of the
+  `importTypes:['call']` funnel's blindness (`has_many`, `define_method`,
+  arbitrary class-body DSL calls) is unchanged — this fix is narrowly scoped
+  to the three attr_* names.
+- **brace-block calls (lines 212-213, 679-680, 691)**: `block_body` (brace
+  blocks `{ }`, including `lambda`/`proc`/stabby-arrow bodies) is now in the
+  bare-call-extraction parent set alongside `body_statement` (`do...end`).
+  `5.times { beep }` and `5.times do beep end` are now equivalent.
