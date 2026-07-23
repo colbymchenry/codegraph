@@ -386,6 +386,7 @@ codegraph install --yes                              # auto-detect agents, insta
 codegraph install --target=cursor,claude --yes       # explicit target list
 codegraph install --target=auto --location=local     # detected agents, project-local
 codegraph install --print-config codex               # print snippet, no file writes
+codegraph install --target=all --transport=http --mcp-url=http://127.0.0.1:3333/mcp
 ```
 
 | Flag | Values | Default |
@@ -395,6 +396,14 @@ codegraph install --print-config codex               # print snippet, no file wr
 | `--yes` | (boolean) | prompt every step |
 | `--no-permissions` | (boolean) skip Claude auto-allow list | permissions on |
 | `--print-config <id>` | dump snippet for one agent and exit | — |
+
+| `--transport` | `stdio`, `http` | `stdio` |
+| `--mcp-url` | HTTP MCP endpoint to install | `http://127.0.0.1:3333/mcp` |
+| `--mcp-token-env-var` | env var containing an HTTP bearer token | unset |
+
+`--transport=http` writes configs that connect to an already-running HTTP MCP
+server. Start it separately, usually with `codegraph serve --mcp --transport
+http --path <indexed-project>`.
 
 ### 2. Restart Your Agent
 

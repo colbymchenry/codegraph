@@ -48,6 +48,7 @@ import {
 import {
   atomicWriteFileSync,
   jsonDeepEqual,
+  normalizeMcpInstallOptions,
   removeMarkedSection,
   upsertInstructionsEntry,
 } from './shared';
@@ -115,7 +116,15 @@ function parseConfig(text: string): Record<string, any> {
   return result as Record<string, any>;
 }
 
-function getOpencodeServerEntry(): { type: string; command: string[]; enabled: boolean } {
+function getOpencodeServerEntry(opts?: InstallOptions['mcp']): Record<string, any> {
+  const normalized = normalizeMcpInstallOptions(opts);
+  if (normalized.transport === 'http') {
+    return {
+      type: 'remote',
+      url: normalized.url,
+      enabled: true,
+    };
+  }
   return {
     type: 'local',
     command: ['codegraph', 'serve', '--mcp'],
@@ -148,9 +157,9 @@ class OpencodeTarget implements AgentTarget {
     return { installed, alreadyConfigured, configPath: file };
   }
 
-  install(loc: Location, _opts: InstallOptions): WriteResult {
+  install(loc: Location, opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
-    files.push(writeMcpEntry(loc));
+    files.push(writeMcpEntry(loc, opts));
 
     // AGENTS.md gets the short marker-fenced CodeGraph block (#704):
     // subagents and non-MCP harnesses read AGENTS.md but never the MCP
@@ -172,11 +181,11 @@ class OpencodeTarget implements AgentTarget {
     return { files };
   }
 
-  printConfig(loc: Location): string {
+  printConfig(loc: Location, opts?: { mcp?: InstallOptions['mcp'] }): string {
     const target = configPath(loc);
     const snippet = JSON.stringify({
       $schema: 'https://opencode.ai/config.json',
-      mcp: { codegraph: getOpencodeServerEntry() },
+      mcp: { codegraph: getOpencodeServerEntry(opts?.mcp) },
     }, null, 2);
     return `# Add to ${target}\n\n${snippet}\n`;
   }
@@ -186,7 +195,7 @@ class OpencodeTarget implements AgentTarget {
   }
 }
 
-function writeMcpEntry(loc: Location): WriteResult['files'][number] {
+function writeMcpEntry(loc: Location, opts: InstallOptions): WriteResult['files'][number] {
   const file = configPath(loc);
   const existed = fs.existsSync(file);
   let text = readConfigText(file);
@@ -200,7 +209,7 @@ function writeMcpEntry(loc: Location): WriteResult['files'][number] {
 
   const config = parseConfig(text);
   const before = config.mcp?.codegraph;
-  const after = getOpencodeServerEntry();
+  const after = getOpencodeServerEntry(opts.mcp);
 
   if (jsonDeepEqual(before, after)) {
     return { path: file, action: 'unchanged' };

@@ -13,6 +13,7 @@
  */
 
 export type Location = 'global' | 'local';
+export type McpTransport = 'stdio' | 'http';
 
 /**
  * Stable string id used in the `--target` CLI flag and the registry
@@ -61,6 +62,12 @@ export interface WriteResult {
   notes?: string[];
 }
 
+export interface McpInstallOptions {
+  transport?: McpTransport;
+  url?: string;
+  tokenEnvVar?: string;
+}
+
 export interface InstallOptions {
   /**
    * Whether to write the agent's permissions / auto-allow surface
@@ -75,6 +82,8 @@ export interface InstallOptions {
    * leaves it untouched. Targets without a prompt-hook concept ignore it.
    */
   promptHook?: boolean;
+  /** MCP transport/config to write for targets that support it. */
+  mcp?: McpInstallOptions;
 }
 
 export interface AgentTarget {
@@ -107,7 +116,7 @@ export interface AgentTarget {
    * target. Used by `codegraph install --print-config <id>` and by
    * the README. Must NOT touch the filesystem.
    */
-  printConfig(loc: Location): string;
+  printConfig(loc: Location, opts?: { mcp?: McpInstallOptions }): string;
   /** Filesystem paths this target would write to at this location. */
   describePaths(loc: Location): string[];
 }

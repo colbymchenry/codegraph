@@ -2279,6 +2279,9 @@ program
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
   .option('--no-permissions', 'Skip writing the auto-allow permissions list (Claude Code only)')
   .option('--print-config <id>', 'Print MCP config snippet for the named agent and exit (no file writes)')
+  .option('--transport <transport>', 'MCP transport to install: "stdio" or "http". Default: stdio', 'stdio')
+  .option('--mcp-url <url>', 'HTTP MCP URL to install. Default: http://127.0.0.1:3333/mcp')
+  .option('--mcp-token-env-var <name>', 'Environment variable containing a bearer token for HTTP MCP clients')
   .option('--refresh', 'Rewrite what previous installs configured, for already-configured agents only (never adds new ones). Run automatically by `codegraph upgrade`')
   .action(async (opts: {
     target?: string;
@@ -2286,8 +2289,25 @@ program
     yes?: boolean;
     permissions?: boolean;
     printConfig?: string;
+    transport?: string;
+    mcpUrl?: string;
+    mcpTokenEnvVar?: string;
     refresh?: boolean;
   }) => {
+    const { parseMcpTransport } = await import('../installer/targets/shared');
+    let transport: 'stdio' | 'http';
+    try {
+      transport = parseMcpTransport(opts.transport);
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+    const mcp = {
+      transport,
+      ...(opts.mcpUrl ? { url: opts.mcpUrl } : {}),
+      ...(opts.mcpTokenEnvVar ? { tokenEnvVar: opts.mcpTokenEnvVar } : {}),
+    };
+
     if (opts.printConfig) {
       const { getTarget, listTargetIds } = await import('../installer/targets/registry');
       const target = getTarget(opts.printConfig);
@@ -2297,7 +2317,7 @@ program
         process.exit(1);
       }
       const loc = (opts.location === 'local' ? 'local' : 'global') as 'global' | 'local';
-      process.stdout.write(target.printConfig(loc));
+      process.stdout.write(target.printConfig(loc, { mcp }));
       return;
     }
 
@@ -2319,7 +2339,7 @@ program
         : ['global', 'local'];
       let changed = 0;
       for (const loc of locs) {
-        for (const report of refreshTargets(ALL_TARGETS, loc)) {
+        for (const report of refreshTargets(ALL_TARGETS, loc, { mcp })) {
           for (const p of report.changedPaths) {
             changed += 1;
             console.log(`  ${report.displayName}: refreshed ${p}`);
@@ -2356,6 +2376,7 @@ program
         location: opts.location as 'global' | 'local' | undefined,
         autoAllow,
         yes: opts.yes,
+        mcp,
       });
     } catch (err) {
       error(err instanceof Error ? err.message : String(err));

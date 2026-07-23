@@ -45,6 +45,7 @@ import {
   atomicWriteFileSync,
   getMcpServerConfig,
   jsonDeepEqual,
+  McpServerConfig,
   readJsonFile,
   writeJsonFile,
 } from './shared';
@@ -105,10 +106,10 @@ class CursorTarget implements AgentTarget {
     return { installed, alreadyConfigured, configPath: mcpPath };
   }
 
-  install(loc: Location, _opts: InstallOptions): WriteResult {
+  install(loc: Location, opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
 
-    files.push(writeMcpEntry(loc));
+    files.push(writeMcpEntry(loc, opts));
 
     // We no longer write `.cursor/rules/codegraph.mdc` — the codegraph
     // usage guidance ships in the MCP server's `initialize` response,
@@ -148,9 +149,9 @@ class CursorTarget implements AgentTarget {
     return { files };
   }
 
-  printConfig(loc: Location): string {
+  printConfig(loc: Location, opts?: { mcp?: InstallOptions['mcp'] }): string {
     const target = mcpJsonPath(loc);
-    const snippet = JSON.stringify({ mcpServers: { codegraph: buildCursorMcpConfig(loc) } }, null, 2);
+    const snippet = JSON.stringify({ mcpServers: { codegraph: buildCursorMcpConfig(loc, opts?.mcp) } }, null, 2);
     return `# Add to ${target}\n\n${snippet}\n`;
   }
 
@@ -168,17 +169,18 @@ class CursorTarget implements AgentTarget {
  * correctly regardless of Cursor's launch cwd. See file header for
  * the full rationale.
  */
-function buildCursorMcpConfig(loc: Location): { type: string; command: string; args: string[] } {
-  const base = getMcpServerConfig();
+function buildCursorMcpConfig(loc: Location, opts?: InstallOptions['mcp']): McpServerConfig {
+  const base = getMcpServerConfig(opts);
+  if (base.type === 'http') return base;
   const pathArg = loc === 'local' ? process.cwd() : '${workspaceFolder}';
   return { ...base, args: [...base.args, '--path', pathArg] };
 }
 
-function writeMcpEntry(loc: Location): WriteResult['files'][number] {
+function writeMcpEntry(loc: Location, opts: InstallOptions): WriteResult['files'][number] {
   const file = mcpJsonPath(loc);
   const existing = readJsonFile(file);
   const before = existing.mcpServers?.codegraph;
-  const after = buildCursorMcpConfig(loc);
+  const after = buildCursorMcpConfig(loc, opts.mcp);
 
   if (jsonDeepEqual(before, after)) {
     return { path: file, action: 'unchanged' };

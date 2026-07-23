@@ -25,6 +25,20 @@ By default this listens on `http://127.0.0.1:3333/mcp`. Tune it with
 `--transport http`. Non-local binds require a bearer token via `--token` or
 `CODEGRAPH_MCP_HTTP_TOKEN`.
 
+To install agent configs that connect to this HTTP endpoint instead of
+launching CodeGraph over stdio:
+
+```bash
+codegraph install --target=all --transport=http --mcp-url=http://127.0.0.1:3333/mcp
+```
+
+If the HTTP server requires a bearer token, set it in the agent environment and
+pass the env var name:
+
+```bash
+codegraph install --target=all --transport=http --mcp-token-env-var=CODEGRAPH_MCP_HTTP_TOKEN
+```
+
 ## One tool by default: `codegraph_explore`
 
 By default the server exposes a **single tool**, `codegraph_explore`. It's Read-equivalent: give it a natural-language question or a bag of symbol and file names, and it returns the **verbatim, line-numbered source** of the relevant symbols grouped by file — the same shape the `Read` tool gives you — plus the call paths between them (including dynamic-dispatch hops like callbacks, React re-render, and JSX children that grep can't follow) and a blast-radius summary of what depends on them. One call usually answers the whole question.

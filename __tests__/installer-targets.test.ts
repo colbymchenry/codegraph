@@ -208,6 +208,71 @@ describe('Installer targets — partial-state idempotency', () => {
     for (const f of second.files) expect(f.action).toBe('unchanged');
   });
 
+  it('all targets: HTTP install writes transport-specific MCP config', () => {
+    const mcp = {
+      transport: 'http' as const,
+      url: 'http://127.0.0.1:3333/mcp',
+      tokenEnvVar: 'CODEGRAPH_MCP_HTTP_TOKEN',
+    };
+
+    for (const target of ALL_TARGETS) {
+      for (const location of (['global', 'local'] as const).filter((l) => target.supportsLocation(l))) {
+        const result = target.install(location, { autoAllow: false, mcp });
+        const configPath = target.detect(location).configPath;
+        expect(configPath, `${target.id}/${location} configPath`).toBeTruthy();
+        expect(result.files.some((f) => f.path === configPath)).toBe(true);
+
+        const body = fs.readFileSync(configPath!, 'utf-8');
+        expect(body, `${target.id}/${location}`).toContain('http://127.0.0.1:3333/mcp');
+
+        if (target.id === 'codex') {
+          expect(body).toContain('url = "http://127.0.0.1:3333/mcp"');
+          expect(body).toContain('enabled = true');
+          expect(body).toContain('bearer_token_env_var = "CODEGRAPH_MCP_HTTP_TOKEN"');
+          expect(body).not.toContain('command = "codegraph"');
+          continue;
+        }
+
+        if (target.id === 'hermes') {
+          expect(body).toContain('url: "http://127.0.0.1:3333/mcp"');
+          expect(body).toContain('Authorization: "Bearer ${CODEGRAPH_MCP_HTTP_TOKEN}"');
+          expect(body).not.toContain('command: codegraph');
+          continue;
+        }
+
+        const parsed = JSON.parse(body);
+        const entry = target.id === 'opencode'
+          ? parsed.mcp?.codegraph
+          : parsed.mcpServers?.codegraph;
+        expect(entry, `${target.id}/${location} codegraph entry`).toBeTruthy();
+
+        if (target.id === 'opencode') {
+          expect(entry).toMatchObject({
+            type: 'remote',
+            url: 'http://127.0.0.1:3333/mcp',
+            enabled: true,
+          });
+          expect(entry.command).toBeUndefined();
+        } else if (target.id === 'gemini') {
+          expect(entry.httpUrl).toBe('http://127.0.0.1:3333/mcp');
+          expect(entry.headers.Authorization).toBe('Bearer ${CODEGRAPH_MCP_HTTP_TOKEN}');
+          expect(entry.command).toBeUndefined();
+        } else if (target.id === 'kiro' || target.id === 'antigravity') {
+          expect(entry.url).toBe('http://127.0.0.1:3333/mcp');
+          expect(entry.headers.Authorization).toBe('Bearer ${CODEGRAPH_MCP_HTTP_TOKEN}');
+          expect(entry.command).toBeUndefined();
+        } else {
+          expect(entry).toMatchObject({
+            type: 'http',
+            url: 'http://127.0.0.1:3333/mcp',
+          });
+          expect(entry.headers.Authorization).toBe('Bearer ${CODEGRAPH_MCP_HTTP_TOKEN}');
+          expect(entry.command).toBeUndefined();
+        }
+      }
+    }
+  });
+
   it('codex: install replaces a legacy AGENTS.md codegraph block with the current one, keeping user content', () => {
     const codex = getTarget('codex')!;
     const dir = path.join(tmpHome, '.codex');
@@ -1253,6 +1318,15 @@ describe('Installer targets — TOML serializer (Codex backbone)', () => {
     expect(block).toContain('[mcp_servers.codegraph]');
     expect(block).toContain('command = "codegraph"');
     expect(block).toContain('args = ["serve", "--mcp"]');
+  });
+
+  it('serializes boolean values for HTTP Codex config', () => {
+    const block = buildTomlTable('mcp_servers.codegraph', {
+      url: 'http://127.0.0.1:3333/mcp',
+      enabled: true,
+    });
+    expect(block).toContain('url = "http://127.0.0.1:3333/mcp"');
+    expect(block).toContain('enabled = true');
   });
 
   it('upsert inserts into empty content', () => {

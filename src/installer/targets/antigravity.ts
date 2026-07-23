@@ -65,7 +65,9 @@ import {
   WriteResult,
 } from './types';
 import {
+  authHeaders,
   jsonDeepEqual,
+  normalizeMcpInstallOptions,
   readJsonFile,
   writeJsonFile,
 } from './shared';
@@ -139,7 +141,14 @@ function resolveCodegraphCommand(): string {
  * field and (b) needs an absolute command path on macOS — see file
  * header.
  */
-function buildAntigravityEntry(): { command: string; args: string[] } {
+function buildAntigravityEntry(opts?: InstallOptions['mcp']): Record<string, any> {
+  const normalized = normalizeMcpInstallOptions(opts);
+  if (normalized.transport === 'http') {
+    return {
+      url: normalized.url,
+      ...(normalized.tokenEnvVar ? { headers: authHeaders(normalized.tokenEnvVar) } : {}),
+    };
+  }
   return {
     command: resolveCodegraphCommand(),
     args: ['serve', '--mcp'],
@@ -172,7 +181,7 @@ class AntigravityTarget implements AgentTarget {
     return { installed, alreadyConfigured, configPath: file };
   }
 
-  install(loc: Location, _opts: InstallOptions): WriteResult {
+  install(loc: Location, opts: InstallOptions): WriteResult {
     if (loc !== 'global') {
       return {
         files: [],
@@ -180,7 +189,7 @@ class AntigravityTarget implements AgentTarget {
       };
     }
     const files: WriteResult['files'] = [];
-    files.push(writeMcpEntry());
+    files.push(writeMcpEntry(opts));
     // If the user originally installed on the legacy path and Antigravity
     // has since migrated, strip the stale legacy entry so they don't
     // wind up with two competing codegraph configs.
@@ -216,12 +225,12 @@ class AntigravityTarget implements AgentTarget {
     return { files };
   }
 
-  printConfig(loc: Location): string {
+  printConfig(loc: Location, opts?: { mcp?: InstallOptions['mcp'] }): string {
     if (loc !== 'global') {
       return '# Antigravity IDE has no project-local config — use --location=global.\n';
     }
     const file = preferredMcpConfigPath();
-    const snippet = JSON.stringify({ mcpServers: { codegraph: buildAntigravityEntry() } }, null, 2);
+    const snippet = JSON.stringify({ mcpServers: { codegraph: buildAntigravityEntry(opts?.mcp) } }, null, 2);
     return `# Add to ${file}\n\n${snippet}\n`;
   }
 
@@ -231,14 +240,14 @@ class AntigravityTarget implements AgentTarget {
   }
 }
 
-function writeMcpEntry(): WriteResult['files'][number] {
+function writeMcpEntry(opts: InstallOptions): WriteResult['files'][number] {
   const file = preferredMcpConfigPath();
   const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
   const existing = readJsonFile(file);
   const before = existing.mcpServers?.codegraph;
-  const after = buildAntigravityEntry();
+  const after = buildAntigravityEntry(opts.mcp);
 
   if (jsonDeepEqual(before, after)) {
     return { path: file, action: 'unchanged' };

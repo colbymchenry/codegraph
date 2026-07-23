@@ -34,8 +34,10 @@ import {
   WriteResult,
 } from './types';
 import {
+  authHeaders,
   getMcpServerConfig,
   jsonDeepEqual,
+  normalizeMcpInstallOptions,
   readJsonFile,
   writeJsonFile,
 } from './shared';
@@ -71,9 +73,9 @@ class KiroTarget implements AgentTarget {
     return { installed, alreadyConfigured, configPath: file };
   }
 
-  install(loc: Location, _opts: InstallOptions): WriteResult {
+  install(loc: Location, opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
-    files.push(writeMcpEntry(loc));
+    files.push(writeMcpEntry(loc, opts));
 
     // The steering doc is no longer written — the codegraph usage
     // guidance ships in the MCP server's `initialize` response (issue
@@ -117,9 +119,9 @@ class KiroTarget implements AgentTarget {
     return { files };
   }
 
-  printConfig(loc: Location): string {
+  printConfig(loc: Location, opts?: { mcp?: InstallOptions['mcp'] }): string {
     const target = mcpJsonPath(loc);
-    const snippet = JSON.stringify({ mcpServers: { codegraph: getMcpServerConfig() } }, null, 2);
+    const snippet = JSON.stringify({ mcpServers: { codegraph: buildKiroMcpConfig(opts?.mcp) } }, null, 2);
     return `# Add to ${target}\n\n${snippet}\n`;
   }
 
@@ -128,14 +130,25 @@ class KiroTarget implements AgentTarget {
   }
 }
 
-function writeMcpEntry(loc: Location): WriteResult['files'][number] {
+function buildKiroMcpConfig(opts?: InstallOptions['mcp']): Record<string, any> {
+  const normalized = normalizeMcpInstallOptions(opts);
+  if (normalized.transport === 'http') {
+    return {
+      url: normalized.url,
+      ...(normalized.tokenEnvVar ? { headers: authHeaders(normalized.tokenEnvVar) } : {}),
+    };
+  }
+  return getMcpServerConfig(opts);
+}
+
+function writeMcpEntry(loc: Location, opts: InstallOptions): WriteResult['files'][number] {
   const file = mcpJsonPath(loc);
   const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
   const existing = readJsonFile(file);
   const before = existing.mcpServers?.codegraph;
-  const after = getMcpServerConfig();
+  const after = buildKiroMcpConfig(opts.mcp);
 
   if (jsonDeepEqual(before, after)) {
     return { path: file, action: 'unchanged' };
