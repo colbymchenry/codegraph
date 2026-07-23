@@ -221,7 +221,9 @@ export class HttpMCPServer {
       return;
     }
 
-    const session = this.sessionFor(req, parsed);
+    const message = this.opts.projectPath ? withoutClientProjectPath(parsed) : parsed;
+
+    const session = this.sessionFor(req, message);
     if (!session) {
       writeJson(res, 404, { error: 'Unknown MCP session; initialize a new session' });
       return;
@@ -229,7 +231,7 @@ export class HttpMCPServer {
 
     res.setHeader('Mcp-Session-Id', session.id);
     res.setHeader('MCP-Protocol-Version', req.headers[PROTOCOL_HEADER] ?? '2024-11-05');
-    await session.transport.handle(parsed, res);
+    await session.transport.handle(message, res);
   }
 
   private sessionFor(req: http.IncomingMessage, msg: JsonRpcRequest): HttpSession | null {
@@ -241,6 +243,7 @@ export class HttpMCPServer {
     const transport = new HttpJsonRpcTransport();
     const session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.opts.projectPath ?? null,
+      preferExplicitProjectPath: !!this.opts.projectPath,
     });
     const httpSession = { id, transport, session };
     this.sessions.set(id, httpSession);
@@ -418,6 +421,23 @@ function isJsonRpcResponse(v: unknown): v is JsonRpcResponse {
   if (!v || typeof v !== 'object') return false;
   const o = v as Record<string, unknown>;
   return o.jsonrpc === '2.0' && 'id' in o && typeof o.method !== 'string' && ('result' in o || 'error' in o);
+}
+
+function withoutClientProjectPath(message: JsonRpcRequest): JsonRpcRequest {
+  if (message.method !== 'tools/call') return message;
+  const params = message.params;
+  if (!params || typeof params !== 'object') return message;
+  const args = (params as { arguments?: unknown }).arguments;
+  if (!args || typeof args !== 'object' || !('projectPath' in args)) return message;
+  const nextArgs = { ...(args as Record<string, unknown>) };
+  delete nextArgs.projectPath;
+  return {
+    ...message,
+    params: {
+      ...(params as Record<string, unknown>),
+      arguments: nextArgs,
+    },
+  };
 }
 
 function isLoopbackHost(host: string): boolean {

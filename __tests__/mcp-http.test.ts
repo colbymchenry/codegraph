@@ -121,4 +121,42 @@ describe('HTTP MCP transport', () => {
     });
     expect(resp.status).toBe(403);
   });
+
+  it('ignores client projectPath arguments when the HTTP server has a fixed project path', async () => {
+    const init = await requestJson(url, {
+      body: {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          rootUri: 'file:///client/local/workspace',
+        },
+      },
+    });
+    const sessionId = init.headers['mcp-session-id'] as string;
+    const clientOnlyPath = path.join(os.tmpdir(), 'client-only-codegraph-path');
+
+    const resp = await requestJson(url, {
+      headers: { 'Mcp-Session-Id': sessionId },
+      body: {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: {
+          name: 'codegraph_explore',
+          arguments: {
+            query: 'spring aop',
+            projectPath: clientOnlyPath,
+          },
+        },
+      },
+    });
+
+    expect(resp.status).toBe(200);
+    const text = resp.body.result.content.map((c: { text?: string }) => c.text ?? '').join('\n');
+    expect(text).not.toContain(clientOnlyPath);
+    expect(text).toContain(tempDir);
+  });
 });

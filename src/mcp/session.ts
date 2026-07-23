@@ -97,6 +97,13 @@ export interface MCPSessionOptions {
    * where the project lives.
    */
   explicitProjectPath?: string | null;
+  /**
+   * Prefer the server-provided explicit project path over client workspace
+   * hints from initialize/rootUri and roots/list. This is for remote/gateway
+   * transports where the client's local filesystem paths do not exist on the
+   * server and would otherwise steer queries away from the indexed project.
+   */
+  preferExplicitProjectPath?: boolean;
 }
 
 /**
@@ -110,6 +117,7 @@ export class MCPSession {
   private rootsAttempted = false;
   private resolvePromise: Promise<void> | null = null;
   private explicitProjectPath: string | null;
+  private preferExplicitProjectPath: boolean;
 
   constructor(
     private transport: JsonRpcTransport,
@@ -117,6 +125,7 @@ export class MCPSession {
     opts: MCPSessionOptions = {},
   ) {
     this.explicitProjectPath = opts.explicitProjectPath ?? null;
+    this.preferExplicitProjectPath = opts.preferExplicitProjectPath ?? false;
   }
 
   /**
@@ -203,7 +212,9 @@ export class MCPSession {
     // with. cwd is NOT used here — we defer it so a roots/list answer can
     // win over it. See issue #196.
     let explicitPath: string | null = null;
-    if (params?.rootUri) {
+    if (this.preferExplicitProjectPath && this.explicitProjectPath) {
+      explicitPath = this.explicitProjectPath;
+    } else if (params?.rootUri) {
       explicitPath = fileUriToPath(params.rootUri);
     } else if (params?.workspaceFolders?.[0]?.uri) {
       explicitPath = fileUriToPath(params.workspaceFolders[0].uri);
