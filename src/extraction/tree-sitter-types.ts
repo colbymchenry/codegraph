@@ -147,6 +147,12 @@ export interface LanguageExtractor {
 
   /** Extract property name when the generic name walk fails (e.g. ObjC @property). */
   extractPropertyName?: (node: SyntaxNode, source: string) => string | null;
+  /**
+   * Override name extraction for languages where the name is not a direct field child.
+   * When provided, replaces the default `nameField`-based lookup in `extractName`.
+   * Return null to fall back to the default logic.
+   */
+  getName?: (node: SyntaxNode, source: string) => string | null;
 
   /** Extract signature from node */
   getSignature?: (node: SyntaxNode, source: string) => string | undefined;
