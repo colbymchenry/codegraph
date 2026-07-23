@@ -9,6 +9,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- CodeGraph now indexes **Julia** (`.jl`) — functions, `struct`/`mutable struct` with typed fields, modules, and `using`/`import` statements, with call edges.
 
 ## [1.5.0] - 2026-07-21
 
