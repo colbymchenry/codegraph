@@ -1728,8 +1728,24 @@ program
   .description('Start CodeGraph as an MCP server for AI assistants')
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
+  .option('--transport <transport>', 'MCP transport: stdio or http', 'stdio')
+  .option('--http', 'Run MCP server over Streamable HTTP (alias for --transport http)')
+  .option('--host <host>', 'HTTP MCP bind host', '127.0.0.1')
+  .option('--port <port>', 'HTTP MCP bind port', '3333')
+  .option('--endpoint <path>', 'HTTP MCP endpoint path', '/mcp')
+  .option('--token <token>', 'Bearer token required for HTTP MCP clients')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
-  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
+  .action(async (options: {
+    path?: string;
+    mcp?: boolean;
+    transport?: string;
+    http?: boolean;
+    host?: string;
+    port?: string;
+    endpoint?: string;
+    token?: string;
+    watch?: boolean;
+  }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
 
     // Commander sets watch=false when --no-watch is passed. Route it through
@@ -1740,6 +1756,31 @@ program
 
     try {
       if (options.mcp) {
+        const transport = options.http ? 'http' : (options.transport ?? 'stdio').toLowerCase();
+        if (transport !== 'stdio' && transport !== 'http') {
+          error(`Unknown MCP transport "${transport}" (expected "stdio" or "http")`);
+          process.exit(1);
+        }
+        if (transport === 'http') {
+          const port = Number(options.port ?? '3333');
+          if (!Number.isInteger(port) || port < 0 || port > 65535) {
+            error(`--port must be an integer from 0 to 65535 (got "${options.port}")`);
+            process.exit(1);
+          }
+          const { HttpMCPServer } = await import('../mcp/index');
+          const server = new HttpMCPServer({
+            projectPath,
+            host: options.host ?? '127.0.0.1',
+            port,
+            endpoint: options.endpoint ?? '/mcp',
+            token: options.token ?? process.env.CODEGRAPH_MCP_HTTP_TOKEN,
+          });
+          await server.start();
+          const stop = () => { void server.stop().finally(() => process.exit(0)); };
+          process.on('SIGINT', stop);
+          process.on('SIGTERM', stop);
+          return;
+        }
         // `serve --mcp` is the stdio MCP server an AI agent launches for itself,
         // not a command to run by hand. A human in a terminal would otherwise
         // see it hang waiting for JSON-RPC on stdin, which reads as broken. If

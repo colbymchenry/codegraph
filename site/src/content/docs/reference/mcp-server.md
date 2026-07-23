@@ -11,6 +11,20 @@ codegraph serve --mcp
 
 When a `.codegraph/` index exists, the agent gets the tool below. In a workspace with **no** index, the server announces itself inactive and lists **no** tools — the agent works normally with its built-in tools, and indexing stays your decision.
 
+## Transports
+
+The installed agent configs use stdio by default. CodeGraph can also serve MCP
+over Streamable HTTP for clients that connect to an HTTP endpoint:
+
+```bash
+codegraph serve --mcp --transport http --path /absolute/path/to/project
+```
+
+By default this listens on `http://127.0.0.1:3333/mcp`. Tune it with
+`--host`, `--port`, and `--endpoint`; `--http` is an alias for
+`--transport http`. Non-local binds require a bearer token via `--token` or
+`CODEGRAPH_MCP_HTTP_TOKEN`.
+
 ## One tool by default: `codegraph_explore`
 
 By default the server exposes a **single tool**, `codegraph_explore`. It's Read-equivalent: give it a natural-language question or a bag of symbol and file names, and it returns the **verbatim, line-numbered source** of the relevant symbols grouped by file — the same shape the `Read` tool gives you — plus the call paths between them (including dynamic-dispatch hops like callbacks, React re-render, and JSX children that grep can't follow) and a blast-radius summary of what depends on them. One call usually answers the whole question.
