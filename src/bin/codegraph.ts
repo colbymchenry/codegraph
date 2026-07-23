@@ -1729,13 +1729,28 @@ program
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
-  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
+  // #1192: some MCP clients (OpenCode, Antigravity IDE, …) don't forward the
+  // `env` block from the MCP server config to the spawned process, so a user
+  // setting `CODEGRAPH_MCP_TOOLS` in their MCP config sees only the default
+  // surface. The CLI flag is set BEFORE MCPServer construction, so the proxy
+  // (static ListTools), the daemon-spawn env spread, and the daemon's
+  // session handler all pick it up — the env-var logic below doesn't change.
+  .option('--tools <list>', 'Comma-separated MCP tools to expose (e.g. "explore,search,node"). Overrides CODEGRAPH_MCP_TOOLS; works even when the MCP client does not forward env vars from its config (#1192).')
+  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean; tools?: string }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
 
     // Commander sets watch=false when --no-watch is passed. Route it through
     // the same env-var chokepoint the watcher and MCP server already honor.
     if (options.watch === false) {
       process.env.CODEGRAPH_NO_WATCH = '1';
+    }
+
+    // #1192: explicit --tools flag wins over any pre-set env var so the
+    // operator's intent in the MCP config is always honored. Set it here so
+    // the proxy (runLocalHandshakeProxy → getStaticTools), the daemon spawn
+    // (env: { ...process.env }), and the direct-mode ToolHandler all see it.
+    if (options.tools !== undefined && options.tools !== '') {
+      process.env.CODEGRAPH_MCP_TOOLS = options.tools;
     }
 
     try {
