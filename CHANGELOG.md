@@ -9,6 +9,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Zig functions stored in local aliases are now linked as function references,
+  so callers and dead-code analysis can follow callback and comptime dispatch
+  flows instead of treating the referenced implementation as unused.
 
 ## [1.5.0] - 2026-07-21
 

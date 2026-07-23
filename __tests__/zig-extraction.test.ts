@@ -43,6 +43,8 @@ pub const Point = struct {
 };
 
 pub fn translate(p: Point) Point {
+    const callback = Point.add;
+    _ = callback;
     return helper.shift(p);
 }
 
@@ -112,6 +114,35 @@ describe('Zig extraction', () => {
       (r) => r.referenceName === 'helper.shift' && r.referenceKind === 'calls'
     );
     expect(ref).toBeDefined();
+  });
+
+  it('emits a function reference for a stored method value', () => {
+    const ref = result.unresolvedReferences.find(
+      (r) => r.referenceName === 'add' && r.referenceKind === 'function_ref'
+    );
+    expect(ref).toBeDefined();
+  });
+
+});
+
+describe('Zig comptime dispatch references', () => {
+  const DISPATCH = `
+fn fast() void {}
+fn slow() void {}
+
+const routes = [_]*const fn () void{
+    fast,
+    slow,
+};
+`;
+
+  it('links functions stored in a file-scope dispatch table', () => {
+    const result = extractFromSource('dispatch.zig', DISPATCH, 'zig');
+    const refs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'function_ref')
+      .map((r) => r.referenceName);
+    expect(refs).toContain('fast');
+    expect(refs).toContain('slow');
   });
 });
 

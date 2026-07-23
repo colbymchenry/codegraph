@@ -235,6 +235,7 @@ const ZIG_SPEC: FnRefSpec = {
   dispatch: new Map<string, CaptureRule>([
     ['arguments', { mode: 'args' }],
     ['assignment_expression', { mode: 'rhs', field: 'right' }],
+    ['variable_declaration', { mode: 'varinit' }],
     ['field_initializer', { mode: 'value' }],
     ['initializer_list', { mode: 'list' }],
   ]),
