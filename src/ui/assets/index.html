@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>CodeGraph topology</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <strong>CodeGraph</strong>
+          <span>repository atlas</span>
+        </div>
+      </div>
+      <div class="search-shell">
+        <label class="sr-only" for="search">Search graph nodes</label>
+        <input
+          id="search"
+          data-testid="graph-search"
+          type="search"
+          maxlength="200"
+          placeholder="Search symbols, files, and document sections"
+          autocomplete="off"
+        >
+        <div id="search-results" class="search-results" hidden></div>
+      </div>
+      <div class="toolbar">
+        <button id="fit-button" type="button">Overview</button>
+        <span id="read-only-badge" class="badge">read only</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="graph-panel" aria-label="Repository graph">
+        <div class="canvas-heading">
+          <div>
+            <span id="canvas-eyebrow">Grouped by semantic role</span>
+            <strong id="canvas-title">Repository distribution</strong>
+          </div>
+          <div id="canvas-metrics" class="canvas-metrics"></div>
+        </div>
+        <svg
+          id="graph"
+          data-testid="topology-graph"
+          viewBox="0 0 1400 900"
+          role="img"
+          aria-label="Interactive repository topology atlas"
+        >
+          <defs>
+            <marker
+              id="arrow"
+              viewBox="0 0 10 10"
+              refX="9"
+              refY="5"
+              markerWidth="5"
+              markerHeight="5"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 0 L 10 5 L 0 10 z"></path>
+            </marker>
+            <marker
+              id="aggregate-arrow"
+              viewBox="0 0 10 10"
+              refX="9"
+              refY="5"
+              markerWidth="6"
+              markerHeight="6"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 0 L 10 5 L 0 10 z"></path>
+            </marker>
+          </defs>
+          <g id="viewport">
+            <g id="group-layer"></g>
+            <g id="aggregate-edge-layer"></g>
+            <g id="exact-edge-layer"></g>
+            <g id="node-layer"></g>
+          </g>
+        </svg>
+        <div id="graph-message" class="graph-message" data-testid="graph-message">
+          Loading repository graph…
+        </div>
+        <div class="graph-hint">Wheel to zoom · drag to pan · double-click a group to focus</div>
+      </section>
+
+      <aside class="sidebar">
+        <section class="summary-card">
+          <div>
+            <span>Project graph</span>
+            <strong id="project-counts" data-testid="project-counts">—</strong>
+          </div>
+          <div>
+            <span>Current view</span>
+            <strong id="view-counts" data-testid="view-counts">—</strong>
+          </div>
+          <p id="truncation-note"></p>
+        </section>
+
+        <section class="side-section view-section">
+          <div class="section-heading">
+            <h2>View model</h2>
+            <button id="reset-view-button" class="text-button" type="button">Reset</button>
+          </div>
+          <div class="control-grid">
+            <label>
+              <span>Group by</span>
+              <select id="group-by" data-testid="group-by">
+                <option value="semantic">Semantic role</option>
+                <option value="directory">Top-level directory</option>
+                <option value="language">Language</option>
+              </select>
+            </label>
+            <label>
+              <span>Color by</span>
+              <select id="color-by" data-testid="color-by">
+                <option value="kind">Node kind</option>
+                <option value="semantic">Semantic role</option>
+                <option value="language">Language</option>
+              </select>
+            </label>
+            <label>
+              <span>Relationships</span>
+              <select id="relation-mode" data-testid="relation-mode">
+                <option value="aggregate">Between groups</option>
+                <option value="selected">Selected node</option>
+                <option value="all">All visible</option>
+                <option value="none">None</option>
+              </select>
+            </label>
+            <label>
+              <span>Labels</span>
+              <select id="label-mode" data-testid="label-mode">
+                <option value="auto">Auto by zoom</option>
+                <option value="key">Key nodes</option>
+                <option value="all">All nodes</option>
+                <option value="none">None</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section class="side-section distribution-section">
+          <div class="section-heading">
+            <h2>Distribution</h2>
+            <span id="group-count" class="section-count"></span>
+          </div>
+          <div id="distribution" data-testid="group-distribution"></div>
+        </section>
+
+        <section class="side-section legend-section">
+          <div class="section-heading">
+            <h2>Node kinds</h2>
+            <button id="show-all-button" class="text-button" type="button">Show all</button>
+          </div>
+          <div id="legend" class="legend" data-testid="kind-legend"></div>
+        </section>
+
+        <section class="side-section edge-filter-section">
+          <div class="section-heading">
+            <h2>Relationship kinds</h2>
+            <button id="show-all-edges-button" class="text-button" type="button">Show all</button>
+          </div>
+          <div id="edge-legend" class="legend" data-testid="edge-legend"></div>
+        </section>
+
+        <section class="side-section inspector-section">
+          <div class="section-heading">
+            <h2>Inspector</h2>
+            <span id="selection-kind" class="kind-pill" hidden></span>
+          </div>
+          <div id="inspector" data-testid="node-inspector">
+            <p class="empty-state">Select a node to see its exact CodeGraph identity and relationships.</p>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

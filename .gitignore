@@ -21,6 +21,10 @@ Thumbs.db
 /coverage/
 .nyc_output/
 
+# Local browser-test artifacts
+/.playwright-cli/
+/output/playwright/
+
 # Environment
 .env
 .env.local

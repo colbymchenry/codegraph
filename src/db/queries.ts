@@ -1071,6 +1071,68 @@ export class QueryBuilder {
   }
 
   /**
+   * Select a deterministic, bounded set of well-connected nodes for a visual
+   * topology. The persisted graph is not aggregated or rewritten: callers can
+   * recover the exact induced edge set with {@link findEdgesBetweenNodes}.
+   *
+   * Degree is computed in SQL so a browser view never has to materialize the
+   * complete node table just to choose a bounded snapshot.
+   */
+  getTopologyNodes(
+    limit: number,
+    kinds?: readonly NodeKind[]
+  ): { nodes: Node[]; totalMatchedNodes: number } {
+    const hasKindFilter = kinds !== undefined && kinds.length > 0;
+    const kindClause = hasKindFilter
+      ? ` WHERE n.kind IN (${kinds!.map(() => '?').join(',')})`
+      : '';
+    const countClause = hasKindFilter
+      ? ` WHERE kind IN (${kinds!.map(() => '?').join(',')})`
+      : '';
+    const kindParams = hasKindFilter ? [...kinds!] : [];
+
+    const totalRow = this.db
+      .prepare(`SELECT COUNT(*) AS count FROM nodes${countClause}`)
+      .get(...kindParams) as { count: number };
+
+    const rows = this.db.prepare(`
+      WITH endpoint_degrees AS (
+        SELECT endpoint, SUM(degree) AS degree
+        FROM (
+          SELECT source AS endpoint, COUNT(*) AS degree
+          FROM edges
+          GROUP BY source
+          UNION ALL
+          SELECT target AS endpoint, COUNT(*) AS degree
+          FROM edges
+          GROUP BY target
+        )
+        GROUP BY endpoint
+      )
+      SELECT n.*
+      FROM nodes n
+      LEFT JOIN endpoint_degrees d ON d.endpoint = n.id
+      ${kindClause}
+      ORDER BY
+        COALESCE(d.degree, 0) DESC,
+        CASE n.kind
+          WHEN 'file' THEN 0
+          WHEN 'section' THEN 1
+          ELSE 2
+        END,
+        n.file_path,
+        n.start_line,
+        n.id
+      LIMIT ?
+    `).all(...kindParams, limit) as NodeRow[];
+
+    return {
+      nodes: rows.map(rowToNode),
+      totalMatchedNodes: totalRow.count,
+    };
+  }
+
+  /**
    * Stream nodes of one language whose `decorators` JSON array contains
    * `decorator`. The LIKE on the JSON text is a cheap index-free pre-filter
    * (a decorator name can appear as a substring of another), so callers must
@@ -1754,6 +1816,40 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getEdgesByTarget.all(targetId) as EdgeRow[];
     return rows.map(rowToEdge);
+  }
+
+  /**
+   * Bounded outgoing-edge page plus the exact persisted total. Used by
+   * read-only visual clients so a high-degree hub never materializes an
+   * unbounded response (or an unbounded intermediate array).
+   */
+  getOutgoingEdgesLimited(
+    sourceId: string,
+    limit: number
+  ): { edges: Edge[]; total: number } {
+    const count = this.db
+      .prepare('SELECT COUNT(*) AS count FROM edges WHERE source = ?')
+      .get(sourceId) as { count: number };
+    const rows = this.db
+      .prepare('SELECT * FROM edges WHERE source = ? ORDER BY rowid LIMIT ?')
+      .all(sourceId, limit) as EdgeRow[];
+    return { edges: rows.map(rowToEdge), total: count.count };
+  }
+
+  /**
+   * Bounded incoming-edge page plus the exact persisted total.
+   */
+  getIncomingEdgesLimited(
+    targetId: string,
+    limit: number
+  ): { edges: Edge[]; total: number } {
+    const count = this.db
+      .prepare('SELECT COUNT(*) AS count FROM edges WHERE target = ?')
+      .get(targetId) as { count: number };
+    const rows = this.db
+      .prepare('SELECT * FROM edges WHERE target = ? ORDER BY rowid LIMIT ?')
+      .all(targetId, limit) as EdgeRow[];
+    return { edges: rows.map(rowToEdge), total: count.count };
   }
 
   /**

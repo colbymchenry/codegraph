@@ -104,6 +104,136 @@ export function matchByFilePath(
 }
 
 /**
+ * Resolve a repository-document link without any suffix, proximity, or fuzzy
+ * fallback. Markdown extraction already normalizes the path from the
+ * referencing document, so only an exact file path / section qualified name
+ * is trustworthy here.
+ */
+export function matchDocumentLink(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const exact = context
+    .getNodesByQualifiedName(ref.referenceName)
+    .filter(
+      (node) =>
+        (node.kind === 'file' || node.kind === 'section') &&
+        node.qualifiedName === ref.referenceName
+    );
+  if (exact.length === 1) {
+    return {
+      original: ref,
+      targetNodeId: exact[0]!.id,
+      confidence: 1,
+      resolvedBy: 'file-path',
+    };
+  }
+
+  // Some ResolutionContext implementations optimize qualified-name lookup for
+  // symbols only. Keep file links portable by checking the exact normalized
+  // path through the basename index as well.
+  if (!ref.referenceName.includes('#')) {
+    const fileName = ref.referenceName.split('/').pop();
+    if (!fileName) return null;
+    const files = context
+      .getNodesByName(fileName)
+      .filter(
+        (node) =>
+          node.kind === 'file' &&
+          (node.filePath === ref.referenceName ||
+            node.qualifiedName === ref.referenceName)
+      );
+    if (files.length === 1) {
+      return {
+        original: ref,
+        targetNodeId: files[0]!.id,
+        confidence: 1,
+        resolvedBy: 'file-path',
+      };
+    }
+  }
+
+  return null;
+}
+
+const DOCUMENT_SYMBOL_KINDS = new Set<Node['kind']>([
+  'module',
+  'class',
+  'struct',
+  'interface',
+  'trait',
+  'protocol',
+  'function',
+  'method',
+  'property',
+  'field',
+  'variable',
+  'constant',
+  'enum',
+  'enum_member',
+  'type_alias',
+  'namespace',
+  'route',
+  'component',
+]);
+
+/**
+ * Resolve an inline-code symbol mention conservatively. A qualified spelling
+ * must have one exact suffix match; an unqualified spelling must name exactly
+ * one definition in the repository. Documentation never enters the normal
+ * fuzzy matcher because a missing edge is safer than a plausible-but-wrong
+ * code relationship.
+ */
+export function matchDocumentSymbol(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const normalized = ref.referenceName.replace(/\(\)$/, '').replace(/->/g, '.');
+  const parts = normalized.split(/::|\./).filter(Boolean);
+  const name = parts[parts.length - 1];
+  if (!name) return null;
+
+  const byId = new Map(
+    context
+      .getNodesByName(name)
+      .filter((node) => DOCUMENT_SYMBOL_KINDS.has(node.kind))
+      .map((node) => [node.id, node])
+  );
+  const candidates = [...byId.values()];
+
+  if (parts.length === 1) {
+    if (candidates.length !== 1) return null;
+    return {
+      original: ref,
+      targetNodeId: candidates[0]!.id,
+      confidence: 0.85,
+      resolvedBy: 'document-symbol',
+    };
+  }
+
+  const variants = new Set([
+    normalized,
+    normalized.replace(/\./g, '::'),
+    normalized.replace(/::/g, '.'),
+  ]);
+  const qualified = candidates.filter((candidate) =>
+    [...variants].some(
+      (variant) =>
+        candidate.qualifiedName === variant ||
+        candidate.qualifiedName.endsWith(`::${variant}`) ||
+        candidate.qualifiedName.endsWith(`.${variant}`)
+    )
+  );
+  if (qualified.length !== 1) return null;
+  return {
+    original: ref,
+    targetNodeId: qualified[0]!.id,
+    confidence: 0.95,
+    resolvedBy: 'document-symbol',
+  };
+}
+
+/**
  * Among several file nodes that all match a bare include/import by basename,
  * pick the one closest to the referencing file: same directory first, then by
  * directory-tree proximity, with the same language family as a tiebreak. A
