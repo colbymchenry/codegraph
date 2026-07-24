@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph install` can now configure **Qwen Code**, wiring CodeGraph in while preserving existing Qwen settings and adding the short CodeGraph hint Qwen can read in agent context.
 
 ## [1.5.0] - 2026-07-21
 

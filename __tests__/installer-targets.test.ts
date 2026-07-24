@@ -413,6 +413,85 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).not.toContain('CODEGRAPH_START');
   });
 
+  it('qwen: install writes settings.json (mcpServers.codegraph) and the QWEN.md block (#704)', () => {
+    const qwen = getTarget('qwen')!;
+    const result = qwen.install('global', { autoAllow: true });
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    const qwenMd = path.join(tmpHome, '.qwen', 'QWEN.md');
+    expect(result.files.some((f) => f.path === settings)).toBe(true);
+    expect(result.files.some((f) => f.path === qwenMd)).toBe(true);
+    expect(fs.existsSync(qwenMd)).toBe(true);
+    expect(fs.readFileSync(qwenMd, 'utf-8')).toContain('codegraph explore');
+
+    const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ command: 'codegraph', args: ['serve', '--mcp'] });
+    expect(cfg.mcpServers.codegraph.type).toBeUndefined();
+  });
+
+  it('qwen: printConfig uses the documented command/args MCP shape without type', () => {
+    const qwen = getTarget('qwen')!;
+    const out = qwen.printConfig('global');
+    const jsonStart = out.indexOf('{');
+    const cfg = JSON.parse(out.slice(jsonStart));
+
+    expect(cfg.mcpServers.codegraph).toEqual({ command: 'codegraph', args: ['serve', '--mcp'] });
+    expect(cfg.mcpServers.codegraph.type).toBeUndefined();
+  });
+
+  it('qwen: install preserves pre-existing settings (security.auth survives)', () => {
+    const qwen = getTarget('qwen')!;
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      security: { auth: { selectedType: 'oauth-personal' } },
+    }, null, 2) + '\n');
+
+    qwen.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.security?.auth?.selectedType).toBe('oauth-personal');
+    expect(after.mcpServers?.codegraph).toBeDefined();
+  });
+
+  it('qwen: uninstall strips codegraph but leaves pre-existing settings (security.auth) intact', () => {
+    const qwen = getTarget('qwen')!;
+    const settings = path.join(tmpHome, '.qwen', 'settings.json');
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({
+      security: { auth: { selectedType: 'oauth-personal' } },
+    }, null, 2) + '\n');
+
+    qwen.install('global', { autoAllow: true });
+    qwen.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(settings, 'utf-8'));
+    expect(after.security?.auth?.selectedType).toBe('oauth-personal');
+    expect(after.mcpServers).toBeUndefined();
+  });
+
+  it('qwen: local install writes ./.qwen/settings.json and the project-root ./QWEN.md block (#704)', () => {
+    const qwen = getTarget('qwen')!;
+    const result = qwen.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.qwen/settings.json'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/QWEN.md'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'QWEN.md'))).toBe(true);
+  });
+
+  it('qwen: uninstall strips a leftover QWEN.md codegraph block, keeping user content', () => {
+    const qwen = getTarget('qwen')!;
+    const qwenMd = path.join(tmpHome, '.qwen', 'QWEN.md');
+    fs.mkdirSync(path.dirname(qwenMd), { recursive: true });
+    fs.writeFileSync(qwenMd, `# My personal Qwen context\n\nAlways respond concisely.\n\n${LEGACY_BLOCK}\n`);
+
+    qwen.uninstall('global');
+
+    const body = fs.readFileSync(qwenMd, 'utf-8');
+    expect(body).toContain('# My personal Qwen context');
+    expect(body).toContain('Always respond concisely.');
+    expect(body).not.toContain('CODEGRAPH_START');
+  });
+
   it('kiro: install writes settings/mcp.json (mcpServers.codegraph) and no steering doc (#529)', () => {
     const kiro = getTarget('kiro')!;
     const result = kiro.install('global', { autoAllow: true });
@@ -1227,6 +1306,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('opencode')?.id).toBe('opencode');
     expect(getTarget('hermes')?.id).toBe('hermes');
     expect(getTarget('gemini')?.id).toBe('gemini');
+    expect(getTarget('qwen')?.id).toBe('qwen');
     expect(getTarget('antigravity')?.id).toBe('antigravity');
     expect(getTarget('kiro')?.id).toBe('kiro');
     expect(getTarget('not-a-real-target')).toBeUndefined();
