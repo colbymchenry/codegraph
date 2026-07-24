@@ -442,8 +442,8 @@ describe('FileWatcher', () => {
       // gate must drop it before scheduling sync. (It must exist on disk:
       // a VANISHED non-source path is the deleted-directory shape, which
       // deliberately schedules a sync — #1285.)
-      fs.writeFileSync(path.join(testDir, 'src', 'readme.md'), '# docs\n');
-      __emitWatchEventForTests(testDir, 'src/readme.md');
+      fs.writeFileSync(path.join(testDir, 'src', 'readme.txt'), 'docs\n');
+      __emitWatchEventForTests(testDir, 'src/readme.txt');
 
       // Wait a bit longer than debounce — sync should NOT trigger.
       await new Promise((r) => setTimeout(r, 400));

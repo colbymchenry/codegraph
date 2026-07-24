@@ -42,6 +42,7 @@ export const NODE_KINDS = [
   'export',
   'route',
   'component',
+  'section',
 ] as const;
 
 export type NodeKind = (typeof NODE_KINDS)[number];
@@ -117,6 +118,7 @@ export const LANGUAGES = [
   'erlang',
   'terraform',
   'unknown',
+  'markdown',
 ] as const;
 
 export type Language = (typeof LANGUAGES)[number];
@@ -319,12 +321,16 @@ export interface ExtractionError {
 }
 
 /**
- * Kinds an unresolved reference can carry. `function_ref` is internal-only —
- * a function name used as a VALUE (callback registration, #756). It never
- * becomes an edge kind: resolution maps it to a `references` edge targeting
- * function/method nodes only (see `matchFunctionRef`).
+ * Kinds an unresolved reference can carry. The extra kinds are internal-only:
+ * callback registrations, repository-document links, and document-to-symbol
+ * mentions. They never become edge kinds; resolution maps them to
+ * `references` edges with distinguishing metadata.
  */
-export type ReferenceKind = EdgeKind | 'function_ref';
+export type ReferenceKind =
+  | EdgeKind
+  | 'function_ref'
+  | 'document_link'
+  | 'document_symbol';
 
 /**
  * A reference that couldn't be resolved during extraction
@@ -389,6 +395,53 @@ export interface Subgraph {
    * for graph traversals that don't run the search-ranking path.
    */
   confidence?: 'high' | 'low';
+}
+
+/**
+ * Options for the read-only topology snapshot used by visual clients.
+ *
+ * A snapshot is intentionally bounded for browser memory. This does not limit
+ * or aggregate the persisted graph.
+ */
+export interface TopologySnapshotOptions {
+  /** Maximum nodes to return. The implementation clamps this to a safe range. */
+  limit?: number;
+
+  /** Optional node kinds to include. Empty or omitted means every kind. */
+  kinds?: NodeKind[];
+}
+
+/**
+ * A deterministic, bounded view of the persisted graph for visualization.
+ */
+export interface TopologySnapshot {
+  /** Nodes selected for the visual snapshot. */
+  nodes: Node[];
+
+  /** Persisted edges whose endpoints are both present in `nodes`. */
+  edges: Edge[];
+
+  /** Whole-project statistics, not just snapshot statistics. */
+  stats: GraphStats;
+
+  /** Number of nodes matching the requested kind filter in the full graph. */
+  totalMatchedNodes: number;
+
+  /** True when matching nodes were omitted only because of the view limit. */
+  truncated: boolean;
+}
+
+/**
+ * A bounded, count-preserving view of one node's exact persisted edges.
+ */
+export interface TopologyNeighborhood {
+  node: Node;
+  incoming: Edge[];
+  outgoing: Edge[];
+  neighbors: Node[];
+  totalIncoming: number;
+  totalOutgoing: number;
+  truncated: boolean;
 }
 
 /**

@@ -30,6 +30,7 @@ import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
+import { MarkdownExtractor } from './markdown-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
 import {
   getAllFrameworkResolvers,
@@ -6663,8 +6664,13 @@ export function extractFromSource(
 
   let result: ExtractionResult;
 
-  // Use custom extractor for Svelte
-  if (detectedLanguage === 'svelte') {
+  // Repository-local Markdown uses a lightweight structural extractor rather
+  // than a tree-sitter grammar.
+  if (detectedLanguage === 'markdown') {
+    const extractor = new MarkdownExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'svelte') {
+    // Use custom extractor for Svelte
     const extractor = new SvelteExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'vue') {

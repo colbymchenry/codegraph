@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, matchDocumentLink, matchDocumentSymbol, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
@@ -853,6 +853,16 @@ export class ReferenceResolver {
    * Resolve a single reference
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    // Repository-document references are deliberately strict and
+    // cross-language. Handle them before built-in detection, name-existence
+    // prefilters, and the normal language-family gate.
+    if (ref.referenceKind === 'document_link') {
+      return matchDocumentLink(ref, this.context);
+    }
+    if (ref.referenceKind === 'document_symbol') {
+      return matchDocumentSymbol(ref, this.context);
+    }
+
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
@@ -1056,8 +1066,16 @@ export class ReferenceResolver {
       // by metadata.resolvedBy === 'function-ref'. callers/impact already
       // traverse `references`, so registration sites surface with no
       // graph-layer changes.
-      let kind: Edge['kind'] =
-        ref.original.referenceKind === 'function_ref' ? 'references' : ref.original.referenceKind;
+      let kind: Edge['kind'];
+      switch (ref.original.referenceKind) {
+        case 'function_ref':
+        case 'document_link':
+        case 'document_symbol':
+          kind = 'references';
+          break;
+        default:
+          kind = ref.original.referenceKind;
+      }
 
       // Promote "extends" to "implements" when a class/struct targets an interface
       if (kind === 'extends') {
@@ -1108,6 +1126,11 @@ export class ReferenceResolver {
           // tooling label "callback registration" and lets validation diff
           // exactly the edges this feature added.
           ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),
+          ...(ref.original.referenceKind === 'document_link'
+            ? { docRef: 'link' }
+            : ref.original.referenceKind === 'document_symbol'
+            ? { docRef: 'symbol' }
+            : {}),
         },
       };
     });

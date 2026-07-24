@@ -1668,6 +1668,78 @@ function printFileTree(
 }
 
 /**
+ * codegraph ui [path]
+ */
+program
+  .command('ui [path]')
+  .description('Open a read-only local web UI for the repository topology')
+  .option('--host <host>', 'Bind address', '127.0.0.1')
+  .option('-p, --port <port>', 'TCP port', '7474')
+  .option('-l, --limit <nodes>', 'Maximum nodes in the initial browser view', '800')
+  .action(async (
+    pathArg: string | undefined,
+    options: { host: string; port: string; limit: string }
+  ) => {
+    const projectPath = resolveProjectPath(pathArg);
+    const port = Number(options.port);
+    const nodeLimit = Number(options.limit);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      error('Port must be an integer from 0 to 65535');
+      process.exitCode = 1;
+      return;
+    }
+    if (!Number.isInteger(nodeLimit) || nodeLimit < 1 || nodeLimit > 2000) {
+      error('Limit must be an integer from 1 to 2000');
+      process.exitCode = 1;
+      return;
+    }
+
+    let cg: import('../index').CodeGraph | null = null;
+    let uiServer: import('../ui/topology-server').TopologyServer | null = null;
+    try {
+      const { CodeGraph } = await loadCodeGraph();
+      const { startTopologyServer } = await import('../ui/topology-server');
+      cg = CodeGraph.openSync(projectPath);
+      uiServer = await startTopologyServer(cg, {
+        host: options.host,
+        port,
+        nodeLimit,
+      });
+      console.log(chalk.bold('\nCodeGraph repository topology\n'));
+      console.log(`  ${chalk.cyan(uiServer.url)}`);
+      console.log(chalk.dim(`  ${projectPath}`));
+      console.log(chalk.dim('\n  Read only · bundled assets · press Ctrl+C to stop\n'));
+
+      await new Promise<void>((resolve) => {
+        let stopping = false;
+        const stop = (): void => {
+          if (stopping) return;
+          stopping = true;
+          void (async () => {
+            try {
+              await uiServer?.close();
+            } finally {
+              cg?.close();
+              resolve();
+            }
+          })();
+        };
+        process.once('SIGINT', stop);
+        process.once('SIGTERM', stop);
+      });
+    } catch (err) {
+      try {
+        await uiServer?.close();
+      } catch {
+        // Preserve the original startup failure.
+      }
+      cg?.close();
+      error(`Failed to start topology UI: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
+  });
+
+/**
  * codegraph daemon — interactive manager for the background daemons. Arrow keys
  * to pick one (the current project's daemon floats to the top, auto-selected),
  * enter to stop it. Falls back to a plain list when output isn't a TTY.

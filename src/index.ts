@@ -19,6 +19,9 @@ import {
   SegmentMatch,
   Context,
   GraphStats,
+  TopologyNeighborhood,
+  TopologySnapshot,
+  TopologySnapshotOptions,
   TaskInput,
   TaskContext,
   BuildContextOptions,
@@ -92,6 +95,12 @@ export {
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
 export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 export { MCPServer } from './mcp';
+export {
+  startTopologyServer,
+  TopologyGraphReader,
+  TopologyServer,
+  TopologyServerOptions,
+} from './ui/topology-server';
 
 /**
  * Options for initializing a new CodeGraph project
@@ -1300,6 +1309,62 @@ export class CodeGraph {
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
     return this.queries.searchNodes(query, options);
+  }
+
+  /**
+   * Return an exact, read-only induced subgraph suitable for a visual client.
+   *
+   * The node selection is bounded and degree-ranked; the returned edges are
+   * the unchanged persisted edges between those nodes. This method never
+   * indexes, synchronizes, aggregates, or mutates the graph.
+   */
+  getTopologySnapshot(options: TopologySnapshotOptions = {}): TopologySnapshot {
+    const requestedLimit = Number.isFinite(options.limit) ? Math.trunc(options.limit!) : 800;
+    const limit = Math.max(1, Math.min(2000, requestedLimit));
+    const kinds = options.kinds && options.kinds.length > 0
+      ? [...new Set(options.kinds)]
+      : undefined;
+    const selected = this.queries.getTopologyNodes(limit, kinds);
+    const edges = this.queries.findEdgesBetweenNodes(selected.nodes.map((node) => node.id));
+
+    return {
+      nodes: selected.nodes,
+      edges,
+      stats: this.getStats(),
+      totalMatchedNodes: selected.totalMatchedNodes,
+      truncated: selected.totalMatchedNodes > selected.nodes.length,
+    };
+  }
+
+  /**
+   * Return one node's exact persisted relationship counts and a bounded edge
+   * page for the topology inspector.
+   */
+  getTopologyNeighborhood(nodeId: string, limit = 1000): TopologyNeighborhood | null {
+    const node = this.queries.getNodeById(nodeId);
+    if (!node) return null;
+    const boundedLimit = Number.isFinite(limit)
+      ? Math.max(1, Math.min(1000, Math.trunc(limit)))
+      : 1000;
+    const incoming = this.queries.getIncomingEdgesLimited(nodeId, boundedLimit);
+    const outgoing = this.queries.getOutgoingEdgesLimited(nodeId, boundedLimit);
+    const neighborIds = new Set<string>();
+    for (const edge of [...incoming.edges, ...outgoing.edges]) {
+      if (edge.source !== nodeId) neighborIds.add(edge.source);
+      if (edge.target !== nodeId) neighborIds.add(edge.target);
+    }
+    const neighborMap = this.queries.getNodesByIds([...neighborIds]);
+
+    return {
+      node,
+      incoming: incoming.edges,
+      outgoing: outgoing.edges,
+      neighbors: [...neighborMap.values()],
+      totalIncoming: incoming.total,
+      totalOutgoing: outgoing.total,
+      truncated:
+        incoming.total > incoming.edges.length || outgoing.total > outgoing.edges.length,
+    };
   }
 
   /**

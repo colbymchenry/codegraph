@@ -121,7 +121,26 @@ codegraph init
 
 </div>
 
-### 4. No more syncing!
+### 4. Open the repository atlas
+
+From the indexed project's directory:
+
+```bash
+codegraph ui
+```
+
+Open <http://127.0.0.1:7474> to explore the repository's code and Markdown
+documents by semantic role, directory, or language. The bundled web service is
+read-only and listens on loopback by default. Use `--port` when running more
+than one repository:
+
+```bash
+codegraph ui --port 7475 --limit 1200
+```
+
+Press `Ctrl+C` to stop the web service.
+
+### 5. No more syncing!
 
 Auto-sync is enabled by default. CodeGraph watches the project and updates the graph on every file change — while your agent edits code, or you add, modify, or delete files. **The index is never stale, and there is nothing to re-run.**
 
@@ -181,6 +200,12 @@ Every language below gets the same treatment — full structural extraction and 
 </p>
 
 <sub>Per-language details — extensions, frameworks, and what exactly gets extracted — in [Supported Languages](#supported-languages).</sub>
+
+Repository-local Markdown is part of the same graph: `.md`, `.mdx`, and
+`.markdown` headings become searchable sections, relative links connect
+documents and source files, and unambiguous symbols in inline code spans link
+prose to their code definitions. External URLs are left in the document but
+are not fetched or added to the graph.
 
 ---
 
@@ -411,6 +436,17 @@ Builds the per-project knowledge graph index, which then auto-syncs on every fil
 
 That's it — your agent will use CodeGraph tools automatically when a `.codegraph/` directory exists.
 
+To inspect the same graph visually, start the bundled read-only local UI:
+
+```bash
+codegraph ui
+```
+
+Open the printed `http://127.0.0.1:7474` address. The page renders code symbols,
+Markdown sections, and their persisted relationships from the existing index.
+It ships inside CodeGraph and makes no CDN requests. Use `--limit`, `--host`,
+or `--port` to change the initial view size or bind address.
+
 <details>
 <summary><strong>Manual Setup (Alternative)</strong></summary>
 
@@ -507,6 +543,7 @@ codegraph uninit [path]           # Remove CodeGraph from a project (--force to 
 codegraph index [path]            # Full index (--force to re-index, --quiet for less output)
 codegraph sync [path]             # Incremental update
 codegraph status [path]           # Show statistics
+codegraph ui [path]               # Serve the read-only local topology UI (--host, --port, --limit)
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
@@ -522,6 +559,22 @@ codegraph upgrade [version]       # Update to the latest release (--check, --for
 codegraph version                 # Print the installed version (also -v, --version)
 codegraph help [command]          # Show help, optionally for one command
 ```
+
+### Repository atlas
+
+After indexing a repository, start the bundled local UI:
+
+```bash
+codegraph ui .                    # Open http://127.0.0.1:7474
+codegraph ui /path/to/repo --port 7480 --limit 1200
+```
+
+The overview allocates area by semantic role so the repository's document,
+structure, type, behavior, data, and dependency distribution is visible at a
+glance. The right panel can regroup by directory or language, change node
+coloring, filter node and relationship kinds, choose aggregate or exact
+relationship views, and inspect the persisted identity and edges of any node.
+The service is read-only, loopback-only by default, and uses bundled assets.
 
 ### `codegraph affected`
 
@@ -795,6 +848,7 @@ is written):
 | Solidity | `.sol` | Full support (contracts, libraries, interfaces, structs, enums, modifiers, events, errors, state variables, `import`/`using` directives, `emit`/`revert` calls) |
 | Terraform / OpenTofu | `.tf`, `.tfvars`, `.tofu` | Full support (resources, data sources, modules, variables, outputs, providers incl. aliases, `locals`; `var.`/`local.`/`module.`/resource references with Terraform's per-directory scoping enforced; module calls bridged across the boundary — inputs to the child module's variables, `module.M.out` to the child's output, `source` to the module's files; cloudposse/atmos `remote-state` cross-component wiring when the component is statically named; `provider = aws.east` selections resolved up the module tree; `moved`/`import`/`removed`/`check` block references; `.tfvars` assignments linked to the variables they set) |
 | Nix | `.nix` | Full support (functions with simple/destructured/curried params, `let`/attrset bindings, `inherit`, `import ./path` file edges — `./dir` resolving through `default.nix` — plus NixOS module `imports = [ ./x.nix ]` lists and `callPackage ./pkg.nix` file edges; call edges; module-system option wiring — a config write like `launchd.user.agents.x = { ... }` links to the module declaring `options.launchd.user.agents`, so option flows trace across modules) |
+| Markdown | `.md`, `.mdx`, `.markdown` | Repository-document support (heading hierarchy as `section` nodes, searchable prose, strict repository-local links to documents/source files, and unique-only inline-code symbol references; fenced code and external URLs are not traversed) |
 
 ## Measured cross-file coverage
 

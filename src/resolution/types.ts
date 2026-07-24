@@ -42,7 +42,7 @@ export interface ResolvedRef {
   /** Confidence score (0-1) */
   confidence: number;
   /** How it was resolved */
-  resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path' | 'function-ref';
+  resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path' | 'function-ref' | 'document-symbol';
 }
 
 /**

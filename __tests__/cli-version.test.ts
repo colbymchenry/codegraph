@@ -42,6 +42,10 @@ describe('codegraph version affordances', () => {
     expect(run(['--help'])).toContain('version');
   });
 
+  it('lists the human-facing topology UI command in --help', () => {
+    expect(run(['--help'])).toMatch(/^\s+ui \[options\] \[path\]/m);
+  });
+
   it('`codegraph help` prints usage and the command list', () => {
     const out = run(['help']);
     expect(out).toContain('Usage: codegraph');

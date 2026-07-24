@@ -9,6 +9,21 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Repository-local Markdown (`.md`, `.mdx`, `.markdown`) now joins the code
+  graph: headings become searchable section nodes, relative links connect
+  documents and source files, and unambiguous inline-code symbol mentions link
+  documentation to their definitions. External URLs remain local-only source
+  text and are never fetched.
+- `codegraph ui` serves a bundled, read-only repository topology from the
+  existing local graph. Code symbols and Markdown sections share one
+  searchable, filterable atlas. Its weighted overview shows semantic,
+  directory, or language distribution; labels disclose progressively with
+  zoom; relationship rendering can switch between exact edges and visual-only
+  group aggregates; and the right panel independently filters node and edge
+  kinds while retaining exact persisted node inspection. The service binds to
+  loopback by default and has no CDN or runtime network dependency.
 
 ## [1.5.0] - 2026-07-21
 
