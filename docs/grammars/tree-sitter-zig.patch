@@ -1,0 +1,211 @@
+diff --git a/grammar.js b/grammar.js
+index e167748..75974a8 100644
+--- a/grammar.js
++++ b/grammar.js
+@@ -127 +127 @@ module.exports = grammar({
+-          field('type', choice($.primary_type_expression, $.if_type_expression, $.comptime_type_expression)),
++          field('type', choice($.primary_type_expression, $.if_type_expression, $.comptime_type_expression, $.error_set_declaration)),
+@@ -129 +129 @@ module.exports = grammar({
+-        field('name', choice($.primary_type_expression, $.if_type_expression, $.comptime_type_expression)),
++        field('name', choice($.primary_type_expression, $.if_type_expression, $.comptime_type_expression, $.error_set_declaration)),
+@@ -293 +292,0 @@ module.exports = grammar({
+-      $.suspend_statement,
+@@ -315,2 +313,0 @@ module.exports = grammar({
+-    suspend_statement: $ => seq('suspend', $._block_expr_statement),
+-
+@@ -416,2 +412,0 @@ module.exports = grammar({
+-      $.async_expression,
+-      $.await_expression,
+@@ -420 +414,0 @@ module.exports = grammar({
+-      $.resume_expression,
+@@ -457 +451,7 @@ module.exports = grammar({
+-    asm_clobbers: $ => seq(':', optionalCommaSep(choice($.string, $.multiline_string))),
++    // Zig 0.16 changed inline-asm clobbers from a string list (`: "rax", "rcx"`)
++    // to an anonymous struct literal (`: .{ .rax = true, .memory = true }`).
++    // Accept both so older and current sources parse.
++    asm_clobbers: $ => seq(':', choice(
++      optionalCommaSep(choice($.string, $.multiline_string)),
++      $.anonymous_struct_initializer,
++    )),
+@@ -541,4 +540,0 @@ module.exports = grammar({
+-    async_expression: $ => prec.right(seq('async', $.expression)),
+-
+-    await_expression: $ => prec.right(seq('await', $.expression)),
+-
+@@ -553,2 +548,0 @@ module.exports = grammar({
+-    resume_expression: $ => prec.right(seq('resume', $.expression)),
+-
+@@ -663 +657 @@ module.exports = grammar({
+-      $.type_expression,
++      choice($.type_expression, $.if_type_expression),
+@@ -689 +683 @@ module.exports = grammar({
+-      $.type_expression,
++      choice($.type_expression, $.if_type_expression),
+@@ -768 +762 @@ module.exports = grammar({
+-      choice($.identifier, alias($.builtin_type, $.identifier)),
++      choice($.identifier, $._reserved_identifier, alias($.builtin_type, $.identifier)),
+@@ -771 +765 @@ module.exports = grammar({
+-    break_label: $ => seq(':', $.identifier),
++    break_label: $ => seq(':', choice($.identifier, $._reserved_identifier)),
+diff --git a/queries/highlights.scm b/queries/highlights.scm
+index 1f90067..ec12f0c 100644
+--- a/queries/highlights.scm
++++ b/queries/highlights.scm
+@@ -126,7 +126 @@
+-[
+-  "async"
+-  "await"
+-  "suspend"
+-  "nosuspend"
+-  "resume"
+-] @keyword.coroutine
++"nosuspend" @keyword.coroutine
+diff --git a/test/corpus/zig_0_16.txt b/test/corpus/zig_0_16.txt
+new file mode 100644
+index 0000000..5d42844
+--- /dev/null
++++ b/test/corpus/zig_0_16.txt
+@@ -0,0 +1,143 @@
++==================
++error sets as container field types
++==================
++
++const State = struct {
++    direct: error{Invalid},
++    inferred: error{Missing},
++};
++
++---
++
++(source_file
++  (variable_declaration
++    (identifier)
++    (struct_declaration
++      (container_field
++        (identifier)
++        (error_set_declaration
++          (identifier)))
++      (container_field
++        (identifier)
++        (error_set_declaration
++          (identifier))))))
++
++==================
++async family names are identifiers
++==================
++
++fn run(async: usize) usize {
++    const await = async;
++    resume(await);
++    return suspend(await);
++}
++
++---
++
++(source_file
++  (function_declaration
++    (identifier)
++    (parameters
++      (parameter
++        (identifier)
++        (builtin_type)))
++    (builtin_type)
++    (block
++      (variable_declaration
++        (identifier)
++        (identifier))
++      (expression_statement
++        (call_expression
++          (identifier)
++          (arguments
++            (identifier))))
++      (expression_statement
++        (return_expression
++          (call_expression
++            (identifier)
++            (arguments
++              (identifier))))))))
++
++==================
++Zig 0.16 inline assembly clobbers
++==================
++
++fn barrier() void {
++    asm volatile ("" ::: .{ .memory = true });
++}
++
++---
++
++(source_file
++  (function_declaration
++    (identifier)
++    (parameters)
++    (builtin_type)
++    (block
++      (expression_statement
++        (asm_expression
++          (string)
++          (asm_output
++            (asm_input
++              (asm_clobbers
++                (anonymous_struct_initializer
++                  (initializer_list
++                    (assignment_expression
++                      (field_expression
++                        (identifier))
++                      (boolean))))))))))))
++
++==================
++conditional slice and pointer element types
++==================
++
++const Slice = []if (enabled) u8 else u16;
++const Pointer = *if (enabled) u8 else u16;
++
++---
++
++(source_file
++  (variable_declaration
++    (identifier)
++    (slice_type
++      (if_type_expression
++        (identifier)
++        (builtin_type)
++        (builtin_type))))
++  (variable_declaration
++    (identifier)
++    (pointer_type
++      (if_type_expression
++        (identifier)
++        (builtin_type)
++        (builtin_type)))))
++
++==================
++reserved words as block labels
++==================
++
++fn value() usize {
++    return test: {
++        break :test 1;
++    };
++}
++
++---
++
++(source_file
++  (function_declaration
++    (identifier)
++    (parameters)
++    (builtin_type)
++    (block
++      (expression_statement
++        (return_expression
++          (labeled_type_expression
++            (block_label
++              (identifier))
++            (block
++              (expression_statement
++                (break_expression
++                  (break_label
++                    (identifier))
++                  (integer))))))))))
