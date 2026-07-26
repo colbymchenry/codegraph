@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Factory Droids (the `droid` CLI) is now supported by `codegraph install`, detected and configured out of the box so the Droid agent can drive the knowledge graph like the other agents.
 
 ## [1.5.0] - 2026-07-21
 

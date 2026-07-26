@@ -501,6 +501,79 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(paths.some((p) => p.endsWith('/.kiro/steering/codegraph.md'))).toBe(false);
   });
 
+  it('factory: install writes ~/.factory/mcp.json (mcpServers.codegraph)', () => {
+    const factory = getTarget('factory')!;
+    const result = factory.install('global', { autoAllow: true });
+    const mcp = path.join(tmpHome, '.factory', 'mcp.json');
+    expect(result.files.some((f) => f.path === mcp)).toBe(true);
+    expect(fs.existsSync(mcp)).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({
+      type: 'stdio',
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+    });
+  });
+
+  it('factory: install preserves a pre-existing sibling MCP server in mcp.json', () => {
+    const factory = getTarget('factory')!;
+    const mcp = path.join(tmpHome, '.factory', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(
+      mcp,
+      JSON.stringify({
+        mcpServers: { sibling: { command: 'uvx', args: ['other-server'] } },
+      }, null, 2) + '\n'
+    );
+
+    factory.install('global', { autoAllow: true });
+
+    const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(cfg.mcpServers.sibling).toEqual({ command: 'uvx', args: ['other-server'] });
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('factory: uninstall strips codegraph but leaves sibling MCP servers intact', () => {
+    const factory = getTarget('factory')!;
+    const mcp = path.join(tmpHome, '.factory', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(
+      mcp,
+      JSON.stringify({
+        mcpServers: { sibling: { command: 'uvx', args: ['other-server'] } },
+      }, null, 2) + '\n'
+    );
+
+    factory.install('global', { autoAllow: true });
+    const result = factory.uninstall('global');
+
+    const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(cfg.mcpServers.sibling).toEqual({ command: 'uvx', args: ['other-server'] });
+    expect(cfg.mcpServers.codegraph).toBeUndefined();
+    expect(result.files).toContainEqual({ path: mcp, action: 'updated' });
+  });
+
+  it('factory: uninstall deletes the mcp.json file when no other content remains', () => {
+    const factory = getTarget('factory')!;
+    const mcp = path.join(tmpHome, '.factory', 'mcp.json');
+
+    factory.install('global', { autoAllow: true });
+    expect(fs.existsSync(mcp)).toBe(true);
+
+    const result = factory.uninstall('global');
+    expect(fs.existsSync(mcp)).toBe(false);
+    expect(result.files).toContainEqual({ path: mcp, action: 'removed' });
+  });
+
+
+  it('factory: local install writes ./.factory/mcp.json', () => {
+    const factory = getTarget('factory')!;
+    const result = factory.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.factory/mcp.json'))).toBe(true);
+  });
+
   it('antigravity: install writes to LEGACY ~/.gemini/antigravity/mcp_config.json when no migration marker', () => {
     const antigravity = getTarget('antigravity')!;
     antigravity.install('global', { autoAllow: true });
@@ -1229,6 +1302,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('gemini')?.id).toBe('gemini');
     expect(getTarget('antigravity')?.id).toBe('antigravity');
     expect(getTarget('kiro')?.id).toBe('kiro');
+    expect(getTarget('factory')?.id).toBe('factory');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
