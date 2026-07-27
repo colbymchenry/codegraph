@@ -20,7 +20,17 @@ export const godotResolver: FrameworkResolver = {
     const result3 = tryResolveGodotAlias(ref, context);
     if (result3) return result3;
 
+    const result4 = tryResolveUid(ref, context);
+    if (result4) return result4;
+
+    const result5 = tryResolveSignal(ref, context);
+    if (result5) return result5;
+
     return null;
+  },
+
+  claimsReference(name: string): boolean {
+    return /^(BT|Limbo|BTAction|BTTask|BTDecorator|BTComposite|BTCondition)/.test(name);
   },
 };
 
@@ -62,6 +72,46 @@ function tryResolveUniqueName(ref: UnresolvedRef, context: ResolutionContext): R
       confidence: 0.85,
       resolvedBy: 'framework',
     };
+  }
+
+  return null;
+}
+
+function tryResolveSignal(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const name = ref.referenceName;
+  if (!name || ref.referenceKind !== 'calls') return null;
+
+  const target = context.getNodesByName(name).find(
+    (n) => n.kind === 'signal' && n.language === 'gdscript'
+  );
+  if (target) {
+    return {
+      original: ref,
+      targetNodeId: target.id,
+      confidence: 0.85,
+      resolvedBy: 'framework',
+    };
+  }
+
+  return null;
+}
+
+function tryResolveUid(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const uid = ref.referenceName;
+  if (!/^[a-z0-9]{16,}$/.test(uid)) return null;
+
+  const nodes = context.getNodesByKind('import').filter(
+    (n) => n.language === 'godot_resource'
+  );
+  for (const node of nodes) {
+    if (node.qualifiedName.includes(uid) || node.name.includes(uid)) {
+      return {
+        original: ref,
+        targetNodeId: node.id,
+        confidence: 0.85,
+        resolvedBy: 'framework',
+      };
+    }
   }
 
   return null;

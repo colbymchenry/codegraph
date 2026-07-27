@@ -217,7 +217,7 @@ func _find_label(label_name: String) -> Label:
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'sprite')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'move_ratio')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'shared_counter')).toBe(true);
-    expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'health_changed')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'signal' && n.name === 'health_changed')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'MainDynamicUISoundController')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'CardReward')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'component' && n.name === 'LootCardRewardButton')).toBe(true);

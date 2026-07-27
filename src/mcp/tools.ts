@@ -85,7 +85,7 @@ const RUST_PATH_PREFIXES = new Set(['crate', 'super', 'self']);
  * multi-thousand-character wall of source that bloats the agent's context.
  */
 const CONTAINER_NODE_KINDS = new Set<NodeKind>([
-  'class', 'struct', 'interface', 'trait', 'protocol', 'enum', 'namespace', 'module',
+  'class', 'struct', 'interface', 'trait', 'protocol', 'enum', 'namespace', 'module', 'component',
 ]);
 
 /** Normalize engine/framework path aliases users commonly type into tools. */
@@ -543,6 +543,34 @@ export const tools: ToolDefinition[] = [
     },
   },
   {
+    name: 'codegraph_references',
+    description: 'Find all symbols that reference <symbol>. Inverse of codegraph_callers — answers "which scenes instance squad_base.tscn?" or "what connects to unit_died signal?" or "which scripts use EnemyManager?". Shows incoming edges by kind.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol: {
+          type: 'string',
+          description: 'Name of the symbol to find referrers for',
+        },
+        file: {
+          type: 'string',
+          description: 'Narrow to definition in this file when several same-named symbols exist',
+        },
+        kind: {
+          type: 'string',
+          description: 'Filter incoming edges by kind (calls, references, extends, imports, etc.)',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of referrers to return (default: 30)',
+          default: 30,
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['symbol'],
+    },
+  },
+  {
     name: 'codegraph_explore',
     description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
     inputSchema: {
@@ -644,7 +672,7 @@ export function getStaticTools(): ToolDefinition[] {
  *   caller with file:line, callback registrations labeled, one section per
  *   same-named definition) is the one job explore/node don't replicate.
  */
-const DEFAULT_MCP_TOOLS = new Set(['explore', 'node', 'search', 'callers']);
+const DEFAULT_MCP_TOOLS = new Set(['explore', 'node', 'search', 'callers', 'references']);
 
 /**
  * Tool handler that executes tools against a CodeGraph instance
@@ -1117,6 +1145,8 @@ export class ToolHandler {
           result = await this.handleCallees(args); break;
         case 'codegraph_impact':
           result = await this.handleImpact(args); break;
+        case 'codegraph_references':
+          result = await this.handleReferences(args); break;
         case 'codegraph_explore':
           result = await this.handleExplore(args); break;
         case 'codegraph_node':
@@ -1313,6 +1343,74 @@ export class ToolHandler {
       && node.language === 'godot_resource'
       && node.filePath.endsWith('.tscn')
       && (node.signature ?? '').includes('instance=ExtResource');
+  }
+
+  /**
+   * Handle codegraph_references
+   */
+  private async handleReferences(args: Record<string, unknown>): Promise<ToolResult> {
+    const symbol = this.validateString(args.symbol, 'symbol');
+    if (typeof symbol !== 'string') return symbol;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const limit = clamp((args.limit as number) || 30, 1, 100);
+    const fileFilter = typeof args.file === 'string' ? args.file : undefined;
+    const kindFilter = typeof args.kind === 'string' ? args.kind : undefined;
+
+    const allMatches = this.findAllSymbols(cg, symbol);
+    if (allMatches.nodes.length === 0) {
+      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+    }
+
+    const { groups } = this.groupDefinitions(allMatches.nodes, fileFilter);
+
+    const collect = (defNodes: Node[]) => {
+      const seen = new Set<string>();
+      const referrers: { node: Node; edge: Edge }[] = [];
+      for (const node of defNodes) {
+        for (const e of cg.getIncomingEdges(node.id)) {
+          if (kindFilter && e.kind !== kindFilter && e.kind !== 'contains') continue;
+          if (e.kind === 'contains') continue;
+          const refNode = cg.getNode(e.source);
+          if (!refNode || seen.has(refNode.id)) continue;
+          seen.add(refNode.id);
+          referrers.push({ node: refNode, edge: e });
+        }
+      }
+      return referrers;
+    };
+
+    if (groups.length === 1) {
+      const referrers = collect(groups[0]!);
+      if (referrers.length === 0) {
+        return this.textResult(`No incoming references found for "${symbol}"`);
+      }
+      const lines: string[] = [`Incoming references to **${symbol}**:\n`];
+      for (const r of referrers.slice(0, limit)) {
+        const kind = r.edge.kind;
+        const label = `  - [${r.node.kind}] ${r.node.name} (${r.node.filePath}:${r.edge.line ?? '?'}) — via **${kind}**`;
+        lines.push(label);
+      }
+      if (referrers.length > limit) lines.push(`\n... and ${referrers.length - limit} more`);
+      return this.textResult(this.truncateOutput(lines.join('\n')));
+    }
+
+    // Multiple definitions
+    const lines: string[] = [`Incoming references to **${symbol}**:\n`];
+    for (let gi = 0; gi < groups.length && gi < 5; gi++) {
+      const group = groups[gi]!;
+      const def = group[0]!;
+      const referrers = collect(group);
+      lines.push(`\n## ${def.qualifiedName}`);
+      for (const r of referrers.slice(0, Math.ceil(limit / groups.length))) {
+        const kind = r.edge.kind;
+        lines.push(`  - [${r.node.kind}] ${r.node.name} (${r.node.filePath}:${r.edge.line ?? '?'}) — via **${kind}**`);
+      }
+      if (referrers.length > Math.ceil(limit / groups.length)) {
+        lines.push(`  ... and ${referrers.length - Math.ceil(limit / groups.length)} more`);
+      }
+    }
+    return this.textResult(this.truncateOutput(lines.join('\n')));
   }
 
   /**
