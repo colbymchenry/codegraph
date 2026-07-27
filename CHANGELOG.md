@@ -9,6 +9,16 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **Crystal** (`.cr`). Modules, classes, structs, enums,
+  macros and C bindings are extracted, along with the `getter`/`setter`/
+  `property` accessor macros that declare most of a Crystal type's attributes.
+  Inheritance, `include`/`extend` mixins, `require` imports and call edges —
+  including parenthesis-less calls and `Receiver.method` calls — resolve across
+  files, so tracing a flow through a Crystal codebase works the same as in any
+  other supported language.
+
 
 ## [1.5.0] - 2026-07-21
 
