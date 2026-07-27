@@ -145,6 +145,11 @@ describe('Language Detection', () => {
     expect(detectLanguage('entry/src/main/ets/common/utils.ts')).toBe('typescript');
   });
 
+  it('should detect Crystal files', () => {
+    expect(detectLanguage('src/server.cr')).toBe('crystal');
+    expect(isSourceFile('src/server.cr')).toBe(true);
+  });
+
   it('should detect Nix files', () => {
     expect(detectLanguage('default.nix')).toBe('nix');
     expect(detectLanguage('pkgs/development/tools/misc/codegraph/default.nix')).toBe('nix');
@@ -2698,6 +2703,441 @@ void publicFunction() {}
 
     expect(privateFunc?.visibility).toBe('private');
     expect(publicFunc?.visibility).toBe('public');
+  });
+});
+
+describe('Crystal Extraction', () => {
+  const SOURCE = `require "http/server"
+require "./models/user"
+
+module Storage
+  VERSION = "1.0.0"
+
+  alias UserId = Int32 | String
+
+  enum Status
+    Active
+    Pending = 7
+  end
+
+  abstract class BaseRepo
+    abstract def fetch(id : UserId) : User?
+  end
+
+  class UserRepo < BaseRepo
+    include Enumerable(User)
+
+    getter name : String
+    property email : String?
+    class_getter total : Int32
+
+    @cache : Hash(UserId, User)
+    @@count = 0
+
+    def initialize(@name : String)
+      @cache = {} of UserId => User
+    end
+
+    def fetch(id : UserId) : User?
+      warm_cache
+      Loader.load(id)
+    end
+
+    def self.build : UserRepo
+      UserRepo.new("default")
+    end
+
+    private def warm_cache
+      1
+    end
+  end
+
+  struct Point
+    def initialize(@x : Float64)
+    end
+  end
+end
+`;
+
+  it('should extract module, class and struct declarations', () => {
+    const result = extractFromSource('src/storage.cr', SOURCE);
+
+    expect(result.nodes.find((n) => n.kind === 'module' && n.name === 'Storage')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'UserRepo')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'BaseRepo')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'Point')).toBeDefined();
+  });
+
+  it('should extract methods with visibility and self-receiver statics', () => {
+    const result = extractFromSource('src/storage.cr', SOURCE);
+
+    const fetch = result.nodes.find((n) => n.kind === 'method' && n.name === 'fetch' && n.qualifiedName.includes('UserRepo'));
+    expect(fetch).toBeDefined();
+    expect(fetch?.visibility).toBe('public');
+
+    // `private def warm_cache` — the def is wrapped in a visibility_modifier.
+    const warm = result.nodes.find((n) => n.kind === 'method' && n.name === 'warm_cache');
+    expect(warm?.visibility).toBe('private');
+
+    // `def self.build` is a class method.
+    const build = result.nodes.find((n) => n.kind === 'method' && n.name === 'build');
+    expect(build?.isStatic).toBe(true);
+
+    // An abstract def has no body but is still part of the type's contract.
+    expect(result.nodes.find((n) => n.kind === 'method' && n.qualifiedName.includes('BaseRepo'))).toBeDefined();
+  });
+
+  it('should extract accessor macros as properties', () => {
+    const result = extractFromSource('src/storage.cr', SOURCE);
+    const props = result.nodes.filter((n) => n.kind === 'property');
+
+    // getter/property/class_getter are how a Crystal type declares its public
+    // attributes — without them a class looks like it has no members.
+    expect(props.map((n) => n.name).sort()).toEqual(['email', 'name', 'total']);
+    expect(props.find((n) => n.name === 'total')?.isStatic).toBe(true);
+  });
+
+  it('should extract instance/class variables as fields and type-scope constants', () => {
+    const result = extractFromSource('src/storage.cr', SOURCE);
+
+    const cache = result.nodes.find((n) => n.kind === 'field' && n.name === '@cache');
+    expect(cache).toBeDefined();
+
+    const count = result.nodes.find((n) => n.kind === 'field' && n.name === '@@count');
+    expect(count?.isStatic).toBe(true);
+
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'VERSION')).toBeDefined();
+  });
+
+  it('should extract enums with both valued and valueless members', () => {
+    const result = extractFromSource('src/storage.cr', SOURCE);
+
+    expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'Status')).toBeDefined();
+    const members = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name).sort();
+    // `Active` is a bare constant, `Pending = 7` a const_assign — both count.
+    expect(members).toEqual(['Active', 'Pending']);
+  });
+
+  it('should extract type aliases and requires', () => {
+    const result = extractFromSource('src/storage.cr', SOURCE);
+
+    expect(result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'UserId')).toBeDefined();
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toContain('http/server');
+    expect(imports).toContain('./models/user');
+  });
+
+  it('should record inheritance, mixins and receiver-qualified calls', () => {
+    const result = extractFromSource('src/storage.cr', SOURCE);
+    const refs = result.unresolvedReferences ?? [];
+
+    // `class UserRepo < BaseRepo` carries the supertype on a `superclass` field.
+    expect(refs.find((r) => r.referenceKind === 'extends' && r.referenceName === 'BaseRepo')).toBeDefined();
+    // `include Enumerable(User)` references the bare module name.
+    expect(refs.find((r) => r.referenceKind === 'implements' && r.referenceName === 'Enumerable')).toBeDefined();
+    // `Loader.load(id)` must name the METHOD, not just the receiver.
+    expect(refs.find((r) => r.referenceKind === 'calls' && r.referenceName === 'Loader.load')).toBeDefined();
+    // Parenthesis-less, receiver-less `warm_cache` is a call, not an identifier.
+    expect(refs.find((r) => r.referenceKind === 'calls' && r.referenceName === 'warm_cache')).toBeDefined();
+    // `UserRepo.new(...)` is construction.
+    expect(refs.find((r) => r.referenceKind === 'instantiates' && r.referenceName === 'UserRepo')).toBeDefined();
+    // Infix operators parse as calls in this grammar but must never be emitted
+    // (a relative `require` path legitimately starts with `.`, so scope to calls).
+    expect(
+      refs.find((r) => r.referenceKind === 'calls' && /^[^A-Za-z_]/.test(r.referenceName))
+    ).toBeUndefined();
+  });
+
+  it('should record the declared return type, not the colon before it', () => {
+    const result = extractFromSource('src/storage.cr', SOURCE);
+    const method = (owner: string, name: string) =>
+      result.nodes.find((n) => n.kind === 'method' && n.name === name && n.qualifiedName.includes(owner));
+
+    // `def fetch(id : UserId) : User?` — the nilable form resolves to its base type.
+    expect(method('UserRepo', 'fetch')?.returnType).toBe('User');
+    expect(method('BaseRepo', 'fetch')?.returnType).toBe('User');
+    expect(method('UserRepo', 'build')?.returnType).toBe('UserRepo');
+
+    const lib = extractFromSource('src/libc.cr', 'lib LibC\n  fun strlen(s : UInt8*) : SizeT\nend\n');
+    expect(lib.nodes.find((n) => n.name === 'strlen')?.returnType).toBe('SizeT');
+  });
+
+  it('should extract file-scope constants and variables without phantom names', () => {
+    const result = extractFromSource('src/app.cr', 'VERSION = "1.0"\nfoo = bar\nlow, high = 1, 9\n');
+
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'VERSION')).toBeDefined();
+    // `bar` is the value being assigned, not a second declaration; a multiple
+    // assignment declares every target.
+    const variables = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+    expect(variables).toEqual(['foo', 'low', 'high']);
+  });
+
+  it('should walk the value of a file-scope assignment', () => {
+    // The typical entry point of a Crystal HTTP app: the server and its handler
+    // live on the right-hand side of a top-level assignment.
+    const result = extractFromSource(
+      'src/app.cr',
+      'server = HTTP::Server.new do |ctx|\n  handle(ctx)\nend\nready = warm_up\n'
+    );
+    const refs = result.unresolvedReferences ?? [];
+    // A parenthesis-less call as the whole value is a call too.
+    expect(refs.find((r) => r.referenceKind === 'calls' && r.referenceName === 'warm_up')).toBeDefined();
+
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'server')).toBeDefined();
+    expect(refs.find((r) => r.referenceKind === 'instantiates' && r.referenceName === 'Server')).toBeDefined();
+    expect(refs.find((r) => r.referenceKind === 'calls' && r.referenceName === 'handle')).toBeDefined();
+  });
+
+  it('should not treat a bare local variable or parameter as a call', () => {
+    const result = extractFromSource(
+      'src/runner.cr',
+      'def run(input)\n  total = 1\n  total\n  input\n  [1].each { |item| item }\n  helper\nend\n'
+    );
+    const calls = (result.unresolvedReferences ?? [])
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+
+    // A local, a method parameter and a block parameter are values, not calls.
+    expect(calls).not.toContain('total');
+    expect(calls).not.toContain('input');
+    expect(calls).not.toContain('item');
+    // `helper` is never assigned or declared here, so it is a parenthesis-less call.
+    expect(calls).toContain('helper');
+  });
+
+  it('should not declare a variable for an attribute or index assignment', () => {
+    const result = extractFromSource('src/app.cr', 'Kemal.config.port = 3000\nENV["X"] = "y"\n');
+    const refs = result.unresolvedReferences ?? [];
+
+    // Setting an attribute or an element declares nothing...
+    expect(result.nodes.filter((n) => n.kind === 'variable' || n.kind === 'constant')).toEqual([]);
+    // ...but the receiver chain is still a call.
+    expect(refs.find((r) => r.referenceKind === 'calls' && r.referenceName === 'Kemal.config')).toBeDefined();
+  });
+
+  it('should keep a block-local variable inside its block', () => {
+    const result = extractFromSource(
+      'src/runner.cr',
+      'def run\n  [1].each do |i|\n    setup = i\n  end\n  [2].each do |j|\n    setup\n  end\n  teardown\nend\n' +
+        'def stop\n  [1].each { |i| teardown = i }\n  teardown\nend\n'
+    );
+    const calls = (result.unresolvedReferences ?? [])
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+
+    // A local assigned in a block is not visible in a sibling block...
+    expect(calls).toContain('setup');
+    // ...nor after the block, so `teardown` in `stop` is a call.
+    expect(calls.filter((c) => c === 'teardown')).toHaveLength(2);
+  });
+
+  it('should name generic types without their type parameters', () => {
+    const result = extractFromSource(
+      'src/box.cr',
+      'class Box(T)\n  def initialize\n  end\nend\nmodule Enumer(T)\nend\nstruct Pair(K, V)\n  def first\n  end\nend\nb = Box(Int32).new\nBox(Int32).build\n'
+    );
+    const refs = result.unresolvedReferences ?? [];
+
+    expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'Box')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'module' && n.name === 'Enumer')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'Pair')).toBeDefined();
+    const init = result.nodes.find((n) => n.kind === 'method' && n.name === 'initialize');
+    expect(init?.qualifiedName).not.toContain('(');
+    // A generic instantiation targets the bare type, as its declaration is named.
+    expect(refs.find((r) => r.referenceKind === 'instantiates' && r.referenceName === 'Box')).toBeDefined();
+    expect(refs.find((r) => r.referenceKind === 'calls' && r.referenceName === 'Box.build')).toBeDefined();
+  });
+
+  it('should mark accessor macros under private as private', () => {
+    const result = extractFromSource(
+      'src/account.cr',
+      'class Account\n  private getter secret : String\n  getter shown : Int32\nend\n'
+    );
+    const prop = (name: string) => result.nodes.find((n) => n.kind === 'property' && n.name === name);
+
+    expect(prop('secret')?.visibility).toBe('private');
+    expect(prop('shown')?.visibility).toBe('public');
+  });
+
+  it('should record a parenthesis-less call used as a value', () => {
+    const result = extractFromSource(
+      'src/go.cr',
+      'def go(x)\n  r = compute\n  y = x\n  return compute2\nend\ndef give(z)\n  return z\nend\n'
+    );
+    const calls = (result.unresolvedReferences ?? [])
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+
+    expect(calls).toContain('compute');
+    expect(calls).toContain('compute2');
+    // A parameter in value position is still a value.
+    expect(calls).not.toContain('x');
+    expect(calls).not.toContain('z');
+  });
+
+  it('should treat a rescue variable and proc parameters as locals', () => {
+    const result = extractFromSource(
+      'src/guard.cr',
+      'def guard\n  work\nrescue ex : Exception\n  ex\nend\n' +
+        'def retry_it\n  begin\n    work\n  rescue err : Exception\n    err\n  end\nend\n' +
+        'def mapper\n  ->(v : Int32) { v }\nend\n'
+    );
+    const calls = (result.unresolvedReferences ?? [])
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+
+    expect(calls).toContain('work');
+    expect(calls).not.toContain('ex');
+    expect(calls).not.toContain('err');
+    expect(calls).not.toContain('v');
+  });
+
+  it('should extract a struct with no body', () => {
+    const result = extractFromSource('src/marker.cr', 'struct Marker < Base(Int32)\nend\n');
+    const refs = result.unresolvedReferences ?? [];
+
+    // Crystal has no forward declarations: an empty struct is a definition.
+    expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'Marker')).toBeDefined();
+    expect(refs.find((r) => r.referenceKind === 'extends' && r.referenceName === 'Base')).toBeDefined();
+  });
+
+  it('should walk accessor defaults and type-body initializers', () => {
+    const result = extractFromSource(
+      'src/service.cr',
+      'class Service\n' +
+        '  getter client = HTTP::Client.new(1)\n' +
+        '  property cache : Int32 = build_cache\n' +
+        '  REGISTRY = Registry.new\n' +
+        '  @@pool = build_pool(3)\n' +
+        '  @conn : DB::Connection = DB.open(1)\n' +
+        'end\n'
+    );
+    const refs = result.unresolvedReferences ?? [];
+    const has = (kind: string, name: string) =>
+      refs.some((r) => r.referenceKind === kind && r.referenceName === name);
+
+    expect(has('instantiates', 'Client')).toBe(true);
+    expect(has('calls', 'build_cache')).toBe(true);
+    expect(has('instantiates', 'Registry')).toBe(true);
+    expect(has('calls', 'build_pool')).toBe(true);
+    expect(has('calls', 'DB.open')).toBe(true);
+  });
+
+  it('should walk a constant assigned inside a file-scope block', () => {
+    const result = extractFromSource(
+      'src/limits_spec.cr',
+      'describe "limits" do\n  LIMIT = compute_limit(2)\nend\n'
+    );
+    const refs = result.unresolvedReferences ?? [];
+
+    expect(refs.find((r) => r.referenceKind === 'calls' && r.referenceName === 'compute_limit')).toBeDefined();
+  });
+
+  it('should record bare calls in constant values, accessor chains and ||= at file scope', () => {
+    const result = extractFromSource(
+      'src/settings.cr',
+      'LIMIT = compute_limit\n' +
+        'cache ||= load_cache\n' +
+        'class Settings\n  MAX = build_max\n  getter base = 1\n  property derived = base\nend\n'
+    );
+    const refs = result.unresolvedReferences ?? [];
+    const calls = refs.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+
+    expect(calls).toContain('compute_limit');
+    expect(calls).toContain('build_max');
+    expect(calls).toContain('load_cache');
+    // `base` is the getter declared just above, not a local of the class body.
+    expect(calls).toContain('base');
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'cache')).toBeDefined();
+  });
+});
+
+describe('Crystal cross-file resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a subclass to its parent, its mixin and the methods it calls', async () => {
+    const src = path.join(tempDir, 'src');
+    fs.mkdirSync(src, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(src, 'mixin.cr'),
+      `module Greetable
+  def greet : String
+    "hi"
+  end
+end
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'base.cr'),
+      `abstract class Base
+  abstract def run : Nil
+
+  def setup
+    1
+  end
+end
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'worker.cr'),
+      `require "./mixin"
+require "./base"
+
+class Worker < Base
+  include Greetable
+
+  def run : Nil
+    setup
+    greet
+    Helper.assist(1)
+  end
+end
+
+module Helper
+  def self.assist(n : Int32) : Int32
+    n * 2
+  end
+end
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const worker = cg.getNodesByKind('class').find((n) => n.name === 'Worker');
+    expect(worker).toBeDefined();
+
+    // Inheritance and mixin both reach Worker from the other files.
+    for (const parentKind of ['class', 'module'] as const) {
+      const parent = cg.getNodesByKind(parentKind).find((n) => n.name === (parentKind === 'class' ? 'Base' : 'Greetable'));
+      expect(parent, parentKind).toBeDefined();
+      const impacted = [...cg.getImpactRadius(parent!.id, 3).nodes.values()].map((n) => n.name);
+      expect(impacted).toContain('Worker');
+    }
+
+    // `run` calls an inherited method, a mixed-in method, and a module method
+    // declared in the same file — all three must resolve to the method itself.
+    const run = cg.getNodesByKind('method').find((n) => n.name === 'run' && n.qualifiedName.includes('Worker'));
+    expect(run).toBeDefined();
+    // getCallees also reports `references` (here: the Helper module itself), so
+    // narrow to real call edges.
+    const callees = cg.getCallees(run!.id)
+      .filter((c) => c.edge.kind === 'calls')
+      .map((c) => c.node.name)
+      .sort();
+    expect(callees).toEqual(['assist', 'greet', 'setup']);
   });
 });
 

@@ -607,5 +607,28 @@
       "files": "~3390",
       "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
     }
+  ],
+  "Crystal": [
+    {
+      "name": "kemal",
+      "repo": "https://github.com/kemalcr/kemal",
+      "size": "Small",
+      "files": "~79",
+      "question": "How does an incoming HTTP request get matched to the block registered by get \"/\" and end up writing a response? Trace the flow from the handler chain entry point to the route handler that invokes the user block."
+    },
+    {
+      "name": "lavinmq",
+      "repo": "https://github.com/cloudamqp/lavinmq",
+      "size": "Medium",
+      "files": "~508",
+      "question": "How does a message published by an AMQP client end up stored in a queue? Trace the flow from the client frame loop through the channel and exchange to the queue that persists the message."
+    },
+    {
+      "name": "crystal",
+      "repo": "https://github.com/crystal-lang/crystal",
+      "size": "Large",
+      "files": "~2450",
+      "question": "How does the compiler turn a parsed method call into typed IR? Trace the flow from the parser producing a Call node to the semantic pass that resolves and types it."
+    }
   ]
 }
