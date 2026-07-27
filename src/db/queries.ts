@@ -19,13 +19,6 @@ import {
 } from '../types';
 import { safeJsonParse } from '../utils';
 import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
-
-/**
- * How much of the exact-name bonus a `deprioritize`d path keeps (#982). Damped
- * rather than zeroed: a query that genuinely targets that tree must still rank
- * it, the same "discount, don't erase" rule the path penalty follows.
- */
-const DEPRIORITIZED_NAME_BONUS_SCALE = 0.25;
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
@@ -56,6 +49,13 @@ function isLowValueFile(filePath: string): boolean {
 }
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
+
+/**
+ * How much of the exact-name bonus a `deprioritize`d path keeps (#982). Damped
+ * rather than zeroed: a query that genuinely targets that tree must still rank
+ * it, the same "discount, don't erase" rule the path penalty follows.
+ */
+const DEPRIORITIZED_NAME_BONUS_SCALE = 0.25;
 
 /**
  * Database row types (snake_case from SQLite)
@@ -336,6 +336,11 @@ export class QueryBuilder {
    */
   setDeprioritizedPathMatcher(matcher: ((filePath: string) => boolean) | undefined): void {
     this.isDeprioritizedPath = matcher;
+  }
+
+  /** The `deprioritize` predicate (#982), so other rankers apply the same lever. */
+  getDeprioritizedPathMatcher(): ((filePath: string) => boolean) | undefined {
+    return this.isDeprioritizedPath;
   }
 
   // ===========================================================================
@@ -1268,18 +1273,14 @@ export class QueryBuilder {
         // on #982's repro, a `usage()` helper sat at 74.8 vs 51.2 for the top
         // product symbol — -15 lands at 59.8, still ahead). Damped, not zeroed,
         // so the tree stays findable when it genuinely is what you asked for.
+        // Evaluated once and reused: the predicate stats the config file.
         const deprioritized = this.isDeprioritizedPath?.(r.node.filePath) ?? false;
         const nameBonus = nameMatchBonus(r.node.name, scoringQuery);
         return {
           ...r,
           score: r.score
             + kindBonus(r.node.kind)
-            + scorePathRelevance(
-              r.node.filePath,
-              scoringQuery,
-              this.projectNameTokens,
-              this.isDeprioritizedPath,
-            )
+            + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens, deprioritized)
             + (deprioritized ? Math.round(nameBonus * DEPRIORITIZED_NAME_BONUS_SCALE) : nameBonus),
         };
       });

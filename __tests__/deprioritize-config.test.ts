@@ -23,6 +23,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
 import { loadDeprioritizePatterns } from '../src/project-config';
+import { scorePathRelevance } from '../src/search/query-utils';
 
 const QUERY = 'desktop status bar context window usage';
 
@@ -162,6 +163,7 @@ describe('#982 minimal repro — ranking with and without deprioritize', () => {
     // This is the status quo the issue reports, and the shape the corpus-frequency
     // discount cannot fix (only two symbols are named `usage` here, so it is rare).
     const results = baseCg.searchNodes(QUERY, { limit: 20 });
+    expect(results.length).toBeGreaterThanOrEqual(2);
     expect(results.slice(0, 2).every(isHelper)).toBe(true);
   });
 
@@ -184,8 +186,74 @@ describe('#982 minimal repro — ranking with and without deprioritize', () => {
     // gateway/ and packages/ are not named, so their scores must not move.
     const score = (cg: CodeGraph, file: string): number | undefined =>
       cg.searchNodes('slugify', { limit: 20 }).find((r) => r.node.filePath.includes(file))?.score;
-    expect(score(cfgCg, 'packages/core/util/strings.ts')).toBe(
-      score(baseCg, 'packages/core/util/strings.ts')
-    );
+    const baseline = score(baseCg, 'packages/core/util/strings.ts');
+    expect(baseline).toBeDefined();
+    expect(score(cfgCg, 'packages/core/util/strings.ts')).toBe(baseline);
+  });
+
+  it('a query that genuinely targets the tree still ranks it, competitor present', () => {
+    // The "discount, don't erase" edge case #982 calls out. `bodyfat_calc` lives
+    // only in the de-prioritized tree; a query naming it must still find it
+    // first, even with product code competing for the same terms.
+    const results = cfgCg.searchNodes('bodyfat calc usage', { limit: 20 });
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].node.filePath).toContain('optional-skills/bodyfat');
+  });
+
+  it('explore ranking honours the setting, not just search', () => {
+    // #982's reproduction rows B/C/D are all `codegraph explore`. Explore ranks
+    // through its own path scorer as well as through searchNodes, so a
+    // search-only fix would leave the reported surface unchanged.
+    const matcher = (cfgCg as unknown as { queries: { getDeprioritizedPathMatcher(): ((p: string) => boolean) | undefined } })
+      .queries.getDeprioritizedPathMatcher();
+    expect(matcher).toBeDefined();
+    expect(matcher!('optional-skills/bodyfat/scripts/bodyfat_calc.ts')).toBe(true);
+    expect(matcher!('apps/desktop/statusbar/StatusBar.ts')).toBe(false);
+  });
+
+  it('picks up a config written after the project was opened', async () => {
+    // wireLayers runs once per open, so a matcher captured there would freeze
+    // at open time — and the MCP server keeps one CodeGraph per root alive for
+    // its whole lifetime, which would make an edited config look like a no-op.
+    const late = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-deprio-late-'));
+    writeRepro(late);
+    const cg = CodeGraph.initSync(late);
+    try {
+      await cg.indexAll();
+      const before = cg.searchNodes(QUERY, { limit: 20 });
+      expect(before.length).toBeGreaterThanOrEqual(2);
+      expect(before.slice(0, 2).every(isHelper)).toBe(true);
+
+      fs.writeFileSync(
+        path.join(late, 'codegraph.json'),
+        JSON.stringify({ deprioritize: ['optional-skills/'] })
+      );
+      const after = cg.searchNodes(QUERY, { limit: 20 });
+      const firstHelper = after.findIndex(isHelper);
+      const firstProduct = after.findIndex((r) => r.node.filePath.includes('apps/desktop'));
+      expect(firstProduct).toBeGreaterThanOrEqual(0);
+      expect(firstHelper === -1 || firstProduct < firstHelper).toBe(true);
+    } finally {
+      cg.destroy();
+      fs.rmSync(late, { recursive: true, force: true });
+    }
+  }, 180_000);
+});
+
+describe('scorePathRelevance — the two deliberate asymmetries (#982)', () => {
+  it('docks a path that is both test-like and de-prioritized only once', () => {
+    const both = 'example/a/foo.ts';
+    const asTestOnly = scorePathRelevance(both, 'foo');
+    const asBoth = scorePathRelevance(both, 'foo', undefined, true);
+    expect(asBoth).toBe(asTestOnly);
+  });
+
+  it('does not waive the user penalty for a test-y query, unlike the built-ins', () => {
+    // The built-in classification is inferred, so a test-y query waives it. A
+    // `deprioritize` pattern is a standing statement by the project, so it
+    // stands. Asserted so the difference is a decision, not an accident.
+    const builtIn = scorePathRelevance('example/a/foo.ts', 'foo test');
+    const userDeclared = scorePathRelevance('optional-skills/a/foo.ts', 'foo test', undefined, true);
+    expect(userDeclared).toBe(builtIn - 15);
   });
 });

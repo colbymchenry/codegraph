@@ -222,7 +222,7 @@ export function scorePathRelevance(
   filePath: string,
   query: string,
   projectNameTokens?: Set<string>,
-  isDeprioritizedPath?: (filePath: string) => boolean,
+  isDeprioritized?: boolean,
 ): number {
   const pathLower = filePath.toLowerCase();
   const fileName = path.basename(filePath).toLowerCase();
@@ -265,14 +265,18 @@ export function scorePathRelevance(
     else if (subtokens.some((t) => pathLower.includes(t))) score += 3;
   }
 
-  // Deprioritize test files unless the query is explicitly about tests. The
-  // project's own `deprioritize` patterns (#982) land in the same penalty: a
-  // peripheral tree the project named is off-target for the same reason a
-  // fixture dir is. Applied ONCE — a path that is both must not be docked twice.
+  // Deprioritize test files unless the query is explicitly about tests, and
+  // apply the same -15 to a path the project declared peripheral (#982).
+  //
+  // Two deliberate asymmetries, both pinned by tests:
+  //  - the built-in test/fixture penalty is waived for a test-y query, because
+  //    the tool inferred that classification; a `deprioritize` pattern is a
+  //    standing statement by the project, so it is NOT waived. The name-bonus
+  //    damping at the call site is what keeps such a tree findable.
+  //  - a path that is both is docked ONCE, not twice.
   const queryLower = query.toLowerCase();
   const isTestQuery = queryLower.includes('test') || queryLower.includes('spec');
-  const offTarget =
-    (!isTestQuery && isTestFile(filePath)) || (isDeprioritizedPath?.(filePath) ?? false);
+  const offTarget = (!isTestQuery && isTestFile(filePath)) || isDeprioritized === true;
   if (offTarget) {
     score -= 15;
   }

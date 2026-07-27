@@ -191,21 +191,36 @@ export class CodeGraph {
     // Down-weight the peripheral trees the project named in `codegraph.json`
     // `deprioritize` — indexed and findable, but never outranking real code
     // (#982). Ranking-only, so a bad pattern costs relevance, never recall.
-    try {
-      const patterns = loadDeprioritizePatterns(this.projectRoot);
-      if (patterns.length > 0) {
-        const matcher = ignore().add(patterns);
-        this.queries.setDeprioritizedPathMatcher((filePath: string) => {
-          const rel = path.isAbsolute(filePath)
-            ? path.relative(this.projectRoot, filePath)
-            : filePath;
-          if (!rel || rel.startsWith('..')) return false;
-          return matcher.ignores(rel.split(path.sep).join('/'));
-        });
+    //
+    // Read LAZILY, not once here: `wireLayers` runs from the constructor and
+    // from `reopenIfReplaced`, so a matcher built here would freeze at whatever
+    // the config said when the project opened. The MCP server caches one
+    // CodeGraph per root for its whole lifetime, so editing `codegraph.json`
+    // would appear to do nothing until the process restarted — `exclude` and
+    // `include` do not behave that way. `loadDeprioritizePatterns` is
+    // mtime-cached, so this costs one `stat`; the compiled matcher is memoized
+    // on the pattern array's identity, which the cache keeps stable.
+    let cachedPatterns: string[] | undefined;
+    let cachedMatcher: ReturnType<typeof ignore> | undefined;
+    this.queries.setDeprioritizedPathMatcher((filePath: string): boolean => {
+      try {
+        const patterns = loadDeprioritizePatterns(this.projectRoot);
+        if (patterns.length === 0) return false;
+        if (patterns !== cachedPatterns) {
+          cachedPatterns = patterns;
+          cachedMatcher = ignore().add(patterns);
+        }
+        const rel = path.isAbsolute(filePath)
+          ? path.relative(this.projectRoot, filePath)
+          : filePath;
+        if (!rel || rel.startsWith('..')) return false;
+        return cachedMatcher!.ignores(rel.split(path.sep).join('/'));
+      } catch {
+        // Ranking must never take the search down with it.
+        return false;
       }
-    } catch {
-      // Best-effort: ranking still works without it.
-    }
+    });
+
     this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
     this.resolver = createResolver(this.projectRoot, this.queries);
     this.graphManager = new GraphQueryManager(this.queries);
