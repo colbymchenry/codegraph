@@ -24,8 +24,16 @@
  * stop killing work that is demonstrably making progress.
  */
 
-/** Yield when more than `budgetMs` of wall-clock has passed since the last yield. */
-export type MaybeYield = () => Promise<void>;
+/**
+ * Yield when more than `budgetMs` of wall-clock has passed since the last
+ * yield. Returns `undefined` on the (overwhelmingly common) not-due path so a
+ * hot loop can skip the await entirely — `await`ing an async no-op costs a
+ * promise allocation + microtask hop, which at hundreds of thousands of calls
+ * per index is real time. Callers may either `await maybeYield()` (works for
+ * both return shapes) or use the fast form:
+ *   `const y = maybeYield(); if (y) await y;`
+ */
+export type MaybeYield = () => Promise<void> | undefined;
 
 /** Default budget: well under the watchdog's minimum heartbeat cadence (~1s), so
  * a heartbeat byte always has a chance to land between yields. */
@@ -33,9 +41,13 @@ export const DEFAULT_YIELD_BUDGET_MS = 250;
 
 export function createYielder(budgetMs: number = DEFAULT_YIELD_BUDGET_MS): MaybeYield {
   let last = Date.now();
-  return async function maybeYield(): Promise<void> {
-    if (Date.now() - last < budgetMs) return;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    last = Date.now();
+  return function maybeYield(): Promise<void> | undefined {
+    if (Date.now() - last < budgetMs) return undefined;
+    return new Promise<void>((resolve) =>
+      setImmediate(() => {
+        last = Date.now();
+        resolve();
+      })
+    );
   };
 }

@@ -59,6 +59,22 @@ const MAX_SYNC_FAILURE_RETRIES = 5;
 /** Cap on the exponential retry backoff (either mode) so it never sleeps absurdly long. */
 const MAX_RETRY_BACKOFF_MS = 30_000;
 
+/**
+ * Adaptive debounce: a pending set this small fires after the quick quiet
+ * window instead of the full debounce — a lone save (or editor + test file
+ * pair) syncs near-instantly, while larger bursts keep the full window and
+ * coalesce exactly as before.
+ */
+const QUICK_SYNC_MAX_PENDING = 2;
+const QUICK_SYNC_QUIET_MS = 300;
+
+/**
+ * Scoped-sync ceiling: above this many pending files a full scan-diff is
+ * simpler and comparably fast (a branch checkout emits thousands of events),
+ * and it self-heals anything event coalescing dropped along the way.
+ */
+const SCOPED_SYNC_MAX_PENDING = 500;
+
 /** Actionable degrade message; both exhaustion paths share it verbatim. */
 const EXHAUSTION_REASON =
   'OS watch/file limit exhausted; auto-sync disabled. Run `codegraph sync` ' +
@@ -274,6 +290,13 @@ export class FileWatcher {
   private inert = false;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   /**
+   * True when the pending set does NOT exactly describe the change (a
+   * directory removal's children are unknown from the event, #1285) — the
+   * next sync must be a full scan-diff. Cleared only after a successful FULL
+   * sync reconciles the tree.
+   */
+  private needsFullScan = false;
+  /**
    * Files seen by the watcher since the last successful sync — populated on
    * every change event, cleared at the start of a sync, and re-populated by
    * events that arrive mid-sync (or restored on sync failure). Keyed by the
@@ -314,7 +337,7 @@ export class FileWatcher {
 
   private readonly projectRoot: string;
   private readonly debounceMs: number;
-  private readonly syncFn: () => Promise<{ filesChanged: number; durationMs: number }>;
+  private readonly syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>;
   private readonly onSyncComplete?: WatchOptions['onSyncComplete'];
   private readonly onSyncError?: WatchOptions['onSyncError'];
   private readonly onDegraded?: WatchOptions['onDegraded'];
@@ -322,7 +345,7 @@ export class FileWatcher {
 
   constructor(
     projectRoot: string,
-    syncFn: () => Promise<{ filesChanged: number; durationMs: number }>,
+    syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>,
     options: WatchOptions = {}
   ) {
     this.projectRoot = projectRoot;
@@ -551,7 +574,10 @@ export class FileWatcher {
     if (!rel || rel === '.' || rel.startsWith('..')) return;
     if (this.isAlwaysIgnored(rel)) return;
     if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
-    if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) return;
+    if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) {
+      this.maybeScheduleForRemovedDir(rel);
+      return;
+    }
 
     logDebug('File change detected', { file: rel });
     if (this.ready) {
@@ -562,6 +588,36 @@ export class FileWatcher {
         lastSeenMs: now,
       });
     }
+    this.scheduleSync();
+  }
+
+  /**
+   * A deleted DIRECTORY arrives as one event on the directory's own path —
+   * no source extension, so the source-file filter drops it, and the files
+   * underneath may never get events of their own (Windows's recursive
+   * watcher reports only the top-most removed entry; macOS FSEvents can
+   * coalesce a tree deletion the same way). The index then kept every child
+   * record until some unrelated edit happened to trigger a sync (#1285).
+   *
+   * If a non-source path no longer exists on disk, treat it as a potential
+   * subtree removal and schedule the debounced sync — its scan-diff removes
+   * whatever is gone, which is the ground truth for what was underneath.
+   * pendingFiles is left alone (we can't know the children from the event).
+   * An event for an EXISTING non-source file stays fully ignored, so build
+   * churn on live files never schedules work; a deleted non-source file
+   * costs at most one no-op scan-diff, absorbed by the debounce.
+   */
+  private maybeScheduleForRemovedDir(rel: string): void {
+    try {
+      fs.statSync(path.join(this.projectRoot, rel));
+      return; // still on disk — an ordinary non-source change, ignore
+    } catch {
+      /* gone — fall through */
+    }
+    logDebug('Non-source path removed; scheduling sync for possible directory removal', {
+      path: rel,
+    });
+    this.needsFullScan = true;
     this.scheduleSync();
   }
 
@@ -736,10 +792,20 @@ export class FileWatcher {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
+    // Adaptive quiet window: a lone save (or a pair — editor + its test file)
+    // fires fast so the graph feels instant; anything bigger keeps the full
+    // configured window so an agent's multi-file burst still coalesces into
+    // one sync exactly as before. Re-arming on each event preserves the
+    // trailing-edge semantics either way: if more events arrive inside the
+    // quick window, the reschedule sees the larger pending set and extends to
+    // the full window. Never exceeds the configured debounce (a user-lowered
+    // CODEGRAPH_WATCH_DEBOUNCE_MS stays authoritative), floor 100ms.
+    const quickMs = Math.max(100, Math.min(QUICK_SYNC_QUIET_MS, this.debounceMs));
+    const delay = this.pendingFiles.size <= QUICK_SYNC_MAX_PENDING ? quickMs : this.debounceMs;
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
       this.flush();
-    }, this.debounceMs);
+    }, delay);
   }
 
   /**
@@ -776,8 +842,19 @@ export class FileWatcher {
     this.syncStartedMs = Date.now();
     this.syncing = true;
 
+    // Scoped fast path: when every pending change is a known file event, hand
+    // the exact paths to sync and skip its O(repo) scan-diff. Anything the
+    // events can't fully describe — a directory removal, an empty pending set
+    // (retry paths), or an event storm past the ceiling — runs the full
+    // scan-diff, which remains the ground truth.
+    const scoped =
+      !this.needsFullScan && this.pendingFiles.size > 0 && this.pendingFiles.size <= SCOPED_SYNC_MAX_PENDING
+        ? [...this.pendingFiles.keys()]
+        : undefined;
+
     try {
-      const result = await this.syncFn();
+      const result = await this.syncFn(scoped);
+      if (!scoped) this.needsFullScan = false;
       this.lockRetryCount = 0; // a clean sync clears any contention backoff
       this.syncFailureRetryCount = 0; // ...and any generic-failure backoff
       // Remove entries whose most recent event predates this sync — those
