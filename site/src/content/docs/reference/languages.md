@@ -18,6 +18,7 @@ Language support is automatic from the file extension — there's nothing to con
 | ASP.NET Razor / Blazor | `.cshtml`, `.razor` | Markup links: `@model`, `@inherits`, `@inject`, `@typeof` and Blazor component tags link to the C# types they name, and what an inline `<script>` block calls links to the JavaScript that defines it |
 | PHP | `.php` | Full support |
 | Ruby | `.rb` | Full support |
+| Crystal | `.cr` | Full support (modules, classes, structs and `record` types, enums, `lib`/`fun` C bindings, macros, `getter`/`setter`/`property` accessor macros, instance/class variables, type aliases, `require` imports, `<` inheritance and `include`/`extend` mixin edges, call edges through parenthesis-less and receiver-qualified calls) |
 | C | `.c`, `.h` | Full support |
 | C++ | `.cpp`, `.hpp`, `.cc` | Full support |
 | Objective-C | `.m`, `.mm`, `.h` | Partial support (classes, protocols, methods, `@property`, `#import`, message sends; `.mm` ObjC++ may parse incompletely) |

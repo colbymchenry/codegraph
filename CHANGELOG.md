@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **Crystal** (`.cr`): modules, classes, structs, `record` types, enums, macros, C bindings and the `getter`/`setter`/`property` accessor macros are extracted, and inheritance, `include`/`extend` mixins, `require` imports and calls, parenthesis-less ones included, resolve across files, so tracing a flow through a Crystal codebase works as in any other supported language.
+
 ### Fixes
 
 - In Python, `import time` no longer links the importing file to a project function that happens to be named `time`, so such a function stops listing every file that imports the standard library module among its callers and in its impact. The same goes for `json`, `copy`, `random`, `logging` and any other module, and for a fallback variable like `brotli = None` beside a guarded `import brotli`. Thanks @inth3shadows for the report. (#3239)
