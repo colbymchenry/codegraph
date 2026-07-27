@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import type { FrameworkResolver, UnresolvedRef } from '../src/resolution/types';
+import type { FrameworkResolver, UnresolvedRef, ResolutionContext } from '../src/resolution/types';
 import type { Node } from '../src/types';
 
 describe('FrameworkResolver.extract interface', () => {
@@ -1669,3 +1669,118 @@ export class UsersController {
     expect(references.map((r) => r.referenceName)).toEqual(['real']);
   });
 });
+
+import { godotResolver } from '../src/resolution/frameworks/godot';
+
+describe('godotResolver', () => {
+  it('detects Godot project by project.godot', () => {
+    const context: ResolutionContext = {
+      getNodesInFile: () => [],
+      getNodesByName: () => [],
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      fileExists: (p) => p === 'project.godot',
+      readFile: () => null,
+      getProjectRoot: () => '/test',
+      getAllFiles: () => ['project.godot'],
+    };
+    expect(godotResolver.detect(context)).toBe(true);
+  });
+
+  it('detects Godot project by .tscn file', () => {
+    const context: ResolutionContext = {
+      getNodesInFile: () => [],
+      getNodesByName: () => [],
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      fileExists: () => false,
+      readFile: () => null,
+      getProjectRoot: () => '/test',
+      getAllFiles: () => ['scenes/main.tscn', 'scripts/player.gd'],
+    };
+    expect(godotResolver.detect(context)).toBe(true);
+  });
+
+  it('resolves res:// path to file node', () => {
+    const mockNodes: Node[] = [
+      {
+        id: 'file:some/script.gd',
+        kind: 'file',
+        name: 'script.gd',
+        qualifiedName: 'some/script.gd',
+        filePath: 'some/script.gd',
+        language: 'gdscript',
+        startLine: 1,
+        endLine: 10,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      },
+    ];
+    const context: ResolutionContext = {
+      getNodesInFile: (fp) => (fp.endsWith('some/script.gd') ? mockNodes : []),
+      getNodesByName: () => [],
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      fileExists: (fp) => fp.endsWith('some/script.gd'),
+      readFile: () => null,
+      getProjectRoot: () => '/test',
+      getAllFiles: () => [],
+    };
+    const ref = {
+      fromNodeId: 'file:player.gd',
+      referenceName: 'res://some/script.gd',
+      referenceKind: 'references' as const,
+      line: 5,
+      column: 10,
+      filePath: 'player.gd',
+      language: 'gdscript' as const,
+    };
+    const result = godotResolver.resolve(ref, context);
+    expect(result).not.toBeNull();
+    expect(result!.targetNodeId).toBe('file:some/script.gd');
+    expect(result!.resolvedBy).toBe('file-path');
+  });
+
+  it('resolves %UniqueName to scene component node', () => {
+    const mockNodes: Node[] = [
+      {
+        id: 'component:main.tscn:HealthLabel:3',
+        kind: 'component',
+        name: 'HealthLabel',
+        qualifiedName: 'main.tscn::node:Root/HealthLabel',
+        filePath: 'main.tscn',
+        language: 'godot_resource',
+        startLine: 3,
+        endLine: 3,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      },
+    ];
+    const context: ResolutionContext = {
+      getNodesInFile: () => [],
+      getNodesByName: (n) => n === 'HealthLabel' ? mockNodes : [],
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      fileExists: () => false,
+      readFile: () => null,
+      getProjectRoot: () => '/test',
+      getAllFiles: () => [],
+    };
+    const ref = {
+      fromNodeId: 'file:player.gd',
+      referenceName: 'HealthLabel',
+      referenceKind: 'references' as const,
+      line: 5,
+      column: 10,
+      filePath: 'player.gd',
+      language: 'gdscript' as const,
+    };
+    const result = godotResolver.resolve(ref, context);
+    expect(result).not.toBeNull();
+    expect(result!.targetNodeId).toBe('component:main.tscn:HealthLabel:3');
+    expect(result!.resolvedBy).toBe('framework');
+  });
+});
+

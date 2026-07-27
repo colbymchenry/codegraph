@@ -296,6 +296,46 @@ func setup() -> void:
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'setup')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'extends' && r.referenceName === 'Control')).toBe(true);
   });
+
+  it('should extract @tool script metadata', () => {
+    const code = `@tool
+extends Node
+
+func _ready() -> void:
+  pass
+`;
+    const result = extractFromSource('tool_script.gd', code);
+    const classNode = result.nodes.find((n) => n.kind === 'class');
+    expect(classNode?.decorators).toContain('tool');
+  });
+
+  it('should extract call() and call_deferred() literal method references', () => {
+    const code = `
+extends Node
+
+func _ready() -> void:
+  call("setup_ui")
+  call_deferred("queue_free")
+  var dynamic = some_var
+  call(dynamic)
+`;
+    const result = extractFromSource('dynamic_call.gd', code);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'setup_ui')).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'queue_free')).toBe(true);
+  });
+
+  it('should extract tween_property string paths', () => {
+    const code = `
+extends Node
+
+func _ready() -> void:
+  var tween = create_tween()
+  tween.tween_property(some_node, "modulate:a", 0.5, 1.0)
+  tween.tween_method(self, "_update_value", 0.0, 1.0, 1.0)
+`;
+    const result = extractFromSource('tween_test.gd', code);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'modulate:a')).toBe(true);
+  });
 });
 
 describe('Godot Resource Extraction', () => {
@@ -378,6 +418,60 @@ card_id = &"knife"
     expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'knife')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'CardResource')).toBe(true);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'res://core/cards/card_resource.gd')).toBe(true);
+  });
+
+  it('should extract unique_name_in_owner declarations', () => {
+    const code = `
+[gd_scene format=3]
+
+[node name="Root" type="Node"]
+[node name="HealthLabel" type="Label" parent="."]
+unique_name_in_owner = true
+[node name="SomeButton" type="Button" parent="."]
+`;
+    const result = extractFromSource('main.tscn', code);
+
+    const healthLabel = result.nodes.find((n) => n.name === 'HealthLabel' && n.kind === 'component');
+    expect(healthLabel).toBeDefined();
+  });
+
+  it('should extract %(UniqueName) references in property values', () => {
+    const code = `
+[gd_scene format=3]
+
+[node name="Root" type="Node"]
+[node name="HealthLabel" type="Label" parent="."]
+unique_name_in_owner = true
+[node name="Updater" type="Node" parent="."]
+target = %HealthLabel
+other_ref = %(SomeOther)
+`;
+    const result = extractFromSource('ref_test.tscn', code);
+
+    const updater = result.nodes.find((n) => n.name === 'Updater' && n.kind === 'component');
+    expect(updater).toBeDefined();
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'HealthLabel' && r.fromNodeId === updater!.id)).toBe(true);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'SomeOther')).toBe(true);
+  });
+
+  it('should resolve %Name in connection from/to attrs', () => {
+    const code = `
+[gd_scene format=3]
+
+[node name="Root" type="Node"]
+[node name="HealthLabel" type="Label" parent="."]
+unique_name_in_owner = true
+[node name="Updater" type="Node" parent="."]
+
+[connection signal="pressed" from="%HealthLabel" to="." method="_on_pressed"]
+`;
+    const result = extractFromSource('conn_test.tscn', code);
+
+    const healthLabel = result.nodes.find((n) => n.name === 'HealthLabel' && n.kind === 'component');
+    const root = result.nodes.find((n) => n.name === 'Root' && n.kind === 'component');
+    expect(healthLabel).toBeDefined();
+    expect(root).toBeDefined();
+    expect(result.edges.some((e) => e.kind === 'references' && e.source === healthLabel!.id && e.target === root!.id && e.metadata?.method === '_on_pressed')).toBe(true);
   });
 });
 

@@ -37,6 +37,9 @@ const EMIT_RE = /\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]/g;
 const SETSTATE_RE = /this\.setState\s*\(/;
 const FLUTTER_SETSTATE_RE = /\bsetState\s*\(/; // Flutter: setState((){…}) / this.setState
 const JSX_TAG_RE = /<([A-Z][A-Za-z0-9_]*)[\s/>]/g;
+// Godot signal connect/emit: .connect("signal", Callable(self, "method")) or .connect("signal", "method")
+const GODOT_CONNECT_RE = /\.connect\s*\(\s*['"]([^'"]+)['"]\s*,\s*(?:Callable\s*\(\s*(?:\w+|self)\s*,\s*['"](\w+)['"]\s*\)|['"](\w+)['"])/g;
+const GODOT_EMIT_SIGNAL_RE = /emit_signal\s*\(\s*['"]([^'"]+)['"]/g;
 const MAX_JSX_CHILDREN = 30;
 // Vue SFC templates: kebab-case child components (<el-button> → ElButton) and
 // event bindings (@click="fn" / v-on:click="fn"). PascalCase children (<VPNav/>)
@@ -278,7 +281,9 @@ function eventEmitterEdges(ctx: ResolutionContext): Edge[] {
     if (!content) continue;
     const hasEmit = content.includes('.emit(') || content.includes('.fire(') || content.includes('.dispatchEvent(');
     const hasOn = content.includes('.on(') || content.includes('.once(') || content.includes('.addListener(');
-    if (!hasEmit && !hasOn) continue;
+    const hasGodotConnect = content.includes('.connect(');
+    const hasGodotEmitSignal = content.includes('emit_signal(');
+    if (!hasEmit && !hasOn && !hasGodotConnect && !hasGodotEmitSignal) continue;
     const nodesInFile = ctx.getNodesInFile(file);
     const lineOf = (idx: number) => content.slice(0, idx).split('\n').length;
 
@@ -296,6 +301,28 @@ function eventEmitterEdges(ctx: ResolutionContext): Edge[] {
       ON_RE.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = ON_RE.exec(content))) {
+        const handlerName = m[2] || m[3];
+        if (!handlerName) continue;
+        const handler = ctx.getNodesByName(handlerName).find((n) => n.kind === 'function' || n.kind === 'method');
+        if (!handler) continue;
+        const map = handlersByEvent.get(m[1]!) ?? new Map<string, string>();
+        map.set(handler.id, `${file}:${lineOf(m.index)}`); handlersByEvent.set(m[1]!, map);
+      }
+    }
+    if (hasGodotEmitSignal) {
+      GODOT_EMIT_SIGNAL_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = GODOT_EMIT_SIGNAL_RE.exec(content))) {
+        const disp = enclosingFn(nodesInFile, lineOf(m.index));
+        if (!disp) continue;
+        const set = emitsByEvent.get(m[1]!) ?? new Set<string>();
+        set.add(disp.id); emitsByEvent.set(m[1]!, set);
+      }
+    }
+    if (hasGodotConnect) {
+      GODOT_CONNECT_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = GODOT_CONNECT_RE.exec(content))) {
         const handlerName = m[2] || m[3];
         if (!handlerName) continue;
         const handler = ctx.getNodesByName(handlerName).find((n) => n.kind === 'function' || n.kind === 'method');

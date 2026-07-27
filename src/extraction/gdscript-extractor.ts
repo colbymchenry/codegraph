@@ -101,6 +101,9 @@ export class GDScriptExtractor {
     try {
       const fileNode = this.createFileNode();
       const scriptClass = this.extractScriptClass(fileNode) ?? this.extractImplicitScriptClass(fileNode);
+      if (scriptClass && /^@tool\b/m.test(this.source)) {
+        scriptClass.decorators = ['tool'];
+      }
       this.extractDeclarations(fileNode, scriptClass);
       this.extractReferences(fileNode, scriptClass);
     } catch (error) {
@@ -296,6 +299,18 @@ export class GDScriptExtractor {
       let resourceMatch;
       while ((resourceMatch = resourceRegex.exec(code)) !== null) {
         this.addReference(owner, resourceMatch[1]!, 'references', lineNumber, resourceMatch.index);
+      }
+
+      const dynamicCallRegex = /\b(?:call|call_deferred)\s*\(\s*["']([A-Za-z_]\w*)["']/g;
+      let dynamicCallMatch;
+      while ((dynamicCallMatch = dynamicCallRegex.exec(code)) !== null) {
+        this.addReference(owner, dynamicCallMatch[1]!, 'calls', lineNumber, dynamicCallMatch.index);
+      }
+
+      const tweenPathRegex = /\b(?:tween_property|tween_method|tween_value)\s*\(\s*[^,]+,\s*["']([^"']+)["']/g;
+      let tweenPathMatch;
+      while ((tweenPathMatch = tweenPathRegex.exec(code)) !== null) {
+        this.addReference(owner, tweenPathMatch[1]!, 'references', lineNumber, tweenPathMatch.index);
       }
 
       this.extractNodePathReferences(owner, code, lineNumber, scriptClass, functionOwner);

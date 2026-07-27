@@ -16,6 +16,7 @@ export class GodotResourceExtractor {
   private errors: ExtractionError[] = [];
   private extResources = new Map<string, string>();
   private nodesByScenePath = new Map<string, Node>();
+  private uniqueNameToNode = new Map<string, Node>();
   private rootNode: Node | null = null;
 
   constructor(filePath: string, source: string) {
@@ -157,20 +158,39 @@ export class GodotResourceExtractor {
     }
 
     const idMatch = line.match(/^\s*(id|content_id|card_id|relic_id|enemy_id|event_id|status_id|encounter_id|pool_id)\s*=\s*&?"([^"]+)"/);
-    if (!idMatch) return;
+    if (idMatch) {
+      const value = idMatch[2]!;
+      const node = this.createNode('constant', value, `${this.filePath}::${idMatch[1]}:${value}`, lineNumber, line.indexOf(value), line.length);
+      node.signature = line.trim();
+      this.addContains(owner.id, node.id);
+      return;
+    }
 
-    const value = idMatch[2]!;
-    const node = this.createNode('constant', value, `${this.filePath}::${idMatch[1]}:${value}`, lineNumber, line.indexOf(value), line.length);
-    node.signature = line.trim();
-    this.addContains(owner.id, node.id);
+    const uniqueNameDecl = line.match(/^\s*unique_name_in_owner\s*=\s*true/);
+    if (uniqueNameDecl) {
+      this.uniqueNameToNode.set(owner.name, owner);
+      return;
+    }
+
+    const uniqueRefRegex = /%\(?([A-Za-z_]\w*)\)?/g;
+    let refMatch;
+    while ((refMatch = uniqueRefRegex.exec(line)) !== null) {
+      this.addReference(owner.id, refMatch[1]!, 'references', lineNumber, refMatch.index);
+    }
   }
 
   private extractConnection(fileNodeId: string, attrs: Map<string, string>, line: string, lineNumber: number): void {
     const method = attrs.get('method');
     if (!method) return;
 
-    const fromNode = this.resolveSceneNode(attrs.get('from') || '.');
-    const toNode = this.resolveSceneNode(attrs.get('to') || '.');
+    const fromStr = attrs.get('from') || '.';
+    const toStr = attrs.get('to') || '.';
+    const fromNode = fromStr.startsWith('%')
+      ? this.uniqueNameToNode.get(fromStr.slice(1)) ?? null
+      : this.resolveSceneNode(fromStr);
+    const toNode = toStr.startsWith('%')
+      ? this.uniqueNameToNode.get(toStr.slice(1)) ?? null
+      : this.resolveSceneNode(toStr);
     const ownerId = fromNode?.id ?? fileNodeId;
     this.addReference(ownerId, method, 'calls', lineNumber, line.indexOf(method));
 
