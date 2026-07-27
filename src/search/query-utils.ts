@@ -346,12 +346,63 @@ function matchesNonProductionDir(lowerPath: string): boolean {
 }
 
 /**
+ * Corpus statistics used to discount an exact name match by how common the
+ * name is. Supplied by the caller because only the DB layer can count names.
+ */
+export interface NameCorpusStats {
+  /** Total indexed nodes. */
+  total: number;
+  /** How many indexed nodes carry this exact name (case-insensitive). */
+  countForName(name: string): number;
+}
+
+/** Floor for {@link nameMatchIdfScale}: a common name is discounted, never erased. */
+const NAME_MATCH_IDF_FLOOR = 0.25;
+
+/**
+ * IDF-style scale for an exact-name bonus, in [NAME_MATCH_IDF_FLOOR, 1].
+ *
+ * An exact name match is strong evidence only when the name is rare. A bare
+ * `usage` that names hundreds of symbols carries almost no signal, yet used to
+ * collect the same flat bonus as a name that occurs once — enough to outrank
+ * product code that does not literally contain the token (#982, the
+ * corpus-frequency discount #746 left unimplemented).
+ *
+ * `log(1 + total/df) / log(1 + total)` gives exactly 1 for a unique name, so
+ * the common case is unchanged, and decays as the name spreads. The floor keeps
+ * a genuinely-intended query for a common name (an actual `usage()` reporter)
+ * ranking above non-matches: the aim is to discount the signal, not erase it.
+ *
+ * @param df - Number of indexed nodes sharing the name.
+ * @param total - Total indexed nodes.
+ * @returns Multiplier for the exact-name bonus.
+ */
+export function nameMatchIdfScale(df: number, total: number): number {
+  if (!Number.isFinite(df) || !Number.isFinite(total)) return 1;
+  if (df <= 1 || total <= 1) return 1;
+  const capped = Math.min(df, total);
+  const scale = Math.log(1 + total / capped) / Math.log(1 + total);
+  return Math.max(NAME_MATCH_IDF_FLOOR, Math.min(1, scale));
+}
+
+/**
  * Bonus when a node's name matches the search query.
  * Exact matches get the largest boost; prefix matches get smaller boosts.
  * Multi-word queries also check individual term matches against the name.
+ *
+ * @param corpus - Optional corpus stats. When given, the two exact-name bonuses
+ *   are scaled by {@link nameMatchIdfScale} so a name shared by many symbols
+ *   stops dominating. Omitted (or unavailable) leaves scoring as before.
  */
-export function nameMatchBonus(nodeName: string, query: string): number {
+export function nameMatchBonus(nodeName: string, query: string, corpus?: NameCorpusStats): number {
   const nameLower = nodeName.toLowerCase();
+
+  // Only the exact-name arms below are discounted. Prefix/substring bonuses are
+  // already small and length-scaled, so they never produced the #982 crowd-out.
+  const exact = (bonus: number): number => {
+    if (!corpus) return bonus;
+    return Math.round(bonus * nameMatchIdfScale(corpus.countForName(nameLower), corpus.total));
+  };
 
   // Split query into word-level terms (handles "CacheBuilder build" → ["cache","builder","build"])
   const rawTerms = query
@@ -367,10 +418,10 @@ export function nameMatchBonus(nodeName: string, query: string): number {
   const queryLower = query.replace(/[\s]+/g, '').toLowerCase();
 
   // Exact match: query exactly equals the node name
-  if (nameLower === queryLower) return 80;
+  if (nameLower === queryLower) return exact(80);
 
   // Exact match on a query token: "CacheBuilder build" and node name is "build"
-  if (queryTokens.length > 1 && queryTokens.includes(nameLower)) return 60;
+  if (queryTokens.length > 1 && queryTokens.includes(nameLower)) return exact(60);
 
   // Name starts with query — scale by length ratio so "Pod"→"Pod" (exact, handled above)
   // scores much higher than "Pod"→"PodGCControllerOptions" (ratio 0.125).

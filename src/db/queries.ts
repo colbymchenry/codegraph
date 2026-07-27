@@ -18,7 +18,7 @@ import {
   SearchResult,
 } from '../types';
 import { safeJsonParse } from '../utils';
-import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
+import { kindBonus, nameMatchBonus, scorePathRelevance, type NameCorpusStats } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
@@ -359,6 +359,34 @@ export class QueryBuilder {
   /** The `deprioritize` predicate (#982), so other rankers apply the same lever. */
   getDeprioritizedPathMatcher(): ((filePath: string) => boolean) | undefined {
     return this.isDeprioritizedPath;
+  }
+
+  /**
+   * Corpus stats for the exact-name bonus discount (#982, the #746 follow-up).
+   *
+   * A fresh object per search, so name counts are memoized for the duration of
+   * one scoring pass but never held across an index write. The total is read
+   * once here rather than per candidate — `COUNT(*)` scans, and the scorer runs
+   * it for every result otherwise.
+   */
+  private nameCorpusStats(): NameCorpusStats {
+    const total = (this.db.prepare('SELECT COUNT(*) AS n FROM nodes').get() as { n: number }).n;
+    const counts = new Map<string, number>();
+    // Both sides lowered in SQL: lowering the parameter in JS and comparing it
+    // against SQLite's `lower(name)` is the ASCII-vs-Unicode asymmetry #1542
+    // documents, so the raw name goes in and SQLite does both sides (#1462).
+    const stmt = this.db.prepare('SELECT COUNT(*) AS n FROM nodes WHERE lower(name) = lower(?)');
+    return {
+      total,
+      countForName: (name: string): number => {
+        const key = name.toLowerCase();
+        const cached = counts.get(key);
+        if (cached !== undefined) return cached;
+        const n = (stmt.get(name) as { n: number } | undefined)?.n ?? 0;
+        counts.set(key, n);
+        return n;
+      },
+    };
   }
 
   // ===========================================================================
@@ -1328,6 +1356,7 @@ export class QueryBuilder {
     // Apply multi-signal scoring
     if (results.length > 0 && (text || query)) {
       const scoringQuery = text || query;
+      const corpus = this.nameCorpusStats();
       results = results.map(r => {
         // A path the project de-prioritized is saying its symbol NAMES are not
         // the answer, so the exact-name bonus has to be damped too. The -15 path
@@ -1337,13 +1366,14 @@ export class QueryBuilder {
         // so the tree stays findable when it genuinely is what you asked for.
         // Evaluated once and reused: the predicate stats the config file.
         const deprioritized = this.isDeprioritizedPath?.(r.node.filePath) ?? false;
-        const nameBonus = nameMatchBonus(r.node.name, scoringQuery);
         return {
           ...r,
           score: r.score
             + kindBonus(r.node.kind)
             + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens, deprioritized)
-            + (deprioritized ? Math.round(nameBonus * DEPRIORITIZED_NAME_BONUS_SCALE) : nameBonus),
+            + (deprioritized
+              ? Math.round(nameMatchBonus(r.node.name, scoringQuery, corpus) * DEPRIORITIZED_NAME_BONUS_SCALE)
+              : nameMatchBonus(r.node.name, scoringQuery, corpus)),
         };
       });
       results.sort((a, b) => b.score - a.score);
