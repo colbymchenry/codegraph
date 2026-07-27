@@ -63,3 +63,4 @@ tmux-web/
 assets/__pycache__/
 
 assets/generate-waitlist.py
+.cate

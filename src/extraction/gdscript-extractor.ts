@@ -101,6 +101,9 @@ export class GDScriptExtractor {
     try {
       const fileNode = this.createFileNode();
       const scriptClass = this.extractScriptClass(fileNode) ?? this.extractImplicitScriptClass(fileNode);
+      if (scriptClass && /^@tool\b/m.test(this.source)) {
+        scriptClass.decorators = ['tool'];
+      }
       this.extractDeclarations(fileNode, scriptClass);
       this.extractReferences(fileNode, scriptClass);
     } catch (error) {
@@ -201,7 +204,7 @@ export class GDScriptExtractor {
 
       const signalMatch = trimmed.match(/^signal\s+([A-Za-z_]\w*)/);
       if (signalMatch) {
-        const node = this.createDeclarationNode('function', signalMatch[1]!, rawLine, lineNumber, indent);
+        const node = this.createDeclarationNode('signal', signalMatch[1]!, rawLine, lineNumber, indent);
         node.signature = trimmed;
         this.addContains(scopes[scopes.length - 1]!.id, node.id);
         continue;
@@ -223,6 +226,10 @@ export class GDScriptExtractor {
         const kind: NodeKind = varMatch[1] === 'const' ? 'constant' : 'variable';
         const node = this.createDeclarationNode(kind, varMatch[2]!, rawLine, lineNumber, indent);
         node.signature = trimmed;
+        const exportAnn = rawLine.match(/@export(?:_(\w+))?(?:\(([^)]*)\))?/);
+        if (exportAnn) {
+          node.decorators = [exportAnn[1] ? `export_${exportAnn[1]}` : 'export'];
+        }
         this.addContains(scopes[scopes.length - 1]!.id, node.id);
         if (kind === 'constant') {
           const stringValueMatch = trimmed.match(/:=?\s*&?["']([^"']+)["']/);
@@ -233,6 +240,12 @@ export class GDScriptExtractor {
             if (/_NAME$/.test(constName) && this.isSimpleNodeName(stringValue)) {
               this.addDynamicNodeNameDeclaration(stringValue, rawLine, trimmed, lineNumber, scopes[scopes.length - 1]!.id);
             }
+          }
+        }
+        if (rawLine.includes('@onready')) {
+          const onreadyPath = rawLine.match(/[$]([A-Za-z_]\w*(?:\/[A-Za-z_]\w*)*)/);
+          if (onreadyPath) {
+            this.addReference(node.id, onreadyPath[1]!, 'references', lineNumber, rawLine.indexOf('$'));
           }
         }
       }
@@ -296,6 +309,24 @@ export class GDScriptExtractor {
       let resourceMatch;
       while ((resourceMatch = resourceRegex.exec(code)) !== null) {
         this.addReference(owner, resourceMatch[1]!, 'references', lineNumber, resourceMatch.index);
+      }
+
+      const dynamicCallRegex = /\b(?:call|call_deferred)\s*\(\s*["']([A-Za-z_]\w*)["']/g;
+      let dynamicCallMatch;
+      while ((dynamicCallMatch = dynamicCallRegex.exec(code)) !== null) {
+        this.addReference(owner, dynamicCallMatch[1]!, 'calls', lineNumber, dynamicCallMatch.index);
+      }
+
+      const groupRegex = /\b(?:add_to_group|remove_from_group)\s*\(\s*["']([^"']+)["']/g;
+      let groupMatch;
+      while ((groupMatch = groupRegex.exec(code)) !== null) {
+        this.addReference(owner, groupMatch[1]!, 'references', lineNumber, groupMatch.index);
+      }
+
+      const tweenPathRegex = /\b(?:tween_property|tween_method|tween_value)\s*\(\s*[^,]+,\s*["']([^"']+)["']/g;
+      let tweenPathMatch;
+      while ((tweenPathMatch = tweenPathRegex.exec(code)) !== null) {
+        this.addReference(owner, tweenPathMatch[1]!, 'references', lineNumber, tweenPathMatch.index);
       }
 
       this.extractNodePathReferences(owner, code, lineNumber, scriptClass, functionOwner);
