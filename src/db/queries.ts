@@ -19,6 +19,13 @@ import {
 } from '../types';
 import { safeJsonParse } from '../utils';
 import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
+
+/**
+ * How much of the exact-name bonus a `deprioritize`d path keeps (#982). Damped
+ * rather than zeroed: a query that genuinely targets that tree must still rank
+ * it, the same "discount, don't erase" rule the path penalty follows.
+ */
+const DEPRIORITIZED_NAME_BONUS_SCALE = 0.25;
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
@@ -196,6 +203,7 @@ export class QueryBuilder {
   // whole project, not a symbol, so it carries no discriminative signal (#720).
   // Set once by the CodeGraph instance; empty by default (no down-weighting).
   private projectNameTokens: Set<string> = new Set();
+  private isDeprioritizedPath: ((filePath: string) => boolean) | undefined;
 
   // Node cache for frequently accessed nodes (LRU-style, max 1000 entries)
   private nodeCache: Map<string, Node> = new Map();
@@ -318,6 +326,16 @@ export class QueryBuilder {
   /** The normalized project-name tokens (#720); empty if none were derived. */
   getProjectNameTokens(): Set<string> {
     return this.projectNameTokens;
+  }
+
+  /**
+   * Set the predicate that marks a path as de-prioritized by the project's
+   * `codegraph.json` `deprioritize` patterns (#982). Ranking-only: those paths
+   * stay indexed and findable, they just stop outranking first-party code.
+   * Called once when the project opens; undefined disables the lever.
+   */
+  setDeprioritizedPathMatcher(matcher: ((filePath: string) => boolean) | undefined): void {
+    this.isDeprioritizedPath = matcher;
   }
 
   // ===========================================================================
@@ -1243,13 +1261,28 @@ export class QueryBuilder {
     // Apply multi-signal scoring
     if (results.length > 0 && (text || query)) {
       const scoringQuery = text || query;
-      results = results.map(r => ({
-        ...r,
-        score: r.score
-          + kindBonus(r.node.kind)
-          + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens)
-          + nameMatchBonus(r.node.name, scoringQuery),
-      }));
+      results = results.map(r => {
+        // A path the project de-prioritized is saying its symbol NAMES are not
+        // the answer, so the exact-name bonus has to be damped too. The -15 path
+        // penalty alone cannot do it: the bonus is additive and larger (measured
+        // on #982's repro, a `usage()` helper sat at 74.8 vs 51.2 for the top
+        // product symbol — -15 lands at 59.8, still ahead). Damped, not zeroed,
+        // so the tree stays findable when it genuinely is what you asked for.
+        const deprioritized = this.isDeprioritizedPath?.(r.node.filePath) ?? false;
+        const nameBonus = nameMatchBonus(r.node.name, scoringQuery);
+        return {
+          ...r,
+          score: r.score
+            + kindBonus(r.node.kind)
+            + scorePathRelevance(
+              r.node.filePath,
+              scoringQuery,
+              this.projectNameTokens,
+              this.isDeprioritizedPath,
+            )
+            + (deprioritized ? Math.round(nameBonus * DEPRIORITIZED_NAME_BONUS_SCALE) : nameBonus),
+        };
+      });
       results.sort((a, b) => b.score - a.score);
       // Trim to requested limit after rescoring
       if (results.length > limit) {

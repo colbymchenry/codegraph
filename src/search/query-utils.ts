@@ -222,6 +222,7 @@ export function scorePathRelevance(
   filePath: string,
   query: string,
   projectNameTokens?: Set<string>,
+  isDeprioritizedPath?: (filePath: string) => boolean,
 ): number {
   const pathLower = filePath.toLowerCase();
   const fileName = path.basename(filePath).toLowerCase();
@@ -264,10 +265,15 @@ export function scorePathRelevance(
     else if (subtokens.some((t) => pathLower.includes(t))) score += 3;
   }
 
-  // Deprioritize test files unless the query is explicitly about tests
+  // Deprioritize test files unless the query is explicitly about tests. The
+  // project's own `deprioritize` patterns (#982) land in the same penalty: a
+  // peripheral tree the project named is off-target for the same reason a
+  // fixture dir is. Applied ONCE — a path that is both must not be docked twice.
   const queryLower = query.toLowerCase();
   const isTestQuery = queryLower.includes('test') || queryLower.includes('spec');
-  if (!isTestQuery && isTestFile(filePath)) {
+  const offTarget =
+    (!isTestQuery && isTestFile(filePath)) || (isDeprioritizedPath?.(filePath) ?? false);
+  if (offTarget) {
     score -= 15;
   }
 

@@ -53,6 +53,8 @@ import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
+import ignore from 'ignore';
+import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -183,6 +185,24 @@ export class CodeGraph {
     // the whole repo, not a symbol, so it has no discriminative value (#720).
     try {
       this.queries.setProjectNameTokens(deriveProjectNameTokens(this.projectRoot));
+    } catch {
+      // Best-effort: ranking still works without it.
+    }
+    // Down-weight the peripheral trees the project named in `codegraph.json`
+    // `deprioritize` — indexed and findable, but never outranking real code
+    // (#982). Ranking-only, so a bad pattern costs relevance, never recall.
+    try {
+      const patterns = loadDeprioritizePatterns(this.projectRoot);
+      if (patterns.length > 0) {
+        const matcher = ignore().add(patterns);
+        this.queries.setDeprioritizedPathMatcher((filePath: string) => {
+          const rel = path.isAbsolute(filePath)
+            ? path.relative(this.projectRoot, filePath)
+            : filePath;
+          if (!rel || rel.startsWith('..')) return false;
+          return matcher.ignores(rel.split(path.sep).join('/'));
+        });
+      }
     } catch {
       // Best-effort: ranking still works without it.
     }
