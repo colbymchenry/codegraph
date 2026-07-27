@@ -337,12 +337,14 @@ function isRubyConstantPath(node: SyntaxNode): boolean {
  * The class a Ruby call receiver constructs, as written: `Foo` for
  * `Foo.new(key)`, `Billing::Card` for `Billing::Card.new`, `::Foo` for
  * `::Foo.new`. Null for any other receiver, a `new` on a value (`klass.new`)
- * among them.
+ * among them. Crystal shares this path: its generic instance `Box(Int32).new`
+ * (a node type Ruby's grammar never produces) constructs the bare `Box`.
  */
 function rubyConstructedClass(receiver: SyntaxNode, source: string): string | null {
   if (receiver.type !== 'call') return null;
   const method = getChildByField(receiver, 'method');
-  const made = getChildByField(receiver, 'receiver');
+  let made = getChildByField(receiver, 'receiver');
+  if (made?.type === 'generic_instance_type') made = made.namedChild(0);
   if (!method || getNodeText(method, source) !== 'new' || !made || !isRubyConstantPath(made)) return null;
   return getNodeText(made, source);
 }
@@ -5650,8 +5652,18 @@ export class TreeSitterExtractor {
     // so a Ruby method's callers/impact were invisible (#1108 follow-up). Build
     // `receiver.method` so the resolver — and local-variable type inference —
     // can link it; `Foo.new` stays an instantiation.
-    if (this.language === 'ruby' && (node.type === 'call' || node.type === 'method_call')) {
+    // Crystal's grammar shapes `call` identically (receiver + method fields), so
+    // it rides the same path — with one extra guard: tree-sitter-crystal also
+    // parses INFIX OPERATORS as calls (`a + b` → method: operator "+"), which
+    // would emit a stream of unresolvable refs named "+"/"*"/"<=>". The guard is
+    // Crystal-only: Ruby parses infix operators as `binary`, so its `call` with an
+    // operator method is an explicit `price.+(tax)` and keeps its reference.
+    if (
+      (this.language === 'ruby' || this.language === 'crystal') &&
+      (node.type === 'call' || node.type === 'method_call')
+    ) {
       const methodNode = getChildByField(node, 'method');
+      if (this.language === 'crystal' && methodNode?.type === 'operator') return;
       const methodName = methodNode ? getNodeText(methodNode, this.source) : '';
       if (!methodName) return; // operator/element-reference call with no method name
       const receiverNode = getChildByField(node, 'receiver');
@@ -5662,7 +5674,14 @@ export class TreeSitterExtractor {
         this.unresolvedReferences.push({ fromNodeId: callerId, referenceName: methodName, referenceKind: 'calls', line, column });
         return;
       }
-      const receiverName = getNodeText(receiverNode, this.source);
+      // A Crystal generic instance (`Box(Int32).new`) names the bare type, which
+      // is how the generic declaration itself is named (`class Box(T)` → `Box`).
+      const receiverName = getNodeText(
+        this.language === 'crystal' && receiverNode.type === 'generic_instance_type'
+          ? receiverNode.namedChild(0) ?? receiverNode
+          : receiverNode,
+        this.source
+      );
       // `Foo.new` / `Foo::Bar.new` is construction — emit an `instantiates` ref to
       // the class (last `::` segment), preserving the "what creates X" edge.
       if (methodName === 'new') {
@@ -7931,6 +7950,32 @@ export class TreeSitterExtractor {
       for (const onType of node.childrenForFieldName('class')) {
         if (onType) pushDartTypeRefs(onType, classId, (ref) => this.unresolvedReferences.push(ref));
       }
+    }
+
+    // Crystal `class Foo < Bar` / `struct P < Base`: the supertype is a bare
+    // `constant` (or `generic_instance_type` for `< Base(T)`) carried on the
+    // `superclass` FIELD, not a distinct extends_clause-shaped node — so the
+    // type-matched loop below never sees it and every subclass would record no
+    // parent. Mixins (`include`/`extend`) are emitted separately by the
+    // Crystal extractor's visitNode hook.
+    if (this.language === 'crystal') {
+      const superclass = getChildByField(node, 'superclass');
+      if (superclass) {
+        // Reference the bare constant so it matches the parent's own
+        // declaration (`Base(T)` → `Base`).
+        const target =
+          superclass.type === 'generic_instance_type'
+            ? superclass.namedChild(0) ?? superclass
+            : superclass;
+        this.unresolvedReferences.push({
+          fromNodeId: classId,
+          referenceName: getNodeText(target, this.source),
+          referenceKind: 'extends',
+          line: target.startPosition.row + 1,
+          column: target.startPosition.column,
+        });
+      }
+      return;
     }
 
     // Look for extends/implements clauses
