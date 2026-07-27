@@ -699,6 +699,212 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(cliAfter.mcpServers.codegraph).toBeDefined();
   });
 
+  it('qoder: install writes SharedClientCache/mcp.json under the platform config dir', () => {
+    const qoder = getTarget('qoder')!;
+    const result = qoder.install('global', { autoAllow: true });
+    const file = result.files[0]!.path;
+    // Path lives under the platform-appropriate Qoder config dir.
+    expect(file.endsWith(path.join('Qoder', 'SharedClientCache', 'mcp.json'))).toBe(true);
+    expect(fs.existsSync(file)).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+    expect(cfg.mcpServers.codegraph.type).toBe('stdio');
+    expect(cfg.mcpServers.codegraph.args).toEqual(['serve', '--mcp']);
+    // command must be a non-empty string. On macOS it may resolve to an
+    // absolute path via `command -v codegraph`; elsewhere the bare name
+    // is fine. Either way, it must end in `codegraph` — an empty or
+    // truncated string here would spawn ENOENT inside Qoder.
+    expect(typeof cfg.mcpServers.codegraph.command).toBe('string');
+    expect(cfg.mcpServers.codegraph.command.length).toBeGreaterThan(0);
+    expect(cfg.mcpServers.codegraph.command).toMatch(/codegraph(\.(cmd|exe|bat))?$/);
+  });
+
+  it('qoder: entry never carries --path or ${workspaceFolder} (Qoder does not substitute vars)', () => {
+    // Regression guard: Qoder passes MCP args to the child verbatim, so a
+    // literal `${workspaceFolder}` reaches codegraph as a bogus path and
+    // (pre-#964 codegraph) yields an empty tools/list. We install with no
+    // --path at all and rely on the MCP roots/list handshake instead.
+    const qoder = getTarget('qoder')!;
+    qoder.install('global', { autoAllow: true });
+    const cfg = JSON.parse(fs.readFileSync(qoder.describePaths('global')[0]!, 'utf-8'));
+    const args: string[] = cfg.mcpServers.codegraph.args;
+    expect(args).not.toContain('--path');
+    expect(args.some((a: string) => a.includes('${workspaceFolder}'))).toBe(false);
+  });
+
+  it('qoder: uninstall strips codegraph but leaves sibling MCP servers intact', () => {
+    const qoder = getTarget('qoder')!;
+    const file = qoder.describePaths('global')[0]!;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      mcpServers: { 'forge-gateway': { url: 'http://example.test/mcp' } },
+    }, null, 2) + '\n');
+
+    qoder.install('global', { autoAllow: true });
+    qoder.uninstall('global');
+
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.mcpServers['forge-gateway']).toBeDefined();
+    expect(cfg.mcpServers.codegraph).toBeUndefined();
+  });
+
+  it('qoder: --location=local writes both the project .qoder/rules/codegraph.md AND the shared MCP config (one command sets up this project, matching opencode/gemini local semantics)', () => {
+    const qoder = getTarget('qoder')!;
+    expect(qoder.supportsLocation('local')).toBe(true);
+
+    const result = qoder.install('local', { autoAllow: true });
+    // Two files touched: project-scoped `.qoder/rules/codegraph.md`
+    // (Qoder's own-whole-file rule surface, higher precedence than
+    // AGENTS.md) + shared user-scope mcp.json (Qoder has no
+    // project-local mcp.json path).
+    const ruleEntry = result.files.find((f) => f.path.endsWith(path.join('.qoder', 'rules', 'codegraph.md')));
+    const mcpEntry = result.files.find((f) => f.path.endsWith('mcp.json'));
+    expect(ruleEntry).toBeDefined();
+    expect(mcpEntry).toBeDefined();
+    // process.cwd() returns the realpath (macOS /var → /private/var), so
+    // resolve tmpCwd through realpath before comparing.
+    expect(ruleEntry!.path).toBe(path.join(fs.realpathSync(tmpCwd), '.qoder', 'rules', 'codegraph.md'));
+    expect(fs.existsSync(ruleEntry!.path)).toBe(true);
+    expect(fs.existsSync(mcpEntry!.path)).toBe(true);
+
+    // Rule file is own-whole-file (NO marker fence) and mentions codegraph.
+    const body = fs.readFileSync(ruleEntry!.path, 'utf-8');
+    expect(body).not.toContain('<!-- CODEGRAPH_START -->');
+    expect(body).not.toContain('<!-- CODEGRAPH_END -->');
+    expect(body.toLowerCase()).toContain('codegraph');
+    // Qoder-specific frontmatter: `trigger: always_on` makes this an
+    // Always Apply rule (in-context every turn). Without it Qoder
+    // classifies the rule as Model Decision and the agent may skip it,
+    // defeating the purpose of shipping the rule at all.
+    expect(body.startsWith('---\n')).toBe(true);
+    expect(body).toMatch(/^---\ntrigger: always_on\n---\n/);
+    // Streamlined English playbook inlined (not the minimal
+    // shared body) because Qoder's client does not consume MCP
+    // `initialize.instructions`. This version is conditional
+    // ("For indexed code"), has explicit triage ("When to use /
+    // When not to"), and softened trust guidance. Signature
+    // content must be present.
+    expect(body).toContain('codegraph_explore');
+    expect(body).toMatch(/When to use.*When not to/);
+    expect(body).toMatch(/Staleness/);
+    // Shell fallback for when MCP isn't reachable (with Qoder caveat).
+    expect(body).toMatch(/codegraph explore/);
+
+    // Rule file is written BEFORE the MCP entry — the Qoder-unique,
+    // project-scoped artefact should lead the output.
+    const ruleIdx = result.files.findIndex((f) => f === ruleEntry);
+    const mcpIdx = result.files.findIndex((f) => f === mcpEntry);
+    expect(ruleIdx).toBeLessThan(mcpIdx);
+
+    // MCP entry landed at the shared user-scope location with the
+    // expected shape (no --path, no ${workspaceFolder} — same
+    // guarantees as the global install).
+    const cfg = JSON.parse(fs.readFileSync(mcpEntry!.path, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toBeDefined();
+    expect(cfg.mcpServers.codegraph.args).toEqual(['serve', '--mcp']);
+    expect(cfg.mcpServers.codegraph.args).not.toContain('--path');
+
+    // Notes surface the (deliberate) shared-vs-project asymmetry.
+    expect(result.notes?.join(' ')).toMatch(/shared user-scope/i);
+
+    // Idempotent: second install is fully unchanged.
+    const second = qoder.install('local', { autoAllow: true });
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+
+    // Uninstall local unlinks the rule file and leaves the shared MCP
+    // entry alone — another project on this machine may still rely on
+    // it; removal of the MCP entry is gated behind
+    // `--location=global` uninstall.
+    qoder.uninstall('local');
+    expect(fs.existsSync(ruleEntry!.path)).toBe(false);
+    const cfgAfter = JSON.parse(fs.readFileSync(mcpEntry!.path, 'utf-8'));
+    expect(cfgAfter.mcpServers?.codegraph).toBeDefined();
+  });
+
+  it('qoder: --location=local self-heals a legacy AGENTS.md CodeGraph fence left by pre-.qoder/rules builds', () => {
+    const qoder = getTarget('qoder')!;
+    const agentsMd = path.join(fs.realpathSync(tmpCwd), 'AGENTS.md');
+    // Simulate a repo upgraded from an earlier build that wrote the
+    // marker-fenced block into AGENTS.md.
+    fs.writeFileSync(
+      agentsMd,
+      'User content above.\n\n<!-- CODEGRAPH_START -->\nlegacy body\n<!-- CODEGRAPH_END -->\n\nUser content below.\n',
+    );
+
+    const result = qoder.install('local', { autoAllow: true });
+    // Legacy fence is stripped; user content is preserved.
+    const after = fs.readFileSync(agentsMd, 'utf-8');
+    expect(after).not.toContain('<!-- CODEGRAPH_START -->');
+    expect(after).not.toContain('<!-- CODEGRAPH_END -->');
+    expect(after).toContain('User content above');
+    expect(after).toContain('User content below');
+    // The cleanup is surfaced as a `removed` file action.
+    const cleanup = result.files.find((f) => f.path === agentsMd);
+    expect(cleanup?.action).toBe('removed');
+  });
+
+  it('qoder: printConfig(global) shows the mcp.json path and JSON snippet without touching the filesystem', () => {
+    const qoder = getTarget('qoder')!;
+    const before = fs.existsSync(qoder.describePaths('global')[0]!);
+    const out = qoder.printConfig('global');
+    // Mentions the shared mcp.json path.
+    expect(out).toContain('mcp.json');
+    // Contains a valid JSON snippet with the codegraph entry.
+    expect(out).toContain('codegraph');
+    expect(out).toContain('serve');
+    expect(out).toContain('--mcp');
+    // Must NOT have created any file.
+    const after = fs.existsSync(qoder.describePaths('global')[0]!);
+    expect(after).toBe(before);
+  });
+
+  it('qoder: printConfig(local) shows both the rule file and MCP snippet', () => {
+    const qoder = getTarget('qoder')!;
+    const out = qoder.printConfig('local');
+    // Rule file section.
+    expect(out).toContain('.qoder/rules/codegraph.md');
+    expect(out).toContain('trigger: always_on');
+    expect(out).toContain('codegraph_explore');
+    // MCP section.
+    expect(out).toContain('mcp.json');
+    expect(out).toContain('serve');
+    // Rule file content precedes the MCP snippet (same order as install).
+    const ruleIdx = out.indexOf('.qoder/rules/codegraph.md');
+    const mcpIdx = out.indexOf('mcp.json');
+    expect(ruleIdx).toBeLessThan(mcpIdx);
+    expect(ruleIdx).toBeGreaterThan(-1);
+  });
+
+  it('qoder: detect() reflects alreadyConfigured before and after install/uninstall', () => {
+    const qoder = getTarget('qoder')!;
+    // Before any install: nothing configured.
+    expect(qoder.detect('global').alreadyConfigured).toBe(false);
+    expect(qoder.detect('local').alreadyConfigured).toBe(false);
+
+    // After global install: global detect flips, local detect stays false
+    // (local configuredness is gated on the project rule file, not the
+    // shared MCP entry).
+    qoder.install('global', { autoAllow: true });
+    expect(qoder.detect('global').alreadyConfigured).toBe(true);
+    expect(qoder.detect('local').alreadyConfigured).toBe(false);
+
+    // After local install: both detect true.
+    qoder.install('local', { autoAllow: true });
+    expect(qoder.detect('global').alreadyConfigured).toBe(true);
+    expect(qoder.detect('local').alreadyConfigured).toBe(true);
+
+    // After local uninstall: local flips back to false; global stays true
+    // (shared MCP entry is intentionally left intact by local uninstall).
+    qoder.uninstall('local');
+    expect(qoder.detect('local').alreadyConfigured).toBe(false);
+    expect(qoder.detect('global').alreadyConfigured).toBe(true);
+
+    // After global uninstall: global also flips back to false.
+    qoder.uninstall('global');
+    expect(qoder.detect('global').alreadyConfigured).toBe(false);
+    expect(qoder.detect('local').alreadyConfigured).toBe(false);
+  });
+
   it('hermes: install adds codegraph MCP server and cli toolset, preserving existing yaml', () => {
     const hermes = getTarget('hermes')!;
     const config = path.join(tmpHome, '.hermes', 'config.yaml');
