@@ -150,6 +150,13 @@ describe('Language Detection', () => {
     expect(isSourceFile('default.nix')).toBe(true);
   });
 
+  it('should detect Clojure files', () => {
+    expect(detectLanguage('core.clj')).toBe('clojure');
+    expect(detectLanguage('src/miracai/app/core.cljc')).toBe('clojure');
+    expect(detectLanguage('src/app/ui.cljs')).toBe('clojure');
+    expect(isSourceFile('core.clj')).toBe(true);
+  });
+
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
     // Lean Unreal-Engine style header: the class is annotated with an export
     // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
@@ -205,6 +212,106 @@ describe('Language Support', () => {
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
     expect(languages).toContain('nix');
+  });
+});
+
+describe('Clojure Extraction', () => {
+  // Clojure has no definition node types — `(defn f [])` and `(foo 1)` are both
+  // `list_lit`, so the extractor dispatches on the head symbol. These tests pin
+  // that dispatch, since a regression would silently turn every definition into
+  // a call (or vice versa) rather than failing loudly.
+  const code = `
+(ns miracai.demo.core
+  (:require [clojure.string :as str]
+            [miracai.demo.util :refer [helper]])
+  (:import [java.time Instant]))
+
+(def ^:private max-retries 3)
+(defonce cache (atom {}))
+
+(defn parse-name [s]
+  (str/trim s))
+
+(defn- normalize [s]
+  (helper (parse-name s)))
+
+(defmulti render :kind)
+(defmethod render :html [x] (normalize x))
+
+(defprotocol Renderer
+  (render-it [this x]))
+
+(defrecord HtmlRenderer [opts])
+
+(deftest parse-name-test
+  (is (= "a" (#'normalize " A "))))
+`;
+
+  it('extracts each def form as its own kind', () => {
+    const result = extractFromSource('core.clj', code);
+    const find = (kind: string, name: string) =>
+      result.nodes.find((n) => n.kind === kind && n.name === name);
+
+    expect(find('module', 'miracai.demo.core')).toBeDefined();
+    expect(find('function', 'parse-name')).toBeDefined();
+    expect(find('function', 'normalize')).toBeDefined();
+    expect(find('function', 'render')).toBeDefined();      // defmulti
+    expect(find('method', 'render')).toBeDefined();        // defmethod
+    expect(find('interface', 'Renderer')).toBeDefined();   // defprotocol
+    expect(find('class', 'HtmlRenderer')).toBeDefined();   // defrecord
+    expect(find('constant', 'max-retries')).toBeDefined();
+    expect(find('constant', 'cache')).toBeDefined();
+    expect(find('function', 'parse-name-test')).toBeDefined();
+  });
+
+  it('extracts ns :require/:import targets as imports', () => {
+    const result = extractFromSource('core.clj', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toContain('clojure.string');
+    expect(imports).toContain('miracai.demo.util');
+    expect(imports).toContain('java.time');
+  });
+
+  it('records calls, including alias-qualified ones, but not special forms', () => {
+    const result = extractFromSource('core.clj', code);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+
+    expect(calls).toContain('trim');       // str/trim — require alias
+    expect(calls).toContain('helper');     // :refer'd
+    expect(calls).toContain('parse-name'); // same-namespace call
+    // Binding/special forms are not calls to user vars.
+    expect(calls).not.toContain('ns');
+    expect(calls).not.toContain('defn');
+    expect(calls).not.toContain('if');
+  });
+
+  it('captures var-quoted references to private vars', () => {
+    const result = extractFromSource('core.clj', code);
+    // `#'normalize` is how tests reach a private var; a head-symbol-only walk
+    // misses it entirely.
+    const refs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'references')
+      .map((r) => r.referenceName);
+    expect(refs).toContain('normalize');
+  });
+
+  it('does not treat Java interop statics as project calls', () => {
+    // `Long/valueOf` reduces to the bare name `valueOf`. Two hazards: it is a
+    // host static, not a project var (dead edge), and on a prototype-bearing
+    // lookup table it would resolve to Object.prototype.valueOf — a function —
+    // and crash the parse worker with a non-cloneable node.
+    const result = extractFromSource('interop.clj', `
+(ns demo.interop)
+(defn to-long [now] (Long/valueOf now))
+`);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).not.toContain('valueOf');
+    expect(result.nodes.every((n) => typeof n.kind === 'string')).toBe(true);
+    expect(result.nodes.find((n) => n.kind === 'function' && n.name === 'to-long')).toBeDefined();
   });
 });
 
