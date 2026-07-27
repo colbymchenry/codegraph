@@ -71,6 +71,7 @@ LANGS = [
     ("csharp",      "C#",          ("devicon", "csharp", "original")),
     ("php",         "PHP",         ("si", "php")),
     ("ruby",        "Ruby",        ("si", "ruby")),
+    ("crystal",     "Crystal",     ("si", "crystal")),
     ("c",           "C",           ("si", "c")),
     ("cpp",         "C++",         ("si", "cplusplus")),
     ("objective-c", "Objective-C", ("devicon", "objectivec", "plain")),
