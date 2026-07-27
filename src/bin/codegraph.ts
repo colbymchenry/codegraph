@@ -2377,6 +2377,89 @@ program
   });
 
 /**
+ * codegraph targets add|list|remove
+ *
+ * Manage user-defined custom installer targets — declarative specs
+ * (family + paths) stored in ~/.codegraph/targets.json that make
+ * `codegraph install --target <id>` work for agents without a built-in
+ * target (opencode forks, Codex-shaped TOML agents, standard
+ * mcpServers-JSON agents). See docs/design/custom-installer-targets.md.
+ */
+const targetsCommand = program
+  .command('targets')
+  .description('Manage custom agent targets for `codegraph install` (add, list, remove)');
+
+targetsCommand
+  .command('add <spec>')
+  .description('Register a custom target from a JSON spec — a file path, or inline JSON starting with "{"')
+  .action(async (specArg: string) => {
+    const { addCustomTargetSpec, targetsFilePath } = await import('../installer/targets/custom');
+    const { ALL_TARGETS } = await import('../installer/targets/registry');
+    let raw = specArg;
+    if (!specArg.trimStart().startsWith('{')) {
+      if (!fs.existsSync(specArg)) {
+        error(`Spec file not found: ${specArg}`);
+        process.exit(1);
+      }
+      raw = fs.readFileSync(specArg, 'utf-8');
+    }
+    let spec: unknown;
+    try {
+      spec = JSON.parse(raw);
+    } catch (err) {
+      error(`Spec is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+    try {
+      const { replaced } = addCustomTargetSpec(spec as any, ALL_TARGETS.map((t) => t.id));
+      const id = (spec as any).id;
+      success(`${replaced ? 'Updated' : 'Added'} custom target "${id}" in ${targetsFilePath()}`);
+      info(`Wire it up with: codegraph install --target ${id}`);
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+targetsCommand
+  .command('list')
+  .description('List registered custom targets and the paths they write')
+  .action(async () => {
+    const { loadCustomTargets, targetsFilePath } = await import('../installer/targets/custom');
+    const { ALL_TARGETS } = await import('../installer/targets/registry');
+    const { specs, targets } = loadCustomTargets(ALL_TARGETS.map((t) => t.id));
+    if (specs.length === 0) {
+      info(`No custom targets registered (${targetsFilePath()}).`);
+      info('Add one with: codegraph targets add <spec.json>');
+      return;
+    }
+    for (let i = 0; i < specs.length; i++) {
+      const spec = specs[i]!;
+      const target = targets[i]!;
+      console.log(`${spec.id} — ${target.displayName} (family: ${spec.family})`);
+      for (const p of target.describePaths('global')) console.log(`  global: ${p}`);
+      if (target.supportsLocation('local')) {
+        for (const p of target.describePaths('local')) console.log(`  local:  ${p}`);
+      }
+    }
+  });
+
+targetsCommand
+  .command('remove <id>')
+  .description('Remove a custom target registration (does not uninstall — run `codegraph uninstall --target <id>` first)')
+  .action(async (id: string) => {
+    const { removeCustomTargetSpec, targetsFilePath } = await import('../installer/targets/custom');
+    try {
+      const { removed } = removeCustomTargetSpec(id);
+      if (removed) success(`Removed custom target "${id}" from ${targetsFilePath()}`);
+      else info(`No custom target "${id}" registered — nothing to remove.`);
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+/**
  * codegraph telemetry [on|off|status]
  */
 program
