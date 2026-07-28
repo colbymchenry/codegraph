@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- On Windows systems with NTFS last-access updates enabled, reading indexed source files no longer makes CodeGraph report them as edited or trigger needless auto-syncs. (#1451)
 
 ## [1.5.0] - 2026-07-21
 
