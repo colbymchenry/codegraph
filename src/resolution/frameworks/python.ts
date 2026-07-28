@@ -4,8 +4,8 @@
  * Handles Django, Flask, and FastAPI patterns.
  */
 
-import { Node } from '../../types';
-import { FrameworkResolver, UnresolvedRef, ResolutionContext, FrameworkExtractionResult } from '../types';
+import type { Node } from '../../types';
+import type { FrameworkResolver, UnresolvedRef, ResolutionContext, FrameworkExtractionResult } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 
 export const djangoResolver: FrameworkResolver = {
@@ -35,27 +35,7 @@ export const djangoResolver: FrameworkResolver = {
       const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, FORM_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
-    // ORM dynamic dispatch: QuerySet._fetch_all (and siblings) call
-    // `self._iterable_class(self)` — a runtime dispatch to the iterable class
-    // (default ModelIterable) whose __iter__ runs the SQL compiler. Static
-    // parsing can't resolve an attribute-as-callable, so it leaves an unresolved
-    // `_iterable_class` ref and a hole in the QuerySet→compiler chain. Bridge it
-    // to ModelIterable.__iter__ so the flow actually exists in the graph.
-    if (ref.referenceName === '_iterable_class') {
-      const target = resolveModelIterableIter(context);
-      if (target) return { original: ref, targetNodeId: target, confidence: 0.7, resolvedBy: 'framework' };
-    }
     return null;
-  },
-
-  // Let two ref shapes past resolveOne's "no possible match" pre-filter so they
-  // reach resolution: the ORM dynamic-dispatch `_iterable_class` (a QuerySet
-  // attribute, not a declared symbol), and a Django `include('app.urls')` module
-  // path — a dotted module name with no symbol/import to match, which resolution
-  // (resolvePythonAbsoluteModule) then maps to its `urls.py` file so the included
-  // URLconf records a dependency on the root urlconf.
-  claimsReference(name) {
-    return name === '_iterable_class' || name.endsWith('.urls');
   },
 
   extract(filePath, content) {
@@ -67,8 +47,7 @@ export const djangoResolver: FrameworkResolver = {
     const safe = stripCommentsForRegex(content, 'python');
 
     // path('url', handler, name=...) / re_path(r'...', handler) / url(r'...', handler)
-    // Capture groups: 1=function name, 2=url string, 3=handler expr
-    // Handler expr may contain one balanced () pair (e.g. View.as_view(), include('x.y'))
+    // Capture groups: 1=function name, 2=url string, 3=handler expression.
     const routeRegex = /\b(path|re_path|url)\s*\(\s*r?['"]([^'"]+)['"]\s*,\s*([\w.]+(?:\s*\([^)]*\))?)/g;
 
     let match: RegExpExecArray | null;
@@ -106,53 +85,9 @@ export const djangoResolver: FrameworkResolver = {
       }
     }
 
-    // DRF router registration: `router.register(r'articles', ArticleViewSet)` →
-    // route → the ViewSet class (the core CRUD endpoints, which path()/url() miss).
-    // The STRING first arg separates this from `admin.site.register(Model, Admin)`
-    // (whose first arg is a model class, not a string); the View/ViewSet suffix on
-    // the 2nd arg keeps it to DRF viewsets.
-    const routerRegex = /\.register\s*\(\s*r?['"]([^'"]+)['"]\s*,\s*([\w.]+)/g;
-    while ((match = routerRegex.exec(safe)) !== null) {
-      const prefix = match[1]!.replace(/^\^|\/?\$$/g, '');
-      const viewset = match[2]!.split('.').pop()!;
-      if (!/View(Set)?$/.test(viewset)) continue;
-      const line = safe.slice(0, match.index).split('\n').length;
-      const routeNode: Node = {
-        id: `route:${filePath}:${line}:VIEWSET:${prefix}`,
-        kind: 'route',
-        name: `VIEWSET /${prefix}`,
-        qualifiedName: `${filePath}::route:${prefix}`,
-        filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length,
-        language: 'python', updatedAt: now,
-      };
-      nodes.push(routeNode);
-      references.push({
-        fromNodeId: routeNode.id,
-        referenceName: viewset,
-        referenceKind: 'references',
-        line, column: 0, filePath, language: 'python',
-      });
-    }
-
     return { nodes, references };
   },
 };
-
-/**
- * Find ModelIterable.__iter__ — the default iterable QuerySet invokes via
- * `self._iterable_class(self)`. Its __iter__ statically calls the SQL compiler,
- * so linking the dynamic dispatch here closes the QuerySet→SQL call chain.
- * (Over-approximates to the default iterable; .values()/.values_list() swap in
- * other BaseIterable subclasses, but ModelIterable is the canonical path.)
- */
-function resolveModelIterableIter(context: ResolutionContext): string | null {
-  const cls = context.getNodesByName('ModelIterable').find((n) => n.kind === 'class');
-  if (!cls) return null;
-  const iter = context.getNodesByName('__iter__').find(
-    (n) => n.filePath === cls.filePath && n.startLine >= cls.startLine && n.startLine <= cls.endLine
-  );
-  return iter ? iter.id : null;
-}
 
 /**
  * Parse a Django URL handler expression and return the symbol/module to link.
