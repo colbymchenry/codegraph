@@ -232,11 +232,11 @@ describe('expressResolver.extract', () => {
     expect(references[0].referenceName).toBe('listUsers');
   });
 
-  it('extracts route with router.post and middleware chain', () => {
+  it('extracts route with router.post', () => {
     const src = `router.post('/items', auth, createItem);\n`;
     const { nodes, references } = expressResolver.extract!('items.ts', src);
     expect(nodes[0].name).toBe('POST /items');
-    // Multiple handlers: prefer the LAST one (convention: middleware first, handler last)
+    // Multiple handlers: prefer the LAST one (convention: middleware comes first, handler last)
     expect(references[0].referenceName).toBe('createItem');
   });
 
