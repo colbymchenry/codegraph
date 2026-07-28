@@ -1087,6 +1087,33 @@ program
   });
 
 /**
+ * codegraph visual [path]
+ */
+program
+  .command('visual [path]')
+  .description('Write a dark-theme D3 HTML graph visualization to .codegraph/visual.html')
+  .action(async (pathArg: string | undefined) => {
+    const projectPath = resolveProjectPath(pathArg);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        info('Run "codegraph init" to initialize');
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const outPath = cg.writeVisualHtml();
+      cg.destroy();
+      success(`Wrote ${outPath}`);
+    } catch (err) {
+      error(`Failed to write visual: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
  * codegraph query <search>
  */
 program

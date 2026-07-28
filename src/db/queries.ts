@@ -2466,6 +2466,31 @@ export class QueryBuilder {
     };
   }
 
+  /**
+   * Distinct cross-file links for the visual File-Level graph (imports + calls).
+   * Both endpoints must exist in `files` (skips mid-sync orphans). Capped so
+   * large indexes don't materialize unbounded edge sets into the HTML export.
+   */
+  getCrossFileLinks(limit: number): Array<{ source: string; target: string; kind: string }> {
+    return this.db
+      .prepare(
+        `
+      SELECT DISTINCT ns.file_path AS source, nt.file_path AS target, e.kind AS kind
+      FROM edges e
+      JOIN nodes ns ON ns.id = e.source
+      JOIN nodes nt ON nt.id = e.target
+      JOIN files fs ON fs.path = ns.file_path
+      JOIN files ft ON ft.path = nt.file_path
+      WHERE ns.file_path != nt.file_path
+        AND e.kind IN ('imports', 'calls')
+        AND ns.file_path != ''
+        AND nt.file_path != ''
+      LIMIT ?
+    `,
+      )
+      .all(limit) as Array<{ source: string; target: string; kind: string }>;
+  }
+
   // ===========================================================================
   // Project Metadata
   // ===========================================================================

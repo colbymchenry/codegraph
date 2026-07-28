@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph visual` writes a dark-theme D3 HTML file-level graph of the index to `.codegraph/visual.html` you can open in a browser.
+
 
 ## [1.5.0] - 2026-07-21
 
