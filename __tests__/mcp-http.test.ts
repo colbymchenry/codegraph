@@ -80,7 +80,7 @@ describe('HTTP MCP transport', () => {
         id: 1,
         method: 'initialize',
         params: {
-          protocolVersion: '2024-11-05',
+          protocolVersion: '2025-03-26',
           capabilities: {},
           clientInfo: { name: 'http-test', version: '0.0.0' },
           rootUri: `file://${tempDir}`,
@@ -89,12 +89,14 @@ describe('HTTP MCP transport', () => {
     });
 
     expect(init.status).toBe(200);
+    expect(init.headers['mcp-protocol-version']).toBe('2025-03-26');
+    expect(init.body.result.protocolVersion).toBe('2025-03-26');
     expect(init.body.result.serverInfo.name).toBe('codegraph');
     const sessionId = init.headers['mcp-session-id'];
     expect(typeof sessionId).toBe('string');
 
     const tools = await requestJson(url, {
-      headers: { 'Mcp-Session-Id': sessionId as string, 'MCP-Protocol-Version': '2024-11-05' },
+      headers: { 'Mcp-Session-Id': sessionId as string, 'MCP-Protocol-Version': '2025-03-26' },
       body: { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
     });
     expect(tools.status).toBe(200);
@@ -112,6 +114,24 @@ describe('HTTP MCP transport', () => {
       body: { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} },
     });
     expect(afterDelete.status).toBe(404);
+  });
+
+  it('uses the Streamable HTTP protocol version even for older initialize requests', async () => {
+    const init = await requestJson(url, {
+      body: {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+        },
+      },
+    });
+
+    expect(init.status).toBe(200);
+    expect(init.headers['mcp-protocol-version']).toBe('2025-03-26');
+    expect(init.body.result.protocolVersion).toBe('2025-03-26');
   });
 
   it('rejects non-local Origin headers', async () => {

@@ -10,7 +10,12 @@
 import * as http from 'http';
 import { randomUUID } from 'crypto';
 import { MCPEngine, type MCPEngineOptions } from './engine';
-import { MCPSession } from './session';
+import {
+  MCPSession,
+  STREAMABLE_HTTP_PROTOCOL_VERSION,
+  SUPPORTED_STREAMABLE_HTTP_PROTOCOL_VERSIONS,
+  negotiateProtocolVersion,
+} from './session';
 import {
   ErrorCodes,
   type JsonRpcError,
@@ -28,7 +33,6 @@ const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_ENDPOINT = '/mcp';
 const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024;
 const SESSION_HEADER = 'mcp-session-id';
-const PROTOCOL_HEADER = 'mcp-protocol-version';
 
 export interface HttpMCPServerOptions {
   projectPath?: string | null;
@@ -230,7 +234,7 @@ export class HttpMCPServer {
     }
 
     res.setHeader('Mcp-Session-Id', session.id);
-    res.setHeader('MCP-Protocol-Version', req.headers[PROTOCOL_HEADER] ?? '2024-11-05');
+    res.setHeader('MCP-Protocol-Version', protocolVersionForResponse(message, session.session));
     await session.transport.handle(message, res);
   }
 
@@ -244,6 +248,8 @@ export class HttpMCPServer {
     const session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.opts.projectPath ?? null,
       preferExplicitProjectPath: !!this.opts.projectPath,
+      defaultProtocolVersion: STREAMABLE_HTTP_PROTOCOL_VERSION,
+      supportedProtocolVersions: SUPPORTED_STREAMABLE_HTTP_PROTOCOL_VERSIONS,
     });
     const httpSession = { id, transport, session };
     this.sessions.set(id, httpSession);
@@ -403,6 +409,16 @@ function acceptsJson(req: http.IncomingMessage): boolean {
   const accept = headerValue(req.headers.accept);
   if (!accept) return true;
   return accept.includes('application/json') || accept.includes('*/*');
+}
+
+function protocolVersionForResponse(message: JsonRpcRequest, session: MCPSession): string {
+  if (message.method !== 'initialize') return session.getProtocolVersion();
+  const params = message.params as { protocolVersion?: unknown } | undefined;
+  return negotiateProtocolVersion(
+    params?.protocolVersion,
+    STREAMABLE_HTTP_PROTOCOL_VERSION,
+    SUPPORTED_STREAMABLE_HTTP_PROTOCOL_VERSIONS,
+  );
 }
 
 function isJsonRpcRequest(v: unknown): v is JsonRpcRequest {
