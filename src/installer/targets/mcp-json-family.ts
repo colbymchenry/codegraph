@@ -81,6 +81,14 @@ export interface McpJsonFamilySpec {
    * other platforms and when resolution fails).
    */
   absoluteCommand?: boolean;
+  /**
+   * Omit the `type: "stdio"` key from the server entry. A few editors
+   * (Windsurf, #952) document their stdio MCP entries as
+   * `{ command, args }` only and can reject an unexpected `type` key —
+   * this writes the leaner shape (the same one the built-in Antigravity
+   * target uses). Default false: the entry keeps `type: "stdio"`.
+   */
+  omitTypeField?: boolean;
 }
 
 class McpJsonFamilyTarget implements AgentTarget {
@@ -98,9 +106,10 @@ class McpJsonFamilyTarget implements AgentTarget {
     return this.spec.serversKey ?? 'mcpServers';
   }
 
-  private serverEntry(): { type: string; command: string; args: string[] } {
-    const entry = getMcpServerConfig();
+  private serverEntry(): { type?: string; command: string; args: string[] } {
+    const entry: { type?: string; command: string; args: string[] } = getMcpServerConfig();
     if (this.spec.absoluteCommand) entry.command = resolveCodegraphCommand();
+    if (this.spec.omitTypeField) delete entry.type;
     return entry;
   }
 

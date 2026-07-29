@@ -76,6 +76,12 @@ export interface CustomTargetSpec {
    * treatment). No-op on other platforms.
    */
   absoluteCommand?: boolean;
+  /**
+   * Omit the `type: "stdio"` key from the server entry — for editors
+   * (Windsurf, #952) that document `{ command, args }`-only stdio
+   * entries. mcp-json family only. Default false.
+   */
+  omitTypeField?: boolean;
 
   // --- any family ---
   /**
@@ -206,6 +212,14 @@ export function validateCustomTargetSpec(spec: unknown, builtinIds: readonly str
     }
   }
 
+  if (s.omitTypeField !== undefined) {
+    if (typeof s.omitTypeField !== 'boolean') {
+      errors.push(`"omitTypeField" must be a boolean (got ${JSON.stringify(s.omitTypeField)})`);
+    } else if (s.family !== 'mcp-json') {
+      errors.push(`"omitTypeField" is only supported by the mcp-json family (got family ${JSON.stringify(s.family)})`);
+    }
+  }
+
   if (s.notes !== undefined) {
     const ok = Array.isArray(s.notes)
       && s.notes.length <= 5
@@ -283,6 +297,7 @@ function buildFamilyTarget(spec: CustomTargetSpec): AgentTarget {
         serversKey: spec.serversKey,
         instructionsFileName: spec.instructionsFileName,
         absoluteCommand: spec.absoluteCommand,
+        omitTypeField: spec.omitTypeField,
       });
   }
 }

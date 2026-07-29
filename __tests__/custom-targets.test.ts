@@ -182,6 +182,12 @@ describe('Custom targets', () => {
       expect(validateCustomTargetSpec({ ...GROK_SPEC, absoluteCommand: true }, BUILTIN_IDS)).not.toEqual([]);
     });
 
+    it('restricts omitTypeField to booleans on the mcp-json family', () => {
+      expect(validateCustomTargetSpec({ ...MCP_JSON_SPEC, omitTypeField: true }, BUILTIN_IDS)).toEqual([]);
+      expect(validateCustomTargetSpec({ ...MCP_JSON_SPEC, omitTypeField: 'yes' }, BUILTIN_IDS)).not.toEqual([]);
+      expect(validateCustomTargetSpec({ ...GROK_SPEC, omitTypeField: true }, BUILTIN_IDS)).not.toEqual([]);
+    });
+
     it('rejects path shapes that could escape the agent config dir', () => {
       expect(validateCustomTargetSpec({ id: 'x', family: 'opencode', appName: '../evil' }, BUILTIN_IDS)).not.toEqual([]);
       expect(validateCustomTargetSpec({ id: 'x', family: 'opencode', appName: 'a/b' }, BUILTIN_IDS)).not.toEqual([]);
@@ -589,6 +595,32 @@ describe('Custom targets', () => {
 
       const plain = JSON.parse(fs.readFileSync(path.join(tmpHome, '.myagent', 'settings.json'), 'utf-8'));
       expect(plain.mcpServers.codegraph.command).toBe('codegraph');
+    });
+  });
+
+  describe('omitTypeField (Windsurf-style no-type entry, #952)', () => {
+    it('drops the type field when set; keeps type: stdio by default', () => {
+      writeSpecs(specFile, [
+        { ...MCP_JSON_SPEC, id: 'notype', configDir: '~/.notype', omitTypeField: true },
+        MCP_JSON_SPEC,
+      ]);
+      getTarget('notype')!.install('global', { autoAllow: false });
+      getTarget('myagent')!.install('global', { autoAllow: false });
+
+      const lean = JSON.parse(fs.readFileSync(path.join(tmpHome, '.notype', 'settings.json'), 'utf-8'));
+      expect(lean.mcpServers.codegraph).toEqual({ command: 'codegraph', args: ['serve', '--mcp'] });
+      expect('type' in lean.mcpServers.codegraph).toBe(false);
+
+      const standard = JSON.parse(fs.readFileSync(path.join(tmpHome, '.myagent', 'settings.json'), 'utf-8'));
+      expect(standard.mcpServers.codegraph.type).toBe('stdio');
+    });
+
+    it('printConfig reflects the leaner shape', () => {
+      writeSpecs(specFile, [{ ...MCP_JSON_SPEC, id: 'notype', configDir: '~/.notype', omitTypeField: true }]);
+      const printed = getTarget('notype')!.printConfig('global');
+      const entry = JSON.parse(printed.split('\n\n')[1]!).mcpServers.codegraph;
+      expect(entry.type).toBeUndefined();
+      expect(entry.command).toBe('codegraph');
     });
   });
 
