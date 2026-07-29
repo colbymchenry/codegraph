@@ -149,6 +149,15 @@ describe('Custom targets', () => {
       expect(validateCustomTargetSpec({ id: 'x', family: 'mcp-json' }, BUILTIN_IDS)).not.toEqual([]);
     });
 
+    it('accepts well-formed notes and rejects malformed ones', () => {
+      expect(validateCustomTargetSpec({ ...MCP_JSON_SPEC, notes: ['Hit Refresh in the MCP panel.'] }, BUILTIN_IDS)).toEqual([]);
+      expect(validateCustomTargetSpec({ ...MCP_JSON_SPEC, notes: 'not an array' }, BUILTIN_IDS)).not.toEqual([]);
+      expect(validateCustomTargetSpec({ ...MCP_JSON_SPEC, notes: ['  '] }, BUILTIN_IDS)).not.toEqual([]);
+      expect(validateCustomTargetSpec({ ...MCP_JSON_SPEC, notes: ['multi\nline'] }, BUILTIN_IDS)).not.toEqual([]);
+      expect(validateCustomTargetSpec({ ...MCP_JSON_SPEC, notes: ['x'.repeat(201)] }, BUILTIN_IDS)).not.toEqual([]);
+      expect(validateCustomTargetSpec({ ...MCP_JSON_SPEC, notes: ['a', 'b', 'c', 'd', 'e', 'f'] }, BUILTIN_IDS)).not.toEqual([]);
+    });
+
     it('rejects path shapes that could escape the agent config dir', () => {
       expect(validateCustomTargetSpec({ id: 'x', family: 'opencode', appName: '../evil' }, BUILTIN_IDS)).not.toEqual([]);
       expect(validateCustomTargetSpec({ id: 'x', family: 'opencode', appName: 'a/b' }, BUILTIN_IDS)).not.toEqual([]);
@@ -479,6 +488,44 @@ describe('Custom targets', () => {
     it('defaults displayName to the id', () => {
       const t = buildCustomTarget(MCP_JSON_SPEC);
       expect(t.displayName).toBe('myagent');
+    });
+  });
+
+  describe('spec notes (Windsurf-style refresh quirks, #952)', () => {
+    const NOTE = "Windsurf doesn't reload mcp_config.json live — open the MCP panel and hit Refresh.";
+    const spec: CustomTargetSpec = {
+      id: 'windsurfish',
+      family: 'mcp-json',
+      configDir: '~/.windsurfish',
+      notes: [NOTE],
+    };
+    const target = () => {
+      writeSpecs(specFile, [spec]);
+      return getTarget('windsurfish')!;
+    };
+
+    it('surfaces notes on install, including idempotent re-runs', () => {
+      const t = target();
+      expect(t.install('global', { autoAllow: false }).notes).toContain(NOTE);
+      // The quirk applies whenever the user (re-)ran install, not just
+      // the first time — an unchanged re-run still surfaces it.
+      expect(t.install('global', { autoAllow: false }).notes).toContain(NOTE);
+    });
+
+    it('does not surface notes on uninstall or unsupported locations', () => {
+      const t = target();
+      t.install('global', { autoAllow: false });
+      expect(t.uninstall('global').notes ?? []).not.toContain(NOTE);
+      // No localConfigDir → local unsupported → family's own note only.
+      const local = t.install('local', { autoAllow: false });
+      expect(local.files).toEqual([]);
+      expect(local.notes ?? []).not.toContain(NOTE);
+    });
+
+    it('leaves targets without notes unwrapped', () => {
+      writeSpecs(specFile, [MCP_JSON_SPEC]);
+      const t = getTarget('myagent')!;
+      expect(t.install('global', { autoAllow: false }).notes).toBeUndefined();
     });
   });
 });

@@ -79,11 +79,21 @@ tests):
       "configFileName": "settings.json", // default
       "localConfigDir": ".myagent",
       "serversKey": "mcpServers",        // default
-      "instructionsFileName": null       // default "AGENTS.md"; null disables
+      "instructionsFileName": null,      // default "AGENTS.md"; null disables
+      "notes": [                         // any family: surfaced verbatim after install
+        "MyAgent only reloads its MCP config from the settings panel — hit Refresh there."
+      ]
     }
   ]
 }
 ```
+
+`notes` (any family) exists for agent quirks the user must act on after a
+successful install — e.g. Windsurf not reloading `mcp_config.json` until the
+MCP panel's Refresh is pressed (#952, reported by the target's author). They
+ride the existing `WriteResult.notes` channel (the same one Cursor's
+"Restart Cursor to apply" uses), are free text shown only to the user, and are
+never written into any agent file.
 
 ### Validation (enforced on `targets add` and on load)
 
@@ -95,6 +105,7 @@ tests):
   never relative, so a spec can't write into whatever cwd install runs from.
 - `localConfigDir`: relative single segment or nested relative path, no `..`,
   not absolute.
+- `notes`: at most 5 non-empty single-line strings, ≤200 chars each.
 - Load is tolerant: an invalid spec is skipped with a one-line warning (the
   installer must never crash because of a bad spec); `targets add` is strict
   and refuses invalid specs up front. Duplicate ids: first wins, rest warned.

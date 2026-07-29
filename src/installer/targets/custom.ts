@@ -63,6 +63,16 @@ export interface CustomTargetSpec {
   serversKey?: string;
   /** Instructions basename; default 'AGENTS.md', null disables. */
   instructionsFileName?: string | null;
+
+  // --- any family ---
+  /**
+   * Post-install notes the orchestrator surfaces verbatim after a
+   * successful install — for agent quirks the user must act on, e.g.
+   * Windsurf not reloading `mcp_config.json` until the MCP panel's
+   * Refresh is hit (#952). Up to 5 single-line strings. Free text
+   * shown to the user; never written to any agent file.
+   */
+  notes?: string[];
 }
 
 const ID_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
@@ -138,10 +148,50 @@ export function validateCustomTargetSpec(spec: unknown, builtinIds: readonly str
     errors.push(`"instructionsFileName" must be a single file name or null (got ${JSON.stringify(s.instructionsFileName)})`);
   }
 
+  if (s.notes !== undefined) {
+    const ok = Array.isArray(s.notes)
+      && s.notes.length <= 5
+      && s.notes.every((n) => typeof n === 'string' && n.trim().length > 0
+        && n.length <= 200 && !n.includes('\n'));
+    if (!ok) {
+      errors.push('"notes" must be an array of at most 5 non-empty single-line strings (≤200 chars each)');
+    }
+  }
+
   return errors;
 }
 
+/**
+ * Wrap a family target so `install()` surfaces the spec's `notes`
+ * after its own (the orchestrator prints `WriteResult.notes` verbatim
+ * — same channel as Cursor's "Restart Cursor to apply"). Install-only:
+ * the notes describe how to make a fresh install take effect, which is
+ * noise on uninstall.
+ */
+function withSpecNotes(inner: AgentTarget, notes: string[]): AgentTarget {
+  return {
+    id: inner.id,
+    displayName: inner.displayName,
+    docsUrl: inner.docsUrl,
+    supportsLocation: (loc) => inner.supportsLocation(loc),
+    detect: (loc) => inner.detect(loc),
+    install: (loc, opts) => {
+      const result = inner.install(loc, opts);
+      if (result.files.length === 0) return result; // unsupported location — nothing to act on
+      return { ...result, notes: [...(result.notes ?? []), ...notes] };
+    },
+    uninstall: (loc) => inner.uninstall(loc),
+    printConfig: (loc) => inner.printConfig(loc),
+    describePaths: (loc) => inner.describePaths(loc),
+  };
+}
+
 export function buildCustomTarget(spec: CustomTargetSpec): AgentTarget {
+  const built = buildFamilyTarget(spec);
+  return spec.notes && spec.notes.length > 0 ? withSpecNotes(built, spec.notes) : built;
+}
+
+function buildFamilyTarget(spec: CustomTargetSpec): AgentTarget {
   const displayName = spec.displayName?.trim() || spec.id;
   switch (spec.family) {
     case 'opencode':
