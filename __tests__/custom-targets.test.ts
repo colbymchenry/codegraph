@@ -158,6 +158,30 @@ describe('Custom targets', () => {
       expect(validateCustomTargetSpec({ ...MCP_JSON_SPEC, notes: ['a', 'b', 'c', 'd', 'e', 'f'] }, BUILTIN_IDS)).not.toEqual([]);
     });
 
+    it('accepts platform-map configDir and env-token paths; rejects malformed ones', () => {
+      const withDir = (configDir: unknown) => ({ id: 'x', family: 'mcp-json', configDir });
+      // Map covering this platform (plus others) is fine.
+      expect(validateCustomTargetSpec(withDir({
+        darwin: '~/Library/Application Support/X', win32: '${APPDATA}/X', linux: '~/.config/X',
+      }), BUILTIN_IDS)).toEqual([]);
+      // Env-token string form is fine.
+      expect(validateCustomTargetSpec(withDir('${APPDATA}/X'), BUILTIN_IDS)).toEqual([]);
+      // Map missing this platform can never work here.
+      const otherPlatform = process.platform === 'win32' ? 'darwin' : 'win32';
+      expect(validateCustomTargetSpec(withDir({ [otherPlatform]: '~/x' }), BUILTIN_IDS)).not.toEqual([]);
+      // Unknown platform keys, bad values, non-env relative paths.
+      expect(validateCustomTargetSpec(withDir({ [process.platform]: '~/x', freebsd: '~/y' }), BUILTIN_IDS)).not.toEqual([]);
+      expect(validateCustomTargetSpec(withDir({ [process.platform]: 'relative/x' }), BUILTIN_IDS)).not.toEqual([]);
+      expect(validateCustomTargetSpec(withDir('$APPDATA/X'), BUILTIN_IDS)).not.toEqual([]);
+      expect(validateCustomTargetSpec(withDir(['~/x']), BUILTIN_IDS)).not.toEqual([]);
+    });
+
+    it('restricts absoluteCommand to booleans on the mcp-json family', () => {
+      expect(validateCustomTargetSpec({ ...MCP_JSON_SPEC, absoluteCommand: true }, BUILTIN_IDS)).toEqual([]);
+      expect(validateCustomTargetSpec({ ...MCP_JSON_SPEC, absoluteCommand: 'yes' }, BUILTIN_IDS)).not.toEqual([]);
+      expect(validateCustomTargetSpec({ ...GROK_SPEC, absoluteCommand: true }, BUILTIN_IDS)).not.toEqual([]);
+    });
+
     it('rejects path shapes that could escape the agent config dir', () => {
       expect(validateCustomTargetSpec({ id: 'x', family: 'opencode', appName: '../evil' }, BUILTIN_IDS)).not.toEqual([]);
       expect(validateCustomTargetSpec({ id: 'x', family: 'opencode', appName: 'a/b' }, BUILTIN_IDS)).not.toEqual([]);
@@ -488,6 +512,83 @@ describe('Custom targets', () => {
     it('defaults displayName to the id', () => {
       const t = buildCustomTarget(MCP_JSON_SPEC);
       expect(t.displayName).toBe('myagent');
+    });
+  });
+
+  describe('platform-map configDir + env tokens (Qoder-style, #1277)', () => {
+    it('resolves the current platform entry of a configDir map', () => {
+      writeSpecs(specFile, [{
+        id: 'qoderish',
+        family: 'mcp-json',
+        configDir: {
+          [process.platform]: '~/qoderish/SharedClientCache',
+          [process.platform === 'win32' ? 'darwin' : 'win32']: '/somewhere/else',
+        } as any,
+        instructionsFileName: null,
+      }]);
+      const t = getTarget('qoderish')!;
+      t.install('global', { autoAllow: false });
+      const cfgPath = path.join(tmpHome, 'qoderish', 'SharedClientCache', 'settings.json');
+      expect(fs.existsSync(cfgPath)).toBe(true);
+      expect(t.detect('global').configPath).toBe(cfgPath);
+    });
+
+    it('expands a leading ${ENV} token', () => {
+      const envRoot = mkTmpDir('envroot');
+      try {
+        process.env.CG_TEST_AGENT_DIR = envRoot;
+        writeSpecs(specFile, [{
+          id: 'envish',
+          family: 'mcp-json',
+          configDir: '${CG_TEST_AGENT_DIR}/agent',
+          instructionsFileName: null,
+        }]);
+        const t = getTarget('envish')!;
+        t.install('global', { autoAllow: false });
+        expect(fs.existsSync(path.join(envRoot, 'agent', 'settings.json'))).toBe(true);
+      } finally {
+        delete process.env.CG_TEST_AGENT_DIR;
+        fs.rmSync(envRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('degrades gracefully when the env token is unset — never throws, never writes', () => {
+      delete process.env.CG_TEST_AGENT_DIR;
+      writeSpecs(specFile, [{
+        id: 'envish',
+        family: 'mcp-json',
+        configDir: '${CG_TEST_AGENT_DIR}/agent',
+        instructionsFileName: null,
+      }]);
+      const t = getTarget('envish')!;
+      expect(t.detect('global')).toEqual({ installed: false, alreadyConfigured: false });
+      const res = t.install('global', { autoAllow: false });
+      expect(res.files).toEqual([]);
+      expect(res.notes?.[0]).toContain('CG_TEST_AGENT_DIR');
+      expect(t.uninstall('global').files).toEqual([]);
+      expect(t.describePaths('global')).toEqual([]);
+      expect(t.printConfig('global')).toContain('CG_TEST_AGENT_DIR');
+    });
+  });
+
+  describe('absoluteCommand (GUI-app PATH stripping, Antigravity-style)', () => {
+    it('writes a resolved codegraph command; bare name without the knob', () => {
+      writeSpecs(specFile, [
+        { ...MCP_JSON_SPEC, id: 'guiapp', configDir: '~/.guiapp', absoluteCommand: true },
+        MCP_JSON_SPEC,
+      ]);
+      getTarget('guiapp')!.install('global', { autoAllow: false });
+      getTarget('myagent')!.install('global', { autoAllow: false });
+
+      const gui = JSON.parse(fs.readFileSync(path.join(tmpHome, '.guiapp', 'settings.json'), 'utf-8'));
+      // Resolution is machine-dependent (absolute path when `codegraph`
+      // is on the shell PATH on macOS, bare name otherwise) — assert
+      // the invariant, not the machine.
+      expect(gui.mcpServers.codegraph.command).toMatch(/codegraph(\.(cmd|exe|bat))?$/);
+      expect(gui.mcpServers.codegraph.args).toEqual(['serve', '--mcp']);
+
+      const plain = JSON.parse(fs.readFileSync(path.join(tmpHome, '.myagent', 'settings.json'), 'utf-8'));
+      expect(plain.mcpServers.codegraph.command).toBe('codegraph');
     });
   });
 

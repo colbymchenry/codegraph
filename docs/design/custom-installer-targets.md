@@ -83,10 +83,35 @@ tests):
       "notes": [                         // any family: surfaced verbatim after install
         "MyAgent only reloads its MCP config from the settings panel — hit Refresh there."
       ]
+    },
+    { // mcp-json family, GUI-IDE variant (Qoder IDE, #1277): per-platform
+      // config dir + absolute codegraph path for Dock/launchd-stripped PATH
+      "id": "qoder",
+      "displayName": "Qoder IDE",
+      "family": "mcp-json",
+      "configDir": {
+        "darwin": "~/Library/Application Support/Qoder/SharedClientCache",
+        "win32": "${APPDATA}/Qoder/SharedClientCache",
+        "linux": "~/.config/Qoder/SharedClientCache"
+      },
+      "configFileName": "mcp.json",
+      "absoluteCommand": true,
+      "instructionsFileName": null
     }
   ]
 }
 ```
+
+`configDir` (toml / mcp-json) accepts a string or a per-platform map
+(`darwin` / `win32` / `linux`); either form may start with a single leading
+`${ENV_VAR}` token (Windows has no `~` for `%APPDATA%`-rooted dirs). If the
+map has no entry for the running platform, or the env var is unset, the target
+degrades to not-installed / a "cannot locate config dir" note — never a crash.
+`absoluteCommand` (mcp-json) reuses the built-in Antigravity target's
+`resolveCodegraphCommand()` so Dock/Finder-launched macOS apps with a stripped
+PATH can spawn an nvm-managed codegraph; it's a no-op bare name elsewhere.
+Note the families never inject `--path`/`${workspaceFolder}` — project scoping
+rides MCP `roots/list` (only the built-in Cursor target needs the quirk).
 
 `notes` (any family) exists for agent quirks the user must act on after a
 successful install — e.g. Windsurf not reloading `mcp_config.json` until the
@@ -101,8 +126,12 @@ never written into any agent file.
   reserved words `auto` / `all` / `none` / `custom`.
 - `family`: one of `opencode` / `toml` / `mcp-json`.
 - `appName` (opencode): single path segment (`^[A-Za-z0-9._-]+$`), required.
-- `configDir` (toml / mcp-json): required; must be absolute or `~/`-prefixed —
-  never relative, so a spec can't write into whatever cwd install runs from.
+- `configDir` (toml / mcp-json): required; a string or a
+  `{darwin, win32, linux}` map. Each dir must be absolute, `~/`-prefixed, or
+  `${ENV}`-prefixed — never relative, so a spec can't write into whatever cwd
+  install runs from. A platform map must cover the machine the spec is loaded
+  on (other platforms' entries may ride along).
+- `absoluteCommand`: boolean, mcp-json family only.
 - `localConfigDir`: relative single segment or nested relative path, no `..`,
   not absolute.
 - `notes`: at most 5 non-empty single-line strings, ≤200 chars each.
@@ -151,6 +180,14 @@ disable it. Uninstall strips the block via the existing #529 markers.
 - **#1324 (grok)** → the `grok` spec above. Differences from the PR: no
   `AGENTS.md` for local installs (family follows Codex), and empty-dir cleanup
   on local uninstall is family behavior.
+- **#968 (Qwen Code)** → `mcp-json`:
+  `{"id":"qwen","family":"mcp-json","configDir":"~/.qwen","localConfigDir":".qwen","instructionsFileName":"QWEN.md"}`.
+- **#1277 (Qoder IDE)** → the `qoder` spec above (platform-map `configDir` +
+  `absoluteCommand`; requirements confirmed by the PR author in #1459). The
+  `.qoder/rules/codegraph.md` steering file from the PR is deliberately not
+  spec-expressible — the author agreed a pure MCP install suffices.
+- **#758 (Qoder CLI — a separate product)** → covered as-is:
+  `{"id":"qoder-cli","family":"mcp-json","configDir":"~/.qoder","localConfigDir":".qoder"}`.
 
 ## Test plan
 

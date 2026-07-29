@@ -26,7 +26,6 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import {
   AgentTarget,
   DetectionResult,
@@ -45,6 +44,7 @@ import {
   CODEGRAPH_SECTION_START,
 } from '../instructions-template';
 import { buildTomlTable, removeTomlTable, upsertTomlTable } from './toml';
+import { SpecDir, resolveSpecDir } from './spec-paths';
 
 export interface TomlFamilySpec {
   /** Registry id, e.g. 'codex', 'grok'. */
@@ -52,11 +52,11 @@ export interface TomlFamilySpec {
   displayName: string;
   docsUrl?: string;
   /**
-   * Global config dir; absolute or `~/`-prefixed (expanded against
-   * `os.homedir()`), e.g. '~/.codex'. Validated by `custom.ts` for
-   * user specs.
+   * Global config dir; absolute, `~/`-prefixed, or `${ENV}`-prefixed —
+   * or a per-platform map (see `./spec-paths.ts`). Validated by
+   * `custom.ts` for user specs.
    */
-  configDir: string;
+  configDir: SpecDir;
   /** Env var that overrides `configDir` when set and non-empty. */
   homeEnvVar?: string;
   /**
@@ -70,14 +70,6 @@ export interface TomlFamilySpec {
 
 const TOML_HEADER = 'mcp_servers.codegraph';
 
-export function expandHomeDir(p: string): string {
-  if (p === '~') return os.homedir();
-  if (p.startsWith('~/') || p.startsWith('~\\')) {
-    return path.join(os.homedir(), p.slice(2));
-  }
-  return p;
-}
-
 class TomlFamilyTarget implements AgentTarget {
   readonly id: string;
   readonly displayName: string;
@@ -89,26 +81,38 @@ class TomlFamilyTarget implements AgentTarget {
     this.docsUrl = spec.docsUrl;
   }
 
-  private globalConfigDir(): string {
+  /**
+   * `null` when the spec's config dir can't be resolved on this
+   * machine (platform map has no entry here; env token unset) —
+   * callers degrade to not-installed / nothing-to-do.
+   */
+  private globalConfigDir(): string | null {
     if (this.spec.homeEnvVar) {
       const override = process.env[this.spec.homeEnvVar];
       if (override && override.trim().length > 0) return override;
     }
-    return expandHomeDir(this.spec.configDir);
+    return resolveSpecDir(this.spec.configDir).dir;
   }
 
-  private configDir(loc: Location): string {
+  private unavailableNote(): string {
+    const { reason } = resolveSpecDir(this.spec.configDir);
+    return `Cannot locate ${this.displayName}'s config dir on this machine: ${reason ?? 'unresolvable configDir'}.`;
+  }
+
+  private configDir(loc: Location): string | null {
     return loc === 'global'
       ? this.globalConfigDir()
       : path.join(process.cwd(), this.spec.localConfigDir!);
   }
 
-  private tomlConfigPath(loc: Location): string {
-    return path.join(this.configDir(loc), this.spec.configFileName ?? 'config.toml');
+  private tomlConfigPath(loc: Location): string | null {
+    const dir = this.configDir(loc);
+    return dir === null ? null : path.join(dir, this.spec.configFileName ?? 'config.toml');
   }
 
-  private instructionsPath(): string {
-    return path.join(this.globalConfigDir(), 'AGENTS.md');
+  private instructionsPath(): string | null {
+    const dir = this.globalConfigDir();
+    return dir === null ? null : path.join(dir, 'AGENTS.md');
   }
 
   supportsLocation(loc: Location): boolean {
@@ -120,6 +124,9 @@ class TomlFamilyTarget implements AgentTarget {
       return { installed: false, alreadyConfigured: false };
     }
     const tomlPath = this.tomlConfigPath(loc);
+    if (tomlPath === null) {
+      return { installed: false, alreadyConfigured: false };
+    }
     let alreadyConfigured = false;
     if (fs.existsSync(tomlPath)) {
       try {
@@ -127,8 +134,9 @@ class TomlFamilyTarget implements AgentTarget {
         alreadyConfigured = content.includes(`[${TOML_HEADER}]`);
       } catch { /* ignore */ }
     }
+    const globalDir = this.globalConfigDir();
     const installed = loc === 'global'
-      ? fs.existsSync(this.globalConfigDir())
+      ? globalDir !== null && fs.existsSync(globalDir)
       : fs.existsSync(tomlPath);
     return { installed, alreadyConfigured, configPath: tomlPath };
   }
@@ -140,6 +148,9 @@ class TomlFamilyTarget implements AgentTarget {
         notes: [`${this.displayName} has no project-local config — re-run with --location=global to install.`],
       };
     }
+    if (this.tomlConfigPath(loc) === null) {
+      return { files: [], notes: [this.unavailableNote()] };
+    }
     const files: WriteResult['files'] = [];
 
     files.push(this.writeMcpEntry(loc));
@@ -149,16 +160,19 @@ class TomlFamilyTarget implements AgentTarget {
     // initialize instructions. Upsert self-heals a stale pre-#529 block.
     // Global-only, matching Codex — a local install still reads the
     // global AGENTS.md.
-    if (loc === 'global') files.push(upsertInstructionsEntry(this.instructionsPath()));
+    if (loc === 'global') files.push(upsertInstructionsEntry(this.instructionsPath()!));
 
     return { files };
   }
 
   uninstall(loc: Location): WriteResult {
     if (!this.supportsLocation(loc)) return { files: [] };
+    const tomlPath = this.tomlConfigPath(loc);
+    if (tomlPath === null) {
+      return { files: [], notes: [this.unavailableNote()] };
+    }
     const files: WriteResult['files'] = [];
 
-    const tomlPath = this.tomlConfigPath(loc);
     if (fs.existsSync(tomlPath)) {
       const content = fs.readFileSync(tomlPath, 'utf-8');
       const { content: nextContent, action } = removeTomlTable(content, TOML_HEADER);
@@ -190,19 +204,23 @@ class TomlFamilyTarget implements AgentTarget {
     if (!this.supportsLocation(loc)) {
       return `# ${this.displayName} has no project-local config — use --location=global.\n`;
     }
+    const target = this.tomlConfigPath(loc);
+    if (target === null) {
+      return `# ${this.unavailableNote()}\n`;
+    }
     const block = buildCodegraphBlock();
-    return `# Add to ${this.tomlConfigPath(loc)}\n\n${block}\n`;
+    return `# Add to ${target}\n\n${block}\n`;
   }
 
   describePaths(loc: Location): string[] {
     if (!this.supportsLocation(loc)) return [];
     const paths = [this.tomlConfigPath(loc)];
     if (loc === 'global') paths.push(this.instructionsPath());
-    return paths;
+    return paths.filter((p): p is string => p !== null);
   }
 
   private writeMcpEntry(loc: Location): WriteResult['files'][number] {
-    const file = this.tomlConfigPath(loc);
+    const file = this.tomlConfigPath(loc)!; // callers guard null
     const dir = path.dirname(file);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
@@ -227,7 +245,7 @@ class TomlFamilyTarget implements AgentTarget {
    * (self-heal on upgrade) and uninstall — see issue #529.
    */
   private removeInstructionsEntry(): WriteResult['files'][number] {
-    const file = this.instructionsPath();
+    const file = this.instructionsPath()!; // callers guard null
     const action = removeMarkedSection(file, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
     return { path: file, action };
   }

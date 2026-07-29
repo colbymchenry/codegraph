@@ -29,6 +29,7 @@ import { atomicWriteFileSync } from './shared';
 import { createOpencodeFamilyTarget } from './opencode-family';
 import { createTomlFamilyTarget } from './toml-family';
 import { createMcpJsonFamilyTarget } from './mcp-json-family';
+import { PlatformDirMap } from './spec-paths';
 
 export type CustomTargetFamily = 'opencode' | 'toml' | 'mcp-json';
 
@@ -47,8 +48,13 @@ export interface CustomTargetSpec {
   schemaUrl?: string;
 
   // --- families: toml, mcp-json ---
-  /** Global config dir; absolute or `~/`-prefixed. */
-  configDir?: string;
+  /**
+   * Global config dir: absolute, `~/`-prefixed, or `${ENV}`-prefixed
+   * (one leading env token, e.g. `${APPDATA}/Qoder/...`) — or a
+   * per-platform map `{darwin, win32, linux}` for agents whose config
+   * dir differs by OS (Qoder IDE, #1277).
+   */
+  configDir?: string | PlatformDirMap;
   /** Config file basename (default: 'config.toml' / 'settings.json'). */
   configFileName?: string;
   /** Project-local config dir name; absent = global-only. */
@@ -63,6 +69,13 @@ export interface CustomTargetSpec {
   serversKey?: string;
   /** Instructions basename; default 'AGENTS.md', null disables. */
   instructionsFileName?: string | null;
+  /**
+   * Write the codegraph binary's resolved absolute path as `command`
+   * — for GUI apps whose Dock/Finder-launched PATH can't find
+   * nvm-managed binaries on macOS (the built-in Antigravity target's
+   * treatment). No-op on other platforms.
+   */
+  absoluteCommand?: boolean;
 
   // --- any family ---
   /**
@@ -80,6 +93,21 @@ const RESERVED_IDS = new Set(['auto', 'all', 'none', 'custom']);
 const FAMILIES: readonly CustomTargetFamily[] = ['opencode', 'toml', 'mcp-json'];
 // Single path segment — no separators, no traversal.
 const SEGMENT_PATTERN = /^[A-Za-z0-9._-]+$/;
+const PLATFORM_KEYS = ['darwin', 'win32', 'linux'] as const;
+
+/**
+ * A global config dir must be rooted somewhere machine-independent:
+ * absolute, `~/`-prefixed, or a single leading `${ENV}` token
+ * (`${APPDATA}/Qoder/...` — Windows has no `~` for %APPDATA%-rooted
+ * dirs). Never relative, so a spec can't write into whatever cwd
+ * install runs from.
+ */
+function isValidDirString(p: unknown): p is string {
+  if (typeof p !== 'string' || !p.trim()) return false;
+  return p.startsWith('~')
+    || path.isAbsolute(p)
+    || /^\$\{[A-Za-z_][A-Za-z0-9_]*\}([\\/]|$)/.test(p);
+}
 
 export function targetsFilePath(): string {
   const override = process.env.CODEGRAPH_TARGETS_FILE;
@@ -123,10 +151,32 @@ export function validateCustomTargetSpec(spec: unknown, builtinIds: readonly str
     }
   } else {
     // toml + mcp-json
-    if (typeof s.configDir !== 'string' || !s.configDir.trim()) {
+    const dir = s.configDir;
+    if (dir === undefined || dir === null) {
       errors.push(`"configDir" is required for the ${s.family} family`);
-    } else if (!s.configDir.startsWith('~') && !path.isAbsolute(s.configDir)) {
-      errors.push(`"configDir" must be absolute or ~/-prefixed (got ${JSON.stringify(s.configDir)})`);
+    } else if (typeof dir === 'string') {
+      if (!isValidDirString(dir)) {
+        errors.push(`"configDir" must be absolute, ~/-prefixed, or \${ENV}-prefixed (got ${JSON.stringify(dir)})`);
+      }
+    } else if (typeof dir === 'object' && !Array.isArray(dir)) {
+      const map = dir as Record<string, unknown>;
+      const unknownKeys = Object.keys(map).filter((k) => !(PLATFORM_KEYS as readonly string[]).includes(k));
+      if (unknownKeys.length > 0) {
+        errors.push(`"configDir" platform map has unknown key(s) ${unknownKeys.join(', ')} — allowed: ${PLATFORM_KEYS.join(', ')}`);
+      }
+      for (const k of PLATFORM_KEYS) {
+        if (map[k] !== undefined && !isValidDirString(map[k])) {
+          errors.push(`"configDir.${k}" must be absolute, ~/-prefixed, or \${ENV}-prefixed (got ${JSON.stringify(map[k])})`);
+        }
+      }
+      // The spec may carry other platforms' dirs, but it must cover
+      // THIS machine — otherwise the target can never work here.
+      if ((PLATFORM_KEYS as readonly string[]).includes(process.platform)
+          && map[process.platform] === undefined) {
+        errors.push(`"configDir" platform map has no entry for this platform ("${process.platform}")`);
+      }
+    } else {
+      errors.push(`"configDir" must be a string or a {${PLATFORM_KEYS.join(', ')}} map (got ${JSON.stringify(dir)})`);
     }
     if (s.localConfigDir !== undefined) {
       const localOk = typeof s.localConfigDir === 'string'
@@ -146,6 +196,14 @@ export function validateCustomTargetSpec(spec: unknown, builtinIds: readonly str
   if (s.family === 'mcp-json' && s.instructionsFileName !== undefined && s.instructionsFileName !== null
       && (typeof s.instructionsFileName !== 'string' || !SEGMENT_PATTERN.test(s.instructionsFileName))) {
     errors.push(`"instructionsFileName" must be a single file name or null (got ${JSON.stringify(s.instructionsFileName)})`);
+  }
+
+  if (s.absoluteCommand !== undefined) {
+    if (typeof s.absoluteCommand !== 'boolean') {
+      errors.push(`"absoluteCommand" must be a boolean (got ${JSON.stringify(s.absoluteCommand)})`);
+    } else if (s.family !== 'mcp-json') {
+      errors.push(`"absoluteCommand" is only supported by the mcp-json family (got family ${JSON.stringify(s.family)})`);
+    }
   }
 
   if (s.notes !== undefined) {
@@ -224,6 +282,7 @@ function buildFamilyTarget(spec: CustomTargetSpec): AgentTarget {
         configFileName: spec.configFileName,
         serversKey: spec.serversKey,
         instructionsFileName: spec.instructionsFileName,
+        absoluteCommand: spec.absoluteCommand,
       });
   }
 }
