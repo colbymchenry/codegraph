@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- `codegraph callers` / `callees` / `impact` (CLI and MCP) no longer silently answer for a different symbol when the name you typed does not exist, or when an exact match has no callers — they report not found (with a did-you-mean hint) instead of labelling a fuzzy hit under your query. (#1473, #1455)
 
 ## [1.5.0] - 2026-07-21
 

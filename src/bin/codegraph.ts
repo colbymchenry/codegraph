@@ -356,6 +356,26 @@ function warn(message: string): void {
   console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
 }
 
+/**
+ * Exact-name match for CLI callers/callees/impact (#1473).
+ * A single fuzzy FTS hit must NOT count as exact — that was the silent
+ * substitution path when `matches.length === 1`.
+ */
+function isCliExactSymbolMatch(nodeName: string, symbol: string): boolean {
+  return (
+    nodeName === symbol ||
+    nodeName.endsWith(`.${symbol}`) ||
+    nodeName.endsWith(`::${symbol}`)
+  );
+}
+
+/** "not found" (+ optional did-you-mean) when no exact symbol matches. */
+function formatSymbolNotFound(symbol: string, fuzzyNames: string[]): string {
+  const suggestions = [...new Set(fuzzyNames.filter((n) => n !== symbol))].slice(0, 3);
+  if (suggestions.length === 0) return `Symbol "${symbol}" not found`;
+  return `Symbol "${symbol}" not found — did you mean: ${suggestions.join(', ')}?`;
+}
+
 type IndexResult = {
   success: boolean;
   filesIndexed: number;
@@ -1850,8 +1870,10 @@ program
       const limit = parseInt(options.limit || '20', 10);
 
       const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
+      const exact = matches.filter((m) => isCliExactSymbolMatch(m.node.name, symbol));
+      if (exact.length === 0) {
+        // #1473: never answer for a fuzzy hit under the typed name
+        info(formatSymbolNotFound(symbol, matches.map((m) => m.node.name)));
         cg.destroy();
         return;
       }
@@ -1859,20 +1881,8 @@ program
       const seen = new Set<string>();
       const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
+      for (const match of exact) {
         for (const c of cg.getCallers(match.node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      // Fallback: if exact filter removed everything, use the top match
-      if (allCallers.length === 0 && matches[0]) {
-        for (const c of cg.getCallers(matches[0].node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
             allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
@@ -1929,8 +1939,10 @@ program
       const limit = parseInt(options.limit || '20', 10);
 
       const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
+      const exact = matches.filter((m) => isCliExactSymbolMatch(m.node.name, symbol));
+      if (exact.length === 0) {
+        // #1473: never answer for a fuzzy hit under the typed name
+        info(formatSymbolNotFound(symbol, matches.map((m) => m.node.name)));
         cg.destroy();
         return;
       }
@@ -1938,19 +1950,8 @@ program
       const seen = new Set<string>();
       const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
+      for (const match of exact) {
         for (const c of cg.getCallees(match.node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      if (allCallees.length === 0 && matches[0]) {
-        for (const c of cg.getCallees(matches[0].node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
             allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
@@ -2007,8 +2008,10 @@ program
       const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
 
       const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
+      const exact = matches.filter((m) => isCliExactSymbolMatch(m.node.name, symbol));
+      if (exact.length === 0) {
+        // #1473: never answer for a fuzzy hit under the typed name
+        info(formatSymbolNotFound(symbol, matches.map((m) => m.node.name)));
         cg.destroy();
         return;
       }
@@ -2018,9 +2021,7 @@ program
       const seenEdges = new Set<string>();
       let edgeCount = 0;
 
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
+      for (const match of exact) {
         const impact = cg.getImpactRadius(match.node.id, depth);
         for (const [id, n] of impact.nodes) {
           mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
@@ -2032,15 +2033,6 @@ program
             edgeCount++;
           }
         }
-      }
-
-      // Fallback to top match if exact filter removed everything
-      if (mergedNodes.size === 0 && matches[0]) {
-        const impact = cg.getImpactRadius(matches[0].node.id, depth);
-        for (const [id, n] of impact.nodes) {
-          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
-        }
-        edgeCount = impact.edges.length;
       }
 
       if (options.json) {

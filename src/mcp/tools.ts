@@ -1579,7 +1579,7 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
@@ -1652,7 +1652,7 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
@@ -1722,7 +1722,7 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
@@ -4494,6 +4494,10 @@ export class ToolHandler {
   /**
    * Find ALL symbols matching a name. Used by callers/callees/impact to aggregate
    * results across all matching symbols (e.g., multiple classes with an `execute` method).
+   *
+   * Exact matches only (#1473): a missing / mistyped name must NOT silently
+   * resolve to the top fuzzy FTS hit under the caller's typed label. Closest
+   * hits may appear in `note` as a did-you-mean hint when `nodes` is empty.
    */
   private findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
     // Nix option paths: the declaration is stored as `options.<path>` and
@@ -4516,41 +4520,56 @@ export class ToolHandler {
         return { nodes, note: '' };
       }
     }
-    let results = cg.searchNodes(symbol, { limit: 50 });
 
-    // Mirror the fallback in `findSymbol` for qualified queries — FTS
-    // strips colons, so a module-qualified lookup needs a second pass
-    // by the bare last part.
-    if (results.length === 0 && /[.\/]|::/.test(symbol)) {
-      const tail = lastQualifierPart(symbol);
-      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit: 50 });
+    const isQualified = /[.\/]|::/.test(symbol);
+    let exactNodes: Node[];
+
+    if (!isQualified) {
+      // Direct index — every exact-name overload, case-sensitive. Avoids FTS
+      // ranking a differently-cased sibling above the real node (#1473 Fetch).
+      exactNodes = cg.getNodesByName(symbol);
+    } else {
+      let results = cg.searchNodes(symbol, { limit: 50 });
+      // Mirror findSymbolMatches — FTS strips colons, so re-search by bare tail.
+      if (results.length === 0) {
+        const tail = lastQualifierPart(symbol);
+        if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit: 50 });
+      }
+      exactNodes = results
+        .filter((r) => this.matchesSymbol(r.node, symbol))
+        .map((r) => r.node);
     }
 
-    if (results.length === 0) {
-      return { nodes: [], note: '' };
+    if (exactNodes.length === 0) {
+      const fuzzy = cg.searchNodes(symbol, { limit: 5 });
+      const suggestions = [
+        ...new Set(fuzzy.map((r) => r.node.name).filter((n) => n !== symbol)),
+      ].slice(0, 3);
+      const note =
+        suggestions.length > 0
+          ? `\n\n> **Note:** no symbol named "${symbol}". Did you mean: ${suggestions.join(', ')}?`
+          : '';
+      return { nodes: [], note };
     }
 
-    const exactMatches = results.filter(r => this.matchesSymbol(r.node, symbol));
-
-    if (exactMatches.length <= 1) {
-      const node = exactMatches[0]?.node ?? results[0]!.node;
-      return { nodes: [node], note: '' };
+    if (exactNodes.length === 1) {
+      return { nodes: exactNodes, note: '' };
     }
 
     // Same generated-file down-rank as findSymbol — keeps callers/callees
     // /impact aggregation aligned (a query against "Send" returns the
     // hand-written implementations before the protobuf scaffold).
-    const ranked = [...exactMatches].sort((a, b) => {
-      const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
-      const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+    const ranked = [...exactNodes].sort((a, b) => {
+      const aGen = isGeneratedFile(a.filePath) ? 1 : 0;
+      const bGen = isGeneratedFile(b.filePath) ? 1 : 0;
       return aGen - bGen;
     });
 
-    const locations = ranked.map(r =>
-      `${r.node.kind} at ${r.node.filePath}:${r.node.startLine}`
+    const locations = ranked.map(
+      (n) => `${n.kind} at ${n.filePath}:${n.startLine}`
     );
     const note = `\n\n> **Note:** Aggregated results across ${ranked.length} symbols named "${symbol}": ${locations.join(', ')}`;
-    return { nodes: ranked.map(r => r.node), note };
+    return { nodes: ranked, note };
   }
 
   /**
