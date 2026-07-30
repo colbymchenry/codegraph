@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph install` now supports VS Code Copilot Chat as a target (`--target=vscode`). Running the installer writes the MCP server entry to VS Code's user-profile `mcp.json` (global) or `.vscode/mcp.json` in the project root (local), making CodeGraph available in Copilot Chat agent mode immediately after restarting VS Code.
 
 ## [1.5.0] - 2026-07-21
 

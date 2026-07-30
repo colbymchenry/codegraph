@@ -136,6 +136,11 @@ describe('Installer targets — contract', () => {
               delete seed.mcpServers;
               seed.mcp = { other: { type: 'local', command: ['x'], enabled: true } };
             }
+            // vscode uses `servers` not `mcpServers`.
+            if (target.id === 'vscode') {
+              delete seed.mcpServers;
+              seed.servers = { other: { command: 'x' } };
+            }
             fs.writeFileSync(jsonPath, JSON.stringify(seed, null, 2) + '\n');
 
             target.install(location, { autoAllow: true });
@@ -144,6 +149,9 @@ describe('Installer targets — contract', () => {
             if (target.id === 'opencode') {
               expect(after.mcp.other).toBeDefined();
               expect(after.mcp.codegraph).toBeDefined();
+            } else if (target.id === 'vscode') {
+              expect(after.servers.other).toBeDefined();
+              expect(after.servers.codegraph).toBeDefined();
             } else {
               expect(after.mcpServers.other).toBeDefined();
               expect(after.mcpServers.codegraph).toBeDefined();
@@ -501,6 +509,63 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(paths.some((p) => p.endsWith('/.kiro/steering/codegraph.md'))).toBe(false);
   });
 
+  it('vscode: global install writes profiles/default/mcp.json (servers.codegraph)', () => {
+    const vscode = getTarget('vscode')!;
+    const result = vscode.install('global', { autoAllow: true });
+    expect(result.files.length).toBe(1);
+    expect(result.files[0].action).toBe('created');
+    expect(result.files[0].path).toMatch(/profiles[/\\]default[/\\]mcp\.json$/);
+    const cfg = JSON.parse(fs.readFileSync(result.files[0].path, 'utf-8'));
+    expect(cfg.servers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('vscode: local install writes .vscode/mcp.json (servers.codegraph)', () => {
+    const vscode = getTarget('vscode')!;
+    const result = vscode.install('local', { autoAllow: true });
+    expect(result.files.length).toBe(1);
+    expect(result.files[0].action).toBe('created');
+    expect(result.files[0].path.replace(/\\/g, '/')).toMatch(/\/\.vscode\/mcp\.json$/);
+    const cfg = JSON.parse(fs.readFileSync(result.files[0].path, 'utf-8'));
+    expect(cfg.servers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('vscode: install preserves a pre-existing sibling in servers', () => {
+    const vscode = getTarget('vscode')!;
+    const mcpFile = path.join(tmpCwd, '.vscode', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcpFile), { recursive: true });
+    fs.writeFileSync(mcpFile, JSON.stringify({
+      servers: { playwright: { command: 'npx', args: ['-y', '@playwright/mcp@latest'] } },
+    }, null, 2) + '\n');
+
+    vscode.install('local', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(mcpFile, 'utf-8'));
+    expect(after.servers.playwright).toBeDefined();
+    expect(after.servers.codegraph).toBeDefined();
+  });
+
+  it('vscode: uninstall strips codegraph but leaves sibling servers intact', () => {
+    const vscode = getTarget('vscode')!;
+    const mcpFile = path.join(tmpCwd, '.vscode', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcpFile), { recursive: true });
+    fs.writeFileSync(mcpFile, JSON.stringify({
+      servers: { playwright: { command: 'npx', args: ['-y', '@playwright/mcp@latest'] } },
+    }, null, 2) + '\n');
+
+    vscode.install('local', { autoAllow: true });
+    vscode.uninstall('local');
+
+    const after = JSON.parse(fs.readFileSync(mcpFile, 'utf-8'));
+    expect(after.servers.playwright).toBeDefined();
+    expect(after.servers.codegraph).toBeUndefined();
+  });
+
+  it('vscode: install writes no instructions file (no AGENTS.md or similar)', () => {
+    const vscode = getTarget('vscode')!;
+    const result = vscode.install('global', { autoAllow: true });
+    expect(result.files.every((f) => !f.path.endsWith('.md'))).toBe(true);
+  });
+
   it('antigravity: install writes to LEGACY ~/.gemini/antigravity/mcp_config.json when no migration marker', () => {
     const antigravity = getTarget('antigravity')!;
     antigravity.install('global', { autoAllow: true });
@@ -673,8 +738,7 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(result.notes?.join(' ')).toMatch(/no project-local config/);
   });
 
-  it('antigravity: does not write GEMINI.md (only gemini target owns instructions)', () => {
-    const antigravity = getTarget('antigravity')!;
+  it('antigravity: does not write GEMINI.md (only gemini target owns instructions)', () => {    const antigravity = getTarget('antigravity')!;
     antigravity.install('global', { autoAllow: true });
     const geminiMd = path.join(tmpHome, '.gemini', 'GEMINI.md');
     expect(fs.existsSync(geminiMd)).toBe(false);
