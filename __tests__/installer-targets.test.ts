@@ -136,11 +136,6 @@ describe('Installer targets — contract', () => {
               delete seed.mcpServers;
               seed.mcp = { other: { type: 'local', command: ['x'], enabled: true } };
             }
-            // vscode uses `servers` not `mcpServers`.
-            if (target.id === 'vscode') {
-              delete seed.mcpServers;
-              seed.servers = { other: { command: 'x' } };
-            }
             fs.writeFileSync(jsonPath, JSON.stringify(seed, null, 2) + '\n');
 
             target.install(location, { autoAllow: true });
@@ -149,9 +144,6 @@ describe('Installer targets — contract', () => {
             if (target.id === 'opencode') {
               expect(after.mcp.other).toBeDefined();
               expect(after.mcp.codegraph).toBeDefined();
-            } else if (target.id === 'vscode') {
-              expect(after.servers.other).toBeDefined();
-              expect(after.servers.codegraph).toBeDefined();
             } else {
               expect(after.mcpServers.other).toBeDefined();
               expect(after.mcpServers.codegraph).toBeDefined();
@@ -509,61 +501,55 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(paths.some((p) => p.endsWith('/.kiro/steering/codegraph.md'))).toBe(false);
   });
 
-  it('vscode: global install writes profiles/default/mcp.json (servers.codegraph)', () => {
-    const vscode = getTarget('vscode')!;
-    const result = vscode.install('global', { autoAllow: true });
+  it('copilot: global install writes ~/.copilot/mcp-config.json (mcpServers.codegraph)', () => {
+    const copilot = getTarget('copilot')!;
+    const result = copilot.install('global', { autoAllow: true });
     expect(result.files.length).toBe(1);
     expect(result.files[0].action).toBe('created');
-    expect(result.files[0].path).toMatch(/profiles[/\\]default[/\\]mcp\.json$/);
+    expect(result.files[0].path).toMatch(/\.copilot[/\\]mcp-config\.json$/);
     const cfg = JSON.parse(fs.readFileSync(result.files[0].path, 'utf-8'));
-    expect(cfg.servers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+    expect(cfg.mcpServers.codegraph).toEqual({ type: 'local', command: 'codegraph', args: ['serve', '--mcp'], tools: ['*'] });
   });
 
-  it('vscode: local install writes .vscode/mcp.json (servers.codegraph)', () => {
-    const vscode = getTarget('vscode')!;
-    const result = vscode.install('local', { autoAllow: true });
+  it('copilot: local install writes .github/mcp.json (mcpServers.codegraph)', () => {
+    const copilot = getTarget('copilot')!;
+    const result = copilot.install('local', { autoAllow: true });
     expect(result.files.length).toBe(1);
     expect(result.files[0].action).toBe('created');
-    expect(result.files[0].path.replace(/\\/g, '/')).toMatch(/\/\.vscode\/mcp\.json$/);
+    expect(result.files[0].path.replace(/\\/g, '/')).toMatch(/\/\.github\/mcp\.json$/);
     const cfg = JSON.parse(fs.readFileSync(result.files[0].path, 'utf-8'));
-    expect(cfg.servers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+    expect(cfg.mcpServers.codegraph).toEqual({ type: 'local', command: 'codegraph', args: ['serve', '--mcp'], tools: ['*'] });
   });
 
-  it('vscode: install preserves a pre-existing sibling in servers', () => {
-    const vscode = getTarget('vscode')!;
-    const mcpFile = path.join(tmpCwd, '.vscode', 'mcp.json');
+  it('copilot: install preserves pre-existing sibling in mcpServers', () => {
+    const copilot = getTarget('copilot')!;
+    const mcpFile = path.join(tmpHome, '.copilot', 'mcp-config.json');
     fs.mkdirSync(path.dirname(mcpFile), { recursive: true });
     fs.writeFileSync(mcpFile, JSON.stringify({
-      servers: { playwright: { command: 'npx', args: ['-y', '@playwright/mcp@latest'] } },
+      mcpServers: { other: { type: 'local', command: 'other', args: [], tools: ['*'] } },
     }, null, 2) + '\n');
 
-    vscode.install('local', { autoAllow: true });
+    copilot.install('global', { autoAllow: true });
 
     const after = JSON.parse(fs.readFileSync(mcpFile, 'utf-8'));
-    expect(after.servers.playwright).toBeDefined();
-    expect(after.servers.codegraph).toBeDefined();
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
   });
 
-  it('vscode: uninstall strips codegraph but leaves sibling servers intact', () => {
-    const vscode = getTarget('vscode')!;
-    const mcpFile = path.join(tmpCwd, '.vscode', 'mcp.json');
+  it('copilot: uninstall strips codegraph but leaves sibling servers intact', () => {
+    const copilot = getTarget('copilot')!;
+    const mcpFile = path.join(tmpHome, '.copilot', 'mcp-config.json');
     fs.mkdirSync(path.dirname(mcpFile), { recursive: true });
     fs.writeFileSync(mcpFile, JSON.stringify({
-      servers: { playwright: { command: 'npx', args: ['-y', '@playwright/mcp@latest'] } },
+      mcpServers: { other: { type: 'local', command: 'other', args: [], tools: ['*'] } },
     }, null, 2) + '\n');
 
-    vscode.install('local', { autoAllow: true });
-    vscode.uninstall('local');
+    copilot.install('global', { autoAllow: true });
+    copilot.uninstall('global');
 
     const after = JSON.parse(fs.readFileSync(mcpFile, 'utf-8'));
-    expect(after.servers.playwright).toBeDefined();
-    expect(after.servers.codegraph).toBeUndefined();
-  });
-
-  it('vscode: install writes no instructions file (no AGENTS.md or similar)', () => {
-    const vscode = getTarget('vscode')!;
-    const result = vscode.install('global', { autoAllow: true });
-    expect(result.files.every((f) => !f.path.endsWith('.md'))).toBe(true);
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
   });
 
   it('antigravity: install writes to LEGACY ~/.gemini/antigravity/mcp_config.json when no migration marker', () => {
