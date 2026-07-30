@@ -1229,6 +1229,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('gemini')?.id).toBe('gemini');
     expect(getTarget('antigravity')?.id).toBe('antigravity');
     expect(getTarget('kiro')?.id).toBe('kiro');
+    expect(getTarget('jcode')?.id).toBe('jcode');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
@@ -1241,6 +1242,148 @@ describe('Installer targets — registry', () => {
 
   it('resolveTargetFlag throws on unknown id', () => {
     expect(() => resolveTargetFlag('claude,bogus', 'global')).toThrow(/Unknown --target/);
+  });
+});
+
+describe('Installer targets — jcode specifics', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it('global install writes mcp.json, AGENTS.md, and the codegraph skill', () => {
+    const jcode = getTarget('jcode')!;
+    const result = jcode.install('global', { autoAllow: true });
+
+    const mcp = path.join(tmpHome, '.jcode', 'mcp.json');
+    const agents = path.join(tmpHome, 'AGENTS.md');
+    const skill = path.join(tmpHome, '.jcode', 'skills', 'codegraph', 'SKILL.md');
+
+    expect(fs.existsSync(mcp)).toBe(true);
+    expect(fs.existsSync(agents)).toBe(true);
+    expect(fs.existsSync(skill)).toBe(true);
+
+    expect(result.files.some((f) => f.path === mcp)).toBe(true);
+    expect(result.files.some((f) => f.path === agents)).toBe(true);
+    expect(result.files.some((f) => f.path === skill)).toBe(true);
+  });
+
+  it('local install writes .jcode/mcp.json and ./AGENTS.md, but no skill file', () => {
+    const jcode = getTarget('jcode')!;
+    const result = jcode.install('local', { autoAllow: true });
+
+    const mcp = path.join(tmpCwd, '.jcode', 'mcp.json');
+    const agents = path.join(tmpCwd, 'AGENTS.md');
+    const skill = path.join(tmpHome, '.jcode', 'skills', 'codegraph', 'SKILL.md');
+
+    expect(fs.existsSync(mcp)).toBe(true);
+    expect(fs.existsSync(agents)).toBe(true);
+    expect(fs.existsSync(skill)).toBe(false);
+
+    expect(result.files.some((f) => f.path === mcp)).toBe(true);
+    expect(result.files.some((f) => f.path === agents)).toBe(true);
+    expect(result.files.some((f) => f.path === skill)).toBe(false);
+  });
+
+  it('MCP entry omits the type field and uses mcpServers', () => {
+    const jcode = getTarget('jcode')!;
+    jcode.install('global', { autoAllow: true });
+
+    const cfg = JSON.parse(fs.readFileSync(path.join(tmpHome, '.jcode', 'mcp.json'), 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ command: 'codegraph', args: ['serve', '--mcp'] });
+    expect(cfg.mcpServers.codegraph.type).toBeUndefined();
+    expect(cfg.servers).toBeUndefined();
+  });
+
+  it('AGENTS.md block is the jcode-optimized variant', () => {
+    const jcode = getTarget('jcode')!;
+    jcode.install('global', { autoAllow: true });
+
+    const body = fs.readFileSync(path.join(tmpHome, 'AGENTS.md'), 'utf-8');
+    expect(body).toContain('codegraph_explore');
+    expect(body).toContain('codegraph impact');
+    expect(body).toContain('codegraph affected');
+    expect(body).toContain('codegraph status');
+    expect(body).toContain('codegraph sync');
+  });
+
+  it('skill file contains the token-efficient playbook', () => {
+    const jcode = getTarget('jcode')!;
+    jcode.install('global', { autoAllow: true });
+
+    const body = fs.readFileSync(path.join(tmpHome, '.jcode', 'skills', 'codegraph', 'SKILL.md'), 'utf-8');
+    expect(body).toContain('# CodeGraph skill');
+    expect(body).toContain('codegraph_explore');
+    expect(body).toContain('codegraph impact');
+    expect(body).toContain('codegraph affected');
+    expect(body).toContain('codegraph_node');
+    expect(body).toContain('codegraph_callers');
+    expect(body).toContain('codegraph_callees');
+  });
+
+  it('uninstall removes only codegraph, preserving sibling MCP servers and user AGENTS.md content', () => {
+    const jcode = getTarget('jcode')!;
+    const mcp = path.join(tmpHome, '.jcode', 'mcp.json');
+    const agents = path.join(tmpHome, 'AGENTS.md');
+    const skill = path.join(tmpHome, '.jcode', 'skills', 'codegraph', 'SKILL.md');
+
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: {
+        other: { command: 'other', args: ['serve'] },
+      },
+    }, null, 2) + '\n');
+    fs.writeFileSync(agents, '# My global rules\n\nAlways use tabs.\n');
+
+    jcode.install('global', { autoAllow: true });
+    expect(fs.existsSync(skill)).toBe(true);
+    jcode.uninstall('global');
+
+    const afterMcp = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(afterMcp.mcpServers.other).toBeDefined();
+    expect(afterMcp.mcpServers.codegraph).toBeUndefined();
+
+    const afterAgents = fs.readFileSync(agents, 'utf-8');
+    expect(afterAgents).toContain('# My global rules');
+    expect(afterAgents).toContain('Always use tabs.');
+    expect(afterAgents).not.toContain('CODEGRAPH_START');
+
+    expect(fs.existsSync(skill)).toBe(false);
+  });
+
+  it('re-running install is idempotent', () => {
+    const jcode = getTarget('jcode')!;
+    jcode.install('global', { autoAllow: true });
+    const second = jcode.install('global', { autoAllow: true });
+    for (const f of second.files) {
+      expect(f.action).toBe('unchanged');
+    }
+  });
+
+  it('detect recognizes alreadyConfigured when mcpServers.codegraph exists', () => {
+    const jcode = getTarget('jcode')!;
+    expect(jcode.detect('global').alreadyConfigured).toBe(false);
+
+    jcode.install('global', { autoAllow: true });
+    expect(jcode.detect('global').alreadyConfigured).toBe(true);
+
+    jcode.uninstall('global');
+    expect(jcode.detect('global').alreadyConfigured).toBe(false);
   });
 });
 

@@ -3,7 +3,7 @@
  *
  * Multi-target: writes MCP server config + instructions for the
  * agents the user picks (Claude Code, Cursor, Codex CLI, opencode,
- * Hermes Agent, Gemini CLI, Antigravity IDE).
+ * Hermes Agent, Gemini CLI, Antigravity IDE, jcode).
  * Defaults to the Claude-only behavior for backwards compatibility
  * when no targets are explicitly chosen and nothing else is detected.
  *
@@ -467,8 +467,8 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro' },
-        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc, ./.gemini, ./.kiro' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.jcode' },
+        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc, ./.gemini, ./.kiro, ./.jcode' },
       ],
       initialValue: 'global' as const,
     });

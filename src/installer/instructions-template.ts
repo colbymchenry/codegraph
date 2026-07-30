@@ -49,3 +49,26 @@ In repositories indexed by CodeGraph (a \`.codegraph/\` directory exists at the 
 
 If there is no \`.codegraph/\` directory, skip CodeGraph entirely — indexing is the user's decision.
 ${CODEGRAPH_SECTION_END}`;
+
+/**
+ * The jcode variant of the instructions block. jcode reads `AGENTS.md` every
+ * turn, so it is kept even shorter and explicitly pairs the graph with jcode's
+ * slash-command affordances (`/review`, `/test`, `/commit`) by nudging the agent
+ * to run `codegraph impact` / `codegraph affected` before editing.
+ *
+ * The shell commands (`codegraph impact`, `codegraph affected`, `codegraph status`,
+ * `codegraph sync`) are always available even when the hidden-by-default MCP tools
+ * are not exposed. This stays safely within the jcode context budget without
+ * duplicating the full server initialize instructions.
+ */
+export const JCODE_CODEGRAPH_INSTRUCTIONS_BLOCK = `${CODEGRAPH_SECTION_START}
+## CodeGraph
+
+In repositories with a \`.codegraph/\` directory, use CodeGraph before grep or file reads:
+- **MCP:** \`codegraph_explore\` answers most questions in one call.
+- **Shell:** \`codegraph explore "<query>"\` prints the same output.
+- **Before edits:** \`codegraph impact <symbol>\` and \`codegraph affected <files...>\` show what to update and test.
+- **Freshness:** \`codegraph status\` checks the index; run \`codegraph sync\` if stale.
+
+If no \`.codegraph/\` directory exists, skip CodeGraph.
+${CODEGRAPH_SECTION_END}`;
