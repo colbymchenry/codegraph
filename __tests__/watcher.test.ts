@@ -264,13 +264,19 @@ describe('FileWatcher', () => {
     });
   });
 
-  describe('lock contention degradation (#876)', () => {
-    it('disables auto-sync after prolonged lock contention, with bounded retries', async () => {
-      const syncFn = vi.fn().mockRejectedValue(new LockUnavailableError());
+  describe('lock contention recovery (#876)', () => {
+    it('keeps retrying with capped backoff and recovers after prolonged lock contention', async () => {
+      let attempts = 0;
+      const syncFn = vi.fn(async () => {
+        attempts += 1;
+        if (attempts <= 8) {
+          throw new LockUnavailableError();
+        }
+        return { filesChanged: 1, durationMs: 5 };
+      });
       const onSyncComplete = vi.fn();
       const onSyncError = vi.fn();
       const onDegraded = vi.fn();
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const watcher = newWatcher(syncFn, {
         debounceMs: 25,
         onSyncComplete,
@@ -281,22 +287,22 @@ describe('FileWatcher', () => {
       await watcher.waitUntilReady();
       __emitWatchEventForTests(testDir, 'src/long-lock.ts');
 
-      // 5 backoff retries (25·1,2,4,8,16 ms), then degrade on the 6th attempt.
-      await waitFor(() => !watcher.isActive(), 8000, 20);
+      // Cross the former five-retry budget and prove the watcher remains live
+      // with its stale entry retained while the competing writer owns the lock.
+      await waitFor(() => syncFn.mock.calls.length >= 7, 8000, 20);
+      expect(watcher.isActive()).toBe(true);
+      expect(watcher.isDegraded()).toBe(false);
+      expect(onDegraded).not.toHaveBeenCalled();
+      expect(watcher.getPendingFiles().some((p) => p.path === 'src/long-lock.ts')).toBe(true);
 
-      expect(syncFn.mock.calls.length).toBeGreaterThanOrEqual(6); // MAX_LOCK_RETRIES + 1
-      expect(watcher.isDegraded()).toBe(true);
-      expect(onDegraded).toHaveBeenCalledTimes(1);
-      expect(onDegraded).toHaveBeenCalledWith(expect.stringContaining('auto-sync disabled'));
-      // A held lock is neither a sync error nor a completion.
+      // The ninth attempt succeeds after eight lock-contention failures.
+      await waitFor(() => onSyncComplete.mock.calls.length > 0, 8000, 20);
+      expect(syncFn).toHaveBeenCalledTimes(9);
       expect(onSyncError).not.toHaveBeenCalled();
-      expect(onSyncComplete).not.toHaveBeenCalled();
-      // Degrade stops the watcher, which clears pending state.
-      expect(watcher.getPendingFiles()).toEqual([]);
-      const disableWarnings = warnSpy.mock.calls.filter(
-        (c) => typeof c[0] === 'string' && c[0].includes('File watcher disabled')
-      );
-      expect(disableWarnings).toHaveLength(1);
+      expect(onSyncComplete).toHaveBeenCalledTimes(1);
+      expect(watcher.getPendingFiles().some((p) => p.path === 'src/long-lock.ts')).toBe(false);
+
+      watcher.stop();
     });
 
     it('does NOT degrade on brief contention — backoff resets after a clean sync', async () => {
