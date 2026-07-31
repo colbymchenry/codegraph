@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- On Windows, the Claude Code prompt hook written by `codegraph install` failed with "command not found" when hooks run through Git Bash, which needs the `.cmd` extension to find the launcher. The installer now writes the platform-correct command, and re-running `codegraph install` (or `codegraph upgrade`) repairs an existing install in place. (#1466)
 
 ## [1.5.0] - 2026-07-21
 
