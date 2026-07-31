@@ -28,66 +28,6 @@ type ReferenceKind = 'references' | 'calls';
 
 const NAME_SEGMENT_TYPES = new Set(['ColId', 'ColLabel', 'type_function_name']);
 
-// Avoid filling unresolved_refs with ubiquitous PostgreSQL/SQL built-ins. A
-// schema-qualified spelling is never filtered because it may be user-defined.
-const BUILTIN_ROUTINES = new Set([
-  'any',
-  'array_length',
-  'array_remove',
-  'array_agg',
-  'avg',
-  'bool_or',
-  'cast',
-  'coalesce',
-  'concat',
-  'count',
-  'current_date',
-  'current_setting',
-  'current_time',
-  'current_timestamp',
-  'date_part',
-  'date_trunc',
-  'encode',
-  'extract',
-  'first_value',
-  'gen_random_uuid',
-  'greatest',
-  'json_agg',
-  'json_build_array',
-  'json_build_object',
-  'jsonb_agg',
-  'jsonb_array_elements_text',
-  'jsonb_array_length',
-  'jsonb_build_array',
-  'jsonb_build_object',
-  'jsonb_set',
-  'jsonb_strip_nulls',
-  'jsonb_typeof',
-  'least',
-  'length',
-  'lower',
-  'max',
-  'min',
-  'nextval',
-  'now',
-  'nullif',
-  'position',
-  'round',
-  'row_number',
-  'row_to_json',
-  'set_config',
-  'split_part',
-  'substring',
-  'sum',
-  'to_char',
-  'to_date',
-  'to_json',
-  'to_jsonb',
-  'trim',
-  'unnest',
-  'upper',
-]);
-
 /** Per-extraction reference de-duplication. `ctx.nodes` is stable for a file. */
 const emittedReferenceKeys = new WeakMap<readonly object[], Set<string>>();
 
@@ -262,10 +202,15 @@ function walkChildren(node: SyntaxNode, ctx: ExtractorContext): void {
   for (const child of children(node)) ctx.visitNode(child);
 }
 
-function createColumn(ctx: ExtractorContext, node: SyntaxNode, nameNode: SyntaxNode): void {
+function createColumn(
+  ctx: ExtractorContext,
+  node: SyntaxNode,
+  nameNode: SyntaxNode,
+  parentQualifiedOverride?: string
+): void {
   const name = readSqlName(nameNode, ctx.source);
   if (!name) return;
-  const parentQualified = currentScopeQualifiedName(ctx);
+  const parentQualified = parentQualifiedOverride ?? currentScopeQualifiedName(ctx);
   ctx.createNode('field', name.simple, node, {
     qualifiedName: parentQualified ? `${parentQualified}.${name.simple}` : name.qualified,
     signature: compactText(node, ctx.source, 200),
@@ -493,6 +438,60 @@ function createExtension(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true;
 }
 
+/**
+ * Model ALTER TABLE ADD COLUMN as a migration delta rather than attaching the
+ * new field to an arbitrary historical CREATE TABLE node. The delta references
+ * its target relation and contains a normally searchable table-qualified field;
+ * a future ordered-migration layer can fold these deltas into an effective
+ * schema without changing the extracted facts.
+ */
+function createAlterTableDeltas(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const relation = directChild(node, 'relation_expr');
+  const tableNode = relation ? firstDescendant(relation, 'qualified_name') : null;
+  const tableName = readSqlName(tableNode, ctx.source);
+  const ownerId = currentScopeId(ctx);
+  if (!tableNode || !tableName || !ownerId) {
+    walkChildren(node, ctx);
+    return true;
+  }
+
+  // Retain the statement-level dependency that ALTER TABLE emitted before
+  // column deltas were modeled.
+  addReference(ctx, ownerId, tableName, 'references', tableNode);
+
+  const commands = directChild(node, 'alter_table_cmds');
+  if (!commands) return true;
+  for (const command of allDescendants(commands, 'alter_table_cmd')) {
+    const column = directChild(command, 'columnDef');
+    const columnNameNode = column ? directChild(column, 'ColId') : null;
+    const columnName = readSqlName(columnNameNode, ctx.source);
+    if (!hasDirectChild(command, 'kw_add') || !column || !columnNameNode || !columnName) {
+      ctx.visitNode(command);
+      continue;
+    }
+
+    const deltaSimple = `ADD COLUMN ${columnName.simple}`;
+    const deltaName: SqlName = {
+      parts: [...tableName.parts, deltaSimple],
+      qualified: `${tableName.qualified}.${deltaSimple}`,
+      simple: deltaSimple,
+    };
+    const created = createDatabaseNode(
+      ctx,
+      command,
+      deltaName,
+      'constant',
+      'alter-table-add-column'
+    );
+    withCreatedScope(ctx, created, () => {
+      if (created) addReference(ctx, created.id, tableName, 'references', tableNode);
+      createColumn(ctx, column, columnNameNode, tableName.qualified);
+      walkChildren(command, ctx);
+    });
+  }
+  return true;
+}
+
 const QUERY_SCOPE_TYPES = new Set([
   'select_no_parens',
   'InsertStmt',
@@ -588,12 +587,11 @@ function emitRoutineCall(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const nameNode = directChild(node, 'func_name');
   const name = readSqlName(nameNode, ctx.source);
   const fromNodeId = currentScopeId(ctx);
-  if (
-    nameNode &&
-    name &&
-    fromNodeId &&
-    !(name.parts.length === 1 && BUILTIN_ROUTINES.has(name.simple))
-  ) {
+  // Emit every routine-shaped call. PostgreSQL permits user routines to share
+  // names with pg_catalog routines (overload resolution and search_path decide
+  // the target), so filtering an unqualified name here would erase valid
+  // project edges before the resolver can inspect the indexed declarations.
+  if (nameNode && name && fromNodeId) {
     addReference(ctx, fromNodeId, name, 'calls', nameNode);
   }
   walkChildren(node, ctx);
@@ -683,6 +681,9 @@ export const postgresExtractor: LanguageExtractor = {
 
       case 'CreateExtensionStmt':
         return createExtension(node, ctx);
+
+      case 'AlterTableStmt':
+        return createAlterTableDeltas(node, ctx);
 
       case 'columnDef': {
         const nameNode = directChild(node, 'ColId');

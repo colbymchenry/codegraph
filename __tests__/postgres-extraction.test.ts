@@ -88,6 +88,23 @@ describe('PostgreSQL extraction', () => {
     expect(refs.some((ref) => ref.referenceName === 'recent')).toBe(false);
   });
 
+  it('retains calls whose names collide with PostgreSQL built-ins', () => {
+    const result = extract([
+      'CREATE VIEW app.dashboard AS',
+      'SELECT count(*), lower(app.display_name), app.custom_metric()',
+      'FROM app.users;',
+    ].join('\n'));
+
+    const view = result.nodes.find((node) => node.qualifiedName === 'app.dashboard');
+    expect(view).toBeTruthy();
+
+    const calls = result.unresolvedReferences
+      .filter((ref) => ref.fromNodeId === view!.id && ref.referenceKind === 'calls')
+      .map((ref) => ref.referenceName)
+      .sort();
+    expect(calls).toEqual(['app.custom_metric', 'count', 'lower']);
+  });
+
   it('does not leak a nested query CTE alias into the outer query scope', () => {
     const result = extract([
       'SELECT * FROM recent',
@@ -126,17 +143,40 @@ describe('PostgreSQL extraction', () => {
     expect(fileRefs).toEqual(['App.Users', 'public.teams']);
   });
 
-  it('does not create file-scoped fields for ALTER TABLE ADD COLUMN', () => {
+  it('models ALTER TABLE ADD COLUMN as a relation-linked migration delta', () => {
     const result = extract([
       'CREATE TABLE app.users (id bigint);',
-      'ALTER TABLE app.users ADD COLUMN email text;',
+      'ALTER TABLE app.users',
+      '  ADD COLUMN email text,',
+      '  ADD COLUMN IF NOT EXISTS display_name text;',
     ].join('\n'));
 
-    const fields = result.nodes.filter((node) => node.kind === 'field');
-    expect(fields.map((node) => node.qualifiedName)).toEqual(['app.users.id']);
-    expect(result.unresolvedReferences.some(
-      (ref) => ref.referenceKind === 'references' && ref.referenceName === 'app.users'
-    )).toBe(true);
+    const fields = result.nodes
+      .filter((node) => node.kind === 'field')
+      .map((node) => node.qualifiedName)
+      .sort();
+    expect(fields).toEqual(['app.users.display_name', 'app.users.email', 'app.users.id']);
+
+    const deltas = result.nodes.filter(
+      (node) => node.decorators?.includes('postgres:alter-table-add-column')
+    );
+    expect(deltas.map((node) => node.qualifiedName).sort()).toEqual([
+      'app.users.ADD COLUMN display_name',
+      'app.users.ADD COLUMN email',
+    ]);
+
+    for (const delta of deltas) {
+      expect(result.unresolvedReferences.some(
+        (ref) => ref.fromNodeId === delta.id &&
+          ref.referenceKind === 'references' &&
+          ref.referenceName === 'app.users'
+      )).toBe(true);
+      expect(result.edges.some(
+        (edge) => edge.source === delta.id &&
+          edge.kind === 'contains' &&
+          result.nodes.find((candidate) => candidate.id === edge.target)?.kind === 'field'
+      )).toBe(true);
+    }
   });
 
   it('keeps dollar-quoted PL/pgSQL bodies opaque in the PostgreSQL-only phase', () => {
@@ -182,6 +222,40 @@ describe('PostgreSQL extraction', () => {
       const incoming = graph.getIncomingEdges(table!.id);
       expect(incoming.some(
         (edge) => edge.source === view!.id && edge.kind === 'references'
+      )).toBe(true);
+    } finally {
+      graph.destroy();
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves an unqualified user routine that shadows a PostgreSQL built-in name', async () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-postgres-shadow-'));
+    fs.writeFileSync(
+      path.join(projectDir, '001_count.sql'),
+      "CREATE FUNCTION count(value integer) RETURNS integer LANGUAGE sql AS 'SELECT value';\n"
+    );
+    fs.writeFileSync(
+      path.join(projectDir, '002_summary.sql'),
+      'CREATE VIEW app.summary AS SELECT count(1);\n'
+    );
+
+    const graph = CodeGraph.initSync(projectDir);
+    try {
+      await graph.indexAll();
+
+      const routine = graph.getNodesByName('count').find(
+        (node) => node.language === 'postgres' && node.decorators?.includes('postgres:function')
+      );
+      const view = graph.getNodesByName('summary').find(
+        (node) => node.qualifiedName === 'app.summary'
+      );
+      expect(routine).toBeTruthy();
+      expect(view).toBeTruthy();
+
+      const incoming = graph.getIncomingEdges(routine!.id);
+      expect(incoming.some(
+        (edge) => edge.source === view!.id && edge.kind === 'calls'
       )).toBe(true);
     } finally {
       graph.destroy();

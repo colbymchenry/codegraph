@@ -11,7 +11,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
-- PostgreSQL projects can now index `.sql`, `.psql`, and `.pgsql` files, including schemas, tables and their `CREATE TABLE` columns, views, routines, types, triggers, policies, indexes, sequences, extensions, and their common table, foreign-key, trigger, and routine dependencies; columns added later by `ALTER TABLE`, and string-literal routine bodies including dollar-quoted PL/pgSQL, remain opaque for now.
+- PostgreSQL projects can now index `.sql`, `.psql`, and `.pgsql` files, including schemas, tables and columns introduced by `CREATE TABLE` or `ALTER TABLE ... ADD COLUMN`, views, routines, types, triggers, policies, indexes, sequences, extensions, and their common table, foreign-key, trigger, and routine dependencies. Altered columns are retained as relation-linked migration deltas instead of being attached to an arbitrary historical table definition; string-literal routine bodies, including dollar-quoted PL/pgSQL, remain opaque for now.
 
 ## [1.5.0] - 2026-07-21
 
