@@ -50,6 +50,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  postgres: 'tree-sitter-postgres.wasm',
 };
 
 /**
@@ -170,6 +171,11 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  // PostgreSQL SQL and migration files. Projects using other PostgreSQL file
+  // extensions can opt into the grammar through a codegraph.json override.
+  '.sql': 'postgres',
+  '.psql': 'postgres',
+  '.pgsql': 'postgres',
 };
 
 /**
@@ -287,10 +293,15 @@ export async function initGrammars(): Promise<void> {
  * (parser.c sha-matched against the crates.io tarball).
  * The kernel-grammar-parity test asserts this alignment; bump the crate and
  * the vendored wasm together.
+ *
+ * PostgreSQL: gmr/tree-sitter-postgres v1.2.4 (BSD-3-Clause), using the
+ * release's prebuilt ABI-15 tree-sitter-postgres.wasm. The artifact's SHA-256
+ * is 084883e58414c407dfac6f37f0facc983afdfe8103e17f5fd2ca138b79a22b92.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'postgres',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -654,6 +665,7 @@ export function getLanguageDisplayName(language: Language): string {
     vbnet: 'Visual Basic .NET',
     erlang: 'Erlang',
     terraform: 'Terraform',
+    postgres: 'PostgreSQL',
     arkts: 'ArkTS',
     unknown: 'Unknown',
   };
