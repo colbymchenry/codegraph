@@ -341,6 +341,78 @@ export function matchFunctionRef(
 }
 
 /**
+ * Resolve PostgreSQL object references without the generic matcher's fuzzy or
+ * path-proximity fallbacks.
+ *
+ * SQL repositories routinely contain the same relation name in several
+ * schemas and several versions of the same object across migration files. In
+ * that setting, choosing the closest file (or the first suffix match) invents
+ * a dependency. PostgreSQL extraction therefore has a deliberately strict
+ * contract:
+ *
+ *  - a qualified reference matches only an exact canonical qualifiedName;
+ *  - an unqualified reference matches only the exact simple name;
+ *  - one same-file candidate wins, otherwise the project-wide candidate must
+ *    be unique;
+ *  - callable references target decorated routines only; relation references
+ *    target relation-like (`struct`) nodes only.
+ *
+ * Ambiguity is left unresolved. A future PostgreSQL-aware resolver can add
+ * search_path and migration-order semantics without weakening this precision
+ * floor.
+ */
+export function matchPostgresReference(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.language !== 'postgres') return null;
+
+  const isCallable = ref.referenceKind === 'calls' || ref.referenceKind === 'function_ref';
+  const eligible = (node: Node): boolean => {
+    if (node.language !== 'postgres') return false;
+    if (isCallable) {
+      return node.kind === 'function' && (
+        node.decorators?.includes('postgres:function') === true ||
+        node.decorators?.includes('postgres:procedure') === true
+      );
+    }
+    return node.kind === 'struct';
+  };
+
+  const isQualified = ref.referenceName.includes('::') || ref.referenceName.includes('.');
+  const candidates = (isQualified
+    ? context.getNodesByQualifiedName(ref.referenceName)
+    : context.getNodesByName(ref.referenceName)
+  ).filter(eligible);
+  if (candidates.length === 0) return null;
+
+  const sameFile = candidates.filter((node) => node.filePath === ref.filePath);
+  let target: Node | undefined;
+  if (sameFile.length === 1) {
+    target = sameFile[0];
+  } else if (sameFile.length > 1) {
+    return null;
+  } else if (candidates.length === 1) {
+    target = candidates[0];
+  } else {
+    return null;
+  }
+  if (!target) return null;
+
+  return {
+    original: ref,
+    targetNodeId: target.id,
+    confidence: isQualified ? 0.95 : 0.9,
+    resolvedBy:
+      ref.referenceKind === 'function_ref'
+        ? 'function-ref'
+        : isQualified
+          ? 'qualified-name'
+          : 'exact-match',
+  };
+}
+
+/**
  * A function nested inside another FUNCTION is only callable from within its
  * container — Python, JS/TS, and every closure language scope it lexically.
  * Resolving a bare name from elsewhere to a nested local fabricates an edge
@@ -2218,6 +2290,13 @@ export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // PostgreSQL migration trees routinely contain duplicate object names across
+  // schemas and historical revisions. They must never reach the generic
+  // qualified-name suffix, fuzzy, or path-proximity fallbacks.
+  if (ref.language === 'postgres') {
+    return matchPostgresReference(ref, context);
+  }
+
   // Function-as-value refs (#756) resolve ONLY through the dedicated matcher —
   // never the fuzzy/qualified fallthrough below (a wrong callback edge is
   // worse than none).
