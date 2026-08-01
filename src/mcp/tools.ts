@@ -2473,7 +2473,7 @@ export class ToolHandler {
       const where = nonTest.length > 0 ? ` in ${shown}${more}` : '';
       const tests = testFiles.length > 0
         ? `; tests: ${testFiles.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ')}${testFiles.length > FILE_CAP ? ` +${testFiles.length - FILE_CAP}` : ''}`
-        : '; ⚠️ no covering tests found';
+        : this.indirectTestNote(cg, uniq, rel);
 
       entries.push(
         `- \`${root.name}\` (${rel(root.filePath)}:${root.startLine}) — ${uniq.length} caller${uniq.length === 1 ? '' : 's'}${where}${tests}`,
@@ -2487,6 +2487,51 @@ export class ToolHandler {
       ...entries,
       '',
     ].join('\n');
+  }
+
+  /**
+   * Test-coverage note for a blast-radius entry whose DIRECT callers include no
+   * test file. A helper called only by production code can still be exercised
+   * by tests further up the caller chain (#1475: 40% of directly-unflagged
+   * symbols had a test within 2-3 hops), so walk up to 2 more hops before
+   * claiming anything — and even then claim only what was measured.
+   */
+  private indirectTestNote(cg: CodeGraph, directCallers: Node[], rel: (p: string) => string): string {
+    const MAX_HOPS = 3; // direct callers are hop 1
+    const BUDGET = 64;  // getCallers lookups per entry — bounds god-fan-in symbols
+    const FILE_CAP = 2;
+    let budget = BUDGET;
+    const visited = new Set(directCallers.map((n) => n.id));
+    let frontier = directCallers;
+    for (let hop = 2; hop <= MAX_HOPS && frontier.length > 0 && budget > 0; hop++) {
+      const next: Node[] = [];
+      const found = new Set<string>();
+      for (const node of frontier) {
+        if (budget-- <= 0) break;
+        let callers: Array<{ node: Node }> = [];
+        try { callers = cg.getCallers(node.id) as Array<{ node: Node }>; } catch { continue; }
+        for (const c of callers) {
+          const n = c?.node;
+          if (!n || visited.has(n.id)) continue;
+          visited.add(n.id);
+          const f = rel(n.filePath);
+          if (isTestFile(f)) found.add(f);
+          else next.push(n);
+        }
+      }
+      if (found.size > 0) {
+        const files = [...found];
+        const shown = files.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ');
+        const more = files.length > FILE_CAP ? ` +${files.length - FILE_CAP}` : '';
+        return `; tested via callers: ${shown}${more}`;
+      }
+      frontier = next;
+    }
+    // Budget exhaustion means hops 2-3 weren't fully searched — fall back to
+    // the weaker claim that IS established by the direct-caller check.
+    return budget > 0
+      ? `; no tests found within ${MAX_HOPS} caller hops`
+      : '; no test calls this directly';
   }
 
   /**
