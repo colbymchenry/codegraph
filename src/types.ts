@@ -574,6 +574,10 @@ export interface GraphStats {
   /** Database size in bytes */
   dbSizeBytes: number;
 
+  /** Size of the SQLite `-wal` sidecar in bytes (0 when absent). A WAL far
+   * larger than the DB at rest means killed sessions left it behind (#1431). */
+  walSizeBytes: number;
+
   /** Last update timestamp */
   lastUpdated: number;
 }

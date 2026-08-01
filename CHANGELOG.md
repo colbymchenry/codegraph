@@ -11,6 +11,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A CodeGraph process that gets force-killed — by the stuck-process watchdog, a crash, or the OS — no longer leaves the database's write-ahead log behind to grow without bound. Previously each killed session stacked more data onto the same log file and nothing ever shrank it, which on machines where sessions were killed regularly could quietly eat tens of gigabytes of disk. The log is now capped, and any oversized leftover is reclaimed automatically the next time the project is opened. Thanks @tiendungdev for the exceptional Windows report that pinned this down. (#1431)
+- The background server's watchdog no longer kills a healthy server that is just waiting on a slow disk: like indexing already does, it now checks whether the database files are still making progress before concluding the process is stuck. Fewer spurious kills also means fewer leftover write-ahead logs. (#1431)
+- `codegraph status` now shows the write-ahead log's size next to the database size and warns when killed sessions have left it oversized, and every line in the background server's log now carries a timestamp so kills and restarts can be placed in time. (#1431)
 - On Windows, the Claude Code prompt hook written by `codegraph install` failed with "command not found" when hooks run through Git Bash, which needs the `.cmd` extension to find the launcher. The installer now writes the platform-correct command, and re-running `codegraph install` (or `codegraph upgrade`) repairs an existing install in place. (#1466)
 
 ## [1.5.0] - 2026-07-21
