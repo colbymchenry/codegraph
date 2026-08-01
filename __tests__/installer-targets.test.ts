@@ -680,6 +680,60 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.existsSync(geminiMd)).toBe(false);
   });
 
+  it('windsurf: install writes ~/.codeium/windsurf/mcp_config.json (mcpServers.codegraph), no type field', () => {
+    const windsurf = getTarget('windsurf')!;
+    const result = windsurf.install('global', { autoAllow: true });
+    const mcp = path.join(tmpHome, '.codeium', 'windsurf', 'mcp_config.json');
+    expect(result.files.some((f) => f.path === mcp)).toBe(true);
+    expect(fs.existsSync(mcp)).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    // Windsurf's documented stdio shape is `{ command, args }` — no `type`.
+    expect(cfg.mcpServers.codegraph).toEqual({ command: 'codegraph', args: ['serve', '--mcp'] });
+    expect(cfg.mcpServers.codegraph.type).toBeUndefined();
+    // Surfaces the load-bearing "click Refresh" note.
+    expect(result.notes?.join(' ')).toMatch(/Refresh/i);
+  });
+
+  it('windsurf: install preserves a pre-existing sibling MCP server', () => {
+    const windsurf = getTarget('windsurf')!;
+    const mcp = path.join(tmpHome, '.codeium', 'windsurf', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { other: { command: 'npx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+
+    windsurf.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('windsurf: uninstall strips codegraph but leaves sibling MCP servers intact', () => {
+    const windsurf = getTarget('windsurf')!;
+    const mcp = path.join(tmpHome, '.codeium', 'windsurf', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { other: { command: 'npx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+
+    windsurf.install('global', { autoAllow: true });
+    windsurf.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+  });
+
+  it('windsurf: rejects --location=local with a clear note (global-only editor)', () => {
+    const windsurf = getTarget('windsurf')!;
+    expect(windsurf.supportsLocation('local')).toBe(false);
+    const result = windsurf.install('local', { autoAllow: true });
+    expect(result.files).toEqual([]);
+    expect(result.notes?.join(' ')).toMatch(/no project-local config/);
+  });
+
   it('gemini + antigravity: both installed coexist (separate MCP files, shared GEMINI.md)', () => {
     const gemini = getTarget('gemini')!;
     const antigravity = getTarget('antigravity')!;
