@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph install` gained a `codev` target for agents that read opencode-style config from renamed paths (`~/.config/codev/codev.jsonc` globally, `./codev.jsonc` per project) — those paths were invisible to the opencode target. Auto-detected, or select it explicitly with `--target=codev`.
+
 ### Fixes
 
 - A CodeGraph process that gets force-killed — by the stuck-process watchdog, a crash, or the OS — no longer leaves the database's write-ahead log behind to grow without bound. Previously each killed session stacked more data onto the same log file and nothing ever shrank it, which on machines where sessions were killed regularly could quietly eat tens of gigabytes of disk. The log is now capped, and any oversized leftover is reclaimed automatically the next time the project is opened. Thanks @tiendungdev for the exceptional Windows report that pinned this down. (#1431)
