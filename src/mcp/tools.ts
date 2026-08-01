@@ -13,7 +13,16 @@ import { findNearestCodeGraphRoot } from '../directory';
 // CodeGraph is pulled in only when a tool actually opens a project. require() is
 // sync + cached (CommonJS build).
 const loadCodeGraph = (): typeof import('../index').default =>
-  (require('../index') as typeof import('../index')).default;
+  loadCodeGraphForTests ?? (require('../index') as typeof import('../index')).default;
+// Test seam (same pattern as the watcher's `__setFsWatchForTests`): vitest's
+// module transform can't service the lazy `require('../index')` above, so
+// in-process tests that exercise a genuine cross-project open (an explicit
+// `projectPath` to a different project — issue #1474's repro shape) inject the
+// already-imported class here. Never set outside tests.
+let loadCodeGraphForTests: typeof import('../index').default | null = null;
+export function __setLoadCodeGraphForTests(cls: typeof import('../index').default | null): void {
+  loadCodeGraphForTests = cls;
+}
 import {
   detectWorktreeIndexMismatch,
   worktreeMismatchWarning,
@@ -26,7 +35,9 @@ import { isTestFile, normalizeNameToken } from '../search/query-utils';
 import {
   existsSync,
   readFileSync,
+  statSync,
 } from 'fs';
+import { createHash } from 'crypto';
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { scanDynamicDispatch } from './dynamic-boundaries';
@@ -1257,6 +1268,67 @@ export class ToolHandler {
    * Cost when nothing is pending — the common case — is one boolean check.
    * No I/O, no parsing of markdown beyond a per-pending-file substring scan.
    */
+  private driftCache = new Map<string, { at: number; stale: boolean }>();
+  private static readonly DRIFT_TTL_MS = 2000;
+
+  /**
+   * On-disk drift check for a single indexed file (issue #1474). The code
+   * renderers slice CURRENT bytes at INDEXED line ranges; when the file
+   * changed after its last index sync those ranges can point at a DIFFERENT
+   * symbol's code — served under the requested name with `isError: false`.
+   * The watcher-based pending/degraded banners can't cover this for a
+   * project reached via `projectPath` (cross-project instances have no
+   * watcher, by construction), so freshness is verified here, at the point
+   * of emission, from data the index already stores.
+   *
+   * Cheap and precise: one stat() per file (size + mtime, the same
+   * comparison the sync fast path uses); only on a stat mismatch is the
+   * content hashed (sha256, matching extraction's `hashContent`) so a
+   * touch/checkout that rewrote identical bytes never false-positives.
+   * Results are memoized briefly so one response rendering the same file in
+   * several sections pays for the check once.
+   *
+   * Returns true when the on-disk file differs from what was indexed —
+   * i.e. indexed line ranges for it are NOT trustworthy. Any failure
+   * (missing files-table row, stat/read error) reports false: those cases
+   * are handled by the existing not-found paths, and a wrong "stale" flag
+   * would needlessly push the agent back to Read.
+   */
+  private isFileStaleOnDisk(cg: CodeGraph, relPath: string, content?: string): boolean {
+    let root: string;
+    try {
+      root = cg.getProjectRoot();
+    } catch {
+      return false;
+    }
+    const key = `${root}\0${relPath}`;
+    const now = Date.now();
+    const hit = this.driftCache.get(key);
+    if (hit && now - hit.at < ToolHandler.DRIFT_TTL_MS) return hit.stale;
+    let stale = false;
+    try {
+      const rec = cg.getFile(relPath);
+      const absPath = rec ? validatePathWithinRoot(root, relPath) : null;
+      if (rec && absPath && existsSync(absPath)) {
+        const st = statSync(absPath);
+        // Same freshness test as the sync fast path (extraction/index.ts):
+        // equal size + equal floored mtime ⇒ unchanged, no read needed.
+        if (st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) {
+          const data = content ?? readFileSync(absPath, 'utf-8');
+          // Must stay byte-identical to extraction's `hashContent` (sha256 over
+          // the utf-8 string) — the identical-rewrite test in
+          // mcp-stale-slice.test.ts pins the parity. Inlined (not imported)
+          // to keep the extraction module off the MCP startup path.
+          stale = createHash('sha256').update(data).digest('hex') !== rec.contentHash;
+        }
+      }
+    } catch {
+      stale = false;
+    }
+    this.driftCache.set(key, { at: now, stale });
+    return stale;
+  }
+
   private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
     if (result.isError) return result;
 
@@ -3139,6 +3211,9 @@ export class ToolHandler {
 
     lines.push('**Source Code**');
     lines.push('');
+    // Recorded so the drift pass below (#1474) can append a per-file exception
+    // to this guarantee after the render loop knows which files drifted.
+    const verbatimHeaderIdx = lines.length;
     lines.push('> The code below is the **verbatim, current on-disk source** of these files — re-read from disk on this call and line-numbered, byte-for-byte identical to what the Read tool returns. It is NOT a summary, outline, or stale cache. Treat each block as a Read you have already performed: do not Read a file shown here.');
     lines.push('');
 
@@ -3148,6 +3223,14 @@ export class ToolHandler {
     // (#1046) — it must reflect what we show, not the raw candidate gather.
     const renderedFilePaths: string[] = [];
     let anyFileTrimmed = false;
+    // Files that changed on disk after their last index sync (#1474). Their
+    // indexed line ranges are untrustworthy, so sliced renders (adaptive /
+    // skeleton / clusters) are OFF for them: a small drifted file still ships
+    // whole (current bytes, correct by construction → staleRendered), a big one
+    // is omitted with an explicit notice (→ staleOmitted) — honest absence
+    // instead of a different symbol's code under the requested name.
+    const staleRendered: string[] = [];
+    const staleOmitted: string[] = [];
 
     for (const [filePath, group] of sortedFiles) {
       if (filesIncluded >= maxFiles) break;
@@ -3173,6 +3256,11 @@ export class ToolHandler {
 
       const fileLines = fileContent.split('\n');
       const lang = group.nodes[0]?.language || '';
+
+      // Disk-drift gate (#1474): every render branch below except whole-file
+      // slices fileContent (CURRENT bytes) at INDEXED line ranges. Content is
+      // already in hand, so the check costs one stat (hash only on mismatch).
+      const fileStale = this.isFileStaleOnDisk(cg, filePath, fileContent);
 
       // Adaptive sizing (CODEGRAPH_ADAPTIVE_EXPLORE, default on): collapse a file
       // to a per-symbol view when it's a redundant member of a polymorphic family.
@@ -3212,7 +3300,7 @@ export class ToolHandler {
       const onSpineGodFile = hasSpineNode
         && namedBodyChars > budget.maxCharsPerFile
         && group.nodes.some(n => CALLABLE_BODY.has(n.kind) && flow.uniqueNamedNodeIds.has(n.id) && !flow.pathNodeIds.has(n.id));
-      if (adaptiveExploreEnabled() && flow.pathNodeIds.size > 0
+      if (!fileStale && adaptiveExploreEnabled() && flow.pathNodeIds.size > 0
           && (onSpineGodFile || (!hasSpineNode && isPolymorphicSibling(group.nodes) && !spared))) {
         const syms = group.nodes
           .filter(n => n.kind !== 'import' && n.kind !== 'export' && n.startLine > 0)
@@ -3326,7 +3414,11 @@ export class ToolHandler {
         )];
         const headerNames = uniqSymbols.slice(0, budget.maxSymbolsInFileHeader);
         const omitted = uniqSymbols.length - headerNames.length;
-        const wholeHeader = fileSectionHeader(filePath, omitted > 0 ? `${headerNames.join(', ')}, +${omitted} more` : headerNames.join(', '));
+        // A drifted file rendered WHOLE is still correct (current bytes,
+        // numbered from 1) — only the index-derived symbol list / line refs to
+        // it elsewhere in this response may be shifted (#1474). Flag that.
+        const staleSuffix = fileStale ? ' · ⚠ changed since last index sync — source below is current; the symbol list may be outdated' : '';
+        const wholeHeader = fileSectionHeader(filePath, (omitted > 0 ? `${headerNames.join(', ')}, +${omitted} more` : headerNames.join(', ')) + staleSuffix);
 
         if (!fileNecessary && totalChars + wholeSection.length + 200 > budget.maxOutputChars) {
           // Don't slice a whole file mid-method: an incidental file that doesn't
@@ -3339,6 +3431,22 @@ export class ToolHandler {
         totalChars += wholeSection.length + 200;
         renderedFilePaths.push(filePath);
         filesIncluded++;
+        if (fileStale) staleRendered.push(filePath);
+        continue;
+      }
+
+      // Drifted file too big for the whole-file window (#1474): the cluster /
+      // skeleton renders below would slice current bytes at indexed ranges —
+      // on a shifted file that serves a DIFFERENT symbol's code under the
+      // requested name. Omit the source with an explicit notice instead;
+      // never render a possibly-wrong slice.
+      if (fileStale) {
+        staleOmitted.push(filePath);
+        lines.push(
+          fileSectionHeader(filePath, '⚠ changed on disk after the last index sync — source omitted (indexed line ranges no longer match, so a slice could show the wrong code). Read this file directly for current content; the change is picked up on that project\'s next index sync.'),
+          '',
+        );
+        totalChars += 260;
         continue;
       }
 
@@ -3624,6 +3732,22 @@ export class ToolHandler {
       totalChars += fileSection.length + 200;
       renderedFilePaths.push(filePath);
       filesIncluded++;
+    }
+
+    // Drift epilogue (#1474). The "verbatim / do not Read" guarantee above
+    // stays TRUE for everything actually rendered (drifted files ship whole or
+    // not at all — never as a possibly-wrong slice), but two caveats must be
+    // explicit: omitted files need Reading, and index-derived LINE REFERENCES
+    // to any drifted file (flow steps, blast radius, trail) may be shifted.
+    if (staleOmitted.length > 0) {
+      lines[verbatimHeaderIdx] += ' (Exception: files flagged "⚠ changed on disk" below drifted from the index after their last sync — their source is omitted rather than risk a mis-sliced block; Read those specific files.)';
+    }
+    const staleAll = [...new Set([...staleOmitted, ...staleRendered])];
+    if (staleAll.length > 0) {
+      lines.push(
+        '',
+        `> ⚠ Changed on disk after the last index sync: ${staleAll.join(', ')}. Line numbers referencing ${staleAll.length === 1 ? 'this file' : 'these files'} elsewhere in this response (flow steps, blast radius, symbol lists) may be shifted until that project's next sync re-indexes ${staleAll.length === 1 ? 'it' : 'them'}.`,
+      );
     }
 
     // The curated header count is computed from the files that SURVIVE the final
@@ -3994,6 +4118,14 @@ export class ToolHandler {
 
   /** Render one symbol: details + (optional) body/outline + its caller/callee trail. */
   private async renderNodeSection(cg: CodeGraph, node: Node, includeCode: boolean): Promise<string> {
+    // Disk-drift gate (issue #1474): the body below is CURRENT bytes sliced at
+    // INDEXED line ranges. If the file changed since its last index sync, that
+    // slice can be a DIFFERENT symbol's code served under this node's name —
+    // confidently wrong, with no watcher banner to catch it on a `projectPath`
+    // (cross-project) target. Never emit a slice from a drifted file.
+    if (this.isFileStaleOnDisk(cg, node.filePath)) {
+      return this.renderStaleNodeSection(cg, node, includeCode);
+    }
     let code: string | null = null;
     let outline: string | null = null;
     if (includeCode) {
@@ -4009,6 +4141,66 @@ export class ToolHandler {
       }
     }
     return this.formatNodeDetails(node, code, outline) + this.formatTrail(cg, node);
+  }
+
+  // Whole-file fallback caps for a drifted file (#1474): small enough to fit
+  // codegraph_node's output cap (MAX_OUTPUT_LENGTH) with headroom for the
+  // header + trail. A file within these bounds is served WHOLE and CURRENT
+  // (Read-parity, correct by construction) instead of a possibly-wrong slice.
+  private static readonly STALE_WHOLE_FILE_MAX_LINES = 300;
+  private static readonly STALE_WHOLE_FILE_MAX_CHARS = 12000;
+
+  /**
+   * codegraph_node render for a symbol whose file changed on disk after the
+   * last index sync (issue #1474). The indexed line range is no longer
+   * trustworthy, so no slice is emitted: a small file gets its full CURRENT
+   * source (Read-parity — sufficiency preserved, the agent still doesn't need
+   * Read); a large one gets an explicit notice steering to the tool's own
+   * file-read mode (or Read) — honest absence instead of confident wrongness.
+   * Location/signature stay (they're the index's answer) but are flagged as
+   * possibly shifted.
+   */
+  private renderStaleNodeSection(cg: CodeGraph, node: Node, includeCode: boolean): string {
+    const lines: string[] = [
+      `**${node.name}** (${node.kind})`,
+      '',
+      `**Location:** ${node.filePath}${node.startLine ? `:${node.startLine}` : ''} — ⚠ as of the last index sync; the file has changed on disk since, so this line may be shifted`,
+    ];
+    if (node.signature) {
+      lines.push(`**Signature:** \`${node.signature}\``);
+    }
+    lines.push('');
+    let embedded = false;
+    if (includeCode) {
+      try {
+        const absPath = validatePathWithinRoot(cg.getProjectRoot(), node.filePath);
+        if (absPath && existsSync(absPath) && !isConfigLeafNode(node)) {
+          const content = readFileSync(absPath, 'utf-8');
+          const body = content.replace(/\n+$/, '');
+          if (
+            body.length <= ToolHandler.STALE_WHOLE_FILE_MAX_CHARS &&
+            body.split('\n').length <= ToolHandler.STALE_WHOLE_FILE_MAX_LINES
+          ) {
+            lines.push(
+              `> ⚠ \`${node.filePath}\` changed on disk after it was last indexed, so the indexed line range for this symbol may no longer match. Showing the file's full CURRENT source instead (Read-parity — treat it as already Read):`,
+              '',
+              '```' + (node.language || ''),
+              numberSourceLines(body, 1),
+              '```',
+            );
+            embedded = true;
+          }
+        }
+      } catch {
+        /* fall through to the notice */
+      }
+    }
+    if (!embedded) {
+      lines.push(
+        `> ⚠ \`${node.filePath}\` changed on disk after it was last indexed — the indexed line range for this symbol no longer reliably matches, so its body is omitted rather than risk showing a different symbol's code. For current content, call codegraph_node with \`file: "${node.filePath}"\` (no symbol; \`offset\`/\`limit\` narrow it like Read), or Read the file. The change is picked up automatically on that project's next index sync.`,
+      );
+    }
+    return lines.join('\n') + this.formatTrail(cg, node);
   }
 
   /**
