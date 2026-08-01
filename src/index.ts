@@ -57,6 +57,8 @@ import { CodeGraphPackageVersion } from './mcp/version';
 import { segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
+import { buildVisualPayload, renderVisualHtml } from './visual';
+import * as fs from 'fs';
 
 // Re-export types for consumers
 export * from './types';
@@ -1792,6 +1794,19 @@ export class CodeGraph {
   // ===========================================================================
   // Database Management
   // ===========================================================================
+
+  /**
+   * Write a self-contained dark-theme D3 HTML visualization of the graph to
+   * `.codegraph/visual.html` (or `outputPath` if provided). Returns the path written.
+   */
+  writeVisualHtml(outputPath?: string): string {
+    const html = renderVisualHtml(buildVisualPayload(this.queries));
+    const out =
+      outputPath ??
+      path.join(getCodeGraphDir(this.projectRoot), 'visual.html');
+    fs.writeFileSync(out, html, 'utf8');
+    return out;
+  }
 
   /**
    * Optimize the database (vacuum and analyze)
