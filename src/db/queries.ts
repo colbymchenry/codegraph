@@ -2462,6 +2462,7 @@ export class QueryBuilder {
       edgesByKind,
       filesByLanguage,
       dbSizeBytes: 0, // Set by caller using DatabaseConnection.getSize()
+      walSizeBytes: 0, // Set by caller using DatabaseConnection.getWalSizeBytes()
       lastUpdated: Date.now(),
     };
   }
