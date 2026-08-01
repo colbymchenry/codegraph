@@ -5,6 +5,22 @@
  */
 
 import { Language, Node } from '../types';
+import {
+  analyzePostgresSearchPath,
+  postgresOffsetAtPosition,
+  postgresSearchPathAtOffset as sharedPostgresSearchPathAtOffset,
+  type PostgresSearchPathState as SharedPostgresSearchPathState,
+} from '../postgres/search-path';
+import {
+  isPostgresQualifiedName,
+  parsePostgresQualifiedName,
+  qualifyPostgresName,
+} from '../postgres/identifiers';
+import {
+  analyzePostgresTemporaryRelationVisibility,
+  postgresTemporaryRelationVisibleAt,
+  type PostgresTemporaryRelationVisibilityState,
+} from '../postgres/temporary-relations';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
 
 /**
@@ -357,10 +373,58 @@ export function matchFunctionRef(
  *  - callable references target decorated routines only; relation references
  *    target relation-like (`struct`) nodes only.
  *
- * Ambiguity is left unresolved. A future PostgreSQL-aware resolver can add
- * search_path and migration-order semantics without weakening this precision
- * floor.
+ * Unqualified references honor top-level SET/RESET search_path state (with
+ * PostgreSQL's default public fallback). Duplicate historical definitions are
+ * still left unresolved until an ordered-migration model can distinguish them.
  */
+const POSTGRES_SEARCH_PATH_CACHE = new WeakMap<
+  ResolutionContext,
+  Map<string, SharedPostgresSearchPathState>
+>();
+const POSTGRES_TEMPORARY_VISIBILITY_CACHE = new WeakMap<
+  ResolutionContext,
+  Map<string, PostgresTemporaryRelationVisibilityState>
+>();
+
+function postgresSearchPathState(
+  context: ResolutionContext,
+  filePath: string
+): SharedPostgresSearchPathState {
+  let byFile = POSTGRES_SEARCH_PATH_CACHE.get(context);
+  if (!byFile) {
+    byFile = new Map();
+    POSTGRES_SEARCH_PATH_CACHE.set(context, byFile);
+  }
+  const cached = byFile.get(filePath);
+  if (cached) return cached;
+
+  const state = analyzePostgresSearchPath(context.readFile(filePath) ?? '');
+  byFile.set(filePath, state);
+  return state;
+}
+
+function postgresTemporaryVisibilityState(
+  context: ResolutionContext,
+  filePath: string,
+  positions: SharedPostgresSearchPathState
+): PostgresTemporaryRelationVisibilityState {
+  let byFile = POSTGRES_TEMPORARY_VISIBILITY_CACHE.get(context);
+  if (!byFile) {
+    byFile = new Map();
+    POSTGRES_TEMPORARY_VISIBILITY_CACHE.set(context, byFile);
+  }
+  const cached = byFile.get(filePath);
+  if (cached) return cached;
+
+  const state = analyzePostgresTemporaryRelationVisibility(
+    context.readFile(filePath) ?? '',
+    context.getNodesInFile(filePath),
+    positions
+  );
+  byFile.set(filePath, state);
+  return state;
+}
+
 export function matchPostgresReference(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -368,8 +432,24 @@ export function matchPostgresReference(
   if (ref.language !== 'postgres') return null;
 
   const isCallable = ref.referenceKind === 'calls' || ref.referenceKind === 'function_ref';
+  const positions = postgresSearchPathState(context, ref.filePath);
+  const refOffset = postgresOffsetAtPosition(positions, ref.line, ref.column);
+  let temporaryVisibility: PostgresTemporaryRelationVisibilityState | null = null;
   const eligible = (node: Node): boolean => {
     if (node.language !== 'postgres') return false;
+    // `pg_temp` is a per-session alias. A temp object extracted from another
+    // migration file cannot safely satisfy this file's reference.
+    if (node.decorators?.includes('postgres:temporary') === true) {
+      if (node.filePath !== ref.filePath) return false;
+      temporaryVisibility ??= postgresTemporaryVisibilityState(
+        context,
+        ref.filePath,
+        positions
+      );
+      if (!postgresTemporaryRelationVisibleAt(temporaryVisibility, node.id, refOffset)) {
+        return false;
+      }
+    }
     if (isCallable) {
       return node.kind === 'function' && (
         node.decorators?.includes('postgres:function') === true ||
@@ -379,23 +459,64 @@ export function matchPostgresReference(
     return node.kind === 'struct';
   };
 
-  const isQualified = ref.referenceName.includes('::') || ref.referenceName.includes('.');
-  const candidates = (isQualified
-    ? context.getNodesByQualifiedName(ref.referenceName)
-    : context.getNodesByName(ref.referenceName)
-  ).filter(eligible);
-  if (candidates.length === 0) return null;
+  const parsedReference = parsePostgresQualifiedName(ref.referenceName);
+  const referenceSimple = parsedReference?.[parsedReference.length - 1] ?? ref.referenceName;
+  const isQualified = ref.referenceName.includes('::') ||
+    isPostgresQualifiedName(ref.referenceName);
+  const pick = (candidates: Node[]): Node | undefined => {
+    const sameFile = candidates.filter((node) => node.filePath === ref.filePath);
+    if (sameFile.length === 1) return sameFile[0];
+    if (sameFile.length > 1) return undefined;
+    return candidates.length === 1 ? candidates[0] : undefined;
+  };
 
-  const sameFile = candidates.filter((node) => node.filePath === ref.filePath);
   let target: Node | undefined;
-  if (sameFile.length === 1) {
-    target = sameFile[0];
-  } else if (sameFile.length > 1) {
-    return null;
-  } else if (candidates.length === 1) {
-    target = candidates[0];
+  if (isQualified) {
+    const candidates = context.getNodesByQualifiedName(ref.referenceName).filter(eligible);
+    target = pick(candidates);
   } else {
-    return null;
+    const searchPath = sharedPostgresSearchPathAtOffset(positions, refOffset);
+    let foundInSearchPath = false;
+    if (!isCallable) {
+      const temporaryName = qualifyPostgresName('pg_temp', ref.referenceName);
+      const temporaryCandidates = temporaryName
+        ? context.getNodesByQualifiedName(temporaryName).filter(eligible)
+        : [];
+      if (temporaryCandidates.length > 0) {
+        foundInSearchPath = true;
+        target = pick(temporaryCandidates);
+      }
+    }
+    for (const schema of searchPath.schemas) {
+      if (foundInSearchPath) break;
+      // The runtime role behind $user is unknowable from source. It shadows
+      // later schemas when present, so choosing a later candidate would invent
+      // certainty; leave the reference unresolved instead.
+      if (schema === '$user') {
+        foundInSearchPath = true;
+        break;
+      }
+      const qualified = qualifyPostgresName(schema, ref.referenceName);
+      const schemaCandidates = [
+        ...(qualified ? context.getNodesByQualifiedName(qualified) : []),
+        ...context.getNodesByQualifiedName(`${schema}::${ref.referenceName}`),
+      ].filter(eligible);
+      if (schemaCandidates.length === 0) continue;
+      // The first schema containing the name shadows every later schema. If
+      // that schema has duplicate historical definitions, preserve ambiguity.
+      foundInSearchPath = true;
+      target = pick(schemaCandidates);
+      break;
+    }
+
+    if (!target && !foundInSearchPath) {
+      const candidates = context.getNodesByName(referenceSimple).filter(eligible);
+      // Never jump to a qualified schema outside the active path. A uniquely
+      // unqualified declaration is retained for extractor backward
+      // compatibility (CREATE TABLE users before schema-aware declarations).
+      const fallback = candidates.filter((node) => node.qualifiedName === ref.referenceName);
+      target = pick(fallback);
+    }
   }
   if (!target) return null;
 
@@ -1243,6 +1364,7 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 /** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
 export function clearNameMatcherMemos(context: ResolutionContext): void {
   INFER_SCAN_STATES.delete(context);
+  POSTGRES_SEARCH_PATH_CACHE.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {

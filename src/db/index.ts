@@ -112,9 +112,12 @@ export class DatabaseConnection {
       runMigrations(db, currentVersion);
     }
 
-    // Self-heal a bulk-load window that never closed (crash between
-    // beginBulkNodeLoad and endBulkNodeLoad): the FTS triggers are missing and
-    // nodes_fts is stale. Rebuild + recreate so search stays in sync.
+    // Self-heal bulk-load windows that never closed. A process can die after
+    // dropping secondary indexes or FTS triggers but before the corresponding
+    // endBulk*Load call recreates them. Schema migrations will not help when
+    // the database already records the current version, so repair the missing
+    // schema objects explicitly on every reopen.
+    conn.healBulkLoadIndexes();
     conn.healBulkNodeLoad();
 
     return conn;
@@ -279,12 +282,13 @@ export class DatabaseConnection {
     'idx_edges_source_kind',
     'idx_edges_target_kind',
     'idx_edges_provenance',
+    'idx_edges_synthesized_by',
   ] as const;
 
   /**
    * Enter bulk-edge-load mode: drop the non-unique edge indexes so the mass
    * INSERT OR IGNORE stream pays one B-tree (the identity index) instead of
-   * five — measured 2.8s → 1.1s inserting a 224k-edge resolution set, with
+   * six — measured 2.8s → 1.1s inserting a 224k-edge resolution set, with
    * recreation costing ~0.3s. MUST be paired with endBulkEdgeLoad(); a crash
    * inside the window is healed on the next DatabaseConnection open (schema.sql
    * re-applies CREATE INDEX IF NOT EXISTS).
@@ -316,6 +320,34 @@ export class DatabaseConnection {
       if (!m) throw new Error(`schema.sql: edge index ${idx} not found for bulk-load recreation`);
       this.db.exec(m[0]);
       await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /**
+   * Recreate secondary indexes left missing by any interrupted bulk-load
+   * window. Only indexes deliberately dropped by beginBulk*Load are eligible:
+   * this keeps open() from silently masking unrelated schema corruption while
+   * covering the parse, reference-resolution, and edge-load windows together.
+   */
+  private healBulkLoadIndexes(): void {
+    const expected = new Set<string>([
+      ...DatabaseConnection.BULK_PARSE_INDEX_NAMES,
+      ...DatabaseConnection.BULK_REF_INDEX_NAMES,
+      ...DatabaseConnection.BULK_EDGE_INDEX_NAMES,
+    ]);
+    const rows = this.db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+      .all() as Array<{ name: string }>;
+    const existing = new Set(rows.map((row) => row.name));
+    const missing = [...expected].filter((name) => !existing.has(name));
+    if (missing.length === 0) return;
+
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    for (const idx of missing) {
+      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
+      if (!m) throw new Error(`schema.sql: index ${idx} not found for bulk-load recovery`);
+      this.db.exec(m[0]);
     }
   }
 

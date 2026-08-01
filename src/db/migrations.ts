@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 8;
+export const CURRENT_SCHEMA_VERSION = 9;
 
 /**
  * Migration definition
@@ -147,6 +147,18 @@ const migrations: Migration[] = [
       db.exec(`
         CREATE INDEX IF NOT EXISTS idx_unresolved_status ON unresolved_refs(status);
         CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail ON unresolved_refs(name_tail) WHERE status = 'failed';
+      `);
+    },
+  },
+  {
+    version: 9,
+    description:
+      'Index synthesized edge ownership so incremental relationship refreshes avoid full edge-table scans',
+    up: (db) => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_edges_synthesized_by
+          ON edges(json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy'))
+          WHERE json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy') IS NOT NULL;
       `);
     },
   },

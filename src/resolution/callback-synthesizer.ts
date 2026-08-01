@@ -3590,7 +3590,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
 ];
 
-/** Fixed non-registry steps: goMethodContains, goImplements, dedupe-merge, insertMergedEdges. */
+/** Fixed non-registry steps: Go relationships, merge, and insert. */
 const FIXED_SYNTH_STEPS = 4;
 export const SYNTH_PROGRESS_STEPS = SYNTH_PASSES.length + FIXED_SYNTH_STEPS;
 export async function synthesizeCallbackEdges(

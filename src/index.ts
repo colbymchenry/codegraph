@@ -932,6 +932,17 @@ export class CodeGraph {
           await this.resolver.resolveDeferredThisMemberRefs();
         }
 
+        // Whole-graph FK edges can have both endpoints in unchanged CREATE
+        // migrations while their owning ALTER migration is the only file that
+        // changed. Scoped sync resolution therefore refreshes this owned edge
+        // set explicitly; node-cascade deletion alone cannot remove it.
+        // Scoped resolution does not run the whole-graph exact FK projection;
+        // batched resolution does, but this call is still cheap there because
+        // the persisted state fingerprint makes it a no-write fast path. Run
+        // it even on a no-change sync so a process killed after the store phase
+        // is healed deterministically on the next sync.
+        await this.resolver.refreshPostgresForeignKeys();
+
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         // Off-thread — see indexAll's call site.
         if (filesChanged || result.filesRemoved > 0 || orphanCount > 0) {
@@ -1149,7 +1160,12 @@ export class CodeGraph {
   resolveReferences(onProgress?: (current: number, total: number) => void): ResolutionResult {
     // Get all unresolved references from the database
     const unresolvedRefs = this.queries.getUnresolvedReferences();
-    return this.resolver.resolveAndPersist(unresolvedRefs, onProgress);
+    const result = this.resolver.resolveAndPersist(unresolvedRefs, onProgress);
+    // Keep the synchronous API's result immediately traversable, just like the
+    // batched/full-index path. PostgreSQL FK table edges depend on both resolved
+    // endpoint refs and therefore cannot be emitted during extraction.
+    this.resolver.refreshPostgresForeignKeysSync();
+    return result;
   }
 
   /**
@@ -1274,6 +1290,11 @@ export class CodeGraph {
    */
   getNodesByName(name: string): Node[] {
     return this.queries.getNodesByName(name);
+  }
+
+  /** Exact qualified-name lookup using the dedicated database index. */
+  getNodesByQualifiedName(qualifiedName: string): Node[] {
+    return this.queries.getNodesByQualifiedNameExact(qualifiedName);
   }
 
   /** Nodes whose name starts with `prefix` (index range scan, capped). */

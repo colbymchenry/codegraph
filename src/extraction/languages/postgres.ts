@@ -1,5 +1,31 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import type { Node, NodeKind } from '../../types';
+import {
+  POSTGRES_FOREIGN_KEY_DECORATOR,
+  encodePostgresForeignKeyDescriptor,
+  type PostgresForeignKeyDescriptor,
+} from '../../postgres/foreign-key';
+import {
+  appendPostgresIdentifier,
+  parsePostgresQualifiedName,
+  serializePostgresQualifiedName,
+} from '../../postgres/identifiers';
+import {
+  analyzePostgresSearchPath,
+  postgresSearchPathAtOffset,
+  type PostgresSearchPathState,
+} from '../../postgres/search-path';
+import {
+  analyzePostgresTemporaryRelationVisibility,
+  postgresTemporaryRelationVisibleAt,
+  type PostgresTemporaryRelationVisibilityState,
+} from '../../postgres/temporary-relations';
+import {
+  POSTGRES_TABLE_RELATION_DECORATOR,
+  encodePostgresTableRelationDescriptor,
+  type PostgresTableRelationDescriptor,
+  type PostgresTableRelationKind,
+} from '../../postgres/table-relation';
 import { getNodeText } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 
@@ -30,6 +56,16 @@ const NAME_SEGMENT_TYPES = new Set(['ColId', 'ColLabel', 'type_function_name']);
 
 /** Per-extraction reference de-duplication. `ctx.nodes` is stable for a file. */
 const emittedReferenceKeys = new WeakMap<readonly object[], Set<string>>();
+const extractionSearchPaths = new WeakMap<readonly object[], PostgresSearchPathState>();
+interface ExtractionTemporaryVisibilityCache {
+  scannedNodeCount: number;
+  candidates: Node[];
+  state: PostgresTemporaryRelationVisibilityState;
+}
+const extractionTemporaryVisibility = new WeakMap<
+  readonly object[],
+  ExtractionTemporaryVisibilityCache
+>();
 
 function children(node: SyntaxNode): SyntaxNode[] {
   const result: SyntaxNode[] = [];
@@ -67,6 +103,15 @@ function allDescendants(node: SyntaxNode, type: string): SyntaxNode[] {
   };
   visit(node);
   return result;
+}
+
+function nearestAncestor(node: SyntaxNode, ...types: string[]): SyntaxNode | null {
+  let ancestor = node.parent;
+  while (ancestor) {
+    if (types.includes(ancestor.type)) return ancestor;
+    ancestor = ancestor.parent;
+  }
+  return null;
 }
 
 function hasDirectChild(node: SyntaxNode, type: string): boolean {
@@ -107,35 +152,177 @@ function readSqlName(node: SyntaxNode | null, source: string): SqlName | null {
 
   visit(node);
   if (parts.length === 0) return null;
+  return sqlNameFromParts(parts);
+}
+
+function sqlNameFromParts(parts: string[]): SqlName {
   return {
     parts,
-    qualified: parts.join('.'),
+    qualified: serializePostgresQualifiedName(parts),
     simple: parts[parts.length - 1]!,
   };
 }
 
-function nestedSchema(node: SyntaxNode, source: string): string | null {
+interface NestedSchema {
+  found: boolean;
+  name: SqlName | null;
+}
+
+function schemaName(node: SyntaxNode, source: string): SqlName | null {
+  return readSqlName(directChild(node, 'ColId', 'opt_single_name', 'RoleSpec'), source);
+}
+
+function nestedSchema(node: SyntaxNode, source: string): NestedSchema {
   let parent = node.parent;
   while (parent) {
     if (parent.type === 'CreateSchemaStmt') {
-      const nameNode = directChild(parent, 'ColId', 'opt_single_name');
-      return readSqlName(nameNode, source)?.qualified ?? null;
+      return { found: true, name: schemaName(parent, source) };
     }
     parent = parent.parent;
   }
-  return null;
+  return { found: false, name: null };
 }
 
-function objectName(node: SyntaxNode, nameNode: SyntaxNode | null, source: string): SqlName | null {
-  const name = readSqlName(nameNode, source);
+function searchPathState(ctx: ExtractorContext): PostgresSearchPathState {
+  let state = extractionSearchPaths.get(ctx.nodes);
+  if (!state) {
+    state = analyzePostgresSearchPath(ctx.source);
+    extractionSearchPaths.set(ctx.nodes, state);
+  }
+  return state;
+}
+
+/**
+ * Extraction appends to `ctx.nodes`. Scan each appended node once and rebuild
+ * the source timeline only when a new temporary declaration appears; relation
+ * lookups must not rescan a large SQL file for every statement.
+ */
+function temporaryVisibilityState(ctx: ExtractorContext): ExtractionTemporaryVisibilityCache {
+  let cached = extractionTemporaryVisibility.get(ctx.nodes);
+  if (!cached) {
+    cached = {
+      scannedNodeCount: 0,
+      candidates: [],
+      state: { changesByNodeId: new Map() },
+    };
+    extractionTemporaryVisibility.set(ctx.nodes, cached);
+  }
+
+  let addedTemporary = false;
+  for (let index = cached.scannedNodeCount; index < ctx.nodes.length; index++) {
+    const candidate = ctx.nodes[index]!;
+    if (candidate.language === 'postgres' &&
+      candidate.filePath === ctx.filePath &&
+      candidate.decorators?.includes('postgres:temporary') === true) {
+      cached.candidates.push(candidate);
+      addedTemporary = true;
+    }
+  }
+  cached.scannedNodeCount = ctx.nodes.length;
+  if (addedTemporary) {
+    cached.state = analyzePostgresTemporaryRelationVisibility(
+      ctx.source,
+      cached.candidates,
+      searchPathState(ctx)
+    );
+  }
+  return cached;
+}
+
+function visibleTemporaryCandidates(
+  ctx: ExtractorContext,
+  name: SqlName,
+  offset: number
+): Node[] {
+  const cached = temporaryVisibilityState(ctx);
+  if (cached.candidates.length === 0) return [];
+  const targetSchema = name.parts.length > 1 ? name.parts[0]! : null;
+  if (targetSchema !== null && targetSchema !== 'pg_temp' &&
+    !/^pg_temp_[0-9]+$/.test(targetSchema)) return [];
+
+  return cached.candidates.filter((candidate) => {
+    if (candidate.name !== name.simple) return false;
+    const parts = parsePostgresQualifiedName(candidate.qualifiedName);
+    if (!parts || parts.length < 2) return false;
+    if (targetSchema !== null &&
+      name.parts.slice(1).some((part, index) => part !== parts[index + 1])) return false;
+    return postgresTemporaryRelationVisibleAt(cached.state, candidate.id, offset);
+  });
+}
+
+function nameInSearchPathSchema(
+  name: SqlName,
+  positionNode: SyntaxNode,
+  ctx: ExtractorContext
+): SqlName {
+  if (name.parts.length > 1) return name;
+  const positions = searchPathState(ctx);
+  const path = postgresSearchPathAtOffset(positions, positionNode.startIndex);
+  const hasSameFileTemporary = visibleTemporaryCandidates(
+    ctx,
+    name,
+    positionNode.startIndex
+  ).length > 0;
+  if (hasSameFileTemporary) return sqlNameFromParts(['pg_temp', ...name.parts]);
+  if (path.schemas.length !== 1 || path.schemas[0] === '$user') return name;
+  const schema = path.schemas[0]!;
+  return sqlNameFromParts([schema, ...name.parts]);
+}
+
+function objectName(
+  node: SyntaxNode,
+  nameNode: SyntaxNode | null,
+  ctx: ExtractorContext
+): SqlName | null {
+  const name = readSqlName(nameNode, ctx.source);
   if (!name || name.parts.length > 1 || node.type === 'CreateSchemaStmt') return name;
-  const schema = nestedSchema(node, source);
-  if (!schema) return name;
-  return {
-    parts: [schema, ...name.parts],
-    qualified: `${schema}.${name.qualified}`,
-    simple: name.simple,
-  };
+  const nested = nestedSchema(node, ctx.source);
+  if (nested.found) {
+    // AUTHORIZATION CURRENT_USER has a runtime-only schema name. Keep nested
+    // declarations searchable but unqualified rather than falsely assigning
+    // them to the ambient/default search_path.
+    return nested.name
+      ? sqlNameFromParts([...nested.name.parts, ...name.parts])
+      : name;
+  }
+  return nameInSearchPathSchema(name, node, ctx);
+}
+
+function isTemporaryRelationName(name: SqlName | null): boolean {
+  const schema = name && name.parts.length > 1 ? name.parts[0]! : null;
+  return schema === 'pg_temp' || (schema !== null && /^pg_temp_[0-9]+$/.test(schema));
+}
+
+function hasTemporaryOption(node: SyntaxNode): boolean {
+  const options = directChild(node, 'OptTemp');
+  return options !== null && (
+    hasDirectChild(options, 'kw_temp') || hasDirectChild(options, 'kw_temporary')
+  );
+}
+
+/**
+ * PostgreSQL tables, views, and sequences share the temporary relation
+ * namespace.  TEMP declarations with an unqualified name live in the
+ * session's pg_temp schema; explicitly targeting pg_temp has the same
+ * semantics even when the TEMP keyword is omitted.
+ */
+function relationDeclarationName(
+  node: SyntaxNode,
+  nameNode: SyntaxNode | null,
+  ctx: ExtractorContext
+): { name: SqlName | null; temporary: boolean } {
+  const rawName = readSqlName(nameNode, ctx.source);
+  const temporary = hasTemporaryOption(node) || isTemporaryRelationName(rawName);
+  const name = temporary && rawName?.parts.length === 1
+    ? sqlNameFromParts(['pg_temp', ...rawName.parts])
+    : objectName(node, nameNode, ctx);
+  return { name, temporary };
+}
+
+function markTemporary(created: Node | null | undefined, temporary: boolean): void {
+  if (created && temporary && !created.decorators?.includes('postgres:temporary')) {
+    created.decorators = [...(created.decorators ?? []), 'postgres:temporary'];
+  }
 }
 
 function compactText(node: SyntaxNode, source: string, maxLength = 320): string {
@@ -168,7 +355,22 @@ function addReference(
     keys = new Set<string>();
     emittedReferenceKeys.set(ctx.nodes, keys);
   }
-  const key = `${fromNodeId}\u0000${kind}\u0000${target.qualified}`;
+  // Search-path segment is semantic in SQL: the same unqualified name on
+  // opposite sides of SET search_path can resolve to different schemas, while
+  // ordinary repeated reads within one segment remain de-duplicated.
+  const activePath = postgresSearchPathAtOffset(
+    searchPathState(ctx),
+    positionNode.startIndex
+  );
+  const temporaryBinding = visibleTemporaryCandidates(
+    ctx,
+    target,
+    positionNode.startIndex
+  ).map((candidate) => candidate.id).sort().join('\u001f');
+  const key = `${fromNodeId}\u0000${kind}\u0000${target.qualified}` +
+    `\u0000${activePath.explicit ? 'explicit' : 'default'}` +
+    `\u0000${activePath.schemas.join('\u001f')}` +
+    `\u0000temp:${temporaryBinding}`;
   if (keys.has(key)) return;
   keys.add(key);
 
@@ -190,7 +392,13 @@ function createDatabaseNode(
   qualifiedName = name.qualified,
   signature = compactText(node, ctx.source)
 ) {
-  return ctx.createNode(kind, name.simple, node, {
+  // Node IDs use the createNode `name` argument plus file/line. PostgreSQL can
+  // switch search_path and declare same-named objects more than once on a
+  // generated/minified line, so simple names are not a safe discriminator.
+  const idDiscriminator = `${qualifiedName}@${node.startPosition.row + 1}:` +
+    `${node.startPosition.column + 1}`;
+  return ctx.createNode(kind, idDiscriminator, node, {
+    name: name.simple,
     qualifiedName,
     signature,
     decorators: [`postgres:${objectKind}`],
@@ -211,8 +419,14 @@ function createColumn(
   const name = readSqlName(nameNode, ctx.source);
   if (!name) return;
   const parentQualified = parentQualifiedOverride ?? currentScopeQualifiedName(ctx);
-  ctx.createNode('field', name.simple, node, {
-    qualifiedName: parentQualified ? `${parentQualified}.${name.simple}` : name.qualified,
+  const qualifiedName = parentQualified
+    ? appendPostgresIdentifier(parentQualified, name.simple)
+    : name.qualified;
+  const idDiscriminator = `${qualifiedName}@${node.startPosition.row + 1}:` +
+    `${node.startPosition.column + 1}`;
+  ctx.createNode('field', idDiscriminator, node, {
+    name: name.simple,
+    qualifiedName,
     signature: compactText(node, ctx.source, 200),
     decorators: ['postgres:column'],
     isExported: true,
@@ -239,8 +453,14 @@ function createEnumMembers(node: SyntaxNode, ctx: ExtractorContext): void {
       ? raw.slice(1, -1).replace(/''/g, "'")
       : raw;
     if (!value) continue;
-    ctx.createNode('enum_member', value, literal, {
-      qualifiedName: parentQualified ? `${parentQualified}.${value}` : value,
+    const qualifiedName = parentQualified
+      ? appendPostgresIdentifier(parentQualified, value)
+      : serializePostgresQualifiedName([value]);
+    const idDiscriminator = `${qualifiedName}@${literal.startPosition.row + 1}:` +
+      `${literal.startPosition.column + 1}`;
+    ctx.createNode('enum_member', idDiscriminator, literal, {
+      name: value,
+      qualifiedName,
       signature: raw,
       decorators: ['postgres:enum-value'],
       isExported: true,
@@ -262,6 +482,80 @@ function withCreatedScope(
   }
 }
 
+function createTableRelationFact(
+  ctx: ExtractorContext,
+  clause: SyntaxNode,
+  sourceTable: SqlName,
+  targetTable: SqlName,
+  relation: PostgresTableRelationKind,
+  sourcePosition: SyntaxNode,
+  targetPosition: SyntaxNode,
+  extra: Pick<PostgresTableRelationDescriptor, 'mode' | 'triggerName'> = {}
+): void {
+  const descriptor: PostgresTableRelationDescriptor = {
+    relation,
+    sourceTable: sourceTable.qualified,
+    targetTable: targetTable.qualified,
+    ...extra,
+  };
+  const label = `${relation.toUpperCase()} → ${targetTable.qualified}`;
+  const identity = `${label} @${clause.startPosition.row + 1}:` +
+    `${clause.startPosition.column + 1}`;
+  const created = ctx.createNode('constant', `${sourceTable.qualified}.${identity}`, clause, {
+    name: label,
+    qualifiedName: appendPostgresIdentifier(sourceTable.qualified, identity),
+    signature: compactText(clause, ctx.source),
+    decorators: [
+      POSTGRES_TABLE_RELATION_DECORATOR,
+      encodePostgresTableRelationDescriptor(descriptor),
+    ],
+    isExported: true,
+  });
+  withCreatedScope(ctx, created, () => {
+    if (!created) return;
+    addReference(ctx, created.id, sourceTable, 'references', sourcePosition);
+    addReference(ctx, created.id, targetTable, 'references', targetPosition);
+  });
+}
+
+function createTableDeclarationRelations(
+  node: SyntaxNode,
+  ctx: ExtractorContext,
+  sourceTable: SqlName,
+  sourcePosition: SyntaxNode
+): void {
+  const directNames = children(node).filter((child) => child.type === 'qualified_name');
+  if (hasDirectChild(node, 'kw_partition') && hasDirectChild(node, 'kw_of')) {
+    const targetNode = directNames.find((candidate) => candidate.startIndex > sourcePosition.endIndex);
+    const target = readSqlName(targetNode ?? null, ctx.source);
+    if (targetNode && target) {
+      createTableRelationFact(
+        ctx, node, sourceTable, target, 'partition-of', sourcePosition, targetNode
+      );
+    }
+  }
+
+  const inheritance = directChild(node, 'OptInherit');
+  if (inheritance) {
+    for (const targetNode of allDescendants(inheritance, 'qualified_name')) {
+      const target = readSqlName(targetNode, ctx.source);
+      if (target) {
+        createTableRelationFact(
+          ctx, targetNode, sourceTable, target, 'inherits', sourcePosition, targetNode
+        );
+      }
+    }
+  }
+
+  for (const like of allDescendants(node, 'TableLikeClause')) {
+    const targetNode = directChild(like, 'qualified_name');
+    const target = readSqlName(targetNode, ctx.source);
+    if (targetNode && target) {
+      createTableRelationFact(ctx, like, sourceTable, target, 'like', sourcePosition, targetNode);
+    }
+  }
+}
+
 function createTableLike(
   node: SyntaxNode,
   ctx: ExtractorContext,
@@ -269,10 +563,12 @@ function createTableLike(
   objectKind: string,
   explicitColumnsContainer?: SyntaxNode | null
 ): boolean {
-  const name = objectName(node, nameNode, ctx.source);
+  const { name, temporary } = relationDeclarationName(node, nameNode, ctx);
   if (!name) return true;
   const created = createDatabaseNode(ctx, node, name, 'struct', objectKind);
+  markTemporary(created, temporary);
   withCreatedScope(ctx, created, () => {
+    if (nameNode) createTableDeclarationRelations(node, ctx, name, nameNode);
     createExplicitColumns(explicitColumnsContainer ?? node, ctx);
     walkChildren(node, ctx);
   });
@@ -290,7 +586,7 @@ function routineSignature(node: SyntaxNode, name: SqlName, source: string): stri
 }
 
 function createRoutine(node: SyntaxNode, ctx: ExtractorContext): boolean {
-  const name = objectName(node, directChild(node, 'func_name'), ctx.source);
+  const name = objectName(node, directChild(node, 'func_name'), ctx);
   if (!name) return true;
   const objectKind = hasDirectChild(node, 'kw_procedure') ? 'procedure' : 'function';
   const created = createDatabaseNode(
@@ -308,7 +604,7 @@ function createRoutine(node: SyntaxNode, ctx: ExtractorContext): boolean {
 
 function createType(node: SyntaxNode, ctx: ExtractorContext): boolean {
   if (!hasDirectChild(node, 'kw_type')) return false;
-  const name = objectName(node, directChild(node, 'any_name'), ctx.source);
+  const name = objectName(node, directChild(node, 'any_name'), ctx);
   if (!name) return true;
   const isEnum = hasDirectChild(node, 'kw_enum');
   const created = createDatabaseNode(
@@ -326,7 +622,7 @@ function createType(node: SyntaxNode, ctx: ExtractorContext): boolean {
 }
 
 function createDomain(node: SyntaxNode, ctx: ExtractorContext): boolean {
-  const name = objectName(node, directChild(node, 'any_name'), ctx.source);
+  const name = objectName(node, directChild(node, 'any_name'), ctx);
   if (!name) return true;
   const created = createDatabaseNode(ctx, node, name, 'type_alias', 'domain');
   withCreatedScope(ctx, created, () => walkChildren(node, ctx));
@@ -334,8 +630,11 @@ function createDomain(node: SyntaxNode, ctx: ExtractorContext): boolean {
 }
 
 function createSchema(node: SyntaxNode, ctx: ExtractorContext): boolean {
-  const name = objectName(node, directChild(node, 'ColId', 'opt_single_name'), ctx.source);
-  if (!name) return true;
+  const name = schemaName(node, ctx.source);
+  if (!name) {
+    walkChildren(node, ctx);
+    return true;
+  }
   const created = createDatabaseNode(ctx, node, name, 'namespace', 'schema');
   withCreatedScope(ctx, created, () => walkChildren(node, ctx));
   return true;
@@ -347,8 +646,9 @@ function createTrigger(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const tableName = readSqlName(tableNode, ctx.source);
   if (!triggerName) return true;
 
-  const qualifiedName = tableName
-    ? `${tableName.qualified}.${triggerName.simple}`
+  const displayTableName = tableName ? nameInSearchPathSchema(tableName, node, ctx) : null;
+  const qualifiedName = displayTableName
+    ? appendPostgresIdentifier(displayTableName.qualified, triggerName.simple)
     : triggerName.qualified;
   const created = createDatabaseNode(
     ctx,
@@ -361,6 +661,26 @@ function createTrigger(node: SyntaxNode, ctx: ExtractorContext): boolean {
   withCreatedScope(ctx, created, () => {
     if (created && tableNode && tableName) {
       addReference(ctx, created.id, tableName, 'references', tableNode);
+    }
+    const constraintSource = directChild(node, 'OptConstrFromTable');
+    const sourceTableNode = constraintSource
+      ? directChild(constraintSource, 'qualified_name')
+      : null;
+    const sourceTable = readSqlName(sourceTableNode, ctx.source);
+    if (created && sourceTableNode && sourceTable) {
+      addReference(ctx, created.id, sourceTable, 'references', sourceTableNode);
+    }
+    if (tableNode && displayTableName && sourceTableNode && sourceTable) {
+      createTableRelationFact(
+        ctx,
+        constraintSource ?? node,
+        displayTableName,
+        sourceTable,
+        'constraint-trigger',
+        tableNode,
+        sourceTableNode,
+        { triggerName: triggerName.simple }
+      );
     }
     const routineNode = directChild(node, 'func_name');
     const routineName = readSqlName(routineNode, ctx.source);
@@ -377,8 +697,9 @@ function createPolicy(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const tableNode = directChild(node, 'qualified_name');
   const tableName = readSqlName(tableNode, ctx.source);
   if (!policyName) return true;
-  const qualifiedName = tableName
-    ? `${tableName.qualified}.${policyName.simple}`
+  const displayTableName = tableName ? nameInSearchPathSchema(tableName, node, ctx) : null;
+  const qualifiedName = displayTableName
+    ? appendPostgresIdentifier(displayTableName.qualified, policyName.simple)
     : policyName.qualified;
   const created = createDatabaseNode(
     ctx,
@@ -406,10 +727,13 @@ function createIndex(node: SyntaxNode, ctx: ExtractorContext): boolean {
     walkChildren(node, ctx);
     return true;
   }
-  const schema = tableName && tableName.parts.length > 1
-    ? tableName.parts.slice(0, -1).join('.')
+  const displayTableName = tableName ? nameInSearchPathSchema(tableName, node, ctx) : null;
+  const schema = displayTableName && displayTableName.parts.length > 1
+    ? serializePostgresQualifiedName(displayTableName.parts.slice(0, -1))
     : null;
-  const qualifiedName = schema ? `${schema}.${rawName.simple}` : rawName.qualified;
+  const qualifiedName = schema
+    ? appendPostgresIdentifier(schema, rawName.simple)
+    : rawName.qualified;
   const created = createDatabaseNode(
     ctx,
     node,
@@ -423,9 +747,14 @@ function createIndex(node: SyntaxNode, ctx: ExtractorContext): boolean {
 }
 
 function createSequence(node: SyntaxNode, ctx: ExtractorContext): boolean {
-  const name = objectName(node, directChild(node, 'qualified_name'), ctx.source);
+  const { name, temporary } = relationDeclarationName(
+    node,
+    directChild(node, 'qualified_name'),
+    ctx
+  );
   if (!name) return true;
   const created = createDatabaseNode(ctx, node, name, 'variable', 'sequence');
+  markTemporary(created, temporary);
   withCreatedScope(ctx, created, () => walkChildren(node, ctx));
   return true;
 }
@@ -438,6 +767,147 @@ function createExtension(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true;
 }
 
+function columnNames(container: SyntaxNode | null, source: string): string[] {
+  if (!container) return [];
+  const result: string[] = [];
+  for (const column of allDescendants(container, 'columnElem')) {
+    const name = readSqlName(column, source);
+    if (name) result.push(name.simple);
+  }
+  return result;
+}
+
+function foreignKeyAction(
+  text: string,
+  event: 'DELETE' | 'UPDATE'
+): PostgresForeignKeyDescriptor['onDelete'] {
+  const match = new RegExp(
+    `\\bON\\s+${event}\\s+(NO\\s+ACTION|RESTRICT|CASCADE|SET\\s+NULL|SET\\s+DEFAULT)\\b`,
+    'i'
+  ).exec(text);
+  return match?.[1]
+    ? match[1].replace(/\s+/g, ' ').toLowerCase() as PostgresForeignKeyDescriptor['onDelete']
+    : undefined;
+}
+
+/**
+ * Create a durable constraint fact instead of attributing REFERENCES to the
+ * migration file. The constraint points at both endpoint relations; a
+ * post-resolution pass turns those two exact facts into a direct table edge.
+ */
+function createForeignKey(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const marker = directChild(node, 'kw_references');
+  if (!marker || (node.type === 'ConstraintElem' && !hasDirectChild(node, 'kw_foreign'))) {
+    walkChildren(node, ctx);
+    return true;
+  }
+
+  const targetNode = children(node).find(
+    (child) => child.type === 'qualified_name' && child.startIndex > marker.endIndex
+  ) ?? null;
+  const target = readSqlName(targetNode, ctx.source);
+  if (!targetNode || !target) {
+    walkChildren(node, ctx);
+    return true;
+  }
+
+  const alter = nearestAncestor(node, 'AlterTableStmt');
+  const alterRelation = alter ? directChild(alter, 'relation_expr') : null;
+  const alterTableNode = alterRelation ? firstDescendant(alterRelation, 'qualified_name') : null;
+  const rawAlterTable = readSqlName(alterTableNode, ctx.source);
+  const alterTable = rawAlterTable && alter
+    ? nameInSearchPathSchema(rawAlterTable, alter, ctx)
+    : rawAlterTable;
+  const scope = currentScopeNode(ctx);
+  const scopeIsTable = scope?.language === 'postgres' && scope.kind === 'struct' &&
+    (scope.decorators?.includes('postgres:table') === true ||
+      scope.decorators?.includes('postgres:foreign-table') === true);
+  const sourceTable: SqlName | null = alterTable ?? (scopeIsTable && scope ? {
+    parts: parsePostgresQualifiedName(scope.qualifiedName) ?? [scope.qualifiedName],
+    qualified: scope.qualifiedName,
+    simple: scope.name,
+  } : null);
+  if (!sourceTable) {
+    walkChildren(node, ctx);
+    return true;
+  }
+
+  const wrapper = nearestAncestor(node, 'TableConstraint', 'ColConstraint');
+  const constraintName = readSqlName(wrapper ? directChild(wrapper, 'name') : null, ctx.source);
+  let sourceColumns: string[];
+  if (node.type === 'ConstraintElem') {
+    sourceColumns = columnNames(directChild(node, 'columnList'), ctx.source);
+  } else {
+    const column = nearestAncestor(node, 'columnDef');
+    const columnName = readSqlName(column ? directChild(column, 'ColId') : null, ctx.source);
+    sourceColumns = columnName ? [columnName.simple] : [];
+  }
+
+  const targetColumnsContainer = children(node).find(
+    (child) => child.startIndex >= targetNode.endIndex &&
+      (child.type === 'opt_column_and_period_list' || child.type === 'opt_column_list')
+  ) ?? null;
+  const targetColumns = columnNames(targetColumnsContainer, ctx.source);
+  const raw = getNodeText(nearestAncestor(node, 'alter_table_cmd') ?? wrapper ?? node, ctx.source);
+  const compact = raw.replace(/\s+/g, ' ').trim();
+  const matchType = /\bMATCH\s+(FULL|PARTIAL|SIMPLE)\b/i.exec(compact)?.[1]?.toLowerCase() as
+    PostgresForeignKeyDescriptor['match'];
+  const initially = /\bINITIALLY\s+(DEFERRED|IMMEDIATE)\b/i.exec(compact)?.[1]?.toLowerCase() as
+    PostgresForeignKeyDescriptor['initially'];
+  const onDelete = foreignKeyAction(compact, 'DELETE');
+  const onUpdate = foreignKeyAction(compact, 'UPDATE');
+  const descriptor: PostgresForeignKeyDescriptor = {
+    sourceTable: sourceTable.qualified,
+    targetTable: target.qualified,
+    ...(constraintName ? { constraintName: constraintName.simple } : {}),
+    sourceColumns,
+    targetColumns,
+    ...(matchType ? { match: matchType } : {}),
+    ...(onDelete ? { onDelete } : {}),
+    ...(onUpdate ? { onUpdate } : {}),
+    ...(/\bNOT\s+DEFERRABLE\b/i.test(compact)
+      ? { deferrable: false }
+      : /\bDEFERRABLE\b/i.test(compact)
+        ? { deferrable: true }
+        : {}),
+    ...(initially ? { initially } : {}),
+    ...(/\bNOT\s+VALID\b/i.test(compact) ? { notValid: true } : {}),
+  };
+
+  const sourceLabel = sourceColumns.length > 0 ? sourceColumns.join(', ') : '?';
+  const simple = constraintName?.simple ?? `FOREIGN KEY (${sourceLabel})`;
+  const qualifiedIdentity = constraintName?.simple ??
+    `FOREIGN KEY (${sourceLabel}) -> ${target.qualified} ` +
+      `@${node.startPosition.row + 1}:${node.startPosition.column + 1}`;
+  const name: SqlName = {
+    parts: [...sourceTable.parts, qualifiedIdentity],
+    qualified: appendPostgresIdentifier(sourceTable.qualified, qualifiedIdentity),
+    simple,
+  };
+  const idDiscriminator = `${sourceTable.qualified}.${qualifiedIdentity} ` +
+    `@${node.startPosition.row + 1}:${node.startPosition.column + 1}`;
+  // createNode's stable ID is based on its `name` argument and start line. Use
+  // the disambiguated identity there, then retain the human-facing name in the
+  // stored node. Generated/minified DDL can declare two anonymous constraints
+  // on one line; using `simple` for the ID would silently collapse one of them.
+  const created = ctx.createNode('constant', idDiscriminator, wrapper ?? node, {
+    name: simple,
+    qualifiedName: name.qualified,
+    signature: compactText(wrapper ?? node, ctx.source),
+    decorators: [
+      POSTGRES_FOREIGN_KEY_DECORATOR,
+      encodePostgresForeignKeyDescriptor(descriptor),
+    ],
+    isExported: true,
+  });
+  withCreatedScope(ctx, created, () => {
+    if (!created) return;
+    addReference(ctx, created.id, sourceTable, 'references', alterTableNode ?? node);
+    addReference(ctx, created.id, target, 'references', targetNode);
+  });
+  return true;
+}
+
 /**
  * Model ALTER TABLE ADD COLUMN as a migration delta rather than attaching the
  * new field to an arbitrary historical CREATE TABLE node. The delta references
@@ -445,15 +915,71 @@ function createExtension(node: SyntaxNode, ctx: ExtractorContext): boolean {
  * a future ordered-migration layer can fold these deltas into an effective
  * schema without changing the extracted facts.
  */
+function createAlterTableRelations(
+  node: SyntaxNode,
+  ctx: ExtractorContext,
+  tableName: SqlName,
+  tableNode: SyntaxNode
+): void {
+  const partition = directChild(node, 'partition_cmd');
+  if (partition) {
+    const childNode = directChild(partition, 'qualified_name');
+    const rawChild = readSqlName(childNode, ctx.source);
+    const child = rawChild ? nameInSearchPathSchema(rawChild, partition, ctx) : null;
+    const attach = hasDirectChild(partition, 'kw_attach');
+    const detach = hasDirectChild(partition, 'kw_detach');
+    if (childNode && child && (attach || detach)) {
+      const compact = compactText(partition, ctx.source).toLowerCase();
+      const mode = /\bconcurrently\b/.test(compact)
+        ? 'concurrently' as const
+        : /\bfinalize\b/.test(compact)
+          ? 'finalize' as const
+          : undefined;
+      createTableRelationFact(
+        ctx,
+        partition,
+        child,
+        tableName,
+        attach ? 'attach-partition' : 'detach-partition',
+        childNode,
+        tableNode,
+        mode ? { mode } : {}
+      );
+    }
+  }
+
+  const commands = directChild(node, 'alter_table_cmds');
+  if (!commands) return;
+  for (const command of allDescendants(commands, 'alter_table_cmd')) {
+    if (!hasDirectChild(command, 'kw_inherit')) continue;
+    const parentNode = directChild(command, 'qualified_name');
+    const parent = readSqlName(parentNode, ctx.source);
+    if (parentNode && parent) {
+      createTableRelationFact(
+        ctx,
+        command,
+        tableName,
+        parent,
+        hasDirectChild(command, 'kw_no') ? 'no-inherit' : 'inherit',
+        tableNode,
+        parentNode
+      );
+    }
+  }
+}
+
 function createAlterTableDeltas(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const relation = directChild(node, 'relation_expr');
   const tableNode = relation ? firstDescendant(relation, 'qualified_name') : null;
-  const tableName = readSqlName(tableNode, ctx.source);
+  const rawTableName = readSqlName(tableNode, ctx.source);
+  const tableName = rawTableName ? nameInSearchPathSchema(rawTableName, node, ctx) : null;
   const ownerId = currentScopeId(ctx);
   if (!tableNode || !tableName || !ownerId) {
     walkChildren(node, ctx);
     return true;
   }
+
+  createAlterTableRelations(node, ctx, tableName, tableNode);
 
   // Retain the statement-level dependency that ALTER TABLE emitted before
   // column deltas were modeled.
@@ -473,7 +999,7 @@ function createAlterTableDeltas(node: SyntaxNode, ctx: ExtractorContext): boolea
     const deltaSimple = `ADD COLUMN ${columnName.simple}`;
     const deltaName: SqlName = {
       parts: [...tableName.parts, deltaSimple],
-      qualified: `${tableName.qualified}.${deltaSimple}`,
+      qualified: appendPostgresIdentifier(tableName.qualified, deltaSimple),
       simple: deltaSimple,
     };
     const created = createDatabaseNode(
@@ -565,20 +1091,6 @@ function emitRelationReference(node: SyntaxNode, ctx: ExtractorContext): boolean
     return true;
   }
   addReference(ctx, fromNodeId, name, 'references', nameNode);
-  walkChildren(node, ctx);
-  return true;
-}
-
-function emitForeignKeyReference(node: SyntaxNode, ctx: ExtractorContext): boolean {
-  const fromNodeId = currentScopeId(ctx);
-  const marker = directChild(node, 'kw_references');
-  if (fromNodeId && marker) {
-    const targetNode = children(node).find(
-      (child) => child.type === 'qualified_name' && child.startIndex > marker.endIndex
-    ) ?? null;
-    const target = readSqlName(targetNode, ctx.source);
-    if (targetNode && target) addReference(ctx, fromNodeId, target, 'references', targetNode);
-  }
   walkChildren(node, ctx);
   return true;
 }
@@ -689,7 +1201,8 @@ export const postgresExtractor: LanguageExtractor = {
         const nameNode = directChild(node, 'ColId');
         const scope = currentScopeNode(ctx);
         const isTableColumn = scope?.decorators?.some(
-          (decorator) => decorator === 'postgres:table' || decorator === 'postgres:foreign-table'
+          (decorator) => decorator === 'postgres:table' ||
+            decorator === 'postgres:foreign-table'
         ) ?? false;
         if (nameNode && isTableColumn) createColumn(ctx, node, nameNode);
         walkChildren(node, ctx);
@@ -698,7 +1211,7 @@ export const postgresExtractor: LanguageExtractor = {
 
       case 'ConstraintElem':
       case 'ColConstraintElem':
-        return emitForeignKeyReference(node, ctx);
+        return createForeignKey(node, ctx);
 
       case 'relation_expr':
       case 'insert_target':

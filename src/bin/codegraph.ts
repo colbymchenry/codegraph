@@ -1095,8 +1095,9 @@ program
   .option('-p, --path <path>', 'Project path')
   .option('-l, --limit <number>', 'Maximum results', '10')
   .option('-k, --kind <kind>', 'Filter by node kind (function, class, etc.)')
+  .option('--language <language>', 'Filter by source language (for example postgres)')
   .option('-j, --json', 'Output as JSON')
-  .action(async (search: string, options: { path?: string; limit?: string; kind?: string; json?: boolean }) => {
+  .action(async (search: string, options: { path?: string; limit?: string; kind?: string; language?: string; json?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1112,6 +1113,7 @@ program
       const rawResults = cg.searchNodes(search, {
         limit,
         kinds: options.kind ? [options.kind as any] : undefined,
+        languages: options.language ? [options.language as any] : undefined,
       });
 
       // Mirror the MCP search down-rank so the CLI also surfaces the
@@ -1140,10 +1142,18 @@ program
           for (const result of results) {
             const node = result.node;
             const location = `${node.filePath}:${node.startLine}`;
+            const postgresKind = node.language === 'postgres'
+              ? node.decorators?.find((decorator: string) =>
+                decorator.startsWith('postgres:') &&
+                !decorator.startsWith('postgres:foreign-key-data:') &&
+                !decorator.startsWith('postgres:table-relation-data:')
+              )?.slice('postgres:'.length)
+              : undefined;
+            const displayName = node.language === 'postgres' ? node.qualifiedName : node.name;
 
             console.log(
-              chalk.cyan(node.kind.padEnd(12)) +
-              chalk.white(node.name)
+              chalk.cyan((postgresKind ?? node.kind).padEnd(12)) +
+              chalk.white(displayName)
             );
             console.log(chalk.dim(`  ${location}`));
             if (node.signature) {

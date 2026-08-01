@@ -51,6 +51,19 @@ function isLowValueFile(filePath: string): boolean {
 const SQLITE_PARAM_CHUNK_SIZE = 500;
 
 /**
+ * Non-empty searches apply JS-only scoring bonuses after SQLite returns the
+ * lexical matches. Every page must therefore rank the same raw candidate set:
+ * growing that set with `offset + limit` lets a later page discover a newly
+ * promoted result and causes duplicates/skips. Keep one fixed top-100 result
+ * window (the same maximum exposed by the MCP search tool); offsets at or past
+ * the window intentionally return no results.
+ *
+ * `searchNodesFTS` over-fetches this by 5x, so the raw FTS universe is also
+ * fixed (500 rows) before global rescoring.
+ */
+const SEARCH_RANKING_WINDOW = 100;
+
+/**
  * Database row types (snake_case from SQLite)
  */
 interface NodeRow {
@@ -213,6 +226,7 @@ export class QueryBuilder {
     insertEdge?: SqliteStatement;
     upsertFile?: SqliteStatement;
     deleteEdgesBySource?: SqliteStatement;
+    deleteEdgesBySynthesizer?: SqliteStatement;
     deleteEdgesByTarget?: SqliteStatement;
     getEdgesBySource?: SqliteStatement;
     getEdgesByTarget?: SqliteStatement;
@@ -1062,6 +1076,14 @@ export class QueryBuilder {
     }
   }
 
+  /** Stream every node for one language in stable ID order. */
+  *iterateNodesByLanguage(language: Language): IterableIterator<Node> {
+    const stmt = this.db.prepare('SELECT * FROM nodes WHERE language = ? ORDER BY id');
+    for (const row of stmt.iterate(language)) {
+      yield rowToNode(row as NodeRow);
+    }
+  }
+
   /**
    * Get all nodes in the database
    */
@@ -1087,6 +1109,100 @@ export class QueryBuilder {
     );
     for (const row of stmt.iterate(language, `"${decorator}"`)) {
       yield rowToNode(row as NodeRow);
+    }
+  }
+
+  /**
+   * Stable, single-query state stream for a decorator-owned relationship
+   * synthesizer. Includes each fact's encoded data and its currently resolved
+   * reference endpoints, avoiding an N+1 edge lookup merely to decide whether
+   * an incremental refresh has any work to do.
+   */
+  *iterateDecoratorReferenceState(
+    language: Language,
+    decorator: string
+  ): IterableIterator<{
+    nodeId: string;
+    decorators: string;
+    targetId: string | null;
+    edgeMetadata: string | null;
+    targetQualifiedName: string | null;
+    targetKind: string | null;
+    targetLanguage: string | null;
+    targetDecorators: string | null;
+  }> {
+    const stmt = this.db.prepare(`
+      SELECT
+        n.id AS node_id,
+        n.decorators AS decorators,
+        e.target AS target_id,
+        e.metadata AS edge_metadata,
+        target.qualified_name AS target_qualified_name,
+        target.kind AS target_kind,
+        target.language AS target_language,
+        target.decorators AS target_decorators
+      FROM nodes n
+      LEFT JOIN edges e ON e.source = n.id AND e.kind = 'references'
+      LEFT JOIN nodes target ON target.id = e.target
+      WHERE n.language = ?
+        AND EXISTS (
+          SELECT 1 FROM json_each(
+            CASE WHEN json_valid(n.decorators) THEN n.decorators ELSE '[]' END
+          )
+          WHERE json_each.value = ?
+        )
+      ORDER BY n.id, e.target, e.id
+    `);
+    for (const row of stmt.iterate(language, decorator) as Iterable<{
+      node_id: string;
+      decorators: string;
+      target_id: string | null;
+      edge_metadata: string | null;
+      target_qualified_name: string | null;
+      target_kind: string | null;
+      target_language: string | null;
+      target_decorators: string | null;
+    }>) {
+      yield {
+        nodeId: row.node_id,
+        decorators: row.decorators,
+        targetId: row.target_id,
+        edgeMetadata: row.edge_metadata,
+        targetQualifiedName: row.target_qualified_name,
+        targetKind: row.target_kind,
+        targetLanguage: row.target_language,
+        targetDecorators: row.target_decorators,
+      };
+    }
+  }
+
+  /** Stream a synthesizer's indexed owned edge set in stable order. */
+  *iterateEdgesBySynthesizer(synthesizedBy: string): IterableIterator<{
+    source: string;
+    target: string;
+    kind: string;
+    metadata: string | null;
+    line: number | null;
+    col: number | null;
+    provenance: string | null;
+  }> {
+    const stmt = this.db.prepare(`
+      SELECT source, target, kind, metadata, line, col, provenance
+      FROM edges
+      WHERE json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy') = ?
+        AND json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy') IS NOT NULL
+      ORDER BY source, target, kind, IFNULL(line, -1), IFNULL(col, -1)
+    `);
+    for (const row of stmt.iterate(synthesizedBy)) {
+      yield row as {
+        source: string;
+        target: string;
+        kind: string;
+        metadata: string | null;
+        line: number | null;
+        col: number | null;
+        provenance: string | null;
+      };
     }
   }
 
@@ -1162,6 +1278,14 @@ export class QueryBuilder {
    */
   searchNodes(query: string, options: SearchOptions = {}): SearchResult[] {
     const { limit = 100, offset = 0 } = options;
+    // Ranking and exact-qualified supplementation happen in this method, after
+    // the raw FTS query. Non-empty queries must use the same bounded candidate
+    // universe on every page. A truly empty query is not rescored, so it can
+    // retain unbounded, name-ordered pagination for callers that enumerate the
+    // graph (for example sync parity checks).
+    const candidateLimit = query
+      ? SEARCH_RANKING_WINDOW
+      : Math.max(limit, offset + limit);
 
     // Parse field-qualified bits out of the raw query (kind:, lang:,
     // path:, name:). Anything not recognised stays in `text` and goes
@@ -1188,16 +1312,16 @@ export class QueryBuilder {
 
     // First try FTS5 with prefix matching
     let results = text
-      ? this.searchNodesFTS(text, { kinds, languages, limit, offset })
+      ? this.searchNodesFTS(text, { kinds, languages, limit: candidateLimit, offset: 0 })
       // Over-fetch by 5× when running filter-only (no text). The
       // post-scoring path: + name: filters can be very selective, so
       // a smaller multiplier risks returning fewer than `limit`
       // results despite the DB having plenty of matches.
-      : this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
+      : this.searchAllByFilters({ kinds, languages, limit: candidateLimit * 5 });
 
     // If no FTS results, try LIKE-based substring search
     if (results.length === 0 && text.length >= 2) {
-      results = this.searchNodesLike(text, { kinds, languages, limit, offset });
+      results = this.searchNodesLike(text, { kinds, languages, limit: candidateLimit, offset: 0 });
     }
 
     // Final fuzzy fallback: scan all known names and keep those within
@@ -1205,7 +1329,7 @@ export class QueryBuilder {
     // returned nothing AND there's a text portion long enough to be
     // worth fuzzing (1-char queries would match too much).
     if (results.length === 0 && text.length >= 3) {
-      results = this.searchNodesFuzzy(text, { kinds, languages, limit });
+      results = this.searchNodesFuzzy(text, { kinds, languages, limit: candidateLimit });
     }
 
     // Supplement: ensure exact name matches are always candidates.
@@ -1229,13 +1353,35 @@ export class QueryBuilder {
           sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
           params.push(...languages);
         }
-        sql += ' LIMIT 20';
+        sql += ' ORDER BY id LIMIT 20';
         const rows = this.db.prepare(sql).all(...params) as NodeRow[];
         for (const row of rows) {
           if (!existingIds.has(row.id)) {
             results.push({ node: rowToNode(row), score: maxFtsScore });
             existingIds.add(row.id);
           }
+        }
+      }
+    }
+
+    // A fully-qualified symbol is the strongest possible lexical match, but
+    // FTS tokenizes its separators and heavily weights the simple-name column.
+    // That can rank `public.users.some_trigger` above the exact `public.users`
+    // table, or cap the exact node out entirely. Probe the indexed qualified
+    // name literally and retain its IDs for an explicit scoring bonus.
+    const exactQualifiedIds = new Set<string>();
+    if (text && /[.\/]|::/.test(text)) {
+      const exactQualified = this.getNodesByQualifiedNameExact(text).filter((node) =>
+        (!kinds || kinds.length === 0 || kinds.includes(node.kind)) &&
+        (!languages || languages.length === 0 || languages.includes(node.language))
+      );
+      const existingIds = new Set(results.map((result) => result.node.id));
+      const maxScore = results.length > 0 ? Math.max(...results.map((result) => result.score)) : 1;
+      for (const node of exactQualified) {
+        exactQualifiedIds.add(node.id);
+        if (!existingIds.has(node.id)) {
+          results.push({ node, score: maxScore });
+          existingIds.add(node.id);
         }
       }
     }
@@ -1248,12 +1394,13 @@ export class QueryBuilder {
         score: r.score
           + kindBonus(r.node.kind)
           + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens)
-          + nameMatchBonus(r.node.name, scoringQuery),
+          + nameMatchBonus(r.node.name, scoringQuery)
+          + (exactQualifiedIds.has(r.node.id) ? 50 : 0),
       }));
-      results.sort((a, b) => b.score - a.score);
-      // Trim to requested limit after rescoring
-      if (results.length > limit) {
-        results = results.slice(0, limit);
+      results.sort((a, b) => b.score - a.score || a.node.id.localeCompare(b.node.id));
+      // Trim to the fixed ranking window after rescoring.
+      if (results.length > candidateLimit) {
+        results = results.slice(0, candidateLimit);
       }
     }
 
@@ -1276,7 +1423,7 @@ export class QueryBuilder {
       });
     }
 
-    return results;
+    return results.slice(offset, offset + limit);
   }
 
   /**
@@ -1301,7 +1448,7 @@ export class QueryBuilder {
       sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
       params.push(...languages);
     }
-    sql += ' ORDER BY name LIMIT ?';
+    sql += ' ORDER BY name, id LIMIT ?';
     params.push(limit);
     const rows = this.db.prepare(sql).all(...params) as NodeRow[];
     return rows.map((row) => ({ node: rowToNode(row), score: 1 }));
@@ -1333,7 +1480,7 @@ export class QueryBuilder {
       const dist = boundedEditDistance(name.toLowerCase(), lowered, maxDist);
       if (dist <= maxDist) candidates.push({ name, dist });
     }
-    candidates.sort((a, b) => a.dist - b.dist);
+    candidates.sort((a, b) => a.dist - b.dist || a.name.localeCompare(b.name));
 
     // Cap the per-name follow-up queries. Each survivor triggers a
     // separate `SELECT * FROM nodes WHERE name = ?`; without this cap
@@ -1357,7 +1504,7 @@ export class QueryBuilder {
         sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
         params.push(...languages);
       }
-      sql += ' LIMIT 5';
+      sql += ' ORDER BY id LIMIT 5';
       const rows = this.db.prepare(sql).all(...params) as NodeRow[];
       for (const row of rows) {
         if (seen.has(row.id)) continue;
@@ -1424,7 +1571,7 @@ export class QueryBuilder {
       params.push(...languages);
     }
 
-    sql += ' ORDER BY score LIMIT ? OFFSET ?';
+    sql += ' ORDER BY score, nodes.id LIMIT ? OFFSET ?';
     params.push(ftsLimit, offset);
 
     try {
@@ -1488,7 +1635,7 @@ export class QueryBuilder {
       params.push(...languages);
     }
 
-    sql += ' ORDER BY score DESC, length(name) ASC LIMIT ? OFFSET ?';
+    sql += ' ORDER BY score DESC, length(name) ASC, nodes.id ASC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
     const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
@@ -1708,6 +1855,50 @@ export class QueryBuilder {
       this.stmts.deleteEdgesBySource = this.db.prepare('DELETE FROM edges WHERE source = ?');
     }
     this.stmts.deleteEdgesBySource.run(sourceId);
+  }
+
+  /**
+   * Replace one synthesizer's complete edge set in a transaction. Cross-file
+   * edges are not owned by either endpoint file, so incremental sync rebuilds
+   * them as a set; the transaction prevents a failed insert leaving a partial
+   * graph that a no-change sync would not revisit.
+   */
+  replaceEdgesBySynthesizer(synthesizedBy: string, edges: Edge[]): void {
+    if (!this.stmts.deleteEdgesBySynthesizer) {
+      this.stmts.deleteEdgesBySynthesizer = this.db.prepare(
+        "DELETE FROM edges WHERE " +
+        "json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy') = ? " +
+        "AND json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy') IS NOT NULL"
+      );
+    }
+    this.db.transaction(() => {
+      this.stmts.deleteEdgesBySynthesizer!.run(synthesizedBy);
+      const endpointIds = new Set<string>();
+      for (const edge of edges) {
+        endpointIds.add(edge.source);
+        endpointIds.add(edge.target);
+      }
+      const existingNodeIds = this.getExistingNodeIds([...endpointIds]);
+      const rows: unknown[][] = [];
+      for (const edge of edges) {
+        if (!existingNodeIds.has(edge.source) || !existingNodeIds.has(edge.target)) continue;
+        rows.push([
+          edge.source,
+          edge.target,
+          edge.kind,
+          edge.metadata ? JSON.stringify(edge.metadata) : null,
+          edge.line ?? null,
+          edge.column ?? null,
+          edge.provenance ?? null,
+        ]);
+      }
+      this.runBatched(
+        'replaceEdgesBySynthesizer',
+        'INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance) VALUES ',
+        '(?,?,?,?,?,?,?)',
+        rows
+      );
+    })();
   }
 
   /**
@@ -2485,6 +2676,11 @@ export class QueryBuilder {
     this.db.prepare(
       'INSERT INTO project_metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
     ).run(key, value, Date.now());
+  }
+
+  /** Delete one project metadata key. */
+  deleteMetadata(key: string): void {
+    this.db.prepare('DELETE FROM project_metadata WHERE key = ?').run(key);
   }
 
   /**

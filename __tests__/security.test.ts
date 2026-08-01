@@ -544,7 +544,7 @@ describe('JSON.parse Error Boundaries in DB', () => {
       INSERT INTO nodes (id, kind, name, qualified_name, file_path, language, start_line, end_line, start_column, end_column, decorators, is_exported, is_async, is_static, is_abstract, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      'test-node-1', 'function', 'myFunc', 'myFunc', 'test.ts', 'typescript',
+      'test-node-1', 'function', 'myFunc', 'myFunc', 'test.sql', 'postgres',
       1, 5, 0, 0,
       '{not valid json!!!}',  // malformed decorators
       0, 0, 0, 0, Date.now()
@@ -555,6 +555,9 @@ describe('JSON.parse Error Boundaries in DB', () => {
     expect(node).not.toBeNull();
     expect(node!.name).toBe('myFunc');
     expect(node!.decorators).toBeUndefined();
+    expect([
+      ...queries.iterateDecoratorReferenceState('postgres', 'postgres:foreign-key'),
+    ]).toEqual([]);
 
     db.close();
   });
@@ -577,6 +580,10 @@ describe('JSON.parse Error Boundaries in DB', () => {
       INSERT INTO edges (source, target, kind, metadata)
       VALUES (?, ?, ?, ?)
     `).run('node-a', 'node-b', 'calls', 'broken json {{{');
+
+    // Whole-graph relationship refreshes must skip malformed legacy metadata
+    // while deleting only edges explicitly owned by that synthesizer.
+    expect(() => queries.replaceEdgesBySynthesizer('postgres-foreign-key', [])).not.toThrow();
 
     // Should not throw - should return edge with undefined metadata
     const edges = queries.getOutgoingEdges('node-a');

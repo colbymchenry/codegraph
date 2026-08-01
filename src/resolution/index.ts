@@ -21,6 +21,14 @@ import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExp
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
+import {
+  refreshPostgresForeignKeyEdges,
+  refreshPostgresForeignKeyEdgesSync,
+} from './postgres-foreign-key-synthesizer';
+import {
+  refreshPostgresStructureEdges,
+  refreshPostgresStructureEdgesSync,
+} from './postgres-structure-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
@@ -1936,6 +1944,20 @@ export class ReferenceResolver {
       // synthesis is additive and optional; ignore failures
     }
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] callback-synthesis: ${Date.now() - tSynth}ms`);
+
+    // PostgreSQL FK table edges are an exact, owned projection of resolved
+    // constraint endpoints, not a best-effort heuristic. Keep this outside the
+    // callback-synthesis catch so failure propagates and a caller never marks
+    // an index complete with stale/missing FK relationships. A state
+    // fingerprint makes the common unchanged path a single join and no writes.
+    const tPostgresFk = Date.now();
+    aggregateStats.byMethod['postgres-foreign-key-synthesis'] =
+      await refreshPostgresForeignKeyEdges(this.queries, createYielder());
+    aggregateStats.byMethod['postgres-structure-synthesis'] =
+      await refreshPostgresStructureEdges(this.queries, createYielder());
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+      console.error(`[phase-timing] postgres-foreign-key-synthesis: ${Date.now() - tPostgresFk}ms`);
+    }
     } finally {
       if (pool) await pool.destroy().catch(() => undefined);
     }
@@ -2431,6 +2453,19 @@ export class ReferenceResolver {
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (tgt && ref.language && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
+  }
+
+  /** Refresh exact PostgreSQL relationship projections after resolution. */
+  async refreshPostgresForeignKeys(): Promise<number> {
+    const yielder = createYielder();
+    return await refreshPostgresForeignKeyEdges(this.queries, yielder) +
+      await refreshPostgresStructureEdges(this.queries, yielder);
+  }
+
+  /** Synchronous refresh used by CodeGraph.resolveReferences(). */
+  refreshPostgresForeignKeysSync(): number {
+    return refreshPostgresForeignKeyEdgesSync(this.queries) +
+      refreshPostgresStructureEdgesSync(this.queries);
   }
 }
 

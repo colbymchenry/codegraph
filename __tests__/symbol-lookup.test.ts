@@ -220,3 +220,177 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     expect((text.match(/\*\*Location:\*\*/g) || []).length).toBeGreaterThanOrEqual(2);
   });
 });
+
+describe.skipIf(!HAS_SQLITE)('PostgreSQL qualified relation lookup', () => {
+  let projectRoot: string;
+  let cg: any;
+  let handler: any;
+  let findSymbolMatches: (cg: any, s: string) => any[];
+  let findAllSymbols: (cg: any, s: string) => { nodes: any[]; note: string };
+  let matchesSymbol: (node: any, s: string) => boolean;
+
+  beforeEach(async () => {
+    projectRoot = tmpRoot();
+    fs.writeFileSync(
+      path.join(projectRoot, 'schema.sql'),
+      [
+        'CREATE TABLE public.users (id bigint PRIMARY KEY);',
+        'CREATE TABLE history.users (id bigint PRIMARY KEY);',
+        'CREATE TABLE app.users (id bigint PRIMARY KEY);',
+        'CREATE TABLE "App"."Users" (id bigint PRIMARY KEY);',
+        'CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint);',
+        "CREATE FUNCTION public.touch_user() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
+        'ALTER TABLE public.orders ADD CONSTRAINT orders_user_fk FOREIGN KEY (user_id) REFERENCES public.users(id);',
+        'CREATE TRIGGER users_touch AFTER UPDATE ON users EXECUTE FUNCTION public.touch_user();',
+      ].join('\n')
+    );
+    fs.writeFileSync(path.join(projectRoot, 'users.ts'), 'export const users = [];\n');
+
+    const CodeGraph = (await import('../src/index')).default;
+    const { ToolHandler } = await import('../src/mcp/tools');
+    cg = CodeGraph.initSync(projectRoot, {
+      config: { include: ['**/*.sql', '**/*.ts'], exclude: [] },
+    });
+    await cg.indexAll();
+    handler = new ToolHandler(cg);
+    findSymbolMatches = (handler as any).findSymbolMatches.bind(handler);
+    findAllSymbols = (handler as any).findAllSymbols.bind(handler);
+    matchesSymbol = (handler as any).matchesSymbol.bind(handler);
+  });
+
+  afterEach(() => {
+    handler?.closeAll();
+    cg?.destroy();
+    rmTree(projectRoot);
+  });
+
+  it('uses the exact qualified-name index for schema.table', async () => {
+    expect(cg.getNodesByQualifiedName('public.users')).toHaveLength(1);
+    const matches = findSymbolMatches(cg, 'public.users');
+    expect(matches.map((node) => node.qualifiedName)).toEqual(['public.users']);
+    expect(findAllSymbols(cg, 'public.users').nodes.map((node) => node.qualifiedName))
+      .toEqual(['public.users']);
+    expect(findSymbolMatches(cg, 'missing.users')).toEqual([]);
+
+    const response = await handler.execute('codegraph_node', { symbol: 'public.users' });
+    const text = response.content?.[0]?.text ?? '';
+    expect(text).toContain('**public.users** (table)');
+    expect(text).not.toContain('Symbol "public.users" not found');
+    expect(text).toContain('**Referenced by foreign keys ←** public.orders');
+    expect(text).toContain('[orders_user_fk]');
+    expect(text).toContain('**Triggers ←** users_touch → public.touch_user');
+  });
+
+  it('folds unquoted qualified inputs without folding quoted identifiers', async () => {
+    expect(findSymbolMatches(cg, 'PUBLIC.USERS').map((node) => node.qualifiedName))
+      .toEqual(['public.users']);
+    expect(findAllSymbols(cg, 'PUBLIC.USERS').nodes.map((node) => node.qualifiedName))
+      .toEqual(['public.users']);
+
+    expect(findSymbolMatches(cg, 'APP.USERS').map((node) => node.qualifiedName))
+      .toEqual(['app.users']);
+    expect(findSymbolMatches(cg, '"App"."Users"').map((node) => node.qualifiedName))
+      .toEqual(['"App"."Users"']);
+    expect(findAllSymbols(cg, '"App"."Users"').nodes.map((node) => node.qualifiedName))
+      .toEqual(['"App"."Users"']);
+
+    const folded = cg.getNodesByQualifiedName('app.users')[0];
+    const quoted = cg.getNodesByQualifiedName('"App"."Users"')[0];
+    expect(matchesSymbol(folded, 'APP.USERS')).toBe(true);
+    expect(matchesSymbol(quoted, '"App"."Users"')).toBe(true);
+    expect(matchesSymbol(quoted, 'App.Users')).toBe(false);
+
+    const response = await handler.execute('codegraph_node', { symbol: 'PUBLIC.USERS' });
+    const text = response.content?.[0]?.text ?? '';
+    expect(text).toContain('**public.users** (table)');
+    expect(text).not.toContain('Symbol "PUBLIC.USERS" not found');
+  });
+
+  it('ranks an exact qualified relation above its triggers', () => {
+    const results = cg.searchNodes('public.users', { limit: 10 });
+    expect(results[0]?.node.qualifiedName).toBe('public.users');
+  });
+
+  it('keeps exact-qualified ranking stable across search pages', () => {
+    const full = cg.searchNodes('public.users', { limit: 10, offset: 0 });
+    const paged = full.map((_: unknown, offset: number) =>
+      cg.searchNodes('public.users', { limit: 1, offset })[0]
+    );
+    expect(full[0]?.node.qualifiedName).toBe('public.users');
+    expect(paged.map((result: any) => result?.node.id))
+      .toEqual(full.map((result: any) => result.node.id));
+  });
+
+  it('exposes PostgreSQL relation filters through MCP search', async () => {
+    const response = await handler.execute('codegraph_search', {
+      query: 'users',
+      kind: 'struct',
+      language: 'postgres',
+      limit: 10,
+    });
+    const text = response.content?.[0]?.text ?? '';
+    expect(text).toContain('**public.users** (table)');
+    expect(text).toContain('**history.users** (table)');
+    expect(text).not.toContain('users.ts');
+  });
+});
+
+describe.skipIf(!HAS_SQLITE)('search result pagination', () => {
+  it('paginates one stable globally-rescored candidate set', async () => {
+    const projectRoot = tmpRoot();
+    const { DatabaseConnection } = await import('../src/db');
+    const { QueryBuilder } = await import('../src/db/queries');
+    const db = DatabaseConnection.initialize(path.join(projectRoot, 'codegraph.db'));
+
+    try {
+      const queries = new QueryBuilder(db.getDb());
+      const variables = Array.from({ length: 101 }, (_, index) => {
+        const suffix = String(index).padStart(3, '0');
+        return {
+          id: `variable-${suffix}`,
+          kind: 'variable' as const,
+          name: `needle${suffix}`,
+          qualifiedName: `fixture.needle${suffix}`,
+          filePath: 'fixture.ts',
+          language: 'typescript' as const,
+          startLine: index + 1,
+          endLine: index + 1,
+          startColumn: 0,
+          endColumn: 9,
+          updatedAt: Date.now(),
+        };
+      });
+      queries.insertNodes([
+        ...variables,
+        {
+          id: 'promoted-function',
+          kind: 'function',
+          name: 'needle101',
+          qualifiedName: 'fixture.needle101',
+          filePath: 'fixture.ts',
+          language: 'typescript',
+          startLine: 102,
+          endLine: 102,
+          startColumn: 0,
+          endColumn: 9,
+          updatedAt: Date.now(),
+        },
+      ]);
+
+      // The function is deliberately inserted after more than the FTS
+      // minimum candidate count. Its kind bonus should promote it only after
+      // every page has selected the same raw candidate universe.
+      const full = queries.searchNodes('needle', { limit: 30 });
+      const paged = Array.from({ length: full.length }, (_, offset) =>
+        queries.searchNodes('needle', { limit: 1, offset })[0]
+      );
+
+      expect(full[0]?.node.id).toBe('promoted-function');
+      expect(paged.map((result) => result?.node.id))
+        .toEqual(full.map((result) => result.node.id));
+    } finally {
+      db.close();
+      rmTree(projectRoot);
+    }
+  });
+});

@@ -185,6 +185,14 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_from_name ON unresolved_refs(from_node
 CREATE INDEX IF NOT EXISTS idx_unresolved_status ON unresolved_refs(status);
 CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail ON unresolved_refs(name_tail) WHERE status = 'failed';
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
+-- Whole-graph synthesizers replace their owned edge sets by the metadata key.
+-- Keep that ownership lookup indexed; without this expression index every
+-- incremental refresh scans the complete edge table. Migration v9 adds it to
+-- existing databases. The guarded expression preserves the database's legacy
+-- behavior of tolerating malformed metadata JSON at read boundaries.
+CREATE INDEX IF NOT EXISTS idx_edges_synthesized_by
+  ON edges(json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy'))
+  WHERE json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy') IS NOT NULL;
 
 -- Project metadata for version/provenance tracking
 CREATE TABLE IF NOT EXISTS project_metadata (

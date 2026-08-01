@@ -21,7 +21,16 @@ import {
   type WorktreeIndexMismatch,
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
-import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
+import {
+  LANGUAGES,
+  NODE_KINDS,
+  type Node,
+  type Edge,
+  type SearchResult,
+  type Subgraph,
+  type NodeKind,
+  type Language,
+} from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
 import {
   existsSync,
@@ -31,6 +40,10 @@ import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, C
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { scanDynamicDispatch } from './dynamic-boundaries';
 import { getUpdateNotice } from '../upgrade/update-check';
+import {
+  parsePostgresQualifiedName,
+  serializePostgresQualifiedName,
+} from '../postgres/identifiers';
 
 /**
  * An expected, recoverable "codegraph can't serve this" condition — most
@@ -79,6 +92,31 @@ const MAX_PATH_LENGTH = 4_096;
  * same as `configurator::stage_apply::run`.
  */
 const RUST_PATH_PREFIXES = new Set(['crate', 'super', 'self']);
+
+/**
+ * Canonicalize a schema-qualified PostgreSQL lookup using PostgreSQL's
+ * identifier rules: unquoted segments fold to lower case while quoted
+ * segments keep their spelling and may contain dots.
+ */
+function canonicalPostgresLookup(symbol: string): string | null {
+  const parts = parsePostgresQualifiedName(symbol);
+  return parts && parts.length > 1 ? serializePostgresQualifiedName(parts) : null;
+}
+
+/**
+ * Prefer the literal qualified-name index hit used by every language. When it
+ * misses, also probe PostgreSQL's canonical spelling, but only accept a
+ * PostgreSQL node so a dotted TypeScript/Python query cannot be redirected to
+ * an unrelated case-folded symbol.
+ */
+function getDirectQualifiedSymbolMatches(cg: CodeGraph, symbol: string): Node[] {
+  const direct = cg.getNodesByQualifiedName(symbol);
+  if (direct.length > 0) return direct;
+
+  const postgresName = canonicalPostgresLookup(symbol);
+  if (!postgresName || postgresName === symbol) return [];
+  return cg.getNodesByQualifiedName(postgresName).filter((node) => node.language === 'postgres');
+}
 
 /**
  * Node kinds that contain other symbols. For these, `codegraph_node` with
@@ -547,7 +585,12 @@ export const tools: ToolDefinition[] = [
         kind: {
           type: 'string',
           description: 'Filter by node kind',
-          enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component'],
+          enum: [...NODE_KINDS, 'type'],
+        },
+        language: {
+          type: 'string',
+          description: 'Filter by source language (for example postgres or typescript)',
+          enum: [...LANGUAGES],
         },
         limit: {
           type: 'number',
@@ -1502,10 +1545,15 @@ export class ToolHandler {
     const kind = rawKind === 'type' ? 'type_alias' : rawKind;
     const rawLimit = Number(args.limit) || 10;
     const limit = clamp(rawLimit, 1, 100);
+    const rawLanguage = typeof args.language === 'string' ? args.language : undefined;
+    const language = rawLanguage && LANGUAGES.includes(rawLanguage as Language)
+      ? rawLanguage as Language
+      : undefined;
 
     const results = cg.searchNodes(query, {
       limit,
       kinds: kind ? [kind as NodeKind] : undefined,
+      languages: language ? [language] : undefined,
     });
 
     if (results.length === 0) {
@@ -4028,11 +4076,16 @@ export class ToolHandler {
       return synth ? `${base} [${synth.compact}]` : base;
     };
     const collect = (edges: Array<{ node: Node; edge: Edge }>): Array<{ node: Node; edge: Edge }> => {
-      const seen = new Set<string>([node.id]);
+      const seen = new Set<string>();
       const out: Array<{ node: Node; edge: Edge }> = [];
       for (const e of edges) {
-        if (seen.has(e.node.id)) continue;
-        seen.add(e.node.id);
+        if (e.node.id === node.id) continue;
+        const relation = typeof e.edge.metadata?.postgresRelation === 'string'
+          ? e.edge.metadata.postgresRelation
+          : e.edge.kind;
+        const key = `${e.node.id}\u0000${relation}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
         out.push(e);
       }
       return out;
@@ -4041,12 +4094,85 @@ export class ToolHandler {
     const callers = collect(cg.getCallers(node.id));
     if (callees.length === 0 && callers.length === 0) return '';
     const lines: string[] = ['', '**Trail — codegraph_node any of these to follow it (no Read needed)**'];
-    if (callees.length > 0) {
-      lines.push(`**Calls →** ${callees.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callees.length > TRAIL_CAP ? `, +${callees.length - TRAIL_CAP} more` : ''}`);
+    const push = (
+      label: string,
+      entries: Array<{ node: Node; edge: Edge }>,
+      formatter = fmt
+    ): void => {
+      if (entries.length === 0) return;
+      lines.push(
+        `**${label}** ${entries.slice(0, TRAIL_CAP).map(formatter).join(', ')}` +
+        (entries.length > TRAIL_CAP ? `, +${entries.length - TRAIL_CAP} more` : '')
+      );
+    };
+    const isCallLike = ({ edge }: { edge: Edge }) =>
+      edge.kind === 'calls' || edge.kind === 'instantiates';
+
+    // Database relations need domain labels, not the generic call vocabulary:
+    // a table is referenced by a trigger/FK/view; none of those "call" it.
+    if (node.language === 'postgres' && node.kind === 'struct') {
+      const isForeignKeyEdge = ({ edge }: { edge: Edge }) =>
+        edge.metadata?.postgresRelation === 'foreign-key';
+      const isTableRelationEdge = ({ edge }: { edge: Edge }) => {
+        const relation = edge.metadata?.postgresRelation;
+        return typeof relation === 'string' &&
+          relation !== 'foreign-key' && relation !== 'schema-containment';
+      };
+      const isTrigger = ({ node: related }: { node: Node }) =>
+        related.decorators?.includes('postgres:trigger') === true;
+      const isConstraint = ({ node: related }: { node: Node }) =>
+        related.decorators?.includes('postgres:foreign-key') === true;
+      const fkLabel = ({ node: related, edge }: { node: Node; edge: Edge }) => {
+        const raw = edge.metadata?.constraints;
+        const constraints = Array.isArray(raw) ? raw as Array<Record<string, unknown>> : [];
+        const names = constraints
+          .map((constraint) => constraint.constraintName)
+          .filter((name): name is string => typeof name === 'string');
+        const qualified = related.qualifiedName || related.name;
+        const suffix = names.length > 0 ? ` [${names.join(', ')}]` : '';
+        return `${qualified} (${related.filePath}:${related.startLine})${suffix}`;
+      };
+      const triggerLabel = ({ node: trigger }: { node: Node; edge: Edge }) => {
+        const routine = cg.getCallees(trigger.id).find(({ edge }) => edge.kind === 'calls')?.node;
+        const hop = routine ? ` → ${routine.qualifiedName || routine.name}` : '';
+        return `${trigger.name}${hop} (${trigger.filePath}:${trigger.startLine})`;
+      };
+      const relationLabel = ({ node: related, edge }: { node: Node; edge: Edge }) =>
+        `${related.qualifiedName || related.name} [${String(edge.metadata?.postgresRelation)}] ` +
+        `(${related.filePath}:${related.startLine})`;
+
+      const fkOutgoing = callees.filter(isForeignKeyEdge);
+      const fkIncoming = callers.filter(isForeignKeyEdge);
+      const relationsOutgoing = callees.filter(isTableRelationEdge);
+      const relationsIncoming = callers.filter(isTableRelationEdge);
+      const triggers = callers.filter(isTrigger);
+      const constraints = callers.filter(isConstraint);
+      const usedOutgoing = new Set([
+        ...fkOutgoing.map(({ node: related }) => related.id),
+        ...relationsOutgoing.map(({ node: related }) => related.id),
+      ]);
+      const usedIncoming = new Set([
+        ...fkIncoming.map(({ node: related }) => related.id),
+        ...relationsIncoming.map(({ node: related }) => related.id),
+        ...triggers.map(({ node: related }) => related.id),
+        ...constraints.map(({ node: related }) => related.id),
+      ]);
+
+      push('Foreign keys →', fkOutgoing, fkLabel);
+      push('Referenced by foreign keys ←', fkIncoming, fkLabel);
+      push('Table relations →', relationsOutgoing, relationLabel);
+      push('Related tables ←', relationsIncoming, relationLabel);
+      push('Triggers ←', triggers, triggerLabel);
+      push('Foreign-key constraints ←', constraints);
+      push('References →', callees.filter((entry) => !usedOutgoing.has(entry.node.id)));
+      push('Referenced by ←', callers.filter((entry) => !usedIncoming.has(entry.node.id)));
+      return lines.join('\n');
     }
-    if (callers.length > 0) {
-      lines.push(`**Called by ←** ${callers.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callers.length > TRAIL_CAP ? `, +${callers.length - TRAIL_CAP} more` : ''}`);
-    }
+
+    push('Calls →', callees.filter(isCallLike));
+    push('References →', callees.filter((entry) => !isCallLike(entry)));
+    push('Called by ←', callers.filter(isCallLike));
+    push('Referenced by ←', callers.filter((entry) => !isCallLike(entry)));
     return lines.join('\n');
   }
 
@@ -4404,6 +4530,13 @@ export class ToolHandler {
     if (node.name === symbol) return true;
     // File basename match (e.g., "product-card" matches "product-card.liquid")
     if (node.kind === 'file' && node.name.replace(/\.[^.]+$/, '') === symbol) return true;
+    // PostgreSQL intentionally preserves SQL's dotted qualified names instead
+    // of CodeGraph's usual `::` hierarchy separator.
+    if (node.qualifiedName === symbol) return true;
+    if (node.language === 'postgres') {
+      const postgresName = canonicalPostgresLookup(symbol);
+      if (postgresName) return node.qualifiedName === postgresName;
+    }
 
     // Qualified-name lookups: split on any supported separator. `\w` keeps
     // identifier chars (incl. `_`) intact; everything else is treated as
@@ -4463,6 +4596,17 @@ export class ToolHandler {
       return fuzzy[0] ? [fuzzy[0].node] : [];
     }
 
+
+    // Literal qualified names (notably PostgreSQL schema.object) have a
+    // dedicated index. Probe it before FTS so a large set of nested symbols
+    // cannot cap out the exact object.
+    const direct = getDirectQualifiedSymbolMatches(cg, symbol);
+    if (direct.length > 0) {
+      return [...direct].sort((a, b) =>
+        (isGeneratedFile(a.filePath) ? 1 : 0) - (isGeneratedFile(b.filePath) ? 1 : 0)
+      );
+    }
+
     // Qualified lookup (`Session.request`, `stage_apply::run`): FTS + matchesSymbol.
     const limit = 50;
     let results = cg.searchNodes(symbol, { limit });
@@ -4513,6 +4657,15 @@ export class ToolHandler {
       if (optionHits.length > 0) {
         const seen = new Set<string>();
         const nodes = optionHits.filter((n) => !seen.has(n.id) && !!seen.add(n.id)).slice(0, 10);
+        return { nodes, note: '' };
+      }
+    }
+    if (/[.\/]|::/.test(symbol)) {
+      const direct = getDirectQualifiedSymbolMatches(cg, symbol);
+      if (direct.length > 0) {
+        const nodes = [...direct].sort((a, b) =>
+          (isGeneratedFile(a.filePath) ? 1 : 0) - (isGeneratedFile(b.filePath) ? 1 : 0)
+        );
         return { nodes, note: '' };
       }
     }
@@ -4574,8 +4727,16 @@ export class ToolHandler {
     for (const result of results) {
       const { node } = result;
       const location = node.startLine ? `:${node.startLine}` : '';
+      const postgresKind = node.language === 'postgres'
+        ? node.decorators?.find((decorator) =>
+          decorator.startsWith('postgres:') &&
+          !decorator.startsWith('postgres:foreign-key-data:') &&
+          !decorator.startsWith('postgres:table-relation-data:')
+        )?.slice('postgres:'.length)
+        : undefined;
+      const displayName = node.language === 'postgres' ? node.qualifiedName : node.name;
       // Compact format: one line per result with key info
-      lines.push(`**${node.name}** (${node.kind})`);
+      lines.push(`**${displayName}** (${postgresKind ?? node.kind})`);
       lines.push(`${node.filePath}${location}`);
       if (node.signature) lines.push(`\`${node.signature}\``);
       lines.push('');
@@ -4667,8 +4828,16 @@ export class ToolHandler {
 
   private formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
     const location = node.startLine ? `:${node.startLine}` : '';
+    const postgresKind = node.language === 'postgres'
+      ? node.decorators?.find((decorator) =>
+        decorator.startsWith('postgres:') &&
+        !decorator.startsWith('postgres:foreign-key-data:') &&
+        !decorator.startsWith('postgres:table-relation-data:')
+      )?.slice('postgres:'.length)
+      : undefined;
+    const displayName = node.language === 'postgres' ? node.qualifiedName : node.name;
     const lines: string[] = [
-      `**${node.name}** (${node.kind})`,
+      `**${displayName}** (${postgresKind ?? node.kind})`,
       '',
       `**Location:** ${node.filePath}${location}`,
     ];

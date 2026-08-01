@@ -252,6 +252,73 @@ describe('runMaintenance', () => {
   });
 });
 
+describe('bulk-load index crash recovery', () => {
+  it('recreates every secondary index dropped by interrupted bulk-load windows on reopen', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-bulk-heal-'));
+    const dbPath = path.join(dir, 'test.db');
+    const db = DatabaseConnection.initialize(dbPath);
+
+    // Simulate a process dying with all three bulk windows open. close() does
+    // not repair schema objects, so the persisted database matches the state a
+    // SIGKILL would leave behind.
+    db.beginBulkParseLoad();
+    db.beginBulkRefLoad();
+
+    const dropped = [
+      'idx_nodes_kind',
+      'idx_nodes_name',
+      'idx_nodes_qualified_name',
+      'idx_nodes_file_path',
+      'idx_nodes_language',
+      'idx_nodes_file_line',
+      'idx_nodes_lower_name',
+      'idx_unresolved_from_node',
+      'idx_unresolved_name',
+      'idx_unresolved_file_path',
+      'idx_unresolved_from_name',
+      'idx_unresolved_status',
+      'idx_unresolved_failed_tail',
+      'idx_files_language',
+      'idx_files_modified_at',
+      'idx_edges_kind',
+      'idx_edges_source_kind',
+      'idx_edges_target_kind',
+      'idx_edges_provenance',
+      'idx_edges_synthesized_by',
+    ];
+    const indexExists = (connection: DatabaseConnection, name: string) =>
+      connection
+        .getDb()
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(name);
+
+    for (const name of dropped) expect(indexExists(db, name)).toBeUndefined();
+    db.close();
+
+    const reopened = DatabaseConnection.open(dbPath);
+    try {
+      for (const name of dropped) expect(indexExists(reopened, name), name).toBeTruthy();
+
+      // The new expression index is not merely present by name: SQLite can use
+      // it for the ownership predicate exercised by whole-graph synthesizers.
+      const plan = reopened
+        .getDb()
+        .prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT source, target, kind
+           FROM edges
+           WHERE json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy') = ?
+             AND json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy') IS NOT NULL`
+        )
+        .all('postgres-foreign-key') as Array<{ detail: string }>;
+      expect(plan.map((row) => row.detail).join(' ')).toContain('idx_edges_synthesized_by');
+    } finally {
+      reopened.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // The edges table carried no UNIQUE constraint, so `insertEdge`'s
 // `INSERT OR IGNORE` had nothing to conflict on and silently admitted
 // byte-identical duplicate rows when two passes emitted the same edge (#1034).
@@ -344,7 +411,7 @@ describe('migration v6: dedup edges + add identity index on upgrade (#1034)', ()
     runMigrations(raw, 5);
 
     expect(count()).toBe(2); // duplicate collapsed, the distinct `calls` edge kept
-    expect(getCurrentVersion(raw)).toBe(8);
+    expect(getCurrentVersion(raw)).toBe(9);
     const idx = raw
       .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_edges_identity'")
       .get();
