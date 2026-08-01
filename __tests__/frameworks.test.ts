@@ -20,6 +20,7 @@ describe('FrameworkResolver.extract interface', () => {
 });
 
 import { getApplicableFrameworks } from '../src/resolution/frameworks';
+import type { FrameworkResolver } from '../src/resolution/types';
 
 describe('getApplicableFrameworks', () => {
   const pyFw: FrameworkResolver = { name: 'py', languages: ['python'], detect: () => true, resolve: () => null };
