@@ -250,7 +250,9 @@ impl<'t> Walker<'t> {
             target_id_str: NONE_STR,
         });
 
-        if kind == "function" || kind == "method" {
+        // Classes join the fn-ref gate for Python (#1478): class-as-value is
+        // a first-class idiom (mirrors flushFnRefCandidates' python branch).
+        if kind == "function" || kind == "method" || kind == "class" {
             self.defined_fn_names.insert(name.to_string());
         }
         // captureValueRefScope
@@ -711,6 +713,11 @@ impl<'t> Walker<'t> {
             "keyword_argument" => ("value", "value"),
             "pair" => ("value", "value"),
             "list" => ("list", ""),
+            // `return SomeClass` / `return handler` (#1478) — a single
+            // returned expression is a direct named child ('list' shape);
+            // tuple returns sit under expression_list and are not descended
+            // (mirrors PYTHON_SPEC).
+            "return_statement" => ("list", ""),
             _ => return,
         };
         if self.stack.is_empty() {
