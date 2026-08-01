@@ -36,6 +36,7 @@ import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packa
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
+import { isPostgresObjectReferenceKind } from '../postgres/reference-intent';
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -900,6 +901,11 @@ export class ReferenceResolver {
         : ref.referenceName;
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
+      // Quoted PostgreSQL identifiers intentionally retain their quotes in the
+      // reference text while node.name stores the decoded segment. Let the
+      // schema-aware matcher inspect object intents directly rather than
+      // dropping e.g. `"Status.Type"` on this generic string pre-filter.
+      isPostgresObjectReferenceKind(ref.referenceKind) ||
       isNixPathImportRef(ref) ||
       this.hasAnyPossibleMatch(existenceName) ||
       this.matchesAnyImport(ref) ||
@@ -907,6 +913,14 @@ export class ReferenceResolver {
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
       return null;
+    }
+
+    // PostgreSQL object intents are internal-only and object-class strict.
+    // Resolve them directly through the PostgreSQL matcher so a framework or
+    // import strategy can never bind a type/sequence use to a same-named node
+    // of another language or object class.
+    if (isPostgresObjectReferenceKind(ref.referenceKind)) {
+      return this.gateLanguage(matchReference(ref, this.context), ref);
     }
 
     // Function-as-value refs (#756) get a dedicated, strictly-gated path:
@@ -1059,13 +1073,14 @@ export class ReferenceResolver {
    */
   createEdges(resolved: ResolvedRef[]): Edge[] {
     return resolved.map((ref) => {
-      // `function_ref` (#756) is internal-only: it persists as a `references`
-      // edge (the registration site depends on the callback), distinguishable
-      // by metadata.resolvedBy === 'function-ref'. callers/impact already
-      // traverse `references`, so registration sites surface with no
-      // graph-layer changes.
+      // Internal intents persist as `references` edges. The original intent is
+      // retained in metadata.refKind so removal/re-index resurrection uses the
+      // same strict matcher rather than degrading to a relation reference.
       let kind: Edge['kind'] =
-        ref.original.referenceKind === 'function_ref' ? 'references' : ref.original.referenceKind;
+        ref.original.referenceKind === 'function_ref' ||
+          isPostgresObjectReferenceKind(ref.original.referenceKind)
+          ? 'references'
+          : ref.original.referenceKind;
 
       // Promote "extends" to "implements" when a class/struct targets an interface
       if (kind === 'extends') {

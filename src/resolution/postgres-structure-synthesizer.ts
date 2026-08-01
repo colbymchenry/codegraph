@@ -4,22 +4,28 @@ import type { QueryBuilder } from '../db/queries';
 import {
   parsePostgresQualifiedName,
   serializePostgresQualifiedName,
-  isPostgresQualifiedName,
 } from '../postgres/identifiers';
 import {
   POSTGRES_TABLE_RELATION_DECORATOR,
   decodePostgresTableRelationDescriptor,
   type PostgresTableRelationDescriptor,
 } from '../postgres/table-relation';
+import { POSTGRES_DROP_RELATION_DECORATOR } from '../postgres/relation-lifecycle';
 import type { MaybeYield } from './cooperative-yield';
+import { postgresEnumLifecycleEdges } from './postgres-enum-lifecycle';
+import { PostgresRelationLifecycle } from './postgres-relation-lifecycle';
+import {
+  PostgresTableRenameTimeline,
+  comparePostgresMigrationPosition,
+  isPostgresMigrationPositionLater,
+  isPostgresRelation,
+  isPostgresTable,
+  type PostgresMigrationPosition,
+  type PostgresResolvedTableEndpoint,
+} from './postgres-rename-timeline';
 
 export const POSTGRES_STRUCTURE_SYNTHESIZER = 'postgres-structure';
 const POSTGRES_STRUCTURE_FINGERPRINT_METADATA = 'postgres_structure_state_fingerprint';
-
-interface ResolvedEndpoint {
-  node: Node;
-  refName: string | undefined;
-}
 
 interface RelationFact extends PostgresTableRelationDescriptor {
   filePath: string;
@@ -41,30 +47,11 @@ const SCHEMA_OBJECT_DECORATORS = new Set([
   'postgres:index',
 ]);
 
-function isTable(node: Node | null): node is Node {
-  return node?.language === 'postgres' && node.kind === 'struct' && (
-    node.decorators?.includes('postgres:table') === true ||
-    node.decorators?.includes('postgres:foreign-table') === true
-  );
-}
-
-function resolvedEndpoint(endpoints: ResolvedEndpoint[], name: string): Node | null {
-  let matches = endpoints
-    .filter((endpoint) => endpoint.refName === name)
-    .map((endpoint) => endpoint.node);
-  if (matches.length === 0) {
-    const qualified = isPostgresQualifiedName(name);
-    const parsed = parsePostgresQualifiedName(name);
-    const simple = parsed?.[parsed.length - 1] ?? name;
-    matches = endpoints
-      .map((endpoint) => endpoint.node)
-      .filter((node) => qualified ? node.qualifiedName === name : node.name === simple);
-  }
-  const unique = new Map(matches.map((node) => [node.id, node]));
-  return unique.size === 1 ? unique.values().next().value ?? null : null;
-}
-
-function relationEdges(queries: QueryBuilder): Edge[] {
+function relationEdges(
+  queries: QueryBuilder,
+  renames: PostgresTableRenameTimeline,
+  lifecycle: PostgresRelationLifecycle
+): Edge[] {
   const edges: Edge[] = [];
   for (const factNode of queries.iterateNodesByLanguageWithDecorator(
     'postgres',
@@ -78,9 +65,30 @@ function relationEdges(queries: QueryBuilder): Edge[] {
         node: queries.getNodeById(edge.target),
         refName: typeof edge.metadata?.refName === 'string' ? edge.metadata.refName : undefined,
       }))
-      .filter((endpoint): endpoint is ResolvedEndpoint => isTable(endpoint.node));
-    const source = resolvedEndpoint(endpoints, descriptor.sourceTable);
-    const target = resolvedEndpoint(endpoints, descriptor.targetTable);
+      .filter((endpoint): endpoint is PostgresResolvedTableEndpoint =>
+        descriptor.relation === 'rename'
+          ? isPostgresRelation(endpoint.node)
+          : isPostgresTable(endpoint.node)
+      );
+    const position: PostgresMigrationPosition = {
+      filePath: factNode.filePath,
+      line: factNode.startLine,
+      column: factNode.startColumn,
+    };
+    if (
+      descriptor.relation !== 'rename' && (
+        lifecycle.isDroppedAfter(descriptor.sourceTable, position) ||
+        lifecycle.isDroppedAfter(descriptor.targetTable, position)
+      )
+    ) continue;
+    // A rename edge records the immediate transition. All other structural
+    // facts are projected through rename statements that occur after them.
+    const source = descriptor.relation === 'rename'
+      ? lifecycle.renameSourceEndpoint(endpoints, descriptor.sourceTable, position)
+      : lifecycle.canonicalTableEndpoint(endpoints, descriptor.sourceTable, position);
+    const target = descriptor.relation === 'rename'
+      ? renames.immediateRelationEndpoint(endpoints, descriptor.targetTable)
+      : lifecycle.canonicalTableEndpoint(endpoints, descriptor.targetTable, position);
     if (!source || !target) continue;
     const fact: RelationFact = {
       ...descriptor,
@@ -110,6 +118,33 @@ function isSchemaObject(node: Node): boolean {
     node.decorators?.includes('postgres:temporary') !== true;
 }
 
+function isEnum(node: Node): boolean {
+  return node.language === 'postgres' && node.kind === 'enum' &&
+    node.decorators?.includes('postgres:enum') === true;
+}
+
+function isEnumMember(node: Node): boolean {
+  return node.language === 'postgres' && node.kind === 'enum_member' &&
+    node.decorators?.includes('postgres:enum-value') === true;
+}
+
+function nativeContainmentTargets(
+  queries: QueryBuilder,
+  cache: Map<string, Set<string>>,
+  parent: Node
+): Set<string> {
+  let targets = cache.get(parent.id);
+  if (!targets) {
+    targets = new Set(
+      queries.getOutgoingEdges(parent.id, ['contains'])
+        .filter((edge) => edge.metadata?.synthesizedBy !== POSTGRES_STRUCTURE_SYNTHESIZER)
+        .map((edge) => edge.target)
+    );
+    cache.set(parent.id, targets);
+  }
+  return targets;
+}
+
 function schemaContainmentEdges(queries: QueryBuilder): Edge[] {
   const schemas = new Map<string, Node[]>();
   const nativeContainment = new Map<string, Set<string>>();
@@ -134,15 +169,7 @@ function schemaContainmentEdges(queries: QueryBuilder): Edge[] {
         ? candidates[0]
         : undefined;
     if (!schema) continue;
-    let nativeTargets = nativeContainment.get(schema.id);
-    if (!nativeTargets) {
-      nativeTargets = new Set(
-        queries.getOutgoingEdges(schema.id, ['contains'])
-          .filter((edge) => edge.metadata?.synthesizedBy !== POSTGRES_STRUCTURE_SYNTHESIZER)
-          .map((edge) => edge.target)
-      );
-      nativeContainment.set(schema.id, nativeTargets);
-    }
+    const nativeTargets = nativeContainmentTargets(queries, nativeContainment, schema);
     if (nativeTargets.has(object.id)) continue;
     edges.push({
       source: schema.id,
@@ -160,8 +187,94 @@ function schemaContainmentEdges(queries: QueryBuilder): Edge[] {
   return edges;
 }
 
+function enumContainmentEdges(queries: QueryBuilder): Edge[] {
+  const enums = new Map<string, Node[]>();
+  const nativeContainment = new Map<string, Set<string>>();
+  for (const node of queries.iterateNodesByLanguage('postgres')) {
+    if (!isEnum(node)) continue;
+    const existing = enums.get(node.qualifiedName);
+    if (existing) existing.push(node);
+    else enums.set(node.qualifiedName, [node]);
+  }
+
+  const edges: Edge[] = [];
+  for (const member of queries.iterateNodesByLanguage('postgres')) {
+    if (!isEnumMember(member)) continue;
+    const parts = parsePostgresQualifiedName(member.qualifiedName);
+    if (!parts || parts.length < 2) continue;
+    const parentName = serializePostgresQualifiedName(parts.slice(0, -1));
+    const candidates = enums.get(parentName) ?? [];
+    const memberPosition: PostgresMigrationPosition = {
+      filePath: member.filePath,
+      line: member.startLine,
+      column: member.startColumn,
+    };
+    // ALTER TYPE values belong to the most recent preceding declaration in
+    // the same migration stream. This disambiguates a later DROP/re-CREATE of
+    // the same enum without attaching an older value to that future version.
+    const preceding = candidates
+      .filter((candidate) => isPostgresMigrationPositionLater(memberPosition, {
+        filePath: candidate.filePath,
+        line: candidate.startLine,
+        column: candidate.startColumn,
+      }))
+      .sort((left, right) => comparePostgresMigrationPosition({
+        filePath: right.filePath,
+        line: right.startLine,
+        column: right.startColumn,
+      }, {
+        filePath: left.filePath,
+        line: left.startLine,
+        column: left.startColumn,
+      }));
+    const latest = preceding[0];
+    const latestPosition = latest && {
+      filePath: latest.filePath,
+      line: latest.startLine,
+      column: latest.startColumn,
+    };
+    const latestCandidates = latestPosition
+      ? preceding.filter((candidate) => comparePostgresMigrationPosition({
+        filePath: candidate.filePath,
+        line: candidate.startLine,
+        column: candidate.startColumn,
+      }, latestPosition) === 0)
+      : [];
+    const sameFile = candidates.filter((candidate) => candidate.filePath === member.filePath);
+    const parent = latestCandidates.length === 1
+      ? latestCandidates[0]
+      : preceding.length === 0 && sameFile.length === 1
+        ? sameFile[0]
+        : preceding.length === 0 && sameFile.length === 0 && candidates.length === 1
+          ? candidates[0]
+          : undefined;
+    if (!parent) continue;
+    if (nativeContainmentTargets(queries, nativeContainment, parent).has(member.id)) continue;
+    edges.push({
+      source: parent.id,
+      target: member.id,
+      kind: 'contains',
+      line: member.startLine,
+      column: member.startColumn,
+      provenance: 'tree-sitter',
+      metadata: {
+        synthesizedBy: POSTGRES_STRUCTURE_SYNTHESIZER,
+        postgresRelation: 'enum-containment',
+      },
+    });
+  }
+  return edges;
+}
+
 function materializePostgresStructureEdges(queries: QueryBuilder): Edge[] {
-  return [...relationEdges(queries), ...schemaContainmentEdges(queries)];
+  const renames = new PostgresTableRenameTimeline(queries);
+  const lifecycle = new PostgresRelationLifecycle(queries, renames);
+  return [
+    ...relationEdges(queries, renames, lifecycle),
+    ...schemaContainmentEdges(queries),
+    ...enumContainmentEdges(queries),
+    ...postgresEnumLifecycleEdges(queries),
+  ];
 }
 
 function structureInputFingerprint(
@@ -181,14 +294,22 @@ function structureInputFingerprint(
     hash.update(JSON.stringify(['fact', row]));
     hash.update('\n');
   }
+  for (const row of queries.iterateDecoratorReferenceState(
+    'postgres',
+    POSTGRES_DROP_RELATION_DECORATOR
+  )) {
+    inputCount++;
+    hash.update(JSON.stringify(['drop-relation', row]));
+    hash.update('\n');
+  }
   for (const node of queries.iterateNodesByLanguage('postgres')) {
-    if (node.kind !== 'namespace' && !isSchemaObject(node)) continue;
+    if (node.kind !== 'namespace' && !isSchemaObject(node) && !isEnumMember(node)) continue;
     inputCount++;
     hash.update(JSON.stringify([
       'node', node.id, node.kind, node.qualifiedName, node.filePath, node.decorators,
     ]));
     hash.update('\n');
-    if (node.kind === 'namespace') {
+    if (node.kind === 'namespace' || isEnum(node)) {
       for (const edge of queries.getOutgoingEdges(node.id, ['contains'])) {
         if (edge.metadata?.synthesizedBy === POSTGRES_STRUCTURE_SYNTHESIZER) continue;
         hash.update(JSON.stringify([
@@ -198,7 +319,7 @@ function structureInputFingerprint(
       }
     }
   }
-  return { fingerprint: `v1:${hash.digest('hex')}`, inputCount };
+  return { fingerprint: `v3:${hash.digest('hex')}`, inputCount };
 }
 
 function structureOutputFingerprint(

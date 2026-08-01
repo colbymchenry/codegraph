@@ -90,6 +90,15 @@ export interface LanguageExtractor {
    */
   preParse?: (source: string, filePath?: string) => string;
 
+  /**
+   * Record recovered tree-sitter ERROR/MISSING nodes in ExtractionResult while
+   * still walking the recoverable tree. Most programming-language grammars are
+   * intentionally tolerant of incomplete editor buffers; strict source formats
+   * such as migration SQL can opt in so indexing does not silently report a
+   * malformed file as clean.
+   */
+  reportParseErrors?: boolean;
+
   // --- Node type mappings ---
 
   /** Node types that represent functions */

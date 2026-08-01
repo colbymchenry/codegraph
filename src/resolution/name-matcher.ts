@@ -5,6 +5,7 @@
  */
 
 import { Language, Node } from '../types';
+import { preParsePostgresSource } from '../extraction/languages/postgres';
 import {
   analyzePostgresSearchPath,
   postgresOffsetAtPosition,
@@ -21,6 +22,12 @@ import {
   postgresTemporaryRelationVisibleAt,
   type PostgresTemporaryRelationVisibilityState,
 } from '../postgres/temporary-relations';
+import {
+  POSTGRES_SEQUENCE_REFERENCE_KIND,
+  POSTGRES_TYPE_REFERENCE_KIND,
+} from '../postgres/reference-intent';
+import { POSTGRES_DROP_RELATION_DECORATOR } from '../postgres/relation-lifecycle';
+import { latestPostgresMigrationNodeBefore } from './postgres-rename-timeline';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
 
 /**
@@ -371,11 +378,15 @@ export function matchFunctionRef(
  *  - one same-file candidate wins, otherwise the project-wide candidate must
  *    be unique;
  *  - callable references target decorated routines only; relation references
- *    target relation-like (`struct`) nodes only.
+ *    target relation-like (`struct`) nodes only;
+ *  - internal type/sequence intents target only their decorated PostgreSQL
+ *    object class and later materialize as ordinary `references` edges.
  *
  * Unqualified references honor top-level SET/RESET search_path state (with
- * PostgreSQL's default public fallback). Duplicate historical definitions are
- * still left unresolved until an ordered-migration model can distinguish them.
+ * PostgreSQL's default public fallback); routine-local SET search_path is
+ * carried on that routine's references as an ordered override. Duplicate
+ * historical definitions are still left unresolved until an ordered-migration
+ * model can distinguish them.
  */
 const POSTGRES_SEARCH_PATH_CACHE = new WeakMap<
   ResolutionContext,
@@ -398,7 +409,14 @@ function postgresSearchPathState(
   const cached = byFile.get(filePath);
   if (cached) return cached;
 
-  const state = analyzePostgresSearchPath(context.readFile(filePath) ?? '');
+  // Resolution must analyze the exact offset-preserving source seen by the
+  // PostgreSQL parser. Raw psql commands and COPY FROM STDIN payloads are not
+  // SQL session statements and must not change search_path here after the
+  // extractor deliberately blanked them.
+  const state = analyzePostgresSearchPath(
+    preParsePostgresSource(context.readFile(filePath) ?? ''),
+    { copyPayloadsMasked: true }
+  );
   byFile.set(filePath, state);
   return state;
 }
@@ -417,9 +435,10 @@ function postgresTemporaryVisibilityState(
   if (cached) return cached;
 
   const state = analyzePostgresTemporaryRelationVisibility(
-    context.readFile(filePath) ?? '',
+    preParsePostgresSource(context.readFile(filePath) ?? ''),
     context.getNodesInFile(filePath),
-    positions
+    positions,
+    true
   );
   byFile.set(filePath, state);
   return state;
@@ -456,6 +475,20 @@ export function matchPostgresReference(
         node.decorators?.includes('postgres:procedure') === true
       );
     }
+    if (ref.referenceKind === POSTGRES_TYPE_REFERENCE_KIND) {
+      return (
+        node.kind === 'enum' && node.decorators?.includes('postgres:enum') === true
+      ) || (
+        node.kind === 'type_alias' && (
+          node.decorators?.includes('postgres:type') === true ||
+          node.decorators?.includes('postgres:domain') === true
+        )
+      );
+    }
+    if (ref.referenceKind === POSTGRES_SEQUENCE_REFERENCE_KIND) {
+      return node.kind === 'variable' &&
+        node.decorators?.includes('postgres:sequence') === true;
+    }
     return node.kind === 'struct';
   };
 
@@ -464,10 +497,23 @@ export function matchPostgresReference(
   const isQualified = ref.referenceName.includes('::') ||
     isPostgresQualifiedName(ref.referenceName);
   const pick = (candidates: Node[]): Node | undefined => {
+    // DROP is itself a lifecycle boundary. With several historical definitions
+    // of the same relation, its target is the latest declaration before the
+    // statement in this migration stream, never a declaration later in the
+    // same file. Apply chronology before the normal same-file preference.
+    const source = context.getNodeById?.(ref.fromNodeId);
+    if (source?.decorators?.includes(POSTGRES_DROP_RELATION_DECORATOR) === true) {
+      return latestPostgresMigrationNodeBefore(candidates, {
+        filePath: ref.filePath,
+        line: ref.line,
+        column: ref.column,
+      }) ?? undefined;
+    }
+
     const sameFile = candidates.filter((node) => node.filePath === ref.filePath);
     if (sameFile.length === 1) return sameFile[0];
-    if (sameFile.length > 1) return undefined;
-    return candidates.length === 1 ? candidates[0] : undefined;
+    if (sameFile.length === 0 && candidates.length === 1) return candidates[0];
+    return undefined;
   };
 
   let target: Node | undefined;
@@ -475,7 +521,6 @@ export function matchPostgresReference(
     const candidates = context.getNodesByQualifiedName(ref.referenceName).filter(eligible);
     target = pick(candidates);
   } else {
-    const searchPath = sharedPostgresSearchPathAtOffset(positions, refOffset);
     let foundInSearchPath = false;
     if (!isCallable) {
       const temporaryName = qualifyPostgresName('pg_temp', ref.referenceName);
@@ -487,29 +532,53 @@ export function matchPostgresReference(
         target = pick(temporaryCandidates);
       }
     }
-    for (const schema of searchPath.schemas) {
-      if (foundInSearchPath) break;
-      // The runtime role behind $user is unknowable from source. It shadows
-      // later schemas when present, so choosing a later candidate would invent
-      // certainty; leave the reference unresolved instead.
-      if (schema === '$user') {
+
+    if (ref.candidates !== undefined) {
+      // A routine-local SET search_path is carried as ordered canonical
+      // qualified candidates. It must override (not mutate) the ambient file
+      // path, and the first schema containing a name shadows every later one.
+      // An empty list is an explicitly empty path. `$user` is a role-dependent
+      // barrier: once reached, choosing a later schema would invent certainty.
+      for (const qualified of ref.candidates) {
+        if (foundInSearchPath) break;
+        if (parsePostgresQualifiedName(qualified)?.[0] === '$user') {
+          foundInSearchPath = true;
+          break;
+        }
+        const schemaCandidates = context
+          .getNodesByQualifiedName(qualified)
+          .filter(eligible);
+        if (schemaCandidates.length === 0) continue;
         foundInSearchPath = true;
+        target = pick(schemaCandidates);
         break;
       }
-      const qualified = qualifyPostgresName(schema, ref.referenceName);
-      const schemaCandidates = [
-        ...(qualified ? context.getNodesByQualifiedName(qualified) : []),
-        ...context.getNodesByQualifiedName(`${schema}::${ref.referenceName}`),
-      ].filter(eligible);
-      if (schemaCandidates.length === 0) continue;
-      // The first schema containing the name shadows every later schema. If
-      // that schema has duplicate historical definitions, preserve ambiguity.
-      foundInSearchPath = true;
-      target = pick(schemaCandidates);
-      break;
+    } else {
+      const searchPath = sharedPostgresSearchPathAtOffset(positions, refOffset);
+      for (const schema of searchPath.schemas) {
+        if (foundInSearchPath) break;
+        // The runtime role behind $user is unknowable from source. It shadows
+        // later schemas when present, so choosing a later candidate would invent
+        // certainty; leave the reference unresolved instead.
+        if (schema === '$user') {
+          foundInSearchPath = true;
+          break;
+        }
+        const qualified = qualifyPostgresName(schema, ref.referenceName);
+        const schemaCandidates = [
+          ...(qualified ? context.getNodesByQualifiedName(qualified) : []),
+          ...context.getNodesByQualifiedName(`${schema}::${ref.referenceName}`),
+        ].filter(eligible);
+        if (schemaCandidates.length === 0) continue;
+        // The first schema containing the name shadows every later schema. If
+        // that schema has duplicate historical definitions, preserve ambiguity.
+        foundInSearchPath = true;
+        target = pick(schemaCandidates);
+        break;
+      }
     }
 
-    if (!target && !foundInSearchPath) {
+    if (!target && !foundInSearchPath && ref.candidates === undefined) {
       const candidates = context.getNodesByName(referenceSimple).filter(eligible);
       // Never jump to a qualified schema outside the active path. A uniquely
       // unqualified declaration is retained for extractor backward

@@ -12,6 +12,7 @@ import {
   UnresolvedReference,
   NodeKind,
   EdgeKind,
+  ReferenceKind,
   Language,
   GraphStats,
   SearchOptions,
@@ -2219,7 +2220,7 @@ export class QueryBuilder {
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
+      referenceKind: row.reference_kind as ReferenceKind,
       line: row.line,
       column: row.col,
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
@@ -2237,7 +2238,7 @@ export class QueryBuilder {
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
+      referenceKind: row.reference_kind as ReferenceKind,
       line: row.line,
       column: row.col,
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
@@ -2285,7 +2286,7 @@ export class QueryBuilder {
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
+      referenceKind: row.reference_kind as ReferenceKind,
       line: row.line,
       column: row.col,
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
@@ -2313,7 +2314,7 @@ export class QueryBuilder {
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
+      referenceKind: row.reference_kind as ReferenceKind,
       line: row.line,
       column: row.col,
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
@@ -2382,7 +2383,7 @@ export class QueryBuilder {
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
+      referenceKind: row.reference_kind as ReferenceKind,
       line: row.line,
       column: row.col,
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
@@ -2564,7 +2565,7 @@ export class QueryBuilder {
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
+      referenceKind: row.reference_kind as ReferenceKind,
       line: row.line,
       column: row.col,
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,

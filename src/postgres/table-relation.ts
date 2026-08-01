@@ -4,6 +4,7 @@ export const POSTGRES_TABLE_RELATION_DECORATOR = 'postgres:table-relation';
 export const POSTGRES_TABLE_RELATION_DATA_PREFIX = 'postgres:table-relation-data:';
 
 export type PostgresTableRelationKind =
+  | 'rename'
   | 'partition-of'
   | 'inherits'
   | 'like'

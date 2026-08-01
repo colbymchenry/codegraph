@@ -1,3 +1,7 @@
+import type { PostgresObjectReferenceKind } from './postgres/reference-intent';
+
+export type { PostgresObjectReferenceKind } from './postgres/reference-intent';
+
 /**
  * CodeGraph Type Definitions
  *
@@ -320,12 +324,13 @@ export interface ExtractionError {
 }
 
 /**
- * Kinds an unresolved reference can carry. `function_ref` is internal-only —
- * a function name used as a VALUE (callback registration, #756). It never
- * becomes an edge kind: resolution maps it to a `references` edge targeting
- * function/method nodes only (see `matchFunctionRef`).
+ * Kinds an unresolved reference can carry. Internal-only intents never become
+ * edge kinds: resolution maps them to `references` after applying stricter
+ * target eligibility than an ordinary reference. `function_ref` targets only
+ * function/method nodes; PostgreSQL object intents retain exact object-class,
+ * quoted-name, and search_path semantics.
  */
-export type ReferenceKind = EdgeKind | 'function_ref';
+export type ReferenceKind = EdgeKind | 'function_ref' | PostgresObjectReferenceKind;
 
 /**
  * A reference that couldn't be resolved during extraction

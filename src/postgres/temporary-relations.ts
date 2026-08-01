@@ -230,7 +230,8 @@ function findSavepointIndex(savepoints: TemporarySavepoint[], name: string): num
 export function analyzePostgresTemporaryRelationVisibility(
   source: string,
   nodes: readonly Node[],
-  positions: PostgresSearchPathState
+  positions: PostgresSearchPathState,
+  copyPayloadsMasked = false
 ): PostgresTemporaryRelationVisibilityState {
   const declarations: TemporaryDeclaration[] = nodes
     .filter((node) => node.language === 'postgres' &&
@@ -288,7 +289,7 @@ export function analyzePostgresTemporaryRelationVisibility(
     }
   };
 
-  for (const statement of postgresTopLevelStatements(source)) {
+  for (const statement of postgresTopLevelStatements(source, { copyPayloadsMasked })) {
     const text = statement.text;
     const savepoint = /^\s*SAVEPOINT\s+("(?:""|[^"])+"|[A-Za-z_][A-Za-z0-9_$]*)\s*;\s*$/i
       .exec(text);

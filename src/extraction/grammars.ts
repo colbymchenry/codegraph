@@ -54,6 +54,15 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
 };
 
 /**
+ * PL/pgSQL is an embedded grammar, not a file language: PostgreSQL files use
+ * the `postgres` grammar and inject routine/DO bodies into this companion.
+ * Keep it out of Language/EXTENSION_MAP while still preloading it whenever a
+ * PostgreSQL index is loaded.
+ */
+const POSTGRES_PLPGSQL_GRAMMAR_KEY = 'plpgsql';
+const POSTGRES_PLPGSQL_WASM_FILE = 'tree-sitter-plpgsql.wasm';
+
+/**
  * File extension to Language mapping
  */
 export const EXTENSION_MAP: Record<string, Language> = {
@@ -239,6 +248,9 @@ export function isPlayRoutesFile(filePath: string): boolean {
 const parserCache = new Map<Language, Parser>();
 const languageCache = new Map<Language, WasmLanguage>();
 const unavailableGrammarErrors = new Map<Language, string>();
+let postgresPlpgsqlParser: Parser | null = null;
+let postgresPlpgsqlLanguage: WasmLanguage | null = null;
+let postgresPlpgsqlUnavailableError: string | null = null;
 
 let parserInitialized = false;
 
@@ -294,9 +306,13 @@ export async function initGrammars(): Promise<void> {
  * The kernel-grammar-parity test asserts this alignment; bump the crate and
  * the vendored wasm together.
  *
- * PostgreSQL: gmr/tree-sitter-postgres v1.2.4 (BSD-3-Clause), using the
- * release's prebuilt ABI-15 tree-sitter-postgres.wasm. The artifact's SHA-256
- * is 084883e58414c407dfac6f37f0facc983afdfe8103e17f5fd2ca138b79a22b92.
+ * PostgreSQL: gmr/tree-sitter-postgres v1.2.4 (BSD-3-Clause), exact commit
+ * 9b27ba5c8700f9bf808221a0f6d17fe6515da787. The SQL grammar uses the
+ * release's prebuilt ABI-15 tree-sitter-postgres.wasm (SHA-256
+ * 084883e58414c407dfac6f37f0facc983afdfe8103e17f5fd2ca138b79a22b92).
+ * The companion PL/pgSQL grammar is built from that tag's checked-in
+ * plpgsql/src/parser.c + scanner.c with tree-sitter-cli 0.26.7; its WASM
+ * SHA-256 is 24a4b44b5263cbf78716d5a7301b5ade6f8696dbce08365421e785382427694e.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
@@ -359,6 +375,11 @@ function resolveWasmPath(lang: GrammarLanguage): string {
     : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
 }
 
+/** Absolute path of the PostgreSQL companion PL/pgSQL grammar. */
+function resolvePostgresPlpgsqlWasmPath(): string {
+  return path.join(__dirname, 'wasm', POSTGRES_PLPGSQL_WASM_FILE);
+}
+
 /**
  * Expand an index set's languages to the grammars actually needed to parse it.
  * SFC languages (svelte/vue/astro) have no grammar of their own — their
@@ -400,7 +421,34 @@ export async function readGrammarWasmBytes(languages: Language[]): Promise<Recor
       // fall through — the worker's own load reports the failure
     }
   }
+  if (toRead.includes('postgres')) {
+    try {
+      out[POSTGRES_PLPGSQL_GRAMMAR_KEY] = await fsp.readFile(resolvePostgresPlpgsqlWasmPath());
+    } catch {
+      // fall through — the worker's own companion load reports the failure
+    }
+  }
   return out;
+}
+
+/** Load the PL/pgSQL companion after the primary PostgreSQL grammar. */
+async function loadPostgresPlpgsqlGrammar(
+  wasmBytes?: Record<string, Uint8Array>
+): Promise<void> {
+  if (postgresPlpgsqlLanguage || postgresPlpgsqlUnavailableError) return;
+  try {
+    const bytes = wasmBytes?.[POSTGRES_PLPGSQL_GRAMMAR_KEY];
+    postgresPlpgsqlLanguage = await WasmLanguage.load(
+      bytes ?? resolvePostgresPlpgsqlWasmPath()
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(
+      '[CodeGraph] Failed to load PostgreSQL PL/pgSQL companion grammar — ' +
+      `routine-body parsing will be unavailable: ${message}`
+    );
+    postgresPlpgsqlUnavailableError = message;
+  }
 }
 
 /**
@@ -440,6 +488,12 @@ export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?
       unavailableGrammarErrors.set(lang, message);
     }
   }
+
+  // Keep the embedded grammar out of the public Language set, but guarantee
+  // it is ready before synchronous PostgreSQL extraction begins.
+  if (languages.includes('postgres')) {
+    await loadPostgresPlpgsqlGrammar(wasmBytes);
+  }
 }
 
 /**
@@ -475,6 +529,24 @@ export function getParser(language: Language): Parser | null {
   const parser = new Parser();
   parser.setLanguage(lang);
   parserCache.set(language, parser);
+  return parser;
+}
+
+/**
+ * Return the preloaded parser for a PL/pgSQL routine/DO body.
+ *
+ * This is intentionally separate from getParser(): PL/pgSQL is embedded in a
+ * PostgreSQL file and must never become an extension-detected file language.
+ * The accessor is synchronous for use during extraction and safely returns
+ * null when the companion failed to load.
+ */
+export function getPostgresPlpgsqlParser(): Parser | null {
+  if (postgresPlpgsqlParser) return postgresPlpgsqlParser;
+  if (!postgresPlpgsqlLanguage) return null;
+
+  const parser = new Parser();
+  parser.setLanguage(postgresPlpgsqlLanguage);
+  postgresPlpgsqlParser = parser;
   return parser;
 }
 
@@ -594,6 +666,10 @@ export function resetParser(language: Language): void {
     old.delete();
     parserCache.delete(language);
   }
+  if (language === 'postgres' && postgresPlpgsqlParser) {
+    postgresPlpgsqlParser.delete();
+    postgresPlpgsqlParser = null;
+  }
 }
 
 /**
@@ -604,9 +680,14 @@ export function clearParserCache(): void {
     parser.delete();
   }
   parserCache.clear();
+  if (postgresPlpgsqlParser) {
+    postgresPlpgsqlParser.delete();
+    postgresPlpgsqlParser = null;
+  }
   // Note: languageCache is NOT cleared — WASM languages persist.
   // To fully re-init, set parserInitialized = false and call initGrammars() again.
   unavailableGrammarErrors.clear();
+  postgresPlpgsqlUnavailableError = null;
 }
 
 /**

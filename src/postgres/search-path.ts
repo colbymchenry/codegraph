@@ -19,6 +19,11 @@ export interface PostgresStatement {
   endOffset: number;
 }
 
+export interface PostgresStatementOptions {
+  /** COPY payloads and their `\.` terminators were already blanked in-place. */
+  copyPayloadsMasked?: boolean;
+}
+
 interface PostgresSavepoint {
   name: string;
   session: PostgresSearchPath;
@@ -177,6 +182,18 @@ function parseSetSearchPath(raw: string): PostgresSearchPath {
   return { schemas, explicit: true };
 }
 
+/**
+ * Parse the value portion of PostgreSQL's `SET search_path TO/=` syntax.
+ *
+ * CREATE FUNCTION/PROCEDURE carries the same grammar inside a routine-local
+ * configuration clause. Exporting this narrow parser keeps quoted identifiers,
+ * string-literal schema names, empty paths, and DEFAULT behavior identical to
+ * top-level SET handling without treating the routine option as session state.
+ */
+export function parsePostgresSearchPathSetting(raw: string): PostgresSearchPath {
+  return parseSetSearchPath(raw);
+}
+
 function parseGucSearchPath(rawLiteral: string): PostgresSearchPath | null {
   const value = decodeSingleQuoted(rawLiteral) ?? decodeDollarQuoted(rawLiteral);
   if (value === null) return null;
@@ -199,7 +216,10 @@ function parseSetSchema(rawLiteral: string): PostgresSearchPath | null {
  * spaces, quoted bodies suppress semicolon splitting, and pg_dump COPY payloads
  * are skipped through their standalone `\.` terminator.
  */
-export function* postgresTopLevelStatements(source: string): IterableIterator<PostgresStatement> {
+export function* postgresTopLevelStatements(
+  source: string,
+  options: PostgresStatementOptions = {}
+): IterableIterator<PostgresStatement> {
   const buffer: string[] = [];
   const MAX_STATEMENT_CHARS = 32_768;
   let blockDepth = 0;
@@ -326,7 +346,8 @@ export function* postgresTopLevelStatements(source: string): IterableIterator<Po
       append(char);
       if (char === ';') {
         const text = buffer.join('');
-        copyPayload = /^\s*COPY\b/i.test(text) &&
+        copyPayload = options.copyPayloadsMasked !== true &&
+          /^\s*COPY\b/i.test(text) &&
           /\bFROM\s+STDIN\s*;\s*$/i.test(statementTail);
         yield { text, endOffset: i + 1 };
         resetLexicalState();
@@ -341,7 +362,10 @@ function samePath(a: PostgresSearchPath, b: PostgresSearchPath): boolean {
     a.schemas.every((schema, index) => schema === b.schemas[index]);
 }
 
-export function analyzePostgresSearchPath(source: string): PostgresSearchPathState {
+export function analyzePostgresSearchPath(
+  source: string,
+  options: PostgresStatementOptions = {}
+): PostgresSearchPathState {
   const changes: PostgresSearchPathChange[] = [];
   const lineStarts = [0];
   for (let i = 0; i < source.length; i++) {
@@ -358,7 +382,7 @@ export function analyzePostgresSearchPath(source: string): PostgresSearchPathSta
     if (!samePath(before, after)) changes.push({ offset, ...clonePath(after) });
   };
 
-  for (const statement of postgresTopLevelStatements(source)) {
+  for (const statement of postgresTopLevelStatements(source, options)) {
     const text = statement.text;
     const before = clonePath(effective());
     const savepoint = /^\s*SAVEPOINT\s+("(?:""|[^"])+"|[A-Za-z_][A-Za-z0-9_$]*)\s*;\s*$/i

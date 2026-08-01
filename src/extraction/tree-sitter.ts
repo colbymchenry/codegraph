@@ -503,6 +503,29 @@ export class TreeSitterExtractor {
       if (!this.tree) {
         throw new Error('Parser returned null tree');
       }
+      if (this.extractor?.reportParseErrors && this.tree.rootNode.hasError) {
+        const findFirstProblem = (node: SyntaxNode): SyntaxNode | null => {
+          if (node.isError || node.isMissing) return node;
+          for (let index = 0; index < node.namedChildCount; index++) {
+            const child = node.namedChild(index);
+            if (!child) continue;
+            const problem = findFirstProblem(child);
+            if (problem) return problem;
+          }
+          return null;
+        };
+        const problem = findFirstProblem(this.tree.rootNode);
+        this.errors.push({
+          message: problem?.isMissing
+            ? `Parser recovered a missing ${problem.type}`
+            : 'Parser recovered an invalid syntax region',
+          filePath: this.filePath,
+          line: (problem?.startPosition.row ?? 0) + 1,
+          column: problem?.startPosition.column ?? 0,
+          severity: 'error',
+          code: 'parse_error',
+        });
+      }
 
       // Create file node representing the source file
       const fileNode: Node = {

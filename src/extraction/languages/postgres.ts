@@ -1,6 +1,12 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import type { Node, NodeKind } from '../../types';
 import {
+  POSTGRES_DROP_CONSTRAINT_DECORATOR,
+  POSTGRES_RENAME_CONSTRAINT_DECORATOR,
+  encodePostgresDropConstraintDescriptor,
+  encodePostgresRenameConstraintDescriptor,
+} from '../../postgres/constraint-mutation';
+import {
   POSTGRES_FOREIGN_KEY_DECORATOR,
   encodePostgresForeignKeyDescriptor,
   type PostgresForeignKeyDescriptor,
@@ -10,6 +16,16 @@ import {
   parsePostgresQualifiedName,
   serializePostgresQualifiedName,
 } from '../../postgres/identifiers';
+import {
+  POSTGRES_SEQUENCE_REFERENCE_KIND,
+  POSTGRES_TYPE_REFERENCE_KIND,
+  type PostgresObjectReferenceKind,
+} from '../../postgres/reference-intent';
+import {
+  POSTGRES_DROP_RELATION_DECORATOR,
+  encodePostgresDropRelationDescriptor,
+  type PostgresDroppedRelationKind,
+} from '../../postgres/relation-lifecycle';
 import {
   analyzePostgresSearchPath,
   postgresSearchPathAtOffset,
@@ -26,6 +42,17 @@ import {
   type PostgresTableRelationDescriptor,
   type PostgresTableRelationKind,
 } from '../../postgres/table-relation';
+import {
+  POSTGRES_ENUM_VALUE_MUTATION_DECORATOR,
+  POSTGRES_TYPE_RENAME_DECORATOR,
+  encodePostgresEnumValueMutationDescriptor,
+  encodePostgresTypeRenameDescriptor,
+} from '../../postgres/type-lifecycle';
+import {
+  discoverPostgresRoutineBodyReferences,
+  postgresStaticSequenceLiteral,
+} from '../../postgres/routine-body';
+import { getParser, getPostgresPlpgsqlParser } from '../grammars';
 import { getNodeText } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 
@@ -38,10 +65,11 @@ import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
  * qualified names (`schema.object`).  Generic CodeGraph node kinds are reused;
  * the precise database-object kind is retained as a `postgres:*` decorator.
  *
- * String-literal routine bodies are opaque leaves in the PostgreSQL grammar.
- * Top-level SQL and SQL expressions are therefore indexed here, while nested
- * SQL/PL/pgSQL extraction requires an injected body grammar and is deliberately
- * left for a follow-up.
+ * Routine bodies are opaque leaves in the outer grammar. Static dollar-quoted
+ * SQL bodies are reparsed with PostgreSQL; PL/pgSQL and DO blocks are first
+ * parsed with the pinned companion grammar and only its explicit SQL regions
+ * are injected back into PostgreSQL. Dynamic EXECUTE remains deliberately
+ * opaque because indexing must never guess or execute generated source.
  */
 
 interface SqlName {
@@ -50,9 +78,33 @@ interface SqlName {
   simple: string;
 }
 
-type ReferenceKind = 'references' | 'calls';
+type ReferenceKind = 'references' | 'calls' | PostgresObjectReferenceKind;
 
 const NAME_SEGMENT_TYPES = new Set(['ColId', 'ColLabel', 'type_function_name']);
+
+// GenericType also covers built-ins such as text/jsonb/uuid. Filter the core
+// catalog spellings so typed object references stay useful instead of adding a
+// failed unresolved row for nearly every column in a schema dump.
+const POSTGRES_BUILTIN_TYPES = new Set([
+  'aclitem', 'any', 'anyarray', 'anycompatible', 'anycompatiblearray', 'anycompatiblenonarray',
+  'anycompatiblemultirange', 'anycompatiblerange', 'anyelement', 'anyenum',
+  'anymultirange', 'anynonarray', 'anyrange', 'bigint', 'bigserial', 'bit', 'bool',
+  'boolean', 'box', 'bpchar', 'bytea', 'char', 'character', 'cidr', 'circle', 'cstring',
+  'date', 'datemultirange', 'daterange', 'decimal', 'double precision', 'event_trigger',
+  'fdw_handler', 'float4', 'float8', 'gtsvector', 'index_am_handler', 'inet', 'int',
+  'int2', 'int2vector', 'int4', 'int4multirange', 'int4range', 'int8', 'int8multirange',
+  'int8range', 'integer', 'internal', 'interval', 'json', 'jsonb', 'language_handler',
+  'line', 'lseg', 'macaddr', 'macaddr8', 'money', 'name', 'numeric', 'nummultirange',
+  'numrange', 'oid', 'oidvector', 'opaque', 'path', 'pg_dependencies', 'pg_lsn',
+  'pg_mcv_list', 'pg_ndistinct', 'pg_node_tree', 'pg_snapshot', 'point', 'polygon',
+  'real', 'record', 'refcursor', 'regclass', 'regcollation', 'regconfig', 'regdictionary',
+  'regnamespace', 'regoper', 'regoperator', 'regproc', 'regprocedure', 'regrole',
+  'regtype', 'serial', 'serial2', 'serial4', 'serial8', 'smallint', 'smallserial',
+  'table_am_handler', 'text', 'tid', 'time', 'timestamp', 'timestamptz', 'timetz',
+  'trigger', 'tsm_handler', 'tsmultirange', 'tsquery', 'tsrange', 'tstzmultirange',
+  'tstzrange', 'tsvector', 'txid_snapshot', 'unknown', 'uuid', 'varbit', 'varchar',
+  'void', 'xid', 'xid8', 'xml',
+]);
 
 /** Per-extraction reference de-duplication. `ctx.nodes` is stable for a file. */
 const emittedReferenceKeys = new WeakMap<readonly object[], Set<string>>();
@@ -66,6 +118,338 @@ const extractionTemporaryVisibility = new WeakMap<
   readonly object[],
   ExtractionTemporaryVisibilityCache
 >();
+
+function postgresDollarTagAt(source: string, offset: number): string | null {
+  if (source[offset] !== '$') return null;
+  let end = offset + 1;
+  if (source[end] === '$') return '$$';
+  if (!/[A-Za-z_]/.test(source[end] ?? '')) return null;
+  end++;
+  while (/[A-Za-z0-9_]/.test(source[end] ?? '')) end++;
+  return source[end] === '$' ? source.slice(offset, end + 1) : null;
+}
+
+function isPostgresEscapeStringStart(source: string, quoteOffset: number): boolean {
+  const prefixOffset = quoteOffset - 1;
+  const prefix = source[prefixOffset];
+  if (prefix !== 'E' && prefix !== 'e') return false;
+  // E/e is a literal prefix only at a token boundary, not the tail of an
+  // identifier such as `some' text'`.
+  return prefixOffset === 0 || !/[A-Za-z0-9_$]/.test(source[prefixOffset - 1] ?? '');
+}
+
+function postgresCodeMask(source: string): string {
+  // split('') retains UTF-16 code-unit indexes; a code-point spread would make
+  // every replacement after an astral character address the wrong position.
+  const masked = source.split('');
+  let single = false;
+  let singleBackslashEscapes = false;
+  let double = false;
+  let dollarTag: string | null = null;
+  let lineComment = false;
+  let blockDepth = 0;
+  for (let index = 0; index < source.length; index++) {
+    const char = source[index]!;
+    const next = source[index + 1];
+    if (lineComment) {
+      if (char !== '\n') masked[index] = ' ';
+      else lineComment = false;
+      continue;
+    }
+    if (blockDepth > 0) {
+      if (char !== '\n') masked[index] = ' ';
+      if (char === '/' && next === '*') {
+        masked[++index] = ' ';
+        blockDepth++;
+      } else if (char === '*' && next === '/') {
+        masked[++index] = ' ';
+        blockDepth--;
+      }
+      continue;
+    }
+    if (dollarTag) {
+      if (char !== '\n') masked[index] = ' ';
+      if (source.startsWith(dollarTag, index)) {
+        for (let cursor = index; cursor < index + dollarTag.length; cursor++) masked[cursor] = ' ';
+        index += dollarTag.length - 1;
+        dollarTag = null;
+      }
+      continue;
+    }
+    if (single) {
+      if (char !== '\n') masked[index] = ' ';
+      if (char === "'" && next === "'") masked[++index] = ' ';
+      else if (char === "'") {
+        single = false;
+        singleBackslashEscapes = false;
+      } else if (
+        singleBackslashEscapes && char === '\\' && index + 1 < source.length
+      ) masked[++index] = ' ';
+      continue;
+    }
+    if (double) {
+      if (char !== '\n') masked[index] = ' ';
+      if (char === '"' && next === '"') masked[++index] = ' ';
+      else if (char === '"') double = false;
+      continue;
+    }
+    if (char === '-' && next === '-') {
+      masked[index] = masked[index + 1] = ' ';
+      lineComment = true;
+      index++;
+    } else if (char === '/' && next === '*') {
+      masked[index] = masked[index + 1] = ' ';
+      blockDepth = 1;
+      index++;
+    } else if (char === "'") {
+      masked[index] = ' ';
+      single = true;
+      singleBackslashEscapes = isPostgresEscapeStringStart(source, index);
+    } else if (char === '"') {
+      masked[index] = ' ';
+      double = true;
+    } else if (char === '$') {
+      const tag = postgresDollarTagAt(source, index);
+      if (tag) {
+        for (let cursor = index; cursor < index + tag.length; cursor++) masked[cursor] = ' ';
+        dollarTag = tag;
+        index += tag.length - 1;
+      }
+    }
+  }
+  return masked.join('');
+}
+
+/** Match COPY's top-level direction without mistaking a query's inner FROM. */
+function isCopyFromStdinStatement(statement: string): boolean {
+  const copy = /^\s*COPY\b/i.exec(statement);
+  if (!copy) return false;
+  let depth = 0;
+  for (let index = copy[0].length; index < statement.length;) {
+    const char = statement[index]!;
+    if (char === '(') {
+      depth++;
+      index++;
+      continue;
+    }
+    if (char === ')') {
+      depth = Math.max(0, depth - 1);
+      index++;
+      continue;
+    }
+    if (depth === 0 && /[A-Za-z_]/.test(char)) {
+      const start = index++;
+      while (/[A-Za-z0-9_$]/.test(statement[index] ?? '')) index++;
+      const word = statement.slice(start, index).toUpperCase();
+      if (word === 'TO') return false;
+      if (word === 'FROM') {
+        while (/\s/.test(statement[index] ?? '')) index++;
+        const source = /^[A-Za-z_][A-Za-z0-9_$]*/.exec(statement.slice(index))?.[0];
+        return source?.toUpperCase() === 'STDIN';
+      }
+      continue;
+    }
+    index++;
+  }
+  return false;
+}
+
+/**
+ * Offset-preserving PostgreSQL dialect cleanup for constructs intentionally
+ * outside the core server grammar:
+ *
+ * - psql meta-command lines are blanked;
+ * - psql variables become equivalent parser-safe expressions;
+ * - a valid CHECK-expression shape that gmr/tree-sitter-postgres currently
+ *   mis-parses receives redundant parentheses in place of existing spaces.
+ *
+ * Every replacement is ASCII-for-ASCII and retains every newline, so the AST
+ * still addresses the original file's byte offsets and source locations.
+ */
+export function preParsePostgresSource(source: string): string {
+  const output = source.split('');
+  const psqlCopyPayloadStarts: number[] = [];
+  let single = false;
+  let singleBackslashEscapes = false;
+  let double = false;
+  let dollarTag: string | null = null;
+  let lineComment = false;
+  let blockDepth = 0;
+  let atLineStart = true;
+
+  for (let index = 0; index < source.length; index++) {
+    if (atLineStart) {
+      atLineStart = false;
+      if (!single && !double && !dollarTag && blockDepth === 0 && !lineComment) {
+        let commandStart = index;
+        while (source[commandStart] === ' ' || source[commandStart] === '\t') commandStart++;
+        if (source[commandStart] === '\\') {
+          const lineEnd = source.indexOf('\n', commandStart);
+          const end = lineEnd < 0 ? source.length : lineEnd;
+          const command = source.slice(commandStart, end).replace(/\r$/, '');
+          const copyStatement = `${command.slice(1).replace(/;?\s*$/, '')};`;
+          if (isCopyFromStdinStatement(copyStatement) && lineEnd >= 0) {
+            psqlCopyPayloadStarts.push(lineEnd + 1);
+          }
+          for (let cursor = commandStart; cursor < end; cursor++) output[cursor] = ' ';
+          index = end - 1;
+          continue;
+        }
+      }
+    }
+
+    const char = source[index]!;
+    const next = source[index + 1];
+    if (lineComment) {
+      if (char === '\n') {
+        lineComment = false;
+        atLineStart = true;
+      }
+      continue;
+    }
+    if (blockDepth > 0) {
+      if (char === '/' && next === '*') {
+        blockDepth++;
+        index++;
+      } else if (char === '*' && next === '/') {
+        blockDepth--;
+        index++;
+      } else if (char === '\n') {
+        atLineStart = true;
+      }
+      continue;
+    }
+    if (dollarTag) {
+      if (source.startsWith(dollarTag, index)) {
+        index += dollarTag.length - 1;
+        dollarTag = null;
+      } else if (char === '\n') {
+        atLineStart = true;
+      }
+      continue;
+    }
+    if (single) {
+      if (char === "'" && next === "'") {
+        index++;
+      } else if (char === "'") {
+        single = false;
+        singleBackslashEscapes = false;
+      } else if (
+        singleBackslashEscapes && char === '\\' && index + 1 < source.length
+      ) {
+        index++;
+      } else if (char === '\n') {
+        atLineStart = true;
+      }
+      continue;
+    }
+    if (double) {
+      if (char === '"' && next === '"') {
+        index++;
+      } else if (char === '"') {
+        double = false;
+      } else if (char === '\n') {
+        atLineStart = true;
+      }
+      continue;
+    }
+
+    if (char === '-' && next === '-') {
+      lineComment = true;
+      index++;
+    } else if (char === '/' && next === '*') {
+      blockDepth = 1;
+      index++;
+    } else if (char === "'") {
+      single = true;
+      singleBackslashEscapes = isPostgresEscapeStringStart(source, index);
+    } else if (char === '"') {
+      double = true;
+    } else if (char === '$') {
+      const tag = postgresDollarTagAt(source, index);
+      if (tag) {
+        dollarTag = tag;
+        index += tag.length - 1;
+      }
+    } else if (char === ':' && source[index - 1] !== ':' && (next === "'" || next === '"')) {
+      // `:'name'` / `:"name"`: removing only the psql interpolation marker
+      // leaves a valid string literal / quoted identifier of identical length.
+      output[index] = ' ';
+    } else if (char === ':' && source[index - 1] !== ':' && /[A-Za-z_]/.test(next ?? '')) {
+      let end = index + 2;
+      while (/[A-Za-z0-9_]/.test(source[end] ?? '')) end++;
+      output[index] = '$';
+      output[index + 1] = '1';
+      for (let cursor = index + 2; cursor < end; cursor++) output[cursor] = ' ';
+      index = end - 1;
+    } else if (char === '\n') {
+      atLineStart = true;
+    }
+  }
+
+  // gmr parses a server COPY statement itself but intentionally does not
+  // consume psql's following text-format payload. psql's `\copy` uses the same
+  // payload protocol but normally has no semicolon and its command line was
+  // blanked above. Only erase a payload when an exact `\.` terminator exists;
+  // without one, subsequent SQL must remain visible instead of being silently
+  // treated as data. Every erased byte keeps its original newline/offset.
+  const blankCopyPayload = (firstDataOffset: number): number | null => {
+    let lineStart = firstDataOffset;
+    let terminatorEnd: number | null = null;
+    while (lineStart < source.length) {
+      const newline = source.indexOf('\n', lineStart);
+      const lineEnd = newline < 0 ? source.length : newline;
+      const line = source.slice(lineStart, lineEnd).replace(/\r$/, '');
+      if (line === '\\.') {
+        terminatorEnd = lineEnd;
+        break;
+      }
+      if (newline < 0) break;
+      lineStart = newline + 1;
+    }
+    if (terminatorEnd === null) return null;
+    for (let cursor = firstDataOffset; cursor < terminatorEnd; cursor++) {
+      if (source[cursor] !== '\n') output[cursor] = ' ';
+    }
+    const newline = source.indexOf('\n', terminatorEnd);
+    return newline < 0 ? source.length : newline + 1;
+  };
+
+  for (const firstDataOffset of psqlCopyPayloadStarts) {
+    blankCopyPayload(firstDataOffset);
+  }
+
+  // Inspect complete semicolon-delimited statements rather than searching for
+  // the words COPY/FROM/STDIN anywhere. This keeps valid identifiers in e.g.
+  // `SELECT copy FROM stdin` from erasing every later line in the file.
+  const preparedCode = postgresCodeMask(output.join(''));
+  let statementStart = 0;
+  for (let cursor = 0; cursor < preparedCode.length; cursor++) {
+    if (preparedCode[cursor] !== ';') continue;
+    const statement = preparedCode.slice(statementStart, cursor + 1);
+    const isCopyFromStdin = isCopyFromStdinStatement(statement);
+    if (isCopyFromStdin) {
+      const headerLineEnd = source.indexOf('\n', cursor + 1);
+      const resume = headerLineEnd < 0 ? null : blankCopyPayload(headerLineEnd + 1);
+      if (resume !== null) {
+        cursor = resume - 1;
+        statementStart = resume;
+        continue;
+      }
+    }
+    statementStart = cursor + 1;
+  }
+
+  const checkPattern = /(\bCHECK)(\s+)\(([^;\n]*?\bIN\s*\([^()\n]*\))(\s+)=/gi;
+  const code = postgresCodeMask(output.join(''));
+  for (let match = checkPattern.exec(code); match; match = checkPattern.exec(code)) {
+    const afterKeyword = match.index + (match[1]?.length ?? 0);
+    const beforeEquals = match.index + match[0].length - 1 - (match[4]?.length ?? 0);
+    output[afterKeyword] = '(';
+    output[beforeEquals] = ')';
+  }
+  return output.join('');
+}
 
 function children(node: SyntaxNode): SyntaxNode[] {
   const result: SyntaxNode[] = [];
@@ -82,6 +466,10 @@ function directChild(node: SyntaxNode, ...types: string[]): SyntaxNode | null {
     if (child && types.includes(child.type)) return child;
   }
   return null;
+}
+
+function directChildren(node: SyntaxNode, ...types: string[]): SyntaxNode[] {
+  return children(node).filter((child) => types.includes(child.type));
 }
 
 function firstDescendant(node: SyntaxNode, ...types: string[]): SyntaxNode | null {
@@ -163,6 +551,13 @@ function sqlNameFromParts(parts: string[]): SqlName {
   };
 }
 
+function isUserDefinedPostgresType(name: SqlName): boolean {
+  if (name.parts.length > 1) {
+    return name.parts[0] !== 'pg_catalog' && name.parts[0] !== 'information_schema';
+  }
+  return !POSTGRES_BUILTIN_TYPES.has(name.simple.toLowerCase());
+}
+
 interface NestedSchema {
   found: boolean;
   name: SqlName | null;
@@ -186,7 +581,7 @@ function nestedSchema(node: SyntaxNode, source: string): NestedSchema {
 function searchPathState(ctx: ExtractorContext): PostgresSearchPathState {
   let state = extractionSearchPaths.get(ctx.nodes);
   if (!state) {
-    state = analyzePostgresSearchPath(ctx.source);
+    state = analyzePostgresSearchPath(ctx.source, { copyPayloadsMasked: true });
     extractionSearchPaths.set(ctx.nodes, state);
   }
   return state;
@@ -223,7 +618,8 @@ function temporaryVisibilityState(ctx: ExtractorContext): ExtractionTemporaryVis
     cached.state = analyzePostgresTemporaryRelationVisibility(
       ctx.source,
       cached.candidates,
-      searchPathState(ctx)
+      searchPathState(ctx),
+      true
     );
   }
   return cached;
@@ -350,6 +746,21 @@ function addReference(
   kind: ReferenceKind,
   positionNode: SyntaxNode
 ): void {
+  addReferenceAt(ctx, fromNodeId, target, kind, {
+    startIndex: positionNode.startIndex,
+    line: positionNode.startPosition.row + 1,
+    column: positionNode.startPosition.column,
+  });
+}
+
+function addReferenceAt(
+  ctx: ExtractorContext,
+  fromNodeId: string,
+  target: SqlName,
+  kind: ReferenceKind,
+  position: { startIndex: number; line: number; column: number },
+  searchPathCandidates?: readonly string[]
+): void {
   let keys = emittedReferenceKeys.get(ctx.nodes);
   if (!keys) {
     keys = new Set<string>();
@@ -360,27 +771,34 @@ function addReference(
   // ordinary repeated reads within one segment remain de-duplicated.
   const activePath = postgresSearchPathAtOffset(
     searchPathState(ctx),
-    positionNode.startIndex
+    position.startIndex
   );
   const temporaryBinding = visibleTemporaryCandidates(
     ctx,
     target,
-    positionNode.startIndex
+    position.startIndex
   ).map((candidate) => candidate.id).sort().join('\u001f');
   const key = `${fromNodeId}\u0000${kind}\u0000${target.qualified}` +
     `\u0000${activePath.explicit ? 'explicit' : 'default'}` +
     `\u0000${activePath.schemas.join('\u001f')}` +
+    `\u0000routine:${searchPathCandidates === undefined
+      ? 'ambient'
+      : searchPathCandidates.join('\u001f')}` +
     `\u0000temp:${temporaryBinding}`;
   if (keys.has(key)) return;
   keys.add(key);
 
-  ctx.addUnresolvedReference({
+  const reference = {
     fromNodeId,
     referenceName: target.qualified,
     referenceKind: kind,
-    line: positionNode.startPosition.row + 1,
-    column: positionNode.startPosition.column,
-  });
+    line: position.line,
+    column: position.column,
+    ...(searchPathCandidates === undefined
+      ? {}
+      : { candidates: [...searchPathCandidates] }),
+  };
+  ctx.addUnresolvedReference(reference);
 }
 
 function createDatabaseNode(
@@ -406,6 +824,13 @@ function createDatabaseNode(
   });
 }
 
+function addDecorators(created: Node | null | undefined, ...decorators: string[]): void {
+  if (!created) return;
+  const merged = new Set(created.decorators ?? []);
+  for (const decorator of decorators) merged.add(decorator);
+  created.decorators = [...merged];
+}
+
 function walkChildren(node: SyntaxNode, ctx: ExtractorContext): void {
   for (const child of children(node)) ctx.visitNode(child);
 }
@@ -415,22 +840,35 @@ function createColumn(
   node: SyntaxNode,
   nameNode: SyntaxNode,
   parentQualifiedOverride?: string
-): void {
+): Node | null {
   const name = readSqlName(nameNode, ctx.source);
-  if (!name) return;
+  if (!name) return null;
   const parentQualified = parentQualifiedOverride ?? currentScopeQualifiedName(ctx);
   const qualifiedName = parentQualified
     ? appendPostgresIdentifier(parentQualified, name.simple)
     : name.qualified;
   const idDiscriminator = `${qualifiedName}@${node.startPosition.row + 1}:` +
     `${node.startPosition.column + 1}`;
-  ctx.createNode('field', idDiscriminator, node, {
+  const created = ctx.createNode('field', idDiscriminator, node, {
     name: name.simple,
     qualifiedName,
     signature: compactText(node, ctx.source, 200),
     decorators: ['postgres:column'],
     isExported: true,
   });
+  const typeNode = directChild(node, 'Typename');
+  const typeName = readSqlName(typeNode, ctx.source);
+  if (created && typeNode && typeName && isUserDefinedPostgresType(typeName)) {
+    addReference(
+      ctx,
+      created.id,
+      typeName,
+      POSTGRES_TYPE_REFERENCE_KIND,
+      typeNode
+    );
+  }
+  if (created) createStaticSequenceReferences(node, ctx, created.id);
+  return created;
 }
 
 function createExplicitColumns(container: SyntaxNode | null, ctx: ExtractorContext): void {
@@ -585,6 +1023,30 @@ function routineSignature(node: SyntaxNode, name: SqlName, source: string): stri
   return `${prefix} ${name.qualified}${argsText}${returnText}`;
 }
 
+function createRoutineBodyReferences(
+  node: SyntaxNode,
+  ctx: ExtractorContext,
+  ownerId: string
+): void {
+  const postgres = getParser('postgres');
+  if (!postgres) return;
+  const discovery = discoverPostgresRoutineBodyReferences(node, ctx.source, {
+    postgres,
+    plpgsql: getPostgresPlpgsqlParser(),
+  });
+  if (discovery.status !== 'analyzed') return;
+  for (const fact of discovery.facts) {
+    addReferenceAt(
+      ctx,
+      ownerId,
+      sqlNameFromParts(fact.parts),
+      fact.kind === 'sequence' ? POSTGRES_SEQUENCE_REFERENCE_KIND : fact.kind,
+      fact,
+      fact.searchPathCandidates
+    );
+  }
+}
+
 function createRoutine(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const name = objectName(node, directChild(node, 'func_name'), ctx);
   if (!name) return true;
@@ -598,7 +1060,26 @@ function createRoutine(node: SyntaxNode, ctx: ExtractorContext): boolean {
     name.qualified,
     routineSignature(node, name, ctx.source)
   );
-  withCreatedScope(ctx, created, () => walkChildren(node, ctx));
+  withCreatedScope(ctx, created, () => {
+    walkChildren(node, ctx);
+    if (created) createRoutineBodyReferences(node, ctx, created.id);
+  });
+  return true;
+}
+
+function createDoBlock(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const identity = `DO@${node.startPosition.row + 1}:${node.startPosition.column + 1}`;
+  const created = ctx.createNode('function', identity, node, {
+    name: 'DO block',
+    qualifiedName: `${ctx.filePath}::${identity}`,
+    signature: 'DO block',
+    decorators: ['postgres:do-block'],
+    isExported: false,
+  });
+  withCreatedScope(ctx, created, () => {
+    walkChildren(node, ctx);
+    if (created) createRoutineBodyReferences(node, ctx, created.id);
+  });
   return true;
 }
 
@@ -709,12 +1190,293 @@ function createPolicy(node: SyntaxNode, ctx: ExtractorContext): boolean {
     'policy',
     qualifiedName
   );
+  if (node.type === 'AlterPolicyStmt') addDecorators(created, 'postgres:alter-policy');
   withCreatedScope(ctx, created, () => {
     if (created && tableNode && tableName) {
       addReference(ctx, created.id, tableName, 'references', tableNode);
     }
     walkChildren(node, ctx);
   });
+  return true;
+}
+
+function renamedName(previous: SqlName, replacement: SqlName): SqlName {
+  return sqlNameFromParts([...previous.parts.slice(0, -1), replacement.simple]);
+}
+
+function createDrop(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const objectType = directChild(node, 'object_type_any_name');
+  if (!objectType) return false;
+  let relationKind: PostgresDroppedRelationKind | null = null;
+  if (hasDirectChild(objectType, 'kw_table')) {
+    relationKind = hasDirectChild(objectType, 'kw_foreign') ? 'foreign-table' : 'table';
+  } else if (hasDirectChild(objectType, 'kw_view')) {
+    relationKind = hasDirectChild(objectType, 'kw_materialized')
+      ? 'materialized-view'
+      : 'view';
+  }
+  if (!relationKind) return false;
+
+  const objectLabel = relationKind.replace('-', ' ').toUpperCase();
+  for (const nameNode of allDescendants(node, 'any_name')) {
+    const rawName = readSqlName(nameNode, ctx.source);
+    const name = rawName ? nameInSearchPathSchema(rawName, node, ctx) : null;
+    if (!name) continue;
+    const displayName = `DROP ${objectLabel} ${name.qualified}`;
+    const created = ctx.createNode('constant', `${displayName}@${node.startIndex}`, node, {
+      name: displayName,
+      qualifiedName: appendPostgresIdentifier(name.qualified, displayName),
+      signature: compactText(node, ctx.source),
+      decorators: [
+        POSTGRES_DROP_RELATION_DECORATOR,
+        encodePostgresDropRelationDescriptor({
+          relationName: name.qualified,
+          relationKind,
+        }),
+      ],
+      isExported: true,
+    });
+    if (created) addReference(ctx, created.id, name, 'references', nameNode);
+  }
+  return true;
+}
+
+function createRename(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const replacementNodes = directChildren(node, 'name');
+
+  if (hasDirectChild(node, 'kw_policy')) {
+    const tableNode = directChild(node, 'qualified_name');
+    const rawTable = readSqlName(tableNode, ctx.source);
+    const table = rawTable ? nameInSearchPathSchema(rawTable, node, ctx) : null;
+    const replacement = readSqlName(replacementNodes[replacementNodes.length - 1] ?? null, ctx.source);
+    if (!tableNode || !table || !replacement) return true;
+    const qualified = appendPostgresIdentifier(table.qualified, replacement.simple);
+    const created = createDatabaseNode(
+      ctx,
+      node,
+      replacement,
+      'constant',
+      'policy',
+      qualified
+    );
+    addDecorators(created, 'postgres:renamed-policy');
+    if (created) addReference(ctx, created.id, table, 'references', tableNode);
+    return true;
+  }
+
+  const relation = directChild(node, 'relation_expr');
+  const tableNode = relation ? firstDescendant(relation, 'qualified_name') : null;
+  const rawTable = readSqlName(tableNode, ctx.source);
+  const table = rawTable ? nameInSearchPathSchema(rawTable, node, ctx) : null;
+
+  if (relation && tableNode && table && hasDirectChild(node, 'opt_column')) {
+    const names = replacementNodes.map((candidate) => readSqlName(candidate, ctx.source));
+    const previous = names[0];
+    const replacement = names[names.length - 1];
+    if (!previous || !replacement) return true;
+    const qualifiedName = appendPostgresIdentifier(table.qualified, replacement.simple);
+    const idDiscriminator = `${qualifiedName}@${node.startPosition.row + 1}:` +
+      `${node.startPosition.column + 1}`;
+    const created = ctx.createNode('field', idDiscriminator, node, {
+      name: replacement.simple,
+      qualifiedName,
+      signature: compactText(node, ctx.source),
+      decorators: ['postgres:column', 'postgres:renamed-column'],
+      isExported: true,
+    });
+    if (created) addReference(ctx, created.id, table, 'references', tableNode);
+    return true;
+  }
+
+  if (relation && tableNode && table && hasDirectChild(node, 'kw_constraint')) {
+    const names = replacementNodes.map((candidate) => readSqlName(candidate, ctx.source));
+    const previous = names[0];
+    const replacement = names[names.length - 1];
+    if (!previous || !replacement) return true;
+    const qualifiedName = appendPostgresIdentifier(table.qualified, replacement.simple);
+    const created = createDatabaseNode(
+      ctx,
+      node,
+      replacement,
+      'constant',
+      'constraint',
+      qualifiedName
+    );
+    addDecorators(
+      created,
+      'postgres:renamed-constraint',
+      POSTGRES_RENAME_CONSTRAINT_DECORATOR,
+      encodePostgresRenameConstraintDescriptor({
+        table: table.qualified,
+        sourceConstraint: previous.simple,
+        targetConstraint: replacement.simple,
+      })
+    );
+    if (created) addReference(ctx, created.id, table, 'references', tableNode);
+    return true;
+  }
+
+  if (relation && tableNode && table && hasDirectChild(node, 'kw_table')) {
+    const replacement = readSqlName(replacementNodes[replacementNodes.length - 1] ?? null, ctx.source);
+    if (!replacement) return true;
+    const next = renamedName(table, replacement);
+    const created = createDatabaseNode(ctx, node, next, 'struct', 'table');
+    addDecorators(created, 'postgres:renamed-relation');
+    markTemporary(created, isTemporaryRelationName(table));
+    if (created) addReference(ctx, created.id, table, 'references', tableNode);
+    createTableRelationFact(
+      ctx,
+      node,
+      table,
+      next,
+      'rename' as PostgresTableRelationKind,
+      tableNode,
+      replacementNodes[replacementNodes.length - 1] ?? node
+    );
+    return true;
+  }
+
+  const sourceNode = directChild(node, 'qualified_name', 'any_name');
+  const rawSource = readSqlName(sourceNode, ctx.source);
+  const source = rawSource ? nameInSearchPathSchema(rawSource, node, ctx) : null;
+  const replacement = readSqlName(replacementNodes[replacementNodes.length - 1] ?? null, ctx.source);
+  if (!sourceNode || !source || !replacement) return true;
+  const next = renamedName(source, replacement);
+
+  if (hasDirectChild(node, 'kw_view')) {
+    const objectKind = hasDirectChild(node, 'kw_materialized')
+      ? 'materialized-view'
+      : 'view';
+    const created = createDatabaseNode(ctx, node, next, 'struct', objectKind);
+    addDecorators(created, 'postgres:renamed-relation');
+    markTemporary(created, isTemporaryRelationName(source));
+    if (created) addReference(ctx, created.id, source, 'references', sourceNode);
+    createTableRelationFact(
+      ctx,
+      node,
+      source,
+      next,
+      'rename' as PostgresTableRelationKind,
+      sourceNode,
+      replacementNodes[replacementNodes.length - 1] ?? node
+    );
+    return true;
+  }
+
+  if (hasDirectChild(node, 'kw_type') && !hasDirectChild(node, 'kw_attribute')) {
+    const created = createDatabaseNode(ctx, node, next, 'type_alias', 'type');
+    addDecorators(
+      created,
+      'postgres:renamed-type',
+      POSTGRES_TYPE_RENAME_DECORATOR,
+      encodePostgresTypeRenameDescriptor({
+        sourceType: source.qualified,
+        targetType: next.qualified,
+      })
+    );
+    if (created) {
+      addReference(ctx, created.id, source, POSTGRES_TYPE_REFERENCE_KIND, sourceNode);
+    }
+    return true;
+  }
+
+  const objectKind = hasDirectChild(node, 'kw_index')
+    ? 'index'
+    : hasDirectChild(node, 'kw_sequence')
+      ? 'sequence'
+      : 'type';
+  const kind: NodeKind = objectKind === 'index'
+    ? 'constant'
+    : objectKind === 'sequence'
+      ? 'variable'
+      : 'type_alias';
+  const created = createDatabaseNode(ctx, node, next, kind, objectKind);
+  addDecorators(created, `postgres:renamed-${objectKind}`);
+  return true;
+}
+
+function postgresStringLiteral(node: SyntaxNode | null, source: string): string | null {
+  if (!node) return null;
+  const raw = getNodeText(node, source);
+  if (raw.length >= 2 && raw.startsWith("'") && raw.endsWith("'")) {
+    return raw.slice(1, -1).replace(/''/g, "'");
+  }
+  return raw || null;
+}
+
+function createAlterEnum(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const typeNode = directChild(node, 'any_name');
+  const rawType = readSqlName(typeNode, ctx.source);
+  const typeName = rawType ? nameInSearchPathSchema(rawType, node, ctx) : null;
+  const values = directChildren(node, 'Sconst')
+    .map((value) => firstDescendant(value, 'string_literal'))
+    .filter((value): value is SyntaxNode => value !== null);
+  const renamed = hasDirectChild(node, 'kw_rename');
+  const sourceValueNode = renamed ? values[0] ?? null : null;
+  const valueNode = renamed ? values[values.length - 1] ?? null : values[0] ?? null;
+  const sourceValue = postgresStringLiteral(sourceValueNode, ctx.source);
+  const value = postgresStringLiteral(valueNode, ctx.source);
+  if (!typeName || !valueNode || !value || (renamed && !sourceValue)) return true;
+  const qualifiedName = appendPostgresIdentifier(typeName.qualified, value);
+  const idDiscriminator = `${qualifiedName}@${valueNode.startPosition.row + 1}:` +
+    `${valueNode.startPosition.column + 1}`;
+  ctx.createNode('enum_member', idDiscriminator, valueNode, {
+    name: value,
+    qualifiedName,
+    signature: compactText(node, ctx.source),
+    decorators: [
+      'postgres:enum-value',
+      renamed ? 'postgres:renamed-enum-value' : 'postgres:alter-enum-add-value',
+      POSTGRES_ENUM_VALUE_MUTATION_DECORATOR,
+      encodePostgresEnumValueMutationDescriptor(renamed ? {
+        mutation: 'rename',
+        enumType: typeName.qualified,
+        sourceValue: sourceValue!,
+        targetValue: value,
+      } : {
+        mutation: 'add',
+        enumType: typeName.qualified,
+        targetValue: value,
+      }),
+    ],
+    isExported: true,
+  });
+  return true;
+}
+
+function createAlterSequence(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const sequenceNode = directChild(node, 'qualified_name');
+  const rawSequence = readSqlName(sequenceNode, ctx.source);
+  const sequence = rawSequence ? nameInSearchPathSchema(rawSequence, node, ctx) : null;
+  const ownerNode = firstDescendant(node, 'any_name');
+  const owner = readSqlName(ownerNode, ctx.source);
+  if (!sequence || !ownerNode || !owner || owner.parts.length < 2) return true;
+  const table = sqlNameFromParts(owner.parts.slice(0, -1));
+  const identity = `OWNED BY ${owner.qualified}`;
+  const deltaName: SqlName = {
+    parts: [...sequence.parts, identity],
+    qualified: appendPostgresIdentifier(sequence.qualified, identity),
+    simple: sequence.simple,
+  };
+  const created = createDatabaseNode(
+    ctx,
+    node,
+    deltaName,
+    'constant',
+    'sequence-ownership'
+  );
+  if (created) {
+    addReference(ctx, created.id, table, 'references', ownerNode);
+    if (sequenceNode) {
+      addReference(
+        ctx,
+        created.id,
+        sequence,
+        POSTGRES_SEQUENCE_REFERENCE_KIND,
+        sequenceNode
+      );
+    }
+  }
   return true;
 }
 
@@ -908,6 +1670,158 @@ function createForeignKey(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true;
 }
 
+function createConstraint(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const references = directChild(node, 'kw_references');
+  if (references && (node.type === 'ColConstraintElem' || hasDirectChild(node, 'kw_foreign'))) {
+    return createForeignKey(node, ctx);
+  }
+
+  const constraintKind = hasDirectChild(node, 'kw_primary')
+    ? 'primary-key'
+    : hasDirectChild(node, 'kw_unique')
+      ? 'unique'
+      : hasDirectChild(node, 'kw_check')
+        ? 'check'
+        : null;
+  if (!constraintKind) {
+    walkChildren(node, ctx);
+    return true;
+  }
+
+  const alter = nearestAncestor(node, 'AlterTableStmt');
+  const alterRelation = alter ? directChild(alter, 'relation_expr') : null;
+  const alterTableNode = alterRelation ? firstDescendant(alterRelation, 'qualified_name') : null;
+  const rawAlterTable = readSqlName(alterTableNode, ctx.source);
+  const alterTable = rawAlterTable && alter
+    ? nameInSearchPathSchema(rawAlterTable, alter, ctx)
+    : rawAlterTable;
+  const scope = currentScopeNode(ctx);
+  const scopeIsTable = scope?.language === 'postgres' && scope.kind === 'struct' &&
+    (scope.decorators?.includes('postgres:table') === true ||
+      scope.decorators?.includes('postgres:foreign-table') === true);
+  const sourceTable: SqlName | null = alterTable ?? (scopeIsTable && scope ? {
+    parts: parsePostgresQualifiedName(scope.qualifiedName) ?? [scope.qualifiedName],
+    qualified: scope.qualifiedName,
+    simple: scope.name,
+  } : null);
+  if (!sourceTable) {
+    walkChildren(node, ctx);
+    return true;
+  }
+
+  const wrapper = nearestAncestor(node, 'TableConstraint', 'ColConstraint');
+  const constraintName = readSqlName(wrapper ? directChild(wrapper, 'name') : null, ctx.source);
+  const columns = node.type === 'ConstraintElem'
+    ? columnNames(directChild(node, 'columnList'), ctx.source)
+    : (() => {
+        const column = nearestAncestor(node, 'columnDef');
+        const name = readSqlName(column ? directChild(column, 'ColId') : null, ctx.source);
+        return name ? [name.simple] : [];
+      })();
+  const label = constraintName?.simple ?? `${constraintKind.toUpperCase()} (${columns.join(', ')})`;
+  const identity = constraintName?.simple ??
+    `${label} @${node.startPosition.row + 1}:${node.startPosition.column + 1}`;
+  const qualifiedName = appendPostgresIdentifier(sourceTable.qualified, identity);
+  const idDiscriminator = `${qualifiedName}@${node.startPosition.row + 1}:` +
+    `${node.startPosition.column + 1}`;
+  const created = ctx.createNode('constant', idDiscriminator, wrapper ?? node, {
+    name: label,
+    qualifiedName,
+    signature: compactText(wrapper ?? node, ctx.source),
+    decorators: ['postgres:constraint', `postgres:${constraintKind}`],
+    isExported: true,
+  });
+  withCreatedScope(ctx, created, () => {
+    if (created) {
+      addReference(ctx, created.id, sourceTable, 'references', alterTableNode ?? node);
+    }
+    walkChildren(node, ctx);
+  });
+  return true;
+}
+
+function createDropConstraint(
+  command: SyntaxNode,
+  ctx: ExtractorContext,
+  tableName: SqlName,
+  tableNode: SyntaxNode
+): boolean {
+  if (!hasDirectChild(command, 'kw_drop') || !hasDirectChild(command, 'kw_constraint')) {
+    return false;
+  }
+  const constraintNode = directChild(command, 'name');
+  const constraint = readSqlName(constraintNode, ctx.source);
+  if (!constraintNode || !constraint) return false;
+  const identity = `DROP CONSTRAINT ${constraint.simple}`;
+  const qualifiedName = appendPostgresIdentifier(tableName.qualified, identity);
+  const idDiscriminator = `${qualifiedName}@${command.startPosition.row + 1}:` +
+    `${command.startPosition.column + 1}`;
+  const created = ctx.createNode('constant', idDiscriminator, command, {
+    name: identity,
+    qualifiedName,
+    signature: compactText(command, ctx.source),
+    decorators: [
+      POSTGRES_DROP_CONSTRAINT_DECORATOR,
+      encodePostgresDropConstraintDescriptor({
+        table: tableName.qualified,
+        constraintName: constraint.simple,
+      }),
+    ],
+    isExported: true,
+  });
+  if (created) addReference(ctx, created.id, tableName, 'references', tableNode);
+  return true;
+}
+
+function createIdentitySequence(
+  command: SyntaxNode,
+  ctx: ExtractorContext,
+  tableName: SqlName,
+  tableNode: SyntaxNode
+): void {
+  const identity = firstDescendant(command, 'kw_identity');
+  if (!identity) return;
+  const sequenceNode = allDescendants(command, 'any_name')
+    .find((candidate) => candidate.startIndex > identity.startIndex) ?? null;
+  const rawSequence = readSqlName(sequenceNode, ctx.source);
+  const sequence = rawSequence ? nameInSearchPathSchema(rawSequence, command, ctx) : null;
+  if (!sequenceNode || !sequence) return;
+  const created = createDatabaseNode(ctx, command, sequence, 'variable', 'sequence');
+  addDecorators(created, 'postgres:identity-sequence');
+  if (created) addReference(ctx, created.id, tableName, 'references', tableNode);
+}
+
+function createAlterColumnType(
+  command: SyntaxNode,
+  ctx: ExtractorContext,
+  tableName: SqlName,
+  tableNode: SyntaxNode
+): boolean {
+  const typeNode = directChild(command, 'Typename');
+  const typeName = readSqlName(typeNode, ctx.source);
+  const columnNode = directChild(command, 'ColId');
+  const columnName = readSqlName(columnNode, ctx.source);
+  if (!typeNode || !typeName || !columnName || !isUserDefinedPostgresType(typeName)) return false;
+  const identity = `ALTER COLUMN ${columnName.simple} TYPE ${typeName.qualified}`;
+  const qualifiedName = appendPostgresIdentifier(tableName.qualified, identity);
+  const idDiscriminator = `${qualifiedName}@${command.startPosition.row + 1}:` +
+    `${command.startPosition.column + 1}`;
+  const created = ctx.createNode('constant', idDiscriminator, command, {
+    name: identity,
+    qualifiedName,
+    signature: compactText(command, ctx.source),
+    decorators: ['postgres:alter-table-column-type'],
+    isExported: true,
+  });
+  withCreatedScope(ctx, created, () => {
+    if (!created) return;
+    addReference(ctx, created.id, tableName, 'references', tableNode);
+    addReference(ctx, created.id, typeName, POSTGRES_TYPE_REFERENCE_KIND, typeNode);
+    walkChildren(command, ctx);
+  });
+  return true;
+}
+
 /**
  * Model ALTER TABLE ADD COLUMN as a migration delta rather than attaching the
  * new field to an arbitrary historical CREATE TABLE node. The delta references
@@ -988,6 +1902,12 @@ function createAlterTableDeltas(node: SyntaxNode, ctx: ExtractorContext): boolea
   const commands = directChild(node, 'alter_table_cmds');
   if (!commands) return true;
   for (const command of allDescendants(commands, 'alter_table_cmd')) {
+    createIdentitySequence(command, ctx, tableName, tableNode);
+    if (createDropConstraint(command, ctx, tableName, tableNode)) {
+      walkChildren(command, ctx);
+      continue;
+    }
+    if (createAlterColumnType(command, ctx, tableName, tableNode)) continue;
     const column = directChild(command, 'columnDef');
     const columnNameNode = column ? directChild(column, 'ColId') : null;
     const columnName = readSqlName(columnNameNode, ctx.source);
@@ -1095,6 +2015,41 @@ function emitRelationReference(node: SyntaxNode, ctx: ExtractorContext): boolean
   return true;
 }
 
+function createStaticSequenceReferences(
+  container: SyntaxNode,
+  ctx: ExtractorContext,
+  ownerId: string
+): void {
+  const applications = container.type === 'func_application'
+    ? [container]
+    : allDescendants(container, 'func_application');
+  for (const application of applications) {
+    const functionName = readSqlName(directChild(application, 'func_name'), ctx.source);
+    if (!functionName || !['nextval', 'currval', 'setval'].includes(functionName.simple)) continue;
+    const literal = postgresStaticSequenceLiteral(application);
+    const rawSequence = postgresStringLiteral(literal, ctx.source);
+    const parts = rawSequence ? parsePostgresQualifiedName(rawSequence) : null;
+    if (!literal || !parts || parts.length === 0) continue;
+    addReference(
+      ctx,
+      ownerId,
+      sqlNameFromParts(parts),
+      POSTGRES_SEQUENCE_REFERENCE_KIND,
+      literal
+    );
+  }
+}
+
+function emitTypeReference(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  if (nearestAncestor(node, 'columnDef', 'alter_table_cmd')) return true;
+  const name = readSqlName(node, ctx.source);
+  const ownerId = currentScopeId(ctx);
+  if (name && ownerId && isUserDefinedPostgresType(name)) {
+    addReference(ctx, ownerId, name, POSTGRES_TYPE_REFERENCE_KIND, node);
+  }
+  return true;
+}
+
 function emitRoutineCall(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const nameNode = directChild(node, 'func_name');
   const name = readSqlName(nameNode, ctx.source);
@@ -1105,12 +2060,17 @@ function emitRoutineCall(node: SyntaxNode, ctx: ExtractorContext): boolean {
   // project edges before the resolver can inspect the indexed declarations.
   if (nameNode && name && fromNodeId) {
     addReference(ctx, fromNodeId, name, 'calls', nameNode);
+    if (!nearestAncestor(node, 'columnDef')) {
+      createStaticSequenceReferences(node, ctx, fromNodeId);
+    }
   }
   walkChildren(node, ctx);
   return true;
 }
 
 export const postgresExtractor: LanguageExtractor = {
+  preParse: preParsePostgresSource,
+  reportParseErrors: true,
   // All relevant grammar nodes have empty field maps, so visitNode owns the
   // PostgreSQL dispatch. Empty generic mappings prevent accidental extraction
   // from wrapper names such as `name` / `ColId`.
@@ -1169,6 +2129,9 @@ export const postgresExtractor: LanguageExtractor = {
       case 'CreateFunctionStmt':
         return createRoutine(node, ctx);
 
+      case 'DoStmt':
+        return createDoBlock(node, ctx);
+
       case 'CreateSchemaStmt':
         return createSchema(node, ctx);
 
@@ -1183,13 +2146,26 @@ export const postgresExtractor: LanguageExtractor = {
         return createTrigger(node, ctx);
 
       case 'CreatePolicyStmt':
+      case 'AlterPolicyStmt':
         return createPolicy(node, ctx);
+
+      case 'RenameStmt':
+        return createRename(node, ctx);
+
+      case 'DropStmt':
+        return createDrop(node, ctx);
+
+      case 'AlterEnumStmt':
+        return createAlterEnum(node, ctx);
 
       case 'IndexStmt':
         return createIndex(node, ctx);
 
       case 'CreateSeqStmt':
         return createSequence(node, ctx);
+
+      case 'AlterSeqStmt':
+        return createAlterSequence(node, ctx);
 
       case 'CreateExtensionStmt':
         return createExtension(node, ctx);
@@ -1211,7 +2187,10 @@ export const postgresExtractor: LanguageExtractor = {
 
       case 'ConstraintElem':
       case 'ColConstraintElem':
-        return createForeignKey(node, ctx);
+        return createConstraint(node, ctx);
+
+      case 'Typename':
+        return emitTypeReference(node, ctx);
 
       case 'relation_expr':
       case 'insert_target':
