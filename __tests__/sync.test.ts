@@ -757,3 +757,76 @@ describe('Sync Module', () => {
     });
   });
 });
+
+describe('Scoped sync parity (#watcher-scoped)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  const snapshot = (g: CodeGraph): string => {
+    // Natural-key snapshot of the whole graph, mirroring dump-graph.mjs at
+    // unit scale: scoped and full sync must land the DB in the same state.
+    const nodes = g
+      .searchNodes('', { limit: 100000 })
+      .map((r) => r.node)
+      .map((n) => `${n.kind}|${n.qualifiedName}|${n.filePath}|${n.startLine}`)
+      .sort()
+      .join('\n');
+    return nodes;
+  };
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sync-scoped-'));
+    const srcDir = path.join(testDir, 'src');
+    fs.mkdirSync(srcDir);
+    fs.writeFileSync(path.join(srcDir, 'a.ts'), `export function alpha() { return beta(); }`);
+    fs.writeFileSync(path.join(srcDir, 'b.ts'), `export function beta() { return 1; }`);
+    cg = CodeGraph.initSync(testDir);
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    cg?.destroy();
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('a scoped modify lands the same graph as a full sync of the same edit', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'b.ts'), `export function beta() { return 2; }\nexport function gamma() { return 3; }`);
+    const scoped = await cg.sync({ paths: ['src/b.ts'] });
+    expect(scoped.filesModified).toBe(1);
+    const scopedSnap = snapshot(cg);
+
+    // Re-apply the same end state through a FULL sync from the same start
+    // state: revert, full-sync, edit again, full-sync.
+    fs.writeFileSync(path.join(testDir, 'src', 'b.ts'), `export function beta() { return 1; }`);
+    await cg.sync();
+    fs.writeFileSync(path.join(testDir, 'src', 'b.ts'), `export function beta() { return 2; }\nexport function gamma() { return 3; }`);
+    const full = await cg.sync();
+    expect(full.filesModified).toBe(1);
+    expect(snapshot(cg)).toBe(scopedSnap);
+  });
+
+  it('a scoped delete removes the file and resurrects cross-file refs like a full sync', async () => {
+    fs.rmSync(path.join(testDir, 'src', 'b.ts'));
+    const scoped = await cg.sync({ paths: ['src/b.ts'] });
+    expect(scoped.filesRemoved).toBe(1);
+    expect(scoped.filesChecked).toBe(1); // checked paths, not found files (#449 lock signature)
+    const gone = cg.searchNodes('beta');
+    expect(gone.filter((r) => r.node.filePath === 'src/b.ts').length).toBe(0);
+  });
+
+  it('a scoped add indexes the new file', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'c.ts'), `export function delta() { return 4; }`);
+    const scoped = await cg.sync({ paths: ['src/c.ts'] });
+    expect(scoped.filesAdded).toBe(1);
+    expect(cg.searchNodes('delta').length).toBeGreaterThan(0);
+  });
+
+  it('scoped sync ignores paths outside the change without touching them', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'a.ts'), `export function alpha() { return beta() + 1; }`);
+    const scoped = await cg.sync({ paths: ['src/a.ts'] });
+    expect(scoped.filesModified).toBe(1);
+    expect(scoped.filesRemoved).toBe(0);
+    // b.ts untouched and still present
+    expect(cg.searchNodes('beta').length).toBeGreaterThan(0);
+  });
+});

@@ -73,3 +73,6 @@ assets/generate-waitlist.py
 
 # Local scratch tests (never commit)
 __tests__/zz-scratch*
+
+# linux-arm64 kernel cross-build cache (rust:1-bookworm builder)
+target-linux/

@@ -232,6 +232,16 @@ export function matchFunctionRef(
     ref.language === 'cpp' || ref.language === 'python' ||
     ref.language === 'php';
 
+  // Python additionally accepts CLASS targets for bare identifiers (#1478):
+  // class-as-value is a core Python idiom (`return SomeSerializer`,
+  // `Meta.model = Org`, registry dicts, `admin.site.register(Model, Admin)`)
+  // and, unlike TS, Python has no type-annotation recovery path. The
+  // false-positive mechanism behind the function-only rule was lowercase
+  // locals colliding with same-named METHODS (docopt.py) — a candidate must
+  // be an exact-name CLASS node here, and the extraction gate (same-file
+  // class ∪ imports) plus unique-or-drop still apply. Methods stay excluded.
+  const bareClassOk = ref.language === 'python';
+
   // Qualified member-pointer (`&Widget::on_click` → "Widget::on_click"):
   // resolve the member ON THAT SCOPE — exempt from bareFnOnly (the `&Cls::m`
   // shape is an explicit member reference). Unique-or-drop like everything else.
@@ -264,7 +274,9 @@ export function matchFunctionRef(
     .getNodesByName(ref.referenceName)
     .filter(
       (n) =>
-        (n.kind === 'function' || (!bareFnOnly && n.kind === 'method')) &&
+        (n.kind === 'function' ||
+          (!bareFnOnly && n.kind === 'method') ||
+          (bareClassOk && n.kind === 'class')) &&
         sameLanguageFamily(n.language, ref.language) &&
         n.id !== ref.fromNodeId // a function registering itself is not a dependency edge
     );
@@ -587,12 +599,16 @@ export function resolveMethodOnType(
     // populated in the conformance pass. Still VALIDATED (the method must exist on
     // a supertype), so a wrong inference produces no edge.
     if (depth < 4 && context.getSupertypes) {
-      for (const supertype of context.getSupertypes(typeName, ref.language)) {
-        const via = resolveMethodOnType(
-          supertype, methodName, ref, context, confidence, resolvedBy, preferredFqn, depth + 1,
-        );
-        if (via) return via;
-      }
+      const viaSupers = nmTimedT('rmot-supers', ref, (): ResolvedRef | null => {
+        for (const supertype of context.getSupertypes!(typeName, ref.language)) {
+          const via = resolveMethodOnType(
+            supertype, methodName, ref, context, confidence, resolvedBy, preferredFqn, depth + 1,
+          );
+          if (via) return via;
+        }
+        return null;
+      });
+      if (viaSupers) return viaSupers;
     }
     return null;
   }
@@ -1685,7 +1701,7 @@ export function matchMethodCall(
               .getImportMappings(ref.filePath, ref.language)
               .find((i) => i.localName === inferredType)?.source
           : undefined;
-      const typedMatch = resolveMethodOnType(
+      const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
         methodName!,
         ref,
@@ -1693,7 +1709,7 @@ export function matchMethodCall(
         0.9,
         'instance-method',
         importedFqn,
-      );
+      ));
       if (typedMatch) {
         return typedMatch;
       }
@@ -1728,7 +1744,7 @@ export function matchMethodCall(
       // imported FQN so resolveMethodOnType can disambiguate (#314).
       const imports = context.getImportMappings(ref.filePath, ref.language);
       const importedFqn = imports.find((i) => i.localName === inferredType)?.source;
-      const typedMatch = resolveMethodOnType(
+      const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
         methodName!,
         ref,
@@ -1736,7 +1752,7 @@ export function matchMethodCall(
         0.9,
         'instance-method',
         importedFqn,
-      );
+      ));
       if (typedMatch) {
         return typedMatch;
       }

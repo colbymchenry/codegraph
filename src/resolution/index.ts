@@ -233,6 +233,32 @@ export class ReferenceResolver {
   private qualifiedNameCache: LRUCache<string, Node[]>; // qualified_name → nodes cache
   private fileLinesCache: LRUCache<string, string[] | null>; // file → split lines cache
   private methodMatchCache: LRUCache<string, Node[]>; // lang\0Type::method → matching method nodes
+  // Per-(language, methodName) owner index for getMethodMatches: buckets a
+  // method name's candidates by their qualifiedName's last two segments so a
+  // (type, method) query is a lookup instead of an O(candidates) filter per
+  // methodMatchCache miss. Derived purely from node rows (stable through the
+  // resolution loop, same window nameCache relies on); dropped in clearCaches.
+  private methodOwnerIndexCache = new Map<string, Map<string, Node[]>>();
+  // Generation-tagged memo for getSupertypes. Supertype edges GROW during the
+  // resolution loop (batch k persists its implements/extends edges BEFORE
+  // batch k+1 fans out — the #1320 ordering), so a plain cache would freeze an
+  // early batch's emptier answer and change later batches' outcomes. Within
+  // one batch the edge state is fixed by that same ordering, so entries are
+  // tagged with a generation that advances at every batch entry point
+  // (resolveBatchYielding / resolveListForAdmission) — a stale-gen entry is
+  // recomputed, making the memo behavior-identical to no memo at every point
+  // in time. On the Swift compiler the unmemoized walk ran 971k times for
+  // 565s of combined worker time (~581µs each, recursion-multiplied).
+  private supertypeGen = 0;
+  private supertypeMemo = new Map<string, { gen: number; supers: string[] }>();
+
+  /** Invalidate the getSupertypes memo — call when resolved edges may have advanced. */
+  private advanceSupertypeGeneration(): void {
+    this.supertypeGen++;
+    // Lazy invalidation via the gen tag; bound the map so a long run over many
+    // batches doesn't accrete dead entries.
+    if (this.supertypeMemo.size > 50_000) this.supertypeMemo.clear();
+  }
   // Node kinds are a small fixed set (~24), so this is a plain Map, not an LRU.
   // getNodesByKind returns the FULL node list for a kind; it was previously
   // uncached — a per-ref `SELECT * FROM nodes WHERE kind=?` + row-mapping. Called
@@ -369,6 +395,9 @@ export class ReferenceResolver {
     this.qualifiedNameCache.clear();
     this.fileLinesCache.clear();
     this.methodMatchCache.clear();
+    this.methodOwnerIndexCache.clear();
+    this.supertypeMemo.clear();
+    this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.knownNames = null;
     this.knownFiles = null;
@@ -428,12 +457,52 @@ export class ReferenceResolver {
           this.nameCache.set(methodName, candidates);
         }
         const want = `${typeName}::${methodName}`;
-        const matches: Node[] = [];
-        for (const m of candidates) {
-          if (m.kind !== 'method') continue;
-          if (m.language !== language) continue;
-          const qn = m.qualifiedName;
-          if (qn === want || qn.endsWith(`::${want}`)) matches.push(m);
+        let matches: Node[];
+        if (typeName.includes('::') || methodName.includes(':')) {
+          // Legacy linear filter for the shapes the owner index below can't
+          // key exactly: a multi-segment typeName (the endsWith test then
+          // spans more than two `::` segments) and ObjC selectors (whose
+          // single/empty-keyword colons defeat the segment split). Tiny
+          // populations; the per-key memo above still amortizes them.
+          matches = [];
+          for (const m of candidates) {
+            if (m.kind !== 'method') continue;
+            if (m.language !== language) continue;
+            const qn = m.qualifiedName;
+            if (qn === want || qn.endsWith(`::${want}`)) matches.push(m);
+          }
+        } else {
+          // Owner index: the linear filter above is O(all same-named methods)
+          // per CACHE MISS, and on overload-heavy landscapes the distinct
+          // (type, method) key space is so large the per-key memo never
+          // amortizes — Swift's `init` has tens of thousands of candidates
+          // and the compiler repo measured 732µs per failing call, most of it
+          // this scan (re-entered once per supertype recursion level, too).
+          // Bucket each (language, methodName)'s candidates ONCE by the
+          // qualifiedName's last two `::` segments — exactly the span the
+          // `qn === want || qn.endsWith('::' + want)` predicate tests for a
+          // segment-clean typeName — then every query is a map lookup.
+          // Bucket insertion follows candidate order, so each bucket is
+          // byte-identical to what the linear filter produced.
+          const idxKey = `${language} ${methodName}`;
+          let ownerIndex = this.methodOwnerIndexCache.get(idxKey);
+          if (!ownerIndex) {
+            ownerIndex = new Map<string, Node[]>();
+            for (const m of candidates) {
+              if (m.kind !== 'method') continue;
+              if (m.language !== language) continue;
+              const qn = m.qualifiedName;
+              const i2 = qn.lastIndexOf('::');
+              if (i2 < 0) continue; // single-segment qn can never match `T::m`
+              const i1 = qn.lastIndexOf('::', i2 - 1);
+              const bucketKey = i1 < 0 ? qn : qn.slice(i1 + 2);
+              const bucket = ownerIndex.get(bucketKey);
+              if (bucket) bucket.push(m);
+              else ownerIndex.set(bucketKey, [m]);
+            }
+            this.methodOwnerIndexCache.set(idxKey, ownerIndex);
+          }
+          matches = ownerIndex.get(want) ?? [];
         }
         this.methodMatchCache.set(key, matches);
         return matches;
@@ -531,18 +600,31 @@ export class ReferenceResolver {
         // Matching by simple name (not id) reconciles a type declared in one node
         // (`KF::Builder`) with conformance declared in a separate extension node
         // (`KF.Builder: KFOptionSetter`) — both have name `Builder`.
+        // Memoized per batch generation (see supertypeMemo): within a batch the
+        // edge state is fixed, and the conformance walk re-queries the same
+        // popular supertypes (Swift stdlib protocols especially) thousands of
+        // times per batch.
+        const memoKey = `${language} ${typeName}`;
+        const hit = this.supertypeMemo.get(memoKey);
+        if (hit && hit.gen === this.supertypeGen) return hit.supers;
         const typeNodes = this.context
           .getNodesByName(typeName)
           .filter((n) => SUPERTYPE_BEARING_KINDS.has(n.kind) && n.language === language);
-        if (typeNodes.length === 0) return [];
-        const supertypes = new Set<string>();
-        for (const tn of typeNodes) {
-          for (const edge of this.queries.getOutgoingEdges(tn.id, ['implements', 'extends'])) {
-            const target = this.queries.getNodeById(edge.target);
-            if (target?.name && target.name !== typeName) supertypes.add(target.name);
+        let supers: string[];
+        if (typeNodes.length === 0) {
+          supers = [];
+        } else {
+          const supertypes = new Set<string>();
+          for (const tn of typeNodes) {
+            for (const edge of this.queries.getOutgoingEdges(tn.id, ['implements', 'extends'])) {
+              const target = this.queries.getNodeById(edge.target);
+              if (target?.name && target.name !== typeName) supertypes.add(target.name);
+            }
           }
+          supers = [...supertypes];
         }
-        return [...supertypes];
+        this.supertypeMemo.set(memoKey, { gen: this.supertypeGen, supers });
+        return supers;
       },
 
       getImportMappings: (filePath: string, language) => {
@@ -833,7 +915,15 @@ export class ReferenceResolver {
       const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
       if (viaImport) {
         const target = this.queries.getNodeById(viaImport.targetNodeId);
-        if (target && (target.kind === 'function' || target.kind === 'method')) {
+        if (
+          target &&
+          (target.kind === 'function' ||
+            target.kind === 'method' ||
+            // Python (#1478): an imported class used as a value (`return
+            // OrgSerializerFull`) resolves through its import like any
+            // callback — mirrors matchFunctionRef's bareClassOk.
+            (ref.language === 'python' && target.kind === 'class'))
+        ) {
           return viaImport;
         }
       }
@@ -1235,6 +1325,7 @@ export class ReferenceResolver {
     maybeYield: MaybeYield
   ): Promise<ResolutionResult> {
     this.warmCaches();
+    this.advanceSupertypeGeneration();
 
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
@@ -1356,6 +1447,7 @@ export class ReferenceResolver {
     byMethod: Record<string, number>;
   } {
     this.warmCaches();
+    this.advanceSupertypeGeneration();
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
     const byMethod: Record<string, number> = {};

@@ -2487,7 +2487,19 @@ export class ExtractionOrchestrator {
    * changes. This works in non-git projects and catches committed changes from
    * `git pull`/`checkout`/`merge`/`rebase` that `git status` cannot see.
    */
-  async sync(onProgress?: (progress: IndexProgress) => void): Promise<SyncResult> {
+  async sync(
+    onProgress?: (progress: IndexProgress) => void,
+    /**
+     * Watcher fast path: the exact project-relative paths the OS reported as
+     * changed. When provided, reconciliation runs over ONLY these paths —
+     * per-path logic identical to the full walk (stat pre-filter, hash
+     * confirm, the #1240 removal/resurrection flow) — skipping the O(repo)
+     * scan and tracked-load. Callers must pass undefined whenever the change
+     * set is not exactly known (directory removals, event overflow): the full
+     * scan-diff remains the ground truth those cases need (#1285).
+     */
+    scopedPaths?: string[]
+  ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
     let filesChecked = 0;
@@ -2514,14 +2526,33 @@ export class ExtractionOrchestrator {
     // changes from `git pull`/`checkout`/`merge`/`rebase` — which `git status`
     // cannot see, because the working tree is clean afterward.
     const tSyncScan = Date.now();
-    const currentFiles = await scanDirectoryAsync(this.rootDir);
-    if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
-    filesChecked = currentFiles.length;
-    const currentSet = new Set(currentFiles);
+    let currentFiles: string[];
+    let trackedFiles: FileRecord[];
+    if (scopedPaths && scopedPaths.length > 0) {
+      // Scoped reconcile: stat only the reported paths. filesChecked counts
+      // the PATHS examined (not the files found) — it must stay non-zero even
+      // when every scoped path was a deletion, because CodeGraph.watch()
+      // reads `filesChecked === 0 && durationMs === 0` as the
+      // lock-unavailable signature (#449).
+      const unique = [...new Set(scopedPaths)];
+      currentFiles = unique.filter((p) => fs.existsSync(path.join(this.rootDir, p)));
+      trackedFiles = [];
+      for (const p of unique) {
+        const rec = this.queries.getFileByPath(p);
+        if (rec) trackedFiles.push(rec);
+      }
+      filesChecked = unique.length;
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scoped: ${Date.now() - tSyncScan}ms (${unique.length} paths, ${trackedFiles.length} tracked)`);
+    } else {
+      currentFiles = await scanDirectoryAsync(this.rootDir);
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
+      filesChecked = currentFiles.length;
 
-    const tTracked = Date.now();
-    const trackedFiles = this.queries.getAllFiles();
-    if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-tracked-load: ${Date.now() - tTracked}ms (${trackedFiles.length} tracked)`);
+      const tTracked = Date.now();
+      trackedFiles = this.queries.getAllFiles();
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-tracked-load: ${Date.now() - tTracked}ms (${trackedFiles.length} tracked)`);
+    }
+    const currentSet = new Set(currentFiles);
     const trackedMap = new Map<string, FileRecord>();
     for (const f of trackedFiles) {
       trackedMap.set(f.path, f);
