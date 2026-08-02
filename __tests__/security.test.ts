@@ -18,6 +18,7 @@ import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
+import { acquireDatabaseWriterLease } from '../src/db/writer-lease';
 
 function createTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-security-test-'));
@@ -64,6 +65,29 @@ describe('FileLock', () => {
     expect(() => lock2.acquire()).toThrow(/locked by another process/);
 
     lock1.release();
+  });
+
+  it('should never steal an old lock from a live process', () => {
+    fs.writeFileSync(lockPath, String(process.pid));
+    const old = new Date(Date.now() - 10 * 60 * 1000);
+    fs.utimesSync(lockPath, old, old);
+
+    const lock = new FileLock(lockPath);
+    expect(() => lock.acquire()).toThrow(/locked by another process/);
+    expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(String(process.pid));
+  });
+
+  it('should keep the database writer lease exclusive across operation locks', () => {
+    const writerLease = acquireDatabaseWriterLease(tempDir);
+    const operationLock = new FileLock(path.join(tempDir, '.codegraph', 'codegraph.lock'));
+    operationLock.acquire();
+    operationLock.release();
+
+    expect(() => acquireDatabaseWriterLease(tempDir)).toThrow(/locked by another process/);
+    writerLease.release();
+
+    const nextWriter = acquireDatabaseWriterLease(tempDir);
+    nextWriter.release();
   });
 
   it('should detect and remove stale locks from dead processes', () => {

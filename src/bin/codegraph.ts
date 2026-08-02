@@ -53,6 +53,8 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
+import { FileLock } from '../utils';
+import { acquireDatabaseWriterLease } from '../db/writer-lease';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -601,6 +603,7 @@ program
   .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean }) => {
     const projectPath = path.resolve(pathArg || process.cwd());
     const clack = await importESM('@clack/prompts');
+    let writerLease: FileLock | null = null;
 
     clack.intro('Initializing CodeGraph');
 
@@ -628,6 +631,7 @@ program
         return;
       }
 
+      writerLease = acquireDatabaseWriterLease(projectPath);
       const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
       const cg = await CodeGraph.init(projectPath, { index: false });
       clack.log.success(`Initialized in ${projectPath}`);
@@ -676,7 +680,9 @@ program
       cg.destroy();
     } catch (err) {
       clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
+      process.exitCode = 1;
+    } finally {
+      writerLease?.release();
     }
   });
 
@@ -689,6 +695,7 @@ program
   .option('-f, --force', 'Skip confirmation prompt')
   .action(async (pathArg: string | undefined, options: { force?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
+    let writerLease: FileLock | null = null;
 
     try {
       if (!isInitialized(projectPath)) {
@@ -714,6 +721,7 @@ program
         }
       }
 
+      writerLease = acquireDatabaseWriterLease(projectPath);
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = CodeGraph.openSync(projectPath);
       cg.uninitialize();
@@ -737,7 +745,9 @@ program
       } catch { /* non-fatal */ }
     } catch (err) {
       error(`Failed to uninitialize: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
+      process.exitCode = 1;
+    } finally {
+      writerLease?.release();
     }
   });
 
@@ -752,6 +762,7 @@ program
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
+    let writerLease: FileLock | null = null;
 
     try {
       // Don't (re)index your home directory / a filesystem root (#845). --force
@@ -759,15 +770,18 @@ program
       const unsafe = unsafeIndexRootReason(projectPath);
       if (unsafe && !options.force) {
         error(`Refusing to index ${projectPath} — it looks like ${unsafe}. Pass --force to override.`);
-        process.exit(1);
+        process.exitCode = 1;
+        return;
       }
 
       if (!isInitialized(projectPath)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         info('Run "codegraph init" first');
-        process.exit(1);
+        process.exitCode = 1;
+        return;
       }
 
+      writerLease = acquireDatabaseWriterLease(projectPath);
       const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
       // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
       // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
@@ -790,7 +804,7 @@ program
         if (options.quiet) {
           // Quiet mode: no UI, just run against the freshly-recreated graph.
           const result = await cg.indexAll();
-          if (!result.success) process.exit(1);
+          if (!result.success) process.exitCode = 1;
           cg.destroy();
           return;
         }
@@ -824,7 +838,8 @@ program
         }
 
         if (!finalResult.success) {
-          process.exit(1);
+          process.exitCode = 1;
+          return;
         }
 
         clack.outro('Done');
@@ -834,7 +849,9 @@ program
       }
     } catch (err) {
       error(`Failed to index: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
+      process.exitCode = 1;
+    } finally {
+      writerLease?.release();
     }
   });
 
@@ -847,15 +864,18 @@ program
   .option('-q, --quiet', 'Suppress output (for git hooks)')
   .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
+    let writerLease: FileLock | null = null;
 
     try {
       if (!isInitialized(projectPath)) {
         if (!options.quiet) {
           error(`CodeGraph not initialized in ${projectPath}`);
         }
-        process.exit(1);
+        process.exitCode = 1;
+        return;
       }
 
+      writerLease = acquireDatabaseWriterLease(projectPath);
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
@@ -896,7 +916,9 @@ program
       if (!options.quiet) {
         error(`Failed to sync: ${err instanceof Error ? err.message : String(err)}`);
       }
-      process.exit(1);
+      process.exitCode = 1;
+    } finally {
+      writerLease?.release();
     }
   });
 
@@ -1822,18 +1844,28 @@ program
         return;
       }
 
-      const lockPath = path.join(getCodeGraphDir(projectPath), 'codegraph.lock');
+      const lockPaths = [
+        path.join(getCodeGraphDir(projectPath), 'codegraph.lock'),
+        path.join(getCodeGraphDir(projectPath), 'database-writer.lock'),
+      ];
+      const existingLocks = lockPaths.filter((lockPath) => fs.existsSync(lockPath));
 
-      if (!fs.existsSync(lockPath)) {
+      if (existingLocks.length === 0) {
         info(`No lock file found ${getGlyphs().dash} nothing to do`);
         return;
       }
 
-      fs.unlinkSync(lockPath);
-      success('Removed lock file. You can now run indexing again.');
+      for (const lockPath of existingLocks) {
+        // FileLock only replaces a dead owner. A live writer is never removed,
+        // even when the lock is old.
+        const staleLock = new FileLock(lockPath);
+        staleLock.acquire();
+        staleLock.release();
+      }
+      success(`Removed ${existingLocks.length} stale lock file(s). You can now run indexing again.`);
     } catch (err) {
       error(`Failed to remove lock: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
+      process.exitCode = 1;
     }
   });
 
