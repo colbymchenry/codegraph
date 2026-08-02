@@ -1220,6 +1220,7 @@ export class CodeGraph {
   getStats(): GraphStats {
     const stats = this.queries.getStats();
     stats.dbSizeBytes = this.db.getSize();
+    stats.walSizeBytes = this.db.getWalSizeBytes();
     return stats;
   }
 
