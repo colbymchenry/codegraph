@@ -656,6 +656,7 @@ export class CodeGraph {
           try {
             this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
             this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
+            this.queries.setMetadata('last_indexed_at', String(Date.now()));
           } catch { /* metadata is advisory — never fail an index over it */ }
         }
 
@@ -945,10 +946,14 @@ export class CodeGraph {
         // rows the sync just wrote are fine). Batched + yielding — sync can
         // run on the daemon's liveness-watchdog thread (#850/#1091).
         try {
-          if (vocabWasEmpty && this.queries.getNodeAndEdgeCount().nodes > 0) {
+        if (vocabWasEmpty && this.queries.getNodeAndEdgeCount().nodes > 0) {
             await this.rebuildNameSegmentVocab();
           }
         } catch { /* vocab is advisory — never fail a sync over it */ }
+
+        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
+          try { this.queries.setMetadata('last_indexed_at', String(Date.now())); } catch { /* advisory */ }
+        }
 
         return result;
       } finally {
@@ -1194,6 +1199,15 @@ export class CodeGraph {
    */
   getPendingReferenceCount(): number {
     return this.queries.getUnresolvedReferencesCount();
+  }
+
+  /** Attempted references with no target, exposed so status is semantically honest. */
+  getFailedReferenceStats(): {
+    total: number;
+    byLanguage: Record<string, number>;
+    byKind: Record<string, number>;
+  } {
+    return this.queries.getFailedReferenceStats();
   }
 
   /**

@@ -18,6 +18,10 @@ Language support is automatic from the file extension — there's nothing to con
 | Ruby | `.rb` | Full support |
 | C | `.c`, `.h` | Full support |
 | C++ | `.cpp`, `.hpp`, `.cc` | Full support |
+| GLSL / Vulkan GLSL | `.glsl`, `.vert`, `.frag`, `.comp`, `.geom`, `.tesc`, `.tese`, `.rgen`, `.rmiss`, `.rchit`, `.rahit`, `.rint`, `.rcall`, `.mesh`, `.task`, `.glslfx` | Full support (OpenUSD GLSLFX included) |
+| HLSL | `.hlsl`, `.hlsli`, `.fx`, `.fxh` | Full support |
+| CMake | `CMakeLists.txt`, `.cmake` | Build-script support |
+| PowerShell | `.ps1`, `.psm1`, `.psd1` | Build-script support with `Import-Module`, cross-module functions, and script-scope call edges |
 | Objective-C | `.m`, `.mm`, `.h` | Partial support (classes, protocols, methods, `@property`, `#import`, message sends; `.mm` ObjC++ may parse incompletely) |
 | Swift | `.swift` | Full support |
 | Kotlin | `.kt`, `.kts` | Full support |

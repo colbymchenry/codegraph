@@ -59,6 +59,21 @@ describe('codegraph status --json — CI fields (#329)', () => {
     cg.close();
   });
 
+  it('advances lastIndexed after a pure deletion sync', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const a = 1;\n');
+    fs.writeFileSync(path.join(tempDir, 'b.ts'), 'export const b = 2;\n');
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    const indexed = cg.getLastIndexedAt()!;
+
+    fs.unlinkSync(path.join(tempDir, 'b.ts'));
+    const beforeDelete = Date.now();
+    const result = await cg.sync();
+    expect(result.filesRemoved).toBe(1);
+    expect(cg.getLastIndexedAt()).toBeGreaterThanOrEqual(Math.max(indexed, beforeDelete));
+    cg.close();
+  });
+
   it('status --json on an UNINITIALIZED project reports version + indexPath + lastIndexed:null', () => {
     const out = runStatusJson(tempDir);
     expect(out.initialized).toBe(false);
@@ -81,6 +96,15 @@ describe('codegraph status --json — CI fields (#329)', () => {
     expect(out.version).toBe(PKG_VERSION);
     expect(out.indexPath as string).toContain('.codegraph');
     expect(typeof out.lastIndexed).toBe('string');
+    expect(out.graphFileNodeCount).toBe(out.fileCount);
+    expect(out.filesWithoutNodes).toBe(0);
+    expect(out.index).toMatchObject({
+      failedRefs: {
+        total: expect.any(Number),
+        byLanguage: expect.any(Object),
+        byKind: expect.any(Object),
+      },
+    });
     // ISO string that round-trips back into the index window.
     const ms = Date.parse(out.lastIndexed as string);
     expect(ms).toBeGreaterThanOrEqual(before - 1000);

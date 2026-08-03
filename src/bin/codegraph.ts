@@ -53,6 +53,7 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
+import type { Node } from '../types';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -947,6 +948,8 @@ program
       // Zero on a healthy index; non-zero at rest means a resolution pass was
       // interrupted, so some files' call edges are missing (#1187).
       const pendingRefs = cg.getPendingReferenceCount();
+      const failedRefs = cg.getFailedReferenceStats();
+      const graphFileNodeCount = stats.nodesByKind.file ?? 0;
 
       // JSON output mode
       if (options.json) {
@@ -958,6 +961,8 @@ program
           indexPath: getCodeGraphDir(projectPath),
           lastIndexed: lastIndexedMs != null ? new Date(lastIndexedMs).toISOString() : null,
           fileCount: stats.fileCount,
+          graphFileNodeCount,
+          filesWithoutNodes: Math.max(0, stats.fileCount - graphFileNodeCount),
           nodeCount: stats.nodeCount,
           edgeCount: stats.edgeCount,
           dbSizeBytes: stats.dbSizeBytes,
@@ -987,6 +992,10 @@ program
             // interrupted resolution pass left edges missing; the next
             // sync sweeps them (#1187).
             pendingRefs,
+            // Attempted but unresolved references are expected to include
+            // external APIs/intrinsics; expose them for semantic auditing
+            // without mislabeling the structurally complete index as partial.
+            failedRefs,
           },
         }));
         cg.destroy();
@@ -1014,7 +1023,8 @@ program
 
       // Index stats
       console.log(chalk.bold('Index Statistics:'));
-      console.log(`  Files:     ${formatNumber(stats.fileCount)}`);
+      const fileNodeGap = Math.max(0, stats.fileCount - graphFileNodeCount);
+      console.log(`  Files:     ${formatNumber(stats.fileCount)}${fileNodeGap ? ` (${formatNumber(graphFileNodeCount)} graph nodes; ${formatNumber(fileNodeGap)} metadata-only)` : ''}`);
       console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);
       console.log(`  Edges:     ${formatNumber(stats.edgeCount)}`);
       console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
@@ -1043,6 +1053,7 @@ program
         ? chalk.green('wal')
         : chalk.yellow(`${journalMode || 'unknown'} ${getGlyphs().dash} WAL inactive; reads can block on writes`);
       console.log(`  Journal:   ${journalLabel}`);
+      console.log(`  Unresolved:${String(formatNumber(failedRefs.total)).padStart(10)} attempted refs`);
       console.log();
 
       // Node breakdown
@@ -1599,6 +1610,33 @@ function normalizeIndexPath(filePath: string, projectPath: string): string {
   return f;
 }
 
+function isGloballyAmbiguous(matches: Array<{ node: { filePath: string } }>): boolean {
+  return matches.length > 20 && new Set(matches.map((m) => m.node.filePath)).size > 8;
+}
+
+function searchSymbolMatches(cg: { getNodesByName(name: string): Node[]; searchNodes(name: string, options: { limit: number }): Array<{ node: Node }> }, symbol: string): Array<{ node: Node }> {
+  return /^[A-Za-z_$][\w$]*$/.test(symbol)
+    ? cg.getNodesByName(symbol).map((node) => ({ node }))
+    : cg.searchNodes(symbol, { limit: 50 });
+}
+
+function narrowSymbolMatchesByLine(
+  matches: Array<{ node: Node }>,
+  line: number | undefined
+): Array<{ node: Node }> {
+  if (!line || !Number.isFinite(line) || line < 1) return matches;
+  const exact = matches.filter((match) => match.node.startLine === line);
+  if (exact.length > 0) return exact;
+  return matches.filter(
+    (match) => match.node.startLine <= line && match.node.endLine >= line
+  );
+}
+
+function repeatedCppLambdaMatches(matches: Array<{ node: Node }>): Array<{ node: Node }> {
+  const lambdas = matches.filter((match) => match.node.decorators?.includes('cpp:lambda'));
+  return lambdas.length > 1 ? lambdas : [];
+}
+
 /**
  * Convert glob pattern to regex
  */
@@ -1848,9 +1886,11 @@ program
   .command('callers <symbol>')
   .description('Find all functions/methods that call a specific symbol')
   .option('-p, --path <path>', 'Project path')
+  .option('--file <path>', 'Narrow to the definition in this file (path or suffix)')
+  .option('--line <number>', 'Narrow to the definition starting at or containing this line')
   .option('-l, --limit <number>', 'Maximum results', '20')
   .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
+  .action(async (symbol: string, options: { path?: string; file?: string; line?: string; limit?: string; json?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1862,16 +1902,44 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
       const limit = parseInt(options.limit || '20', 10);
+      const lineFilter = options.line ? parseInt(options.line, 10) : undefined;
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      const fileFilter = options.file ? normalizeIndexPath(options.file, projectPath) : undefined;
+      let matches = searchSymbolMatches(cg, symbol).filter((match) =>
+        !fileFilter || match.node.filePath === fileFilter || match.node.filePath.endsWith(`/${fileFilter}`)
+      );
+      matches = narrowSymbolMatchesByLine(matches, lineFilter);
       if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
+        const location = fileFilter
+          ? ` in ${fileFilter}${lineFilter ? ` at line ${lineFilter}` : ''}`
+          : lineFilter ? ` at line ${lineFilter}` : '';
+        info(`Symbol "${symbol}" not found${location}`);
+        cg.destroy();
+        return;
+      }
+      const repeatedLambdas = fileFilter && !lineFilter ? repeatedCppLambdaMatches(matches) : [];
+      if (repeatedLambdas.length > 0) {
+        const definitions = repeatedLambdas.map((match) => ({
+          qualifiedName: match.node.qualifiedName,
+          filePath: match.node.filePath,
+          startLine: match.node.startLine,
+        }));
+        const hint = 'Pass --line to select one local lambda definition';
+        if (options.json) console.log(JSON.stringify({ symbol, ambiguous: true, definitionCount: definitions.length, hint, definitions }, null, 2));
+        else info(`"${symbol}" has ${definitions.length} local lambda definitions in ${fileFilter}; pass --line to select one: ${definitions.map((definition) => definition.startLine).join(', ')}`);
+        cg.destroy();
+        return;
+      }
+      if (!fileFilter && isGloballyAmbiguous(matches)) {
+        const definitions = matches.slice(0, 50).map((m) => ({ name: m.node.name, kind: m.node.kind, filePath: m.node.filePath, startLine: m.node.startLine }));
+        if (options.json) console.log(JSON.stringify({ symbol, ambiguous: true, definitionCount: matches.length, hint: 'Pass --file to select one definition', definitions }, null, 2));
+        else info(`"${symbol}" has ${matches.length} definitions across the project; pass --file to select one.`);
         cg.destroy();
         return;
       }
 
       const seen = new Set<string>();
-      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
+      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number; callLine?: number }> = [];
 
       for (const match of matches) {
         const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
@@ -1879,7 +1947,7 @@ program
         for (const c of cg.getCallers(match.node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine, callLine: c.edge.line ?? undefined });
           }
         }
       }
@@ -1889,7 +1957,7 @@ program
         for (const c of cg.getCallers(matches[0].node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine, callLine: c.edge.line ?? undefined });
           }
         }
       }
@@ -1897,13 +1965,13 @@ program
       const limited = allCallers.slice(0, limit);
 
       if (options.json) {
-        console.log(JSON.stringify({ symbol, callers: limited }, null, 2));
+        console.log(JSON.stringify({ symbol, file: fileFilter, line: lineFilter, callers: limited }, null, 2));
       } else if (limited.length === 0) {
         info(`No callers found for "${symbol}"`);
       } else {
         console.log(chalk.bold(`\nCallers of "${symbol}" (${limited.length}):\n`));
         for (const node of limited) {
-          const loc = node.startLine ? `:${node.startLine}` : '';
+          const loc = node.callLine || node.startLine ? `:${node.callLine ?? node.startLine}` : '';
           console.log(
             chalk.cyan(node.kind.padEnd(12)) +
             chalk.white(node.name)
@@ -1927,9 +1995,11 @@ program
   .command('callees <symbol>')
   .description('Find all functions/methods that a specific symbol calls')
   .option('-p, --path <path>', 'Project path')
+  .option('--file <path>', 'Narrow to the definition in this file (path or suffix)')
+  .option('--line <number>', 'Narrow to the definition starting at or containing this line')
   .option('-l, --limit <number>', 'Maximum results', '20')
   .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
+  .action(async (symbol: string, options: { path?: string; file?: string; line?: string; limit?: string; json?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1941,16 +2011,44 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
       const limit = parseInt(options.limit || '20', 10);
+      const lineFilter = options.line ? parseInt(options.line, 10) : undefined;
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      const fileFilter = options.file ? normalizeIndexPath(options.file, projectPath) : undefined;
+      let matches = searchSymbolMatches(cg, symbol).filter((match) =>
+        !fileFilter || match.node.filePath === fileFilter || match.node.filePath.endsWith(`/${fileFilter}`)
+      );
+      matches = narrowSymbolMatchesByLine(matches, lineFilter);
       if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
+        const location = fileFilter
+          ? ` in ${fileFilter}${lineFilter ? ` at line ${lineFilter}` : ''}`
+          : lineFilter ? ` at line ${lineFilter}` : '';
+        info(`Symbol "${symbol}" not found${location}`);
+        cg.destroy();
+        return;
+      }
+      const repeatedLambdas = fileFilter && !lineFilter ? repeatedCppLambdaMatches(matches) : [];
+      if (repeatedLambdas.length > 0) {
+        const definitions = repeatedLambdas.map((match) => ({
+          qualifiedName: match.node.qualifiedName,
+          filePath: match.node.filePath,
+          startLine: match.node.startLine,
+        }));
+        const hint = 'Pass --line to select one local lambda definition';
+        if (options.json) console.log(JSON.stringify({ symbol, ambiguous: true, definitionCount: definitions.length, hint, definitions }, null, 2));
+        else info(`"${symbol}" has ${definitions.length} local lambda definitions in ${fileFilter}; pass --line to select one: ${definitions.map((definition) => definition.startLine).join(', ')}`);
+        cg.destroy();
+        return;
+      }
+      if (!fileFilter && isGloballyAmbiguous(matches)) {
+        const definitions = matches.slice(0, 50).map((m) => ({ name: m.node.name, kind: m.node.kind, filePath: m.node.filePath, startLine: m.node.startLine }));
+        if (options.json) console.log(JSON.stringify({ symbol, ambiguous: true, definitionCount: matches.length, hint: 'Pass --file to select one definition', definitions }, null, 2));
+        else info(`"${symbol}" has ${matches.length} definitions across the project; pass --file to select one.`);
         cg.destroy();
         return;
       }
 
       const seen = new Set<string>();
-      const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
+      const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number; callLine?: number }> = [];
 
       for (const match of matches) {
         const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
@@ -1958,7 +2056,7 @@ program
         for (const c of cg.getCallees(match.node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine, callLine: c.edge.line ?? undefined });
           }
         }
       }
@@ -1967,7 +2065,7 @@ program
         for (const c of cg.getCallees(matches[0].node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine, callLine: c.edge.line ?? undefined });
           }
         }
       }
@@ -1975,13 +2073,13 @@ program
       const limited = allCallees.slice(0, limit);
 
       if (options.json) {
-        console.log(JSON.stringify({ symbol, callees: limited }, null, 2));
+        console.log(JSON.stringify({ symbol, file: fileFilter, line: lineFilter, callees: limited }, null, 2));
       } else if (limited.length === 0) {
         info(`No callees found for "${symbol}"`);
       } else {
         console.log(chalk.bold(`\nCallees of "${symbol}" (${limited.length}):\n`));
         for (const node of limited) {
-          const loc = node.startLine ? `:${node.startLine}` : '';
+          const loc = node.callLine || node.startLine ? `:${node.callLine ?? node.startLine}` : '';
           console.log(
             chalk.cyan(node.kind.padEnd(12)) +
             chalk.white(node.name)
@@ -2005,9 +2103,11 @@ program
   .command('impact <symbol>')
   .description('Analyze what code is affected by changing a symbol')
   .option('-p, --path <path>', 'Project path')
+  .option('--file <path>', 'Narrow to the definition in this file (path or suffix)')
+  .option('--line <number>', 'Narrow to the definition starting at or containing this line')
   .option('-d, --depth <number>', 'Traversal depth', '2')
   .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; depth?: string; json?: boolean }) => {
+  .action(async (symbol: string, options: { path?: string; file?: string; line?: string; depth?: string; json?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -2019,16 +2119,44 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
       const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
+      const lineFilter = options.line ? parseInt(options.line, 10) : undefined;
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      const fileFilter = options.file ? normalizeIndexPath(options.file, projectPath) : undefined;
+      let matches = searchSymbolMatches(cg, symbol).filter((match) =>
+        !fileFilter || match.node.filePath === fileFilter || match.node.filePath.endsWith(`/${fileFilter}`)
+      );
+      matches = narrowSymbolMatchesByLine(matches, lineFilter);
       if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
+        const location = fileFilter
+          ? ` in ${fileFilter}${lineFilter ? ` at line ${lineFilter}` : ''}`
+          : lineFilter ? ` at line ${lineFilter}` : '';
+        info(`Symbol "${symbol}" not found${location}`);
+        cg.destroy();
+        return;
+      }
+      const repeatedLambdas = fileFilter && !lineFilter ? repeatedCppLambdaMatches(matches) : [];
+      if (repeatedLambdas.length > 0) {
+        const definitions = repeatedLambdas.map((match) => ({
+          qualifiedName: match.node.qualifiedName,
+          filePath: match.node.filePath,
+          startLine: match.node.startLine,
+        }));
+        const hint = 'Pass --line to select one local lambda definition';
+        if (options.json) console.log(JSON.stringify({ symbol, ambiguous: true, definitionCount: definitions.length, hint, definitions }, null, 2));
+        else info(`"${symbol}" has ${definitions.length} local lambda definitions in ${fileFilter}; pass --line to select one: ${definitions.map((definition) => definition.startLine).join(', ')}`);
+        cg.destroy();
+        return;
+      }
+      if (!fileFilter && isGloballyAmbiguous(matches)) {
+        const definitions = matches.slice(0, 50).map((m) => ({ name: m.node.name, kind: m.node.kind, filePath: m.node.filePath, startLine: m.node.startLine }));
+        if (options.json) console.log(JSON.stringify({ symbol, ambiguous: true, definitionCount: matches.length, hint: 'Pass --file to select one definition', definitions }, null, 2));
+        else info(`"${symbol}" has ${matches.length} definitions across the project; pass --file to select one.`);
         cg.destroy();
         return;
       }
 
       // Merge impact subgraphs across all exact-matching symbols
-      const mergedNodes = new Map<string, { name: string; kind: string; filePath: string; startLine?: number }>();
+      const mergedNodes = new Map<string, { name: string; kind: string; filePath: string; startLine?: number; decorators?: string[] }>();
       const seenEdges = new Set<string>();
       let edgeCount = 0;
 
@@ -2037,7 +2165,7 @@ program
         if (!exactMatch && matches.length > 1) continue;
         const impact = cg.getImpactRadius(match.node.id, depth);
         for (const [id, n] of impact.nodes) {
-          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
+          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine, decorators: n.decorators });
         }
         for (const e of impact.edges) {
           const key = `${e.source}->${e.target}:${e.kind}`;
@@ -2052,17 +2180,23 @@ program
       if (mergedNodes.size === 0 && matches[0]) {
         const impact = cg.getImpactRadius(matches[0].node.id, depth);
         for (const [id, n] of impact.nodes) {
-          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
+          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine, decorators: n.decorators });
         }
         edgeCount = impact.edges.length;
       }
 
       if (options.json) {
+        const variantRoots = Array.from(mergedNodes.values())
+          .filter((node) => node.decorators?.some((decorator) => decorator.startsWith('pp:')))
+          .map((node) => ({ filePath: node.filePath, name: node.name, startLine: node.startLine, conditions: node.decorators?.filter((decorator) => decorator.startsWith('pp:')) }));
         console.log(JSON.stringify({
           symbol,
+          file: fileFilter,
+          line: lineFilter,
           depth,
           nodeCount: mergedNodes.size,
           edgeCount,
+          ...(variantRoots.length > 0 ? { preprocessorVariants: variantRoots } : {}),
           affected: Array.from(mergedNodes.values()),
         }, null, 2));
       } else if (mergedNodes.size === 0) {
@@ -2154,9 +2288,10 @@ program
         /\.spec\./,
         /\.test\./,
         /\/__tests__\//,
-        /\/tests?\//,
+        /\/tests?\//i,
         /\/e2e\//,
         /\/spec\//,
+        /(?:^|\/)[^/]*(?:Test|Tests)\.(?:c|cc|cpp|cxx|m|mm|h|hpp|glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|hlsl|hlsli|fx|fxh)$/i,
       ];
 
       // Custom filter pattern
@@ -2171,9 +2306,55 @@ program
         customFilter = new RegExp(regex);
       }
 
+      const vendoredPath = /(?:^|\/)(?:External|vendor|vendors|third[_-]?party|deps)(?:\/|$)/i;
+      const changedVendoredCode = changedFiles.some((file) => vendoredPath.test(file));
+      const shaderPath = /\.(?:glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|hlsli|fx|fxh)$/i;
+      const shaderEntryPath = /\.(?:glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|fx)$/i;
+
+      function isShaderTestEntry(filePath: string): boolean {
+        if (!shaderEntryPath.test(filePath)) return false;
+        const inTestDirectory = /(?:^|\/)(?:tests?|specs?|__tests__)(?:\/|$)/i.test(filePath);
+        if (!inTestDirectory) return false;
+        if (/(?:Test|Tests)\.[^/]+$/i.test(filePath)) return true;
+        return cg.getNodesInFile(filePath).some((node) =>
+          node.kind === 'function' && (node.decorators?.includes('entrypoint') || node.name === 'main')
+        );
+      }
+
       function isTestFile(filePath: string): boolean {
         if (customFilter) return customFilter.test(filePath);
+        // A project-owned change should not return dozens of dependency-suite
+        // tests merely because an `External/` subtree is indexed. Keep vendored
+        // tests available when the changed file itself is vendored, and let an
+        // explicit --filter opt back in for custom workflows.
+        if (!changedVendoredCode && vendoredPath.test(filePath)) return false;
+        if (shaderPath.test(filePath)) return isShaderTestEntry(filePath);
+        if (/(?:^|\/)CMakeLists\.txt$/i.test(filePath)) return false;
         return defaultTestPatterns.some(p => p.test(filePath));
+      }
+
+      function shaderCompilationRoots(filePath: string): string[] {
+        const fileNode = cg.getNodesInFile(filePath).find((node) => node.kind === 'file');
+        if (!fileNode || (fileNode.language !== 'glsl' && fileNode.language !== 'hlsl')) return [];
+        const files = new Set<string>([filePath]);
+        const hasShaderParent = new Set<string>();
+        const queue = [filePath];
+        for (let index = 0; index < queue.length && index < 4096; index++) {
+          const current = queue[index]!;
+          const currentFile = cg.getNodesInFile(current).find((node) => node.kind === 'file');
+          if (!currentFile) continue;
+          for (const edge of cg.getIncomingEdges(currentFile.id)) {
+            if (edge.kind !== 'imports') continue;
+            const source = cg.getNode(edge.source);
+            if (source?.kind !== 'file' || (source.language !== 'glsl' && source.language !== 'hlsl')) continue;
+            hasShaderParent.add(current);
+            if (!files.has(source.filePath)) {
+              files.add(source.filePath);
+              queue.push(source.filePath);
+            }
+          }
+        }
+        return [...files].filter((candidate) => !hasShaderParent.has(candidate) && shaderEntryPath.test(candidate)).sort();
       }
 
       // BFS to find all transitive dependents of changed files, filtered to test files
@@ -2181,6 +2362,29 @@ program
       const allDependents = new Set<string>();
 
       for (const file of changedFiles) {
+        if (shaderPath.test(file)) {
+          const roots = shaderCompilationRoots(file);
+          if (roots.length > 0) {
+            for (const root of roots) {
+              allDependents.add(root);
+              if (isTestFile(root)) affectedTests.add(root);
+              const queue: Array<{ file: string; depth: number }> = [{ file: root, depth: 0 }];
+              const visited = new Set<string>([root]);
+              while (queue.length > 0) {
+                const current = queue.shift()!;
+                if (current.depth >= maxDepth) continue;
+                for (const dep of cg.getFileDependents(current.file)) {
+                  if (visited.has(dep) || shaderPath.test(dep)) continue;
+                  visited.add(dep);
+                  allDependents.add(dep);
+                  if (isTestFile(dep)) affectedTests.add(dep);
+                  else queue.push({ file: dep, depth: current.depth + 1 });
+                }
+              }
+            }
+            continue;
+          }
+        }
         // If the changed file is itself a test file, include it
         if (isTestFile(file)) {
           affectedTests.add(file);

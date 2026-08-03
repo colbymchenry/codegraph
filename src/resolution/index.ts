@@ -28,6 +28,7 @@ import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packa
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
+import { isShaderLanguage, ShaderResolver } from './shader-resolver';
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -279,6 +280,7 @@ export class ReferenceResolver {
   private goModule: GoModule | null | undefined = undefined;
   // Monorepo workspace member packages. Same lazy/immutable convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
+  private shaderResolver: ShaderResolver;
 
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
@@ -301,6 +303,7 @@ export class ReferenceResolver {
     this.methodMatchCache = new LRUCache(limit);
 
     this.context = this.createContext();
+    this.shaderResolver = new ShaderResolver(this.context);
   }
 
   /**
@@ -402,6 +405,7 @@ export class ReferenceResolver {
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
+    this.shaderResolver.clear();
     // The import-resolver's and name-matcher's per-context memos assume the
     // same stable window as the caches above — drop them together.
     if (this.context) {
@@ -704,6 +708,7 @@ export class ReferenceResolver {
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
     const byMethod: Record<string, number> = {};
+    let resolvedRefCount = 0;
 
     // Convert to our internal format, using denormalized fields when available
     const refs: UnresolvedRef[] = unresolvedRefs.map((ref) => ({
@@ -712,6 +717,7 @@ export class ReferenceResolver {
       referenceKind: ref.referenceKind,
       line: ref.line,
       column: ref.column,
+      candidates: ref.candidates,
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
       rowId: ref.rowId,
@@ -722,11 +728,12 @@ export class ReferenceResolver {
 
     for (let i = 0; i < refs.length; i++) {
       const ref = refs[i]!; // Array index is guaranteed to be in bounds
-      const result = this.resolveOneTimed(ref);
+      const results = this.resolveTargetsTimed(ref);
 
-      if (result) {
-        resolved.push(result);
-        byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
+      if (results.length > 0) {
+        resolved.push(...results);
+        resolvedRefCount++;
+        byMethod[results[0]!.resolvedBy] = (byMethod[results[0]!.resolvedBy] || 0) + 1;
       } else {
         unresolved.push(ref);
       }
@@ -751,7 +758,7 @@ export class ReferenceResolver {
       unresolved,
       stats: {
         total: refs.length,
-        resolved: resolved.length,
+        resolved: resolvedRefCount,
         unresolved: unresolved.length,
         byMethod,
       },
@@ -858,6 +865,11 @@ export class ReferenceResolver {
       return null;
     }
 
+    // Shader symbols live in a translation unit assembled from explicit includes.
+    // Never fall through to global path-proximity matching: duplicate helpers and
+    // resources are common across shader variants, so ambiguity must stay silent.
+    if (isShaderLanguage(ref.language)) return this.shaderResolver.resolve(ref);
+
     // CFML component paths in inheritance (#1152): `extends="coldbox.system.web.
     // Controller"` names the supertype by its dot-separated path (or `extends=
     // "../base"` by relative file path) — the graph indexes the class under its
@@ -948,6 +960,28 @@ export class ReferenceResolver {
       if (razorResult) return razorResult;
     }
 
+    // A named local C++ lambda is lexically closer than anything introduced by
+    // an included header. Resolve that scoped child before import resolution can
+    // capture the bare call with an unrelated same-named method declaration.
+    if (ref.language === 'cpp' && ref.referenceKind === 'calls') {
+      const lexical = this.gateLanguage(matchReference(ref, this.context), ref);
+      if (lexical) {
+        const caller = this.queries.getNodeById(ref.fromNodeId);
+        const target = this.queries.getNodeById(lexical.targetNodeId);
+        if (
+          caller && target &&
+          (caller.kind === 'function' || caller.kind === 'method') &&
+          target.kind === 'function' &&
+          target.filePath === ref.filePath &&
+          (target.qualifiedName.startsWith(`${caller.qualifiedName}::`) ||
+            target.qualifiedName.startsWith(`${caller.name}::`) ||
+            target.qualifiedName.includes(`::${caller.name}::`))
+        ) {
+          return lexical;
+        }
+      }
+    }
+
     const candidates: ResolvedRef[] = [];
 
     // Strategy 1: Try framework-specific resolution. Cross-language bridges
@@ -994,6 +1028,21 @@ export class ReferenceResolver {
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
           )
+        : null;
+    }
+
+    // PowerShell has no ambient project-wide function namespace. A command is
+    // callable from the same script or from an explicitly imported module;
+    // never let the generic matcher jump to a same-named function in an
+    // unrelated audit script.
+    if (ref.language === 'powershell' && ref.referenceKind === 'calls') {
+      const local = this.gateLanguage(matchReference(ref, this.context), ref);
+      if (local) {
+        const target = this.queries.getNodeById(local.targetNodeId);
+        if (target?.filePath === ref.filePath) return local;
+      }
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
         : null;
     }
 
@@ -1052,6 +1101,18 @@ export class ReferenceResolver {
     return candidates.reduce((best, curr) =>
       curr.confidence > best.confidence ? curr : best
     );
+  }
+
+  private resolveTargets(ref: UnresolvedRef): ResolvedRef[] {
+    const single = this.resolveOne(ref);
+    if (single) return [single];
+    if (!isShaderLanguage(ref.language)) return [];
+    return this.shaderResolver.getConditionalCallTargets(ref).map((target) => ({
+      original: ref,
+      targetNodeId: target.id,
+      confidence: 0.95,
+      resolvedBy: 'import' as const,
+    }));
   }
 
   /**
@@ -1330,6 +1391,7 @@ export class ReferenceResolver {
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
     const byMethod: Record<string, number> = {};
+    let resolvedRefCount = 0;
 
     for (const raw of batch) {
       const ref: UnresolvedRef = {
@@ -1338,14 +1400,16 @@ export class ReferenceResolver {
         referenceKind: raw.referenceKind,
         line: raw.line,
         column: raw.column,
+        candidates: raw.candidates,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
       };
-      const result = this.resolveOneTimed(ref);
-      if (result) {
-        resolved.push(result);
-        byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
+      const results = this.resolveTargetsTimed(ref);
+      if (results.length > 0) {
+        resolved.push(...results);
+        resolvedRefCount++;
+        byMethod[results[0]!.resolvedBy] = (byMethod[results[0]!.resolvedBy] || 0) + 1;
       } else {
         unresolved.push(ref);
       }
@@ -1360,7 +1424,7 @@ export class ReferenceResolver {
       unresolved,
       stats: {
         total: batch.length,
-        resolved: resolved.length,
+        resolved: resolvedRefCount,
         unresolved: unresolved.length,
         byMethod,
       },
@@ -1408,12 +1472,12 @@ export class ReferenceResolver {
     }
   }
 
-  private resolveOneTimed(ref: UnresolvedRef): ResolvedRef | null {
-    if (!this.resolveProfile) return this.resolveOne(ref);
+  private resolveTargetsTimed(ref: UnresolvedRef): ResolvedRef[] {
+    if (!this.resolveProfile) return this.resolveTargets(ref);
     const t0 = process.hrtime.bigint();
-    const result = this.resolveOne(ref);
+    const results = this.resolveTargets(ref);
     const dt = process.hrtime.bigint() - t0;
-    const key = result ? result.resolvedBy : `fail:${ref.referenceKind}`;
+    const key = results.length > 0 ? results[0]!.resolvedBy : `fail:${ref.referenceKind}`;
     const slot = this.resolveProfile.get(key);
     if (slot) {
       slot.n++;
@@ -1421,7 +1485,7 @@ export class ReferenceResolver {
     } else {
       this.resolveProfile.set(key, { n: 1, ns: dt });
     }
-    return result;
+    return results;
   }
 
   /** Dump the CODEGRAPH_RESOLVE_PROFILE histogram to stderr (no-op when off). */
@@ -1462,10 +1526,10 @@ export class ReferenceResolver {
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
       };
-      const result = this.resolveOneTimed(ref);
-      if (result) {
-        resolved.push(result);
-        byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
+      const results = this.resolveTargetsTimed(ref);
+      if (results.length > 0) {
+        resolved.push(...results);
+        byMethod[results[0]!.resolvedBy] = (byMethod[results[0]!.resolvedBy] || 0) + 1;
       } else {
         unresolved.push(ref);
       }
@@ -2413,6 +2477,11 @@ export class ReferenceResolver {
 
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
+    if (
+      (ref.language === 'cmake' || ref.language === 'powershell') &&
+      result.resolvedBy === 'file-path' &&
+      (ref.referenceKind === 'references' || ref.referenceKind === 'imports')
+    ) return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (!tgt || !ref.language) return result;
     if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !sameLanguageFamily(tgt, ref.language)) return null;

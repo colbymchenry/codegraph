@@ -28,6 +28,12 @@ interface TraversalStep {
   depth: number;
 }
 
+interface ShaderImpactContext {
+  roots: Set<string>;
+  files: Set<string>;
+  rootSites: Map<string, number>;
+}
+
 /**
  * Graph traverser for BFS and DFS traversal
  */
@@ -527,11 +533,54 @@ export class GraphTraverser {
     const edges: Edge[] = [];
     const visited = new Set<string>();
 
+    const shaderContext = this.getShaderImpactContext(focalNode);
+
     // Add focal node
     nodes.set(focalNode.id, focalNode);
 
     // Traverse incoming edges to find all dependents
-    this.getImpactRecursive(nodeId, maxDepth, 0, nodes, edges, visited);
+    this.getImpactRecursive(nodeId, maxDepth, 0, nodes, edges, visited, shaderContext);
+    if (shaderContext) {
+      for (const root of shaderContext.roots) {
+        const line = shaderContext.rootSites.get(root);
+        const rootNodes = this.queries.getNodesByFile(root);
+        const source = rootNodes.find((node) => node.kind === 'import' && line !== undefined && node.startLine === line)
+          ?? rootNodes.find((node) => node.kind === 'file');
+        if (source && !nodes.has(source.id)) {
+          nodes.set(source.id, source);
+          edges.push({
+            source: source.id,
+            target: focalNode.id,
+            kind: 'imports',
+            line,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'shader-context-root',
+              contextRoot: root,
+              targetFile: focalNode.filePath,
+              registeredAt: `${root}:${line ?? source.startLine}`,
+            },
+          });
+        }
+        const entry = this.findShaderRootEntryCaller(focalNode.id, root);
+        if (entry && !nodes.has(entry.node.id)) nodes.set(entry.node.id, entry.node);
+        if (entry) {
+          edges.push({
+            source: entry.node.id,
+            target: focalNode.id,
+            kind: 'calls',
+            line: entry.line,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'shader-context-entry',
+              contextRoot: root,
+              targetFile: focalNode.filePath,
+              registeredAt: `${root}:${entry.line ?? entry.node.startLine}`,
+            },
+          });
+        }
+      }
+    }
 
     return {
       nodes,
@@ -540,13 +589,138 @@ export class GraphTraverser {
     };
   }
 
+  private getShaderFileClosure(root: string): Set<string> {
+    const files = new Set<string>();
+    const queue = [root];
+    for (let index = 0; index < queue.length && index < 4096; index++) {
+      const filePath = queue[index]!;
+      if (files.has(filePath)) continue;
+      files.add(filePath);
+      const fileNode = this.queries.getNodesByFile(filePath).find((node) => node.kind === 'file');
+      if (!fileNode) continue;
+      const imports = this.queries.getOutgoingEdges(fileNode.id, ['imports']);
+      const targets = this.queries.getNodesByIds(imports.map((edge) => edge.target));
+      for (const edge of imports) {
+        const target = targets.get(edge.target);
+        if (target?.kind === 'file' && (target.language === 'glsl' || target.language === 'hlsl') && !files.has(target.filePath)) {
+          queue.push(target.filePath);
+        }
+      }
+    }
+    return files;
+  }
+
+  private findShaderRootEntryCaller(focalId: string, root: string): { node: Node; line?: number } | null {
+    const allowedFiles = this.getShaderFileClosure(root);
+    const queue = [focalId];
+    const visited = new Set<string>([focalId]);
+    for (let index = 0; index < queue.length && index < 4096; index++) {
+      const current = queue[index]!;
+      const incoming = this.queries.getIncomingEdges(current).filter((edge) => edge.kind === 'calls');
+      const sources = this.queries.getNodesByIds(incoming.map((edge) => edge.source));
+      for (const edge of incoming) {
+        const source = sources.get(edge.source);
+        if (!source || (source.language !== 'glsl' && source.language !== 'hlsl') || !allowedFiles.has(source.filePath)) continue;
+        if (source.filePath === root && source.kind === 'function' && (source.name === 'main' || source.decorators?.includes('entrypoint'))) {
+          return { node: source, line: edge.line };
+        }
+        if (!visited.has(source.id)) {
+          visited.add(source.id);
+          queue.push(source.id);
+        }
+      }
+    }
+    return null;
+  }
+
+  private getShaderImpactContext(focalNode: Node): ShaderImpactContext | null {
+    if (focalNode.language !== 'glsl' && focalNode.language !== 'hlsl') return null;
+    const roots = new Set<string>();
+    for (const edge of this.queries.getIncomingEdges(focalNode.id)) {
+      const metadata = edge.metadata as Record<string, unknown> | undefined;
+      if (metadata?.synthesizedBy !== 'shader-context-variant' || !Array.isArray(metadata.contextRoots)) continue;
+      for (const root of metadata.contextRoots) if (typeof root === 'string') roots.add(root);
+    }
+    if (roots.size === 0) {
+      const reverseFiles = new Set<string>([focalNode.filePath]);
+      const hasShaderParent = new Set<string>();
+      const queue = [focalNode.filePath];
+      for (let index = 0; index < queue.length && index < 4096; index++) {
+        const filePath = queue[index]!;
+        const fileNode = this.queries.getNodesByFile(filePath).find((node) => node.kind === 'file');
+        if (!fileNode) continue;
+        const incoming = this.queries.getIncomingEdges(fileNode.id).filter((edge) => edge.kind === 'imports');
+        const sources = this.queries.getNodesByIds(incoming.map((edge) => edge.source));
+        for (const edge of incoming) {
+          const source = sources.get(edge.source);
+          if (source?.kind !== 'file' || (source.language !== 'glsl' && source.language !== 'hlsl')) continue;
+          hasShaderParent.add(filePath);
+          if (!reverseFiles.has(source.filePath)) {
+            reverseFiles.add(source.filePath);
+            queue.push(source.filePath);
+          }
+        }
+      }
+      const entryExtension = /\.(?:glsl|vert|frag|comp|geom|tesc|tese|rgen|rmiss|rchit|rahit|rint|rcall|mesh|task|glslfx|hlsl|fx)$/i;
+      for (const filePath of reverseFiles) {
+        if (!hasShaderParent.has(filePath) && entryExtension.test(filePath)) roots.add(filePath);
+      }
+    }
+    if (roots.size === 0) return null;
+    const files = new Set<string>();
+    const queue = [...roots];
+    for (let index = 0; index < queue.length && index < 4096; index++) {
+      const filePath = queue[index]!;
+      if (files.has(filePath)) continue;
+      files.add(filePath);
+      const fileNode = this.queries.getNodesByFile(filePath).find((node) => node.kind === 'file');
+      if (!fileNode) continue;
+      const imports = this.queries.getOutgoingEdges(fileNode.id, ['imports']);
+      const targets = this.queries.getNodesByIds(imports.map((edge) => edge.target));
+      for (const edge of imports) {
+        const target = targets.get(edge.target);
+        if (target?.kind === 'file' && (target.language === 'glsl' || target.language === 'hlsl') && !files.has(target.filePath)) {
+          queue.push(target.filePath);
+        }
+      }
+    }
+    files.add(focalNode.filePath);
+    const rootSites = new Map<string, number>();
+    for (const root of roots) {
+      const queue: Array<{ filePath: string; firstLine?: number }> = [{ filePath: root }];
+      const visited = new Set<string>();
+      for (let index = 0; index < queue.length && index < 4096; index++) {
+        const current = queue[index]!;
+        if (visited.has(current.filePath)) continue;
+        visited.add(current.filePath);
+        const fileNode = this.queries.getNodesByFile(current.filePath).find((node) => node.kind === 'file');
+        if (!fileNode) continue;
+        const imports = this.queries.getOutgoingEdges(fileNode.id, ['imports']);
+        const targets = this.queries.getNodesByIds(imports.map((edge) => edge.target));
+        for (const edge of imports) {
+          const target = targets.get(edge.target);
+          if (target?.kind !== 'file' || (target.language !== 'glsl' && target.language !== 'hlsl')) continue;
+          const firstLine = current.firstLine ?? edge.line;
+          if (target.filePath === focalNode.filePath) {
+            if (firstLine !== undefined) rootSites.set(root, firstLine);
+            queue.length = 0;
+            break;
+          }
+          if (!visited.has(target.filePath)) queue.push({ filePath: target.filePath, firstLine });
+        }
+      }
+    }
+    return { roots, files, rootSites };
+  }
+
   private getImpactRecursive(
     nodeId: string,
     maxDepth: number,
     currentDepth: number,
     nodes: Map<string, Node>,
     edges: Edge[],
-    visited: Set<string>
+    visited: Set<string>,
+    shaderContext: ShaderImpactContext | null,
   ): void {
     // Mark visited before the depth check so a node collected at the depth
     // boundary still lands in `visited`. Otherwise it could sit in `nodes` but
@@ -575,7 +749,7 @@ export class GraphTraverser {
               nodes.set(childNode.id, childNode);
               edges.push(edge);
               // Recurse into children at the same depth (they're part of the same symbol)
-              this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited);
+              this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited, shaderContext);
             }
           }
         }
@@ -593,6 +767,14 @@ export class GraphTraverser {
     for (const edge of incomingEdges) {
       const sourceNode = sources.get(edge.source);
       if (!sourceNode) continue;
+      if (shaderContext && (sourceNode.language === 'glsl' || sourceNode.language === 'hlsl')) {
+        if (!shaderContext.files.has(sourceNode.filePath)) continue;
+        const metadata = edge.metadata as Record<string, unknown> | undefined;
+        if (metadata?.synthesizedBy === 'shader-context-variant' && Array.isArray(metadata.contextRoots)) {
+          const overlaps = metadata.contextRoots.some((root) => typeof root === 'string' && shaderContext.roots.has(root));
+          if (!overlaps) continue;
+        }
+      }
       // Record the dependency edge unconditionally. The gate used to also gate
       // edge collection (`!nodes.has(...)`), so a second incoming edge into a
       // node already collected via another path was silently dropped from
@@ -601,7 +783,7 @@ export class GraphTraverser {
       edges.push(edge);
       if (!visited.has(sourceNode.id)) {
         nodes.set(sourceNode.id, sourceNode);
-        this.getImpactRecursive(sourceNode.id, maxDepth, currentDepth + 1, nodes, edges, visited);
+        this.getImpactRecursive(sourceNode.id, maxDepth, currentDepth + 1, nodes, edges, visited, shaderContext);
       }
     }
   }

@@ -10,6 +10,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
 import { resolveWorkspaceImport } from './workspace-packages';
+import { extractPowershellDependencies } from '../powershell-dependencies';
 import {
   resolveMethodOnType,
   localReceiverTypePatterns,
@@ -1304,10 +1305,54 @@ function pickClosestJvmCandidate(candidates: Node[], fromPath: string): Node {
   return best;
 }
 
+function powershellDependencyPaths(filePath: string, context: ResolutionContext): Array<{ filePath: string; exportedOnly: boolean }> {
+  const source = context.readFile(filePath);
+  if (!source) return [];
+  const files = new Set(context.getAllFiles());
+  const result = new Map<string, boolean>();
+  for (const dependency of extractPowershellDependencies(source)) {
+    const candidate = path.posix.normalize(path.posix.join(
+      path.posix.dirname(filePath.replace(/\\/g, '/')),
+      dependency.relativePath.replace(/\\/g, '/'),
+    ));
+    if (candidate.startsWith('../') || !files.has(candidate)) continue;
+    const exportedOnly = dependency.kind === 'module';
+    result.set(candidate, (result.get(candidate) ?? true) && exportedOnly);
+  }
+  return [...result].map(([dependencyPath, exportedOnly]) => ({ filePath: dependencyPath, exportedOnly }));
+}
+
+function powershellExports(modulePath: string, context: ResolutionContext): Set<string> | null {
+  const source = context.readFile(modulePath);
+  const match = source?.match(/Export-ModuleMember\b[^\r\n]*?-Function\s+([^\r\n]+)/i);
+  if (!match) return null;
+  return new Set(match[1]!.split(',').map((name) => name.trim().replace(/^['"]|['"]$/g, '').toLowerCase()).filter(Boolean));
+}
+
 export function resolveViaImport(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  if (ref.language === 'powershell') {
+    if (ref.referenceKind === 'imports') {
+      const target = context.getNodesInFile(ref.referenceName).find((node) => node.kind === 'file');
+      return target ? { original: ref, targetNodeId: target.id, confidence: 0.98, resolvedBy: 'file-path' } : null;
+    }
+    if (ref.referenceKind === 'calls') {
+      const matches: Node[] = [];
+      for (const dependency of powershellDependencyPaths(ref.filePath, context)) {
+        const exports = dependency.exportedOnly ? powershellExports(dependency.filePath, context) : null;
+        if (exports && !exports.has(ref.referenceName.toLowerCase())) continue;
+        for (const node of context.getNodesInFile(dependency.filePath)) {
+          if (node.kind === 'function' && node.name.toLowerCase() === ref.referenceName.toLowerCase()) matches.push(node);
+        }
+      }
+      return matches.length === 1
+        ? { original: ref, targetNodeId: matches[0]!.id, confidence: 0.97, resolvedBy: 'import' }
+        : null;
+    }
+  }
+
   // C/C++ #include references — resolve directly to the included file
   // (file→file edge), bypassing symbol lookup. The extractor emits these
   // with `referenceKind: 'imports'` and `referenceName: <include path>`

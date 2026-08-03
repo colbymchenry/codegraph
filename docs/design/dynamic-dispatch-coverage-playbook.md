@@ -630,6 +630,21 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
   frontier — no named target); React lazy data-router (variable paths + lazy imports); C++ pure-virtual base
   methods (extracting bodyless decls risks duplicate decl/def nodes for modest gain). Forcing these would add
   noise, violating "partial coverage worse than none."
+- **GLSL / HLSL / GLSLFX shaders (validated 2026-07-13, engine corpus + six public corpora + OpenUSD).**
+  The local v1.4.1 build indexed the Vulkan engine's 99 first-party GLSL files with zero extraction failures
+  and stable reindex counts (416 total indexed files and 15,139 nodes). The explicit corpus harness also
+  parsed ignored/vendor inputs: 191 shader files across GLSL, Vulkan ray-tracing stages, HLSL/HLSLI, and
+  GLSLFX, with zero failures and stable symbol IDs. Public corpus coverage: glsl-blend 31 shader files / 267
+  nodes / 880 edges; gl-transitions 125 / 847 / 1,178; lygia 1,235 / 17,486 / 27,369; NoiseShader 7 / 125 /
+  188; NRD 72 / 2,128 / 6,868; Magpie 146 / 7,821 / 52,207. Representative include-to-call probes resolve
+  across files (`backInOut -> backIn`, `bounceIn -> bounceOut`, `blendColor -> rgb2hsv`,
+  `ClassicNoise_impl -> wglnoise_fade`, `NRD_CS_MAIN -> WithRectOrigin`, and `Pass2 -> MulAdd`). The canonical
+  OpenUSD sparse corpus parsed 55 GLSLFX files twice with zero failures (1,079 nodes / 1,050 extraction edges),
+  preserving embedded GLSL line mappings. C++ integration produced 93 exact shader-file references plus 93
+  entry-point call edges in the engine. A real-corpus precision audit caught broad binding-0 links through a
+  generic helper; interface synthesis now requires one unique shader association, leaving zero ambiguous
+  bindless links. Agent A/B was not run in this Windows implementation session; these are deterministic
+  extraction, graph, reindex, retrieval, and precision probes only.
 - **Difficulty gradient is real:** named-ref dispatch (resolver) is cheap; anonymous
   callback dispatch (synthesizer) is medium; **anonymous-arrow handlers are the hard
   remaining gap** (no identity → need synthesizer link-through-body, not yet built).

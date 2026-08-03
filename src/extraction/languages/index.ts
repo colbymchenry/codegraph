@@ -36,6 +36,8 @@ import { solidityExtractor } from './solidity';
 import { terraformExtractor } from './terraform';
 import { arktsExtractor } from './arkts';
 import { nixExtractor } from './nix';
+import { glslExtractor } from './glsl';
+import { hlslExtractor } from './hlsl';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -69,4 +71,6 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   terraform: terraformExtractor,
   arkts: arktsExtractor,
   nix: nixExtractor,
+  glsl: glslExtractor,
+  hlsl: hlslExtractor,
 };

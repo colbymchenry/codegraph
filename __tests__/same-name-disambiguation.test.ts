@@ -15,6 +15,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
 import { ToolHandler } from '../src/mcp/tools';
 import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
@@ -22,6 +23,7 @@ import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
 let tmpDir: string;
 let cg: CodeGraph;
 let handler: ToolHandler;
+const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
 const text = async (tool: string, args: Record<string, unknown>): Promise<string> => {
   const res = await handler.execute(tool, args);
@@ -67,6 +69,24 @@ beforeAll(async () => {
       ].join('\n')
     );
   }
+
+  mk(
+    'src/lambdas.cpp',
+    [
+      'int firstLeaf() { return 1; }',
+      'int secondLeaf() { return 2; }',
+      'void record() {',
+      '  {',
+      '    auto bufferResource = []() { return firstLeaf(); };',
+      '    bufferResource();',
+      '  }',
+      '  {',
+      '    auto bufferResource = []() { return secondLeaf(); };',
+      '    bufferResource();',
+      '  }',
+      '}',
+    ].join('\n')
+  );
 
   cg = CodeGraph.initSync(tmpDir);
   await cg.indexAll();
@@ -137,5 +157,67 @@ describe('same-named symbols across apps (#764)', () => {
   it('callees: grouped the same way', async () => {
     const out = await text('codegraph_callees', { symbol: 'list' });
     expect(out).toContain('2 distinct definitions');
+  });
+
+  it('line narrows repeated same-name lambdas within one file and scope', async () => {
+    const lambdas = cg.getNodesByName('bufferResource');
+    expect(lambdas.map((node) => node.startLine).sort((a, b) => a - b)).toEqual([5, 9]);
+    expect(new Set(lambdas.map((node) => node.qualifiedName)).size).toBe(1);
+    expect(lambdas.every((node) => node.decorators?.includes('cpp:lambda'))).toBe(true);
+
+    const fileOnly = await text('codegraph_impact', {
+      symbol: 'bufferResource',
+      file: 'src/lambdas.cpp',
+    });
+    expect(fileOnly).toContain('2 distinct definitions');
+    expect(fileOnly).toContain('src/lambdas.cpp:5');
+    expect(fileOnly).toContain('src/lambdas.cpp:9');
+
+    const callees = await text('codegraph_callees', {
+      symbol: 'bufferResource',
+      file: 'src/lambdas.cpp',
+      line: 5,
+    });
+    expect(callees).toContain('firstLeaf');
+    expect(callees).not.toContain('secondLeaf');
+
+    const impact = await text('codegraph_impact', {
+      symbol: 'bufferResource',
+      file: 'src/lambdas.cpp',
+      line: 5,
+    });
+    expect(impact).toContain('bufferResource');
+    expect(impact).not.toContain(':9');
+  });
+
+  it('CLI impact accepts --line to select one same-file definition', () => {
+    const output = execFileSync(process.execPath, [
+      BIN,
+      'impact',
+      'bufferResource',
+      '--file',
+      'src/lambdas.cpp',
+      '--line',
+      '5',
+      '--path',
+      tmpDir,
+      '--json',
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, CODEGRAPH_WASM_RELAUNCHED: '1' },
+    });
+    const result = JSON.parse(output) as { line: number; affected: Array<{ name: string; startLine?: number }> };
+    expect(result.line).toBe(5);
+    expect(result.affected).toContainEqual(expect.objectContaining({ name: 'bufferResource', startLine: 5 }));
+    expect(result.affected).not.toContainEqual(expect.objectContaining({ name: 'bufferResource', startLine: 9 }));
+  });
+
+  it('line misses are success-shaped and do not fall back to another definition', async () => {
+    const out = await text('codegraph_callers', {
+      symbol: 'bufferResource',
+      file: 'src/lambdas.cpp',
+      line: 99,
+    });
+    expect(out).toContain('not found at file "src/lambdas.cpp" at line 99');
   });
 });

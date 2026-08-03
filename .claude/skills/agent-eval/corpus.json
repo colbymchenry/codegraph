@@ -607,5 +607,51 @@
       "files": "~3390",
       "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
     }
+  ],
+  "GLSL": [
+    {
+      "name": "glsl-blend",
+      "repo": "https://github.com/jamieowen/glsl-blend",
+      "size": "Small",
+      "files": "~43",
+      "question": "How does the overlay blend entry function reach the shared channel-level blend helpers across the shader includes?"
+    },
+    {
+      "name": "gl-transitions",
+      "repo": "https://github.com/gl-transitions/gl-transitions",
+      "size": "Medium",
+      "files": "~145",
+      "question": "How does a transition shader's main entry point reach its transition function and shared sampling helpers?"
+    },
+    {
+      "name": "lygia",
+      "repo": "https://github.com/patriciogonzalezvivo/lygia",
+      "size": "Large",
+      "files": "~2860",
+      "question": "How does a lighting shader reach the material, BRDF, and sampling helpers brought in through Lygia's include hierarchy?"
+    }
+  ],
+  "HLSL": [
+    {
+      "name": "NoiseShader",
+      "repo": "https://github.com/keijiro/NoiseShader",
+      "size": "Small",
+      "files": "~112",
+      "question": "How do the public noise shader functions reach the shared hash and interpolation helpers?"
+    },
+    {
+      "name": "NRD",
+      "repo": "https://github.com/NVIDIA-RTX/NRD",
+      "size": "Medium",
+      "files": "~132",
+      "question": "How does an NRD compute shader entry point reach its macro-declared resources and shared denoising helpers?"
+    },
+    {
+      "name": "Magpie",
+      "repo": "https://github.com/Blinue/Magpie",
+      "size": "Large",
+      "files": "~631",
+      "question": "How does a scaling effect entry point reach the common sampling and color-processing helpers across included HLSL files?"
+    }
   ]
 }

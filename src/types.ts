@@ -116,6 +116,10 @@ export const LANGUAGES = [
   'vbnet',
   'erlang',
   'terraform',
+  'glsl',
+  'hlsl',
+  'cmake',
+  'powershell',
   'unknown',
 ] as const;
 
