@@ -3,14 +3,21 @@
  *
  * This file is public on purpose: it is the exact code that receives codegraph's
  * anonymous usage telemetry, so anyone can audit what is (and is not) stored.
- * The schema contract lives in docs/design/telemetry.md.
+ * The schema contract lives in docs/design/telemetry.md; the storage schema — the
+ * complete list of what is kept — is migrations/0001_init.sql.
  *
  * Guarantees enforced here:
  * - strict allowlist: unknown events are dropped, unknown properties are stripped
- * - the client IP is never read, logged, or forwarded
+ * - the client IP is never read, logged, or stored
+ * - accepted events land in our own Cloudflare D1 database and are never forwarded
+ *   to a third-party analytics vendor — this worker makes no outbound requests
  * - per-machine rate limiting, bounded body/batch sizes
- * - forwarding happens off the response path (ctx.waitUntil); bodies are never logged
+ * - the write happens off the response path (ctx.waitUntil); bodies are never logged
+ * - raw events expire: a nightly cron rolls each day up into anonymous daily counts
+ *   and then deletes the rows behind it (rollup.ts)
  */
+
+import { handleAdminRollup, retentionDays, runNightly } from './rollup';
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_EVENTS_PER_BATCH = 100;
@@ -20,12 +27,24 @@ const TOKEN_RE = /^[A-Za-z0-9_.:+-]+$/;
 // Human-ish labels: MCP clientInfo names like "Claude Code", "cursor-vscode/1.2".
 const LABEL_RE = /^[A-Za-z0-9_.:+/ @()-]+$/;
 
-const INFO_TEXT = `codegraph anonymous-telemetry ingest.
+const infoText = (keepDays: number): string => `codegraph anonymous-telemetry ingest.
 
 What gets collected (and what never does) is documented field-by-field:
 https://github.com/colbymchenry/codegraph/blob/main/docs/design/telemetry.md
 This endpoint's full source:
 https://github.com/colbymchenry/codegraph/tree/main/telemetry-worker
+
+Guarantees: no code, file paths, repo/file/symbol names, or query strings are ever
+sent; the client IP is never read or stored; the machine ID is a random UUID the
+client mints locally and can delete at any time. Accepted events are stored in our
+own database on Cloudflare (D1) and are never forwarded to any third-party analytics
+vendor. The stored schema is the complete list of what is kept:
+https://github.com/colbymchenry/codegraph/blob/main/telemetry-worker/migrations/0001_init.sql
+
+Individual events are deleted after ${keepDays} days. What outlives them: anonymous
+daily totals (counts per day of things like operating system, version and language),
+and which days each machine ID was active, so returning-user numbers survive. No event
+details, and still nothing that identifies a person or a codebase.
 
 Disable any time: codegraph telemetry off  |  CODEGRAPH_TELEMETRY=0  |  DO_NOT_TRACK=1
 `;
@@ -117,11 +136,17 @@ const ENVELOPE_PROPS: Record<string, Sanitize> = {
   schema_version: nonNegInt(99),
 };
 
-interface PostHogEvent {
+/**
+ * One sanitized event, ready to become one `events` row. The envelope is NOT
+ * folded in here: it is identical for every event in a batch and lands in its own
+ * columns, so it is carried alongside (`common`) and bound at write time.
+ */
+interface StoredEvent {
   event: string;
-  distinct_id: string;
-  timestamp?: string;
-  properties: JsonObject;
+  /** Clamped ISO 8601 UTC; absent when the client sent none or sent nonsense. */
+  ts?: string;
+  /** Event-specific props only — stored as the `props` JSON column. */
+  props: JsonObject;
 }
 
 function clampTimestamp(v: unknown): string | undefined {
@@ -134,7 +159,7 @@ function clampTimestamp(v: unknown): string | undefined {
   return new Date(t).toISOString();
 }
 
-function sanitizeEvent(raw: unknown, machineId: string, common: JsonObject): PostHogEvent | null {
+function sanitizeEvent(raw: unknown): StoredEvent | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const e = raw as JsonObject;
   if (typeof e.event !== 'string') return null;
@@ -151,36 +176,94 @@ function sanitizeEvent(raw: unknown, machineId: string, common: JsonObject): Pos
     if (!(req in props)) return null;
   }
 
-  const out: PostHogEvent = {
-    event: e.event,
-    distinct_id: machineId,
-    properties: {
-      ...props,
-      ...common,
-      // Anonymous events: no person profiles, no geo enrichment.
-      $process_person_profile: false,
-      $geoip_disable: true,
-      $lib: 'codegraph-telemetry-worker',
-    },
-  };
+  const out: StoredEvent = { event: e.event, props };
   const ts = clampTimestamp(e.ts);
-  if (ts !== undefined) out.timestamp = ts;
+  if (ts !== undefined) out.ts = ts;
   return out;
 }
 
-async function forwardToPostHog(env: Env, batch: PostHogEvent[]): Promise<void> {
+/**
+ * Re-narrow a sanitized envelope value for binding. The ENVELOPE_PROPS sanitizers
+ * already guarantee these types; these just turn "absent" into a NULL bind.
+ */
+const asText = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+const asInt = (v: unknown): number | null => (typeof v === 'number' ? v : null);
+const asFlag = (v: unknown): number | null => (typeof v === 'boolean' ? (v ? 1 : 0) : null);
+
+const INSERT_EVENT = `INSERT INTO events (
+  received_at, ts, day, event, machine_id,
+  codegraph_version, os, arch, node_major, ci, schema_version, props
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+// prod = 0 only if EVERY event this machine sent that day carried ci = 1, so a later
+// non-CI batch flips the day to production and never back (max, not overwrite).
+const UPSERT_MACHINE_DAY = `INSERT INTO machine_days (machine_id, day, prod) VALUES (?, ?, ?)
+  ON CONFLICT (machine_id, day) DO UPDATE SET prod = max(machine_days.prod, excluded.prod)`;
+
+// A late-arriving offline buffer can move a machine's first day earlier, never later.
+const UPSERT_FIRST_SEEN = `INSERT INTO machine_first_seen (machine_id, first_day) VALUES (?, ?)
+  ON CONFLICT (machine_id) DO UPDATE SET first_day = min(machine_first_seen.first_day, excluded.first_day)`;
+
+/**
+ * Persist a sanitized batch: one `events` row per event, plus the machine×day and
+ * first-seen bookkeeping the dashboard's retention/activation panels need. One D1
+ * `batch()` = one implicit transaction = one round trip.
+ *
+ * Fail-silent by design: the client treats every response as final and never retries,
+ * so a failed write loses a datapoint rather than costing availability. The error is
+ * logged (Workers Logs) with counts only — never the payload.
+ */
+async function writeToD1(
+  env: Env,
+  machineId: string,
+  common: JsonObject,
+  batch: StoredEvent[],
+): Promise<void> {
   try {
-    const res = await fetch(`${env.POSTHOG_HOST}/batch/`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ api_key: env.POSTHOG_KEY, batch }),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) {
-      console.error(JSON.stringify({ msg: 'posthog forward failed', status: res.status, events: batch.length }));
+    const receivedAt = new Date().toISOString();
+    const insertEvent = env.DB.prepare(INSERT_EVENT);
+    const stmts: D1PreparedStatement[] = [];
+    // Envelope columns are identical for every row in the batch.
+    const envelopeCols = [
+      asText(common.codegraph_version),
+      asText(common.os),
+      asText(common.arch),
+      asInt(common.node_major),
+      asFlag(common.ci),
+      asInt(common.schema_version),
+    ] as const;
+    // A batch can span days (offline buffers hold completed-day rollups), so
+    // machine_days gets one row per distinct day rather than one per batch.
+    const days = new Set<string>();
+
+    for (const e of batch) {
+      const day = (e.ts ?? receivedAt).slice(0, 10);
+      days.add(day);
+      stmts.push(
+        insertEvent.bind(
+          receivedAt,
+          e.ts ?? null,
+          day,
+          e.event,
+          machineId,
+          ...envelopeCols,
+          JSON.stringify(e.props),
+        ),
+      );
     }
+
+    const prod = common.ci === true ? 0 : 1;
+    const upsertDay = env.DB.prepare(UPSERT_MACHINE_DAY);
+    for (const day of days) stmts.push(upsertDay.bind(machineId, day, prod));
+
+    const firstDay = [...days].sort()[0];
+    if (firstDay !== undefined) {
+      stmts.push(env.DB.prepare(UPSERT_FIRST_SEEN).bind(machineId, firstDay));
+    }
+
+    await env.DB.batch(stmts);
   } catch (err) {
-    console.error(JSON.stringify({ msg: 'posthog forward error', err: String(err), events: batch.length }));
+    console.error(JSON.stringify({ msg: 'd1 write failed', err: String(err), events: batch.length }));
   }
 }
 
@@ -190,7 +273,13 @@ export default {
       const url = new URL(request.url);
 
       if (request.method === 'GET' && url.pathname === '/') {
-        return new Response(INFO_TEXT, { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+        return new Response(infoText(retentionDays(env)), {
+          headers: { 'content-type': 'text/plain; charset=utf-8' },
+        });
+      }
+      // Backfill/repair for the nightly rollup. 404s unless ADMIN_TOKEN is configured.
+      if (url.pathname === '/admin/rollup') {
+        return await handleAdminRollup(request, env, url);
       }
       if (url.pathname !== '/v1/events') {
         return new Response('not found\n', { status: 404 });
@@ -240,14 +329,16 @@ export default {
       }
 
       const rawEvents = Array.isArray(body.events) ? body.events.slice(0, MAX_EVENTS_PER_BATCH) : [];
-      const batch: PostHogEvent[] = [];
+      const batch: StoredEvent[] = [];
       for (const raw of rawEvents) {
-        const sanitized = sanitizeEvent(raw, machineId, common);
+        const sanitized = sanitizeEvent(raw);
         if (sanitized) batch.push(sanitized);
       }
 
+      // Nothing survived the allowlist ⇒ nothing is written at all, not even the
+      // machine×day bookkeeping: those tables must only ever describe stored events.
       if (batch.length > 0) {
-        ctx.waitUntil(forwardToPostHog(env, batch));
+        ctx.waitUntil(writeToD1(env, machineId, common, batch));
       }
       // Accepted (including "everything was dropped by the allowlist") — the
       // client treats every response as final and never retries.
@@ -256,5 +347,15 @@ export default {
       console.error(JSON.stringify({ msg: 'unhandled error', err: String(err) }));
       return new Response('internal error\n', { status: 500 });
     }
+  },
+
+  /**
+   * Nightly (00:30 UTC, see wrangler.jsonc): roll the completed day up into the
+   * daily_* tables and purge raw events past the retention window. Awaited rather
+   * than backgrounded so a failure marks the cron run failed — everything it does is
+   * an idempotent upsert or a bounded delete, so the retry is safe.
+   */
+  async scheduled(event, env): Promise<void> {
+    await runNightly(env, event.scheduledTime);
   },
 } satisfies ExportedHandler<Env>;

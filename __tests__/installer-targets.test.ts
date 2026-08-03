@@ -1144,6 +1144,11 @@ describe('Installer targets — partial-state idempotency', () => {
   // Opt-in (default-yes in the installer) UserPromptSubmit hook that runs
   // `codegraph prompt-hook`. Must write/remove surgically, be idempotent, and
   // round-trip an opt-out — without disturbing the user's own hooks.
+  // Platform-aware since #1466: Windows writes `codegraph.cmd prompt-hook`
+  // (Git Bash applies no PATHEXT, so the bare form is exit 127 there), and
+  // install self-heals the other platform's spelling in place.
+  const HOOK_CMD = process.platform === 'win32' ? 'codegraph.cmd prompt-hook' : 'codegraph prompt-hook';
+  const OTHER_PLATFORM_HOOK_CMD = process.platform === 'win32' ? 'codegraph prompt-hook' : 'codegraph.cmd prompt-hook';
   const promptCommands = (s: any): string[] =>
     (s.hooks?.UserPromptSubmit ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
 
@@ -1151,7 +1156,7 @@ describe('Installer targets — partial-state idempotency', () => {
     const claude = getTarget('claude')!;
     claude.install('global', { autoAllow: true, promptHook: true });
     const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
-    expect(promptCommands(s)).toContain('codegraph prompt-hook');
+    expect(promptCommands(s)).toContain(HOOK_CMD);
     expect(s.permissions?.allow).toContain('mcp__codegraph__*');
   });
 
@@ -1159,7 +1164,7 @@ describe('Installer targets — partial-state idempotency', () => {
     const claude = getTarget('claude')!;
     claude.install('global', { autoAllow: true });
     const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
-    expect(promptCommands(s)).not.toContain('codegraph prompt-hook');
+    expect(promptCommands(s)).not.toContain(HOOK_CMD);
   });
 
   it('claude: install with promptHook:true is idempotent (no duplicate, byte-identical re-run)', () => {
@@ -1170,7 +1175,7 @@ describe('Installer targets — partial-state idempotency', () => {
     claude.install('global', { autoAllow: true, promptHook: true });
     expect(fs.readFileSync(file, 'utf-8')).toBe(first);
     const s = JSON.parse(first);
-    expect(promptCommands(s).filter((c: string) => c === 'codegraph prompt-hook')).toHaveLength(1);
+    expect(promptCommands(s).filter((c: string) => c === HOOK_CMD)).toHaveLength(1);
   });
 
   it('claude: install with promptHook:false strips a hook a prior install wrote (opt-out round-trips)', () => {
@@ -1178,7 +1183,7 @@ describe('Installer targets — partial-state idempotency', () => {
     claude.install('global', { autoAllow: true, promptHook: true });
     claude.install('global', { autoAllow: true, promptHook: false });
     const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
-    expect(promptCommands(s)).not.toContain('codegraph prompt-hook');
+    expect(promptCommands(s)).not.toContain(HOOK_CMD);
   });
 
   it('claude: writePromptHookEntry preserves a sibling UserPromptSubmit hook', () => {
@@ -1187,14 +1192,37 @@ describe('Installer targets — partial-state idempotency', () => {
     });
     expect(writePromptHookEntry('global').action).toBe('updated');
     const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    expect(promptCommands(s)).toEqual(['my-own-hook', 'codegraph prompt-hook']);
+    expect(promptCommands(s)).toEqual(['my-own-hook', HOOK_CMD]);
+  });
+
+  it('claude: writePromptHookEntry migrates the other platform\'s spelling in place (#1466 self-heal)', () => {
+    const file = seedSettings('global', {
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: OTHER_PLATFORM_HOOK_CMD }] }] },
+    });
+    expect(writePromptHookEntry('global').action).toBe('updated');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual([HOOK_CMD]);
+    // A re-run after migration is byte-identical.
+    const healed = fs.readFileSync(file, 'utf-8');
+    expect(writePromptHookEntry('global').action).toBe('unchanged');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(healed);
+  });
+
+  it('claude: writePromptHookEntry leaves an npx-form hook untouched (no duplicate, no rewrite)', () => {
+    const npxCmd = 'npx @colbymchenry/codegraph prompt-hook';
+    const file = seedSettings('global', {
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: npxCmd }] }] },
+    });
+    expect(writePromptHookEntry('global').action).toBe('unchanged');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual([npxCmd]);
   });
 
   it('claude: uninstall removes the prompt hook but keeps the user\'s sibling', () => {
     const file = seedSettings('global', {
       hooks: {
         UserPromptSubmit: [
-          { hooks: [{ type: 'command', command: 'codegraph prompt-hook' }] },
+          { hooks: [{ type: 'command', command: HOOK_CMD }] },
           { hooks: [{ type: 'command', command: 'my-own-hook' }] },
         ],
       },
@@ -1204,16 +1232,27 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(promptCommands(s)).toEqual(['my-own-hook']);
   });
 
+  it('claude: removePromptHookEntry removes the other platform\'s spelling too', () => {
+    const file = seedSettings('global', {
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: OTHER_PLATFORM_HOOK_CMD }] }],
+      },
+    });
+    expect(removePromptHookEntry('global').action).toBe('removed');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual([]);
+  });
+
   it('claude: removePromptHookEntry leaves the legacy auto-sync hook untouched', () => {
     const file = seedSettings('global', {
       hooks: {
-        UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'codegraph prompt-hook' }] }],
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: HOOK_CMD }] }],
         Stop: [{ hooks: [{ type: 'command', command: 'codegraph sync-if-dirty' }] }],
       },
     });
     expect(removePromptHookEntry('global').action).toBe('removed');
     const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    expect(promptCommands(s)).not.toContain('codegraph prompt-hook');
+    expect(promptCommands(s)).not.toContain(HOOK_CMD);
     const stopCmds = (s.hooks?.Stop ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
     expect(stopCmds).toContain('codegraph sync-if-dirty');
   });
