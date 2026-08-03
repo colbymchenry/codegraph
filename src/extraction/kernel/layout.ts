@@ -17,7 +17,7 @@
  * path instead of mis-decoding.
  */
 
-export const KERNEL_ABI_VERSION = 1;
+export const KERNEL_ABI_VERSION = 2;
 
 /** Sentinel for "absent" in u32 slots and string-ref offsets. */
 export const NONE = 0xffffffff;
@@ -77,6 +77,7 @@ export const EDGE = {
 export const REF = {
   fromIdx: 0, // u32 (NONE → fromIdStr)
   kind: 4, // u8 — EDGE_KINDS index, or FUNCTION_REF_CODE
+  flags: 5, // u8 — REF_FLAGS bits (v2)
   line: 8, // u32
   column: 12, // u32
   referenceName: 16, // str
@@ -86,6 +87,15 @@ export const REF = {
 
 /** ReferenceKind wire code for the internal-only `function_ref` (#756). */
 export const FUNCTION_REF_CODE = 200;
+
+/**
+ * Ref-row flag bits (v2). FILE_PATH: the ref carries `filePath` = the
+ * extracted file — the ruby/php visitNode hooks set `filePath: ctx.filePath`
+ * on their mixin/trait `implements` refs (unlike every other extraction ref,
+ * which the store denormalizes); decode re-attaches its own filePath
+ * parameter, which is byte-identical.
+ */
+export const REF_FLAG_FILE_PATH = 1;
 
 /** Node bool-flag bit pairs: bit(2n) = present, bit(2n+1) = value. */
 export const FLAG = {

@@ -35,7 +35,11 @@ and the raw bulk path), so no blanking ported to Rust.
   starting points; linux `kernel/`+`mm/` subtrees 79% → 58%), each
   offset-preserving, TS-side, shared by both arms, and a graph-quality win
   for the wasm path itself (git 7.1k → 13.3k nodes; the linux subtrees
-  2.4k → 7.2k): `#ifdef __cplusplus` guard bodies, lone macro lines
+  2.4k → 7.2k — NOTE these are parity-sweep compared-file totals, NOT
+  full-graph counts: round 2 established that full-graph node deltas are
+  small because wasm error recovery was already salvaging most SYMBOLS on
+  deferred files; the blanks' full-graph win is EDGES + phantom cleanup —
+  see the round-2 record below): `#ifdef __cplusplus` guard bodies, lone macro lines
   (`FMT_BEGIN_NAMESPACE`, `Q_OBJECT`), C statement iterator macros
   (`list_for_each_entry(…) { }` and brace-less bodies), C trailing param
   attrs (`int argc UNUSED`), the curated Linux/sparse annotation list
@@ -61,6 +65,49 @@ and the raw bulk path), so no blanking ported to Rust.
   > file` then hash the FILE; the in-container 6GB heap OOMs and a straight
   pipe at GB scale dies with ENOBUFS, both of which silently hash truncated
   output as the empty stream.)
+
+- **Deferral round 2 (2026-07-18)** — eight new C-only passes + word-list
+  extensions took the linux `kernel/`+`mm/` deferral **58.6% → 33.9%**
+  (483 → 279 of 824 files; census-driven: `bucket-defers.mjs` clusters each
+  deferring file's FIRST post-preParse error-line shape). New passes, all in
+  `preParseCSource`: parameterized-annotation whole-blank (`__free(kfree)`,
+  `__printf(4,0)`, `__counted_by(n)`, `__bpf_md_ptr(…)` — extends through a
+  stranded field `;`, since a lone-`;` field errors but an empty struct body
+  doesn't), type-keyword-arg scanner (`kzalloc_obj(struct T)`,
+  `list_entry(p, struct T, m)` — a bounded hand scanner, NOT a nested regex
+  (backtracking risk on untrusted repos); head exclusions
+  sizeof/offsetof/`_Generic`/va_arg + call-vs-declaration guard: an
+  identifier or `*` before the head rejects, `return` excepted; blanks
+  trailing stars so `DEFINE_PER_CPU(struct T *, x)` leaves two plain
+  idents), `static|extern CAPS_MACRO(…);` whole-line blank at ANY scope
+  (bare `EXPORT_SYMBOL(x);` parses natively as a K&R decl — probed — and
+  stays), the ONE REWRITE in the family — `static CAPS(type, name) = {` →
+  `static <type> <name> = {` (name + tail keep exact offsets via d-flag
+  indices; blanking would strand the brace block or discard initializer
+  fn-refs), `va_arg(ap, const char *)` second-arg blank (single-token
+  `va_arg(ap, int)` parses natively — probed), GNU named-variadic
+  `#define f(args...)` DOTS-only blank (post-`restoreDirectiveLines` by
+  design; whole-tail blanking fails — `#define NAME` + trailing spaces
+  errors, measured), storage-sandwiched lowercase markers
+  (`static notrace void` — the sandwich is the guard), C23 `auto`
+  (`auto x =` only; `auto int x` untouched), and multi-line spans for the
+  statement-iterator-macro blank (`hlist_for_each_entry_rcu(…,\n
+  lockdep_is_held(&m)) {` — bails on `;`/braces mid-span). Word list +=
+  cacheline family (2- AND 4-underscore spellings), `__noclone`,
+  `__lockfunc`, `__ref`, `__private`, `__bitwise`, `__nosavedata`,
+  `__no_kcsan`, `__cpuidle`, `__ksym`, `__net_initdata`,
+  `__initdata_memblock`/`_or_meminfo`. Cross-repo: git 16.1 → 12.2%,
+  redis 25.3 → 24.1%, fmt/protobuf unchanged (cpp-dominant — C-only passes,
+  correct), **0 diffs all five sweeps**. Linux full-tree (2c gate runs):
+  kernel-arm parse **356 → 306s**, envelope 19.1 → ~17.1min (host-
+  contaminated, indicative), counts **2,049,153 / 6,413,518** (+858 nodes,
+  **+6,585 edges** vs R7a — the SYMBOLS were mostly already error-recovered;
+  the graph win is relationships + phantom cleanup). Deliberately skipped:
+  `#ifdef CONFIG_X` if/else interleaves + labels (genuine preprocessing),
+  TP_PROTO/TRACE_EVENT DSL headers (no real code to recover), `module_init(x)`
+  without `;` (K&R-definition ambiguity), single-token va_arg (native).
+  Torture fixture grew a round-2 section (both-arm parity pinned); unit
+  tests in extraction.test.ts; suite 2517 green.
 
 The sections below are §0a-recipe step 1's output — every TS-side branch the
 walker mirrors, with file:line anchors (as of `705e501`). Read WITH

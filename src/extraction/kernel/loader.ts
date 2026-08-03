@@ -53,10 +53,41 @@ export interface KernelGrammarInfo {
   fieldNames: string[];
 }
 
+/** Input to the cFnPtr extraction sweep: one file's raw text + its struct
+ *  node extents (`endLine ?? startLine` applied by the caller). */
+export interface CfnptrFileIn {
+  text: string;
+  structs: { id: string; startLine: number; endLine: number }[];
+}
+
+/** Per-file facts from the native cFnPtr extraction sweep — mirror of the
+ *  Rust `CfnptrFacts` (see codegraph-kernel/src/cfnptr.rs); semantics match
+ *  the JS sweep in src/resolution/c-fnptr-synthesizer.ts. */
+export interface CfnptrFactsOut {
+  fnPtrTypedefs: string[];
+  fnTypeTypedefs: string[];
+  structs: { id: string; parsed: boolean; fields: { name: string; index: number; ptr: boolean; type: string }[] }[];
+  inlinePtr: boolean;
+  inlineTypes: string[];
+  inlineTags: string[];
+  initTokens: string[];
+  arrayElems: string[];
+  aliasNames: string[];
+  dPairs: string[];
+  dispatchFields: string[];
+  arrayDispatchNames: string[];
+  includes: string[];
+}
+
 export interface KernelModule {
   extractFile(filePath: string, content: string, language: string): KernelBuffers;
   contractInfo(): KernelContractInfo;
   grammarInfo(language: string): KernelGrammarInfo | null;
+  /** Batched cFnPtr extraction sweep (task #5 step 2). OPTIONAL: absent on
+   *  older binaries — callers feature-detect and keep their JS path. */
+  cfnptrScanFiles?(files: CfnptrFileIn[]): CfnptrFactsOut[];
+  /** Native `stripCommentsForRegex(text, 'c')` — differential-oracle hook. */
+  cfnptrStripC?(text: string): string;
 }
 
 const debugEnabled = () => process.env.CODEGRAPH_KERNEL_DEBUG === '1';

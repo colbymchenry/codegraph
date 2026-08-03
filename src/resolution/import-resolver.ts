@@ -107,6 +107,8 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   importPathMemos.delete(context);
   exportedSymbolMemos.delete(context);
   fileExportIndexes.delete(context);
+  luaFileBasenameIndexes.delete(context);
+  cobolCopybookIndexes.delete(context);
 }
 
 export function resolveImportPath(
@@ -181,6 +183,32 @@ function resolveImportPathUncached(
  * file node would go quadratic on copybook-heavy repos).
  */
 const cobolCopybookIndexes = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/**
+ * Per-context basename → file-paths index for Lua/Luau require resolution
+ * (cobolCopybookIndexes pattern). resolveLuaRequire previously ran
+ * `getAllFiles().filter(endsWith)` FOUR times per require ref — ~7.5k string
+ * suffix scans each, measured at ~0.9ms/ref (2.7s combined on kong's 3k
+ * requires). Buckets preserve getAllFiles() iteration order so the per-suffix
+ * candidate list filters to exactly the array the full scan produced —
+ * identical matches, identical stable sort, identical winner.
+ */
+const luaFileBasenameIndexes = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+function luaBasenameIndex(context: ResolutionContext): Map<string, string[]> {
+  let index = luaFileBasenameIndexes.get(context);
+  if (!index) {
+    index = new Map();
+    for (const f of context.getAllFiles()) {
+      const base = f.split('/').pop() ?? '';
+      const paths = index.get(base);
+      if (paths) paths.push(f);
+      else index.set(base, [f]);
+    }
+    luaFileBasenameIndexes.set(context, index);
+  }
+  return index;
+}
 
 function resolveCobolCopybook(
   member: string,
@@ -1692,14 +1720,18 @@ function resolveLuaRequire(ref: UnresolvedRef, context: ResolutionContext): Reso
   if (!name) return null;
   const base = name.includes('.') ? name.replace(/\./g, '/') : name;
   const suffixes = [`${base}.lua`, `${base}.luau`, `${base}/init.lua`, `${base}/init.luau`];
-  const files = context.getAllFiles();
+  const byBasename = luaBasenameIndex(context);
   const shared = (a: string, b: string): number => {
     let i = 0;
     while (i < a.length && i < b.length && a[i] === b[i]) i++;
     return i;
   };
   for (const suffix of suffixes) {
-    const matches = files.filter((f) => f === suffix || f.endsWith('/' + suffix));
+    // Only files sharing the suffix's basename can match — the bucket is in
+    // getAllFiles() order, so this filter yields exactly what the full-list
+    // scan did.
+    const candidates = byBasename.get(suffix.split('/').pop() ?? '') ?? [];
+    const matches = candidates.filter((f) => f === suffix || f.endsWith('/' + suffix));
     if (matches.length === 0) continue;
     matches.sort((x, y) => shared(y, ref.filePath) - shared(x, ref.filePath));
     const best = matches[0]!;

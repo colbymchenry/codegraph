@@ -1,5 +1,6 @@
 /**
- * Memory headroom for worker-pool sizing — cgroup-honest on Linux.
+ * Memory headroom for worker-pool sizing — cgroup-honest on Linux,
+ * reclaim-honest on macOS.
  *
  * `os.freemem()` reads /proc/meminfo, which inside a container reports the
  * HOST's (or VM's) memory, not the cgroup's — the same blindness os.cpus()
@@ -7,8 +8,19 @@
  * kernel-scale index in a 7GB-capped container (migration plan §7a.1:
  * oom_kill=5, six ~1GB workers at true 8-core concurrency), so pool sizing
  * combines a CPU term with the memory headroom this module reports.
+ *
+ * On macOS `os.freemem()` has the OPPOSITE failure: it counts only
+ * `free_count` pages, and macOS deliberately keeps RAM full of reclaimable
+ * cache — a mostly-idle 64GB machine reads ~1GB "free", so the memory term
+ * capped the resolver pool at 2 workers where the CPU term allowed 6
+ * (measured on the dubbo warm-wall bench: resolution settle 3.0s at 2
+ * workers vs 1.9s at 6, ~1.5–2s of init wall). `darwinMemoryAvailable`
+ * reports what Activity Monitor calls available — free + inactive +
+ * speculative + purgeable pages — the same reclaimable-inclusive convention
+ * the Linux branch uses by crediting `inactive_file` back.
  */
 
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 
@@ -67,12 +79,45 @@ export function cgroupMemoryAvailable(): number | null {
 }
 
 /**
+ * Reclaimable-inclusive available memory on macOS, or null elsewhere / on
+ * any parse failure (→ callers fall back to `os.freemem()`). Reads
+ * `/usr/bin/vm_stat` — the stable public interface over host_statistics64 —
+ * once per call (pool sizing runs it once per init; a few ms). Never throws.
+ */
+export function darwinMemoryAvailable(): number | null {
+  if (process.platform !== 'darwin') return null;
+  try {
+    const out = execFileSync('/usr/bin/vm_stat', { encoding: 'utf8', timeout: 2000 });
+    const pageMatch = /page size of (\d+) bytes/.exec(out);
+    const pageSize = pageMatch ? Number.parseInt(pageMatch[1]!, 10) : 16384;
+    const count = (label: string): number => {
+      const m = new RegExp(`^${label}:\\s+(\\d+)`, 'm').exec(out);
+      return m ? Number.parseInt(m[1]!, 10) : 0;
+    };
+    const pages =
+      count('Pages free') +
+      count('Pages inactive') +
+      count('Pages speculative') +
+      count('Pages purgeable');
+    const bytes = pages * pageSize;
+    return bytes > 0 && Number.isFinite(bytes) ? bytes : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The budget pool sizing divides: the smaller of system free memory and the
- * cgroup headroom (when contained). Conservative by construction — both
- * numbers shrink as the process itself grows.
+ * cgroup headroom (when contained), with the macOS reclaimable-inclusive
+ * reading replacing the too-small darwin `freemem`. Conservative by
+ * construction — every number shrinks as the process itself grows.
  */
 export function memoryBudgetBytes(): number {
   const free = os.freemem();
   const cgroup = cgroupMemoryAvailable();
-  return cgroup === null ? free : Math.min(free, cgroup);
+  if (cgroup !== null) return Math.min(free, cgroup);
+  // darwinAvailable ⊇ free by construction (the sum includes free pages);
+  // max() guards a hypothetical undercounting parse.
+  const darwin = darwinMemoryAvailable();
+  return darwin === null ? free : Math.max(free, darwin);
 }

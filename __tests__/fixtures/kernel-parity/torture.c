@@ -82,3 +82,73 @@ static void spawn_workers(void) {
   register_handler(cb_a);
   signal_connect(&cb_b);
 }
+
+/* ---- deferral round 2 (the linux-idiom preParse family) --------------------
+ * Every shape below used to drop the WHOLE file into error recovery (and
+ * therefore defer it to wasm). Each now parses via a round-2 blank/rewrite;
+ * this section pins kernel-vs-wasm parity on all of them at once. */
+
+/* file-scope prefixed declaration macros — whole-line blank */
+static DEFINE_PER_CPU(struct llist_head, rstat_backlog_list);
+static DECLARE_WORK(init_free_wq, do_free_init);
+extern DECLARE_PER_CPU(struct tick_device, tick_cpu_device);
+
+/* initialized per-cpu declaration — the REWRITE (type + name survive) */
+static DEFINE_PER_CPU(struct conn, cpuhp_state) = {
+  .fd = 1,
+};
+
+/* type-keyword arguments — keyword (and trailing stars) blank */
+static void type_args(void *head, void *map) {
+  void *opts = kzalloc_obj(struct conn);
+  void *entry = list_first_entry(head,
+             struct conn, fd);
+  void *outer = hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(head)),
+             struct conn, fd);
+  use_ptr(outer, container_of(map, struct conn, fd));
+  use_ptr(opts, entry);
+}
+DEFINE_PER_CPU(struct conn *, ksoftirqd);
+
+/* parameterized annotations — name+args blank whole */
+static void cleanup_scope(void) {
+  struct conn *token __free(kfree) = NULL;
+  use_ptr(token, token);
+}
+static void __printf(1, 2) log_fmt(const char *fmt, ...);
+struct flex_tail {
+  int count;
+  int owners[] __counted_by(count);
+};
+
+/* sandwiched lowercase annotations + C23 auto */
+static notrace void tick_do(int x) { use_val(x); }
+static nokprobe_inline void arm_probe(void) { }
+static void auto_user(void) {
+  auto hb = shadowed_reader();
+  use_val(hb);
+}
+
+/* va_arg with a qualified type argument */
+static void drain_args(va_list ap) {
+  const char *s = va_arg(ap, const char *);
+  int n = va_arg(ap, int);
+  use_ptr((void *)s, (void *)(long)n);
+}
+
+/* multi-line statement-position iterator macro */
+static void walk_rcu(void *head) {
+  hlist_for_each_entry_rcu(pos, head, hlist,
+         lockdep_is_held(&probe_mutex)) {
+    use_ptr(pos, head);
+  }
+}
+
+/* GNU named-variadic define — dots blank, body survives */
+#define verbose(env, fmt, args...) log_writer(env, fmt, ##args)
+
+/* block-scope prefixed declaration macro */
+static void ratelimited_warn(void) {
+  static DEFINE_RATELIMIT_STATE(ratelimit, 5 * HZ, 5);
+  use_ptr(&ratelimit, 0);
+}

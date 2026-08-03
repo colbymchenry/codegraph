@@ -41,6 +41,15 @@ const port = parentPort;
 let db: SqliteDatabase | null = null;
 let queries: QueryBuilder | null = null;
 
+// CODEGRAPH_SYNTH_TIMINGS: split the writer lane's busy time into its two
+// halves — kernel-buffer decode+finalize (JS-object materialization, the §4d
+// buffer→bind candidate) vs the SQL bundle store — printed once at close.
+const STORE_TIMINGS = !!process.env.CODEGRAPH_SYNTH_TIMINGS;
+let decodeNs = 0n;
+let storeNs = 0n;
+let bundleCount = 0;
+let kernelBundleCount = 0;
+
 type InMessage =
   | { type: 'open'; dbPath: string; fastInit: boolean }
   | { type: 'bundle'; bundle: StoreBundle | KernelStoreBundle }
@@ -88,6 +97,23 @@ port.on('message', (msg: InMessage) => {
       }
       case 'bundle': {
         if (!queries) throw new Error('store-worker: bundle before open');
+        if (STORE_TIMINGS) {
+          bundleCount++;
+          const t0 = process.hrtime.bigint();
+          let bundle: StoreBundle;
+          if ('kernel' in msg.bundle) {
+            kernelBundleCount++;
+            bundle = decodeKernelBundle(msg.bundle);
+          } else {
+            bundle = msg.bundle;
+          }
+          const t1 = process.hrtime.bigint();
+          queries.storeFileBundle(bundle);
+          decodeNs += t1 - t0;
+          storeNs += process.hrtime.bigint() - t1;
+          port.postMessage({ type: 'ack' });
+          break;
+        }
         const bundle = 'kernel' in msg.bundle ? decodeKernelBundle(msg.bundle) : msg.bundle;
         queries.storeFileBundle(bundle);
         port.postMessage({ type: 'ack' });
@@ -98,6 +124,11 @@ port.on('message', (msg: InMessage) => {
         break;
       }
       case 'close': {
+        if (STORE_TIMINGS && bundleCount > 0) {
+          console.error(
+            `[store-timing] bundles=${bundleCount} (kernel=${kernelBundleCount}) decode=${(Number(decodeNs / 1_000_000n) / 1000).toFixed(2)}s store=${(Number(storeNs / 1_000_000n) / 1000).toFixed(2)}s`
+          );
+        }
         try {
           db?.close();
         } catch {

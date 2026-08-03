@@ -63,6 +63,7 @@ export class ResolverPool {
   private nextId = 0;
   private waiters = new Map<number, { resolve: (r: ChunkResult) => void; reject: (e: Error) => void }>();
   private synthWaiters = new Map<number, { resolve: (r: SynthPassResult) => void; reject: (e: Error) => void }>();
+  private recycleWaiters = new Map<number, () => void>();
   private failed: Error | null = null;
 
   /**
@@ -174,6 +175,10 @@ export class ResolverPool {
           const waiter = this.synthWaiters.get(msg.id);
           this.synthWaiters.delete(msg.id);
           waiter?.resolve({ edges: msg.edges ?? [], ms: msg.ms ?? 0 });
+        } else if (msg.type === 'recycled' && msg.id !== undefined) {
+          const waiter = this.recycleWaiters.get(msg.id);
+          this.recycleWaiters.delete(msg.id);
+          waiter?.();
         } else if (msg.type === 'error') {
           pw.busy--;
           const err = new Error(`resolver worker: ${msg.message}`);
@@ -211,6 +216,10 @@ export class ResolverPool {
     this.waiters.clear();
     for (const [, waiter] of this.synthWaiters) waiter.reject(this.failed);
     this.synthWaiters.clear();
+    // Pending recycles resolve rather than reject: their per-call timeout
+    // owns rejection, and the recycle caller checks this.failed next round.
+    for (const [, done] of this.recycleWaiters) done();
+    this.recycleWaiters.clear();
   }
 
   /** Whether this batch is worth fanning out. */
@@ -271,6 +280,43 @@ export class ResolverPool {
       this.synthWaiters.set(id, { resolve, reject });
       pw.worker.postMessage({ type: 'synth', id, pass: passName });
     });
+  }
+
+  /**
+   * Ask every worker to close and reopen its read-only connection, and wait
+   * for all acks. MUST be called only at the pool-idle boundary (all fanned
+   * chunks settled, next batch not yet dispatched) — the workers close their
+   * connections in place. Why: a long-lived reader pins WAL checkpoint
+   * progress, and the deep WAL behind it taxes every main-thread B-tree
+   * page operation (writes-under-readers, plan §7a.6 — deletes 42.6→118.8s
+   * from 0 to 4 attached readers). Releasing the read marks periodically
+   * lets the existing checkpoints advance, keeping the WAL shallow WITHOUT
+   * the full-park folds an aggressive valve pays (+129s measured at 64MB).
+   * A recycle failure fails the pool — the caller's sequential fallback
+   * covers the rest of the run.
+   */
+  async recycleWorkers(): Promise<void> {
+    if (this.failed) throw this.failed;
+    await Promise.all(
+      this.workers.map(
+        (pw) =>
+          new Promise<void>((resolve, reject) => {
+            const id = this.nextId++;
+            const t = setTimeout(() => {
+              if (this.recycleWaiters.delete(id)) {
+                const err = new Error('resolver worker recycle timed out');
+                this.fail(err);
+                reject(err);
+              }
+            }, 10_000);
+            this.recycleWaiters.set(id, () => {
+              clearTimeout(t);
+              resolve();
+            });
+            pw.worker.postMessage({ type: 'recycle', id });
+          })
+      )
+    );
   }
 
   async destroy(): Promise<void> {

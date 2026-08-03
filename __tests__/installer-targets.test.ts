@@ -876,6 +876,48 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(after).not.toContain('enabled = true');
   });
 
+  it('codex: install, re-install, and uninstall preserve trailing array-of-tables siblings', () => {
+    const codex = getTarget('codex')!;
+    const tomlPath = path.join(tmpHome, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(tomlPath), { recursive: true });
+    const historyTables = [
+      '[[history]]',
+      'id = 1',
+      'note = "keep first"',
+      '',
+      '[[history]]',
+      'id = 2',
+      'note = "keep second"',
+      '',
+    ].join('\n');
+    fs.writeFileSync(tomlPath, [
+      '[mcp_servers.codegraph]',
+      'command = "old-codegraph"',
+      'args = ["old"]',
+      'description = """',
+      'header-shaped text inside a multiline string:',
+      '[[not-a-table]]',
+      'still part of the string',
+      '"""',
+      '',
+      historyTables,
+    ].join('\n'));
+
+    const first = codex.install('global', { autoAllow: false });
+    expect(first.files.find((f) => f.path === tomlPath)?.action).toBe('updated');
+    const afterInstall = fs.readFileSync(tomlPath, 'utf-8');
+    expect(afterInstall).toContain('command = "codegraph"');
+    expect(afterInstall).not.toContain('[[not-a-table]]');
+    expect(afterInstall.endsWith(historyTables)).toBe(true);
+
+    const second = codex.install('global', { autoAllow: false });
+    expect(second.files.find((f) => f.path === tomlPath)?.action).toBe('unchanged');
+    expect(fs.readFileSync(tomlPath, 'utf-8')).toBe(afterInstall);
+
+    codex.uninstall('global');
+    expect(fs.readFileSync(tomlPath, 'utf-8')).toBe(historyTables);
+  });
+
   it('claude: local install writes ./.mcp.json (project scope), not ./.claude.json', () => {
     const claude = getTarget('claude')!;
     const result = claude.install('local', { autoAllow: false });
@@ -1102,6 +1144,11 @@ describe('Installer targets — partial-state idempotency', () => {
   // Opt-in (default-yes in the installer) UserPromptSubmit hook that runs
   // `codegraph prompt-hook`. Must write/remove surgically, be idempotent, and
   // round-trip an opt-out — without disturbing the user's own hooks.
+  // Platform-aware since #1466: Windows writes `codegraph.cmd prompt-hook`
+  // (Git Bash applies no PATHEXT, so the bare form is exit 127 there), and
+  // install self-heals the other platform's spelling in place.
+  const HOOK_CMD = process.platform === 'win32' ? 'codegraph.cmd prompt-hook' : 'codegraph prompt-hook';
+  const OTHER_PLATFORM_HOOK_CMD = process.platform === 'win32' ? 'codegraph prompt-hook' : 'codegraph.cmd prompt-hook';
   const promptCommands = (s: any): string[] =>
     (s.hooks?.UserPromptSubmit ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
 
@@ -1109,7 +1156,7 @@ describe('Installer targets — partial-state idempotency', () => {
     const claude = getTarget('claude')!;
     claude.install('global', { autoAllow: true, promptHook: true });
     const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
-    expect(promptCommands(s)).toContain('codegraph prompt-hook');
+    expect(promptCommands(s)).toContain(HOOK_CMD);
     expect(s.permissions?.allow).toContain('mcp__codegraph__*');
   });
 
@@ -1117,7 +1164,7 @@ describe('Installer targets — partial-state idempotency', () => {
     const claude = getTarget('claude')!;
     claude.install('global', { autoAllow: true });
     const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
-    expect(promptCommands(s)).not.toContain('codegraph prompt-hook');
+    expect(promptCommands(s)).not.toContain(HOOK_CMD);
   });
 
   it('claude: install with promptHook:true is idempotent (no duplicate, byte-identical re-run)', () => {
@@ -1128,7 +1175,7 @@ describe('Installer targets — partial-state idempotency', () => {
     claude.install('global', { autoAllow: true, promptHook: true });
     expect(fs.readFileSync(file, 'utf-8')).toBe(first);
     const s = JSON.parse(first);
-    expect(promptCommands(s).filter((c: string) => c === 'codegraph prompt-hook')).toHaveLength(1);
+    expect(promptCommands(s).filter((c: string) => c === HOOK_CMD)).toHaveLength(1);
   });
 
   it('claude: install with promptHook:false strips a hook a prior install wrote (opt-out round-trips)', () => {
@@ -1136,7 +1183,7 @@ describe('Installer targets — partial-state idempotency', () => {
     claude.install('global', { autoAllow: true, promptHook: true });
     claude.install('global', { autoAllow: true, promptHook: false });
     const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
-    expect(promptCommands(s)).not.toContain('codegraph prompt-hook');
+    expect(promptCommands(s)).not.toContain(HOOK_CMD);
   });
 
   it('claude: writePromptHookEntry preserves a sibling UserPromptSubmit hook', () => {
@@ -1145,14 +1192,37 @@ describe('Installer targets — partial-state idempotency', () => {
     });
     expect(writePromptHookEntry('global').action).toBe('updated');
     const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    expect(promptCommands(s)).toEqual(['my-own-hook', 'codegraph prompt-hook']);
+    expect(promptCommands(s)).toEqual(['my-own-hook', HOOK_CMD]);
+  });
+
+  it('claude: writePromptHookEntry migrates the other platform\'s spelling in place (#1466 self-heal)', () => {
+    const file = seedSettings('global', {
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: OTHER_PLATFORM_HOOK_CMD }] }] },
+    });
+    expect(writePromptHookEntry('global').action).toBe('updated');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual([HOOK_CMD]);
+    // A re-run after migration is byte-identical.
+    const healed = fs.readFileSync(file, 'utf-8');
+    expect(writePromptHookEntry('global').action).toBe('unchanged');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(healed);
+  });
+
+  it('claude: writePromptHookEntry leaves an npx-form hook untouched (no duplicate, no rewrite)', () => {
+    const npxCmd = 'npx @colbymchenry/codegraph prompt-hook';
+    const file = seedSettings('global', {
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: npxCmd }] }] },
+    });
+    expect(writePromptHookEntry('global').action).toBe('unchanged');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual([npxCmd]);
   });
 
   it('claude: uninstall removes the prompt hook but keeps the user\'s sibling', () => {
     const file = seedSettings('global', {
       hooks: {
         UserPromptSubmit: [
-          { hooks: [{ type: 'command', command: 'codegraph prompt-hook' }] },
+          { hooks: [{ type: 'command', command: HOOK_CMD }] },
           { hooks: [{ type: 'command', command: 'my-own-hook' }] },
         ],
       },
@@ -1162,16 +1232,27 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(promptCommands(s)).toEqual(['my-own-hook']);
   });
 
+  it('claude: removePromptHookEntry removes the other platform\'s spelling too', () => {
+    const file = seedSettings('global', {
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: OTHER_PLATFORM_HOOK_CMD }] }],
+      },
+    });
+    expect(removePromptHookEntry('global').action).toBe('removed');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual([]);
+  });
+
   it('claude: removePromptHookEntry leaves the legacy auto-sync hook untouched', () => {
     const file = seedSettings('global', {
       hooks: {
-        UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'codegraph prompt-hook' }] }],
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: HOOK_CMD }] }],
         Stop: [{ hooks: [{ type: 'command', command: 'codegraph sync-if-dirty' }] }],
       },
     });
     expect(removePromptHookEntry('global').action).toBe('removed');
     const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    expect(promptCommands(s)).not.toContain('codegraph prompt-hook');
+    expect(promptCommands(s)).not.toContain(HOOK_CMD);
     const stopCmds = (s.hooks?.Stop ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
     expect(stopCmds).toContain('codegraph sync-if-dirty');
   });
@@ -1291,6 +1372,113 @@ describe('Installer targets — TOML serializer (Codex backbone)', () => {
     const { content } = upsertTomlTable(existing, 'mcp_servers.codegraph', block);
     expect(content.match(/\[\[foo\]\]/g)?.length).toBe(2);
     expect(content).toContain('[mcp_servers.codegraph]');
+  });
+
+  it('upsert replaces the managed table without consuming trailing array-of-tables siblings', () => {
+    const historyTables = [
+      '[[history]]',
+      'id = 1',
+      'note = "keep first"',
+      '',
+      '[[history]]',
+      'id = 2',
+      'note = "keep second"',
+      '',
+    ].join('\n');
+    const existing = [
+      '[mcp_servers.codegraph]',
+      'command = "old-codegraph"',
+      'args = ["old"]',
+      '',
+      historyTables,
+    ].join('\n');
+    const block = buildTomlTable('mcp_servers.codegraph', {
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+    });
+
+    const { content, action } = upsertTomlTable(existing, 'mcp_servers.codegraph', block);
+
+    expect(action).toBe('replaced');
+    expect(content).toBe(`${block}\n\n${historyTables}`);
+  });
+
+  it('remove preserves trailing array-of-tables siblings byte-for-byte', () => {
+    const historyTables = [
+      '[[history]]',
+      'id = 1',
+      'note = "keep first"',
+      '',
+      '[[history]]',
+      'id = 2',
+      'note = "keep second"',
+      '',
+    ].join('\n');
+    const existing = [
+      '[mcp_servers.codegraph]',
+      'command = "codegraph"',
+      'args = ["serve", "--mcp"]',
+      '',
+      historyTables,
+    ].join('\n');
+
+    const { content, action } = removeTomlTable(existing, 'mcp_servers.codegraph');
+
+    expect(action).toBe('removed');
+    expect(content).toBe(historyTables);
+  });
+
+  it.each([
+    ['table', '[ mcp_servers.other ]'],
+    ['array-of-tables', '[[ history ]]'],
+  ])('preserves a trailing %s header with inner whitespace', (_kind, siblingHeader) => {
+    const siblingTable = `${siblingHeader}\nvalue = "keep"\n`;
+    const existing = [
+      '[mcp_servers.codegraph]',
+      'command = "old-codegraph"',
+      'args = ["old"]',
+      '',
+      siblingTable,
+    ].join('\n');
+    const block = buildTomlTable('mcp_servers.codegraph', {
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+    });
+
+    const upserted = upsertTomlTable(existing, 'mcp_servers.codegraph', block);
+    const removed = removeTomlTable(existing, 'mcp_servers.codegraph');
+
+    expect(upserted.content).toBe(`${block}\n\n${siblingTable}`);
+    expect(removed.content).toBe(siblingTable);
+  });
+
+  it.each([
+    ['basic', '"""'],
+    ['literal', "'''"],
+  ])('ignores header-shaped text inside a multiline %s string', (_kind, delimiter) => {
+    const historyTable = '[[history]]\nid = 1\n';
+    const existing = [
+      '[mcp_servers.codegraph]',
+      'command = "old-codegraph"',
+      'args = [',
+      `  ${delimiter}first line`,
+      '[[not-a-table]]',
+      `last line${delimiter},`,
+      '  "serve",',
+      ']',
+      '',
+      historyTable,
+    ].join('\n');
+    const block = buildTomlTable('mcp_servers.codegraph', {
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+    });
+
+    const upserted = upsertTomlTable(existing, 'mcp_servers.codegraph', block);
+    const removed = removeTomlTable(existing, 'mcp_servers.codegraph');
+
+    expect(upserted.content).toBe(`${block}\n\n${historyTable}`);
+    expect(removed.content).toBe(historyTable);
   });
 });
 

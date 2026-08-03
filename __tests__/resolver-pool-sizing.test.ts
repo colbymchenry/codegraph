@@ -7,8 +7,13 @@
  * 7GB container at true 8-core concurrency).
  */
 import { describe, it, expect } from 'vitest';
+import * as os from 'os';
 import { ResolverPool } from '../src/resolution/resolver-pool';
-import { cgroupMemoryAvailable, memoryBudgetBytes } from '../src/resolution/memory-budget';
+import {
+  cgroupMemoryAvailable,
+  darwinMemoryAvailable,
+  memoryBudgetBytes,
+} from '../src/resolution/memory-budget';
 
 const GB = 1024 * 1024 * 1024;
 const MB = 1024 * 1024;
@@ -77,4 +82,27 @@ describe('memory budget helpers', () => {
       expect(v === null || (v >= 0 && Number.isFinite(v))).toBe(true);
     }
   });
+
+  it.runIf(process.platform === 'darwin')(
+    'darwin: available memory counts reclaimable pages, not just free_count',
+    () => {
+      const v = darwinMemoryAvailable();
+      // vm_stat exists on every macOS; a null here means the parse broke.
+      expect(v).not.toBeNull();
+      expect(Number.isFinite(v!)).toBe(true);
+      // The sum includes the free pages freemem() counts, so it can only be
+      // larger (modulo TOCTOU drift between the two reads — allow slack).
+      expect(v!).toBeGreaterThanOrEqual(os.freemem() * 0.5);
+      // And the budget must ride it (the 2-worker strangulation regression:
+      // a mostly-idle Mac read ~1GB free and halved the resolver pool).
+      expect(memoryBudgetBytes()).toBeGreaterThanOrEqual(v! * 0.5);
+    }
+  );
+
+  it.runIf(process.platform !== 'darwin')(
+    'darwinMemoryAvailable is null off-macOS and never throws',
+    () => {
+      expect(darwinMemoryAvailable()).toBeNull();
+    }
+  );
 });

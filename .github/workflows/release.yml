@@ -30,13 +30,16 @@ permissions:
 
 jobs:
   # Native extraction-kernel prebuilds (docs/design/rust-kernel-migration-plan.md).
-  # The kernel is an OPTIONAL per-language speedup: a bundle without a .node
-  # runs the wasm extraction path unchanged. continue-on-error keeps a Rust
-  # toolchain flake from ever blocking a release — the release job runs with
-  # whatever prebuilds succeeded. (Runner images ship rustup; build-kernel.sh
+  # As of 1.5.0 the kernel is the release's HEADLINE, not an optional extra, so
+  # this matrix is REQUIRED: a failed kernel build blocks the release instead of
+  # silently shipping wasm-only bundles under a Rust-engine banner. Per-file
+  # wasm fallback still exists at runtime for erroring files and unsupported
+  # platforms — but every published bundle must carry its .node. Note the
+  # vendored-grammar-C languages (kotlin/lua/scala/dart) compile parser.c via
+  # the cc crate, so each leg needs its platform C toolchain (runner images
+  # ship one). (Runner images ship rustup; build-kernel.sh
   # adds each cross target itself.)
   kernel:
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -165,29 +168,30 @@ jobs:
           fi
 
       - name: Download kernel prebuilds
-        # Best-effort: whatever platform legs succeeded land in release/kernel/
-        # (<target>/codegraph-kernel.node); build-bundle.sh includes a target's
-        # kernel when present and falls back to the wasm path when not.
-        continue-on-error: true
+        # All legs are required (see the kernel job), so every target's
+        # <target>/codegraph-kernel.node must be present in release/kernel/.
         uses: actions/download-artifact@v4
         with:
           pattern: kernel-*
           merge-multiple: true
           path: release/kernel/
 
-      - name: Kernel contract + grammar-parity gate
-        # Asserts the native grammars and the vendored wasm grammars are built
-        # from the same grammar revisions (node-kind/field tables compared id
-        # by id) and that the .node speaks the expected wire contract.
-        # CODEGRAPH_KERNEL_EXPECT=1 turns a missing binary into a FAILURE here
-        # so the gate can't silently pass by not building the kernel.
+      - name: Kernel contract + full walker-parity gate
+        # Runs EVERY kernel suite (__tests__/kernel-*.test.ts — the wire
+        # contract, the grammar-source parity table checks, and all 20
+        # languages' walker byte-parity suites incl. torture/CRLF/defer pins)
+        # against the freshly built linux-x64 .node. The glob keeps this gate
+        # current as languages are added. CODEGRAPH_KERNEL_EXPECT=1 turns a
+        # missing binary into a FAILURE, and a missing prebuild fails outright
+        # — the matrix is required, so absence here means a wiring bug.
         run: |
           if [ -f release/kernel/linux-x64/codegraph-kernel.node ]; then
             mkdir -p codegraph-kernel/prebuilds/linux-x64
             cp release/kernel/linux-x64/codegraph-kernel.node codegraph-kernel/prebuilds/linux-x64/
-            CODEGRAPH_KERNEL_EXPECT=1 npx vitest run __tests__/kernel-scaffold.test.ts __tests__/kernel-grammar-parity.test.ts
+            CODEGRAPH_KERNEL_EXPECT=1 npx vitest run __tests__/kernel-*.test.ts
           else
-            echo "::warning::no linux-x64 kernel prebuild — skipping kernel gate (bundles ship wasm-only)"
+            echo "::error::linux-x64 kernel prebuild missing despite required matrix"
+            exit 1
           fi
 
       - name: Build all platform bundles

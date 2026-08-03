@@ -127,6 +127,8 @@ export interface IndexOptions {
 
   /** Enable verbose logging (worker lifecycle, memory, timeouts) */
   verbose?: boolean;
+  /** Watcher fast path: reconcile ONLY these project-relative paths (see ExtractionOrchestrator.sync). */
+  paths?: string[];
 }
 
 /**
@@ -493,6 +495,11 @@ export class CodeGraph {
         // triggers, rebuild nodes_fts once from the nodes table afterwards.
         // Crash inside the window is healed on the next DatabaseConnection.open.
         this.db.beginBulkNodeLoad();
+        // Fresh-init only: also drop the parse-lane secondary indexes for the
+        // mass insert (the store-writer's B-tree-maintenance floor, plan §4d)
+        // and rebuild each in one scan afterwards. Incremental runs keep them
+        // — they delete per-file rows mid-phase through the file_path indexes.
+        if (freshDb) this.db.beginBulkParseLoad();
         let result: IndexResult;
         try {
           result = await this.orchestrator.indexAll(
@@ -506,6 +513,11 @@ export class CodeGraph {
             freshDb ? { dbPath: this.db.getPath(), fastInit } : null
           );
         } finally {
+          if (freshDb) {
+            const tIdx = Date.now();
+            await this.db.endBulkParseLoad();
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] parse-index-rebuild: ${Date.now() - tIdx}ms`);
+          }
           const tFts = Date.now();
           this.db.endBulkNodeLoad();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] fts-rebuild: ${Date.now() - tFts}ms`);
@@ -769,7 +781,7 @@ export class CodeGraph {
           try { return this.queries.isNameSegmentVocabEmpty(); } catch { return false; }
         })();
 
-        const result = await this.orchestrator.sync(options.onProgress);
+        const result = await this.orchestrator.sync(options.onProgress, options.paths);
 
         // Fold the store phase's WAL BEFORE the post-store reads below
         // (resolution reads on the main thread) — same rationale as
@@ -983,8 +995,8 @@ export class CodeGraph {
 
     this.watcher = new FileWatcher(
       this.projectRoot,
-      async () => {
-        const result = await this.sync();
+      async (paths?: string[]) => {
+        const result = await this.sync({ paths });
         // sync() returns this exact zero-shape iff it failed to acquire the
         // file lock (a real empty sync always has filesChecked > 0 because
         // scanDirectory ran). Surface that to the watcher as a typed error
@@ -1170,6 +1182,10 @@ export class CodeGraph {
         begin: () => this.db.beginBulkEdgeLoad(),
         end: () => this.db.endBulkEdgeLoad(),
       },
+      refIndexLoad: {
+        begin: () => this.db.beginBulkRefLoad(),
+        end: () => this.db.endBulkRefLoad(),
+      },
       backpressure,
     });
   }
@@ -1218,6 +1234,7 @@ export class CodeGraph {
   getStats(): GraphStats {
     const stats = this.queries.getStats();
     stats.dbSizeBytes = this.db.getSize();
+    stats.walSizeBytes = this.db.getWalSizeBytes();
     return stats;
   }
 

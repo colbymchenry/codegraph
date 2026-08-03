@@ -48,6 +48,68 @@ const DEFAULT_ROUTED: ReadonlySet<Language> = new Set<Language>([
   // scripts/kernel-parity.mjs --max-deferral).
   'c',
   'cpp',
+  // R7b (2026-07-20): parity swept 0-diff on ripgrep/tokio/rust-analyzer
+  // (2,108 files byte-parity) + full-init dump-diffs byte-identical. Rust
+  // deferral is ~0% on normal repos; token-macro-table sources (rust-analyzer's
+  // parser crates, 18%) error on BOTH arms — grammar-inherent, not a walker
+  // signal.
+  'rust',
+  // R7b (2026-07-20): parity swept 0-diff on serilog/Newtonsoft.Json/jellyfin
+  // (3,229 files byte-parity) + full-init dump-diffs byte-identical ×3.
+  // Deferral 0.05–3.3% — both-branches-kept `#if` damage that errors on BOTH
+  // arms (the preParse blanking hoist keeps the kernel's input identical).
+  'csharp',
+  // R7b (2026-07-20): parity swept 0-diff on sinatra/jekyll/rails (3,763
+  // files byte-parity, 0 deferrals — ruby error incidence is 0.00%) +
+  // full-init dump-diffs byte-identical ×3. Any deferral on a ruby sweep is
+  // a walker-bug signal, not grammar reality.
+  'ruby',
+  // R7b (2026-07-20): parity swept 0-diff on monolog/laravel-framework/
+  // symfony (13,950 files byte-parity) + full-init dump-diffs byte-identical
+  // ×3. Deferral ≈0–0.1% (genuinely-broken fixtures) — default sweep guard.
+  'php',
+  // R7b (2026-07-20): parity swept 0-diff on Alamofire/vapor/swift-nio (720
+  // clean files byte-parity; Alamofire's 348 #1020 property nodes reproduced
+  // exactly) + full-init dump-diffs byte-identical ×3. Swift error incidence
+  // is structurally 9–27% on BOTH arms (heavy #if conditionalization) —
+  // sweeps run --max-deferral 0.3; a deferral-rate JUMP is the bug signal.
+  'swift',
+  // R7b (2026-07-20): parity swept 0-diff on okio/okhttp/kotlinx.coroutines
+  // (1,861 clean files byte-parity; KMP expect/actual synthesis identical —
+  // 412 edges both arms on kotlinx.coroutines) + full-init dump-diffs
+  // byte-identical ×3. Deferral 4.7–8.5% both-arm grammar reality
+  // (fun-interface misparses + PHANTOM hasError files) — default sweep guard
+  // holds; a JUMP past ~10% is the bug signal.
+  'kotlin',
+  // R7b batch 4 (2026-07-20): parity swept 0-diff on dplyr/ggplot2/shiny +
+  // AnomalyDetection + full-init dump-diffs byte-identical ×3. R error
+  // incidence is ~0% (deferrals 0/0/0/1 across the gate repos — the 1 is a
+  // moustache-template pseudo-R file, both-arm): any deferral on an R sweep
+  // is a walker-bug signal, not grammar reality.
+  'r',
+  // R7b batch 4 (2026-07-20): one walker, two dialects. Parity swept 0-diff
+  // on kong/lazy.nvim/lua-resty-core (lua) + lune/Fusion (luau) + full-init
+  // dump-diffs byte-identical. Lua error incidence ~0% (any deferral is a
+  // walker-bug signal); luau 1.4–7.1% both-arm grammar reality (generic type
+  // packs, default type params) — a JUMP past ~10% is the bug signal.
+  'lua',
+  'luau',
+  // R7b batch 4 (2026-07-20): parity swept 0-diff on os-lib/cats + scala3
+  // compiler/src + library/src + full-init dump-diffs byte-identical.
+  // Error incidence is bimodal: mainstream Scala-2-style repos ~0-2%
+  // (os-lib 0%, cats 1.8%) but scala-3-frontier code runs 10-18% with
+  // PHANTOM-dominated error sets (hasError=true, zero ERROR nodes —
+  // capture-checking `^` types; defer on the FLAG). Sweeps over
+  // scala3-style repos use --max-deferral 0.3 (swift precedent); a
+  // deferral JUMP on cats/os-lib-style code is the bug signal.
+  'scala',
+  // R7b batch 4 (2026-07-20): parity swept 0-diff on shelf/bloc/flutter +
+  // full-init dump-diffs byte-identical. Error incidence 3.4-20.7% both-arm
+  // grammar reality (empty object patterns — the sealed-class idiom — and
+  // unnamed `library;` dominate; flutter sits at ~21%) — sweeps use
+  // --max-deferral 0.3; the RATE, not the count, is the signal (flutter
+  // HEAD drifts).
+  'dart',
 ]);
 
 /**

@@ -48,7 +48,7 @@ if (paths.length === 0) {
   process.exit(2);
 }
 
-const KERNEL_LANGS = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go', 'c', 'cpp']);
+const KERNEL_LANGS = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go', 'c', 'cpp', 'rust', 'csharp', 'ruby', 'php', 'swift', 'kotlin', 'r', 'lua', 'luau', 'scala', 'dart']);
 const EXTS = new Map([
   ['.ts', 'typescript'], ['.mts', 'typescript'], ['.cts', 'typescript'],
   ['.tsx', 'tsx'], ['.js', 'javascript'], ['.mjs', 'javascript'],
@@ -58,6 +58,16 @@ const EXTS = new Map([
   ['.c', 'c'], ['.h', 'detect'],
   ['.cpp', 'cpp'], ['.cc', 'cpp'], ['.cxx', 'cpp'], ['.hpp', 'cpp'], ['.hxx', 'cpp'],
   ['.metal', 'cpp'], ['.cu', 'cpp'], ['.cuh', 'cpp'],
+  ['.rs', 'rust'], // R7b
+  ['.cs', 'csharp'], // R7b
+  ['.rb', 'ruby'], ['.rake', 'ruby'], // R7b
+  ['.php', 'php'], ['.module', 'php'], ['.install', 'php'], ['.theme', 'php'], ['.inc', 'php'], // R7b
+  ['.swift', 'swift'], // R7b
+  ['.kt', 'kotlin'], ['.kts', 'kotlin'], // R7b
+  ['.r', 'r'], // R7b batch 4 — real-world casing is `.R`; extname lowercased below
+  ['.lua', 'lua'], ['.luau', 'luau'], // R7b batch 4
+  ['.scala', 'scala'], ['.sc', 'scala'], // R7b batch 4
+  ['.dart', 'dart'], // R7b batch 4
 ]);
 
 /** Collect candidate files. */
@@ -72,8 +82,10 @@ function collect(p, out) {
     const base = path.basename(p);
     if (base === 'node_modules' || base === '.git' || base === 'dist' || base === '.codegraph') return;
     for (const e of fs.readdirSync(p)) collect(path.join(p, e), out);
-  } else if (EXTS.has(path.extname(p))) {
-    const lang = EXTS.get(path.extname(p));
+  } else if (EXTS.has(path.extname(p).toLowerCase())) {
+    // Lowercased to match the real indexer's routing (detectLanguage
+    // lowercases the extension — `.R` is the dominant real-world casing).
+    const lang = EXTS.get(path.extname(p).toLowerCase());
     // 'detect' (.h) resolves per file in the run loop; under --lang it rides
     // along whenever either C-family language is requested.
     const passes =

@@ -18,11 +18,22 @@
 
 mod buffers;
 mod ccpp;
+mod cfnptr;
+mod csharp;
+mod dart;
 mod docstring;
 mod ids;
 mod go;
 mod java;
+mod kotlin;
 mod langs;
+mod lua;
+mod php;
+mod rlang;
+mod ruby;
+mod rustlang;
+mod scala;
+mod swift;
 mod textutil;
 mod python;
 mod tsjs;
@@ -98,6 +109,111 @@ pub fn grammar_info(language: String) -> Option<GrammarInfo> {
     })
 }
 
+/// One struct node's extent for the cFnPtr sweep (mirror of the TS caller's
+/// `{ id, startLine, endLine }`, with `endLine ?? startLine` applied TS-side).
+#[napi(object)]
+pub struct CfnptrStructIn {
+    pub id: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+#[napi(object)]
+pub struct CfnptrFileIn {
+    /// RAW file text, exactly as the resolver's readFile returned it.
+    pub text: String,
+    pub structs: Vec<CfnptrStructIn>,
+}
+
+#[napi(object)]
+pub struct CfnptrField {
+    pub name: String,
+    pub index: u32,
+    pub ptr: bool,
+    #[napi(js_name = "type")]
+    pub ty: String,
+}
+
+#[napi(object)]
+pub struct CfnptrStructOut {
+    pub id: String,
+    pub parsed: bool,
+    pub fields: Vec<CfnptrField>,
+}
+
+/// The cFnPtr extraction-sweep facts for one file — see cfnptr.rs (and the
+/// TS synthesizer's `FileFacts`) for field semantics.
+#[napi(object)]
+pub struct CfnptrFacts {
+    pub fn_ptr_typedefs: Vec<String>,
+    pub fn_type_typedefs: Vec<String>,
+    pub structs: Vec<CfnptrStructOut>,
+    pub inline_ptr: bool,
+    pub inline_types: Vec<String>,
+    pub inline_tags: Vec<String>,
+    pub init_tokens: Vec<String>,
+    pub array_elems: Vec<String>,
+    pub alias_names: Vec<String>,
+    pub d_pairs: Vec<String>,
+    pub dispatch_fields: Vec<String>,
+    pub array_dispatch_names: Vec<String>,
+    pub includes: Vec<String>,
+}
+
+/// Batched cFnPtr extraction sweep (task #5 step 2): one call scans a batch
+/// of files and returns their collected facts, amortizing the NAPI boundary.
+/// Feature-detected by the TS loader — absent on older binaries, where the
+/// synthesizer keeps its JS sweep.
+#[napi]
+pub fn cfnptr_scan_files(files: Vec<CfnptrFileIn>) -> Vec<CfnptrFacts> {
+    files
+        .into_iter()
+        .map(|f| {
+            let structs: Vec<cfnptr::StructExtent> = f
+                .structs
+                .into_iter()
+                .map(|s| cfnptr::StructExtent { id: s.id, start_line: s.start_line, end_line: s.end_line })
+                .collect();
+            let facts = cfnptr::scan_file(&f.text, &structs);
+            CfnptrFacts {
+                fn_ptr_typedefs: facts.fn_ptr_typedefs,
+                fn_type_typedefs: facts.fn_type_typedefs,
+                structs: facts
+                    .structs
+                    .into_iter()
+                    .map(|s| CfnptrStructOut {
+                        id: s.id,
+                        parsed: s.parsed,
+                        fields: s
+                            .fields
+                            .into_iter()
+                            .map(|fl| CfnptrField { name: fl.name, index: fl.index, ptr: fl.ptr, ty: fl.ty })
+                            .collect(),
+                    })
+                    .collect(),
+                inline_ptr: facts.inline_ptr,
+                inline_types: facts.inline_types,
+                inline_tags: facts.inline_tags,
+                init_tokens: facts.init_tokens,
+                array_elems: facts.array_elems,
+                alias_names: facts.alias_names,
+                d_pairs: facts.d_pairs,
+                dispatch_fields: facts.dispatch_fields,
+                array_dispatch_names: facts.array_dispatch_names,
+                includes: facts.includes,
+            }
+        })
+        .collect()
+}
+
+/// Debug/differential hook: the native `stripCommentsForRegex(text, 'c')`.
+/// Exists so the strip differential oracle can pin the Rust stripper against
+/// the TS reference directly.
+#[napi]
+pub fn cfnptr_strip_c(text: String) -> String {
+    String::from_utf8_lossy(&cfnptr::strip_c(text.as_bytes())).into_owned()
+}
+
 #[napi]
 pub fn extract_file(file_path: String, content: String, language: String) -> Result<ExtractBuffers> {
     let out = match language.as_str() {
@@ -105,6 +221,16 @@ pub fn extract_file(file_path: String, content: String, language: String) -> Res
         "python" => python::extract(&file_path, &content).map_err(Error::from_reason)?,
         "go" => go::extract(&file_path, &content).map_err(Error::from_reason)?,
         "c" | "cpp" => ccpp::extract(&file_path, &content, &language).map_err(Error::from_reason)?,
+        "rust" => rustlang::extract(&file_path, &content).map_err(Error::from_reason)?,
+        "csharp" => csharp::extract(&file_path, &content).map_err(Error::from_reason)?,
+        "ruby" => ruby::extract(&file_path, &content).map_err(Error::from_reason)?,
+        "php" => php::extract(&file_path, &content).map_err(Error::from_reason)?,
+        "swift" => swift::extract(&file_path, &content).map_err(Error::from_reason)?,
+        "kotlin" => kotlin::extract(&file_path, &content).map_err(Error::from_reason)?,
+        "r" => rlang::extract(&file_path, &content).map_err(Error::from_reason)?,
+        "lua" | "luau" => lua::extract(&file_path, &content, &language).map_err(Error::from_reason)?,
+        "scala" => scala::extract(&file_path, &content).map_err(Error::from_reason)?,
+        "dart" => dart::extract(&file_path, &content).map_err(Error::from_reason)?,
         _ => tsjs::extract(&file_path, &content, &language).map_err(Error::from_reason)?,
     };
     Ok(ExtractBuffers {

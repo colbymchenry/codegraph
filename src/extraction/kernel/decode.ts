@@ -30,6 +30,7 @@ import {
   NONE,
   PROVENANCES,
   REF,
+  REF_FLAG_FILE_PATH,
   REF_ROW_SIZE,
   VISIBILITIES,
 } from './layout';
@@ -148,9 +149,13 @@ export function decodeExtractBuffers(
     const row = buffers.refs.subarray(i * REF_ROW_SIZE, (i + 1) * REF_ROW_SIZE);
     const fromIdx = row.readUInt32LE(REF.fromIdx);
     const kindByte = row.readUInt8(REF.kind);
-    // No filePath/language here: the wasm extractors emit refs WITHOUT the
-    // denormalized fields (the store fills them via `ref.filePath ?? filePath`),
-    // and the kernel must match the extractFromSource seam exactly.
+    // No filePath/language on ordinary refs: the wasm extractors emit them
+    // WITHOUT the denormalized fields (the store fills `ref.filePath ??
+    // filePath`), and the kernel must match the extractFromSource seam
+    // exactly. The ONE exception is flagged (REF_FLAG_FILE_PATH): the
+    // ruby/php visitNode hooks set `filePath: ctx.filePath` on their
+    // mixin/trait `implements` refs — re-attach the decode call's own
+    // filePath, which is that exact value.
     const ref: UnresolvedReference = {
       fromNodeId: fromIdx === NONE ? str(arena, row, REF.fromIdStr)! : idByRow[fromIdx]!,
       referenceName: str(arena, row, REF.referenceName)!,
@@ -161,6 +166,7 @@ export function decodeExtractBuffers(
       line: row.readUInt32LE(REF.line),
       column: row.readUInt32LE(REF.column),
     };
+    if ((row.readUInt8(REF.flags) & REF_FLAG_FILE_PATH) !== 0) ref.filePath = filePath;
     const candidates = strList(arena, row, REF.candidates);
     if (candidates !== undefined) ref.candidates = candidates;
     unresolvedReferences[i] = ref;

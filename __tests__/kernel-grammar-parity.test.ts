@@ -36,7 +36,7 @@ const kernelBuilt = fs.existsSync(KERNEL_PATH);
 
 // Every kernel-capable language. `jsx` shares the javascript grammar on BOTH
 // paths (langs.rs mirrors WASM_GRAMMAR_FILES), so the distinct grammars are:
-const GRAMMAR_LANGUAGES: Language[] = ['typescript', 'tsx', 'javascript', 'java', 'python', 'go', 'c', 'cpp'];
+const GRAMMAR_LANGUAGES: Language[] = ['typescript', 'tsx', 'javascript', 'java', 'python', 'go', 'c', 'cpp', 'rust', 'csharp', 'ruby', 'php', 'swift', 'kotlin', 'r', 'lua', 'luau', 'scala', 'dart'];
 
 describe.skipIf(!kernelBuilt)('kernel↔wasm grammar parity', () => {
   beforeAll(async () => {

@@ -57,14 +57,18 @@
 //! ref row (40 bytes):
 //!   0   u32  fromNode row index (NONE → use fromNodeIdStr)
 //!   4   u8   ReferenceKind (EDGE_KINDS index, or 200 = function_ref)
-//!   5   [3]  pad
+//!   5   u8   flags — bit 0: ref carries the extracting file's path (v2; the
+//!            ruby/php visitNode hooks set `filePath: ctx.filePath` on their
+//!            mixin/trait `implements` refs — decode re-attaches the decode
+//!            call's own filePath, which is byte-identical)
+//!   6   [2]  pad
 //!   8   u32  line (1-based)
 //!   12  u32  column (0-based)
 //!   16  str  referenceName
 //!   24  str  candidates (NUL-joined list)
 //!   32  str  fromNodeIdStr
 
-pub const KERNEL_ABI_VERSION: u8 = 1;
+pub const KERNEL_ABI_VERSION: u8 = 2;
 pub const NONE: u32 = 0xFFFF_FFFF;
 
 pub const META_SIZE: usize = 36;
@@ -116,6 +120,9 @@ pub const EDGE_KINDS: [&str; 12] = [
 
 /// ReferenceKind code for the internal-only `function_ref` (#756).
 pub const FUNCTION_REF_CODE: u8 = 200;
+
+/// Ref-row flag bit 0: the ref carries `filePath` = the extracted file.
+pub const REF_FLAG_FILE_PATH: u8 = 1;
 
 pub fn node_kind_index(kind: &str) -> Option<u8> {
     NODE_KINDS.iter().position(|k| *k == kind).map(|i| i as u8)
@@ -303,10 +310,15 @@ impl Tables {
     }
 
     pub fn push_ref(&mut self, r: &RefRow) {
+        self.push_ref_flagged(r, 0);
+    }
+
+    pub fn push_ref_flagged(&mut self, r: &RefRow, flags: u8) {
         let buf = &mut self.refs;
         buf.extend_from_slice(&r.from_idx.to_le_bytes());
         buf.push(r.kind);
-        buf.extend_from_slice(&[0u8; 3]); // pad
+        buf.push(flags);
+        buf.extend_from_slice(&[0u8; 2]); // pad
         buf.extend_from_slice(&r.line.to_le_bytes());
         buf.extend_from_slice(&r.column.to_le_bytes());
         push_str_ref(buf, r.reference_name);

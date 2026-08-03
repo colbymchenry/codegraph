@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
+import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
@@ -234,6 +234,32 @@ export class ReferenceResolver {
   private qualifiedNameCache: LRUCache<string, Node[]>; // qualified_name → nodes cache
   private fileLinesCache: LRUCache<string, string[] | null>; // file → split lines cache
   private methodMatchCache: LRUCache<string, Node[]>; // lang\0Type::method → matching method nodes
+  // Per-(language, methodName) owner index for getMethodMatches: buckets a
+  // method name's candidates by their qualifiedName's last two segments so a
+  // (type, method) query is a lookup instead of an O(candidates) filter per
+  // methodMatchCache miss. Derived purely from node rows (stable through the
+  // resolution loop, same window nameCache relies on); dropped in clearCaches.
+  private methodOwnerIndexCache = new Map<string, Map<string, Node[]>>();
+  // Generation-tagged memo for getSupertypes. Supertype edges GROW during the
+  // resolution loop (batch k persists its implements/extends edges BEFORE
+  // batch k+1 fans out — the #1320 ordering), so a plain cache would freeze an
+  // early batch's emptier answer and change later batches' outcomes. Within
+  // one batch the edge state is fixed by that same ordering, so entries are
+  // tagged with a generation that advances at every batch entry point
+  // (resolveBatchYielding / resolveListForAdmission) — a stale-gen entry is
+  // recomputed, making the memo behavior-identical to no memo at every point
+  // in time. On the Swift compiler the unmemoized walk ran 971k times for
+  // 565s of combined worker time (~581µs each, recursion-multiplied).
+  private supertypeGen = 0;
+  private supertypeMemo = new Map<string, { gen: number; supers: string[] }>();
+
+  /** Invalidate the getSupertypes memo — call when resolved edges may have advanced. */
+  private advanceSupertypeGeneration(): void {
+    this.supertypeGen++;
+    // Lazy invalidation via the gen tag; bound the map so a long run over many
+    // batches doesn't accrete dead entries.
+    if (this.supertypeMemo.size > 50_000) this.supertypeMemo.clear();
+  }
   // Node kinds are a small fixed set (~24), so this is a plain Map, not an LRU.
   // getNodesByKind returns the FULL node list for a kind; it was previously
   // uncached — a per-ref `SELECT * FROM nodes WHERE kind=?` + row-mapping. Called
@@ -372,14 +398,20 @@ export class ReferenceResolver {
     this.qualifiedNameCache.clear();
     this.fileLinesCache.clear();
     this.methodMatchCache.clear();
+    this.methodOwnerIndexCache.clear();
+    this.supertypeMemo.clear();
+    this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
     this.shaderResolver.clear();
-    // The import-resolver's per-context memos assume the same stable window
-    // as the caches above — drop them together.
-    if (this.context) clearImportResolverMemos(this.context);
+    // The import-resolver's and name-matcher's per-context memos assume the
+    // same stable window as the caches above — drop them together.
+    if (this.context) {
+      clearImportResolverMemos(this.context);
+      clearNameMatcherMemos(this.context);
+    }
   }
 
   /** `readFile` through the LRU content cache (null = read failed, also cached). */
@@ -429,12 +461,52 @@ export class ReferenceResolver {
           this.nameCache.set(methodName, candidates);
         }
         const want = `${typeName}::${methodName}`;
-        const matches: Node[] = [];
-        for (const m of candidates) {
-          if (m.kind !== 'method') continue;
-          if (m.language !== language) continue;
-          const qn = m.qualifiedName;
-          if (qn === want || qn.endsWith(`::${want}`)) matches.push(m);
+        let matches: Node[];
+        if (typeName.includes('::') || methodName.includes(':')) {
+          // Legacy linear filter for the shapes the owner index below can't
+          // key exactly: a multi-segment typeName (the endsWith test then
+          // spans more than two `::` segments) and ObjC selectors (whose
+          // single/empty-keyword colons defeat the segment split). Tiny
+          // populations; the per-key memo above still amortizes them.
+          matches = [];
+          for (const m of candidates) {
+            if (m.kind !== 'method') continue;
+            if (m.language !== language) continue;
+            const qn = m.qualifiedName;
+            if (qn === want || qn.endsWith(`::${want}`)) matches.push(m);
+          }
+        } else {
+          // Owner index: the linear filter above is O(all same-named methods)
+          // per CACHE MISS, and on overload-heavy landscapes the distinct
+          // (type, method) key space is so large the per-key memo never
+          // amortizes — Swift's `init` has tens of thousands of candidates
+          // and the compiler repo measured 732µs per failing call, most of it
+          // this scan (re-entered once per supertype recursion level, too).
+          // Bucket each (language, methodName)'s candidates ONCE by the
+          // qualifiedName's last two `::` segments — exactly the span the
+          // `qn === want || qn.endsWith('::' + want)` predicate tests for a
+          // segment-clean typeName — then every query is a map lookup.
+          // Bucket insertion follows candidate order, so each bucket is
+          // byte-identical to what the linear filter produced.
+          const idxKey = `${language} ${methodName}`;
+          let ownerIndex = this.methodOwnerIndexCache.get(idxKey);
+          if (!ownerIndex) {
+            ownerIndex = new Map<string, Node[]>();
+            for (const m of candidates) {
+              if (m.kind !== 'method') continue;
+              if (m.language !== language) continue;
+              const qn = m.qualifiedName;
+              const i2 = qn.lastIndexOf('::');
+              if (i2 < 0) continue; // single-segment qn can never match `T::m`
+              const i1 = qn.lastIndexOf('::', i2 - 1);
+              const bucketKey = i1 < 0 ? qn : qn.slice(i1 + 2);
+              const bucket = ownerIndex.get(bucketKey);
+              if (bucket) bucket.push(m);
+              else ownerIndex.set(bucketKey, [m]);
+            }
+            this.methodOwnerIndexCache.set(idxKey, ownerIndex);
+          }
+          matches = ownerIndex.get(want) ?? [];
         }
         this.methodMatchCache.set(key, matches);
         return matches;
@@ -532,18 +604,31 @@ export class ReferenceResolver {
         // Matching by simple name (not id) reconciles a type declared in one node
         // (`KF::Builder`) with conformance declared in a separate extension node
         // (`KF.Builder: KFOptionSetter`) — both have name `Builder`.
+        // Memoized per batch generation (see supertypeMemo): within a batch the
+        // edge state is fixed, and the conformance walk re-queries the same
+        // popular supertypes (Swift stdlib protocols especially) thousands of
+        // times per batch.
+        const memoKey = `${language} ${typeName}`;
+        const hit = this.supertypeMemo.get(memoKey);
+        if (hit && hit.gen === this.supertypeGen) return hit.supers;
         const typeNodes = this.context
           .getNodesByName(typeName)
           .filter((n) => SUPERTYPE_BEARING_KINDS.has(n.kind) && n.language === language);
-        if (typeNodes.length === 0) return [];
-        const supertypes = new Set<string>();
-        for (const tn of typeNodes) {
-          for (const edge of this.queries.getOutgoingEdges(tn.id, ['implements', 'extends'])) {
-            const target = this.queries.getNodeById(edge.target);
-            if (target?.name && target.name !== typeName) supertypes.add(target.name);
+        let supers: string[];
+        if (typeNodes.length === 0) {
+          supers = [];
+        } else {
+          const supertypes = new Set<string>();
+          for (const tn of typeNodes) {
+            for (const edge of this.queries.getOutgoingEdges(tn.id, ['implements', 'extends'])) {
+              const target = this.queries.getNodeById(edge.target);
+              if (target?.name && target.name !== typeName) supertypes.add(target.name);
+            }
           }
+          supers = [...supertypes];
         }
-        return [...supertypes];
+        this.supertypeMemo.set(memoKey, { gen: this.supertypeGen, supers });
+        return supers;
       },
 
       getImportMappings: (filePath: string, language) => {
@@ -817,12 +902,14 @@ export class ReferenceResolver {
       ref.language === 'arkts' && ref.referenceName.startsWith('.')
         ? ref.referenceName.slice(1)
         : ref.referenceName;
-    if (
-      !isNixPathImportRef(ref) &&
-      !this.hasAnyPossibleMatch(existenceName) &&
-      !this.matchesAnyImport(ref) &&
-      !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
-    ) {
+    const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
+    const preFilterPass =
+      isNixPathImportRef(ref) ||
+      this.hasAnyPossibleMatch(existenceName) ||
+      this.matchesAnyImport(ref) ||
+      this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
+    if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
+    if (!preFilterPass) {
       return null;
     }
 
@@ -840,7 +927,15 @@ export class ReferenceResolver {
       const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
       if (viaImport) {
         const target = this.queries.getNodeById(viaImport.targetNodeId);
-        if (target && (target.kind === 'function' || target.kind === 'method')) {
+        if (
+          target &&
+          (target.kind === 'function' ||
+            target.kind === 'method' ||
+            // Python (#1478): an imported class used as a value (`return
+            // OrgSerializerFull`) resolves through its import like any
+            // callback — mirrors matchFunctionRef's bareClassOk.
+            (ref.language === 'python' && target.kind === 'class'))
+        ) {
           return viaImport;
         }
       }
@@ -850,7 +945,9 @@ export class ReferenceResolver {
     // JVM FQN imports skip framework/name-matcher: `import com.example.Bar`
     // resolves directly through the qualifiedName index, which is unambiguous
     // even when several `Bar` classes exist in different packages.
+    const tJvm = this.profileStages ? process.hrtime.bigint() : 0n;
     const jvmImport = resolveJvmImport(ref, this.context);
+    if (this.profileStages) this.stageAdd('jvmImport', ref, !!jvmImport, tJvm);
     if (jvmImport) return jvmImport;
 
     // Razor/Blazor: a markup or `@code` type ref resolves through the file's
@@ -892,16 +989,25 @@ export class ReferenceResolver {
     // JS → native `calls`) — `gateFrameworkLanguage` only drops a type/import
     // edge between two KNOWN families (see its doc), never a `calls` bridge or
     // a config↔code edge.
+    const tFw = this.profileStages ? process.hrtime.bigint() : 0n;
+    let fwEarly: ResolvedRef | null = null;
     for (const framework of this.frameworks) {
       const result = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
       if (result) {
-        if (result.confidence >= 0.9) return result; // High confidence, return immediately
+        if (result.confidence >= 0.9) {
+          fwEarly = result; // High confidence, return immediately (below)
+          break;
+        }
         candidates.push(result);
       }
     }
+    if (this.profileStages) this.stageAdd('frameworks', ref, fwEarly !== null, tFw);
+    if (fwEarly) return fwEarly;
 
     // Strategy 2: Try import-based resolution
+    const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
     const importResult = this.gateLanguage(resolveViaImport(ref, this.context), ref);
+    if (this.profileStages) this.stageAdd('viaImport', ref, !!importResult, tImp);
     if (importResult) {
       if (importResult.confidence >= 0.9) return importResult;
       candidates.push(importResult);
@@ -941,7 +1047,9 @@ export class ReferenceResolver {
     }
 
     // Strategy 3: Try name matching
+    const tName = this.profileStages ? process.hrtime.bigint() : 0n;
     let nameResult = this.gateLanguage(matchReference(ref, this.context), ref);
+    if (this.profileStages) this.stageAdd('nameMatch', ref, !!nameResult, tName);
     // Nix has no ambient cross-file namespace — a callee binds lexically
     // (same file) or through explicit import/callPackage wiring (the import
     // path above). A cross-file name match is wrong by construction: every
@@ -1278,6 +1386,7 @@ export class ReferenceResolver {
     maybeYield: MaybeYield
   ): Promise<ResolutionResult> {
     this.warmCaches();
+    this.advanceSupertypeGeneration();
 
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
@@ -1342,6 +1451,27 @@ export class ReferenceResolver {
   private resolveProfile: Map<string, { n: number; ns: bigint }> | null =
     process.env.CODEGRAPH_RESOLVE_PROFILE ? new Map() : null;
 
+  /**
+   * CODEGRAPH_RESOLVE_PROFILE=2 additionally attributes time to the
+   * STRATEGIES inside resolveOne (`stage:<name>|<refKind>|hit/miss` rows in
+   * the same histogram) — i.e. WHICH machinery a failing class of refs pays
+   * for, not just that it fails. =1 keeps the per-outcome rows only.
+   */
+  private profileStages: boolean = process.env.CODEGRAPH_RESOLVE_PROFILE === '2';
+
+  private stageAdd(stage: string, ref: UnresolvedRef, hit: boolean, t0: bigint): void {
+    if (!this.resolveProfile) return;
+    const dt = process.hrtime.bigint() - t0;
+    const key = `stage:${stage}|${ref.referenceKind}|${hit ? 'hit' : 'miss'}`;
+    const slot = this.resolveProfile.get(key);
+    if (slot) {
+      slot.n++;
+      slot.ns += dt;
+    } else {
+      this.resolveProfile.set(key, { n: 1, ns: dt });
+    }
+  }
+
   private resolveTargetsTimed(ref: UnresolvedRef): ResolvedRef[] {
     if (!this.resolveProfile) return this.resolveTargets(ref);
     const t0 = process.hrtime.bigint();
@@ -1369,6 +1499,8 @@ export class ReferenceResolver {
         `[resolve-profile] ${label} ${r.k}: n=${r.n} total=${(r.ms / 1000).toFixed(1)}s avg=${((r.ms * 1000) / Math.max(1, r.n)).toFixed(0)}µs`
       );
     }
+    // =2 only: this thread's matchReference sub-stage table rides along.
+    dumpNameMatcherProfile(label);
   }
 
   resolveListForAdmission(refs: UnresolvedReference[]): {
@@ -1379,6 +1511,7 @@ export class ReferenceResolver {
     byMethod: Record<string, number>;
   } {
     this.warmCaches();
+    this.advanceSupertypeGeneration();
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
     const byMethod: Record<string, number> = {};
@@ -1452,6 +1585,10 @@ export class ReferenceResolver {
     parallel?: {
       dbPath: string;
       bulkEdgeLoad?: { begin: () => void; end: () => void | Promise<void> };
+      /** unresolved_refs index window for the batched loop — the loop only
+       *  reads the status index + PK; dropping the sync-path ref indexes cuts
+       *  each per-batch DELETE's B-tree work (DatabaseConnection.beginBulkRefLoad). */
+      refIndexLoad?: { begin: () => void; end: () => void | Promise<void> };
       backpressure?: () => Promise<void> | null;
     }
   ): Promise<ResolutionResult> {
@@ -1472,7 +1609,7 @@ export class ReferenceResolver {
     // these counters name where the other ~340s goes (reads, edge build+insert,
     // deletes/marks, the per-batch count guard).
     const loopProf: Record<string, number> | null = process.env.CODEGRAPH_RESOLVE_PROFILE
-      ? { read: 0, settle: 0, backpressure: 0, createEdges: 0, insertEdges: 0, deletes: 0, marks: 0, countGuard: 0 }
+      ? { read: 0, settle: 0, backpressure: 0, recycle: 0, createEdges: 0, insertEdges: 0, deletes: 0, marks: 0, countGuard: 0 }
       : null;
     const lp = (k: string, t0: number): void => { if (loopProf) loopProf[k] = (loopProf[k] ?? 0) + (Date.now() - t0); };
     let tLp = 0;
@@ -1495,17 +1632,38 @@ export class ReferenceResolver {
     // costs zero wall-clock. Any failure downgrades to sequential permanently.
     let pool: ResolverPool | null = null;
     let poolReady = false;
-    const tPoolStart = Date.now();
-    if (parallel && total >= minRefsForPool()) {
-      pool = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot);
-      pool?.ready().then(
+    // True once pool creation has been attempted by EITHER engage site (the
+    // up-front ref-count gate or the adaptive projection below) — a pool that
+    // failed or was destroyed must stay down (downgrade is permanent), and
+    // tryCreate's sizing probes shouldn't re-run every batch on hosts that
+    // declined.
+    let poolEngageTried = false;
+    const createPool = (t0: number, why: string): ResolverPool | null => {
+      poolEngageTried = true;
+      if (!parallel) return null;
+      const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot);
+      p?.ready().then(
         () => {
           poolReady = true;
-          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] pool ready after ${Date.now() - tPoolStart}ms`);
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] pool ready after ${Date.now() - t0}ms (${why})`);
         },
-        () => { void pool?.destroy().catch(() => undefined); pool = null; }
+        () => {
+          void p.destroy().catch(() => undefined);
+          if (pool === p) pool = null;
+        }
       );
+      return p;
+    };
+    if (parallel && total >= minRefsForPool()) {
+      pool = createPool(Date.now(), 'ref-count');
     }
+    // Adaptive engagement bar (see the batch-loop hook): projected remaining
+    // sequential settle above this boots the pool mid-loop. Boot is async and
+    // fan-out waits for ready, so a marginal engage costs background boot
+    // only; the bar just needs to clear the fan-out's own overhead class.
+    const ADAPTIVE_ENGAGE_SETTLE_MS = 400;
+    let adaptiveSeqMs = 0;
+    let adaptiveSeqRefs = 0;
 
     // Process in PIPELINED batches (double-buffer). The enumeration is the
     // head of the pending set in rowid order; every ref a persisted batch
@@ -1513,6 +1671,14 @@ export class ReferenceResolver {
     // unresolvable ones flip to status='failed'), shifting the remaining
     // pending rows forward.
     let prevRemaining = Number.POSITIVE_INFINITY;
+
+    // Cadence for the worker connection recycling below — ~8 batches
+    // ≈ 40k refs between recycles keeps the WAL shallow at kernel scale
+    // while a small sync never recycles at all. (25 recovered only half
+    // the write tax — the WAL re-deepened between recycles; reopens are
+    // sub-millisecond so the shorter cadence is ~free.)
+    const RECYCLE_EVERY_BATCHES = 8;
+    let batchesSinceRecycle = 0;
 
     // Fan-out result of ResolverPool.resolveBatch, settled (never rejecting)
     // so a fan-out begun before the previous batch's persist can't produce an
@@ -1588,6 +1754,16 @@ export class ReferenceResolver {
         bulkEdgesActive = true;
       } catch { /* keep the indexes; inserts just pay the per-row maintenance */ }
     }
+    // Same gate for the ref-index window: the loop's deletes stop maintaining
+    // the five sync-path unresolved_refs indexes, and the end-of-loop rebuild
+    // is near-free (only failed refs survive the loop).
+    let bulkRefsActive = false;
+    if (parallel?.refIndexLoad && total >= minRefsForPool()) {
+      try {
+        parallel.refIndexLoad.begin();
+        bulkRefsActive = true;
+      } catch { /* keep the indexes; deletes just pay the per-row maintenance */ }
+    }
 
     try {
     try {
@@ -1610,6 +1786,28 @@ export class ReferenceResolver {
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] batch ${inFlight.mode}: ${batch.length} refs in ${Date.now() - tBatch}ms`);
       lp('settle', tBatch);
 
+      // Adaptive pool engagement: the fixed ref-count gate can't see PER-REF
+      // cost, and settle rates differ ~9× by language (56k Rust refs cost
+      // more sequential settle than 154k Go refs — 36µs vs 4µs measured on
+      // tokio/prometheus). After each sequential batch, project the remaining
+      // settle from the observed rate and boot the pool mid-loop when it
+      // clears the bar. The loop already switches to fan-out only when the
+      // async boot reports ready, admission order is mode-independent, and
+      // 2-core/low-memory hosts still decline inside tryCreate's sizing —
+      // so the switch changes wall-clock, never the graph.
+      if (inFlight.mode === 'seq' && parallel && pool === null && !poolEngageTried) {
+        adaptiveSeqMs += Date.now() - tBatch;
+        adaptiveSeqRefs += batch.length;
+        const remaining = total - processed - batch.length;
+        const projectedMs = (adaptiveSeqMs / Math.max(1, adaptiveSeqRefs)) * Math.max(0, remaining);
+        if (projectedMs >= ADAPTIVE_ENGAGE_SETTLE_MS) {
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+            console.error(`[pool-timing] adaptive engage: projected ${Math.round(projectedMs)}ms sequential settle over ${remaining} remaining refs`);
+          }
+          pool = createPool(Date.now(), 'adaptive');
+        }
+      }
+
       // WAL-valve backstop at the ONE pool-idle boundary of the double-buffer
       // (this batch settled, the next not yet fanned out): past the hard cap
       // the writer parks for a full backfill here, where the pool's readers
@@ -1620,6 +1818,31 @@ export class ReferenceResolver {
       const bp = parallel?.backpressure?.();
       if (bp) await bp;
       lp('backpressure', tLp);
+
+      // Recycle the workers' read connections periodically at this same
+      // worker-idle boundary (batch k settled, batch k+1 not yet fanned
+      // out): a long-lived reader pins WAL checkpoint progress, and the
+      // deep WAL that accumulates behind it taxes the writer's OWN page
+      // operations — the §7a.6 writes-under-readers finding (deletes
+      // 42.6s → 118.8s from 0 to 4 attached readers; an aggressive valve
+      // recovered the writes but paid +129s in full-park folds). Releasing
+      // the read marks every ~25 batches lets the existing checkpoints
+      // advance instead, at ~milliseconds of reopen cost. A failed recycle
+      // downgrades to sequential permanently, same as a failed fan-out.
+      if (pool && poolReady && ++batchesSinceRecycle >= RECYCLE_EVERY_BATCHES) {
+        batchesSinceRecycle = 0;
+        tLp = Date.now();
+        try {
+          await pool.recycleWorkers();
+        } catch (err) {
+          logDebug('Worker connection recycle failed; falling back to sequential', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          await pool.destroy().catch(() => undefined);
+          pool = null;
+        }
+        lp('recycle', tLp);
+      }
 
       // Persist in bounded sub-transactions with yields between: a whole
       // batch's edge insert / keyed deletes are otherwise one solid
@@ -1748,6 +1971,11 @@ export class ReferenceResolver {
       // Recreate the edge indexes BEFORE synthesis (kind-keyed reads) and on
       // any error path. A crash before this line is healed by the next
       // DatabaseConnection open (schema.sql re-applies IF NOT EXISTS).
+      if (bulkRefsActive) {
+        const tRef = Date.now();
+        await parallel!.refIndexLoad!.end();
+        if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] ref-index-recreate: ${Date.now() - tRef}ms`);
+      }
       if (bulkEdgesActive) {
         const tIdx = Date.now();
         await parallel!.bulkEdgeLoad!.end();

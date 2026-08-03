@@ -326,6 +326,47 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // the crates.io tarballs. `.metal`/`.cu` map to language 'cpp', so the
   // dialects ride the same (single, coherent) upgraded grammar.
   'c', 'cpp',
+  // R7b (Rust kernel port prep): tree-sitter-rust v0.24.2 (77a3747),
+  // parser.c/scanner.c sha-matched against the crates.io tarball. Replaces the
+  // 2023-era tree-sitter-wasms build (ABI 14 → 15).
+  'rust',
+  // R7b (Ruby kernel port prep): tree-sitter-ruby v0.23.1 (71bd32f),
+  // parser.c/scanner.c sha-matched against the crates.io tarball. Replaces the
+  // ^0.20.1 tree-sitter-wasms build. Content bump only — the tag's checked-in
+  // parser.c is still ABI 14 (predates the ABI-15 generator).
+  'ruby',
+  // R7b (PHP kernel port prep): tree-sitter-php v0.24.2 (5b5627f), the FULL
+  // `php` grammar variant (HTML interleaving — php_only errors on leading
+  // HTML), built from the tag's checked-in php/src/parser.c + scanner.c
+  // (+ shared common/scanner.h), all sha-matched against the crates.io
+  // tarball. Replaces the ^0.22 tree-sitter-wasms build (ABI 14 → 15). NOT
+  // graph-neutral — the classified delta list lives in the php checklist doc.
+  'php',
+  // R7b (Swift kernel port prep): tree-sitter-swift crate 0.7.3. Built from
+  // the CRATE TARBALL's src/ (NOT a tag sha-match: alex-pinkus keeps
+  // generated files off main and the 0.7.3-with-generated-files tag ships an
+  // older ABI-14 generation; grammar.json rules are JSON-equal, and the crate
+  // tarball is byte-for-byte what the kernel's cargo build compiles — table
+  // identity by construction). Replaces the ^0.4.0 tree-sitter-wasms build
+  // (ABI 13 → 15). NOT graph-neutral — delta is error-set membership only;
+  // classified list in the swift checklist doc.
+  'swift',
+  // R7b (Kotlin kernel port prep): fwcd tree-sitter-kotlin 0.3.8 (tag
+  // e1a2d5a), parser.c/scanner.c sha-matched crate↔tag; behavior-IDENTICAL
+  // to the tree-sitter-wasms build (0 CST/error disagreements across the
+  // gate repos) — a reproducibility re-vendor, ABI stays 14. The crates.io
+  // crate is UNUSABLE by the kernel (pins tree-sitter <0.23) and
+  // tree-sitter-kotlin-ng is a different grammar — the kernel compiles the
+  // same vendored C sources instead (codegraph-kernel/grammars/kotlin).
+  'kotlin',
+  // R7b batch 4 (Dart kernel port prep): the byte-copied tree-sitter-wasms
+  // 0.1.13 artifact (sha256 7f5364e4…, built from UserNobody14/
+  // tree-sitter-dart master@d4d8f3e337d8). tree-sitter-wasms' dart dep is an
+  // UNPINNED github ref, so a routine tree-sitter-wasms update would have
+  // silently changed dart's grammar — vendoring kills that hazard. The
+  // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
+  // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
+  'dart',
   'glsl', 'hlsl',
 ]);
 

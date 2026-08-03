@@ -291,6 +291,24 @@ export class QueryBuilder {
     this.db = db;
   }
 
+  /**
+   * Swap the underlying connection in place. Used by pool workers'
+   * connection recycling (plan §7a.6, writes-under-readers): a long-lived
+   * read connection pins WAL checkpoint progress, and the deep WAL that
+   * accumulates behind it taxes every main-thread B-tree page operation
+   * (deletes measured 42.6s → 118.8s from 0 to 4 attached readers on
+   * identical hardware). Workers therefore close and reopen their read-only
+   * connection at the pool-idle boundary; everything above the connection —
+   * this QueryBuilder, the resolver and its warm caches — survives, and only
+   * connection-derived state (prepared statements) resets, re-preparing
+   * lazily on next use.
+   */
+  rebind(db: SqliteDatabase): void {
+    this.db = db;
+    this.stmts = {};
+    this.batchStmts.clear();
+  }
+
   /** Set the normalized project-name tokens used to down-weight non-discriminative
    * query words in path scoring (#720). Called once when the project opens. */
   setProjectNameTokens(tokens: Set<string>): void {
@@ -2470,6 +2488,7 @@ export class QueryBuilder {
       edgesByKind,
       filesByLanguage,
       dbSizeBytes: 0, // Set by caller using DatabaseConnection.getSize()
+      walSizeBytes: 0, // Set by caller using DatabaseConnection.getWalSizeBytes()
       lastUpdated: Date.now(),
     };
   }

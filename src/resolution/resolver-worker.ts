@@ -39,15 +39,19 @@ let resolver: ReferenceResolver | null = null;
 
 type InMessage =
   | { type: 'open'; dbPath: string; projectRoot: string }
+  | { type: 'recycle'; id: number }
   | { type: 'resolve'; id: number; refs: UnresolvedReference[] }
   | { type: 'synth'; id: number; pass: string }
   | { type: 'close' };
+
+let dbPath: string | null = null;
 
 port.on('message', (msg: InMessage) => {
   try {
     switch (msg.type) {
       case 'open': {
         const tOpen = Date.now();
+        dbPath = msg.dbPath;
         const created = createDatabase(msg.dbPath, { readOnly: true });
         db = created.db;
         db.pragma('busy_timeout = 5000');
@@ -58,6 +62,25 @@ port.on('message', (msg: InMessage) => {
         resolver.initialize();
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker open: db=${tDb - tOpen}ms init=${Date.now() - tDb}ms`);
         port.postMessage({ type: 'ready' });
+        break;
+      }
+      case 'recycle': {
+        // Close and reopen the read-only connection so the WAL checkpoints
+        // the writer runs can advance past this reader's mark (see
+        // QueryBuilder.rebind). Everything above the connection survives —
+        // the resolver keeps its warm caches; prepared statements re-prepare
+        // lazily. Runs only at the pool-idle boundary, so no query is in
+        // flight on this connection.
+        if (!queries || !dbPath) throw new Error('resolver-worker: recycle before open');
+        try {
+          db?.close();
+        } catch { /* already closed */ }
+        const reopened = createDatabase(dbPath, { readOnly: true });
+        db = reopened.db;
+        db.pragma('busy_timeout = 5000');
+        db.pragma('cache_size = -32000');
+        queries.rebind(db);
+        port.postMessage({ type: 'recycled', id: msg.id });
         break;
       }
       case 'resolve': {

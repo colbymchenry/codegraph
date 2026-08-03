@@ -11296,6 +11296,171 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(out).toContain('__u32 count');
   });
 
+  it('blankCParameterizedAnnotationMacros blanks name+args whole, eats a stranded field semicolon', async () => {
+    const { blankCParameterizedAnnotationMacros } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'struct file *f __free(fput) = NULL;',
+      'static void __printf(4, 0) log_it(int a, const char *fmt, ...);',
+      'struct ctx {',
+      '\t__bpf_md_ptr(struct bpf_iter_meta *, meta);',
+      '};',
+      'int keep = __hash(key);',
+      '',
+    ].join('\n');
+    const out = blankCParameterizedAnnotationMacros(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('__free');
+    expect(out).not.toContain('__printf');
+    // Mid-line match keeps its statement tail…
+    expect(out).toContain('= NULL;');
+    // …but a whole-line FIELD match eats the `;` too — a lone `;` field is
+    // itself a parse error while an empty struct body is not.
+    expect(out).not.toContain('__bpf_md_ptr');
+    expect(out.split('\n')[3]?.trim()).toBe('');
+    // Non-curated dunder calls are real code.
+    expect(out).toContain('__hash(key)');
+  });
+
+  it('blankCTypeKeywordArgs blanks bare type-keyword call args, spares valid look-alikes', async () => {
+    const { blankCTypeKeywordArgs } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void j(void *head, void *map) {',
+      '\tvoid *p = kzalloc_obj(struct bpf_mount_opts);',
+      '\tvoid *e = list_first_entry(head,',
+      '\t\t\tstruct async_entry, domain_list);',
+      '\tvoid *n = hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(head)),',
+      '\t\t\tstruct bpf_dtab_netdev, index_hlist);',
+      '\treturn container_of(map, struct bpf_map, inner);',
+      '}',
+      'DEFINE_PER_CPU(struct task_struct *, ksoftirqd);',
+      '',
+    ].join('\n');
+    const out = blankCTypeKeywordArgs(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('struct bpf_mount_opts');
+    expect(out).toContain('       bpf_mount_opts'); // keyword → spaces, ident stays
+    expect(out).toContain('       async_entry, domain_list');
+    expect(out).toContain('       bpf_dtab_netdev'); // nested-paren predecessor arg
+    expect(out).toContain('       bpf_map, inner'); // `return` precedes real calls
+    // Pointer form blanks the stars too — two plain identifier args remain.
+    expect(out).toContain('       task_struct  , ksoftirqd');
+    // Valid look-alikes stay byte-identical.
+    for (const valid of [
+      'int a = sizeof(struct point);',
+      'int b = offsetof(struct point, y);',
+      'int c = _Generic(x, struct foo *: 1, default: 0);',
+      'int wf(struct a,\n\tstruct b);',
+      'void cast(void *p) { use((struct foo *)p); }',
+      'struct ops { int (*probe)(struct device *dev); };',
+    ]) {
+      expect(blankCTypeKeywordArgs(valid)).toBe(valid);
+    }
+  });
+
+  it('blankCFileScopePrefixedDeclMacros blanks static/extern CAPS-macro lines at any scope', async () => {
+    const { blankCFileScopePrefixedDeclMacros } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static DEFINE_PER_CPU(struct llist_head, rstat_backlog_list);',
+      'void f(void) {',
+      '\tstatic DEFINE_RATELIMIT_STATE(ratelimit, 5 * HZ, 5);',
+      '}',
+      'EXPORT_SYMBOL(vmalloc);',
+      'static DEFINE_PER_CPU(struct cpuhp_cpu_state, cpuhp_state) = {',
+      '',
+    ].join('\n');
+    const out = blankCFileScopePrefixedDeclMacros(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('DEFINE_PER_CPU(struct llist_head');
+    expect(out).not.toContain('DEFINE_RATELIMIT_STATE'); // block scope blanks too
+    // Bare CAPS lines parse natively as K&R declarations — untouched.
+    expect(out).toContain('EXPORT_SYMBOL(vmalloc);');
+    // Initializer forms belong to the rewrite, not the blank.
+    expect(out).toContain('cpuhp_state) = {');
+  });
+
+  it('rewriteCPrefixedDeclMacroInitializers rewrites `static CAPS(type, name) = {` into the declaration', async () => {
+    const { rewriteCPrefixedDeclMacroInitializers } = await import('../src/extraction/languages/c-cpp');
+    const line = 'static DEFINE_PER_CPU(struct cpuhp_cpu_state, cpuhp_state) = {';
+    const src = [line, '\t.fail = CPUHP_INVALID,', '};', ''].join('\n');
+    const out = rewriteCPrefixedDeclMacroInitializers(src);
+    expect(out.length).toBe(src.length);
+    const rewritten = out.split('\n')[0] as string;
+    expect(rewritten).toContain('static struct cpuhp_cpu_state');
+    expect(rewritten).not.toContain('DEFINE_PER_CPU');
+    // The NAME keeps its exact original column, and the tail its offsets.
+    expect(rewritten.indexOf('cpuhp_state')).not.toBe(-1);
+    expect(rewritten.indexOf('cpuhp_state', 30)).toBe(line.indexOf('cpuhp_state', 30));
+    expect(rewritten.indexOf('= {')).toBe(line.indexOf('= {'));
+    // Three-argument macros never match.
+    const threeArg = 'static DEFINE_TIMER(t, fn, 0) = {\n};\n';
+    expect(rewriteCPrefixedDeclMacroInitializers(threeArg)).toBe(threeArg);
+  });
+
+  it('blankCVaArgQualifiedTypeArgs blanks multi-token va_arg types, spares single tokens', async () => {
+    const { blankCVaArgQualifiedTypeArgs } = await import('../src/extraction/languages/c-cpp');
+    const src = 'void f(va_list ap) {\n\tconst char *s = va_arg(ap, const char *);\n\tint n = va_arg(ap, int);\n}\n';
+    const out = blankCVaArgQualifiedTypeArgs(src);
+    expect(out.length).toBe(src.length);
+    expect(out).toContain('va_arg(ap              );');
+    expect(out).toContain('va_arg(ap, int);'); // parses natively — untouched
+  });
+
+  it('blankCNamedVariadicDefineDots blanks only the dots of GNU named-variadic params', async () => {
+    const { blankCNamedVariadicDefineDots } = await import('../src/extraction/languages/c-cpp');
+    const named = '#define verbose(env, fmt, args...) log_write(env, fmt, ##args)\nint x;\n';
+    const out = blankCNamedVariadicDefineDots(named);
+    expect(out.length).toBe(named.length);
+    expect(out).toContain('args   )'); // dots → spaces
+    expect(out).toContain('##args'); // body untouched
+    const std = '#define pr(fmt, ...) printk(fmt, __VA_ARGS__)\nint y;\n';
+    expect(blankCNamedVariadicDefineDots(std)).toBe(std);
+  });
+
+  it('blankCSandwichedAnnotations and blankCAutoInference: sandwich and C23-auto guards', async () => {
+    const { blankCSandwichedAnnotations, blankCAutoInference } = await import(
+      '../src/extraction/languages/c-cpp'
+    );
+    const src = 'static notrace void tick_do(void) { }\nstatic nokprobe_inline void arm(void) { }\n';
+    const out = blankCSandwichedAnnotations(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('notrace');
+    expect(out).not.toContain('nokprobe_inline');
+    // As a variable name (no following word) it survives.
+    const varUse = 'void f(void) { int notrace = 1; use(notrace); }\n';
+    expect(blankCSandwichedAnnotations(varUse)).toBe(varUse);
+    const c23 = 'void q(void) { auto hb = get_hb(); }\n';
+    const autoOut = blankCAutoInference(c23);
+    expect(autoOut.length).toBe(c23.length);
+    expect(autoOut).toContain('     hb = get_hb();');
+    // The storage-class reading has a TYPE after `auto` — untouched.
+    const storage = 'void s(void) { auto int x = 1; }\n';
+    expect(blankCAutoInference(storage)).toBe(storage);
+  });
+
+  it('blankCStatementMacroCalls spans wrapped iterator macros, spares wrapped real calls', async () => {
+    const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static void walk(void *head) {',
+      '\thlist_for_each_entry_rcu(p, head, hlist,',
+      '\t\t\t\t lockdep_is_held(&kprobe_mutex)) {',
+      '\t\tuse(p);',
+      '\t}',
+      '}',
+      '',
+    ].join('\n');
+    const out = blankCStatementMacroCalls(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('hlist_for_each_entry_rcu');
+    expect(out).not.toContain('lockdep_is_held');
+    expect(out).toContain('use(p);');
+    // A wrapped REAL call ends in `;` — untouched.
+    const call = 'void f(void) {\n\tdo_thing(a,\n\t\t b);\n}\n';
+    expect(blankCStatementMacroCalls(call)).toBe(call);
+    // A wrapped condition is keyword-led — untouched.
+    const cond = 'void g(int a) {\n\tif (check(a,\n\t\t  a)) {\n\t\tuse(a);\n\t}\n}\n';
+    expect(blankCStatementMacroCalls(cond)).toBe(cond);
+  });
+
   it('restoreDirectiveLines keeps #define lines out of the blanking blast radius', async () => {
     const { extractFromSource } = await import('../src/extraction');
     // FMT_API matches the _API-suffix member blank; without the directive

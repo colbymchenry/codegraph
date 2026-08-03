@@ -31,7 +31,7 @@ import {
 } from '../src/sync/watcher';
 import CodeGraph from '../src/index';
 
-type SyncFn = () => Promise<{ filesChanged: number; durationMs: number }>;
+type SyncFn = (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>;
 
 /**
  * Helper to wait for a condition with timeout. Used for assertions that depend
@@ -768,6 +768,58 @@ describe('FileWatcher', () => {
       expect(results.length).toBeGreaterThan(0);
 
       cg.unwatch();
+    });
+  });
+
+  describe('scoped sync fast path (#watcher-scoped)', () => {
+    it('passes the exact pending paths to syncFn for plain file events', async () => {
+      const calls: (string[] | undefined)[] = [];
+      const syncFn: SyncFn = async (paths?: string[]) => {
+        calls.push(paths);
+        return { filesChanged: 1, durationMs: 5 };
+      };
+      const watcher = newWatcher(syncFn, { debounceMs: 30 });
+      expect(watcher.start()).toBe(true);
+      fs.writeFileSync(path.join(testDir, 'src', 'a.ts'), 'export const a = 1;');
+      __emitWatchEventForTests(testDir, 'src/a.ts');
+      await new Promise((r) => setTimeout(r, 500));
+      watcher.stop();
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls[0]).toEqual(['src/a.ts']);
+    });
+
+    it('falls back to a full sync (undefined paths) after a directory removal event', async () => {
+      const calls: (string[] | undefined)[] = [];
+      const syncFn: SyncFn = async (paths?: string[]) => {
+        calls.push(paths);
+        return { filesChanged: 0, durationMs: 5 };
+      };
+      const watcher = newWatcher(syncFn, { debounceMs: 30 });
+      expect(watcher.start()).toBe(true);
+      // A non-source path that does not exist on disk = the #1285 dir-removal shape.
+      __emitWatchEventForTests(testDir, 'src/removed-dir');
+      await new Promise((r) => setTimeout(r, 500));
+      watcher.stop();
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls[0]).toBeUndefined();
+    });
+
+    it('a lone file event fires on the quick window, well before the full debounce', async () => {
+      const calls: (string[] | undefined)[] = [];
+      const syncFn: SyncFn = async (paths?: string[]) => {
+        calls.push(paths);
+        return { filesChanged: 1, durationMs: 1 };
+      };
+      // Full debounce is deliberately huge; the quick window (300ms) must win
+      // for a single pending file.
+      const watcher = newWatcher(syncFn, { debounceMs: 30_000 });
+      expect(watcher.start()).toBe(true);
+      fs.writeFileSync(path.join(testDir, 'src', 'quick.ts'), 'export const q = 1;');
+      __emitWatchEventForTests(testDir, 'src/quick.ts');
+      await new Promise((r) => setTimeout(r, 1500));
+      watcher.stop();
+      expect(calls.length).toBe(1);
+      expect(calls[0]).toEqual(['src/quick.ts']);
     });
   });
 });
