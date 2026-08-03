@@ -37,7 +37,6 @@ import { terraformExtractor } from './terraform';
 import { enforcescriptExtractor } from './enforcescript';
 import { arktsExtractor } from './arkts';
 import { nixExtractor } from './nix';
-import { enforcescriptExtractor } from './enforcescript';
 
 export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   typescript: typescriptExtractor,
@@ -72,5 +71,4 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   enforcescript: enforcescriptExtractor,
   arkts: arktsExtractor,
   nix: nixExtractor,
-  enforcescript: enforcescriptExtractor,
 };

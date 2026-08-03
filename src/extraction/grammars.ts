@@ -51,7 +51,6 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   enforcescript: 'tree-sitter-c_sharp.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
-  enforcescript: 'tree-sitter-c_sharp.wasm',
 };
 
 /**
@@ -422,22 +421,6 @@ export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?
   // See: https://github.com/tree-sitter/tree-sitter/issues/2338
   for (const lang of toLoad) {
     try {
-      // Some grammars ship their own WASMs (not in tree-sitter-wasms, or the
-      // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
-      // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
-      // 0.25 (drops nested calls/imports on every file after the first); we
-      // vendor the upstream ABI-15 wasm instead. C#: the tree-sitter-wasms
-      // build (ABI 13) has no primary-constructor support and parses
-      // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
-      // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
-      // primary constructors natively. Terraform: tree-sitter-wasms does not
-      // ship HCL/Terraform at all, so we vendor the prebuilt
-      // tree-sitter-terraform.wasm from @tree-sitter-grammars/tree-sitter-hcl
-      // 1.2.0 (Apache-2.0) — byte-identical to the npm package's artifact.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'enforcescript' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol' || lang === 'vbnet' || lang === 'erlang' || lang === 'terraform')
-        ? path.join(__dirname, 'wasm', wasmFile)
-        : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
-      const language = await WasmLanguage.load(wasmPath);
       const bytes = wasmBytes?.[lang];
       const language = await WasmLanguage.load(bytes ?? resolveWasmPath(lang));
       languageCache.set(lang, language);
@@ -674,7 +657,6 @@ export function getLanguageDisplayName(language: Language): string {
     terraform: 'Terraform',
     enforcescript: 'Enforce Script',
     arkts: 'ArkTS',
-    enforcescript: 'Enforce Script',
     unknown: 'Unknown',
   };
   return names[language] || language;
