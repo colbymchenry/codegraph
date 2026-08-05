@@ -751,6 +751,16 @@ impl<'t> Walker<'t> {
                 if let Some(row) = row {
                     self.extract_decorators_for(node, row);
                     self.extract_type_annotations(node, row);
+                    // Walk the initializer ATTRIBUTED to the declared field
+                    // (#693, the Go fix): the dispatcher only fn-ref-scans this
+                    // subtree, so a lambda / method reference / anonymous class
+                    // in `private final Runnable r = () -> target();` emitted no
+                    // call edge at all.
+                    if let Some(value) = decl.child_by_field_name("value") {
+                        self.stack.push(Scope { row, kind: field_kind, name: name.clone() });
+                        self.visit_function_body(value);
+                        self.stack.pop();
+                    }
                 }
             }
         } else {

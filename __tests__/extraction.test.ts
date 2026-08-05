@@ -1337,6 +1337,37 @@ public class Splitter {
     );
     expect(sepStart, 'override inside the lambda-returned anon class should be a method node').toBeDefined();
   });
+
+  it('walks a field initializer scoped to the field (#693 for Java)', () => {
+    // The dispatcher only scanned a field_declaration for function-as-value
+    // candidates, so a lambda or anonymous class holding the work — the
+    // Android listener idiom — contributed no call edge and `target` looked
+    // callerless.
+    const code = `
+package p;
+class T {
+    private final Runnable fieldLambda = () -> target();
+    private final Runnable anonClass = new Runnable() {
+        public void run() { target(); }
+    };
+    private final int eager = compute();
+    void directCall() { target(); }
+    private void target() {}
+    private static int compute() { return 1; }
+}
+`;
+    const result = extractFromSource('T.java', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const callersOf = (name: string) =>
+      result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+        .map((u) => byId.get(u.fromNodeId)?.name)
+        .sort();
+
+    // `run` is the anonymous class's override, itself extracted under the field.
+    expect(callersOf('target')).toEqual(['directCall', 'fieldLambda', 'run']);
+    expect(callersOf('compute')).toEqual(['eager']);
+  });
 });
 
 describe('C# Extraction', () => {
