@@ -931,6 +931,42 @@ const token = getTokenMp();
     );
     expect(call).toBeDefined();
   });
+
+  describe('initializer walk is scoped to the declared symbol (#693 for TS/JS)', () => {
+    const code = `
+const eager = load();
+const obj = { handler: () => target(), plain: target() };
+const list = [() => target()];
+export const exported = { handler: () => target() };
+`;
+    const callersOf = (name: string) => {
+      const result = extractFromSource('app.ts', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      return result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+        .map((u) => byId.get(u.fromNodeId))
+        .map((n) => (n ? `${n.kind}:${n.name}` : '?'))
+        .sort();
+    };
+
+    it("a plain call initializer names the CONSTANT as caller, not the file", () => {
+      // The walk ran with only the file on the stack, so `load` recorded the
+      // file as its caller — useless for callers/impact.
+      expect(callersOf('load')).toEqual(['constant:eager']);
+    });
+
+    it('a non-exported object literal contributes calls (it was skipped outright)', () => {
+      // `exported`'s members are minted as their own function nodes, so its
+      // arrow's call comes from `handler`; the non-exported ones attribute to
+      // the declared constant.
+      expect(callersOf('target')).toEqual([
+        'constant:list',
+        'constant:obj',
+        'constant:obj',
+        'function:handler',
+      ]);
+    });
+  });
 });
 
 describe('File Node Extraction', () => {
@@ -1018,6 +1054,42 @@ class UserService:
     const classNode = result.nodes.find((n) => n.kind === 'class');
     expect(classNode).toBeDefined();
     expect(classNode?.name).toBe('UserService');
+  });
+
+  it('walks a module-level assignment initializer scoped to the name (#693 for Python)', () => {
+    // The assignment minted a node and stopped, so everything a module builds
+    // at import time — `app = FastAPI()`, `ENGINE = create_engine(url)` — was
+    // missing from the graph. A tuple target mints no symbol, so its
+    // right-hand side attributes to the enclosing scope instead of vanishing.
+    const code = `
+def target(): pass
+def compute(): return 1
+
+APP = compute()
+handler = lambda: target()
+MAPPING = {"a": compute()}
+first, second = compute(), target()
+
+class K:
+    ATTR = compute()
+`;
+    const result = extractFromSource('app.py', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const owners = result.unresolvedReferences
+      .filter((u) => u.referenceKind === 'calls')
+      .map((u) => {
+        const n = byId.get(u.fromNodeId);
+        return `${u.referenceName}<-${n ? `${n.kind}:${n.name}` : '?'}`;
+      })
+      .sort();
+    expect(owners).toEqual([
+      'compute<-class:K', // a class attribute still rides the class (no node of its own)
+      'compute<-file:app.py', // the tuple target mints nothing
+      'compute<-variable:APP',
+      'compute<-variable:MAPPING',
+      'target<-file:app.py',
+      'target<-variable:handler',
+    ]);
   });
 });
 
@@ -1173,6 +1245,26 @@ impl Counter {
       (r) => r.referenceKind === 'implements'
     );
     expect(implRefs).toHaveLength(0);
+  });
+
+  it('walks a const/static initializer scoped to the declared symbol (#693 for Rust)', () => {
+    // The declaration minted a node and stopped, so a handler table, a
+    // lazily-built singleton or any computed const linked to nothing.
+    const code = `
+const LEN: usize = compute_len();
+static REGISTRY: Lazy<Cfg> = Lazy::new(|| build_cfg());
+`;
+    const result = extractFromSource('lib.rs', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const owner = (name: string) => {
+      const u = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === name
+      );
+      const n = u ? byId.get(u.fromNodeId) : undefined;
+      return n ? `${n.kind}:${n.name}` : undefined;
+    };
+    expect(owner('compute_len')).toBe('variable:LEN');
+    expect(owner('build_cfg')).toBe('variable:REGISTRY');
   });
 });
 
@@ -1336,6 +1428,37 @@ public class Splitter {
         n.qualifiedName.includes('$anon@')
     );
     expect(sepStart, 'override inside the lambda-returned anon class should be a method node').toBeDefined();
+  });
+
+  it('walks a field initializer scoped to the field (#693 for Java)', () => {
+    // The dispatcher only scanned a field_declaration for function-as-value
+    // candidates, so a lambda or anonymous class holding the work — the
+    // Android listener idiom — contributed no call edge and `target` looked
+    // callerless.
+    const code = `
+package p;
+class T {
+    private final Runnable fieldLambda = () -> target();
+    private final Runnable anonClass = new Runnable() {
+        public void run() { target(); }
+    };
+    private final int eager = compute();
+    void directCall() { target(); }
+    private void target() {}
+    private static int compute() { return 1; }
+}
+`;
+    const result = extractFromSource('T.java', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const callersOf = (name: string) =>
+      result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+        .map((u) => byId.get(u.fromNodeId)?.name)
+        .sort();
+
+    // `run` is the anonymous class's override, itself extracted under the field.
+    expect(callersOf('target')).toEqual(['directCall', 'fieldLambda', 'run']);
+    expect(callersOf('compute')).toEqual(['eager']);
   });
 });
 
@@ -1939,6 +2062,120 @@ class Bar {
     expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
     const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
     expect(cls?.qualifiedName).toBe('Bar');
+  });
+
+  describe('property initializers are walked, attributed to the property (#693 for Kotlin)', () => {
+    // The property hook consumes the whole property_declaration subtree, so
+    // before this the initializer was only scanned for function-as-value
+    // candidates and every call inside it vanished from the graph. Android/MSDK
+    // callbacks are declared exactly this way (`private val l = Listener { … }`),
+    // so anything reached only through one looked like it had no callers at all.
+    const code = `
+package repro
+
+class Repro {
+    private val fieldLambda: () -> Unit = { target() }
+    private val samField = Runnable { target() }
+    private val plain = target()
+    private val delegated by lazy { target() }
+    private val anonObject = object : Runnable { override fun run() { target() } }
+
+    fun directCall() { target() }
+    fun lambdaInMethod() { run { target() } }
+
+    private fun target() {}
+}
+
+object Holder {
+    val topLevelLambda: () -> Unit = { hit() }
+    private fun hit() {}
+}
+`;
+    const callersOf = (target: string) => {
+      const result = extractFromSource('Repro.kt', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      return result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === target)
+        .map((u) => byId.get(u.fromNodeId)?.name)
+        .sort();
+    };
+
+    it('a lambda / SAM / plain / delegated / object initializer calls FROM the property', () => {
+      // `run` is the anonymous object's override, extracted as its own node
+      // under `anonObject` — the same shape Go's initializer walk produces.
+      expect(callersOf('target')).toEqual([
+        'delegated',
+        'directCall',
+        'fieldLambda',
+        'lambdaInMethod',
+        'plain',
+        'run',
+        'samField',
+      ]);
+    });
+
+    it('a property in an `object` singleton is a caller too', () => {
+      expect(callersOf('hit')).toEqual(['topLevelLambda']);
+    });
+
+    it('an accessor body belongs to its property, written on either line', () => {
+      // `val x: T get() = …` nests the accessor UNDER the declaration; written
+      // on its own line the grammar makes it a following SIBLING instead. Both
+      // used to lose their calls (the nested one) or hand them to the enclosing
+      // class (the sibling); both now attribute to the property.
+      const src = `
+package p
+
+class C {
+    val sameLine: Int get() = compute()
+    val nextLine: Int
+        get() = compute()
+    var written: Int = 0
+        set(v) { store(v) }
+    private fun compute(): Int = 1
+    private fun store(v: Int) {}
+}
+`;
+      const result = extractFromSource('C.kt', src);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const ownersOf = (name: string) =>
+        result.unresolvedReferences
+          .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+          .map((u) => {
+            const n = byId.get(u.fromNodeId);
+            return n ? `${n.kind}:${n.name}` : '?';
+          })
+          .sort();
+      expect(ownersOf('compute')).toEqual(['field:nextLine', 'field:sameLine']);
+      expect(ownersOf('store')).toEqual(['field:written']);
+    });
+
+    it('an `init` block and a destructuring RHS no longer vanish', () => {
+      // Both mint no symbol of their own, so the hook consumed them and their
+      // code disappeared entirely; they now attribute to the enclosing scope.
+      const src = `
+package p
+
+class C {
+    init { val q = initCall() }
+    val (a, b) = makePair()
+}
+
+val (t1, t2) = topMakePair()
+`;
+      const result = extractFromSource('C.kt', src);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const owner = (name: string) => {
+        const u = result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'calls' && r.referenceName === name
+        );
+        const n = u ? byId.get(u.fromNodeId) : undefined;
+        return n ? `${n.kind}:${n.name}` : undefined;
+      };
+      expect(owner('initCall')).toBe('class:C');
+      expect(owner('makePair')).toBe('class:C');
+      expect(owner('topMakePair')).toBe('namespace:p');
+    });
   });
 });
 
@@ -7560,6 +7797,35 @@ def processData(): Unit = {
       const result = extractFromSource('processor.scala', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
       expect(calls.length).toBeGreaterThan(0);
+    });
+
+    it('walks a val/var initializer scoped to the declared symbol (#693 for Scala)', () => {
+      // The val/var hook minted the node and returned true, so the dispatcher
+      // only scanned the subtree for function-as-value candidates — every call
+      // in an initializer was dropped, which on a `val`-heavy codebase
+      // (SpinalHDL, Akka wiring) is most of the wiring.
+      const code = `
+class C {
+  val fieldLambda: () => Unit = () => target()
+  val direct = target()
+  lazy val lazily = target()
+  private def target(): Unit = {}
+}
+
+object O {
+  val topLambda = () => hit()
+  def hit(): Unit = {}
+}
+`;
+      const result = extractFromSource('C.scala', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const callersOf = (name: string) =>
+        result.unresolvedReferences
+          .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+          .map((u) => byId.get(u.fromNodeId)?.name)
+          .sort();
+      expect(callersOf('target')).toEqual(['direct', 'fieldLambda', 'lazily']);
+      expect(callersOf('hit')).toEqual(['topLambda']);
     });
   });
 });

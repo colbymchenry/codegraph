@@ -2143,6 +2143,21 @@ export class TreeSitterExtractor {
           // and the language-aware path in `extractTypeAnnotations` descends
           // into that wrapper (#381).
           this.extractTypeAnnotations(node, fieldNode.id);
+          // Walk the initializer ATTRIBUTED to the declared field (#693, the
+          // Go fix; same shape as the TS/JS class-field walk above). The
+          // dispatcher only scanned this subtree for function-as-value
+          // candidates, so a lambda / method reference / anonymous class in
+          // `private final Runnable r = () -> target();` contributed NO call
+          // edge at all and `target` looked callerless. Keyed on the `value`
+          // FIELD, which only Java's `variable_declarator` carries — C#,
+          // VB.NET and PHP spell their initializer differently and are
+          // deliberately untouched here.
+          const valueNode = getChildByField(decl, 'value');
+          if (valueNode) {
+            this.nodeStack.push(fieldNode.id);
+            this.visitFunctionBody(valueNode, fieldNode.id);
+            this.nodeStack.pop();
+          }
         }
       }
     } else {
@@ -2682,19 +2697,24 @@ export class TreeSitterExtractor {
               storeCollections.push(objectOfFns);
             }
 
-            // Visit the initializer body for calls — EXCEPT object literals (their
-            // function-valued properties are extracted below) and the store-factory
-            // / createApi / store-collection call whose nested objects we extract
-            // method-by-method below (walking the whole call would re-visit those
-            // method arrows and mis-attribute their inner calls to the file scope).
-            if (valueNode &&
-                valueNode.type !== 'object' &&
-                valueNode.type !== 'object_expression' &&
-                !(extractObjectMethods && valueNode.type === 'call_expression') &&
-                !rtkEndpoints &&
-                !piniaSetup &&
-                storeCollections.length === 0) {
+            // Visit the initializer body for calls, ATTRIBUTED to the declared
+            // symbol (#693) — EXCEPT the shapes whose members are extracted
+            // one-by-one below (the store-factory / createApi / store-collection
+            // objects), where walking the whole initializer would re-visit each
+            // member arrow and double-count its calls.
+            //
+            // Two things were wrong here before. The walk ran with only the FILE
+            // on the stack, so `const cfg = load()` recorded the FILE as load's
+            // caller — the exact leak Go's #693 fixed. And an object literal was
+            // skipped outright, so `const obj = { handler: () => target() }`
+            // contributed nothing at all unless the const was exported (only then
+            // does extractObjectLiteralFunctions mint the members).
+            const membersExtractedSeparately =
+              extractObjectMethods || !!rtkEndpoints || !!piniaSetup || storeCollections.length > 0;
+            if (valueNode && !membersExtractedSeparately) {
+              if (varNode) this.nodeStack.push(varNode.id);
               this.visitFunctionBody(valueNode, '');
+              if (varNode) this.nodeStack.pop();
             }
 
             if (extractObjectMethods && objectOfFns) {
@@ -2719,6 +2739,7 @@ export class TreeSitterExtractor {
 
       // Ruby constant assignments (`MAX = 3`) have a `constant`-typed LHS, not
       // `identifier`; without this they were never extracted as symbols at all.
+      let assigned: Node | null = null;
       if (left && (left.type === 'identifier' || left.type === 'constant')) {
         const name = getNodeText(left, this.source);
         // Skip if name starts with lowercase and looks like a function call result
@@ -2726,10 +2747,22 @@ export class TreeSitterExtractor {
         const initValue = right ? getNodeText(right, this.source).slice(0, 100) : undefined;
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
-        this.createNode(kind, name, node, {
+        assigned = this.createNode(kind, name, node, {
           docstring,
           signature: initSignature,
         });
+      }
+      // Walk the initializer ATTRIBUTED to the assigned name (#693). A
+      // module-level `app = FastAPI()` / `ENGINE = create_engine(url)` /
+      // `handler = lambda: run()` dropped every call on the right-hand side, so
+      // whatever the module builds at import time linked to nothing. A tuple
+      // target (`a, b = f(), g()`) mints no symbol, so its RHS is walked at the
+      // enclosing scope rather than lost. Python only: Ruby shares this branch
+      // and gets its own turn.
+      if (this.language === 'python' && right) {
+        if (assigned) this.nodeStack.push(assigned.id);
+        this.visitFunctionBody(right, '');
+        if (assigned) this.nodeStack.pop();
       }
     } else if (this.language === 'go') {
       // Go: var_declaration, short_var_declaration, const_declaration
@@ -2869,6 +2902,8 @@ export class TreeSitterExtractor {
     } else {
       // Generic fallback for other languages
       // Try to find identifier children
+      const nameField = getChildByField(node, 'name');
+      let declared: Node | null = null;
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child?.type === 'identifier' || child?.type === 'variable_declarator') {
@@ -2877,11 +2912,28 @@ export class TreeSitterExtractor {
             : extractName(child, this.source, this.extractor);
 
           if (name && name !== '<anonymous>') {
-            this.createNode(kind, name, child, {
+            const created = this.createNode(kind, name, child, {
               docstring,
               isExported,
             });
+            if (created && nameField && child.startIndex === nameField.startIndex) {
+              declared = created;
+            }
           }
+        }
+      }
+      // Walk the initializer ATTRIBUTED to the declared symbol (#693). Rust
+      // only for now: `const N: usize = compute()` and
+      // `static REGISTRY: Lazy<T> = Lazy::new(|| build())` dropped every call
+      // inside the initializer, so a handler table or a lazily-built singleton
+      // linked to nothing. The other languages sharing this fallback spell
+      // their initializer differently and get their own turn.
+      if (this.language === 'rust') {
+        const valueNode = getChildByField(node, 'value');
+        if (valueNode) {
+          if (declared) this.nodeStack.push(declared.id);
+          this.visitFunctionBody(valueNode, '');
+          if (declared) this.nodeStack.pop();
         }
       }
     }
