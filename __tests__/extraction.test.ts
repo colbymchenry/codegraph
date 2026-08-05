@@ -7710,6 +7710,35 @@ def processData(): Unit = {
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
       expect(calls.length).toBeGreaterThan(0);
     });
+
+    it('walks a val/var initializer scoped to the declared symbol (#693 for Scala)', () => {
+      // The val/var hook minted the node and returned true, so the dispatcher
+      // only scanned the subtree for function-as-value candidates — every call
+      // in an initializer was dropped, which on a `val`-heavy codebase
+      // (SpinalHDL, Akka wiring) is most of the wiring.
+      const code = `
+class C {
+  val fieldLambda: () => Unit = () => target()
+  val direct = target()
+  lazy val lazily = target()
+  private def target(): Unit = {}
+}
+
+object O {
+  val topLambda = () => hit()
+  def hit(): Unit = {}
+}
+`;
+      const result = extractFromSource('C.scala', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const callersOf = (name: string) =>
+        result.unresolvedReferences
+          .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+          .map((u) => byId.get(u.fromNodeId)?.name)
+          .sort();
+      expect(callersOf('target')).toEqual(['direct', 'fieldLambda', 'lazily']);
+      expect(callersOf('hit')).toEqual(['topLambda']);
+    });
   });
 });
 
