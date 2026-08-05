@@ -17,9 +17,10 @@ export const tclExtractor: LanguageExtractor = {
   structTypes: [],
   enumTypes: [],
   typeAliasTypes: [],
-  // command is ONLY in callTypes. The engine's else-if chain (importTypes → callTypes)
-  // means a type in importTypes never creates call edges — `source` detection is done
-  // inside extractImport, leaving call edges for every other command node.
+  // command is ONLY in callTypes — a type in importTypes never also gets call edges
+  // (else-if dispatch). `source` import detection is instead handled in visitNode
+  // below, which the engine always calls regardless of importTypes membership —
+  // extractImport would never fire here since 'command' isn't in importTypes.
   importTypes: [],
   callTypes: ['command'],
   // 'set' is the grammar's variable assignment node (not 'variable_definition').
@@ -101,15 +102,5 @@ export const tclExtractor: LanguageExtractor = {
     }
 
     return false;
-  },
-    // `source filename` — word list is the second child.
-    const wl = node.namedChild(1);
-    if (!wl) return null;
-    const fileArg = wl.namedChild(0);
-    if (!fileArg) return null;
-    const filename = source
-      .substring(fileArg.startIndex, fileArg.endIndex)
-      .replace(/^["'{]|['"}\]]+$/g, '');
-    return { moduleName: filename, signature: `source ${filename}` };
   },
 };
