@@ -15,7 +15,15 @@ import { isGeneratedFile } from '../extraction/generated-detection';
  * - Entry points with locations
  * - Code blocks only for key symbols
  */
-export function formatContextAsMarkdown(context: TaskContext): string {
+export function formatContextAsMarkdown(
+  context: TaskContext,
+  /**
+   * Generated-file test. Defaults to the filename convention alone; the
+   * ContextBuilder passes a DB-backed predicate so files flagged by their
+   * HEADER at index time (#1500) demote here too.
+   */
+  isGenerated: (filePath: string) => boolean = isGeneratedFile
+): string {
   const lines: string[] = [];
 
   // Header with query
@@ -26,8 +34,8 @@ export function formatContextAsMarkdown(context: TaskContext): string {
   // .pulsar.go, mocks, …) rank LAST — a flow query should lead with the
   // hand-written implementation, not protobuf scaffolding.
   const orderedEntries = [...context.entryPoints].sort((a, b) => {
-    const aGen = isGeneratedFile(a.filePath) ? 1 : 0;
-    const bGen = isGeneratedFile(b.filePath) ? 1 : 0;
+    const aGen = isGenerated(a.filePath) ? 1 : 0;
+    const bGen = isGenerated(b.filePath) ? 1 : 0;
     return aGen - bGen;
   });
   if (orderedEntries.length > 0) {
@@ -49,7 +57,7 @@ export function formatContextAsMarkdown(context: TaskContext): string {
   // Related Symbols, pure noise that displaced real-flow entries).
   const otherSymbols = Array.from(context.subgraph.nodes.values())
     .filter(n => !context.entryPoints.some(e => e.id === n.id))
-    .filter(n => !isGeneratedFile(n.filePath))
+    .filter(n => !isGenerated(n.filePath))
     .slice(0, 10); // Limit to 10 related symbols
 
   if (otherSymbols.length > 0) {
@@ -72,8 +80,8 @@ export function formatContextAsMarkdown(context: TaskContext): string {
   // show first (consistent with Entry Points reordering above).
   if (context.codeBlocks.length > 0) {
     const orderedBlocks = [...context.codeBlocks].sort((a, b) => {
-      const aGen = isGeneratedFile(a.filePath) ? 1 : 0;
-      const bGen = isGeneratedFile(b.filePath) ? 1 : 0;
+      const aGen = isGenerated(a.filePath) ? 1 : 0;
+      const bGen = isGenerated(b.filePath) ? 1 : 0;
       return aGen - bGen;
     });
     lines.push('### Code\n');

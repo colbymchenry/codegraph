@@ -45,7 +45,7 @@ custom `visitNode` hooks like Scala's val/var handler) get a candidates-only
 | C / ObjC | `argument_list` | `assignment_expression.right` | `initializer_pair.value` | `initializer_list`, `init_declarator.value` | `&fn` (`pointer_expression`), `@selector(...)` (ObjC) |
 | C++ | **`&` forms only** in args/rhs/varinit | (same — explicit `&` only) | bare ids at FILE scope only | bare ids at FILE scope only | `&fn`, `&Cls::method` (resolved scoped to the class) |
 | TS / JS (tsx/jsx) | `arguments` | `assignment_expression.right` | `pair.value` | `array`, `variable_declarator.value` | `this.method` (`member_expression`, class-scoped — see rule 3) |
-| Python | `argument_list`, `keyword_argument.value` | `assignment.right` | `pair.value` | `list` | `self.method` (`attribute`) |
+| Python | `argument_list`, `keyword_argument.value`, `return_statement` (#1478 — single expression only; tuple returns not descended) | `assignment.right` | `pair.value` | `list` | `self.method` (`attribute`) |
 | Go | `argument_list` | `assignment_statement` / `short_var_declaration` (`expression_list`) | `keyed_element` | `literal_value`, `var_spec.value` | — |
 | Rust | `arguments` | `assignment_expression.right` | `field_initializer.value` | `array_expression`, `static_item` / `let_declaration.value` | — |
 | Java | `argument_list` | `assignment_expression.right` | — | `variable_declarator.value` | `method_reference` (`Cls::m`, `this::m`) — the only form |
@@ -76,11 +76,18 @@ custom `visitNode` hooks like Scala's val/var handler) get a candidates-only
    `arena_ind_prev = arena_ind` (redis/jemalloc) each matched a unique
    same-named function somewhere and produced wrong edges when `rhs`/`varinit`
    were ungated.
-3. **TS/JS/Python: bare ids resolve to `function` kind only.** A bare
-   identifier can never be a method value in these languages (methods need a
-   receiver — `this.m` / `self.m`), so allowing method targets soaked up
-   locals passed as arguments (`new Set(selectedPointsIndices)`;
-   docopt.py's `name`/`match` params — excalidraw/fmt A/B findings).
+3. **TS/JS/Python: bare ids resolve to `function` kind only — plus `class`
+   for Python (#1478).** A bare identifier can never be a method value in
+   these languages (methods need a receiver — `this.m` / `self.m`), so
+   allowing method targets soaked up locals passed as arguments
+   (`new Set(selectedPointsIndices)`; docopt.py's `name`/`match` params —
+   excalidraw/fmt A/B findings). Python bare ids ALSO accept CLASS targets:
+   class-as-value is a core Python idiom (`return SomeSerializer`, registry
+   dicts, `admin.site.register(Model, Admin)`) with no type-annotation
+   recovery path, the gate additionally admits same-file CLASS names for
+   Python, and the docopt false-positive mechanism (lowercase locals vs
+   same-named methods) doesn't transfer to exact-name class matches. TS/JS
+   keep the class exclusion (the KIND FILTER contract).
    TS/JS `this.X` values are captured as `this.`-PREFIXED candidates and
    resolved CLASS-SCOPED (`resolveThisMemberFnRef` in
    `src/resolution/index.ts`): the target must be a function/method whose

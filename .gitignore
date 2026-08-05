@@ -76,3 +76,6 @@ __tests__/zz-scratch*
 
 # linux-arm64 kernel cross-build cache (rust:1-bookworm builder)
 target-linux/
+.kommandr/kommandr.db
+.kommandr/kommandr.db-wal
+.kommandr/kommandr.db-shm

@@ -649,6 +649,12 @@ export class TreeSitterExtractor {
     const definedHere = new Set<string>();
     for (const n of this.nodes) {
       if (n.kind === 'function' || n.kind === 'method') definedHere.add(n.name);
+      // Python only (#1478): class-as-value is a first-class idiom (DRF
+      // get_serializer_class, Meta.model, registry dicts), so same-file CLASS
+      // names pass the gate too. Other languages keep the function/method
+      // gate — TS/JS recover class references through type annotations, and
+      // resolution's kind filter would drop their class candidates anyway.
+      else if (this.language === 'python' && n.kind === 'class') definedHere.add(n.name);
     }
 
     // Import-binding names only (all binding emitters push kind 'imports').

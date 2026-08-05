@@ -113,7 +113,9 @@ const capMs = Number(process.argv[3]);
 const progressPaths = process.argv.slice(4);
 const secs = Math.round(timeoutMs / 1000);
 function kill(extra) {
-  try { fs.writeSync(2, Buffer.from('[CodeGraph] Main thread unresponsive for ~' + secs + 's' + (extra || '') + ' — killing the wedged process so a fresh one can start (#850). Disable with CODEGRAPH_NO_WATCHDOG=1.\\n')); } catch (e) {}
+  // Timestamped so daemon.log kills can be correlated with anything (#1431) —
+  // computed here at kill time; this child process is never the wedged one.
+  try { fs.writeSync(2, Buffer.from('[' + new Date().toISOString() + '] [CodeGraph] Main thread unresponsive for ~' + secs + 's' + (extra || '') + ' — killing the wedged process so a fresh one can start (#850). Disable with CODEGRAPH_NO_WATCHDOG=1.\\n')); } catch (e) {}
   try { process.kill(parentPid, 'SIGKILL'); } catch (e) {}
   process.exit(0);
 }

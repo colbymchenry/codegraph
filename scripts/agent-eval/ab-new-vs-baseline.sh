@@ -21,7 +21,19 @@
 #   <indexed-repo>  a repo with a .codegraph index (copied per arm)
 #   "<task>"        an implementation task, e.g. "Add X to Y and wire it through"
 #   [baseline-ref]  git ref for the BEFORE build (default: HEAD~1)
-# Env: AGENT_EVAL_OUT (default: /tmp/ab-new-vs-baseline)
+# Env:
+#   AGENT_EVAL_OUT  output dir (default: /tmp/ab-new-vs-baseline)
+#   RUNS            runs per arm (default 1). Run-to-run variance is large —
+#                   use >=2 and report the range, never a single run. Both arms
+#                   build/index ONCE and then run RUNS times, so raising this is
+#                   far cheaper than re-invoking the script.
+#   MODEL / EFFORT  default sonnet / high. Never raise without a reason: sonnet
+#                   is the deliberate floor model (see CLAUDE.md).
+#
+# Both arms run with CODEGRAPH_NO_PROMPT_HOOK=1: the machine's ambient
+# UserPromptSubmit front-load hook resolves to whichever build is currently in
+# dist/, so leaving it on injects context through a second, uncontrolled channel
+# and confounds the tool-call counts this script exists to compare.
 set -uo pipefail
 
 TARGET="${1:?usage: ab-new-vs-baseline.sh <indexed-repo> \"<task>\" [baseline-ref]}"
@@ -46,7 +58,9 @@ cleanup() {
   git -C "$ENGINE" checkout HEAD -- $CHANGED 2>/dev/null
   ( cd "$ENGINE" && npm run build >/dev/null 2>&1 )
 }
-trap cleanup EXIT
+# INT/TERM too: killing the script mid-baseline-arm otherwise leaves the engine
+# checked out at the baseline ref, which silently poisons every later build.
+trap cleanup EXIT INT TERM
 
 mkdir -p "$OUT"
 echo "###### engine=$ENGINE  baseline=$BASE_REF"
@@ -67,18 +81,27 @@ prewarm() { # target — spawn a persistent daemon (current $BIN) and wait for i
     && echo "  daemon warm: $1" || echo "  WARN: daemon never bound for $1 (arm may run without codegraph)"
 }
 
-run_arm() { # label, target-copy
+run_arm() { # label, target-copy — runs the task $RUNS times against one build
   local label="$1" tgt="$2" c="$OUT/mcp-$1.json"
   # Connect to the pre-warmed daemon; skip the startup re-exec for a fast attach.
-  printf '{"mcpServers":{"codegraph":{"command":"env","args":["CODEGRAPH_WASM_RELAUNCHED=1","node","%s","serve","--mcp","--path","%s"]}}}' "$BIN" "$tgt" > "$c"
-  prewarm "$tgt"
+  # CODEGRAPH_EXPLORE_DEBUG points explore's per-file allocation diagnostic at a
+  # sidecar (no-op on builds predating it; never perturbs the response).
+  printf '{"mcpServers":{"codegraph":{"command":"env","args":["CODEGRAPH_WASM_RELAUNCHED=1","CODEGRAPH_EXPLORE_DEBUG=%s","node","%s","serve","--mcp","--path","%s"]}}}' \
+    "$OUT/explore-$label.jsonl" "$BIN" "$tgt" > "$c"
+  rm -f "$OUT/explore-$label.jsonl"
   echo "############## ARM [$label] ##############"
-  ( cd "$tgt" && claude -p "$TASK" \
-      --output-format stream-json --verbose --permission-mode bypassPermissions \
-      --model "${MODEL:-sonnet}" --effort "${EFFORT:-high}" --max-budget-usd 4 --strict-mcp-config --mcp-config "$c" \
-      </dev/null > "$OUT/run-$label.jsonl" 2>"$OUT/run-$label.err" )
-  node "$PARSE" "$OUT/run-$label.jsonl" 2>&1 | grep -E "by type|Result" || echo "  (parse failed — see $OUT/run-$label.jsonl)"
-  pkill -9 -f "serve --mcp --path $tgt" 2>/dev/null
+  for i in $(seq 1 "${RUNS:-1}"); do
+    # Re-warm per run: the previous run's daemon is killed below, and a cold
+    # attach is exactly the failure this pre-warm exists to prevent.
+    prewarm "$tgt"
+    ( cd "$tgt" && CODEGRAPH_NO_PROMPT_HOOK=1 claude -p "$TASK" \
+        --output-format stream-json --verbose --permission-mode bypassPermissions \
+        --model "${MODEL:-sonnet}" --effort "${EFFORT:-high}" --max-budget-usd 4 --strict-mcp-config --mcp-config "$c" \
+        </dev/null > "$OUT/run-$label-$i.jsonl" 2>"$OUT/run-$label-$i.err" )
+    echo "-- run $i --"
+    node "$PARSE" "$OUT/run-$label-$i.jsonl" 2>&1 | grep -E "by type|Result" || echo "  (parse failed — see $OUT/run-$label-$i.jsonl)"
+    pkill -9 -f "serve --mcp --path $tgt" 2>/dev/null
+  done
   echo
 }
 
