@@ -21,6 +21,7 @@ import { CodeGraphPackageVersion } from './version';
 import { findNearestCodeGraphRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
 import { getUpdateNotice } from '../upgrade/update-check';
+import { ExploreSessionState } from './explore-session-state';
 
 /**
  * MCP Server Info — kept on the session because some clients log it. The
@@ -110,6 +111,15 @@ export class MCPSession {
   private rootsAttempted = false;
   private resolvePromise: Promise<void> | null = null;
   private explicitProjectPath: string | null;
+  /**
+   * What `codegraph_explore` has already returned to THIS client, per project
+   * (CG-17). Owned by the session, not the engine: the daemon shares one engine
+   * (and one ToolHandler, and a pool of worker threads) across every connected
+   * client, so state kept over there would blend two agents' histories and let
+   * one session's calls suppress source the other has never seen. It dies with
+   * the session — a reconnecting client starts clean.
+   */
+  private readonly exploreSession = new ExploreSessionState();
 
   constructor(
     private transport: JsonRpcTransport,
@@ -138,6 +148,15 @@ export class MCPSession {
   /** Underlying transport — exposed for daemon-side close hooks. */
   getTransport(): JsonRpcTransport {
     return this.transport;
+  }
+
+  /**
+   * This session's explore call history (CG-17). Exposed so tests can assert
+   * that two sessions on one daemon keep separate state; nothing in the server
+   * reaches for another session's copy.
+   */
+  getExploreSessionState(): ExploreSessionState {
+    return this.exploreSession;
   }
 
   private async handleMessage(message: JsonRpcRequest | JsonRpcNotification): Promise<void> {
@@ -286,7 +305,7 @@ export class MCPSession {
     await this.retryInitIfNeeded();
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);
-    const result = await this.engine.getToolHandler().execute(toolName, toolArgs);
+    const result = await this.engine.getToolHandler().execute(toolName, toolArgs, this.exploreSession);
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} done\n`);
     this.transport.sendResult(request.id, result);
     // After the reply is on the wire — telemetry must never delay a tool

@@ -42,6 +42,26 @@ import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, C
 import { scanDynamicDispatch } from './dynamic-boundaries';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreDiagnostics } from './explore-diagnostics';
+import {
+  EXPLORE_EMISSION_KEY,
+  EXPLORE_SESSION_VIEW_ARG,
+  ExploreSessionState,
+  readExploreSessionView,
+  viewForProject,
+  type ExploreEmission,
+  type ExploreFileEmission,
+  type ExploreLineRange,
+} from './explore-session-state';
+import {
+  EXPLORE_DEDUP,
+  dedupeRange,
+  exploreDedupEnabled,
+  fileFingerprint,
+  formatBackReference,
+  mergeRanges,
+  servedRangesForFile,
+  symbolsInSpans,
+} from './explore-dedup';
 
 /**
  * An expected, recoverable "codegraph can't serve this" condition — most
@@ -891,6 +911,15 @@ export interface ToolResult {
     text: string;
   }>;
   isError?: boolean;
+  /**
+   * INTERNAL side-channel (CG-17): what a `codegraph_explore` call actually put
+   * on the wire — files, line ranges, bytes. It rides the result because the
+   * call may have run on a query-pool worker, while the session state it feeds
+   * lives on the main thread. {@link ToolHandler.execute} records it and DELETES
+   * it, so nothing here ever reaches the client. Keyed by
+   * {@link EXPLORE_EMISSION_KEY}; the two must stay in sync.
+   */
+  _cgExploreEmission?: ExploreEmission;
 }
 
 /**
@@ -1805,9 +1834,19 @@ export class ToolHandler {
   }
 
   /**
-   * Execute a tool by name
+   * Execute a tool by name.
+   *
+   * `sessionState` is the CALLER's per-session explore history (CG-17). The
+   * daemon shares one ToolHandler across every connected session, so this state
+   * cannot live on the handler — each session owns one and hands it in, which is
+   * what keeps two sessions on one daemon from ever seeing each other's calls.
+   * Omit it (the CLI does) and explore behaves exactly as before, untracked.
    */
-  async execute(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+  async execute(
+    toolName: string,
+    args: Record<string, unknown>,
+    sessionState?: ExploreSessionState,
+  ): Promise<ToolResult> {
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
@@ -1869,9 +1908,20 @@ export class ToolHandler {
       // cross-cutting notices — worktree-index mismatch (#155) and per-file
       // staleness (#403) — which need the watched MAIN instance and so are
       // always applied here, never in the worker.
-      const result = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
-        ? await this.queryPool.run(toolName, args)
-        : await this.executeReadTool(toolName, args);
+      //
+      // Explore also carries the session's own call history down (CG-17) and its
+      // emission record back up. Both travel as plain properties — on the args
+      // object down, on the ToolResult up — because either leg may cross a
+      // structured-clone boundary into a worker, where a closure or a handler
+      // field could not follow.
+      const dispatchArgs = this.withSessionView(toolName, args, sessionState);
+      const raw = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
+        ? await this.queryPool.run(toolName, dispatchArgs)
+        : await this.executeReadTool(toolName, dispatchArgs);
+      // Record + STRIP before anything else touches the result: the emission is
+      // internal bookkeeping and must never reach the client, whether or not a
+      // caller passed session state.
+      const result = this.takeExploreEmission(raw, sessionState);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
@@ -1891,6 +1941,57 @@ export class ToolHandler {
         'continue without codegraph for this task.'
       );
     }
+  }
+
+  /**
+   * Attach the caller's session view to an explore call's args (CG-17), on a
+   * COPY so the caller's object is never mutated. Nothing else sees it: a
+   * non-explore tool, or a caller with no session state, gets the args
+   * unchanged and pays nothing.
+   *
+   * A client that spells the internal key itself is stripped rather than
+   * trusted — the view decides what source a later call may withhold, so it has
+   * to come from the server's own record, never from the wire.
+   */
+  private withSessionView(
+    toolName: string,
+    args: Record<string, unknown>,
+    sessionState: ExploreSessionState | undefined,
+  ): Record<string, unknown> {
+    if (!(EXPLORE_SESSION_VIEW_ARG in args) && (!sessionState || toolName !== 'codegraph_explore')) {
+      return args;
+    }
+    const copy = { ...args };
+    delete copy[EXPLORE_SESSION_VIEW_ARG];
+    if (sessionState && toolName === 'codegraph_explore') {
+      copy[EXPLORE_SESSION_VIEW_ARG] = sessionState.view();
+    }
+    return copy;
+  }
+
+  /**
+   * Record an explore call's emission into the caller's session state and strip
+   * it from the result (CG-17).
+   *
+   * Unconditional strip: the property is internal, so it comes off even when
+   * there is no session state to record it into (the CLI path) — that is what
+   * keeps the agent-facing response byte-identical. Recording is wrapped
+   * because a bookkeeping bug must never fail a tool call that already
+   * succeeded.
+   */
+  private takeExploreEmission(
+    result: ToolResult,
+    sessionState: ExploreSessionState | undefined,
+  ): ToolResult {
+    const emission = result?.[EXPLORE_EMISSION_KEY];
+    if (emission === undefined) return result;
+    delete result[EXPLORE_EMISSION_KEY];
+    if (sessionState) {
+      try {
+        sessionState.record(emission);
+      } catch { /* bookkeeping only — never fail a served call */ }
+    }
+    return result;
   }
 
   /**
@@ -3044,6 +3145,53 @@ export class ToolHandler {
     // byte-identical. It only OBSERVES: it must never feed back into rendering.
     const diag = ExploreDiagnostics.start(query, projectRoot, budget, maxFiles, indexedFileCount);
 
+    // What this session has already been served for THIS project (CG-17), and
+    // whether this call may act on it (CG-18). Dedup is off on the session's
+    // first call by construction — there is nothing to point back AT — and off
+    // entirely under `CODEGRAPH_EXPLORE_DEDUP=0`.
+    const priorCalls = viewForProject(readExploreSessionView(args), projectRoot);
+    diag?.noteSession(priorCalls);
+    const dedupEnabled = exploreDedupEnabled() && (priorCalls?.calls.length ?? 0) > 0;
+
+    // Cross-call dedup accounting (CG-18). `newSourceChars` is the load-bearing
+    // one: a response whose source is ENTIRELY back-references is the shape that
+    // reads as a failure, so the loop keeps the top suppressed file's real
+    // section in hand and restores it if nothing new made it in — see
+    // `suppressedFallback` below.
+    let newSourceChars = 0;
+    const backReferencedFiles: string[] = [];
+
+    // What this call ends up emitting, per file — the record handed back to the
+    // session state on the main thread. Filled by every render path below, then
+    // filtered to the files that SURVIVE the final hard-ceiling cut, so the
+    // record is what the agent actually received rather than what the loop
+    // hoped to send.
+    //
+    // Back-referenced spans are recorded too, with zero bytes (CG-18): the
+    // record means "source the agent HOLDS for this file", not "bytes this call
+    // spent". Re-recording them refreshes them inside the retained-call window,
+    // so a file pointed at across many calls doesn't age out of the history and
+    // get re-served for no reason.
+    const emittedByFile = new Map<
+      string,
+      { ranges: ExploreLineRange[]; bytes: number; fingerprint?: string }
+    >();
+    const noteEmitted = (
+      fp: string,
+      ranges: ExploreLineRange[],
+      bytes: number,
+      fingerprint?: string,
+    ): void => {
+      const existing = emittedByFile.get(fp);
+      if (existing) {
+        existing.ranges.push(...ranges);
+        existing.bytes += bytes;
+        if (fingerprint) existing.fingerprint = fingerprint;
+      } else {
+        emittedByFile.set(fp, { ranges: [...ranges], bytes, fingerprint });
+      }
+    };
+
     // Step 1: Find relevant context with generous parameters.
     // Use a large maxNodes budget — explore has its own 35k char output limit
     // that prevents context bloat, so more nodes just means better coverage
@@ -3057,7 +3205,12 @@ export class ToolHandler {
 
     if (subgraph.nodes.size === 0) {
       diag?.finishEmpty('no relevant code found — empty subgraph');
-      return this.textResult(`No relevant code found for "${query}"`);
+      const empty = `No relevant code found for "${query}"`;
+      // Still an explore call, so it is still recorded: an empty answer spends a
+      // call against the tier budget even though it emits no source.
+      return this.exploreResult(empty, {
+        projectRoot, query, files: [], sourceBytes: 0, responseBytes: empty.length,
+      });
     }
 
     // Graph-aware glue: findRelevantContext builds the subgraph from name/text
@@ -3872,6 +4025,28 @@ export class ToolHandler {
     // instead of a different symbol's code under the requested name.
     const staleRendered: string[] = [];
     const staleOmitted: string[] = [];
+    // Anti-abandonment hold-back (CG-18). The first file dedup suppressed
+    // ENTIRELY, kept with its real section so it can be put back if the loop
+    // ends with no new source anywhere. A response made only of pointers is the
+    // shape that reads as "codegraph has nothing" — and one such response early
+    // in a session is enough to make an agent stop calling the tool at all — so
+    // the highest-ranked suppressed file is restored rather than risk it. It
+    // costs a re-serve of one file, on the one call shape where dedup would
+    // otherwise have saved everything: the safe direction.
+    type SuppressedFallback = {
+      filePath: string;
+      /** Index in `lines` where this file's pointer block starts. */
+      at: number;
+      /** How many `lines` entries the pointer block occupies. */
+      replacing: number;
+      /** The full, undeduped section to splice back in. */
+      section: string[];
+      sourceChars: number;
+      overhead: number;
+      ranges: ExploreLineRange[];
+      fingerprint: string;
+    };
+    let suppressedFallback: SuppressedFallback | null = null;
     // Reservation carry-forward (CG-21). A reservation is a promise the render
     // loop has to KEEP, not a cap it may quietly under-use: a file that cannot
     // spend what it was given — thin matched-symbol set, unreadable, drifted off
@@ -3949,6 +4124,135 @@ export class ToolHandler {
 
       const fileLines = fileContent.split('\n');
       const lang = group.nodes[0]?.language || '';
+      const withLineNumbers = exploreLineNumbersEnabled();
+      // Language-neutral separator between two non-contiguous slices of one file
+      // (no `//` — not a comment in Python, Ruby, etc.). With line numbers on,
+      // the line-number jump also signals the gap.
+      const GAP_MARKER = '\n\n... (gap) ...\n\n';
+
+      // Cross-call dedup (CG-18). `served` is what THIS session already sent the
+      // agent for THIS file, and it is empty unless the file still hashes to the
+      // bytes those spans were sliced from — an edit between calls means the
+      // agent's copy is wrong, so nothing is withheld. Every render path below
+      // routes its spans through `dedupeSpans`, which is the only place a span
+      // is ever dropped.
+      const fingerprint = fileFingerprint(fileContent);
+      const served = dedupEnabled ? servedRangesForFile(priorCalls, filePath, fingerprint) : [];
+      /** Render one line span exactly as the render paths do. */
+      const renderSpan = (r: ExploreLineRange): string => {
+        const slice = fileLines.slice(r.start - 1, r.end).join('\n');
+        return withLineNumbers ? numberSourceLines(slice, r.start) : slice;
+      };
+      /**
+       * Apply the session history to a set of spans-with-text. A span the agent
+       * already holds is dropped and reported in `covered`; a partially-held one
+       * is re-rendered down to its new lines. Text is rebuilt from the surviving
+       * spans rather than sliced out of the original string — the spans ARE the
+       * contract with the session record, so rebuilding from them is what keeps
+       * what we claim to have sent and what we sent the same thing.
+       */
+      const dedupeSpans = (
+        parts: ReadonlyArray<{ range: ExploreLineRange; text: string }>,
+      ): { parts: Array<{ range: ExploreLineRange; text: string }>; covered: ExploreLineRange[] } => {
+        if (served.length === 0) return { parts: [...parts], covered: [] };
+        const kept: Array<{ range: ExploreLineRange; text: string }> = [];
+        const covered: ExploreLineRange[] = [];
+        for (const part of parts) {
+          const split = dedupeRange(part.range, served);
+          if (split.covered.length === 0) {
+            kept.push(part);
+            continue;
+          }
+          covered.push(...split.covered);
+          for (const r of split.emit) kept.push({ range: r, text: renderSpan(r) });
+        }
+        return { parts: kept, covered: mergeRanges(covered) };
+      };
+      const coveredChars = (spans: ReadonlyArray<ExploreLineRange>): number =>
+        spans.reduce((sum, r) => sum + fileLines.slice(r.start - 1, r.end).join('\n').length, 0);
+      /**
+       * Emit one file's section — header, the back-reference for whatever the
+       * agent already holds, and the fence for what is new. Every render path
+       * ends here so that the dedup bookkeeping (freed bytes, freed `maxFiles`
+       * slot, the session record, the diagnostic) is written in exactly one
+       * place and no path can forget a piece of it.
+       *
+       * A fully-held file emits its header and pointer and NO fence, and
+       * deliberately does not consume a `maxFiles` slot: that is half of where
+       * the reclaimed budget goes (the other half is `sourceSpent`, which the
+       * carry-forward pool hands down the rank order). Both send bytes to files
+       * the agent has NOT seen, which is the whole point.
+       */
+      const emitFileSection = (opts: {
+        header: string;
+        /** Deduped source. Empty ⇒ the agent already holds all of it. */
+        body: string;
+        /** Spans `body` covers. */
+        ranges: ExploreLineRange[];
+        /** Spans replaced by the back-reference. */
+        covered: ExploreLineRange[];
+        /** Chars charged to `totalChars` on top of the body (fences, header). */
+        overhead: number;
+        mode: 'whole' | 'clusters' | 'focused' | 'skeleton';
+        clipped: boolean;
+        /** The undeduped render, kept for the no-new-source fallback. */
+        fullBody: string;
+        fullRanges: ExploreLineRange[];
+      }): void => {
+        // A remainder too small to be worth a fence is folded into the pointer
+        // (see MIN_DELTA_CHARS). Its ranges are then NOT recorded — the record
+        // must only ever claim source that was actually sent.
+        const folded = opts.covered.length > 0 && opts.body.length < EXPLORE_DEDUP.MIN_DELTA_CHARS;
+        const body = folded ? '' : opts.body;
+        const ranges = folded ? [] : opts.ranges;
+        const at = lines.length;
+        lines.push(opts.header, '');
+        if (opts.covered.length > 0) {
+          const pointer = formatBackReference(
+            filePath,
+            opts.covered,
+            symbolsInSpans(group.nodes, opts.covered),
+            { partial: body.length > 0 },
+          );
+          lines.push(pointer, '');
+          totalChars += pointer.length + 2;
+          backReferencedFiles.push(filePath);
+        }
+        if (body.length > 0) {
+          lines.push('```' + lang, body, '```', '');
+          totalChars += body.length + opts.overhead;
+          sourceSpent += body.length;
+          newSourceChars += body.length;
+          diag?.recordRender(filePath, opts.mode, body.length, opts.clipped || opts.covered.length > 0);
+          if (opts.covered.length > 0) diag?.recordDedup(filePath, coveredChars(opts.covered), opts.covered);
+          noteEmitted(filePath, [...ranges, ...opts.covered], body.length, fingerprint);
+          renderedFilePaths.push(filePath);
+          filesIncluded++;
+          return;
+        }
+        // Fully held. The section is the pointer; the slot and the bytes go to a
+        // file the agent has not seen. The spans are still recorded (at zero
+        // bytes) because the record means "source the agent HAS", not "bytes
+        // this call spent" — refreshing them keeps a long session from ageing
+        // them out of the retained window and re-serving them for nothing.
+        totalChars += opts.overhead;
+        diag?.recordRender(filePath, 'backref', 0, false);
+        diag?.recordDedup(filePath, coveredChars(opts.covered), opts.covered);
+        noteEmitted(filePath, opts.covered, 0, fingerprint);
+        renderedFilePaths.push(filePath);
+        if (!suppressedFallback && opts.fullBody.length > 0) {
+          suppressedFallback = {
+            filePath,
+            at,
+            replacing: lines.length - at,
+            section: [opts.header, '', '```' + lang, opts.fullBody, '```', ''],
+            sourceChars: opts.fullBody.length,
+            overhead: opts.overhead,
+            ranges: opts.fullRanges,
+            fingerprint,
+          };
+        }
+      };
 
       // Disk-drift gate (#1474): every render branch below except whole-file
       // slices fileContent (CURRENT bytes) at INDEXED line ranges. Content is
@@ -4028,7 +4332,7 @@ export class ToolHandler {
         // Pass 2: render in line order — full body for chosen symbols, else the
         // signature line (capped, with a "+N more" tail so the structure map of a
         // god-file doesn't itself bloat the budget).
-        const skel: string[] = [];
+        const skel: Array<{ range: ExploreLineRange; text: string }> = [];
         let coveredUntil = 0; // skip symbols already inside an emitted body
         let sigCount = 0, sigDropped = 0;
         const SIG_MAX = Math.max(12, budget.maxSymbolsInFileHeader * 2);
@@ -4037,7 +4341,10 @@ export class ToolHandler {
           if (bodyIds.has(n.id)) {
             const end = n.endLine;
             const body = fileLines.slice(n.startLine - 1, end).join('\n');
-            skel.push(exploreLineNumbersEnabled() ? numberSourceLines(body, n.startLine) : body);
+            skel.push({
+              range: { start: n.startLine, end },
+              text: withLineNumbers ? numberSourceLines(body, n.startLine) : body,
+            });
             coveredUntil = end;
           } else {
             // Elide the body, emit the signature. node.startLine can point at a
@@ -4049,10 +4356,16 @@ export class ToolHandler {
             if (lineNo <= coveredUntil) continue;
             if (sigCount >= SIG_MAX) { sigDropped++; continue; }
             const sig = (fileLines[lineNo - 1] || '').trim();
-            if (sig) { skel.push(exploreLineNumbersEnabled() ? `${lineNo}\t${sig}` : sig); sigCount++; }
+            if (sig) {
+              skel.push({
+                range: { start: lineNo, end: lineNo },
+                text: withLineNumbers ? `${lineNo}\t${sig}` : sig,
+              });
+              sigCount++;
+            }
           }
         }
-        if (sigDropped > 0) skel.push(`… +${sigDropped} more (signatures elided)`);
+        const sigTail = sigDropped > 0 ? `… +${sigDropped} more (signatures elided)` : '';
         if (skel.length > 0) {
           const names = [...new Set(group.nodes.filter(n => n.kind !== 'import' && n.kind !== 'export').map(n => n.name))]
             .slice(0, budget.maxSymbolsInFileHeader).join(', ');
@@ -4065,13 +4378,25 @@ export class ToolHandler {
           const tag = bodyIds.size > 0
             ? 'focused (the methods you named in full, the rest as signatures — codegraph_explore a signature by name for its body; do NOT Read)'
             : 'skeleton (signatures only — codegraph_explore a name for its full body; do NOT Read)';
-          lines.push(fileSectionHeader(filePath, `${names} · ${tag}`), '', '```' + lang, skel.join('\n'), '```', '');
-          totalChars += skel.join('\n').length + 120;
-          sourceSpent += skel.join('\n').length;
-          // Always "clipped": the per-symbol view elides bodies by construction.
-          diag?.recordRender(filePath, bodyIds.size > 0 ? 'focused' : 'skeleton', skel.join('\n').length, true);
-          renderedFilePaths.push(filePath);
-          filesIncluded++;
+          // Dedup runs on the per-symbol parts, so a body the agent already has
+          // becomes a pointer while the signature map around it survives intact
+          // (a one-line signature is far under MIN_COVERED_LINES and is never
+          // withheld — the structure map is what makes this render legible).
+          const dd = dedupeSpans(skel);
+          const withTail = (parts: ReadonlyArray<{ text: string }>) =>
+            [...parts.map((p) => p.text), ...(sigTail ? [sigTail] : [])].join('\n');
+          emitFileSection({
+            header: fileSectionHeader(filePath, `${names} · ${tag}`),
+            body: dd.parts.length > 0 ? withTail(dd.parts) : '',
+            ranges: dd.parts.map((p) => p.range),
+            covered: dd.covered,
+            overhead: 120,
+            mode: bodyIds.size > 0 ? 'focused' : 'skeleton',
+            // Always "clipped": the per-symbol view elides bodies by construction.
+            clipped: true,
+            fullBody: withTail(skel),
+            fullRanges: skel.map((p) => p.range),
+          });
           continue;
         }
       }
@@ -4149,7 +4474,14 @@ export class ToolHandler {
             && totalChars + fileContent.length + EXPLORE_ALLOCATION.FILE_OVERHEAD <= renderCeiling);
       if (fileLines.length <= WHOLE_FILE_MAX_LINES && buysWhole) {
         const body = fileContent.replace(/\n+$/, '');
-        let wholeSection = exploreLineNumbersEnabled() ? numberSourceLines(body, 1) : body;
+        const wholeRange: ExploreLineRange = { start: 1, end: body.split('\n').length };
+        const fullSection = withLineNumbers ? numberSourceLines(body, 1) : body;
+        // The buy decision above was made on the file's FULL size on purpose: it
+        // asks "did this file's relevance earn all of itself", which dedup does
+        // not change. Dedup then only ever makes the render smaller, so a buy
+        // that was funded stays funded.
+        const ddWhole = dedupeSpans([{ range: wholeRange, text: fullSection }]);
+        const wholeSection = ddWhole.parts.map((p) => p.text).join(GAP_MARKER);
         const uniqSymbols = [...new Set(
           group.nodes
             .filter(n => n.kind !== 'import' && n.kind !== 'export')
@@ -4170,12 +4502,18 @@ export class ToolHandler {
           diag?.recordSkip(filePath, 'budget-whole-file');
           continue;
         }
-        lines.push(wholeHeader, '', '```' + lang, wholeSection, '```', '');
-        totalChars += wholeSection.length + 200;
-        sourceSpent += wholeSection.length;
-        diag?.recordRender(filePath, 'whole', wholeSection.length, false);
-        renderedFilePaths.push(filePath);
-        filesIncluded++;
+        emitFileSection({
+          header: wholeHeader,
+          body: wholeSection,
+          // The whole file, minus any trailing blank lines the render trimmed.
+          ranges: ddWhole.parts.map((p) => p.range),
+          covered: ddWhole.covered,
+          overhead: 200,
+          mode: 'whole',
+          clipped: false,
+          fullBody: fullSection,
+          fullRanges: [wholeRange],
+        });
         if (fileStale) staleRendered.push(filePath);
         continue;
       }
@@ -4328,10 +4666,6 @@ export class ToolHandler {
       // until the per-file char cap is hit. Truly enormous single clusters
       // get tail-trimmed with a marker.
       const contextPadding = 3;
-      const withLineNumbers = exploreLineNumbersEnabled();
-      // Language-neutral separator (no `//` — not a comment in Python, Ruby,
-      // etc.). With line numbers on, the line-number jump also signals the gap.
-      const GAP_MARKER = '\n\n... (gap) ...\n\n';
       // An oversize spine method (the call path runs THROUGH a god-method — n8n's
       // processRunExecutionData is 962 lines) is windowed to its next-hop CALL site
       // plus the signature head, NOT dumped whole. Without this the cluster is too big
@@ -4340,28 +4674,50 @@ export class ToolHandler {
       // the spine's call still appears in context.
       const OVERSIZE_SPINE_LINES = 200;
       const SPINE_WINDOW = 28; // lines each side of the next-hop call site
-      const buildSection = (c: { start: number; end: number; hasSpine?: boolean; spineCallLine?: number }): string => {
+      // Returns the rendered text as SPAN-KEYED PARTS. Every part carries the
+      // exact line range its text was sliced from, which two things depend on:
+      // the session record (CG-17) — a record claiming lines it never sent would
+      // withhold them from a later call, costing a Read — and cross-call dedup
+      // (CG-18), which rebuilds a part's text from a narrower span when the
+      // agent already holds the rest. Both read the spans from the function that
+      // does the slicing; a second function mirroring these window/padding rules
+      // would drift.
+      type SectionPart = { range: ExploreLineRange; text: string };
+      const sectionText = (parts: ReadonlyArray<SectionPart>): string =>
+        parts.map((p) => p.text).join(GAP_MARKER);
+      const buildSection = (
+        c: { start: number; end: number; hasSpine?: boolean; spineCallLine?: number },
+      ): SectionPart[] => {
         if (c.hasSpine && c.spineCallLine && (c.end - c.start + 1) > OVERSIZE_SPINE_LINES) {
           const call = c.spineCallLine;
           const winStart = Math.max(c.start, call - SPINE_WINDOW);
           const winEnd = Math.min(c.end, call + SPINE_WINDOW);
-          const parts: string[] = [];
+          const parts: SectionPart[] = [];
           // Signature head, only when it sits clearly above the window (else the
           // window already covers the method opening).
           const headEnd = Math.min(c.start + 4, winStart - 2);
           if (headEnd >= c.start) {
             const head = fileLines.slice(c.start - 1, headEnd).join('\n');
-            parts.push(withLineNumbers ? numberSourceLines(head, c.start) : head);
+            parts.push({
+              range: { start: c.start, end: headEnd },
+              text: withLineNumbers ? numberSourceLines(head, c.start) : head,
+            });
           }
           const win = fileLines.slice(winStart - 1, winEnd).join('\n');
-          parts.push(withLineNumbers ? numberSourceLines(win, winStart) : win);
-          return parts.join(GAP_MARKER);
+          parts.push({
+            range: { start: winStart, end: winEnd },
+            text: withLineNumbers ? numberSourceLines(win, winStart) : win,
+          });
+          return parts;
         }
         const startIdx = Math.max(0, c.start - 1 - contextPadding);
         const endIdx = Math.min(fileLines.length, c.end + contextPadding);
         const slice = fileLines.slice(startIdx, endIdx).join('\n');
         // startIdx is 0-based, so the slice's first line is line startIdx + 1.
-        return withLineNumbers ? numberSourceLines(slice, startIdx + 1) : slice;
+        return [{
+          range: { start: startIdx + 1, end: endIdx },
+          text: withLineNumbers ? numberSourceLines(slice, startIdx + 1) : slice,
+        }];
       };
 
       /**
@@ -4380,7 +4736,7 @@ export class ToolHandler {
        * body is never cut, and the members are chosen by the same importance the
        * cluster ranking uses. Returns null when nothing needed shrinking.
        */
-      const shrinkCluster = (c: ExploreCluster, cap: number): string | null => {
+      const shrinkCluster = (c: ExploreCluster, cap: number): SectionPart[] | null => {
         if (c.members.length < 2) return null;
         const byImportance = [...c.members].sort((a, b) =>
           b.importance - a.importance || (a.end - a.start) - (b.end - b.start) || a.start - b.start);
@@ -4405,7 +4761,30 @@ export class ToolHandler {
           if (last && r.start <= last.end + gapThreshold) last.end = Math.max(last.end, r.end);
           else merged.push({ start: r.start, end: r.end });
         }
-        return merged.map((m) => buildSection(m)).join(GAP_MARKER);
+        return merged.flatMap((m) => buildSection(m));
+      };
+
+      /**
+       * One cluster's final parts: built, shrunk if it overruns `cap`, then
+       * passed through the session history (CG-18).
+       *
+       * The shrink decision reads the DEDUPED length on purpose. A cluster whose
+       * bytes the agent already holds costs this response nothing, so shrinking
+       * it on its raw size would drop new symbols to make room for source that
+       * is not being sent — spending the file's budget on nothing.
+       */
+      const renderCluster = (
+        c: ExploreCluster,
+        cap: number,
+      ): { parts: SectionPart[]; covered: ExploreLineRange[]; shrunk: boolean } => {
+        const base = dedupeSpans(buildSection(c));
+        if (sectionText(base.parts).length <= cap) {
+          return { parts: base.parts, covered: base.covered, shrunk: false };
+        }
+        const shrunk = shrinkCluster(c, cap);
+        if (shrunk === null) return { parts: base.parts, covered: base.covered, shrunk: false };
+        const dd = dedupeSpans(shrunk);
+        return { parts: dd.parts, covered: dd.covered, shrunk: true };
       };
 
       // Rank clusters for inclusion under the per-file cap. Entry-point
@@ -4452,23 +4831,28 @@ export class ToolHandler {
       // spine can't run away or starve co-flow files entirely.
       const SPINE_CEILING = Math.min(Math.round(allowance * 1.5), headroom);
       const chosenIndices = new Set<number>();
-      // Shrunk renders for oversize clusters, by cluster index (CG-12). Computed
+      // Final renders (deduped, shrunk where oversize) by cluster index. Computed
       // during selection and reused at emission so the two never disagree.
-      const shrunkSections = new Map<number, string>();
+      const renderedClusters = new Map<number, ReturnType<typeof renderCluster>>();
+      let anyClusterShrunk = false;
       let projectedChars = 0;
       for (const rc of rankedClusters) {
-        const sectionLen = buildSection(rc.c).length + (chosenIndices.size > 0 ? GAP_MARKER.length : 0);
         // The top-ranked cluster is always taken — an empty file section sends the
         // agent to Read, negating the savings. But "always taken" is not "taken at
         // any size": when it overruns the reservation it is SHRUNK to the
         // highest-importance whole symbol ranges inside it, so a single-cluster
-        // god-file spends its allotment instead of the whole response's.
-        if (chosenIndices.size === 0) {
-          const cap = rc.c.hasSpine ? SPINE_CEILING : fileBudget;
-          const shrunk = sectionLen > cap ? shrinkCluster(rc.c, cap) : null;
-          if (shrunk !== null) shrunkSections.set(rc.idx, shrunk);
+        // god-file spends its allotment instead of the whole response's. Later
+        // clusters are never shrunk — they either fit or wait for another call.
+        const first = chosenIndices.size === 0;
+        const cap = rc.c.hasSpine ? SPINE_CEILING : fileBudget;
+        const section = renderCluster(rc.c, first ? cap : Infinity);
+        const text = sectionText(section.parts);
+        const sectionLen = text.length + (!first && text.length > 0 ? GAP_MARKER.length : 0);
+        if (first) {
+          renderedClusters.set(rc.idx, section);
+          anyClusterShrunk = anyClusterShrunk || section.shrunk;
           chosenIndices.add(rc.idx);
-          projectedChars += shrunk !== null ? shrunk.length : sectionLen;
+          projectedChars += sectionLen;
           continue;
         }
         // A spine cluster (the rendered call path) is the flow answer — include it
@@ -4477,6 +4861,7 @@ export class ToolHandler {
         const fits = projectedChars + sectionLen <= fileBudget;
         const spineFits = rc.c.hasSpine && projectedChars + sectionLen <= SPINE_CEILING;
         if (!fits && !spineFits) continue;
+        renderedClusters.set(rc.idx, section);
         chosenIndices.add(rc.idx);
         projectedChars += sectionLen;
       }
@@ -4484,12 +4869,19 @@ export class ToolHandler {
       // Emit chosen clusters in source order so the file reads top-to-bottom.
       let fileSection = '';
       const allSymbols: string[] = [];
+      const sectionRanges: ExploreLineRange[] = [];
+      const coveredRanges: ExploreLineRange[] = [];
       for (let i = 0; i < clusters.length; i++) {
         if (!chosenIndices.has(i)) continue;
         const cluster = clusters[i]!;
-        const section = shrunkSections.get(i) ?? buildSection(cluster);
-        if (fileSection.length > 0) fileSection += GAP_MARKER;
-        fileSection += section;
+        const section = renderedClusters.get(i)!;
+        const text = sectionText(section.parts);
+        if (text.length > 0) {
+          if (fileSection.length > 0) fileSection += GAP_MARKER;
+          fileSection += text;
+        }
+        sectionRanges.push(...section.parts.map((p) => p.range));
+        coveredRanges.push(...section.covered);
         allSymbols.push(...cluster.symbols);
       }
 
@@ -4499,7 +4891,7 @@ export class ToolHandler {
       // method is useless (the agent just Reads the rest for the other half), which
       // is the very fallback explore exists to prevent. A pathological file is
       // bounded by the cluster SELECTION above + the total hard ceiling.
-      if (chosenIndices.size < clusters.length || shrunkSections.size > 0) {
+      if (chosenIndices.size < clusters.length || anyClusterShrunk) {
         anyFileTrimmed = true;
       }
 
@@ -4537,18 +4929,62 @@ export class ToolHandler {
         continue;
       }
 
-      lines.push(fileHeader);
-      lines.push('');
-      lines.push('```' + lang);
-      lines.push(fileSection);
-      lines.push('```');
-      lines.push('');
+      // The undeduped render of the same clusters, needed only if this file ends
+      // up fully back-referenced AND the whole call finds nothing new to say —
+      // see `suppressedFallback`. Built lazily: on every other call it is dead
+      // weight.
+      const fullClusterParts = fileSection.length === 0
+        ? clusters.flatMap((c, i) => (chosenIndices.has(i) ? buildSection(c) : []))
+        : [];
+      emitFileSection({
+        header: fileHeader,
+        body: fileSection,
+        ranges: sectionRanges,
+        covered: mergeRanges(coveredRanges),
+        overhead: 200,
+        mode: 'clusters',
+        clipped: chosenIndices.size < clusters.length,
+        fullBody: sectionText(fullClusterParts),
+        fullRanges: fullClusterParts.map((p) => p.range),
+      });
+    }
 
-      totalChars += fileSection.length + 200;
-      sourceSpent += fileSection.length;
-      diag?.recordRender(filePath, 'clusters', fileSection.length, chosenIndices.size < clusters.length);
-      renderedFilePaths.push(filePath);
-      filesIncluded++;
+    // Anti-abandonment restore (CG-18). Dedup withheld everything and nothing new
+    // took its place — the response would be pointers only, which is the shape
+    // that reads as "codegraph found nothing" and sends the agent to Read for
+    // good. Put the top suppressed file back, in full, and keep its pointer off.
+    // Deliberately checked against `newSourceChars` (source THIS call emitted)
+    // rather than the response length: the flow and blast-radius sections are
+    // always there, and they are not what makes a response feel sufficient.
+    // Cast, not annotation: the only writer is the render loop's `emitFileSection`
+    // closure, which TypeScript's flow analysis cannot see, so it narrows the
+    // variable to `null` here and the truthiness check below would be `never`.
+    const restore = suppressedFallback as SuppressedFallback | null;
+    if (newSourceChars === 0 && restore) {
+      if (totalChars + restore.sourceChars + restore.overhead <= renderCeiling) {
+        lines.splice(restore.at, restore.replacing, ...restore.section);
+        totalChars += restore.sourceChars + restore.overhead;
+        sourceSpent += restore.sourceChars;
+        newSourceChars += restore.sourceChars;
+        filesIncluded++;
+        const idx = backReferencedFiles.indexOf(restore.filePath);
+        if (idx >= 0) backReferencedFiles.splice(idx, 1);
+        emittedByFile.set(restore.filePath, {
+          ranges: [...restore.ranges],
+          bytes: restore.sourceChars,
+          fingerprint: restore.fingerprint,
+        });
+        diag?.recordRender(restore.filePath, 'clusters', restore.sourceChars, false);
+        diag?.recordDedup(restore.filePath, 0, []);
+      }
+    }
+
+    // The back-reference convention, stated once where the verbatim guarantee is
+    // (#1474 does the same for drift). Without it a pointer reads as an
+    // apology for missing source rather than as an index into source the agent
+    // already has.
+    if (backReferencedFiles.length > 0) {
+      lines[verbatimHeaderIdx] += ` (Files marked **"Already sent earlier in this conversation"** are not repeated: their source came back on an earlier codegraph_explore call in THIS conversation and the file has not changed since, so that copy is exact and current — scroll back for it rather than re-fetching or Reading.)`;
     }
 
     // Drift epilogue (#1474). The "verbatim / do not Read" guarantee above
@@ -4693,7 +5129,45 @@ export class ToolHandler {
     // shares account for the hard-ceiling truncation above (CG-4).
     diag?.finish(finalText, output.length, hardCeiling, filesIncluded);
 
-    return this.textResult(finalText);
+    // Session record (CG-17): only the files that SURVIVED the hard ceiling —
+    // a section the truncation dropped was never delivered, and recording it
+    // would let a later call withhold source the agent has never seen.
+    //
+    // A back-referenced file records its spans at ZERO bytes (CG-18) — it is
+    // still source the agent holds for this file, which is what the record
+    // means; dropping it would let the span age out of the retained window and
+    // be re-served for nothing.
+    const emittedFiles: ExploreFileEmission[] = [];
+    let sourceBytes = 0;
+    for (const fp of survivors) {
+      const emitted = emittedByFile.get(fp);
+      if (!emitted || emitted.ranges.length === 0) continue;
+      emittedFiles.push({
+        path: fp,
+        ranges: emitted.ranges,
+        bytes: emitted.bytes,
+        fingerprint: emitted.fingerprint,
+      });
+      sourceBytes += emitted.bytes;
+    }
+    return this.exploreResult(finalText, {
+      projectRoot,
+      query,
+      files: emittedFiles,
+      sourceBytes,
+      responseBytes: finalText.length,
+    });
+  }
+
+  /**
+   * An explore response plus the record of what it emitted (CG-17). The record
+   * rides the result only as far as {@link execute}, which files it into the
+   * calling session's state and deletes it — see {@link EXPLORE_EMISSION_KEY}.
+   */
+  private exploreResult(text: string, emission: ExploreEmission): ToolResult {
+    const result = this.textResult(text);
+    result[EXPLORE_EMISSION_KEY] = emission;
+    return result;
   }
 
   /**

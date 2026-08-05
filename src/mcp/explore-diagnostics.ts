@@ -32,6 +32,7 @@
  */
 
 import { appendFileSync } from 'fs';
+import type { ExploreProjectState } from './explore-session-state';
 
 /** How a file's source was rendered into the response. */
 export type ExploreRenderMode =
@@ -40,6 +41,7 @@ export type ExploreRenderMode =
   | 'focused'       // per-symbol view, named/spine bodies full
   | 'skeleton'      // per-symbol view, signatures only
   | 'stale-omitted' // drifted on disk; source deliberately withheld
+  | 'backref'       // fully served by an earlier call this session (CG-18)
   | 'dropped';      // rendered into `lines` but cut by the final hard ceiling
 
 /** Why a ranked candidate never reached the output. */
@@ -91,6 +93,17 @@ interface FileRecord extends ExploreCandidateMeta {
    */
   allowance: number | null;
   render?: ExploreRenderMode;
+  /**
+   * Source chars this call did NOT re-send because an earlier call in the
+   * session already did (CG-18). Reclaimed, not lost: it leaves through
+   * `sourceSpent` (the carry-forward pool hands it to lower-ranked files) and,
+   * for a fully back-referenced file, through the freed `maxFiles` slot. The
+   * reallocation is legible as the difference between this file's
+   * `allowance` and `emittedChars` against the files below it in the table.
+   */
+  dedupSavedChars: number;
+  /** Line spans replaced by a back-reference. */
+  dedupCovered: Array<[number, number]>;
   /** Source chars the render loop handed to `lines` (pre-final-truncation). */
   emittedChars: number;
   /** Source chars present in the FINAL text — authoritative, truncation-aware. */
@@ -129,10 +142,28 @@ export interface ExploreDiagnosticFile extends ExploreCandidateMeta {
   render: ExploreRenderMode | null;
   skipped: ExploreSkipReason | null;
   clipped: boolean;
+  dedupSavedChars: number;
+  dedupCovered: Array<[number, number]>;
   emittedChars: number;
   finalChars: number;
   share: number;
   allocatedShare: number;
+}
+
+/**
+ * This session's explore history for this project, as of BEFORE the call being
+ * reported (CG-17). Present only when the caller tracks session state — the CLI
+ * and bare-handler callers don't, so it is absent there rather than zeroed.
+ */
+export interface ExploreDiagnosticSession {
+  /** 1-based index of THIS call within the session, for this project. */
+  callIndex: number;
+  /** Calls already served this session for this project. */
+  priorCalls: number;
+  /** Response chars already served this session for this project. */
+  priorResponseChars: number;
+  /** Files already served source this session, most-recent call first. */
+  priorFiles: Array<{ path: string; ranges: Array<[number, number]>; bytes: number }>;
 }
 
 /** The full report — one per explore call, JSON-serialized to the sink. */
@@ -142,6 +173,8 @@ export interface ExploreDiagnosticReport {
   projectRoot: string;
   indexedFileCount: number;
   note?: string;
+  /** Session-scoped call state (CG-17); absent when the caller tracks none. */
+  session?: ExploreDiagnosticSession;
   budget: {
     maxOutputChars: number;
     maxCharsPerFile: number;
@@ -171,6 +204,17 @@ export interface ExploreDiagnosticReport {
     filesRanked: number;
     filesRenderedByLoop: number;
     filesInFinalOutput: number;
+  };
+  /**
+   * Cross-call source dedup (CG-18): what this call did NOT re-send because an
+   * earlier call in this session already sent it, and where those bytes went.
+   * `savedChars` 0 with a non-empty session block means nothing overlapped.
+   */
+  dedup: {
+    savedChars: number;
+    backReferenced: string[];
+    /** Files fully replaced by a pointer — each one also freed a `maxFiles` slot. */
+    fullyBackReferenced: string[];
   };
   /** The proportional split (CG-12): what each file was promised, and why. */
   allocation: {
@@ -221,6 +265,7 @@ export class ExploreDiagnostics {
   private graphGateThreshold = 0;
   private graphGateApplied = false;
   private note = '';
+  private session: ExploreDiagnosticSession | undefined;
   private allocPool = 0;
   private allocCliffAt = 0;
   private allocCliffed: string[] = [];
@@ -265,6 +310,40 @@ export class ExploreDiagnostics {
     this.stages.pastRelevanceGate = kept;
   }
 
+  /**
+   * Record what this session had already been served for this project (CG-17),
+   * so the report says which call in the session it is and what the earlier ones
+   * cost. Read-only for now: nothing in the render loop consults it, which is
+   * what keeps the response byte-identical at this stage.
+   *
+   * Files are listed most-recent call first and de-duplicated by path — the same
+   * file re-served across calls is the pattern this instrument exists to make
+   * visible, and its ranges are unioned so a glance shows what of it the agent
+   * already holds.
+   */
+  noteSession(prior: ExploreProjectState | null): void {
+    if (!prior) return;
+    const byPath = new Map<string, { path: string; ranges: Array<[number, number]>; bytes: number }>();
+    for (const call of [...prior.calls].reverse()) {
+      for (const file of call.files) {
+        const existing = byPath.get(file.path);
+        const spans = file.ranges.map((r) => [r.start, r.end] as [number, number]);
+        if (existing) {
+          existing.ranges.push(...spans);
+          existing.bytes += file.bytes;
+        } else {
+          byPath.set(file.path, { path: file.path, ranges: spans, bytes: file.bytes });
+        }
+      }
+    }
+    this.session = {
+      callIndex: prior.callCount + 1,
+      priorCalls: prior.callCount,
+      priorResponseChars: prior.responseBytes,
+      priorFiles: [...byPath.values()],
+    };
+  }
+
   /** Candidate count after the `group.score >= floor` filter. */
   setScoreFloor(floor: number, kept: number): void {
     this.scoreFloor = floor;
@@ -284,6 +363,7 @@ export class ExploreDiagnostics {
   noteCandidate(path: string, meta: ExploreCandidateMeta): void {
     this.files.set(path, {
       path, ...meta, allowance: null,
+      dedupSavedChars: 0, dedupCovered: [],
       emittedChars: 0, finalChars: 0, share: 0, allocatedShare: 0, clipped: false,
     });
   }
@@ -322,6 +402,19 @@ export class ExploreDiagnostics {
   }
 
   /**
+   * Source this call withheld because the session already holds it (CG-18).
+   * Called with `(path, 0, [])` to clear a record — the anti-abandonment restore
+   * puts a suppressed file's source back, and a diagnostic still claiming the
+   * saving would misreport where the envelope went.
+   */
+  recordDedup(path: string, savedChars: number, covered: ReadonlyArray<{ start: number; end: number }>): void {
+    const rec = this.files.get(path);
+    if (!rec) return;
+    rec.dedupSavedChars = savedChars;
+    rec.dedupCovered = covered.map((r) => [r.start, r.end] as [number, number]);
+  }
+
+  /**
    * A candidate was passed over before rendering. First reason wins — the
    * blanket `max-files` sweep must not overwrite a file's specific reason.
    */
@@ -356,8 +449,10 @@ export class ExploreDiagnostics {
         rec.share = envelope > 0 ? rec.finalChars / envelope : 0;
         rec.allocatedShare = allocatedChars > 0 ? rec.emittedChars / allocatedChars : 0;
         // Rendered into `lines` but absent from the final text → the hard
-        // ceiling dropped its whole section.
-        if (rec.render && rec.render !== 'stale-omitted' && rec.finalChars === 0) {
+        // ceiling dropped its whole section. A back-referenced file has no
+        // fenced source BY DESIGN (CG-18), so it is never "dropped".
+        if (rec.render && rec.render !== 'stale-omitted' && rec.render !== 'backref'
+            && rec.finalChars === 0) {
           rec.render = 'dropped';
           rec.clipped = true;
         }
@@ -384,6 +479,7 @@ export class ExploreDiagnostics {
       projectRoot: this.projectRoot,
       indexedFileCount: this.indexedFileCount,
       note: this.note || undefined,
+      session: this.session,
       budget: {
         maxOutputChars: this.budget.maxOutputChars,
         maxCharsPerFile: this.budget.maxCharsPerFile,
@@ -411,6 +507,11 @@ export class ExploreDiagnostics {
         filesRanked: this.stages.pastRelevanceGate,
         filesRenderedByLoop: filesIncluded,
         filesInFinalOutput: rendered.length,
+      },
+      dedup: {
+        savedChars: records.reduce((s, r) => s + r.dedupSavedChars, 0),
+        backReferenced: records.filter((r) => r.dedupSavedChars > 0).map((r) => r.path),
+        fullyBackReferenced: records.filter((r) => r.render === 'backref').map((r) => r.path),
       },
       allocation: {
         pool: this.allocPool,
@@ -440,6 +541,8 @@ export class ExploreDiagnostics {
           render: r.render ?? null,
           skipped: r.skipped ?? null,
           clipped: r.clipped,
+          dedupSavedChars: r.dedupSavedChars,
+          dedupCovered: r.dedupCovered.map((s) => [...s] as [number, number]),
           emittedChars: r.emittedChars,
           finalChars: r.finalChars,
           share: round6(r.share),
@@ -524,6 +627,20 @@ export function renderTable(report: ExploreDiagnosticReport): string {
   out.push(`codegraph explore diagnostic — "${report.query}"`);
   out.push(`  project ${report.projectRoot} · ${num(report.indexedFileCount)} files indexed`);
   if (report.note) out.push(`  note: ${report.note}`);
+  if (report.session) {
+    const s = report.session;
+    out.push(
+      `  session call #${s.callIndex} for this project` +
+      ` · ${num(s.priorCalls)} prior call${s.priorCalls === 1 ? '' : 's'}` +
+      ` · ${num(s.priorResponseChars)} chars already served`,
+    );
+    for (const f of s.priorFiles.slice(0, 12)) {
+      const spans = f.ranges.slice(0, 6).map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(',');
+      const more = f.ranges.length > 6 ? `,+${f.ranges.length - 6}` : '';
+      out.push(`    already served ${f.path} · ${num(f.bytes)} chars · L${spans}${more}`);
+    }
+    if (s.priorFiles.length > 12) out.push(`    … +${s.priorFiles.length - 12} more already-served file(s)`);
+  }
   out.push(
     `  envelope ${num(env.chars)} chars delivered · ${num(env.allocatedChars)} allocated` +
     ` of ${num(budget.maxOutputChars)} budget (hard ceiling ${num(budget.hardCeiling)})` +
@@ -545,6 +662,15 @@ export function renderTable(report: ExploreDiagnosticReport): string {
     `  relevance gate ${sel.graphGateApplied ? 'applied' : 'not applied'}` +
     ` at graph >= ${sel.graphGateThreshold.toFixed(5)} (6% of max ${sel.maxGraph.toFixed(5)})`,
   );
+  const dedup = report.dedup;
+  if (dedup && dedup.savedChars > 0) {
+    out.push(
+      `  dedup ${num(dedup.savedChars)} chars not re-sent` +
+      ` · ${dedup.fullyBackReferenced.length} file(s) fully back-referenced` +
+      ` (each also freed a maxFiles slot)` +
+      (dedup.backReferenced.length > 0 ? `: ${dedup.backReferenced.join(', ')}` : ''),
+    );
+  }
   const alloc = report.allocation;
   out.push(
     `  allocation ${num(alloc.reserved)} reserved of ${num(alloc.pool)} pool` +
@@ -558,7 +684,7 @@ export function renderTable(report: ExploreDiagnosticReport): string {
   // Allocated (not delivered) is the allocator's own decision — the number the
   // budget work is about. Delivered is what the agent got. They differ only
   // when the ceiling truncated; showing both makes that divergence obvious.
-  const shown = files.filter((f) => f.emittedChars > 0 || f.finalChars > 0);
+  const shown = files.filter((f) => f.emittedChars > 0 || f.finalChars > 0 || f.render === 'backref');
   if (shown.length > 0) {
     out.push('   #  alloc%  deliv%    bytes  reserved  score    graph  hits  pen   flags                render     file');
     for (const f of shown) {
@@ -578,6 +704,11 @@ export function renderTable(report: ExploreDiagnosticReport): string {
         f.path,
       );
       out.push('        kinds: ' + (f.kinds || '-'));
+      if (f.dedupSavedChars > 0) {
+        const spans = f.dedupCovered.slice(0, 6).map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(',');
+        const more = f.dedupCovered.length > 6 ? `,+${f.dedupCovered.length - 6}` : '';
+        out.push(`        dedup: ${num(f.dedupSavedChars)} chars already sent this session · L${spans}${more}`);
+      }
     }
     out.push('  (bytes = source allocated by the render loop; deliv% = 0 means the hard ceiling dropped the section)');
     out.push('  (* = clipped: some source in this file was elided, windowed, or its section dropped)');

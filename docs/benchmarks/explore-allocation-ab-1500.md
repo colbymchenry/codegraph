@@ -51,6 +51,11 @@ rendered markdown of the responses the agent actually received. The CG-4 diagnos
 only exists on the new build, so it cannot measure the baseline arm; the markdown parse is the
 only instrument that measures both arms the same way.
 
+That `--answer <glob>` is hand-specified ground truth. Every run now also reports the same
+intersection inferred from the agent's own final answer, so it needs no per-question setup —
+see [`explore-allocation-efficiency.md`](explore-allocation-efficiency.md), which re-scores
+the arms below (express: 82% baseline → 100% new).
+
 | Repo | Lang | Files | Generated | Tier | Role |
 |---|---|---|---|---|---|
 | `kubernetes/client-go` | Go | 2,454 | 2,001 | medium (2 calls / 28K) | **the #1500 shape** — generated CRUD beside hand-written machinery |

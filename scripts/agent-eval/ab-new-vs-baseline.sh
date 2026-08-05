@@ -1,9 +1,27 @@
 #!/usr/bin/env bash
 # A/B a codegraph retrieval/steering change: the NEW build (current HEAD) vs a
 # BASELINE build (a git ref) — BOTH with codegraph attached — on the same
-# implementation task, measuring how many Read vs codegraph calls the agent
-# makes. ISOLATES the change (unlike run-all.sh's with-vs-without). The agent
-# works on a throwaway copy of the target, so your repos are never touched.
+# implementation task. ISOLATES the change (unlike run-all.sh's
+# with-vs-without). The agent works on a throwaway copy of the target, so your
+# repos are never touched.
+#
+# Each run reports the tool mix AND the three feedback metrics; compare-arms.mjs
+# then puts both arms side by side:
+#   residual context occupancy (CG-7)  window still held by the arm's retrieval
+#   explore sufficiency        (CG-8)  was the response ENOUGH — the agent's next act
+#   allocation efficiency      (CG-9)  share of returned bytes the answer cited
+# This is the harness those metrics were built for: both arms are codegraph-on,
+# so every one of them is measuring the retrieval change rather than adoption.
+# docs/benchmarks/agent-eval-feedback-metrics.md is the entry point; the three
+# per-metric docs it links carry the caveats — in particular that allocation
+# efficiency is RELATIVE (attribution is by citation), which is exactly why
+# same-question new-vs-baseline is the comparison it is valid for.
+#
+# Both arms also run with the codegraph CLI blocked (no-cli-shim.sh). Here that
+# is not a with/without leak but an ATTRIBUTION one: an explore issued through
+# Bash is charged to Bash in the occupancy table and never reaches the
+# sufficiency or allocation parse at all, so a run that shells out silently
+# drops calls from all three metrics.
 #
 # Reliable attach (works even when this is itself run nested inside a Claude
 # session): each arm PRE-WARMS a persistent codegraph daemon for its target so
@@ -39,10 +57,11 @@ set -uo pipefail
 TARGET="${1:?usage: ab-new-vs-baseline.sh <indexed-repo> \"<task>\" [baseline-ref]}"
 TASK="${2:?task required}"
 BASE_REF="${3:-HEAD~1}"
-ENGINE="$(cd "$(dirname "$0")/../.." && pwd)"
+HARNESS="$(cd "$(dirname "$0")" && pwd)"
+ENGINE="$(cd "$HARNESS/../.." && pwd)"
 BIN="$ENGINE/dist/bin/codegraph.js"
 OUT="${AGENT_EVAL_OUT:-/tmp/ab-new-vs-baseline}"
-PARSE="$ENGINE/scripts/agent-eval/parse-run.mjs"
+PARSE="$HARNESS/parse-run.mjs"
 
 command -v claude >/dev/null || { echo "claude CLI not on PATH"; exit 1; }
 [ -d "$TARGET/.codegraph" ] || { echo "target not indexed: run 'codegraph init $TARGET' first"; exit 1; }
@@ -63,6 +82,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "$OUT"
+
+# Sanitized PATH + the absolute-path block, shared with run-all.sh. Sets
+# $ARM_PATH and $ARM_SETTINGS; aborts if either layer fails its own probe.
+. "$HARNESS/no-cli-shim.sh"
+cg_no_cli_setup "$OUT" || exit 1
+
 echo "###### engine=$ENGINE  baseline=$BASE_REF"
 echo "###### changed: $(echo "$CHANGED" | tr '\n' ' ')"
 echo "###### target=$TARGET"
@@ -94,12 +119,16 @@ run_arm() { # label, target-copy — runs the task $RUNS times against one build
     # Re-warm per run: the previous run's daemon is killed below, and a cold
     # attach is exactly the failure this pre-warm exists to prevent.
     prewarm "$tgt"
-    ( cd "$tgt" && CODEGRAPH_NO_PROMPT_HOOK=1 claude -p "$TASK" \
+    ( cd "$tgt" && PATH="$ARM_PATH" CODEGRAPH_NO_PROMPT_HOOK=1 claude -p "$TASK" \
         --output-format stream-json --verbose --permission-mode bypassPermissions \
         --model "${MODEL:-sonnet}" --effort "${EFFORT:-high}" --max-budget-usd 4 --strict-mcp-config --mcp-config "$c" \
+        --settings "$ARM_SETTINGS" \
         </dev/null > "$OUT/run-$label-$i.jsonl" 2>"$OUT/run-$label-$i.err" )
     echo "-- run $i --"
-    node "$PARSE" "$OUT/run-$label-$i.jsonl" 2>&1 | grep -E "by type|Result" || echo "  (parse failed — see $OUT/run-$label-$i.jsonl)"
+    # --brief: tool counts, result, and the three metric blocks, minus the
+    # numbered call transcript (RUNS>=2 is otherwise mostly call listings; the
+    # full sequence is one `parse-run.mjs $OUT/run-$label-$i.jsonl` away).
+    node "$PARSE" --brief "$OUT/run-$label-$i.jsonl" 2>&1 || echo "  (parse failed — see $OUT/run-$label-$i.jsonl)"
     pkill -9 -f "serve --mcp --path $tgt" 2>/dev/null
   done
   echo
@@ -121,5 +150,12 @@ done
 node "$BIN" init "$OUT/t-base" >/dev/null 2>&1 && echo "  indexed t-base"
 run_arm baseline "$OUT/t-base"
 
-echo "###### DONE. Compare the [new] vs [baseline] 'by type' counts above"
-echo "###### (especially Read vs mcp__codegraph__*). Full logs in: $OUT"
+# Both arms, all three metrics, one table. The per-run blocks above say WHY a
+# number moved (which query fell short, which file nothing cited); this says
+# whether it moved at all, with the range across RUNS — never read the median
+# of one run.
+node "$HARNESS/compare-arms.mjs" "$OUT" new baseline 2>&1 || true
+
+echo "###### DONE. Read the ARM COMPARISON above first, then the per-run blocks"
+echo "###### for the queries and files behind any number that moved."
+echo "###### Full logs in: $OUT"
