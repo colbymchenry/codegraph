@@ -9,10 +9,10 @@
 //! is source-order dependent) and extractModifiers (expect/actual platform
 //! modifiers → the node DECORATORS wire field, on every created node — the
 //! KMP synthesizer's input). Preserved on purpose: the FIELD_COUNT-0 dead
-//! cluster (no signatures, ZERO type-annotation refs), hook-consumed property
-//! initializers emitting nothing, the bodiless-class header re-walk asymmetry,
-//! enum-entry bodies being invisible, KDoc (`multiline_comment`) never being
-//! a docstring AND chain-breaking, comment-gluing into import/package extents,
+//! cluster (no signatures, ZERO type-annotation refs), the bodiless-class
+//! header re-walk asymmetry, enum-entry bodies being invisible, KDoc
+//! (`multiline_comment`) never being a docstring AND chain-breaking,
+//! comment-gluing into import/package extents,
 //! `@Anno(args)` emitting nothing while `@Anno` emits decorates, zero
 //! instantiates refs (constructors are capitalized `calls`), the qualified-
 //! receiver `com::qext` bug, the paren-then-lambda `trailing()` garbage
@@ -85,6 +85,34 @@ fn is_js_space(c: char) -> bool {
 }
 fn strip_js_ws(s: &str) -> String {
     s.chars().filter(|c| !is_js_space(*c)).collect()
+}
+
+/// A property's RHS: the named child right after the `=` token, plus a
+/// `property_delegate` (`by lazy { … }`). Everything else a
+/// `property_declaration` can hold is a declaration, not code — modifiers, the
+/// `val`/`var` keyword, the name+type, an extension receiver's type and type
+/// parameters, and `getter`/`setter` — so it stays unwalked. (Go's #693 fix
+/// walks the `value` field for the same reason; this grammar exposes no fields
+/// at all, hence the `=` anchor.)
+fn property_initializers<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let mut out: Vec<Node<'t>> = Vec::new();
+    let mut after_eq = false;
+    for i in 0..node.child_count() {
+        let Some(c) = node.child(i) else { continue };
+        if !c.is_named() {
+            if c.kind() == "=" {
+                after_eq = true;
+            }
+            continue;
+        }
+        if after_eq {
+            out.push(c);
+            after_eq = false;
+        } else if c.kind() == "property_delegate" {
+            out.push(c);
+        }
+    }
+    out
 }
 
 struct Scope {
@@ -641,7 +669,18 @@ impl<'t> Walker<'t> {
         // The `type`-field signature read is dead (zero fields) → signature
         // undefined; NO docstring/visibility/isStatic — the modifiers merge in
         // create_node still decorates expect/actual properties.
-        self.create_node(kind, &name, node, Extra::default());
+        let row = self.create_node(kind, &name, node, Extra::default());
+        // Walk the initializer ATTRIBUTED to the declared symbol (#693, the Go
+        // fix, ported): without this the subtree is only fn-ref-scanned, so a
+        // lambda / SAM / object initializer (`val cb = Runnable { target() }` —
+        // the idiomatic Android callback field) contributed NO call edge at all.
+        if let Some(row) = row {
+            self.stack.push(Scope { row, kind, name: name.clone() });
+            for init in property_initializers(node) {
+                self.visit_function_body(init);
+            }
+            self.stack.pop();
+        }
         true
     }
 

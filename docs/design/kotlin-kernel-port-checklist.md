@@ -278,10 +278,18 @@ Hooks PRESENT (port each exactly):
      but createNode's extractModifiers merge still runs, so `expect val` /
      `actual val` DO get decorators. Return true → the dispatcher runs
      `scanFnRefSubtree(node, 0)` (capture-only, halts at nested
-     function/lambda types) and NEVER descends → **property initializers
-     emit NO calls/instantiates refs anywhere** (`val SHARED = WidgetK(0)`
-     → nothing; `by lazy { compute() }` → nothing, the scan halts at the
-     lambda_literal). Consequences pinned in `extract-torture.txt`.
+     function/lambda types) and never descends on its own. **The hook itself
+     then walks the property's RHS under the property's scope** — the named
+     child after the `=` token plus a `property_delegate` — via
+     `ctx.visitFunctionBody`, so `val SHARED = WidgetK(0)`, `val cb =
+     Runnable { hit() }` and `by lazy { compute() }` all emit their calls
+     FROM the property node (Go's #693 initializer walk, ported). The
+     declaration's own children — modifiers, `val`/`var`, the name+type, an
+     extension receiver's type and type parameters, `getter`/`setter` — are
+     NOT walked: a same-line `val c get() = f()` still emits nothing, a
+     next-line accessor still attributes to the class, and a
+     hook-DECLINED destructuring RHS is still invisible.
+     Consequences pinned in `extract-torture.txt`.
   2. **`lambda_literal` after a fun-interface ERROR (:139-143)** and
   3. **fun-interface misparse recovery (:145-214)** (ERROR/
      function_declaration shapes; `isFunInterfaceNode` :46; Pattern 1 walks
@@ -391,7 +399,7 @@ Hooks ABSENT (the walker must NOT do these): `preParse`, `resolveName`,
 | `anonymous_initializer` (`init { }`) | no branch | recursed → its statements' calls → **`calls` refs FROM THE CLASS node**; its `val` locals → hook 'local' → nothing (pinned: `calls "register" from=class:WidgetK`) |
 | `secondary_constructor` | no branch | **NO constructor node**; recursed → body calls attribute to the CLASS (`calls "log" from=class:WidgetK`); the `constructor_delegation_call`'s value_arguments still feed fn-ref capture |
 | `getter`/`setter` as SIBLINGS (accessor on its own line) | no branch | recursed → accessor-body calls attribute to the CLASS (or file). See §Properties for the sibling/child split |
-| `object_literal` (`object : T { … }` initializer) | no branch anywhere | never a node; see §Body walker for the method-leak quirk |
+| `object_literal` (`object : T { … }` initializer) | no branch anywhere | never a node itself; inside a PROPERTY initializer the hook's walk reaches its `fun`s, which leak out as FUNCTIONS under the property (see §Body walker for the same method-leak quirk) |
 | `file_annotation` (`@file:JvmName("x")`) | no branch | recursed; its value_arguments feed fn-ref capture (string args → nothing). No decorates ref |
 | INSTANTIATION_KINDS (354-361) | **no kotlin member** | extractInstantiation:4610 is **UNREACHABLE** for kotlin — constructor calls `Foo()` are call_expressions → plain `calls` refs named `Foo` (capitalized). Kotlin emits **zero `instantiates` refs**, ever |
 | `impl_item`:1274 / property_signature:1282 / export_statement / swift property:1121 | never | not kotlin node kinds (the swift `property_declaration` branch at 1121-1193 is gated `language === 'swift'` — kotlin property_declarations never enter it) |
@@ -659,7 +667,8 @@ refs — kotlin emits NO instantiates, §dispatch table); backticked
 ### Static-member / value-read refs (4750-4808) — kotlin IS in STATIC_MEMBER_LANGS (345-347)
 
 Called ONLY from the body walker (5218) — top-level/class-scope reads emit
-nothing (hook-consumed property initializers doubly so).
+nothing — EXCEPT a property initializer, which the hook now walks through
+visitFunctionBody under the property's own scope (§Properties).
 `navigation_expression` ∈ MEMBER_ACCESS_TYPES (326). Mechanics:
 
 - callee-of-call skip (4772-4778): parent ∈ callTypes AND parent.namedChild(0)
@@ -850,12 +859,13 @@ unwrap/ungatedModes/addressOfOnly.
 - Capture points: visitNode:990 (top-level/class-scope call args),
   visitFunctionBody:5137, scanFnRefSubtree (hook-consumed property
   subtrees — `val x = register(::f)` captures via the inner
-  value_arguments; **the scan halts at `lambda_literal` (610), so refs
-  inside `by lazy { }`/trailing lambdas under a hook-consumed property are
-  NOT captured**). **NOT captured anywhere: property/local initializer
-  callable refs (`val m = ::caller`, `val bound = w::render`) — kotlin's
-  dispatch has NO property_declaration/varinit key** (unlike SWIFT_SPEC —
-  do not borrow it). Pinned: torture emits exactly three function_refs —
+  value_arguments; **the scan halts at `lambda_literal` (610)**, but the
+  hook's own initializer walk (§Properties) covers the same subtree with the
+  PROPERTY on the stack, so refs inside `by lazy { }`/trailing lambdas are
+  captured there — a shallow `::ref` reachable by BOTH is emitted twice, once
+  from the class and once from the property). **NOT captured anywhere:
+  local initializer callable refs — kotlin's dispatch has NO
+  property_declaration/varinit key** (unlike SWIFT_SPEC — do not borrow it). Pinned: torture emits exactly three function_refs —
   `topLevel` (definedHere), `OtherClass::handle`, `this.caller`.
 - Flush gate (639-728): generated-file skip; `this.`-prefixed +
   `::`-containing candidates always flush; bare names need definedHere
@@ -1039,7 +1049,7 @@ unwrap/ungatedModes/addressOfOnly.
    `Unit` / nullable / lambda return / `: T` generic leak; `expect fun`
    (bodiless + dec) / `actual fun`; tailrec self-call in expression body;
    top-level `val`/`var`/`const val`/`by lazy {}` (constant/variable kinds,
-   NO initializer refs, NO capture inside the delegate lambda) +
+   initializer + delegate refs attributed TO the property) +
    **destructuring (`val (a,b)` → nothing, both scopes)** + next-line-getter
    top-level `val` (getter calls → file/namespace); class with primary ctor
    (props invisible, defaults not walked), class-body val/var/computed

@@ -1940,6 +1940,61 @@ class Bar {
     const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
     expect(cls?.qualifiedName).toBe('Bar');
   });
+
+  describe('property initializers are walked, attributed to the property (#693 for Kotlin)', () => {
+    // The property hook consumes the whole property_declaration subtree, so
+    // before this the initializer was only scanned for function-as-value
+    // candidates and every call inside it vanished from the graph. Android/MSDK
+    // callbacks are declared exactly this way (`private val l = Listener { … }`),
+    // so anything reached only through one looked like it had no callers at all.
+    const code = `
+package repro
+
+class Repro {
+    private val fieldLambda: () -> Unit = { target() }
+    private val samField = Runnable { target() }
+    private val plain = target()
+    private val delegated by lazy { target() }
+    private val anonObject = object : Runnable { override fun run() { target() } }
+
+    fun directCall() { target() }
+    fun lambdaInMethod() { run { target() } }
+
+    private fun target() {}
+}
+
+object Holder {
+    val topLevelLambda: () -> Unit = { hit() }
+    private fun hit() {}
+}
+`;
+    const callersOf = (target: string) => {
+      const result = extractFromSource('Repro.kt', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      return result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === target)
+        .map((u) => byId.get(u.fromNodeId)?.name)
+        .sort();
+    };
+
+    it('a lambda / SAM / plain / delegated / object initializer calls FROM the property', () => {
+      // `run` is the anonymous object's override, extracted as its own node
+      // under `anonObject` — the same shape Go's initializer walk produces.
+      expect(callersOf('target')).toEqual([
+        'delegated',
+        'directCall',
+        'fieldLambda',
+        'lambdaInMethod',
+        'plain',
+        'run',
+        'samField',
+      ]);
+    });
+
+    it('a property in an `object` singleton is a caller too', () => {
+      expect(callersOf('hit')).toEqual(['topLevelLambda']);
+    });
+  });
 });
 
 describe('Dart Extraction', () => {

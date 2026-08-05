@@ -42,6 +42,35 @@ function extractKotlinReturnType(node: SyntaxNode, source: string): string | und
   return undefined;
 }
 
+/**
+ * A property's RHS: the named child right after the `=` token, plus a
+ * `property_delegate` (`by lazy { … }`). Everything else a
+ * `property_declaration` can hold is a declaration, not code — modifiers, the
+ * `val`/`var` keyword, the name+type, an extension receiver's type and type
+ * parameters, and `getter`/`setter` — so it stays unwalked. (Go's #693 fix
+ * walks the `value` field for the same reason; tree-sitter-kotlin exposes no
+ * fields at all, hence the `=` anchor.)
+ */
+function kotlinPropertyInitializers(node: SyntaxNode): SyntaxNode[] {
+  const out: SyntaxNode[] = [];
+  let afterEq = false;
+  for (let i = 0; i < node.childCount; i++) {
+    const c = node.child(i);
+    if (!c) continue;
+    if (!c.isNamed) {
+      if (c.type === '=') afterEq = true;
+      continue;
+    }
+    if (afterEq) {
+      out.push(c);
+      afterEq = false;
+    } else if (c.type === 'property_delegate') {
+      out.push(c);
+    }
+  }
+  return out;
+}
+
 /** Check if a node matches the `fun interface` misparse pattern */
 function isFunInterfaceNode(node: SyntaxNode): boolean {
   let hasFun = false;
@@ -126,7 +155,19 @@ export const kotlinExtractor: LanguageExtractor = {
       const sig = typeNode
         ? `${isVal ? 'val' : 'var'} ${name}: ${getNodeText(typeNode, ctx.source)}`
         : undefined;
-      ctx.createNode(kind, name, node, { signature: sig });
+      const created = ctx.createNode(kind, name, node, { signature: sig });
+      // Walk the initializer ATTRIBUTED to the declared symbol (#693, the Go
+      // fix, ported to Kotlin): the hook consumes this subtree, so without an
+      // explicit walk a lambda / SAM / object initializer
+      // (`private val cb = Runnable { target() }` — the idiomatic Android
+      // callback field) contributed NO call edge at all, and everything reached
+      // only through such a callback looked like it had no callers.
+      const inits = created ? kotlinPropertyInitializers(node) : [];
+      if (created && inits.length > 0) {
+        ctx.pushScope(created.id);
+        for (const init of inits) ctx.visitFunctionBody(init, created.id);
+        ctx.popScope();
+      }
       return true;
     }
 
