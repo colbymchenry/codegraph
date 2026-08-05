@@ -50,6 +50,9 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  verilog: 'tree-sitter-verilog.wasm',
+  tcl: 'tree-sitter-tcl.wasm',
+  vhdl: 'tree-sitter-vhdl.wasm',
 };
 
 /**
@@ -141,6 +144,15 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cu': 'cpp',
   '.cuh': 'cpp',
   '.nix': 'nix',
+  // HDL: SystemVerilog and Verilog
+  '.sv': 'verilog',
+  '.svh': 'verilog',
+  '.v': 'verilog',
+  // Tcl
+  '.tcl': 'tcl',
+  // VHDL
+  '.vhd': 'vhdl',
+  '.vhdl': 'vhdl',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -271,6 +283,17 @@ export async function initGrammars(): Promise<void> {
  * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
  * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
  * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
+ * HDL languages: tree-sitter-wasms doesn't ship SystemVerilog, Tcl, or VHDL;
+ * we vendor WASM files built from their upstream grammars:
+ *   - tree-sitter/tree-sitter-verilog (MIT) — covers IEEE 1800 SystemVerilog
+ *     and IEEE 1364 Verilog; built from the repo's checked-in parser.c with
+ *     tree-sitter-cli `build --wasm`, ABI 14.
+ *   - tree-sitter-grammars/tree-sitter-tcl (MIT) — Tcl/Tk 8.x command
+ *     grammar; built from the repo's checked-in parser.c with
+ *     tree-sitter-cli `build --wasm`, ABI 14.
+ *   - alemuller/tree-sitter-vhdl (MIT) — VHDL-93 through VHDL-2008; built
+ *     from the repo's checked-in parser.c with tree-sitter-cli `build --wasm`,
+ *     ABI 14.
  *
  * TypeScript/TSX/JavaScript (+jsx, which shares the javascript grammar): the
  * tree-sitter-wasms builds are 2023-era (^0.20.x); we vendor wasm built from
@@ -290,7 +313,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix', 'verilog', 'tcl', 'vhdl',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -655,6 +678,9 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    verilog: 'SystemVerilog / Verilog',
+    tcl: 'Tcl',
+    vhdl: 'VHDL',
     unknown: 'Unknown',
   };
   return names[language] || language;
