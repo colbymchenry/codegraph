@@ -209,3 +209,8 @@ fn mount() {
 }
 
 routes![top_level_h];
+
+// Initializer walks attributed to the declared symbol (#693).
+const INIT_CONST: usize = compute_len();
+static INIT_LAZY: Lazy<Cfg> = Lazy::new(|| build_cfg());
+static INIT_ALIAS: fn() = free_fn;

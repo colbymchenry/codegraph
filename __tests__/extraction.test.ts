@@ -1210,6 +1210,26 @@ impl Counter {
     );
     expect(implRefs).toHaveLength(0);
   });
+
+  it('walks a const/static initializer scoped to the declared symbol (#693 for Rust)', () => {
+    // The declaration minted a node and stopped, so a handler table, a
+    // lazily-built singleton or any computed const linked to nothing.
+    const code = `
+const LEN: usize = compute_len();
+static REGISTRY: Lazy<Cfg> = Lazy::new(|| build_cfg());
+`;
+    const result = extractFromSource('lib.rs', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const owner = (name: string) => {
+      const u = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === name
+      );
+      const n = u ? byId.get(u.fromNodeId) : undefined;
+      return n ? `${n.kind}:${n.name}` : undefined;
+    };
+    expect(owner('compute_len')).toBe('variable:LEN');
+    expect(owner('build_cfg')).toBe('variable:REGISTRY');
+  });
 });
 
 describe('Java Extraction', () => {

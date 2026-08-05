@@ -2889,6 +2889,8 @@ export class TreeSitterExtractor {
     } else {
       // Generic fallback for other languages
       // Try to find identifier children
+      const nameField = getChildByField(node, 'name');
+      let declared: Node | null = null;
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child?.type === 'identifier' || child?.type === 'variable_declarator') {
@@ -2897,11 +2899,28 @@ export class TreeSitterExtractor {
             : extractName(child, this.source, this.extractor);
 
           if (name && name !== '<anonymous>') {
-            this.createNode(kind, name, child, {
+            const created = this.createNode(kind, name, child, {
               docstring,
               isExported,
             });
+            if (created && nameField && child.startIndex === nameField.startIndex) {
+              declared = created;
+            }
           }
+        }
+      }
+      // Walk the initializer ATTRIBUTED to the declared symbol (#693). Rust
+      // only for now: `const N: usize = compute()` and
+      // `static REGISTRY: Lazy<T> = Lazy::new(|| build())` dropped every call
+      // inside the initializer, so a handler table or a lazily-built singleton
+      // linked to nothing. The other languages sharing this fallback spell
+      // their initializer differently and get their own turn.
+      if (this.language === 'rust') {
+        const valueNode = getChildByField(node, 'value');
+        if (valueNode) {
+          if (declared) this.nodeStack.push(declared.id);
+          this.visitFunctionBody(valueNode, '');
+          if (declared) this.nodeStack.pop();
         }
       }
     }
