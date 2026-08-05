@@ -2062,11 +2062,11 @@ object Holder {
       expect(callersOf('hit')).toEqual(['topLevelLambda']);
     });
 
-    it('a same-line accessor body is walked too; a next-line one still is not', () => {
-      // `val x: T get() = …` nests the accessor UNDER the declaration, so the
-      // hook consumed it and its calls vanished. Written on its own line the
-      // accessor parses as a SIBLING of the property — out of reach from here,
-      // and still attributed to the enclosing class as before.
+    it('an accessor body belongs to its property, written on either line', () => {
+      // `val x: T get() = …` nests the accessor UNDER the declaration; written
+      // on its own line the grammar makes it a following SIBLING instead. Both
+      // used to lose their calls (the nested one) or hand them to the enclosing
+      // class (the sibling); both now attribute to the property.
       const src = `
 package p
 
@@ -2074,19 +2074,51 @@ class C {
     val sameLine: Int get() = compute()
     val nextLine: Int
         get() = compute()
+    var written: Int = 0
+        set(v) { store(v) }
     private fun compute(): Int = 1
+    private fun store(v: Int) {}
 }
 `;
       const result = extractFromSource('C.kt', src);
       const byId = new Map(result.nodes.map((n) => [n.id, n]));
-      const owners = result.unresolvedReferences
-        .filter((u) => u.referenceKind === 'calls' && u.referenceName === 'compute')
-        .map((u) => {
-          const n = byId.get(u.fromNodeId);
-          return n ? `${n.kind}:${n.name}` : '?';
-        })
-        .sort();
-      expect(owners).toEqual(['class:C', 'field:sameLine']);
+      const ownersOf = (name: string) =>
+        result.unresolvedReferences
+          .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+          .map((u) => {
+            const n = byId.get(u.fromNodeId);
+            return n ? `${n.kind}:${n.name}` : '?';
+          })
+          .sort();
+      expect(ownersOf('compute')).toEqual(['field:nextLine', 'field:sameLine']);
+      expect(ownersOf('store')).toEqual(['field:written']);
+    });
+
+    it('an `init` block and a destructuring RHS no longer vanish', () => {
+      // Both mint no symbol of their own, so the hook consumed them and their
+      // code disappeared entirely; they now attribute to the enclosing scope.
+      const src = `
+package p
+
+class C {
+    init { val q = initCall() }
+    val (a, b) = makePair()
+}
+
+val (t1, t2) = topMakePair()
+`;
+      const result = extractFromSource('C.kt', src);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const owner = (name: string) => {
+        const u = result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'calls' && r.referenceName === name
+        );
+        const n = u ? byId.get(u.fromNodeId) : undefined;
+        return n ? `${n.kind}:${n.name}` : undefined;
+      };
+      expect(owner('initCall')).toBe('class:C');
+      expect(owner('makePair')).toBe('class:C');
+      expect(owner('topMakePair')).toBe('namespace:p');
     });
   });
 });

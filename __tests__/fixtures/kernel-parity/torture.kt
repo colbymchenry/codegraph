@@ -278,3 +278,14 @@ class AccessorK {
     var sameLinePair: Int get() = compute()
         set(v) { draw(v) }
 }
+
+class SiblingAccessorK {
+    var nextLine: Int = 0
+        get() = compute()
+        set(v) { draw(v) }
+    val (localA, localB) = makePair()
+    init {
+        val fromInit = compute()
+        register(fromInit)
+    }
+}
