@@ -56,11 +56,52 @@ export const tclExtractor: LanguageExtractor = {
     return firstLine.length > 120 ? firstLine.substring(0, 120) + '…' : firstLine;
   },
 
-  extractImport(node: SyntaxNode, source: string) {
-    if (node.type !== 'command') return null;
-    const nameChild = node.namedChild(0);
-    if (!nameChild || source.substring(nameChild.startIndex, nameChild.endIndex) !== 'source')
-      return null;
+  visitNode(node: SyntaxNode, ctx: import('../tree-sitter-types').ExtractorContext): boolean {
+    if (node.type === 'command') {
+      const nameChild = node.namedChild(0);
+      if (!nameChild) return false;
+      const cmd = ctx.source.substring(nameChild.startIndex, nameChild.endIndex);
+      if (cmd !== 'source') return false;
+
+      const wl = node.namedChild(1);
+      const fileArg = wl?.namedChild(0);
+      if (!fileArg) return true;
+
+      const filename = ctx.source
+        .substring(fileArg.startIndex, fileArg.endIndex)
+        .replace(/^["'{]|['"}\]]+$/g, '');
+
+      ctx.createNode('import', filename, node, { signature: `source ${filename}` });
+
+      const parentId = ctx.nodeStack[ctx.nodeStack.length - 1];
+      if (parentId && filename) {
+        ctx.addUnresolvedReference({
+          fromNodeId: parentId,
+          referenceName: filename,
+          referenceKind: 'imports',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return true;
+    }
+
+    if (node.type === 'set') {
+      const id = node.namedChild(0);
+      if (id && id.type === 'id') {
+        const name = ctx.source.substring(id.startIndex, id.endIndex);
+        ctx.createNode('variable', name, node, { signature: `set ${name}` });
+      }
+      // Preserve call extraction from `set` values (default variable extraction would skip children).
+      for (let i = 1; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child) ctx.visitNode(child);
+      }
+      return true;
+    }
+
+    return false;
+  },
     // `source filename` — word list is the second child.
     const wl = node.namedChild(1);
     if (!wl) return null;
