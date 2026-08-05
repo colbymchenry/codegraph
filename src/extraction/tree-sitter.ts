@@ -2739,6 +2739,7 @@ export class TreeSitterExtractor {
 
       // Ruby constant assignments (`MAX = 3`) have a `constant`-typed LHS, not
       // `identifier`; without this they were never extracted as symbols at all.
+      let assigned: Node | null = null;
       if (left && (left.type === 'identifier' || left.type === 'constant')) {
         const name = getNodeText(left, this.source);
         // Skip if name starts with lowercase and looks like a function call result
@@ -2746,10 +2747,22 @@ export class TreeSitterExtractor {
         const initValue = right ? getNodeText(right, this.source).slice(0, 100) : undefined;
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
-        this.createNode(kind, name, node, {
+        assigned = this.createNode(kind, name, node, {
           docstring,
           signature: initSignature,
         });
+      }
+      // Walk the initializer ATTRIBUTED to the assigned name (#693). A
+      // module-level `app = FastAPI()` / `ENGINE = create_engine(url)` /
+      // `handler = lambda: run()` dropped every call on the right-hand side, so
+      // whatever the module builds at import time linked to nothing. A tuple
+      // target (`a, b = f(), g()`) mints no symbol, so its RHS is walked at the
+      // enclosing scope rather than lost. Python only: Ruby shares this branch
+      // and gets its own turn.
+      if (this.language === 'python' && right) {
+        if (assigned) this.nodeStack.push(assigned.id);
+        this.visitFunctionBody(right, '');
+        if (assigned) this.nodeStack.pop();
       }
     } else if (this.language === 'go') {
       // Go: var_declaration, short_var_declaration, const_declaration

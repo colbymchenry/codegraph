@@ -1055,6 +1055,42 @@ class UserService:
     expect(classNode).toBeDefined();
     expect(classNode?.name).toBe('UserService');
   });
+
+  it('walks a module-level assignment initializer scoped to the name (#693 for Python)', () => {
+    // The assignment minted a node and stopped, so everything a module builds
+    // at import time — `app = FastAPI()`, `ENGINE = create_engine(url)` — was
+    // missing from the graph. A tuple target mints no symbol, so its
+    // right-hand side attributes to the enclosing scope instead of vanishing.
+    const code = `
+def target(): pass
+def compute(): return 1
+
+APP = compute()
+handler = lambda: target()
+MAPPING = {"a": compute()}
+first, second = compute(), target()
+
+class K:
+    ATTR = compute()
+`;
+    const result = extractFromSource('app.py', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const owners = result.unresolvedReferences
+      .filter((u) => u.referenceKind === 'calls')
+      .map((u) => {
+        const n = byId.get(u.fromNodeId);
+        return `${u.referenceName}<-${n ? `${n.kind}:${n.name}` : '?'}`;
+      })
+      .sort();
+    expect(owners).toEqual([
+      'compute<-class:K', // a class attribute still rides the class (no node of its own)
+      'compute<-file:app.py', // the tuple target mints nothing
+      'compute<-variable:APP',
+      'compute<-variable:MAPPING',
+      'target<-file:app.py',
+      'target<-variable:handler',
+    ]);
+  });
 });
 
 describe('Go Extraction', () => {
