@@ -87,13 +87,15 @@ fn strip_js_ws(s: &str) -> String {
     s.chars().filter(|c| !is_js_space(*c)).collect()
 }
 
-/// A property's RHS: the named child right after the `=` token, plus a
-/// `property_delegate` (`by lazy { … }`). Everything else a
-/// `property_declaration` can hold is a declaration, not code — modifiers, the
-/// `val`/`var` keyword, the name+type, an extension receiver's type and type
-/// parameters, and `getter`/`setter` — so it stays unwalked. (Go's #693 fix
-/// walks the `value` field for the same reason; this grammar exposes no fields
-/// at all, hence the `=` anchor.)
+/// A property's CODE children: the named child right after the `=` token, a
+/// `property_delegate` (`by lazy { … }`), and an accessor the grammar nested
+/// under the declaration (`val x: Int get() = compute()` — written on ONE line;
+/// an accessor on its own line parses as a SIBLING of the property and is not
+/// reachable from here). What stays unwalked is the declaration itself —
+/// modifiers, the `val`/`var` keyword, the name+type, and an extension
+/// receiver's type and type parameters. (Go's #693 fix walks the `value` field
+/// for the same reason; this grammar exposes no fields at all, hence the `=`
+/// anchor.)
 fn property_initializers<'t>(node: Node<'t>) -> Vec<Node<'t>> {
     let mut out: Vec<Node<'t>> = Vec::new();
     let mut after_eq = false;
@@ -108,7 +110,7 @@ fn property_initializers<'t>(node: Node<'t>) -> Vec<Node<'t>> {
         if after_eq {
             out.push(c);
             after_eq = false;
-        } else if c.kind() == "property_delegate" {
+        } else if matches!(c.kind(), "property_delegate" | "getter" | "setter") {
             out.push(c);
         }
     }

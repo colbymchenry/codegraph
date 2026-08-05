@@ -43,13 +43,15 @@ function extractKotlinReturnType(node: SyntaxNode, source: string): string | und
 }
 
 /**
- * A property's RHS: the named child right after the `=` token, plus a
- * `property_delegate` (`by lazy { … }`). Everything else a
- * `property_declaration` can hold is a declaration, not code — modifiers, the
- * `val`/`var` keyword, the name+type, an extension receiver's type and type
- * parameters, and `getter`/`setter` — so it stays unwalked. (Go's #693 fix
- * walks the `value` field for the same reason; tree-sitter-kotlin exposes no
- * fields at all, hence the `=` anchor.)
+ * A property's CODE children: the named child right after the `=` token, a
+ * `property_delegate` (`by lazy { … }`), and an accessor the grammar nested
+ * under the declaration (`val x: Int get() = compute()` — written on ONE line;
+ * an accessor on its own line parses as a SIBLING of the property and is not
+ * reachable from here). What stays unwalked is the declaration itself —
+ * modifiers, the `val`/`var` keyword, the name+type, and an extension
+ * receiver's type and type parameters. (Go's #693 fix walks the `value` field
+ * for the same reason; tree-sitter-kotlin exposes no fields at all, hence the
+ * `=` anchor.)
  */
 function kotlinPropertyInitializers(node: SyntaxNode): SyntaxNode[] {
   const out: SyntaxNode[] = [];
@@ -64,7 +66,7 @@ function kotlinPropertyInitializers(node: SyntaxNode): SyntaxNode[] {
     if (afterEq) {
       out.push(c);
       afterEq = false;
-    } else if (c.type === 'property_delegate') {
+    } else if (c.type === 'property_delegate' || c.type === 'getter' || c.type === 'setter') {
       out.push(c);
     }
   }

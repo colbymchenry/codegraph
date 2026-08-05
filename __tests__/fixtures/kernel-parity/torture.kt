@@ -272,3 +272,9 @@ fun labeledLambda() {
 }
 
 fun whereClause(): Int where Int : Comparable<Int> = 1
+
+class AccessorK {
+    val sameLineGetter: Int get() = compute()
+    var sameLinePair: Int get() = compute()
+        set(v) { draw(v) }
+}

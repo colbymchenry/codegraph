@@ -2061,6 +2061,33 @@ object Holder {
     it('a property in an `object` singleton is a caller too', () => {
       expect(callersOf('hit')).toEqual(['topLevelLambda']);
     });
+
+    it('a same-line accessor body is walked too; a next-line one still is not', () => {
+      // `val x: T get() = …` nests the accessor UNDER the declaration, so the
+      // hook consumed it and its calls vanished. Written on its own line the
+      // accessor parses as a SIBLING of the property — out of reach from here,
+      // and still attributed to the enclosing class as before.
+      const src = `
+package p
+
+class C {
+    val sameLine: Int get() = compute()
+    val nextLine: Int
+        get() = compute()
+    private fun compute(): Int = 1
+}
+`;
+      const result = extractFromSource('C.kt', src);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const owners = result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === 'compute')
+        .map((u) => {
+          const n = byId.get(u.fromNodeId);
+          return n ? `${n.kind}:${n.name}` : '?';
+        })
+        .sort();
+      expect(owners).toEqual(['class:C', 'field:sameLine']);
+    });
   });
 });
 
