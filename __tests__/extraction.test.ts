@@ -150,6 +150,11 @@ describe('Language Detection', () => {
     expect(isSourceFile('default.nix')).toBe(true);
   });
 
+  it('should detect Odin files', () => {
+    expect(detectLanguage('src/artifact/sidecar.odin')).toBe('odin');
+    expect(isSourceFile('src/artifact/sidecar.odin')).toBe(true);
+  });
+
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
     // Lean Unreal-Engine style header: the class is annotated with an export
     // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
@@ -205,6 +210,7 @@ describe('Language Support', () => {
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
     expect(languages).toContain('nix');
+    expect(languages).toContain('odin');
   });
 });
 
@@ -11461,5 +11467,561 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(result.errors).toEqual([]);
     expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
+  });
+});
+
+describe('Odin Extraction', () => {
+  // Real-shaped Odin: everything is declared with `::`, attributes sit ABOVE
+  // the name, procedures are all top-level, and a package is the directory.
+  const code = `#+vet
+package artifact
+
+import "core:fmt"
+import "core:os"
+import st "core:strings"
+import "../shared"
+foreign import kernel32 "system:kernel32.lib"
+
+MAX_DIGITS :: 12
+DEFAULT_NAME := "sidecar"
+
+Handle :: distinct u32
+Callback :: proc(x: int) -> bool
+
+Sidecar :: struct {
+	path:            string,
+	source_modified: i64,
+	digest:          Handle,
+}
+
+Fault :: enum u8 {
+	None,
+	Unreadable,
+	Path_Not_Ascii,
+}
+
+Value :: union {
+	string,
+	i64,
+}
+
+Flags :: bit_field u8 {
+	visible: bool | 1,
+	level:   u8   | 3,
+}
+
+@(require_results)
+sidecar_read :: proc(path: string) -> (Sidecar, bool) {
+	s: Sidecar
+	fmt.eprintln("reading", path)
+	s.path = st.clone(path)
+	shared.record(s.path)
+	if !sidecar_valid(&s) {
+		return s, false
+	}
+	return s, true
+}
+
+@(private)
+@(require_results)
+sidecar_write :: proc(s: ^Sidecar) -> Fault {
+	return .None
+}
+
+sidecar_valid :: proc "contextless" (s: ^Sidecar) -> bool {
+	return s.path != ""
+}
+
+sidecar_of :: proc {
+	sidecar_of_path,
+	sidecar_of_handle,
+}
+
+sidecar_of_path :: proc(path: string) -> Sidecar {return Sidecar{path = path}}
+sidecar_of_handle :: proc(h: Handle) -> Sidecar {return Sidecar{digest = h}}
+
+@(test)
+reads_a_sidecar :: proc(t: ^testing.T) {
+	_, ok := sidecar_read("a.json")
+	testing.expect(t, ok)
+}
+
+foreign kernel32 {
+	GetLastError :: proc() -> u32 ---
+}
+
+when ODIN_OS == .Windows {
+	platform_name :: proc() -> string {
+		return "windows"
+	}
+
+	PLATFORM :: "windows"
+}
+`;
+
+  describe('Language detection', () => {
+    it('should detect Odin files', () => {
+      expect(detectLanguage('src/artifact/sidecar.odin')).toBe('odin');
+      expect(isSourceFile('src/artifact/sidecar.odin')).toBe(true);
+    });
+
+    it('should report Odin as supported', () => {
+      expect(isLanguageSupported('odin')).toBe(true);
+      expect(getSupportedLanguages()).toContain('odin');
+    });
+  });
+
+  describe('Procedure extraction', () => {
+    it('should name a procedure by its identifier, not by its attributes', () => {
+      // `@(require_results)` / `@(private)` / `@(test)` are the FIRST named child
+      // of a decorated declaration, so a firstNamedChild name walk names most of
+      // an idiomatic Odin file "@(require_results)".
+      const result = extractFromSource('sidecar.odin', code);
+      const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(names).toContain('sidecar_read');
+      expect(names).toContain('sidecar_write');
+      expect(names).toContain('reads_a_sidecar');
+      expect(names.some((n) => n.startsWith('@'))).toBe(false);
+    });
+
+    it('should capture signatures including the calling convention', () => {
+      const result = extractFromSource('sidecar.odin', code);
+      const read = result.nodes.find((n) => n.kind === 'function' && n.name === 'sidecar_read');
+      expect(read?.language).toBe('odin');
+      expect(read?.signature).toBe('proc(path: string) -> (Sidecar, bool)');
+      const valid = result.nodes.find((n) => n.kind === 'function' && n.name === 'sidecar_valid');
+      expect(valid?.signature).toContain('"contextless"');
+    });
+
+    it('should read visibility from @(private) and modifiers from every attribute', () => {
+      const result = extractFromSource('sidecar.odin', code);
+      const write = result.nodes.find((n) => n.kind === 'function' && n.name === 'sidecar_write');
+      expect(write?.visibility).toBe('private');
+      expect(write?.isExported).toBe(false);
+      expect(write?.decorators).toEqual(expect.arrayContaining(['private', 'require_results']));
+      const read = result.nodes.find((n) => n.kind === 'function' && n.name === 'sidecar_read');
+      expect(read?.visibility).toBe('public');
+      const test = result.nodes.find((n) => n.kind === 'function' && n.name === 'reads_a_sidecar');
+      expect(test?.decorators).toContain('test');
+    });
+
+    it('should extract a procedure GROUP and link it to its overloads', () => {
+      const result = extractFromSource('sidecar.odin', code);
+      const group = result.nodes.find((n) => n.kind === 'function' && n.name === 'sidecar_of');
+      expect(group).toBeDefined();
+      expect(group?.signature).toContain('sidecar_of_path');
+      const refs = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'references' && r.fromNodeId === group?.id
+      );
+      expect(refs.map((r) => r.referenceName)).toEqual(['sidecar_of_path', 'sidecar_of_handle']);
+    });
+
+    it('should extract a foreign-block FFI procedure and a when-block procedure', () => {
+      const result = extractFromSource('sidecar.odin', code);
+      // Bodiless, inside `foreign kernel32 { … }` — still a real callable.
+      expect(result.nodes.find((n) => n.kind === 'function' && n.name === 'GetLastError')).toBeDefined();
+      // Declarations inside a top-level `when` are ordinary declarations.
+      expect(result.nodes.find((n) => n.kind === 'function' && n.name === 'platform_name')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'PLATFORM')).toBeDefined();
+    });
+  });
+
+  describe('Type declaration extraction', () => {
+    it('should extract struct fields with their declared types', () => {
+      const result = extractFromSource('sidecar.odin', code);
+      const struct = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Sidecar');
+      expect(struct).toBeDefined();
+      const fields = result.nodes.filter((n) => n.kind === 'field');
+      expect(fields.map((f) => f.name)).toEqual(
+        expect.arrayContaining(['path', 'source_modified', 'digest', 'visible', 'level'])
+      );
+      expect(fields.find((f) => f.name === 'digest')?.signature).toBe('digest: Handle');
+      // The field's declared type is a dependency of the record.
+      expect(
+        result.unresolvedReferences.some(
+          (r) =>
+            r.referenceKind === 'references' &&
+            r.referenceName === 'Handle' &&
+            r.fromNodeId === struct?.id
+        )
+      ).toBe(true);
+    });
+
+    it('should extract enum members WITHOUT minting one named after the enum', () => {
+      // The enum's own name is an `identifier` child exactly like its members
+      // are, and the backing type (`u8`) sits between them.
+      const result = extractFromSource('sidecar.odin', code);
+      expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'Fault')).toBeDefined();
+      const members = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+      expect(members).toEqual(['None', 'Unreadable', 'Path_Not_Ascii']);
+    });
+
+    it('should extract a union as a struct referencing its variants', () => {
+      const result = extractFromSource('sidecar.odin', code);
+      const union = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Value');
+      expect(union).toBeDefined();
+      const variants = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'references' && r.fromNodeId === union?.id)
+        .map((r) => r.referenceName);
+      expect(variants).toEqual(['string', 'i64']);
+    });
+
+    it('should split type aliases out of `::` constants', () => {
+      const result = extractFromSource('sidecar.odin', code);
+      // `Handle :: distinct u32` and `Callback :: proc(...) -> bool` are types…
+      const aliases = result.nodes.filter((n) => n.kind === 'type_alias');
+      expect(aliases.map((n) => n.name)).toEqual(['Handle', 'Callback']);
+      expect(aliases.find((n) => n.name === 'Handle')?.signature).toBe('distinct u32');
+      // …while `MAX_DIGITS :: 12` stays a constant and `:=` stays a variable.
+      expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'MAX_DIGITS')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'DEFAULT_NAME')).toBeDefined();
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should extract collection, relative, aliased and foreign imports', () => {
+      const result = extractFromSource('sidecar.odin', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toEqual([
+        'core:fmt',
+        'core:os',
+        'core:strings',
+        '../shared',
+        'system:kernel32.lib',
+      ]);
+      // The alias is not the module — `import st "core:strings"` imports strings.
+      const aliased = result.nodes.find((n) => n.kind === 'import' && n.name === 'core:strings');
+      expect(aliased?.signature).toBe('import st "core:strings"');
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'imports')).toHaveLength(5);
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should keep the package qualifier on a qualified call', () => {
+      // `fmt.eprintln(x)` parses as member_expression(identifier, call_expression)
+      // — the qualifier is a SIBLING of the call, so the generic callee path
+      // would emit a bare `eprintln` that links to any same-named local.
+      const result = extractFromSource('sidecar.odin', code);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('fmt::eprintln');
+      expect(calls).toContain('st::clone');
+      expect(calls).toContain('shared::record');
+      expect(calls).not.toContain('eprintln');
+    });
+
+    it('should emit a bare name for a same-package call and attribute it to the caller', () => {
+      const result = extractFromSource('sidecar.odin', code);
+      const caller = result.nodes.find((n) => n.kind === 'function' && n.name === 'sidecar_read');
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'sidecar_valid'
+      );
+      expect(call).toBeDefined();
+      expect(call?.fromNodeId).toBe(caller?.id);
+    });
+
+    it('should NOT emit a call ref for an unqualified builtin', () => {
+      // `len`/`append`/`make`/`max` are `base:builtin` — spelled exactly like a
+      // call of your own, so emitting them name-matches any same-named symbol
+      // anywhere, INCLUDING a struct field (`calls … -> Ring::len [field]`) and
+      // a package that is never imported.
+      const src = `package app
+
+use_it :: proc(xs: []int) -> int {
+	ys := make([]int, 4)
+	append(&ys, 1)
+	clear(&ys)
+	return len(xs) + cap(ys) + max(1, 2) + size_of(int)
+}
+`;
+      const result = extractFromSource('a.odin', src);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toEqual([]);
+    });
+
+    it('should still emit a QUALIFIED call whose member shares a builtin name', () => {
+      // Only the bare form is a builtin — `slice.max(xs)` is somebody's `max`.
+      const src = `package app
+
+f :: proc(xs: []int) -> int {
+	return slice.max(xs)
+}
+`;
+      const result = extractFromSource('a.odin', src);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toEqual(['slice::max']);
+    });
+
+    it('should NOT read a `->` receiver as a package qualifier', () => {
+      // `h->run()` is selector_call_expression(function: `h`, call_expression),
+      // the same shape a qualified call has — but `h` is a receiver VARIABLE.
+      // Emitted as `h::run` it is byte-identical to a cross-package call, so a
+      // receiver named after a repo package mints exactly the wrong edge the
+      // qualifier exists to prevent.
+      const src = `package app
+
+Sink :: struct {
+	run: proc(n: int),
+}
+
+use_it :: proc(h: ^Sink) {
+	h->run(1)
+	sink.run(2)
+}
+`;
+      const result = extractFromSource('a.odin', src);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('run');
+      expect(calls).not.toContain('h::run');
+      // The genuine package qualifier is untouched.
+      expect(calls).toContain('sink::run');
+    });
+
+    it('should read the callee THROUGH a compiler directive, and emit none for a bare one', () => {
+      // A directive is a `function`-field child of the call and it comes FIRST:
+      // `#force_inline f()` has two (tag, identifier) and `#assert(x)` has only
+      // the tag. Reading the first named `#force_inline` as the callee, lost the
+      // real one, and filed `#assert` as a call to a symbol nothing can declare.
+      const src = `package app
+
+MAX_DIGITS :: 12
+#assert(MAX_DIGITS < 19)
+BLOB :: #load("data.bin")
+
+target :: proc() {}
+
+f :: proc() {
+	#force_inline target()
+	#no_bounds_check target()
+}
+`;
+      const result = extractFromSource('a.odin', src);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toEqual(['target', 'target']);
+      expect(calls.some((n) => n.startsWith('#'))).toBe(false);
+    });
+  });
+
+  describe('Composite literals', () => {
+    it('should link an enumerated-array table to the enum it keys on', () => {
+      // `[Fault]string{…}` is the compiler's exhaustiveness guard: add a member
+      // to `Fault` and the build fails until the table grows a row. So the table
+      // is the declaration that MUST change with the enum, and it was the one
+      // declaration that did not name it — outdeg 0 on every table in a repo
+      // built around them.
+      const src = `package app
+
+Fault :: enum u8 {
+	None,
+	Broken,
+}
+
+Facts :: struct {
+	label: string,
+}
+
+FAULT := [Fault]string {
+	.None   = "",
+	.Broken = "broken",
+}
+
+TABLE :: [Fault]Facts {
+	.None   = {label = ""},
+	.Broken = {label = "broken"},
+}
+
+None :: proc() -> int {return 0}
+`;
+      const result = extractFromSource('a.odin', src);
+      const refsOf = (name: string) => {
+        const owner = result.nodes.find((n) => n.name === name);
+        return result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'references' && r.fromNodeId === owner?.id)
+          .map((r) => r.referenceName);
+      };
+      expect(refsOf('FAULT')).toEqual(['Fault', 'string']);
+      expect(refsOf('TABLE')).toEqual(['Fault', 'Facts']);
+      // `.None` is an enum MEMBER in the literal's data, not a type — taking it
+      // would link the table to the same-named procedure below.
+      expect(refsOf('FAULT')).not.toContain('None');
+      expect(refsOf('TABLE')).not.toContain('None');
+    });
+
+    it('should link a record, map and slice literal to their element types', () => {
+      const src = `package app
+
+A := Sidecar{path = "x"}
+B := [dynamic]Sidecar{}
+C := map[string]Sidecar{}
+D := []Sidecar{}
+`;
+      const result = extractFromSource('a.odin', src);
+      const refsOf = (name: string) => {
+        const owner = result.nodes.find((n) => n.name === name);
+        return result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'references' && r.fromNodeId === owner?.id)
+          .map((r) => r.referenceName);
+      };
+      expect(refsOf('A')).toEqual(['Sidecar']);
+      expect(refsOf('B')).toEqual(['Sidecar']);
+      expect(refsOf('C')).toEqual(['string', 'Sidecar']);
+      expect(refsOf('D')).toEqual(['Sidecar']);
+    });
+  });
+
+  describe('Multi-name declarations', () => {
+    it('should index EVERY name in a comma-separated declaration, with its own value', () => {
+      // `A, B :: 1, 2` and `x, y: int = 3, 4` are ONE declaration node each,
+      // with the names as a leading run — taking only the first dropped B and
+      // y entirely, and `at(-1)` gave A the value of B.
+      const src = `package sample
+
+A, B :: 1, 2
+x, y: int = 3, 4
+g: Registry
+`;
+      const result = extractFromSource('s.odin', src);
+      const named = (name: string) => result.nodes.find((n) => n.name === name);
+      expect(named('A')?.kind).toBe('constant');
+      expect(named('A')?.signature).toBe('= 1');
+      expect(named('B')?.kind).toBe('constant');
+      expect(named('B')?.signature).toBe('= 2');
+      expect(named('x')?.signature).toBe(': int = 3');
+      expect(named('y')?.signature).toBe(': int = 4');
+      // A trailing `type` child is the declared TYPE, not an initializer.
+      expect(named('g')?.kind).toBe('variable');
+      expect(named('g')?.signature).toBe(': Registry');
+    });
+
+    it('should not mistake `Alias :: Other` for a two-name declaration', () => {
+      // The comma is what bounds the name run: `Other` follows a `::`.
+      const src = `package sample
+
+Alias :: Other
+Handle :: SOME_CONST
+`;
+      const result = extractFromSource('s.odin', src);
+      expect(
+        result.nodes.filter((n) => n.kind === 'constant' || n.kind === 'variable').map((n) => n.name)
+      ).toEqual(['Alias', 'Handle']);
+    });
+
+    it('should attribute an initializer call to the name it initializes', () => {
+      const src = `package sample
+
+Table, Index := build_table(), build_index()
+`;
+      const result = extractFromSource('s.odin', src);
+      const table = result.nodes.find((n) => n.name === 'Table');
+      const index = result.nodes.find((n) => n.name === 'Index');
+      const callOf = (name: string) =>
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'calls' && r.referenceName === name
+        );
+      expect(callOf('build_table')?.fromNodeId).toBe(table?.id);
+      expect(callOf('build_index')?.fromNodeId).toBe(index?.id);
+    });
+  });
+
+  describe('Type references', () => {
+    it('should not leak a nested anonymous struct or inline enum binding as a type ref', () => {
+      // The nested members are BINDINGS, never type names — emitted, they made
+      // the record depend on same-named procedures it has no relation to.
+      const src = `package pkg
+
+Config :: struct {
+	inner: struct {
+		parse:  int,
+		render: bool,
+	},
+	mode: enum {
+		Fast,
+		Slow,
+	},
+	flags: bit_field u8 {
+		lo: bool | 1,
+	},
+	next: ^Node,
+}
+
+parse :: proc() -> int {return 1}
+render :: proc() -> bool {return true}
+`;
+      const result = extractFromSource('c.odin', src);
+      const config = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Config');
+      const refs = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'references' && r.fromNodeId === config?.id)
+        .map((r) => r.referenceName);
+      expect(refs).not.toContain('parse');
+      expect(refs).not.toContain('render');
+      expect(refs).not.toContain('Fast');
+      expect(refs).not.toContain('Slow');
+      expect(refs).not.toContain('lo');
+      // …while the declared TYPES inside the same nesting still emit.
+      expect(refs).toContain('Node');
+      // The nested members are still indexed as fields of the record.
+      expect(result.nodes.filter((n) => n.kind === 'field').map((n) => n.name)).toEqual(
+        expect.arrayContaining(['inner', 'mode', 'flags', 'next'])
+      );
+    });
+
+    it('should not leak a parameter or named-return binding, including a comma run', () => {
+      const src = `package pkg
+
+Cb :: proc(p, q: int, r: Thing) -> (ok: bool, err: Fault)
+`;
+      const result = extractFromSource('c.odin', src);
+      const alias = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Cb');
+      const refs = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'references' && r.fromNodeId === alias?.id)
+        .map((r) => r.referenceName);
+      expect(refs).toEqual(['int', 'Thing', 'bool', 'Fault']);
+    });
+  });
+
+  describe('Return types', () => {
+    it('should read a NAMED return tuple and a QUALIFIED return type', () => {
+      // A named tuple holds `named_type` children rather than `type` ones, and
+      // a qualified type is a `field_type` — 150 of transcibr's 342 returning
+      // procedures are one shape or the other.
+      const src = `package pkg
+
+read_sidecar :: proc(text: string) -> (s: Sidecar, ok: bool) {return}
+not_a_sidecar :: proc(s: Sidecar) -> (Sidecar, bool) {return}
+note_node :: proc(x: int) -> ^ast.Visitor {return nil}
+plain :: proc() -> ^Sidecar {return nil}
+qual :: proc() -> transcript.Render_Context {return {}}
+bare :: proc() -> bool {return true}
+`;
+      const result = extractFromSource('r.odin', src);
+      const ret = (name: string) =>
+        result.nodes.find((n) => n.kind === 'function' && n.name === name)?.returnType;
+      expect(ret('read_sidecar')).toBe('Sidecar');
+      expect(ret('not_a_sidecar')).toBe('Sidecar');
+      expect(ret('note_node')).toBe('Visitor');
+      expect(ret('plain')).toBe('Sidecar');
+      expect(ret('qual')).toBe('Render_Context');
+      expect(ret('bare')).toBe('bool');
+    });
+  });
+
+  describe('Package scoping', () => {
+    it('should qualify every top-level symbol with its package', () => {
+      const result = extractFromSource('sidecar.odin', code);
+      expect(result.nodes.find((n) => n.kind === 'namespace' && n.name === 'artifact')).toBeDefined();
+      const read = result.nodes.find((n) => n.kind === 'function' && n.name === 'sidecar_read');
+      // Matches the `pkg::callee` shape qualified calls are emitted in, so a
+      // cross-package call resolves by qualified name.
+      expect(read?.qualifiedName).toBe('artifact::sidecar_read');
+    });
   });
 });
