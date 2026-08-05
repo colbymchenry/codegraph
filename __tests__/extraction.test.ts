@@ -931,6 +931,42 @@ const token = getTokenMp();
     );
     expect(call).toBeDefined();
   });
+
+  describe('initializer walk is scoped to the declared symbol (#693 for TS/JS)', () => {
+    const code = `
+const eager = load();
+const obj = { handler: () => target(), plain: target() };
+const list = [() => target()];
+export const exported = { handler: () => target() };
+`;
+    const callersOf = (name: string) => {
+      const result = extractFromSource('app.ts', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      return result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+        .map((u) => byId.get(u.fromNodeId))
+        .map((n) => (n ? `${n.kind}:${n.name}` : '?'))
+        .sort();
+    };
+
+    it("a plain call initializer names the CONSTANT as caller, not the file", () => {
+      // The walk ran with only the file on the stack, so `load` recorded the
+      // file as its caller — useless for callers/impact.
+      expect(callersOf('load')).toEqual(['constant:eager']);
+    });
+
+    it('a non-exported object literal contributes calls (it was skipped outright)', () => {
+      // `exported`'s members are minted as their own function nodes, so its
+      // arrow's call comes from `handler`; the non-exported ones attribute to
+      // the declared constant.
+      expect(callersOf('target')).toEqual([
+        'constant:list',
+        'constant:obj',
+        'constant:obj',
+        'function:handler',
+      ]);
+    });
+  });
 });
 
 describe('File Node Extraction', () => {

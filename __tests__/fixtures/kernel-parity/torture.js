@@ -73,3 +73,9 @@ export default {
     },
   },
 };
+
+// Initializer walks attributed to the declared symbol (#693). A plain call
+// leaked to the FILE node; a non-exported object literal was skipped outright.
+const eagerConfig = loadConfig();
+const handlerMap = { onSave: () => persist(eagerConfig), onLoad: loadConfig() };
+const lazyList = [() => persist(eagerConfig)];

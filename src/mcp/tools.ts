@@ -2383,8 +2383,16 @@ export class ToolHandler {
       // fed only to the dynamic-dispatch-links scan below.
       const dynNamed = new Map<string, Node>();
       const DYN_KINDS = new Set(['constant', 'variable', 'field', 'property']);
+      // RAW edges, not getCallers/getCallees: those return one row per NEIGHBOUR
+      // (the #1086 de-dup), so when a pair is joined by BOTH a static and a
+      // synthesized edge the static one wins and the synthesized one becomes
+      // invisible — which is exactly what happens once a thunk's `dispatch(x)`
+      // is walked statically. The question here is about the graph, not about
+      // callers, so ask the edges directly.
       const hasHeuristicEdge = (id: string): boolean =>
-        [...cg.getCallers(id), ...cg.getCallees(id)].some(({ edge }) => edge.provenance === 'heuristic');
+        [...cg.getIncomingEdges(id), ...cg.getOutgoingEdges(id)].some(
+          (e) => e.provenance === 'heuristic'
+        );
       for (const t of tokens) {
         const hits = this.findAllSymbols(cg, t).nodes;
         const cands = hits.filter((n) => CALLABLE.has(n.kind));
@@ -2432,9 +2440,16 @@ export class ToolHandler {
         const synthSeen = new Set<string>();
         for (const n of [...named.values(), ...dynNamed.values()]) {
           if (synthLines.length >= 6) break;
-          for (const { node: other, edge } of [...cg.getCallers(n.id), ...cg.getCallees(n.id)]) {
+          // RAW edges for the same reason as hasHeuristicEdge above — a static
+          // edge over the same pair hides the synthesized one from getCallers.
+          const incident = [...cg.getIncomingEdges(n.id), ...cg.getOutgoingEdges(n.id)];
+          for (const edge of incident) {
             if (synthLines.length >= 6) break;
-            if (edge.provenance !== 'heuristic' || other.id === n.id) continue;
+            if (edge.provenance !== 'heuristic') continue;
+            const otherId = edge.source === n.id ? edge.target : edge.source;
+            if (otherId === n.id) continue;
+            const other = cg.getNode(otherId);
+            if (!other) continue;
             if (skipInChain && skipInChain(edge)) continue;
             const src = edge.source === n.id ? n : other;
             const tgt = edge.source === n.id ? other : n;
