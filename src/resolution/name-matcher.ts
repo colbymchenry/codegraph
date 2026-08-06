@@ -751,7 +751,7 @@ export function matchByExactName(
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
   const bareJs = isBareJsCall(ref, context);
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
+  let candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
     .filter((n) => n.kind !== 'import')
     // Nested locals are only reachable from inside their container (#1230).
     .filter((n) => isLexicallyReachable(n, ref, context))
@@ -775,6 +775,18 @@ export function matchByExactName(
     // importable, so it is not a candidate. Without this a `path`/`id`/`url`
     // import resolved to some interface's same-named property.
     .filter((n) => ref.referenceKind !== 'imports' || isImportableKind(n.kind));
+
+  if (ref.language === 'gleam' && ref.referenceKind === 'calls') {
+    candidates = candidates.filter(
+      (candidate) => candidate.kind !== 'enum' && candidate.kind !== 'type_alias',
+    );
+    const localConstructors = candidates.filter(
+      (candidate) => candidate.kind === 'enum_member' && candidate.filePath === ref.filePath,
+    );
+    candidates = localConstructors.length > 0
+      ? localConstructors
+      : candidates.filter((candidate) => candidate.kind !== 'enum_member');
+  }
 
   if (candidates.length === 0) {
     return null;

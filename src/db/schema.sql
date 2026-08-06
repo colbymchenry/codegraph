@@ -78,9 +78,11 @@ CREATE TABLE IF NOT EXISTS files (
 
 -- Unresolved References: References that need resolution after full indexing.
 -- status lifecycle: rows are inserted 'pending' by extraction; a completed
--- resolution pass either deletes a row (resolved) or marks it 'failed'
+-- resolution pass either deletes a row (resolved), marks it 'failed'
 -- (attempted, no match — kept so a later sync can retry it when a changed
--- file introduces a symbol that could satisfy it, #1240). name_tail is the
+-- file introduces a symbol that could satisfy it, #1240), or marks it
+-- 'external' (built-in/dependency terminal that must never be retried by name).
+-- name_tail is the
 -- last segment of reference_name ('util.greet' → 'greet'), written when a
 -- row is marked failed, so the retry lookup matches new node names against
 -- dotted refs too. Rows follow their from_node via ON DELETE CASCADE, so
@@ -93,6 +95,7 @@ CREATE TABLE IF NOT EXISTS unresolved_refs (
     line INTEGER NOT NULL,
     col INTEGER NOT NULL,
     candidates TEXT, -- JSON array
+    metadata TEXT, -- JSON object carried from extraction to the resolved edge
     file_path TEXT NOT NULL DEFAULT '',
     language TEXT NOT NULL DEFAULT 'unknown',
     status TEXT NOT NULL DEFAULT 'pending',
