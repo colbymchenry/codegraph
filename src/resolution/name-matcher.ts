@@ -232,6 +232,16 @@ export function matchFunctionRef(
     ref.language === 'cpp' || ref.language === 'python' ||
     ref.language === 'php';
 
+  // Python additionally accepts CLASS targets for bare identifiers (#1478):
+  // class-as-value is a core Python idiom (`return SomeSerializer`,
+  // `Meta.model = Org`, registry dicts, `admin.site.register(Model, Admin)`)
+  // and, unlike TS, Python has no type-annotation recovery path. The
+  // false-positive mechanism behind the function-only rule was lowercase
+  // locals colliding with same-named METHODS (docopt.py) — a candidate must
+  // be an exact-name CLASS node here, and the extraction gate (same-file
+  // class ∪ imports) plus unique-or-drop still apply. Methods stay excluded.
+  const bareClassOk = ref.language === 'python';
+
   // Qualified member-pointer (`&Widget::on_click` → "Widget::on_click"):
   // resolve the member ON THAT SCOPE — exempt from bareFnOnly (the `&Cls::m`
   // shape is an explicit member reference). Unique-or-drop like everything else.
@@ -264,7 +274,9 @@ export function matchFunctionRef(
     .getNodesByName(ref.referenceName)
     .filter(
       (n) =>
-        (n.kind === 'function' || (!bareFnOnly && n.kind === 'method')) &&
+        (n.kind === 'function' ||
+          (!bareFnOnly && n.kind === 'method') ||
+          (bareClassOk && n.kind === 'class')) &&
         sameLanguageFamily(n.language, ref.language) &&
         n.id !== ref.fromNodeId // a function registering itself is not a dependency edge
     );

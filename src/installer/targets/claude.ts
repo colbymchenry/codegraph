@@ -296,12 +296,24 @@ function isLegacyCodegraphHookCommand(command: unknown): boolean {
 
 /**
  * The front-load prompt-hook command the installer writes into Claude's
- * `UserPromptSubmit` (see writePromptHookEntry). Matched by substring so an
+ * `UserPromptSubmit` (see writePromptHookEntry). On Windows the launcher on
+ * PATH is `codegraph.cmd`, and Claude Code executes hooks through Git Bash,
+ * which — unlike cmd.exe — applies no PATHEXT: a bare `codegraph` is
+ * "command not found", exit 127 (#1466). Write the extension there; the
+ * `.cmd` spelling also resolves fine under cmd.exe and PowerShell.
+ */
+const PROMPT_HOOK_COMMAND = process.platform === 'win32'
+  ? 'codegraph.cmd prompt-hook'
+  : 'codegraph prompt-hook';
+
+/**
+ * Every spelling the installer has ever written (a settings.json can carry
+ * the other platform's form across a sync). Matched by substring so an
  * `npx @colbymchenry/codegraph prompt-hook` form is recognized too.
  */
-const PROMPT_HOOK_COMMAND = 'codegraph prompt-hook';
+const PROMPT_HOOK_FORMS = ['codegraph prompt-hook', 'codegraph.cmd prompt-hook'];
 function isPromptHookCommand(command: unknown): boolean {
-  return typeof command === 'string' && command.includes(PROMPT_HOOK_COMMAND);
+  return typeof command === 'string' && PROMPT_HOOK_FORMS.some((f) => command.includes(f));
 }
 
 /**
@@ -424,10 +436,31 @@ export function writePromptHookEntry(loc: Location): WriteResult['files'][number
   }
   if (!Array.isArray(settings.hooks.UserPromptSubmit)) settings.hooks.UserPromptSubmit = [];
 
+  // Self-heal (#1466): a pre-fix install on Windows wrote the bare
+  // `codegraph prompt-hook`, which Git Bash resolves to nothing; a
+  // settings.json carried across platforms can hold the other spelling too.
+  // Rewrite an installer-written command to this platform's form in place.
+  // Only the exact installer spellings migrate — an `npx …` or hand-edited
+  // variant is the user's own and stays untouched.
+  let migrated = false;
+  for (const group of settings.hooks.UserPromptSubmit) {
+    if (!group || !Array.isArray(group.hooks)) continue;
+    for (const h of group.hooks) {
+      if (h && PROMPT_HOOK_FORMS.includes(h.command) && h.command !== PROMPT_HOOK_COMMAND) {
+        h.command = PROMPT_HOOK_COMMAND;
+        migrated = true;
+      }
+    }
+  }
+
   const already = settings.hooks.UserPromptSubmit.some(
     (g: any) => g && Array.isArray(g.hooks) && g.hooks.some((h: any) => isPromptHookCommand(h?.command)),
   );
-  if (already) return { path: file, action: 'unchanged' };
+  if (already) {
+    if (!migrated) return { path: file, action: 'unchanged' };
+    writeJsonFile(file, settings);
+    return { path: file, action: 'updated' };
+  }
 
   settings.hooks.UserPromptSubmit.push({
     hooks: [{ type: 'command', command: PROMPT_HOOK_COMMAND }],

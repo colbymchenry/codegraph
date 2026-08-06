@@ -6,7 +6,14 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "types": "wrangler types",
-    "check": "wrangler types && tsc --noEmit && wrangler deploy --dry-run"
+    "check": "wrangler types && tsc --noEmit && wrangler deploy --dry-run",
+    "smoke": "./scripts/smoke-ingest.sh",
+    "smoke:rollup": "./scripts/smoke-rollup.sh",
+    "smoke:cutover": "./scripts/smoke-cutover.sh",
+    "db:migrate:local": "wrangler d1 migrations apply codegraph-telemetry --local",
+    "db:migrate": "wrangler d1 migrations apply codegraph-telemetry --remote",
+    "db:migrations": "wrangler d1 migrations list codegraph-telemetry --remote",
+    "db:sql": "wrangler d1 execute codegraph-telemetry --remote --command"
   },
   "devDependencies": {
     "typescript": "^5.0.0",

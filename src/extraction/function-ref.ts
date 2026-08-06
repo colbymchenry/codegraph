@@ -194,6 +194,12 @@ const PYTHON_SPEC: FnRefSpec = {
     ['keyword_argument', { mode: 'value', field: 'value' }], // Thread(target=worker)
     ['pair', { mode: 'value', field: 'value' }],
     ['list', { mode: 'list' }],
+    // `return SomeClass` / `return handler` — factory returns are how DRF
+    // wires views to serializers (get_serializer_class) and how Python
+    // factories hand back callables (#1478). A single returned expression is
+    // a direct named child, so 'list' covers it; tuple returns (`return A, B`)
+    // sit under an expression_list child and are deliberately not descended.
+    ['return_statement', { mode: 'list' }],
   ]),
   special: new Set(['attribute']),
 };

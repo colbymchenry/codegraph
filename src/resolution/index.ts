@@ -915,7 +915,15 @@ export class ReferenceResolver {
       const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
       if (viaImport) {
         const target = this.queries.getNodeById(viaImport.targetNodeId);
-        if (target && (target.kind === 'function' || target.kind === 'method')) {
+        if (
+          target &&
+          (target.kind === 'function' ||
+            target.kind === 'method' ||
+            // Python (#1478): an imported class used as a value (`return
+            // OrgSerializerFull`) resolves through its import like any
+            // callback — mirrors matchFunctionRef's bareClassOk.
+            (ref.language === 'python' && target.kind === 'class'))
+        ) {
           return viaImport;
         }
       }

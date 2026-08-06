@@ -252,6 +252,15 @@ export interface FileRecord {
 
   /** Any extraction errors */
   errors?: ExtractionError[];
+
+  /**
+   * Tool-generated source, decided at index time from the filename
+   * convention OR a generation banner in the file's header (see
+   * extraction/generated-detection.ts). A relevance hint for ranking, not a
+   * hard filter. Absent on indexes built before schema v9 — treat
+   * `undefined` as "content signal unknown, fall back to the path check".
+   */
+  generated?: boolean;
 }
 
 // =============================================================================
@@ -573,6 +582,10 @@ export interface GraphStats {
 
   /** Database size in bytes */
   dbSizeBytes: number;
+
+  /** Size of the SQLite `-wal` sidecar in bytes (0 when absent). A WAL far
+   * larger than the DB at rest means killed sessions left it behind (#1431). */
+  walSizeBytes: number;
 
   /** Last update timestamp */
   lastUpdated: number;

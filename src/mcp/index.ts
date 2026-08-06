@@ -104,6 +104,47 @@ function daemonInternalSet(): boolean {
 }
 
 /**
+ * Prefix every `process.stderr.write` chunk with an ISO-8601 timestamp. Called
+ * once, only when this process becomes the detached daemon — whose stderr is
+ * appended to `.codegraph/daemon.log`. Before #1431 no log line carried a
+ * timestamp, so watchdog kills and restarts could be counted but never placed
+ * in time. (The watchdog child writes its kill notice through its own
+ * inherited fd 2, bypassing this wrapper — it stamps that line itself.)
+ */
+export function timestampStderrLines(): void {
+  const orig = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    return (orig as (...args: unknown[]) => boolean)(stampLogChunk(chunk), ...rest);
+  }) as typeof process.stderr.write;
+}
+
+/** Prepend `[<ISO-8601>] ` to a log chunk; unknown chunk types pass through. */
+export function stampLogChunk(chunk: string | Uint8Array): string | Uint8Array {
+  try {
+    const stamp = `[${new Date().toISOString()}] `;
+    if (typeof chunk === 'string') return stamp + chunk;
+    if (Buffer.isBuffer(chunk)) return Buffer.concat([Buffer.from(stamp), chunk]);
+  } catch { /* stamping is best-effort; never block the write */ }
+  return chunk;
+}
+
+/**
+ * Watchdog `progressPaths` for a server keyed on `root`'s index: the SQLite DB
+ * + its WAL. With these, the #850 liveness watchdog only kills on heartbeat
+ * silence when the DB files are NOT advancing — the same slow-disk deferral
+ * the CLI `index`/`init` path got in #1231. Without it, one >timeout
+ * synchronous statement on a big DB (multi-GB index behind Windows Defender)
+ * SIGKILLs a perfectly healthy daemon — and a daemon SIGKILL'd at the end of
+ * nearly every session is what ratcheted the WAL leak in #1431. A true wedge
+ * still dies: a wedged loop writes nothing, so the files stay still.
+ */
+export function watchdogProgressPaths(root: string | null): { progressPaths?: string[] } {
+  if (!root) return {};
+  const dbPath = path.join(getCodeGraphDir(root), 'codegraph.db');
+  return { progressPaths: [dbPath, `${dbPath}-wal`] };
+}
+
+/**
  * Resolve the project root the daemon machinery should key on. Returns
  * `null` when no `.codegraph/` is reachable from the candidate path — in
  * that case the caller must run in direct mode, since the daemon lockfile
@@ -346,7 +387,7 @@ export class MCPServer {
     this.mode = 'direct';
     this.installSignalHandlers();
     this.installPpidWatchdog();
-    this.livenessWatchdog = installMainThreadWatchdog();
+    this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(resolveDaemonRoot(this.projectPath)));
   }
 
   /**
@@ -359,6 +400,9 @@ export class MCPServer {
    * and reaps itself via client-refcount + idle timeout (see {@link Daemon}).
    */
   private async startDaemonProcess(): Promise<void> {
+    // In daemon mode stderr IS `.codegraph/daemon.log`; stamp every line so
+    // kills/restarts can be placed in time (#1431 — the log was undatable).
+    timestampStderrLines();
     const root = resolveDaemonRoot(this.projectPath) ?? this.projectPath ?? process.cwd();
     for (let attempt = 0; attempt < TAKEOVER_MAX_RETRIES; attempt++) {
       const lock = tryAcquireDaemonLock(root);
@@ -371,7 +415,7 @@ export class MCPServer {
         // The detached daemon has no PPID watchdog or stdin lifeline, so a
         // wedged main thread would pin a core forever (#850). The liveness
         // watchdog is its only recovery path.
-        this.livenessWatchdog = installMainThreadWatchdog();
+        this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(root));
         return; // the net.Server keeps the process alive
       }
 
