@@ -50,4 +50,26 @@ export const pythonExtractor: LanguageExtractor = {
     // import_statement creates multiple imports - return null for core fallback
     return null;
   },
+  isExported: (node) => {
+    // Python has no export syntax — every module- and class-level def/class is
+    // importable by name (`from module import _foo` works fine; a leading
+    // underscore is only a PEP 8 convention, not an enforcement, and `__all__`
+    // only restricts `import *`). The only names actually unreachable from
+    // outside the file are ones nested inside a function body (closures).
+    // Without this, the extractor left `isExported` unset for every Python
+    // symbol, so `findExportedSymbol`'s `byName` index (import-resolver.ts) was
+    // always empty for Python — the generic "named import used in a direct
+    // call" resolution path silently failed for every Python file. Other
+    // Python-specific paths (resolvePythonModuleMember, resolveModuleImportToFile)
+    // built their own unfiltered file scans and so masked this everywhere
+    // except a directly-called aliased function import
+    // (`from mod import fn as alias; alias()`), which has no other resolution
+    // path (found on a real project).
+    let parent = node.parent;
+    while (parent) {
+      if (parent.type === 'function_definition') return false;
+      parent = parent.parent;
+    }
+    return true;
+  },
 };
