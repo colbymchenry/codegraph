@@ -8,6 +8,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { execFileSync } from 'node:child_process';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
@@ -17,6 +18,133 @@ import { normalizePath } from '../src/utils';
 beforeAll(async () => {
   await initGrammars();
   await loadAllGrammars();
+});
+
+// =============================================================================
+// Gleam
+// =============================================================================
+
+describe('Gleam Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Gleam files', () => {
+      expect(detectLanguage('main.gleam')).toBe('gleam');
+      expect(detectLanguage('src/app/server.gleam')).toBe('gleam');
+    });
+
+    it('should report Gleam as supported', () => {
+      expect(isLanguageSupported('gleam')).toBe(true);
+      expect(getSupportedLanguages()).toContain('gleam');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract public function declarations', () => {
+      const code = `
+pub fn add(a: Int, b: Int) -> Int {
+  a + b
+}
+`;
+      const result = extractFromSource('math.gleam', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'add');
+      expect(fn).toBeDefined();
+      expect(fn?.language).toBe('gleam');
+      expect(fn?.isExported).toBe(true);
+      expect(fn?.signature).toContain('Int');
+    });
+
+    it('should extract private function declarations as not exported', () => {
+      const code = `
+fn helper(x: Int) -> Int {
+  x * 2
+}
+`;
+      const result = extractFromSource('util.gleam', code);
+      const fn = result.nodes.find((n) => n.name === 'helper');
+      expect(fn).toBeDefined();
+      expect(fn?.isExported).toBe(false);
+    });
+
+    it('should extract external functions', () => {
+      const code = `
+@external(erlang, "io", "format")
+pub fn ext_format(fmt: String) -> Nil
+`;
+      const result = extractFromSource('ffi.gleam', code);
+      expect(result.nodes.find((n) => n.name === 'ext_format')).toBeDefined();
+    });
+  });
+
+  describe('Type extraction', () => {
+    it('should extract custom type as enum with data constructors as enum_member', () => {
+      const code = `
+pub type Shape {
+  Circle(radius: Float)
+  Square(side: Float)
+  Rectangle(width: Float, height: Float)
+}
+`;
+      const result = extractFromSource('shape.gleam', code);
+      const shape = result.nodes.find((n) => n.kind === 'enum' && n.name === 'Shape');
+      expect(shape).toBeDefined();
+      expect(shape?.isExported).toBe(true);
+      const members = result.nodes.filter((n) => n.kind === 'enum_member');
+      expect(members.find((m) => m.name === 'Circle')).toBeDefined();
+      expect(members.find((m) => m.name === 'Square')).toBeDefined();
+      expect(members.find((m) => m.name === 'Rectangle')).toBeDefined();
+    });
+
+    it('should extract type aliases', () => {
+      const code = `
+pub type UserId = String
+type Pair = #(Int, Int)
+`;
+      const result = extractFromSource('types.gleam', code);
+      const aliases = result.nodes.filter((n) => n.kind === 'type_alias');
+      expect(aliases.find((a) => a.name === 'UserId')).toBeDefined();
+      expect(aliases.find((a) => a.name === 'Pair')).toBeDefined();
+    });
+  });
+
+  describe('Constant extraction', () => {
+    it('should extract top-level constants', () => {
+      const code = `
+pub const max_retries = 3
+const default_timeout = 30
+`;
+      const result = extractFromSource('config.gleam', code);
+      const constants = result.nodes.filter((n) => n.kind === 'constant');
+      expect(constants.find((c) => c.name === 'max_retries')).toBeDefined();
+      expect(constants.find((c) => c.name === 'default_timeout')).toBeDefined();
+    });
+  });
+
+  describe('Import and call extraction', () => {
+    it('should extract bare and selective imports', () => {
+      const code = `
+import gleam/io as out
+import gleam/list.{map, filter}
+`;
+      const result = extractFromSource('main.gleam', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import');
+      expect(imports.find((i) => i.name === 'gleam/io')).toBeDefined();
+      expect(imports.find((i) => i.name === 'gleam/list')).toBeDefined();
+    });
+
+    it('should emit unresolved refs for bare and qualified calls', () => {
+      const code = `
+import gleam/io.{println}
+
+pub fn main() -> Nil {
+  println("hi")
+  io.print("there")
+}
+`;
+      const result = extractFromSource('app.gleam', code);
+      const callRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(callRefs.find((r) => r.referenceName === 'println')).toBeDefined();
+      expect(callRefs.find((r) => r.referenceName.startsWith('io.'))).toBeDefined();
+    });
+  });
 });
 
 // Create a temporary directory for each test
@@ -6767,6 +6895,27 @@ describe('Full Indexing', () => {
     cleanupTempDir(tempDir);
   });
 
+  it('treats a tracked-but-deleted file as removed during full indexing', async () => {
+    const filePath = path.join(tempDir, 'src', 'gone.gleam');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, 'pub fn gone() -> Nil { Nil }\n');
+    execFileSync('git', ['init', '-q'], { cwd: tempDir });
+    execFileSync('git', ['add', 'src/gone.gleam'], { cwd: tempDir });
+
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    expect(cg.getNodesInFile('src/gone.gleam').some((node) => node.name === 'gone')).toBe(true);
+
+    fs.unlinkSync(filePath);
+    const result = await cg.indexAll();
+
+    expect(result.errors.some((error) => error.filePath === 'src/gone.gleam')).toBe(false);
+    expect(result.filesErrored).toBe(0);
+    expect(cg.getFile('src/gone.gleam')).toBeNull();
+    expect(cg.getNodesInFile('src/gone.gleam')).toEqual([]);
+    cg.close();
+  });
+
   it('should index a TypeScript file', async () => {
     // Create test file
     const srcDir = path.join(tempDir, 'src');
@@ -6979,6 +7128,25 @@ describe('Directory Exclusion', () => {
 
   afterEach(() => {
     cleanupTempDir(tempDir);
+  });
+
+  it('excludes Gleam _build output by default', () => {
+    const ig = buildDefaultIgnore(tempDir);
+    expect(ig.ignores('_build/default/lib/dep/src/generated.gleam')).toBe(true);
+    expect(ig.ignores('src/_build_helpers/real.gleam')).toBe(false);
+  });
+
+  it('does not index tracked Gleam files under _build', () => {
+    const buildDir = path.join(tempDir, '_build', 'default', 'lib', 'dep', 'src');
+    const srcDir = path.join(tempDir, 'src');
+    fs.mkdirSync(buildDir, { recursive: true });
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(path.join(buildDir, 'generated.gleam'), 'pub fn generated() -> Nil { Nil }\n');
+    fs.writeFileSync(path.join(srcDir, 'main.gleam'), 'pub fn main() -> Nil { Nil }\n');
+    execFileSync('git', ['init', '-q'], { cwd: tempDir });
+    execFileSync('git', ['add', '.'], { cwd: tempDir });
+
+    expect(scanDirectory(tempDir)).toEqual(['src/main.gleam']);
   });
 
   it('should exclude directories listed in .gitignore', () => {

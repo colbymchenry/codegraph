@@ -96,6 +96,17 @@ function clauseHeader(clause: SyntaxNode, source: string): string | undefined {
   return collapseWs(source.substring(clause.startIndex, end)) || undefined;
 }
 
+const ERLANG_ARITY_PREFIX = 'erlang-arity:';
+
+function clauseArity(clause: SyntaxNode): number {
+  const args = getChildByField(clause, 'args');
+  return args?.namedChildren.filter((child) => child.type !== 'comment').length ?? 0;
+}
+
+function arityDecorators(clauses: SyntaxNode[]): string[] {
+  return [...new Set(clauses.map((clause) => `${ERLANG_ARITY_PREFIX}${clauseArity(clause)}`))];
+}
+
 function handleFunDecl(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const clauses = node.namedChildren.filter((c) => c.type === 'function_clause');
   const first = clauses[0];
@@ -107,11 +118,19 @@ function handleFunDecl(node: SyntaxNode, ctx: ExtractorContext): boolean {
 
   // Continuation clause: extend the existing node's span and attribute this
   // clause's calls to it.
-  if (ctx.filePath === lastFnFile && name === lastFnName && lastFnId) {
+  if (
+    ctx.filePath === lastFnFile &&
+    name === lastFnName &&
+    lastFnId &&
+    ctx.nodes.some((candidate) => candidate.id === lastFnId)
+  ) {
     for (let i = ctx.nodes.length - 1; i >= 0; i--) {
       const n = ctx.nodes[i];
       if (n && n.id === lastFnId) {
         if (node.endPosition.row + 1 > n.endLine) n.endLine = node.endPosition.row + 1;
+        const decorators = new Set(n.decorators ?? []);
+        for (const decorator of arityDecorators(clauses)) decorators.add(decorator);
+        n.decorators = [...decorators];
         break;
       }
     }
@@ -129,6 +148,7 @@ function handleFunDecl(node: SyntaxNode, ctx: ExtractorContext): boolean {
       ? collapseWs(getNodeText(spec, ctx.source)).slice(0, 300)
       : clauseHeader(first, ctx.source),
     isExported: exports === 'all' || exports.has(name),
+    decorators: arityDecorators(clauses),
   });
   if (!fn) return true;
   ctx.pushScope(fn.id);

@@ -36,6 +36,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   dart: 'tree-sitter-dart.wasm',
   pascal: 'tree-sitter-pascal.wasm',
   scala: 'tree-sitter-scala.wasm',
+  gleam: 'tree-sitter-gleam.wasm',
   lua: 'tree-sitter-lua.wasm',
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
@@ -119,6 +120,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.fmx': 'pascal',
   '.scala': 'scala',
   '.sc': 'scala',
+  '.gleam': 'gleam',
   '.lua': 'lua',
   '.luau': 'luau',
   '.m': 'objc',
@@ -289,7 +291,7 @@ export async function initGrammars(): Promise<void> {
  * the vendored wasm together.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
-  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
+  'pascal', 'scala', 'gleam', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
@@ -638,6 +640,7 @@ export function getLanguageDisplayName(language: Language): string {
     liquid: 'Liquid',
     pascal: 'Pascal / Delphi',
     scala: 'Scala',
+    gleam: 'Gleam',
     lua: 'Lua',
     luau: 'Luau',
     objc: 'Objective-C',

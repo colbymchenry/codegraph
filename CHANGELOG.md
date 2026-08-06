@@ -19,6 +19,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - GitHub Copilot is now a supported agent: `codegraph install` can configure Copilot Chat in VS Code (`copilot-vscode`), the GitHub Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`). Installed Copilot surfaces are auto-detected like every other agent, existing MCP server entries in their config files are preserved, and `codegraph uninstall` reverses the setup cleanly. Restart VS Code or your JetBrains IDE after installing so Copilot picks up the server.
 
+- Added full Gleam language support for `.gleam` files, including the vendored
+  tree-sitter grammar, functions, types, constants, imports, call references,
+  and cross-file module resolution.
+
 ### Fixes
 
 - C, C++, Objective-C and Rust unions are now indexed as first-class `union` nodes. A `union` declaration previously produced no symbol at all, so it never appeared in search or `codegraph_explore`, and anything attached to it disappeared with it — in Rust, every `impl SomeTrait for MyUnion` lost its edge, the methods from that impl were left pointing at a type the graph did not contain, and asking which types implement a trait quietly skipped the union ones. A union-shaped dispatch table in C now resolves its function pointers like a struct-shaped one. A `typedef union { … } Name;` in C keeps the typedef's name and is no longer mistaken for a plain type alias. Thanks @ctype-lab. Re-index after upgrading to pick up unions in existing projects. (#1515)

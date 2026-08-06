@@ -197,6 +197,17 @@ export interface LanguageExtractor {
   visitNode?: (node: SyntaxNode, ctx: ExtractorContext) => boolean;
 
   /**
+   * Inspect a function after the generic extractor has created its symbol.
+   * Languages use this for relationships encoded outside the declaration node,
+   * such as Gleam's preceding @external attribute.
+   */
+  afterExtractFunction?: (
+    syntaxNode: SyntaxNode,
+    functionNode: Node,
+    ctx: ExtractorContext,
+  ) => void;
+
+  /**
    * Synthesize members that exist at compile time but not in the source AST,
    * called at the end of class extraction with the class still on the scope
    * stack (so `ctx.createNode` attaches containment + qualified names) and the

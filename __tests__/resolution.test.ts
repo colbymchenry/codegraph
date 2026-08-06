@@ -604,6 +604,213 @@ from ..services import auth_service
       expect(mappings.some((m) => m.localName === 'helper')).toBe(true);
       expect(mappings.some((m) => m.localName === 'User')).toBe(true);
     });
+
+    it('should extract Gleam namespace, selective, aliased, and type imports', () => {
+      const content = [
+        'import app/io',
+        'import app/math as m',
+        'import app/list.{map, filter as keep, type User}',
+      ].join('\n');
+
+      const mappings = extractImportMappings('src/app.gleam', content, 'gleam');
+
+      expect(mappings).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          localName: 'io', source: 'app/io', exportedName: '*', isNamespace: true,
+        }),
+        expect.objectContaining({
+          localName: 'm', source: 'app/math', exportedName: '*', isNamespace: true,
+        }),
+        expect.objectContaining({
+          localName: 'map', source: 'app/list', exportedName: 'map', isNamespace: false,
+        }),
+        expect.objectContaining({
+          localName: 'keep', source: 'app/list', exportedName: 'filter', isNamespace: false,
+        }),
+        expect.objectContaining({
+          localName: 'User', source: 'app/list', exportedName: 'User', isNamespace: false,
+        }),
+      ]));
+    });
+
+    it('extracts multiline Gleam imports without commented-out mappings', () => {
+      const mappings = extractImportMappings(
+        'src/main.gleam',
+        [
+          '// import fake/module.{phantom}',
+          'import app/list.{',
+          '  map, // keep the next binding',
+          '  filter as keep',
+          '}',
+        ].join('\n'),
+        'gleam',
+      );
+
+      expect(mappings.some((mapping) => mapping.source === 'fake/module')).toBe(false);
+      expect(mappings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ localName: 'map', source: 'app/list' }),
+        expect.objectContaining({ localName: 'keep', exportedName: 'filter', source: 'app/list' }),
+      ]));
+    });
+
+    it('should resolve Gleam project modules and treat the standard library as external', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: (p) => p === 'src/app/io.gleam',
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => ['src/app/io.gleam'],
+      };
+
+      expect(resolveImportPath('app/io', 'src/main.gleam', 'gleam', context)).toBe('src/app/io.gleam');
+      expect(resolveImportPath('gleam/io', 'src/main.gleam', 'gleam', context)).toBeNull();
+    });
+
+    it('resolves src and test modules from the nearest Gleam package root', () => {
+      const files = new Set([
+        'apps/api/gleam.toml',
+        'apps/api/src/api/service.gleam',
+        'apps/api/test/api/support.gleam',
+        'src/api/service.gleam',
+      ]);
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: (filePath) => files.has(filePath),
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => [...files],
+      };
+
+      expect(resolveImportPath('api/service', 'apps/api/src/main.gleam', 'gleam', context))
+        .toBe('apps/api/src/api/service.gleam');
+      expect(resolveImportPath('api/support', 'apps/api/test/main_test.gleam', 'gleam', context))
+        .toBe('apps/api/test/api/support.gleam');
+    });
+
+    it('does not escape a Gleam package through repository-global fallback paths', () => {
+      const nestedFiles = new Set([
+        'apps/api/gleam.toml',
+        'app/service.gleam',
+      ]);
+      const nestedContext: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: (filePath) => nestedFiles.has(filePath),
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => [...nestedFiles],
+      };
+      expect(resolveImportPath('app/service', 'apps/api/src/main.gleam', 'gleam', nestedContext))
+        .toBeNull();
+
+      const rootFiles = new Set(['gleam.toml', 'app/service.gleam']);
+      const rootContext: ResolutionContext = {
+        ...nestedContext,
+        fileExists: (filePath) => rootFiles.has(filePath),
+        getAllFiles: () => [...rootFiles],
+      };
+      expect(resolveImportPath('app/service', 'src/main.gleam', 'gleam', rootContext)).toBeNull();
+    });
+
+    it('should resolve Gleam imported bare, aliased, and qualified calls', async () => {
+      fs.mkdirSync(path.join(tempDir, 'app'));
+      fs.writeFileSync(
+        path.join(tempDir, 'app', 'lib.gleam'),
+        `pub fn run() -> Nil { Nil }\n\npub fn format() -> Nil { Nil }\n`,
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'app', 'main.gleam'),
+        `import app/lib.{run, format as fmt}\nimport app/lib as m\n\npub fn main() -> Nil {\n  run()\n  fmt()\n  m.run()\n  Nil\n}\n`,
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const main = cg.getNodesByKind('function').find(
+        (n) => n.name === 'main' && n.filePath.replace(/\\/g, '/') === 'app/main.gleam',
+      );
+      expect(main).toBeDefined();
+      const calls = cg.getOutgoingEdges(main!.id).filter((e) => e.kind === 'calls');
+      expect(calls).toHaveLength(3);
+      const targets = calls.map((edge) => cg.getNode(edge.target));
+      expect(targets.map((node) => node?.name)).toEqual(expect.arrayContaining(['run', 'format']));
+      expect(targets.every((node) => node?.filePath.replace(/\\/g, '/') === 'app/lib.gleam')).toBe(true);
+    }, 30000);
+
+    it('should not bind external Gleam stdlib imports to project symbols', async () => {
+      fs.mkdirSync(path.join(tempDir, 'src'));
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'helpers.gleam'),
+        'pub fn println(message: String) -> Nil { Nil }\n',
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'main.gleam'),
+        `import gleam/io.{println}\n\npub fn main() -> Nil {\n  println("hello")\n  Nil\n}\n`,
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const main = cg.getNodesByKind('function').find(
+        (n) => n.name === 'main' && n.filePath.replace(/\\/g, '/') === 'src/main.gleam',
+      );
+      expect(main).toBeDefined();
+      expect(cg.getOutgoingEdges(main!.id).filter((e) => e.kind === 'calls')).toHaveLength(0);
+    }, 30000);
+
+    it('should record a file edge for a Gleam module-only import', async () => {
+      fs.mkdirSync(path.join(tempDir, 'src', 'app'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'app', 'lib.gleam'),
+        'pub fn run() -> Nil { Nil }\n',
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'main.gleam'),
+        'import app/lib\n\npub fn main() -> Nil { Nil }\n',
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const mainFile = cg.getNodesByKind('file').find(
+        (n) => n.filePath.replace(/\\/g, '/') === 'src/main.gleam',
+      );
+      expect(mainFile).toBeDefined();
+      const importEdges = cg.getOutgoingEdges(mainFile!.id).filter((e) => e.kind === 'imports');
+      expect(importEdges).toHaveLength(1);
+      expect(cg.getNode(importEdges[0]!.target)?.filePath.replace(/\\/g, '/')).toBe('src/app/lib.gleam');
+    }, 30000);
+
+    it('should resolve imported Gleam enum constructor calls', async () => {
+      fs.mkdirSync(path.join(tempDir, 'src', 'app'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'app', 'shape.gleam'),
+        'pub type Shape { Circle(radius: Int) }\n',
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'src', 'main.gleam'),
+        `import app/shape.{Circle}\n\npub fn main() -> Nil {\n  Circle(1)\n  Nil\n}\n`,
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const main = cg.getNodesByKind('function').find(
+        (n) => n.name === 'main' && n.filePath.replace(/\\/g, '/') === 'src/main.gleam',
+      );
+      expect(main).toBeDefined();
+      const calls = cg.getOutgoingEdges(main!.id).filter((e) => e.kind === 'calls');
+      expect(calls).toHaveLength(1);
+      expect(cg.getNode(calls[0]!.target)).toMatchObject({
+        kind: 'enum_member',
+        name: 'Circle',
+        filePath: 'src/app/shape.gleam',
+      });
+    }, 30000);
   });
 
   describe('JVM FQN Import Resolution', () => {

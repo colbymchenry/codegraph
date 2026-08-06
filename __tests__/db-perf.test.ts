@@ -142,6 +142,101 @@ describe('deleteResolvedReferences (chunking)', () => {
   });
 });
 
+describe('unresolved reference metadata', () => {
+  let dir: string;
+  let db: DatabaseConnection;
+  let q: QueryBuilder;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-perf-unresolved-metadata-'));
+    db = DatabaseConnection.initialize(path.join(dir, 'test.db'));
+    q = new QueryBuilder(db.getDb());
+  });
+
+  afterEach(() => {
+    db.close();
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('round-trips structured metadata through a single unresolved-ref insert', () => {
+    q.insertNode(makeNode('caller'));
+    const metadata = {
+      ffi: true,
+      targetLanguage: 'erlang',
+      module: 'config_ffi',
+      function: 'getenv',
+      arity: 2,
+    } as const;
+
+    q.insertUnresolvedRef({
+      fromNodeId: 'caller',
+      referenceName: 'config_ffi.getenv',
+      referenceKind: 'calls',
+      line: 1,
+      column: 0,
+      metadata,
+    });
+
+    expect(q.getUnresolvedReferences()).toHaveLength(1);
+    expect(q.getUnresolvedReferences()[0]?.metadata).toEqual(metadata);
+  });
+
+  it('round-trips structured metadata through a batch unresolved-ref insert', () => {
+    q.insertNode(makeNode('caller'));
+    const metadata = {
+      ffi: true,
+      targetLanguage: 'erlang',
+      module: 'config_ffi',
+      function: 'getenv',
+      arity: 2,
+    } as const;
+
+    q.insertUnresolvedRefsBatch([
+      {
+        fromNodeId: 'caller',
+        referenceName: 'config_ffi::getenv',
+        referenceKind: 'calls',
+        line: 1,
+        column: 0,
+        metadata,
+      },
+    ]);
+
+    expect(q.getUnresolvedReferences()).toHaveLength(1);
+    expect(q.getUnresolvedReferences()[0]?.metadata).toEqual(metadata);
+  });
+
+  it('retains structured metadata when a failed reference is retried', () => {
+    q.insertNode(makeNode('caller'));
+    const metadata = {
+      ffi: true,
+      targetLanguage: 'erlang',
+      module: 'config_ffi',
+      function: 'getenv',
+      arity: 2,
+    } as const;
+
+    q.insertUnresolvedRef({
+      fromNodeId: 'caller',
+      referenceName: 'config_ffi::getenv',
+      referenceKind: 'calls',
+      line: 1,
+      column: 0,
+      metadata,
+    });
+    q.markReferencesFailed([
+      {
+        fromNodeId: 'caller',
+        referenceName: 'config_ffi::getenv',
+        referenceKind: 'calls',
+      },
+    ]);
+
+    expect(q.getRetryableFailedReferences(['getenv'])).toHaveLength(1);
+    expect(q.getRetryableFailedReferences(['getenv'])[0]?.metadata).toEqual(metadata);
+  });
+});
+
 describe('insertNode cache invalidation', () => {
   let dir: string;
   let db: DatabaseConnection;
@@ -358,6 +453,26 @@ describe('migration v6: dedup edges + add identity index on upgrade (#1034)', ()
       { source: 'A', target: 'B', kind: 'references', line: 153, column: 12, metadata: { resolvedBy: 'x' } },
     ]);
     expect(count()).toBe(2);
+
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('migration v10: persist unresolved reference metadata', () => {
+  it('adds the metadata column to a version 9 database', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-mig10-'));
+    const db = DatabaseConnection.initialize(path.join(dir, 'test.db'));
+    const raw = db.getDb();
+
+    raw.exec('ALTER TABLE unresolved_refs DROP COLUMN metadata');
+    raw.prepare('DELETE FROM schema_versions WHERE version >= 10').run();
+
+    runMigrations(raw, 9);
+
+    const columns = raw.prepare('PRAGMA table_info(unresolved_refs)').all() as Array<{ name: string }>;
+    expect(columns.some((column) => column.name === 'metadata')).toBe(true);
+    expect(getCurrentVersion(raw)).toBe(10);
 
     db.close();
     fs.rmSync(dir, { recursive: true, force: true });

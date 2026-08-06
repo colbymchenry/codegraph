@@ -26,6 +26,10 @@ export interface UnresolvedRef {
   language: Language;
   /** Possible qualified names it might resolve to */
   candidates?: string[];
+  /** Additive extraction metadata, including explicit foreign-function targets. */
+  metadata?: Record<string, unknown>;
+  /** Terminal reference supplied outside the indexed project; never retry by name. */
+  disposition?: 'external';
   /** `unresolved_refs.id` when loaded from the database — post-pass cleanup
    * targets exactly this row instead of every same-key sibling (#1269). */
   rowId?: number;
@@ -42,7 +46,7 @@ export interface ResolvedRef {
   /** Confidence score (0-1) */
   confidence: number;
   /** How it was resolved */
-  resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path' | 'function-ref';
+  resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path' | 'function-ref' | 'foreign-function';
 }
 
 /**
