@@ -1151,10 +1151,10 @@ program
       // Mirror the MCP search down-rank so the CLI also surfaces the
       // hand-written implementation before protobuf/gRPC scaffolding
       // when both share a name. See extraction/generated-detection.ts.
-      const { isGeneratedFile } = await import('../extraction/generated-detection');
+      const isGen = cg.generatedFilePredicate(rawResults.map((r) => r.node.filePath));
       const results = [...rawResults].sort((a, b) => {
-        const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
-        const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+        const aGen = isGen(a.node.filePath) ? 1 : 0;
+        const bGen = isGen(b.node.filePath) ? 1 : 0;
         return aGen - bGen;
       });
 

@@ -24,13 +24,18 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
 
 /**
- * Path-only heuristic for files that should not be candidates for
- * "dominant file" detection: test/spec files and tool-generated files.
- * Generated files (`*.pb.go`, `*.pulsar.go`, mock outputs, …) often
- * have huge in-file edge counts that dwarf the real source — etcd's
- * `rpc.pb.go` has 4× the in-file edges of `server.go`.
+ * Files that should not be candidates for "dominant file" detection: test/spec
+ * files and tool-generated files. Generated files (`*.pb.go`, `*.pulsar.go`,
+ * mock outputs, …) often have huge in-file edge counts that dwarf the real
+ * source — etcd's `rpc.pb.go` has 4× the in-file edges of `server.go`.
+ *
+ * Path patterns plus, when the caller passes the indexed set, files whose
+ * HEADER declares them generated — a `payroll.go` full of generated CRUD has
+ * exactly the same edge-density problem as `rpc.pb.go` and nothing in its name
+ * to catch it (#1500).
  */
-function isLowValueFile(filePath: string): boolean {
+function isLowValueFile(filePath: string, generated?: ReadonlySet<string>): boolean {
+  if (generated?.has(filePath)) return true;
   const lp = filePath.toLowerCase();
   return (
     /(?:^|\/)(tests?|__tests?__|spec)\//.test(lp) ||
@@ -97,6 +102,8 @@ interface FileRow {
   indexed_at: number;
   node_count: number;
   errors: string | null;
+  /** Absent on pre-v9 rows read through a stale prepared statement. */
+  generated?: number | null;
 }
 
 interface UnresolvedRefRow {
@@ -182,6 +189,7 @@ function rowToFileRecord(row: FileRow): FileRecord {
     indexedAt: row.indexed_at,
     nodeCount: row.node_count,
     errors: row.errors ? safeJsonParse(row.errors, undefined) : undefined,
+    generated: row.generated === 1,
   };
 }
 
@@ -922,7 +930,8 @@ export class QueryBuilder {
       `);
     }
     const rows = this.stmts.getDominantFile.all() as Array<{ file_path: string; edge_count: number }>;
-    const filtered = rows.filter(r => !isLowValueFile(r.file_path));
+    const generated = this.getGeneratedPathsAmong(rows.map(r => r.file_path));
+    const filtered = rows.filter(r => !isLowValueFile(r.file_path, generated));
     if (filtered.length === 0 || filtered[0]!.edge_count < 20) return null;
     return {
       filePath: filtered[0]!.file_path,
@@ -955,7 +964,8 @@ export class QueryBuilder {
       `);
     }
     const rows = this.stmts.getTopRouteFile.all() as Array<{ file_path: string; cnt: number }>;
-    const filtered = rows.filter(r => !isLowValueFile(r.file_path));
+    const generated = this.getGeneratedPathsAmong(rows.map(r => r.file_path));
+    const filtered = rows.filter(r => !isLowValueFile(r.file_path, generated));
     if (filtered.length === 0) return null;
     const totalRoutes = filtered.reduce((sum, r) => sum + r.cnt, 0);
     const top = filtered[0]!;
@@ -1006,7 +1016,8 @@ export class QueryBuilder {
       url: string; handler: string; handler_file: string; handler_line: number; handler_kind: string;
     }>;
     // Drop test/generated handlers — same hygiene as elsewhere.
-    const filtered = rows.filter(r => !isLowValueFile(r.handler_file));
+    const generated = this.getGeneratedPathsAmong(rows.map(r => r.handler_file));
+    const filtered = rows.filter(r => !isLowValueFile(r.handler_file, generated));
     if (filtered.length < 3) return null;
     // Identify the file holding the most handlers (the "primary handler file").
     const fileCounts = new Map<string, number>();
@@ -1865,8 +1876,8 @@ export class QueryBuilder {
   upsertFile(file: FileRecord): void {
     if (!this.stmts.upsertFile) {
       this.stmts.upsertFile = this.db.prepare(`
-        INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at, node_count, errors)
-        VALUES (@path, @contentHash, @language, @size, @modifiedAt, @indexedAt, @nodeCount, @errors)
+        INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at, node_count, errors, generated)
+        VALUES (@path, @contentHash, @language, @size, @modifiedAt, @indexedAt, @nodeCount, @errors, @generated)
         ON CONFLICT(path) DO UPDATE SET
           content_hash = @contentHash,
           language = @language,
@@ -1874,7 +1885,8 @@ export class QueryBuilder {
           modified_at = @modifiedAt,
           indexed_at = @indexedAt,
           node_count = @nodeCount,
-          errors = @errors
+          errors = @errors,
+          generated = @generated
       `);
     }
 
@@ -1887,7 +1899,57 @@ export class QueryBuilder {
       indexedAt: file.indexedAt,
       nodeCount: file.nodeCount,
       errors: file.errors ? JSON.stringify(file.errors) : null,
+      // The upsert always REWRITES the flag: a file that loses its banner in an
+      // edit must lose the flag on the next sync, not keep a stale 1.
+      generated: file.generated ? 1 : 0,
     });
+  }
+
+  /**
+   * Which of `filePaths` the index flagged as tool-generated (schema v9+).
+   *
+   * Bounded-lookup by design: every consumer already holds a short candidate
+   * list (a ranked file group, an FTS result page, a LIMIT-20 aggregate), so
+   * this stays a partial-index probe over a handful of paths — no whole-repo
+   * set to materialize, and no cache to invalidate, which means a ranking call
+   * can never serve a verdict the last sync already replaced.
+   *
+   * Returns ONLY the content/index signal; callers union it with
+   * {@link isGeneratedFile} so pre-v9 databases (column present, all zeros
+   * until a re-index) keep the path-only behavior rather than regressing.
+   */
+  getGeneratedPathsAmong(filePaths: Iterable<string>): Set<string> {
+    const unique = [...new Set(filePaths)];
+    const found = new Set<string>();
+    if (unique.length === 0) return found;
+
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT path FROM files WHERE generated = 1 AND path IN (${placeholders})`)
+        .all(...chunk) as Array<{ path: string }>;
+      for (const row of rows) found.add(row.path);
+    }
+    return found;
+  }
+
+  /**
+   * A reusable `(path) => boolean` over a bounded candidate list, unioning the
+   * indexed flag with the path convention. This is the shape every ranking
+   * comparator wants: one query up front, then O(1) per comparison.
+   */
+  generatedPredicateFor(filePaths: Iterable<string>): (filePath: string) => boolean {
+    const flagged = this.getGeneratedPathsAmong(filePaths);
+    return (filePath: string) => flagged.has(filePath) || isGeneratedFile(filePath);
+  }
+
+  /** How many indexed files carry the generated flag. Surfaced by `status`. */
+  countGeneratedFiles(): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS n FROM files WHERE generated = 1')
+      .get() as { n: number } | undefined;
+    return row?.n ?? 0;
   }
 
   /**

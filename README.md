@@ -192,47 +192,51 @@ When an AI agent needs to understand code — to answer a question or make a cha
 
 <img width="1536" height="1024" alt="token-cost-savings-scale" src="https://github.com/user-attachments/assets/eb74a11a-a3ab-4b01-80a6-19f78352ae8e" />
 
-> **A note on cost:** CodeGraph's win on *every* codebase is precision — the agent stops crawling files and answers from the graph. On current models that precision is also a large direct saving: the 2026-07 re-validation measured **60% lower cost and 69% fewer tokens on average** across the seven benchmark repos, because a strong model *without* the graph burns millions of tokens re-deriving structure. The savings scale with repo size and tangle — dramatic on VS-Code-class trees, modest on a 100-file project — and compound across a team's daily agent usage.
+> **A note on cost:** CodeGraph's win on *every* codebase is precision — the agent stops crawling files and answers from the graph. On current models that precision is also a large direct saving: the 2026-08 re-measurement, on a harness that blocks the CLI in both arms, put it at **44% lower cost and 62% fewer tokens on average** across the seven benchmark repos, because a strong model *without* the graph burns its budget re-deriving structure. Cost tracks how much *discovery* a question demands more than raw repo size: 57–78% on questions the file-reading agent needed 28–43 tool calls to answer, near-even where it got there in 7.
+
+> **A note on context:** the numbers above measure *throughput* — tokens processed, tools called, dollars spent to reach one answer. They don't measure what is still sitting in your context window afterward, and on that axis CodeGraph costs **more**, not less. Across the same seven repos in multi-turn sessions, CodeGraph's responses leave about **80% more retrieval context resident** at the end of a session than a file-reading agent's do — on VS Code, 67k tokens against 18k. The mechanism is the same one that makes it fast: CodeGraph returns one dense, verbatim payload that answers the question and then stays in the window, where a grep-and-read agent churns through many small results that get evicted. Fewer tokens *processed* and a larger persistent *footprint* are both real at once. If you run long sessions in a small window, budget for it. Measured per-repo: [`docs/benchmarks/residual-context-occupancy.md`](docs/benchmarks/residual-context-occupancy.md).
 
 ### Benchmark Results
 
-Tested across **7 real-world open-source codebases** spanning 7 languages, comparing an agent (Claude Code, headless) answering one architecture question **with** and **without** CodeGraph, at the **median of 4 runs per arm**. _Re-validated 2026-07-21 on **Claude Opus 4.8** against the current build — the Rust kernel plus this cycle's resolution overhaul._
+Tested across **7 real-world open-source codebases** spanning 7 languages, comparing an agent (Claude Code, headless) answering one architecture question **with** and **without** CodeGraph, at the **median of 4 runs per arm**. _Re-measured 2026-08-05 on **Claude Opus 4.8** against the current build, on a harness that blocks the `codegraph` CLI in **both** arms — contamination row: 0 of 28 without-arm runs._
 
-> **The universal win — every repo, every size: 89% fewer tool calls · 60% cheaper · 69% fewer tokens · file reads cut to zero on all seven repos.**
+> **The universal win — every repo, every size: 88% fewer tool calls · 53% faster · 62% fewer tokens · 44% cheaper · file reads cut to zero on all seven repos.**
 
-With the index available, the agent answers from a couple of `codegraph_explore` calls and stops. Without it, the agent burns its budget on discovery — up to **57 tool calls and 4.3M tokens** re-deriving what the graph already knew. The **Time** column averages 20% faster but is the noisiest metric: on two small repos a strong model's raw grep loop finishes the wall-clock race sooner while still spending 5–10× the tokens and money — noted per-row below.
+With the index available, the agent answers from one to four `codegraph_explore` calls and stops. Without it, the agent burns its budget on discovery — up to **43 tool calls and 19 file reads** re-deriving what the graph already knew. Every repo was faster with CodeGraph in this measurement — by 35% on the narrowest question, by 3.6× on the widest.
 
 | Codebase | Language | Tool calls | Time | File reads | Tokens | Cost |
 |----------|----------|------------|------|------------|--------|------|
-| **VS Code** | TypeScript · ~11k files | **2 vs 40** | **5× faster** (41s vs 3m 24s) | **0** vs 17 | 83% fewer | 75% cheaper |
-| **Excalidraw** | TypeScript · ~640 | 3 vs 55 | 36s vs 23s¹ | **0** vs 24 | 89% fewer | 78% cheaper |
-| **Django** | Python · ~3k | **2 vs 29** | 38% faster | **0** vs 16 | 78% fewer | 69% cheaper |
-| **Tokio** | Rust · ~790 | 3 vs 57 | 65% faster | **0** vs 15 | 91% fewer | 86% cheaper |
-| **OkHttp** | Java · ~645 | 1 vs 5 | 10% faster | **0** vs 1 | 33% fewer | ~even² |
-| **Gin** | Go · ~110 | 3 vs 10 | 57% faster | **0** vs 4 | 18% fewer | 41% cheaper |
-| **Alamofire** | Swift · ~110 | 3 vs 53 | 49s vs 31s¹ | **0** vs 18 | 90% fewer | 86% cheaper |
+| **VS Code** | TypeScript · ~11k files | **2 vs 28** | **2.2× faster** (58s vs 2m 10s) | **0** vs 12 | 77% fewer | 71% cheaper |
+| **Excalidraw** | TypeScript · ~640 | **2 vs 43** | **3.6× faster** (45s vs 2m 42s) | **0** vs 18 | 84% fewer | 78% cheaper |
+| **Django** | Python · ~3k | 3 vs 14 | 35% faster (54s vs 1m 23s) | **0** vs 8.5 | 41% fewer | 13% cheaper¹ |
+| **Tokio** | Rust · ~790 | 3 vs 29 | **2.6× faster** (1m 3s vs 2m 43s) | **0** vs 19 | 65% fewer | 64% cheaper |
+| **OkHttp** | Java · ~645 | 1 vs 6 | 43% faster (33s vs 58s) | **0** vs 2 | 54% fewer | 21% cheaper |
+| **Gin** | Go · ~110 | 1 vs 7 | 39% faster (28s vs 46s) | **0** vs 4 | 52% fewer | ~even¹ |
+| **Alamofire** | Swift · ~110 | 4 vs 33 | **2.6× faster** (54s vs 2m 22s) | **0** vs 16.5 | 59% fewer | 57% cheaper |
 
-<sub>¹ The small-repo floor effect: Opus 4.8 greps small trees fast enough to win wall-clock while spending ~5–10× the tokens and ~4–7× the cost — the with-arm still answers from zero file reads. ² OkHttp's without-arm got lucky in 5 calls; the with-arm answered in 1 call for ~$0.03 more. **File reads** = median files opened — the surgical-context win in one column: the agent never reads a file on any of the seven repos when CodeGraph is present.</sub>
+<sub>¹ Cost tracks how much *discovery* the question demanded, which is why it varies far more than the other columns: 57–78% on repos where the file-reading arm needed 28–43 tool calls, but only 13% on Django and even on Gin, where it got there in 14 and 7. The with-arm still answered in 3 and 1 calls with zero file reads. **File reads** = median files opened — the surgical-context win in one column: the agent never reads a file on any of the seven repos when CodeGraph is present.</sub>
 
 <details>
 <summary><strong>Per-repo breakdown — WITH vs WITHOUT (median of 4)</strong></summary>
 
 | Codebase | Metric | WITH cg | WITHOUT cg |
 |---|---|---|---|
-| **VS Code** | Time / Tools / Tokens / Cost | 41s / 2 / 265k / $0.36 | 3m 24s / 40 / 1.5M / $1.41 |
-| **Excalidraw** | Time / Tools / Tokens / Cost | 36s / 3 / 324k / $0.40 | 23s / 55 / 2.9M / $1.81 |
-| **Django** | Time / Tools / Tokens / Cost | 42s / 2 / 254k / $0.35 | 1m 8s / 29 / 1.2M / $1.13 |
-| **Tokio** | Time / Tools / Tokens / Cost | 46s / 3 / 386k / $0.44 | 2m 11s / 57 / 4.3M / $3.04 |
-| **OkHttp** | Time / Tools / Tokens / Cost | 27s / 1 / 156k / $0.23 | 30s / 5 / 233k / $0.20 |
-| **Gin** | Time / Tools / Tokens / Cost | 30s / 3 / 246k / $0.27 | 1m 10s / 10 / 300k / $0.46 |
-| **Alamofire** | Time / Tools / Tokens / Cost | 49s / 3 / 316k / $0.35 | 31s / 53 / 3.1M / $2.51 |
+| **VS Code** | Time / Tools / Tokens / Cost | 58s / 2 / 155k / $0.53 | 2m 10s / 28 / 670k / $1.80 |
+| **Excalidraw** | Time / Tools / Tokens / Cost | 45s / 2 / 156k / $0.54 | 2m 42s / 43 / 991k / $2.43 |
+| **Django** | Time / Tools / Tokens / Cost | 54s / 3 / 183k / $0.55 | 1m 23s / 14 / 309k / $0.63 |
+| **Tokio** | Time / Tools / Tokens / Cost | 1m 3s / 3 / 201k / $0.66 | 2m 43s / 29 / 573k / $1.83 |
+| **OkHttp** | Time / Tools / Tokens / Cost | 33s / 1 / 107k / $0.39 | 58s / 6 / 230k / $0.50 |
+| **Gin** | Time / Tools / Tokens / Cost | 28s / 1 / 87k / $0.31 | 46s / 7 / 180k / $0.31 |
+| **Alamofire** | Time / Tools / Tokens / Cost | 54s / 4 / 209k / $0.54 | 2m 22s / 33 / 505k / $1.27 |
 
 </details>
 
 <details>
 <summary><strong>Full benchmark details</strong></summary>
 
-**Methodology.** Each arm is `claude -p` (Claude Opus 4.8) run headlessly against the repo with `--strict-mcp-config`: **WITH** = CodeGraph's MCP server enabled, **WITHOUT** = an empty MCP config. Built-in Read/Grep/Bash stay available to both. Same question per repo, **4 runs per arm, median reported**. Cost = the run's `total_cost_usd`; Tokens = total tokens processed (input incl. cached + output); Time = wall-clock; Tool calls = every tool invocation, including those inside any sub-agents the model spawns. Repos cloned at `--depth 1` and indexed by the same CodeGraph build that served them. Re-validated 2026-07-21 on the current build (native Rust kernel, adaptive parallel resolution, scoped sync).
+**Methodology.** Each arm is `claude -p` (Claude Opus 4.8, `claude-opus-4-8`) run headlessly against the repo with `--strict-mcp-config`: **WITH** = CodeGraph's MCP server enabled, **WITHOUT** = an empty MCP config. Built-in Read/Grep/Bash stay available to both. Same question per repo, **4 runs per arm, median reported**. Cost = the run's `total_cost_usd`; Tokens = total tokens processed, summed per assistant turn (input incl. cache reads + cache creation + output); Time = wall-clock; Tool calls = every tool invocation, including those inside any sub-agents the model spawns. Repos cloned at `--depth 1` and indexed by the same CodeGraph build that served them. Re-measured 2026-08-05 on the current build.
+
+**The `codegraph` CLI is blocked in both arms.** A sanitized `PATH` plus a `PreToolUse` hook denies any Bash invocation of the CLI, in the WITHOUT arm as well as the WITH arm. This matters: without that block the control arm is not a control. On an unblocked harness we measured the WITHOUT agent finding the CLI on `PATH` and reaching CodeGraph through Bash in **26 of 28 runs** — which distorts the comparison in both directions, since a CLI call is not counted as a tool call and its output still enters the window. Earlier published figures were produced without this block. In the run reported above, all 28 WITHOUT runs attempted the CLI and **all 28 were blocked — 0 contaminated**.
 
 **Queries:**
 | Codebase | Query |

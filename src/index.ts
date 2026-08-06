@@ -1537,6 +1537,24 @@ export class CodeGraph {
     return this.queries.getAllFiles();
   }
 
+  /**
+   * A `(path) => boolean` generated-file test over a BOUNDED candidate list,
+   * unioning the index-time content-banner flag with the filename convention
+   * (#1500). One query up front, O(1) per call after — built for use inside a
+   * ranking comparator, where re-querying per comparison would be quadratic.
+   *
+   * Pass every path you might ask about; a path outside the list falls back to
+   * the filename check alone.
+   */
+  generatedFilePredicate(filePaths: Iterable<string>): (filePath: string) => boolean {
+    return this.queries.generatedPredicateFor(filePaths);
+  }
+
+  /** How many indexed files are flagged tool-generated. Reported by `status`. */
+  getGeneratedFileCount(): number {
+    return this.queries.countGeneratedFiles();
+  }
+
   // ===========================================================================
   // Graph Query Methods
   // ===========================================================================

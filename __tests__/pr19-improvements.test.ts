@@ -298,8 +298,21 @@ describe('Best-Candidate Resolution', () => {
 
 describe('Schema v2 Migration', () => {
   it.skipIf(!HAS_SQLITE)('should have correct current schema version', async () => {
-    const { CURRENT_SCHEMA_VERSION } = await import('../src/db/migrations');
-    expect(CURRENT_SCHEMA_VERSION).toBe(8);
+    const { CURRENT_SCHEMA_VERSION, getPendingMigrations } = await import('../src/db/migrations');
+    const { DatabaseConnection } = await import('../src/db');
+
+    // The constant must track the migration table, not a literal — a literal
+    // just makes every schema change edit this test (v9/#1500 was the latest).
+    // A fresh database records the current version, so nothing is pending;
+    // ask a version-0 database instead to see the full migration list.
+    const dbPath = path.join(createTempDir(), 'schema-version.db');
+    const conn = DatabaseConnection.initialize(dbPath);
+    const raw = conn.getDb();
+    raw.prepare('DELETE FROM schema_versions').run();
+    const highest = Math.max(...getPendingMigrations(raw).map((m) => m.version));
+    conn.close();
+
+    expect(CURRENT_SCHEMA_VERSION).toBe(highest);
   });
 
   it.skipIf(!HAS_SQLITE)('should have migration for version 2', async () => {

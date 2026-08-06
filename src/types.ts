@@ -252,6 +252,15 @@ export interface FileRecord {
 
   /** Any extraction errors */
   errors?: ExtractionError[];
+
+  /**
+   * Tool-generated source, decided at index time from the filename
+   * convention OR a generation banner in the file's header (see
+   * extraction/generated-detection.ts). A relevance hint for ranking, not a
+   * hard filter. Absent on indexes built before schema v9 — treat
+   * `undefined` as "content signal unknown, fall back to the path check".
+   */
+  generated?: boolean;
 }
 
 // =============================================================================
