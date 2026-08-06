@@ -1243,6 +1243,59 @@ def external_caller():
       expect(externalCalls).toHaveLength(0);
     });
 
+    it('resolves Python imports inside a line-wrapped `from pkg import (...)` list', async () => {
+      // extractPythonImports re-parses raw source with a regex, separately from
+      // the tree-sitter AST. That regex was `from\s+([\w.]+)\s+import\s+([^#\n]+)`
+      // — the `[^#\n]+` capture stops at the first newline. PEP 8 wraps a long
+      // parenthesized import list across multiple physical lines, so every name
+      // after line one of the statement fell outside the match and got no
+      // ImportMapping at all. Reproduces with as few as two names split across
+      // two lines; both names below are checked so a fix that only recovers the
+      // last name (rather than every name after line one) still fails this.
+      fs.mkdirSync(path.join(tempDir, 'services'));
+      fs.writeFileSync(path.join(tempDir, 'services', '__init__.py'), '');
+      fs.writeFileSync(
+        path.join(tempDir, 'services', 'rentabilite.py'),
+        'def compute():\n    return 42\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'services', 'echeancier.py'),
+        'def upcoming():\n    return []\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'main.py'),
+        `from .services import (echeancier,
+                       rentabilite)
+
+
+def etudes():
+    return rentabilite.compute()
+
+
+def dashboard():
+    return echeancier.upcoming()
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const etudes = cg.getNodesByKind('function').filter((n) => n.name === 'etudes')[0];
+      expect(etudes).toBeDefined();
+      const etudesCalls = cg.getOutgoingEdges(etudes!.id).filter((e) => e.kind === 'calls');
+      expect(etudesCalls).toHaveLength(1);
+      const etudesTarget = cg.getNode(etudesCalls[0]!.target);
+      expect(etudesTarget?.name).toBe('compute');
+      expect(etudesTarget?.filePath.replace(/\\/g, '/')).toBe('services/rentabilite.py');
+
+      const dashboard = cg.getNodesByKind('function').filter((n) => n.name === 'dashboard')[0];
+      expect(dashboard).toBeDefined();
+      const dashboardCalls = cg.getOutgoingEdges(dashboard!.id).filter((e) => e.kind === 'calls');
+      expect(dashboardCalls).toHaveLength(1);
+      const dashboardTarget = cg.getNode(dashboardCalls[0]!.target);
+      expect(dashboardTarget?.name).toBe('upcoming');
+      expect(dashboardTarget?.filePath.replace(/\\/g, '/')).toBe('services/echeancier.py');
+    });
+
     it('attaches Go methods to their receiver type across files (#583, cross-file half)', async () => {
       // In Go a type's methods are commonly declared in a different file from the
       // `type` declaration (`type Box` in box.go, `func (b *Box) Get()` in
