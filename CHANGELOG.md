@@ -225,6 +225,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- Rust unit structs (`struct Unit;`) and their trait implementation relationships now appear in the graph after re-indexing. (#1513, #1514)
 - Imports from Node built-ins or npm packages no longer connect to unrelated type members with matching names; re-index after upgrading to clear existing false dependencies. Thanks @ctype-lab. (#1537)
 
 - Inheritance relationships no longer attach external Rust or npm supertypes to unrelated local symbols with the same name, including in Svelte, Vue and Astro components; re-index after upgrading to clear existing false relationships. Thanks @ctype-lab. (#1536)
