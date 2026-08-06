@@ -149,6 +149,13 @@ export interface ResolutionContext {
    */
   getGoModule?(): import('./go-module').GoModule | null;
   /**
+   * Index over **every** `go.mod` in the project (multi-module monorepo).
+   * Returns `null` when the project has no `go.mod` at all. Preferred over
+   * `getGoModule()` — `getGoModule()` is retained only as a single-module
+   * fast path and backward-compat fallback.
+   */
+  getGoModules?(): import('./go-module').GoModuleIndex | null;
+  /**
    * Monorepo workspace member packages, keyed by declared package name.
    * Returns `null` for single-package repos (no `workspaces` field).
    * Lets the resolver treat `@scope/ui/sub` as a local import into the

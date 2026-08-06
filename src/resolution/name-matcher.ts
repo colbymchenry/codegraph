@@ -1957,14 +1957,22 @@ function matchGoFieldChainCall(
       // fabrication this matcher exists to prevent (#1276).
       if (rawType.includes('.')) {
         const pkg = rawType.split('.')[0]!;
+        // A package-qualified field type is followed only when the package is
+        // IN-MODULE. Multi-module index first (covers side-by-side modules in
+        // one tree); single-module path stays as the backward-compat fallback.
+        // This guard exists to PREVENT fabrication (#1276): stripping the
+        // qualifier and matching the bare name would conflate a stdlib /
+        // third-party type with any same-named project type. Keep it precise —
+        // only a package that genuinely belongs to a local module passes.
+        const idx = context.getGoModules?.();
         const mod = context.getGoModule?.();
         const imp = context
           .getImportMappings(s.filePath, 'go')
           .find((i) => i.localName === pkg);
         const inModule =
-          !!mod &&
           !!imp &&
-          (imp.source === mod.modulePath || imp.source.startsWith(mod.modulePath + '/'));
+          (!!idx?.resolve(imp.source) ||
+            (!!mod && (imp.source === mod.modulePath || imp.source.startsWith(mod.modulePath + '/'))));
         if (!inModule) continue;
       }
       // Unexported (lowercase) types are idiomatic Go and stay eligible —
