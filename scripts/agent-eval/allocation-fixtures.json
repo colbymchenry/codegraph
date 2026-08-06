@@ -1,0 +1,159 @@
+{
+  "$comment": [
+    "Regression fixtures for GitHub issue #1500 / epic CG-1 — relevance-proportional",
+    "explore budget allocation. Run them with `node scripts/agent-eval/probe-allocation.mjs`",
+    "against a built dist/.",
+    "",
+    "STATUS: BOTH FIXTURES PASS. CG-10 (relevance scoring) closed the RANKING half —",
+    "nothing incidental reaches the envelope any more — and CG-12 (score-proportional",
+    "allocation with a relative cliff) closed the BYTE SPLIT: each file's share is reserved",
+    "before anything renders, and a file under 15% of the top weight gets no source at all,",
+    "freeing both its bytes and its maxFiles slot. Each fixture records the pre-CG-10",
+    "`baseline`, the interim `afterCG10`, and the current `afterCG12`.",
+    "",
+    "`groups` partitions the files explore rendered into `answer` (what the query is",
+    "actually about) and `incidental` (what wins the envelope today on name collisions).",
+    "Assertions are on the DELIVERED envelope unless suffixed `Allocated`; delivered is",
+    "what the agent got, allocated is what the render loop chose before the hard ceiling.",
+    "Shares are fractions of the whole response, meta-text included, so they never sum to 1."
+  ],
+  "fixtures": [
+    {
+      "id": "payroll-go",
+      "title": "#1500 — generated Go CRUD beside a hand-written payroll workflow",
+      "kind": "fixture",
+      "path": "__tests__/fixtures/payroll-go",
+      "query": "how does payroll cycle create and calculate payslips?",
+      "rationale": [
+        "The reporter's repo shape: a Go service whose generated FKIT CRUD layer sits",
+        "beside the hand-written use-case that does the real work. The query deliberately",
+        "does NOT name runPayrollCycleAll / BuildPayslip / Upsert — an architecture",
+        "question phrased the way a newcomer would phrase it. The generated layer",
+        "name-collides on every query term (CreatePayslip, PayrollCycleCreateRequest,",
+        "CalculatePayrollCycleTotals, a second BuildPayslip, a second Upsert), so a",
+        "scorer that rewards incidental name matches surfaces the CRUD path.",
+        "Half the generated files carry ORDINARY names and are only detectable by their",
+        "`// Code generated ... DO NOT EDIT.` header (CG-5), which is what makes this",
+        "the #1500 case rather than a .pb.go case."
+      ],
+      "groups": {
+        "answer": [
+          "internal/usecase/**",
+          "internal/store/**",
+          "internal/transport/**",
+          "internal/domain/**",
+          "cmd/**"
+        ],
+        "incidental": ["internal/gen/**"]
+      },
+      "assert": {
+        "answerShareAtLeast": 0.55,
+        "incidentalShareAtMost": 0.25,
+        "topFileGroup": "answer",
+        "mustDeliverBytes": [
+          "internal/usecase/payroll/cycle.go",
+          "internal/usecase/payroll/payslip_builder.go"
+        ],
+        "$mustContainComment": "Needles are chosen to match the HAND-WRITTEN chain only — a bare `BuildPayslip`/`Upsert` also matches the generated collisions, which is the whole point of the fixture.",
+        "mustContain": [
+          "runPayrollCycleAll",
+          "func (s *Service) BuildPayslip",
+          "s.store.Upsert(ctx, slip)"
+        ]
+      },
+      "baseline": {
+        "measuredOn": "2026-08-03",
+        "note": "19 files → very-tiny tier (13,000 budget); 23,020 chars allocated against it, cut to 16,011 by the 19,500 hard ceiling.",
+        "delivered": {
+          "internal/gen/fkit/payroll/payslip.go": 0.307,
+          "internal/gen/fkit/payroll/payroll_cycle.go": 0.266,
+          "internal/domain/payroll/payslip.go": 0.256,
+          "internal/usecase/payroll/cycle.go": 0.0
+        },
+        "verdict": "The workflow file is allocated the single largest slice (30.6%) and delivers ZERO — the hard ceiling drops its whole section. Generated CRUD takes 57.4% of what the agent actually receives; runPayrollCycleAll, BuildPayslip and the real Upsert never reach the response."
+      },
+      "afterCG10": {
+        "measuredOn": "2026-08-04",
+        "delivered": {
+          "internal/usecase/payroll/cycle.go": 0.389,
+          "internal/gen/fkit/payroll/payroll_cycle.go": 0.235,
+          "internal/domain/payroll/payslip.go": 0.226,
+          "internal/gen/fkit/payroll/payslip.go": 0.0
+        },
+        "verdict": "PASSES answerShareAtLeast (61.5%), incidentalShareAtMost (23.5%), topFileGroup, and the cycle.go + runPayrollCycleAll + real-Upsert needles. The generated files now rank #3/#4 instead of #1/#2 — kind weighting plus a 0.3x generated penalty on BOTH the score and the graph mass, which is the key the comparator sorts on. STILL FAILING for CG-12: payslip_builder.go ranks #6 against the tier's maxFiles of 4, so `func (s *Service) BuildPayslip` never renders."
+      },
+      "afterCG12": {
+        "measuredOn": "2026-08-04",
+        "note": "19,337 delivered, nothing truncated. Both generated files cliffed to pointers (weight 3.9 and 3.5 against a cliff of 5.4), which frees the two maxFiles slots the hand-written store and builder then take.",
+        "delivered": {
+          "internal/usecase/payroll/cycle.go": 0.306,
+          "internal/domain/payroll/payslip.go": 0.212,
+          "internal/usecase/payroll/payslip_builder.go": 0.151,
+          "internal/store/payslipstore/store.go": 0.118,
+          "internal/gen/fkit/payroll/payroll_cycle.go": 0.0,
+          "internal/gen/fkit/payroll/payslip.go": 0.0
+        },
+        "verdict": "ALL GATES PASS. Answer group 78.7% (from 25.6% at baseline), generated layer 0.0% (from 57.4%). All four hand-written files deliver source, including payslip_builder.go — `func (s *Service) BuildPayslip`, the 'calculate' half of the question, finally reaches the agent. The generated files are still NAMED with their symbols and line numbers under 'Not shown above', so withholding their bytes costs ~100 chars each instead of ~4,500 and stays one follow-up explore away."
+      }
+    },
+    {
+      "id": "self-query",
+      "title": "This repo — incidental `explore`/`BUDGET` matches in the agent-eval scripts",
+      "kind": "self",
+      "path": ".",
+      "query": "how does explore allocate its output budget across files",
+      "rationale": [
+        "The same failure mode with no generated code in sight. `scripts/agent-eval/*.mjs`",
+        "mention `explore` and `BUDGET` incidentally — they are eval harnesses, not the",
+        "allocator — and they are small enough to ship WHOLE, while src/mcp/tools.ts (which",
+        "carries getExploreOutputBudget and the render loop, and scores 4x higher on every",
+        "signal) is large enough to be clipped at maxCharsPerFile. Allocation follows file",
+        "size, not relevance.",
+        "",
+        "Unlike payroll-go this fixture reads THIS repo's live index, so its exact numbers",
+        "move as the repo changes (indexed file count crossing 500 flips the budget tier).",
+        "The assertions are therefore relative — answer-vs-incidental, not fixed percentages."
+      ],
+      "groups": {
+        "answer": ["src/mcp/**"],
+        "incidental": ["scripts/**"]
+      },
+      "assert": {
+        "answerShareAtLeast": 0.5,
+        "incidentalShareAtMost": 0.25,
+        "topFileGroup": "answer",
+        "mustDeliverBytes": ["src/mcp/tools.ts"]
+      },
+      "baseline": {
+        "measuredOn": "2026-08-03",
+        "note": "493 files → small tier (18,000 budget); 27,518 chars allocated against it, cut to 19,749 by the 25,000 hard ceiling.",
+        "delivered": {
+          "scripts/agent-eval/offload-eval-hook.mjs": 0.25,
+          "scripts/agent-eval/offload-eval-metrics.mjs": 0.236,
+          "scripts/agent-eval/parse-session.mjs": 0.232,
+          "src/mcp/tools.ts": 0.185,
+          "scripts/agent-eval/offload-eval-cost.mjs": 0.0
+        },
+        "verdict": "The script corpus takes 71.8% of the delivered envelope (79.4% of what was allocated) against tools.ts's 18.5%, despite tools.ts scoring 46 vs 10, carrying 2.3x the graph mass and 3x the distinct term hits."
+      },
+      "afterCG10": {
+        "measuredOn": "2026-08-04",
+        "delivered": {
+          "src/resolution/memory-budget.ts": 0.512,
+          "src/mcp/tools.ts": 0.329
+        },
+        "verdict": "PASSES incidentalShareAtMost: every scripts/agent-eval/*.mjs file is gone (0.0%), which is CG-10's acceptance bar — their sole match was an unused file-scope `explore`/`BUDGET` constant, worth 0.08x weight, and the relative floor (8.2) then cut them. tools.ts ranks #1. STILL FAILING for CG-12: memory-budget.ts scores 18 to tools.ts's 41 yet takes 51.2% of the envelope to tools.ts's 32.9%, purely because it is small enough to ship whole while tools.ts is clipped at maxCharsPerFile. Allocation still follows file size, not relevance."
+      },
+      "afterCG12": {
+        "measuredOn": "2026-08-04",
+        "note": "18,134 delivered, nothing truncated. tools.ts scores 58 here (it grew by the allocator this task added), memory-budget.ts 18.",
+        "delivered": {
+          "src/mcp/tools.ts": 0.606,
+          "src/resolution/memory-budget.ts": 0.172,
+          "src/resolution/lru-cache.ts": 0.111
+        },
+        "verdict": "ALL GATES PASS. tools.ts takes 60.6% of the envelope, up from 18.5% at baseline and 32.9% after CG-10 — past the epic's >50% acceptance bar. The reversal is the whole point: memory-budget.ts no longer wins by being small enough to ship whole (it now clusters within its 3.1K reservation), and tools.ts is no longer clipped at maxCharsPerFile (11K reservation, ~3x the old flat cap). Exception to 'no previously-unclipped file becomes clipped': memory-budget.ts was unclipped-whole at 5,672 and is now clipped to its proportional share. That is the epic's own diagnosis of the bug, not a regression — it scored 18 against tools.ts's 58 and was taking the larger slice."
+      }
+    }
+  ]
+}

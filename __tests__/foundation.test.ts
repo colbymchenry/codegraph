@@ -12,6 +12,7 @@ import { CodeGraph } from '../src';
 import { Node, Edge } from '../src/types';
 import { isInitialized, getCodeGraphDir, validateDirectory, codeGraphDirName, isCodeGraphDataDir } from '../src/directory';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from '../src/db';
+import { CURRENT_SCHEMA_VERSION } from '../src/db/migrations';
 
 // Create a temporary directory for each test
 function createTempDir(): string {
@@ -370,7 +371,9 @@ describe('Database Connection', () => {
 
     const version = db.getSchemaVersion();
     expect(version).not.toBeNull();
-    expect(version?.version).toBe(8);
+    // A freshly initialized database records the current version outright
+    // (schema.sql already contains every migration's end state).
+    expect(version?.version).toBe(CURRENT_SCHEMA_VERSION);
 
     db.close();
   });

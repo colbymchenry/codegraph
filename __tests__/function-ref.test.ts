@@ -11,7 +11,9 @@
  *  - decoy: an ambiguous cross-file name (no import, ≥2 definitions) → NO edge
  *  - same-file priority: a same-file definition beats a same-named decoy
  *  - kind filter: a class/variable passed as a value never gets a
- *    function-ref edge
+ *    function-ref edge — except Python, where class-as-value is a core
+ *    idiom and bare ids ALSO resolve to classes (#1478); methods stay
+ *    excluded for bare ids everywhere
  *  - self: a function passing itself → no self-loop
  *  - drain: all resolvable function_ref rows leave unresolved_refs (no
  *    batched-resolver runaway), and re-index is idempotent
@@ -738,6 +740,117 @@ describe('Function-as-value capture (#756)', () => {
       // `validates :title` names an attribute — the same-named METHOD must
       // get no registration edge.
       expect(fnRefEdgesInto(cg, 'title')).toHaveLength(0);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
+  it('PYTHON CLASSES: return / alias / registry dict / arg positions produce references edges (#1478)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-pycls-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'serializers.py'),
+      [
+        'class OrgSerializerFull:',
+        '    pass',
+        '',
+        'class OrgSerializerBrief:',
+        '    pass',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'views.py'),
+      [
+        'from serializers import OrgSerializerFull, OrgSerializerBrief',
+        '',
+        'def register(cls):',
+        '    pass',
+        '',
+        'class OrgViewSet:',
+        '    def get_serializer_class(self):',
+        '        if True:',
+        '            return OrgSerializerFull',
+        '        return OrgSerializerBrief',
+        '',
+        'SERIALIZER_REGISTRY = {"org": OrgSerializerFull}',
+        'register(OrgSerializerBrief)',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'models.py'),
+      [
+        'class Config:',
+        '    pass',
+        '',
+        'def make_config_cls():',
+        '    return Config',
+        '',
+        'ActiveConfig = Config',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+
+      // The DRF wiring: get_serializer_class → the imported serializer class,
+      // via `return` — the issue's headline gap. The module-level registry
+      // dict rides the file node.
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'OrgSerializerFull'))).toEqual([
+        'get_serializer_class',
+        'views.py',
+      ]);
+      // Second branch return + a module-level call argument.
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'OrgSerializerBrief'))).toEqual([
+        'get_serializer_class',
+        'views.py',
+      ]);
+
+      // Same-file: factory return + module-level alias assignment.
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'Config'))).toEqual([
+        'make_config_cls',
+        'models.py',
+      ]);
+
+      // callers() must now surface the view as a consumer of the serializer.
+      const serializer = cg
+        .getNodesByName('OrgSerializerFull')
+        .find((n) => n.kind === 'class')!;
+      const callers = cg.getCallers(serializer.id);
+      expect(callers.some((c) => c.node.name === 'get_serializer_class')).toBe(true);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
+  it('PYTHON KIND FILTER: bare ids still never resolve to methods; unknown names stay silent', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-pyneg-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'svc.py'),
+      [
+        'class Svc:',
+        '    def refresh(self):',
+        '        pass',
+        '',
+        'def wire(cb):',
+        '    pass',
+        '',
+        'def setup(refresh):',
+        // A local/parameter sharing a same-file METHOD name: the gate lets it
+        // through (methods are in definedHere) but resolution must refuse —
+        // a bare id can never be a method value in Python.
+        '    wire(refresh)',
+        // A name with no matching class/function anywhere: no edge, silently.
+        '    return unknown_thing',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      expect(fnRefEdgesInto(cg, 'refresh')).toHaveLength(0);
+      expect(fnRefEdgesInto(cg, 'unknown_thing')).toHaveLength(0);
     } finally {
       cg.destroy();
       tmpDir = undefined;

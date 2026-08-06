@@ -265,7 +265,14 @@ export class ContextBuilder {
 
     // Return formatted output or raw context
     if (opts.format === 'markdown') {
-      return formatContextAsMarkdown(context)
+      // Bounded candidate set (entry points + subgraph + code blocks), so the
+      // DB-backed generated check is one probe, not a per-comparison query.
+      const isGenerated = this.queries.generatedPredicateFor([
+        ...entryPoints.map((n) => n.filePath),
+        ...Array.from(subgraph.nodes.values(), (n) => n.filePath),
+        ...codeBlocks.map((b) => b.filePath),
+      ]);
+      return formatContextAsMarkdown(context, isGenerated)
         + this.buildCallPathsSection(subgraph)
         + (subgraph.confidence === 'low' ? this.buildLowConfidenceNote(entryPoints) : '');
     } else if (opts.format === 'json') {

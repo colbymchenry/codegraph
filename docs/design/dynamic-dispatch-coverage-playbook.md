@@ -278,6 +278,30 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
 (Verify the exact supported set against `src/extraction/languages/` and
 `src/resolution/frameworks/` before starting — this table is a starting point.)
 
+### Retrieval A/Bs that are not coverage work
+
+Coverage decides whether a flow *exists* in the graph. A second class of change decides
+whether the answer explore returns is *sufficient* — how the byte envelope is divided across
+the files it found. Same pass bar (Read → 0, no wall-clock regression), same `--model sonnet
+--effort high` rule, but the harness is `ab-new-vs-baseline.sh` (new build vs baseline build,
+**both codegraph-on**) rather than `run-all.sh`'s with-vs-without, because the question is
+whether a change to codegraph helped, not whether codegraph helps.
+
+| Change | Repos | Result |
+|---|---|---|
+| **Score-proportional byte allocation** (#1500, epic CG-1) — 2026-08-04, `feature/CG-1` vs `main`, 3 runs/arm | client-go (Go, 2,454 f, 2,001 generated — the reporter's shape), excalidraw (TS, 672 f), express (JS, 147 f, control) | **Gate FAILED.** Read 0/0/0 both arms on client-go and excalidraw; excalidraw **34s → 24s median with one fewer explore call**; generated clientsets/informers drop from 10.5% of a baseline envelope to 0% in every new run. But express regressed in 1 of 3 runs (**4 Reads, 52s**) from a reproducible non-agent cause: a file whose proportional reservation lands below its own size no longer renders whole and its cluster render leaves the reservation **unspent** (`lib/utils.js` 6,380 B whole → 583 B stub, envelope 13.8K → 9.2K). Full record: [`docs/benchmarks/explore-allocation-ab-1500.md`](../benchmarks/explore-allocation-ab-1500.md) |
+| **↳ re-run after CG-21** — 2026-08-04, `feature/CG-1` @ `fca7d87` vs the same `main`, **6 runs/arm** on express + excalidraw, 3 on client-go | same three repos | **Gate PASSES, all four bars.** **Read = 0 in all 15 new-arm runs** — the express regression does not reproduce in 6 attempts, and the *baseline* now reads in 4 of 6 while the new arm reads in none; express median **24.5s → 21.5s**. client-go answer share 92.7–96.2% vs a baseline run at 53.8%. Excalidraw's new arm is ~8s slower at the median, **not attributed to the build**: explore's own latency is 374 ms vs 372 ms (n=5), deterministic responses differ by +2% with one byte-identical, and the *unchanged* `main` build's own median moved 34s → 26.5s between the two sessions. Deterministic core: `lib/utils.js` 583 B stub → **6,268 B whole**, envelope 9.2K → **14.5K** on an unchanged budget |
+| **↳ the gate (CG-22)** — 2026-08-04, `feature/CG-1` @ `abee46c` vs `main` @ `49c11fc` pinned by SHA, **CG-15's exact setup**: `RUNS=3`, fresh clones, 3 runs/arm (6 on client-go, two pooled batches) | same three repos (excalidraw now 677 f; same tier) | **Gate PASSES, all four bars — re-measured independently of the task that wrote the fix.** **Read = 0 in all 12 new-arm runs**, while the *baseline* reads in **3 of 3** express runs and 1 of 6 client-go runs. Express median 26s → **24s**, `lib/utils.js` delivered whole in every new run (6,455–7,673 B) and never opened. client-go answer share **89.8–97.8%** (baseline 85.6–100% — this session's baseline sampled well, so the gap is smaller than CG-21's); generated clientsets/informers take **0%** in all 12 runs. One honest counter-point: excalidraw's new arm runs **below** its baseline on answer share (66.6–81.9 vs 75.5–92.7), still far above the 50% bar. client-go's +1.5s median at n=6 is **not the build** — explore's own latency is 669 vs 668 ms and the new build's deterministic response is *smaller* (15.8K vs 18.9K) and more concentrated (50.2% vs 35.7% on the top file). Deterministic core, both builds re-measured in-session: `lib/utils.js` **6,380 B whole on both**, envelope **13,849 → 14,913** on an unchanged 13,000 budget |
+
+Two harness lessons from that run, both now baked into `ab-new-vs-baseline.sh`:
+
+- **Name codegraph in the prompt for this class of A/B.** Whether the agent picks the tool at
+  all is an adoption axis a retrieval change does not touch; a run that never calls explore
+  measures nothing about how explore divides its bytes (one pre-run: 0 codegraph calls, 3
+  Reads). It is not a forced-Read-0 — the agent stays free to fall back, which is the bar.
+- **`CODEGRAPH_NO_PROMPT_HOOK=1` on both arms.** The machine's ambient front-load hook resolves
+  to whatever is in `dist/`, which the script itself rewrites between arms.
+
 ---
 
 ## 7. Known limits & gotchas (from the excalidraw/django work)
