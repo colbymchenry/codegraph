@@ -183,6 +183,19 @@ export interface LanguageExtractor {
    * bodiless class IS complete (Kotlin `class Empty`, Scala `case object`). (#1093)
    */
   skipBodilessClass?: boolean;
+  /**
+   * Keep a bodiless struct node — it IS a complete definition, not a forward
+   * declaration. Set only for languages where a bodiless `struct` is complete:
+   * Rust's unit struct (`struct Unit;`). Leave unset for C/C++, where
+   * `struct Foo;` is a forward declaration.
+   *
+   * Opposite polarity from `skipBodilessClass` (#1093) because the defaults
+   * differ: a bodiless CLASS is kept unless a language opts into skipping,
+   * a bodiless STRUCT is skipped unless a language opts into keeping. The
+   * hardcoded C# `record_declaration` carve-out (#831) is the same situation
+   * predating this flag.
+   */
+  allowBodilessStruct?: boolean;
   /** NodeKind to use for interface-like declarations (Rust: 'trait'). Default: 'interface' */
   interfaceKind?: NodeKind;
 

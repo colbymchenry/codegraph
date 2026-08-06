@@ -135,7 +135,7 @@ undefined; **no isConst means `const_item`/`static_item` extract as kind
 |---|---|---|
 | `function_item` (top level) | functionTypes, tree-sitter.ts:994 → extractFunction:1517 | not inside class-like at file scope → extractFunction; **first line of extractFunction (1522): if getReceiverType returns a value → extractMethod instead** (this is how impl-block fns become methods — impl_item does NOT push a scope) |
 | `function_signature_item` | same | in a trait body (trait pushed, class-like) → extractMethod; no `body` field → no body walk |
-| `struct_item` | structTypes:1059 → extractStruct:1869 | `body` field required: **unit structs `struct Unit;` have no body → NO node minted** (1876, `record_declaration` exemption is C#-only). Tuple structs have body `ordered_field_declaration_list` → extracted. `field_declaration` children make NO nodes (rust has no fieldTypes) — visitNode recurses into them and finds nothing |
+| `struct_item` | structTypes:1059 → extractStruct:1869 | ~~`body` field required: unit structs `struct Unit;` have no body → NO node minted~~ — **superseded: Rust now sets `allowBodilessStruct`, so `struct Unit;` mints a node with no members.** Rust has no forward declarations, so the bodiless skip (meant for C/C++) never applied here; the `record_declaration` exemption is the C# form of the same carve-out. Tuple structs have body `ordered_field_declaration_list` → extracted. `field_declaration` children make NO nodes (rust has no fieldTypes) — visitNode recurses into them and finds nothing |
 | `enum_item` | enumTypes:1064 → extractEnum:1914 | body `enum_variant_list`; `enum_variant` children → extractEnumMembers:1958 — **`name` field path: one `enum_member` node from `getChildByField(node,'name')`, then return** (variant payload bodies `B(u32)` / `C { x }` are never walked). Non-variant children (e.g. `attribute_item`) → visitNode (no-op) |
 | `trait_item` | interfaceTypes:1054 → extractInterface:1834 | kind `'trait'` (interfaceKind); extractInheritance sees the `trait_bounds` child (see below); body `declaration_list` children visited with the trait pushed → fn items become methods with QN `Trait::name` via nodeStack |
 | `impl_item` | dedicated branch:1273-1276 → extractRustImplItem:5690 | emits the implements back-reference (below); **skipChildren stays false** → the `declaration_list` is then visited normally by the loop at 1295 (that's how impl members are reached; impl pushes NOTHING on the nodeStack) |
@@ -480,7 +480,7 @@ inner `array_expression`, but `const CB: fn() = handler;` captures nothing
 ## Gates (per plan §5, no exceptions)
 
 - **Torture fixture `torture.rs`** (+ CRLF variant, derived in-memory), pinning
-  at minimum: unit struct (NO node) / tuple struct / field struct; enum with
+  at minimum: unit struct (node, no members) / tuple struct / field struct; enum with
   unit+tuple+struct variants; trait with supertraits incl. a SCOPED one
   (`fmt::Debug` — dropped) + `function_signature_item` + default method +
   associated type/const (no node; const value call attributes to trait);

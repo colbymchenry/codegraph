@@ -42,6 +42,9 @@ export const rustExtractor: LanguageExtractor = {
   methodTypes: ['function_item', 'function_signature_item'],
   interfaceTypes: ['trait_item'],
   structTypes: ['struct_item'],
+  // `struct Unit;` is a unit struct — a complete definition with no body
+  // field, not a forward declaration. Rust has no forward declarations.
+  allowBodilessStruct: true,
   enumTypes: ['enum_item'],
   enumMemberTypes: ['enum_variant'],
   typeAliasTypes: ['type_item'], // Rust type aliases

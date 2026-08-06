@@ -19,8 +19,7 @@
 //!   kind is always `variable`, no signature, and EVERY direct `identifier`
 //!   child mints a node (`const MAX: u32 = OTHER;` → two nodes, `MAX` + the
 //!   phantom `OTHER`). Top-level initializer values are never body-walked.
-//! - Unit structs (`struct Unit;`, no body field) mint NO node; `mod_item`
-//!   mints no module node and adds no QN prefix.
+//! - `mod_item` mints no module node and adds no QN prefix.
 //! - Chained-call re-encode is scoped_identifier-gated (`Foo::new().bar()` →
 //!   `Foo::new().bar`); instance chains, parens, `.await`, 2-hop fields, and
 //!   `self` receivers all collapse to the bare method name (`self` is node
@@ -579,10 +578,11 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    /// extractStruct — body field REQUIRED (unit structs mint no node; tuple
-    /// structs' ordered_field_declaration_list is a body).
+    /// extractStruct — the body field is OPTIONAL. A unit struct (`struct U;`)
+    /// has no body and is still a complete definition, so it mints a node with
+    /// no members; tuple structs' ordered_field_declaration_list is a body.
+    /// Mirrors the TS reference's `allowBodilessStruct`.
     fn extract_struct(&mut self, node: Node<'t>) {
-        let Some(body) = node.child_by_field_name("body") else { return };
         let name = self.extract_name(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
@@ -591,6 +591,10 @@ impl<'t> Walker<'t> {
         };
         let Some(row) = self.create_node("struct", &name, node, extra) else { return };
         self.extract_inheritance(node, row);
+
+        // Unit structs have no body to walk — the node itself is the whole
+        // definition.
+        let Some(body) = node.child_by_field_name("body") else { return };
 
         self.stack.push(Scope { row, kind: "struct", name });
         for i in 0..body.named_child_count() {

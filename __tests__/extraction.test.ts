@@ -1089,6 +1089,35 @@ pub struct User {
     expect(structNode?.name).toBe('User');
   });
 
+  it('should extract unit and tuple structs, not just brace structs', () => {
+    // A unit struct has no body field, but it IS a complete definition —
+    // Rust has no forward declarations. Skipping it dropped the type and
+    // every `impl Trait for UnitStruct` edge with it.
+    const code = `
+pub struct Unit;
+pub struct Tuple(pub u32);
+pub struct Brace { pub x: u32 }
+`;
+    const result = extractFromSource('shapes.rs', code);
+
+    const structs = result.nodes.filter((n) => n.kind === 'struct').map((n) => n.name).sort();
+    expect(structs).toEqual(['Brace', 'Tuple', 'Unit']);
+  });
+
+  it('should link impl Trait for a unit struct', () => {
+    const code = `
+pub struct Unit;
+pub trait Greet { fn hi(&self) -> String; }
+impl Greet for Unit { fn hi(&self) -> String { "unit".into() } }
+`;
+    const result = extractFromSource('greet.rs', code);
+
+    const unit = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Unit');
+    expect(unit).toBeDefined();
+    const trait = result.nodes.find((n) => n.kind === 'trait' && n.name === 'Greet');
+    expect(trait).toBeDefined();
+  });
+
   it('should extract trait declarations', () => {
     const code = `
 pub trait Repository {
